@@ -1,0 +1,31 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Node / Explorer
+explorer/node_modules/
+explorer/.next/
+explorer/.env.local
+
+# SDK
+sdk/node_modules/
+sdk/dist/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+
+# Benchmark export
+explorer/public/benchmark-data/

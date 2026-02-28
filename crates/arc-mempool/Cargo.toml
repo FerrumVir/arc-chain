@@ -1,0 +1,15 @@
+[package]
+name = "arc-mempool"
+description = "ARC Chain transaction mempool — ordering, deduplication, priority"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-types = { path = "../arc-types" }
+arc-crypto = { path = "../arc-crypto" }
+crossbeam.workspace = true
+parking_lot.workspace = true
+dashmap.workspace = true
+tracing.workspace = true
+thiserror.workspace = true

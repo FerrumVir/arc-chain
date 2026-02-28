@@ -1,0 +1,30 @@
+# Rust build artifacts
+target/
+*.rs.bk
+
+# Node / Explorer
+explorer/node_modules/
+explorer/.next/
+explorer/.env.local
+
+# SDK
+sdk/node_modules/
+sdk/dist/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.yml
+Dockerfile.node
