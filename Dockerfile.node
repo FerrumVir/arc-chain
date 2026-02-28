@@ -1,0 +1,37 @@
+# ── Stage 1: Build ────────────────────────────────────────────
+# Rust 1.85+ required for edition = "2024"
+FROM rust:1.85-bookworm AS builder
+
+# System deps for wgpu (Vulkan/Mesa) and wasmer
+RUN apt-get update && apt-get install -y \
+    cmake \
+    libvulkan-dev \
+    mesa-vulkan-drivers \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy manifests first for dependency caching
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+# Build both binaries in release mode
+RUN cargo build --release -p arc-node -p arc-bench
+
+# ── Stage 2: Runtime ─────────────────────────────────────────
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    curl \
+    libvulkan1 \
+    mesa-vulkan-drivers \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/arc-node /usr/local/bin/
+COPY --from=builder /app/target/release/arc-bench /usr/local/bin/
+
+EXPOSE 9090
+
+CMD ["arc-node"]

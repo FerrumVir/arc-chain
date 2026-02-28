@@ -1,0 +1,18 @@
+[package]
+name = "arc-vm"
+description = "ARC Chain WASM virtual machine — smart contract execution runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-crypto = { path = "../arc-crypto" }
+arc-types = { path = "../arc-types" }
+arc-state = { path = "../arc-state" }
+wasmer.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+wat = "1.245"
