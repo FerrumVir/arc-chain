@@ -1,0 +1,352 @@
+@import "tailwindcss";
+
+/* ARC Brand System — extracted from brandpad.io/arc (August 2024)
+   Design quality reference: private.arc.ai
+   Core:         #03030A Deep Bluish Black / #FFFFFF White
+   Accent:       #002DDE Pacific Purple / #3855E9 Medium Blue / #6F7CF4 Aquarius
+   Gradient:     #6F7CF4 → #002DDE
+   Greys:        #777785 → #8E8E9D → #AEAEBC → #C7C7D6 → #E5E5EA → #F4F4F4
+   Typography:   Favorit (primary), Favorit Mono (code), Inter (fallback)
+*/
+
+@font-face {
+  font-family: "Favorit";
+  src: url("/fonts/Favorit-Regular.otf") format("opentype");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  /* Warm-shifted backgrounds (inspired by private.arc.ai paper-like feel) */
+  --bg: #faf9f7;
+  --bg-secondary: #f3f2ee;
+  --bg-input: #FFFFFF;
+  --bg-elevated: #FFFFFF;
+
+  /* Text — warm near-black (not cold #333) */
+  --text: #1c1b18;
+  --text-secondary: #6b6a65;
+  --text-tertiary: #a3a29c;
+
+  /* Warm borders (paper edge feel) */
+  --border: #e5e3dd;
+  --border-light: #eeece7;
+
+  /* ARC brand accent — blue from brandpad */
+  --accent: #002DDE;
+  --accent-mid: #3855E9;
+  --accent-soft: #6F7CF4;
+  --accent-light: #eef0ff;
+  --accent-glow: rgba(0, 45, 222, 0.10);
+
+  /* ARC gradient */
+  --gradient-arc: linear-gradient(135deg, #6F7CF4, #002DDE);
+
+  /* Status — Protocol reds, Reactor greens, Matrix oranges */
+  --shield-green: #3d9e6a;
+  --shield-green-bg: #edf7f0;
+  --shield-yellow: #d4a843;
+  --shield-yellow-bg: #fdf8ed;
+  --shield-red: #c75050;
+  --shield-red-bg: #fdf0f0;
+
+  /* Markdown / code */
+  --code-bg: #05182B;
+  --code-tab: #0A2540;
+  --code-highlight-1: #4A7ED3;
+  --code-highlight-2: #00D4FF;
+  --code-highlight-3: #50DF96;
+
+  /* Interaction */
+  --hover-lift: translateY(-2px);
+  --press-scale: scale(0.98);
+  --spring-ease: cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1c1b18;
+    --bg-secondary: #252420;
+    --bg-input: #2a2925;
+    --bg-elevated: #2e2d28;
+    --text: #e8e6e1;
+    --text-secondary: #a3a29c;
+    --text-tertiary: #6b6a65;
+    --border: #33322d;
+    --border-light: #2a2925;
+    --accent: #6F7CF4;
+    --accent-mid: #3855E9;
+    --accent-soft: #002DDE;
+    --accent-light: #1a1d35;
+    --accent-glow: rgba(111, 124, 244, 0.12);
+    --gradient-arc: linear-gradient(135deg, #6F7CF4, #3855E9);
+    --shield-green: #6bc490;
+    --shield-green-bg: #1a2e22;
+    --shield-yellow: #e0b85a;
+    --shield-yellow-bg: #2a2510;
+    --shield-red: #e06060;
+    --shield-red-bg: #2e1a1a;
+    --code-bg: #05182B;
+    --code-tab: #0A2540;
+    --code-highlight-1: #4A7ED3;
+    --code-highlight-2: #00D4FF;
+    --code-highlight-3: #50DF96;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Reset & Base                                                        */
+/* ------------------------------------------------------------------ */
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body {
+  height: 100%;
+  font-family: "Favorit", "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  font-weight: 300;
+  background: var(--bg);
+  color: var(--text);
+  letter-spacing: -0.01em;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ------------------------------------------------------------------ */
+/* Custom scrollbar (thin, warm)                                       */
+/* ------------------------------------------------------------------ */
+
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-tertiary); }
+
+/* ------------------------------------------------------------------ */
+/* Premium typography utilities                                        */
+/* ------------------------------------------------------------------ */
+
+.tracking-display { letter-spacing: -0.035em; }
+.tracking-headline { letter-spacing: -0.025em; }
+.tracking-label { letter-spacing: 0.12em; }
+
+/* ------------------------------------------------------------------ */
+/* Animations — spring easing, subtle motion                           */
+/* ------------------------------------------------------------------ */
+
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes fade-slide-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes pulse-glow {
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-glow); }
+  50% { box-shadow: 0 0 12px 2px var(--accent-glow); }
+}
+
+@keyframes shield-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes arc-scan {
+  0% { transform: translateX(-100%); opacity: 0; }
+  10% { opacity: 1; }
+  90% { opacity: 1; }
+  100% { transform: translateX(200%); opacity: 0; }
+}
+
+@keyframes shield-fill {
+  0% { clip-path: inset(100% 0 0 0); }
+  100% { clip-path: inset(0 0 0 0); }
+}
+
+@keyframes proof-check-in {
+  0% { opacity: 0; transform: scale(0.3) rotate(-45deg); }
+  50% { transform: scale(1.15) rotate(5deg); }
+  100% { opacity: 1; transform: scale(1) rotate(0deg); }
+}
+
+@keyframes block-pop {
+  0% { opacity: 0; transform: scale(0.95) translateY(4px); }
+  60% { transform: scale(1.02) translateY(-1px); }
+  100% { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+@keyframes pulse-text {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.7; }
+}
+
+@keyframes count-up-glow {
+  0% { text-shadow: none; }
+  100% { text-shadow: 0 0 40px var(--accent-glow), 0 0 80px var(--accent-glow); }
+}
+
+@keyframes bar-grow {
+  from { width: 0; }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.3s ease-out forwards;
+}
+
+.animate-fade-slide-in {
+  animation: fade-slide-in 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}
+
+.animate-shield-pulse {
+  animation: shield-pulse 2s ease-in-out infinite;
+}
+
+.shimmer {
+  background: linear-gradient(90deg, var(--bg-secondary) 25%, var(--border-light) 50%, var(--bg-secondary) 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.5s infinite;
+}
+
+.animate-arc-scan {
+  animation: arc-scan 1.2s ease-in-out infinite;
+}
+
+.animate-shield-fill {
+  animation: shield-fill 0.4s ease-out forwards;
+}
+
+.animate-proof-check {
+  animation: proof-check-in 0.5s ease-out forwards;
+  opacity: 0;
+}
+
+.animate-block-pop {
+  animation: block-pop 0.35s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  opacity: 0;
+}
+
+.animate-pulse-text {
+  animation: pulse-text 2s ease-in-out infinite;
+}
+
+/* Proof verification delay classes */
+.proof-delay-1 { animation-delay: 0.1s; }
+.proof-delay-2 { animation-delay: 0.2s; }
+.proof-delay-3 { animation-delay: 0.3s; }
+.proof-delay-4 { animation-delay: 0.4s; }
+
+/* Staggered entrance delays */
+.delay-100 { animation-delay: 100ms; }
+.delay-200 { animation-delay: 200ms; }
+.delay-300 { animation-delay: 300ms; }
+.delay-400 { animation-delay: 400ms; }
+.delay-500 { animation-delay: 500ms; }
+
+/* ------------------------------------------------------------------ */
+/* Mono font for hashes and addresses                                  */
+/* ------------------------------------------------------------------ */
+
+.font-hash {
+  font-family: "JetBrains Mono", "SF Mono", "Fira Code", monospace;
+  font-size: 12px;
+  letter-spacing: 0em;
+}
+
+/* ------------------------------------------------------------------ */
+/* Premium card surface                                                */
+/* ------------------------------------------------------------------ */
+
+.card-surface {
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.card-surface:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06), 0 1px 3px rgba(0, 0, 0, 0.04);
+  transform: translateY(-1px);
+}
+
+.card-flat {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+}
+
+/* ------------------------------------------------------------------ */
+/* Frosted glass nav                                                   */
+/* ------------------------------------------------------------------ */
+
+.glass-nav {
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+/* ------------------------------------------------------------------ */
+/* Decorative background gradient blurs (ambient atmosphere)           */
+/* ------------------------------------------------------------------ */
+
+.ambient-glow {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(100px);
+  pointer-events: none;
+  opacity: 0.04;
+}
+
+/* ------------------------------------------------------------------ */
+/* Interactive utilities                                                */
+/* ------------------------------------------------------------------ */
+
+.interactive-lift {
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.interactive-lift:hover {
+  transform: translateY(-2px) scale(1.01);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.06);
+}
+
+.interactive-lift:active {
+  transform: scale(0.98);
+}
+
+.interactive-press {
+  transition: all 0.15s ease;
+}
+
+.interactive-press:hover {
+  opacity: 0.85;
+}
+
+.interactive-press:active {
+  transform: scale(0.97);
+}

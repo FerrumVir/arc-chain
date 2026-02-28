@@ -1,0 +1,36 @@
+services:
+  arc-node:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    ports:
+      - "9090:9090"
+    command: ["arc-node"]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  explorer:
+    build:
+      context: ./explorer
+      dockerfile: Dockerfile
+    ports:
+      - "3100:3100"
+    environment:
+      - ARC_NODE_URL=http://arc-node:9090
+    depends_on:
+      arc-node:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Standalone benchmark — runs once then exits.
+  # Start manually: docker compose run arc-bench
+  arc-bench:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    command: ["arc-bench"]
+    profiles: ["bench"]

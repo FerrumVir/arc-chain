@@ -1,0 +1,24 @@
+[package]
+name = "arc-crypto"
+description = "ARC Chain cryptographic primitives — Pedersen commitments, BLAKE3, Merkle trees, ZK aggregation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blake3.workspace = true
+curve25519-dalek.workspace = true
+sha2.workspace = true
+rand.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+hex.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "crypto_bench"
+harness = false

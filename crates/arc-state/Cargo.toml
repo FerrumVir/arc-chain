@@ -1,0 +1,18 @@
+[package]
+name = "arc-state"
+description = "ARC Chain state management — accounts, balances, state tree"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-crypto = { path = "../arc-crypto" }
+arc-types = { path = "../arc-types" }
+serde.workspace = true
+bincode.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+blake3.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

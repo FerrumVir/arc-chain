@@ -1,0 +1,16 @@
+[package]
+name = "arc-types"
+description = "ARC Chain core types — transactions, blocks, accounts, proofs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-crypto = { path = "../arc-crypto" }
+blake3.workspace = true
+serde.workspace = true
+bincode.workspace = true
+hex.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
