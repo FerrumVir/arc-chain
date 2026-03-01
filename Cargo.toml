@@ -26,6 +26,7 @@ blake3 = { version = "1.5", features = ["rayon"] }
 curve25519-dalek = { version = "4.1", features = ["digest", "rand_core"] }
 ed25519-dalek = { version = "2.1", features = ["batch", "rand_core"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
+fips204 = "0.4"
 sha2 = "0.10"
 rand = "0.8"
 rand_core = "0.6"
