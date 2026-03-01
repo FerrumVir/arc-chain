@@ -42,6 +42,8 @@ axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 quinn = "0.11"
+rcgen = "0.13"
+rustls = { version = "0.23", features = ["ring"] }
 
 # WASM runtime
 wasmer = "6.0"
