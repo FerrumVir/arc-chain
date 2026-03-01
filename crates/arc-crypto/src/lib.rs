@@ -12,6 +12,6 @@ pub use zk_aggregate::{AggregateProof, aggregate_proofs, verify_aggregate};
 pub use hash::{Hash256, hash_bytes, hash_pair};
 pub use signature::{
     Signature, KeyPair, SignatureError,
-    address_from_ed25519_pubkey, address_from_secp256k1_pubkey,
-    batch_verify_ed25519,
+    address_from_ed25519_pubkey, address_from_secp256k1_pubkey, address_from_ml_dsa_pubkey,
+    batch_verify_ed25519, batch_verify_ml_dsa,
 };

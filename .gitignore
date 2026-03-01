@@ -6,6 +6,7 @@ Cargo.lock
 # Node / Explorer
 explorer/node_modules/
 explorer/.next/
+explorer/dist/
 explorer/.env.local
 
 # SDK

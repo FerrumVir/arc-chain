@@ -1,16 +1,27 @@
 //! Digital signature primitives for ARC Chain.
 //!
-//! Two signature schemes:
+//! Three signature schemes:
 //! - **Ed25519**: Fast agent/native transactions (~4-9M batch verifications/sec)
 //! - **Secp256k1**: ETH-compatible operations (MetaMask, bridge verification)
+//! - **ML-DSA-65**: Post-quantum signatures (NIST FIPS 204, lattice-based)
 //!
 //! Address derivation:
 //! - Ed25519: `address = BLAKE3(public_key)[0..32]`
 //! - Secp256k1: `address = BLAKE3(uncompressed_pubkey[1..65])[0..32]`
+//! - ML-DSA-65: `address = BLAKE3(public_key)[0..32]`
 
 use crate::hash::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+// ── ML-DSA-65 constants (FIPS 204) ──────────────────────────────────────────
+
+/// ML-DSA-65 public key length in bytes.
+pub const ML_DSA_PK_LEN: usize = fips204::ml_dsa_65::PK_LEN;
+/// ML-DSA-65 secret key length in bytes.
+pub const ML_DSA_SK_LEN: usize = fips204::ml_dsa_65::SK_LEN;
+/// ML-DSA-65 signature length in bytes.
+pub const ML_DSA_SIG_LEN: usize = fips204::ml_dsa_65::SIG_LEN;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -47,6 +58,7 @@ pub enum SignatureError {
 ///
 /// Ed25519 signatures carry the public key (96 bytes total).
 /// Secp256k1 signatures are recoverable (65 bytes total: r‖s‖v).
+/// ML-DSA-65 signatures carry the public key (1952 + 3309 = 5261 bytes total).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Signature {
     /// Ed25519 signature (fast, for native/agent transactions).
@@ -61,6 +73,13 @@ pub enum Signature {
         /// 65-byte recoverable signature: r[32] ‖ s[32] ‖ v[1].
         signature: Vec<u8>,
     },
+    /// ML-DSA-65 post-quantum signature (NIST FIPS 204).
+    MlDsa65 {
+        /// 1952-byte ML-DSA-65 public key.
+        public_key: Vec<u8>,
+        /// 3309-byte ML-DSA-65 signature.
+        signature: Vec<u8>,
+    },
 }
 
 impl Signature {
@@ -71,6 +90,9 @@ impl Signature {
     ///
     /// For Secp256k1: recovers the public key from `(signature, recovery_id)`,
     /// then checks it hashes to `expected_address`.
+    ///
+    /// For ML-DSA-65: checks that `public_key` hashes to `expected_address`,
+    /// then verifies the lattice-based signature over `message_hash`.
     pub fn verify(
         &self,
         message_hash: &Hash256,
@@ -149,6 +171,51 @@ impl Signature {
 
                 Ok(())
             }
+
+            Signature::MlDsa65 {
+                public_key,
+                signature,
+            } => {
+                use fips204::traits::{SerDes, Verifier};
+
+                // Length checks
+                if signature.len() != ML_DSA_SIG_LEN {
+                    return Err(SignatureError::InvalidLength {
+                        expected: ML_DSA_SIG_LEN,
+                        got: signature.len(),
+                    });
+                }
+                if public_key.len() != ML_DSA_PK_LEN {
+                    return Err(SignatureError::InvalidPublicKey);
+                }
+
+                // 1. Public key must hash to the expected address
+                let derived = address_from_ml_dsa_pubkey(public_key);
+                if derived != *expected_address {
+                    return Err(SignatureError::AddressMismatch {
+                        expected: expected_address.to_hex(),
+                        got: derived.to_hex(),
+                    });
+                }
+
+                // 2. Reconstruct public key and verify signature
+                let pk_arr: [u8; ML_DSA_PK_LEN] = public_key
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SignatureError::InvalidPublicKey)?;
+                let pk = fips204::ml_dsa_65::PublicKey::try_from_bytes(pk_arr)
+                    .map_err(|_| SignatureError::InvalidPublicKey)?;
+                let sig_arr: [u8; ML_DSA_SIG_LEN] = signature
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SignatureError::InvalidSignature)?;
+
+                if pk.verify(message_hash.as_bytes(), &sig_arr, &[]) {
+                    Ok(())
+                } else {
+                    Err(SignatureError::InvalidSignature)
+                }
+            }
         }
     }
 
@@ -186,6 +253,14 @@ pub enum KeyPair {
     Ed25519(ed25519_dalek::SigningKey),
     /// Secp256k1 key pair — ETH-compatible operations.
     Secp256k1(k256::ecdsa::SigningKey),
+    /// ML-DSA-65 key pair — quantum-resistant operations (NIST FIPS 204).
+    /// Stored as serialized bytes because fips204 types don't implement Debug/Serialize.
+    MlDsa65 {
+        /// 4032-byte serialized private key.
+        sk_bytes: Vec<u8>,
+        /// 1952-byte serialized public key.
+        pk_bytes: Vec<u8>,
+    },
 }
 
 impl KeyPair {
@@ -201,10 +276,22 @@ impl KeyPair {
         KeyPair::Secp256k1(signing_key)
     }
 
+    /// Generate a new random ML-DSA-65 key pair (post-quantum).
+    pub fn generate_ml_dsa() -> Self {
+        use fips204::traits::SerDes;
+        let (pk, sk) = fips204::ml_dsa_65::try_keygen()
+            .expect("ML-DSA-65 keygen failed (RNG error)");
+        KeyPair::MlDsa65 {
+            sk_bytes: sk.into_bytes().to_vec(),
+            pk_bytes: pk.into_bytes().to_vec(),
+        }
+    }
+
     /// Derive the ARC chain address from this key pair.
     ///
     /// Ed25519: `BLAKE3(public_key)`
     /// Secp256k1: `BLAKE3(uncompressed_point[1..65])`
+    /// ML-DSA-65: `BLAKE3(public_key)`
     pub fn address(&self) -> Hash256 {
         match self {
             KeyPair::Ed25519(sk) => {
@@ -216,6 +303,9 @@ impl KeyPair {
                 let uncompressed = vk.to_encoded_point(false);
                 let point_bytes = uncompressed.as_bytes();
                 address_from_secp256k1_pubkey(&point_bytes[1..65])
+            }
+            KeyPair::MlDsa65 { pk_bytes, .. } => {
+                address_from_ml_dsa_pubkey(pk_bytes)
             }
         }
     }
@@ -245,6 +335,26 @@ impl KeyPair {
                     signature: sig_bytes,
                 })
             }
+            KeyPair::MlDsa65 { sk_bytes, pk_bytes } => {
+                use fips204::traits::{SerDes, Signer};
+
+                let sk_arr: [u8; ML_DSA_SK_LEN] = sk_bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| SignatureError::SigningFailed(
+                        "invalid ML-DSA secret key length".into(),
+                    ))?;
+                let sk = fips204::ml_dsa_65::PrivateKey::try_from_bytes(sk_arr)
+                    .map_err(|e| SignatureError::SigningFailed(e.to_string()))?;
+                let sig = sk
+                    .try_sign(message_hash.as_bytes(), &[])
+                    .map_err(|e| SignatureError::SigningFailed(e.to_string()))?;
+
+                Ok(Signature::MlDsa65 {
+                    public_key: pk_bytes.clone(),
+                    signature: sig.to_vec(),
+                })
+            }
         }
     }
 
@@ -256,6 +366,7 @@ impl KeyPair {
                 let vk = sk.verifying_key();
                 vk.to_encoded_point(true).as_bytes().to_vec()
             }
+            KeyPair::MlDsa65 { pk_bytes, .. } => pk_bytes.clone(),
         }
     }
 }
@@ -265,6 +376,7 @@ impl std::fmt::Debug for KeyPair {
         match self {
             KeyPair::Ed25519(_) => write!(f, "KeyPair::Ed25519(<redacted>)"),
             KeyPair::Secp256k1(_) => write!(f, "KeyPair::Secp256k1(<redacted>)"),
+            KeyPair::MlDsa65 { .. } => write!(f, "KeyPair::MlDsa65(<redacted>)"),
         }
     }
 }
@@ -290,6 +402,19 @@ pub fn address_from_secp256k1_pubkey(raw_pubkey_64: &[u8]) -> Hash256 {
     hash_bytes(raw_pubkey_64)
 }
 
+/// Derive an ARC address from an ML-DSA-65 public key.
+/// `address = BLAKE3(public_key)[0..32]`
+#[inline]
+pub fn address_from_ml_dsa_pubkey(public_key: &[u8]) -> Hash256 {
+    debug_assert_eq!(
+        public_key.len(),
+        ML_DSA_PK_LEN,
+        "expected {}-byte ML-DSA-65 pubkey",
+        ML_DSA_PK_LEN
+    );
+    hash_bytes(public_key)
+}
+
 // ── Batch verification ──────────────────────────────────────────────────────
 
 /// Batch verify N Ed25519 signatures using multi-scalar multiplication.
@@ -303,6 +428,39 @@ pub fn batch_verify_ed25519(
 ) -> Result<(), SignatureError> {
     ed25519_dalek::verify_batch(messages, signatures, verifying_keys)
         .map_err(|_| SignatureError::BatchVerifyFailed)
+}
+
+/// Batch verify N ML-DSA-65 signatures using parallel individual verification.
+///
+/// ML-DSA doesn't have native batch verification like Ed25519, but the NTT-based
+/// verification is CPU-bound and parallelizes well across cores with Rayon.
+///
+/// All three slices must have the same length.
+pub fn batch_verify_ml_dsa(
+    messages: &[&[u8]],
+    signatures: &[[u8; ML_DSA_SIG_LEN]],
+    public_keys: &[[u8; ML_DSA_PK_LEN]],
+) -> Result<(), SignatureError> {
+    use fips204::traits::{SerDes, Verifier};
+    use rayon::prelude::*;
+
+    let all_valid = messages
+        .par_iter()
+        .zip(signatures.par_iter())
+        .zip(public_keys.par_iter())
+        .all(|((msg, sig), pk_bytes)| {
+            let pk = match fips204::ml_dsa_65::PublicKey::try_from_bytes(*pk_bytes) {
+                Ok(pk) => pk,
+                Err(_) => return false,
+            };
+            pk.verify(msg, sig, &[])
+        });
+
+    if all_valid {
+        Ok(())
+    } else {
+        Err(SignatureError::BatchVerifyFailed)
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -383,6 +541,65 @@ mod tests {
         assert!(sig.verify(&wrong, &address).is_err());
     }
 
+    // ── ML-DSA-65 (Post-Quantum) ──
+
+    #[test]
+    fn ml_dsa_sign_and_verify() {
+        let kp = KeyPair::generate_ml_dsa();
+        let address = kp.address();
+        let msg = hash_bytes(b"quantum-proof transaction");
+
+        let sig = kp.sign(&msg).expect("sign ok");
+        sig.verify(&msg, &address).expect("verify ok");
+    }
+
+    #[test]
+    fn ml_dsa_wrong_address_fails() {
+        let kp = KeyPair::generate_ml_dsa();
+        let wrong = hash_bytes(b"wrong address");
+        let msg = hash_bytes(b"quantum-proof transaction");
+
+        let sig = kp.sign(&msg).expect("sign ok");
+        assert!(sig.verify(&msg, &wrong).is_err());
+    }
+
+    #[test]
+    fn ml_dsa_wrong_message_fails() {
+        let kp = KeyPair::generate_ml_dsa();
+        let address = kp.address();
+        let msg = hash_bytes(b"msg1");
+        let wrong = hash_bytes(b"msg2");
+
+        let sig = kp.sign(&msg).expect("sign ok");
+        assert!(sig.verify(&wrong, &address).is_err());
+    }
+
+    #[test]
+    fn ml_dsa_address_is_deterministic() {
+        let kp = KeyPair::generate_ml_dsa();
+        assert_eq!(kp.address(), kp.address());
+    }
+
+    #[test]
+    fn ml_dsa_public_key_bytes_correct_length() {
+        let kp = KeyPair::generate_ml_dsa();
+        assert_eq!(kp.public_key_bytes().len(), ML_DSA_PK_LEN);
+    }
+
+    #[test]
+    fn ml_dsa_signature_correct_length() {
+        let kp = KeyPair::generate_ml_dsa();
+        let msg = hash_bytes(b"test");
+        let sig = kp.sign(&msg).expect("sign ok");
+        match sig {
+            Signature::MlDsa65 { signature, public_key } => {
+                assert_eq!(signature.len(), ML_DSA_SIG_LEN);
+                assert_eq!(public_key.len(), ML_DSA_PK_LEN);
+            }
+            _ => panic!("expected MlDsa65 signature"),
+        }
+    }
+
     // ── Batch verification ──
 
     #[test]
@@ -441,6 +658,69 @@ mod tests {
         assert!(batch_verify_ed25519(&msg_refs, &signatures, &verifying_keys).is_err());
     }
 
+    #[test]
+    fn batch_verify_ml_dsa_5_signatures() {
+        let count = 5;
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut signatures: Vec<[u8; ML_DSA_SIG_LEN]> = Vec::with_capacity(count);
+        let mut public_keys: Vec<[u8; ML_DSA_PK_LEN]> = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let kp = KeyPair::generate_ml_dsa();
+            let msg = format!("quantum message {}", i).into_bytes();
+            let msg_hash = hash_bytes(&msg);
+            let sig = kp.sign(&msg_hash).expect("sign ok");
+
+            match sig {
+                Signature::MlDsa65 {
+                    public_key,
+                    signature,
+                } => {
+                    messages.push(msg_hash.as_bytes().to_vec());
+                    signatures.push(signature.as_slice().try_into().unwrap());
+                    public_keys.push(public_key.as_slice().try_into().unwrap());
+                }
+                _ => panic!("expected MlDsa65"),
+            }
+        }
+
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+        batch_verify_ml_dsa(&msg_refs, &signatures, &public_keys).expect("batch verify ok");
+    }
+
+    #[test]
+    fn batch_verify_ml_dsa_fails_on_bad_signature() {
+        let count = 3;
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut signatures: Vec<[u8; ML_DSA_SIG_LEN]> = Vec::with_capacity(count);
+        let mut public_keys: Vec<[u8; ML_DSA_PK_LEN]> = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let kp = KeyPair::generate_ml_dsa();
+            let msg = format!("quantum message {}", i).into_bytes();
+            let msg_hash = hash_bytes(&msg);
+            let sig = kp.sign(&msg_hash).expect("sign ok");
+
+            match sig {
+                Signature::MlDsa65 {
+                    public_key,
+                    signature,
+                } => {
+                    messages.push(msg_hash.as_bytes().to_vec());
+                    signatures.push(signature.as_slice().try_into().unwrap());
+                    public_keys.push(public_key.as_slice().try_into().unwrap());
+                }
+                _ => panic!("expected MlDsa65"),
+            }
+        }
+
+        // Corrupt: use a different message for verification of entry 1
+        messages[1] = hash_bytes(b"tampered").as_bytes().to_vec();
+
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+        assert!(batch_verify_ml_dsa(&msg_refs, &signatures, &public_keys).is_err());
+    }
+
     // ── Null / Default ──
 
     #[test]
@@ -457,6 +737,13 @@ mod tests {
         assert!(!sig.is_null());
     }
 
+    #[test]
+    fn ml_dsa_signature_is_not_null() {
+        let kp = KeyPair::generate_ml_dsa();
+        let sig = kp.sign(&hash_bytes(b"x")).unwrap();
+        assert!(!sig.is_null());
+    }
+
     // ── Cross-scheme ──
 
     #[test]
@@ -465,6 +752,16 @@ mod tests {
         let secp = KeyPair::generate_secp256k1();
         // Different schemes → different addresses (collision probability ~2^-256)
         assert_ne!(ed.address(), secp.address());
+    }
+
+    #[test]
+    fn all_three_schemes_produce_different_addresses() {
+        let ed = KeyPair::generate_ed25519();
+        let secp = KeyPair::generate_secp256k1();
+        let ml = KeyPair::generate_ml_dsa();
+        assert_ne!(ed.address(), secp.address());
+        assert_ne!(ed.address(), ml.address());
+        assert_ne!(secp.address(), ml.address());
     }
 
     #[test]
@@ -479,6 +776,15 @@ mod tests {
     #[test]
     fn secp256k1_signature_serialization_roundtrip() {
         let kp = KeyPair::generate_secp256k1();
+        let sig = kp.sign(&hash_bytes(b"test")).unwrap();
+        let json = serde_json::to_string(&sig).expect("serialize");
+        let recovered: Signature = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(sig, recovered);
+    }
+
+    #[test]
+    fn ml_dsa_signature_serialization_roundtrip() {
+        let kp = KeyPair::generate_ml_dsa();
         let sig = kp.sign(&hash_bytes(b"test")).unwrap();
         let json = serde_json::to_string(&sig).expect("serialize");
         let recovered: Signature = serde_json::from_str(&json).expect("deserialize");

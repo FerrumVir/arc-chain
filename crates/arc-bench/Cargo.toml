@@ -40,3 +40,4 @@ hostname = "0.4"
 uuid.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
+fips204.workspace = true
