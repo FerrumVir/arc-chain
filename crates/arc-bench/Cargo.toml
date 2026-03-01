@@ -9,6 +9,14 @@ license.workspace = true
 name = "arc-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "arc-bench-node"
+path = "src/node_bench.rs"
+
+[[bin]]
+name = "arc-bench-signed"
+path = "src/signed_bench.rs"
+
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
@@ -21,6 +29,14 @@ rayon.workspace = true
 bincode.workspace = true
 rand.workspace = true
 chrono.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tokio.workspace = true
+axum = { workspace = true, features = ["ws"] }
+reqwest = { version = "0.12", features = ["json"] }
+hostname = "0.4"
+uuid.workspace = true
+clap.workspace = true
+ed25519-dalek.workspace = true
