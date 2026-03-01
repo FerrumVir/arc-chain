@@ -890,6 +890,24 @@ impl ConsensusEngine {
         *self.validator_set.write() = new_set;
     }
 
+    /// Reset the DAG for a validator set transition.
+    ///
+    /// Called when switching between single-validator and multi-validator mode.
+    /// Previous blocks were already executed (fast path or DAG commit), so the
+    /// DAG can be cleared and round tracking restarted from 0.
+    pub fn reset_dag(&self) {
+        let old_round = self.current_round.swap(0, Ordering::SeqCst);
+        let dag_size = self.dag.len();
+        self.dag.clear();
+        self.rounds.clear();
+        self.committed.write().clear();
+        info!(
+            old_round = old_round,
+            cleared_blocks = dag_size,
+            "DAG reset for validator set transition"
+        );
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Insert a block into the DAG and the round index.
