@@ -20,3 +20,7 @@ thiserror.workspace = true
 bytes.workspace = true
 rand.workspace = true
 blake3.workspace = true
+rcgen = { workspace = true }
+rustls = { workspace = true }
+arc-consensus = { path = "../arc-consensus" }
+anyhow.workspace = true

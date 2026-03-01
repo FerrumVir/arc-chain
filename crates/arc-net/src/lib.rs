@@ -7,8 +7,16 @@
 //! - **Peer management**: Stake-weighted peer selection, shard-aware routing.
 //! - **Network node**: Orchestrates shred broadcasts and tx gossip.
 //!
-//! Actual QUIC connections (quinn) will be wired in a future pass. For now the
-//! `NetworkNode` manages peers and prepares messages without opening sockets.
+//! The QUIC transport layer is implemented in the `transport` module and wired
+//! into the node binary via tokio channels.
+
+pub mod protocol;
+pub mod transport;
+
+pub use protocol::{
+    DagBlockWithTxsMessage, HandshakeMessage, MessageType, TxGossipMessage as GossipMessage,
+};
+pub use transport::{run_transport, InboundMessage, OutboundMessage};
 
 use arc_crypto::{hash_bytes, Hash256};
 use dashmap::DashMap;
