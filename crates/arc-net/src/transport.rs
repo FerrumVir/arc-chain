@@ -13,6 +13,7 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -182,6 +183,7 @@ pub async fn run_transport(
     genesis_hash: Hash256,
     mut outbound_rx: mpsc::Receiver<OutboundMessage>,
     inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
 ) {
     // ── Install rustls crypto provider (required for rustls 0.23+) ─────
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -217,6 +219,7 @@ pub async fn run_transport(
             &handshake_msg,
             &connections,
             &inbound_tx,
+            &peer_count,
         )
         .await
         {
@@ -278,6 +281,7 @@ pub async fn run_transport(
         let handshake_clone = handshake_msg.clone();
         let connections_clone = connections.clone();
         let inbound_clone = inbound_tx.clone();
+        let peer_count_clone = peer_count.clone();
 
         tokio::spawn(async move {
             if let Err(e) = accept_peer(
@@ -285,6 +289,7 @@ pub async fn run_transport(
                 &handshake_clone,
                 &connections_clone,
                 &inbound_clone,
+                &peer_count_clone,
             )
             .await
             {
@@ -302,6 +307,7 @@ async fn dial_peer(
     local_handshake: &HandshakeMessage,
     connections: &Arc<PeerConnections>,
     inbound_tx: &mpsc::Sender<InboundMessage>,
+    peer_count: &Arc<AtomicU32>,
 ) -> anyhow::Result<()> {
     let conn = endpoint.connect(peer_addr, "localhost")?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -335,6 +341,7 @@ async fn dial_peer(
     connections
         .peers
         .insert(remote.validator_address.0, send);
+    peer_count.fetch_add(1, Ordering::Relaxed);
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
             address: remote.validator_address,
@@ -346,9 +353,11 @@ async fn dial_peer(
     let peer_addr_hash = remote.validator_address;
     let inbound_clone = inbound_tx.clone();
     let connections_ref = connections.clone();
+    let peer_count_clone = peer_count.clone();
     tokio::spawn(async move {
         handle_peer_recv(recv, peer_addr_hash, &inbound_clone).await;
         connections_ref.peers.remove(&peer_addr_hash.0);
+        peer_count_clone.fetch_sub(1, Ordering::Relaxed);
         let _ = inbound_clone
             .send(InboundMessage::PeerDisconnected {
                 address: peer_addr_hash,
@@ -366,6 +375,7 @@ async fn accept_peer(
     local_handshake: &HandshakeMessage,
     connections: &Arc<PeerConnections>,
     inbound_tx: &mpsc::Sender<InboundMessage>,
+    peer_count: &Arc<AtomicU32>,
 ) -> anyhow::Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await?;
 
@@ -394,6 +404,7 @@ async fn accept_peer(
     connections
         .peers
         .insert(remote.validator_address.0, send);
+    peer_count.fetch_add(1, Ordering::Relaxed);
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
             address: remote.validator_address,
@@ -405,9 +416,11 @@ async fn accept_peer(
     let peer_addr_hash = remote.validator_address;
     let inbound_clone = inbound_tx.clone();
     let connections_ref = connections.clone();
+    let peer_count_clone = peer_count.clone();
     tokio::spawn(async move {
         handle_peer_recv(recv, peer_addr_hash, &inbound_clone).await;
         connections_ref.peers.remove(&peer_addr_hash.0);
+        peer_count_clone.fetch_sub(1, Ordering::Relaxed);
         let _ = inbound_clone
             .send(InboundMessage::PeerDisconnected {
                 address: peer_addr_hash,

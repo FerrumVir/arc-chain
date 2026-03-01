@@ -183,6 +183,12 @@ impl ConsensusManager {
                                 if let Ok(tx) =
                                     bincode::deserialize::<Transaction>(&tx_bytes)
                                 {
+                                    // Skip if already proposed (prevents gossip loop:
+                                    // drain removes from mempool.seen, so without this
+                                    // check the same tx bounces between peers forever)
+                                    if pending_txs.contains_key(&tx.hash.0) {
+                                        continue;
+                                    }
                                     if mempool.insert(tx).is_ok() {
                                         inserted += 1;
                                     }
