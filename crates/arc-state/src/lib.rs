@@ -70,6 +70,8 @@ pub struct StateDB {
     wal: WalWriter,
     /// On-chain identity registry (address -> Identity).
     identities: DashMap<[u8; 32], Identity>,
+    /// Full transaction bodies indexed by tx hash (for explorer queries).
+    pub full_transactions: DashMap<[u8; 32], Transaction>,
     /// Blocks since last snapshot.
     snapshot_counter: AtomicU64,
 }
@@ -88,6 +90,7 @@ impl StateDB {
             contracts: DashMap::new(),
             wal: WalWriter::null(),
             identities: DashMap::new(),
+            full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
         }
     }
@@ -107,6 +110,7 @@ impl StateDB {
             contracts: DashMap::new(),
             wal,
             identities: DashMap::new(),
+            full_transactions: DashMap::new(),
             snapshot_counter: AtomicU64::new(0),
         })
     }
@@ -244,6 +248,11 @@ impl StateDB {
         self.contracts.get(&address.0).map(|c| c.clone())
     }
 
+    /// Get the full transaction by hash (for explorer/RPC).
+    pub fn get_transaction(&self, tx_hash: &[u8; 32]) -> Option<Transaction> {
+        self.full_transactions.get(tx_hash).map(|t| t.clone())
+    }
+
     /// Set a storage value for a contract.
     pub fn set_storage(&self, contract: &Address, key: Hash256, value: Vec<u8>) {
         self.storage
@@ -369,11 +378,12 @@ impl StateDB {
             }
         }
 
-        // Index receipts, tx locations, and account transactions
+        // Index receipts, tx locations, account transactions, and full tx bodies
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.index_account_tx(tx);
+            self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
         // Store block + WAL
@@ -473,11 +483,12 @@ impl StateDB {
             }
         }
 
-        // Index receipts, tx locations, and account transactions
+        // Index receipts, tx locations, account transactions, and full tx bodies
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.index_account_tx(tx);
+            self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
         // Store block + WAL
@@ -586,6 +597,7 @@ impl StateDB {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.index_account_tx(tx);
+            self.full_transactions.insert(tx.hash.0, tx.clone());
         }
 
         self.blocks.insert(height, block.clone());

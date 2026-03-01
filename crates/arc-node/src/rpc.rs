@@ -62,6 +62,9 @@ pub async fn serve(
         .route("/blocks", get(get_blocks))
         .route("/account/{address}/txs", get(get_account_txs))
         .route("/stats", get(get_stats))
+        .route("/tx/{hash}/full", get(get_full_transaction))
+        .route("/contract/{address}", get(get_contract_info))
+        .route("/contract/{address}/call", post(call_contract))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
         .layer(CorsLayer::permissive())
         .with_state(node);
@@ -451,4 +454,208 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "mempool_size": node.mempool.len(),
         "total_receipts": node.state.receipts.len(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Full transaction & contract endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /tx/{hash}/full — Return the full transaction body with type-specific fields.
+async fn get_full_transaction(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let tx_hash = parse_hash(&hash)?;
+
+    let tx = node
+        .state
+        .get_transaction(&tx_hash)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let receipt = node.state.get_receipt(&tx_hash);
+
+    let body_json = match &tx.body {
+        TxBody::Transfer(b) => json!({
+            "type": "Transfer",
+            "to": b.to.to_hex(),
+            "amount": b.amount,
+            "amount_commitment": b.amount_commitment.map(hex::encode),
+        }),
+        TxBody::Settle(b) => json!({
+            "type": "Settle",
+            "agent_id": b.agent_id.to_hex(),
+            "service_hash": b.service_hash.to_hex(),
+            "amount": b.amount,
+            "usage_units": b.usage_units,
+        }),
+        TxBody::Swap(b) => json!({
+            "type": "Swap",
+            "counterparty": b.counterparty.to_hex(),
+            "offer_amount": b.offer_amount,
+            "receive_amount": b.receive_amount,
+            "offer_asset": b.offer_asset.to_hex(),
+            "receive_asset": b.receive_asset.to_hex(),
+        }),
+        TxBody::Escrow(b) => json!({
+            "type": "Escrow",
+            "beneficiary": b.beneficiary.to_hex(),
+            "amount": b.amount,
+            "conditions_hash": b.conditions_hash.to_hex(),
+            "is_create": b.is_create,
+        }),
+        TxBody::Stake(b) => json!({
+            "type": "Stake",
+            "amount": b.amount,
+            "is_stake": b.is_stake,
+            "validator": b.validator.to_hex(),
+        }),
+        TxBody::WasmCall(b) => json!({
+            "type": "WasmCall",
+            "contract": b.contract.to_hex(),
+            "function": b.function,
+            "calldata": hex::encode(&b.calldata),
+            "value": b.value,
+            "gas_limit": b.gas_limit,
+        }),
+        TxBody::MultiSig(b) => json!({
+            "type": "MultiSig",
+            "signers": b.signers.iter().map(|s| s.to_hex()).collect::<Vec<_>>(),
+            "threshold": b.threshold,
+        }),
+        TxBody::DeployContract(b) => json!({
+            "type": "DeployContract",
+            "bytecode_size": b.bytecode.len(),
+            "constructor_args_size": b.constructor_args.len(),
+            "state_rent_deposit": b.state_rent_deposit,
+        }),
+        TxBody::RegisterAgent(b) => json!({
+            "type": "RegisterAgent",
+            "agent_name": b.agent_name,
+            "endpoint": b.endpoint,
+            "protocol": b.protocol.to_hex(),
+            "capabilities_size": b.capabilities.len(),
+        }),
+    };
+
+    let mut result = json!({
+        "tx_hash": Hash256(tx_hash).to_hex(),
+        "tx_type": format!("{:?}", tx.tx_type),
+        "from": tx.from.to_hex(),
+        "nonce": tx.nonce,
+        "fee": tx.fee,
+        "gas_limit": tx.gas_limit,
+        "body": body_json,
+    });
+
+    if let Some(r) = receipt {
+        result["block_height"] = json!(r.block_height);
+        result["block_hash"] = json!(r.block_hash.to_hex());
+        result["index"] = json!(r.index);
+        result["success"] = json!(r.success);
+        result["gas_used"] = json!(r.gas_used);
+    }
+
+    Ok(Json(result))
+}
+
+/// GET /contract/{address} — Return contract info.
+async fn get_contract_info(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+) -> Result<Json<Value>, StatusCode> {
+    let addr = Hash256::from_hex(&address).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let bytecode = node
+        .state
+        .get_contract(&addr)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let code_hash = hex::encode(arc_crypto::hash_bytes(&bytecode).0);
+
+    Ok(Json(json!({
+        "address": address,
+        "bytecode_size": bytecode.len(),
+        "code_hash": code_hash,
+        "is_wasm": bytecode.len() >= 4 && &bytecode[..4] == b"\0asm",
+    })))
+}
+
+/// POST /contract/{address}/call — Read-only contract call.
+#[derive(Deserialize)]
+struct ContractCallRequest {
+    function: String,
+    calldata: Option<String>,
+    from: Option<String>,
+    gas_limit: Option<u64>,
+}
+
+async fn call_contract(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(address): axum::extract::Path<String>,
+    Json(req): Json<ContractCallRequest>,
+) -> Result<Json<Value>, StatusCode> {
+    let contract_addr = Hash256::from_hex(&address).map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let bytecode = node
+        .state
+        .get_contract(&contract_addr)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let caller = req
+        .from
+        .as_ref()
+        .and_then(|f| Hash256::from_hex(f).ok())
+        .unwrap_or(Hash256::ZERO);
+
+    let calldata = req
+        .calldata
+        .as_ref()
+        .map(|h| hex::decode(h).unwrap_or_default())
+        .unwrap_or_default();
+
+    let gas_limit = req.gas_limit.unwrap_or(1_000_000);
+
+    let context = arc_vm::ContractContext {
+        caller,
+        self_address: contract_addr,
+        value: 0,
+        gas_limit,
+        block_height: node.state.height(),
+        block_timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64,
+    };
+
+    let mut vm = arc_vm::ArcVM::new();
+    let module = match vm.compile(&bytecode) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(Json(json!({
+                "success": false,
+                "error": format!("compilation error: {e}"),
+            })));
+        }
+    };
+
+    // Read-only: storage writes are buffered but never flushed to StateDB
+    match vm.execute_with_state(&module, &req.function, &[], &context, &node.state) {
+        Ok(result) => Ok(Json(json!({
+            "success": result.success,
+            "gas_used": result.gas_used,
+            "return_data": hex::encode(&result.return_data),
+            "logs": result.logs,
+            "events": result.events.iter().map(|e| json!({
+                "topic": hex::encode(&e.topic),
+                "data": hex::encode(&e.data),
+            })).collect::<Vec<Value>>(),
+        }))),
+        Err(e) => {
+            let err_msg = e.to_string();
+            Ok(Json(json!({
+                "success": false,
+                "error": err_msg,
+            })))
+        }
+    }
 }
