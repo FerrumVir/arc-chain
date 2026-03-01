@@ -12,6 +12,7 @@ export default function Home() {
   const [blocks, setBlocks] = useState<BlockSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [tps, setTps] = useState(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchData = useCallback(async () => {
@@ -26,6 +27,19 @@ export default function Home() {
       setHealth(healthData);
       setInfo(infoData);
       setBlocks(blocksData.blocks);
+
+      // Calculate TPS from recent blocks (timestamps are unix millis)
+      const recentBlocks = blocksData.blocks;
+      if (recentBlocks.length >= 2) {
+        const newest = recentBlocks[0];
+        const oldest = recentBlocks[recentBlocks.length - 1];
+        const timeSpanMs = newest.timestamp - oldest.timestamp;
+        if (timeSpanMs > 0) {
+          const totalTxs = recentBlocks.reduce((sum, b) => sum + b.tx_count, 0);
+          setTps(totalTxs / (timeSpanMs / 1000));
+        }
+      }
+
       setError('');
     } catch (err) {
       setError(
@@ -37,7 +51,7 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    document.title = 'ARC Explorer — Chain Overview';
+    document.title = 'ARC scan — Chain Overview';
     fetchData();
     intervalRef.current = setInterval(fetchData, 5000);
     return () => {
@@ -47,24 +61,24 @@ export default function Home() {
 
   const statCards = [
     {
+      label: 'Live TPS',
+      value: tps > 0 ? tps.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '0',
+      suffix: 'tx/s',
+      loading,
+    },
+    {
+      label: 'Total Transactions',
+      value: stats?.total_receipts ?? 0,
+      loading,
+    },
+    {
+      label: 'Network Nodes',
+      value: (health?.peers ?? 0) + 1,
+      loading,
+    },
+    {
       label: 'Block Height',
       value: stats?.block_height ?? 0,
-      loading,
-    },
-    {
-      label: 'Total Accounts',
-      value: stats?.total_accounts ?? 0,
-      loading,
-    },
-    {
-      label: 'Mempool',
-      value: stats?.mempool_size ?? 0,
-      suffix: 'txns',
-      loading,
-    },
-    {
-      label: 'Receipts',
-      value: stats?.total_receipts ?? 0,
       loading,
     },
   ];
@@ -81,11 +95,11 @@ export default function Home() {
       <div className="space-y-2">
         <h1 className="text-3xl font-medium tracking-tight">
           <span className="text-gradient">ARC</span>{' '}
-          <span className="text-arc-white">Chain Explorer</span>
+          <span className="text-arc-white">scan</span>
         </h1>
         <p className="text-sm text-arc-grey-600">
           {stats
-            ? `${stats.chain} v${stats.version} — ${stats.total_receipts.toLocaleString()} receipts processed`
+            ? `${stats.chain} v${stats.version} — ${stats.total_receipts.toLocaleString()} transactions processed`
             : 'Connecting to node...'}
         </p>
       </div>
