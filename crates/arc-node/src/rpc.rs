@@ -1,10 +1,11 @@
+use arc_consensus::StakeTier;
 use arc_crypto::{Hash256, MerkleProof};
 use arc_gpu::probe_gpu;
 use arc_mempool::Mempool;
 use arc_state::StateDB;
 use arc_types::*;
 use axum::{
-    extract::{Query, State as AxumState},
+    extract::{DefaultBodyLimit, Query, State as AxumState},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -12,6 +13,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Instant;
 use tower_http::cors::CorsLayer;
 
 /// Shared node state passed to all handlers.
@@ -19,16 +21,37 @@ use tower_http::cors::CorsLayer;
 pub struct NodeState {
     pub state: Arc<StateDB>,
     pub mempool: Arc<Mempool>,
+    pub validator_address: Hash256,
+    pub stake: u64,
+    pub tier: StakeTier,
+    pub boot_time: Instant,
 }
 
 /// Start the RPC server.
-pub async fn serve(addr: &str, state: Arc<StateDB>, mempool: Arc<Mempool>) -> anyhow::Result<()> {
-    let node = NodeState { state, mempool };
+pub async fn serve(
+    addr: &str,
+    state: Arc<StateDB>,
+    mempool: Arc<Mempool>,
+    validator_address: Hash256,
+    stake: u64,
+    boot_time: Instant,
+) -> anyhow::Result<()> {
+    let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
+
+    let node = NodeState {
+        state,
+        mempool,
+        validator_address,
+        stake,
+        tier,
+        boot_time,
+    };
 
     let app = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/info", get(chain_info))
+        .route("/node/info", get(node_info))
         .route("/block/{height}", get(get_block))
         .route("/account/{address}", get(get_account))
         .route("/tx/submit", post(submit_tx))
@@ -39,6 +62,7 @@ pub async fn serve(addr: &str, state: Arc<StateDB>, mempool: Arc<Mempool>) -> an
         .route("/blocks", get(get_blocks))
         .route("/account/{address}/txs", get(get_account_txs))
         .route("/stats", get(get_stats))
+        .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
         .layer(CorsLayer::permissive())
         .with_state(node);
 
@@ -51,18 +75,53 @@ async fn index() -> &'static str {
     "ARC Chain — Agent Runtime Chain — Testnet v0.1.0"
 }
 
+// ---------------------------------------------------------------------------
+// Health & Node Info
+// ---------------------------------------------------------------------------
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: String,
     version: String,
+    height: u64,
+    peers: u32,
+    uptime_secs: u64,
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
         version: "0.1.0".to_string(),
+        height: node.state.height(),
+        peers: 0, // P2P not wired yet
+        uptime_secs: node.boot_time.elapsed().as_secs(),
     })
 }
+
+#[derive(Serialize)]
+struct NodeInfoResponse {
+    validator: String,
+    stake: u64,
+    tier: String,
+    height: u64,
+    version: String,
+    mempool_size: usize,
+}
+
+async fn node_info(AxumState(node): AxumState<NodeState>) -> Json<NodeInfoResponse> {
+    Json(NodeInfoResponse {
+        validator: node.validator_address.to_hex(),
+        stake: node.stake,
+        tier: format!("{:?}", node.tier),
+        height: node.state.height(),
+        version: "0.1.0".to_string(),
+        mempool_size: node.mempool.len(),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Chain Info
+// ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
 struct ChainInfoResponse {
@@ -84,6 +143,10 @@ async fn chain_info(AxumState(node): AxumState<NodeState>) -> Json<ChainInfoResp
         gpu: probe_gpu(),
     })
 }
+
+// ---------------------------------------------------------------------------
+// Block & Account endpoints
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct BlockPath {
@@ -110,6 +173,10 @@ async fn get_account(
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
+
+// ---------------------------------------------------------------------------
+// Transaction submission
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 struct SubmitTxRequest {
