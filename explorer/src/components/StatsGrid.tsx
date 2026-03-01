@@ -1,93 +1,52 @@
-"use client";
+import { formatNumber } from '../utils';
 
-import { Activity, Blocks, Users, Zap, Shield, Clock } from "lucide-react";
-import { formatNumber, formatTPS } from "@/lib/format";
-import type { NetworkStats } from "@/lib/types";
-
-interface StatCardProps {
+interface StatCard {
   label: string;
-  value: string;
-  sub?: string;
-  icon: React.ElementType;
-  accent?: boolean;
-  delay?: number;
+  value: string | number;
+  suffix?: string;
+  loading?: boolean;
 }
 
-function StatCard({ label, value, sub, icon: Icon, accent, delay = 0 }: StatCardProps) {
+interface StatsGridProps {
+  stats: StatCard[];
+}
+
+function SkeletonCard() {
   return (
-    <div
-      className={`animate-slide-up card-surface p-4 flex flex-col gap-2 hover:border-[var(--accent)]/30 ${accent ? "border-l-2 border-l-[var(--accent)]" : ""}`}
-      style={{ animationDelay: `${delay}ms` }}
-    >
-      <div className="flex items-center justify-between">
-        <span className="text-[11px] uppercase tracking-label text-[var(--text-tertiary)] font-medium">
-          {label}
-        </span>
-        <Icon
-          className={`w-4 h-4 ${accent ? "text-[var(--accent)]" : "text-[var(--text-tertiary)]"}`}
-        />
-      </div>
-      <div className="flex items-baseline gap-1.5">
-        <span
-          className={`text-[22px] font-semibold tracking-tight ${
-            accent ? "text-[var(--accent)]" : ""
-          }`}
-        >
-          {value}
-        </span>
-        {sub && (
-          <span className="text-[11px] text-[var(--text-tertiary)]">{sub}</span>
-        )}
-      </div>
+    <div className="bg-arc-surface-raised border border-arc-border p-5">
+      <div className="skeleton h-3 w-24 mb-3" />
+      <div className="skeleton h-7 w-32" />
     </div>
   );
 }
 
-export default function StatsGrid({ stats }: { stats: NetworkStats }) {
-  const uptime = Math.floor(stats.uptime_seconds / 86400);
-
+export default function StatsGrid({ stats }: StatsGridProps) {
   return (
-    <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3">
-      <StatCard
-        label="Current TPS"
-        value={formatTPS(stats.tps_current)}
-        sub="tx/sec"
-        icon={Zap}
-        accent
-        delay={0}
-      />
-      <StatCard
-        label="Peak TPS"
-        value={formatTPS(stats.tps_peak)}
-        sub="tx/sec"
-        icon={Activity}
-        delay={50}
-      />
-      <StatCard
-        label="Block Height"
-        value={formatNumber(stats.chain_height)}
-        icon={Blocks}
-        delay={100}
-      />
-      <StatCard
-        label="Total Txns"
-        value={formatNumber(stats.total_transactions)}
-        icon={Shield}
-        delay={150}
-      />
-      <StatCard
-        label="Accounts"
-        value={formatNumber(stats.total_accounts)}
-        icon={Users}
-        delay={200}
-      />
-      <StatCard
-        label="Uptime"
-        value={`${uptime}d`}
-        sub={`${stats.node_count} node${stats.node_count > 1 ? "s" : ""}`}
-        icon={Clock}
-        delay={250}
-      />
+    <div className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-arc-border">
+      {stats.map((stat, i) =>
+        stat.loading ? (
+          <SkeletonCard key={i} />
+        ) : (
+          <div
+            key={i}
+            className="bg-arc-surface-raised p-5 card-glow"
+          >
+            <p className="text-xs uppercase tracking-widest text-arc-grey-600 mb-2">
+              {stat.label}
+            </p>
+            <p className="text-2xl font-medium tracking-tight text-arc-white">
+              {typeof stat.value === 'number'
+                ? formatNumber(stat.value)
+                : stat.value}
+              {stat.suffix && (
+                <span className="text-sm text-arc-grey-600 ml-1.5">
+                  {stat.suffix}
+                </span>
+              )}
+            </p>
+          </div>
+        )
+      )}
     </div>
   );
 }
