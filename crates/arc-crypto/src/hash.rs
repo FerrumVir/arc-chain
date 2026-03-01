@@ -44,8 +44,12 @@ impl Hash256 {
 
     pub fn from_hex(s: &str) -> Result<Self, hex::FromHexError> {
         let bytes = hex::decode(s)?;
+        if bytes.len() != 32 {
+            // Return InvalidStringLength error for wrong-length input
+            return Err(hex::FromHexError::InvalidStringLength);
+        }
         let mut arr = [0u8; 32];
-        arr.copy_from_slice(&bytes[..32]);
+        arr.copy_from_slice(&bytes);
         Ok(Self(arr))
     }
 }

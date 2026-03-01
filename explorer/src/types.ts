@@ -32,7 +32,9 @@ export interface StatsResponse {
   block_height: number;
   total_accounts: number;
   mempool_size: number;
-  total_receipts: number;
+  total_transactions: number;
+  indexed_hashes: number;
+  indexed_receipts: number;
 }
 
 // ─── Blocks ──────────────────────────────────────────────────────

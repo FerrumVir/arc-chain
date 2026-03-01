@@ -34,3 +34,6 @@ uuid.workspace = true
 parking_lot.workspace = true
 dashmap.workspace = true
 clap.workspace = true
+crossbeam.workspace = true
+ed25519-dalek.workspace = true
+rayon.workspace = true
