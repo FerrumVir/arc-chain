@@ -1,23 +1,27 @@
 {
   "name": "arc-explorer",
-  "version": "0.1.0",
   "private": true,
+  "version": "1.0.0",
+  "type": "module",
   "scripts": {
-    "dev": "next dev --port 3100",
-    "build": "next build",
-    "start": "next start --port 3100"
+    "dev": "vite --port 3100",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview --port 3100"
   },
   "dependencies": {
-    "@noble/hashes": "^2.0.1",
-    "@tailwindcss/postcss": "^4.2.1",
-    "@types/node": "^25.3.2",
-    "@types/react": "^19.2.14",
-    "lucide-react": "^0.575.0",
-    "next": "^16.1.6",
-    "postcss": "^8.5.6",
-    "react": "^19.2.4",
-    "react-dom": "^19.2.4",
-    "tailwindcss": "^4.2.1",
-    "typescript": "^5.9.3"
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^7.1.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.0",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.5.0",
+    "tailwindcss": "^4.0.0",
+    "@tailwindcss/vite": "^4.0.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.1.0"
   }
 }

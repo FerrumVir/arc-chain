@@ -1,0 +1,193 @@
+@import "tailwindcss";
+
+/* ─── ARC Brand Theme ─────────────────────────────────────────── */
+
+@theme {
+  /* Core palette */
+  --color-arc-black: #03030A;
+  --color-arc-white: #FFFFFF;
+  --color-arc-purple: #002DDE;
+  --color-arc-blue: #3855E9;
+  --color-arc-aquarius: #6F7CF4;
+
+  /* Greys */
+  --color-arc-grey-700: #777785;
+  --color-arc-grey-600: #8E8E9D;
+  --color-arc-grey-500: #AEAEBC;
+  --color-arc-grey-400: #C7C7D6;
+  --color-arc-grey-300: #E5E5EA;
+  --color-arc-grey-200: #F4F4F4;
+
+  /* Semantic */
+  --color-arc-success: #51EB8E;
+  --color-arc-error: #FF0040;
+  --color-arc-warning: #FF9446;
+  --color-arc-info: #00D4FF;
+
+  /* Surfaces */
+  --color-arc-surface: #0A0A14;
+  --color-arc-surface-raised: #12121E;
+  --color-arc-surface-overlay: #1A1A28;
+  --color-arc-border: #1E1E2E;
+  --color-arc-border-subtle: #14141F;
+}
+
+/* ─── Global Styles ───────────────────────────────────────────── */
+
+html {
+  background-color: var(--color-arc-black);
+  color: var(--color-arc-white);
+  font-family:
+    'Inter',
+    'SF Pro Display',
+    -apple-system,
+    BlinkMacSystemFont,
+    'Segoe UI',
+    Roboto,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* ─── Mono Font ───────────────────────────────────────────────── */
+
+.font-mono {
+  font-family:
+    'SF Mono',
+    'Fira Code',
+    'JetBrains Mono',
+    'Cascadia Code',
+    Consolas,
+    monospace;
+}
+
+/* ─── Gradient Text ───────────────────────────────────────────── */
+
+.text-gradient {
+  background: linear-gradient(135deg, #6F7CF4 0%, #002DDE 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ─── ARC Button ──────────────────────────────────────────────── */
+
+.btn-arc {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.625rem 1.25rem;
+  background: var(--color-arc-white);
+  color: var(--color-arc-black);
+  border: 1px solid var(--color-arc-black);
+  border-radius: 0;
+  font-weight: 500;
+  font-size: 0.875rem;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.btn-arc:hover {
+  background: var(--color-arc-black);
+  color: var(--color-arc-white);
+  border-color: var(--color-arc-white);
+}
+
+.btn-arc-outline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.625rem 1.25rem;
+  background: transparent;
+  color: var(--color-arc-white);
+  border: 1px solid var(--color-arc-border);
+  border-radius: 0;
+  font-weight: 500;
+  font-size: 0.875rem;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.btn-arc-outline:hover {
+  border-color: var(--color-arc-aquarius);
+  color: var(--color-arc-aquarius);
+}
+
+/* ─── Skeleton Loader ─────────────────────────────────────────── */
+
+@keyframes skeleton-pulse {
+  0%, 100% { opacity: 0.04; }
+  50% { opacity: 0.08; }
+}
+
+.skeleton {
+  background: var(--color-arc-white);
+  animation: skeleton-pulse 1.8s ease-in-out infinite;
+  border-radius: 2px;
+}
+
+/* ─── Subtle glow on cards ────────────────────────────────────── */
+
+.card-glow {
+  position: relative;
+}
+
+.card-glow::before {
+  content: '';
+  position: absolute;
+  inset: -1px;
+  background: linear-gradient(135deg, rgba(111, 124, 244, 0.1) 0%, rgba(0, 45, 222, 0.05) 100%);
+  z-index: -1;
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
+
+.card-glow:hover::before {
+  opacity: 1;
+}
+
+/* ─── Table row hover ─────────────────────────────────────────── */
+
+.table-row-hover {
+  transition: background-color 150ms ease;
+}
+
+.table-row-hover:hover {
+  background-color: rgba(111, 124, 244, 0.04);
+}
+
+/* ─── Scrollbar ───────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-arc-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-arc-grey-700);
+}
+
+/* ─── Selection ───────────────────────────────────────────────── */
+
+::selection {
+  background: rgba(56, 85, 233, 0.3);
+  color: var(--color-arc-white);
+}
