@@ -207,25 +207,31 @@ impl ConsensusManager {
             let current_round = self.engine.current_round();
             let already_proposed = last_proposed_round == Some(current_round);
 
-            // ── 1. Propose a block if we have pending txs and can produce ────
-            if can_produce && mempool.len() > 0 && !already_proposed {
+            // ── 1. Propose a block ─────────────────────────────────────────
+            // In multi-validator mode, propose every round (even empty) so the
+            // DAG advances and the 2-round commit rule can fire.
+            // In single-validator mode, only propose when there are transactions.
+            if can_produce && !already_proposed {
                 let transactions = mempool.drain(100_000);
-                if !transactions.is_empty() {
+                let has_txs = !transactions.is_empty();
+
+                if has_txs || multi_validator {
                     let tx_hashes: Vec<Hash256> =
                         transactions.iter().map(|tx| tx.hash).collect();
 
-                    // Index the full transactions so we can look them up at commit time
-                    for tx in &transactions {
-                        pending_txs.insert(tx.hash.0, tx.clone());
-                    }
-
-                    // Gossip transactions to peers before proposing
-                    if let Some(ref tx_chan) = outbound_tx {
-                        let tx_bytes: Vec<Vec<u8>> = transactions
-                            .iter()
-                            .filter_map(|t| bincode::serialize(t).ok())
-                            .collect();
-                        let _ = tx_chan.try_send(OutboundMessage::BroadcastTransactions(tx_bytes));
+                    // Index and gossip only when we have transactions
+                    if has_txs {
+                        for tx in &transactions {
+                            pending_txs.insert(tx.hash.0, tx.clone());
+                        }
+                        if let Some(ref tx_chan) = outbound_tx {
+                            let tx_bytes: Vec<Vec<u8>> = transactions
+                                .iter()
+                                .filter_map(|t| bincode::serialize(t).ok())
+                                .collect();
+                            let _ = tx_chan
+                                .try_send(OutboundMessage::BroadcastTransactions(tx_bytes));
+                        }
                     }
 
                     let timestamp = SystemTime::now()
@@ -245,10 +251,11 @@ impl ConsensusManager {
 
                             // Broadcast to peers
                             if let Some(ref tx_chan) = outbound_tx {
-                                let _ = tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
-                                    block: block.clone(),
-                                    transactions: transactions.clone(),
-                                });
+                                let _ =
+                                    tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
+                                        block: block.clone(),
+                                        transactions: transactions.clone(),
+                                    });
                             }
                         }
                         Err(e) => {
@@ -263,11 +270,13 @@ impl ConsensusManager {
                         // ── Multi-validator: DAG commit path ─────────────
                         // Do NOT execute directly. Wait for DAG commit rule
                         // (step 2 below) to finalize blocks before execution.
-                        debug!(
-                            pending = pending_txs.len(),
-                            "Multi-validator mode: waiting for DAG commit"
-                        );
-                    } else {
+                        if has_txs {
+                            debug!(
+                                pending = pending_txs.len(),
+                                "Multi-validator mode: waiting for DAG commit"
+                            );
+                        }
+                    } else if has_txs {
                         // ── Fast path: single-validator mode ─────────────
                         // With only one validator, DAG commit requires multiple
                         // rounds of self-references which is slow. Execute the
