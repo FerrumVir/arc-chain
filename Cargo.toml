@@ -9,6 +9,8 @@ members = [
     "crates/arc-node",
     "crates/arc-gpu",
     "crates/arc-bench",
+    "crates/arc-consensus",
+    "crates/arc-net",
 ]
 
 [workspace.package]
@@ -22,6 +24,8 @@ repository = "https://github.com/arc-chain/arc"
 # Crypto
 blake3 = { version = "1.5", features = ["rayon"] }
 curve25519-dalek = { version = "4.1", features = ["digest", "rand_core"] }
+ed25519-dalek = { version = "2.1", features = ["batch", "rand_core"] }
+k256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 rand = "0.8"
 rand_core = "0.6"
@@ -36,6 +40,7 @@ tokio = { version = "1.0", features = ["full"] }
 axum = "0.8"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
+quinn = "0.11"
 
 # WASM runtime
 wasmer = "6.0"
@@ -47,6 +52,10 @@ wgpu = "24.0"
 rayon = "1.10"
 crossbeam = "0.8"
 dashmap = "6.1"
+
+# Persistence
+crc32fast = "1.4"
+lz4_flex = "0.11"
 
 # Logging / errors
 tracing = "0.1"
@@ -63,6 +72,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
 parking_lot = "0.12"
 bytes = "1.0"
+clap = { version = "4.5", features = ["derive"] }
 
 [profile.release]
 opt-level = 3
