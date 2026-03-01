@@ -4,7 +4,7 @@ use arc_mempool::Mempool;
 use arc_net::transport::{run_transport, InboundMessage, OutboundMessage};
 use arc_node::{consensus::ConsensusManager, rpc};
 use arc_state::StateDB;
-use arc_types::Block;
+use arc_types::{Block, Transaction};
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
@@ -45,6 +45,19 @@ struct Cli {
     /// Default: "arc-validator-0"
     #[arg(long, default_value = "arc-validator-0")]
     validator_seed: String,
+
+    /// Enable continuous transaction generation (testnet benchmark mode).
+    /// Generates transfers between genesis accounts to keep the chain busy.
+    #[arg(long, default_value_t = false)]
+    benchmark: bool,
+
+    /// Transactions per batch in benchmark mode.
+    #[arg(long, default_value_t = 500)]
+    bench_batch: usize,
+
+    /// Milliseconds between benchmark batches.
+    #[arg(long, default_value_t = 200)]
+    bench_interval: u64,
 }
 
 #[tokio::main]
@@ -138,6 +151,41 @@ async fn main() -> Result<()> {
             .run_consensus_loop(state_clone, mempool_clone, Some(inbound_rx), Some(outbound_tx))
             .await;
     });
+
+    // ── Start benchmark transaction generator (optional) ───────────────
+    if cli.benchmark {
+        let mempool_bench = mempool.clone();
+        let batch_size = cli.bench_batch;
+        let interval_ms = cli.bench_interval;
+        // Use genesis accounts 0..50 as senders, 50..100 as receivers
+        let senders: Vec<Hash256> = (0..50u8).map(|i| hash_bytes(&[i])).collect();
+        let receivers: Vec<Hash256> = (50..100u8).map(|i| hash_bytes(&[i])).collect();
+        tokio::spawn(async move {
+            let mut nonce_base = 0u64;
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms)).await;
+                let mut inserted = 0;
+                for i in 0..batch_size {
+                    let sender = senders[i % senders.len()];
+                    let receiver = receivers[i % receivers.len()];
+                    let nonce = nonce_base + (i as u64);
+                    let tx = Transaction::new_transfer(sender, receiver, 1, nonce);
+                    if mempool_bench.insert(tx).is_ok() {
+                        inserted += 1;
+                    }
+                }
+                nonce_base += batch_size as u64;
+                if inserted > 0 {
+                    tracing::debug!(count = inserted, "Benchmark: generated transactions");
+                }
+            }
+        });
+        tracing::info!(
+            batch = cli.bench_batch,
+            interval_ms = cli.bench_interval,
+            "Benchmark mode ACTIVE — generating continuous load"
+        );
+    }
 
     // ── Start RPC server ────────────────────────────────────────────────
     tracing::info!("RPC server listening on {}", cli.rpc);

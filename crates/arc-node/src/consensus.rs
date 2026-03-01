@@ -129,10 +129,16 @@ impl ConsensusManager {
                                 0,
                             );
                             self.engine.update_validator_set(new_set);
+                            // Reset DAG so both nodes start fresh at round 0.
+                            // Previous single-validator blocks were already executed
+                            // via fast path, so nothing is lost.
+                            self.engine.reset_dag();
+                            pending_txs.clear();
+                            last_proposed_round = None;
                             info!(
                                 peer = %address,
                                 validators = self.engine.validator_set().len(),
-                                "Peer connected — ValidatorSet updated"
+                                "Peer connected — ValidatorSet updated, DAG reset"
                             );
                         }
                         InboundMessage::PeerDisconnected { address } => {
@@ -142,9 +148,13 @@ impl ConsensusManager {
                                     .expect("local validator");
                             let new_set = ValidatorSet::new(vec![local_validator], 0);
                             self.engine.update_validator_set(new_set);
+                            // Reset DAG for clean single-validator operation.
+                            self.engine.reset_dag();
+                            pending_txs.clear();
+                            last_proposed_round = None;
                             info!(
                                 peer = %address,
-                                "Peer disconnected — reverting to single-validator mode"
+                                "Peer disconnected — reverting to single-validator mode, DAG reset"
                             );
                         }
                         InboundMessage::DagBlockWithTxs {
@@ -211,7 +221,27 @@ impl ConsensusManager {
             // In multi-validator mode, propose every round (even empty) so the
             // DAG advances and the 2-round commit rule can fire.
             // In single-validator mode, only propose when there are transactions.
-            if can_produce && !already_proposed {
+            //
+            // IMPORTANT: Check parent readiness BEFORE draining the mempool.
+            // If the peer's block from the previous round hasn't arrived yet,
+            // we would fail to propose and lose the drained transactions.
+            let has_quorum_parents = if current_round == 0 {
+                true // Round 0 has no parent requirement
+            } else {
+                let vs = self.engine.validator_set();
+                let prev_blocks = self.engine.blocks_in_round(current_round - 1);
+                let mut parent_stake = 0u64;
+                for hash in &prev_blocks {
+                    if let Some(block) = self.engine.get_block(&hash) {
+                        if let Some(validator) = vs.get_validator(&block.author) {
+                            parent_stake += validator.stake;
+                        }
+                    }
+                }
+                parent_stake >= vs.quorum
+            };
+
+            if can_produce && !already_proposed && has_quorum_parents {
                 let transactions = mempool.drain(100_000);
                 let has_txs = !transactions.is_empty();
 
