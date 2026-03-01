@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARC Chain — Live TPS</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        :root {
+            --bg: #03030A;
+            --surface: #0d0d14;
+            --border: #1a1a2e;
+            --text: #ffffff;
+            --dim: #8e8e9d;
+            --accent: #6F7CF4;
+            --accent2: #002DDE;
+            --green: #51EB8E;
+            --red: #FF0040;
+        }
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            min-height: 100vh;
+        }
+        .wrap { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+
+        /* Header */
+        header { text-align: center; padding: 2.5rem 0 0.5rem; }
+        header h1 {
+            font-size: 1.1rem; letter-spacing: 0.35em;
+            text-transform: uppercase; color: var(--dim); font-weight: 400;
+        }
+        header p { font-size: 0.8rem; color: var(--dim); margin-top: 0.4rem; }
+        .status {
+            display: flex; align-items: center; justify-content: center;
+            gap: 0.4rem; margin-top: 0.5rem; font-size: 0.7rem; color: var(--dim);
+        }
+        .dot {
+            width: 7px; height: 7px; border-radius: 50%; background: var(--green);
+            animation: pulse 2s infinite;
+        }
+        .dot.off { background: var(--red); animation: none; }
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.35} }
+
+        /* TPS */
+        .tps { text-align: center; padding: 2.5rem 0; }
+        .tps-val {
+            font-size: 5.5rem; font-weight: 700; line-height: 1;
+            font-variant-numeric: tabular-nums;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .tps-unit {
+            display: block; font-size: 1.3rem; color: var(--dim);
+            font-weight: 300; margin-top: 0.4rem; letter-spacing: 0.2em;
+        }
+        .target { font-size: 0.8rem; color: var(--dim); margin-top: 1rem; }
+        .bar { width: 280px; height: 3px; background: var(--border); border-radius: 2px; margin: 0.4rem auto 0; overflow: hidden; }
+        .bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 2px; transition: width 0.5s; }
+
+        /* Stats */
+        .stats {
+            display: grid; grid-template-columns: repeat(4,1fr); gap: 1rem;
+            padding: 1.5rem 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+        }
+        .st { text-align: center; }
+        .st-v { font-size: 1.8rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+        .st-l { font-size: 0.7rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.08em; margin-top: 0.15rem; }
+
+        /* Join */
+        .join {
+            text-align: center; padding: 2rem; margin: 1.5rem 0;
+            background: var(--surface); border: 1px solid var(--border);
+        }
+        .join h2 { font-size: 0.9rem; font-weight: 500; letter-spacing: 0.15em; text-transform: uppercase; margin-bottom: 0.8rem; }
+        .join code {
+            display: inline-block; background: var(--bg); border: 1px solid var(--border);
+            padding: 0.6rem 1.2rem; font-family: 'SF Mono','Fira Code',monospace;
+            font-size: 0.85rem; color: var(--accent); cursor: pointer; transition: border-color 0.2s;
+        }
+        .join code:hover { border-color: var(--accent); }
+        .join .hint { font-size: 0.7rem; color: var(--dim); margin-top: 0.6rem; }
+
+        /* Nodes */
+        .nodes-hdr { display: flex; justify-content: space-between; align-items: center; margin: 1.5rem 0 0.8rem; }
+        .nodes-hdr h2 { font-size: 0.8rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.12em; color: var(--dim); }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.6rem; }
+        .card {
+            background: var(--surface); border: 1px solid var(--border);
+            padding: 0.85rem; transition: border-color 0.2s;
+        }
+        .card:hover { border-color: var(--accent); }
+        .card .host { font-size: 0.8rem; font-weight: 500; margin-bottom: 0.3rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .card .ctps { font-size: 1.2rem; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--accent); }
+        .card .meta { font-size: 0.65rem; color: var(--dim); margin-top: 0.15rem; }
+
+        /* Projections */
+        .proj { margin: 1.5rem 0; padding: 1.2rem; background: var(--surface); border: 1px solid var(--border); }
+        .proj h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.12em; color: var(--dim); margin-bottom: 0.8rem; }
+        .pr { display: flex; justify-content: space-between; padding: 0.3rem 0; font-size: 0.8rem; font-variant-numeric: tabular-nums; }
+        .pr .lb { color: var(--dim); }
+        .pr.hi { color: var(--accent); font-weight: 600; }
+
+        footer { text-align: center; padding: 1.5rem; color: var(--dim); font-size: 0.65rem; }
+
+        @media (max-width: 640px) {
+            .tps-val { font-size: 3rem; }
+            .stats { grid-template-columns: repeat(2,1fr); }
+        }
+    </style>
+</head>
+<body>
+<div class="wrap">
+    <header>
+        <h1>ARC Chain</h1>
+        <p>Live Transaction Throughput</p>
+        <div class="status">
+            <div class="dot" id="dot"></div>
+            <span id="conn">Connecting...</span>
+        </div>
+    </header>
+
+    <div class="tps">
+        <div class="tps-val" id="tv">0</div>
+        <span class="tps-unit">transactions per second</span>
+        <div class="target">
+            <span>Target: 1,000,000,000 TPS</span>
+            <div class="bar"><div class="bar-fill" id="bf" style="width:0%"></div></div>
+        </div>
+    </div>
+
+    <div class="stats">
+        <div class="st"><div class="st-v" id="nc">0</div><div class="st-l">Nodes</div></div>
+        <div class="st"><div class="st-v" id="at">0</div><div class="st-l">Avg / Node</div></div>
+        <div class="st"><div class="st-v" id="ut">0:00</div><div class="st-l">Uptime</div></div>
+        <div class="st"><div class="st-v" id="pt">0</div><div class="st-l">1K-Node Proj.</div></div>
+    </div>
+
+    <div class="join">
+        <h2>Join the Swarm</h2>
+        <code id="jc" onclick="copyCmd()">curl -sSL http://localhost:8080/join.sh | sh</code>
+        <div class="hint">Click to copy &middot; macOS or Linux</div>
+    </div>
+
+    <div class="nodes-hdr"><h2>Active Nodes</h2></div>
+    <div class="grid" id="ng">
+        <div class="card" style="border-style:dashed;opacity:0.5">
+            <div class="host">Waiting for nodes...</div>
+            <div class="ctps">&mdash;</div>
+            <div class="meta">Run the join command to add a node</div>
+        </div>
+    </div>
+
+    <div class="proj" id="pj" style="display:none">
+        <h3>Scaling Projections (88% network efficiency)</h3>
+        <div id="prs"></div>
+    </div>
+
+    <footer>ARC Chain &mdash; Agent Runtime Chain v0.1.0 &mdash; GPU-accelerated BLAKE3</footer>
+</div>
+<script>
+let ws, cur = 0, tgt = 0;
+const $ = id => document.getElementById(id);
+
+function fmt(n) {
+    if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
+    if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+    if (n >= 1e3) return (n/1e3).toFixed(0)+'K';
+    return Math.floor(n).toLocaleString();
+}
+function fmtFull(n) { return Math.floor(n).toLocaleString(); }
+function fmtTime(s) {
+    const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=Math.floor(s%60);
+    return h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(ss).padStart(2,'0')}`
+                  : `${m}:${String(ss).padStart(2,'0')}`;
+}
+function esc(s) { const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+function tick() {
+    const d = tgt - cur;
+    if (Math.abs(d) > 1) { cur += d * 0.12; $('tv').textContent = fmtFull(cur); }
+    requestAnimationFrame(tick);
+}
+
+function upd(d) {
+    tgt = d.total_tps;
+    $('nc').textContent = d.node_count;
+    $('at').textContent = fmt(d.avg_node_tps);
+    $('ut').textContent = fmtTime(d.uptime_secs);
+    $('pt').textContent = fmt(d.projected_1000_nodes);
+    const pct = d.total_tps > 0 ? Math.min(100, (Math.log10(d.total_tps)/9)*100) : 0;
+    $('bf').style.width = pct+'%';
+
+    const g = $('ng');
+    if (d.nodes && d.nodes.length > 0) {
+        g.innerHTML = d.nodes
+            .sort((a,b) => b.compact_pipeline_tps - a.compact_pipeline_tps)
+            .map(n => `<div class="card">
+                <div class="host">${esc(n.hostname)}</div>
+                <div class="ctps">${fmt(n.compact_pipeline_tps)} TPS</div>
+                <div class="meta">${n.cpu_cores} cores &middot; ${n.gpu_available ? esc(n.gpu_name) : 'CPU only'}</div>
+            </div>`).join('');
+    }
+
+    if (d.avg_node_tps > 0) {
+        $('pj').style.display = 'block';
+        const e = 0.88, a = d.avg_node_tps;
+        $('prs').innerHTML = [10,50,100,250,500,1000].map(n => {
+            const t = a*n*e, hi = t >= 1e9;
+            return `<div class="pr${hi?' hi':''}"><span class="lb">${n} nodes</span><span>${fmt(t)} TPS${hi?' — 1B+':''}</span></div>`;
+        }).join('');
+    }
+}
+
+function connect() {
+    const p = location.protocol==='https:'?'wss:':'ws:';
+    ws = new WebSocket(`${p}//${location.host}/ws/dashboard`);
+    ws.onopen = () => { $('dot').classList.remove('off'); $('conn').textContent='Connected'; };
+    ws.onmessage = e => { try { upd(JSON.parse(e.data)); } catch(err) { console.error(err); } };
+    ws.onclose = () => { $('dot').classList.add('off'); $('conn').textContent='Reconnecting...'; setTimeout(connect, 2000); };
+    ws.onerror = () => ws.close();
+}
+function copyCmd() {
+    const el=$('jc'), t=el.textContent;
+    navigator.clipboard.writeText(t).then(()=>{ el.textContent='Copied!'; setTimeout(()=>el.textContent=t,1500); });
+}
+$('jc').textContent = `curl -sSL http://${location.host}/join.sh | sh`;
+connect(); tick();
+</script>
+</body>
+</html>

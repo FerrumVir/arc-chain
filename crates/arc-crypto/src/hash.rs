@@ -1,9 +1,35 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 /// 256-bit hash used throughout the chain.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+/// Serializes as hex string in human-readable formats (JSON),
+/// raw bytes in binary formats (bincode).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Hash256(pub [u8; 32]);
+
+impl Serialize for Hash256 {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_hex())
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Hash256 {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            // Strip optional 0x prefix
+            let hex_str = s.strip_prefix("0x").unwrap_or(&s);
+            Self::from_hex(hex_str).map_err(serde::de::Error::custom)
+        } else {
+            let bytes = <[u8; 32]>::deserialize(deserializer)?;
+            Ok(Self(bytes))
+        }
+    }
+}
 
 impl Hash256 {
     pub const ZERO: Self = Self([0u8; 32]);

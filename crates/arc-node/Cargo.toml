@@ -16,6 +16,8 @@ arc-state = { path = "../arc-state" }
 arc-vm = { path = "../arc-vm" }
 arc-mempool = { path = "../arc-mempool" }
 arc-gpu = { path = "../arc-gpu" }
+arc-consensus = { path = "../arc-consensus" }
+arc-net = { path = "../arc-net" }
 tokio.workspace = true
 axum.workspace = true
 tower.workspace = true
@@ -30,3 +32,5 @@ anyhow.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 parking_lot.workspace = true
+dashmap.workspace = true
+clap.workspace = true

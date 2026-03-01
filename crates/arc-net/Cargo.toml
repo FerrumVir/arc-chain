@@ -1,6 +1,6 @@
 [package]
-name = "arc-state"
-description = "ARC Chain state management — accounts, balances, WAL persistence, snapshots"
+name = "arc-net"
+description = "ARC Chain networking — QUIC transport, shred propagation, tx gossip"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,14 +9,14 @@ license.workspace = true
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
 serde.workspace = true
+serde_json.workspace = true
 bincode.workspace = true
+tokio.workspace = true
+quinn.workspace = true
 dashmap.workspace = true
-parking_lot.workspace = true
-rayon.workspace = true
 crossbeam.workspace = true
-blake3.workspace = true
-crc32fast.workspace = true
-lz4_flex.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
-wasmer.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+rand.workspace = true
+blake3.workspace = true

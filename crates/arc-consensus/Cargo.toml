@@ -1,6 +1,6 @@
 [package]
-name = "arc-state"
-description = "ARC Chain state management — accounts, balances, WAL persistence, snapshots"
+name = "arc-consensus"
+description = "ARC Chain DAG-based consensus — Mysticeti-inspired, sender-sharded"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -14,9 +14,8 @@ dashmap.workspace = true
 parking_lot.workspace = true
 rayon.workspace = true
 crossbeam.workspace = true
-blake3.workspace = true
-crc32fast.workspace = true
-lz4_flex.workspace = true
-thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
-wasmer.workspace = true
+thiserror.workspace = true
+rand.workspace = true
+blake3.workspace = true
