@@ -7,6 +7,7 @@ use arc_state::StateDB;
 use arc_types::Block;
 use clap::Parser;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -100,6 +101,7 @@ async fn main() -> Result<()> {
     // ── Create channels for P2P transport ↔ consensus ─────────────────
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(1000);
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(1000);
+    let peer_count = Arc::new(AtomicU32::new(0));
 
     // Deterministic genesis hash (same for all nodes with same genesis config)
     let genesis_hash = Block::genesis().hash;
@@ -114,6 +116,7 @@ async fn main() -> Result<()> {
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", cli.p2p_port).parse()?;
 
     // ── Start P2P transport in background ──────────────────────────────
+    let peer_count_transport = peer_count.clone();
     tokio::spawn(run_transport(
         listen_addr,
         bootstrap_peers,
@@ -122,6 +125,7 @@ async fn main() -> Result<()> {
         genesis_hash,
         outbound_rx,
         inbound_tx,
+        peer_count_transport,
     ));
 
     // ── Start DAG consensus in background ─────────────────────────────
@@ -144,6 +148,7 @@ async fn main() -> Result<()> {
         validator_address,
         cli.stake,
         boot_time,
+        peer_count,
     )
     .await?;
 
