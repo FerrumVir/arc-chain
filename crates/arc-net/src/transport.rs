@@ -64,12 +64,14 @@ fn make_server_config() -> quinn::ServerConfig {
         QuicServerConfig::try_from(server_crypto).expect("failed to create QUIC server config"),
     ));
 
-    // Keep connections alive for a long time (testnet)
+    // Keep connections alive and allow large payloads (testnet)
     let transport = Arc::get_mut(&mut server_config.transport).unwrap();
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
     ));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024)); // 64 MB
+    transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024)); // 256 MB
 
     server_config
 }
@@ -84,12 +86,14 @@ fn make_client_config() -> quinn::ClientConfig {
         QuicClientConfig::try_from(crypto).expect("failed to create QUIC client config"),
     ));
 
-    // Keep connections alive for a long time (testnet)
+    // Keep connections alive and allow large payloads (testnet)
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
         quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
     ));
     transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+    transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+    transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024));
     client_config.transport_config(Arc::new(transport));
 
     client_config
