@@ -6,9 +6,11 @@
 use arc_consensus::{ConsensusEngine, StakeTier, Validator, ValidatorSet};
 use arc_crypto::Hash256;
 use arc_mempool::Mempool;
+use arc_net::transport::{InboundMessage, OutboundMessage};
 use arc_state::StateDB;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 /// Orchestrates DAG consensus for a single validator node.
@@ -75,34 +77,23 @@ impl ConsensusManager {
     /// Run the consensus loop: propose blocks, advance rounds, commit, and
     /// execute against state.
     ///
-    /// This drains transactions from the mempool, proposes DAG blocks via the
-    /// consensus engine, executes committed transactions against the state
-    /// database, and produces on-chain blocks with Merkle roots.
-    ///
-    /// # Consensus Paths
-    ///
-    /// - **Single-validator (fast path)**: When only one validator is in the
-    ///   set, transactions are executed directly against state for instant
-    ///   finality. This avoids the multi-round DAG self-reference overhead.
-    ///
-    /// - **Multi-validator (DAG commit path)**: When the ValidatorSet has
-    ///   more than one validator, blocks must go through the full DAG commit
-    ///   rule (propose → certify → commit) before execution. Committed
-    ///   transactions are resolved from the pending index and executed.
+    /// When `inbound_rx` and `outbound_tx` are provided, the loop integrates
+    /// with the P2P transport layer for multi-node consensus. When `None`,
+    /// it behaves as a single-node (backward compatible).
     pub async fn run_consensus_loop(
         &self,
         state: Arc<StateDB>,
         mempool: Arc<Mempool>,
+        mut inbound_rx: Option<mpsc::Receiver<InboundMessage>>,
+        outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
     ) {
         use arc_types::Transaction;
         use dashmap::DashMap;
 
-        let multi_validator = self.is_multi_validator();
-
         info!(
             tier = ?self.tier,
             address = %self.validator_address,
-            multi_validator = multi_validator,
+            multi_validator = self.is_multi_validator(),
             validators = self.engine.validator_set().len(),
             "Consensus loop started"
         );
@@ -116,11 +107,102 @@ impl ConsensusManager {
         // Transactions live here between drain from mempool and execution.
         let pending_txs: DashMap<[u8; 32], Transaction> = DashMap::new();
 
+        // Track last proposed round to avoid double-proposing.
+        let mut last_proposed_round: Option<u64> = None;
+
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+            // ── 0. Process inbound network messages ─────────────────────
+            if let Some(ref mut rx) = inbound_rx {
+                while let Ok(msg) = rx.try_recv() {
+                    match msg {
+                        InboundMessage::PeerConnected { address, stake } => {
+                            // Build new ValidatorSet with both validators
+                            let local_validator =
+                                Validator::new(self.validator_address, self.stake, 0)
+                                    .expect("local validator");
+                            let remote_validator = Validator::new(address, stake, 0)
+                                .expect("remote validator stake too low");
+                            let new_set = ValidatorSet::new(
+                                vec![local_validator, remote_validator],
+                                0,
+                            );
+                            self.engine.update_validator_set(new_set);
+                            info!(
+                                peer = %address,
+                                validators = self.engine.validator_set().len(),
+                                "Peer connected — ValidatorSet updated"
+                            );
+                        }
+                        InboundMessage::PeerDisconnected { address } => {
+                            // Revert to single-validator set
+                            let local_validator =
+                                Validator::new(self.validator_address, self.stake, 0)
+                                    .expect("local validator");
+                            let new_set = ValidatorSet::new(vec![local_validator], 0);
+                            self.engine.update_validator_set(new_set);
+                            info!(
+                                peer = %address,
+                                "Peer disconnected — reverting to single-validator mode"
+                            );
+                        }
+                        InboundMessage::DagBlockWithTxs {
+                            block,
+                            transactions,
+                        } => {
+                            // Insert the full transactions into pending_txs
+                            // so we can resolve them when this block commits.
+                            for tx in &transactions {
+                                pending_txs.insert(tx.hash.0, tx.clone());
+                            }
+                            // Feed block into consensus engine
+                            match self.engine.receive_block(&block) {
+                                Ok(()) => {
+                                    debug!(
+                                        author = %block.author,
+                                        round = block.round,
+                                        txs = block.transactions.len(),
+                                        "Received DAG block from peer"
+                                    );
+                                    let _ = self.engine.advance_round();
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        author = %block.author,
+                                        round = block.round,
+                                        "Rejected DAG block: {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        InboundMessage::Transactions(txs) => {
+                            let mut inserted = 0usize;
+                            for tx_bytes in txs {
+                                if let Ok(tx) =
+                                    bincode::deserialize::<Transaction>(&tx_bytes)
+                                {
+                                    if mempool.insert(tx).is_ok() {
+                                        inserted += 1;
+                                    }
+                                }
+                            }
+                            if inserted > 0 {
+                                debug!(count = inserted, "Inserted gossiped txs into mempool");
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Check multi-validator EACH iteration (validator set is dynamic).
+            let multi_validator = self.is_multi_validator();
+            let current_round = self.engine.current_round();
+            let already_proposed = last_proposed_round == Some(current_round);
+
             // ── 1. Propose a block if we have pending txs and can produce ────
-            if can_produce && mempool.len() > 0 {
+            if can_produce && mempool.len() > 0 && !already_proposed {
                 let transactions = mempool.drain(100_000);
                 if !transactions.is_empty() {
                     let tx_hashes: Vec<Hash256> =
@@ -129,6 +211,15 @@ impl ConsensusManager {
                     // Index the full transactions so we can look them up at commit time
                     for tx in &transactions {
                         pending_txs.insert(tx.hash.0, tx.clone());
+                    }
+
+                    // Gossip transactions to peers before proposing
+                    if let Some(ref tx_chan) = outbound_tx {
+                        let tx_bytes: Vec<Vec<u8>> = transactions
+                            .iter()
+                            .filter_map(|t| bincode::serialize(t).ok())
+                            .collect();
+                        let _ = tx_chan.try_send(OutboundMessage::BroadcastTransactions(tx_bytes));
                     }
 
                     let timestamp = SystemTime::now()
@@ -144,6 +235,15 @@ impl ConsensusManager {
                                 hash = %block.hash,
                                 "Proposed DAG block"
                             );
+                            last_proposed_round = Some(block.round);
+
+                            // Broadcast to peers
+                            if let Some(ref tx_chan) = outbound_tx {
+                                let _ = tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
+                                    block: block.clone(),
+                                    transactions: transactions.clone(),
+                                });
+                            }
                         }
                         Err(e) => {
                             warn!("Failed to propose block: {}", e);
