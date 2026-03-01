@@ -16,14 +16,17 @@ export default function Layout() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6">
           <div className="flex items-center justify-between h-16 gap-6">
             {/* Logo */}
-            <Link to="/" className="flex items-center gap-3 shrink-0">
+            <Link to="/" className="flex items-center gap-1.5 shrink-0">
               <img
                 src="/brand/arc-logo-white.png"
                 alt="ARC"
-                className="h-6"
+                className="h-5"
               />
-              <span className="text-xs font-medium tracking-widest uppercase text-arc-grey-500 hidden sm:inline">
-                Explorer
+              <span
+                className="text-lg tracking-tight text-arc-white"
+                style={{ fontFamily: "'Favorit', sans-serif" }}
+              >
+                scan
               </span>
             </Link>
 
@@ -74,7 +77,7 @@ export default function Layout() {
       <footer className="border-t border-arc-border mt-auto">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 flex items-center justify-between">
           <p className="text-xs text-arc-grey-700">
-            ARC Chain Explorer
+            ARC scan
           </p>
           <p className="text-xs text-arc-grey-700">
             ai for Humans First
