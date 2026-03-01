@@ -1,6 +1,6 @@
 import { Link } from 'react-router-dom';
 import type { BlockSummary } from '../types';
-import { truncateHash } from '../utils';
+import { truncateHash, formatNumber } from '../utils';
 import TimeAgo from './TimeAgo';
 
 interface BlocksTableProps {
@@ -89,7 +89,7 @@ export default function BlocksTable({
                   </Link>
                 </td>
                 <td className="px-4 py-3.5 text-arc-grey-400">
-                  {block.tx_count}
+                  {formatNumber(block.tx_count)}
                 </td>
                 <td className="px-4 py-3.5">
                   <TimeAgo timestamp={block.timestamp} />
