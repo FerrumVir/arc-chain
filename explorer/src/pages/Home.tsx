@@ -28,11 +28,12 @@ export default function Home() {
       setInfo(infoData);
       setBlocks(blocksData.blocks);
 
-      // Calculate TPS from recent blocks (timestamps are unix millis)
-      const recentBlocks = blocksData.blocks;
+      // Calculate TPS from recent blocks (timestamps are unix millis).
+      // Blocks come in ascending height order; skip genesis (timestamp 0).
+      const recentBlocks = blocksData.blocks.filter(b => b.timestamp > 0);
       if (recentBlocks.length >= 2) {
-        const newest = recentBlocks[0];
-        const oldest = recentBlocks[recentBlocks.length - 1];
+        const oldest = recentBlocks[0];
+        const newest = recentBlocks[recentBlocks.length - 1];
         const timeSpanMs = newest.timestamp - oldest.timestamp;
         if (timeSpanMs > 0) {
           const totalTxs = recentBlocks.reduce((sum, b) => sum + b.tx_count, 0);
