@@ -7,6 +7,9 @@ import type {
   BlockDetail,
   TxReceipt,
   TxProof,
+  FullTransaction,
+  ContractInfo,
+  ContractCallResult,
   AccountInfo,
   AccountTxsResponse,
 } from './types';
@@ -86,6 +89,42 @@ export function getAccount(address: string): Promise<AccountInfo> {
 
 export function getAccountTxs(address: string): Promise<AccountTxsResponse> {
   return request<AccountTxsResponse>(`/account/${address}/txs`);
+}
+
+// ─── Full Transaction ────────────────────────────────────────────
+
+export function getFullTx(hash: string): Promise<FullTransaction> {
+  return request<FullTransaction>(`/tx/${hash}/full`);
+}
+
+// ─── Contracts ──────────────────────────────────────────────────
+
+export function getContractInfo(address: string): Promise<ContractInfo> {
+  return request<ContractInfo>(`/contract/${address}`);
+}
+
+export async function callContract(
+  address: string,
+  functionName: string,
+  calldata?: string,
+  from?: string,
+  gasLimit?: number,
+): Promise<ContractCallResult> {
+  const url = `${BASE_URL}/contract/${address}/call`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      function: functionName,
+      calldata,
+      from,
+      gas_limit: gasLimit,
+    }),
+  });
+  if (!res.ok) {
+    throw new ApiError(`Contract call failed: ${res.status}`, res.status);
+  }
+  return res.json() as Promise<ContractCallResult>;
 }
 
 export { ApiError };
