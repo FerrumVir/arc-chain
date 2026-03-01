@@ -1,11 +1,15 @@
 use anyhow::Result;
 use arc_crypto::{hash_bytes, Hash256};
 use arc_mempool::Mempool;
+use arc_net::transport::{run_transport, InboundMessage, OutboundMessage};
 use arc_node::{consensus::ConsensusManager, rpc};
 use arc_state::StateDB;
+use arc_types::Block;
 use clap::Parser;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -93,14 +97,41 @@ async fn main() -> Result<()> {
     // ── Record boot time for uptime tracking ──────────────────────────
     let boot_time = Instant::now();
 
-    // ── Start DAG consensus in background ───────────────────────────────
+    // ── Create channels for P2P transport ↔ consensus ─────────────────
+    let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(1000);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(1000);
+
+    // Deterministic genesis hash (same for all nodes with same genesis config)
+    let genesis_hash = Block::genesis().hash;
+
+    // Parse bootstrap peers
+    let bootstrap_peers: Vec<SocketAddr> = cli
+        .peers
+        .iter()
+        .filter_map(|p| p.parse().ok())
+        .collect();
+
+    let listen_addr: SocketAddr = format!("0.0.0.0:{}", cli.p2p_port).parse()?;
+
+    // ── Start P2P transport in background ──────────────────────────────
+    tokio::spawn(run_transport(
+        listen_addr,
+        bootstrap_peers,
+        validator_address,
+        cli.stake,
+        genesis_hash,
+        outbound_rx,
+        inbound_tx,
+    ));
+
+    // ── Start DAG consensus in background ─────────────────────────────
     let consensus =
         ConsensusManager::new(validator_address, cli.stake, 4 /* num_shards */);
     let state_clone = state.clone();
     let mempool_clone = mempool.clone();
     tokio::spawn(async move {
         consensus
-            .run_consensus_loop(state_clone, mempool_clone)
+            .run_consensus_loop(state_clone, mempool_clone, Some(inbound_rx), Some(outbound_tx))
             .await;
     });
 
