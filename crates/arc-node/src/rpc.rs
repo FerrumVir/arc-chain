@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
@@ -25,6 +26,7 @@ pub struct NodeState {
     pub stake: u64,
     pub tier: StakeTier,
     pub boot_time: Instant,
+    pub peer_count: Arc<AtomicU32>,
 }
 
 /// Start the RPC server.
@@ -35,6 +37,7 @@ pub async fn serve(
     validator_address: Hash256,
     stake: u64,
     boot_time: Instant,
+    peer_count: Arc<AtomicU32>,
 ) -> anyhow::Result<()> {
     let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
 
@@ -45,6 +48,7 @@ pub async fn serve(
         stake,
         tier,
         boot_time,
+        peer_count,
     };
 
     let app = Router::new()
@@ -96,7 +100,7 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
         status: "ok".to_string(),
         version: "0.1.0".to_string(),
         height: node.state.height(),
-        peers: 0, // P2P not wired yet
+        peers: node.peer_count.load(Ordering::Relaxed),
         uptime_secs: node.boot_time.elapsed().as_secs(),
     })
 }
