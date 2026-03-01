@@ -463,6 +463,21 @@ pub fn batch_verify_ml_dsa(
     }
 }
 
+// ── Benchmark keypair derivation ─────────────────────────────────────────────
+
+/// Derive a deterministic Ed25519 keypair from a benchmark index.
+/// All nodes derive the same keypairs → same genesis → compatible P2P.
+pub fn benchmark_keypair(index: u8) -> ed25519_dalek::SigningKey {
+    let seed = blake3::derive_key("ARC-chain-benchmark-keypair-v1", &[index]);
+    ed25519_dalek::SigningKey::from_bytes(&seed)
+}
+
+/// ARC address for benchmark keypair at the given index.
+/// `address = BLAKE3(ed25519_public_key)`
+pub fn benchmark_address(index: u8) -> Hash256 {
+    address_from_ed25519_pubkey(benchmark_keypair(index).verifying_key().as_bytes())
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

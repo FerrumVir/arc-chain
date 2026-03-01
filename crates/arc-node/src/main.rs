@@ -2,9 +2,9 @@ use anyhow::Result;
 use arc_crypto::{hash_bytes, Hash256};
 use arc_mempool::Mempool;
 use arc_net::transport::{run_transport, InboundMessage, OutboundMessage};
-use arc_node::{consensus::ConsensusManager, rpc};
+use arc_node::{benchmark::BenchmarkPool, consensus::ConsensusManager, rpc};
 use arc_state::StateDB;
-use arc_types::{Block, Transaction};
+use arc_types::Block;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicU32;
@@ -58,6 +58,23 @@ struct Cli {
     /// Milliseconds between benchmark batches.
     #[arg(long, default_value_t = 200)]
     bench_interval: u64,
+
+    /// First sender index for benchmark mode (0-49). Use to partition senders
+    /// across nodes in multi-node benchmarks to avoid nonce conflicts.
+    #[arg(long, default_value_t = 0)]
+    bench_sender_start: u8,
+
+    /// Number of senders this node owns in benchmark mode.
+    #[arg(long, default_value_t = 50)]
+    bench_sender_count: u8,
+
+    /// Number of signing threads in benchmark mode.
+    #[arg(long, default_value_t = 4)]
+    bench_sign_threads: usize,
+
+    /// Number of rayon threads for batch verification.
+    #[arg(long, default_value_t = 6)]
+    bench_rayon_threads: usize,
 }
 
 #[tokio::main]
@@ -67,6 +84,15 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    // ── Configure rayon thread pool ─────────────────────────────────────
+    // In benchmark mode, limit rayon to leave CPU for signing threads
+    if cli.benchmark {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cli.bench_rayon_threads)
+            .build_global()
+            .ok();
+    }
 
     // ── Validate stake ──────────────────────────────────────────────────
     if cli.stake < cli.min_stake {
@@ -100,9 +126,17 @@ async fn main() -> Result<()> {
     }
 
     // ── Genesis accounts — prefunded for testing ────────────────────────
-    let genesis_accounts: Vec<(Hash256, u64)> = (0..100u8)
-        .map(|i| (hash_bytes(&[i]), 1_000_000_000_000))
-        .collect();
+    // In benchmark mode, use deterministic ed25519 keypair-derived addresses
+    // so signatures can be verified. All nodes derive the same keypairs.
+    let genesis_accounts: Vec<(Hash256, u64)> = if cli.benchmark {
+        (0..100u8)
+            .map(|i| (arc_crypto::benchmark_address(i), 1_000_000_000_000))
+            .collect()
+    } else {
+        (0..100u8)
+            .map(|i| (hash_bytes(&[i]), 1_000_000_000_000))
+            .collect()
+    };
 
     // TODO: Use `cli.data_dir` for WAL persistence once disk-backed mode is wired.
     let state = Arc::new(StateDB::with_genesis(&genesis_accounts));
@@ -141,51 +175,44 @@ async fn main() -> Result<()> {
         peer_count_transport,
     ));
 
+    // ── Start benchmark signing pool + indexer (if benchmark mode) ─────
+    let benchmark_pool = if cli.benchmark {
+        state.start_benchmark_indexer();
+        let pool = BenchmarkPool::start(
+            cli.bench_sender_start,
+            cli.bench_sender_count,
+            cli.bench_sign_threads,
+            10_000, // txs per batch
+        );
+        tracing::info!(
+            "Benchmark mode ACTIVE — ed25519 signed txs, senders {}-{}, async indexing",
+            cli.bench_sender_start,
+            cli.bench_sender_start + cli.bench_sender_count - 1
+        );
+        Some(Arc::new(pool))
+    } else {
+        None
+    };
+
     // ── Start DAG consensus in background ─────────────────────────────
+    // Each node starts single-validator; peers added dynamically via P2P PeerConnected.
+    // In benchmark mode this keeps the fast path active (no DAG quorum needed).
     let consensus =
-        ConsensusManager::new(validator_address, cli.stake, 4 /* num_shards */);
+        ConsensusManager::new(validator_address, cli.stake, 4 /* num_shards */, cli.benchmark, &[]);
     let state_clone = state.clone();
     let mempool_clone = mempool.clone();
+    let pool_clone = benchmark_pool.clone();
     tokio::spawn(async move {
         consensus
-            .run_consensus_loop(state_clone, mempool_clone, Some(inbound_rx), Some(outbound_tx))
+            .run_consensus_loop(
+                state_clone,
+                mempool_clone,
+                Some(inbound_rx),
+                Some(outbound_tx),
+                pool_clone,
+            )
             .await;
     });
-
-    // ── Start benchmark transaction generator (optional) ───────────────
-    if cli.benchmark {
-        let mempool_bench = mempool.clone();
-        let batch_size = cli.bench_batch;
-        let interval_ms = cli.bench_interval;
-        // Use genesis accounts 0..50 as senders, 50..100 as receivers
-        let senders: Vec<Hash256> = (0..50u8).map(|i| hash_bytes(&[i])).collect();
-        let receivers: Vec<Hash256> = (50..100u8).map(|i| hash_bytes(&[i])).collect();
-        tokio::spawn(async move {
-            let mut nonce_base = 0u64;
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(interval_ms)).await;
-                let mut inserted = 0;
-                for i in 0..batch_size {
-                    let sender = senders[i % senders.len()];
-                    let receiver = receivers[i % receivers.len()];
-                    let nonce = nonce_base + (i as u64);
-                    let tx = Transaction::new_transfer(sender, receiver, 1, nonce);
-                    if mempool_bench.insert(tx).is_ok() {
-                        inserted += 1;
-                    }
-                }
-                nonce_base += batch_size as u64;
-                if inserted > 0 {
-                    tracing::debug!(count = inserted, "Benchmark: generated transactions");
-                }
-            }
-        });
-        tracing::info!(
-            batch = cli.bench_batch,
-            interval_ms = cli.bench_interval,
-            "Benchmark mode ACTIVE — generating continuous load"
-        );
-    }
 
     // ── Start RPC server ────────────────────────────────────────────────
     tracing::info!("RPC server listening on {}", cli.rpc);
