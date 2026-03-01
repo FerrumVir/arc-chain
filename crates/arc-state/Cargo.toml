@@ -20,3 +20,4 @@ lz4_flex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 wasmer.workspace = true
+ed25519-dalek.workspace = true

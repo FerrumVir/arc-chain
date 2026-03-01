@@ -4,6 +4,7 @@ import { getStats, getBlocks, getHealth, getInfo } from '../api';
 import type { StatsResponse, BlockSummary, HealthResponse, InfoResponse } from '../types';
 import StatsGrid from '../components/StatsGrid';
 import BlocksTable from '../components/BlocksTable';
+import { formatNumber } from '../utils';
 
 export default function Home() {
   const [stats, setStats] = useState<StatsResponse | null>(null);
@@ -63,13 +64,17 @@ export default function Home() {
   const statCards = [
     {
       label: 'Live TPS',
-      value: tps > 0 ? tps.toLocaleString(undefined, { maximumFractionDigits: 0 }) : '0',
+      value: tps > 0
+        ? tps >= 1_000_000
+          ? (tps / 1_000_000).toFixed(1) + 'M'
+          : tps.toLocaleString(undefined, { maximumFractionDigits: 0 })
+        : '0',
       suffix: 'tx/s',
       loading,
     },
     {
       label: 'Total Transactions',
-      value: stats?.total_receipts ?? 0,
+      value: stats?.total_transactions ?? 0,
       loading,
     },
     {
@@ -100,7 +105,7 @@ export default function Home() {
         </h1>
         <p className="text-sm text-arc-grey-600">
           {stats
-            ? `${stats.chain} v${stats.version} — ${stats.total_receipts.toLocaleString()} transactions processed`
+            ? `${stats.chain} v${stats.version} — ${formatNumber(stats.total_transactions)} transactions processed`
             : 'Connecting to node...'}
         </p>
       </div>

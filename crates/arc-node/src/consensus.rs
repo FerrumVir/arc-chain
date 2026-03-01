@@ -25,6 +25,8 @@ pub struct ConsensusManager {
     pub tier: StakeTier,
     /// Number of sender-shards.
     pub num_shards: u16,
+    /// Whether benchmark mode is active (bypass mempool, generate txs directly).
+    pub benchmark: bool,
 }
 
 impl ConsensusManager {
@@ -37,7 +39,7 @@ impl ConsensusManager {
     ///
     /// # Panics
     /// Panics if `stake` is below the minimum Spark threshold (500 000 ARC).
-    pub fn new(validator_address: Hash256, stake: u64, num_shards: u16) -> Self {
+    pub fn new(validator_address: Hash256, stake: u64, num_shards: u16, benchmark: bool, peer_validators: &[(Hash256, u64)]) -> Self {
         let tier = StakeTier::from_stake(stake)
             .expect("stake must be >= 500_000 ARC (Spark threshold)");
 
@@ -45,8 +47,14 @@ impl ConsensusManager {
         let validator = Validator::new(validator_address, stake, 0)
             .expect("validator creation failed — stake below minimum");
 
-        // Bootstrap with a single-validator set at epoch 0.
-        let validator_set = ValidatorSet::new(vec![validator], 0);
+        // Build validator set: local + any known peers.
+        let mut validators = vec![validator];
+        for (addr, peer_stake) in peer_validators {
+            if let Some(v) = Validator::new(*addr, *peer_stake, 0) {
+                validators.push(v);
+            }
+        }
+        let validator_set = ValidatorSet::new(validators, 0);
 
         let engine = Arc::new(ConsensusEngine::new(validator_set, validator_address));
 
@@ -64,6 +72,7 @@ impl ConsensusManager {
             stake,
             tier,
             num_shards,
+            benchmark,
         }
     }
 
@@ -86,6 +95,7 @@ impl ConsensusManager {
         mempool: Arc<Mempool>,
         mut inbound_rx: Option<mpsc::Receiver<InboundMessage>>,
         outbound_tx: Option<mpsc::Sender<OutboundMessage>>,
+        benchmark_pool: Option<Arc<crate::benchmark::BenchmarkPool>>,
     ) {
         use arc_types::Transaction;
         use dashmap::DashMap;
@@ -242,103 +252,150 @@ impl ConsensusManager {
             };
 
             if can_produce && !already_proposed && has_quorum_parents {
-                let transactions = mempool.drain(5_000);
-                let has_txs = !transactions.is_empty();
-
-                if has_txs || multi_validator {
-                    let tx_hashes: Vec<Hash256> =
-                        transactions.iter().map(|tx| tx.hash).collect();
-
-                    // Index and gossip only when we have transactions
-                    if has_txs {
-                        for tx in &transactions {
-                            pending_txs.insert(tx.hash.0, tx.clone());
-                        }
-                        if let Some(ref tx_chan) = outbound_tx {
-                            let tx_bytes: Vec<Vec<u8>> = transactions
-                                .iter()
-                                .filter_map(|t| bincode::serialize(t).ok())
-                                .collect();
-                            let _ = tx_chan
-                                .try_send(OutboundMessage::BroadcastTransactions(tx_bytes));
+                // ── Benchmark fast path: drain pre-signed txs, verify+execute ──
+                if self.benchmark && !multi_validator {
+                    if let Some(ref pool) = benchmark_pool {
+                        let signed_txs = pool.drain(1_000_000);
+                        if !signed_txs.is_empty() {
+                            let tx_count = signed_txs.len() as u64;
+                            let start = std::time::Instant::now();
+                            match state.execute_block_signed_benchmark(
+                                &signed_txs,
+                                self.validator_address,
+                            ) {
+                                Ok(block) => {
+                                    let elapsed = start.elapsed();
+                                    let tps = if elapsed.as_secs_f64() > 0.0 {
+                                        tx_count as f64 / elapsed.as_secs_f64()
+                                    } else {
+                                        tx_count as f64
+                                    };
+                                    info!(
+                                        height = block.header.height,
+                                        txs = tx_count,
+                                        elapsed_ms = elapsed.as_millis(),
+                                        tps = format!("{:.0}", tps),
+                                        "Signed benchmark block produced"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Benchmark block failed: {}", e);
+                                }
+                            }
                         }
                     }
-
+                    // Still advance DAG round for tracking
                     let timestamp = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .unwrap()
                         .as_millis() as u64;
-
-                    match self.engine.propose_block(tx_hashes, timestamp) {
-                        Ok(block) => {
-                            debug!(
-                                round = block.round,
-                                txs = block.transactions.len(),
-                                hash = %block.hash,
-                                "Proposed DAG block"
-                            );
-                            last_proposed_round = Some(block.round);
-
-                            // Broadcast to peers
-                            if let Some(ref tx_chan) = outbound_tx {
-                                let _ =
-                                    tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
-                                        block: block.clone(),
-                                        transactions: transactions.clone(),
-                                    });
+                    let _ = self.engine.propose_block(vec![], timestamp);
+                    let _ = self.engine.advance_round();
+                } else {
+                    // ── Benchmark multi-validator: feed signed txs into mempool ──
+                    if self.benchmark {
+                        if let Some(ref pool) = benchmark_pool {
+                            let signed_txs = pool.drain(5_000);
+                            for tx in signed_txs {
+                                let _ = mempool.insert(tx);
                             }
-                        }
-                        Err(e) => {
-                            warn!("Failed to propose block: {}", e);
                         }
                     }
 
-                    // After proposing, try to advance the round.
-                    let _ = self.engine.advance_round();
+                    // ── Normal path: drain mempool ──────────────────────────────
+                    let transactions = mempool.drain(5_000);
+                    let has_txs = !transactions.is_empty();
 
-                    if multi_validator {
-                        // ── Multi-validator: DAG commit path ─────────────
-                        // Do NOT execute directly. Wait for DAG commit rule
-                        // (step 2 below) to finalize blocks before execution.
+                    if has_txs || multi_validator {
+                        let tx_hashes: Vec<Hash256> =
+                            transactions.iter().map(|tx| tx.hash).collect();
+
+                        // Index and gossip only when we have transactions
                         if has_txs {
-                            debug!(
-                                pending = pending_txs.len(),
-                                "Multi-validator mode: waiting for DAG commit"
-                            );
+                            for tx in &transactions {
+                                pending_txs.insert(tx.hash.0, tx.clone());
+                            }
+                            if let Some(ref tx_chan) = outbound_tx {
+                                let tx_bytes: Vec<Vec<u8>> = transactions
+                                    .iter()
+                                    .filter_map(|t| bincode::serialize(t).ok())
+                                    .collect();
+                                let _ = tx_chan
+                                    .try_send(OutboundMessage::BroadcastTransactions(tx_bytes));
+                            }
                         }
-                    } else if has_txs {
-                        // ── Fast path: single-validator mode ─────────────
-                        // With only one validator, DAG commit requires multiple
-                        // rounds of self-references which is slow. Execute the
-                        // transactions directly against state for instant finality.
-                        let start = std::time::Instant::now();
-                        match state.execute_block(&transactions, self.validator_address) {
-                            Ok((block, receipts)) => {
-                                let elapsed = start.elapsed();
-                                let success = receipts.iter().filter(|r| r.success).count();
-                                let tps = if elapsed.as_secs_f64() > 0.0 {
-                                    transactions.len() as f64 / elapsed.as_secs_f64()
-                                } else {
-                                    transactions.len() as f64
-                                };
-                                info!(
-                                    height = block.header.height,
-                                    txs = transactions.len(),
-                                    success = success,
-                                    elapsed_ms = elapsed.as_millis(),
-                                    tps = format!("{:.0}", tps),
-                                    root = %block.header.tx_root,
-                                    "Block produced (fast path)"
+
+                        let timestamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as u64;
+
+                        match self.engine.propose_block(tx_hashes, timestamp) {
+                            Ok(block) => {
+                                debug!(
+                                    round = block.round,
+                                    txs = block.transactions.len(),
+                                    hash = %block.hash,
+                                    "Proposed DAG block"
                                 );
+                                last_proposed_round = Some(block.round);
+
+                                // Broadcast to peers
+                                if let Some(ref tx_chan) = outbound_tx {
+                                    let _ =
+                                        tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
+                                            block: block.clone(),
+                                            transactions: transactions.clone(),
+                                        });
+                                }
                             }
                             Err(e) => {
-                                warn!("Block execution failed: {}", e);
+                                warn!("Failed to propose block: {}", e);
                             }
                         }
 
-                        // Clean up executed transactions from the pending index
-                        for tx in &transactions {
-                            pending_txs.remove(&tx.hash.0);
+                        // After proposing, try to advance the round.
+                        let _ = self.engine.advance_round();
+
+                        if multi_validator {
+                            // ── Multi-validator: DAG commit path ─────────────
+                            if has_txs {
+                                debug!(
+                                    pending = pending_txs.len(),
+                                    "Multi-validator mode: waiting for DAG commit"
+                                );
+                            }
+                        } else if has_txs {
+                            // ── Fast path: single-validator mode ─────────────
+                            let start = std::time::Instant::now();
+                            match state.execute_block(&transactions, self.validator_address) {
+                                Ok((block, receipts)) => {
+                                    let elapsed = start.elapsed();
+                                    let success = receipts.iter().filter(|r| r.success).count();
+                                    let tps = if elapsed.as_secs_f64() > 0.0 {
+                                        transactions.len() as f64 / elapsed.as_secs_f64()
+                                    } else {
+                                        transactions.len() as f64
+                                    };
+                                    info!(
+                                        height = block.header.height,
+                                        txs = transactions.len(),
+                                        success = success,
+                                        elapsed_ms = elapsed.as_millis(),
+                                        tps = format!("{:.0}", tps),
+                                        root = %block.header.tx_root,
+                                        "Block produced (fast path)"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!("Block execution failed: {}", e);
+                                }
+                            }
+
+                            // Clean up executed transactions from the pending index
+                            for tx in &transactions {
+                                pending_txs.remove(&tx.hash.0);
+                            }
                         }
                     }
                 }
@@ -407,7 +464,7 @@ mod tests {
     #[test]
     fn test_consensus_manager_core_tier() {
         let addr = hash_bytes(b"core-validator");
-        let mgr = ConsensusManager::new(addr, 50_000_000, 4);
+        let mgr = ConsensusManager::new(addr, 50_000_000, 4, false, &[]);
         assert_eq!(mgr.tier, StakeTier::Core);
         assert_eq!(mgr.stake, 50_000_000);
     }
@@ -415,14 +472,14 @@ mod tests {
     #[test]
     fn test_consensus_manager_arc_tier() {
         let addr = hash_bytes(b"arc-validator");
-        let mgr = ConsensusManager::new(addr, 5_000_000, 4);
+        let mgr = ConsensusManager::new(addr, 5_000_000, 4, false, &[]);
         assert_eq!(mgr.tier, StakeTier::Arc);
     }
 
     #[test]
     fn test_consensus_manager_spark_tier() {
         let addr = hash_bytes(b"spark-validator");
-        let mgr = ConsensusManager::new(addr, 500_000, 4);
+        let mgr = ConsensusManager::new(addr, 500_000, 4, false, &[]);
         assert_eq!(mgr.tier, StakeTier::Spark);
         // Spark validators cannot produce blocks
         assert!(!mgr.tier.can_produce_blocks());
@@ -432,6 +489,6 @@ mod tests {
     #[should_panic(expected = "stake must be >= 500_000")]
     fn test_consensus_manager_below_minimum() {
         let addr = hash_bytes(b"too-poor");
-        ConsensusManager::new(addr, 100_000, 4);
+        ConsensusManager::new(addr, 100_000, 4, false, &[]);
     }
 }

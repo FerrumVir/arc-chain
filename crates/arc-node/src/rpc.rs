@@ -64,6 +64,7 @@ pub async fn serve(
         .route("/tx/{hash}/proof", get(get_tx_proof))
         .route("/block/{height}/proofs", get(get_block_proofs))
         .route("/blocks", get(get_blocks))
+        .route("/block/{height}/txs", get(get_block_txs))
         .route("/account/{address}/txs", get(get_account_txs))
         .route("/stats", get(get_stats))
         .route("/tx/{hash}/full", get(get_full_transaction))
@@ -283,39 +284,73 @@ fn parse_hash(hex_str: &str) -> Result<[u8; 32], StatusCode> {
 }
 
 /// GET /tx/{hash} — Look up a transaction receipt by its hash.
+/// Falls back to on-demand reconstruction for benchmark transactions.
 async fn get_transaction(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<Json<TxReceipt>, StatusCode> {
     let tx_hash = parse_hash(&hash)?;
+    // Try indexed receipts first
+    if let Some(receipt) = node.state.get_receipt(&tx_hash) {
+        return Ok(Json(receipt));
+    }
+    // Fall back to on-demand reconstruction for benchmark txs
     node.state
-        .get_receipt(&tx_hash)
+        .get_benchmark_receipt_by_hash(&tx_hash)
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
 
 /// GET /tx/{hash}/proof — Return a full verification bundle for a transaction.
+/// For benchmark transactions, reconstructs the Merkle tree on-demand (~130ms).
 async fn get_tx_proof(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     let tx_hash = parse_hash(&hash)?;
 
-    let receipt = node
+    // Try indexed receipt with stored proof first
+    if let Some(receipt) = node.state.get_receipt(&tx_hash) {
+        if let Some(ref proof_bytes) = receipt.inclusion_proof {
+            if let Ok(merkle_proof) = bincode::deserialize::<MerkleProof>(proof_bytes) {
+                let siblings: Vec<Value> = merkle_proof
+                    .siblings
+                    .iter()
+                    .map(|(h, is_left)| {
+                        json!({
+                            "hash": h.to_hex(),
+                            "is_left": is_left,
+                        })
+                    })
+                    .collect();
+
+                return Ok(Json(json!({
+                    "tx_hash": Hash256(tx_hash).to_hex(),
+                    "blake3_domain": "ARC-chain-tx-v1",
+                    "merkle_proof": {
+                        "leaf": merkle_proof.leaf.to_hex(),
+                        "index": merkle_proof.index,
+                        "siblings": siblings,
+                        "root": merkle_proof.root.to_hex(),
+                    },
+                    "block_height": receipt.block_height,
+                    "pedersen_commitment": receipt.value_commitment.map(hex::encode),
+                })));
+            }
+        }
+    }
+
+    // Fall back to on-demand proof reconstruction for benchmark txs
+    let (height, idx) = node
         .state
-        .get_receipt(&tx_hash)
+        .get_tx_location(&tx_hash)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    // Deserialize the stored Merkle proof
-    let proof_bytes = receipt
-        .inclusion_proof
-        .as_ref()
+    let merkle_proof = node
+        .state
+        .reconstruct_benchmark_proof(height, idx)
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let merkle_proof: MerkleProof =
-        bincode::deserialize(proof_bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    // Build sibling list for JSON
     let siblings: Vec<Value> = merkle_proof
         .siblings
         .iter()
@@ -327,7 +362,13 @@ async fn get_tx_proof(
         })
         .collect();
 
-    let body = json!({
+    let block_tx_root = node
+        .state
+        .get_block(height)
+        .map(|b| b.header.tx_root);
+    let verified = block_tx_root.map(|r| r == merkle_proof.root).unwrap_or(false);
+
+    Ok(Json(json!({
         "tx_hash": Hash256(tx_hash).to_hex(),
         "blake3_domain": "ARC-chain-tx-v1",
         "merkle_proof": {
@@ -336,11 +377,10 @@ async fn get_tx_proof(
             "siblings": siblings,
             "root": merkle_proof.root.to_hex(),
         },
-        "block_height": receipt.block_height,
-        "pedersen_commitment": receipt.value_commitment.map(hex::encode),
-    });
-
-    Ok(Json(body))
+        "block_height": height,
+        "block_tx_root": block_tx_root.map(|r| r.to_hex()),
+        "verified": verified,
+    })))
 }
 
 /// GET /block/{height}/proofs — Return all Merkle proofs for transactions in a block.
@@ -431,6 +471,84 @@ async fn get_blocks(
     }))
 }
 
+/// GET /block/{height}/txs?offset=0&limit=100 — Paginated transaction listing for a block.
+/// Reconstructs benchmark transactions on-demand from deterministic parameters.
+#[derive(Deserialize)]
+struct BlockTxsQuery {
+    offset: Option<u32>,
+    limit: Option<u32>,
+}
+
+async fn get_block_txs(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(height): axum::extract::Path<u64>,
+    Query(params): Query<BlockTxsQuery>,
+) -> Result<Json<Value>, StatusCode> {
+    let block = node
+        .state
+        .get_block(height)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let offset = params.offset.unwrap_or(0);
+    let limit = params.limit.unwrap_or(100).min(1000);
+
+    // Try existing tx_hashes first (normal blocks)
+    if !block.tx_hashes.is_empty() {
+        let end = (offset + limit).min(block.header.tx_count);
+        let txs: Vec<Value> = (offset..end)
+            .filter_map(|i| {
+                let hash = block.tx_hashes.get(i as usize)?;
+                Some(json!({
+                    "index": i,
+                    "hash": hash.to_hex(),
+                }))
+            })
+            .collect();
+
+        return Ok(Json(json!({
+            "block_height": height,
+            "tx_count": block.header.tx_count,
+            "offset": offset,
+            "limit": limit,
+            "returned": txs.len(),
+            "transactions": txs,
+        })));
+    }
+
+    // Reconstruct benchmark transactions on-demand
+    let txs = node.state.get_benchmark_block_txs(height, offset, limit);
+    let tx_list: Vec<Value> = txs
+        .iter()
+        .enumerate()
+        .map(|(i, tx)| {
+            json!({
+                "index": offset + i as u32,
+                "hash": tx.hash.to_hex(),
+                "from": tx.from.to_hex(),
+                "nonce": tx.nonce,
+                "tx_type": format!("{:?}", tx.tx_type),
+                "body": match &tx.body {
+                    TxBody::Transfer(b) => json!({
+                        "type": "Transfer",
+                        "to": b.to.to_hex(),
+                        "amount": b.amount,
+                    }),
+                    _ => json!({}),
+                },
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "block_height": height,
+        "tx_count": block.header.tx_count,
+        "offset": offset,
+        "limit": limit,
+        "returned": tx_list.len(),
+        "transactions": tx_list,
+    })))
+}
+
 /// GET /account/{address}/txs — Return transaction hashes involving an account.
 async fn get_account_txs(
     AxumState(node): AxumState<NodeState>,
@@ -450,13 +568,18 @@ async fn get_account_txs(
 
 /// GET /stats — Basic chain statistics.
 async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let indexed_receipts = node.state.receipts.len();
+    let indexed_hashes = node.state.tx_index.len();
+    let executed = node.state.benchmark_tx_count.load(std::sync::atomic::Ordering::Relaxed) as usize;
     Json(json!({
         "chain": "ARC Chain",
         "version": "0.1.0",
         "block_height": node.state.height(),
         "total_accounts": node.state.account_count(),
         "mempool_size": node.mempool.len(),
-        "total_receipts": node.state.receipts.len(),
+        "total_transactions": indexed_receipts + executed,
+        "indexed_hashes": indexed_hashes,
+        "indexed_receipts": indexed_receipts,
     }))
 }
 
@@ -465,6 +588,7 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
 // ---------------------------------------------------------------------------
 
 /// GET /tx/{hash}/full — Return the full transaction body with type-specific fields.
+/// Falls back to on-demand reconstruction for benchmark transactions.
 async fn get_full_transaction(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
@@ -474,9 +598,13 @@ async fn get_full_transaction(
     let tx = node
         .state
         .get_transaction(&tx_hash)
+        .or_else(|| node.state.get_benchmark_tx_by_hash(&tx_hash))
         .ok_or(StatusCode::NOT_FOUND)?;
 
-    let receipt = node.state.get_receipt(&tx_hash);
+    let receipt = node
+        .state
+        .get_receipt(&tx_hash)
+        .or_else(|| node.state.get_benchmark_receipt_by_hash(&tx_hash));
 
     let body_json = match &tx.body {
         TxBody::Transfer(b) => json!({
@@ -541,6 +669,27 @@ async fn get_full_transaction(
         }),
     };
 
+    let sig_json = match &tx.signature {
+        arc_crypto::Signature::Ed25519 { public_key, signature } => json!({
+            "Ed25519": {
+                "public_key": hex::encode(public_key),
+                "signature": hex::encode(signature),
+            }
+        }),
+        arc_crypto::Signature::Secp256k1 { signature } => json!({
+            "Secp256k1": {
+                "signature": hex::encode(signature),
+            }
+        }),
+        arc_crypto::Signature::MlDsa65 { public_key, signature } => json!({
+            "MlDsa65": {
+                "public_key_size": public_key.len(),
+                "signature_size": signature.len(),
+            }
+        }),
+        _ => json!(null),
+    };
+
     let mut result = json!({
         "tx_hash": Hash256(tx_hash).to_hex(),
         "tx_type": format!("{:?}", tx.tx_type),
@@ -549,6 +698,7 @@ async fn get_full_transaction(
         "fee": tx.fee,
         "gas_limit": tx.gas_limit,
         "body": body_json,
+        "signature": sig_json,
     });
 
     if let Some(r) = receipt {

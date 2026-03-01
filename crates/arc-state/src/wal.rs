@@ -117,8 +117,19 @@ impl WalWriter {
         }
     }
 
+    /// Returns true if this WAL writer is active (not null).
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        self.handle.is_some()
+    }
+
     /// Non-blocking. Sends an entry to the background writer.
     pub fn append(&self, op: WalOp, block_height: u64) {
+        // Null WAL: no writer thread, no handle → skip serialize/send entirely
+        if self.handle.is_none() {
+            return;
+        }
+
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
         let payload = bincode::serialize(&(&block_height, &seq, &op)).unwrap_or_default();
         let checksum = crc32fast::hash(&payload);

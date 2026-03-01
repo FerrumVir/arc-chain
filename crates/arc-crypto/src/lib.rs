@@ -14,4 +14,5 @@ pub use signature::{
     Signature, KeyPair, SignatureError,
     address_from_ed25519_pubkey, address_from_secp256k1_pubkey, address_from_ml_dsa_pubkey,
     batch_verify_ed25519, batch_verify_ml_dsa,
+    benchmark_keypair, benchmark_address,
 };
