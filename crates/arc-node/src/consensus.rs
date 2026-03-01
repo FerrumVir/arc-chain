@@ -111,7 +111,7 @@ impl ConsensusManager {
         let mut last_proposed_round: Option<u64> = None;
 
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
             // ── 0. Process inbound network messages ─────────────────────
             if let Some(ref mut rx) = inbound_rx {
@@ -242,7 +242,7 @@ impl ConsensusManager {
             };
 
             if can_produce && !already_proposed && has_quorum_parents {
-                let transactions = mempool.drain(100_000);
+                let transactions = mempool.drain(5_000);
                 let has_txs = !transactions.is_empty();
 
                 if has_txs || multi_validator {
