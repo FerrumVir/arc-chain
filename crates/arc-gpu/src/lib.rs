@@ -1,3 +1,5 @@
+pub mod metal_verify;
+
 use arc_crypto::Hash256;
 use rayon::prelude::*;
 use std::borrow::Cow;
@@ -37,7 +39,7 @@ pub fn probe_gpu() -> GpuInfo {
     }));
 
     match adapter {
-        Some(adapter) => {
+        Ok(adapter) => {
             let info = adapter.get_info();
             GpuInfo {
                 available: true,
@@ -45,7 +47,7 @@ pub fn probe_gpu() -> GpuInfo {
                 backend: format!("{:?}", info.backend),
             }
         }
-        None => GpuInfo {
+        Err(_) => GpuInfo {
             available: false,
             name: "none".to_string(),
             backend: "none".to_string(),
@@ -184,7 +186,7 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
         force_fallback_adapter: false,
         compatible_surface: None,
     }))
-    .ok_or(GpuError::NoAdapter)?;
+    .map_err(|_| GpuError::NoAdapter)?;
 
     let gpu_info = adapter.get_info();
     info!(
@@ -201,7 +203,6 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
             required_limits: wgpu::Limits::default(),
             ..Default::default()
         },
-        None,
     ))
     .map_err(|e| GpuError::DeviceError(e.to_string()))?;
 
@@ -368,7 +369,7 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
         sender.send(result).unwrap();
     });
-    device.poll(wgpu::Maintain::Wait);
+    device.poll(wgpu::PollType::wait()).unwrap();
     receiver.recv().unwrap().map_err(|e| GpuError::DeviceError(format!("{e:?}")))?;
 
     let raw_data = buffer_slice.get_mapped_range();
@@ -388,6 +389,100 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
     staging_buffer.unmap();
 
     Ok(hashes)
+}
+
+// ─── GPU Merkle Root ─────────────────────────────────────────────────────────
+
+/// Compute a Merkle root from leaf hashes using GPU-accelerated BLAKE3.
+///
+/// Uses the existing GPU BLAKE3 batch hashing to compute each layer of the
+/// Merkle tree in parallel.  Falls back to CPU if GPU is unavailable or if
+/// the leaf count is below `GPU_MIN_BATCH`.
+///
+/// Layer computation: For N leaf hashes, concatenate pairs (64 bytes each),
+/// hash N/2 pairs → repeat until one root remains.
+pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
+    if leaves.is_empty() {
+        return Ok(Hash256([0u8; 32]));
+    }
+    if leaves.len() == 1 {
+        return Ok(leaves[0]);
+    }
+
+    let mut current: Vec<Hash256> = leaves.to_vec();
+
+    // Pad to even length with zero hash if needed
+    if current.len() % 2 != 0 {
+        current.push(Hash256([0u8; 32]));
+    }
+
+    while current.len() > 1 {
+        // Concatenate pairs into 64-byte payloads
+        let pairs: Vec<[u8; 64]> = current
+            .chunks_exact(2)
+            .map(|pair| {
+                let mut concat = [0u8; 64];
+                concat[..32].copy_from_slice(&pair[0].0);
+                concat[32..].copy_from_slice(&pair[1].0);
+                concat
+            })
+            .collect();
+
+        let refs: Vec<&[u8]> = pairs.iter().map(|p| p.as_slice()).collect();
+
+        // Use GPU for large layers, CPU for small ones
+        current = if refs.len() >= GPU_MIN_BATCH {
+            gpu_batch_commit(&refs)?
+        } else {
+            cpu_batch_commit(&refs)
+        };
+
+        // Pad again if odd
+        if current.len() > 1 && current.len() % 2 != 0 {
+            current.push(Hash256([0u8; 32]));
+        }
+    }
+
+    Ok(current[0])
+}
+
+// ─── GPU-accelerated Ed25519 batch verification ──────────────────────────────
+
+/// Batch verify Ed25519 signatures using CPU-parallel rayon.
+///
+/// This is the high-throughput verification path: rayon distributes
+/// individual verifications across all CPU cores.  For batches >= 1024,
+/// this achieves near-linear scaling.
+///
+/// **Future**: Replace with Metal/CUDA MSM compute shader for 10-40× on GPU.
+/// The Metal shader requires Pippenger bucket MSM for the `R + H(R,A,M)*A`
+/// check — a complex implementation that deserves its own dedicated sprint.
+pub fn gpu_batch_verify_ed25519(
+    messages: &[&[u8]],
+    signatures: &[ed25519_dalek::Signature],
+    verifying_keys: &[ed25519_dalek::VerifyingKey],
+) -> Vec<bool> {
+    assert_eq!(messages.len(), signatures.len());
+    assert_eq!(messages.len(), verifying_keys.len());
+
+    // For large batches, use rayon parallel iterator for per-signature verification.
+    // ed25519_dalek::verify_batch is already fast but gives all-or-nothing;
+    // we need per-signature results for selective re-execution.
+    if messages.len() >= 256 {
+        messages
+            .par_iter()
+            .zip(signatures.par_iter())
+            .zip(verifying_keys.par_iter())
+            .map(|((msg, sig), vk)| vk.verify_strict(msg, sig).is_ok())
+            .collect()
+    } else {
+        messages
+            .iter()
+            .zip(signatures.iter())
+            .zip(verifying_keys.iter())
+            .map(|((msg, sig), vk)| vk.verify_strict(msg, sig).is_ok())
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -463,6 +558,80 @@ mod tests {
             }
             Err(e) => panic!("GPU batch commit failed: {e}"),
         }
+    }
+
+    #[test]
+    fn test_gpu_merkle_root_basic() {
+        // 4 leaves → 2 parents → 1 root
+        let leaves: Vec<Hash256> = (0..4u32)
+            .map(|i| arc_crypto::hash_bytes(&i.to_le_bytes()))
+            .collect();
+        let root = gpu_merkle_root(&leaves).unwrap();
+        // Should be deterministic
+        let root2 = gpu_merkle_root(&leaves).unwrap();
+        assert_eq!(root, root2);
+        // Should differ from leaves
+        assert_ne!(root, leaves[0]);
+    }
+
+    #[test]
+    fn test_gpu_merkle_root_single() {
+        let leaf = arc_crypto::hash_bytes(b"hello");
+        let root = gpu_merkle_root(&[leaf]).unwrap();
+        assert_eq!(root, leaf);
+    }
+
+    #[test]
+    fn test_gpu_merkle_root_empty() {
+        let root = gpu_merkle_root(&[]).unwrap();
+        assert_eq!(root, Hash256([0u8; 32]));
+    }
+
+    #[test]
+    fn test_gpu_batch_verify_ed25519() {
+        use ed25519_dalek::Signer;
+        let mut rng = rand::thread_rng();
+
+        // Generate 100 keypairs and sign messages
+        let keypairs: Vec<ed25519_dalek::SigningKey> = (0..100)
+            .map(|_| ed25519_dalek::SigningKey::generate(&mut rng))
+            .collect();
+        let messages: Vec<Vec<u8>> = (0..100u32)
+            .map(|i| format!("message {}", i).into_bytes())
+            .collect();
+        let sigs: Vec<ed25519_dalek::Signature> = keypairs
+            .iter()
+            .zip(messages.iter())
+            .map(|(kp, msg)| kp.sign(msg))
+            .collect();
+        let vks: Vec<ed25519_dalek::VerifyingKey> =
+            keypairs.iter().map(|kp| kp.verifying_key()).collect();
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+
+        let results = gpu_batch_verify_ed25519(&msg_refs, &sigs, &vks);
+        assert_eq!(results.len(), 100);
+        assert!(results.iter().all(|&v| v), "all signatures should be valid");
+    }
+
+    #[test]
+    fn test_gpu_batch_verify_detects_invalid() {
+        use ed25519_dalek::Signer;
+        let mut rng = rand::thread_rng();
+
+        let kp = ed25519_dalek::SigningKey::generate(&mut rng);
+        let msg = b"hello";
+        let bad_msg = b"world";
+        let sig = kp.sign(msg.as_slice());
+        let vk = kp.verifying_key();
+
+        // Valid then invalid
+        let results = gpu_batch_verify_ed25519(
+            &[msg.as_slice(), bad_msg.as_slice()],
+            &[sig, sig],
+            &[vk, vk],
+        );
+        assert!(results[0]);
+        assert!(!results[1]);
     }
 
     #[test]

@@ -11,11 +11,17 @@ arc-types = { path = "../arc-types" }
 wgpu.workspace = true
 blake3.workspace = true
 rayon.workspace = true
+ed25519-dalek.workspace = true
+curve25519-dalek.workspace = true
+sha2 = "0.10"
 serde.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 bytemuck = { version = "1.0", features = ["derive"] }
+dashmap.workspace = true
+parking_lot.workspace = true
 pollster = "0.4"
 
 [dev-dependencies]
 hex.workspace = true
+rand = "0.8"
