@@ -27,7 +27,11 @@ curve25519-dalek = { version = "4.1", features = ["digest", "rand_core"] }
 ed25519-dalek = { version = "2.1", features = ["batch", "rand_core"] }
 k256 = { version = "0.13", features = ["ecdsa"] }
 fips204 = "0.4"
+pqcrypto-falcon = { version = "0.4", features = ["std"] }
+pqcrypto-traits = "0.3"
 sha2 = "0.10"
+sha3 = "0.10"
+blst = { version = "0.3", features = ["portable"] }
 rand = "0.8"
 rand_core = "0.6"
 
@@ -48,8 +52,11 @@ rustls = { version = "0.23", features = ["ring"] }
 # WASM runtime
 wasmer = "6.0"
 
+# EVM runtime
+revm = { version = "19", default-features = false, features = ["std"] }
+
 # GPU compute
-wgpu = "24.0"
+wgpu = "25.0"
 
 # Parallelism
 rayon = "1.10"
