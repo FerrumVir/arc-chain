@@ -7,10 +7,13 @@ license.workspace = true
 
 [dependencies]
 blake3.workspace = true
+blst.workspace = true
 curve25519-dalek.workspace = true
 ed25519-dalek.workspace = true
 k256.workspace = true
 fips204.workspace = true
+pqcrypto-falcon.workspace = true
+pqcrypto-traits.workspace = true
 sha2.workspace = true
 rand.workspace = true
 rand_core.workspace = true
