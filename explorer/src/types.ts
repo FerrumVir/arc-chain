@@ -122,7 +122,19 @@ export type TransactionBody =
   | { type: 'WasmCall'; contract: string; function: string; calldata: string; value: number; gas_limit: number }
   | { type: 'MultiSig'; signers: string[]; threshold: number }
   | { type: 'DeployContract'; bytecode_size: number; constructor_args_size: number; state_rent_deposit: number }
-  | { type: 'RegisterAgent'; agent_name: string; endpoint: string; protocol: string; capabilities_size: number };
+  | { type: 'RegisterAgent'; agent_name: string; endpoint: string; protocol: string; capabilities_size: number }
+  | { type: 'JoinValidator'; pubkey: number[]; initial_stake: number }
+  | { type: 'LeaveValidator' }
+  | { type: 'ClaimRewards' }
+  | { type: 'UpdateStake'; new_stake: number }
+  | { type: 'Governance'; proposal_id: number; action: string }
+  | { type: 'BridgeLock'; destination_chain: number; destination_address: number[]; amount: number }
+  | { type: 'BridgeMint'; source_chain: number; source_tx_hash: string; recipient: string; amount: number; merkle_proof: number[] }
+  | { type: 'BatchSettle'; entries: Array<{ agent_id: string; service_hash: string; amount: number }> }
+  | { type: 'ChannelOpen'; channel_id: string; counterparty: string; deposit: number; timeout_blocks: number }
+  | { type: 'ChannelClose'; channel_id: string; opener_balance: number; counterparty_balance: number; counterparty_sig: number[]; state_nonce: number }
+  | { type: 'ChannelDispute'; channel_id: string; opener_balance: number; counterparty_balance: number; other_party_sig: number[]; state_nonce: number; challenge_period: number }
+  | { type: 'ShardProof'; shard_id: number; block_height: number; block_hash: string; prev_state_root: string; post_state_root: string; tx_count: number; proof_data: number[] };
 
 // ─── Contract ───────────────────────────────────────────────────
 
@@ -155,4 +167,34 @@ export interface AccountTxsResponse {
   address: string;
   tx_count: number;
   tx_hashes: string[];
+}
+
+// ─── Faucet ─────────────────────────────────────────────────────
+
+export interface FaucetStatus {
+  address: string;
+  node_url: string;
+  claims_today: number;
+  claim_amount: number;
+  rate_limit_secs: number;
+}
+
+export interface FaucetClaimResponse {
+  tx_hash: string;
+  amount: number;
+  message: string;
+}
+
+// ─── Validators ──────────────────────────────────────────────────
+
+export interface ValidatorInfo {
+  address: string;
+  stake: number;
+  tier: string;
+}
+
+export interface ValidatorsResponse {
+  validators: ValidatorInfo[];
+  total_stake: number;
+  count: number;
 }

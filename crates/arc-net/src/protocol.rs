@@ -20,6 +20,18 @@ pub enum MessageType {
     HandshakeAck = 0x02,
     DagBlockWithTxs = 0x03,
     TxGossip = 0x04,
+    /// State diff from a proposer node (Propose-Verify protocol).
+    StateDiff = 0x05,
+    /// Peer Exchange — share known peer list for dynamic discovery.
+    PeerExchange = 0x06,
+    /// State Sync — request the snapshot manifest from a peer.
+    SnapshotManifestRequest = 0x07,
+    /// State Sync — response with snapshot manifest.
+    SnapshotManifestResponse = 0x08,
+    /// State Sync — request a single snapshot chunk by index.
+    SnapshotChunkRequest = 0x09,
+    /// State Sync — response with a snapshot chunk.
+    SnapshotChunkResponse = 0x0A,
 }
 
 impl MessageType {
@@ -29,6 +41,12 @@ impl MessageType {
             0x02 => Some(Self::HandshakeAck),
             0x03 => Some(Self::DagBlockWithTxs),
             0x04 => Some(Self::TxGossip),
+            0x05 => Some(Self::StateDiff),
+            0x06 => Some(Self::PeerExchange),
+            0x07 => Some(Self::SnapshotManifestRequest),
+            0x08 => Some(Self::SnapshotManifestResponse),
+            0x09 => Some(Self::SnapshotChunkRequest),
+            0x0A => Some(Self::SnapshotChunkResponse),
             _ => None,
         }
     }
@@ -37,12 +55,24 @@ impl MessageType {
 // ─── Message Payloads ───────────────────────────────────────────────────────
 
 /// Exchanged on peer connection.
+///
+/// Each peer proves identity by signing a random nonce with their validator key.
+/// The receiver verifies: (1) public_key hashes to validator_address,
+/// (2) challenge_sig is a valid Ed25519 signature over
+/// `BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeMessage {
     pub validator_address: Hash256,
     pub stake: u64,
     pub listen_port: u16,
     pub genesis_hash: Hash256,
+    /// Ed25519 public key bytes (32 bytes). Receiver verifies it hashes to validator_address.
+    pub public_key: Vec<u8>,
+    /// Random 32-byte nonce (prevents replay attacks).
+    pub nonce: [u8; 32],
+    /// Ed25519 signature over BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash).
+    /// Proves the sender controls the private key for validator_address.
+    pub challenge_sig: Vec<u8>,
 }
 
 /// A DAG block bundled with the full transaction bodies it references,
@@ -57,6 +87,58 @@ pub struct DagBlockWithTxsMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TxGossipMessage {
     pub transactions: Vec<Vec<u8>>,
+}
+
+/// State diff broadcast from a proposer node (Propose-Verify protocol).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateDiffMessage {
+    pub block_hash: Hash256,
+    pub diff: arc_types::StateDiff,
+    pub block_height: u64,
+}
+
+/// Peer Exchange message — shares a list of known peers for dynamic discovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerExchangeMessage {
+    pub peers: Vec<PexPeerInfo>,
+}
+
+/// State Sync — request snapshot manifest from a peer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotManifestRequestMessage {
+    /// Optionally request a snapshot at a specific height (0 = latest).
+    pub prefer_height: u64,
+}
+
+/// State Sync — response with snapshot manifest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotManifestResponseMessage {
+    /// The manifest describing the chunked snapshot.
+    pub manifest: arc_state::SnapshotManifest,
+}
+
+/// State Sync — request a single snapshot chunk by index.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotChunkRequestMessage {
+    /// BLAKE3 hash of the manifest (to identify which snapshot).
+    pub manifest_hash: Hash256,
+    /// Zero-based chunk index.
+    pub chunk_index: u32,
+}
+
+/// State Sync — response with a snapshot chunk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotChunkResponseMessage {
+    /// The snapshot chunk data (includes BLAKE3 proof for verification).
+    pub chunk: arc_state::StateSnapshot,
+}
+
+/// Compact peer info exchanged via PEX protocol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PexPeerInfo {
+    pub address: Hash256,
+    pub socket_addr: String,
+    pub stake: u64,
 }
 
 // ─── Framing ────────────────────────────────────────────────────────────────

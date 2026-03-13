@@ -12,10 +12,15 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
+
+/// Faucet configuration.
+const FAUCET_CLAIM_AMOUNT: u64 = 10_000;
+const FAUCET_RATE_LIMIT_SECS: u64 = 3600; // 1 hour per address
 
 /// Shared node state passed to all handlers.
 #[derive(Clone)]
@@ -27,6 +32,33 @@ pub struct NodeState {
     pub tier: StakeTier,
     pub boot_time: Instant,
     pub peer_count: Arc<AtomicU32>,
+    /// Faucet rate limiter: address → last claim time.
+    pub faucet_claims: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    /// Total faucet claims since boot.
+    pub faucet_claims_total: Arc<AtomicU32>,
+}
+
+/// Build a `NodeState` from components.
+pub fn build_node_state(
+    state: Arc<StateDB>,
+    mempool: Arc<Mempool>,
+    validator_address: Hash256,
+    stake: u64,
+    boot_time: Instant,
+    peer_count: Arc<AtomicU32>,
+) -> NodeState {
+    let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
+    NodeState {
+        state,
+        mempool,
+        validator_address,
+        stake,
+        tier,
+        boot_time,
+        peer_count,
+        faucet_claims: Arc::new(Mutex::new(HashMap::new())),
+        faucet_claims_total: Arc::new(AtomicU32::new(0)),
+    }
 }
 
 /// Start the RPC server.
@@ -39,17 +71,7 @@ pub async fn serve(
     boot_time: Instant,
     peer_count: Arc<AtomicU32>,
 ) -> anyhow::Result<()> {
-    let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
-
-    let node = NodeState {
-        state,
-        mempool,
-        validator_address,
-        stake,
-        tier,
-        boot_time,
-        peer_count,
-    };
+    let node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count);
 
     let app = Router::new()
         .route("/", get(index))
@@ -59,7 +81,9 @@ pub async fn serve(
         .route("/block/{height}", get(get_block))
         .route("/account/{address}", get(get_account))
         .route("/tx/submit", post(submit_tx))
+        .route("/tx/submit_signed", post(submit_signed_tx))
         .route("/tx/submit_batch", post(submit_batch))
+        .route("/validators", get(get_validators))
         .route("/tx/{hash}", get(get_transaction))
         .route("/tx/{hash}/proof", get(get_tx_proof))
         .route("/block/{height}/proofs", get(get_block_proofs))
@@ -70,7 +94,34 @@ pub async fn serve(
         .route("/tx/{hash}/full", get(get_full_transaction))
         .route("/contract/{address}", get(get_contract_info))
         .route("/contract/{address}/call", post(call_contract))
+        // Faucet (testnet token dispensing)
+        .route("/faucet/claim", post(faucet_claim))
+        .route("/faucet/status", get(faucet_status))
+        // Light Client Finality Proofs (A8)
+        .route("/light/snapshot", get(light_snapshot))
+        // State Sync Protocol (A5) — snapshot bootstrap for new nodes
+        .route("/sync/snapshot", get(sync_snapshot))
+        .route("/sync/snapshot/info", get(sync_snapshot_info))
+        // Chunked State Sync — parallel chunk download for fast catch-up
+        .route("/sync/manifest", get(sync_manifest))
+        .route("/sync/chunk/{index}", get(sync_chunk))
+        .route("/sync/status", get(sync_status))
+        // ETH-compatible JSON-RPC (MetaMask, Hardhat, Foundry)
+        .route("/eth", post(eth_json_rpc))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
+        .layer(CorsLayer::permissive())
+        .with_state(node);
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Start an ETH-compatible JSON-RPC server on a separate port.
+/// Handles only the `/` POST endpoint for MetaMask, Hardhat, Foundry, etc.
+pub async fn serve_eth(addr: &str, node: NodeState) -> anyhow::Result<()> {
+    let app = Router::new()
+        .route("/", post(eth_json_rpc))
         .layer(CorsLayer::permissive())
         .with_state(node);
 
@@ -269,6 +320,180 @@ async fn submit_batch(
         accepted,
         rejected,
         tx_hashes: hashes,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Signed transaction submission (for CLI / external signers)
+// ---------------------------------------------------------------------------
+
+async fn submit_signed_tx(
+    AxumState(node): AxumState<NodeState>,
+    Json(tx): Json<Transaction>,
+) -> Result<Json<SubmitTxResponse>, StatusCode> {
+    let hash = tx.hash.to_hex();
+
+    node.mempool
+        .insert(tx)
+        .map_err(|_| StatusCode::CONFLICT)?;
+
+    Ok(Json(SubmitTxResponse {
+        tx_hash: hash,
+        status: "pending".to_string(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Validators endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct ValidatorInfoResponse {
+    address: String,
+    stake: u64,
+    tier: String,
+}
+
+#[derive(Serialize)]
+struct ValidatorsResponse {
+    validators: Vec<ValidatorInfoResponse>,
+    total_stake: u64,
+    count: usize,
+}
+
+async fn get_validators(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<ValidatorsResponse> {
+    let staked = node.state.get_staked_accounts();
+    let mut validators: Vec<ValidatorInfoResponse> = staked
+        .into_iter()
+        .map(|(addr, account)| {
+            let tier = StakeTier::from_stake(account.staked_balance)
+                .map(|t| format!("{:?}", t))
+                .unwrap_or_else(|| "Below minimum".to_string());
+            ValidatorInfoResponse {
+                address: addr.to_hex(),
+                stake: account.staked_balance,
+                tier,
+            }
+        })
+        .collect();
+
+    // Sort by stake descending
+    validators.sort_by(|a, b| b.stake.cmp(&a.stake));
+    let total_stake: u64 = validators.iter().map(|v| v.stake).sum();
+    let count = validators.len();
+
+    Json(ValidatorsResponse {
+        validators,
+        total_stake,
+        count,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Faucet endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct FaucetClaimRequest {
+    address: String,
+}
+
+#[derive(Serialize)]
+struct FaucetClaimResponse {
+    tx_hash: String,
+    amount: u64,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct FaucetErrorResponse {
+    error: String,
+}
+
+#[derive(Serialize)]
+struct FaucetStatusResponse {
+    address: String,
+    node_url: String,
+    claims_today: u32,
+    claim_amount: u64,
+    rate_limit_secs: u64,
+}
+
+async fn faucet_claim(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<FaucetClaimRequest>,
+) -> Result<Json<FaucetClaimResponse>, (StatusCode, Json<FaucetErrorResponse>)> {
+    // Parse recipient address
+    let to = Hash256::from_hex(&req.address).map_err(|_| {
+        (StatusCode::BAD_REQUEST, Json(FaucetErrorResponse {
+            error: "Invalid address. Must be 64 hex characters.".to_string(),
+        }))
+    })?;
+
+    // Rate limiting: check if this address claimed recently
+    {
+        let claims = node.faucet_claims.lock().unwrap();
+        if let Some(last_claim) = claims.get(&to.0) {
+            let elapsed = last_claim.elapsed().as_secs();
+            if elapsed < FAUCET_RATE_LIMIT_SECS {
+                let remaining = FAUCET_RATE_LIMIT_SECS - elapsed;
+                return Err((StatusCode::TOO_MANY_REQUESTS, Json(FaucetErrorResponse {
+                    error: format!(
+                        "Rate limited. Try again in {} minutes.",
+                        (remaining + 59) / 60
+                    ),
+                })));
+            }
+        }
+    }
+
+    // Get faucet account (validator address) nonce
+    let faucet_addr = node.validator_address;
+    let faucet_nonce = node.state
+        .get_account(&faucet_addr)
+        .map(|a| a.nonce)
+        .unwrap_or(0);
+
+    // Create transfer transaction from faucet to recipient
+    let tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, faucet_nonce);
+    let hash = tx.hash.to_hex();
+
+    // Insert into mempool
+    node.mempool.insert(tx).map_err(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
+            error: "Failed to submit faucet transaction. Try again later.".to_string(),
+        }))
+    })?;
+
+    // Record claim time
+    {
+        let mut claims = node.faucet_claims.lock().unwrap();
+        claims.insert(to.0, Instant::now());
+    }
+    node.faucet_claims_total.fetch_add(1, Ordering::Relaxed);
+
+    Ok(Json(FaucetClaimResponse {
+        tx_hash: hash,
+        amount: FAUCET_CLAIM_AMOUNT,
+        message: format!(
+            "Sent {} ARC to {}",
+            FAUCET_CLAIM_AMOUNT,
+            req.address
+        ),
+    }))
+}
+
+async fn faucet_status(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<FaucetStatusResponse> {
+    Json(FaucetStatusResponse {
+        address: node.validator_address.to_hex(),
+        node_url: "http://localhost:9090".to_string(),
+        claims_today: node.faucet_claims_total.load(Ordering::Relaxed),
+        claim_amount: FAUCET_CLAIM_AMOUNT,
+        rate_limit_secs: FAUCET_RATE_LIMIT_SECS,
     })
 }
 
@@ -584,6 +809,133 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
 }
 
 // ---------------------------------------------------------------------------
+// State Sync Protocol (A5) — snapshot bootstrap for new nodes
+// ---------------------------------------------------------------------------
+
+/// Returns metadata about the latest snapshot available for sync.
+async fn sync_snapshot_info(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let height = node.state.height();
+    let state_root = node.state.get_state_root();
+    let account_count = node.state.account_count();
+    Json(json!({
+        "available": true,
+        "height": height,
+        "state_root": format!("{}", state_root),
+        "account_count": account_count,
+    }))
+}
+
+/// Stream the full state snapshot as LZ4-compressed bincode.
+/// New nodes download this to bootstrap without replaying from genesis.
+async fn sync_snapshot(
+    AxumState(node): AxumState<NodeState>,
+) -> Result<axum::response::Response, StatusCode> {
+    use axum::response::IntoResponse;
+    use axum::http::header;
+
+    let snapshot = node.state.export_snapshot();
+    let data = bincode::serialize(&snapshot)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let compressed = lz4_flex::compress_prepend_size(&data);
+
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream"),
+            (header::CONTENT_DISPOSITION, "attachment; filename=\"snapshot.lz4\""),
+        ],
+        compressed,
+    ).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Light Client Proofs (A8)
+// ---------------------------------------------------------------------------
+
+/// GET /light/snapshot — Returns a lightweight snapshot for light client bootstrapping:
+/// current height, state root, account count, total supply, latest block hash.
+async fn light_snapshot(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let snap = node.state.generate_light_snapshot();
+    Json(json!({
+        "height": snap.height,
+        "state_root": format!("{}", snap.state_root),
+        "account_count": snap.account_count,
+        "total_supply": snap.total_supply,
+        "latest_block_hash": format!("{}", snap.latest_block_hash),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Chunked State Sync — parallel chunk download for fast catch-up
+// ---------------------------------------------------------------------------
+
+/// GET /sync/manifest — Returns the snapshot manifest (height, chunk count,
+/// state root, accounts) so a syncing node can plan parallel chunk downloads.
+async fn sync_manifest(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let manifest = node.state.export_snapshot_manifest();
+    Json(json!({
+        "version": manifest.version,
+        "state_root": format!("{}", manifest.state_root),
+        "total_accounts": manifest.total_accounts,
+        "total_chunks": manifest.total_chunks,
+        "chunk_size": manifest.chunk_size,
+        "manifest_hash": format!("{}", manifest.manifest_hash),
+    }))
+}
+
+/// GET /sync/chunk/:index — Returns a single snapshot chunk by index.
+/// Each chunk contains ~1000 accounts with a BLAKE3 integrity proof.
+async fn sync_chunk(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(index): axum::extract::Path<u32>,
+) -> Result<Json<Value>, StatusCode> {
+    let manifest = node.state.export_snapshot_manifest();
+    let chunk = node.state.export_snapshot_chunk(index, manifest.chunk_size)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    let accounts: Vec<Value> = chunk.accounts.iter().map(|(addr, acct)| {
+        json!({
+            "address": format!("{}", addr),
+            "balance": acct.balance,
+            "nonce": acct.nonce,
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "version": chunk.version,
+        "state_root": format!("{}", chunk.state_root),
+        "chunk_index": chunk.chunk_index,
+        "total_chunks": chunk.total_chunks,
+        "chunk_proof": format!("{}", chunk.chunk_proof),
+        "accounts": accounts,
+        "account_count": chunk.accounts.len(),
+    })))
+}
+
+/// GET /sync/status — Returns whether this node can serve snapshots and
+/// information about the latest available snapshot.
+async fn sync_status(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let manifest = node.state.export_snapshot_manifest();
+    Json(json!({
+        "available": true,
+        "syncing": false,
+        "latest_snapshot": {
+            "height": manifest.version,
+            "state_root": format!("{}", manifest.state_root),
+            "total_chunks": manifest.total_chunks,
+            "total_accounts": manifest.total_accounts,
+        },
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Full transaction & contract endpoints
 // ---------------------------------------------------------------------------
 
@@ -666,6 +1018,79 @@ async fn get_full_transaction(
             "endpoint": b.endpoint,
             "protocol": b.protocol.to_hex(),
             "capabilities_size": b.capabilities.len(),
+        }),
+        TxBody::JoinValidator(b) => json!({
+            "type": "JoinValidator",
+            "pubkey": hex::encode(b.pubkey),
+            "initial_stake": b.initial_stake,
+        }),
+        TxBody::LeaveValidator => json!({
+            "type": "LeaveValidator",
+        }),
+        TxBody::ClaimRewards => json!({
+            "type": "ClaimRewards",
+        }),
+        TxBody::UpdateStake(b) => json!({
+            "type": "UpdateStake",
+            "new_stake": b.new_stake,
+        }),
+        TxBody::Governance(b) => json!({
+            "type": "Governance",
+            "proposal_id": b.proposal_id,
+            "action": format!("{:?}", b.action),
+        }),
+        TxBody::BridgeLock(b) => json!({
+            "type": "BridgeLock",
+            "destination_chain": b.destination_chain,
+            "destination_address": hex::encode(b.destination_address),
+            "amount": b.amount,
+        }),
+        TxBody::BridgeMint(b) => json!({
+            "type": "BridgeMint",
+            "source_chain": b.source_chain,
+            "source_tx_hash": b.source_tx_hash.to_hex(),
+            "recipient": b.recipient.to_hex(),
+            "amount": b.amount,
+            "merkle_proof_size": b.merkle_proof.len(),
+        }),
+        TxBody::BatchSettle(body) => {
+            let total: u64 = body.entries.iter().map(|e| e.amount).sum();
+            json!({
+                "type": "BatchSettle",
+                "entries": body.entries.len(),
+                "total_amount": total,
+            })
+        }
+        TxBody::ChannelOpen(body) => json!({
+            "type": "ChannelOpen",
+            "channel_id": format!("0x{}", hex::encode(&body.channel_id.0)),
+            "counterparty": format!("0x{}", hex::encode(&body.counterparty.0)),
+            "deposit": body.deposit,
+            "timeout_blocks": body.timeout_blocks,
+        }),
+        TxBody::ChannelClose(body) => json!({
+            "type": "ChannelClose",
+            "channel_id": format!("0x{}", hex::encode(&body.channel_id.0)),
+            "opener_balance": body.opener_balance,
+            "counterparty_balance": body.counterparty_balance,
+            "state_nonce": body.state_nonce,
+        }),
+        TxBody::ChannelDispute(body) => json!({
+            "type": "ChannelDispute",
+            "channel_id": format!("0x{}", hex::encode(&body.channel_id.0)),
+            "opener_balance": body.opener_balance,
+            "counterparty_balance": body.counterparty_balance,
+            "state_nonce": body.state_nonce,
+            "challenge_period": body.challenge_period,
+        }),
+        TxBody::ShardProof(body) => json!({
+            "type": "ShardProof",
+            "shard_id": body.shard_id,
+            "block_height": body.block_height,
+            "tx_count": body.tx_count,
+            "proof_size": body.proof_data.len(),
+            "prev_state_root": format!("0x{}", hex::encode(&body.prev_state_root.0)),
+            "post_state_root": format!("0x{}", hex::encode(&body.post_state_root.0)),
         }),
     };
 
@@ -812,4 +1237,975 @@ async fn call_contract(
             })))
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// ETH-Compatible JSON-RPC
+// ---------------------------------------------------------------------------
+// Implements the Ethereum JSON-RPC specification so that MetaMask, Hardhat,
+// Foundry, and other EVM tooling can interact with ARC Chain unchanged.
+// Endpoint: POST /eth
+// Protocol: JSON-RPC 2.0
+
+/// ARC Chain ID (unique, registered-style). 0x415243 = "ARC" in ASCII.
+const ARC_CHAIN_ID: u64 = 0x415243;
+
+/// Standard ETH JSON-RPC request.
+#[derive(Deserialize)]
+struct EthRpcRequest {
+    #[allow(dead_code)]
+    jsonrpc: Option<String>,
+    method: String,
+    params: Option<Value>,
+    id: Value,
+}
+
+fn eth_rpc_error(id: &Value, code: i64, message: &str) -> Json<Value> {
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message },
+    }))
+}
+
+fn eth_rpc_result(id: &Value, result: Value) -> Json<Value> {
+    Json(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result,
+    }))
+}
+
+/// Main ETH JSON-RPC dispatcher.
+async fn eth_json_rpc(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<EthRpcRequest>,
+) -> Json<Value> {
+    let params = req.params.unwrap_or(Value::Array(vec![]));
+
+    match req.method.as_str() {
+        "eth_chainId" => eth_rpc_result(&req.id, json!(format!("0x{:x}", ARC_CHAIN_ID))),
+        "eth_blockNumber" => eth_rpc_result(&req.id, json!(format!("0x{:x}", node.state.height()))),
+        "net_version" => eth_rpc_result(&req.id, json!(ARC_CHAIN_ID.to_string())),
+        "web3_clientVersion" => eth_rpc_result(&req.id, json!("ARC/v0.1.0")),
+        "eth_gasPrice" => eth_rpc_result(&req.id, json!("0x0")), // Zero-fee chain
+        "net_listening" => eth_rpc_result(&req.id, json!(true)),
+        "net_peerCount" => {
+            let peers = node.peer_count.load(Ordering::Relaxed);
+            eth_rpc_result(&req.id, json!(format!("0x{:x}", peers)))
+        }
+        "eth_syncing" => eth_rpc_result(&req.id, json!(false)), // Always synced
+        "eth_mining" => eth_rpc_result(&req.id, json!(false)),
+        "eth_hashrate" => eth_rpc_result(&req.id, json!("0x0")),
+        "eth_accounts" => eth_rpc_result(&req.id, json!([])),
+        "eth_getBalance" => eth_get_balance(&node, &params, &req.id),
+        "eth_getTransactionCount" => eth_get_tx_count(&node, &params, &req.id),
+        "eth_getCode" => eth_get_code(&node, &params, &req.id),
+        "eth_getStorageAt" => eth_get_storage_at(&node, &params, &req.id),
+        "eth_getBlockByNumber" => eth_get_block_by_number(&node, &params, &req.id),
+        "eth_getBlockByHash" => eth_rpc_result(&req.id, json!(null)), // TODO: index by hash
+        "eth_getTransactionByHash" => eth_get_tx_by_hash(&node, &params, &req.id),
+        "eth_getTransactionReceipt" => eth_get_tx_receipt(&node, &params, &req.id),
+        "eth_call" => eth_call(&node, &params, &req.id),
+        "eth_estimateGas" => eth_estimate_gas(&node, &params, &req.id),
+        "eth_sendRawTransaction" => eth_send_raw_transaction(&node, &params, &req.id),
+        "eth_getLogs" => eth_get_logs(&node, &params, &req.id),
+        "eth_getBlockTransactionCountByNumber" => {
+            let block_num = parse_block_number(&node, params.get(0));
+            match node.state.get_block(block_num) {
+                Some(b) => eth_rpc_result(&req.id, json!(format!("0x{:x}", b.header.tx_count))),
+                None => eth_rpc_result(&req.id, json!(null)),
+            }
+        }
+        _ => eth_rpc_error(&req.id, -32601, &format!("Method not found: {}", req.method)),
+    }
+}
+
+/// Parse a hex-encoded 20-byte ETH address, returning a 32-byte ARC address.
+fn parse_eth_address(hex_str: &str) -> Result<Address, ()> {
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    if hex_str.len() != 40 {
+        return Err(());
+    }
+    let bytes = hex::decode(hex_str).map_err(|_| ())?;
+    let mut addr = [0u8; 32];
+    addr[..20].copy_from_slice(&bytes);
+    Ok(Hash256(addr))
+}
+
+/// Parse block number parameter ("latest", "earliest", "pending", or hex number).
+fn parse_block_number(node: &NodeState, param: Option<&Value>) -> u64 {
+    match param.and_then(|v| v.as_str()) {
+        None | Some("latest") | Some("pending") => node.state.height().saturating_sub(1),
+        Some("earliest") => 0,
+        Some(hex) => {
+            let hex = hex.strip_prefix("0x").unwrap_or(hex);
+            u64::from_str_radix(hex, 16).unwrap_or(0)
+        }
+    }
+}
+
+fn eth_get_balance(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    let addr_str = match params.get(0).and_then(|v| v.as_str()) {
+        Some(a) => a,
+        None => return eth_rpc_error(id, -32602, "Missing address parameter"),
+    };
+    let addr = match parse_eth_address(addr_str) {
+        Ok(a) => a,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid address"),
+    };
+    let balance = node
+        .state
+        .get_account(&addr)
+        .map(|a| a.balance)
+        .unwrap_or(0);
+    eth_rpc_result(id, json!(format!("0x{:x}", balance)))
+}
+
+fn eth_get_tx_count(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    let addr_str = match params.get(0).and_then(|v| v.as_str()) {
+        Some(a) => a,
+        None => return eth_rpc_error(id, -32602, "Missing address parameter"),
+    };
+    let addr = match parse_eth_address(addr_str) {
+        Ok(a) => a,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid address"),
+    };
+    let nonce = node
+        .state
+        .get_account(&addr)
+        .map(|a| a.nonce)
+        .unwrap_or(0);
+    eth_rpc_result(id, json!(format!("0x{:x}", nonce)))
+}
+
+fn eth_get_code(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    let addr_str = match params.get(0).and_then(|v| v.as_str()) {
+        Some(a) => a,
+        None => return eth_rpc_error(id, -32602, "Missing address parameter"),
+    };
+    let addr = match parse_eth_address(addr_str) {
+        Ok(a) => a,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid address"),
+    };
+    match node.state.get_contract(&addr) {
+        Some(code) => eth_rpc_result(id, json!(format!("0x{}", hex::encode(&code)))),
+        None => eth_rpc_result(id, json!("0x")),
+    }
+}
+
+fn eth_get_storage_at(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    let addr_str = match params.get(0).and_then(|v| v.as_str()) {
+        Some(a) => a,
+        None => return eth_rpc_error(id, -32602, "Missing address parameter"),
+    };
+    let addr = match parse_eth_address(addr_str) {
+        Ok(a) => a,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid address"),
+    };
+    let slot_str = match params.get(1).and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => return eth_rpc_error(id, -32602, "Missing storage slot"),
+    };
+    let slot_str = slot_str.strip_prefix("0x").unwrap_or(slot_str);
+    let slot_bytes = match hex::decode(slot_str) {
+        Ok(b) => b,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid storage slot hex"),
+    };
+    let mut key = [0u8; 32];
+    let start = 32usize.saturating_sub(slot_bytes.len());
+    let copy_len = slot_bytes.len().min(32);
+    key[start..start + copy_len].copy_from_slice(&slot_bytes[..copy_len]);
+    let slot_hash = Hash256(key);
+
+    match node.state.get_storage(&addr, &slot_hash) {
+        Some(value) => {
+            let mut padded = vec![0u8; 32];
+            let s = 32usize.saturating_sub(value.len());
+            let c = value.len().min(32);
+            padded[s..s + c].copy_from_slice(&value[..c]);
+            eth_rpc_result(id, json!(format!("0x{}", hex::encode(&padded))))
+        }
+        None => eth_rpc_result(id, json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
+    }
+}
+
+fn eth_get_block_by_number(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    let block_num = parse_block_number(node, params.get(0));
+    let full_txs = params.get(1).and_then(|v| v.as_bool()).unwrap_or(false);
+
+    match node.state.get_block(block_num) {
+        Some(block) => {
+            let txs: Value = if full_txs {
+                json!(block.tx_hashes.iter().map(|h| h.to_hex()).collect::<Vec<_>>())
+            } else {
+                json!(block.tx_hashes.iter().map(|h| format!("0x{}", h.to_hex())).collect::<Vec<_>>())
+            };
+
+            eth_rpc_result(id, json!({
+                "number": format!("0x{:x}", block.header.height),
+                "hash": format!("0x{}", block.hash.to_hex()),
+                "parentHash": format!("0x{}", block.header.parent_hash.to_hex()),
+                "nonce": "0x0000000000000000",
+                "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+                "logsBloom": format!("0x{}", "00".repeat(256)),
+                "transactionsRoot": format!("0x{}", block.header.tx_root.to_hex()),
+                "stateRoot": format!("0x{}", block.header.state_root.to_hex()),
+                "receiptsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "miner": format!("0x{}", hex::encode(&block.header.producer.0[..20])),
+                "difficulty": "0x0",
+                "totalDifficulty": "0x0",
+                "extraData": "0x",
+                "size": "0x0",
+                "gasLimit": "0xffffffffffffffff",
+                "gasUsed": "0x0",
+                "timestamp": format!("0x{:x}", block.header.timestamp / 1000),
+                "transactions": txs,
+                "uncles": [],
+                "baseFeePerGas": "0x0",
+            }))
+        }
+        None => eth_rpc_result(id, json!(null)),
+    }
+}
+
+fn eth_get_tx_by_hash(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    let hash_str = match params.get(0).and_then(|v| v.as_str()) {
+        Some(h) => h,
+        None => return eth_rpc_error(id, -32602, "Missing hash parameter"),
+    };
+    let hash_str = hash_str.strip_prefix("0x").unwrap_or(hash_str);
+    let tx_hash = match Hash256::from_hex(hash_str) {
+        Ok(h) => h,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid hash"),
+    };
+
+    let tx = node.state.get_transaction(&tx_hash.0)
+        .or_else(|| node.state.get_benchmark_tx_by_hash(&tx_hash.0));
+
+    match tx {
+        Some(tx) => {
+            let (to, value) = match &tx.body {
+                TxBody::Transfer(b) => (Some(format!("0x{}", hex::encode(&b.to.0[..20]))), format!("0x{:x}", b.amount)),
+                TxBody::WasmCall(b) => (Some(format!("0x{}", hex::encode(&b.contract.0[..20]))), format!("0x{:x}", b.value)),
+                _ => (None, "0x0".to_string()),
+            };
+
+            eth_rpc_result(id, json!({
+                "hash": format!("0x{}", tx_hash.to_hex()),
+                "nonce": format!("0x{:x}", tx.nonce),
+                "from": format!("0x{}", hex::encode(&tx.from.0[..20])),
+                "to": to,
+                "value": value,
+                "gas": format!("0x{:x}", tx.gas_limit),
+                "gasPrice": "0x0",
+                "input": "0x",
+                "blockNumber": null,
+                "blockHash": null,
+                "transactionIndex": null,
+                "type": "0x0",
+                "chainId": format!("0x{:x}", ARC_CHAIN_ID),
+                "v": "0x0",
+                "r": "0x0",
+                "s": "0x0",
+            }))
+        }
+        None => eth_rpc_result(id, json!(null)),
+    }
+}
+
+fn eth_get_tx_receipt(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    let hash_str = match params.get(0).and_then(|v| v.as_str()) {
+        Some(h) => h,
+        None => return eth_rpc_error(id, -32602, "Missing hash parameter"),
+    };
+    let hash_str = hash_str.strip_prefix("0x").unwrap_or(hash_str);
+    let tx_hash = match Hash256::from_hex(hash_str) {
+        Ok(h) => h,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid hash"),
+    };
+
+    let receipt = node.state.get_receipt(&tx_hash.0)
+        .or_else(|| node.state.get_benchmark_receipt_by_hash(&tx_hash.0));
+
+    match receipt {
+        Some(r) => {
+            let tx = node.state.get_transaction(&tx_hash.0)
+                .or_else(|| node.state.get_benchmark_tx_by_hash(&tx_hash.0));
+
+            let from = tx.as_ref().map(|t| format!("0x{}", hex::encode(&t.from.0[..20]))).unwrap_or_default();
+            let to = tx.as_ref().and_then(|t| match &t.body {
+                TxBody::Transfer(b) => Some(format!("0x{}", hex::encode(&b.to.0[..20]))),
+                TxBody::WasmCall(b) => Some(format!("0x{}", hex::encode(&b.contract.0[..20]))),
+                _ => None,
+            });
+
+            let logs_json: Vec<Value> = r.logs.iter().enumerate().map(|(i, log)| {
+                let topics: Vec<String> = log.topics.iter()
+                    .map(|t| format!("0x{}", t.to_hex()))
+                    .collect();
+                json!({
+                    "address": format!("0x{}", hex::encode(&log.address.0[..20])),
+                    "topics": topics,
+                    "data": format!("0x{}", hex::encode(&log.data)),
+                    "blockNumber": format!("0x{:x}", log.block_height),
+                    "transactionHash": format!("0x{}", tx_hash.to_hex()),
+                    "transactionIndex": format!("0x{:x}", r.index),
+                    "blockHash": format!("0x{}", r.block_hash.to_hex()),
+                    "logIndex": format!("0x{:x}", i),
+                    "removed": false,
+                })
+            }).collect();
+
+            eth_rpc_result(id, json!({
+                "transactionHash": format!("0x{}", tx_hash.to_hex()),
+                "transactionIndex": format!("0x{:x}", r.index),
+                "blockNumber": format!("0x{:x}", r.block_height),
+                "blockHash": format!("0x{}", r.block_hash.to_hex()),
+                "from": from,
+                "to": to,
+                "cumulativeGasUsed": format!("0x{:x}", r.gas_used),
+                "gasUsed": format!("0x{:x}", r.gas_used),
+                "contractAddress": null,
+                "logs": logs_json,
+                "logsBloom": format!("0x{}", "00".repeat(256)),
+                "status": if r.success { "0x1" } else { "0x0" },
+                "effectiveGasPrice": "0x0",
+                "type": "0x0",
+            }))
+        }
+        None => eth_rpc_result(id, json!(null)),
+    }
+}
+
+/// eth_getLogs — returns event logs matching a filter.
+fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    let filter = match params.get(0) {
+        Some(f) => f,
+        None => return eth_rpc_error(id, -32602, "Missing filter object"),
+    };
+
+    let from_block = filter.get("fromBlock")
+        .and_then(|v| v.as_str())
+        .map(|s| parse_block_number(node, Some(&json!(s))))
+        .unwrap_or(0);
+
+    let to_block = filter.get("toBlock")
+        .and_then(|v| v.as_str())
+        .map(|s| parse_block_number(node, Some(&json!(s))))
+        .unwrap_or_else(|| node.state.height());
+
+    let address_filter: Option<Vec<Hash256>> = filter.get("address")
+        .and_then(|v| {
+            if let Some(s) = v.as_str() {
+                parse_eth_address(s).ok().map(|a| vec![a])
+            } else if let Some(arr) = v.as_array() {
+                let addrs: Vec<Hash256> = arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter_map(|s| parse_eth_address(s).ok())
+                    .collect();
+                if addrs.is_empty() { None } else { Some(addrs) }
+            } else {
+                None
+            }
+        });
+
+    let topic_filters: Vec<Option<Hash256>> = filter.get("topics")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter().map(|t| {
+                t.as_str()
+                    .and_then(|s| {
+                        let s = s.strip_prefix("0x").unwrap_or(s);
+                        Hash256::from_hex(s).ok()
+                    })
+            }).collect()
+        })
+        .unwrap_or_default();
+
+    let mut result_logs: Vec<Value> = Vec::new();
+    let max_height = to_block.min(from_block + 10_000); // Cap range
+
+    for height in from_block..=max_height {
+        if let Some(logs) = node.state.event_logs.get(&height) {
+            for log in logs.iter() {
+                // Address filter
+                if let Some(ref addrs) = address_filter {
+                    if !addrs.iter().any(|a| a.0 == log.address.0) {
+                        continue;
+                    }
+                }
+                // Topic filter
+                let mut topic_match = true;
+                for (i, filter_topic) in topic_filters.iter().enumerate() {
+                    if let Some(expected) = filter_topic {
+                        if log.topics.get(i).map(|t| t.0) != Some(expected.0) {
+                            topic_match = false;
+                            break;
+                        }
+                    }
+                }
+                if !topic_match { continue; }
+
+                let block = node.state.get_block(height);
+                let block_hash = block.map(|b| format!("0x{}", b.hash.to_hex()))
+                    .unwrap_or_else(|| "0x".to_string() + &"00".repeat(32));
+
+                let topics: Vec<String> = log.topics.iter()
+                    .map(|t| format!("0x{}", t.to_hex()))
+                    .collect();
+
+                result_logs.push(json!({
+                    "address": format!("0x{}", hex::encode(&log.address.0[..20])),
+                    "topics": topics,
+                    "data": format!("0x{}", hex::encode(&log.data)),
+                    "blockNumber": format!("0x{:x}", log.block_height),
+                    "transactionHash": format!("0x{}", log.tx_hash.to_hex()),
+                    "blockHash": block_hash,
+                    "logIndex": format!("0x{:x}", log.log_index),
+                    "removed": false,
+                }));
+            }
+        }
+    }
+
+    eth_rpc_result(id, json!(result_logs))
+}
+
+fn eth_call(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    let call_obj = match params.get(0) {
+        Some(obj) => obj,
+        None => return eth_rpc_error(id, -32602, "Missing call object"),
+    };
+
+    let from = call_obj.get("from")
+        .and_then(|v| v.as_str())
+        .and_then(|s| parse_eth_address(s).ok())
+        .unwrap_or(Hash256::ZERO);
+
+    let to = match call_obj.get("to").and_then(|v| v.as_str()) {
+        Some(s) => match parse_eth_address(s) {
+            Ok(a) => a,
+            Err(_) => return eth_rpc_error(id, -32602, "Invalid to address"),
+        },
+        None => return eth_rpc_error(id, -32602, "Missing to address"),
+    };
+
+    let data = call_obj.get("data")
+        .or_else(|| call_obj.get("input"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.strip_prefix("0x").unwrap_or(s))
+        .and_then(|s| hex::decode(s).ok())
+        .unwrap_or_default();
+
+    let value = call_obj.get("value")
+        .and_then(|v| v.as_str())
+        .map(|s| s.strip_prefix("0x").unwrap_or(s))
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+
+    let gas = call_obj.get("gas")
+        .and_then(|v| v.as_str())
+        .map(|s| s.strip_prefix("0x").unwrap_or(s))
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(10_000_000);
+
+    let result = arc_vm::evm::evm_call(&node.state, from, to, data, value, gas);
+    if result.success {
+        eth_rpc_result(id, json!(format!("0x{}", hex::encode(&result.return_data))))
+    } else {
+        eth_rpc_error(id, 3, result.revert_reason.as_deref().unwrap_or("execution reverted"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// eth_sendRawTransaction — accept RLP-encoded Ethereum transactions
+// ---------------------------------------------------------------------------
+// Decodes signed Ethereum transactions (legacy format), recovers the sender
+// via secp256k1 ecrecover, converts to an ARC Transaction, and inserts into
+// the mempool. Returns the Keccak-256 transaction hash (Ethereum-style).
+
+/// Minimal RLP decoder — just enough to parse Ethereum legacy transactions.
+///
+/// RLP encoding rules:
+///   - Single byte in [0x00, 0x7f]: the byte itself is its RLP encoding
+///   - [0x80, 0xb7]: short string, length = first_byte - 0x80
+///   - [0xb8, 0xbf]: long string, length-of-length = first_byte - 0xb7
+///   - [0xc0, 0xf7]: short list, payload length = first_byte - 0xc0
+///   - [0xf8, 0xff]: long list, length-of-length = first_byte - 0xf7
+#[allow(dead_code)]
+mod rlp {
+    /// An RLP-decoded item: either raw bytes or a list of items.
+    #[derive(Debug, Clone)]
+    pub enum RlpItem {
+        Bytes(Vec<u8>),
+        List(Vec<RlpItem>),
+    }
+
+    impl RlpItem {
+        /// Extract as byte slice. Panics if this is a List.
+        pub fn as_bytes(&self) -> &[u8] {
+            match self {
+                RlpItem::Bytes(b) => b,
+                RlpItem::List(_) => panic!("expected RLP bytes, got list"),
+            }
+        }
+
+        /// Extract as list. Panics if this is Bytes.
+        pub fn as_list(&self) -> &[RlpItem] {
+            match self {
+                RlpItem::List(items) => items,
+                RlpItem::Bytes(_) => panic!("expected RLP list, got bytes"),
+            }
+        }
+    }
+
+    /// Decode a single RLP item from `data` starting at `offset`.
+    /// Returns `(item, bytes_consumed)`.
+    pub fn decode(data: &[u8], offset: usize) -> Result<(RlpItem, usize), String> {
+        if offset >= data.len() {
+            return Err("RLP: unexpected end of data".into());
+        }
+
+        let prefix = data[offset];
+
+        if prefix < 0x80 {
+            // Single byte
+            Ok((RlpItem::Bytes(vec![prefix]), 1))
+        } else if prefix <= 0xb7 {
+            // Short string: 0-55 bytes
+            let len = (prefix - 0x80) as usize;
+            if offset + 1 + len > data.len() {
+                return Err("RLP: short string overflow".into());
+            }
+            let bytes = data[offset + 1..offset + 1 + len].to_vec();
+            Ok((RlpItem::Bytes(bytes), 1 + len))
+        } else if prefix <= 0xbf {
+            // Long string: length encoded in next N bytes
+            let len_of_len = (prefix - 0xb7) as usize;
+            if offset + 1 + len_of_len > data.len() {
+                return Err("RLP: long string length overflow".into());
+            }
+            let len = read_be_uint(&data[offset + 1..offset + 1 + len_of_len]);
+            if offset + 1 + len_of_len + len > data.len() {
+                return Err("RLP: long string data overflow".into());
+            }
+            let bytes = data[offset + 1 + len_of_len..offset + 1 + len_of_len + len].to_vec();
+            Ok((RlpItem::Bytes(bytes), 1 + len_of_len + len))
+        } else if prefix <= 0xf7 {
+            // Short list: total payload 0-55 bytes
+            let payload_len = (prefix - 0xc0) as usize;
+            if offset + 1 + payload_len > data.len() {
+                return Err("RLP: short list overflow".into());
+            }
+            let items = decode_list_payload(data, offset + 1, payload_len)?;
+            Ok((RlpItem::List(items), 1 + payload_len))
+        } else {
+            // Long list: length encoded in next N bytes
+            let len_of_len = (prefix - 0xf7) as usize;
+            if offset + 1 + len_of_len > data.len() {
+                return Err("RLP: long list length overflow".into());
+            }
+            let payload_len = read_be_uint(&data[offset + 1..offset + 1 + len_of_len]);
+            if offset + 1 + len_of_len + payload_len > data.len() {
+                return Err("RLP: long list data overflow".into());
+            }
+            let items = decode_list_payload(data, offset + 1 + len_of_len, payload_len)?;
+            Ok((RlpItem::List(items), 1 + len_of_len + payload_len))
+        }
+    }
+
+    /// Decode all items within a list payload.
+    fn decode_list_payload(
+        data: &[u8],
+        start: usize,
+        payload_len: usize,
+    ) -> Result<Vec<RlpItem>, String> {
+        let mut items = Vec::new();
+        let mut pos = 0;
+        while pos < payload_len {
+            let (item, consumed) = decode(data, start + pos)?;
+            items.push(item);
+            pos += consumed;
+        }
+        Ok(items)
+    }
+
+    /// Read a big-endian unsigned integer from a byte slice (1-8 bytes).
+    fn read_be_uint(bytes: &[u8]) -> usize {
+        let mut result: usize = 0;
+        for &b in bytes {
+            result = (result << 8) | (b as usize);
+        }
+        result
+    }
+
+    /// Encode a single byte-string item as RLP.
+    pub fn encode_bytes(data: &[u8]) -> Vec<u8> {
+        if data.len() == 1 && data[0] < 0x80 {
+            vec![data[0]]
+        } else if data.len() <= 55 {
+            let mut out = vec![0x80 + data.len() as u8];
+            out.extend_from_slice(data);
+            out
+        } else {
+            let len_bytes = to_be_bytes(data.len());
+            let mut out = vec![0xb7 + len_bytes.len() as u8];
+            out.extend_from_slice(&len_bytes);
+            out.extend_from_slice(data);
+            out
+        }
+    }
+
+    /// Encode a list of already-encoded items as an RLP list.
+    pub fn encode_list(encoded_items: &[Vec<u8>]) -> Vec<u8> {
+        let payload: Vec<u8> = encoded_items.iter().flat_map(|i| i.iter().copied()).collect();
+        if payload.len() <= 55 {
+            let mut out = vec![0xc0 + payload.len() as u8];
+            out.extend_from_slice(&payload);
+            out
+        } else {
+            let len_bytes = to_be_bytes(payload.len());
+            let mut out = vec![0xf7 + len_bytes.len() as u8];
+            out.extend_from_slice(&len_bytes);
+            out.extend_from_slice(&payload);
+            out
+        }
+    }
+
+    /// Convert a usize to minimal big-endian bytes.
+    fn to_be_bytes(val: usize) -> Vec<u8> {
+        if val == 0 {
+            return vec![0];
+        }
+        let bytes = val.to_be_bytes();
+        let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+        bytes[first_nonzero..].to_vec()
+    }
+
+    /// Encode a u64 as an RLP byte string (minimal big-endian, no leading zeros).
+    pub fn encode_u64(val: u64) -> Vec<u8> {
+        if val == 0 {
+            // RLP encoding of zero is the empty byte string
+            encode_bytes(&[])
+        } else {
+            let bytes = val.to_be_bytes();
+            let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+            encode_bytes(&bytes[first_nonzero..])
+        }
+    }
+
+    /// Encode a u256 (represented as a 32-byte big-endian slice) as an RLP byte string.
+    pub fn encode_u256(bytes: &[u8]) -> Vec<u8> {
+        // Strip leading zeros
+        let first_nonzero = bytes.iter().position(|&b| b != 0);
+        match first_nonzero {
+            Some(idx) => encode_bytes(&bytes[idx..]),
+            None => encode_bytes(&[]), // all zeros = empty
+        }
+    }
+}
+
+/// Parse a big-endian byte slice into a u64.
+/// Handles 0 to 8 bytes. Returns 0 for empty slices.
+fn be_bytes_to_u64(bytes: &[u8]) -> u64 {
+    let mut result: u64 = 0;
+    for &b in bytes {
+        result = result.checked_shl(8).unwrap_or(0) | (b as u64);
+    }
+    result
+}
+
+/// Parse a big-endian byte slice into a u128.
+/// Handles 0 to 16 bytes. Returns 0 for empty slices.
+fn be_bytes_to_u128(bytes: &[u8]) -> u128 {
+    let mut result: u128 = 0;
+    for &b in bytes {
+        result = result.checked_shl(8).unwrap_or(0) | (b as u128);
+    }
+    result
+}
+
+/// Compute Keccak-256 hash of data.
+fn keccak256(data: &[u8]) -> [u8; 32] {
+    use sha3::{Digest, Keccak256};
+    let mut hasher = Keccak256::new();
+    hasher.update(data);
+    let result = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&result);
+    out
+}
+
+/// Process `eth_sendRawTransaction`.
+///
+/// Accepts an RLP-encoded signed Ethereum transaction (legacy format):
+///   `[nonce, gasPrice, gasLimit, to, value, data, v, r, s]`
+///
+/// Steps:
+///   1. Hex-decode params[0]
+///   2. RLP-decode the 9-field list
+///   3. Reconstruct the unsigned tx RLP for signing hash:
+///      `RLP([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0])`
+///   4. Keccak-256 hash that → signing hash
+///   5. Recover the secp256k1 public key from (r, s, v) + signing hash
+///   6. Derive the ARC address (BLAKE3 of uncompressed pubkey)
+///   7. Build an ARC `Transaction` (Transfer or WasmCall) and insert into mempool
+///   8. Return the Keccak-256 hash of the full signed RLP (Ethereum tx hash)
+fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    // --- 1. Extract and hex-decode the raw transaction ---
+    let raw_hex = match params.get(0).and_then(|v| v.as_str()) {
+        Some(h) => h,
+        None => return eth_rpc_error(id, -32602, "Missing raw transaction parameter"),
+    };
+    let raw_hex = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
+    let raw_bytes = match hex::decode(raw_hex) {
+        Ok(b) => b,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid hex encoding"),
+    };
+
+    // --- 2. RLP-decode the transaction ---
+    let (item, _) = match rlp::decode(&raw_bytes, 0) {
+        Ok(r) => r,
+        Err(e) => return eth_rpc_error(id, -32602, &format!("RLP decode error: {}", e)),
+    };
+
+    let fields = match &item {
+        rlp::RlpItem::List(items) => items,
+        _ => return eth_rpc_error(id, -32602, "Expected RLP list for transaction"),
+    };
+
+    // Legacy transactions have exactly 9 fields
+    if fields.len() != 9 {
+        return eth_rpc_error(
+            id,
+            -32602,
+            &format!(
+                "Expected 9 fields in legacy tx, got {}. EIP-2930/1559 not yet supported.",
+                fields.len()
+            ),
+        );
+    }
+
+    // --- Extract fields ---
+    let nonce_bytes = fields[0].as_bytes();
+    let gas_price_bytes = fields[1].as_bytes();
+    let gas_limit_bytes = fields[2].as_bytes();
+    let to_bytes = fields[3].as_bytes();
+    let value_bytes = fields[4].as_bytes();
+    let data_bytes = fields[5].as_bytes();
+    let v_bytes = fields[6].as_bytes();
+    let r_bytes = fields[7].as_bytes();
+    let s_bytes = fields[8].as_bytes();
+
+    let nonce = be_bytes_to_u64(nonce_bytes);
+    let gas_limit = be_bytes_to_u64(gas_limit_bytes);
+    let _gas_price = be_bytes_to_u128(gas_price_bytes);
+
+    // Value: ETH uses 256-bit, ARC uses u64. Clamp to u64::MAX.
+    let value_u128 = be_bytes_to_u128(value_bytes);
+    let value: u64 = if value_u128 > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        value_u128 as u64
+    };
+
+    // v: EIP-155 encodes chainId into v. For ARC (chainId = 0x415243):
+    //   v = chainId * 2 + 35 + recovery_id(0 or 1)
+    //   => v = 0x415243 * 2 + 35 + {0,1} = 8537639 or 8537640
+    // Pre-EIP-155: v = 27 or 28
+    let v = be_bytes_to_u64(v_bytes);
+
+    let (recovery_id_byte, chain_id_for_signing) = if v >= 35 {
+        // EIP-155: chain_id = (v - 35) / 2, recovery_id = (v - 35) % 2
+        let chain_id = (v - 35) / 2;
+        let rec_id = ((v - 35) % 2) as u8;
+        (rec_id, Some(chain_id))
+    } else if v == 27 || v == 28 {
+        // Pre-EIP-155
+        ((v - 27) as u8, None)
+    } else {
+        return eth_rpc_error(id, -32602, &format!("Invalid v value: {}", v));
+    };
+
+    // --- 3. Reconstruct the unsigned transaction RLP for the signing hash ---
+    // EIP-155: hash(RLP([nonce, gasPrice, gasLimit, to, value, data, chainId, 0, 0]))
+    // Pre-EIP-155: hash(RLP([nonce, gasPrice, gasLimit, to, value, data]))
+    let unsigned_rlp = {
+        let mut items: Vec<Vec<u8>> = vec![
+            rlp::encode_bytes(nonce_bytes),
+            rlp::encode_bytes(gas_price_bytes),
+            rlp::encode_bytes(gas_limit_bytes),
+            rlp::encode_bytes(to_bytes),
+            rlp::encode_bytes(value_bytes),
+            rlp::encode_bytes(data_bytes),
+        ];
+        if let Some(cid) = chain_id_for_signing {
+            items.push(rlp::encode_u64(cid));
+            items.push(rlp::encode_bytes(&[])); // 0
+            items.push(rlp::encode_bytes(&[])); // 0
+        }
+        rlp::encode_list(&items)
+    };
+
+    let signing_hash = keccak256(&unsigned_rlp);
+
+    // --- 4. Recover secp256k1 public key ---
+    // Build 32-byte zero-padded r and s
+    let mut r_padded = [0u8; 32];
+    if r_bytes.len() <= 32 {
+        r_padded[32 - r_bytes.len()..].copy_from_slice(r_bytes);
+    } else {
+        return eth_rpc_error(id, -32602, "Invalid r value (too long)");
+    }
+
+    let mut s_padded = [0u8; 32];
+    if s_bytes.len() <= 32 {
+        s_padded[32 - s_bytes.len()..].copy_from_slice(s_bytes);
+    } else {
+        return eth_rpc_error(id, -32602, "Invalid s value (too long)");
+    }
+
+    let mut rs_bytes = [0u8; 64];
+    rs_bytes[..32].copy_from_slice(&r_padded);
+    rs_bytes[32..].copy_from_slice(&s_padded);
+
+    let recovery_id = match k256::ecdsa::RecoveryId::try_from(recovery_id_byte) {
+        Ok(rid) => rid,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid recovery ID"),
+    };
+
+    let signature = match k256::ecdsa::Signature::from_slice(&rs_bytes) {
+        Ok(sig) => sig,
+        Err(_) => return eth_rpc_error(id, -32602, "Invalid signature bytes"),
+    };
+
+    let recovered_vk = match k256::ecdsa::VerifyingKey::recover_from_prehash(
+        &signing_hash,
+        &signature,
+        recovery_id,
+    ) {
+        Ok(vk) => vk,
+        Err(_) => return eth_rpc_error(id, -32602, "Failed to recover sender public key"),
+    };
+
+    // --- 5. Derive ARC address from recovered public key ---
+    // ARC uses BLAKE3(uncompressed_pubkey_64_bytes) for secp256k1 addresses
+    let uncompressed = recovered_vk.to_encoded_point(false);
+    let point_bytes = uncompressed.as_bytes();
+    let sender_address = arc_crypto::address_from_secp256k1_pubkey(&point_bytes[1..65]);
+
+    // --- 6. Parse the "to" address ---
+    let is_contract_creation = to_bytes.is_empty() && !data_bytes.is_empty();
+    let to_address = if to_bytes.is_empty() {
+        Hash256::ZERO
+    } else if to_bytes.len() == 20 {
+        // Standard 20-byte ETH address → pad to 32-byte ARC address
+        let mut addr = [0u8; 32];
+        addr[..20].copy_from_slice(to_bytes);
+        Hash256(addr)
+    } else {
+        return eth_rpc_error(id, -32602, &format!("Invalid to address length: {}", to_bytes.len()));
+    };
+
+    // --- 7. Build the ARC Transaction ---
+    let mut sig_65 = Vec::with_capacity(65);
+    sig_65.extend_from_slice(&rs_bytes);
+    sig_65.push(recovery_id_byte);
+    let secp_sig = arc_crypto::Signature::Secp256k1 { signature: sig_65 };
+
+    let arc_tx = if is_contract_creation {
+        // Contract deployment — run EVM deploy immediately and persist
+        let result = arc_vm::evm::evm_deploy(
+            &node.state,
+            sender_address,
+            data_bytes.to_vec(),
+            value,
+            gas_limit,
+        );
+        if !result.success {
+            return eth_rpc_error(id, -32000, &format!(
+                "Contract deployment failed: {}",
+                result.revert_reason.unwrap_or_default()
+            ));
+        }
+
+        // Store event logs from deployment
+        if !result.logs.is_empty() {
+            let height = node.state.height();
+            node.state.store_event_logs(height + 1, result.logs);
+        }
+
+        // Build an ARC Transfer tx as the on-chain record
+        let mut tx = Transaction::new_transfer(sender_address, to_address, value, nonce);
+        tx.gas_limit = gas_limit;
+        tx.signature = secp_sig;
+        tx.hash = tx.compute_hash();
+        tx
+    } else if data_bytes.is_empty() {
+        // Simple value transfer
+        let mut tx = Transaction::new_transfer(sender_address, to_address, value, nonce);
+        tx.gas_limit = gas_limit;
+        tx.signature = secp_sig;
+        tx.hash = tx.compute_hash();
+        tx
+    } else {
+        // Contract call — map to WasmCall with raw calldata
+        let mut tx = Transaction::new_wasm_call(
+            sender_address,
+            to_address,
+            String::new(), // No function name in EVM ABI (selector is in calldata)
+            data_bytes.to_vec(),
+            value,
+            gas_limit,
+            nonce,
+        );
+        tx.signature = secp_sig;
+        tx.hash = tx.compute_hash();
+        tx
+    };
+
+    // --- 8. Insert into mempool ---
+    if let Err(e) = node.mempool.insert(arc_tx) {
+        return eth_rpc_error(id, -32000, &format!("Mempool rejected transaction: {}", e));
+    }
+
+    // --- 9. Return the Ethereum-style tx hash (Keccak-256 of the full signed RLP) ---
+    let eth_tx_hash = keccak256(&raw_bytes);
+    eth_rpc_result(id, json!(format!("0x{}", hex::encode(eth_tx_hash))))
+}
+
+fn eth_estimate_gas(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
+    // Run the same as eth_call and return gas used
+    let call_obj = match params.get(0) {
+        Some(obj) => obj,
+        None => return eth_rpc_error(id, -32602, "Missing call object"),
+    };
+
+    let from = call_obj.get("from")
+        .and_then(|v| v.as_str())
+        .and_then(|s| parse_eth_address(s).ok())
+        .unwrap_or(Hash256::ZERO);
+
+    let to = call_obj.get("to")
+        .and_then(|v| v.as_str())
+        .and_then(|s| parse_eth_address(s).ok())
+        .unwrap_or(Hash256::ZERO);
+
+    let data = call_obj.get("data")
+        .or_else(|| call_obj.get("input"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.strip_prefix("0x").unwrap_or(s))
+        .and_then(|s| hex::decode(s).ok())
+        .unwrap_or_default();
+
+    let value = call_obj.get("value")
+        .and_then(|v| v.as_str())
+        .map(|s| s.strip_prefix("0x").unwrap_or(s))
+        .and_then(|s| u64::from_str_radix(s, 16).ok())
+        .unwrap_or(0);
+
+    let result = arc_vm::evm::evm_call(&node.state, from, to, data, value, 30_000_000);
+    let gas_estimate = if result.gas_used == 0 { 21000 } else { result.gas_used };
+    eth_rpc_result(id, json!(format!("0x{:x}", gas_estimate)))
 }

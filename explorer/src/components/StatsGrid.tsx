@@ -1,10 +1,13 @@
 import { formatNumber } from '../utils';
+import MiniChart from './MiniChart';
 
 interface StatCard {
   label: string;
   value: string | number;
   suffix?: string;
   loading?: boolean;
+  sparkline?: number[];
+  sparkColor?: string;
 }
 
 interface StatsGridProps {
@@ -31,10 +34,20 @@ export default function StatsGrid({ stats }: StatsGridProps) {
             key={i}
             className="bg-arc-surface-raised p-5 card-glow"
           >
-            <p className="text-xs uppercase tracking-widest text-arc-grey-600 mb-2">
-              {stat.label}
-            </p>
-            <p className="text-2xl font-medium tracking-tight text-arc-white">
+            <div className="flex items-start justify-between mb-2">
+              <p className="text-xs uppercase tracking-widest text-arc-grey-600">
+                {stat.label}
+              </p>
+              {stat.sparkline && stat.sparkline.length >= 2 && (
+                <MiniChart
+                  data={stat.sparkline}
+                  color={stat.sparkColor}
+                  width={64}
+                  height={24}
+                />
+              )}
+            </div>
+            <p className="text-2xl font-medium tracking-tight text-arc-white stat-value">
               {typeof stat.value === 'number'
                 ? formatNumber(stat.value)
                 : stat.value}

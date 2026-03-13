@@ -35,6 +35,8 @@ fn make_test_validators(stakes: &[(u64, u16)]) -> (ValidatorSet, Vec<Hash256>) {
 }
 
 /// Create a DAG block directly (bypassing propose_block) for test scaffolding.
+/// Transactions are sorted into canonical lexicographic order to match the
+/// MEV-protection scheme enforced by `verify_ordering()`.
 fn make_block(
     author: Address,
     round: u64,
@@ -42,6 +44,9 @@ fn make_block(
     transactions: Vec<Hash256>,
     timestamp: u64,
 ) -> DagBlock {
+    let mut transactions = transactions;
+    transactions.sort_by(|a, b| a.0.cmp(&b.0));
+    let ordering_commitment = DagBlock::compute_ordering_commitment(&transactions);
     let mut block = DagBlock {
         author,
         round,
@@ -50,6 +55,7 @@ fn make_block(
         timestamp,
         hash: Hash256::ZERO,
         signature: Vec::new(),
+        ordering_commitment,
     };
     block.hash = block.compute_hash();
     block
@@ -710,11 +716,13 @@ mod formal_tests {
             }
         }
 
-        // The equivocating validator only counts once in the effective stake calculation
+        // The equivocating validator only counts once in the effective stake calculation.
+        // Their stake is also reduced by slashing (20% for Arc tier).
+        let slashed_stake = STAKE_ARC - (STAKE_ARC * SLASH_RATE_ARC / 100);
         assert_eq!(
             effective_stake,
-            4 * STAKE_ARC,
-            "Equivocating validator should only be counted once in stake calculation"
+            3 * STAKE_ARC + slashed_stake,
+            "Equivocating validator should only count once and have reduced stake from slashing"
         );
     }
 

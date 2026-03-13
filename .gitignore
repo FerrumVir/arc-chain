@@ -30,3 +30,6 @@ Thumbs.db
 
 # Benchmark export
 explorer/public/benchmark-data/
+
+# Deploy state
+deploy/.node-ips

@@ -1,0 +1,5 @@
+timestamp,elapsed_s,total_height,total_accounts,total_errors,total_mem_mb
+1772409355,0,0,0,0,31
+1772409363,5,25,0,0,1893
+1772409372,13,34,0,0,4691
+1772409383,22,14,0,0,6658
