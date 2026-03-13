@@ -1,0 +1,33 @@
+[Unit]
+Description=ARC Chain Node
+After=network-online.target
+Wants=network-online.target
+Documentation=https://github.com/FerrumVir/arc-chain
+
+[Service]
+Type=simple
+User=arc
+Group=arc
+ExecStart=/usr/local/bin/arc-node --config /etc/arc/config.toml --genesis /etc/arc/genesis.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=arc-node
+
+# Environment
+Environment=RUST_LOG=info
+Environment=RUST_BACKTRACE=1
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/arc
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

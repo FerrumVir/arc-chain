@@ -367,10 +367,10 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
     let buffer_slice = staging_buffer.slice(..);
     let (sender, receiver) = std::sync::mpsc::channel();
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        sender.send(result).unwrap();
+        let _ = sender.send(result);
     });
-    device.poll(wgpu::PollType::wait()).unwrap();
-    receiver.recv().unwrap().map_err(|e| GpuError::DeviceError(format!("{e:?}")))?;
+    device.poll(wgpu::PollType::wait()).map_err(|e| GpuError::DeviceError(format!("{e:?}")))?;
+    receiver.recv().map_err(|e| GpuError::DeviceError(format!("Channel error: {e}")))?.map_err(|e| GpuError::DeviceError(format!("{e:?}")))?;
 
     let raw_data = buffer_slice.get_mapped_range();
     let output_u32s: &[u32] = bytemuck::cast_slice(&raw_data);

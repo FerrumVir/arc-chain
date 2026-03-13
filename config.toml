@@ -1,0 +1,30 @@
+# ARC Chain Node Configuration
+# ─────────────────────────────────────────────────────────────────────────
+# All values shown are defaults — uncomment and modify as needed.
+# CLI arguments take precedence over values in this file.
+#
+# Usage: arc-node --config config.toml
+
+[rpc]
+listen = "0.0.0.0:9090"
+eth_port = 8545
+
+[p2p]
+port = 9091
+# peers = ["1.2.3.4:9091", "5.6.7.8:9091"]
+
+[validator]
+seed = "arc-validator-0"
+stake = 5_000_000
+min_stake = 500_000
+
+[storage]
+data_dir = "./arc-data"
+
+# [benchmark]
+# batch_size = 500
+# interval_ms = 200
+# sender_start = 0
+# sender_count = 50
+# sign_threads = 4
+# rayon_threads = 6

@@ -1,0 +1,26 @@
+═══════════════════════════════════════════════
+  ARC Chain — Soak Test Report
+  Sun Mar  1 17:53:14 CST 2026
+═══════════════════════════════════════════════
+
+Configuration:
+  Nodes:    3
+  Duration: 0h 0m 30s (target: 0h)
+
+Per-Node Status:
+  Node 0: height=17 uptime=42s errors=0
+0
+  Node 1: height=16 uptime=44s errors=0
+0
+  Node 2: height=0 uptime=0s errors=0
+0
+
+Aggregate:
+  Total errors across logs: 18
+  Max height: 17
+  Min height: 0
+  Height spread: 17
+  Consistency: WARN (spread > 5 blocks)
+
+Metrics CSV: logs/aggregate_20260301_175244.csv
+═══════════════════════════════════════════════

@@ -1,4 +1,9 @@
 pub mod benchmark;
+pub mod block_stm;
+pub mod coalesce;
 pub mod consensus;
+pub mod pipeline;
 pub mod producer;
 pub mod rpc;
+pub mod state_sync;
+pub mod vrf;

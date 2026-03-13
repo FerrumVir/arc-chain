@@ -1,0 +1,20 @@
+# ARC Chain Node Configuration — Validator 2
+# -----------------------------------------------------------------
+# Deployed to /etc/arc/config.toml on arc-node-2.
+# Peer addresses are populated by setup-testnet.sh after provisioning.
+
+[rpc]
+listen = "0.0.0.0:9090"
+eth_port = 8545
+
+[p2p]
+port = 9091
+peers = ["__NODE_0_IP__:9091", "__NODE_1_IP__:9091", "__NODE_3_IP__:9091"]
+
+[validator]
+seed = "arc-validator-2"
+stake = 5_000_000
+min_stake = 500_000
+
+[storage]
+data_dir = "/var/lib/arc/data"

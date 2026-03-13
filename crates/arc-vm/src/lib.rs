@@ -3,6 +3,17 @@
 //! Executes smart contracts compiled to WebAssembly with full host imports
 //! wired to the StateDB for storage, balance queries, and event emission.
 
+pub mod evm;
+pub mod precompiles;
+pub mod inference;
+pub mod inference_verify;
+pub mod oracle;
+pub mod zk_precompile;
+pub mod agent;
+pub mod test_framework;
+pub mod security_tests;
+pub mod formal_verify;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -224,9 +235,15 @@ fn host_use_gas(mut env: FunctionEnvMut<'_, VmHostEnv>, amount: i64) {
     }
 }
 
+/// Maximum allocation size for WASM host calls (10 MB).
+const MAX_HOST_ALLOC: usize = 10 * 1024 * 1024;
+
 /// `log(ptr: i32, len: i32)` — read a UTF-8 string from WASM memory and push to logs.
 fn host_log(mut env: FunctionEnvMut<'_, VmHostEnv>, ptr: i32, len: i32) {
     let (data, store) = env.data_and_store_mut();
+    if len < 0 || (len as usize) > MAX_HOST_ALLOC {
+        return;
+    }
     if let Some(ref memory) = data.memory {
         let view = memory.view(&store);
         let mut buf = vec![0u8; len as usize];
@@ -301,6 +318,9 @@ fn host_storage_set(
 
     let mut key = [0u8; 32];
     if view.read(key_ptr as u64, &mut key).is_err() {
+        return;
+    }
+    if val_len < 0 || (val_len as usize) > MAX_HOST_ALLOC {
         return;
     }
     let mut val = vec![0u8; val_len as usize];

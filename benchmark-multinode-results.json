@@ -1,0 +1,23 @@
+{
+  "config": {
+    "num_nodes": 2,
+    "total_transactions": 500000,
+    "batch_size": 1000,
+    "warmup_blocks": 3,
+    "senders_per_node": 90
+  },
+  "total_transactions": 500000,
+  "committed_transactions": 500000,
+  "elapsed_seconds": 18.544730084,
+  "tps": 26961.837553590998,
+  "peak_tps": 350000.0,
+  "avg_block_time_ms": 2633.1428571428573,
+  "avg_block_size": 71428.57142857143,
+  "finality_time_ms": 5266.285714285715,
+  "nodes": 2,
+  "cpu_cores": 10,
+  "projected_4_nodes": 47452.834094320155,
+  "projected_16_nodes": 189811.33637728062,
+  "projected_64_nodes": 759245.3455091225,
+  "projected_256_nodes": 3036981.38203649
+}

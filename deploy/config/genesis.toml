@@ -1,0 +1,58 @@
+# ARC Chain Genesis Configuration — 4-Node Testnet
+# -----------------------------------------------------------------
+# Deployed to /etc/arc/genesis.toml on each validator.
+# All nodes MUST use an identical copy of this file.
+
+[chain]
+name = "arc-testnet"
+chain_id = "0x415243"  # "ARC" in ASCII hex
+
+# -- Faucet Account (1 billion ARC) --------------------------------
+# Used by the testnet faucet to fund test accounts.
+
+[[accounts]]
+address = "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
+balance = 1_000_000_000
+
+# -- Validator Accounts (100K ARC each) ----------------------------
+# Pre-funded so validators can pay transaction fees.
+
+# Validator 0
+[[accounts]]
+address = "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+balance = 100_000
+
+# Validator 1
+[[accounts]]
+address = "ab13bedf42e84bae0f7c62c7dd6a8ada571e8829bed6ea558217f0361b5e25d0"
+balance = 100_000
+
+# Validator 2
+[[accounts]]
+address = "e1e0e81d6ea39b0cf8b86ffd440921011f57400cbc3f76a8a171906a9b8d7505"
+balance = 100_000
+
+# Validator 3
+[[accounts]]
+address = "0c389a743e34fda435fbd575bb889dbc0d3e66b9f9d81e00be33b7188509e7eb"
+balance = 100_000
+
+# -- Genesis Validators --------------------------------------------
+# All 4 validators are part of the initial validator set.
+# Seeds must match the --seed / config.toml [validator].seed on each node.
+
+[[validators]]
+seed = "arc-validator-0"
+stake = 5_000_000
+
+[[validators]]
+seed = "arc-validator-1"
+stake = 5_000_000
+
+[[validators]]
+seed = "arc-validator-2"
+stake = 5_000_000
+
+[[validators]]
+seed = "arc-validator-3"
+stake = 5_000_000

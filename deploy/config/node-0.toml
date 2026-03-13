@@ -1,0 +1,21 @@
+# ARC Chain Node Configuration — Validator 0 (Boot Node)
+# -----------------------------------------------------------------
+# Deployed to /etc/arc/config.toml on arc-node-0.
+# Peer addresses are populated by setup-testnet.sh after provisioning.
+
+[rpc]
+listen = "0.0.0.0:9090"
+eth_port = 8545
+
+[p2p]
+port = 9091
+# Peers injected by setup-testnet.sh — node-0 is the boot node
+peers = ["__NODE_1_IP__:9091", "__NODE_2_IP__:9091", "__NODE_3_IP__:9091"]
+
+[validator]
+seed = "arc-validator-0"
+stake = 5_000_000
+min_stake = 500_000
+
+[storage]
+data_dir = "/var/lib/arc/data"

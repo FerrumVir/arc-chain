@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+stwo-prover = ["dep:stwo", "dep:stwo-constraint-framework", "dep:num-traits"]
+stwo-icicle = ["stwo-prover", "dep:icicle-runtime", "dep:icicle-core", "dep:icicle-m31", "dep:icicle-hash"]
+
 [dependencies]
 blake3.workspace = true
 blst.workspace = true
@@ -22,6 +27,15 @@ serde_json.workspace = true
 hex.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
+# Stwo STARK prover (optional — requires nightly Rust)
+stwo = { workspace = true, optional = true }
+stwo-constraint-framework = { workspace = true, optional = true }
+num-traits = { workspace = true, optional = true }
+# GPU acceleration (ICICLE — optional, for future GPU Backend)
+icicle-runtime = { workspace = true, optional = true }
+icicle-core = { workspace = true, optional = true }
+icicle-m31 = { workspace = true, optional = true }
+icicle-hash = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

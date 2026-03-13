@@ -537,7 +537,38 @@ impl Pipeline {
                                         account_snapshot.insert(body.agent_id.0, acct);
                                     }
                                 }
-                                _ => {}
+                                TxBody::WasmCall(body) => {
+                                    // Pre-load contract account for value transfers + execution
+                                    if let Some(acct) = exec_state.get_account(&body.contract) {
+                                        account_snapshot.insert(body.contract.0, acct);
+                                    }
+                                }
+                                TxBody::Swap(body) => {
+                                    if let Some(acct) = exec_state.get_account(&body.counterparty) {
+                                        account_snapshot.insert(body.counterparty.0, acct);
+                                    }
+                                }
+                                TxBody::Escrow(body) => {
+                                    if let Some(acct) = exec_state.get_account(&body.beneficiary) {
+                                        account_snapshot.insert(body.beneficiary.0, acct);
+                                    }
+                                }
+                                TxBody::Stake(body) => {
+                                    // Pre-load the validator address account if different from sender
+                                    if body.validator != sender_addr {
+                                        if let Some(acct) = exec_state.get_account(&body.validator) {
+                                            account_snapshot.insert(body.validator.0, acct);
+                                        }
+                                    }
+                                }
+                                TxBody::DeployContract(_) | TxBody::RegisterAgent(_)
+                                | TxBody::MultiSig(_) | TxBody::JoinValidator(_)
+                                | TxBody::LeaveValidator | TxBody::ClaimRewards
+                                | TxBody::UpdateStake(_) | TxBody::Governance(_)
+                                | TxBody::BridgeLock(_) | TxBody::BridgeMint(_)
+                                | TxBody::BatchSettle(_) | TxBody::ChannelOpen(_)
+                                | TxBody::ChannelClose(_) | TxBody::ChannelDispute(_)
+                                | TxBody::ShardProof(_) => {}
                             }
                         }
 

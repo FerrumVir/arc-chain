@@ -1,9 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Link } from 'react-router-dom';
-import { getStats, getBlocks, getHealth, getInfo } from '../api';
+import { getStats, getBlocks, getHealth, getInfo, getBlock } from '../api';
 import type { StatsResponse, BlockSummary, HealthResponse, InfoResponse } from '../types';
 import StatsGrid from '../components/StatsGrid';
 import BlocksTable from '../components/BlocksTable';
+import TxTable from '../components/TxTable';
 import { formatNumber } from '../utils';
 
 export default function Home() {
@@ -11,9 +12,15 @@ export default function Home() {
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [info, setInfo] = useState<InfoResponse | null>(null);
   const [blocks, setBlocks] = useState<BlockSummary[]>([]);
+  const [latestTxHashes, setLatestTxHashes] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [tps, setTps] = useState(0);
+
+  // Sparkline history (last 10 snapshots)
+  const [tpsHistory, setTpsHistory] = useState<number[]>([]);
+  const [blockTimeHistory, setBlockTimeHistory] = useState<number[]>([]);
+
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const fetchData = useCallback(async () => {
@@ -29,18 +36,36 @@ export default function Home() {
       setInfo(infoData);
       setBlocks(blocksData.blocks);
 
+      // Fetch latest block's transactions for the "Latest Transactions" section
+      if (blocksData.blocks.length > 0) {
+        const latestHeight = blocksData.blocks[blocksData.blocks.length - 1].height;
+        try {
+          const latestBlock = await getBlock(latestHeight);
+          setLatestTxHashes(latestBlock.tx_hashes.slice(0, 10));
+        } catch {
+          // Non-critical — just skip latest TXs
+        }
+      }
+
       // Calculate TPS from recent blocks (timestamps are unix millis).
-      // Blocks come in ascending height order; skip genesis (timestamp 0).
       const recentBlocks = blocksData.blocks.filter(b => b.timestamp > 0);
+      let currentTps = 0;
+      let avgBlockTime = 0;
+
       if (recentBlocks.length >= 2) {
         const oldest = recentBlocks[0];
         const newest = recentBlocks[recentBlocks.length - 1];
         const timeSpanMs = newest.timestamp - oldest.timestamp;
         if (timeSpanMs > 0) {
           const totalTxs = recentBlocks.reduce((sum, b) => sum + b.tx_count, 0);
-          setTps(totalTxs / (timeSpanMs / 1000));
+          currentTps = totalTxs / (timeSpanMs / 1000);
+          avgBlockTime = timeSpanMs / (recentBlocks.length - 1) / 1000;
         }
       }
+
+      setTps(currentTps);
+      setTpsHistory((prev) => [...prev.slice(-9), currentTps]);
+      setBlockTimeHistory((prev) => [...prev.slice(-9), avgBlockTime]);
 
       setError('');
     } catch (err) {
@@ -71,6 +96,8 @@ export default function Home() {
         : '0',
       suffix: 'tx/s',
       loading,
+      sparkline: tpsHistory,
+      sparkColor: '#6F7CF4',
     },
     {
       label: 'Total Transactions',
@@ -86,6 +113,8 @@ export default function Home() {
       label: 'Block Height',
       value: stats?.block_height ?? 0,
       loading,
+      sparkline: blockTimeHistory,
+      sparkColor: '#51EB8E',
     },
   ];
 
@@ -130,6 +159,97 @@ export default function Home() {
         </div>
         <div className="border border-arc-border bg-arc-surface">
           <BlocksTable blocks={blocks} loading={loading} compact />
+        </div>
+      </section>
+
+      {/* ─── Latest Transactions ─────────────────────────────── */}
+      {latestTxHashes.length > 0 && (
+        <section>
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-medium text-arc-white">Latest Transactions</h2>
+          </div>
+          <div className="border border-arc-border bg-arc-surface">
+            <TxTable txHashes={latestTxHashes} loading={loading} compact />
+          </div>
+        </section>
+      )}
+
+      {/* ─── Get Started CTA ─────────────────────────────────── */}
+      <section>
+        <h2 className="text-lg font-medium text-arc-white mb-4">Get Started</h2>
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          {/* Run a Node */}
+          <a
+            href="https://docs.arc.tech/node"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="group border border-arc-border bg-arc-surface-raised p-6 hover:border-arc-aquarius/50 transition-all duration-200"
+          >
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-10 h-10 flex items-center justify-center bg-arc-aquarius/10 text-arc-aquarius">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="2" y="2" width="20" height="8" rx="2" ry="2" />
+                  <rect x="2" y="14" width="20" height="8" rx="2" ry="2" />
+                  <line x1="6" y1="6" x2="6.01" y2="6" />
+                  <line x1="6" y1="18" x2="6.01" y2="18" />
+                </svg>
+              </div>
+              <h3 className="text-sm font-medium text-arc-white group-hover:text-arc-aquarius transition-colors">
+                Run a Node
+              </h3>
+            </div>
+            <p className="text-xs text-arc-grey-600 leading-relaxed">
+              Deploy your own ARC validator node. Earn staking rewards and help secure the network.
+            </p>
+          </a>
+
+          {/* Build on ARC */}
+          <a
+            href="https://docs.arc.tech"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="group border border-arc-border bg-arc-surface-raised p-6 hover:border-arc-blue/50 transition-all duration-200"
+          >
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-10 h-10 flex items-center justify-center bg-arc-blue/10 text-arc-blue">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="16 18 22 12 16 6" />
+                  <polyline points="8 6 2 12 8 18" />
+                </svg>
+              </div>
+              <h3 className="text-sm font-medium text-arc-white group-hover:text-arc-blue transition-colors">
+                Build on ARC
+              </h3>
+            </div>
+            <p className="text-xs text-arc-grey-600 leading-relaxed">
+              Deploy smart contracts with WASM support. Full SDK, CLI tools, and comprehensive docs.
+            </p>
+          </a>
+
+          {/* Join Community */}
+          <a
+            href="https://discord.gg/arc"
+            target="_blank"
+            rel="noopener noreferrer"
+            className="group border border-arc-border bg-arc-surface-raised p-6 hover:border-arc-success/50 transition-all duration-200"
+          >
+            <div className="flex items-center gap-3 mb-3">
+              <div className="w-10 h-10 flex items-center justify-center bg-arc-success/10 text-arc-success">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
+                  <circle cx="9" cy="7" r="4" />
+                  <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
+                  <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+                </svg>
+              </div>
+              <h3 className="text-sm font-medium text-arc-white group-hover:text-arc-success transition-colors">
+                Join Community
+              </h3>
+            </div>
+            <p className="text-xs text-arc-grey-600 leading-relaxed">
+              Connect with builders, validators, and the ARC team on Discord, Twitter, and more.
+            </p>
+          </a>
         </div>
       </section>
 

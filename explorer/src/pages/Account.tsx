@@ -1,10 +1,12 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { getAccount, getAccountTxs } from '../api';
 import type { AccountInfo, AccountTxsResponse } from '../types';
 import { formatHash, formatNumber } from '../utils';
 import CopyButton from '../components/CopyButton';
 import TxTable from '../components/TxTable';
+
+const TX_PAGE_SIZE = 25;
 
 interface DetailRowProps {
   label: string;
@@ -30,11 +32,13 @@ export default function Account() {
   const [txData, setTxData] = useState<AccountTxsResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [txPage, setTxPage] = useState(0);
 
   useEffect(() => {
     if (!address) return;
     document.title = `Account ${address.slice(0, 12)}... — ARC Explorer`;
     setLoading(true);
+    setTxPage(0);
 
     Promise.all([getAccount(address), getAccountTxs(address)])
       .then(([accountData, txsData]) => {
@@ -49,6 +53,16 @@ export default function Account() {
       })
       .finally(() => setLoading(false));
   }, [address]);
+
+  const totalTxPages = Math.max(1, Math.ceil((txData?.tx_hashes.length ?? 0) / TX_PAGE_SIZE));
+  const paginatedHashes = useMemo(
+    () =>
+      (txData?.tx_hashes ?? []).slice(
+        txPage * TX_PAGE_SIZE,
+        (txPage + 1) * TX_PAGE_SIZE
+      ),
+    [txData, txPage]
+  );
 
   if (loading) {
     return (
@@ -83,6 +97,8 @@ export default function Account() {
   }
 
   if (!account || !address) return null;
+
+  const txCount = txData?.tx_hashes.length ?? 0;
 
   return (
     <div className="space-y-8">
@@ -131,8 +147,39 @@ export default function Account() {
             </span>
           </h2>
           <div className="border border-arc-border bg-arc-surface">
-            <TxTable txHashes={txData.tx_hashes} />
+            <TxTable txHashes={paginatedHashes} />
           </div>
+          {txCount > TX_PAGE_SIZE && (
+            <div className="flex items-center justify-between text-sm mt-4">
+              <p className="text-arc-grey-600">
+                Showing {txPage * TX_PAGE_SIZE + 1}–
+                {Math.min((txPage + 1) * TX_PAGE_SIZE, txCount)} of{' '}
+                {txCount.toLocaleString()}
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => setTxPage((p) => p - 1)}
+                  disabled={txPage === 0}
+                  className={`btn-arc-outline text-xs px-4 py-2 ${
+                    txPage === 0 ? 'opacity-30 cursor-not-allowed' : ''
+                  }`}
+                >
+                  Previous
+                </button>
+                <button
+                  onClick={() => setTxPage((p) => p + 1)}
+                  disabled={txPage >= totalTxPages - 1}
+                  className={`btn-arc-outline text-xs px-4 py-2 ${
+                    txPage >= totalTxPages - 1
+                      ? 'opacity-30 cursor-not-allowed'
+                      : ''
+                  }`}
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </section>
       )}
     </div>

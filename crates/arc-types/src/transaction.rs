@@ -4,6 +4,143 @@ use serde::{Deserialize, Serialize};
 
 use crate::account::Address;
 
+// ---------------------------------------------------------------------------
+// Gas constants & metering
+// ---------------------------------------------------------------------------
+
+/// Gas costs for common operations (aligned with EVM for comparability).
+pub mod gas_costs {
+    /// Base gas cost for any transaction.
+    pub const TX_BASE: u64 = 21_000;
+    /// Gas per byte of transaction data.
+    pub const TX_DATA_BYTE: u64 = 16;
+    /// Gas for a simple transfer.
+    pub const TRANSFER: u64 = 21_000;
+    /// Gas for a settle transaction.
+    pub const SETTLE: u64 = 25_000;
+    /// Gas for a swap transaction.
+    pub const SWAP: u64 = 30_000;
+    /// Gas for staking operations.
+    pub const STAKE: u64 = 25_000;
+    /// Gas for escrow operations.
+    pub const ESCROW: u64 = 35_000;
+    /// Gas for contract deployment.
+    pub const DEPLOY_CONTRACT: u64 = 53_000;
+    /// Gas for contract call (base, plus execution).
+    pub const CONTRACT_CALL: u64 = 21_000;
+    /// Gas for agent registration.
+    pub const REGISTER_AGENT: u64 = 30_000;
+    /// Gas for multi-sig operations.
+    pub const MULTI_SIG: u64 = 35_000;
+    /// Gas for validator join.
+    pub const JOIN_VALIDATOR: u64 = 30_000;
+    /// Gas for validator leave.
+    pub const LEAVE_VALIDATOR: u64 = 25_000;
+    /// Gas for claiming rewards.
+    pub const CLAIM_REWARDS: u64 = 25_000;
+    /// Gas for updating validator stake.
+    pub const UPDATE_STAKE: u64 = 25_000;
+    /// Gas for governance proposal execution.
+    pub const GOVERNANCE: u64 = 50_000;
+    /// Gas for locking tokens in the bridge escrow.
+    pub const BRIDGE_LOCK: u64 = 50_000;
+    /// Gas for minting bridged tokens from another chain.
+    pub const BRIDGE_MINT: u64 = 50_000;
+    /// Gas for batch settlement (covers netting computation).
+    pub const BATCH_SETTLE: u64 = 30_000;
+    /// Gas for opening a state channel.
+    pub const CHANNEL_OPEN: u64 = 40_000;
+    /// Gas for closing a state channel (mutual).
+    pub const CHANNEL_CLOSE: u64 = 35_000;
+    /// Gas for disputing a state channel.
+    pub const CHANNEL_DISPUTE: u64 = 50_000;
+    /// Gas for submitting a shard STARK proof.
+    pub const SHARD_PROOF: u64 = 60_000;
+    /// Gas for storage read.
+    pub const SLOAD: u64 = 200;
+    /// Gas for storage write.
+    pub const SSTORE: u64 = 5_000;
+    /// Gas for event emission.
+    pub const LOG: u64 = 375;
+    /// Default block gas limit.
+    pub const BLOCK_GAS_LIMIT: u64 = 30_000_000;
+}
+
+/// Gas metering state for transaction execution.
+#[derive(Clone, Debug, Default)]
+pub struct GasMeter {
+    /// Maximum gas allowed for this transaction.
+    pub limit: u64,
+    /// Gas consumed so far.
+    pub consumed: u64,
+}
+
+impl GasMeter {
+    /// Create a new gas meter with the given limit.
+    pub fn new(limit: u64) -> Self {
+        Self { limit, consumed: 0 }
+    }
+
+    /// Charge gas for an operation. Returns Err if out of gas.
+    pub fn charge(&mut self, amount: u64) -> Result<(), GasError> {
+        let new_consumed = self
+            .consumed
+            .checked_add(amount)
+            .ok_or(GasError::Overflow)?;
+        if new_consumed > self.limit {
+            self.consumed = self.limit; // Cap at limit
+            return Err(GasError::OutOfGas {
+                limit: self.limit,
+                consumed: new_consumed,
+            });
+        }
+        self.consumed = new_consumed;
+        Ok(())
+    }
+
+    /// Remaining gas.
+    pub fn remaining(&self) -> u64 {
+        self.limit.saturating_sub(self.consumed)
+    }
+
+    /// Whether gas has been exhausted.
+    pub fn is_exhausted(&self) -> bool {
+        self.consumed >= self.limit
+    }
+}
+
+/// Gas-related errors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GasError {
+    OutOfGas { limit: u64, consumed: u64 },
+    Overflow,
+    BlockGasLimitExceeded { block_limit: u64, total: u64 },
+}
+
+impl std::fmt::Display for GasError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GasError::OutOfGas { limit, consumed } => {
+                write!(f, "out of gas: limit={}, consumed={}", limit, consumed)
+            }
+            GasError::Overflow => write!(f, "gas counter overflow"),
+            GasError::BlockGasLimitExceeded { block_limit, total } => {
+                write!(
+                    f,
+                    "block gas limit exceeded: limit={}, total={}",
+                    block_limit, total
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for GasError {}
+
+// ---------------------------------------------------------------------------
+// Transaction types
+// ---------------------------------------------------------------------------
+
 /// Transaction type discriminant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -26,6 +163,30 @@ pub enum TxType {
     DeployContract = 0x08,
     /// Register an agent on-chain.
     RegisterAgent = 0x09,
+    /// Join the validator set.
+    JoinValidator = 0x0a,
+    /// Leave the validator set.
+    LeaveValidator = 0x0b,
+    /// Claim staking rewards.
+    ClaimRewards = 0x0c,
+    /// Update validator stake.
+    UpdateStake = 0x0d,
+    /// Execute a governance proposal on-chain.
+    Governance = 0x0e,
+    /// Lock tokens for cross-chain bridge transfer.
+    BridgeLock = 0x0f,
+    /// Mint bridged tokens from another chain.
+    BridgeMint = 0x10,
+    /// Batch settlement — nets bilateral balances from multiple settlements.
+    BatchSettle = 0x11,
+    /// Open a bilateral state channel (lock funds).
+    ChannelOpen = 0x12,
+    /// Close a state channel (mutual agreement, release funds).
+    ChannelClose = 0x13,
+    /// Dispute a state channel (submit latest signed state).
+    ChannelDispute = 0x14,
+    /// Submit a STARK proof for a shard block.
+    ShardProof = 0x15,
 }
 
 /// A transaction on the ARC chain.
@@ -45,11 +206,13 @@ pub struct Transaction {
     pub body: TxBody,
     /// Fee in ARC (can be 0 for settlements).
     pub fee: u64,
-    /// Max gas for WASM calls (0 for non-WASM transactions).
+    /// Gas limit for this transaction. Zero means unlimited (backward compat).
+    /// For transfers the typical cost is 21,000; for deploys 53,000, etc.
+    #[serde(default)]
     pub gas_limit: u64,
     /// BLAKE3 hash of the signable content (computed on creation).
     pub hash: Hash256,
-    /// Cryptographic signature (null for unsigned/benchmark transactions).
+    /// Cryptographic signature. Must be valid — null signatures are rejected.
     pub signature: Signature,
 }
 
@@ -65,6 +228,30 @@ pub enum TxBody {
     MultiSig(MultiSigBody),
     DeployContract(DeployBody),
     RegisterAgent(RegisterBody),
+    /// Request to join the validator set.
+    JoinValidator(JoinValidatorBody),
+    /// Request to leave the validator set (unstake).
+    LeaveValidator,
+    /// Claim accumulated staking rewards.
+    ClaimRewards,
+    /// Increase or decrease validator stake.
+    UpdateStake(UpdateStakeBody),
+    /// Execute a governance proposal on-chain.
+    Governance(GovernanceBody),
+    /// Lock tokens for cross-chain bridge transfer.
+    BridgeLock(BridgeLockBody),
+    /// Mint bridged tokens from another chain.
+    BridgeMint(BridgeMintBody),
+    /// Batch settlement — multiple settlements netted into one TX.
+    BatchSettle(BatchSettleBody),
+    /// Open a bilateral state channel.
+    ChannelOpen(ChannelOpenBody),
+    /// Close a state channel.
+    ChannelClose(ChannelCloseBody),
+    /// Dispute a state channel.
+    ChannelDispute(ChannelDisputeBody),
+    /// Submit a STARK proof for a shard block.
+    ShardProof(ShardProofBody),
 }
 
 /// Simple value transfer.
@@ -159,6 +346,182 @@ pub struct RegisterBody {
     pub metadata: Vec<u8>,
 }
 
+/// Request to join the validator set.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct JoinValidatorBody {
+    /// Ed25519 public key bytes for block signing.
+    pub pubkey: [u8; 32],
+    /// Initial stake amount (must meet minimum tier threshold).
+    pub initial_stake: u64,
+}
+
+/// Update validator stake amount.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UpdateStakeBody {
+    /// New stake amount. If lower than current, difference is returned.
+    pub new_stake: u64,
+}
+
+/// Governance transaction payload — records on-chain execution of a passed proposal.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GovernanceBody {
+    /// The proposal ID being executed.
+    pub proposal_id: u64,
+    /// The governance action to perform.
+    pub action: GovernanceAction,
+}
+
+/// The action to perform in a governance transaction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum GovernanceAction {
+    /// Execute a passed proposal (records execution on-chain).
+    Execute,
+}
+
+/// Lock tokens on ARC Chain for transfer to a destination chain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BridgeLockBody {
+    /// Target chain identifier.
+    pub destination_chain: u32,
+    /// Recipient address on the destination chain.
+    pub destination_address: [u8; 32],
+    /// Amount of ARC to lock in escrow.
+    pub amount: u64,
+}
+
+/// Mint bridged tokens on ARC Chain from a source chain.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BridgeMintBody {
+    /// Source chain identifier.
+    pub source_chain: u32,
+    /// Transaction hash on the source chain that locked the tokens.
+    pub source_tx_hash: Hash256,
+    /// Recipient address on ARC Chain.
+    pub recipient: Address,
+    /// Amount of ARC to mint.
+    pub amount: u64,
+    /// Merkle proof of the lock transaction on the source chain.
+    pub merkle_proof: Vec<u8>,
+}
+
+/// Batch settlement — nets bilateral balances for efficiency.
+///
+/// Instead of N individual Settle transactions (N state reads + N writes),
+/// a BatchSettle computes the net balance change per account and applies
+/// them in a single TX. 1000:1 compression ratio for bilateral agent settlements.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct BatchSettleBody {
+    /// Individual settlement entries to net.
+    pub entries: Vec<SettleEntry>,
+}
+
+/// A single entry within a batch settlement.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SettleEntry {
+    /// Agent being paid.
+    pub agent_id: Address,
+    /// Service hash (for audit trail).
+    pub service_hash: Hash256,
+    /// Gross amount owed.
+    pub amount: u64,
+}
+
+/// Open a bilateral state channel between two parties.
+///
+/// Locks funds from the opener into the channel. The counterparty can
+/// accept by submitting their own ChannelOpen with the same channel_id.
+/// Once both sides have locked funds, off-chain bilateral trading begins.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChannelOpenBody {
+    /// Unique channel identifier (BLAKE3 of both parties + nonce).
+    pub channel_id: Hash256,
+    /// The other party in the channel.
+    pub counterparty: Address,
+    /// Amount to lock in the channel.
+    pub deposit: u64,
+    /// Timeout in blocks — if counterparty doesn't open, funds unlock.
+    pub timeout_blocks: u64,
+}
+
+/// Close a state channel by mutual agreement.
+///
+/// Both parties sign the final balances. Funds are released according
+/// to the agreed split. This is the happy path (no dispute).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChannelCloseBody {
+    /// Channel being closed.
+    pub channel_id: Hash256,
+    /// Final balance for the opener.
+    pub opener_balance: u64,
+    /// Final balance for the counterparty.
+    pub counterparty_balance: u64,
+    /// Counterparty's signature over the final state.
+    pub counterparty_sig: Vec<u8>,
+    /// State sequence number (monotonically increasing).
+    pub state_nonce: u64,
+}
+
+/// Dispute a state channel by submitting the latest signed state.
+///
+/// Starts a challenge period. If the other party has a newer signed state,
+/// they can submit it to override. After the challenge period, the latest
+/// submitted state is finalized.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChannelDisputeBody {
+    /// Channel being disputed.
+    pub channel_id: Hash256,
+    /// Claimed final balance for the opener.
+    pub opener_balance: u64,
+    /// Claimed final balance for the counterparty.
+    pub counterparty_balance: u64,
+    /// Signature of the other party over this state.
+    pub other_party_sig: Vec<u8>,
+    /// State sequence number (higher wins).
+    pub state_nonce: u64,
+    /// Challenge period in blocks.
+    pub challenge_period: u64,
+}
+
+/// Submit a STARK proof for a shard block.
+///
+/// The shard proposer generates a Stwo STARK proof of the block's
+/// state transition (prev_root → post_root given transactions).
+/// Other shards/validators verify the proof instead of re-executing.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShardProofBody {
+    /// Shard index this proof covers.
+    pub shard_id: u16,
+    /// Block height within the shard.
+    pub block_height: u64,
+    /// Block hash being proven.
+    pub block_hash: Hash256,
+    /// Pre-state root before the block.
+    pub prev_state_root: Hash256,
+    /// Post-state root after the block.
+    pub post_state_root: Hash256,
+    /// Number of transactions in the proven block.
+    pub tx_count: u32,
+    /// The serialized STARK proof data.
+    pub proof_data: Vec<u8>,
+}
+
+/// EVM event log emitted during contract execution.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventLog {
+    /// Contract address that emitted the event.
+    pub address: Address,
+    /// Indexed event topics (topic[0] = event signature hash).
+    pub topics: Vec<Hash256>,
+    /// Non-indexed event data.
+    pub data: Vec<u8>,
+    /// Block height.
+    pub block_height: u64,
+    /// Transaction hash.
+    pub tx_hash: Hash256,
+    /// Log index within the block.
+    pub log_index: u32,
+}
+
 /// Transaction receipt (result of execution).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TxReceipt {
@@ -172,6 +535,8 @@ pub struct TxReceipt {
     pub value_commitment: Option<[u8; 32]>,
     /// Merkle proof of inclusion in the block.
     pub inclusion_proof: Option<Vec<u8>>,
+    /// Event logs emitted during execution.
+    pub logs: Vec<EventLog>,
 }
 
 /// Compact transfer transaction — optimized for throughput benchmarks.
@@ -579,5 +944,50 @@ mod tests {
         let hash_b = b.compute_hash();
 
         assert_ne!(hash_a, hash_b, "different fees must produce different hashes");
+    }
+
+    // ── Gas metering ──
+
+    #[test]
+    fn test_gas_meter_basic() {
+        let mut gas = GasMeter::new(100_000);
+        assert_eq!(gas.remaining(), 100_000);
+        assert!(!gas.is_exhausted());
+
+        assert!(gas.charge(21_000).is_ok());
+        assert_eq!(gas.consumed, 21_000);
+        assert_eq!(gas.remaining(), 79_000);
+    }
+
+    #[test]
+    fn test_gas_meter_out_of_gas() {
+        let mut gas = GasMeter::new(10_000);
+        assert!(gas.charge(10_001).is_err());
+        assert!(gas.is_exhausted());
+    }
+
+    #[test]
+    fn test_gas_meter_exact_limit() {
+        let mut gas = GasMeter::new(21_000);
+        assert!(gas.charge(21_000).is_ok());
+        assert!(gas.is_exhausted());
+        assert_eq!(gas.remaining(), 0);
+    }
+
+    #[test]
+    fn test_gas_meter_multiple_charges() {
+        let mut gas = GasMeter::new(50_000);
+        assert!(gas.charge(21_000).is_ok());
+        assert!(gas.charge(5_000).is_ok());
+        assert!(gas.charge(5_000).is_ok());
+        assert_eq!(gas.consumed, 31_000);
+        assert!(gas.charge(20_000).is_err()); // Would exceed limit
+    }
+
+    #[test]
+    fn test_gas_costs_constants() {
+        assert_eq!(gas_costs::TX_BASE, 21_000);
+        assert!(gas_costs::DEPLOY_CONTRACT > gas_costs::TRANSFER);
+        assert!(gas_costs::BLOCK_GAS_LIMIT >= 30_000_000);
     }
 }

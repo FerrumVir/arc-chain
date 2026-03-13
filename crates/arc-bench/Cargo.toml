@@ -17,6 +17,30 @@ path = "src/node_bench.rs"
 name = "arc-bench-signed"
 path = "src/signed_bench.rs"
 
+[[bin]]
+name = "arc-bench-production"
+path = "src/production_bench.rs"
+
+[[bin]]
+name = "arc-bench-mixed"
+path = "src/mixed_bench.rs"
+
+[[bin]]
+name = "arc-bench-parallel"
+path = "src/parallel_bench.rs"
+
+[[bin]]
+name = "arc-bench-soak"
+path = "src/soak_bench.rs"
+
+[[bin]]
+name = "arc-bench-propose-verify"
+path = "src/propose_verify_bench.rs"
+
+[[bin]]
+name = "arc-bench-multinode"
+path = "src/multinode_bench.rs"
+
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
@@ -24,6 +48,10 @@ arc-state = { path = "../arc-state" }
 arc-vm = { path = "../arc-vm" }
 arc-mempool = { path = "../arc-mempool" }
 arc-gpu = { path = "../arc-gpu" }
+arc-node = { path = "../arc-node" }
+arc-consensus = { path = "../arc-consensus" }
+arc-net = { path = "../arc-net" }
+crossbeam = { workspace = true }
 blake3.workspace = true
 rayon.workspace = true
 bincode.workspace = true
@@ -41,3 +69,4 @@ uuid.workspace = true
 clap.workspace = true
 ed25519-dalek.workspace = true
 fips204.workspace = true
+libc = "0.2"

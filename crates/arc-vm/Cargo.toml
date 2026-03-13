@@ -10,9 +10,15 @@ arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
 arc-state = { path = "../arc-state" }
 wasmer.workspace = true
+revm.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+hex.workspace = true
+blake3.workspace = true
+ed25519-dalek.workspace = true
 
 [dev-dependencies]
 wat = "1.245"
+rand.workspace = true

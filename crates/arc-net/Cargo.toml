@@ -23,4 +23,5 @@ blake3.workspace = true
 rcgen = { workspace = true }
 rustls = { workspace = true }
 arc-consensus = { path = "../arc-consensus" }
+arc-state = { path = "../arc-state" }
 anyhow.workspace = true

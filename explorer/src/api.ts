@@ -12,6 +12,9 @@ import type {
   ContractCallResult,
   AccountInfo,
   AccountTxsResponse,
+  ValidatorsResponse,
+  FaucetStatus,
+  FaucetClaimResponse,
 } from './types';
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:9090';
@@ -125,6 +128,49 @@ export async function callContract(
     throw new ApiError(`Contract call failed: ${res.status}`, res.status);
   }
   return res.json() as Promise<ContractCallResult>;
+}
+
+// ─── Validators ─────────────────────────────────────────────────
+
+export function getValidators(): Promise<ValidatorsResponse> {
+  return request<ValidatorsResponse>('/validators');
+}
+
+// ─── Faucet ────────────────────────────────────────────────────
+
+const FAUCET_URL = import.meta.env.VITE_FAUCET_URL || 'http://localhost:3001';
+
+export function getFaucetStatus(): Promise<FaucetStatus> {
+  return faucetRequest<FaucetStatus>('/status');
+}
+
+export async function claimFaucetTokens(address: string): Promise<FaucetClaimResponse> {
+  const url = `${FAUCET_URL}/claim`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ address }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    throw new ApiError(
+      data.error || `Claim failed: ${res.status}`,
+      res.status
+    );
+  }
+  return data as FaucetClaimResponse;
+}
+
+async function faucetRequest<T>(path: string): Promise<T> {
+  const url = `${FAUCET_URL}${path}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    throw new ApiError(
+      `Faucet request failed: ${res.status} ${res.statusText}`,
+      res.status
+    );
+  }
+  return res.json() as Promise<T>;
 }
 
 export { ApiError };

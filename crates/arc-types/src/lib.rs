@@ -1,7 +1,23 @@
 pub mod transaction;
 pub mod block;
 pub mod account;
+pub mod account_abstraction;
+pub mod bridge;
+pub mod defi;
+pub mod economics;
+pub mod governance;
 pub mod identity;
+pub mod indexer;
+pub mod intent;
+pub mod wallet;
+pub mod devtools;
+pub mod ai_native;
+pub mod proof_market;
+pub mod sdk;
+pub mod docs;
+pub mod multisig;
+pub mod social_recovery;
+pub mod session_keys;
 
 pub use transaction::*;
 pub use block::*;

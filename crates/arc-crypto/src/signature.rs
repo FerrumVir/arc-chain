@@ -1,14 +1,16 @@
 //! Digital signature primitives for ARC Chain.
 //!
-//! Three signature schemes:
+//! Four signature schemes:
 //! - **Ed25519**: Fast agent/native transactions (~4-9M batch verifications/sec)
 //! - **Secp256k1**: ETH-compatible operations (MetaMask, bridge verification)
 //! - **ML-DSA-65**: Post-quantum signatures (NIST FIPS 204, lattice-based)
+//! - **Falcon-512**: Post-quantum signatures (NIST round-3, hash-based lattice)
 //!
 //! Address derivation:
 //! - Ed25519: `address = BLAKE3(public_key)[0..32]`
 //! - Secp256k1: `address = BLAKE3(uncompressed_pubkey[1..65])[0..32]`
 //! - ML-DSA-65: `address = BLAKE3(public_key)[0..32]`
+//! - Falcon-512: `address = BLAKE3(public_key)[0..32]`
 
 use crate::hash::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
@@ -22,6 +24,16 @@ pub const ML_DSA_PK_LEN: usize = fips204::ml_dsa_65::PK_LEN;
 pub const ML_DSA_SK_LEN: usize = fips204::ml_dsa_65::SK_LEN;
 /// ML-DSA-65 signature length in bytes.
 pub const ML_DSA_SIG_LEN: usize = fips204::ml_dsa_65::SIG_LEN;
+
+// ── Falcon-512 constants ────────────────────────────────────────────────────
+
+/// Falcon-512 public key length in bytes.
+pub const FALCON_PK_LEN: usize = 897;
+/// Falcon-512 secret key length in bytes.
+pub const FALCON_SK_LEN: usize = 1281;
+/// Falcon-512 maximum signature length in bytes.
+/// Falcon signatures are variable-length (up to 752 bytes).
+pub const FALCON_SIG_MAX_LEN: usize = 752;
 
 // ── Errors ──────────────────────────────────────────────────────────────────
 
@@ -59,6 +71,7 @@ pub enum SignatureError {
 /// Ed25519 signatures carry the public key (96 bytes total).
 /// Secp256k1 signatures are recoverable (65 bytes total: r‖s‖v).
 /// ML-DSA-65 signatures carry the public key (1952 + 3309 = 5261 bytes total).
+/// Falcon-512 signatures carry the public key (897 + up to 752 = up to 1649 bytes total).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Signature {
     /// Ed25519 signature (fast, for native/agent transactions).
@@ -78,6 +91,13 @@ pub enum Signature {
         /// 1952-byte ML-DSA-65 public key.
         public_key: Vec<u8>,
         /// 3309-byte ML-DSA-65 signature.
+        signature: Vec<u8>,
+    },
+    /// Falcon-512 post-quantum signature (NTRU lattice-based).
+    Falcon512 {
+        /// 897-byte Falcon-512 public key.
+        public_key: Vec<u8>,
+        /// Variable-length Falcon-512 signature (up to 752 bytes).
         signature: Vec<u8>,
     },
 }
@@ -216,6 +236,45 @@ impl Signature {
                     Err(SignatureError::InvalidSignature)
                 }
             }
+
+            Signature::Falcon512 {
+                public_key,
+                signature,
+            } => {
+                use pqcrypto_traits::sign::{
+                    PublicKey as PqPublicKey,
+                    DetachedSignature as PqDetachedSignature,
+                };
+
+                // Length checks
+                if signature.len() > FALCON_SIG_MAX_LEN {
+                    return Err(SignatureError::InvalidLength {
+                        expected: FALCON_SIG_MAX_LEN,
+                        got: signature.len(),
+                    });
+                }
+                if public_key.len() != FALCON_PK_LEN {
+                    return Err(SignatureError::InvalidPublicKey);
+                }
+
+                // 1. Public key must hash to the expected address
+                let derived = address_from_falcon_pubkey(public_key);
+                if derived != *expected_address {
+                    return Err(SignatureError::AddressMismatch {
+                        expected: expected_address.to_hex(),
+                        got: derived.to_hex(),
+                    });
+                }
+
+                // 2. Reconstruct public key and detached signature, then verify
+                let pk = pqcrypto_falcon::falcon512::PublicKey::from_bytes(public_key)
+                    .map_err(|_| SignatureError::InvalidPublicKey)?;
+                let sig = pqcrypto_falcon::falcon512::DetachedSignature::from_bytes(signature)
+                    .map_err(|_| SignatureError::InvalidSignature)?;
+
+                pqcrypto_falcon::falcon512::verify_detached_signature(&sig, message_hash.as_bytes(), &pk)
+                    .map_err(|_| SignatureError::InvalidSignature)
+            }
         }
     }
 
@@ -248,6 +307,7 @@ impl Default for Signature {
 // ── KeyPair ─────────────────────────────────────────────────────────────────
 
 /// Key pair for signing ARC chain transactions.
+#[derive(Clone)]
 pub enum KeyPair {
     /// Ed25519 key pair — fast, native operations.
     Ed25519(ed25519_dalek::SigningKey),
@@ -259,6 +319,14 @@ pub enum KeyPair {
         /// 4032-byte serialized private key.
         sk_bytes: Vec<u8>,
         /// 1952-byte serialized public key.
+        pk_bytes: Vec<u8>,
+    },
+    /// Falcon-512 key pair — post-quantum NTRU lattice signatures.
+    /// Stored as serialized bytes (pqcrypto types don't implement Debug/Serialize by default).
+    Falcon512 {
+        /// 1281-byte serialized secret key.
+        sk_bytes: Vec<u8>,
+        /// 897-byte serialized public key.
         pk_bytes: Vec<u8>,
     },
 }
@@ -287,6 +355,16 @@ impl KeyPair {
         }
     }
 
+    /// Generate a new random Falcon-512 key pair (post-quantum).
+    pub fn generate_falcon512() -> Self {
+        use pqcrypto_traits::sign::{PublicKey as PqPk, SecretKey as PqSk};
+        let (pk, sk) = pqcrypto_falcon::falcon512::keypair();
+        KeyPair::Falcon512 {
+            sk_bytes: sk.as_bytes().to_vec(),
+            pk_bytes: pk.as_bytes().to_vec(),
+        }
+    }
+
     /// Derive the ARC chain address from this key pair.
     ///
     /// Ed25519: `BLAKE3(public_key)`
@@ -306,6 +384,9 @@ impl KeyPair {
             }
             KeyPair::MlDsa65 { pk_bytes, .. } => {
                 address_from_ml_dsa_pubkey(pk_bytes)
+            }
+            KeyPair::Falcon512 { pk_bytes, .. } => {
+                address_from_falcon_pubkey(pk_bytes)
             }
         }
     }
@@ -355,6 +436,26 @@ impl KeyPair {
                     signature: sig.to_vec(),
                 })
             }
+            KeyPair::Falcon512 { sk_bytes, pk_bytes } => {
+                use pqcrypto_traits::sign::{
+                    SecretKey as PqSk,
+                    DetachedSignature as PqDetachedSig,
+                };
+
+                let sk = pqcrypto_falcon::falcon512::SecretKey::from_bytes(sk_bytes)
+                    .map_err(|e| SignatureError::SigningFailed(format!(
+                        "invalid Falcon-512 secret key: {}", e
+                    )))?;
+                let sig = pqcrypto_falcon::falcon512::detached_sign(
+                    message_hash.as_bytes(),
+                    &sk,
+                );
+
+                Ok(Signature::Falcon512 {
+                    public_key: pk_bytes.clone(),
+                    signature: sig.as_bytes().to_vec(),
+                })
+            }
         }
     }
 
@@ -367,6 +468,7 @@ impl KeyPair {
                 vk.to_encoded_point(true).as_bytes().to_vec()
             }
             KeyPair::MlDsa65 { pk_bytes, .. } => pk_bytes.clone(),
+            KeyPair::Falcon512 { pk_bytes, .. } => pk_bytes.clone(),
         }
     }
 }
@@ -377,6 +479,7 @@ impl std::fmt::Debug for KeyPair {
             KeyPair::Ed25519(_) => write!(f, "KeyPair::Ed25519(<redacted>)"),
             KeyPair::Secp256k1(_) => write!(f, "KeyPair::Secp256k1(<redacted>)"),
             KeyPair::MlDsa65 { .. } => write!(f, "KeyPair::MlDsa65(<redacted>)"),
+            KeyPair::Falcon512 { .. } => write!(f, "KeyPair::Falcon512(<redacted>)"),
         }
     }
 }
@@ -411,6 +514,19 @@ pub fn address_from_ml_dsa_pubkey(public_key: &[u8]) -> Hash256 {
         ML_DSA_PK_LEN,
         "expected {}-byte ML-DSA-65 pubkey",
         ML_DSA_PK_LEN
+    );
+    hash_bytes(public_key)
+}
+
+/// Derive an ARC address from a Falcon-512 public key.
+/// `address = BLAKE3(public_key)[0..32]`
+#[inline]
+pub fn address_from_falcon_pubkey(public_key: &[u8]) -> Hash256 {
+    debug_assert_eq!(
+        public_key.len(),
+        FALCON_PK_LEN,
+        "expected {}-byte Falcon-512 pubkey",
+        FALCON_PK_LEN
     );
     hash_bytes(public_key)
 }
@@ -463,6 +579,47 @@ pub fn batch_verify_ml_dsa(
     }
 }
 
+/// Batch verify N Falcon-512 signatures using parallel individual verification.
+///
+/// Falcon doesn't have native batch verification, but each verification is
+/// CPU-bound and parallelizes well across cores with Rayon.
+///
+/// All three slices must have the same length.
+/// Signatures are variable-length, so they are passed as `Vec<u8>` slices.
+pub fn batch_verify_falcon512(
+    messages: &[&[u8]],
+    signatures: &[&[u8]],
+    public_keys: &[&[u8]],
+) -> Result<(), SignatureError> {
+    use pqcrypto_traits::sign::{
+        PublicKey as PqPublicKey,
+        DetachedSignature as PqDetachedSignature,
+    };
+    use rayon::prelude::*;
+
+    let all_valid = messages
+        .par_iter()
+        .zip(signatures.par_iter())
+        .zip(public_keys.par_iter())
+        .all(|((msg, sig_bytes), pk_bytes)| {
+            let pk = match pqcrypto_falcon::falcon512::PublicKey::from_bytes(pk_bytes) {
+                Ok(pk) => pk,
+                Err(_) => return false,
+            };
+            let sig = match pqcrypto_falcon::falcon512::DetachedSignature::from_bytes(sig_bytes) {
+                Ok(sig) => sig,
+                Err(_) => return false,
+            };
+            pqcrypto_falcon::falcon512::verify_detached_signature(&sig, msg, &pk).is_ok()
+        });
+
+    if all_valid {
+        Ok(())
+    } else {
+        Err(SignatureError::BatchVerifyFailed)
+    }
+}
+
 // ── Benchmark keypair derivation ─────────────────────────────────────────────
 
 /// Derive a deterministic Ed25519 keypair from a benchmark index.
@@ -476,6 +633,74 @@ pub fn benchmark_keypair(index: u8) -> ed25519_dalek::SigningKey {
 /// `address = BLAKE3(ed25519_public_key)`
 pub fn benchmark_address(index: u8) -> Hash256 {
     address_from_ed25519_pubkey(benchmark_keypair(index).verifying_key().as_bytes())
+}
+
+// ── Falcon-512 standalone helpers ────────────────────────────────────────────
+
+/// Generate a new Falcon-512 key pair, returning raw bytes.
+/// Public key: 897 bytes, Secret key: 1281 bytes.
+pub fn falcon_keygen() -> (Vec<u8>, Vec<u8>) {
+    use pqcrypto_traits::sign::{PublicKey as PqPk, SecretKey as PqSk};
+    let (pk, sk) = pqcrypto_falcon::falcon512::keypair();
+    (pk.as_bytes().to_vec(), sk.as_bytes().to_vec())
+}
+
+/// Sign a message with a Falcon-512 secret key, returning the detached signature bytes.
+pub fn falcon_sign(secret_key: &[u8], message: &[u8]) -> Result<Vec<u8>, SignatureError> {
+    use pqcrypto_traits::sign::{SecretKey as PqSk, DetachedSignature as PqDetachedSig};
+    let sk = pqcrypto_falcon::falcon512::SecretKey::from_bytes(secret_key)
+        .map_err(|e| SignatureError::SigningFailed(format!("invalid Falcon secret key: {}", e)))?;
+    let sig = pqcrypto_falcon::falcon512::detached_sign(message, &sk);
+    Ok(sig.as_bytes().to_vec())
+}
+
+/// Verify a Falcon-512 detached signature against a message and public key.
+pub fn falcon_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
+    use pqcrypto_traits::sign::{
+        PublicKey as PqPublicKey,
+        DetachedSignature as PqDetachedSignature,
+    };
+    let pk = match pqcrypto_falcon::falcon512::PublicKey::from_bytes(public_key) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+    let sig = match pqcrypto_falcon::falcon512::DetachedSignature::from_bytes(signature) {
+        Ok(sig) => sig,
+        Err(_) => return false,
+    };
+    pqcrypto_falcon::falcon512::verify_detached_signature(&sig, message, &pk).is_ok()
+}
+
+/// Batch verify N Falcon-512 signatures, returning per-element results.
+///
+/// Unlike `batch_verify_falcon512` which returns a single pass/fail,
+/// this returns a `Vec<bool>` indicating which individual signatures are valid.
+pub fn falcon_batch_verify(
+    keys: &[&[u8]],
+    messages: &[&[u8]],
+    signatures: &[&[u8]],
+) -> Vec<bool> {
+    use rayon::prelude::*;
+    use pqcrypto_traits::sign::{
+        PublicKey as PqPublicKey,
+        DetachedSignature as PqDetachedSignature,
+    };
+
+    keys.par_iter()
+        .zip(messages.par_iter())
+        .zip(signatures.par_iter())
+        .map(|((pk_bytes, msg), sig_bytes)| {
+            let pk = match pqcrypto_falcon::falcon512::PublicKey::from_bytes(pk_bytes) {
+                Ok(pk) => pk,
+                Err(_) => return false,
+            };
+            let sig = match pqcrypto_falcon::falcon512::DetachedSignature::from_bytes(sig_bytes) {
+                Ok(sig) => sig,
+                Err(_) => return false,
+            };
+            pqcrypto_falcon::falcon512::verify_detached_signature(&sig, msg, &pk).is_ok()
+        })
+        .collect()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -736,6 +961,224 @@ mod tests {
         assert!(batch_verify_ml_dsa(&msg_refs, &signatures, &public_keys).is_err());
     }
 
+    // ── Falcon-512 (Post-Quantum) ──
+
+    #[test]
+    fn falcon512_sign_and_verify() {
+        let kp = KeyPair::generate_falcon512();
+        let address = kp.address();
+        let msg = hash_bytes(b"falcon quantum-proof transaction");
+
+        let sig = kp.sign(&msg).expect("sign ok");
+        sig.verify(&msg, &address).expect("verify ok");
+    }
+
+    #[test]
+    fn falcon512_wrong_address_fails() {
+        let kp = KeyPair::generate_falcon512();
+        let wrong = hash_bytes(b"wrong address");
+        let msg = hash_bytes(b"falcon quantum-proof transaction");
+
+        let sig = kp.sign(&msg).expect("sign ok");
+        assert!(sig.verify(&msg, &wrong).is_err());
+    }
+
+    #[test]
+    fn falcon512_wrong_message_fails() {
+        let kp = KeyPair::generate_falcon512();
+        let address = kp.address();
+        let msg = hash_bytes(b"msg1");
+        let wrong = hash_bytes(b"msg2");
+
+        let sig = kp.sign(&msg).expect("sign ok");
+        assert!(sig.verify(&wrong, &address).is_err());
+    }
+
+    #[test]
+    fn falcon512_address_is_deterministic() {
+        let kp = KeyPair::generate_falcon512();
+        assert_eq!(kp.address(), kp.address());
+    }
+
+    #[test]
+    fn falcon512_public_key_bytes_correct_length() {
+        let kp = KeyPair::generate_falcon512();
+        assert_eq!(kp.public_key_bytes().len(), FALCON_PK_LEN);
+    }
+
+    #[test]
+    fn falcon512_signature_correct_length() {
+        let kp = KeyPair::generate_falcon512();
+        let msg = hash_bytes(b"test");
+        let sig = kp.sign(&msg).expect("sign ok");
+        match sig {
+            Signature::Falcon512 { signature, public_key } => {
+                assert!(signature.len() <= FALCON_SIG_MAX_LEN);
+                assert!(signature.len() > 0);
+                assert_eq!(public_key.len(), FALCON_PK_LEN);
+            }
+            _ => panic!("expected Falcon512 signature"),
+        }
+    }
+
+    #[test]
+    fn falcon512_signature_serialization_roundtrip() {
+        let kp = KeyPair::generate_falcon512();
+        let sig = kp.sign(&hash_bytes(b"test")).unwrap();
+        let json = serde_json::to_string(&sig).expect("serialize");
+        let recovered: Signature = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(sig, recovered);
+    }
+
+    #[test]
+    fn falcon512_is_not_null() {
+        let kp = KeyPair::generate_falcon512();
+        let sig = kp.sign(&hash_bytes(b"x")).unwrap();
+        assert!(!sig.is_null());
+    }
+
+    // ── Falcon-512 standalone helpers ──
+
+    #[test]
+    fn falcon_keygen_produces_valid_keys() {
+        let (pk, sk) = falcon_keygen();
+        assert_eq!(pk.len(), FALCON_PK_LEN);
+        assert_eq!(sk.len(), FALCON_SK_LEN);
+    }
+
+    #[test]
+    fn falcon_sign_and_verify_standalone() {
+        let (pk, sk) = falcon_keygen();
+        let msg = b"standalone falcon test";
+        let sig = falcon_sign(&sk, msg).expect("sign ok");
+        assert!(falcon_verify(&pk, msg, &sig));
+    }
+
+    #[test]
+    fn falcon_verify_rejects_wrong_message() {
+        let (pk, sk) = falcon_keygen();
+        let sig = falcon_sign(&sk, b"correct").expect("sign ok");
+        assert!(!falcon_verify(&pk, b"wrong", &sig));
+    }
+
+    #[test]
+    fn falcon_batch_verify_all_valid() {
+        let count = 5;
+        let mut pks = Vec::with_capacity(count);
+        let mut msgs: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut sigs = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let (pk, sk) = falcon_keygen();
+            let msg = format!("falcon batch message {}", i).into_bytes();
+            let sig = falcon_sign(&sk, &msg).expect("sign ok");
+            pks.push(pk);
+            msgs.push(msg);
+            sigs.push(sig);
+        }
+
+        let pk_refs: Vec<&[u8]> = pks.iter().map(|p| p.as_slice()).collect();
+        let msg_refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
+        let sig_refs: Vec<&[u8]> = sigs.iter().map(|s| s.as_slice()).collect();
+
+        let results = falcon_batch_verify(&pk_refs, &msg_refs, &sig_refs);
+        assert!(results.iter().all(|&v| v));
+    }
+
+    #[test]
+    fn falcon_batch_verify_detects_bad_signature() {
+        let count = 3;
+        let mut pks = Vec::with_capacity(count);
+        let mut msgs: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut sigs = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let (pk, sk) = falcon_keygen();
+            let msg = format!("falcon batch message {}", i).into_bytes();
+            let sig = falcon_sign(&sk, &msg).expect("sign ok");
+            pks.push(pk);
+            msgs.push(msg);
+            sigs.push(sig);
+        }
+
+        // Corrupt message at index 1
+        msgs[1] = b"tampered".to_vec();
+
+        let pk_refs: Vec<&[u8]> = pks.iter().map(|p| p.as_slice()).collect();
+        let msg_refs: Vec<&[u8]> = msgs.iter().map(|m| m.as_slice()).collect();
+        let sig_refs: Vec<&[u8]> = sigs.iter().map(|s| s.as_slice()).collect();
+
+        let results = falcon_batch_verify(&pk_refs, &msg_refs, &sig_refs);
+        assert!(results[0], "first should be valid");
+        assert!(!results[1], "second should be invalid (tampered)");
+        assert!(results[2], "third should be valid");
+    }
+
+    // ── Batch verification (Falcon-512 aggregate) ──
+
+    #[test]
+    fn batch_verify_falcon512_5_signatures() {
+        let count = 5;
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut signatures: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut public_keys: Vec<Vec<u8>> = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let kp = KeyPair::generate_falcon512();
+            let msg = format!("falcon quantum message {}", i).into_bytes();
+            let msg_hash = hash_bytes(&msg);
+            let sig = kp.sign(&msg_hash).expect("sign ok");
+
+            match sig {
+                Signature::Falcon512 { public_key, signature } => {
+                    messages.push(msg_hash.as_bytes().to_vec());
+                    signatures.push(signature);
+                    public_keys.push(public_key);
+                }
+                _ => panic!("expected Falcon512"),
+            }
+        }
+
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+        let sig_refs: Vec<&[u8]> = signatures.iter().map(|s| s.as_slice()).collect();
+        let pk_refs: Vec<&[u8]> = public_keys.iter().map(|p| p.as_slice()).collect();
+
+        batch_verify_falcon512(&msg_refs, &sig_refs, &pk_refs).expect("batch verify ok");
+    }
+
+    #[test]
+    fn batch_verify_falcon512_fails_on_bad_signature() {
+        let count = 3;
+        let mut messages: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut signatures: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut public_keys: Vec<Vec<u8>> = Vec::with_capacity(count);
+
+        for i in 0..count {
+            let kp = KeyPair::generate_falcon512();
+            let msg = format!("falcon quantum message {}", i).into_bytes();
+            let msg_hash = hash_bytes(&msg);
+            let sig = kp.sign(&msg_hash).expect("sign ok");
+
+            match sig {
+                Signature::Falcon512 { public_key, signature } => {
+                    messages.push(msg_hash.as_bytes().to_vec());
+                    signatures.push(signature);
+                    public_keys.push(public_key);
+                }
+                _ => panic!("expected Falcon512"),
+            }
+        }
+
+        // Corrupt: tamper with a message
+        messages[1] = hash_bytes(b"tampered").as_bytes().to_vec();
+
+        let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
+        let sig_refs: Vec<&[u8]> = signatures.iter().map(|s| s.as_slice()).collect();
+        let pk_refs: Vec<&[u8]> = public_keys.iter().map(|p| p.as_slice()).collect();
+
+        assert!(batch_verify_falcon512(&msg_refs, &sig_refs, &pk_refs).is_err());
+    }
+
     // ── Null / Default ──
 
     #[test]
@@ -770,13 +1213,17 @@ mod tests {
     }
 
     #[test]
-    fn all_three_schemes_produce_different_addresses() {
+    fn all_four_schemes_produce_different_addresses() {
         let ed = KeyPair::generate_ed25519();
         let secp = KeyPair::generate_secp256k1();
         let ml = KeyPair::generate_ml_dsa();
+        let falcon = KeyPair::generate_falcon512();
         assert_ne!(ed.address(), secp.address());
         assert_ne!(ed.address(), ml.address());
+        assert_ne!(ed.address(), falcon.address());
         assert_ne!(secp.address(), ml.address());
+        assert_ne!(secp.address(), falcon.address());
+        assert_ne!(ml.address(), falcon.address());
     }
 
     #[test]
