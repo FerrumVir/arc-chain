@@ -28,6 +28,7 @@ use crossbeam::channel::{self, Receiver, Sender};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::thread;
+use arc_consensus::encode_block_data;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -96,11 +97,15 @@ pub struct PipelineConfig {
 impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
-            execution_mode: ExecutionMode::Sequential,
-            verify_mode: VerifyMode::Cpu,
+            execution_mode: ExecutionMode::BlockSTM,
+            verify_mode: if cfg!(target_os = "macos") {
+                VerifyMode::GpuMetal
+            } else {
+                VerifyMode::Cpu
+            },
             coalesce_enabled: false,
             batch_size: 10_000,
-            gpu_state_enabled: false,
+            gpu_state_enabled: true,
             gpu_state_capacity: 1_000_000,
         }
     }
@@ -836,6 +841,51 @@ impl Pipeline {
                                 .filter(|&&v| v)
                                 .count();
 
+                            // ── STARK proof generation ──────────────────
+                            let proof_input = arc_crypto::stark::BlockProofInput {
+                                height: block.header.height,
+                                block_hash: block.hash.0,
+                                prev_state_root: block.header.parent_hash.0,
+                                post_state_root: block.header.state_root.0,
+                                tx_hashes: block.tx_hashes.iter().map(|h| h.0).collect(),
+                                state_diffs: vec![],
+                                transfers: vec![],
+                            };
+                            let proof = arc_crypto::stark::BlockProof::prove(&proof_input);
+                            let vr = proof.verify();
+
+                            // Compress the proof for storage / transmission
+                            let compressed = arc_crypto::proof_compress::compress_proof(&proof.proof_data);
+                            let ratio = if compressed.original_size > 0 {
+                                compressed.compressed_data.len() as f64 / compressed.original_size as f64
+                            } else {
+                                1.0
+                            };
+                            debug!(
+                                height = block.header.height,
+                                proof_size = proof.proof_size_bytes,
+                                compressed_size = compressed.compressed_data.len(),
+                                ratio = format!("{:.2}", ratio),
+                                proving_ms = proof.proving_time_ms,
+                                valid = vr.is_valid,
+                                prover = if cfg!(feature = "stwo-prover") { "stwo-circle-stark" } else { "mock-blake3" },
+                                "Pipeline: STARK proof generated"
+                            );
+
+                            // ── DA erasure encoding ──────────────────
+                            let da_input: Vec<u8> = block
+                                .tx_hashes
+                                .iter()
+                                .flat_map(|h| h.0.to_vec())
+                                .collect();
+                            let da_encoding = encode_block_data(&da_input, 4, 2);
+                            debug!(
+                                height = block.header.height,
+                                da_root = format!("{:.2}", hex::encode(da_encoding.root.0)),
+                                chunk_count = da_encoding.chunk_count,
+                                "Pipeline: DA erasure encoding committed"
+                            );
+
                             info!(
                                 height = block.header.height,
                                 txs = ebatch.transactions.len(),
@@ -938,8 +988,8 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.tx_count, 1);
         assert_eq!(result.success_count, 1);
-        // Default mode should be Sequential.
-        assert_eq!(result.execution_mode, ExecutionMode::Sequential);
+        // Default mode is now BlockSTM.
+        assert_eq!(result.execution_mode, ExecutionMode::BlockSTM);
         assert!(result.coalesce_reads_saved.is_none());
     }
 
@@ -973,7 +1023,7 @@ mod tests {
     #[test]
     fn test_pipeline_config_defaults() {
         let cfg = PipelineConfig::default();
-        assert_eq!(cfg.execution_mode, ExecutionMode::Sequential);
+        assert_eq!(cfg.execution_mode, ExecutionMode::BlockSTM);
         assert!(!cfg.coalesce_enabled);
         assert_eq!(cfg.batch_size, 10_000);
     }
