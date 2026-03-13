@@ -3,7 +3,7 @@
 **Date**: March 13, 2026
 **Version**: v1.1
 **Hardware**: Apple M4, 10 CPU cores, 16 GB unified memory
-**Codebase**: ~72,400 LOC Rust | 1,028 tests | 10 crates
+**Codebase**: 75,285 LOC Rust | 1,028 tests | 11 crates
 
 ---
 
@@ -59,15 +59,15 @@ Users / AI Agents
 | `arc-types` | 14,071 | 258 | 21 transaction types, blocks, accounts, staking, governance, bridge, account abstraction, social recovery |
 | `arc-crypto` | 11,680 | 240 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512, ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
 | `arc-state` | 12,127 | 138 | DashMap state DB, Jellyfish Merkle Tree, WAL persistence, BlockSTM parallel execution, GPU-resident state cache, chunked state sync |
-| `arc-vm` | 8,265 | 145 | WASM runtime (Wasmer 6.0), EVM interpreter (revm 19), gas metering, host imports, precompiles, AI inference oracle |
-| `arc-node` | 8,298 | 65 | Block producer, pipelined execution, RPC server (20+ HTTP + ETH JSON-RPC), consensus manager |
+| `arc-vm` | 8,439 | 145 | WASM runtime (Wasmer 6.0), EVM interpreter (revm 19), gas metering, host imports, 11 precompiles, AI inference oracle |
+| `arc-node` | 8,408 | 61 | Block producer, pipelined execution, RPC server (20+ HTTP + ETH JSON-RPC), consensus manager, STARK proof generation, DA erasure coding |
 | `arc-consensus` | 7,523 | 126 | DAG consensus engine, validator sets, stake tiers, 2-round commit rule, slashing, cross-shard coordination |
 | `arc-bench` | 5,336 | — | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
 | `arc-gpu` | 3,810 | 37 | Metal MSL + WGSL GPU Ed25519 batch verification, GPU account buffer, unified/managed memory, buffer pooling |
 | `arc-net` | 2,355 | 24 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
 | `arc-mempool` | 876 | 17 | Lock-free SegQueue + DashSet deduplication, encrypted mempool (BLS threshold) |
 | `arc-cli` | 660 | — | CLI client: keygen, RPC queries, transaction submission |
-| **Total** | **75,001** | **1,050** | |
+| **Total** | **75,285** | **1,028** | **11 crates** |
 
 Additional code outside `/crates`:
 - Python SDK: 2,688 LOC
@@ -243,6 +243,30 @@ structs), not that it exists in separate memory.
 | Proof size | ~100-200 KB (Stwo FRI) |
 | Verification | O(log n) with BLAKE2s Merkle channel |
 
+### Parallel Execution Modes
+
+| Mode | TPS | Speedup | ETH-weighted |
+|------|-----|---------|-------------|
+| CPU verify + Sequential exec | 64.3K | 1.00x | 16.4K |
+| CPU verify + Block-STM exec | 59.8K | 0.93x | 15.2K |
+| CPU verify + Block-STM + Coalesce | 69.3K | 1.08x | 17.6K |
+| GPU verify + Sequential exec | 35.1K | 0.55x | 8.9K |
+| GPU verify + Block-STM exec | 40.0K | 0.62x | 10.2K |
+| GPU verify + Block-STM + Coalesce | 37.4K | 0.58x | 9.5K |
+
+Best single-node (raw): 69.3K TPS
+Best single-node (weighted): 17.6K TPS
+vs Ethereum (~15 TPS): 1,176x faster
+
+**Multi-node projections (propose-verify, ETH-weighted):**
+
+| Nodes | Projected TPS |
+|-------|--------------|
+| 10 | 158.7K |
+| 50 | 749.5K |
+| 100 | 1.41M |
+| 500 | 6.17M |
+
 ---
 
 ## 7. Scaling Projections
@@ -372,7 +396,7 @@ A complete transaction goes through these stages:
 
 ## 9. Transaction Types
 
-ARC Chain supports 13 native transaction types:
+ARC Chain supports 21 native transaction types:
 
 | Type | Code | Description |
 |------|------|-------------|
@@ -389,6 +413,14 @@ ARC Chain supports 13 native transaction types:
 | LeaveValidator | 0x0b | Gracefully exit the validator set |
 | ClaimRewards | 0x0c | Claim accrued staking/validation rewards |
 | UpdateStake | 0x0d | Increase or decrease validator stake |
+| Governance | 0x0e | On-chain governance proposals and voting |
+| BridgeLock | 0x0f | Lock tokens for cross-chain bridge |
+| BridgeMint | 0x10 | Mint bridged tokens on destination chain |
+| BatchSettle | 0x11 | Bilateral netting, 1000:1 compression |
+| ChannelOpen | 0x12 | Lock funds in state channel escrow |
+| ChannelClose | 0x13 | Mutual close, release channel funds |
+| ChannelDispute | 0x14 | Submit signed state with challenge period |
+| ShardProof | 0x15 | Record verified STARK proof, validate state root transition |
 
 ---
 
@@ -427,7 +459,7 @@ ARC Chain supports 13 native transaction types:
 
 ```
 Total:   1,028 tests passed, 0 failed
-Crates:  10 (all passing)
+Crates:  11 (all passing)
 ```
 
 Coverage includes:
@@ -471,16 +503,17 @@ cargo test --workspace
 | Metric | Value |
 |--------|-------|
 | **Language** | Rust (100% core) |
-| **Codebase** | 75,001 LOC Rust, 11 crates |
-| **Tests** | 1,050 passing, 0 failing |
+| **Codebase** | 75,285 LOC Rust, 11 crates |
+| **Tests** | 1,028 passing, 0 failing |
 | **Consensus** | DAG (Mysticeti-inspired), 2-round finality |
-| **Measured TPS** | 27,000 (2 nodes, M4 laptop, full stack) |
+| **Measured TPS** | 69.3K (single-node peak, M4), 27K (2-node sustained) |
 | **Projected TPS** | 300K-1.3M (A100/H100 server, single shard) |
 | **Peak TPS** | 350,000 (1-second burst on M4) |
 | **State lookups** | 15.2M/sec (GPU-resident cache, Metal unified) |
 | **Commit rate** | 100% (500K/500K) |
 | **GPU support** | Metal, Vulkan, CUDA, DirectX 12, WebGPU (via wgpu) |
 | **TX types** | 21 native types (16 core + 5 L1 scaling) |
+| **Precompiles** | 11 (BLAKE3, Ed25519, VRF, Oracle, Merkle, BlockInfo, Identity, Falcon-512, ZK-verify, AI-inference, BLS-verify) |
 | **Smart contracts** | WASM (Wasmer 6.0) + EVM (revm 19) |
 | **Signatures** | Ed25519, Secp256k1, BLS12-381, Falcon-512 (post-quantum), ML-DSA |
 | **Proofs** | Stwo Circle STARK (post-quantum, no trusted setup) |

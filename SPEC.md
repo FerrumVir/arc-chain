@@ -26,8 +26,8 @@ Agents / Users
 └──────────────┘
 ```
 
-Crates: `arc-crypto`, `arc-types`, `arc-state`, `arc-vm`, `arc-mempool`,
-`arc-consensus` (new), `arc-net` (new), `arc-node`, `arc-gpu`, `arc-bench`
+Crates (11): `arc-crypto`, `arc-types`, `arc-state`, `arc-vm`, `arc-mempool`,
+`arc-consensus` (new), `arc-net` (new), `arc-node`, `arc-gpu`, `arc-bench`, `arc-cli`
 
 ---
 
@@ -78,8 +78,8 @@ Validators sign blocks using BLS12-381. N validator signatures aggregate into
 one 48-byte signature. Verification cost is constant regardless of validator count.
 
 ```rust
-pub struct BlsSignature(pub [u8; 48]);
-pub struct BlsPublicKey(pub [u8; 96]);
+pub struct BlsPublicKey(pub [u8; 48]);
+pub struct BlsSignature(pub [u8; 96]);
 
 /// Aggregate N signatures into one.
 pub fn bls_aggregate(signatures: &[BlsSignature]) -> BlsSignature;
@@ -124,7 +124,7 @@ pub struct Transaction {
 
 **Verification:** Before execution, verify `signature` recovers to `from`. For ed25519, check `public_key` in signature hashes to `from`. For secp256k1, recover the public key from signature + hash, verify it hashes to `from`.
 
-### 2.2 Transaction Types (9 total)
+### 2.2 Transaction Types (21 total)
 
 Existing 7 types unchanged. Two new types added:
 
@@ -139,6 +139,18 @@ pub enum TxBody {
     MultiSig(MultiSigBody),         // 0x07
     DeployContract(DeployBody),     // 0x08 — NEW
     RegisterAgent(RegisterBody),    // 0x09 — NEW
+    JoinValidator(JoinValidatorBody),    // 0x0a
+    LeaveValidator(LeaveValidatorBody),  // 0x0b
+    ClaimRewards(ClaimRewardsBody),      // 0x0c
+    UpdateStake(UpdateStakeBody),        // 0x0d
+    Governance(GovernanceBody),          // 0x0e
+    BridgeLock(BridgeLockBody),          // 0x0f
+    BridgeMint(BridgeMintBody),         // 0x10
+    BatchSettle(BatchSettleBody),        // 0x11
+    ChannelOpen(ChannelOpenBody),        // 0x12
+    ChannelClose(ChannelCloseBody),      // 0x13
+    ChannelDispute(ChannelDisputeBody),  // 0x14
+    ShardProof(ShardProofBody),          // 0x15
 }
 
 pub struct DeployBody {
@@ -491,6 +503,36 @@ Fee distribution per block:
 Settlement transactions (`Settle` type) have ZERO base fee — agents settle
 for free. This is the core value proposition. Fee revenue comes from transfers,
 WASM calls, and contract deployments.
+
+### 4.6 STARK Proof Pipeline
+
+Every committed block generates a STARK proof in the commit stage:
+
+1. Construct `BlockProofInput` from block hash, state roots, and transaction hashes
+2. Call `BlockProof::prove()` — dispatches to mock (BLAKE3) or real (Stwo Circle STARK) based on feature flag
+3. Verify the proof inline
+4. Compress proof via RLE/dictionary encoding
+5. Generate DA erasure encoding (4+2 Reed-Solomon) with Merkle commitment
+
+On stable Rust, the mock prover generates deterministic BLAKE3-based proofs.
+With `--features stwo-prover` (nightly), the real Stwo Circle STARK prover runs
+with a 22-constraint transfer AIR over the M31 field.
+
+### 4.7 Precompiles (11 total)
+
+| Address | Name | Gas | Description |
+|---------|------|-----|-------------|
+| 0x01 | blake3 | 100 | BLAKE3 hash |
+| 0x02 | ed25519_verify | 3,000 | Ed25519 signature verification |
+| 0x03 | vrf_random | 5,000 | VRF random number generation |
+| 0x04 | price_oracle | 1,000 | On-chain price feed |
+| 0x05 | merkle_verify | 2,000 | Merkle proof verification |
+| 0x06 | block_info | 100 | Block height/timestamp query |
+| 0x07 | identity_lookup | 500 | Agent identity resolution |
+| 0x08 | falcon512_verify | 5,000 | Falcon-512 post-quantum sig verify |
+| 0x09 | zk_verify | 50,000 | ZK proof verification (circuit registry) |
+| 0x0A | ai_inference | 500,000+ | AI model inference (NeuralNet engine) |
+| 0x0B | bls_verify | 10,000 | BLS12-381 signature verification |
 
 ---
 

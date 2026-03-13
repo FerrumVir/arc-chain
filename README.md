@@ -10,7 +10,8 @@ A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built 
 
 | Metric | Value | Conditions |
 |--------|-------|------------|
-| **Sustained TPS** | **27,000** | 2 validators, real QUIC, real consensus, real Ed25519 signatures |
+| **Single-node peak TPS** | **69,300** | BlockSTM + Coalesce, CPU verify |
+| **Multi-node sustained TPS** | **27,000** | 2 validators, real QUIC, real consensus |
 | **Peak TPS** | **350,000** | 1-second burst window |
 | **Commit rate** | **100%** | 500K/500K transactions committed |
 | **State lookups** | **15.2M/sec** | GPU-resident state cache, Metal unified memory |
@@ -60,15 +61,15 @@ Users / AI Agents
 
 ## Codebase
 
-**75,001 LOC Rust** | **1,050 tests** | **11 crates**
+**75,285 LOC Rust** | **1,028 tests** | **11 crates**
 
 | Crate | LOC | Tests | What It Does |
 |-------|-----|-------|-------------|
 | `arc-types` | 14,071 | 258 | 21 transaction types, blocks, accounts, governance, staking, bridge, account abstraction, social recovery |
 | `arc-crypto` | 11,680 | 240 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512 (post-quantum), ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
 | `arc-state` | 12,127 | 138 | DashMap state DB, Jellyfish Merkle Tree, WAL persistence, BlockSTM parallel execution, GPU-resident state cache, state sync |
-| `arc-vm` | 8,265 | 145 | Wasmer WASM runtime, revm EVM interpreter, gas metering, host imports, precompiles, AI inference oracle |
-| `arc-node` | 8,298 | 65 | Pipelined block production, signature verification, RPC server (20+ HTTP + ETH JSON-RPC), consensus manager |
+| `arc-vm` | 8,439 | 145 | Wasmer WASM runtime, revm EVM interpreter, gas metering, host imports, 11 precompiles, AI inference oracle |
+| `arc-node` | 8,408 | 61 | Pipelined block production, signature verification, RPC server (20+ HTTP + ETH JSON-RPC), consensus manager, STARK proof gen, DA erasure coding, encrypted mempool |
 | `arc-consensus` | 7,523 | 126 | DAG consensus, 2-round finality, stake tiers, slashing, cross-shard coordination, epoch transitions |
 | `arc-bench` | 5,336 | — | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
 | `arc-gpu` | 3,810 | 37 | Metal MSL + WGSL Ed25519 batch verification, GPU account buffer, unified/managed memory, buffer pooling |
@@ -93,6 +94,7 @@ Users / AI Agents
 - **Stake tiers** — Spark (500K), Arc (5M), Core (50M) ARC
 - **VRF proposer selection** — verifiable random leader rotation
 - **Slashing** — equivocation + liveness detection, progressive penalties
+- **Encrypted mempool** — BLS threshold commit-reveal for MEV protection
 
 ### Cryptography
 - **Ed25519** — primary transaction signing (118K sigs/sec)
@@ -107,6 +109,9 @@ Users / AI Agents
 - **WASM + EVM** — dual smart contract runtime (Wasmer 6.0 + revm 19)
 - **21 transaction types** — transfers, settlements, staking, governance, bridge, channels, shard proofs
 - **Zero-fee settlements** — AI agents settle for free
+- **STARK proof generation** — per-block proof with compression (mock on stable, real Stwo via feature flag)
+- **DA erasure coding** — 4+2 Reed-Solomon with Merkle commitment per block
+- **11 precompiles** — BLAKE3, Ed25519, VRF, Oracle, Merkle, BlockInfo, Identity, Falcon-512, ZK-verify, AI-inference, BLS-verify
 
 ### State
 - **DashMap** — lock-free concurrent reads/writes
@@ -134,7 +139,7 @@ Users / AI Agents
 git clone https://github.com/FerrumVir/arc-chain.git
 cd arc-chain
 cargo build --release
-cargo test --workspace --lib    # 1,050 tests
+cargo test --workspace --lib    # 1,028 tests
 ```
 
 ### Run benchmarks
@@ -211,8 +216,10 @@ Compound scaling from measured 27K TPS baseline:
 | BlockSTM parallel execution | 3-5x | Implemented |
 | GPU-resident state | 2-4x | Implemented |
 | Pipelined block production | 1.5-2x | Implemented |
+| STARK proof generation | per-block | Implemented (mock + Stwo) |
+| DA erasure coding | per-block | Implemented |
 
-**Projected single-machine:** 300K-1.3M TPS (A100/H100 server)
+**Measured single-node:** 69.3K TPS (M4), **Projected:** 300K-1.3M TPS (A100/H100)
 **Projected multi-node:** 1B+ TPS (100 H100 nodes with sharding)
 
 ---
