@@ -17,6 +17,9 @@ pub struct Account {
     pub code_hash: Hash256,
     /// Storage root (Merkle root of contract storage).
     pub storage_root: Hash256,
+    /// Amount staked by this account (locked, not spendable).
+    #[serde(default)]
+    pub staked_balance: u64,
 }
 
 impl Account {
@@ -28,6 +31,7 @@ impl Account {
             nonce: 0,
             code_hash: Hash256::ZERO,
             storage_root: Hash256::ZERO,
+            staked_balance: 0,
         }
     }
 
@@ -39,6 +43,7 @@ impl Account {
             nonce: 0,
             code_hash,
             storage_root: Hash256::ZERO,
+            staked_balance: 0,
         }
     }
 

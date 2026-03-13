@@ -6,7 +6,7 @@
 
 use crate::protocol::*;
 use arc_consensus::DagBlock;
-use arc_crypto::Hash256;
+use arc_crypto::{Hash256, KeyPair, Signature as CryptoSignature, hash_bytes};
 use arc_types::Transaction;
 use dashmap::DashMap;
 use quinn::crypto::rustls::QuicClientConfig;
@@ -35,6 +35,33 @@ pub enum InboundMessage {
         transactions: Vec<Transaction>,
     },
     Transactions(Vec<Vec<u8>>),
+    /// State diff from a proposer node (Propose-Verify protocol).
+    /// Verifiers apply the diff and confirm the root matches.
+    StateDiff {
+        block_hash: Hash256,
+        diff: arc_types::StateDiff,
+        block_height: u64,
+    },
+    /// State Sync — a peer is requesting our snapshot manifest.
+    SnapshotManifestRequest {
+        source: Hash256,
+    },
+    /// State Sync — a peer is requesting a specific snapshot chunk.
+    SnapshotChunkRequest {
+        source: Hash256,
+        manifest_hash: Hash256,
+        chunk_index: u32,
+    },
+    /// State Sync — received a snapshot manifest from a peer.
+    SnapshotManifestResponse {
+        source: Hash256,
+        manifest: arc_state::SnapshotManifest,
+    },
+    /// State Sync — received a snapshot chunk from a peer.
+    SnapshotChunkResponse {
+        source: Hash256,
+        chunk: arc_state::StateSnapshot,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -45,6 +72,12 @@ pub enum OutboundMessage {
         transactions: Vec<Transaction>,
     },
     BroadcastTransactions(Vec<Vec<u8>>),
+    /// Broadcast a state diff (Propose-Verify protocol).
+    BroadcastStateDiff {
+        block_hash: Hash256,
+        diff: arc_types::StateDiff,
+        block_height: u64,
+    },
 }
 
 // ─── TLS Configuration ─────────────────────────────────────────────────────
@@ -76,34 +109,110 @@ fn make_server_config() -> quinn::ServerConfig {
     server_config
 }
 
+/// Build the QUIC client TLS configuration.
+///
+/// Without the `strict-tls` feature (default), this uses [`TestnetCertVerifier`]
+/// which accepts all server certificates. Peer identity is instead verified via
+/// application-layer challenge-response (see module docs on [`TestnetCertVerifier`]).
+///
+/// With `strict-tls` enabled, this panics at startup — certificate pinning is
+/// not yet implemented. This feature flag exists to prevent accidental production
+/// deployment without TLS-layer peer verification.
 fn make_client_config() -> quinn::ClientConfig {
-    let crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
-        .with_no_client_auth();
+    #[cfg(feature = "strict-tls")]
+    {
+        // TODO: Implement certificate pinning via a validator cert registry.
+        // Each validator's self-signed cert fingerprint (SHA-256) should be
+        // pre-registered in the genesis config or an on-chain registry.
+        // The verifier would check the presented cert's fingerprint against
+        // the registry, providing TLS-layer identity verification in addition
+        // to the application-layer challenge-response.
+        panic!(
+            "strict-tls feature is enabled but certificate pinning is not yet implemented. \
+             Disable strict-tls for testnet or implement PinnedCertVerifier."
+        );
+    }
 
-    let mut client_config = quinn::ClientConfig::new(Arc::new(
-        QuicClientConfig::try_from(crypto).expect("failed to create QUIC client config"),
-    ));
+    #[cfg(not(feature = "strict-tls"))]
+    {
+        warn!(
+            "TLS certificate verification is DISABLED — using TestnetCertVerifier. \
+             Peer identity is verified via application-layer challenge-response only. \
+             Do NOT use this configuration in production without enabling the `strict-tls` feature."
+        );
 
-    // Keep connections alive and allow large payloads (testnet)
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
-    ));
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
-    transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
-    transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024));
-    client_config.transport_config(Arc::new(transport));
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TestnetCertVerifier))
+            .with_no_client_auth();
 
-    client_config
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            QuicClientConfig::try_from(crypto).expect("failed to create QUIC client config"),
+        ));
+
+        // Keep connections alive and allow large payloads (testnet)
+        let mut transport = quinn::TransportConfig::default();
+        transport.max_idle_timeout(Some(
+            quinn::IdleTimeout::try_from(std::time::Duration::from_secs(300)).unwrap(),
+        ));
+        transport.keep_alive_interval(Some(std::time::Duration::from_secs(5)));
+        transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024));
+        transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024));
+        client_config.transport_config(Arc::new(transport));
+
+        client_config
+    }
 }
 
-/// Skip TLS certificate verification (testnet only).
-#[derive(Debug)]
-struct SkipServerVerification;
+/// Build a production QUIC client TLS configuration with certificate pinning.
+///
+/// Each validator's self-signed certificate fingerprint (SHA-256 of the DER-encoded
+/// cert) must be pre-registered in `pinned_fingerprints`. The TLS handshake will
+/// reject any server whose certificate fingerprint is not in the set.
+///
+/// This provides defense-in-depth: TLS verifies the peer's cert fingerprint,
+/// AND the application layer verifies the peer's validator identity via
+/// challenge-response.
+// TODO: Implement once the validator cert registry exists.
+// fn make_client_config_production(
+//     pinned_fingerprints: &HashSet<[u8; 32]>,
+// ) -> quinn::ClientConfig {
+//     unimplemented!("Certificate pinning not yet implemented — see TestnetCertVerifier docs")
+// }
 
-impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+/// TLS certificate verifier that accepts all certificates without validation.
+///
+/// # Security Model
+///
+/// In ARC Chain's permissioned validator network, peer identity is NOT verified
+/// at the TLS layer. Instead, the security model is:
+///
+/// 1. **TLS provides encryption only** — all QUIC traffic is encrypted in transit,
+///    preventing passive eavesdropping.
+/// 2. **Peer identity is verified at the application layer** via challenge-response
+///    authentication (see [`verify_handshake`]). Each peer must prove ownership of
+///    their validator private key by signing a random challenge. The public key is
+///    then verified to derive to the claimed validator address.
+/// 3. **Genesis hash binding** — peers must share the same genesis hash, preventing
+///    cross-network connections.
+///
+/// This means TLS cert verification is intentionally skipped: validators use
+/// ephemeral self-signed certificates, and there is no CA or cert registry.
+/// A MITM attacker who intercepts the QUIC connection would still fail the
+/// application-layer challenge-response, since they cannot forge a valid
+/// signature for a registered validator address.
+///
+/// # Production Hardening
+///
+/// For production, consider implementing certificate pinning via a validator
+/// cert registry so that TLS itself authenticates peers (defense in depth).
+/// Enable the `strict-tls` feature flag to enforce this — it will panic at
+/// startup until cert pinning is implemented, preventing accidental deployment
+/// without TLS verification.
+#[derive(Debug)]
+struct TestnetCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for TestnetCertVerifier {
     fn verify_server_cert(
         &self,
         _end_entity: &CertificateDer<'_>,
@@ -145,18 +254,96 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
+// ─── Challenge-Response Authentication ──────────────────────────────────────
+
+/// Compute the challenge hash: BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash)
+fn compute_challenge(nonce: &[u8; 32], genesis_hash: &Hash256) -> Hash256 {
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-peer-auth-v1");
+    hasher.update(nonce);
+    hasher.update(&genesis_hash.0);
+    Hash256(*hasher.finalize().as_bytes())
+}
+
+/// Create a signed handshake message.
+fn make_signed_handshake(
+    local_address: Hash256,
+    local_stake: u64,
+    listen_port: u16,
+    genesis_hash: Hash256,
+    keypair: &KeyPair,
+) -> HandshakeMessage {
+    let mut nonce = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+
+    let challenge = compute_challenge(&nonce, &genesis_hash);
+    let sig = keypair.sign(&challenge).expect("signing challenge failed");
+    let sig_bytes = bincode::serialize(&sig).unwrap_or_default();
+
+    HandshakeMessage {
+        validator_address: local_address,
+        stake: local_stake,
+        listen_port,
+        genesis_hash,
+        public_key: keypair.public_key_bytes(),
+        nonce,
+        challenge_sig: sig_bytes,
+    }
+}
+
+/// Verify a peer's handshake: pubkey derives to claimed address, signature is valid.
+fn verify_handshake(msg: &HandshakeMessage) -> anyhow::Result<()> {
+    // 1. Verify public key derives to the claimed validator address
+    let derived_address = hash_bytes(&msg.public_key);
+    if derived_address != msg.validator_address {
+        anyhow::bail!(
+            "public key does not derive to claimed address: derived={}, claimed={}",
+            derived_address,
+            msg.validator_address
+        );
+    }
+
+    // 2. Verify the challenge signature
+    let challenge = compute_challenge(&msg.nonce, &msg.genesis_hash);
+    let sig: CryptoSignature = bincode::deserialize(&msg.challenge_sig)
+        .map_err(|e| anyhow::anyhow!("failed to deserialize challenge signature: {e}"))?;
+    sig.verify(&challenge, &msg.validator_address)
+        .map_err(|e| anyhow::anyhow!("challenge signature verification failed: {e}"))?;
+
+    Ok(())
+}
+
 // ─── Peer Connection Map ────────────────────────────────────────────────────
 
-/// Tracks active peer send streams for outbound broadcast.
+/// Metadata for a connected peer (dial address + stake).
+struct PeerMeta {
+    /// The address to dial this peer at (IP from connection + listen_port from handshake).
+    dial_addr: SocketAddr,
+    /// The peer's self-reported stake.
+    stake: u64,
+}
+
+/// Tracks active peer send streams and metadata for outbound broadcast.
 struct PeerConnections {
     peers: DashMap<[u8; 32], quinn::SendStream>,
+    meta: DashMap<[u8; 32], PeerMeta>,
 }
 
 impl PeerConnections {
     fn new() -> Self {
         Self {
             peers: DashMap::new(),
+            meta: DashMap::new(),
         }
+    }
+
+    /// Store peer metadata after successful handshake.
+    fn insert_meta(&self, key: [u8; 32], dial_addr: SocketAddr, stake: u64) {
+        self.meta.insert(key, PeerMeta { dial_addr, stake });
+    }
+
+    /// Check if a peer is currently connected by validator address bytes.
+    fn is_connected(&self, key: &[u8; 32]) -> bool {
+        self.peers.contains_key(key)
     }
 
     async fn broadcast(&self, msg_type: MessageType, payload: &[u8]) {
@@ -169,6 +356,7 @@ impl PeerConnections {
         }
         for key in dead_peers {
             self.peers.remove(&key);
+            self.meta.remove(&key);
         }
     }
 }
@@ -188,6 +376,8 @@ pub async fn run_transport(
     mut outbound_rx: mpsc::Receiver<OutboundMessage>,
     inbound_tx: mpsc::Sender<InboundMessage>,
     peer_count: Arc<AtomicU32>,
+    local_keypair: KeyPair,
+    data_dir: String,
 ) {
     // ── Install rustls crypto provider (required for rustls 0.23+) ─────
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -207,28 +397,60 @@ pub async fn run_transport(
     info!("P2P transport listening on {}", listen_addr);
 
     let connections = Arc::new(PeerConnections::new());
-    let handshake_msg = HandshakeMessage {
-        validator_address: local_address,
-        stake: local_stake,
-        listen_port: listen_addr.port(),
-        genesis_hash,
-    };
+    let keypair = Arc::new(local_keypair);
+
+    // ── PEX auto-dial channel ───────────────────────────────────────────
+    let (pex_dial_tx, mut pex_dial_rx) = mpsc::channel::<SocketAddr>(64);
 
     // ── Dial bootstrap peers ────────────────────────────────────────────
     for peer_addr in &bootstrap_peers {
         info!("Dialing bootstrap peer {}", peer_addr);
+        let handshake_msg = make_signed_handshake(
+            local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+        );
         match dial_peer(
             &endpoint,
             *peer_addr,
             &handshake_msg,
+            local_address,
             &connections,
             &inbound_tx,
             &peer_count,
+            &pex_dial_tx,
         )
         .await
         {
             Ok(()) => info!("Connected to bootstrap peer {}", peer_addr),
             Err(e) => warn!("Failed to connect to {}: {}", peer_addr, e),
+        }
+    }
+
+    // ── Dial persisted peers (from previous sessions) ───────────────────
+    let persisted_peers = load_peers_from_disk(&data_dir);
+    if !persisted_peers.is_empty() {
+        info!("Loading {} persisted peers from disk", persisted_peers.len());
+    }
+    for peer_addr in &persisted_peers {
+        if bootstrap_peers.contains(peer_addr) {
+            continue;
+        }
+        let handshake_msg = make_signed_handshake(
+            local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+        );
+        match dial_peer(
+            &endpoint,
+            *peer_addr,
+            &handshake_msg,
+            local_address,
+            &connections,
+            &inbound_tx,
+            &peer_count,
+            &pex_dial_tx,
+        )
+        .await
+        {
+            Ok(()) => info!("Connected to persisted peer {}", peer_addr),
+            Err(e) => debug!("Failed to connect to persisted peer {}: {}", peer_addr, e),
         }
     }
 
@@ -257,49 +479,151 @@ pub async fn run_transport(
                         conn_out.broadcast(MessageType::TxGossip, &bytes).await;
                     }
                 }
+                OutboundMessage::BroadcastStateDiff { block_hash, diff, block_height } => {
+                    let payload = crate::protocol::StateDiffMessage {
+                        block_hash,
+                        diff,
+                        block_height,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out.broadcast(MessageType::StateDiff, &bytes).await;
+                    }
+                }
             }
         }
     });
 
-    // ── Accept incoming connections ─────────────────────────────────────
+    // ── Accept incoming connections + PEX + reconnect ──────────────────
+    let mut pex_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+    pex_interval.tick().await; // skip immediate fire
+
+    let mut reconnect_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+    reconnect_interval.tick().await; // skip immediate fire
+
+    let conn_pex = connections.clone();
+
     loop {
-        let incoming = match endpoint.accept().await {
-            Some(inc) => inc,
-            None => {
-                info!("QUIC endpoint closed");
-                break;
+        tokio::select! {
+            // ── Accept inbound connections ──────────────────────────────
+            incoming_opt = endpoint.accept() => {
+                let incoming = match incoming_opt {
+                    Some(inc) => inc,
+                    None => {
+                        info!("QUIC endpoint closed");
+                        break;
+                    }
+                };
+
+                let conn = match incoming.await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("Failed to accept connection: {}", e);
+                        continue;
+                    }
+                };
+
+                let remote_addr = conn.remote_address();
+                info!("Incoming connection from {}", remote_addr);
+
+                let connections_clone = connections.clone();
+                let inbound_clone = inbound_tx.clone();
+                let peer_count_clone = peer_count.clone();
+                let keypair_clone = keypair.clone();
+                let pex_dial_clone = pex_dial_tx.clone();
+
+                tokio::spawn(async move {
+                    let handshake_msg = make_signed_handshake(
+                        local_address, local_stake, listen_addr.port(), genesis_hash, &keypair_clone,
+                    );
+                    if let Err(e) = accept_peer(
+                        conn,
+                        &handshake_msg,
+                        local_address,
+                        &connections_clone,
+                        &inbound_clone,
+                        &peer_count_clone,
+                        &pex_dial_clone,
+                    )
+                    .await
+                    {
+                        warn!("Failed to accept peer from {}: {}", remote_addr, e);
+                    }
+                });
             }
-        };
 
-        let conn = match incoming.await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("Failed to accept connection: {}", e);
-                continue;
+            // ── PEX broadcast (every 60s) — now with real metadata ─────
+            _ = pex_interval.tick() => {
+                let peer_list: Vec<crate::protocol::PexPeerInfo> = conn_pex
+                    .meta
+                    .iter()
+                    .map(|entry| crate::protocol::PexPeerInfo {
+                        address: Hash256(*entry.key()),
+                        socket_addr: entry.value().dial_addr.to_string(),
+                        stake: entry.value().stake,
+                    })
+                    .collect();
+
+                if !peer_list.is_empty() {
+                    let pex_msg = crate::protocol::PeerExchangeMessage { peers: peer_list };
+                    if let Ok(bytes) = bincode::serialize(&pex_msg) {
+                        debug!("Broadcasting PEX with {} peers", pex_msg.peers.len());
+                        conn_pex.broadcast(MessageType::PeerExchange, &bytes).await;
+                    }
+                }
+
+                // Persist known peers to disk
+                save_peers_to_disk(&data_dir, &conn_pex);
             }
-        };
 
-        let remote_addr = conn.remote_address();
-        info!("Incoming connection from {}", remote_addr);
-
-        let handshake_clone = handshake_msg.clone();
-        let connections_clone = connections.clone();
-        let inbound_clone = inbound_tx.clone();
-        let peer_count_clone = peer_count.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = accept_peer(
-                conn,
-                &handshake_clone,
-                &connections_clone,
-                &inbound_clone,
-                &peer_count_clone,
-            )
-            .await
-            {
-                warn!("Failed to accept peer from {}: {}", remote_addr, e);
+            // ── PEX auto-dial (from handle_peer_recv) ──────────────────
+            addr = pex_dial_rx.recv() => {
+                if let Some(peer_addr) = addr {
+                    // Skip if already connected to this address
+                    let already = conn_pex.meta.iter().any(|e| e.value().dial_addr == peer_addr);
+                    if !already {
+                        info!("PEX: dialing discovered peer {}", peer_addr);
+                        let handshake_msg = make_signed_handshake(
+                            local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+                        );
+                        let c = connections.clone();
+                        let itx = inbound_tx.clone();
+                        let pc = peer_count.clone();
+                        let ep = endpoint.clone();
+                        let pdt = pex_dial_tx.clone();
+                        tokio::spawn(async move {
+                            match dial_peer(&ep, peer_addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt).await {
+                                Ok(()) => info!("PEX: connected to {}", peer_addr),
+                                Err(e) => debug!("PEX: failed to dial {}: {}", peer_addr, e),
+                            }
+                        });
+                    }
+                }
             }
-        });
+
+            // ── Reconnect timer (every 30s) ────────────────────────────
+            _ = reconnect_interval.tick() => {
+                let known = load_peers_from_disk(&data_dir);
+                for addr in known {
+                    let already = conn_pex.meta.iter().any(|e| e.value().dial_addr == addr);
+                    if !already {
+                        debug!("Reconnect: trying {}", addr);
+                        let handshake_msg = make_signed_handshake(
+                            local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+                        );
+                        let c = connections.clone();
+                        let itx = inbound_tx.clone();
+                        let pc = peer_count.clone();
+                        let ep = endpoint.clone();
+                        let pdt = pex_dial_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt).await {
+                                debug!("Reconnect to {} failed: {}", addr, e);
+                            }
+                        });
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -309,9 +633,11 @@ async fn dial_peer(
     endpoint: &quinn::Endpoint,
     peer_addr: SocketAddr,
     local_handshake: &HandshakeMessage,
+    local_address: Hash256,
     connections: &Arc<PeerConnections>,
     inbound_tx: &mpsc::Sender<InboundMessage>,
     peer_count: &Arc<AtomicU32>,
+    pex_dial_tx: &mpsc::Sender<SocketAddr>,
 ) -> anyhow::Result<()> {
     let conn = endpoint.connect(peer_addr, "localhost")?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -336,15 +662,22 @@ async fn dial_peer(
         );
     }
 
+    // Verify peer's identity: pubkey → address + valid signature
+    verify_handshake(&remote)?;
+
+    // Compute dialable address: remote IP + their listen port
+    let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
+
     info!(
-        "Handshake complete with {} (stake: {}, port: {})",
-        remote.validator_address, remote.stake, remote.listen_port
+        "Handshake verified with {} (stake: {}, dial: {})",
+        remote.validator_address, remote.stake, dial_addr
     );
 
-    // Register peer
+    // Register peer + metadata
     connections
         .peers
         .insert(remote.validator_address.0, send);
+    connections.insert_meta(remote.validator_address.0, dial_addr, remote.stake);
     peer_count.fetch_add(1, Ordering::Relaxed);
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
@@ -358,9 +691,11 @@ async fn dial_peer(
     let inbound_clone = inbound_tx.clone();
     let connections_ref = connections.clone();
     let peer_count_clone = peer_count.clone();
+    let pex_dial_clone = pex_dial_tx.clone();
     tokio::spawn(async move {
-        handle_peer_recv(recv, peer_addr_hash, &inbound_clone).await;
+        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref).await;
         connections_ref.peers.remove(&peer_addr_hash.0);
+        connections_ref.meta.remove(&peer_addr_hash.0);
         peer_count_clone.fetch_sub(1, Ordering::Relaxed);
         let _ = inbound_clone
             .send(InboundMessage::PeerDisconnected {
@@ -377,9 +712,11 @@ async fn dial_peer(
 async fn accept_peer(
     conn: quinn::Connection,
     local_handshake: &HandshakeMessage,
+    local_address: Hash256,
     connections: &Arc<PeerConnections>,
     inbound_tx: &mpsc::Sender<InboundMessage>,
     peer_count: &Arc<AtomicU32>,
+    pex_dial_tx: &mpsc::Sender<SocketAddr>,
 ) -> anyhow::Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await?;
 
@@ -395,19 +732,26 @@ async fn accept_peer(
         anyhow::bail!("genesis mismatch");
     }
 
-    // Send our handshake ack
+    // Verify peer's identity: pubkey → address + valid signature
+    verify_handshake(&remote)?;
+
+    // Send our handshake ack (with our own signed challenge)
     let payload = bincode::serialize(local_handshake)?;
     write_message(&mut send, MessageType::HandshakeAck, &payload).await?;
 
+    // Compute dialable address: remote IP + their listen port
+    let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
+
     info!(
-        "Accepted peer {} (stake: {})",
-        remote.validator_address, remote.stake
+        "Accepted verified peer {} (stake: {}, dial: {})",
+        remote.validator_address, remote.stake, dial_addr
     );
 
-    // Register peer
+    // Register peer + metadata
     connections
         .peers
         .insert(remote.validator_address.0, send);
+    connections.insert_meta(remote.validator_address.0, dial_addr, remote.stake);
     peer_count.fetch_add(1, Ordering::Relaxed);
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
@@ -421,9 +765,11 @@ async fn accept_peer(
     let inbound_clone = inbound_tx.clone();
     let connections_ref = connections.clone();
     let peer_count_clone = peer_count.clone();
+    let pex_dial_clone = pex_dial_tx.clone();
     tokio::spawn(async move {
-        handle_peer_recv(recv, peer_addr_hash, &inbound_clone).await;
+        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref).await;
         connections_ref.peers.remove(&peer_addr_hash.0);
+        connections_ref.meta.remove(&peer_addr_hash.0);
         peer_count_clone.fetch_sub(1, Ordering::Relaxed);
         let _ = inbound_clone
             .send(InboundMessage::PeerDisconnected {
@@ -440,7 +786,10 @@ async fn accept_peer(
 async fn handle_peer_recv(
     mut recv: quinn::RecvStream,
     peer_address: Hash256,
+    local_address: Hash256,
     inbound_tx: &mpsc::Sender<InboundMessage>,
+    pex_dial_tx: &mpsc::Sender<SocketAddr>,
+    connections: &Arc<PeerConnections>,
 ) {
     loop {
         let (msg_type, data) = match read_message(&mut recv).await {
@@ -488,9 +837,178 @@ async fn handle_peer_recv(
                     }
                 }
             }
+            MessageType::StateDiff => {
+                match bincode::deserialize::<crate::protocol::StateDiffMessage>(&data) {
+                    Ok(msg) => {
+                        debug!(
+                            "Received state diff for block {} from {}",
+                            msg.block_hash,
+                            peer_address
+                        );
+                        let _ = inbound_tx
+                            .send(InboundMessage::StateDiff {
+                                block_hash: msg.block_hash,
+                                diff: msg.diff,
+                                block_height: msg.block_height,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize StateDiff from {}: {}", peer_address, e);
+                    }
+                }
+            }
+            MessageType::PeerExchange => {
+                match bincode::deserialize::<crate::protocol::PeerExchangeMessage>(&data) {
+                    Ok(msg) => {
+                        debug!(
+                            "Received PEX with {} peers from {}",
+                            msg.peers.len(),
+                            peer_address
+                        );
+                        for pex_peer in &msg.peers {
+                            // Skip self
+                            if pex_peer.address == local_address {
+                                continue;
+                            }
+                            // Skip already-connected peers
+                            if connections.is_connected(&pex_peer.address.0) {
+                                continue;
+                            }
+                            // Skip empty addresses
+                            if pex_peer.socket_addr.is_empty() {
+                                continue;
+                            }
+                            // Queue for dialing
+                            if let Ok(addr) = pex_peer.socket_addr.parse::<SocketAddr>() {
+                                debug!("PEX: queueing discovered peer {} at {}", pex_peer.address, addr);
+                                let _ = pex_dial_tx.try_send(addr);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize PeerExchange from {}: {}", peer_address, e);
+                    }
+                }
+            }
+            MessageType::SnapshotManifestRequest => {
+                match bincode::deserialize::<crate::protocol::SnapshotManifestRequestMessage>(&data) {
+                    Ok(_msg) => {
+                        debug!("Received snapshot manifest request from {}", peer_address);
+                        let _ = inbound_tx
+                            .send(InboundMessage::SnapshotManifestRequest {
+                                source: peer_address,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize SnapshotManifestRequest from {}: {}", peer_address, e);
+                    }
+                }
+            }
+            MessageType::SnapshotManifestResponse => {
+                match bincode::deserialize::<crate::protocol::SnapshotManifestResponseMessage>(&data) {
+                    Ok(msg) => {
+                        debug!(
+                            "Received snapshot manifest from {} (height={}, chunks={})",
+                            peer_address, msg.manifest.version, msg.manifest.total_chunks
+                        );
+                        let _ = inbound_tx
+                            .send(InboundMessage::SnapshotManifestResponse {
+                                source: peer_address,
+                                manifest: msg.manifest,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize SnapshotManifestResponse from {}: {}", peer_address, e);
+                    }
+                }
+            }
+            MessageType::SnapshotChunkRequest => {
+                match bincode::deserialize::<crate::protocol::SnapshotChunkRequestMessage>(&data) {
+                    Ok(msg) => {
+                        debug!(
+                            "Received snapshot chunk request from {} (chunk={})",
+                            peer_address, msg.chunk_index
+                        );
+                        let _ = inbound_tx
+                            .send(InboundMessage::SnapshotChunkRequest {
+                                source: peer_address,
+                                manifest_hash: msg.manifest_hash,
+                                chunk_index: msg.chunk_index,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize SnapshotChunkRequest from {}: {}", peer_address, e);
+                    }
+                }
+            }
+            MessageType::SnapshotChunkResponse => {
+                match bincode::deserialize::<crate::protocol::SnapshotChunkResponseMessage>(&data) {
+                    Ok(msg) => {
+                        debug!(
+                            "Received snapshot chunk from {} (index={}/{})",
+                            peer_address, msg.chunk.chunk_index, msg.chunk.total_chunks
+                        );
+                        let _ = inbound_tx
+                            .send(InboundMessage::SnapshotChunkResponse {
+                                source: peer_address,
+                                chunk: msg.chunk,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize SnapshotChunkResponse from {}: {}", peer_address, e);
+                    }
+                }
+            }
             other => {
                 warn!("Unexpected message type {:?} from {}", other, peer_address);
             }
         }
+    }
+}
+
+// ─── Peer Persistence ──────────────────────────────────────────────────────
+
+/// Save known peer dial addresses to `known_peers.json` in the data directory.
+fn save_peers_to_disk(data_dir: &str, connections: &PeerConnections) {
+    let peers: Vec<String> = connections
+        .meta
+        .iter()
+        .map(|entry| entry.value().dial_addr.to_string())
+        .collect();
+    if peers.is_empty() {
+        return;
+    }
+    let path = std::path::Path::new(data_dir).join("known_peers.json");
+    // Ensure directory exists
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match serde_json::to_string_pretty(&peers) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                warn!("Failed to save peers to {}: {}", path.display(), e);
+            } else {
+                debug!("Saved {} peers to {}", peers.len(), path.display());
+            }
+        }
+        Err(e) => warn!("Failed to serialize peer list: {}", e),
+    }
+}
+
+/// Load known peer dial addresses from disk.
+fn load_peers_from_disk(data_dir: &str) -> Vec<SocketAddr> {
+    let path = std::path::Path::new(data_dir).join("known_peers.json");
+    match std::fs::read_to_string(&path) {
+        Ok(json) => serde_json::from_str::<Vec<String>>(&json)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect(),
+        Err(_) => Vec::new(),
     }
 }

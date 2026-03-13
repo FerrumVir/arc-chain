@@ -1,0 +1,23 @@
+[package]
+name = "arc-cli"
+description = "ARC Chain CLI — key management, queries, transactions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "arc"
+path = "src/main.rs"
+
+[dependencies]
+arc-crypto = { path = "../arc-crypto" }
+arc-types = { path = "../arc-types" }
+clap.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+ed25519-dalek.workspace = true
+k256.workspace = true

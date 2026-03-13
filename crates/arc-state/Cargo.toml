@@ -5,9 +5,14 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+stwo-prover = ["arc-crypto/stwo-prover"]
+
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
+arc-gpu = { path = "../arc-gpu" }
 serde.workspace = true
 bincode.workspace = true
 dashmap.workspace = true
@@ -21,3 +26,4 @@ thiserror.workspace = true
 tracing.workspace = true
 wasmer.workspace = true
 ed25519-dalek.workspace = true
+libc = "0.2"
