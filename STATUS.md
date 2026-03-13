@@ -2,10 +2,10 @@
 
 > **Version**: 0.2.0 (pre-mainnet, L1 scaling)
 > **Last updated**: 2026-03-13
-> **Codebase**: 75,001 LOC Rust (11 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
-> **Tests**: 1,050 passing, 0 failures
+> **Codebase**: 75,285 LOC Rust (11 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
+> **Tests**: 1,028 passing, 0 failures
 > **TX Types**: 21 (16 core + 5 L1 scaling)
-> **Benchmark**: 27K TPS sustained (M4 MacBook, 2 validators, real consensus)
+> **Benchmark**: 69.3K TPS single-node peak (M4 MacBook, BlockSTM + Coalesce)
 
 ---
 
@@ -25,15 +25,15 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 | Crate | LOC | Tests | Status | What It Does |
 |-------|-----|-------|--------|-------------|
-| **arc-crypto** | ~8,200 | 126 | Production | Ed25519, Secp256k1, BLS (blst), BLAKE3, ML-DSA, Falcon-512, VRF, threshold crypto, Merkle trees, Pedersen commitments, ZK circuits, Stwo STARK prover |
-| **arc-types** | ~5,800 | 258 | Production | 21 transaction types (16 core + 5 L1 scaling), block/header, protocol versioning, governance, economics (EIP-1559), staking tiers, bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs |
-| **arc-state** | ~7,800 | 60 | Production | DashMap state, JMT (Jellyfish Merkle Tree) with inclusion + non-membership proofs, WAL persistence (CRC32 + LZ4), snapshots, BlockSTM parallel execution, GPU-resident state cache (Metal unified memory / CPU fallback), light client proofs, state sync |
-| **arc-vm** | ~3,900 | 32 | Production | Wasmer 6.0 WASM runtime, revm 19 EVM, gas metering, host imports, precompiles (Ed25519/Secp256k1/BLS/BLAKE3/SHA256), AI inference oracle, formal verification model-checker |
-| **arc-mempool** | ~1,200 | 17 | Production | SegQueue FIFO, deduplication, encrypted mempool (BLS threshold, feature-flagged), capacity limits |
-| **arc-consensus** | ~4,500 | 26 | Production | Mysticeti-inspired DAG, 2-round finality, stake tiers (Spark/Arc/Core), slashing (equivocation + liveness), cross-shard coordination, canonical TX ordering (MEV protection), epoch transitions |
-| **arc-net** | ~2,800 | 31+ | Production | QUIC transport (quinn), shred propagation with XOR FEC, TX gossip, challenge-response peer auth, stake-weighted peer selection, PEX (peer exchange protocol) |
-| **arc-node** | ~7,100 | 17 | Production | Consensus manager with VRF proposer selection, signature verification pipeline, RPC API (20+ HTTP + ETH JSON-RPC), propose-verify mode |
-| **arc-gpu** | ~2,400 | 32 | Production | Metal MSL + WGSL Ed25519 batch verification, branchless Shamir's trick, buffer pool, async dispatch, SigVerifyCache, GPU account buffer (unified/managed/CPU-only memory) |
+| **arc-crypto** | 11,680 | 220 | Production | Ed25519, Secp256k1, BLS (blst), BLAKE3, ML-DSA, Falcon-512, VRF, threshold crypto, Merkle trees, Pedersen commitments, ZK circuits, Stwo STARK prover |
+| **arc-types** | 14,071 | 258 | Production | 21 transaction types (16 core + 5 L1 scaling), block/header, protocol versioning, governance, economics (EIP-1559), staking tiers, bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs |
+| **arc-state** | 12,127 | 138 | Production | DashMap state, JMT (Jellyfish Merkle Tree) with inclusion + non-membership proofs, WAL persistence (CRC32 + LZ4), snapshots, BlockSTM parallel execution, GPU-resident state cache (Metal unified memory / CPU fallback), light client proofs, state sync |
+| **arc-vm** | 8,439 | 145 | Production | Wasmer 6.0 WASM runtime, revm 19 EVM, gas metering, host imports, 11 precompiles (Ed25519/Secp256k1/BLS/BLAKE3/SHA256/VRF/Oracle/Merkle/Falcon/ZK-verify/AI-inference), AI inference oracle, formal verification model-checker |
+| **arc-mempool** | 876 | 17 | Production | SegQueue FIFO, deduplication, encrypted mempool (BLS threshold, wired into ConsensusManager), capacity limits |
+| **arc-consensus** | 7,523 | 126 | Production | Mysticeti-inspired DAG, 2-round finality, stake tiers (Spark/Arc/Core), slashing (equivocation + liveness), cross-shard coordination, canonical TX ordering (MEV protection), epoch transitions |
+| **arc-net** | 2,355 | 26 | Production | QUIC transport (quinn), shred propagation with XOR FEC, TX gossip, challenge-response peer auth, stake-weighted peer selection, PEX (peer exchange protocol) |
+| **arc-node** | 8,408 | 61 | Production | Consensus manager with VRF proposer selection, signature verification pipeline, RPC API (20+ HTTP + ETH JSON-RPC), propose-verify mode, STARK proof generation, DA erasure coding, encrypted mempool integration |
+| **arc-gpu** | 3,810 | 37 | Production | Metal MSL + WGSL Ed25519 batch verification, branchless Shamir's trick, buffer pool, async dispatch, SigVerifyCache, GPU account buffer (unified/managed/CPU-only memory) |
 | **arc-bench** | 5,336 | — | Tool | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
 | **arc-cli** | 660 | — | Tool | Command-line client: keygen, RPC queries, transaction submission |
 
@@ -86,7 +86,7 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | VRF proposer selection | DONE | Wired into ConsensusManager (2026-03-06) |
 | View change / timeout | DONE | force_advance_round() with relaxed parent check |
 | Canonical TX ordering (MEV) | DONE | Lexicographic by hash, ordering_commitment verified |
-| Encrypted mempool | DONE | BLS threshold, feature-flagged, FIFO ordering |
+| Encrypted mempool | DONE | wired into ConsensusManager — slot-based commit-reveal, BLS threshold decryption after block commit |
 | Cross-shard coordination | DONE | Lock/commit/abort state machine, 30s timeout |
 | Epoch transitions | DONE | Validator reward calculation, set updates |
 | Protocol versioning | DONE | Semantic versions, upgrade schedule, feature flags |
@@ -114,8 +114,11 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | Gas metering | DONE | Per-operation costs, OutOfGas handling |
 | Contract deployment | DONE | Address = BLAKE3(deployer ‖ nonce), bytecode storage |
 | Cross-contract calls | DONE | Synchronous, value passing |
-| Precompiles | DONE | Ed25519, Secp256k1, BLS, BLAKE3, SHA256, modexp |
+| Precompiles | DONE | 11 precompiles: BLAKE3, Ed25519, VRF, Oracle, Merkle, BlockInfo, Identity, Falcon-512, ZK-verify, AI-inference, BLS-verify |
 | AI inference oracle | DONE | Model ID + input/output hash on-chain |
+| STARK proof generation | DONE | Mock BLAKE3 on stable, real Stwo Circle STARK via --features stwo-prover (nightly) |
+| Proof compression | DONE | RLE + dictionary compression per block proof |
+| DA erasure coding | DONE | 4+2 Reed-Solomon encoding, Merkle commitment per block |
 
 ### State
 
@@ -233,16 +236,14 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 ---
 
-## Benchmark Results (2026-03-06)
+## Benchmark Results (2026-03-13)
 
 | Metric | Value |
 |--------|-------|
-| Sustained TPS (100K TX) | 19,800 |
-| Sustained TPS (500K TX) | 27,000 |
-| Peak TPS (1-second window) | 350,000 |
+| Best single-node TPS (CPU + BlockSTM + Coalesce) | 69,300 |
+| Best single-node ETH-weighted TPS | 17,600 |
+| Multi-node sustained (2 validators) | 27,000 |
 | Commit rate | 100% (500K/500K) |
-| Elapsed time (500K TX) | 18.5 seconds |
-| Blocks produced | 7 |
 | Hardware | Apple M4 MacBook Pro, 10 cores |
 | Validators | 2 (real QUIC, real consensus, real signatures) |
 
@@ -250,11 +251,12 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 | Hardware | Projected TPS | Basis |
 |----------|--------------|-------|
-| M4 MacBook (measured) | 27,000 | Actual benchmark |
-| EPYC 9654 (96 cores) | 162,000-270,000 | 6-10x CPU scaling |
+| M4 MacBook single-node (measured) | 69,300 | Actual benchmark (BlockSTM + Coalesce) |
+| M4 MacBook multi-node (measured) | 27,000 | Actual benchmark (2 validators) |
+| 100 nodes | 1,410,000 | Projected linear scaling |
+| 500 nodes | 6,170,000 | Projected linear scaling |
 | A100 (GPU sig verify) | 270,000-810,000 | 2-3x GPU batch verify |
 | H100 (GPU + CPU) | 540,000-1,350,000 | Compound scaling |
-| 128 validators (sharded) | 1,000,000+ | Linear shard scaling |
 
 ---
 
@@ -264,9 +266,10 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 1. **SPEC.md update** — Sync with actual implementation (21 TX types, VRF, PEX, FEC, governance, bridge, channels, shard proofs)
 2. **Channel counterparty tracking** — Store counterparty address in channel metadata on-chain so ChannelClose credits both parties
-3. **ShardProof ↔ Stwo integration** — Wire ShardProof TX to call `stwo_air::verify_recursive_proof()` for actual cryptographic verification
-4. **Governance auto-mutation** — Wire `apply_governance_outcome()` so proposals auto-execute on StateDB
-5. **A100/H100 benchmark** — Run multinode_bench on server hardware to validate projections
+3. **Governance auto-mutation** — Wire `apply_governance_outcome()` so proposals auto-execute on StateDB
+4. **Stwo real STARK proofs** — Requires nightly, available via `--features stwo-prover`
+5. **Bridge relayer service** — Event listener + proof submission for cross-chain relay
+6. **A100/H100 benchmark** — Run multinode_bench on server hardware to validate projections
 
 ### Short-term (1-3 months)
 
