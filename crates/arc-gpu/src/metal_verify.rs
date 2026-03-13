@@ -796,7 +796,7 @@ fn dispatch_ed25519_verify_timed(
 
     encoder.copy_buffer_to_buffer(&pool.output_buffer, 0, &pool.staging_buffer, 0, output_size);
     ctx.queue.submit(Some(encoder.finish()));
-    ctx.device.poll(wgpu::PollType::wait()).unwrap();
+    ctx.device.poll(wgpu::PollType::wait()).map_err(|e| format!("GPU poll error: {e:?}"))?;
 
     let compute_elapsed = t_compute.elapsed();
 
@@ -806,9 +806,9 @@ fn dispatch_ed25519_verify_timed(
     let buffer_slice = pool.staging_buffer.slice(..output_size);
     let (sender, receiver) = std::sync::mpsc::channel();
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        sender.send(result).unwrap();
+        let _ = sender.send(result);
     });
-    ctx.device.poll(wgpu::PollType::wait()).unwrap();
+    ctx.device.poll(wgpu::PollType::wait()).map_err(|e| format!("GPU poll error: {e:?}"))?;
     receiver
         .recv()
         .map_err(|e| format!("Channel error: {e}"))?
@@ -855,9 +855,9 @@ impl GpuVerifyFuture {
         let buffer_slice = self.staging_buffer.slice(..output_size);
         let (sender, receiver) = std::sync::mpsc::channel();
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
+            let _ = sender.send(result);
         });
-        ctx.device.poll(wgpu::PollType::wait()).unwrap();
+        ctx.device.poll(wgpu::PollType::wait()).map_err(|e| format!("GPU poll error: {e:?}"))?;
         receiver
             .recv()
             .map_err(|e| format!("Channel error: {e}"))?

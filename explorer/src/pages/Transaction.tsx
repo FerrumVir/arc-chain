@@ -157,6 +157,151 @@ function TransactionBodyDetails({ body }: { body: TransactionBody }) {
           <DetailRow label="Protocol"><span className="font-mono text-xs">{formatHash(body.protocol)}</span></DetailRow>
         </>
       );
+    case 'JoinValidator':
+      return (
+        <>
+          <DetailRow label="Public Key">
+            <span className="font-mono text-xs">
+              {Array.isArray(body.pubkey)
+                ? '0x' + body.pubkey.map((b: number) => b.toString(16).padStart(2, '0')).join('')
+                : String(body.pubkey)}
+            </span>
+          </DetailRow>
+          <DetailRow label="Initial Stake">{body.initial_stake.toLocaleString()} ARC</DetailRow>
+        </>
+      );
+    case 'LeaveValidator':
+      return (
+        <DetailRow label="Action">
+          <Badge variant="warning">Leave Validator Set</Badge>
+        </DetailRow>
+      );
+    case 'ClaimRewards':
+      return (
+        <DetailRow label="Action">
+          <Badge variant="success">Claim Staking Rewards</Badge>
+        </DetailRow>
+      );
+    case 'UpdateStake':
+      return (
+        <DetailRow label="New Stake">{body.new_stake.toLocaleString()} ARC</DetailRow>
+      );
+    case 'Governance':
+      return (
+        <>
+          <DetailRow label="Proposal ID">{body.proposal_id}</DetailRow>
+          <DetailRow label="Action">
+            <Badge variant="info">{body.action}</Badge>
+          </DetailRow>
+        </>
+      );
+    case 'BridgeLock':
+      return (
+        <>
+          <DetailRow label="Destination Chain">Chain #{body.destination_chain}</DetailRow>
+          <DetailRow label="Destination Address">
+            <span className="font-mono text-xs">
+              {Array.isArray(body.destination_address)
+                ? '0x' + body.destination_address.map((b: number) => b.toString(16).padStart(2, '0')).join('')
+                : String(body.destination_address)}
+            </span>
+          </DetailRow>
+          <DetailRow label="Amount">{body.amount.toLocaleString()} ARC</DetailRow>
+        </>
+      );
+    case 'BridgeMint':
+      return (
+        <>
+          <DetailRow label="Source Chain">Chain #{body.source_chain}</DetailRow>
+          <DetailRow label="Source TX">
+            <span className="font-mono text-xs">{formatHash(body.source_tx_hash)}</span>
+          </DetailRow>
+          <DetailRow label="Recipient">
+            <Link to={`/account/${body.recipient}`} className="font-mono text-xs text-arc-aquarius hover:text-arc-blue transition-colors">
+              {formatHash(body.recipient)}
+            </Link>
+          </DetailRow>
+          <DetailRow label="Amount">{body.amount.toLocaleString()} ARC</DetailRow>
+          <DetailRow label="Proof Size">{body.merkle_proof.length} bytes</DetailRow>
+        </>
+      );
+    case 'BatchSettle':
+      return (
+        <>
+          <DetailRow label="Entries">{body.entries.length} settlements</DetailRow>
+          {body.entries.slice(0, 10).map((entry: { agent_id: string; service_hash: string; amount: number }, i: number) => (
+            <DetailRow key={i} label={`Entry ${i + 1}`}>
+              <span className="flex flex-col gap-1">
+                <Link to={`/account/${entry.agent_id}`} className="font-mono text-xs text-arc-aquarius hover:text-arc-blue transition-colors">
+                  {formatHash(entry.agent_id)}
+                </Link>
+                <span className="text-xs text-arc-grey-500">{entry.amount.toLocaleString()} ARC</span>
+              </span>
+            </DetailRow>
+          ))}
+          {body.entries.length > 10 && (
+            <DetailRow label="">
+              <span className="text-xs text-arc-grey-600">...and {body.entries.length - 10} more</span>
+            </DetailRow>
+          )}
+        </>
+      );
+    case 'ChannelOpen':
+      return (
+        <>
+          <DetailRow label="Channel ID">
+            <span className="font-mono text-xs">{formatHash(body.channel_id)}</span>
+          </DetailRow>
+          <DetailRow label="Counterparty">
+            <Link to={`/account/${body.counterparty}`} className="font-mono text-xs text-arc-aquarius hover:text-arc-blue transition-colors">
+              {formatHash(body.counterparty)}
+            </Link>
+          </DetailRow>
+          <DetailRow label="Deposit">{body.deposit.toLocaleString()} ARC</DetailRow>
+          <DetailRow label="Timeout">{body.timeout_blocks.toLocaleString()} blocks</DetailRow>
+        </>
+      );
+    case 'ChannelClose':
+      return (
+        <>
+          <DetailRow label="Channel ID">
+            <span className="font-mono text-xs">{formatHash(body.channel_id)}</span>
+          </DetailRow>
+          <DetailRow label="Opener Balance">{body.opener_balance.toLocaleString()} ARC</DetailRow>
+          <DetailRow label="Counterparty Balance">{body.counterparty_balance.toLocaleString()} ARC</DetailRow>
+          <DetailRow label="State Nonce">{body.state_nonce}</DetailRow>
+        </>
+      );
+    case 'ChannelDispute':
+      return (
+        <>
+          <DetailRow label="Channel ID">
+            <span className="font-mono text-xs">{formatHash(body.channel_id)}</span>
+          </DetailRow>
+          <DetailRow label="Opener Balance">{body.opener_balance.toLocaleString()} ARC</DetailRow>
+          <DetailRow label="Counterparty Balance">{body.counterparty_balance.toLocaleString()} ARC</DetailRow>
+          <DetailRow label="State Nonce">{body.state_nonce}</DetailRow>
+          <DetailRow label="Challenge Period">{body.challenge_period.toLocaleString()} blocks</DetailRow>
+        </>
+      );
+    case 'ShardProof':
+      return (
+        <>
+          <DetailRow label="Shard ID">{body.shard_id}</DetailRow>
+          <DetailRow label="Block Height">{body.block_height.toLocaleString()}</DetailRow>
+          <DetailRow label="Block Hash">
+            <span className="font-mono text-xs">{formatHash(body.block_hash)}</span>
+          </DetailRow>
+          <DetailRow label="Prev State Root">
+            <span className="font-mono text-xs">{formatHash(body.prev_state_root)}</span>
+          </DetailRow>
+          <DetailRow label="Post State Root">
+            <span className="font-mono text-xs">{formatHash(body.post_state_root)}</span>
+          </DetailRow>
+          <DetailRow label="TX Count">{body.tx_count.toLocaleString()}</DetailRow>
+          <DetailRow label="Proof Size">{body.proof_data.length.toLocaleString()} bytes</DetailRow>
+        </>
+      );
     default:
       return null;
   }

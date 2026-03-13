@@ -15,9 +15,10 @@ WORKDIR /app
 # Copy manifests first for dependency caching
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY config.toml genesis.toml ./
 
-# Build both binaries in release mode
-RUN cargo build --release -p arc-node -p arc-bench
+# Build all binaries in release mode
+RUN cargo build --release -p arc-node -p arc-bench -p arc-cli
 
 # ── Stage 2: Runtime ─────────────────────────────────────────
 FROM debian:bookworm-slim
@@ -31,7 +32,10 @@ RUN apt-get update && apt-get install -y \
 
 COPY --from=builder /app/target/release/arc-node /usr/local/bin/
 COPY --from=builder /app/target/release/arc-bench /usr/local/bin/
+COPY --from=builder /app/target/release/arc /usr/local/bin/
+COPY --from=builder /app/config.toml /etc/arc/
+COPY --from=builder /app/genesis.toml /etc/arc/
 
-EXPOSE 9090
+EXPOSE 9090 9091 8545
 
 CMD ["arc-node"]

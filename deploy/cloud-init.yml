@@ -1,0 +1,108 @@
+#cloud-config
+# ARC Chain Node — Hetzner Cloud-Init
+# This file bootstraps a fresh VM into a ready-to-run ARC Chain validator.
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - build-essential
+  - pkg-config
+  - libssl-dev
+  - git
+  - curl
+  - ufw
+  - jq
+
+# Create dedicated arc user with no login shell
+users:
+  - name: arc
+    system: true
+    shell: /usr/sbin/nologin
+    home: /var/lib/arc
+    no-create-home: false
+
+# Create directories and download binary
+runcmd:
+  # Firewall — allow SSH, RPC, P2P only
+  - ufw default deny incoming
+  - ufw default allow outgoing
+  - ufw allow 22/tcp comment 'SSH'
+  - ufw allow 9090/tcp comment 'ARC RPC'
+  - ufw allow 9091/tcp comment 'ARC P2P'
+  - ufw --force enable
+
+  # Create config directory
+  - mkdir -p /etc/arc
+  - mkdir -p /var/lib/arc
+
+  # Download arc-node binary from GitHub releases
+  # REPLACE with actual release URL before deployment
+  - |
+    ARCH=$(uname -m)
+    if [ "$ARCH" = "aarch64" ]; then
+      BINARY_URL="https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-node-linux-arm64"
+    else
+      BINARY_URL="https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-node-linux-amd64"
+    fi
+    curl -fsSL "$BINARY_URL" -o /usr/local/bin/arc-node
+    chmod +x /usr/local/bin/arc-node
+
+  # Install systemd service
+  - |
+    cat > /etc/systemd/system/arc-node.service << 'UNIT'
+    [Unit]
+    Description=ARC Chain Node
+    After=network-online.target
+    Wants=network-online.target
+
+    [Service]
+    Type=simple
+    User=arc
+    Group=arc
+    ExecStart=/usr/local/bin/arc-node --config /etc/arc/config.toml --genesis /etc/arc/genesis.toml
+    Restart=always
+    RestartSec=5
+    LimitNOFILE=65536
+    StandardOutput=journal
+    StandardError=journal
+    SyslogIdentifier=arc-node
+    Environment=RUST_LOG=info
+    Environment=RUST_BACKTRACE=1
+    NoNewPrivileges=true
+    ProtectSystem=strict
+    ProtectHome=true
+    ReadWritePaths=/var/lib/arc
+    PrivateTmp=true
+
+    [Install]
+    WantedBy=multi-user.target
+    UNIT
+
+  # Set ownership
+  - chown -R arc:arc /var/lib/arc
+  - chown -R arc:arc /etc/arc
+
+  # NOTE: config.toml and genesis.toml are deployed by setup-testnet.sh
+  # after cloud-init completes. The service is enabled but not started here.
+  - systemctl daemon-reload
+  - systemctl enable arc-node.service
+
+write_files:
+  - path: /etc/arc/genesis.toml
+    owner: arc:arc
+    permissions: '0644'
+    content: |
+      # Placeholder — overwritten by setup-testnet.sh
+      [chain]
+      name = "arc-testnet"
+
+  - path: /etc/arc/config.toml
+    owner: arc:arc
+    permissions: '0644'
+    content: |
+      # Placeholder — overwritten by setup-testnet.sh
+      [rpc]
+      listen = "0.0.0.0:9090"
+
+final_message: "ARC Chain node provisioned in ${UPTIME} seconds"

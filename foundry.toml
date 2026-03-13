@@ -1,0 +1,28 @@
+[profile.default]
+src = "contracts"
+out = "build"
+libs = ["lib"]
+optimizer = true
+optimizer_runs = 200
+evm_version = "shanghai"
+solc_version = "0.8.24"
+via_ir = false
+ffi = false
+gas_reports = ["*"]
+verbosity = 3
+
+[profile.default.fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = false
+int_types = "long"
+multiline_func_header = "attributes_first"
+quote_style = "double"
+number_underscore = "thousands"
+
+[profile.default.rpc_endpoints]
+arc_local = "http://localhost:9090/eth"
+arc_testnet = "http://testnet.arc.ai:9090/eth"
+
+[etherscan]
+arc = { key = "", chain = 42069, url = "http://localhost:3000/api/verify" }
