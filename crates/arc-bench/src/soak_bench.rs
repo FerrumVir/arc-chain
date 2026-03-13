@@ -380,6 +380,7 @@ fn main() {
         verify_mode: VerifyMode::Cpu,
         coalesce_enabled: true,
         batch_size: args.batch_size,
+        ..Default::default()
     };
     let pipeline = Pipeline::with_config(Arc::clone(&state), config);
     let producer = benchmark_address(255);

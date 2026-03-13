@@ -41,6 +41,10 @@ path = "src/propose_verify_bench.rs"
 name = "arc-bench-multinode"
 path = "src/multinode_bench.rs"
 
+[[bin]]
+name = "arc-bench-gpu-state"
+path = "src/gpu_state_bench_main.rs"
+
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
