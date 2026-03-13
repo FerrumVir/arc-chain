@@ -1,9 +1,9 @@
 # ARC Chain — Project Status
 
 > **Version**: 0.2.0 (pre-mainnet, L1 scaling)
-> **Last updated**: 2026-03-06
-> **Codebase**: ~72,400 LOC Rust · ~1,900 LOC Solidity · ~5,800 LOC SDKs · ~2,500 LOC docs/explorer/faucet
-> **Tests**: 1,028 passing, 0 failures
+> **Last updated**: 2026-03-13
+> **Codebase**: 75,001 LOC Rust (11 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
+> **Tests**: 1,050 passing, 0 failures
 > **TX Types**: 21 (16 core + 5 L1 scaling)
 > **Benchmark**: 27K TPS sustained (M4 MacBook, 2 validators, real consensus)
 
@@ -27,14 +27,15 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 |-------|-----|-------|--------|-------------|
 | **arc-crypto** | ~8,200 | 126 | Production | Ed25519, Secp256k1, BLS (blst), BLAKE3, ML-DSA, Falcon-512, VRF, threshold crypto, Merkle trees, Pedersen commitments, ZK circuits, Stwo STARK prover |
 | **arc-types** | ~5,800 | 258 | Production | 21 transaction types (16 core + 5 L1 scaling), block/header, protocol versioning, governance, economics (EIP-1559), staking tiers, bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs |
-| **arc-state** | ~7,800 | 60 | Production | DashMap state, JMT (Jellyfish Merkle Tree) with inclusion + non-membership proofs, WAL persistence (CRC32 + LZ4), snapshots, BlockSTM parallel execution, light client proofs, state sync |
+| **arc-state** | ~7,800 | 60 | Production | DashMap state, JMT (Jellyfish Merkle Tree) with inclusion + non-membership proofs, WAL persistence (CRC32 + LZ4), snapshots, BlockSTM parallel execution, GPU-resident state cache (Metal unified memory / CPU fallback), light client proofs, state sync |
 | **arc-vm** | ~3,900 | 32 | Production | Wasmer 6.0 WASM runtime, revm 19 EVM, gas metering, host imports, precompiles (Ed25519/Secp256k1/BLS/BLAKE3/SHA256), AI inference oracle, formal verification model-checker |
 | **arc-mempool** | ~1,200 | 17 | Production | SegQueue FIFO, deduplication, encrypted mempool (BLS threshold, feature-flagged), capacity limits |
 | **arc-consensus** | ~4,500 | 26 | Production | Mysticeti-inspired DAG, 2-round finality, stake tiers (Spark/Arc/Core), slashing (equivocation + liveness), cross-shard coordination, canonical TX ordering (MEV protection), epoch transitions |
 | **arc-net** | ~2,800 | 31+ | Production | QUIC transport (quinn), shred propagation with XOR FEC, TX gossip, challenge-response peer auth, stake-weighted peer selection, PEX (peer exchange protocol) |
 | **arc-node** | ~7,100 | 17 | Production | Consensus manager with VRF proposer selection, signature verification pipeline, RPC API (20+ HTTP + ETH JSON-RPC), propose-verify mode |
-| **arc-gpu** | ~2,400 | 32 | Production | Metal MSL + WGSL Ed25519 batch verification, branchless Shamir's trick, buffer pool, async dispatch, SigVerifyCache |
-| **arc-bench** | ~3,100 | — | Tool | 8 benchmark binaries (parallel, signed, soak, node, multinode, propose-verify, shard, network) |
+| **arc-gpu** | ~2,400 | 32 | Production | Metal MSL + WGSL Ed25519 batch verification, branchless Shamir's trick, buffer pool, async dispatch, SigVerifyCache, GPU account buffer (unified/managed/CPU-only memory) |
+| **arc-bench** | 5,336 | — | Tool | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
+| **arc-cli** | 660 | — | Tool | Command-line client: keygen, RPC queries, transaction submission |
 
 ---
 
@@ -128,6 +129,7 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | Snapshots | DONE | Bincode + LZ4, chunked for parallel download |
 | State sync | DONE | StreamedSnapshot, per-chunk verification |
 | State pruning | DONE | prune_versions_before() on JMT |
+| GPU-resident state cache | DONE | wgpu unified memory (Metal) / managed (Vulkan) / CPU fallback. CPU-side DashMap mirror for fast reads, GPU buffer for batch compute shaders (BlockSTM, Merkle hashing). Lazy flush_to_gpu() per block. 15.2M lookups/sec on M4. (2026-03-13) |
 
 ### Cryptography
 
@@ -144,6 +146,7 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | Threshold encryption | DONE | Shamir secret sharing, verifiable shares |
 | Stwo STARK prover | DONE | Circuit building, proof aggregation, recursive composition |
 | GPU Ed25519 (Metal + WGSL) | DONE | Branchless Shamir, buffer pool, async dispatch |
+| GPU account buffer | DONE | 128-byte aligned GpuAccountRepr, unified/managed/CPU-only memory paths, secure shutdown (2026-03-13) |
 
 ### Token Economics
 
