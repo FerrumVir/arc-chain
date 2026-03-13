@@ -292,7 +292,38 @@ Format: LZ4-compressed bincode. Typical size: ~2 bytes per account field.
 3. Verify final state root matches WAL's last checkpoint
 4. Resume operation
 
-### 3.5 State Rent
+### 3.5 GPU-Resident State Cache
+
+Accounts can be cached in GPU memory for high-throughput batch compute shader
+access (BlockSTM parallel execution, batch Merkle hashing). The cache uses a
+dual-write architecture:
+
+- **CPU-side DashMap mirror** — serves all individual reads at ~15M lookups/sec
+- **GPU buffer (wgpu)** — 128-byte aligned `GpuAccountRepr` structs accessible
+  by compute shaders at unified memory bandwidth (~2 TB/s on Apple Silicon)
+- **Lazy flush** — `flush_to_gpu()` batch-writes dirty accounts once per block,
+  avoiding per-account wgpu overhead during transaction execution
+
+```rust
+pub struct GpuStateCache {
+    gpu_buffer: Arc<GpuAccountBuffer>,   // wgpu buffer (unified/managed/CPU-only)
+    cpu_mirror: DashMap<[u8;32], CachedAccount>,  // fast individual reads
+    slot_map: DashMap<[u8;32], AccessMeta>,       // GPU slot tracking
+    warm: DashMap<[u8;32], CachedAccount>,        // overflow (CPU RAM)
+}
+```
+
+**Memory models:**
+- `UnifiedMetal` — Apple Silicon: zero-copy, CPU and GPU share physical pages
+- `ManagedDiscrete` — NVIDIA/AMD: staging buffer with explicit sync
+- `CpuOnly` — fallback when no GPU available
+
+**Eviction:** LRU or LFU policy, configurable. Evicted accounts move to warm
+(CPU) tier. Auto-promotion on warm hit.
+
+**Security:** `secure_shutdown()` zeros all GPU memory before release.
+
+### 3.6 State Rent
 
 Accounts not touched in `RENT_EPOCH` blocks (default: 100,000 ≈ ~3 hours at
 10 blocks/sec) get evicted from RAM to cold storage (SSD). Re-activation
@@ -323,7 +354,21 @@ const RENT_PER_BYTE_PER_EPOCH: u64 = 1; // contract storage cost
 10. Finalize: 2/3+ validators signed → block is final
 ```
 
-### 4.2 Signature Verification Pipeline
+### 4.2 Execution Modes
+
+The pipeline supports three execution modes:
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `Sequential` | Single-threaded state execution | Debugging, correctness verification |
+| `BlockStm` | Optimistic parallel execution (sender-sharded) | Production default |
+| `GpuResident` | BlockSTM + GPU-resident state cache | Maximum throughput with GPU acceleration |
+
+In `GpuResident` mode, the pipeline prefetches block accounts into the GPU cache,
+runs BlockSTM execution with the GPU-backed state, then flushes dirty state back
+to the GPU buffer for compute shader access.
+
+### 4.3 Signature Verification Pipeline
 
 Signatures are verified in a dedicated thread pool BEFORE execution, pipelined
 with the previous block's execution.

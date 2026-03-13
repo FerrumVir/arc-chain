@@ -250,7 +250,7 @@ impl BenchNode {
             transport_inbound_tx,
             transport_peer_count,
             transport_keypair,
-            format!("/tmp/arc-bench-node-{}", i),
+            format!("/tmp/arc-bench-node-{}", port),
         ));
 
         // Start DAG consensus — no pre-populated peers (dynamic discovery via transport)
