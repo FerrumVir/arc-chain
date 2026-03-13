@@ -1,4 +1,7 @@
 pub mod metal_verify;
+pub mod gpu_memory;
+
+pub use gpu_memory::{GpuAccountBuffer, GpuAccountRepr, MemoryModel as GpuMemoryModel, ACCOUNT_SLOT_SIZE};
 
 use arc_crypto::Hash256;
 use rayon::prelude::*;

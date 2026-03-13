@@ -258,6 +258,7 @@ fn main() {
             verify_mode: mode.verify,
             coalesce_enabled: mode.coalesce,
             batch_size: args.batch,
+            ..Default::default()
         };
         let (success, elapsed) = run_mode(mode.name, config, &transactions, &genesis, args.batch);
         let tps = success as f64 / elapsed.as_secs_f64();
