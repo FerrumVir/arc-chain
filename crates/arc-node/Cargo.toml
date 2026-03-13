@@ -9,6 +9,12 @@ license.workspace = true
 name = "arc-node"
 path = "src/main.rs"
 
+# To enable real Stwo Circle-STARK proofs (requires nightly Rust):
+#   cargo +nightly build -p arc-node --features stwo-prover
+[features]
+default = []
+stwo-prover = ["arc-crypto/stwo-prover"]
+
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
