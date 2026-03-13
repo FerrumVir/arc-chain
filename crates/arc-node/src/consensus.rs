@@ -5,7 +5,7 @@
 
 use arc_consensus::{ConsensusEngine, StakeTier, Validator, ValidatorSet};
 use arc_crypto::{Hash256, KeyPair};
-use arc_mempool::Mempool;
+use arc_mempool::{EncryptedMempool, Mempool};
 use arc_net::transport::{InboundMessage, OutboundMessage};
 use arc_state::StateDB;
 use crate::pipeline::{Pipeline, PipelineBatch};
@@ -36,6 +36,9 @@ pub struct ConsensusManager {
     pending_diffs: dashmap::DashMap<[u8; 32], (arc_types::StateDiff, u64)>,
     /// VRF-based proposer selector (None = VRF disabled, backward compat).
     vrf_selector: Option<ProposerSelector>,
+    /// Encrypted mempool for MEV-protected commit-reveal transactions.
+    /// Runs alongside the regular mempool when `Some`.
+    encrypted_mempool: Option<Arc<EncryptedMempool>>,
 }
 
 impl ConsensusManager {
@@ -62,7 +65,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))) }
     }
 
     /// Create a consensus manager with a signing keypair (production mode).
@@ -89,7 +92,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))) }
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -187,6 +190,10 @@ impl ConsensusManager {
 
         // Track last proposed round to avoid double-proposing.
         let mut last_proposed_round: Option<u64> = None;
+
+        // Pending encrypted transaction batches, keyed by DAG block hash.
+        // Stored at proposal time, revealed after DAG commit.
+        let pending_encrypted: DashMap<[u8; 32], Vec<arc_mempool::EncryptedTx>> = DashMap::new();
 
         // ── Pipeline for single-validator pipelined execution ────────────
         let pipeline = Pipeline::new(Arc::clone(&state));
@@ -466,7 +473,25 @@ impl ConsensusManager {
 
                     // ── Normal path: drain mempool ──────────────────────────────
                     let transactions = mempool.drain(50_000);
-                    let has_txs = !transactions.is_empty();
+
+                    // ── Encrypted mempool: drain encrypted txs in FIFO order ──
+                    // Encrypted transactions are included alongside regular ones.
+                    // They remain opaque until after DAG commit (reveal phase).
+                    let encrypted_batch = if let Some(ref emp) = self.encrypted_mempool {
+                        let batch = emp.drain_fifo(10_000);
+                        if !batch.is_empty() {
+                            debug!(
+                                count = batch.len(),
+                                slot = emp.current_slot(),
+                                "Drained encrypted transactions (FIFO)"
+                            );
+                        }
+                        batch
+                    } else {
+                        Vec::new()
+                    };
+
+                    let has_txs = !transactions.is_empty() || !encrypted_batch.is_empty();
 
                     if has_txs || multi_validator {
                         let tx_hashes: Vec<Hash256> =
@@ -501,6 +526,11 @@ impl ConsensusManager {
                                 );
                                 last_proposed_round = Some(block.round);
 
+                                // Store encrypted batch for reveal after commit.
+                                if !encrypted_batch.is_empty() {
+                                    pending_encrypted.insert(block.hash.0, encrypted_batch.clone());
+                                }
+
                                 // Broadcast to peers
                                 if let Some(ref tx_chan) = outbound_tx {
                                     let _ =
@@ -517,6 +547,12 @@ impl ConsensusManager {
 
                         // After proposing, try to advance the round.
                         let _ = self.engine.advance_round();
+
+                        // Advance the encrypted mempool slot each round so that
+                        // new encrypted transactions target the next slot key.
+                        if let Some(ref emp) = self.encrypted_mempool {
+                            emp.advance_slot();
+                        }
 
                         if multi_validator {
                             // ── Multi-validator: DAG commit path ─────────────
@@ -554,6 +590,30 @@ impl ConsensusManager {
                         txs = dag_block.transactions.len(),
                         "DAG block committed"
                     );
+
+                    // ── Encrypted mempool: reveal phase (commit-reveal) ──────
+                    // After DAG commit, decrypt encrypted transactions from
+                    // the batch that was included in this block. Revealed
+                    // transactions are fed back into pending_txs for execution.
+                    if let Some(ref emp) = self.encrypted_mempool {
+                        if let Some((_, enc_batch)) = pending_encrypted.remove(&dag_block.hash.0) {
+                            if !enc_batch.is_empty() {
+                                let revealed = emp.reveal_batch(&enc_batch, dag_block.round);
+                                let revealed_count = revealed.len();
+                                for rtx in revealed {
+                                    pending_txs.insert(rtx.transaction.hash.0, rtx.transaction);
+                                }
+                                if revealed_count > 0 {
+                                    info!(
+                                        count = revealed_count,
+                                        round = dag_block.round,
+                                        block = %dag_block.hash,
+                                        "Revealed encrypted transactions after DAG commit"
+                                    );
+                                }
+                            }
+                        }
+                    }
 
                     // In multi-validator mode, process committed transactions.
                     // Proposer: full execution + export state diff.

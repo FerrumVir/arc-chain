@@ -14,6 +14,9 @@
 //! | `0x06`  | Block info        | Query block height / timestamp / etc.    |
 //! | `0x07`  | Identity / DID    | Look up on-chain identity for an address |
 //! | `0x08`  | Falcon-512 verify | Verify a post-quantum Falcon signature   |
+//! | `0x09`  | ZK proof verify   | Verify a ZK proof against registered key |
+//! | `0x0A`  | AI inference      | Run model inference (deterministic)      |
+//! | `0x0B`  | BLS verify        | Verify a BLS12-381 signature             |
 
 // Add to lib.rs: pub mod precompiles;
 
@@ -498,6 +501,177 @@ impl PrecompileRegistry {
             });
         }
 
+        // ── 0x09: ZK proof verify ──────────────────────────────────
+        // Input: 32B circuit_id ‖ 1B public_inputs_count ‖ (count * 8B LE) public_inputs ‖ proof_data
+        // Output: 1 byte (1 = valid, 0 = invalid)
+        {
+            use crate::zk_precompile::{ZkVerifierRegistry, ZkProofInput};
+            let mut addr = [0u8; 32];
+            addr[31] = 0x09;
+            let zk_registry = Arc::new(RwLock::new(ZkVerifierRegistry::new(100_000)));
+            let zk_ref = Arc::clone(&zk_registry);
+            precompiles.insert(addr, PrecompileEntry {
+                name: "zk_verify".into(),
+                base_gas: 100_000,
+                per_word_gas: 0,
+                handler: Box::new(move |input: &[u8]| {
+                    if input.len() < 33 {
+                        return PrecompileResult {
+                            success: false,
+                            output: vec![],
+                            gas_used: 100_000,
+                            error: Some("input too short: need 32B circuit_id + data".into()),
+                        };
+                    }
+
+                    let circuit_id: [u8; 32] = input[..32].try_into().unwrap();
+                    let count = input[32] as usize;
+                    let pi_end = 33 + count * 8;
+                    if input.len() < pi_end {
+                        return PrecompileResult {
+                            success: false,
+                            output: vec![],
+                            gas_used: 100_000,
+                            error: Some("input too short for declared public inputs".into()),
+                        };
+                    }
+                    let mut public_inputs = Vec::with_capacity(count);
+                    for i in 0..count {
+                        let off = 33 + i * 8;
+                        let val = u64::from_le_bytes(input[off..off + 8].try_into().unwrap());
+                        public_inputs.push(val);
+                    }
+                    let proof_data = input[pi_end..].to_vec();
+
+                    let mut guard = zk_ref.write().unwrap();
+                    let result = guard.verify_proof(&ZkProofInput {
+                        circuit_id,
+                        proof_data,
+                        public_inputs,
+                    });
+                    PrecompileResult {
+                        success: true,
+                        output: vec![if result.valid { 1 } else { 0 }],
+                        gas_used: result.gas_used,
+                        error: result.error,
+                    }
+                }),
+            });
+        }
+
+        // ── 0x0A: AI inference ──────────────────────────────────────
+        // Input: 32B model_id ‖ msg (UTF-8)
+        // Output: inference result (UTF-8 bytes)
+        {
+            use crate::inference::{InferenceEngine, InferenceConfig, InferenceRequest, InferenceInput, InferenceParams};
+            let mut addr = [0u8; 32];
+            addr[31] = 0x0A;
+            let engine = Arc::new(RwLock::new(InferenceEngine::new(InferenceConfig {
+                max_loaded_models: 16,
+                default_timeout_ms: 5_000,
+                max_tokens: 1024,
+                temperature: 0.7,
+            })));
+            let eng_ref = Arc::clone(&engine);
+            precompiles.insert(addr, PrecompileEntry {
+                name: "ai_inference".into(),
+                base_gas: 500_000,
+                per_word_gas: 1_000,
+                handler: Box::new(move |input: &[u8]| {
+                    if input.len() < 33 {
+                        return PrecompileResult {
+                            success: false,
+                            output: vec![],
+                            gas_used: 500_000,
+                            error: Some("input too short: need 32B model_id + data".into()),
+                        };
+                    }
+                    let model_id: [u8; 32] = input[..32].try_into().unwrap();
+                    let text = String::from_utf8_lossy(&input[32..]).to_string();
+                    let request = InferenceRequest {
+                        model_id,
+                        input: InferenceInput::Text(text),
+                        params: InferenceParams {
+                            max_tokens: 256,
+                            temperature: 0.7,
+                            top_p: 0.9,
+                            stop_sequences: vec![],
+                        },
+                    };
+                    let mut guard = eng_ref.write().unwrap();
+                    match guard.run_inference(&request) {
+                        Ok(resp) => {
+                            let output_bytes = match &resp.output {
+                                crate::inference::InferenceOutput::Text(s) => s.as_bytes().to_vec(),
+                                crate::inference::InferenceOutput::Tokens(t) => {
+                                    t.iter().flat_map(|v| v.to_le_bytes()).collect()
+                                }
+                                crate::inference::InferenceOutput::Embedding(e) => {
+                                    e.iter().flat_map(|v| v.to_le_bytes()).collect()
+                                }
+                                crate::inference::InferenceOutput::Classification(classes) => {
+                                    classes.first()
+                                        .map(|(label, _)| label.as_bytes().to_vec())
+                                        .unwrap_or_default()
+                                }
+                            };
+                            PrecompileResult {
+                                success: true,
+                                output: output_bytes,
+                                gas_used: 500_000 + resp.tokens_used * 1_000,
+                                error: None,
+                            }
+                        }
+                        Err(e) => PrecompileResult {
+                            success: false,
+                            output: vec![],
+                            gas_used: 500_000,
+                            error: Some(e),
+                        },
+                    }
+                }),
+            });
+        }
+
+        // ── 0x0B: BLS verify ─────────────────────────────────────────
+        // Input: 48B pubkey ‖ 96B signature ‖ msg (variable)
+        // Output: 1 byte (1 = valid, 0 = invalid)
+        {
+            let mut addr = [0u8; 32];
+            addr[31] = 0x0B;
+            precompiles.insert(addr, PrecompileEntry {
+                name: "bls_verify".into(),
+                base_gas: 10_000,
+                per_word_gas: 0,
+                handler: Box::new(|input: &[u8]| {
+                    if input.len() < 145 {
+                        return PrecompileResult {
+                            success: true,
+                            output: vec![0],
+                            gas_used: 10_000,
+                            error: Some("input too short: need 48B pk + 96B sig + msg".into()),
+                        };
+                    }
+                    let mut pk_bytes = [0u8; 48];
+                    pk_bytes.copy_from_slice(&input[..48]);
+                    let pk = arc_crypto::bls::BlsPublicKey(pk_bytes);
+
+                    let mut sig_bytes = [0u8; 96];
+                    sig_bytes.copy_from_slice(&input[48..144]);
+                    let sig = arc_crypto::bls::BlsSignature(sig_bytes);
+
+                    let msg = &input[144..];
+                    let valid = arc_crypto::bls::bls_verify(&pk, msg, &sig);
+                    PrecompileResult {
+                        success: true,
+                        output: vec![if valid { 1 } else { 0 }],
+                        gas_used: 10_000,
+                        error: None,
+                    }
+                }),
+            });
+        }
+
         Self { precompiles }
     }
 
@@ -721,8 +895,8 @@ mod tests {
         let registry = PrecompileRegistry::new();
         let list = registry.list_precompiles();
 
-        // We registered 8 precompiles (0x01 through 0x08).
-        assert_eq!(list.len(), 8);
+        // We registered 11 precompiles (0x01 through 0x0B).
+        assert_eq!(list.len(), 11);
 
         // Check that they are sorted by address.
         for i in 1..list.len() {
@@ -732,8 +906,8 @@ mod tests {
         // Verify names of first and last.
         assert_eq!(list[0].1, "blake3");
         assert_eq!(list[0].0[31], 0x01);
-        assert_eq!(list[7].1, "falcon512_verify");
-        assert_eq!(list[7].0[31], 0x08);
+        assert_eq!(list[10].1, "bls_verify");
+        assert_eq!(list[10].0[31], 0x0B);
     }
 
     // ── 8. Oracle registry — update and read price ─────────────────────
@@ -844,8 +1018,8 @@ mod tests {
     fn test_is_precompile() {
         let registry = PrecompileRegistry::new();
 
-        // Registered addresses.
-        for id in 1..=8u8 {
+        // Registered addresses (0x01 through 0x0B).
+        for id in 1..=0x0Bu8 {
             assert!(
                 registry.is_precompile(&precompile_address(id)),
                 "0x{:02x} should be a precompile",
@@ -855,7 +1029,7 @@ mod tests {
 
         // Unregistered addresses.
         assert!(!registry.is_precompile(&precompile_address(0x00)));
-        assert!(!registry.is_precompile(&precompile_address(0x09)));
+        assert!(!registry.is_precompile(&precompile_address(0x0C)));
         assert!(!registry.is_precompile(&precompile_address(0xFF)));
         assert!(!registry.is_precompile(&[0xFF; 32]));
     }
