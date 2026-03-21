@@ -1,0 +1,8 @@
+# ARC Chain Testnet Seed Nodes
+# Validator-0 is the initial seed node.
+# Replace with actual public IP before distributing.
+
+[[seeds]]
+address = "127.0.0.1:9091"
+name = "arc-seed-0"
+pubkey = ""  # filled by create-testnet.sh
