@@ -1,12 +1,13 @@
-//! Block-STM — optimistic parallel transaction execution.
+//! Block-STM — optimistic parallel transaction execution with adaptive mode.
 //!
 //! Statically predicts the read/write set of each transaction from its body,
 //! partitions transactions into conflict-free batches, and executes each batch
 //! in parallel.  Batches with inter-batch dependencies run sequentially.
 //!
-//! This replaces simple sender-sharding, which only parallelises across
-//! different senders.  Block-STM also parallelises across different *receivers*
-//! (and any other disjoint account sets), which is strictly better.
+//! **Adaptive execution**: The chain automatically chooses between sequential
+//! and BlockSTM based on the transaction mix.  Simple transfer-only blocks run
+//! sequentially (lower overhead).  Blocks with smart contract calls or high
+//! receiver diversity use BlockSTM for parallelism.
 
 use arc_types::{Account, Address, Transaction, TxBody};
 use dashmap::DashMap;
@@ -196,6 +197,82 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 2);
         assert_eq!(batches[1].len(), 2);
+    }
+}
+
+// ===========================================================================
+// Adaptive execution mode selection
+// ===========================================================================
+
+/// Whether a block should use BlockSTM parallel execution or sequential.
+///
+/// The chain automatically picks the best mode based on the transaction mix:
+/// - **Sequential**: best for simple transfer-only blocks (no overhead)
+/// - **BlockSTM**: best for blocks with smart contracts, high receiver diversity,
+///   or mixed TX types where parallelism pays off
+///
+/// Decision factors:
+/// 1. Contract calls (WasmCall, DeployContract) → always BlockSTM
+/// 2. High unique-receiver ratio (>50% unique recipients) → BlockSTM
+/// 3. Large batches with BatchSettle → BlockSTM (many state writes)
+/// 4. Small blocks (<100 TXs) → sequential (overhead not worth it)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptiveMode {
+    /// Execute sequentially — lowest overhead for simple workloads.
+    Sequential,
+    /// Execute with BlockSTM — parallel for diverse workloads.
+    BlockSTM,
+}
+
+/// Analyze a block of transactions and decide the optimal execution mode.
+pub fn choose_execution_mode(transactions: &[Transaction]) -> AdaptiveMode {
+    if transactions.len() < 100 {
+        return AdaptiveMode::Sequential; // Overhead not worth it for small blocks
+    }
+
+    let mut has_contracts = false;
+    let mut has_batch_settle = false;
+    let mut unique_receivers = HashSet::new();
+
+    for tx in transactions {
+        match &tx.body {
+            TxBody::WasmCall(_) | TxBody::DeployContract(_) => {
+                has_contracts = true;
+            }
+            TxBody::BatchSettle(body) if body.entries.len() > 10 => {
+                has_batch_settle = true;
+            }
+            TxBody::Transfer(body) => {
+                unique_receivers.insert(body.to.0);
+            }
+            TxBody::Settle(body) => {
+                unique_receivers.insert(body.agent_id.0);
+            }
+            _ => {}
+        }
+    }
+
+    // Contract calls always benefit from BlockSTM (long execution, independent contracts)
+    if has_contracts {
+        return AdaptiveMode::BlockSTM;
+    }
+
+    // BatchSettle with many entries benefits from parallel state writes
+    if has_batch_settle {
+        return AdaptiveMode::BlockSTM;
+    }
+
+    // High receiver diversity means low conflict rate → BlockSTM wins
+    let diversity_ratio = if transactions.is_empty() {
+        0.0
+    } else {
+        unique_receivers.len() as f64 / transactions.len() as f64
+    };
+
+    if diversity_ratio > 0.5 {
+        AdaptiveMode::BlockSTM
+    } else {
+        AdaptiveMode::Sequential
     }
 }
 
