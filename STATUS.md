@@ -1,11 +1,11 @@
 # ARC Chain — Project Status
 
-> **Version**: 0.2.0 (pre-mainnet, L1 scaling)
-> **Last updated**: 2026-03-20
-> **Codebase**: 76,255 LOC Rust (11 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
-> **Tests**: 1,031 passing, 0 failures
+> **Version**: 0.3.0 (pre-mainnet, L1 scaling)
+> **Last updated**: 2026-03-21
+> **Codebase**: 77,244 LOC Rust (11 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
+> **Tests**: 1,054 passing, 0 failures
 > **TX Types**: 23 (16 core + 5 L1 scaling + 2 inference)
-> **Benchmark**: 69.3K TPS single-node peak (M4 MacBook, BlockSTM + Coalesce)
+> **Benchmark**: 183K TPS single-node peak (M2 Ultra, CPU verify + Sequential) · 33.2K multi-node (2 validators, real QUIC + DAG)
 
 ---
 
@@ -26,13 +26,13 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | Crate | LOC | Tests | Status | What It Does |
 |-------|-----|-------|--------|-------------|
 | **arc-crypto** | 11,680 | 220 | Production | Ed25519, Secp256k1, BLS (blst), BLAKE3, ML-DSA, Falcon-512, VRF, threshold crypto, Merkle trees, Pedersen commitments, ZK circuits, Stwo STARK prover |
-| **arc-types** | 14,320 | 261 | Production | 23 transaction types (16 core + 5 L1 scaling + 2 inference), block/header, protocol versioning, governance, economics (no-burn fee distribution), validator roles (Proposer/Verifier/Observer), bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs, inference attestation/challenge |
-| **arc-state** | 12,378 | 140 | Production | DashMap state, JMT (Jellyfish Merkle Tree) with inclusion + non-membership proofs + auto-pruning (every 100 blocks, keeps 1000 versions), segmented WAL with auto-rotate at 256MB (CRC32 + LZ4), pruning after snapshots, BlockSTM parallel execution, GPU-resident state cache (Metal unified memory / CPU fallback), light client proofs, state sync |
+| **arc-types** | 14,490 | 264 | Production | 23 transaction types (16 core + 5 L1 scaling + 2 inference), block/header, protocol versioning, governance, economics (no-burn 40/25/15/20 fee distribution), validator roles (Proposer/Verifier/Observer), bootstrap fund (40M ARC/2yr), state rent, bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs, inference attestation/challenge |
+| **arc-state** | 13,203 | 147 | Production | DashMap state, JMT with inclusion + non-membership proofs + auto-pruning (every 100 blocks, keeps 1000 versions), segmented WAL with auto-rotate at 256MB (CRC32 + LZ4), pruning after snapshots, adaptive BlockSTM (auto-selects Sequential vs parallel), GPU-resident state cache (Metal unified memory / CPU fallback), receipt pruning, state rent collection, light client proofs, state sync |
 | **arc-vm** | 8,439 | 145 | Production | Wasmer 6.0 WASM runtime, revm 19 EVM, gas metering, host imports, 11 precompiles (Ed25519/Secp256k1/BLS/BLAKE3/SHA256/VRF/Oracle/Merkle/Falcon/ZK-verify/AI-inference), AI inference oracle, formal verification model-checker |
 | **arc-mempool** | 876 | 17 | Production | SegQueue FIFO, deduplication, encrypted mempool (BLS threshold, wired into ConsensusManager), capacity limits |
-| **arc-consensus** | 7,523 | 126 | Production | Mysticeti-inspired DAG, 2-round finality, stake tiers (Spark/Arc/Core), slashing (equivocation + liveness), cross-shard coordination, canonical TX ordering (MEV protection), epoch transitions |
+| **arc-consensus** | 7,971 | 137 | Production | Mysticeti-inspired DAG, 2-round finality, beacon chain shard coordinator (global root, validator assignment, epoch management), stake tiers (Spark/Arc/Core), slashing (equivocation + liveness), cross-shard coordination, canonical TX ordering (MEV protection), epoch transitions |
 | **arc-net** | 2,355 | 26 | Production | QUIC transport (quinn), shred propagation with XOR FEC, TX gossip, challenge-response peer auth, stake-weighted peer selection, PEX (peer exchange protocol) |
-| **arc-node** | 8,408 | 61 | Production | Consensus manager with VRF proposer selection, signature verification pipeline, RPC API (20+ HTTP + ETH JSON-RPC), propose-verify mode, STARK proof generation, DA erasure coding, encrypted mempool integration |
+| **arc-node** | 8,424 | 61 | Production | Consensus manager with VRF proposer selection + adaptive execution (auto-selects Sequential vs BlockSTM), signature verification pipeline, RPC API (30 HTTP + ETH JSON-RPC), propose-verify mode, STARK proof generation, DA erasure coding, encrypted mempool integration |
 | **arc-gpu** | 3,810 | 37 | Production | Metal MSL + WGSL Ed25519 batch verification, branchless Shamir's trick, buffer pool, async dispatch, SigVerifyCache, GPU account buffer (unified/managed/CPU-only memory) |
 | **arc-bench** | 5,336 | — | Tool | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
 | **arc-cli** | 660 | — | Tool | Command-line client: keygen, RPC queries, transaction submission |
@@ -249,55 +249,58 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 ---
 
-## Benchmark Results (2026-03-13)
+## Benchmark Results (2026-03-21)
+
+### M2 Ultra Mac Studio (24 cores, 64GB)
 
 | Metric | Value |
 |--------|-------|
-| Best single-node TPS (CPU + BlockSTM + Coalesce) | 69,300 |
-| Best single-node ETH-weighted TPS | 17,600 |
-| Multi-node sustained (2 validators) | 27,000 |
+| Best single-node TPS (CPU verify + Sequential) | **183,000** |
+| Best single-node ETH-weighted TPS | **46,600** |
+| Multi-node sustained (2 validators) | **33,230** |
+| Multi-node sustained (4 validators) | **39,700** |
+| GPU Ed25519 verification | **379,000 sigs/sec** (13.68x over CPU) |
 | Commit rate | 100% (500K/500K) |
-| Hardware | Apple M4 MacBook Pro, 10 cores |
-| Validators | 2 (real QUIC, real consensus, real signatures) |
+| Finality | 4.27s (2-round DAG commit) |
 
-### Projected Performance
+### M4 MacBook Pro (10 cores, 16GB) — previous
 
-| Hardware | Projected TPS | Basis |
-|----------|--------------|-------|
-| M4 MacBook single-node (measured) | 69,300 | Actual benchmark (BlockSTM + Coalesce) |
-| M4 MacBook multi-node (measured) | 27,000 | Actual benchmark (2 validators) |
-| 100 nodes | 1,410,000 | Projected linear scaling |
-| 500 nodes | 6,170,000 | Projected linear scaling |
-| A100 (GPU sig verify) | 270,000-810,000 | 2-3x GPU batch verify |
-| H100 (GPU + CPU) | 540,000-1,350,000 | Compound scaling |
+| Metric | Value |
+|--------|-------|
+| Best single-node TPS | 69,300 (BlockSTM + Coalesce) |
+| Multi-node sustained | 27,000 (2 validators) |
+
+### Projected Performance (with sharding)
+
+| Setup | TPS | Basis |
+|-------|-----|-------|
+| 1 Mac Mini proposer (measured baseline) | ~60,000 | Extrapolated from M4 |
+| 50 community Mac proposers (50 shards) | ~3,000,000 | Linear sharding |
+| 100 community proposers (100 shards) | ~6,000,000 | Linear sharding |
+| 3 A100 proposers + community verifiers | ~1,320,000 | $50/day compute |
 
 ---
 
 ## What's Next
 
-### Immediate (next sprint)
+### Blocks Launch (do first)
 
-1. **Channel counterparty tracking** — Store counterparty address in channel metadata on-chain so ChannelClose credits both parties
-2. **Governance auto-mutation** — Wire `apply_governance_outcome()` so proposals auto-execute on StateDB
-3. **Stwo real STARK proofs** — Requires nightly, available via `--features stwo-prover`
-4. **Bridge relayer service** — Event listener + proof submission for cross-chain relay
-5. **A100/H100 benchmark** — Run multinode_bench on server hardware to validate projections
-6. **Inference Tier 2 challenge window tuning** — Optimize dispute window duration based on model complexity
+1. **Bridge relayer service** — Event listener + proof submission for ETH↔ARC cross-chain relay. Without this, $ARC holders can't bridge tokens and the 3% tax revenue can't flow. NOT STARTED.
+2. **Testnet launch** — 4+ validators on separate machines/locations, running 30+ days. Proves stability over real networks. NOT STARTED.
+3. **One-click node setup** — Install script (`curl ... | sh`) that handles Rust toolchain, build, config, and systemd service. Currently requires manual cargo build. NOT STARTED.
 
-### Short-term (1-3 months)
+### Pre-Mainnet
 
-6. **Ethereum light client on ARC** — Store ETH block headers, verify Merkle proofs trustlessly (removes bridge relayer trust assumption)
-7. **WebSocket subscriptions** — Real-time block/TX streaming on RPC
-8. **Explorer contract verification** — Accept source + compiler version, verify bytecode match
-9. **Foundry deployment docs** — End-to-end: write contract → compile → deploy → verify → interact
-10. **Testnet launch** — 4+ validators running publicly for 30+ days
+4. **A100 benchmark** — Run multinode_bench on server hardware to validate per-shard scaling projections. ~$1 cost. NOT STARTED.
+5. **Governance auto-mutation** — Wire `apply_governance_outcome()` so proposals auto-execute on StateDB. Currently proposals pass but don't mutate state. PARTIAL.
+6. **Channel counterparty tracking** — Store counterparty address in channel metadata so ChannelClose correctly credits both parties in all cases. PARTIAL.
+7. **WebSocket subscriptions** — Real-time block/TX streaming on RPC for explorer and SDKs. NOT STARTED.
 
-### Medium-term (3-6 months)
+### Pre-Mainnet (3-6 months)
 
-11. **Security audit** — External firm (Trail of Bits, OtterSec, Halborn)
-12. **Formal safety proof** — TLA+ or Coq model of DAG consensus
-13. **Multi-shard benchmark** — 4+ shards with cross-shard TX load
-14. **Mainnet genesis** — Token migration from ERC-20, validator onboarding
+8. **Security audit** — External firm (Trail of Bits, OtterSec, Halborn). Required before mainnet. NOT STARTED.
+9. **Ethereum light client on ARC** — Store ETH block headers, verify Merkle proofs trustlessly. Removes bridge relayer trust assumption. NOT STARTED.
+10. **Mainnet genesis** — Token migration from ERC-20, validator onboarding, bootstrap fund activation.
 15. **SDK v2** — Auto-generated TypeScript bindings from contract ABI
 
 ---

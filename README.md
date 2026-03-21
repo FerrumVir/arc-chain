@@ -61,19 +61,19 @@ Users / AI Agents
 
 ## Codebase
 
-**76,255 LOC Rust** | **1,031 tests** | **11 crates**
+**77,244 LOC Rust** | **1,054 tests** | **11 crates**
 
 | Crate | LOC | Tests | What It Does |
 |-------|-----|-------|-------------|
-| `arc-types` | 14,320 | 261 | 23 transaction types, blocks, accounts, governance, staking, bridge, account abstraction, social recovery, inference attestation/challenge |
-| `arc-crypto` | 11,680 | 240 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512 (post-quantum), ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
-| `arc-state` | 12,378 | 140 | DashMap state DB, Jellyfish Merkle Tree, segmented WAL with auto-rotate, BlockSTM parallel execution, GPU-resident state cache, JMT auto-pruning, state sync |
+| `arc-types` | 14,490 | 264 | 23 transaction types, blocks, accounts, governance, staking, bridge, account abstraction, social recovery, inference attestation/challenge, state rent |
+| `arc-state` | 13,203 | 147 | DashMap state DB, Jellyfish Merkle Tree, segmented WAL with auto-rotate, adaptive BlockSTM parallel execution, GPU-resident state cache, JMT auto-pruning, receipt pruning, state rent, state sync |
+| `arc-crypto` | 11,680 | 220 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512 (post-quantum), ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
 | `arc-vm` | 8,439 | 145 | Wasmer WASM runtime, revm EVM interpreter, gas metering, host imports, 11 precompiles, AI inference oracle |
-| `arc-node` | 8,408 | 61 | Pipelined block production, signature verification, RPC server (20+ HTTP + ETH JSON-RPC), consensus manager, STARK proof gen, DA erasure coding, encrypted mempool |
-| `arc-consensus` | 7,523 | 126 | DAG consensus, 2-round finality, validator roles (Proposer/Verifier/Observer), slashing, cross-shard coordination, epoch transitions |
+| `arc-node` | 8,424 | 61 | Pipelined block production, adaptive execution (auto-selects Sequential vs BlockSTM), RPC server (30 HTTP + ETH JSON-RPC), consensus manager, STARK proof gen, DA erasure coding, encrypted mempool |
+| `arc-consensus` | 7,971 | 137 | DAG consensus, 2-round finality, beacon chain shard coordinator, validator roles (Proposer/Verifier/Observer), slashing, cross-shard coordination, epoch transitions |
 | `arc-bench` | 5,336 | — | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
-| `arc-gpu` | 3,810 | 37 | Metal MSL + WGSL Ed25519 batch verification, GPU account buffer, unified/managed memory, buffer pooling |
-| `arc-net` | 2,355 | 24 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
+| `arc-gpu` | 3,810 | 37 | Metal MSL + WGSL Ed25519 batch verification (379K sigs/sec on M2 Ultra), GPU account buffer, unified/managed memory, buffer pooling |
+| `arc-net` | 2,355 | 26 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
 | `arc-mempool` | 876 | 17 | Lock-free SegQueue FIFO, DashSet deduplication, encrypted mempool (BLS threshold) |
 | `arc-cli` | 660 | — | Command-line client: keygen, RPC queries, transaction submission |
 
