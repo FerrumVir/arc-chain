@@ -129,6 +129,14 @@ Users / AI Agents
 
 ## Quick Start
 
+### One-Click Install (recommended)
+
+```bash
+curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-node.sh | bash
+```
+
+This will install Rust (if needed), clone the repo, build the node, generate a validator keypair, and start the node as a background service. Works on Linux (systemd) and macOS (launchd), Intel and ARM.
+
 ### Prerequisites
 
 - Rust 1.85+ (edition 2024)

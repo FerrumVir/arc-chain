@@ -12,6 +12,8 @@ members = [
     "crates/arc-consensus",
     "crates/arc-net",
     "crates/arc-cli",
+    "agents",
+    "relayer",
 ]
 
 [workspace.package]
