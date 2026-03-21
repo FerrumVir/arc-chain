@@ -33,3 +33,4 @@ explorer/public/benchmark-data/
 
 # Deploy state
 deploy/.node-ips
+desktop/src-tauri/target/
