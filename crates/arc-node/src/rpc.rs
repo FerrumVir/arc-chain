@@ -94,6 +94,8 @@ pub async fn serve(
         .route("/tx/{hash}/full", get(get_full_transaction))
         .route("/contract/{address}", get(get_contract_info))
         .route("/contract/{address}/call", post(call_contract))
+        // Agents (Synths)
+        .route("/agents", get(get_agents))
         // Faucet (testnet token dispensing)
         .route("/faucet/claim", post(faucet_claim))
         .route("/faucet/status", get(faucet_status))
@@ -429,6 +431,74 @@ async fn get_validators(
         total_stake,
         count,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Agents (Synths) endpoint
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct AgentInfoResponse {
+    name: String,
+    address: String,
+    status: String,
+    model_type: String,
+    endpoint: String,
+    inferences: u64,
+    earned: u64,
+    uptime_secs: u64,
+    last_action: String,
+    last_action_timestamp: u64,
+}
+
+#[derive(Serialize)]
+struct AgentsListResponse {
+    agents: Vec<AgentInfoResponse>,
+    count: usize,
+}
+
+async fn get_agents(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<AgentsListResponse> {
+    // Scan full_transactions for RegisterAgent transactions and build agent list.
+    let mut agents: Vec<AgentInfoResponse> = Vec::new();
+    let mut seen_names = std::collections::HashSet::new();
+
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if let TxBody::RegisterAgent(body) = &tx.body {
+            // Deduplicate by agent name (latest registration wins)
+            if seen_names.contains(&body.agent_name) {
+                continue;
+            }
+            seen_names.insert(body.agent_name.clone());
+
+            let uptime = node.boot_time.elapsed().as_secs();
+            agents.push(AgentInfoResponse {
+                name: body.agent_name.clone(),
+                address: tx.from.to_hex(),
+                status: "active".to_string(),
+                model_type: if body.metadata.is_empty() {
+                    "Unknown".to_string()
+                } else {
+                    String::from_utf8(body.metadata.clone())
+                        .unwrap_or_else(|_| "Unknown".to_string())
+                },
+                endpoint: body.endpoint.clone(),
+                inferences: 0,
+                earned: 0,
+                uptime_secs: uptime,
+                last_action: "Registered on-chain".to_string(),
+                last_action_timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            });
+        }
+    }
+
+    let count = agents.len();
+    Json(AgentsListResponse { agents, count })
 }
 
 // ---------------------------------------------------------------------------

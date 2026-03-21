@@ -2,11 +2,12 @@ import type {SidebarsConfig} from '@docusaurus/plugin-content-docs';
 
 const sidebars: SidebarsConfig = {
   docsSidebar: [
+    'intro',
     {
       type: 'category',
       label: 'Getting Started',
       collapsed: false,
-      items: ['quickstart', 'running-testnet'],
+      items: ['quickstart', 'testnet'],
     },
     {
       type: 'category',
@@ -15,23 +16,28 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
-      label: 'API',
+      label: 'AI Agents',
+      items: ['agents-overview', 'deploy-agent'],
+    },
+    {
+      type: 'category',
+      label: 'API Reference',
       items: ['rpc-api'],
     },
     {
       type: 'category',
       label: 'SDKs',
-      items: ['sdk-typescript', 'sdk-python'],
+      items: ['sdk-python'],
     },
     {
       type: 'category',
-      label: 'Advanced',
-      items: ['smart-contracts', 'benchmarking'],
+      label: 'Economics',
+      items: ['tokenomics'],
     },
     {
-      type: 'doc',
-      id: 'overview',
-      label: 'Overview',
+      type: 'category',
+      label: 'Performance',
+      items: ['benchmarks'],
     },
   ],
 };

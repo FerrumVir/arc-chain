@@ -4,14 +4,14 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'ARC Chain Docs',
-  tagline: 'ai for Humans First',
+  tagline: "The world's fastest AI-native blockchain",
   favicon: 'img/favicon.ico',
 
   future: {
     v4: true,
   },
 
-  url: 'https://docs.arc.tech',
+  url: 'https://arc-chain-docs.vercel.app',
   baseUrl: '/',
 
   organizationName: 'FerrumVir',

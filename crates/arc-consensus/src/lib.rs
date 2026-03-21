@@ -1578,11 +1578,12 @@ impl ConsensusEngine {
     /// Proposer failover timeout in milliseconds.
     /// If the current round hasn't advanced within this time, the next
     /// validator in rotation can take over as proposer.
-    const PROPOSER_TIMEOUT_MS: u128 = 500;
+    const PROPOSER_TIMEOUT_MS: u128 = 100;
 
     /// View-change timeout in milliseconds.
     /// If the round is stalled for this long, force-advance to prevent halts.
-    const VIEW_CHANGE_TIMEOUT_MS: u128 = 2000;
+    /// Set to 200ms for ~400ms two-round finality.
+    const VIEW_CHANGE_TIMEOUT_MS: u128 = 200;
 
     /// Check if the current round's proposer has timed out.
     ///
