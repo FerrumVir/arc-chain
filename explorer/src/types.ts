@@ -185,6 +185,36 @@ export interface FaucetClaimResponse {
   message: string;
 }
 
+// ─── Agents (Synths) ─────────────────────────────────────────
+
+export interface AgentInfo {
+  name: string;
+  address: string;
+  status: 'active' | 'paused' | 'terminated';
+  model_type: string;
+  endpoint: string;
+  inferences: number;
+  earned: number;
+  uptime_secs: number;
+  last_action: string;
+  last_action_timestamp: number;
+}
+
+export interface AgentsResponse {
+  agents: AgentInfo[];
+  count: number;
+}
+
+export interface AgentAction {
+  timestamp: number;
+  agent_name: string;
+  action: string;
+  result: string;
+  confidence: number;
+  amount: number;
+  tx_hash: string;
+}
+
 // ─── Validators ──────────────────────────────────────────────────
 
 export interface ValidatorInfo {

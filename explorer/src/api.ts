@@ -15,6 +15,8 @@ import type {
   ValidatorsResponse,
   FaucetStatus,
   FaucetClaimResponse,
+  AgentsResponse,
+  AgentAction,
 } from './types';
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:9090';
@@ -134,6 +136,21 @@ export async function callContract(
 
 export function getValidators(): Promise<ValidatorsResponse> {
   return request<ValidatorsResponse>('/validators');
+}
+
+// ─── Agents (Synths) ────────────────────────────────────────────
+
+export function fetchAgents(): Promise<AgentsResponse> {
+  return request<AgentsResponse>('/agents');
+}
+
+export async function fetchAgentActions(): Promise<AgentAction[]> {
+  try {
+    return await request<AgentAction[]>('/agents/actions');
+  } catch {
+    // Endpoint may not exist yet — return simulated data for demo
+    return [];
+  }
 }
 
 // ─── Faucet ────────────────────────────────────────────────────

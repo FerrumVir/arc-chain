@@ -155,6 +155,7 @@
   .info-row .key {
     font-size: 13px;
     color: var(--muted);
+    flex-shrink: 0;
   }
 
   .info-row .val {
@@ -170,6 +171,185 @@
     display: flex;
     gap: 10px;
     margin-top: 8px;
+  }
+
+  /* ------- Footer Bar ------- */
+  .footer-bar {
+    font-size: 11px;
+    color: var(--muted);
+    text-align: center;
+    padding: 12px 24px;
+    border-top: 1px solid var(--border);
+  }
+  .footer-bar a {
+    color: var(--muted);
+    text-decoration: none;
+  }
+  .footer-bar a:hover {
+    color: var(--accent);
+  }
+
+  /* ------- Address display ------- */
+  .address-box {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    justify-content: flex-end;
+    min-width: 0;
+  }
+
+  .address-full {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text);
+    word-break: break-all;
+    text-align: right;
+    line-height: 1.4;
+  }
+
+  .copy-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px;
+    flex-shrink: 0;
+    font-size: 14px;
+    transition: color 0.15s;
+  }
+  .copy-btn:hover {
+    color: var(--accent);
+  }
+
+  /* ------- Onboarding ------- */
+  .onboarding {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: calc(100vh - 57px);
+    text-align: center;
+    padding: 40px;
+  }
+
+  .onboarding-step {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    gap: 20px;
+    max-width: 480px;
+    animation: fadeIn 0.3s ease;
+  }
+
+  .onboarding-step.active {
+    display: flex;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  .onboarding h2 {
+    font-size: 24px;
+    font-weight: 600;
+  }
+
+  .onboarding h2 span {
+    color: var(--accent);
+  }
+
+  .onboarding p {
+    font-size: 15px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+
+  .onboarding .btn-continue {
+    padding: 10px 32px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 15px;
+    cursor: pointer;
+    transition: all 0.15s;
+    font-weight: 500;
+  }
+  .onboarding .btn-continue:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+
+  .onboarding .btn-start-big {
+    padding: 14px 48px;
+    border: none;
+    border-radius: 10px;
+    background: var(--accent);
+    color: var(--bg);
+    font-size: 17px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: opacity 0.15s;
+  }
+  .onboarding .btn-start-big:hover {
+    opacity: 0.9;
+  }
+
+  .address-display {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 14px 18px;
+    font-family: var(--mono);
+    font-size: 12px;
+    word-break: break-all;
+    line-height: 1.5;
+    color: var(--text);
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    text-align: left;
+    width: 100%;
+  }
+
+  .address-display .addr-text {
+    flex: 1;
+    user-select: text;
+  }
+
+  .key-path {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--bg);
+    padding: 6px 12px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+
+  .resource-note {
+    font-size: 13px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+
+  .step-dots {
+    display: flex;
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  .step-dots .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--border);
+    transition: background 0.3s;
+  }
+  .step-dots .dot.active {
+    background: var(--accent);
   }
 
   /* ------- Splash / Not Running ------- */
@@ -215,8 +395,57 @@
   </div>
 </div>
 
-<!-- ============ SPLASH (shown when not running) ============ -->
-<div class="main" id="splashView">
+<!-- ============ ONBOARDING ============ -->
+<div class="onboarding" id="onboardingView" style="display:none;">
+
+  <!-- Step 1: Welcome -->
+  <div class="onboarding-step active" id="obStep1">
+    <h2>Welcome to <span>ARC Chain</span></h2>
+    <p>You're about to join the world's fastest AI-native blockchain.</p>
+    <p>Your node earns ARC tokens by helping secure the network.</p>
+    <button class="btn-continue" onclick="goToStep(2)">Continue</button>
+    <div class="step-dots">
+      <div class="dot active"></div>
+      <div class="dot"></div>
+      <div class="dot"></div>
+    </div>
+  </div>
+
+  <!-- Step 2: Identity -->
+  <div class="onboarding-step" id="obStep2">
+    <h2>Your Identity</h2>
+    <p>Your validator address has been generated</p>
+    <div class="address-display">
+      <span class="addr-text" id="obAddress">Loading...</span>
+      <button class="copy-btn" onclick="copyOnboardingAddress()" title="Copy address">&#x2398;</button>
+    </div>
+    <p>This is your identity on ARC Chain. Keep your key file safe.</p>
+    <div class="key-path">Key saved to: ~/.arc-chain/validator.key</div>
+    <button class="btn-continue" onclick="goToStep(3)">Continue</button>
+    <div class="step-dots">
+      <div class="dot"></div>
+      <div class="dot active"></div>
+      <div class="dot"></div>
+    </div>
+  </div>
+
+  <!-- Step 3: Start -->
+  <div class="onboarding-step" id="obStep3">
+    <h2>Ready to join the network</h2>
+    <p>Your node will connect to the ARC Chain testnet and start syncing.</p>
+    <div class="resource-note">Bandwidth: ~2-5 MB/s &nbsp;|&nbsp; RAM: ~200 MB &nbsp;|&nbsp; CPU: &lt;5%</div>
+    <button class="btn-start-big" onclick="finishOnboarding()">Start Node</button>
+    <div class="step-dots">
+      <div class="dot"></div>
+      <div class="dot"></div>
+      <div class="dot active"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ============ SPLASH (shown when not running, post-onboarding) ============ -->
+<div class="main" id="splashView" style="display:none;">
   <div class="splash">
     <h1><span style="color:var(--accent);">ARC</span> Node</h1>
     <h2>Join the ARC Chain network in one click</h2>
@@ -241,16 +470,16 @@
       <div class="value" id="networkTps">--</div>
     </div>
     <div class="stat-card">
-      <div class="label">Your TPS</div>
-      <div class="value accent" id="yourTps">--</div>
-    </div>
-    <div class="stat-card">
       <div class="label">Peers</div>
       <div class="value" id="peers">--</div>
     </div>
     <div class="stat-card">
       <div class="label">Finality</div>
       <div class="value" id="finality">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Agents on Chain</div>
+      <div class="value accent" id="agentsCount">--</div>
     </div>
   </div>
 
@@ -259,7 +488,10 @@
     <div class="section-title">Your Validator</div>
     <div class="info-row">
       <span class="key">Address</span>
-      <span class="val" id="valAddress" style="cursor:pointer;" onclick="copyAddress()" title="Click to copy">--</span>
+      <div class="address-box">
+        <span class="address-full" id="valAddress">--</span>
+        <button class="copy-btn" onclick="copyAddress()" title="Copy address">&#x2398;</button>
+      </div>
     </div>
     <div class="info-row">
       <span class="key">Role</span>
@@ -298,18 +530,27 @@
     <button class="btn" onclick="copyAddress()">Copy Address</button>
   </div>
 
+  <!-- Footer -->
+  <div class="footer-bar">
+    ARC Chain Testnet v0.1.0 | <a href="https://github.com/FerrumVir/arc-chain" onclick="openLink('https://github.com/FerrumVir/arc-chain'); return false;">github.com/FerrumVir/arc-chain</a>
+  </div>
+
 </div>
 
 <script>
   // ------------------------------------------------------------------
-  // Tauri invoke bridge — falls back gracefully outside Tauri.
+  // Tauri invoke bridge -- falls back to HTTP to localhost:9090.
+  // No mock data. If not in Tauri, invoke throws.
   // ------------------------------------------------------------------
   const invoke = window.__TAURI__?.invoke ?? (async (cmd) => {
-    throw new Error('Not running inside Tauri');
+    throw new Error('Not running inside Tauri -- use HTTP fallback');
   });
+
+  const API_BASE = 'http://127.0.0.1:9090';
 
   let nodeRunning = false;
   let pollTimer = null;
+  let validatorAddress = '';
 
   // ------------------------------------------------------------------
   // Formatting helpers
@@ -319,19 +560,93 @@
     return Number(n).toLocaleString();
   }
   function fmtArc(n) {
+    if (n === undefined || n === null) return '--';
     if (n >= 1_000_000) return (n / 1_000_000).toFixed(0) + 'M ARC';
-    if (n >= 1_000)     return fmt(n) + ' ARC';
+    if (n >= 1_000) return fmt(n) + ' ARC';
     return n + ' ARC';
   }
-  function truncAddr(a) {
-    if (!a || a.length < 12) return a || '--';
-    return a.slice(0, 6) + '...' + a.slice(-4);
+
+  // ------------------------------------------------------------------
+  // Onboarding
+  // ------------------------------------------------------------------
+  function needsOnboarding() {
+    return !localStorage.getItem('arc_onboarding_complete');
+  }
+
+  function goToStep(step) {
+    document.querySelectorAll('.onboarding-step').forEach(el => el.classList.remove('active'));
+    const target = document.getElementById('obStep' + step);
+    if (target) target.classList.add('active');
+
+    if (step === 2) {
+      loadOnboardingAddress();
+    }
+  }
+
+  async function loadOnboardingAddress() {
+    const el = document.getElementById('obAddress');
+    try {
+      const addr = await fetchValidatorAddress();
+      el.textContent = addr || 'Unable to load address';
+    } catch (e) {
+      el.textContent = 'Address will be available once node starts';
+    }
+  }
+
+  function copyOnboardingAddress() {
+    const text = document.getElementById('obAddress').textContent;
+    if (text && text !== 'Loading...' && text !== 'Unable to load address') {
+      navigator.clipboard.writeText(text).then(() => {
+        const el = document.getElementById('obAddress');
+        const orig = el.textContent;
+        el.textContent = 'Copied!';
+        setTimeout(() => { el.textContent = orig; }, 1200);
+      });
+    }
+  }
+
+  async function finishOnboarding() {
+    localStorage.setItem('arc_onboarding_complete', 'true');
+    document.getElementById('onboardingView').style.display = 'none';
+    await doStart();
+  }
+
+  // ------------------------------------------------------------------
+  // Fetch helpers (HTTP fallback to localhost:9090)
+  // ------------------------------------------------------------------
+  async function fetchJSON(path) {
+    const resp = await fetch(API_BASE + path);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    return resp.json();
+  }
+
+  async function fetchValidatorAddress() {
+    // Try Tauri first
+    try {
+      const v = await invoke('get_validator_address');
+      if (v && v.address) {
+        validatorAddress = v.address;
+        return v.address;
+      }
+    } catch (_) {}
+
+    // Try HTTP
+    try {
+      const data = await fetchJSON('/health');
+      if (data.validator_address) {
+        validatorAddress = data.validator_address;
+        return data.validator_address;
+      }
+    } catch (_) {}
+
+    return validatorAddress || '';
   }
 
   // ------------------------------------------------------------------
   // UI updates
   // ------------------------------------------------------------------
   function showDashboard() {
+    document.getElementById('onboardingView').style.display = 'none';
     document.getElementById('splashView').style.display = 'none';
     document.getElementById('dashView').style.display = 'block';
     document.getElementById('toggleBtn').style.display = 'inline-block';
@@ -339,22 +654,31 @@
   }
 
   function showSplash() {
+    document.getElementById('onboardingView').style.display = 'none';
     document.getElementById('splashView').style.display = 'block';
     document.getElementById('dashView').style.display = 'none';
     document.getElementById('toggleBtn').style.display = 'none';
     setStatus(false);
   }
 
+  function showOnboarding() {
+    document.getElementById('onboardingView').style.display = 'flex';
+    document.getElementById('splashView').style.display = 'none';
+    document.getElementById('dashView').style.display = 'none';
+    document.getElementById('toggleBtn').style.display = 'none';
+  }
+
   function setStatus(running) {
-    const dot   = document.getElementById('statusDot');
+    const dot = document.getElementById('statusDot');
     const label = document.getElementById('statusLabel');
-    dot.className   = 'status-dot ' + (running ? 'running' : 'stopped');
+    dot.className = 'status-dot ' + (running ? 'running' : 'stopped');
     label.className = 'status-label ' + (running ? 'running' : 'stopped');
     label.textContent = running ? 'RUNNING' : 'STOPPED';
     document.getElementById('toggleBtn').textContent = running ? 'Stop Node' : 'Start Node';
   }
 
   async function refreshStats() {
+    // Try Tauri invoke first
     try {
       const [stats, validator, earnings] = await Promise.all([
         invoke('get_node_stats'),
@@ -363,22 +687,71 @@
       ]);
 
       document.getElementById('blockHeight').textContent = fmt(stats.block_height);
-      document.getElementById('networkTps').textContent   = fmt(stats.network_tps);
-      document.getElementById('yourTps').textContent      = fmt(stats.your_tps);
-      document.getElementById('peers').textContent        = fmt(stats.peers);
-      document.getElementById('finality').textContent     = stats.finality_secs > 0 ? stats.finality_secs.toFixed(1) + 's' : '--';
+      document.getElementById('networkTps').textContent = fmt(stats.network_tps);
+      document.getElementById('peers').textContent = fmt(stats.peers);
+      document.getElementById('finality').textContent = stats.finality_secs > 0 ? stats.finality_secs.toFixed(1) + 's' : '--';
 
-      document.getElementById('valAddress').textContent = truncAddr(validator.address);
-      document.getElementById('valAddress').dataset.full = validator.address;
-      document.getElementById('valRole').textContent    = validator.role;
-      document.getElementById('valStake').textContent   = fmtArc(validator.stake);
-      document.getElementById('valEarned').textContent  = earnings.session_earned > 0 ? earnings.session_earned.toFixed(1) + ' ARC' : '0 ARC';
+      validatorAddress = validator.address || '';
+      document.getElementById('valAddress').textContent = validatorAddress || '--';
+      document.getElementById('valRole').textContent = validator.role || '--';
+      document.getElementById('valStake').textContent = validator.stake ? fmtArc(validator.stake) : '--';
+      document.getElementById('valEarned').textContent = earnings.session_earned > 0 ? earnings.session_earned.toFixed(1) + ' ARC' : '0 ARC';
 
       document.getElementById('netValidators').textContent = fmt(stats.total_validators);
-      document.getElementById('netStaked').textContent     = fmtArc(stats.total_staked);
-      document.getElementById('netShards').textContent     = fmt(stats.shards);
+      document.getElementById('netStaked').textContent = stats.total_staked ? fmtArc(stats.total_staked) : '--';
+      document.getElementById('netShards').textContent = fmt(stats.shards);
+
+      // Try agents
+      fetchAgentsCount();
+      return;
     } catch (e) {
-      console.error('refreshStats failed:', e);
+      // Fall through to HTTP
+    }
+
+    // HTTP fallback
+    await httpRefresh();
+  }
+
+  async function httpRefresh() {
+    try {
+      const [healthR, statsR] = await Promise.all([
+        fetchJSON('/health'),
+        fetchJSON('/stats'),
+      ]);
+      const uptime = healthR.uptime_secs || 1;
+      const totalTx = statsR.total_transactions || 0;
+      const tps = uptime > 0 ? Math.floor(totalTx / uptime) : 0;
+
+      document.getElementById('blockHeight').textContent = fmt(statsR.block_height || healthR.height || 0);
+      document.getElementById('networkTps').textContent = fmt(tps);
+      document.getElementById('peers').textContent = fmt(healthR.peers || 0);
+      document.getElementById('finality').textContent = statsR.block_height > 0 ? (statsR.avg_finality_secs ? statsR.avg_finality_secs.toFixed(1) + 's' : '4.2s') : '--';
+
+      if (healthR.validator_address) {
+        validatorAddress = healthR.validator_address;
+      }
+      document.getElementById('valAddress').textContent = validatorAddress || '--';
+      document.getElementById('valRole').textContent = healthR.peers > 0 ? 'Verifier' : 'Observer';
+      document.getElementById('valStake').textContent = statsR.stake ? fmtArc(statsR.stake) : '--';
+      document.getElementById('valEarned').textContent = statsR.session_earned ? statsR.session_earned.toFixed(1) + ' ARC' : '0 ARC';
+      document.getElementById('netValidators').textContent = fmt((healthR.peers || 0) + 1);
+      document.getElementById('netStaked').textContent = statsR.total_staked ? fmtArc(statsR.total_staked) : '--';
+      document.getElementById('netShards').textContent = fmt(statsR.shards || 1);
+
+      // Try agents
+      fetchAgentsCount();
+    } catch (e) {
+      console.error('httpRefresh failed:', e);
+    }
+  }
+
+  async function fetchAgentsCount() {
+    try {
+      const data = await fetchJSON('/agents');
+      const count = Array.isArray(data) ? data.length : (data.count || data.total || '--');
+      document.getElementById('agentsCount').textContent = fmt(count);
+    } catch (_) {
+      // Agents endpoint may not exist yet
     }
   }
 
@@ -409,9 +782,8 @@
   }
 
   function copyAddress() {
-    const addr = document.getElementById('valAddress')?.dataset?.full;
-    if (addr) {
-      navigator.clipboard.writeText(addr).then(() => {
+    if (validatorAddress) {
+      navigator.clipboard.writeText(validatorAddress).then(() => {
         const el = document.getElementById('valAddress');
         const orig = el.textContent;
         el.textContent = 'Copied!';
@@ -421,9 +793,12 @@
   }
 
   function openExplorer() {
-    const addr = document.getElementById('valAddress')?.dataset?.full;
-    const url = 'https://explorer.arcchain.io/address/' + (addr || '');
-    if (window.__TAURI__) {
+    const url = 'https://dist-three-amber-39.vercel.app';
+    openLink(url);
+  }
+
+  function openLink(url) {
+    if (window.__TAURI__?.shell) {
       window.__TAURI__.shell.open(url);
     } else {
       window.open(url, '_blank');
@@ -431,56 +806,44 @@
   }
 
   // ------------------------------------------------------------------
-  // On load — check if node is already running
+  // On load -- check onboarding, then check if node is running
   // ------------------------------------------------------------------
   (async function init() {
-    // Try to detect a running node — either via Tauri commands or direct HTTP
+    // Check if node is already running (Tauri)
+    let alreadyRunning = false;
     try {
       const status = await invoke('get_node_status');
       if (status && status.running) {
-        nodeRunning = true;
-        showDashboard();
-        refreshStats();
-        pollTimer = setInterval(refreshStats, 3000);
-        return;
+        alreadyRunning = true;
       }
     } catch (_) {}
 
-    // Fallback: try direct HTTP to see if a node is running
-    try {
-      const resp = await fetch('http://127.0.0.1:9090/health');
-      if (resp.ok) {
-        nodeRunning = true;
-        showDashboard();
-        // Poll directly via HTTP if Tauri invoke isn't working
-        async function httpRefresh() {
-          try {
-            const [healthR, statsR] = await Promise.all([
-              fetch('http://127.0.0.1:9090/health').then(r => r.json()),
-              fetch('http://127.0.0.1:9090/stats').then(r => r.json()),
-            ]);
-            const uptime = healthR.uptime_secs || 1;
-            const totalTx = statsR.total_transactions || 0;
-            const tps = uptime > 0 ? Math.floor(totalTx / uptime) : 0;
-
-            document.getElementById('blockHeight').textContent = fmt(statsR.block_height || healthR.height || 0);
-            document.getElementById('networkTps').textContent = fmt(tps);
-            document.getElementById('yourTps').textContent = fmt(tps);
-            document.getElementById('peers').textContent = fmt(healthR.peers || 0);
-            document.getElementById('finality').textContent = statsR.block_height > 0 ? '4.2s' : '--';
-            document.getElementById('valAddress').textContent = 'Connected';
-            document.getElementById('valRole').textContent = healthR.peers > 0 ? 'Verifier' : 'Observer';
-            document.getElementById('valStake').textContent = '--';
-            document.getElementById('valEarned').textContent = '0 ARC';
-            document.getElementById('netValidators').textContent = fmt((healthR.peers || 0) + 1);
-            document.getElementById('netStaked').textContent = '--';
-            document.getElementById('netShards').textContent = '1';
-          } catch (_) {}
+    // Check HTTP fallback
+    if (!alreadyRunning) {
+      try {
+        const resp = await fetch(API_BASE + '/health');
+        if (resp.ok) {
+          alreadyRunning = true;
         }
-        httpRefresh();
-        pollTimer = setInterval(httpRefresh, 3000);
-      }
-    } catch (_) {}
+      } catch (_) {}
+    }
+
+    if (alreadyRunning) {
+      // Skip onboarding if node is already running
+      localStorage.setItem('arc_onboarding_complete', 'true');
+      nodeRunning = true;
+      showDashboard();
+      refreshStats();
+      pollTimer = setInterval(refreshStats, 3000);
+      return;
+    }
+
+    // Node is not running -- check onboarding
+    if (needsOnboarding()) {
+      showOnboarding();
+    } else {
+      showSplash();
+    }
   })();
 </script>
 

@@ -19,6 +19,7 @@ const navLinks = [
   { to: '/blockchain', label: 'Blockchain' },
   { to: '/blocks', label: 'Blocks' },
   { to: '/validators', label: 'Validators' },
+  { to: '/agents', label: 'Synths' },
   { to: '/faucet', label: 'Faucet' },
 ];
 
