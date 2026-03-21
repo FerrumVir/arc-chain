@@ -217,6 +217,9 @@ pub struct StateDB {
     /// Optional GPU-resident state cache for hot accounts.
     /// When enabled, `get_account()` checks GPU memory first.
     gpu_cache: Option<Arc<gpu_state::GpuStateCache>>,
+    /// Archive mode — when true, skips all pruning (keeps full history).
+    /// Used by block explorers and analytics nodes.
+    pub archive_mode: bool,
 }
 
 impl StateDB {
@@ -250,6 +253,7 @@ impl StateDB {
             jmt: parking_lot::Mutex::new(JmtStateTree::new()),
             use_jmt: false,
             gpu_cache: None,
+            archive_mode: false,
         }
     }
 
@@ -285,6 +289,7 @@ impl StateDB {
             jmt: parking_lot::Mutex::new(JmtStateTree::new()),
             use_jmt: false,
             gpu_cache: None,
+            archive_mode: false,
         })
     }
 
@@ -3768,9 +3773,9 @@ impl StateDB {
         self.wal.append(WalOp::SetBlock(height, block.clone()), height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
 
-        // Auto-prune old JMT state every 100 blocks, keeping the last 1000 versions.
-        // Also prune old receipts to prevent unbounded memory growth at high TPS.
-        if height % 100 == 0 {
+        // Auto-prune old state every 100 blocks unless in archive mode.
+        // Archive nodes keep full history for block explorers and analytics.
+        if !self.archive_mode && height % 100 == 0 {
             self.prune_old_state(1000);
             self.prune_old_receipts(1000);
         }

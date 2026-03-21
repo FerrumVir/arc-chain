@@ -53,6 +53,12 @@ struct Cli {
     #[arg(long, default_value = "arc-validator-0")]
     validator_seed: String,
 
+    /// Archive mode — disable all pruning, keep full transaction history.
+    /// Use for block explorers and analytics. Requires more disk space.
+    /// Regular validators should NOT use this flag.
+    #[arg(long, default_value_t = false)]
+    archive: bool,
+
     /// Enable continuous transaction generation (testnet benchmark mode).
     /// Generates transfers between genesis accounts to keep the chain busy.
     #[arg(long, default_value_t = false)]
@@ -328,8 +334,15 @@ async fn main() -> Result<()> {
             .collect()
     };
 
-    let state = Arc::new(StateDB::with_genesis_persistent(&genesis_accounts, &data_dir)
-        .expect("Failed to initialize state with WAL persistence"));
+    let state = Arc::new({
+        let mut db = StateDB::with_genesis_persistent(&genesis_accounts, &data_dir)
+            .expect("Failed to initialize state with WAL persistence");
+        if cli.archive {
+            db.archive_mode = true;
+            tracing::info!("Archive mode ENABLED — no pruning, full transaction history retained");
+        }
+        db
+    });
 
     // ── State Sync Protocol (A5) — bootstrap from peer snapshot ─────
     if let Some(peer) = &cli.sync_from {
