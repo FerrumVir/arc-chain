@@ -97,7 +97,7 @@ export default function Home() {
       suffix: 'tx/s',
       loading,
       sparkline: tpsHistory,
-      sparkColor: '#6F7CF4',
+      sparkColor: '#2563EB',
     },
     {
       label: 'Total Transactions',
@@ -114,7 +114,7 @@ export default function Home() {
       value: stats?.block_height ?? 0,
       loading,
       sparkline: blockTimeHistory,
-      sparkColor: '#51EB8E',
+      sparkColor: '#60A5FA',
     },
   ];
 

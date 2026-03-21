@@ -264,7 +264,7 @@ export default function Blockchain() {
           <div
             className="absolute w-[600px] h-[600px] rounded-full opacity-[0.07]"
             style={{
-              background: '#6F7CF4',
+              background: '#2563EB',
               filter: 'blur(120px)',
               top: '-10%',
               left: '15%',
@@ -273,7 +273,7 @@ export default function Blockchain() {
           <div
             className="absolute w-[500px] h-[500px] rounded-full opacity-[0.05]"
             style={{
-              background: '#002DDE',
+              background: '#1E40AF',
               filter: 'blur(120px)',
               top: '20%',
               right: '10%',
@@ -282,7 +282,7 @@ export default function Blockchain() {
           <div
             className="absolute w-[400px] h-[400px] rounded-full opacity-[0.04]"
             style={{
-              background: '#3855E9',
+              background: '#60A5FA',
               filter: 'blur(120px)',
               bottom: '0%',
               left: '40%',
@@ -295,7 +295,7 @@ export default function Blockchain() {
           className="absolute inset-0 pointer-events-none opacity-[0.03]"
           style={{
             backgroundImage:
-              'linear-gradient(rgba(111,124,244,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(111,124,244,0.3) 1px, transparent 1px)',
+              'linear-gradient(rgba(37,99,235,0.3) 1px, transparent 1px), linear-gradient(90deg, rgba(37,99,235,0.3) 1px, transparent 1px)',
             backgroundSize: '60px 60px',
           }}
         />
@@ -637,7 +637,7 @@ export default function Blockchain() {
           <div
             className="absolute w-[600px] h-[400px] rounded-full opacity-[0.04]"
             style={{
-              background: '#6F7CF4',
+              background: '#2563EB',
               filter: 'blur(120px)',
               top: '10%',
               left: '20%',
@@ -646,7 +646,7 @@ export default function Blockchain() {
           <div
             className="absolute w-[500px] h-[400px] rounded-full opacity-[0.03]"
             style={{
-              background: '#002DDE',
+              background: '#1E40AF',
               filter: 'blur(120px)',
               top: '10%',
               right: '20%',

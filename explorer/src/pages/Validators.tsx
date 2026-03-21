@@ -32,9 +32,9 @@ function StakeDistribution({
   if (!validators.length || totalStake === 0) return null;
 
   const tierColors: Record<string, string> = {
-    Core: '#6F7CF4',
-    Arc: '#3855E9',
-    Spark: '#51EB8E',
+    Core: '#2563EB',
+    Arc: '#1E40AF',
+    Spark: '#60A5FA',
   };
 
   // Group by tier for legend
