@@ -1092,6 +1092,20 @@ async fn get_full_transaction(
             "prev_state_root": format!("0x{}", hex::encode(&body.prev_state_root.0)),
             "post_state_root": format!("0x{}", hex::encode(&body.post_state_root.0)),
         }),
+        TxBody::InferenceAttestation(body) => json!({
+            "type": "InferenceAttestation",
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "input_hash": format!("0x{}", hex::encode(&body.input_hash.0)),
+            "output_hash": format!("0x{}", hex::encode(&body.output_hash.0)),
+            "challenge_period": body.challenge_period,
+            "bond": body.bond,
+        }),
+        TxBody::InferenceChallenge(body) => json!({
+            "type": "InferenceChallenge",
+            "attestation_hash": format!("0x{}", hex::encode(&body.attestation_hash.0)),
+            "challenger_output_hash": format!("0x{}", hex::encode(&body.challenger_output_hash.0)),
+            "challenger_bond": body.challenger_bond,
+        }),
     };
 
     let sig_json = match &tx.signature {
