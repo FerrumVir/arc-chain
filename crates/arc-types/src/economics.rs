@@ -10,6 +10,148 @@ use crate::account::Address;
 pub const TOTAL_SUPPLY: u128 = 1_030_000_000_000_000_000; // 1.03B * 10^9
 pub const DECIMALS: u8 = 9;
 
+/// Blocks per year at ~400ms block time.
+pub const BLOCKS_PER_YEAR: u64 = 78_840_000;
+
+/// Maximum annual inflation rate for staking rewards (basis points). 300 = 3%.
+pub const MAX_ANNUAL_INFLATION_BPS: u16 = 300;
+
+/// No token burning. All fees are distributed to validators and treasury.
+/// The 3% trading tax on the ERC-20 side funds ongoing rewards via bridge.
+pub const BURN_ENABLED: bool = false;
+
+// ─── Validator roles (distinct from staking tiers) ──────────────────────────
+
+/// Validator role within a shard. Determines hardware requirements and revenue share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ValidatorRole {
+    /// Executes transactions, produces blocks. Requires GPU + high-core CPU.
+    /// Minimum stake: Arc tier (5M ARC).
+    Proposer,
+    /// Verifies state diffs from proposers. Moderate CPU.
+    /// Minimum stake: Spark tier (500K ARC).
+    Verifier,
+    /// Light verification, proof checking. Minimal hardware.
+    /// Minimum stake: Lite tier (50K ARC).
+    Observer,
+}
+
+/// Revenue split configuration for all protocol revenue (fees + tax).
+///
+/// No tokens are burned. 100% of revenue flows to participants:
+///   - Proposers: 40% (cover GPU/server costs)
+///   - Verifiers: 25% (cover moderate hardware)
+///   - Observers: 15% (reward home node runners)
+///   - Treasury:  20% (team revenue, development, grants)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleRevenueConfig {
+    /// Proposer share (basis points). Default: 4000 = 40%.
+    pub proposer_share_bps: u16,
+    /// Verifier share, split equally (basis points). Default: 2500 = 25%.
+    pub verifier_share_bps: u16,
+    /// Observer pool, pro-rata by stake (basis points). Default: 1500 = 15%.
+    pub observer_pool_bps: u16,
+    /// Treasury/team share (basis points). Default: 2000 = 20%.
+    pub treasury_share_bps: u16,
+}
+
+impl Default for RoleRevenueConfig {
+    fn default() -> Self {
+        Self {
+            proposer_share_bps: 4000,
+            verifier_share_bps: 2500,
+            observer_pool_bps: 1500,
+            treasury_share_bps: 2000,
+        }
+    }
+}
+
+impl RoleRevenueConfig {
+    /// Split a fee amount into (proposer, per_verifier, observer_pool, treasury).
+    /// `num_verifiers` is the count of active verifiers in this shard.
+    pub fn split_fee(&self, total: u64, num_verifiers: u32) -> FeeSplit {
+        let proposer = (total as u128 * self.proposer_share_bps as u128 / 10_000) as u64;
+        let verifier_total = (total as u128 * self.verifier_share_bps as u128 / 10_000) as u64;
+        let per_verifier = if num_verifiers > 0 {
+            verifier_total / num_verifiers as u64
+        } else {
+            0
+        };
+        let observer_pool = (total as u128 * self.observer_pool_bps as u128 / 10_000) as u64;
+        let treasury = (total as u128 * self.treasury_share_bps as u128 / 10_000) as u64;
+        FeeSplit { proposer, per_verifier, observer_pool, treasury }
+    }
+}
+
+/// Result of splitting fees across validator roles and treasury.
+#[derive(Debug, Clone)]
+pub struct FeeSplit {
+    /// Amount to the block proposer.
+    pub proposer: u64,
+    /// Amount to each individual verifier.
+    pub per_verifier: u64,
+    /// Amount to the observer staking pool.
+    pub observer_pool: u64,
+    /// Amount to the protocol treasury (team revenue).
+    pub treasury: u64,
+}
+
+// ─── Validator bootstrap fund ───────────────────────────────────────────────
+
+/// Bootstrap fund for subsidizing early validators before fee revenue is sufficient.
+/// Linear vesting with optional cliff.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapFund {
+    /// Total ARC allocated to the fund.
+    pub total_allocation: u128,
+    /// Amount already distributed.
+    pub distributed: u128,
+    /// Block height when vesting begins.
+    pub vesting_start_block: u64,
+    /// Total vesting duration in blocks.
+    pub vesting_duration_blocks: u64,
+    /// Cliff period: no vesting before this many blocks after start.
+    pub cliff_blocks: u64,
+}
+
+impl BootstrapFund {
+    /// Create a 2-year bootstrap fund with 1-week cliff.
+    pub fn new_two_year(total_allocation: u128, start_block: u64) -> Self {
+        Self {
+            total_allocation,
+            distributed: 0,
+            vesting_start_block: start_block,
+            vesting_duration_blocks: BLOCKS_PER_YEAR * 2, // 2 years
+            cliff_blocks: 1_512_000,                       // ~7 days
+        }
+    }
+
+    /// Amount vested (unlocked) at a given block height.
+    pub fn vested_amount(&self, current_block: u64) -> u128 {
+        if current_block < self.vesting_start_block + self.cliff_blocks {
+            return 0;
+        }
+        let elapsed = current_block.saturating_sub(self.vesting_start_block);
+        if elapsed >= self.vesting_duration_blocks {
+            return self.total_allocation;
+        }
+        self.total_allocation * elapsed as u128 / self.vesting_duration_blocks as u128
+    }
+
+    /// Amount claimable (vested minus already distributed).
+    pub fn claimable(&self, current_block: u64) -> u128 {
+        self.vested_amount(current_block).saturating_sub(self.distributed)
+    }
+
+    /// Per-block distribution amount for active validators.
+    pub fn per_block_amount(&self) -> u128 {
+        if self.vesting_duration_blocks == 0 {
+            return 0;
+        }
+        self.total_allocation / self.vesting_duration_blocks as u128
+    }
+}
+
 /// Minimum stake amounts per tier (in smallest unit, 9 decimals).
 pub const MIN_STAKE_LITE: u64 = 50_000_000_000_000; // 50K ARC
 pub const MIN_STAKE_SPARK: u64 = 500_000_000_000_000; // 500K ARC
@@ -211,6 +353,9 @@ impl StakePosition {
 // ─── Fee model (EIP-1559 style) ────────────────────────────────────────────
 
 /// Configuration for the EIP-1559 style dynamic fee market.
+///
+/// At high TPS, the base fee auto-scales to maintain a target annual burn rate
+/// of ~0.25% of circulating supply, preventing fee-driven supply exhaustion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FeeConfig {
     /// Current base fee per gas unit (smallest ARC unit).
@@ -227,9 +372,25 @@ pub struct FeeConfig {
     pub burn_percentage: u16,
     /// Percentage of base fee to block proposer (basis points). 5000 = 50%.
     pub proposer_percentage: u16,
+    /// Smoothed TPS estimate (exponential moving average, updated each block).
+    #[serde(default)]
+    pub smoothed_tps: f64,
+    /// Circulating supply for burn-rate targeting (updated each block).
+    #[serde(default = "default_circulating_supply")]
+    pub circulating_supply: u128,
+    /// Target annual burn rate (basis points). Default: 25 = 0.25%.
+    #[serde(default = "default_target_burn_bps")]
+    pub target_annual_burn_bps: u16,
+    /// Revenue split by validator role.
+    #[serde(default)]
+    pub role_revenue: RoleRevenueConfig,
 }
 
+fn default_circulating_supply() -> u128 { TOTAL_SUPPLY }
+fn default_target_burn_bps() -> u16 { 0 }
+
 /// Breakdown of fees for a single transaction.
+/// No tokens are burned — 100% distributed to validators + treasury.
 #[derive(Debug, Clone)]
 pub struct FeeBreakdown {
     /// Base fee component.
@@ -238,25 +399,34 @@ pub struct FeeBreakdown {
     pub priority_fee: u64,
     /// Total fee paid by the sender.
     pub total_fee: u64,
-    /// Amount of the total fee that is burned.
-    pub burned: u64,
-    /// Amount of the total fee that goes to the block proposer.
+    /// Amount to the block proposer (40%).
     pub to_proposer: u64,
+    /// Amount to shard verifiers (25%, split equally).
+    pub to_verifiers: u64,
+    /// Amount to the observer pool (15%, pro-rata by stake).
+    pub to_observer_pool: u64,
+    /// Amount to protocol treasury / team (20%).
+    pub to_treasury: u64,
     /// Whether this transaction is a free settlement.
     pub is_free_settlement: bool,
 }
 
 impl FeeConfig {
     /// Sensible default configuration for ARC Chain mainnet.
+    /// No burn — 100% of fees distributed to validators + treasury.
     pub fn default_config() -> Self {
         Self {
-            base_fee: 1_000, // 0.000001 ARC per gas unit
-            min_base_fee: 100,
-            max_base_fee: 1_000_000_000, // 1 ARC per gas unit
+            base_fee: 1_000,
+            min_base_fee: 1,
+            max_base_fee: 1_000_000_000,
             target_block_utilization: 0.5,
-            adjustment_speed: 8, // 1/8 max change per block
-            burn_percentage: 5000, // 50%
-            proposer_percentage: 5000, // 50%
+            adjustment_speed: 8,
+            burn_percentage: 0,       // No burn
+            proposer_percentage: 10000, // 100% to validators (split by role_revenue)
+            smoothed_tps: 0.0,
+            circulating_supply: TOTAL_SUPPLY,
+            target_annual_burn_bps: 0, // No burn target
+            role_revenue: RoleRevenueConfig::default(),
         }
     }
 
@@ -276,8 +446,10 @@ impl FeeConfig {
                 base_fee: 0,
                 priority_fee: 0,
                 total_fee: 0,
-                burned: 0,
                 to_proposer: 0,
+                to_verifiers: 0,
+                to_observer_pool: 0,
+                to_treasury: 0,
                 is_free_settlement: true,
             };
         }
@@ -286,20 +458,24 @@ impl FeeConfig {
         let priority_component = priority_fee.saturating_mul(gas_used);
         let total = base_component.saturating_add(priority_component);
 
-        // Base fee is split: burn_percentage burned, proposer_percentage to proposer.
-        let burned = (base_component as u128 * self.burn_percentage as u128 / 10_000) as u64;
-        let base_to_proposer =
-            (base_component as u128 * self.proposer_percentage as u128 / 10_000) as u64;
-
-        // Priority fee goes entirely to the proposer.
-        let to_proposer = base_to_proposer.saturating_add(priority_component);
+        // No burn — 100% of fees distributed by role.
+        let to_proposer =
+            (total as u128 * self.role_revenue.proposer_share_bps as u128 / 10_000) as u64;
+        let to_verifiers =
+            (total as u128 * self.role_revenue.verifier_share_bps as u128 / 10_000) as u64;
+        let to_observer_pool =
+            (total as u128 * self.role_revenue.observer_pool_bps as u128 / 10_000) as u64;
+        let to_treasury =
+            (total as u128 * self.role_revenue.treasury_share_bps as u128 / 10_000) as u64;
 
         FeeBreakdown {
             base_fee: base_component,
             priority_fee: priority_component,
             total_fee: total,
-            burned,
             to_proposer,
+            to_verifiers,
+            to_observer_pool,
+            to_treasury,
             is_free_settlement: false,
         }
     }
@@ -348,6 +524,57 @@ impl FeeConfig {
 
         self.base_fee = new_fee.clamp(self.min_base_fee, self.max_base_fee);
     }
+
+    /// Update smoothed TPS and auto-scale base fee to keep fees sustainable.
+    ///
+    /// At high TPS, fees auto-decrease so total fee extraction stays reasonable
+    /// relative to circulating supply (~5% of supply/year in total fees).
+    /// At low TPS, fees stay at defaults to prevent spam.
+    pub fn adjust_for_tps(&mut self, block_tx_count: u64, block_time_secs: f64) {
+        if block_time_secs <= 0.0 {
+            return;
+        }
+
+        // Update smoothed TPS (exponential moving average, alpha = 0.1).
+        let instant_tps = block_tx_count as f64 / block_time_secs;
+        self.smoothed_tps = self.smoothed_tps * 0.9 + instant_tps * 0.1;
+
+        if self.smoothed_tps < 100.0 {
+            return; // Don't adjust at very low TPS
+        }
+
+        // Target: total annual fee extraction ≈ 5% of circulating supply.
+        // This funds validators + treasury without inflating or burning.
+        let target_annual_fees = self.circulating_supply * 500 / 10_000; // 5%
+        let target_fees_per_block = target_annual_fees / BLOCKS_PER_YEAR as u128;
+
+        if target_fees_per_block == 0 {
+            return;
+        }
+
+        // Estimated actual fees per block at current base_fee:
+        let avg_gas: u128 = 21_000;
+        let txs_per_block = (self.smoothed_tps * block_time_secs) as u128;
+        let actual_fees_per_block = (self.base_fee as u128)
+            .saturating_mul(avg_gas)
+            .saturating_mul(txs_per_block);
+
+        if actual_fees_per_block == 0 {
+            return;
+        }
+
+        // Adjust proportionally, clamped to ±50% per block.
+        let ratio = target_fees_per_block as f64 / actual_fees_per_block as f64;
+        let clamped_ratio = ratio.clamp(0.5, 2.0);
+        let new_fee = ((self.base_fee as f64) * clamped_ratio) as u64;
+
+        self.base_fee = new_fee.clamp(self.min_base_fee, self.max_base_fee);
+    }
+
+    /// Update circulating supply tracker.
+    pub fn update_supply(&mut self, circulating: u128) {
+        self.circulating_supply = circulating;
+    }
 }
 
 // ─── Block reward ──────────────────────────────────────────────────────────
@@ -363,10 +590,14 @@ pub struct BlockReward {
     pub base_fee_revenue: u64,
     /// Total priority fee revenue collected.
     pub priority_fee_revenue: u64,
-    /// Total tokens burned from base fees.
-    pub burned: u64,
-    /// Total reward paid to the proposer (base share + tips).
+    /// Total reward paid to the proposer (40% of fees).
     pub proposer_reward: u64,
+    /// Total reward paid to verifiers (25% of fees).
+    pub verifier_reward: u64,
+    /// Amount added to observer pool (15% of fees).
+    pub observer_pool_reward: u64,
+    /// Amount sent to treasury (20% of fees).
+    pub treasury_reward: u64,
     /// Total staking rewards distributed in this block.
     pub staking_rewards_distributed: u64,
     /// Number of transactions in the block.
@@ -377,19 +608,22 @@ pub struct BlockReward {
 
 // ─── Supply tracker ────────────────────────────────────────────────────────
 
-/// Tracks the evolving ARC token supply (deflationary mechanics).
+/// Tracks the ARC token supply. Fixed supply — no burn, no inflation.
+/// Staking rewards and validator payments come from fees + tax revenue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupplyTracker {
-    /// The genesis supply.
-    pub initial_supply: u128,
-    /// Cumulative tokens burned.
-    pub total_burned: u128,
+    /// The fixed total supply (never changes).
+    pub total_supply: u128,
     /// Tokens currently locked in staking.
     pub total_staked: u128,
-    /// Circulating supply = initial - burned.
-    pub circulating_supply: u128,
-    /// Cumulative staking rewards paid out.
-    pub total_rewards_paid: u128,
+    /// Tokens locked in bootstrap fund (vesting).
+    pub bootstrap_locked: u128,
+    /// Tokens locked in treasury.
+    pub treasury_balance: u128,
+    /// Cumulative fee revenue distributed to validators.
+    pub total_fees_distributed: u128,
+    /// Cumulative tax revenue bridged from ETH and distributed.
+    pub total_tax_revenue: u128,
     /// Current block height.
     pub current_block: u64,
 }
@@ -398,21 +632,14 @@ impl SupplyTracker {
     /// Initialize the tracker at genesis.
     pub fn new() -> Self {
         Self {
-            initial_supply: TOTAL_SUPPLY,
-            total_burned: 0,
+            total_supply: TOTAL_SUPPLY,
             total_staked: 0,
-            circulating_supply: TOTAL_SUPPLY,
-            total_rewards_paid: 0,
+            bootstrap_locked: 0,
+            treasury_balance: 0,
+            total_fees_distributed: 0,
+            total_tax_revenue: 0,
             current_block: 0,
         }
-    }
-
-    /// Burn tokens, reducing the circulating supply permanently.
-    pub fn burn(&mut self, amount: u128) {
-        self.total_burned = self.total_burned.saturating_add(amount);
-        self.circulating_supply = self
-            .initial_supply
-            .saturating_sub(self.total_burned);
     }
 
     /// Record tokens moving into staking.
@@ -425,17 +652,28 @@ impl SupplyTracker {
         self.total_staked = self.total_staked.saturating_sub(amount);
     }
 
-    /// Record staking rewards paid out (inflationary pressure counter).
-    pub fn pay_reward(&mut self, amount: u128) {
-        self.total_rewards_paid = self.total_rewards_paid.saturating_add(amount);
+    /// Record fee revenue distributed to validators.
+    pub fn record_fees(&mut self, amount: u128) {
+        self.total_fees_distributed = self.total_fees_distributed.saturating_add(amount);
     }
 
-    /// Deflation rate as a percentage of the initial supply that has been burned.
-    pub fn deflation_rate(&self) -> f64 {
-        if self.initial_supply == 0 {
-            return 0.0;
-        }
-        self.total_burned as f64 / self.initial_supply as f64 * 100.0
+    /// Record tax revenue bridged from ETH.
+    pub fn record_tax_revenue(&mut self, amount: u128) {
+        self.total_tax_revenue = self.total_tax_revenue.saturating_add(amount);
+    }
+
+    /// Circulating supply = total - staked - bootstrap_locked - treasury.
+    pub fn circulating_supply(&self) -> u128 {
+        self.total_supply
+            .saturating_sub(self.total_staked)
+            .saturating_sub(self.bootstrap_locked)
+            .saturating_sub(self.treasury_balance)
+    }
+
+    /// Staking ratio as percentage.
+    pub fn staking_ratio(&self) -> f64 {
+        if self.total_supply == 0 { return 0.0; }
+        self.total_staked as f64 / self.total_supply as f64 * 100.0
     }
 }
 
@@ -615,12 +853,12 @@ mod tests {
         assert!(pos.can_withdraw(1_000 + UNBONDING_ARC + 1_000));
     }
 
-    // 7. Normal transaction fee split
+    // 7. Normal transaction fee split — no burn, 100% to validators + treasury
     #[test]
     fn test_fee_calculation_normal_tx() {
         let config = FeeConfig::default_config();
         let gas_used = 21_000;
-        let priority_fee = 500; // per gas unit
+        let priority_fee = 500;
 
         let fee = config.calculate_fee(gas_used, priority_fee, "Transfer");
 
@@ -629,16 +867,21 @@ mod tests {
         assert_eq!(fee.priority_fee, priority_fee * gas_used);
         assert_eq!(fee.total_fee, fee.base_fee + fee.priority_fee);
 
-        // 50% of base fee burned
-        let expected_burned = fee.base_fee / 2;
-        assert_eq!(fee.burned, expected_burned);
+        // No burn — all fees distributed
+        let total_distributed = fee.to_proposer + fee.to_verifiers + fee.to_observer_pool + fee.to_treasury;
+        // Allow ±4 for integer rounding across 4 splits
+        assert!(
+            (total_distributed as i64 - fee.total_fee as i64).abs() <= 4,
+            "distributed {} should ≈ total_fee {}", total_distributed, fee.total_fee
+        );
 
-        // Proposer gets 50% of base fee + 100% of priority
-        let expected_to_proposer = fee.base_fee / 2 + fee.priority_fee;
-        assert_eq!(fee.to_proposer, expected_to_proposer);
+        // Proposer gets 40%
+        let expected_proposer = (fee.total_fee as u128 * 4000 / 10_000) as u64;
+        assert_eq!(fee.to_proposer, expected_proposer);
 
-        // Burned + proposer should account for entire fee
-        assert_eq!(fee.burned + fee.to_proposer, fee.total_fee);
+        // Treasury gets 20%
+        let expected_treasury = (fee.total_fee as u128 * 2000 / 10_000) as u64;
+        assert_eq!(fee.to_treasury, expected_treasury);
     }
 
     // 8. Settlement transactions are free
@@ -649,10 +892,8 @@ mod tests {
 
         assert!(fee.is_free_settlement);
         assert_eq!(fee.total_fee, 0);
-        assert_eq!(fee.base_fee, 0);
-        assert_eq!(fee.priority_fee, 0);
-        assert_eq!(fee.burned, 0);
         assert_eq!(fee.to_proposer, 0);
+        assert_eq!(fee.to_treasury, 0);
     }
 
     // 9. Base fee increases when block is more than half full
@@ -687,35 +928,34 @@ mod tests {
         );
     }
 
-    // 11. Supply tracker burn reduces circulating supply
+    // 11. Supply tracker — staking reduces circulating supply
     #[test]
-    fn test_supply_tracker_burn() {
+    fn test_supply_tracker_staking() {
         let mut tracker = SupplyTracker::new();
-        assert_eq!(tracker.circulating_supply, TOTAL_SUPPLY);
+        assert_eq!(tracker.circulating_supply(), TOTAL_SUPPLY);
 
-        let burn_amount: u128 = 1_000_000_000_000_000; // 1M ARC
-        tracker.burn(burn_amount);
+        let stake_amount: u128 = 5_000_000_000_000_000; // 5M ARC
+        tracker.stake(stake_amount);
 
-        assert_eq!(tracker.total_burned, burn_amount);
-        assert_eq!(tracker.circulating_supply, TOTAL_SUPPLY - burn_amount);
+        assert_eq!(tracker.total_staked, stake_amount);
+        assert_eq!(tracker.circulating_supply(), TOTAL_SUPPLY - stake_amount);
     }
 
-    // 12. Deflation rate calculated correctly
+    // 12. Staking ratio
     #[test]
-    fn test_supply_tracker_deflation() {
+    fn test_supply_tracker_staking_ratio() {
         let mut tracker = SupplyTracker::new();
-        assert_eq!(tracker.deflation_rate(), 0.0);
+        assert_eq!(tracker.staking_ratio(), 0.0);
 
-        // Burn 1% of total supply
-        let one_percent = TOTAL_SUPPLY / 100;
-        tracker.burn(one_percent);
+        // Stake 10% of total supply
+        let ten_percent = TOTAL_SUPPLY / 10;
+        tracker.stake(ten_percent);
 
-        let rate = tracker.deflation_rate();
-        // Should be very close to 1.0%
+        let ratio = tracker.staking_ratio();
         assert!(
-            (rate - 1.0).abs() < 0.01,
-            "Deflation rate should be ~1.0%, got {}",
-            rate
+            (ratio - 10.0).abs() < 0.01,
+            "Staking ratio should be ~10.0%, got {}",
+            ratio
         );
     }
 

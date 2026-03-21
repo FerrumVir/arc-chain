@@ -1556,6 +1556,8 @@ impl ConsensusEngine {
             TxBody::ChannelClose(_) => false,  // Escrow is deterministic
             TxBody::ChannelDispute(_) => false,  // Escrow is deterministic
             TxBody::ShardProof(_) => false,  // Shard-local proof recording
+            TxBody::InferenceAttestation(_) => false,  // Escrow is local to sender's shard
+            TxBody::InferenceChallenge(_) => false,  // Resolved on attestation's shard
         }
     }
 

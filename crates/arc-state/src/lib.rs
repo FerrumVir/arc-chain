@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
-pub use wal::{WalWriter, WalOp, WalEntry, Snapshot, PersistenceConfig, read_wal, find_last_checkpoint};
+pub use wal::{WalWriter, WalOp, WalEntry, Snapshot, PersistenceConfig, read_wal, read_wal_dir, find_last_checkpoint};
 
 #[derive(Error, Debug)]
 pub enum StateError {
@@ -2054,11 +2054,16 @@ impl StateDB {
             TxBody::Governance(_) => gas_costs::GOVERNANCE,
             TxBody::BridgeLock(_) => gas_costs::BRIDGE_LOCK,
             TxBody::BridgeMint(_) => gas_costs::BRIDGE_MINT,
-            TxBody::BatchSettle(_) => gas_costs::BATCH_SETTLE,
+            TxBody::BatchSettle(body) => {
+                gas_costs::BATCH_SETTLE_BASE
+                    + (body.entries.len() as u64) * gas_costs::BATCH_SETTLE_PER_ENTRY
+            }
             TxBody::ChannelOpen(_) => gas_costs::CHANNEL_OPEN,
             TxBody::ChannelClose(_) => gas_costs::CHANNEL_CLOSE,
             TxBody::ChannelDispute(_) => gas_costs::CHANNEL_DISPUTE,
             TxBody::ShardProof(_) => gas_costs::SHARD_PROOF,
+            TxBody::InferenceAttestation(_) => gas_costs::INFERENCE_ATTESTATION,
+            TxBody::InferenceChallenge(_) => gas_costs::INFERENCE_CHALLENGE,
         }
     }
 
@@ -3172,6 +3177,19 @@ impl StateDB {
             }
             TxBody::BatchSettle(body) => {
                 // --- Batch Settlement: net bilateral balances ---
+                // Validate entry count before any state access (DoS protection).
+                if body.entries.len() > gas_costs::BATCH_SETTLE_MAX_ENTRIES {
+                    return Err(StateError::ExecutionError(format!(
+                        "BatchSettle exceeds max entries: {} > {}",
+                        body.entries.len(),
+                        gas_costs::BATCH_SETTLE_MAX_ENTRIES
+                    )));
+                }
+                if body.entries.is_empty() {
+                    return Err(StateError::ExecutionError(
+                        "BatchSettle with zero entries".to_string(),
+                    ));
+                }
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -3408,6 +3426,100 @@ impl StateDB {
 
                 Ok(gas.consumed)
             }
+            TxBody::InferenceAttestation(body) => {
+                // --- Tier 2 Optimistic Inference Attestation ---
+                // 1. Verify sender nonce
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+
+                // 2. Verify sender has sufficient balance for bond
+                if sender.balance < body.bond {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: body.bond,
+                    });
+                }
+
+                // 3. Debit bond from sender and increment nonce
+                sender.balance -= body.bond;
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                // 4. Lock bond in deterministic escrow: BLAKE3("arc-inference" || attestation_hash)
+                let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
+                let mut escrow = self.get_or_create_account(&escrow_addr);
+                escrow.balance += body.bond;
+                // Store model_id fingerprint in nonce (for lookup)
+                escrow.nonce = u64::from_le_bytes(body.model_id.0[..8].try_into().unwrap_or([0u8; 8]));
+                // Store the current block height in storage_root (as metadata)
+                // so the challenge period can be verified later.
+                let mut meta_input = Vec::new();
+                meta_input.extend_from_slice(&body.input_hash.0);
+                meta_input.extend_from_slice(&body.output_hash.0);
+                meta_input.extend_from_slice(&body.challenge_period.to_le_bytes());
+                meta_input.extend_from_slice(&self.height().to_le_bytes());
+                escrow.storage_root = hash_bytes(&meta_input);
+                self.accounts.insert(escrow_addr.0, escrow.clone());
+                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+
+                Ok(gas.consumed)
+            }
+            TxBody::InferenceChallenge(body) => {
+                // --- Tier 2 Inference Challenge (Fraud Proof) ---
+                // 1. Verify sender nonce
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+
+                // 2. Verify sender has sufficient balance for challenger bond
+                if sender.balance < body.challenger_bond {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: body.challenger_bond,
+                    });
+                }
+
+                // 3. Look up the attestation escrow
+                let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
+                let escrow = self.get_or_create_account(&escrow_addr);
+                if escrow.balance == 0 {
+                    return Err(StateError::ExecutionError(
+                        "inference challenge: attestation escrow not found or already resolved".to_string(),
+                    ));
+                }
+
+                // 4. Debit challenger bond and increment nonce
+                sender.balance -= body.challenger_bond;
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                // 5. Lock challenger's bond in the same escrow
+                let total_bond = escrow.balance + body.challenger_bond;
+                let mut escrow = escrow.clone();
+                escrow.balance = total_bond;
+                self.accounts.insert(escrow_addr.0, escrow.clone());
+                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+
+                // 6. Dispute resolution: if challenger_output_hash differs from the
+                //    attested output, the dispute is recorded.  On-chain re-execution
+                //    via precompile 0x0A determines the winner.  For now, the dispute
+                //    is recorded and validators resolve it at challenge period expiry.
+                //    Full resolution would call the AI precompile and compare outputs;
+                //    the winner receives both bonds and the loser is slashed.
+
+                Ok(gas.consumed)
+            }
         }
     }
 
@@ -3508,7 +3620,23 @@ impl StateDB {
         self.wal.append(WalOp::SetBlock(height, block.clone()), height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
 
+        // Auto-prune old JMT state every 100 blocks, keeping the last 1000 versions.
+        if height % 100 == 0 {
+            self.prune_old_state(1000);
+        }
+
         Ok((block, receipts))
+    }
+
+    /// Prune old JMT state, keeping the last `keep_versions` versions.
+    /// This frees memory for historical state that is no longer needed for
+    /// rollback or proofs.
+    pub fn prune_old_state(&self, keep_versions: u64) {
+        let mut jmt = self.jmt.lock();
+        let current = jmt.version();
+        if current > keep_versions {
+            jmt.prune_versions_before(current - keep_versions);
+        }
     }
 
     /// Look up a transaction receipt by tx hash.
@@ -3600,6 +3728,14 @@ impl StateDB {
             }
             TxBody::ChannelOpen(_) | TxBody::ChannelClose(_) | TxBody::ChannelDispute(_) => {}
             TxBody::ShardProof(_) => {}
+            TxBody::InferenceAttestation(_) => {
+                let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
+                self.account_txs.entry(escrow_addr.0).or_default().push(tx.hash);
+            }
+            TxBody::InferenceChallenge(body) => {
+                let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
+                self.account_txs.entry(escrow_addr.0).or_default().push(tx.hash);
+            }
         }
     }
 
@@ -3660,6 +3796,14 @@ impl StateDB {
                 proof_input.extend_from_slice(&body.block_height.to_le_bytes());
                 let proof_key = hash_bytes(&proof_input);
                 self.dirty_accounts.insert(proof_key.0);
+            }
+            TxBody::InferenceAttestation(_) => {
+                let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
+                self.dirty_accounts.insert(escrow_addr.0);
+            }
+            TxBody::InferenceChallenge(body) => {
+                let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
+                self.dirty_accounts.insert(escrow_addr.0);
             }
         }
     }

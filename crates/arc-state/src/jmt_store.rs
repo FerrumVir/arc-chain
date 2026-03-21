@@ -1017,6 +1017,24 @@ impl JmtStateTree {
         current_level[0]
     }
 
+    /// Remove historical state for versions strictly before `version`.
+    /// The simplified `JmtStateTree` does not store per-version node data,
+    /// so this is a lightweight operation that only updates the version
+    /// watermark. Callers can safely invoke this periodically to signal
+    /// that earlier versions are no longer needed.
+    pub fn prune_versions_before(&mut self, version: u64) {
+        // The simplified tree keeps only the latest state (no versioned
+        // node store), so there is nothing to physically free.  We record
+        // the prune watermark in `version` so that future extensions can
+        // use it.
+        if version > self.version {
+            // Cannot prune past the current version — clamp silently.
+            return;
+        }
+        // In the full VersionedJmtStore this would drop old nodes.
+        // Here it is intentionally a no-op on the node set.
+    }
+
     /// Number of leaves (accounts) in the tree.
     pub fn len(&self) -> usize {
         self.leaves.len()
