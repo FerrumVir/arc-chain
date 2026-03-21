@@ -8,6 +8,7 @@ import Transaction from './pages/Transaction';
 import Account from './pages/Account';
 import Faucet from './pages/Faucet';
 import Validators from './pages/Validators';
+import Agents from './pages/Agents';
 
 export default function App() {
   return (
@@ -21,6 +22,7 @@ export default function App() {
         <Route path="/account/:address" element={<Account />} />
         <Route path="/faucet" element={<Faucet />} />
         <Route path="/validators" element={<Validators />} />
+        <Route path="/agents" element={<Agents />} />
       </Route>
     </Routes>
   );
