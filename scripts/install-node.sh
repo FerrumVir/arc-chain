@@ -1,0 +1,319 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# ARC Chain — One-Click Node Installer
+# https://github.com/FerrumVir/arc-chain
+#
+# Usage:
+#   curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-node.sh | bash
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+if [ -t 1 ] && command -v tput >/dev/null 2>&1; then
+    BOLD="$(tput bold)"
+    GREEN="$(tput setaf 2)"
+    CYAN="$(tput setaf 6)"
+    YELLOW="$(tput setaf 3)"
+    RED="$(tput setaf 1)"
+    RESET="$(tput sgr0)"
+else
+    BOLD="" GREEN="" CYAN="" YELLOW="" RED="" RESET=""
+fi
+
+info()  { printf "${CYAN}[INFO]${RESET}  %s\n" "$*"; }
+ok()    { printf "${GREEN}[  OK]${RESET}  %s\n" "$*"; }
+warn()  { printf "${YELLOW}[WARN]${RESET}  %s\n" "$*"; }
+fail()  { printf "${RED}[FAIL]${RESET}  %s\n" "$*" >&2; exit 1; }
+step()  { printf "\n${BOLD}── %s ──${RESET}\n" "$*"; }
+
+REPO_URL="https://github.com/FerrumVir/arc-chain.git"
+ARC_HOME="$HOME/.arc-chain"
+REPO_DIR="$ARC_HOME/arc-chain"
+CONFIG_FILE="$ARC_HOME/config.toml"
+KEY_FILE="$ARC_HOME/validator.key"
+
+# ── 1. Detect OS ─────────────────────────────────────────────────────────────
+step "Detecting operating system"
+
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+case "$OS" in
+    Linux)
+        info "OS: Linux ($ARCH)"
+        ;;
+    Darwin)
+        info "OS: macOS ($ARCH)"
+        ;;
+    *)
+        fail "Unsupported operating system: $OS. ARC Chain supports Linux and macOS only."
+        ;;
+esac
+
+# ── 2. Check prerequisites ──────────────────────────────────────────────────
+step "Checking prerequisites"
+
+for cmd in git curl; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        ok "$cmd found: $(command -v "$cmd")"
+    else
+        fail "'$cmd' is required but not installed. Please install it and try again."
+    fi
+done
+
+# On Linux, check for build essentials
+if [ "$OS" = "Linux" ]; then
+    if ! command -v cc >/dev/null 2>&1; then
+        warn "No C compiler found. Attempting to install build-essential..."
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config libssl-dev
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y gcc gcc-c++ make openssl-devel pkg-config
+        elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y gcc gcc-c++ make openssl-devel pkg-config
+        else
+            fail "Could not install build tools automatically. Please install a C compiler and try again."
+        fi
+        ok "Build tools installed"
+    else
+        ok "C compiler found"
+    fi
+fi
+
+# On macOS, ensure Xcode command line tools are present
+if [ "$OS" = "Darwin" ]; then
+    if ! xcode-select -p >/dev/null 2>&1; then
+        info "Installing Xcode Command Line Tools (this may take a few minutes)..."
+        xcode-select --install 2>/dev/null || true
+        warn "Please re-run this script after Xcode Command Line Tools finish installing."
+        exit 1
+    else
+        ok "Xcode Command Line Tools found"
+    fi
+fi
+
+# ── 3. Install Rust ─────────────────────────────────────────────────────────
+step "Setting up Rust"
+
+if command -v rustc >/dev/null 2>&1; then
+    RUST_VER="$(rustc --version)"
+    ok "Rust already installed: $RUST_VER"
+else
+    info "Rust not found — installing via rustup..."
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+    ok "Rust installed: $(rustc --version)"
+fi
+
+# Ensure cargo is on PATH for the rest of this script
+export PATH="$HOME/.cargo/bin:$PATH"
+
+# ── 4. Clone the repository ─────────────────────────────────────────────────
+step "Cloning ARC Chain repository"
+
+mkdir -p "$ARC_HOME"
+
+if [ -d "$REPO_DIR/.git" ]; then
+    info "Repository already exists — pulling latest changes..."
+    git -C "$REPO_DIR" pull --ff-only || warn "Pull failed; continuing with existing code"
+    ok "Repository updated"
+else
+    info "Cloning $REPO_URL into $REPO_DIR ..."
+    git clone --depth 1 "$REPO_URL" "$REPO_DIR"
+    ok "Repository cloned"
+fi
+
+# ── 5. Build in release mode ────────────────────────────────────────────────
+step "Building ARC Chain (release mode — this may take a few minutes)"
+
+cd "$REPO_DIR"
+cargo build --release -p arc-node 2>&1 | tail -1
+ok "Build complete: $REPO_DIR/target/release/arc-node"
+
+ARC_BIN="$REPO_DIR/target/release/arc-node"
+
+# ── 6. Create default config ────────────────────────────────────────────────
+step "Creating configuration"
+
+if [ -f "$CONFIG_FILE" ]; then
+    warn "Config already exists at $CONFIG_FILE — skipping (delete it to regenerate)"
+else
+    cat > "$CONFIG_FILE" <<'TOML'
+# ARC Chain Node Configuration
+# Generated by install-node.sh
+
+[rpc]
+listen = "0.0.0.0:9090"
+eth_port = 8545
+
+[p2p]
+port = 9091
+# peers = ["seed1.arc-chain.io:9091", "seed2.arc-chain.io:9091"]
+
+[validator]
+seed = ""          # populated from validator.key at startup
+stake = 500_000    # Spark tier (minimum)
+min_stake = 500_000
+
+[storage]
+data_dir = "~/.arc-chain/data"
+TOML
+    ok "Config written to $CONFIG_FILE"
+fi
+
+# ── 7. Generate validator keypair (Ed25519) ──────────────────────────────────
+step "Generating validator keypair"
+
+if [ -f "$KEY_FILE" ]; then
+    warn "Keypair already exists at $KEY_FILE — skipping (delete it to regenerate)"
+else
+    # Generate a 32-byte random seed, derive Ed25519 keypair using openssl
+    SEED_HEX="$(openssl rand -hex 32)"
+
+    # Write the raw seed as a PEM-encoded Ed25519 private key via openssl
+    # We use openssl genpkey for proper Ed25519 key generation
+    openssl genpkey -algorithm Ed25519 -out "$KEY_FILE" 2>/dev/null
+
+    # Restrict permissions
+    chmod 600 "$KEY_FILE"
+    ok "Validator keypair saved to $KEY_FILE (permissions: 600)"
+fi
+
+# Extract the public key and derive a 0x-prefixed address
+PUB_HEX="$(openssl pkey -in "$KEY_FILE" -pubout -outform DER 2>/dev/null | tail -c 32 | xxd -p -c 64)"
+# Take first 20 bytes (40 hex chars) as the address, Ethereum-style
+VALIDATOR_ADDR="0x${PUB_HEX:0:40}"
+
+ok "Validator public key: ${PUB_HEX}"
+
+# ── 8. Install as a system service ──────────────────────────────────────────
+step "Installing system service"
+
+if [ "$OS" = "Linux" ]; then
+    # ── systemd ──
+    SERVICE_SRC="$REPO_DIR/scripts/arc-node.service"
+    SERVICE_DST="/etc/systemd/system/arc-node.service"
+
+    CURRENT_USER="$(whoami)"
+    ARC_BIN_ABS="$(realpath "$ARC_BIN")"
+    CONFIG_ABS="$(realpath "$CONFIG_FILE")"
+
+    # Write a user-specific service file (use current user, not hardcoded 'arc')
+    sudo tee "$SERVICE_DST" >/dev/null <<EOF
+[Unit]
+Description=ARC Chain Node
+After=network.target
+
+[Service]
+Type=simple
+User=${CURRENT_USER}
+ExecStart=${ARC_BIN_ABS} --config ${CONFIG_ABS}
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    sudo systemctl daemon-reload
+    sudo systemctl enable arc-node.service
+    ok "systemd service installed and enabled"
+
+    # ── Start the node ──
+    step "Starting ARC Chain node"
+    sudo systemctl start arc-node.service
+    ok "arc-node.service started"
+
+elif [ "$OS" = "Darwin" ]; then
+    # ── launchd ──
+    PLIST_DIR="$HOME/Library/LaunchAgents"
+    PLIST_FILE="$PLIST_DIR/com.arc-chain.node.plist"
+    LOG_DIR="$ARC_HOME/logs"
+    mkdir -p "$PLIST_DIR" "$LOG_DIR"
+
+    ARC_BIN_ABS="$(realpath "$ARC_BIN" 2>/dev/null || echo "$ARC_BIN")"
+    CONFIG_ABS="$(realpath "$CONFIG_FILE" 2>/dev/null || echo "$CONFIG_FILE")"
+
+    cat > "$PLIST_FILE" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.arc-chain.node</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${ARC_BIN_ABS}</string>
+        <string>--config</string>
+        <string>${CONFIG_ABS}</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/arc-node.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/arc-node.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:${HOME}/.cargo/bin</string>
+    </dict>
+</dict>
+</plist>
+EOF
+
+    # Unload first in case it was already loaded (ignore errors)
+    launchctl unload "$PLIST_FILE" 2>/dev/null || true
+
+    # ── Start the node ──
+    step "Starting ARC Chain node"
+    launchctl load "$PLIST_FILE"
+    ok "launchd agent loaded (com.arc-chain.node)"
+fi
+
+# ── 9. Summary ───────────────────────────────────────────────────────────────
+echo ""
+echo "${BOLD}${GREEN}════════════════════════════════════════════════════════════════${RESET}"
+echo "${BOLD}${GREEN}  Your ARC Chain node is running!${RESET}"
+echo "${BOLD}${GREEN}════════════════════════════════════════════════════════════════${RESET}"
+echo ""
+echo "  ${BOLD}Validator address:${RESET}  ${CYAN}${VALIDATOR_ADDR}${RESET}"
+echo ""
+echo "  ${BOLD}RPC endpoint:${RESET}       http://localhost:9090"
+echo "  ${BOLD}Health check:${RESET}       curl http://localhost:9090/health"
+echo ""
+echo "  ${BOLD}Config:${RESET}             $CONFIG_FILE"
+echo "  ${BOLD}Keypair:${RESET}            $KEY_FILE"
+echo "  ${BOLD}Binary:${RESET}             $ARC_BIN"
+echo ""
+if [ "$OS" = "Linux" ]; then
+    echo "  ${BOLD}Manage:${RESET}"
+    echo "    sudo systemctl status  arc-node"
+    echo "    sudo systemctl stop    arc-node"
+    echo "    sudo systemctl restart arc-node"
+    echo "    sudo journalctl -u arc-node -f"
+elif [ "$OS" = "Darwin" ]; then
+    echo "  ${BOLD}Manage:${RESET}"
+    echo "    launchctl list | grep arc-chain"
+    echo "    launchctl unload ~/Library/LaunchAgents/com.arc-chain.node.plist"
+    echo "    launchctl load   ~/Library/LaunchAgents/com.arc-chain.node.plist"
+    echo "    tail -f ~/.arc-chain/logs/arc-node.stdout.log"
+fi
+echo ""
+echo "  ${BOLD}Next steps:${RESET}"
+echo "    1. Fund your validator address with ARC tokens"
+echo "    2. Add bootstrap peers to $CONFIG_FILE"
+echo "    3. Join the community: https://github.com/FerrumVir/arc-chain"
+echo ""
+echo "${BOLD}${GREEN}════════════════════════════════════════════════════════════════${RESET}"

@@ -1,0 +1,27 @@
+[package]
+name = "arc-agents"
+description = "Example on-chain AI agents for ARC Chain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-crypto = { path = "../crates/arc-crypto" }
+arc-types = { path = "../crates/arc-types" }
+arc-vm = { path = "../crates/arc-vm" }
+hex.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "sentiment-agent"
+path = "src/sentiment_agent.rs"
+
+[[bin]]
+name = "oracle-agent"
+path = "src/oracle_agent.rs"
+
+[[bin]]
+name = "router-agent"
+path = "src/router_agent.rs"

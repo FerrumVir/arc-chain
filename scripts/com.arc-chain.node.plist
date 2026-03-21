@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.arc-chain.node</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/arc/.arc-chain/arc-chain/target/release/arc-node</string>
+        <string>--config</string>
+        <string>/Users/arc/.arc-chain/config.toml</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/arc/.arc-chain/logs/arc-node.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/arc/.arc-chain/logs/arc-node.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/Users/arc/.cargo/bin</string>
+    </dict>
+</dict>
+</plist>

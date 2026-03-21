@@ -1,0 +1,13 @@
+[Unit]
+Description=ARC Chain Node
+After=network.target
+
+[Service]
+Type=simple
+User=arc
+ExecStart=/home/arc/.arc-chain/arc-chain/target/release/arc-node --config /home/arc/.arc-chain/config.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
