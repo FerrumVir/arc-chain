@@ -180,7 +180,7 @@ export default function Home() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           {/* Run a Node */}
           <a
-            href="https://docs.arc.tech/node"
+            href="https://github.com/FerrumVir/arc-chain/blob/main/testnet/README.md"
             target="_blank"
             rel="noopener noreferrer"
             className="group border border-arc-border bg-arc-surface-raised p-6 hover:border-arc-aquarius/50 transition-all duration-200"
@@ -205,7 +205,7 @@ export default function Home() {
 
           {/* Build on ARC */}
           <a
-            href="https://docs.arc.tech"
+            href="https://github.com/FerrumVir/arc-chain"
             target="_blank"
             rel="noopener noreferrer"
             className="group border border-arc-border bg-arc-surface-raised p-6 hover:border-arc-blue/50 transition-all duration-200"
@@ -228,7 +228,7 @@ export default function Home() {
 
           {/* Join Community */}
           <a
-            href="https://discord.gg/arc"
+            href="https://x.com/arcreactorai"
             target="_blank"
             rel="noopener noreferrer"
             className="group border border-arc-border bg-arc-surface-raised p-6 hover:border-arc-success/50 transition-all duration-200"
@@ -247,7 +247,7 @@ export default function Home() {
               </h3>
             </div>
             <p className="text-xs text-arc-grey-600 leading-relaxed">
-              Connect with builders, validators, and the ARC team on Discord, Twitter, and more.
+              Follow @arcreactorai for updates. Join the testnet and run a node.
             </p>
           </a>
         </div>

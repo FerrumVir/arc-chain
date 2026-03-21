@@ -35,9 +35,8 @@ const footerColumns = [
   {
     title: 'Developers',
     links: [
-      { label: 'Documentation', href: 'https://docs.arc.tech' },
-      { label: 'GitHub', href: 'https://github.com/ARC-Chain' },
-      { label: 'API Reference', href: 'https://docs.arc.tech/api' },
+      { label: 'GitHub', href: 'https://github.com/FerrumVir/arc-chain' },
+      { label: 'Documentation', href: 'https://github.com/FerrumVir/arc-chain/blob/main/SPEC.md' },
       { label: 'Smart Contracts', to: '/blockchain' },
     ],
   },
@@ -45,18 +44,14 @@ const footerColumns = [
     title: 'Network',
     links: [
       { label: 'Blockchain', to: '/blockchain' },
-      { label: 'Node Setup', href: 'https://docs.arc.tech/node' },
-      { label: 'Testnet', href: 'https://testnet.arc.tech' },
-      { label: 'Status', href: 'https://status.arc.tech' },
+      { label: 'Run a Node', href: 'https://github.com/FerrumVir/arc-chain/blob/main/testnet/README.md' },
     ],
   },
   {
     title: 'Community',
     links: [
-      { label: 'Twitter', href: 'https://twitter.com/ARC_Chain' },
-      { label: 'Discord', href: 'https://discord.gg/arc' },
-      { label: 'Blog', href: 'https://arc.tech/blog' },
-      { label: 'Brand', href: 'https://brandpad.io/arc' },
+      { label: 'Twitter', href: 'https://x.com/arcreactorai' },
+      { label: 'Token', href: 'https://etherscan.io/token/0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499' },
     ],
   },
 ];

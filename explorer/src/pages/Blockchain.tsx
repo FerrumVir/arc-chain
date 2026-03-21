@@ -240,7 +240,7 @@ const DEV_TOOLS = [
   },
   {
     title: 'Explorer & Faucet',
-    install: 'scan.arc.ai',
+    install: 'explorer.arc.ai',
     desc: 'Real-time block explorer with testnet faucet. GPU verification status and TPS metrics.',
     lang: 'Web',
   },
