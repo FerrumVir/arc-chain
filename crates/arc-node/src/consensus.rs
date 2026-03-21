@@ -632,8 +632,8 @@ impl ConsensusManager {
                             let received_diff = self.pending_diffs.remove(&dag_block.hash.0);
 
                             if self.proposer_mode || received_diff.is_none() {
-                                // ── PROPOSER PATH: full execution ─────────────
-                                match state.execute_block_verified(&committed_txs, self.validator_address)
+                                // ── PROPOSER PATH: adaptive execution (auto-selects Sequential vs BlockSTM) ──
+                                match state.execute_block_adaptive(&committed_txs, self.validator_address)
                                 {
                                     Ok((block, receipts)) => {
                                         let elapsed = start.elapsed();
