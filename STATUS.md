@@ -1,10 +1,10 @@
 # ARC Chain — Project Status
 
 > **Version**: 0.2.0 (pre-mainnet, L1 scaling)
-> **Last updated**: 2026-03-13
-> **Codebase**: 75,285 LOC Rust (11 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
-> **Tests**: 1,028 passing, 0 failures
-> **TX Types**: 21 (16 core + 5 L1 scaling)
+> **Last updated**: 2026-03-20
+> **Codebase**: 76,255 LOC Rust (11 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
+> **Tests**: 1,031 passing, 0 failures
+> **TX Types**: 23 (16 core + 5 L1 scaling + 2 inference)
 > **Benchmark**: 69.3K TPS single-node peak (M4 MacBook, BlockSTM + Coalesce)
 
 ---
@@ -26,8 +26,8 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | Crate | LOC | Tests | Status | What It Does |
 |-------|-----|-------|--------|-------------|
 | **arc-crypto** | 11,680 | 220 | Production | Ed25519, Secp256k1, BLS (blst), BLAKE3, ML-DSA, Falcon-512, VRF, threshold crypto, Merkle trees, Pedersen commitments, ZK circuits, Stwo STARK prover |
-| **arc-types** | 14,071 | 258 | Production | 21 transaction types (16 core + 5 L1 scaling), block/header, protocol versioning, governance, economics (EIP-1559), staking tiers, bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs |
-| **arc-state** | 12,127 | 138 | Production | DashMap state, JMT (Jellyfish Merkle Tree) with inclusion + non-membership proofs, WAL persistence (CRC32 + LZ4), snapshots, BlockSTM parallel execution, GPU-resident state cache (Metal unified memory / CPU fallback), light client proofs, state sync |
+| **arc-types** | 14,320 | 261 | Production | 23 transaction types (16 core + 5 L1 scaling + 2 inference), block/header, protocol versioning, governance, economics (no-burn fee distribution), validator roles (Proposer/Verifier/Observer), bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs, inference attestation/challenge |
+| **arc-state** | 12,378 | 140 | Production | DashMap state, JMT (Jellyfish Merkle Tree) with inclusion + non-membership proofs + auto-pruning (every 100 blocks, keeps 1000 versions), segmented WAL with auto-rotate at 256MB (CRC32 + LZ4), pruning after snapshots, BlockSTM parallel execution, GPU-resident state cache (Metal unified memory / CPU fallback), light client proofs, state sync |
 | **arc-vm** | 8,439 | 145 | Production | Wasmer 6.0 WASM runtime, revm 19 EVM, gas metering, host imports, 11 precompiles (Ed25519/Secp256k1/BLS/BLAKE3/SHA256/VRF/Oracle/Merkle/Falcon/ZK-verify/AI-inference), AI inference oracle, formal verification model-checker |
 | **arc-mempool** | 876 | 17 | Production | SegQueue FIFO, deduplication, encrypted mempool (BLS threshold, wired into ConsensusManager), capacity limits |
 | **arc-consensus** | 7,523 | 126 | Production | Mysticeti-inspired DAG, 2-round finality, stake tiers (Spark/Arc/Core), slashing (equivocation + liveness), cross-shard coordination, canonical TX ordering (MEV protection), epoch transitions |
@@ -39,7 +39,7 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 ---
 
-## Transaction Types (21 total)
+## Transaction Types (23 total)
 
 ### Core Protocol (16 types)
 
@@ -66,11 +66,18 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 | Code | Type | Gas | Status |
 |------|------|-----|--------|
-| 0x11 | BatchSettle (bilateral netting) | 30,000 | Implemented (2026-03-06) |
+| 0x11 | BatchSettle (bilateral netting) | 30,000 + 500/entry (max 10K entries) | Implemented (2026-03-06), gas scaling fix (2026-03-20) |
 | 0x12 | ChannelOpen (lock funds) | 40,000 | Implemented (2026-03-06) |
 | 0x13 | ChannelClose (mutual release) | 35,000 | Implemented (2026-03-06) |
 | 0x14 | ChannelDispute (challenge) | 50,000 | Implemented (2026-03-06) |
 | 0x15 | ShardProof (STARK verification) | 60,000 | Implemented (2026-03-06) |
+
+### Inference (2 types — AI inference attestation and dispute)
+
+| Code | Type | Gas | Status |
+|------|------|-----|--------|
+| 0x16 | InferenceAttestation (off-chain result) | 30,000 | Implemented (2026-03-20) |
+| 0x17 | InferenceChallenge (fraud proof) | 50,000 | Implemented (2026-03-20) |
 
 ---
 
@@ -128,10 +135,10 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | JMT (Jellyfish Merkle Tree) | DONE | Incremental updates, domain-separated BLAKE3 |
 | Inclusion proofs | DONE | Log(n) Merkle proofs for light clients |
 | Non-membership proofs | DONE | Empty-slot + different-key verification (2026-03-06) |
-| WAL persistence | DONE | CRC32 integrity, LZ4 compression, checkpoint + replay |
+| WAL persistence | DONE | Segmented WAL with auto-rotate at 256MB, CRC32 integrity, LZ4 compression, checkpoint + replay, pruning after snapshots |
 | Snapshots | DONE | Bincode + LZ4, chunked for parallel download |
 | State sync | DONE | StreamedSnapshot, per-chunk verification |
-| State pruning | DONE | prune_versions_before() on JMT |
+| State pruning | DONE | JMT auto-pruning: prune_versions_before() called every 100 blocks, keeps 1000 versions |
 | GPU-resident state cache | DONE | wgpu unified memory (Metal) / managed (Vulkan) / CPU fallback. CPU-side DashMap mirror for fast reads, GPU buffer for batch compute shaders (BlockSTM, Merkle hashing). Lazy flush_to_gpu() per block. 15.2M lookups/sec on M4. (2026-03-13) |
 
 ### Cryptography
@@ -155,13 +162,16 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Native ARC token | DONE | Genesis accounts, transfer TX |
-| EIP-1559 fee market | DONE | Base fee + priority fee, 50% burn / 50% proposer |
+| Native ARC token | DONE | Genesis accounts, transfer TX, fixed 1.03B supply |
+| No-burn fee distribution | DONE | 100% distributed: 40% proposers, 25% verifiers, 15% observers, 20% treasury. No tokens burned. |
+| Validator roles | DONE | Proposer (5M ARC, 40% fees), Verifier (500K ARC, 25% fees), Observer (50K ARC, 15% fees) |
+| TPS-aware fee scaling | DONE | base_fee auto-adjusts at high TPS to keep fees sustainable |
 | Staking with APY tiers | DONE | 5% Lite / 8% Spark / 15% Arc / 25% Core |
 | Slashing penalties | DONE | Progressive by tier |
 | Unbonding periods | DONE | 1d Lite / 7d Spark / 14d Arc / 30d Core |
 | Claim rewards | DONE | On-demand calculation + claim TX |
 | Free settlements | DONE | Settle TX type = zero base fee |
+| Bootstrap fund | DONE | 40M ARC over 2 years for early validator subsidies |
 
 ### Smart Contract Tooling
 
@@ -180,7 +190,7 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| BatchSettle TX (0x11) | DONE | Bilateral netting, 1000:1 compression, nets per-recipient via HashMap (2026-03-06) |
+| BatchSettle TX (0x11) | DONE | Bilateral netting, 1000:1 compression, nets per-recipient via HashMap (2026-03-06). Gas scaling fix: 30K + 500/entry, max 10K entries (2026-03-20) |
 | ChannelOpen TX (0x12) | DONE | Locks deposit in deterministic escrow (BLAKE3("arc-channel" ‖ channel_id)) (2026-03-06) |
 | ChannelClose TX (0x13) | DONE | Mutual close, validates balances vs escrow, releases funds (2026-03-06) |
 | ChannelDispute TX (0x14) | DONE | Submit signed state with state_nonce ordering, challenge period (2026-03-06) |
@@ -188,6 +198,9 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | Propose-verify mode | DONE | Proposers execute + export diff, verifiers apply diff + check root. Fraud detection. |
 | Cross-shard locking | DONE | Lock/commit/abort state machine, 30s timeout, atomic batch ops |
 | Transaction coalescing | DONE | I/O optimization: nets same-account reads/writes across batch |
+| Inference Tier 1 (on-chain) | DONE | Precompile 0x0A, deterministic re-execution |
+| Inference Tier 2 (optimistic) | DONE | InferenceAttestation (0x16) + InferenceChallenge (0x17) fraud proofs (2026-03-20) |
+| Inference Tier 3 (STARK-verified) | DONE | Off-chain inference with STARK proof via ShardProof (0x15) |
 
 ### Bridge
 
@@ -264,12 +277,12 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 
 ### Immediate (next sprint)
 
-1. **SPEC.md update** — Sync with actual implementation (21 TX types, VRF, PEX, FEC, governance, bridge, channels, shard proofs)
-2. **Channel counterparty tracking** — Store counterparty address in channel metadata on-chain so ChannelClose credits both parties
-3. **Governance auto-mutation** — Wire `apply_governance_outcome()` so proposals auto-execute on StateDB
-4. **Stwo real STARK proofs** — Requires nightly, available via `--features stwo-prover`
-5. **Bridge relayer service** — Event listener + proof submission for cross-chain relay
-6. **A100/H100 benchmark** — Run multinode_bench on server hardware to validate projections
+1. **Channel counterparty tracking** — Store counterparty address in channel metadata on-chain so ChannelClose credits both parties
+2. **Governance auto-mutation** — Wire `apply_governance_outcome()` so proposals auto-execute on StateDB
+3. **Stwo real STARK proofs** — Requires nightly, available via `--features stwo-prover`
+4. **Bridge relayer service** — Event listener + proof submission for cross-chain relay
+5. **A100/H100 benchmark** — Run multinode_bench on server hardware to validate projections
+6. **Inference Tier 2 challenge window tuning** — Optimize dispute window duration based on model complexity
 
 ### Short-term (1-3 months)
 

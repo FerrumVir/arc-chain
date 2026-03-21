@@ -124,9 +124,9 @@ pub struct Transaction {
 
 **Verification:** Before execution, verify `signature` recovers to `from`. For ed25519, check `public_key` in signature hashes to `from`. For secp256k1, recover the public key from signature + hash, verify it hashes to `from`.
 
-### 2.2 Transaction Types (21 total)
+### 2.2 Transaction Types (23 total)
 
-Existing 7 types unchanged. Two new types added:
+Existing 7 types unchanged. Additional types added:
 
 ```rust
 pub enum TxBody {
@@ -151,6 +151,8 @@ pub enum TxBody {
     ChannelClose(ChannelCloseBody),      // 0x13
     ChannelDispute(ChannelDisputeBody),  // 0x14
     ShardProof(ShardProofBody),          // 0x15
+    InferenceAttestation(InferenceAttestationBody), // 0x16
+    InferenceChallenge(InferenceChallengeBody),     // 0x17
 }
 
 pub struct DeployBody {
@@ -165,6 +167,22 @@ pub struct RegisterBody {
     pub endpoint: String,           // how to reach this agent (URL, DID, etc.)
     pub protocol: Hash256,          // optional — linked WASM contract address
     pub metadata: Vec<u8>,          // arbitrary metadata, max 1024 bytes
+}
+
+pub struct InferenceAttestationBody {
+    pub model_id: Hash256,          // BLAKE3 hash of model identifier
+    pub input_hash: Hash256,        // BLAKE3 hash of inference input
+    pub output_hash: Hash256,       // BLAKE3 hash of inference output
+    pub provider: Address,          // address of inference provider
+    pub timestamp: u64,             // when inference was performed
+    pub metadata: Vec<u8>,          // model version, hardware info, etc.
+}
+
+pub struct InferenceChallengeBody {
+    pub attestation_hash: Hash256,  // hash of the attestation being challenged
+    pub proof_data: Vec<u8>,        // fraud proof (re-execution result)
+    pub challenger: Address,        // address of challenger
+    pub expected_output_hash: Hash256, // correct output from re-execution
 }
 ```
 
@@ -490,15 +508,25 @@ fn execute_with_gas(module: &Module, gas_limit: u64) -> ExecutionResult {
 ### 4.5 Fee Model
 
 ```
-base_fee = 1 ARC (minimum for any transaction)
+base_fee = 1 ARC (minimum for any transaction, auto-adjusts with TPS)
 gas_price = 0.001 ARC per gas unit (for WASM calls)
 total_fee = base_fee + (gas_used * gas_price)
 ```
 
-Fee distribution per block:
-- 50% burned (deflationary pressure)
-- 30% to block producer
-- 20% to staking rewards pool
+**No-burn fee distribution** — 100% of fees are distributed, no tokens are ever burned:
+- 40% to Proposers (block producers, 5M ARC stake, GPU/server hardware)
+- 25% to Verifiers (state verifiers, 500K ARC stake, Mac Mini/desktop)
+- 15% to Observers (network monitors, 50K ARC stake, Raspberry Pi/laptop)
+- 20% to Treasury (protocol development, ecosystem grants)
+
+**TPS-aware fee scaling:** The base_fee auto-adjusts at high TPS to keep fees
+sustainable and prevent spam during load spikes.
+
+**Fixed supply:** 1.03B ARC total supply. No deflationary mechanics — the token
+economy is designed around fee distribution, not scarcity via burning.
+
+**BatchSettle gas scaling:** gas = 30,000 + 500 per entry, max 10,000 entries.
+This prevents gas underpricing on large batch settlements.
 
 Settlement transactions (`Settle` type) have ZERO base fee — agents settle
 for free. This is the core value proposition. Fee revenue comes from transfers,
@@ -738,7 +766,7 @@ Bandwidth allocation = Priority * total_bandwidth
 ### 7.1 ARC on Ethereum (existing)
 
 - ERC-20 at `0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499`
-- 1.03B total supply, 2% buy/sell tax
+- 1.03B fixed total supply — no tokens are ever burned
 - Upgradeable proxy with modular tax system
 
 ### 7.2 Staking Contract (Solidity, new)
@@ -808,23 +836,53 @@ interface ITaxSplitter {
 
 On the L1 itself:
 - Settlement transactions: **FREE** (zero fee — the killer feature)
-- Transfers: 1 ARC base fee
+- Transfers: 1 ARC base fee (auto-adjusts with TPS)
 - WASM calls: 1 ARC + gas
 - Contract deploy: 100 ARC + state rent deposit
 - Agent registration: 10 ARC
+- BatchSettle: 30K + 500/entry gas (max 10K entries)
 
-Fee distribution: 50% burned, 30% block producer, 20% rewards.
+Fee distribution: 40% proposers, 25% verifiers, 15% observers, 20% treasury. **No burn.**
 
 ### 7.5 Block Rewards
 
 Each block producer receives:
 ```
-block_reward = base_reward + sum(tx_fees) * 0.30
+block_reward = base_reward + sum(tx_fees) * 0.40
 base_reward = 10 ARC per block (during bootstrap phase, first 2 years)
 ```
 
-Bootstrap rewards come from a genesis allocation (separate from circulating supply).
-After 2 years, block rewards transition to fee-only (deflationary).
+**Bootstrap fund:** 40M ARC allocated over 2 years for early validator subsidies,
+ensuring validators are profitable before fee volume ramps up.
+
+After 2 years, block rewards transition to fee-only (sustained by fee distribution).
+
+### 7.6 Validator Roles
+
+| Role | Hardware | Stake | Fee Share | Capabilities |
+|------|----------|-------|-----------|-------------|
+| Observer | Raspberry Pi / laptop | 50,000 ARC | 15% | Monitor, attest |
+| Verifier | Mac Mini / desktop | 500,000 ARC | 25% | Validate, verify state |
+| Proposer | GPU server | 5,000,000 ARC | 40% | Produce blocks, full execution |
+
+Treasury receives the remaining 20% of all fees.
+
+### 7.7 Inference Tiers
+
+Three tiers of AI inference with different trust and cost tradeoffs:
+
+| Tier | Execution | Verification | TX/Precompile |
+|------|-----------|-------------|---------------|
+| Tier 1 | On-chain (precompile 0x0A) | Deterministic re-execution | Precompile 0x0A |
+| Tier 2 | Off-chain (optimistic) | Fraud proofs | InferenceAttestation (0x16) / InferenceChallenge (0x17) |
+| Tier 3 | Off-chain (STARK-verified) | ZK proof verification | ShardProof (0x15) |
+
+**Tier 2 flow:** Provider submits `InferenceAttestation` with model ID and I/O hashes.
+Challenge window (default 100 blocks) allows anyone to dispute via `InferenceChallenge`
+with re-execution proof. Unchallenged attestations are accepted as final.
+
+**Tier 3 flow:** Provider generates STARK proof of correct inference execution.
+Proof submitted via `ShardProof` and verified on-chain. No dispute window needed.
 
 ---
 

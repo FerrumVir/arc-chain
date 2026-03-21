@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+pub mod beacon;
 pub mod data_availability;
 pub mod subnet;
 pub mod security;
