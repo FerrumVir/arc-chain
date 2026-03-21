@@ -1,0 +1,14 @@
+# ARC Chain Testnet — Seed Nodes
+# Each line is a peer address (host:port).
+# Lines starting with # are comments.
+#
+# To join the testnet, run:
+#   arc-node --seeds-file testnet/seeds.txt
+#
+# Or use the one-click installer which downloads this file automatically.
+
+# Seed node 0 (primary) — replace with actual IP before launch
+# 1.2.3.4:9091
+
+# Seed node 1 (backup)
+# 5.6.7.8:9091

@@ -1,18 +1,77 @@
+# ARC Chain — Local Testnet (2-node) with Explorer and Faucet
+# Usage: docker compose up
+#
+# Services:
+#   node-0    Seed validator     RPC :9090  P2P :9091
+#   node-1    Validator          RPC :9190  P2P :9092
+#   explorer  Block explorer     HTTP :3100
+#   faucet    Testnet faucet     HTTP :8080
+#
+# Benchmark (on-demand): docker compose run arc-bench
+
 services:
-  arc-node:
+  # ── Validator Node 0 (seed) ───────────────────────────────────────────────
+  node-0:
     build:
       context: .
       dockerfile: Dockerfile.node
     ports:
       - "9090:9090"
-    command: ["arc-node"]
+      - "9091:9091"
+    command:
+      - arc-node
+      - --seed
+      - arc-validator-0
+      - --stake
+      - "5000000"
+      - --rpc
+      - "0.0.0.0:9090"
+      - --p2p-port
+      - "9091"
+    volumes:
+      - node0-data:/data
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:9090/health"]
       interval: 10s
       timeout: 3s
-      retries: 3
+      retries: 5
+      start_period: 15s
 
+  # ── Validator Node 1 ─────────────────────────────────────────────────────
+  node-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    ports:
+      - "9190:9190"
+      - "9092:9092"
+    command:
+      - arc-node
+      - --seed
+      - arc-validator-1
+      - --stake
+      - "5000000"
+      - --rpc
+      - "0.0.0.0:9190"
+      - --p2p-port
+      - "9092"
+      - --peers
+      - node-0:9091
+    volumes:
+      - node1-data:/data
+    depends_on:
+      node-0:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9190/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+
+  # ── Block Explorer ───────────────────────────────────────────────────────
   explorer:
     build:
       context: ./explorer
@@ -20,13 +79,29 @@ services:
     ports:
       - "3100:3100"
     environment:
-      - ARC_NODE_URL=http://arc-node:9090
+      - ARC_NODE_URL=http://node-0:9090
+      - VITE_API_URL=http://node-0:9090
     depends_on:
-      arc-node:
+      node-0:
         condition: service_healthy
     restart: unless-stopped
 
-  # Standalone benchmark — runs once then exits.
+  # ── Testnet Faucet ───────────────────────────────────────────────────────
+  faucet:
+    build:
+      context: ./faucet
+    ports:
+      - "8080:8080"
+    environment:
+      - ARC_NODE_URL=http://node-0:9090
+      - FAUCET_AMOUNT=10000
+      - FAUCET_LISTEN=0.0.0.0:8080
+    depends_on:
+      node-0:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── Benchmark (on-demand) ────────────────────────────────────────────────
   # Start manually: docker compose run arc-bench
   arc-bench:
     build:
@@ -34,3 +109,7 @@ services:
       dockerfile: Dockerfile.node
     command: ["arc-bench"]
     profiles: ["bench"]
+
+volumes:
+  node0-data:
+  node1-data:
