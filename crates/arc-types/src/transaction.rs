@@ -46,7 +46,13 @@ pub mod gas_costs {
     pub const BRIDGE_LOCK: u64 = 50_000;
     /// Gas for minting bridged tokens from another chain.
     pub const BRIDGE_MINT: u64 = 50_000;
-    /// Gas for batch settlement (covers netting computation).
+    /// Base gas for batch settlement (before per-entry charges).
+    pub const BATCH_SETTLE_BASE: u64 = 30_000;
+    /// Gas per entry in a batch settlement.
+    pub const BATCH_SETTLE_PER_ENTRY: u64 = 500;
+    /// Maximum entries allowed in a single BatchSettle transaction.
+    pub const BATCH_SETTLE_MAX_ENTRIES: usize = 10_000;
+    /// Legacy flat gas constant (deprecated — use BATCH_SETTLE_BASE + PER_ENTRY).
     pub const BATCH_SETTLE: u64 = 30_000;
     /// Gas for opening a state channel.
     pub const CHANNEL_OPEN: u64 = 40_000;
@@ -56,6 +62,10 @@ pub mod gas_costs {
     pub const CHANNEL_DISPUTE: u64 = 50_000;
     /// Gas for submitting a shard STARK proof.
     pub const SHARD_PROOF: u64 = 60_000;
+    /// Gas for submitting an optimistic inference attestation (Tier 2).
+    pub const INFERENCE_ATTESTATION: u64 = 50_000;
+    /// Gas for challenging an inference attestation (Tier 2).
+    pub const INFERENCE_CHALLENGE: u64 = 100_000;
     /// Gas for storage read.
     pub const SLOAD: u64 = 200;
     /// Gas for storage write.
@@ -187,6 +197,10 @@ pub enum TxType {
     ChannelDispute = 0x14,
     /// Submit a STARK proof for a shard block.
     ShardProof = 0x15,
+    /// Optimistic inference attestation (Tier 2 — off-chain with fraud proofs).
+    InferenceAttestation = 0x16,
+    /// Challenge an inference attestation (Tier 2 fraud proof).
+    InferenceChallenge = 0x17,
 }
 
 /// A transaction on the ARC chain.
@@ -252,6 +266,10 @@ pub enum TxBody {
     ChannelDispute(ChannelDisputeBody),
     /// Submit a STARK proof for a shard block.
     ShardProof(ShardProofBody),
+    /// Optimistic inference attestation (Tier 2).
+    InferenceAttestation(InferenceAttestationBody),
+    /// Challenge an inference attestation (Tier 2 fraud proof).
+    InferenceChallenge(InferenceChallengeBody),
 }
 
 /// Simple value transfer.
@@ -503,6 +521,43 @@ pub struct ShardProofBody {
     pub tx_count: u32,
     /// The serialized STARK proof data.
     pub proof_data: Vec<u8>,
+}
+
+/// Optimistic inference attestation (Tier 2).
+///
+/// An off-chain inference provider attests to the result of running a model
+/// on given inputs.  A bond is locked as collateral; if no challenge is
+/// submitted within `challenge_period` blocks the attestation is finalized
+/// and the bond is returned.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceAttestationBody {
+    /// Model commitment hash (Merkle root of weights).
+    pub model_id: Hash256,
+    /// Hash of the input data.
+    pub input_hash: Hash256,
+    /// Hash of the output data.
+    pub output_hash: Hash256,
+    /// Challenge period in blocks (default: 100).
+    pub challenge_period: u64,
+    /// Bond amount locked as collateral (slashed if fraud proven).
+    pub bond: u64,
+}
+
+/// Challenge an inference attestation (Tier 2 fraud proof).
+///
+/// A challenger disagrees with the attested output and submits their own
+/// computed output hash along with a bond.  If the challenger's output is
+/// confirmed correct (via on-chain re-execution through precompile 0x0A),
+/// the challenger receives both bonds; otherwise the challenger's bond is
+/// slashed and the attester keeps both.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceChallengeBody {
+    /// Hash of the attestation TX being challenged.
+    pub attestation_hash: Hash256,
+    /// The challenger's computed output hash (should differ from attested).
+    pub challenger_output_hash: Hash256,
+    /// Bond amount from challenger (returned if challenge succeeds).
+    pub challenger_bond: u64,
 }
 
 /// EVM event log emitted during contract execution.
