@@ -3,7 +3,7 @@
 **Date**: March 13, 2026
 **Version**: v1.1
 **Hardware**: Apple M4, 10 CPU cores, 16 GB unified memory
-**Codebase**: 75,285 LOC Rust | 1,028 tests | 11 crates
+**Codebase**: 76,255 LOC Rust | 1,031 tests | 11 crates
 
 ---
 
@@ -56,9 +56,9 @@ Users / AI Agents
 
 | Crate | LOC | Tests | Purpose |
 |-------|-----|-------|---------|
-| `arc-types` | 14,071 | 258 | 21 transaction types, blocks, accounts, staking, governance, bridge, account abstraction, social recovery |
+| `arc-types` | 14,320 | 261 | 23 transaction types, blocks, accounts, staking, governance, bridge, account abstraction, social recovery, inference attestation/challenge |
 | `arc-crypto` | 11,680 | 240 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512, ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
-| `arc-state` | 12,127 | 138 | DashMap state DB, Jellyfish Merkle Tree, WAL persistence, BlockSTM parallel execution, GPU-resident state cache, chunked state sync |
+| `arc-state` | 12,378 | 140 | DashMap state DB, Jellyfish Merkle Tree, segmented WAL with auto-rotate, BlockSTM parallel execution, GPU-resident state cache, JMT auto-pruning, chunked state sync |
 | `arc-vm` | 8,439 | 145 | WASM runtime (Wasmer 6.0), EVM interpreter (revm 19), gas metering, host imports, 11 precompiles, AI inference oracle |
 | `arc-node` | 8,408 | 61 | Block producer, pipelined execution, RPC server (20+ HTTP + ETH JSON-RPC), consensus manager, STARK proof generation, DA erasure coding |
 | `arc-consensus` | 7,523 | 126 | DAG consensus engine, validator sets, stake tiers, 2-round commit rule, slashing, cross-shard coordination |
@@ -67,7 +67,7 @@ Users / AI Agents
 | `arc-net` | 2,355 | 24 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
 | `arc-mempool` | 876 | 17 | Lock-free SegQueue + DashSet deduplication, encrypted mempool (BLS threshold) |
 | `arc-cli` | 660 | — | CLI client: keygen, RPC queries, transaction submission |
-| **Total** | **75,285** | **1,028** | **11 crates** |
+| **Total** | **76,255** | **1,031** | **11 crates** |
 
 Additional code outside `/crates`:
 - Python SDK: 2,688 LOC
@@ -396,7 +396,7 @@ A complete transaction goes through these stages:
 
 ## 9. Transaction Types
 
-ARC Chain supports 21 native transaction types:
+ARC Chain supports 23 native transaction types:
 
 | Type | Code | Description |
 |------|------|-------------|
@@ -421,6 +421,8 @@ ARC Chain supports 21 native transaction types:
 | ChannelClose | 0x13 | Mutual close, release channel funds |
 | ChannelDispute | 0x14 | Submit signed state with challenge period |
 | ShardProof | 0x15 | Record verified STARK proof, validate state root transition |
+| InferenceAttestation | 0x16 | Attest to off-chain AI inference result (Tier 2 optimistic) |
+| InferenceChallenge | 0x17 | Challenge an inference attestation with fraud proof |
 
 ---
 
@@ -455,10 +457,38 @@ ARC Chain supports 21 native transaction types:
 
 ---
 
-## 12. Test Coverage
+## 12. Inference Tier Architecture
+
+ARC Chain supports three tiers of AI inference with different performance/trust tradeoffs:
+
+| Tier | Method | Verification | Latency | Cost |
+|------|--------|-------------|---------|------|
+| **Tier 1 (on-chain)** | Precompile `0x0A` | Deterministic re-execution | ~10ms | High gas (500K+) |
+| **Tier 2 (optimistic)** | Off-chain + `InferenceAttestation` (`0x16`) | Fraud proof via `InferenceChallenge` (`0x17`) | ~100ms + challenge window | Low gas (30K attest) |
+| **Tier 3 (STARK-verified)** | Off-chain + `ShardProof` (`0x15`) | ZK proof verification | ~1-10s proving | Medium gas (60K verify) |
+
+**Fee distribution** (no-burn model): 100% of inference fees are distributed — 40% to proposers, 25% to verifiers, 15% to observers, 20% to treasury. No tokens are burned. Fixed 1.03B supply.
+
+**Tier 2 flow:**
+1. Inference provider runs model off-chain
+2. Provider submits `InferenceAttestation` (0x16) with model ID, input hash, output hash
+3. Challenge window opens (configurable, default 100 blocks)
+4. Anyone can submit `InferenceChallenge` (0x17) with re-execution proof
+5. If unchallenged, attestation is accepted as final
+
+**Tier 3 flow:**
+1. Inference provider runs model off-chain and generates STARK proof
+2. Provider submits `ShardProof` (0x15) with proof data
+3. On-chain STARK verifier confirms correctness — no dispute window needed
+
+> Note: Inference tier benchmarks will be published once A100/H100 hardware testing is complete. The architecture is implemented and tested with mock inference workloads.
+
+---
+
+## 13. Test Coverage
 
 ```
-Total:   1,028 tests passed, 0 failed
+Total:   1,031 tests passed, 0 failed
 Crates:  11 (all passing)
 ```
 
@@ -472,7 +502,7 @@ Coverage includes:
 
 ---
 
-## 13. How to Reproduce
+## 14. How to Reproduce
 
 ```bash
 # Clone and build
@@ -498,13 +528,13 @@ cargo test --workspace
 
 ---
 
-## 14. Summary
+## 15. Summary
 
 | Metric | Value |
 |--------|-------|
 | **Language** | Rust (100% core) |
-| **Codebase** | 75,285 LOC Rust, 11 crates |
-| **Tests** | 1,028 passing, 0 failing |
+| **Codebase** | 76,255 LOC Rust, 11 crates |
+| **Tests** | 1,031 passing, 0 failing |
 | **Consensus** | DAG (Mysticeti-inspired), 2-round finality |
 | **Measured TPS** | 69.3K (single-node peak, M4), 27K (2-node sustained) |
 | **Projected TPS** | 300K-1.3M (A100/H100 server, single shard) |
@@ -512,7 +542,7 @@ cargo test --workspace
 | **State lookups** | 15.2M/sec (GPU-resident cache, Metal unified) |
 | **Commit rate** | 100% (500K/500K) |
 | **GPU support** | Metal, Vulkan, CUDA, DirectX 12, WebGPU (via wgpu) |
-| **TX types** | 21 native types (16 core + 5 L1 scaling) |
+| **TX types** | 23 native types (16 core + 5 L1 scaling + 2 inference) |
 | **Precompiles** | 11 (BLAKE3, Ed25519, VRF, Oracle, Merkle, BlockInfo, Identity, Falcon-512, ZK-verify, AI-inference, BLS-verify) |
 | **Smart contracts** | WASM (Wasmer 6.0) + EVM (revm 19) |
 | **Signatures** | Ed25519, Secp256k1, BLS12-381, Falcon-512 (post-quantum), ML-DSA |

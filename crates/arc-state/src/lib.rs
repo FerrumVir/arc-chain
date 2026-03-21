@@ -10,6 +10,7 @@ pub mod wal;
 use arc_crypto::{Hash256, IncrementalMerkle, MerkleTree, hash_bytes, hash_pair};
 use arc_types::{Account, Address, Identity, IdentityLevel, Transaction, TxBody, TxType, TxReceipt, TransferBody, Block, BlockHeader, ProtocolVersion};
 use arc_types::block::{StateDiff, AccountChange};
+use arc_types::economics::StateRentConfig;
 use arc_types::transaction::{GasMeter, gas_costs};
 
 use crate::jmt_store::JmtStateTree;
@@ -3621,8 +3622,10 @@ impl StateDB {
         self.wal.append(WalOp::Checkpoint(state_root), height);
 
         // Auto-prune old JMT state every 100 blocks, keeping the last 1000 versions.
+        // Also prune old receipts to prevent unbounded memory growth at high TPS.
         if height % 100 == 0 {
             self.prune_old_state(1000);
+            self.prune_old_receipts(1000);
         }
 
         Ok((block, receipts))
@@ -3637,6 +3640,77 @@ impl StateDB {
         if current > keep_versions {
             jmt.prune_versions_before(current - keep_versions);
         }
+    }
+
+    /// Prune receipts, tx_index, full_transactions, and account_txs entries
+    /// for blocks older than `keep_blocks` blocks behind the current height.
+    ///
+    /// This prevents unbounded memory growth at high TPS by discarding
+    /// historical receipt data that is no longer needed for normal operation.
+    pub fn prune_old_receipts(&self, keep_blocks: u64) {
+        let current = self.height();
+        if current <= keep_blocks {
+            return;
+        }
+        let cutoff = current - keep_blocks;
+
+        // Remove receipts whose block_height is at or below the cutoff.
+        self.receipts.retain(|_, receipt| receipt.block_height > cutoff);
+
+        // Remove tx_index entries that point to pruned blocks.
+        self.tx_index.retain(|_, &mut (block_height, _)| block_height > cutoff);
+
+        // Remove full transactions for pruned blocks.
+        self.full_transactions.retain(|hash, _| {
+            // If we have no tx_index entry left for this hash, it was pruned.
+            self.tx_index.contains_key(hash)
+        });
+    }
+
+    /// Collect state rent from all accounts using the given rent configuration.
+    ///
+    /// For each account:
+    /// - Deduct one epoch of rent from the balance.
+    /// - If the balance falls below the dust threshold, the account is
+    ///   considered dormant (balance is left as-is for grace period tracking).
+    ///
+    /// Returns `(rent_collected, dormant_count)`.
+    pub fn collect_rent(&self, config: &StateRentConfig) -> (u64, u64) {
+        let rent = config.rent_per_epoch();
+        if rent == 0 {
+            return (0, 0);
+        }
+
+        let mut total_collected: u64 = 0;
+        let mut dormant_count: u64 = 0;
+
+        // Iterate all accounts and deduct rent.
+        let keys: Vec<[u8; 32]> = self.accounts.iter().map(|e| *e.key()).collect();
+        for key in keys {
+            if let Some(mut entry) = self.accounts.get_mut(&key) {
+                let account = entry.value_mut();
+
+                // Skip accounts that are already below dust threshold (dormant).
+                if config.is_dormant(account.balance) {
+                    dormant_count += 1;
+                    continue;
+                }
+
+                // Deduct rent.
+                let deducted = account.balance.min(rent);
+                account.balance = account.balance.saturating_sub(rent);
+                total_collected += deducted;
+
+                // Check if account became dormant after deduction.
+                if config.is_dormant(account.balance) {
+                    dormant_count += 1;
+                }
+
+                self.dirty_accounts.insert(key);
+            }
+        }
+
+        (total_collected, dormant_count)
     }
 
     /// Look up a transaction receipt by tx hash.
@@ -5185,5 +5259,126 @@ mod tests {
         // Total balance unchanged (transfer is zero-sum ignoring fees)
         assert_eq!(summary2.total_balance, 1_750_000);
         assert_eq!(summary2.block_height, 1);
+    }
+
+    // ── Receipt pruning tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_prune_old_receipts() {
+        let state = StateDB::with_genesis(&[
+            (addr(1), 10_000_000),
+            (addr(2), 10_000_000),
+        ]);
+
+        // Execute several blocks to build up receipts.
+        for i in 0..5 {
+            let tx = Transaction::new_transfer(addr(1), addr(2), 100, i);
+            state.execute_block(&[tx], addr(99)).unwrap();
+        }
+
+        assert_eq!(state.height(), 5);
+        // Should have 5 receipts (one tx per block).
+        assert_eq!(state.receipts.len(), 5);
+
+        // Prune keeping only last 2 blocks → blocks 4,5 kept, blocks 1,2,3 pruned.
+        state.prune_old_receipts(2);
+
+        // Only receipts from blocks 4 and 5 should remain.
+        assert_eq!(state.receipts.len(), 2);
+        for entry in state.receipts.iter() {
+            assert!(entry.value().block_height > 3,
+                "receipt at height {} should have been pruned", entry.value().block_height);
+        }
+    }
+
+    #[test]
+    fn test_prune_old_receipts_noop_when_young() {
+        let state = StateDB::with_genesis(&[
+            (addr(1), 10_000_000),
+            (addr(2), 10_000_000),
+        ]);
+
+        let tx = Transaction::new_transfer(addr(1), addr(2), 100, 0);
+        state.execute_block(&[tx], addr(99)).unwrap();
+
+        // keep_blocks > current height → nothing pruned.
+        state.prune_old_receipts(1000);
+        assert_eq!(state.receipts.len(), 1);
+    }
+
+    // ── State rent tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_collect_rent_deducts_balance() {
+        let state = StateDB::with_genesis(&[
+            (addr(1), 5_000_000),   // above dust threshold (1_000_000)
+            (addr(2), 10_000_000),  // above dust threshold
+        ]);
+
+        let config = StateRentConfig::default();
+        let rent = config.rent_per_epoch(); // 128
+
+        let (collected, dormant) = state.collect_rent(&config);
+
+        // Both accounts should have rent deducted.
+        assert_eq!(collected, rent * 2);
+        assert_eq!(dormant, 0);
+
+        let acct1 = state.get_account(&addr(1)).unwrap();
+        assert_eq!(acct1.balance, 5_000_000 - rent);
+
+        let acct2 = state.get_account(&addr(2)).unwrap();
+        assert_eq!(acct2.balance, 10_000_000 - rent);
+    }
+
+    #[test]
+    fn test_collect_rent_marks_dormant() {
+        // Account with balance just above dust threshold → rent pushes it below.
+        let balance = 1_000_100; // dust = 1_000_000, rent = 128 → after: 999_972 < 1_000_000
+        let state = StateDB::with_genesis(&[
+            (addr(1), balance),
+        ]);
+
+        let config = StateRentConfig::default();
+        let (collected, dormant) = state.collect_rent(&config);
+
+        assert_eq!(collected, config.rent_per_epoch());
+        assert_eq!(dormant, 1); // became dormant after deduction
+
+        let acct = state.get_account(&addr(1)).unwrap();
+        assert!(config.is_dormant(acct.balance));
+    }
+
+    #[test]
+    fn test_collect_rent_skips_already_dormant() {
+        let state = StateDB::with_genesis(&[
+            (addr(1), 500), // well below dust threshold
+        ]);
+
+        let config = StateRentConfig::default();
+        let (collected, dormant) = state.collect_rent(&config);
+
+        // Already dormant → no rent deducted.
+        assert_eq!(collected, 0);
+        assert_eq!(dormant, 1);
+
+        let acct = state.get_account(&addr(1)).unwrap();
+        assert_eq!(acct.balance, 500); // unchanged
+    }
+
+    #[test]
+    fn test_collect_rent_zero_rent_noop() {
+        let state = StateDB::with_genesis(&[
+            (addr(1), 5_000_000),
+        ]);
+
+        let config = StateRentConfig {
+            cost_per_byte_per_epoch: 0,
+            ..Default::default()
+        };
+
+        let (collected, dormant) = state.collect_rent(&config);
+        assert_eq!(collected, 0);
+        assert_eq!(dormant, 0);
     }
 }

@@ -577,6 +577,64 @@ impl FeeConfig {
     }
 }
 
+// ─── State rent ─────────────────────────────────────────────────────────────
+
+/// Configuration for state rent — charges accounts for on-chain storage to
+/// prevent unbounded state growth at high TPS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StateRentConfig {
+    /// Cost per byte per epoch (in smallest ARC unit, i.e. nanoARC).
+    pub cost_per_byte_per_epoch: u64,
+    /// Epoch length in blocks.
+    pub epoch_length_blocks: u64,
+    /// Minimum balance to keep an account alive (below this = dormant).
+    pub dust_threshold: u64,
+    /// Grace period in epochs before dormant accounts are archived.
+    pub grace_epochs: u64,
+    /// Bytes per standard account (for rent calculation).
+    pub account_size_bytes: u64,
+}
+
+impl Default for StateRentConfig {
+    fn default() -> Self {
+        Self {
+            cost_per_byte_per_epoch: 1,        // 1 nanoARC per byte per epoch
+            epoch_length_blocks: 216_000,      // ~1 day at 400ms blocks
+            dust_threshold: 1_000_000,         // 0.001 ARC
+            grace_epochs: 30,                  // ~30 days
+            account_size_bytes: 128,           // bytes per standard account
+        }
+    }
+}
+
+impl StateRentConfig {
+    /// Cost per account per epoch: `cost_per_byte_per_epoch * account_size_bytes`.
+    pub fn rent_per_epoch(&self) -> u64 {
+        self.cost_per_byte_per_epoch.saturating_mul(self.account_size_bytes)
+    }
+
+    /// Returns `true` if the balance is below the dust threshold (dormant).
+    pub fn is_dormant(&self, balance: u64) -> bool {
+        balance < self.dust_threshold
+    }
+
+    /// How many full epochs of rent the given balance can cover before the
+    /// account would be considered dormant.
+    ///
+    /// Returns `u64::MAX` if rent per epoch is zero (rent disabled).
+    pub fn epochs_until_archive(&self, balance: u64) -> u64 {
+        let rent = self.rent_per_epoch();
+        if rent == 0 {
+            return u64::MAX;
+        }
+        // After deducting rent each epoch, the account becomes dormant once
+        // balance drops below dust_threshold. Usable balance for rent is
+        // everything above the threshold (if already below, 0 epochs left).
+        let usable = balance.saturating_sub(self.dust_threshold);
+        usable / rent
+    }
+}
+
 // ─── Block reward ──────────────────────────────────────────────────────────
 
 /// Summary of economic activity in a single block.
@@ -982,5 +1040,71 @@ mod tests {
         assert_eq!(pos.tier, StakeTier::Core);
         assert!(pos.tier.can_propose());
         assert!(pos.tier.can_govern());
+    }
+
+    // ── State rent tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_state_rent_defaults() {
+        let config = StateRentConfig::default();
+        assert_eq!(config.cost_per_byte_per_epoch, 1);
+        assert_eq!(config.epoch_length_blocks, 216_000);
+        assert_eq!(config.dust_threshold, 1_000_000);
+        assert_eq!(config.grace_epochs, 30);
+        assert_eq!(config.account_size_bytes, 128);
+    }
+
+    #[test]
+    fn test_rent_per_epoch() {
+        let config = StateRentConfig::default();
+        // 1 nanoARC/byte * 128 bytes = 128 nanoARC per epoch
+        assert_eq!(config.rent_per_epoch(), 128);
+    }
+
+    #[test]
+    fn test_rent_per_epoch_custom() {
+        let config = StateRentConfig {
+            cost_per_byte_per_epoch: 10,
+            account_size_bytes: 256,
+            ..Default::default()
+        };
+        assert_eq!(config.rent_per_epoch(), 2560);
+    }
+
+    #[test]
+    fn test_is_dormant() {
+        let config = StateRentConfig::default();
+        assert!(config.is_dormant(0));
+        assert!(config.is_dormant(999_999));
+        assert!(!config.is_dormant(1_000_000));
+        assert!(!config.is_dormant(10_000_000));
+    }
+
+    #[test]
+    fn test_epochs_until_archive() {
+        let config = StateRentConfig::default();
+        // rent_per_epoch = 128
+        // dust_threshold = 1_000_000
+        // balance = 1_000_000 + 128*10 = 1_001_280 → usable = 1280 → 10 epochs
+        assert_eq!(config.epochs_until_archive(1_001_280), 10);
+
+        // Already below dust threshold → 0 epochs
+        assert_eq!(config.epochs_until_archive(500_000), 0);
+
+        // Exactly at threshold → usable = 0 → 0 epochs
+        assert_eq!(config.epochs_until_archive(1_000_000), 0);
+
+        // Large balance → many epochs
+        let balance = 1_000_000 + 128 * 1000;
+        assert_eq!(config.epochs_until_archive(balance), 1000);
+    }
+
+    #[test]
+    fn test_epochs_until_archive_zero_rent() {
+        let config = StateRentConfig {
+            cost_per_byte_per_epoch: 0,
+            ..Default::default()
+        };
+        assert_eq!(config.epochs_until_archive(100), u64::MAX);
     }
 }
