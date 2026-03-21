@@ -32,9 +32,20 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 16px 24px;
+    padding: 12px 24px;
     border-bottom: 1px solid var(--border);
     background: var(--surface);
+    height: 57px;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .header-logo svg {
+    display: block;
   }
 
   .header h1 {
@@ -59,8 +70,17 @@
     background: var(--muted);
     transition: background 0.3s;
   }
-  .status-dot.running { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .status-dot.running {
+    background: var(--accent);
+    box-shadow: 0 0 8px var(--accent);
+    animation: pulse 2s ease-in-out infinite;
+  }
   .status-dot.stopped { background: var(--danger); }
+
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 4px var(--accent); }
+    50% { box-shadow: 0 0 14px var(--accent), 0 0 20px rgba(81, 235, 142, 0.3); }
+  }
 
   .status-label {
     font-size: 13px;
@@ -91,7 +111,7 @@
   .main {
     padding: 24px;
     overflow-y: auto;
-    height: calc(100vh - 57px);
+    height: calc(100vh - 57px - 40px);
   }
 
   /* ------- Stats Grid ------- */
@@ -178,8 +198,13 @@
     font-size: 11px;
     color: var(--muted);
     text-align: center;
-    padding: 12px 24px;
+    padding: 10px 24px;
     border-top: 1px solid var(--border);
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--surface);
   }
   .footer-bar a {
     color: var(--muted);
@@ -228,27 +253,31 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    height: calc(100vh - 57px);
+    height: calc(100vh - 57px - 40px);
     text-align: center;
     padding: 40px;
   }
 
   .onboarding-step {
-    display: none;
     flex-direction: column;
     align-items: center;
     gap: 20px;
     max-width: 480px;
-    animation: fadeIn 0.3s ease;
+    opacity: 0;
+    transform: translateY(8px);
+    transition: opacity 0.3s ease, transform 0.3s ease;
+    display: none;
   }
 
   .onboarding-step.active {
     display: flex;
+    opacity: 1;
+    transform: translateY(0);
   }
 
-  @keyframes fadeIn {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
+  .onboarding-step.fade-out {
+    opacity: 0;
+    transform: translateY(-8px);
   }
 
   .onboarding h2 {
@@ -291,10 +320,22 @@
     font-size: 17px;
     font-weight: 700;
     cursor: pointer;
-    transition: opacity 0.15s;
+    transition: opacity 0.15s, transform 0.15s;
   }
   .onboarding .btn-start-big:hover {
     opacity: 0.9;
+    transform: scale(1.02);
+  }
+
+  .logo-circle {
+    width: 100px;
+    height: 100px;
+    border-radius: 50%;
+    background: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 4px;
   }
 
   .address-display {
@@ -319,14 +360,37 @@
     user-select: text;
   }
 
-  .key-path {
-    font-family: var(--mono);
-    font-size: 12px;
+  .key-note {
+    font-size: 13px;
     color: var(--muted);
-    background: var(--bg);
-    padding: 6px 12px;
-    border-radius: 4px;
-    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .key-note svg {
+    flex-shrink: 0;
+  }
+
+  .resource-list {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    width: 100%;
+    max-width: 280px;
+  }
+
+  .resource-item {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    font-size: 14px;
+    color: var(--muted);
+    text-align: left;
+  }
+
+  .resource-item svg {
+    flex-shrink: 0;
   }
 
   .resource-note {
@@ -347,9 +411,19 @@
     border-radius: 50%;
     background: var(--border);
     transition: background 0.3s;
+    cursor: pointer;
+  }
+  .step-dots .dot:hover {
+    background: var(--muted);
   }
   .step-dots .dot.active {
     background: var(--accent);
+  }
+
+  .small-note {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: -4px;
   }
 
   /* ------- Splash / Not Running ------- */
@@ -387,7 +461,14 @@
 
 <!-- ============ HEADER ============ -->
 <div class="header">
-  <h1><span>ARC</span> Node</h1>
+  <div class="header-left">
+    <div class="header-logo">
+      <svg width="32" height="22" viewBox="0 0 120 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M10 12 Q60 -14 110 12" stroke="#51EB8E" stroke-width="5" stroke-linecap="round" fill="none"/>
+        <text x="8" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="800" fill="#e6edf3" letter-spacing="2">ARC</text>
+      </svg>
+    </div>
+  </div>
   <div class="status-row">
     <div class="status-dot" id="statusDot"></div>
     <span class="status-label" id="statusLabel">STOPPED</span>
@@ -400,45 +481,66 @@
 
   <!-- Step 1: Welcome -->
   <div class="onboarding-step active" id="obStep1">
+    <div class="logo-circle">
+      <svg width="64" height="50" viewBox="0 0 120 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M10 12 Q60 -14 110 12" stroke="#51EB8E" stroke-width="6" stroke-linecap="round" fill="none"/>
+        <text x="8" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="800" fill="#0e1117" letter-spacing="2">ARC</text>
+      </svg>
+    </div>
     <h2>Welcome to <span>ARC Chain</span></h2>
-    <p>You're about to join the world's fastest AI-native blockchain.</p>
-    <p>Your node earns ARC tokens by helping secure the network.</p>
-    <button class="btn-continue" onclick="goToStep(2)">Continue</button>
+    <p>The world's fastest AI-native blockchain</p>
+    <p>Run a node, earn rewards, power the future of AI.</p>
+    <button class="btn-continue" onclick="goToStep(2)">Get Started &rarr;</button>
     <div class="step-dots">
-      <div class="dot active"></div>
-      <div class="dot"></div>
-      <div class="dot"></div>
+      <div class="dot active" onclick="goToStep(1)"></div>
+      <div class="dot" onclick="goToStep(2)"></div>
+      <div class="dot" onclick="goToStep(3)"></div>
     </div>
   </div>
 
-  <!-- Step 2: Identity -->
+  <!-- Step 2: Your Node -->
   <div class="onboarding-step" id="obStep2">
-    <h2>Your Identity</h2>
-    <p>Your validator address has been generated</p>
+    <h2>Your node is ready</h2>
     <div class="address-display">
       <span class="addr-text" id="obAddress">Loading...</span>
       <button class="copy-btn" onclick="copyOnboardingAddress()" title="Copy address">&#x2398;</button>
     </div>
-    <p>This is your identity on ARC Chain. Keep your key file safe.</p>
-    <div class="key-path">Key saved to: ~/.arc-chain/validator.key</div>
-    <button class="btn-continue" onclick="goToStep(3)">Continue</button>
+    <div class="key-note">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#51EB8E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      Your validator key has been saved securely.
+    </div>
+    <p>Your node helps secure the network and earns ARC tokens.</p>
+    <button class="btn-continue" onclick="goToStep(3)">Continue &rarr;</button>
     <div class="step-dots">
-      <div class="dot"></div>
-      <div class="dot active"></div>
-      <div class="dot"></div>
+      <div class="dot" onclick="goToStep(1)"></div>
+      <div class="dot active" onclick="goToStep(2)"></div>
+      <div class="dot" onclick="goToStep(3)"></div>
     </div>
   </div>
 
-  <!-- Step 3: Start -->
+  <!-- Step 3: Launch -->
   <div class="onboarding-step" id="obStep3">
     <h2>Ready to join the network</h2>
-    <p>Your node will connect to the ARC Chain testnet and start syncing.</p>
-    <div class="resource-note">Bandwidth: ~2-5 MB/s &nbsp;|&nbsp; RAM: ~200 MB &nbsp;|&nbsp; CPU: &lt;5%</div>
-    <button class="btn-start-big" onclick="finishOnboarding()">Start Node</button>
+    <div class="resource-list">
+      <div class="resource-item">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#51EB8E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 010 8.49"/><path d="M7.76 16.24a6 6 0 010-8.49"/><path d="M19.07 4.93a10 10 0 010 14.14"/><path d="M4.93 19.07a10 10 0 010-14.14"/></svg>
+        Bandwidth: ~2-5 MB/s
+      </div>
+      <div class="resource-item">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#51EB8E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4"/><path d="M14 12h4"/></svg>
+        Storage: &lt;1 GB
+      </div>
+      <div class="resource-item">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#51EB8E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        CPU: &lt;5% usage
+      </div>
+    </div>
+    <button class="btn-start-big" onclick="finishOnboarding()">Launch Node</button>
+    <p class="small-note">You can stop the node at any time from the dashboard</p>
     <div class="step-dots">
-      <div class="dot"></div>
-      <div class="dot"></div>
-      <div class="dot active"></div>
+      <div class="dot" onclick="goToStep(1)"></div>
+      <div class="dot" onclick="goToStep(2)"></div>
+      <div class="dot active" onclick="goToStep(3)"></div>
     </div>
   </div>
 
@@ -447,7 +549,10 @@
 <!-- ============ SPLASH (shown when not running, post-onboarding) ============ -->
 <div class="main" id="splashView" style="display:none;">
   <div class="splash">
-    <h1><span style="color:var(--accent);">ARC</span> Node</h1>
+    <svg width="120" height="80" viewBox="0 0 120 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <path d="M10 12 Q60 -14 110 12" stroke="#51EB8E" stroke-width="5" stroke-linecap="round" fill="none"/>
+      <text x="8" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="800" fill="#e6edf3" letter-spacing="2">ARC</text>
+    </svg>
     <h2>Join the ARC Chain network in one click</h2>
     <button class="btn start" onclick="doStart()">Start Node</button>
     <p style="color:var(--muted);font-size:12px;max-width:400px;">
@@ -530,17 +635,16 @@
     <button class="btn" onclick="copyAddress()">Copy Address</button>
   </div>
 
-  <!-- Footer -->
-  <div class="footer-bar">
-    ARC Chain Testnet v0.1.0 | <a href="https://github.com/FerrumVir/arc-chain" onclick="openLink('https://github.com/FerrumVir/arc-chain'); return false;">github.com/FerrumVir/arc-chain</a>
-  </div>
+</div>
 
+<!-- ============ FOOTER BAR ============ -->
+<div class="footer-bar" id="footerBar">
+  ARC Chain Testnet v0.1.0
 </div>
 
 <script>
   // ------------------------------------------------------------------
   // Tauri invoke bridge -- falls back to HTTP to localhost:9090.
-  // No mock data. If not in Tauri, invoke throws.
   // ------------------------------------------------------------------
   const invoke = window.__TAURI__?.invoke ?? (async (cmd) => {
     throw new Error('Not running inside Tauri -- use HTTP fallback');
@@ -551,6 +655,7 @@
   let nodeRunning = false;
   let pollTimer = null;
   let validatorAddress = '';
+  let currentStep = 1;
 
   // ------------------------------------------------------------------
   // Formatting helpers
@@ -574,9 +679,30 @@
   }
 
   function goToStep(step) {
-    document.querySelectorAll('.onboarding-step').forEach(el => el.classList.remove('active'));
-    const target = document.getElementById('obStep' + step);
-    if (target) target.classList.add('active');
+    if (step === currentStep) return;
+    const oldEl = document.getElementById('obStep' + currentStep);
+    const newEl = document.getElementById('obStep' + step);
+    if (!newEl) return;
+
+    // Fade out current
+    if (oldEl) {
+      oldEl.classList.add('fade-out');
+      setTimeout(() => {
+        oldEl.classList.remove('active', 'fade-out');
+        oldEl.style.display = 'none';
+        // Fade in new
+        newEl.style.display = 'flex';
+        // Force reflow
+        void newEl.offsetWidth;
+        newEl.classList.add('active');
+        currentStep = step;
+      }, 150);
+    } else {
+      newEl.style.display = 'flex';
+      void newEl.offsetWidth;
+      newEl.classList.add('active');
+      currentStep = step;
+    }
 
     if (step === 2) {
       loadOnboardingAddress();
@@ -701,14 +827,12 @@
       document.getElementById('netStaked').textContent = stats.total_staked ? fmtArc(stats.total_staked) : '--';
       document.getElementById('netShards').textContent = fmt(stats.shards);
 
-      // Try agents
       fetchAgentsCount();
       return;
     } catch (e) {
       // Fall through to HTTP
     }
 
-    // HTTP fallback
     await httpRefresh();
   }
 
@@ -738,7 +862,6 @@
       document.getElementById('netStaked').textContent = statsR.total_staked ? fmtArc(statsR.total_staked) : '--';
       document.getElementById('netShards').textContent = fmt(statsR.shards || 1);
 
-      // Try agents
       fetchAgentsCount();
     } catch (e) {
       console.error('httpRefresh failed:', e);
@@ -829,7 +952,6 @@
     }
 
     if (alreadyRunning) {
-      // Skip onboarding if node is already running
       localStorage.setItem('arc_onboarding_complete', 'true');
       nodeRunning = true;
       showDashboard();

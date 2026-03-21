@@ -1,358 +1,231 @@
 ---
-title: "Architecture Deep Dive"
+title: Architecture
 sidebar_position: 3
-slug: "/architecture"
+id: architecture
 ---
-# Architecture Deep Dive
 
-ARC Chain is structured as a five-layer blockchain stack, implemented across 10 Rust crates totaling ~70,600 lines of code. Each layer is a distinct crate with clean dependency boundaries.
+# Architecture
 
----
+ARC Chain is structured as 11 Rust crates, each responsible for a distinct layer of the blockchain stack. This page covers the major subsystems: consensus, execution, state management, networking, cryptography, and GPU acceleration.
 
 ## Layer Overview
 
 ```
-                    ┌──────────────────────────────────┐
-                    │          Applications             │
-                    │   SDKs (Python, TypeScript)       │
-                    │   Block Explorer, Faucet          │
-                    └──────────────┬───────────────────┘
-                                   │
-                    ┌──────────────┴───────────────────┐
-                    │         RPC Layer (arc-node)      │
-                    │   REST API + ETH JSON-RPC         │
-                    │   axum + tower-http               │
-                    └──────────────┬───────────────────┘
-                                   │
-          ┌────────────────────────┼────────────────────────┐
-          │                        │                        │
-┌─────────┴─────────┐  ┌──────────┴──────────┐  ┌─────────┴─────────┐
-│   Consensus Layer  │  │  Execution Layer    │  │   Network Layer   │
-│   (arc-consensus)  │  │  (arc-vm, arc-state)│  │   (arc-net)       │
-│                    │  │                     │  │                    │
-│ DAG-based consensus│  │ WASM VM runtime     │  │ QUIC transport    │
-│ VRF proposer       │  │ Block-STM parallel  │  │ Reed-Solomon FEC  │
-│ Staking tiers      │  │ JMT state tree      │  │ PEX discovery     │
-│ Cross-shard coord  │  │ WAL persistence     │  │ Shred protocol    │
-└─────────┬─────────┘  └──────────┬──────────┘  └─────────┬─────────┘
-          │                        │                        │
-          └────────────────────────┼────────────────────────┘
-                                   │
-                    ┌──────────────┴───────────────────┐
-                    │     Cryptography Layer            │
-                    │     (arc-crypto, arc-gpu)         │
-                    │                                   │
-                    │  BLAKE3 hashing, Ed25519/secp256k1│
-                    │  Stwo STARK (Circle STARK, M31)   │
-                    │  GPU Ed25519 (Metal + WGSL)       │
-                    │  BLS threshold, Poseidon, VRF     │
-                    │  Merkle trees + inclusion proofs  │
-                    └──────────────────────────────────┘
+Users / AI Agents
+       |
+       v
++- arc-net ------------------------------------------------+
+|  QUIC transport (quinn), TLS 1.3, shred propagation,     |
+|  XOR FEC erasure coding, TX gossip, peer exchange (PEX)   |
++---------------------+------------------------------------+
+                      v
++- arc-consensus ---------------------------------------+
+|  DAG block proposals (Mysticeti-inspired),             |
+|  stake-weighted 2-round finality, VRF proposer select  |
++---------------------+--------------------------------+
+                      v
++- arc-node --------------------------------------------+
+|  Block production pipeline, signature verification,    |
+|  RPC API (20+ endpoints + ETH JSON-RPC), consensus mgr |
++-----------+---------------------+--------------------+
+            v                     v
++- arc-state -----------+  +- arc-vm ------------------+
+|  DashMap + JMT         |  |  Wasmer 6.0 WASM runtime  |
+|  GPU-resident cache    |  |  revm 19 EVM interpreter   |
+|  BlockSTM parallel     |  |  Gas metering, precompiles |
+|  WAL persistence       |  +---------------------------+
++------------------------+
+            |
++- arc-gpu -----------------+
+|  Metal/WGSL Ed25519 batch  |
+|  GPU account buffer (wgpu) |
+|  Unified memory state      |
++----------------------------+
 ```
 
-## Crate Dependency Graph
+## Crate Breakdown
 
-```
-arc-node (Axum RPC server, block production, consensus loop)
-├── arc-state (StateDB, JMT, WAL, snapshots, Block-STM)
-│   ├── arc-crypto (BLAKE3, Ed25519, Secp256k1, BLS, Poseidon, VRF, Merkle)
-│   ├── arc-types (Transaction, Block, Account, TxBody, Hash256, gas costs)
-│   └── arc-vm (WASM runtime, host imports, gas metering, storage I/O)
-├── arc-mempool (transaction pool, priority ordering, deduplication)
-├── arc-consensus (DAG consensus, VRF proposer, staking tiers, shard routing)
-├── arc-net (QUIC transport, shred propagation, PEX, Reed-Solomon FEC)
-└── arc-gpu (wgpu compute shaders, GPU Ed25519, Metal MSL + WGSL)
+| Crate | LOC | Tests | What It Does |
+|-------|-----|-------|-------------|
+| `arc-types` | 14,490 | 264 | 23 transaction types, blocks, accounts, governance, staking, bridge, account abstraction, social recovery, inference attestation/challenge, state rent |
+| `arc-state` | 13,203 | 147 | DashMap state DB, Jellyfish Merkle Tree, segmented WAL with auto-rotate, adaptive BlockSTM parallel execution, GPU-resident state cache, JMT auto-pruning, receipt pruning, state rent, state sync |
+| `arc-crypto` | 11,680 | 220 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512 (post-quantum), ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
+| `arc-vm` | 8,439 | 145 | Wasmer WASM runtime, revm EVM interpreter, gas metering, host imports, 11 precompiles, AI inference oracle |
+| `arc-node` | 8,424 | 61 | Pipelined block production, adaptive execution, RPC server (30 HTTP + ETH JSON-RPC), consensus manager, STARK proof gen, DA erasure coding, encrypted mempool |
+| `arc-consensus` | 7,971 | 137 | DAG consensus, 2-round finality, beacon chain shard coordinator, validator roles, slashing, cross-shard coordination, epoch transitions |
+| `arc-bench` | 5,336 | -- | 10 benchmark binaries |
+| `arc-gpu` | 3,810 | 37 | Metal MSL + WGSL Ed25519 batch verification (379K sigs/sec), GPU account buffer, unified/managed memory, buffer pooling |
+| `arc-net` | 2,355 | 26 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
+| `arc-mempool` | 876 | 17 | Lock-free SegQueue FIFO, DashSet deduplication, encrypted mempool (BLS threshold) |
+| `arc-cli` | 660 | -- | Command-line client: keygen, RPC queries, transaction submission |
 
-arc-bench (benchmark suite)
-├── arc-node, arc-crypto, arc-state, arc-types, arc-gpu
-```
+## DAG Consensus (`arc-consensus`)
 
----
+Unlike linear blockchains where one leader proposes at a time, ARC Chain uses a **directed acyclic graph (DAG)** where all validators propose blocks concurrently. The design is inspired by Mysticeti.
 
-## Consensus Layer (`arc-consensus`)
+### Commit Rule
 
-ARC Chain uses a **DAG-based consensus protocol** with **VRF (Verifiable Random Function) proposer selection**. Validators are organized into staking tiers that determine their block proposal weight.
+A block B in round R is finalized when:
 
-### Staking Tiers
+1. A "certifier" block C in round R+1 references B as a parent
+2. C is referenced by blocks in round R+2 with combined stake >= 2f+1
 
-| Tier | Minimum Stake | Role |
-|---|---|---|
-| Spark | 500,000 ARC | Observer / vote only (cannot produce blocks) |
-| Arc | 5,000,000 ARC | Block producer + voter |
-| Core | 50,000,000 ARC | Priority producer + governance |
+This gives **two-round finality** with no leader election overhead. Measured finality is approximately 450ms at 150ms per round.
 
-### VRF Proposer Selection
+### Validator Roles and Stake Tiers
 
-The `ProposerSelector` module (900+ lines) uses a VRF to determine which validator proposes each block. The VRF output is deterministic given the validator's private key and the current round, but unpredictable to other validators until revealed. This prevents front-running and MEV extraction.
+| Role | Min Stake | Fee Share | Responsibilities |
+|------|-----------|-----------|-----------------|
+| **Observer** | 50,000 ARC | 15% | Monitor network, attest to block validity |
+| **Verifier** | 500,000 ARC | 25% | Validate transactions, check state transitions |
+| **Proposer** | 5,000,000 ARC | 40% | Produce blocks, run full execution |
 
-The VRF is wired into `ConsensusManager` -- block proposals check `vrf_approved` before proceeding. Backward compatible: if VRF is not configured, all validators can propose.
+**VRF proposer selection** ensures verifiable random leader rotation each round.
 
-### Cross-Shard Coordination
+### Slashing
 
-For sharded execution, ARC Chain implements a **cross-shard locking protocol**:
+Equivocation (double-proposing in the same round) results in automatic stake reduction. Progressive penalties: 10% / 20% / 30% by tier. Validators below the Spark threshold are ejected.
 
-1. **Lock phase**: Acquire locks on all affected accounts across shards
-2. **Execute phase**: Transactions execute within their shard
-3. **Commit/Abort**: If all shards succeed, commit; otherwise abort and release locks
+### MEV Protection
 
-Transaction types are automatically routed to shards based on their access set declarations in `block_stm.rs`. For example, `ChannelOpen` is cross-shard if the counterparty resides on a different shard; `ChannelClose` and `ChannelDispute` are always local.
+An encrypted mempool using BLS threshold commit-reveal prevents front-running. Transactions are encrypted before inclusion and only decrypted after the block is committed.
 
----
+## State Management (`arc-state`)
 
-## Execution Layer
+### DashMap
 
-### Block-STM Parallel Execution (`arc-state`)
-
-ARC Chain uses **Block-STM** (Software Transactional Memory) for parallel transaction execution within a block. Transactions are speculatively executed in parallel across CPU cores, and conflicts are detected and re-executed.
-
-Each transaction type declares its **access set** -- the accounts it reads and writes:
-
-| TX Type | Read/Write Set |
-|---|---|
-| Transfer | sender, recipient |
-| Stake | sender, validator |
-| WasmCall | sender, contract |
-| Escrow | sender, beneficiary |
-| BatchSettle | sender, all entry agent accounts |
-| ChannelOpen | sender, counterparty |
-| ShardProof | (no cross-account conflicts) |
+Lock-free concurrent reads and writes. The primary in-memory state store for accounts, balances, nonces, and contract storage. Achieves 22.3M lookups/sec on M2 Ultra.
 
 ### Jellyfish Merkle Tree (JMT)
 
-Account state is stored in a **Jellyfish Merkle Tree** -- the same authenticated data structure used by Aptos/Diem:
+Provides O(log n) inclusion and non-membership proofs for light clients. Features:
 
-- **Incremental updates**: `apply_dirty()` is O(k log n) where k = changed accounts
-- **Merkle inclusion proofs**: For any account, produce a proof verifiable against the state root
-- **Non-membership proofs**: Prove that an account does NOT exist (verified via empty-slot walks or different-key-at-slot proofs)
-- **WAL persistence**: Write-ahead log with CRC32 checksums ensures crash recovery
-- **Snapshots**: Full state snapshots (LZ4-compressed bincode) for node bootstrapping via `/sync/snapshot`
+- Incremental updates with domain-separated BLAKE3 hashing
+- Auto-pruning every 100 blocks (keeps 1,000 versions)
+- Non-membership proofs via empty-slot and different-key verification
 
-### WASM Virtual Machine (`arc-vm`)
+### Write-Ahead Log (WAL)
 
-Smart contracts compile to WASM bytecode and execute in a sandboxed `ArcVM` runtime:
+Segmented WAL with:
+- Auto-rotate at 256 MB
+- CRC32 integrity checks
+- LZ4 compression
+- Checkpoint and replay for crash recovery
+- Pruning after snapshots
 
-- Gas metering (charge per opcode, enforced limits)
-- Storage I/O (read/write contract storage slots via `StateDB`)
-- Event emission (EVM-compatible event logs with indexed topics)
-- Read-only calls (no state mutation, for queries via `/contract/{address}/call`)
-- Module compilation and caching
+### BlockSTM Parallel Execution
 
-### Gas Costs
+Optimistic parallel transaction execution with sender-sharded conflict detection. The node auto-selects between Sequential and BlockSTM modes depending on workload characteristics.
 
-Every operation has a defined gas cost. The block gas limit is **30,000,000**.
+## GPU Acceleration (`arc-gpu`)
 
-| Operation | Gas | Notes |
-|---|---|---|
-| Transaction base (TX_BASE) | 21,000 | Charged for every transaction |
-| Data byte (TX_DATA_BYTE) | 16 | Per byte of transaction data |
-| Storage read (SLOAD) | 200 | |
-| Storage write (SSTORE) | 5,000 | |
-| Event log (LOG) | 375 | |
-| Transfer | 21,000 | |
-| Settle | 25,000 | Agent settlements |
-| Swap | 30,000 | Atomic asset swap |
-| Stake | 25,000 | Stake/unstake |
-| Escrow | 35,000 | Create/release |
-| Deploy Contract | 53,000 | + bytecode storage |
-| Contract Call | 21,000 | + execution gas |
-| Register Agent | 30,000 | |
-| Multi-Sig | 35,000 | |
-| Join Validator | 30,000 | |
-| Leave Validator | 25,000 | |
-| Claim Rewards | 25,000 | |
-| Update Stake | 25,000 | |
-| Governance | 50,000 | |
-| Bridge Lock | 50,000 | |
-| Bridge Mint | 50,000 | |
-| Batch Settle | 30,000 | Covers netting computation |
-| Channel Open | 40,000 | |
-| Channel Close | 35,000 | |
-| Channel Dispute | 50,000 | |
-| Shard Proof | 60,000 | STARK proof submission |
+### Ed25519 Batch Verification
 
----
+GPU-accelerated signature verification using Metal (Apple) and WGSL (cross-platform) compute shaders:
 
-## State Layer (`arc-state`)
+- **379,000 verifications/sec** on M2 Ultra (13.68x over CPU)
+- Branchless Shamir's trick with 4-entry LUT, zero SIMD divergence
+- Buffer pool with async dispatch for non-blocking GPU submission
+- Portable to CUDA, Vulkan, DirectX 12, and WebGPU via wgpu
 
-### Account Model
+### GPU-Resident State Cache
 
-Every account on ARC Chain has:
+Account data formatted as 128-byte aligned `GpuAccountRepr` structs in GPU unified memory. On Apple Silicon, the GPU buffer and DashMap share the same physical memory pages. This enables batch compute shaders (BlockSTM execution, Merkle hashing) to access account state at approximately 2 TB/s unified memory bandwidth.
 
-```rust
-pub struct Account {
-    pub address: Address,        // 32-byte BLAKE3 hash of public key
-    pub balance: u64,            // Spendable balance (smallest unit)
-    pub nonce: u64,              // Replay protection counter
-    pub code_hash: Hash256,      // WASM bytecode hash (zero if not a contract)
-    pub storage_root: Hash256,   // Merkle root of contract storage
-    pub staked_balance: u64,     // Locked stake (not spendable)
-}
-```
+| Backend | Platform | Status |
+|---------|----------|--------|
+| Metal | macOS, iOS | Implemented + tested (native MSL shaders) |
+| Vulkan | Linux, Windows, Android | Supported via wgpu (WGSL shaders) |
+| CUDA | NVIDIA GPUs (A100, H100) | Supported via wgpu Vulkan backend |
+| DirectX 12 | Windows | Supported via wgpu |
+| WebGPU | Browsers | Supported via wgpu |
 
-Addresses are 32-byte BLAKE3 hashes. The ETH JSON-RPC layer maps 20-byte Ethereum addresses into the 32-byte space for tooling compatibility.
+## Execution (`arc-vm`)
 
-### Transaction Structure
+### Dual Runtime
 
-```rust
-pub struct Transaction {
-    pub tx_type: TxType,         // Discriminant (0x01-0x15)
-    pub from: Address,           // Sender address
-    pub nonce: u64,              // Replay protection
-    pub body: TxBody,            // Type-specific payload (enum of 21 variants)
-    pub fee: u64,                // Fee in ARC (can be 0 for settlements)
-    pub gas_limit: u64,          // Gas limit (0 = unlimited for backward compat)
-    pub hash: Hash256,           // BLAKE3 signing hash
-    pub signature: Signature,    // Ed25519, secp256k1, or ML-DSA-65
-}
-```
+- **WASM** (Wasmer 6.0) -- host imports for `balance_of`, `transfer`, `storage_get/set`, `emit_event`, `block_height`, `caller`. Deterministic execution with metered gas.
+- **EVM** (revm 19) -- full EVM opcode execution with gas translation. Solidity contracts compile and deploy natively.
 
-The signing hash covers `tx_type || from || nonce || body || fee || gas_limit` using BLAKE3 with domain separation key `"ARC-chain-tx-v1"`.
+### Precompiles
 
-### Persistence
+11 precompiles at fixed addresses:
 
-State is persisted through two mechanisms:
+| Address | Precompile | Purpose |
+|---------|-----------|---------|
+| 0x01 | BLAKE3 | Fast hashing |
+| 0x02 | Ed25519 | Signature verification |
+| 0x03 | VRF | Verifiable random function |
+| 0x04 | Oracle | Price feed reads |
+| 0x05 | Merkle | Merkle proof verification |
+| 0x06 | BlockInfo | Current block metadata |
+| 0x07 | Identity | Identity precompile |
+| 0x08 | Falcon-512 | Post-quantum signature verification |
+| 0x09 | ZK-verify | STARK proof verification |
+| 0x0A | AI-inference | On-chain model inference (Tier 1) |
+| 0x0B | BLS-verify | BLS signature verification |
 
-1. **Write-Ahead Log (WAL)** -- Every state mutation is appended to an on-disk journal before acknowledgement. Sequential writes only, CRC32 checksums.
+### STARK Proof Generation
 
-2. **Snapshots** -- Full state dump every N blocks (LZ4-compressed bincode). Used for fast node bootstrap and crash recovery.
+Per-block STARK proof using the Stwo Circle STARK prover (M31 field). A 22-constraint transfer AIR covers balance conservation, nonce monotonicity, and signature binding. Recursive proof composition is supported. Proofs are compressed with RLE + dictionary compression.
 
-**Crash recovery**: Load latest snapshot, replay WAL from checkpoint, verify state root.
+## Networking (`arc-net`)
 
----
+- **QUIC** (quinn) -- multiplexed streams, TLS 1.3, 0-RTT reconnect
+- **Shred propagation** -- 1,280-byte chunks with XOR erasure coding (50% redundancy, single-shred recovery)
+- **TX gossip** -- batched, stake-weighted fan-out with DashSet deduplication
+- **Peer Exchange (PEX)** -- automatic peer discovery on a 60-second broadcast interval
+- **Challenge-response auth** -- Ed25519 signed nonce + genesis hash binding
 
-## Network Layer (`arc-net`)
+## Cryptographic Stack (`arc-crypto`)
 
-### QUIC Transport
+| Algorithm | Library | Purpose |
+|-----------|---------|---------|
+| Ed25519 | ed25519-dalek | Primary transaction signing (118K sigs/sec) |
+| Secp256k1 | k256 | Ethereum-compatible operations (MetaMask, bridges) |
+| BLS12-381 | blst | Aggregate validator signatures (N sigs -> 1 verify) |
+| BLAKE3 | blake3 | Domain-separated hashing, GPU-accelerated |
+| Falcon-512 | pqcrypto | Post-quantum signatures (NIST selected) |
+| ML-DSA | pqcrypto | Post-quantum digital signatures (FIPS 204) |
+| Stwo STARK | stwo | Zero-knowledge proofs, no trusted setup |
+| Pedersen | custom | Homomorphic commitments, privacy-preserving |
 
-All P2P communication uses **QUIC** (via the `quinn` crate):
+## Transaction Types (23 total)
 
-- Encrypted transport (TLS 1.3 built-in)
-- Multiplexed streams on a single connection
-- 0-RTT connection resumption
-- NAT traversal friendly (UDP-based)
+### Core Protocol (16 types)
 
-### Shred Protocol
+| Code | Type | Gas |
+|------|------|-----|
+| 0x01 | Transfer | 21,000 |
+| 0x02 | Settle (zero-fee agent settlement) | 25,000 |
+| 0x03 | Swap | 30,000 |
+| 0x04 | Escrow | 35,000 |
+| 0x05 | Stake | 25,000 |
+| 0x06 | WasmCall | 21,000 + exec |
+| 0x07 | MultiSig | 35,000 |
+| 0x08 | DeployContract | 53,000 |
+| 0x09 | RegisterAgent | 30,000 |
+| 0x0a | JoinValidator | 30,000 |
+| 0x0b | LeaveValidator | 25,000 |
+| 0x0c | ClaimRewards | 25,000 |
+| 0x0d | UpdateStake | 25,000 |
+| 0x0e | Governance | 50,000 |
+| 0x0f | BridgeLock | 50,000 |
+| 0x10 | BridgeMint | 50,000 |
 
-Blocks are split into **shreds** for parallel dissemination:
+### L1 Native Scaling (5 types)
 
-1. Block data is chunked into fixed-size data shreds
-2. **Reed-Solomon FEC** generates parity shreds: for every 2 data shreds, 1 XOR parity shred (50% redundancy)
-3. Shreds are broadcast to peers independently
-4. Receivers can recover any single missing data shred from its pair + parity
-5. If both data shreds in a pair are lost, recovery fails (graceful degradation)
+| Code | Type | Gas |
+|------|------|-----|
+| 0x11 | BatchSettle (bilateral netting) | 30,000 + 500/entry |
+| 0x12 | ChannelOpen | 40,000 |
+| 0x13 | ChannelClose | 35,000 |
+| 0x14 | ChannelDispute | 50,000 |
+| 0x15 | ShardProof (STARK verification) | 60,000 |
 
-### Peer Exchange (PEX)
+### Inference (2 types)
 
-Nodes share their peer tables every 60 seconds via the `PeerExchange` protocol message (type `0x06`). The PEX message contains `PexPeerInfo` records with peer addresses and connection metadata. New validators can join the network by knowing just one existing peer.
-
----
-
-## Cryptography Layer (`arc-crypto`, `arc-gpu`)
-
-### Signature Schemes
-
-ARC Chain supports three signature algorithms:
-
-| Scheme | Key Size | Signature Size | Use Case |
-|---|---|---|---|
-| Ed25519 | 32 bytes | 64 bytes | Default, fastest verification |
-| secp256k1 | 33 bytes | 64 bytes | Ethereum/Bitcoin compatibility |
-| ML-DSA-65 | 1,952 bytes | 3,309 bytes | Post-quantum (experimental) |
-
-### GPU-Accelerated Ed25519 (`arc-gpu`)
-
-On Apple Silicon (and other wgpu-capable GPUs), Ed25519 verification is offloaded to GPU compute shaders:
-
-- **Metal MSL shader** (`ed25519_verify.metal`): Native hardware u64, preferred path
-- **WGSL fallback** (`ed25519_verify.wgsl`): Cross-platform WebGPU path
-- **Branchless Shamir's trick**: 4-entry LUT indexed by `(a_bit + 2*b_bit)` -- zero SIMD divergence
-- **Buffer pool**: Pre-allocated GPU buffers reused via `queue.write_buffer()`
-- **SigVerifyCache**: `DashMap` pre-verification cache integrated into the block pipeline
-- **Async dispatch**: `GpuVerifyFuture` with per-dispatch staging buffer
-
-Performance (M4 Pro, 100K batch, release build):
-- CPU parallel (Rayon): ~235K verifications/sec
-- GPU (Metal MSL): ~121K verifications/sec
-
-### Stwo STARK Prover
-
-ARC Chain uses the **Stwo** prover (Circle STARK over the Mersenne-31 field):
-
-- **22-constraint AIR** (Algebraic Intermediate Representation)
-- **Inner-circuit STARK recursion** for composable proofs
-- **Shard proof submission** via `ShardProof` TX type (0x15)
-- **232 additional tests** enabled with `cargo test -p arc-crypto --features stwo-prover`
-
-### Hashing
-
-- **BLAKE3**: Primary hash function for transactions, blocks, Merkle trees (with domain separation)
-- **Poseidon**: ZK-friendly hash for STARK circuits
-- **Keccak-256**: Ethereum ABI compatibility (function selectors in SDKs)
-
----
-
-## Propose-Verify Pipeline
-
-ARC Chain supports a **bifurcated execution model** for maximum throughput:
-
-1. **Proposer node** (with `--proposer-mode`):
-   - Executes all transactions in the block
-   - Computes state diffs (account balance changes)
-   - Broadcasts the block with state diffs attached
-
-2. **Verifier nodes**:
-   - Receive the block with state diffs
-   - Re-execute to verify diffs match
-   - If verified, apply state diffs directly
-
-This enables verifiers to validate blocks significantly faster than full re-execution.
-
----
-
-## Transaction Types (All 21)
-
-### Core Operations (0x01-0x04)
-
-| Type | Gas | Body Fields |
-|---|---|---|
-| **Transfer** (0x01) | 21,000 | `to`, `amount`, optional `amount_commitment` (Pedersen) |
-| **Settle** (0x02) | 25,000 | `agent_id`, `service_hash`, `amount`, `usage_units` |
-| **Swap** (0x03) | 30,000 | `counterparty`, `offer_amount`, `receive_amount`, `offer_asset`, `receive_asset` |
-| **Escrow** (0x04) | 35,000 | `beneficiary`, `amount`, `conditions_hash`, `is_create` |
-
-### Staking & Contracts (0x05-0x09)
-
-| Type | Gas | Body Fields |
-|---|---|---|
-| **Stake** (0x05) | 25,000 | `amount`, `is_stake`, `validator` |
-| **WasmCall** (0x06) | 21,000 + exec | `contract`, `function`, `calldata`, `value`, `gas_limit` |
-| **MultiSig** (0x07) | 35,000 | `inner_tx`, `signers`, `threshold` |
-| **DeployContract** (0x08) | 53,000 | `bytecode`, `constructor_args`, `state_rent_deposit` |
-| **RegisterAgent** (0x09) | 30,000 | `agent_name`, `capabilities`, `endpoint`, `protocol`, `metadata` |
-
-### Validator Operations (0x0a-0x0d)
-
-| Type | Gas | Body Fields |
-|---|---|---|
-| **JoinValidator** (0x0a) | 30,000 | `pubkey` (Ed25519 32 bytes), `initial_stake` |
-| **LeaveValidator** (0x0b) | 25,000 | (no body) |
-| **ClaimRewards** (0x0c) | 25,000 | (no body) |
-| **UpdateStake** (0x0d) | 25,000 | `new_stake` |
-
-### Governance & Bridges (0x0e-0x10)
-
-| Type | Gas | Body Fields |
-|---|---|---|
-| **Governance** (0x0e) | 50,000 | `proposal_id`, `action` (Execute) |
-| **BridgeLock** (0x0f) | 50,000 | `destination_chain`, `destination_address`, `amount` |
-| **BridgeMint** (0x10) | 50,000 | `source_chain`, `source_tx_hash`, `recipient`, `amount`, `merkle_proof` |
-
-### L1 Scaling (0x11-0x15)
-
-| Type | Gas | Body Fields |
-|---|---|---|
-| **BatchSettle** (0x11) | 30,000 | `entries[]` (each: `agent_id`, `service_hash`, `amount`) |
-| **ChannelOpen** (0x12) | 40,000 | `channel_id`, `counterparty`, `deposit`, `timeout_blocks` |
-| **ChannelClose** (0x13) | 35,000 | `channel_id`, `opener_balance`, `counterparty_balance`, `counterparty_sig`, `state_nonce` |
-| **ChannelDispute** (0x14) | 50,000 | `channel_id`, `opener_balance`, `counterparty_balance`, `other_party_sig`, `state_nonce`, `challenge_period` |
-| **ShardProof** (0x15) | 60,000 | `shard_id`, `block_height`, `block_hash`, `prev_state_root`, `post_state_root`, `tx_count`, `proof_data` |
+| Code | Type | Gas |
+|------|------|-----|
+| 0x16 | InferenceAttestation | 30,000 |
+| 0x17 | InferenceChallenge | 50,000 |

@@ -40,7 +40,7 @@ const DEMO_AGENTS: AgentInfo[] = [
     inferences: 421,
     earned: 89,
     uptime_secs: 43200,
-    last_action: "Predicted ETH/USD → $3,241 (±2.1%)",
+    last_action: "Predicted ETH/USD ratio (±2.1%)",
     last_action_timestamp: Math.floor(Date.now() / 1000) - 3600,
   },
 ];
@@ -86,7 +86,7 @@ const DEMO_ACTIONS: AgentAction[] = [
     timestamp: Math.floor(Date.now() / 1000) - 58,
     agent_name: 'PriceOracle v1',
     action: 'predicted price',
-    result: 'ETH/USD $3,241',
+    result: 'ETH/USD ratio',
     confidence: 81,
     amount: 8,
     tx_hash: '7ecf5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890a1b2c3d4e5f67890abcd',
