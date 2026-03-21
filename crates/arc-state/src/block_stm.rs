@@ -62,6 +62,14 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
         }
         TxBody::ChannelClose(_) | TxBody::ChannelDispute(_) => {}
         TxBody::ShardProof(_) => {}
+        TxBody::InferenceAttestation(_) => {
+            // Escrow address is derived from tx hash (not known statically);
+            // sender account is already included.
+        }
+        TxBody::InferenceChallenge(_) => {
+            // Escrow address depends on attestation hash (not known statically);
+            // sender account is already included.
+        }
     }
 
     TxAccessSet { accounts }

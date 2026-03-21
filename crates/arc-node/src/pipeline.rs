@@ -600,7 +600,9 @@ impl Pipeline {
                                 | TxBody::BridgeLock(_) | TxBody::BridgeMint(_)
                                 | TxBody::BatchSettle(_) | TxBody::ChannelOpen(_)
                                 | TxBody::ChannelClose(_) | TxBody::ChannelDispute(_)
-                                | TxBody::ShardProof(_) => {}
+                                | TxBody::ShardProof(_)
+                                | TxBody::InferenceAttestation(_)
+                                | TxBody::InferenceChallenge(_) => {}
                             }
                         }
 
