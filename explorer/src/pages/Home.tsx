@@ -180,7 +180,7 @@ export default function Home() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           {/* Run a Node */}
           <a
-            href="https://github.com/FerrumVir/arc-chain/blob/main/testnet/README.md"
+            href="https://build-two-tau-96.vercel.app/docs/quickstart"
             target="_blank"
             rel="noopener noreferrer"
             className="group border border-arc-border bg-arc-surface-raised p-6 hover:border-arc-aquarius/50 transition-all duration-200"
@@ -205,7 +205,7 @@ export default function Home() {
 
           {/* Build on ARC */}
           <a
-            href="https://github.com/FerrumVir/arc-chain"
+            href="https://build-two-tau-96.vercel.app/docs/architecture"
             target="_blank"
             rel="noopener noreferrer"
             className="group border border-arc-border bg-arc-surface-raised p-6 hover:border-arc-blue/50 transition-all duration-200"

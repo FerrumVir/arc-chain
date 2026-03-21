@@ -36,8 +36,8 @@ const footerColumns = [
   {
     title: 'Developers',
     links: [
-      { label: 'GitHub', href: 'https://github.com/FerrumVir/arc-chain' },
-      { label: 'Documentation', href: 'https://github.com/FerrumVir/arc-chain/blob/main/SPEC.md' },
+      { label: 'Source Code', href: 'https://build-two-tau-96.vercel.app/docs/architecture' },
+      { label: 'Documentation', href: 'https://build-two-tau-96.vercel.app/docs/architecture' },
       { label: 'Smart Contracts', to: '/blockchain' },
     ],
   },
@@ -45,7 +45,7 @@ const footerColumns = [
     title: 'Network',
     links: [
       { label: 'Blockchain', to: '/blockchain' },
-      { label: 'Run a Node', href: 'https://github.com/FerrumVir/arc-chain/blob/main/testnet/README.md' },
+      { label: 'Run a Node', href: 'https://build-two-tau-96.vercel.app/docs/testnet' },
     ],
   },
   {

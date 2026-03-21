@@ -78,6 +78,7 @@ pub async fn serve(
         .route("/health", get(health))
         .route("/info", get(chain_info))
         .route("/node/info", get(node_info))
+        .route("/block/latest", get(get_latest_block))
         .route("/block/{height}", get(get_block))
         .route("/account/{address}", get(get_account))
         .route("/tx/submit", post(submit_tx))
@@ -212,6 +213,19 @@ async fn chain_info(AxumState(node): AxumState<NodeState>) -> Json<ChainInfoResp
 #[derive(Deserialize)]
 struct BlockPath {
     height: u64,
+}
+
+async fn get_latest_block(
+    AxumState(node): AxumState<NodeState>,
+) -> Result<Json<Block>, StatusCode> {
+    let height = node.state.height();
+    if height == 0 {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    node.state
+        .get_block(height)
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 async fn get_block(

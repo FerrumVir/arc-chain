@@ -216,7 +216,7 @@ export default function Agents() {
           </code>
           <div className="pt-4">
             <a
-              href="https://github.com/FerrumVir/arc-chain/blob/main/agents/README.md"
+              href="https://build-two-tau-96.vercel.app/docs/agents/deploy-agent"
               target="_blank"
               rel="noopener noreferrer"
               className="btn-arc-outline text-xs"
@@ -481,7 +481,7 @@ export default function Agents() {
           cargo run --release -p arc-agents --bin sentiment-agent
         </code>
         <a
-          href="https://github.com/FerrumVir/arc-chain/blob/main/agents/README.md"
+          href="https://build-two-tau-96.vercel.app/docs/agents/deploy-agent"
           target="_blank"
           rel="noopener noreferrer"
           className="btn-arc-outline text-xs"
