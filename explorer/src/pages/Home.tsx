@@ -199,7 +199,7 @@ export default function Home() {
               </h3>
             </div>
             <p className="text-xs text-arc-grey-600 leading-relaxed">
-              Deploy your own ARC validator node. Earn staking rewards and help secure the network.
+              Join ARC Chain as a validator. Earn rewards and help power the AI-native network.
             </p>
           </a>
 
