@@ -6,7 +6,7 @@ id: quickstart
 
 # Quickstart
 
-Get ARC Chain running locally in under five minutes.
+Join the ARC Chain network in under five minutes.
 
 ## One-Click Install (recommended)
 
