@@ -1,22 +1,40 @@
 ---
-title: "Quickstart"
-sidebar_position: 1
-slug: "/quickstart"
+title: Quickstart
+sidebar_position: 2
+id: quickstart
 ---
+
 # Quickstart
 
-Get ARC Chain running locally and submit your first transaction in under 5 minutes.
+Get ARC Chain running locally in under five minutes.
 
----
+## One-Click Install (recommended)
 
-## Prerequisites
+```bash
+curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-node.sh | bash
+```
 
-- **Rust** (nightly recommended): [rustup.rs](https://rustup.rs/)
-- **Node.js 18+** (for the block explorer)
-- **Python 3.10+** (for the Python SDK)
-- **solc 0.8.24+** (optional, for Solidity contract compilation)
+This script will:
+1. Install the Rust toolchain (if not already present)
+2. Clone the `arc-chain` repository
+3. Build the node in release mode
+4. Generate a validator keypair
+5. Start the node as a background service (systemd on Linux, launchd on macOS)
 
-## 1. Clone and Build
+Works on Linux and macOS, Intel and ARM.
+
+## Desktop App
+
+The ARC Node desktop app provides a graphical interface for running a node, viewing chain status, and managing your validator identity. Downloads are available on the [GitHub releases page](https://github.com/FerrumVir/arc-chain/releases).
+
+## Build from Source
+
+### Prerequisites
+
+- **Rust 1.85+** (edition 2024)
+- **Node.js 22+** (only needed for the block explorer)
+
+### Clone and build
 
 ```bash
 git clone https://github.com/FerrumVir/arc-chain.git
@@ -24,212 +42,80 @@ cd arc-chain
 cargo build --release
 ```
 
-This compiles all 10 crates and produces binaries in `target/release/`:
-
-| Binary | Purpose |
-|---|---|
-| `arc-node` | Full blockchain node (RPC + P2P + consensus) |
-| `arc-bench` | Throughput benchmark suite |
-| `arc-bench-multinode` | Real multi-node TPS benchmark |
-| `arc-bench-propose-verify` | Propose-verify pipeline benchmark |
-
-## 2. Run a Local Node
-
-Start a single validator node with default settings:
+### Run tests
 
 ```bash
-./target/release/arc-node
+cargo test --workspace --lib    # 1,054 tests
 ```
 
-This starts:
-- **ARC RPC server** on `http://0.0.0.0:9090`
-- **ETH JSON-RPC** on `http://0.0.0.0:8545` (MetaMask/Foundry compatible)
-- **P2P transport** on QUIC port `9091`
+## Running Your First Node
 
-The genesis state includes 100 pre-funded accounts for testing.
-
-### Common CLI Flags
+Start a node with default settings:
 
 ```bash
-./target/release/arc-node \
-  --rpc 0.0.0.0:9090 \
-  --p2p-port 9091 \
-  --stake 5000000 \
-  --data-dir ./arc-data \
-  --eth-rpc-port 8545 \
-  --validator-seed my-node \
-  --peers 127.0.0.1:9091
+cargo run --release -p arc-node
 ```
 
-| Flag | Default | Description |
-|---|---|---|
-| `--rpc` | `0.0.0.0:9090` | RPC listen address |
-| `--p2p-port` | `9091` | QUIC P2P listen port |
-| `--stake` | `5000000` | Validator stake in ARC |
-| `--data-dir` | `./arc-data` | WAL/snapshot directory |
-| `--eth-rpc-port` | `8545` | ETH JSON-RPC port (0 to disable) |
-| `--validator-seed` | `arc-validator-0` | Unique seed for validator identity |
-| `--peers` | (none) | Bootstrap peers (comma-separated `host:port`) |
-| `--min-stake` | `500000` | Minimum stake to run this node |
-| `--benchmark` | `false` | Enable continuous test TX generation |
-| `--proposer-mode` | `false` | Enable proposer execution pipeline |
-
-## 3. Verify the Node is Running
+The RPC server starts at `http://localhost:9090`. Verify it is running:
 
 ```bash
 curl http://localhost:9090/health
 ```
 
-Expected response:
+You should see a JSON response with the node status, peer count, and current block height.
 
-```json
-{
-  "status": "ok",
-  "version": "0.1.0",
-  "height": 1,
-  "peers": 0,
-  "uptime_secs": 5
-}
-```
-
-## 4. Get Chain Info
+### Check chain stats
 
 ```bash
-curl http://localhost:9090/info
+curl http://localhost:9090/stats
 ```
 
-```json
-{
-  "chain": "ARC Chain",
-  "version": "0.1.0",
-  "block_height": 1,
-  "account_count": 100,
-  "mempool_size": 0,
-  "gpu": {
-    "name": "Apple M4 Pro",
-    "backend": "Metal",
-    "available": true
-  }
-}
-```
+Returns live TPS, block height, and total transaction count.
 
-## 5. Submit a Transaction
+### Submit a transaction
 
-Send 1,000 ARC between two accounts via the native RPC:
+Use the CLI to generate a keypair and submit a transfer:
 
 ```bash
-curl -X POST http://localhost:9090/tx/submit \
-  -H "Content-Type: application/json" \
-  -d '{
-    "from": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
-    "to":   "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213",
-    "amount": 1000,
-    "nonce": 0
-  }'
+# Generate a keypair
+cargo run --release -p arc-cli -- keygen
+
+# Submit a transfer (replace addresses with real ones)
+cargo run --release -p arc-cli -- transfer \
+    --from <sender-address> \
+    --to <receiver-address> \
+    --amount 1000
 ```
 
-Response:
-
-```json
-{
-  "tx_hash": "a1b2c3d4...",
-  "status": "pending"
-}
-```
-
-### Submit via ETH JSON-RPC
-
-ARC Chain exposes an Ethereum-compatible JSON-RPC on port 8545. Query the block number:
+## Running the Block Explorer
 
 ```bash
-curl -X POST http://localhost:8545 \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jsonrpc": "2.0",
-    "method": "eth_blockNumber",
-    "params": [],
-    "id": 1
-  }'
+cd explorer && npm install && npm run dev
 ```
 
-## 6. Look Up a Transaction
+The explorer runs at `http://localhost:3100` and connects to the local node at port 9090.
+
+## Docker Compose
+
+Run both the node and explorer with Docker:
 
 ```bash
-curl http://localhost:9090/tx/<TX_HASH>
+docker compose up -d --build
+# Node: http://localhost:9090
+# Explorer: http://localhost:3100
 ```
 
-Returns the transaction receipt including block height, success status, and gas used.
-
-For the full transaction body with type-specific fields:
+## Bare Metal Deployment (Ubuntu/Debian)
 
 ```bash
-curl http://localhost:9090/tx/<TX_HASH>/full
+git clone https://github.com/FerrumVir/arc-chain.git /opt/arc-chain
+cd /opt/arc-chain && bash deploy.sh
 ```
 
-## 7. Submit a Batch
-
-```bash
-curl -X POST http://localhost:9090/tx/submit_batch \
-  -H "Content-Type: application/json" \
-  -d '{
-    "transactions": [
-      {"from": "aa...", "to": "bb...", "amount": 100, "nonce": 0},
-      {"from": "aa...", "to": "cc...", "amount": 200, "nonce": 1}
-    ]
-  }'
-```
-
-Response includes `accepted`, `rejected` counts and `tx_hashes`.
-
-## 8. Run a Multi-Validator Network
-
-Start two nodes that peer with each other:
-
-```bash
-# Node 1
-./target/release/arc-node \
-  --rpc 0.0.0.0:9090 \
-  --p2p-port 9091 \
-  --validator-seed node-0 \
-  --data-dir ./arc-data-0 &
-
-# Node 2
-./target/release/arc-node \
-  --rpc 0.0.0.0:9092 \
-  --p2p-port 9093 \
-  --eth-rpc-port 8546 \
-  --validator-seed node-1 \
-  --data-dir ./arc-data-1 \
-  --peers 127.0.0.1:9091 &
-```
-
-Both nodes discover each other via PEX (Peer Exchange) and participate in DAG consensus.
-
-## 9. Run the Block Explorer
-
-```bash
-cd explorer
-npm install
-npm run dev
-```
-
-The explorer launches at `http://localhost:5173` and connects to the local node RPC.
-
-## 10. Run the Test Suite
-
-```bash
-# Full workspace (1,000+ tests)
-cargo test --workspace
-
-# Include STARK prover tests (+200 STARK tests)
-cargo test -p arc-crypto --features stwo-prover
-```
+This creates systemd services for `arc-node` and `arc-explorer` with automatic restart.
 
 ## Next Steps
 
-- [Architecture Deep Dive](./architecture.md) -- Understand consensus, execution, state, and cryptography layers
-- [RPC API Reference](./rpc-api.md) -- Complete endpoint documentation
-- [Smart Contract Development](./smart-contracts.md) -- Deploy Solidity contracts
-- [Python SDK](./sdk-python.md) / [TypeScript SDK](./sdk-typescript.md) -- Build applications
-- [Benchmarking](./benchmarking.md) -- Measure throughput performance
-- [Running a Testnet](./running-testnet.md) -- Multi-node setup with staking and monitoring
+- [Architecture](./architecture.md) -- understand how ARC Chain works under the hood
+- [Testnet](./testnet.md) -- join the public testnet
+- [RPC API](./rpc-api.md) -- explore all available endpoints
