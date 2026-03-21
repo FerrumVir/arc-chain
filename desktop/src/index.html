@@ -305,16 +305,7 @@
   // Tauri invoke bridge — falls back gracefully outside Tauri.
   // ------------------------------------------------------------------
   const invoke = window.__TAURI__?.invoke ?? (async (cmd) => {
-    console.warn(`[mock] invoke("${cmd}") — not running inside Tauri`);
-    // Return mock data so the UI is previewable in a regular browser.
-    if (cmd === 'get_node_status')      return { running: true, version: '0.1.0', uptime_secs: 312 };
-    if (cmd === 'get_node_stats')       return { block_height: 12345, network_tps: 45200, your_tps: 11300, peers: 7, finality_secs: 4.2, total_validators: 847, total_staked: 425000000, shards: 12 };
-    if (cmd === 'get_validator_address') return { address: '0x3a8f92c1d7e4b56a0f3c8d9e2b1a7f6c5d4e3a2b', role: 'Observer', stake: 50000 };
-    if (cmd === 'get_earnings')         return { session_earned: 142.5, total_earned: 1024.8 };
-    if (cmd === 'get_peers')            return 7;
-    if (cmd === 'start_node')           return 'Node started';
-    if (cmd === 'stop_node')            return 'Node stopped';
-    return null;
+    throw new Error('Not running inside Tauri');
   });
 
   let nodeRunning = false;
@@ -443,6 +434,7 @@
   // On load — check if node is already running
   // ------------------------------------------------------------------
   (async function init() {
+    // Try to detect a running node — either via Tauri commands or direct HTTP
     try {
       const status = await invoke('get_node_status');
       if (status && status.running) {
@@ -450,10 +442,45 @@
         showDashboard();
         refreshStats();
         pollTimer = setInterval(refreshStats, 3000);
+        return;
       }
-    } catch (_) {
-      // Not inside Tauri — stay on splash.
-    }
+    } catch (_) {}
+
+    // Fallback: try direct HTTP to see if a node is running
+    try {
+      const resp = await fetch('http://127.0.0.1:9090/health');
+      if (resp.ok) {
+        nodeRunning = true;
+        showDashboard();
+        // Poll directly via HTTP if Tauri invoke isn't working
+        async function httpRefresh() {
+          try {
+            const [healthR, statsR] = await Promise.all([
+              fetch('http://127.0.0.1:9090/health').then(r => r.json()),
+              fetch('http://127.0.0.1:9090/stats').then(r => r.json()),
+            ]);
+            const uptime = healthR.uptime_secs || 1;
+            const totalTx = statsR.total_transactions || 0;
+            const tps = uptime > 0 ? Math.floor(totalTx / uptime) : 0;
+
+            document.getElementById('blockHeight').textContent = fmt(statsR.block_height || healthR.height || 0);
+            document.getElementById('networkTps').textContent = fmt(tps);
+            document.getElementById('yourTps').textContent = fmt(tps);
+            document.getElementById('peers').textContent = fmt(healthR.peers || 0);
+            document.getElementById('finality').textContent = statsR.block_height > 0 ? '4.2s' : '--';
+            document.getElementById('valAddress').textContent = 'Connected';
+            document.getElementById('valRole').textContent = healthR.peers > 0 ? 'Verifier' : 'Observer';
+            document.getElementById('valStake').textContent = '--';
+            document.getElementById('valEarned').textContent = '0 ARC';
+            document.getElementById('netValidators').textContent = fmt((healthR.peers || 0) + 1);
+            document.getElementById('netStaked').textContent = '--';
+            document.getElementById('netShards').textContent = '1';
+          } catch (_) {}
+        }
+        httpRefresh();
+        pollTimer = setInterval(httpRefresh, 3000);
+      }
+    } catch (_) {}
   })();
 </script>
 
