@@ -244,6 +244,10 @@ struct SubmitTxRequest {
     amount: u64,
     nonce: u64,
     tx_type: Option<String>,
+    /// Ed25519 signature (128-char hex, optional). Required for mainnet.
+    signature: Option<String>,
+    /// Ed25519 public key (64-char hex, required with signature).
+    public_key: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -255,20 +259,56 @@ struct SubmitTxResponse {
 async fn submit_tx(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<SubmitTxRequest>,
-) -> Result<Json<SubmitTxResponse>, StatusCode> {
-    let from = Hash256::from_hex(&req.from).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let to = Hash256::from_hex(&req.to).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<SubmitTxResponse>, (StatusCode, String)> {
+    let from = Hash256::from_hex(&req.from).map_err(|_| (StatusCode::BAD_REQUEST, "invalid from address".to_string()))?;
+    let to = Hash256::from_hex(&req.to).map_err(|_| (StatusCode::BAD_REQUEST, "invalid to address".to_string()))?;
 
+    // Check if a signature was provided
+    if let Some(ref sig_hex) = req.signature {
+        if let Some(ref pubkey_hex) = req.public_key {
+            // Build signed transaction
+            let mut tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
+
+            // Parse signature and public key
+            let sig_bytes = hex::decode(sig_hex).map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature hex".to_string()))?;
+            let pk_bytes = hex::decode(pubkey_hex).map_err(|_| (StatusCode::BAD_REQUEST, "invalid public_key hex".to_string()))?;
+
+            if sig_bytes.len() != 64 || pk_bytes.len() != 32 {
+                return Err((StatusCode::BAD_REQUEST, "signature must be 64 bytes, public_key must be 32 bytes".to_string()));
+            }
+
+            let mut pk_arr = [0u8; 32];
+            pk_arr.copy_from_slice(&pk_bytes);
+
+            tx.signature = arc_crypto::signature::Signature::Ed25519 {
+                public_key: pk_arr,
+                signature: sig_bytes,
+            };
+
+            // Verify signature before accepting
+            tx.verify_signature().map_err(|_| (StatusCode::BAD_REQUEST, "signature verification failed".to_string()))?;
+
+            let hash = tx.hash.to_hex();
+            node.mempool.insert(tx).map_err(|_| (StatusCode::CONFLICT, "duplicate transaction".to_string()))?;
+
+            return Ok(Json(SubmitTxResponse {
+                tx_hash: hash,
+                status: "pending".to_string(),
+            }));
+        }
+    }
+
+    // No signature provided — reject in production mode
+    // For backward compatibility, still accept unsigned in testnet
+    // TODO: Remove unsigned path before mainnet
     let tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
     let hash = tx.hash.to_hex();
 
-    node.mempool
-        .insert(tx)
-        .map_err(|_| StatusCode::CONFLICT)?;
+    node.mempool.insert(tx).map_err(|_| (StatusCode::CONFLICT, "duplicate transaction".to_string()))?;
 
     Ok(Json(SubmitTxResponse {
         tx_hash: hash,
-        status: "pending".to_string(),
+        status: "pending (unsigned — will fail execution, use SDK for signed TXs)".to_string(),
     }))
 }
 

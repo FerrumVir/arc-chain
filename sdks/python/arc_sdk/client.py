@@ -231,11 +231,15 @@ class ArcClient:
         """
         POST /tx/submit -- Submit a transaction to the mempool.
 
-        Accepts either a raw RPC-format dict ({from, to, amount, nonce}) or
-        a signed transaction dict from TransactionBuilder.sign().
+        Accepts either:
+        - A signed transaction from TransactionBuilder.sign() (recommended)
+        - A raw dict ({from, to, amount, nonce}) (unsigned, will warn)
+
+        Signed transactions include Ed25519 signature and public key,
+        which are verified by the node before acceptance.
 
         Args:
-            tx: Transaction dict.
+            tx: Transaction dict (signed or unsigned).
 
         Returns:
             Transaction hash string.
@@ -253,6 +257,11 @@ class ArcClient:
                 "nonce": tx.get("nonce", 0),
                 "tx_type": tx.get("tx_type"),
             }
+            # Include signature if present (from TransactionBuilder.sign())
+            if "signature" in tx and isinstance(tx["signature"], dict):
+                sig_data = tx["signature"].get("Ed25519", {})
+                payload["signature"] = sig_data.get("signature", "")
+                payload["public_key"] = sig_data.get("public_key", "")
         else:
             payload = tx
 
