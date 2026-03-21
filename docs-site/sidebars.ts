@@ -17,7 +17,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'AI Agents',
-      items: ['agents-overview', 'deploy-agent'],
+      items: ['agents/agents-overview', 'agents/deploy-agent'],
     },
     {
       type: 'category',
@@ -27,7 +27,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'SDKs',
-      items: ['sdk-python'],
+      items: ['sdk/sdk-python'],
     },
     {
       type: 'category',
