@@ -58,12 +58,26 @@ from .types import (
     NodeInfo,
 )
 
-__version__ = "0.1.0"
+from .agent_runner import (
+    AgentRunner,
+    openai_runner,
+    anthropic_runner,
+    ollama_runner,
+    openclaw_runner,
+)
+
+__version__ = "0.2.0"
 
 __all__ = [
     "ArcClient",
     "KeyPair",
     "TransactionBuilder",
+    # Agent Runner (connect any AI model to ARC Chain)
+    "AgentRunner",
+    "openai_runner",
+    "anthropic_runner",
+    "ollama_runner",
+    "openclaw_runner",
     # ABI encoding/decoding
     "encode_abi",
     "decode_abi",
