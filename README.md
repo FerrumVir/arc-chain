@@ -61,16 +61,16 @@ Users / AI Agents
 
 ## Codebase
 
-**75,285 LOC Rust** | **1,028 tests** | **11 crates**
+**76,255 LOC Rust** | **1,031 tests** | **11 crates**
 
 | Crate | LOC | Tests | What It Does |
 |-------|-----|-------|-------------|
-| `arc-types` | 14,071 | 258 | 21 transaction types, blocks, accounts, governance, staking, bridge, account abstraction, social recovery |
+| `arc-types` | 14,320 | 261 | 23 transaction types, blocks, accounts, governance, staking, bridge, account abstraction, social recovery, inference attestation/challenge |
 | `arc-crypto` | 11,680 | 240 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512 (post-quantum), ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
-| `arc-state` | 12,127 | 138 | DashMap state DB, Jellyfish Merkle Tree, WAL persistence, BlockSTM parallel execution, GPU-resident state cache, state sync |
+| `arc-state` | 12,378 | 140 | DashMap state DB, Jellyfish Merkle Tree, segmented WAL with auto-rotate, BlockSTM parallel execution, GPU-resident state cache, JMT auto-pruning, state sync |
 | `arc-vm` | 8,439 | 145 | Wasmer WASM runtime, revm EVM interpreter, gas metering, host imports, 11 precompiles, AI inference oracle |
 | `arc-node` | 8,408 | 61 | Pipelined block production, signature verification, RPC server (20+ HTTP + ETH JSON-RPC), consensus manager, STARK proof gen, DA erasure coding, encrypted mempool |
-| `arc-consensus` | 7,523 | 126 | DAG consensus, 2-round finality, stake tiers, slashing, cross-shard coordination, epoch transitions |
+| `arc-consensus` | 7,523 | 126 | DAG consensus, 2-round finality, validator roles (Proposer/Verifier/Observer), slashing, cross-shard coordination, epoch transitions |
 | `arc-bench` | 5,336 | — | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
 | `arc-gpu` | 3,810 | 37 | Metal MSL + WGSL Ed25519 batch verification, GPU account buffer, unified/managed memory, buffer pooling |
 | `arc-net` | 2,355 | 24 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
@@ -107,7 +107,8 @@ Users / AI Agents
 - **BlockSTM** — optimistic parallel transaction execution with conflict detection
 - **GPU-resident state** — account data in GPU unified memory for compute shader access
 - **WASM + EVM** — dual smart contract runtime (Wasmer 6.0 + revm 19)
-- **21 transaction types** — transfers, settlements, staking, governance, bridge, channels, shard proofs
+- **23 transaction types** — transfers, settlements, staking, governance, bridge, channels, shard proofs, inference attestation/challenge
+- **No-burn tokenomics** — 100% of fees distributed: 40% proposers, 25% verifiers, 15% observers, 20% treasury. Fixed 1.03B supply.
 - **Zero-fee settlements** — AI agents settle for free
 - **STARK proof generation** — per-block proof with compression (mock on stable, real Stwo via feature flag)
 - **DA erasure coding** — 4+2 Reed-Solomon with Merkle commitment per block
@@ -115,8 +116,8 @@ Users / AI Agents
 
 ### State
 - **DashMap** — lock-free concurrent reads/writes
-- **Jellyfish Merkle Tree** — O(log n) inclusion + non-membership proofs
-- **WAL persistence** — CRC32 integrity, LZ4 compression, crash recovery
+- **Jellyfish Merkle Tree** — O(log n) inclusion + non-membership proofs, auto-pruning every 100 blocks (keeps 1000 versions)
+- **WAL persistence** — Segmented WAL with auto-rotate at 256MB, CRC32 integrity, LZ4 compression, pruning after snapshots
 - **GPU state cache** — CPU-side DashMap mirror + wgpu buffer for batch compute
 
 ### Networking
@@ -139,7 +140,7 @@ Users / AI Agents
 git clone https://github.com/FerrumVir/arc-chain.git
 cd arc-chain
 cargo build --release
-cargo test --workspace --lib    # 1,028 tests
+cargo test --workspace --lib    # 1,031 tests
 ```
 
 ### Run benchmarks
@@ -218,9 +219,47 @@ Compound scaling from measured 27K TPS baseline:
 | Pipelined block production | 1.5-2x | Implemented |
 | STARK proof generation | per-block | Implemented (mock + Stwo) |
 | DA erasure coding | per-block | Implemented |
+| Inference Tier 2 (optimistic) | Off-chain AI with fraud proofs | Implemented |
+| Inference Tier 3 (STARK-verified) | ZK-proven off-chain AI | Implemented |
 
 **Measured single-node:** 69.3K TPS (M4), **Projected:** 300K-1.3M TPS (A100/H100)
 **Projected multi-node:** 1B+ TPS (100 H100 nodes with sharding)
+
+---
+
+## Inference Tiers
+
+ARC Chain supports three tiers of AI inference execution, each with different trust/cost tradeoffs:
+
+| Tier | Execution | Verification | Precompile/TX | Use Case |
+|------|-----------|-------------|---------------|----------|
+| **Tier 1** | On-chain | Deterministic (precompile) | Precompile `0x0A` | Small models, low-latency, full trust |
+| **Tier 2** | Off-chain (optimistic) | Fraud proofs via InferenceAttestation (`0x16`) / InferenceChallenge (`0x17`) | TX types `0x16`, `0x17` | Large models, cost-efficient, challenge window |
+| **Tier 3** | Off-chain (STARK-verified) | ZK proof via ShardProof (`0x15`) | TX type `0x15` | Maximum trust, cryptographic verification |
+
+- **Tier 1**: Inference runs inside the EVM/WASM VM via the `ai_inference` precompile at address `0x0A`. Fully deterministic, every validator re-executes.
+- **Tier 2**: Inference runs off-chain. The result is posted on-chain via `InferenceAttestation` (`0x16`). Anyone can challenge with `InferenceChallenge` (`0x17`) during the dispute window. Optimistic — accepted unless challenged.
+- **Tier 3**: Inference runs off-chain with a STARK proof of correct execution. The proof is submitted via `ShardProof` (`0x15`) and verified on-chain. No dispute window needed.
+
+---
+
+## Home Node Support
+
+ARC Chain is designed so regular people can participate in network validation from home hardware:
+
+| Role | Hardware | Stake | Fee Share | Est. Cost |
+|------|----------|-------|-----------|-----------|
+| **Observer** | Raspberry Pi / laptop | 50,000 ARC | 15% of fees | ~$1/mo electricity |
+| **Verifier** | Mac Mini / desktop | 500,000 ARC | 25% of fees | ~$3/mo electricity |
+| **Proposer** | GPU server | 5,000,000 ARC | 40% of fees | Server-class hardware |
+
+- **Observers** monitor the network, attest to block validity, and earn 15% of total fees. Minimal hardware requirements — a Raspberry Pi is sufficient.
+- **Verifiers** validate transactions, check state transitions, and earn 25% of total fees. A Mac Mini or equivalent desktop handles the workload.
+- **Proposers** produce blocks, run full execution, and earn 40% of total fees. Requires GPU-capable server hardware.
+- **Treasury** receives the remaining 20% for protocol development and ecosystem grants.
+- **Bootstrap fund**: 40M ARC allocated over 2 years for early validator subsidies to ensure profitability before fee volume ramps up.
+
+No tokens are ever burned. The fixed supply of 1.03B ARC is fully preserved.
 
 ---
 
