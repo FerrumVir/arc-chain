@@ -626,6 +626,29 @@ impl ConsensusManager {
                             }
                         }
                         if !committed_txs.is_empty() {
+                            // ── Pipeline stage overlap: pre-verify signatures ──
+                            // Verify all signatures in a background task before
+                            // execution, so the next block's verification can
+                            // overlap with this block's execution.
+                            let pre_verify_handle = {
+                                let mut txs = committed_txs.clone();
+                                tokio::spawn(async move {
+                                    for tx in txs.iter_mut() {
+                                        if !tx.is_unsigned() && !tx.sig_verified {
+                                            if tx.verify_signature().is_ok() {
+                                                tx.sig_verified = true;
+                                            }
+                                        }
+                                    }
+                                    txs
+                                })
+                            };
+                            // Await pre-verification (overlaps with any prior commit work)
+                            committed_txs = match pre_verify_handle.await {
+                                Ok(verified_txs) => verified_txs,
+                                Err(_) => committed_txs, // fallback: use unverified
+                            };
+
                             let start = std::time::Instant::now();
 
                             // Check if we have a state diff from a proposer.

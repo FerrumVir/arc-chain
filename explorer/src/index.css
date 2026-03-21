@@ -20,11 +20,11 @@
 
 @theme {
   /* Core palette */
-  --color-arc-black: #03030A;
+  --color-arc-black: #0A0F1A;
   --color-arc-white: #FFFFFF;
-  --color-arc-purple: #002DDE;
-  --color-arc-blue: #3855E9;
-  --color-arc-aquarius: #6F7CF4;
+  --color-arc-purple: #1E40AF;
+  --color-arc-blue: #2563EB;
+  --color-arc-aquarius: #2563EB;
 
   /* Greys */
   --color-arc-grey-700: #777785;
@@ -35,17 +35,17 @@
   --color-arc-grey-200: #F4F4F4;
 
   /* Semantic */
-  --color-arc-success: #51EB8E;
+  --color-arc-success: #60A5FA;
   --color-arc-error: #FF0040;
-  --color-arc-warning: #FF9446;
-  --color-arc-info: #00D4FF;
+  --color-arc-warning: #60A5FA;
+  --color-arc-info: #60A5FA;
 
   /* Surfaces */
-  --color-arc-surface: #0A0A14;
-  --color-arc-surface-raised: #12121E;
-  --color-arc-surface-overlay: #1A1A28;
-  --color-arc-border: #1E1E2E;
-  --color-arc-border-subtle: #14141F;
+  --color-arc-surface: #0A0F1A;
+  --color-arc-surface-raised: #111827;
+  --color-arc-surface-overlay: #1a2234;
+  --color-arc-border: #1F2937;
+  --color-arc-border-subtle: #151d2e;
 }
 
 /* ─── Global Styles ───────────────────────────────────────────── */
@@ -87,7 +87,7 @@ body {
 /* ─── Gradient Text ───────────────────────────────────────────── */
 
 .text-gradient {
-  background: linear-gradient(135deg, #6F7CF4 0%, #002DDE 100%);
+  background: linear-gradient(135deg, #60A5FA 0%, #2563EB 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -163,7 +163,7 @@ body {
   content: '';
   position: absolute;
   inset: -1px;
-  background: linear-gradient(135deg, rgba(111, 124, 244, 0.1) 0%, rgba(0, 45, 222, 0.05) 100%);
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.1) 0%, rgba(30, 64, 175, 0.05) 100%);
   z-index: -1;
   opacity: 0;
   transition: opacity 200ms ease;
@@ -180,7 +180,7 @@ body {
 }
 
 .table-row-hover:hover {
-  background-color: rgba(111, 124, 244, 0.04);
+  background-color: rgba(37, 99, 235, 0.04);
 }
 
 /* ─── Scrollbar ───────────────────────────────────────────────── */
@@ -206,7 +206,7 @@ body {
 /* ─── Selection ───────────────────────────────────────────────── */
 
 ::selection {
-  background: rgba(56, 85, 233, 0.3);
+  background: rgba(37, 99, 235, 0.3);
   color: var(--color-arc-white);
 }
 

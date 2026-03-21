@@ -6,14 +6,18 @@
 <title>ARC Node</title>
 <style>
   :root {
-    --bg:       #0e1117;
-    --surface:  #161b22;
-    --border:   #30363d;
-    --text:     #e6edf3;
-    --muted:    #8b949e;
-    --accent:   #51EB8E;
-    --danger:   #f85149;
-    --mono:     'SF Mono', 'Cascadia Mono', 'Fira Code', 'Consolas', monospace;
+    --bg:        #0A0F1A;
+    --surface:   #111827;
+    --surface-2: #1a2234;
+    --border:    #1F2937;
+    --text:      #F9FAFB;
+    --muted:     #9CA3AF;
+    --accent:    #2563EB;
+    --accent-light: #60A5FA;
+    --accent-dark: #1E40AF;
+    --accent-ice: #DBEAFE;
+    --danger:    #EF4444;
+    --mono:      'SF Mono', 'Cascadia Mono', 'Fira Code', 'Consolas', monospace;
   }
 
   * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -36,6 +40,7 @@
     border-bottom: 1px solid var(--border);
     background: var(--surface);
     height: 57px;
+    backdrop-filter: blur(12px);
   }
 
   .header-left {
@@ -44,9 +49,7 @@
     gap: 10px;
   }
 
-  .header-logo svg {
-    display: block;
-  }
+  .header-logo svg { display: block; }
 
   .header h1 {
     font-size: 16px;
@@ -54,9 +57,7 @@
     letter-spacing: 0.5px;
   }
 
-  .header h1 span {
-    color: var(--accent);
-  }
+  .header h1 span { color: var(--accent-light); }
 
   .status-row {
     display: flex;
@@ -79,7 +80,7 @@
 
   @keyframes pulse {
     0%, 100% { box-shadow: 0 0 4px var(--accent); }
-    50% { box-shadow: 0 0 14px var(--accent), 0 0 20px rgba(81, 235, 142, 0.3); }
+    50% { box-shadow: 0 0 14px var(--accent), 0 0 24px rgba(37, 99, 235, 0.3); }
   }
 
   .status-label {
@@ -103,9 +104,24 @@
     cursor: pointer;
     transition: all 0.15s;
   }
-  .btn:hover { border-color: var(--accent); color: var(--accent); }
-  .btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
+  .btn:hover { border-color: var(--accent); color: var(--accent-light); }
+  .btn.active { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
   .btn.danger:hover { border-color: var(--danger); color: var(--danger); }
+
+  .btn-outline-blue {
+    padding: 8px 20px;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--accent-light);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn-outline-blue:hover {
+    background: rgba(37, 99, 235, 0.1);
+    border-color: var(--accent-light);
+  }
 
   /* ------- Main ------- */
   .main {
@@ -125,8 +141,15 @@
   .stat-card {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 16px;
+    border-top: 3px solid var(--accent);
+    transition: all 0.2s;
+  }
+  .stat-card:hover {
+    border-color: var(--accent);
+    box-shadow: 0 0 20px rgba(37, 99, 235, 0.08);
+    background: var(--surface-2);
   }
 
   .stat-card .label {
@@ -141,18 +164,22 @@
     font-family: var(--mono);
     font-size: 22px;
     font-weight: 700;
-    color: var(--text);
+    color: #fff;
   }
 
-  .stat-card .value.accent { color: var(--accent); }
+  .stat-card .value.accent { color: var(--accent-light); }
 
   /* ------- Sections ------- */
   .section {
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 10px;
     padding: 20px;
     margin-bottom: 16px;
+    transition: all 0.2s;
+  }
+  .section:hover {
+    box-shadow: 0 0 20px rgba(37, 99, 235, 0.06);
   }
 
   .section-title {
@@ -181,10 +208,10 @@
   .info-row .val {
     font-family: var(--mono);
     font-size: 13px;
-    color: var(--text);
+    color: #fff;
   }
 
-  .info-row .val.accent { color: var(--accent); }
+  .info-row .val.accent { color: var(--accent-light); }
 
   /* ------- Footer Actions ------- */
   .footer-actions {
@@ -211,7 +238,7 @@
     text-decoration: none;
   }
   .footer-bar a:hover {
-    color: var(--accent);
+    color: var(--accent-light);
   }
 
   /* ------- Address display ------- */
@@ -227,7 +254,7 @@
   .address-full {
     font-family: var(--mono);
     font-size: 11px;
-    color: var(--text);
+    color: #fff;
     word-break: break-all;
     text-align: right;
     line-height: 1.4;
@@ -243,9 +270,7 @@
     font-size: 14px;
     transition: color 0.15s;
   }
-  .copy-btn:hover {
-    color: var(--accent);
-  }
+  .copy-btn:hover { color: var(--accent-light); }
 
   /* ------- Onboarding ------- */
   .onboarding {
@@ -256,6 +281,7 @@
     height: calc(100vh - 57px - 40px);
     text-align: center;
     padding: 40px;
+    background: radial-gradient(ellipse at center, rgba(37, 99, 235, 0.06) 0%, var(--bg) 70%);
   }
 
   .onboarding-step {
@@ -285,9 +311,7 @@
     font-weight: 600;
   }
 
-  .onboarding h2 span {
-    color: var(--accent);
-  }
+  .onboarding h2 span { color: var(--accent-light); }
 
   .onboarding p {
     font-size: 15px;
@@ -295,59 +319,59 @@
     line-height: 1.6;
   }
 
+  .onboarding p.subtitle {
+    font-size: 16px;
+    color: var(--muted);
+  }
+
   .onboarding .btn-continue {
-    padding: 10px 32px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--surface);
-    color: var(--text);
+    padding: 12px 36px;
+    border: none;
+    border-radius: 10px;
+    background: var(--accent);
+    color: #fff;
     font-size: 15px;
     cursor: pointer;
     transition: all 0.15s;
-    font-weight: 500;
+    font-weight: 600;
   }
   .onboarding .btn-continue:hover {
-    border-color: var(--accent);
-    color: var(--accent);
+    background: var(--accent-dark);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 16px rgba(37, 99, 235, 0.3);
   }
 
   .onboarding .btn-start-big {
     padding: 14px 48px;
     border: none;
-    border-radius: 10px;
+    border-radius: 12px;
     background: var(--accent);
-    color: var(--bg);
+    color: #fff;
     font-size: 17px;
     font-weight: 700;
     cursor: pointer;
-    transition: opacity 0.15s, transform 0.15s;
+    transition: all 0.15s;
   }
   .onboarding .btn-start-big:hover {
-    opacity: 0.9;
-    transform: scale(1.02);
+    background: var(--accent-dark);
+    transform: translateY(-1px);
+    box-shadow: 0 6px 24px rgba(37, 99, 235, 0.35);
   }
 
-  .logo-circle {
-    width: 100px;
-    height: 100px;
-    border-radius: 50%;
-    background: #fff;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    margin-bottom: 4px;
+  .logo-arc {
+    margin-bottom: 8px;
   }
 
   .address-display {
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 14px 18px;
+    background: rgba(37, 99, 235, 0.06);
+    border: 1px solid rgba(37, 99, 235, 0.2);
+    border-radius: 10px;
+    padding: 16px 20px;
     font-family: var(--mono);
     font-size: 12px;
     word-break: break-all;
     line-height: 1.5;
-    color: var(--text);
+    color: var(--accent-light);
     display: flex;
     align-items: flex-start;
     gap: 10px;
@@ -365,19 +389,17 @@
     color: var(--muted);
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
   }
 
-  .key-note svg {
-    flex-shrink: 0;
-  }
+  .key-note svg { flex-shrink: 0; }
 
   .resource-list {
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 16px;
     width: 100%;
-    max-width: 280px;
+    max-width: 300px;
   }
 
   .resource-item {
@@ -387,17 +409,14 @@
     font-size: 14px;
     color: var(--muted);
     text-align: left;
+    background: var(--surface);
+    padding: 12px 16px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
   }
 
-  .resource-item svg {
-    flex-shrink: 0;
-  }
-
-  .resource-note {
-    font-size: 13px;
-    color: var(--muted);
-    font-family: var(--mono);
-  }
+  .resource-item svg { flex-shrink: 0; }
+  .resource-item strong { color: #fff; }
 
   .step-dots {
     display: flex;
@@ -413,12 +432,8 @@
     transition: background 0.3s;
     cursor: pointer;
   }
-  .step-dots .dot:hover {
-    background: var(--muted);
-  }
-  .step-dots .dot.active {
-    background: var(--accent);
-  }
+  .step-dots .dot:hover { background: var(--muted); }
+  .step-dots .dot.active { background: var(--accent); }
 
   .small-note {
     font-size: 12px;
@@ -435,6 +450,7 @@
     height: 70%;
     text-align: center;
     gap: 20px;
+    background: radial-gradient(ellipse at center, rgba(37, 99, 235, 0.04) 0%, transparent 70%);
   }
 
   .splash h2 {
@@ -447,13 +463,14 @@
     font-size: 16px;
     padding: 12px 40px;
     background: var(--accent);
-    color: var(--bg);
+    color: #fff;
     border: none;
-    border-radius: 8px;
+    border-radius: 10px;
     font-weight: 700;
   }
   .splash .btn.start:hover {
-    opacity: 0.9;
+    background: var(--accent-dark);
+    box-shadow: 0 4px 16px rgba(37, 99, 235, 0.3);
   }
 </style>
 </head>
@@ -464,8 +481,8 @@
   <div class="header-left">
     <div class="header-logo">
       <svg width="32" height="22" viewBox="0 0 120 80" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M10 12 Q60 -14 110 12" stroke="#51EB8E" stroke-width="5" stroke-linecap="round" fill="none"/>
-        <text x="8" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="800" fill="#e6edf3" letter-spacing="2">ARC</text>
+        <path d="M10 12 Q60 -14 110 12" stroke="#2563EB" stroke-width="5" stroke-linecap="round" fill="none"/>
+        <text x="8" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="800" fill="#F9FAFB" letter-spacing="2">ARC</text>
       </svg>
     </div>
   </div>
@@ -481,15 +498,14 @@
 
   <!-- Step 1: Welcome -->
   <div class="onboarding-step active" id="obStep1">
-    <div class="logo-circle">
-      <svg width="64" height="50" viewBox="0 0 120 80" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M10 12 Q60 -14 110 12" stroke="#51EB8E" stroke-width="6" stroke-linecap="round" fill="none"/>
-        <text x="8" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="800" fill="#0e1117" letter-spacing="2">ARC</text>
+    <div class="logo-arc">
+      <svg width="80" height="60" viewBox="0 0 120 80" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M10 12 Q60 -14 110 12" stroke="#2563EB" stroke-width="6" stroke-linecap="round" fill="none"/>
+        <text x="8" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="800" fill="#F9FAFB" letter-spacing="2">ARC</text>
       </svg>
     </div>
     <h2>Welcome to <span>ARC Chain</span></h2>
-    <p>The world's fastest AI-native blockchain</p>
-    <p>Run a node, earn rewards, power the future of AI.</p>
+    <p class="subtitle">The AI-native blockchain</p>
     <button class="btn-continue" onclick="goToStep(2)">Get Started &rarr;</button>
     <div class="step-dots">
       <div class="dot active" onclick="goToStep(1)"></div>
@@ -498,18 +514,17 @@
     </div>
   </div>
 
-  <!-- Step 2: Your Node -->
+  <!-- Step 2: Identity -->
   <div class="onboarding-step" id="obStep2">
-    <h2>Your node is ready</h2>
+    <h2>Your identity on <span>ARC Chain</span></h2>
     <div class="address-display">
       <span class="addr-text" id="obAddress">Loading...</span>
       <button class="copy-btn" onclick="copyOnboardingAddress()" title="Copy address">&#x2398;</button>
     </div>
     <div class="key-note">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#51EB8E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-      Your validator key has been saved securely.
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      Secured with Ed25519 cryptography
     </div>
-    <p>Your node helps secure the network and earns ARC tokens.</p>
     <button class="btn-continue" onclick="goToStep(3)">Continue &rarr;</button>
     <div class="step-dots">
       <div class="dot" onclick="goToStep(1)"></div>
@@ -520,22 +535,22 @@
 
   <!-- Step 3: Launch -->
   <div class="onboarding-step" id="obStep3">
-    <h2>Ready to join the network</h2>
+    <h2>Ready to join</h2>
     <div class="resource-list">
       <div class="resource-item">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#51EB8E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 010 8.49"/><path d="M7.76 16.24a6 6 0 010-8.49"/><path d="M19.07 4.93a10 10 0 010 14.14"/><path d="M4.93 19.07a10 10 0 010-14.14"/></svg>
-        Bandwidth: ~2-5 MB/s
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M16.24 7.76a6 6 0 010 8.49"/><path d="M7.76 16.24a6 6 0 010-8.49"/><path d="M19.07 4.93a10 10 0 010 14.14"/><path d="M4.93 19.07a10 10 0 010-14.14"/></svg>
+        <span>Bandwidth <strong>~2 MB/s</strong></span>
       </div>
       <div class="resource-item">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#51EB8E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4"/><path d="M14 12h4"/></svg>
-        Storage: &lt;1 GB
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 12h4"/><path d="M14 12h4"/></svg>
+        <span>Storage <strong>&lt;1 GB</strong></span>
       </div>
       <div class="resource-item">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#51EB8E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
-        CPU: &lt;5% usage
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#2563EB" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
+        <span>CPU <strong>&lt;5%</strong></span>
       </div>
     </div>
-    <button class="btn-start-big" onclick="finishOnboarding()">Launch Node</button>
+    <button class="btn-start-big" onclick="finishOnboarding()">Launch Node &rarr;</button>
     <p class="small-note">You can stop the node at any time from the dashboard</p>
     <div class="step-dots">
       <div class="dot" onclick="goToStep(1)"></div>
@@ -550,8 +565,8 @@
 <div class="main" id="splashView" style="display:none;">
   <div class="splash">
     <svg width="120" height="80" viewBox="0 0 120 80" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <path d="M10 12 Q60 -14 110 12" stroke="#51EB8E" stroke-width="5" stroke-linecap="round" fill="none"/>
-      <text x="8" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="800" fill="#e6edf3" letter-spacing="2">ARC</text>
+      <path d="M10 12 Q60 -14 110 12" stroke="#2563EB" stroke-width="5" stroke-linecap="round" fill="none"/>
+      <text x="8" y="62" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="48" font-weight="800" fill="#F9FAFB" letter-spacing="2">ARC</text>
     </svg>
     <h2>Join the ARC Chain network in one click</h2>
     <button class="btn start" onclick="doStart()">Start Node</button>
@@ -631,7 +646,7 @@
 
   <!-- Actions -->
   <div class="footer-actions">
-    <button class="btn" onclick="openExplorer()">View in Explorer</button>
+    <button class="btn-outline-blue" onclick="openExplorer()">View on ARC Scan</button>
     <button class="btn" onclick="copyAddress()">Copy Address</button>
   </div>
 
@@ -684,15 +699,17 @@
     const newEl = document.getElementById('obStep' + step);
     if (!newEl) return;
 
-    // Fade out current
+    // Update dots
+    document.querySelectorAll('.step-dots .dot').forEach((d, i) => {
+      d.classList.toggle('active', i === step - 1);
+    });
+
     if (oldEl) {
       oldEl.classList.add('fade-out');
       setTimeout(() => {
         oldEl.classList.remove('active', 'fade-out');
         oldEl.style.display = 'none';
-        // Fade in new
         newEl.style.display = 'flex';
-        // Force reflow
         void newEl.offsetWidth;
         newEl.classList.add('active');
         currentStep = step;
@@ -747,7 +764,6 @@
   }
 
   async function fetchValidatorAddress() {
-    // Try Tauri first
     try {
       const v = await invoke('get_validator_address');
       if (v && v.address) {
@@ -756,7 +772,6 @@
       }
     } catch (_) {}
 
-    // Try HTTP
     try {
       const data = await fetchJSON('/health');
       if (data.validator_address) {
@@ -799,12 +814,11 @@
     const label = document.getElementById('statusLabel');
     dot.className = 'status-dot ' + (running ? 'running' : 'stopped');
     label.className = 'status-label ' + (running ? 'running' : 'stopped');
-    label.textContent = running ? 'RUNNING' : 'STOPPED';
+    label.textContent = running ? 'ONLINE' : 'STOPPED';
     document.getElementById('toggleBtn').textContent = running ? 'Stop Node' : 'Start Node';
   }
 
   async function refreshStats() {
-    // Try Tauri invoke first
     try {
       const [stats, validator, earnings] = await Promise.all([
         invoke('get_node_stats'),
@@ -929,10 +943,9 @@
   }
 
   // ------------------------------------------------------------------
-  // On load -- check onboarding, then check if node is running
+  // On load
   // ------------------------------------------------------------------
   (async function init() {
-    // Check if node is already running (Tauri)
     let alreadyRunning = false;
     try {
       const status = await invoke('get_node_status');
@@ -941,7 +954,6 @@
       }
     } catch (_) {}
 
-    // Check HTTP fallback
     if (!alreadyRunning) {
       try {
         const resp = await fetch(API_BASE + '/health');
@@ -960,7 +972,6 @@
       return;
     }
 
-    // Node is not running -- check onboarding
     if (needsOnboarding()) {
       showOnboarding();
     } else {

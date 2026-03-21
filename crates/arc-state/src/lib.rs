@@ -909,7 +909,22 @@ impl StateDB {
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         use rayon::prelude::*;
 
-        let batches = crate::block_stm::partition_batches(transactions);
+        // ── Pre-sort by (sender, nonce) to reduce BlockSTM conflicts ──────
+        // Build a sorted index so same-sender TXs are adjacent in nonce order.
+        // This makes the partition algorithm place them in sequential batches
+        // naturally, reducing cross-batch conflicts.
+        let mut sorted_indices: Vec<usize> = (0..transactions.len()).collect();
+        sorted_indices.sort_by(|&a, &b| {
+            transactions[a].from.0.cmp(&transactions[b].from.0)
+                .then(transactions[a].nonce.cmp(&transactions[b].nonce))
+        });
+
+        // Build a re-ordered transaction slice for partitioning.
+        let sorted_txs: Vec<Transaction> = sorted_indices.iter()
+            .map(|&i| transactions[i].clone())
+            .collect();
+        // Map from sorted position back to original index.
+        let batches = crate::block_stm::partition_batches(&sorted_txs);
         let mut receipts = vec![None; transactions.len()];
         let mut tx_hashes = vec![Hash256::ZERO; transactions.len()];
 
@@ -925,14 +940,19 @@ impl StateDB {
 
         // Execute batches: within each batch, TXs run in parallel.
         // Batches run sequentially (they may have cross-batch dependencies).
+        // Note: batch indices refer to positions in sorted_txs; we map back
+        // to original positions via sorted_indices for receipt/hash placement.
         for batch in &batches {
             let batch_results: Vec<(usize, bool, u64)> = batch
                 .par_iter()
-                .map(|&idx| {
-                    let tx = &transactions[idx];
+                .map(|&sorted_idx| {
+                    let orig_idx = sorted_indices[sorted_idx];
+                    let tx = &transactions[orig_idx];
                     self.mark_tx_accounts_dirty(tx);
                     let result = if tx.is_unsigned() {
                         Err(StateError::ExecutionError("unsigned transaction".into()))
+                    } else if tx.sig_verified {
+                        self.execute_tx(tx)
                     } else if tx.verify_signature().is_err() {
                         Err(StateError::ExecutionError("invalid signature".into()))
                     } else {
@@ -942,17 +962,17 @@ impl StateDB {
                         Ok(gas) => (true, gas),
                         Err(_) => (false, Self::gas_cost_for_tx(tx)),
                     };
-                    (idx, success, gas_used)
+                    (orig_idx, success, gas_used)
                 })
                 .collect();
 
-            for (idx, success, gas_used) in batch_results {
-                tx_hashes[idx] = transactions[idx].hash;
-                receipts[idx] = Some(TxReceipt {
-                    tx_hash: transactions[idx].hash,
+            for (orig_idx, success, gas_used) in batch_results {
+                tx_hashes[orig_idx] = transactions[orig_idx].hash;
+                receipts[orig_idx] = Some(TxReceipt {
+                    tx_hash: transactions[orig_idx].hash,
                     block_height: height,
                     block_hash: Hash256::ZERO,
-                    index: idx as u32,
+                    index: orig_idx as u32,
                     success,
                     gas_used,
                     value_commitment: None,
@@ -1044,11 +1064,80 @@ impl StateDB {
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
-        // Execute each transaction with signature verification
+        // ── Batch Ed25519 signature verification ──────────────────────────
+        // Collect all unverified Ed25519 signatures and verify them in a single
+        // batch operation (~2x faster than individual verification).
+        // Transactions already verified at mempool insertion are skipped.
+        let mut batch_sig_valid = vec![None; transactions.len()]; // None = needs individual check
+        {
+            let mut ed_indices: Vec<usize> = Vec::new();
+            let mut ed_msgs: Vec<Vec<u8>> = Vec::new();
+            let mut ed_sigs: Vec<ed25519_dalek::Signature> = Vec::new();
+            let mut ed_vks: Vec<ed25519_dalek::VerifyingKey> = Vec::new();
+
+            for (i, tx) in transactions.iter().enumerate() {
+                if tx.is_unsigned() || tx.sig_verified {
+                    continue; // unsigned handled below; pre-verified skipped
+                }
+                // Hash integrity check
+                if tx.compute_hash() != tx.hash {
+                    batch_sig_valid[i] = Some(false);
+                    continue;
+                }
+                if let arc_crypto::signature::Signature::Ed25519 { public_key, signature } = &tx.signature {
+                    if signature.len() == 64 {
+                        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key) {
+                            let mut sig_bytes = [0u8; 64];
+                            sig_bytes.copy_from_slice(signature);
+                            ed_indices.push(i);
+                            ed_msgs.push(tx.hash.0.to_vec());
+                            ed_sigs.push(ed25519_dalek::Signature::from_bytes(&sig_bytes));
+                            ed_vks.push(vk);
+                            continue;
+                        }
+                    }
+                    batch_sig_valid[i] = Some(false); // malformed
+                }
+                // Non-Ed25519 signatures fall through to individual verification
+            }
+
+            if !ed_indices.is_empty() {
+                let msg_refs: Vec<&[u8]> = ed_msgs.iter().map(|m| m.as_slice()).collect();
+                match arc_crypto::signature::batch_verify_ed25519(&msg_refs, &ed_sigs, &ed_vks) {
+                    Ok(()) => {
+                        // All valid
+                        for &idx in &ed_indices {
+                            batch_sig_valid[idx] = Some(true);
+                        }
+                    }
+                    Err(_) => {
+                        // Batch failed — fall back to individual verification to find bad ones
+                        for &idx in &ed_indices {
+                            let valid = transactions[idx].verify_signature().is_ok();
+                            batch_sig_valid[idx] = Some(valid);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Execute each transaction with signature verification.
+        // Skip re-verification for transactions already verified at mempool insertion
+        // or batch-verified above.
         for (i, tx) in transactions.iter().enumerate() {
             self.mark_tx_accounts_dirty(tx);
             let result = if tx.is_unsigned() {
                 Err(StateError::ExecutionError("unsigned transaction".into()))
+            } else if tx.sig_verified {
+                // Already verified at mempool insertion — skip costly re-verification
+                self.execute_tx(tx)
+            } else if let Some(valid) = batch_sig_valid[i] {
+                // Batch-verified above
+                if valid {
+                    self.execute_tx(tx)
+                } else {
+                    Err(StateError::ExecutionError("invalid signature".into()))
+                }
             } else if tx.verify_signature().is_err() {
                 Err(StateError::ExecutionError("invalid signature".into()))
             } else {
