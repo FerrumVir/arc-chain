@@ -1,23 +1,23 @@
 {
   "config": {
     "num_nodes": 2,
-    "total_transactions": 300000,
+    "total_transactions": 500000,
     "batch_size": 1000,
     "warmup_blocks": 3,
     "senders_per_node": 90
   },
-  "total_transactions": 300000,
-  "committed_transactions": 300000,
-  "elapsed_seconds": 11.249659417,
-  "tps": 26667.473998959733,
-  "peak_tps": 300000.0,
-  "avg_block_time_ms": 2799.75,
-  "avg_block_size": 75000.0,
-  "finality_time_ms": 5599.5,
+  "total_transactions": 500000,
+  "committed_transactions": 500000,
+  "elapsed_seconds": 11.403085,
+  "tps": 43847.78329723929,
+  "peak_tps": 450000.0,
+  "avg_block_time_ms": 2825.0,
+  "avg_block_size": 125000.0,
+  "finality_time_ms": 5650.0,
   "nodes": 2,
   "cpu_cores": 24,
-  "projected_4_nodes": 46934.75423816913,
-  "projected_16_nodes": 187739.01695267652,
-  "projected_64_nodes": 750956.0678107061,
-  "projected_256_nodes": 3003824.2712428244
+  "projected_4_nodes": 77172.09860314116,
+  "projected_16_nodes": 308688.39441256464,
+  "projected_64_nodes": 1234753.5776502586,
+  "projected_256_nodes": 4939014.310601034
 }

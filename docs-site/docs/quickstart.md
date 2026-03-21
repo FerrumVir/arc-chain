@@ -4,118 +4,80 @@ sidebar_position: 2
 id: quickstart
 ---
 
-# Quickstart
+# Join ARC Chain
 
-Join the ARC Chain network in under five minutes.
+Two ways to join — pick whichever is easier for you.
 
-## One-Click Install (recommended)
+## Option 1: Desktop App (Easiest)
+
+Download the ARC Node app. Open it. Click "Launch Node." Done.
+
+| Platform | Download |
+|----------|----------|
+| macOS (Apple Silicon) | Coming soon |
+| macOS (Intel) | Coming soon |
+| Windows | Coming soon |
+| Linux | Coming soon |
+
+The app handles everything — keypair generation, peer discovery, syncing, and earning rewards. No terminal needed.
+
+## Option 2: Terminal (One Command)
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-node.sh | bash
 ```
 
-This script will:
-1. Install the Rust toolchain (if not already present)
-2. Clone the `arc-chain` repository
-3. Build the node in release mode
-4. Generate a validator keypair
-5. Start the node as a background service (systemd on Linux, launchd on macOS)
+This installs Rust (if needed), builds the node, generates your validator keypair, and starts it as a background service. Works on macOS and Linux, Intel and ARM.
 
-Works on Linux and macOS, Intel and ARM.
+Your node is running. That's it.
 
-## Desktop App
+## Verify Your Node
 
-The ARC Node desktop app provides a graphical interface for running a node, viewing chain status, and managing your validator identity. Downloads are available on the [GitHub releases page](https://github.com/FerrumVir/arc-chain/releases).
+Open ARC Scan to see your node on the network:
 
-## Build from Source
+**[ARC Scan →](https://dist-three-amber-39.vercel.app)**
 
-### Prerequisites
-
-- **Rust 1.85+** (edition 2024)
-- **Node.js 22+** (only needed for the block explorer)
-
-### Clone and build
-
-```bash
-git clone https://github.com/FerrumVir/arc-chain.git
-cd arc-chain
-cargo build --release
-```
-
-### Run tests
-
-```bash
-cargo test --workspace --lib    # 1,054 tests
-```
-
-## Running Your First Node
-
-Start a node with default settings:
-
-```bash
-cargo run --release -p arc-node
-```
-
-The RPC server starts at `http://localhost:9090`. Verify it is running:
+Or check from the terminal:
 
 ```bash
 curl http://localhost:9090/health
 ```
 
-You should see a JSON response with the node status, peer count, and current block height.
+## Get Test Tokens
 
-### Check chain stats
-
-```bash
-curl http://localhost:9090/stats
-```
-
-Returns live TPS, block height, and total transaction count.
-
-### Submit a transaction
-
-Use the CLI to generate a keypair and submit a transfer:
+Your node comes pre-funded with genesis tokens. To get more:
 
 ```bash
-# Generate a keypair
-cargo run --release -p arc-cli -- keygen
-
-# Submit a transfer (replace addresses with real ones)
-cargo run --release -p arc-cli -- transfer \
-    --from <sender-address> \
-    --to <receiver-address> \
-    --amount 1000
+curl -X POST http://localhost:9090/faucet/claim \
+  -H "Content-Type: application/json" \
+  -d '{"address": "YOUR_VALIDATOR_ADDRESS"}'
 ```
 
-## Running the Block Explorer
+The faucet sends 10,000 test ARC to your address.
+
+## Run an AI Agent
+
+Deploy a sentiment analysis agent that does real on-chain inference:
 
 ```bash
-cd explorer && npm install && npm run dev
+cargo run --release -p arc-agents --bin sentiment-agent
 ```
 
-The explorer runs at `http://localhost:3100` and connects to the local node at port 9090.
+Or connect GPT-4 to ARC Chain:
 
-## Docker Compose
+```python
+from arc_sdk import ArcClient, KeyPair
+from arc_sdk.agent_runner import openai_runner
 
-Run both the node and explorer with Docker:
-
-```bash
-docker compose up -d --build
-# Node: http://localhost:9090
-# Explorer: http://localhost:3100
+client = ArcClient("http://localhost:9090")
+kp = KeyPair.generate()
+runner = openai_runner(client, kp, model="gpt-4o")
+result = await runner.infer("Analyze this market data...")
 ```
-
-## Bare Metal Deployment (Ubuntu/Debian)
-
-```bash
-git clone https://github.com/FerrumVir/arc-chain.git /opt/arc-chain
-cd /opt/arc-chain && bash deploy.sh
-```
-
-This creates systemd services for `arc-node` and `arc-explorer` with automatic restart.
 
 ## Next Steps
 
-- [Architecture](./architecture.md) -- understand how ARC Chain works under the hood
-- [Testnet](./testnet.md) -- join the public testnet
-- [RPC API](./rpc-api.md) -- explore all available endpoints
+- [Architecture](./architecture.md) — how ARC Chain works under the hood
+- [Deploy an AI Agent](./agents/deploy-agent.md) — connect any model to ARC Chain
+- [RPC API](./rpc-api.md) — all available endpoints
+- [Tokenomics](./tokenomics.md) — how rewards work
