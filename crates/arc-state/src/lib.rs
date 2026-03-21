@@ -872,6 +872,153 @@ impl StateDB {
     /// Execute a batch of transactions with signature verification.
     /// Unsigned or invalid-signature transactions are marked as failed.
     /// Returns the new block and receipts for each transaction.
+    /// Execute a block with adaptive mode selection.
+    ///
+    /// Automatically chooses sequential or BlockSTM based on the transaction mix:
+    /// - Simple transfer-only blocks → sequential (no overhead)
+    /// - Contract calls / high diversity → BlockSTM (parallel)
+    ///
+    /// This is the primary execution entry point for the consensus pipeline.
+    pub fn execute_block_adaptive(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        let mode = crate::block_stm::choose_execution_mode(transactions);
+        match mode {
+            crate::block_stm::AdaptiveMode::Sequential => {
+                self.execute_block_verified(transactions, producer)
+            }
+            crate::block_stm::AdaptiveMode::BlockSTM => {
+                // Use BlockSTM partitioned execution
+                self.execute_block_blockstm(transactions, producer)
+            }
+        }
+    }
+
+    /// Execute a block using BlockSTM partitioned parallel execution.
+    fn execute_block_blockstm(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        use rayon::prelude::*;
+
+        let batches = crate::block_stm::partition_batches(transactions);
+        let mut receipts = vec![None; transactions.len()];
+        let mut tx_hashes = vec![Hash256::ZERO; transactions.len()];
+
+        let height = {
+            let mut h = self.height.write();
+            *h += 1;
+            *h
+        };
+
+        let parent = self.blocks.get(&(height - 1))
+            .map(|b| b.hash)
+            .unwrap_or(Hash256::ZERO);
+
+        // Execute batches: within each batch, TXs run in parallel.
+        // Batches run sequentially (they may have cross-batch dependencies).
+        for batch in &batches {
+            let batch_results: Vec<(usize, bool, u64)> = batch
+                .par_iter()
+                .map(|&idx| {
+                    let tx = &transactions[idx];
+                    self.mark_tx_accounts_dirty(tx);
+                    let result = if tx.is_unsigned() {
+                        Err(StateError::ExecutionError("unsigned transaction".into()))
+                    } else if tx.verify_signature().is_err() {
+                        Err(StateError::ExecutionError("invalid signature".into()))
+                    } else {
+                        self.execute_tx(tx)
+                    };
+                    let (success, gas_used) = match result {
+                        Ok(gas) => (true, gas),
+                        Err(_) => (false, Self::gas_cost_for_tx(tx)),
+                    };
+                    (idx, success, gas_used)
+                })
+                .collect();
+
+            for (idx, success, gas_used) in batch_results {
+                tx_hashes[idx] = transactions[idx].hash;
+                receipts[idx] = Some(TxReceipt {
+                    tx_hash: transactions[idx].hash,
+                    block_height: height,
+                    block_hash: Hash256::ZERO,
+                    index: idx as u32,
+                    success,
+                    gas_used,
+                    value_commitment: None,
+                    inclusion_proof: None,
+                    logs: vec![],
+                });
+            }
+        }
+
+        // Unwrap all receipts (all slots should be filled)
+        let receipts: Vec<TxReceipt> = receipts.into_iter()
+            .enumerate()
+            .map(|(i, r)| r.unwrap_or(TxReceipt {
+                tx_hash: transactions[i].hash,
+                block_height: height,
+                block_hash: Hash256::ZERO,
+                index: i as u32,
+                success: false,
+                gas_used: 0,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: vec![],
+            }))
+            .collect();
+
+        // Build block (same as sequential path)
+        let tree = MerkleTree::from_leaves(tx_hashes.clone());
+        let tx_root = tree.root();
+        let state_root = self.compute_state_root();
+
+        let header = BlockHeader {
+            height,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            parent_hash: parent,
+            tx_root,
+            state_root,
+            proof_hash: Hash256::ZERO,
+            tx_count: transactions.len() as u32,
+            producer,
+            protocol_version: ProtocolVersion::GENESIS,
+            state_diff: None,
+        };
+
+        let mut block = Block::new(header, tx_hashes);
+
+        let mut final_receipts = receipts;
+        for (i, receipt) in final_receipts.iter_mut().enumerate() {
+            receipt.block_hash = block.hash;
+            if let Some(proof) = tree.proof(i) {
+                receipt.inclusion_proof = bincode::serialize(&proof).ok();
+            }
+        }
+
+        for (i, tx) in transactions.iter().enumerate() {
+            self.receipts.insert(tx.hash.0, final_receipts[i].clone());
+            self.tx_index.insert(tx.hash.0, (height, i as u32));
+            self.index_account_tx(tx);
+            self.full_transactions.insert(tx.hash.0, tx.clone());
+        }
+
+        self.blocks.insert(height, block.clone());
+        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal.append(WalOp::Checkpoint(state_root), height);
+
+        Ok((block, final_receipts))
+    }
+
+    /// Execute a block with sequential verification (original path).
     pub fn execute_block_verified(
         &self,
         transactions: &[Transaction],
