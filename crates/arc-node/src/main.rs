@@ -38,6 +38,11 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     peers: Vec<String>,
 
+    /// Path to a seeds file (one peer address per line, # comments allowed).
+    /// Seeds are merged with --peers. Useful for testnet bootstrap.
+    #[arg(long)]
+    seeds_file: Option<String>,
+
     /// Minimum staked ARC required to run this node
     #[arg(long, default_value_t = 500_000)]
     min_stake: u64,
@@ -172,12 +177,35 @@ async fn main() -> Result<()> {
         node_cfg.rpc.eth_port
     };
 
-    // Peers: merge CLI peers with config peers (CLI takes priority if any provided)
-    let peers = if !cli.peers.is_empty() {
+    // Peers: merge CLI peers + config peers + seeds file
+    let mut peers = if !cli.peers.is_empty() {
         cli.peers.clone()
     } else {
         node_cfg.p2p.peers.clone()
     };
+
+    // Load additional seeds from file (if provided)
+    if let Some(ref seeds_path) = cli.seeds_file {
+        match std::fs::read_to_string(seeds_path) {
+            Ok(contents) => {
+                let seed_peers: Vec<String> = contents
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(|l| l.to_string())
+                    .collect();
+                tracing::info!("Loaded {} seeds from {}", seed_peers.len(), seeds_path);
+                peers.extend(seed_peers);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to read seeds file {}: {}", seeds_path, e);
+            }
+        }
+    }
+
+    // Deduplicate peers
+    peers.sort();
+    peers.dedup();
 
     // Benchmark settings: CLI > config > default
     let _bench_batch = if matches.value_source("bench_batch") == Some(clap::parser::ValueSource::CommandLine) {

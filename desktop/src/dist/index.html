@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ARC Node</title>
+<style>
+  :root {
+    --bg:       #0e1117;
+    --surface:  #161b22;
+    --border:   #30363d;
+    --text:     #e6edf3;
+    --muted:    #8b949e;
+    --accent:   #51EB8E;
+    --danger:   #f85149;
+    --mono:     'SF Mono', 'Cascadia Mono', 'Fira Code', 'Consolas', monospace;
+  }
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+    user-select: none;
+  }
+
+  /* ------- Header ------- */
+  .header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 24px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .header h1 {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+  }
+
+  .header h1 span {
+    color: var(--accent);
+  }
+
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .status-dot {
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    background: var(--muted);
+    transition: background 0.3s;
+  }
+  .status-dot.running { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  .status-dot.stopped { background: var(--danger); }
+
+  .status-label {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+    transition: color 0.3s;
+  }
+  .status-label.running { color: var(--accent); }
+  .status-label.stopped { color: var(--danger); }
+
+  .btn {
+    padding: 6px 16px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--surface);
+    color: var(--text);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); font-weight: 600; }
+  .btn.danger:hover { border-color: var(--danger); color: var(--danger); }
+
+  /* ------- Main ------- */
+  .main {
+    padding: 24px;
+    overflow-y: auto;
+    height: calc(100vh - 57px);
+  }
+
+  /* ------- Stats Grid ------- */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-bottom: 24px;
+  }
+
+  .stat-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+
+  .stat-card .label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--muted);
+    margin-bottom: 6px;
+  }
+
+  .stat-card .value {
+    font-family: var(--mono);
+    font-size: 22px;
+    font-weight: 700;
+    color: var(--text);
+  }
+
+  .stat-card .value.accent { color: var(--accent); }
+
+  /* ------- Sections ------- */
+  .section {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+
+  .section-title {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--muted);
+    margin-bottom: 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .info-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 0;
+  }
+
+  .info-row .key {
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .info-row .val {
+    font-family: var(--mono);
+    font-size: 13px;
+    color: var(--text);
+  }
+
+  .info-row .val.accent { color: var(--accent); }
+
+  /* ------- Footer Actions ------- */
+  .footer-actions {
+    display: flex;
+    gap: 10px;
+    margin-top: 8px;
+  }
+
+  /* ------- Splash / Not Running ------- */
+  .splash {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 70%;
+    text-align: center;
+    gap: 20px;
+  }
+
+  .splash h2 {
+    font-size: 20px;
+    font-weight: 400;
+    color: var(--muted);
+  }
+
+  .splash .btn.start {
+    font-size: 16px;
+    padding: 12px 40px;
+    background: var(--accent);
+    color: var(--bg);
+    border: none;
+    border-radius: 8px;
+    font-weight: 700;
+  }
+  .splash .btn.start:hover {
+    opacity: 0.9;
+  }
+</style>
+</head>
+<body>
+
+<!-- ============ HEADER ============ -->
+<div class="header">
+  <h1><span>ARC</span> Node</h1>
+  <div class="status-row">
+    <div class="status-dot" id="statusDot"></div>
+    <span class="status-label" id="statusLabel">STOPPED</span>
+    <button class="btn danger" id="toggleBtn" style="display:none;" onclick="toggleNode()">Stop Node</button>
+  </div>
+</div>
+
+<!-- ============ SPLASH (shown when not running) ============ -->
+<div class="main" id="splashView">
+  <div class="splash">
+    <h1><span style="color:var(--accent);">ARC</span> Node</h1>
+    <h2>Join the ARC Chain network in one click</h2>
+    <button class="btn start" onclick="doStart()">Start Node</button>
+    <p style="color:var(--muted);font-size:12px;max-width:400px;">
+      This will run a validator node in the background. You can stop it at any time.
+    </p>
+  </div>
+</div>
+
+<!-- ============ DASHBOARD (shown when running) ============ -->
+<div class="main" id="dashView" style="display:none;">
+
+  <!-- Stats grid -->
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="label">Block Height</div>
+      <div class="value" id="blockHeight">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Network TPS</div>
+      <div class="value" id="networkTps">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Your TPS</div>
+      <div class="value accent" id="yourTps">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Peers</div>
+      <div class="value" id="peers">--</div>
+    </div>
+    <div class="stat-card">
+      <div class="label">Finality</div>
+      <div class="value" id="finality">--</div>
+    </div>
+  </div>
+
+  <!-- Validator section -->
+  <div class="section">
+    <div class="section-title">Your Validator</div>
+    <div class="info-row">
+      <span class="key">Address</span>
+      <span class="val" id="valAddress" style="cursor:pointer;" onclick="copyAddress()" title="Click to copy">--</span>
+    </div>
+    <div class="info-row">
+      <span class="key">Role</span>
+      <span class="val" id="valRole">--</span>
+    </div>
+    <div class="info-row">
+      <span class="key">Stake</span>
+      <span class="val" id="valStake">--</span>
+    </div>
+    <div class="info-row">
+      <span class="key">Earned (session)</span>
+      <span class="val accent" id="valEarned">--</span>
+    </div>
+  </div>
+
+  <!-- Network section -->
+  <div class="section">
+    <div class="section-title">Network</div>
+    <div class="info-row">
+      <span class="key">Total Validators</span>
+      <span class="val" id="netValidators">--</span>
+    </div>
+    <div class="info-row">
+      <span class="key">Total Staked</span>
+      <span class="val" id="netStaked">--</span>
+    </div>
+    <div class="info-row">
+      <span class="key">Shards</span>
+      <span class="val" id="netShards">--</span>
+    </div>
+  </div>
+
+  <!-- Actions -->
+  <div class="footer-actions">
+    <button class="btn" onclick="openExplorer()">View in Explorer</button>
+    <button class="btn" onclick="copyAddress()">Copy Address</button>
+  </div>
+
+</div>
+
+<script>
+  // ------------------------------------------------------------------
+  // Tauri invoke bridge — falls back gracefully outside Tauri.
+  // ------------------------------------------------------------------
+  const invoke = window.__TAURI__?.invoke ?? (async (cmd) => {
+    console.warn(`[mock] invoke("${cmd}") — not running inside Tauri`);
+    // Return mock data so the UI is previewable in a regular browser.
+    if (cmd === 'get_node_status')      return { running: true, version: '0.1.0', uptime_secs: 312 };
+    if (cmd === 'get_node_stats')       return { block_height: 12345, network_tps: 45200, your_tps: 11300, peers: 7, finality_secs: 4.2, total_validators: 847, total_staked: 425000000, shards: 12 };
+    if (cmd === 'get_validator_address') return { address: '0x3a8f92c1d7e4b56a0f3c8d9e2b1a7f6c5d4e3a2b', role: 'Observer', stake: 50000 };
+    if (cmd === 'get_earnings')         return { session_earned: 142.5, total_earned: 1024.8 };
+    if (cmd === 'get_peers')            return 7;
+    if (cmd === 'start_node')           return 'Node started';
+    if (cmd === 'stop_node')            return 'Node stopped';
+    return null;
+  });
+
+  let nodeRunning = false;
+  let pollTimer = null;
+
+  // ------------------------------------------------------------------
+  // Formatting helpers
+  // ------------------------------------------------------------------
+  function fmt(n) {
+    if (n === undefined || n === null) return '--';
+    return Number(n).toLocaleString();
+  }
+  function fmtArc(n) {
+    if (n >= 1_000_000) return (n / 1_000_000).toFixed(0) + 'M ARC';
+    if (n >= 1_000)     return fmt(n) + ' ARC';
+    return n + ' ARC';
+  }
+  function truncAddr(a) {
+    if (!a || a.length < 12) return a || '--';
+    return a.slice(0, 6) + '...' + a.slice(-4);
+  }
+
+  // ------------------------------------------------------------------
+  // UI updates
+  // ------------------------------------------------------------------
+  function showDashboard() {
+    document.getElementById('splashView').style.display = 'none';
+    document.getElementById('dashView').style.display = 'block';
+    document.getElementById('toggleBtn').style.display = 'inline-block';
+    setStatus(true);
+  }
+
+  function showSplash() {
+    document.getElementById('splashView').style.display = 'block';
+    document.getElementById('dashView').style.display = 'none';
+    document.getElementById('toggleBtn').style.display = 'none';
+    setStatus(false);
+  }
+
+  function setStatus(running) {
+    const dot   = document.getElementById('statusDot');
+    const label = document.getElementById('statusLabel');
+    dot.className   = 'status-dot ' + (running ? 'running' : 'stopped');
+    label.className = 'status-label ' + (running ? 'running' : 'stopped');
+    label.textContent = running ? 'RUNNING' : 'STOPPED';
+    document.getElementById('toggleBtn').textContent = running ? 'Stop Node' : 'Start Node';
+  }
+
+  async function refreshStats() {
+    try {
+      const [stats, validator, earnings] = await Promise.all([
+        invoke('get_node_stats'),
+        invoke('get_validator_address'),
+        invoke('get_earnings'),
+      ]);
+
+      document.getElementById('blockHeight').textContent = fmt(stats.block_height);
+      document.getElementById('networkTps').textContent   = fmt(stats.network_tps);
+      document.getElementById('yourTps').textContent      = fmt(stats.your_tps);
+      document.getElementById('peers').textContent        = fmt(stats.peers);
+      document.getElementById('finality').textContent     = stats.finality_secs > 0 ? stats.finality_secs.toFixed(1) + 's' : '--';
+
+      document.getElementById('valAddress').textContent = truncAddr(validator.address);
+      document.getElementById('valAddress').dataset.full = validator.address;
+      document.getElementById('valRole').textContent    = validator.role;
+      document.getElementById('valStake').textContent   = fmtArc(validator.stake);
+      document.getElementById('valEarned').textContent  = earnings.session_earned > 0 ? earnings.session_earned.toFixed(1) + ' ARC' : '0 ARC';
+
+      document.getElementById('netValidators').textContent = fmt(stats.total_validators);
+      document.getElementById('netStaked').textContent     = fmtArc(stats.total_staked);
+      document.getElementById('netShards').textContent     = fmt(stats.shards);
+    } catch (e) {
+      console.error('refreshStats failed:', e);
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Actions
+  // ------------------------------------------------------------------
+  async function doStart() {
+    try {
+      await invoke('start_node');
+    } catch (e) {
+      console.warn('start_node invoke failed (may be running in browser):', e);
+    }
+    nodeRunning = true;
+    showDashboard();
+    refreshStats();
+    pollTimer = setInterval(refreshStats, 3000);
+  }
+
+  async function toggleNode() {
+    if (nodeRunning) {
+      try { await invoke('stop_node'); } catch (_) {}
+      nodeRunning = false;
+      clearInterval(pollTimer);
+      showSplash();
+    } else {
+      await doStart();
+    }
+  }
+
+  function copyAddress() {
+    const addr = document.getElementById('valAddress')?.dataset?.full;
+    if (addr) {
+      navigator.clipboard.writeText(addr).then(() => {
+        const el = document.getElementById('valAddress');
+        const orig = el.textContent;
+        el.textContent = 'Copied!';
+        setTimeout(() => { el.textContent = orig; }, 1200);
+      });
+    }
+  }
+
+  function openExplorer() {
+    const addr = document.getElementById('valAddress')?.dataset?.full;
+    const url = 'https://explorer.arcchain.io/address/' + (addr || '');
+    if (window.__TAURI__) {
+      window.__TAURI__.shell.open(url);
+    } else {
+      window.open(url, '_blank');
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // On load — check if node is already running
+  // ------------------------------------------------------------------
+  (async function init() {
+    try {
+      const status = await invoke('get_node_status');
+      if (status && status.running) {
+        nodeRunning = true;
+        showDashboard();
+        refreshStats();
+        pollTimer = setInterval(refreshStats, 3000);
+      }
+    } catch (_) {
+      // Not inside Tauri — stay on splash.
+    }
+  })();
+</script>
+
+</body>
+</html>
