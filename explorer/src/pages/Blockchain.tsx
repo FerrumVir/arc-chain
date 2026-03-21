@@ -331,7 +331,7 @@ export default function Blockchain() {
               <Link to="/" className="btn-arc">
                 Explore Chain <span aria-hidden="true">&rarr;</span>
               </Link>
-              <a href="https://github.com/FerrumVir/arc-chain/tree/main/docs" target="_blank" rel="noopener noreferrer" className="btn-arc-outline">
+              <a href="https://build-two-tau-96.vercel.app/docs/architecture" target="_blank" rel="noopener noreferrer" className="btn-arc-outline">
                 Read Docs <span aria-hidden="true">&rarr;</span>
               </a>
             </div>
@@ -622,7 +622,7 @@ export default function Blockchain() {
 
           <Reveal delay={0.3}>
             <div className="mt-10 text-center">
-              <a href="https://github.com/FerrumVir/arc-chain/tree/main/docs" target="_blank" rel="noopener noreferrer" className="btn-arc-outline">
+              <a href="https://build-two-tau-96.vercel.app/docs/architecture" target="_blank" rel="noopener noreferrer" className="btn-arc-outline">
                 View Documentation <span aria-hidden="true">&rarr;</span>
               </a>
             </div>
