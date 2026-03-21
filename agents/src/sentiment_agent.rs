@@ -20,9 +20,8 @@
 //! └─────────────┘                           └──────────────┘
 //! ```
 
-use arc_crypto::hash::hash_bytes;
+use arc_crypto::{hash_bytes, Hash256};
 use arc_crypto::signature::Signature;
-use arc_crypto::Hash256;
 use arc_types::transaction::{
     RegisterBody, SettleBody, Transaction, TxBody, TxType,
 };
@@ -30,8 +29,7 @@ use arc_vm::agent::{
     Agent, AgentConfig, AgentId, AgentRegistry, AgentState, ActionResult, ActionType, AgentAction,
 };
 use arc_vm::inference::{
-    InferenceConfig, InferenceEngine, InferenceInput, InferenceParams, InferenceRequest,
-    Layer, ModelInfo, NeuralNet,
+    InferenceConfig, InferenceEngine, Layer, ModelInfo, NeuralNet,
 };
 
 // ---------------------------------------------------------------------------
@@ -42,6 +40,7 @@ use arc_vm::inference::{
 const AGENT_NAME: &str = "sentiment-classifier-v1";
 
 /// Inference precompile address (0x0A).
+#[allow(dead_code)]
 const INFERENCE_PRECOMPILE: u8 = 0x0A;
 
 /// Input dimension: simple bag-of-words encoding uses 128 features.
