@@ -303,6 +303,8 @@ async fn submit_tx(
 
             // Verify signature before accepting
             tx.verify_signature().map_err(|_| (StatusCode::BAD_REQUEST, "signature verification failed".to_string()))?;
+            // Mark as pre-verified so block execution can skip re-verification.
+            tx.sig_verified = true;
 
             let hash = tx.hash.to_hex();
             node.mempool.insert(tx).map_err(|_| (StatusCode::CONFLICT, "duplicate transaction".to_string()))?;

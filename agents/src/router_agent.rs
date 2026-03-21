@@ -156,6 +156,7 @@ fn build_register_tx(owner: Hash256, nonce: u64) -> Transaction {
         gas_limit: 30_000,
         hash,
         signature: Signature::null(),
+        sig_verified: false,
     }
 }
 
@@ -184,6 +185,7 @@ fn build_routing_fee_settle_tx(
         gas_limit: 25_000,
         hash,
         signature: Signature::null(),
+        sig_verified: false,
     }
 }
 
@@ -213,6 +215,7 @@ fn build_provider_settle_tx(
         gas_limit: 25_000,
         hash,
         signature: Signature::null(),
+        sig_verified: false,
     }
 }
 

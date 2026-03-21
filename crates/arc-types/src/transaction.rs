@@ -228,6 +228,10 @@ pub struct Transaction {
     pub hash: Hash256,
     /// Cryptographic signature. Must be valid — null signatures are rejected.
     pub signature: Signature,
+    /// Whether the signature has already been verified (e.g. at mempool insertion).
+    /// When true, block execution can skip re-verification for a ~2x speedup.
+    #[serde(default)]
+    pub sig_verified: bool,
 }
 
 /// Type-specific transaction payload.
@@ -662,6 +666,7 @@ impl Transaction {
             gas_limit: 0,
             hash: Hash256::ZERO,
             signature: Signature::null(),
+            sig_verified: false,
         };
         tx.hash = tx.compute_hash();
         tx
@@ -692,6 +697,7 @@ impl Transaction {
             gas_limit: 0,
             hash: Hash256::ZERO,
             signature: Signature::null(),
+            sig_verified: false,
         };
         tx.hash = tx.compute_hash();
         tx
@@ -723,6 +729,7 @@ impl Transaction {
             gas_limit,
             hash: Hash256::ZERO,
             signature: Signature::null(),
+            sig_verified: false,
         };
         tx.hash = tx.compute_hash();
         tx
@@ -752,6 +759,7 @@ impl Transaction {
             gas_limit,
             hash: Hash256::ZERO,
             signature: Signature::null(),
+            sig_verified: false,
         };
         tx.hash = tx.compute_hash();
         tx
@@ -784,6 +792,7 @@ impl Transaction {
             gas_limit: 0,
             hash: Hash256::ZERO,
             signature: Signature::null(),
+            sig_verified: false,
         };
         tx.hash = tx.compute_hash();
         tx
