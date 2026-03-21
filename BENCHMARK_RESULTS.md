@@ -1,9 +1,10 @@
 # ARC Chain — Benchmark Results & Technical Overview
 
-**Date**: March 13, 2026
-**Version**: v1.1
-**Hardware**: Apple M4, 10 CPU cores, 16 GB unified memory
-**Codebase**: 76,255 LOC Rust | 1,031 tests | 11 crates
+**Date**: March 21, 2026
+**Version**: v1.2
+**Hardware**: Apple M2 Ultra, 24 CPU cores (16P+8E), 64 GB unified memory
+**Previous**: Apple M4, 10 CPU cores, 16 GB unified memory
+**Codebase**: 77,020 LOC Rust | 1,054 tests | 11 crates
 
 ---
 
@@ -245,27 +246,38 @@ structs), not that it exists in separate memory.
 
 ### Parallel Execution Modes
 
+**M2 Ultra (24 cores, 64GB) — measured March 21, 2026:**
+
+| Mode | TPS | Speedup | ETH-weighted |
+|------|-----|---------|-------------|
+| CPU verify + Sequential exec | **183.0K** | 1.00x | 46.6K |
+| CPU verify + Block-STM exec | 143.1K | 0.78x | 36.4K |
+| CPU verify + Block-STM + Coalesce | 179.6K | 0.98x | 45.7K |
+| GPU verify + Sequential exec | 96.9K | 0.53x | 24.7K |
+| GPU verify + Block-STM exec | 115.9K | 0.63x | 29.5K |
+| GPU verify + Block-STM + Coalesce | 121.5K | 0.66x | 30.9K |
+
+Best single-node (raw): **183.0K TPS**
+Best single-node (weighted): **46.6K TPS**
+vs Ethereum (~15 TPS): **3,104x faster**
+
+**GPU Ed25519 verification: 379K sigs/sec (13.68x over CPU)**
+
+**M4 (10 cores, 16GB) — previous results for comparison:**
+
 | Mode | TPS | Speedup | ETH-weighted |
 |------|-----|---------|-------------|
 | CPU verify + Sequential exec | 64.3K | 1.00x | 16.4K |
-| CPU verify + Block-STM exec | 59.8K | 0.93x | 15.2K |
 | CPU verify + Block-STM + Coalesce | 69.3K | 1.08x | 17.6K |
-| GPU verify + Sequential exec | 35.1K | 0.55x | 8.9K |
-| GPU verify + Block-STM exec | 40.0K | 0.62x | 10.2K |
-| GPU verify + Block-STM + Coalesce | 37.4K | 0.58x | 9.5K |
-
-Best single-node (raw): 69.3K TPS
-Best single-node (weighted): 17.6K TPS
-vs Ethereum (~15 TPS): 1,176x faster
 
 **Multi-node projections (propose-verify, ETH-weighted):**
 
 | Nodes | Projected TPS |
 |-------|--------------|
-| 10 | 158.7K |
-| 50 | 749.5K |
-| 100 | 1.41M |
-| 500 | 6.17M |
+| 10 | 419.1K |
+| 50 | 1.98M |
+| 100 | 3.72M |
+| 500 | 16.30M |
 
 ---
 

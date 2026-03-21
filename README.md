@@ -10,15 +10,15 @@ A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built 
 
 | Metric | Value | Conditions |
 |--------|-------|------------|
-| **Single-node peak TPS** | **69,300** | BlockSTM + Coalesce, CPU verify |
-| **Multi-node sustained TPS** | **27,000** | 2 validators, real QUIC, real consensus |
+| **Single-node peak TPS** | **183,000** | CPU verify + Sequential exec, M2 Ultra |
+| **Multi-node sustained TPS** | **33,230** | 2 validators, real QUIC, real DAG consensus |
 | **Peak TPS** | **350,000** | 1-second burst window |
 | **Commit rate** | **100%** | 500K/500K transactions committed |
-| **State lookups** | **15.2M/sec** | GPU-resident state cache, Metal unified memory |
-| **Ed25519 signing** | **118,000/sec** | Single-core, ed25519-dalek |
-| **GPU sig verify** | **121,000/sec** | Metal compute shader, branchless Shamir |
+| **State lookups** | **22.3M/sec** | DashMap baseline, M2 Ultra |
+| **GPU Ed25519 verify** | **379,000/sec** | Metal compute shader, 13.68x over CPU |
+| **Ed25519 signing** | **82,800/sec** | Single-core, ed25519-dalek |
 
-All numbers measured on Apple M4 MacBook Pro (10 cores, 16 GB). See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full methodology.
+All numbers measured on Apple M2 Ultra Mac Studio (24 cores, 64 GB). See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full methodology.
 
 ---
 
