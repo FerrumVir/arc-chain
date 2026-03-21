@@ -4,7 +4,7 @@
 **Version**: v1.2
 **Hardware**: Apple M2 Ultra, 24 CPU cores (16P+8E), 64 GB unified memory
 **Previous**: Apple M4, 10 CPU cores, 16 GB unified memory
-**Codebase**: 77,020 LOC Rust | 1,054 tests | 11 crates
+**Codebase**: 77,244 LOC Rust | 1,054 tests | 11 crates
 
 ---
 
@@ -57,18 +57,18 @@ Users / AI Agents
 
 | Crate | LOC | Tests | Purpose |
 |-------|-----|-------|---------|
-| `arc-types` | 14,320 | 261 | 23 transaction types, blocks, accounts, staking, governance, bridge, account abstraction, social recovery, inference attestation/challenge |
+| `arc-types` | 14,490 | 264 | 23 transaction types, blocks, accounts, staking, governance, bridge, account abstraction, social recovery, inference attestation/challenge, state rent |
 | `arc-crypto` | 11,680 | 240 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512, ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
-| `arc-state` | 12,378 | 140 | DashMap state DB, Jellyfish Merkle Tree, segmented WAL with auto-rotate, BlockSTM parallel execution, GPU-resident state cache, JMT auto-pruning, chunked state sync |
+| `arc-state` | 13,203 | 147 | DashMap state DB, Jellyfish Merkle Tree, segmented WAL with auto-rotate, adaptive BlockSTM, GPU-resident state cache, JMT auto-pruning, receipt pruning, state rent, state sync |
 | `arc-vm` | 8,439 | 145 | WASM runtime (Wasmer 6.0), EVM interpreter (revm 19), gas metering, host imports, 11 precompiles, AI inference oracle |
-| `arc-node` | 8,408 | 61 | Block producer, pipelined execution, RPC server (20+ HTTP + ETH JSON-RPC), consensus manager, STARK proof generation, DA erasure coding |
-| `arc-consensus` | 7,523 | 126 | DAG consensus engine, validator sets, stake tiers, 2-round commit rule, slashing, cross-shard coordination |
+| `arc-node` | 8,424 | 61 | Block producer, adaptive execution (Sequential/BlockSTM), RPC server (30 HTTP + ETH JSON-RPC), consensus manager, STARK proof generation, DA erasure coding |
+| `arc-consensus` | 7,971 | 137 | DAG consensus engine, beacon chain shard coordinator, validator roles, 2-round commit rule, slashing, cross-shard coordination |
 | `arc-bench` | 5,336 | — | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
 | `arc-gpu` | 3,810 | 37 | Metal MSL + WGSL GPU Ed25519 batch verification, GPU account buffer, unified/managed memory, buffer pooling |
-| `arc-net` | 2,355 | 24 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
+| `arc-net` | 2,355 | 26 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
 | `arc-mempool` | 876 | 17 | Lock-free SegQueue + DashSet deduplication, encrypted mempool (BLS threshold) |
 | `arc-cli` | 660 | — | CLI client: keygen, RPC queries, transaction submission |
-| **Total** | **76,255** | **1,031** | **11 crates** |
+| **Total** | **77,244** | **1,054** | **11 crates** |
 
 Additional code outside `/crates`:
 - Python SDK: 2,688 LOC
