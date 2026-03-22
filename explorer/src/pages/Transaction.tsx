@@ -302,6 +302,56 @@ function TransactionBodyDetails({ body }: { body: TransactionBody }) {
           <DetailRow label="Proof Size">{body.proof_data.length.toLocaleString()} bytes</DetailRow>
         </>
       );
+    case 'InferenceAttestation':
+      return (
+        <>
+          <DetailRow label="Type">
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-purple-100 text-purple-800">
+              AI Inference Attestation
+            </span>
+          </DetailRow>
+          <DetailRow label="Model ID">
+            <span className="font-mono text-xs break-all">{body.model_id}</span>
+          </DetailRow>
+          <DetailRow label="Input Hash">
+            <span className="font-mono text-xs break-all">{body.input_hash}</span>
+          </DetailRow>
+          <DetailRow label="Output Hash">
+            <span className="font-mono text-xs break-all">{body.output_hash}</span>
+          </DetailRow>
+          <DetailRow label="Challenge Period">{body.challenge_period} blocks</DetailRow>
+          <DetailRow label="Bond">{body.bond.toLocaleString()} ARC</DetailRow>
+        </>
+      );
+    case 'InferenceChallenge':
+      return (
+        <>
+          <DetailRow label="Type">
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
+              AI Inference Challenge (Fraud Proof)
+            </span>
+          </DetailRow>
+          <DetailRow label="Attestation Hash">
+            <span className="font-mono text-xs break-all">{body.attestation_hash}</span>
+          </DetailRow>
+          <DetailRow label="Challenger Output Hash">
+            <span className="font-mono text-xs break-all">{body.challenger_output_hash}</span>
+          </DetailRow>
+          <DetailRow label="Challenger Bond">{body.challenger_bond.toLocaleString()} ARC</DetailRow>
+        </>
+      );
+    case 'InferenceRegister':
+      return (
+        <>
+          <DetailRow label="Type">
+            <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800">
+              Inference Provider Registration
+            </span>
+          </DetailRow>
+          <DetailRow label="Hardware Tier">Tier {body.tier}</DetailRow>
+          <DetailRow label="Stake Bond">{body.stake_bond.toLocaleString()} ARC</DetailRow>
+        </>
+      );
     default:
       return null;
   }

@@ -13,6 +13,7 @@ pub mod proof_compress;
 pub mod threshold;
 pub mod circuits;
 pub mod batch_prover;
+pub mod inference_proof;
 #[cfg(feature = "stwo-prover")]
 pub mod stwo_air;
 

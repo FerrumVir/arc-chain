@@ -201,6 +201,8 @@ pub enum TxType {
     InferenceAttestation = 0x16,
     /// Challenge an inference attestation (Tier 2 fraud proof).
     InferenceChallenge = 0x17,
+    /// Register as an inference provider (declare hardware tier + stake).
+    InferenceRegister = 0x18,
 }
 
 /// A transaction on the ARC chain.
@@ -274,6 +276,8 @@ pub enum TxBody {
     InferenceAttestation(InferenceAttestationBody),
     /// Challenge an inference attestation (Tier 2 fraud proof).
     InferenceChallenge(InferenceChallengeBody),
+    /// Register as an inference provider (declare hardware tier + stake).
+    InferenceRegister(InferenceRegisterBody),
 }
 
 /// Simple value transfer.
@@ -562,6 +566,19 @@ pub struct InferenceChallengeBody {
     pub challenger_output_hash: Hash256,
     /// Bond amount from challenger (returned if challenge succeeds).
     pub challenger_bond: u64,
+}
+
+/// Register as an inference provider.
+///
+/// Validators declare their hardware tier and lock a stake bond.
+/// The chain maintains a registry: `DashMap<Address, InferenceTier>`.
+/// VRF committee selection reads from this registry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceRegisterBody {
+    /// Hardware tier this validator can support (1-4).
+    pub tier: u8,
+    /// Stake bond to lock (proves commitment, returned on deregister).
+    pub stake_bond: u64,
 }
 
 /// EVM event log emitted during contract execution.

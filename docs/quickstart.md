@@ -19,7 +19,7 @@ cd arc-chain
 cargo build --release
 ```
 
-This compiles all 10 crates and produces binaries in `target/release/`:
+This compiles all 13 crates and produces binaries in `target/release/`:
 
 | Binary | Purpose |
 |---|---|

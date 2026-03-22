@@ -1,10 +1,10 @@
 # ARC Chain — Project Status
 
-> **Version**: 0.3.0 (pre-mainnet, L1 scaling)
+> **Version**: 0.4.0 (pre-mainnet, kernels + channels + inference)
 > **Last updated**: 2026-03-21
-> **Codebase**: 77,244 LOC Rust (11 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
-> **Tests**: 1,066 passing, 0 failures
-> **TX Types**: 23 (16 core + 5 L1 scaling + 2 inference)
+> **Codebase**: 80,683 LOC Rust (13 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
+> **Tests**: 1,117 passing, 0 failures
+> **TX Types**: 24 (16 core + 5 L1 scaling + 3 inference)
 > **Benchmark**: 183K TPS single-node peak (M2 Ultra, CPU verify + Sequential) · 33.2K multi-node (2 validators, real QUIC + DAG)
 
 ---
@@ -26,20 +26,22 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | Crate | LOC | Tests | Status | What It Does |
 |-------|-----|-------|--------|-------------|
 | **arc-crypto** | 11,680 | 220 | Production | Ed25519, Secp256k1, BLS (blst), BLAKE3, ML-DSA, Falcon-512, VRF, threshold crypto, Merkle trees, Pedersen commitments, ZK circuits, Stwo STARK prover |
-| **arc-types** | 14,490 | 264 | Production | 23 transaction types (16 core + 5 L1 scaling + 2 inference), block/header, protocol versioning, governance, economics (no-burn 40/25/15/20 fee distribution), validator roles (Proposer/Verifier/Observer), bootstrap fund (40M ARC/2yr), state rent, bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs, inference attestation/challenge |
+| **arc-types** | 14,590 | 264 | Production | 24 transaction types (16 core + 5 L1 scaling + 3 inference), block/header, protocol versioning, governance, economics (no-burn 40/25/15/20 fee distribution), validator roles (Proposer/Verifier/Observer), bootstrap fund (40M ARC/2yr), state rent, bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs, inference attestation/challenge |
 | **arc-state** | 13,203 | 147 | Production | DashMap state, JMT with inclusion + non-membership proofs + auto-pruning (every 100 blocks, keeps 1000 versions), segmented WAL with auto-rotate at 256MB (CRC32 + LZ4), pruning after snapshots, adaptive BlockSTM (auto-selects Sequential vs parallel), GPU-resident state cache (Metal unified memory / CPU fallback), receipt pruning, state rent collection, light client proofs, state sync |
 | **arc-vm** | 8,439 | 145 | Production | Wasmer 6.0 WASM runtime, revm 19 EVM, gas metering with storage write costs (5K base + 10/byte, 256KB cap), host imports, 11 precompiles, event/log emission limits (1024/exec), StateDB-backed storage reads + balance queries, formal verification model-checker |
 | **arc-mempool** | 876 | 17 | Production | SegQueue FIFO, deduplication, encrypted mempool (BLS threshold, wired into ConsensusManager), capacity limits |
 | **arc-consensus** | 7,971 | 137 | Production | Mysticeti-inspired DAG, 2-round finality, beacon chain shard coordinator (global root, validator assignment, epoch management), stake tiers (Spark/Arc/Core), slashing (equivocation + liveness), cross-shard coordination, canonical TX ordering (MEV protection), epoch transitions |
 | **arc-net** | 2,355 | 26 | Production | QUIC transport (quinn), shred propagation with XOR FEC, TX gossip, challenge-response peer auth, stake-weighted peer selection, PEX, MAX_PEERS=128 connection limit, per-peer rate limiting (500 msg/sec), bounded TX hash dedup (1M max, auto-evict) |
-| **arc-node** | 8,424 | 61 | Production | Consensus manager with VRF proposer selection + adaptive execution (auto-selects Sequential vs BlockSTM), signature verification pipeline, RPC API (30 HTTP + ETH JSON-RPC), propose-verify mode, STARK proof generation, DA erasure coding, encrypted mempool integration |
-| **arc-gpu** | 3,810 | 37 | Production | Metal MSL + WGSL Ed25519 batch verification, branchless Shamir's trick, buffer pool, async dispatch, SigVerifyCache, GPU account buffer (unified/managed/CPU-only memory) |
+| **arc-node** | 8,650 | 61 | Production | Consensus manager with VRF proposer selection + adaptive execution (auto-selects Sequential vs BlockSTM), signature verification pipeline with runtime hardware auto-detection (5 backends: CPU/Metal/CUDA/AVX-512/NEON), RPC API (32 HTTP + ETH JSON-RPC + channel relay), propose-verify mode, STARK proof generation, DA erasure coding, encrypted mempool integration |
+| **arc-gpu** | 5,250 | 45 | Production | Metal MSL + WGSL Ed25519 batch verification, branchless Shamir's trick, buffer pool, async dispatch, SigVerifyCache, GPU account buffer (unified/managed/CPU-only memory), **hardware auto-detection** (CUDA/Metal/AVX-512/NEON), AVX-512 kernel (x86_64), NEON kernel (aarch64), CUDA kernel (feature-gated) |
+| **arc-channel** | 480 | 10 | Production | Off-chain bilateral payment channels: ChannelStateMachine (propose/receive/pay/close/dispute), BLAKE3 state commitments, Ed25519 co-signing, nonce ordering, conservation enforcement |
+| **arc-inference** | 620 | 17 | Production | On-chain INT4 inference runtime, 4 hardware tiers (Tier 1-4), VRF committee selection (7-of-N, 5/7 agreement), EIP-1559 inference gas lane (target 5 TXs/block, ×1.125 adjustment), per-address rate limiting |
 | **arc-bench** | 5,336 | — | Tool | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
 | **arc-cli** | 660 | — | Tool | Command-line client: keygen, RPC queries, transaction submission |
 
 ---
 
-## Transaction Types (23 total)
+## Transaction Types (24 total)
 
 ### Core Protocol (16 types)
 
@@ -72,12 +74,13 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | 0x14 | ChannelDispute (challenge) | 50,000 | Implemented (2026-03-06) |
 | 0x15 | ShardProof (STARK verification) | 60,000 | Implemented (2026-03-06) |
 
-### Inference (2 types — AI inference attestation and dispute)
+### Inference (3 types — AI inference attestation, dispute, and provider registration)
 
 | Code | Type | Gas | Status |
 |------|------|-----|--------|
 | 0x16 | InferenceAttestation (off-chain result) | 30,000 | Implemented (2026-03-20) |
 | 0x17 | InferenceChallenge (fraud proof) | 50,000 | Implemented (2026-03-20) |
+| 0x18 | InferenceRegister (declare hardware tier) | 30,000 | Implemented (2026-03-21) — validators declare Tier 1-4 capability, lock stake bond |
 
 ---
 
@@ -157,6 +160,10 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | Stwo STARK prover | DONE | Circuit building, proof aggregation, recursive composition |
 | GPU Ed25519 (Metal + WGSL) | DONE | Branchless Shamir, buffer pool, async dispatch |
 | GPU account buffer | DONE | 128-byte aligned GpuAccountRepr, unified/managed/CPU-only memory paths, secure shutdown (2026-03-13) |
+| Hardware auto-detection | DONE | `hardware_detect` module — runtime probe for CUDA (NVIDIA GPU name), Metal (wgpu backend), AVX-512 (`is_x86_feature_detected!`), NEON (aarch64 mandatory). Priority: CUDA → Metal → AVX-512 → NEON → CPU (2026-03-21) |
+| CUDA Ed25519 kernel | DONE | `cuda_verify` module — CudaVerifier with embedded PTX source, feature-gated behind `cuda`, CPU fallback (2026-03-21) |
+| AVX-512 Ed25519 kernel | DONE | `avx512_verify` module — Avx512Verifier, x86_64 cfg-gated, rayon parallel batch processing (2026-03-21) |
+| NEON Ed25519 kernel | DONE | `neon_verify` module — NeonVerifier, aarch64 NEON batch processing in groups of 2, EMA throughput tracking (2026-03-21) |
 
 ### Token Economics
 
@@ -193,7 +200,7 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | BatchSettle TX (0x11) | DONE | Bilateral netting, 1000:1 compression, nets per-recipient via HashMap (2026-03-06). Gas scaling fix: 30K + 500/entry, max 10K entries (2026-03-20) |
 | ChannelOpen TX (0x12) | DONE | Locks deposit in deterministic escrow (BLAKE3("arc-channel" ‖ channel_id)) (2026-03-06) |
 | ChannelClose TX (0x13) | DONE | Mutual close, validates balances vs escrow, releases funds (2026-03-06) |
-| ChannelDispute TX (0x14) | DONE | Submit signed state with state_nonce ordering, challenge period (2026-03-06) |
+| ChannelDispute TX (0x14) | DONE | Full dispute resolution: state_nonce tracking in escrow, challenge_expiry enforcement, balance conservation validation, authorization check, blocks ChannelClose during active dispute (enhanced 2026-03-21) |
 | ShardProof TX (0x15) | DONE | Records verified STARK proof at deterministic address, validates state root transition (2026-03-06) |
 | Propose-verify mode | DONE | Proposers execute + export diff, verifiers apply diff + check root. Fraud detection. |
 | Cross-shard locking | DONE | Lock/commit/abort state machine, 30s timeout, atomic batch ops |
@@ -201,6 +208,13 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | Inference Tier 1 (on-chain) | DONE | Precompile 0x0A, deterministic re-execution |
 | Inference Tier 2 (optimistic) | DONE | InferenceAttestation (0x16) + InferenceChallenge (0x17) fraud proofs (2026-03-20) |
 | Inference Tier 3 (STARK-verified) | DONE | Off-chain inference with STARK proof via ShardProof (0x15) |
+| InferenceRegister TX (0x18) | DONE | Validators declare hardware tier (1-4), lock stake bond, min stake enforcement (2026-03-21) |
+| VRF committee selection | DONE | `arc-inference::committee` — deterministic selection of K=7 from eligible pool, 5/7 agreement, BLAKE3(seed ‖ addr) scoring (2026-03-21) |
+| EIP-1559 inference gas lane | DONE | `arc-inference::gas` — separate base fee, target 5 TXs/block, max 10, ×1.125 adjustment, per-address rate limit (10 blocks) (2026-03-21) |
+| Off-chain channel SDK | DONE | `arc-channel` crate — ChannelStateMachine with propose/receive/pay/close/dispute, BLAKE3 state commitments, Ed25519 co-signing (2026-03-21) |
+| Channel HTTP relay | DONE | `/channel/{id}/relay` POST + `/channel/{id}/state` GET endpoints in RPC (2026-03-21) |
+| TypeScript channel SDK | DONE | `sdks/typescript/src/channel.ts` — Channel class with pay/receive/close/dispute + TX builders (2026-03-21) |
+| Python channel SDK | DONE | `sdks/python/arc_sdk/channel.py` — Channel class matching TypeScript API (2026-03-21) |
 
 ### Bridge
 

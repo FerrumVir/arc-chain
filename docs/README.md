@@ -1,8 +1,8 @@
 # ARC Chain Developer Documentation
 
-ARC Chain is an AI-native Layer 1 blockchain purpose-built for autonomous agent economies. It provides 21 native transaction types, STARK zero-knowledge proofs (Stwo/Circle STARK over M31), GPU-accelerated Ed25519 signature verification, DAG-based consensus with VRF proposer selection, and Block-STM parallel execution -- all in a single, integrated Rust codebase.
+ARC Chain is an AI-native Layer 1 blockchain purpose-built for autonomous agent economies. It provides 24 native transaction types, STARK zero-knowledge proofs (Stwo/Circle STARK over M31), GPU-accelerated Ed25519 signature verification with multi-platform hardware auto-detection (CUDA/Metal/AVX-512/NEON), DAG-based consensus with VRF proposer selection, Block-STM parallel execution, off-chain payment channels, and tiered on-chain inference with VRF committee selection -- all in a single, integrated Rust codebase.
 
-**Codebase:** ~70,600 lines of Rust across 10 crates, with 1,028+ tests passing.
+**Codebase:** 80,683 lines of Rust across 13 crates, with 1,117 tests passing.
 
 ---
 

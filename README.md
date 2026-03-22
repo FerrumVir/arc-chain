@@ -61,21 +61,23 @@ Users / AI Agents
 
 ## Codebase
 
-**77,244 LOC Rust** | **1,054 tests** | **11 crates**
+**80,683 LOC Rust** | **1,117 tests** | **13 crates**
 
 | Crate | LOC | Tests | What It Does |
 |-------|-----|-------|-------------|
-| `arc-types` | 14,490 | 264 | 23 transaction types, blocks, accounts, governance, staking, bridge, account abstraction, social recovery, inference attestation/challenge, state rent |
+| `arc-types` | 14,490 | 264 | 24 transaction types, blocks, accounts, governance, staking, bridge, account abstraction, social recovery, inference attestation/challenge, state rent |
 | `arc-state` | 13,203 | 147 | DashMap state DB, Jellyfish Merkle Tree, segmented WAL with auto-rotate, adaptive BlockSTM parallel execution, GPU-resident state cache, JMT auto-pruning, receipt pruning, state rent, state sync |
 | `arc-crypto` | 11,680 | 220 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512 (post-quantum), ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
 | `arc-vm` | 8,439 | 145 | Wasmer WASM runtime, revm EVM interpreter, gas metering, host imports, 11 precompiles, AI inference oracle |
 | `arc-node` | 8,424 | 61 | Pipelined block production, adaptive execution (auto-selects Sequential vs BlockSTM), RPC server (30 HTTP + ETH JSON-RPC), consensus manager, STARK proof gen, DA erasure coding, encrypted mempool |
 | `arc-consensus` | 7,971 | 137 | DAG consensus, 2-round finality, beacon chain shard coordinator, validator roles (Proposer/Verifier/Observer), slashing, cross-shard coordination, epoch transitions |
 | `arc-bench` | 5,336 | — | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
-| `arc-gpu` | 3,810 | 37 | Metal MSL + WGSL Ed25519 batch verification (379K sigs/sec on M2 Ultra), GPU account buffer, unified/managed memory, buffer pooling |
+| `arc-gpu` | 5,250 | 45 | Metal MSL + WGSL Ed25519 batch verification (379K sigs/sec on M2 Ultra), GPU account buffer, hardware auto-detection (CUDA/Metal/AVX-512/NEON), AVX-512 + NEON + CUDA verification kernels |
 | `arc-net` | 2,355 | 26 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
 | `arc-mempool` | 876 | 17 | Lock-free SegQueue FIFO, DashSet deduplication, encrypted mempool (BLS threshold) |
 | `arc-cli` | 660 | — | Command-line client: keygen, RPC queries, transaction submission |
+| `arc-inference` | 620 | 17 | On-chain INT4 inference runtime, 4 hardware tiers, VRF committee selection (7-of-N, 5/7 quorum), EIP-1559 inference gas lane |
+| `arc-channel` | 480 | 10 | Off-chain bilateral payment channels: ChannelStateMachine, BLAKE3 state commitments, Ed25519 co-signing |
 
 **Additional code:**
 - Python SDK: 2,688 LOC
@@ -107,7 +109,7 @@ Users / AI Agents
 - **BlockSTM** — optimistic parallel transaction execution with conflict detection
 - **GPU-resident state** — account data in GPU unified memory for compute shader access
 - **WASM + EVM** — dual smart contract runtime (Wasmer 6.0 + revm 19)
-- **23 transaction types** — transfers, settlements, staking, governance, bridge, channels, shard proofs, inference attestation/challenge
+- **24 transaction types** — transfers, settlements, staking, governance, bridge, channels, shard proofs, inference attestation/challenge
 - **No-burn tokenomics** — 100% of fees distributed: 40% proposers, 25% verifiers, 15% observers, 20% treasury. Fixed 1.03B supply.
 - **Zero-fee settlements** — AI agents settle for free
 - **STARK proof generation** — per-block proof with compression (mock on stable, real Stwo via feature flag)

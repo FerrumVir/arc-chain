@@ -176,6 +176,9 @@ const TX_CATEGORIES: TxCategory[] = [
       { name: 'ChannelClose', gas: '35k', desc: 'Cooperatively close a channel' },
       { name: 'ChannelDispute', gas: '50k', desc: 'Submit dispute proof' },
       { name: 'ShardProof', gas: '60k', desc: 'Cross-shard state proof' },
+      { name: 'InferenceAttestation', gas: '30k', desc: 'AI inference result attestation with bond' },
+      { name: 'InferenceChallenge', gas: '50k', desc: 'Challenge an inference attestation (fraud proof)' },
+      { name: 'InferenceRegister', gas: '30k', desc: 'Register as inference provider (declare hardware tier)' },
     ],
   },
 ];

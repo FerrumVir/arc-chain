@@ -1,0 +1,18 @@
+[package]
+name = "arc-channel"
+description = "ARC Chain off-chain payment channels — bilateral state machine for high-throughput agent payments"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-crypto = { path = "../arc-crypto" }
+arc-types = { path = "../arc-types" }
+blake3.workspace = true
+ed25519-dalek.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rand.workspace = true

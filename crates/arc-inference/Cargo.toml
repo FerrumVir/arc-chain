@@ -1,0 +1,29 @@
+[package]
+name = "arc-inference"
+description = "ARC Chain on-chain inference — INT4 runtime, VRF committee selection, EIP-1559 inference gas lane"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+
+[dependencies]
+arc-crypto = { path = "../arc-crypto" }
+arc-types = { path = "../arc-types" }
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+dashmap.workspace = true
+hex.workspace = true
+
+# Optional: real INT4/GGUF inference via Hugging Face candle
+candle-core = { version = "0.8", optional = true }
+candle-nn = { version = "0.8", optional = true }
+candle-transformers = { version = "0.8", optional = true }
+
+[dev-dependencies]
+rand.workspace = true
