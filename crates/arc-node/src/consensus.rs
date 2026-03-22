@@ -380,8 +380,12 @@ impl ConsensusManager {
             if self.benchmark && multi_validator {
                 if let Some(ref pool) = benchmark_pool {
                     let signed_txs = pool.drain(10_000);
+                    let fed = signed_txs.len();
                     for tx in signed_txs {
                         let _ = mempool.insert(tx);
+                    }
+                    if fed > 0 {
+                        info!("Benchmark pre-feed: {} txs into mempool (size now: {})", fed, mempool.len());
                     }
                 }
             }
@@ -489,6 +493,9 @@ impl ConsensusManager {
 
                     // ── Normal path: drain mempool ──────────────────────────────
                     let transactions = mempool.drain(50_000);
+                    if !transactions.is_empty() {
+                        info!("Drained {} txs from mempool for DAG proposal", transactions.len());
+                    }
 
                     // ── Encrypted mempool: drain encrypted txs in FIFO order ──
                     // Encrypted transactions are included alongside regular ones.
