@@ -1622,8 +1622,9 @@ impl ConsensusEngine {
 
     /// View-change timeout in milliseconds.
     /// If the round is stalled for this long, force-advance to prevent halts.
-    /// Set to 200ms for ~400ms two-round finality.
-    const VIEW_CHANGE_TIMEOUT_MS: u128 = 200;
+    /// Testnet: 2000ms to allow block propagation across global nodes.
+    /// Production: 200ms for ~400ms two-round finality.
+    const VIEW_CHANGE_TIMEOUT_MS: u128 = 2000;
 
     /// Check if the current round's proposer has timed out.
     ///
