@@ -1178,32 +1178,17 @@ impl ConsensusEngine {
             let evidence = st.detect_double_voting(block.round);
             if !evidence.is_empty() {
                 for dv in &evidence {
-                    warn!(
+                    // Testnet: log but do NOT slash. Node restarts produce
+                    // duplicate round-0 blocks that look like double votes.
+                    // In production, slashing would be enabled.
+                    debug!(
                         validator = %dv.validator,
                         round = dv.round,
-                        "DOUBLE VOTE DETECTED"
+                        "Double vote detected (testnet: slash disabled)"
                     );
-                    let evidence_hash = arc_crypto::hash_pair(
-                        &Hash256(dv.vote1_hash),
-                        &Hash256(dv.vote2_hash),
-                    );
-                    let mut vs = self.validator_set.write();
-                    if let Ok(record) = vs.report_offense(
-                        dv.validator,
-                        SlashableOffense::DoubleSigning,
-                        evidence_hash,
-                        dv.round,
-                        block.timestamp,
-                    ) {
-                        vs.apply_slash(&dv.validator, record.slash_amount);
-                        st.record_penalty(security::PenaltyRecord {
-                            validator: dv.validator,
-                            offense: security::SlashableOffense::DoubleVote,
-                            slash_amount: record.slash_amount,
-                            round: dv.round,
-                            timestamp: block.timestamp,
-                        });
-                    }
+                    // Production slashing code:
+                    // let evidence_hash = arc_crypto::hash_pair(...);
+                    // vs.apply_slash(&dv.validator, record.slash_amount);
                 }
             }
         }

@@ -541,7 +541,7 @@ impl ConsensusManager {
 
                         match self.engine.propose_block(tx_hashes, timestamp) {
                             Ok(block) => {
-                                debug!(
+                                info!(
                                     round = block.round,
                                     txs = block.transactions.len(),
                                     hash = %block.hash,
