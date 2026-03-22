@@ -84,7 +84,12 @@ ensure_dir() {
 build() {
     section "Building arc-node (release)"
     cd "$PROJECT_DIR"
-    cargo build --release -p arc-node 2>&1 | tail -5
+    # Use nightly + stwo-prover for real STARK proofs if available
+    if rustup run nightly cargo --version >/dev/null 2>&1; then
+        rustup run nightly cargo build --release -p arc-node --features stwo-prover 2>&1 | tail -5
+    else
+        cargo build --release -p arc-node 2>&1 | tail -5
+    fi
 
     if [ ! -f "$BIN" ]; then
         fail "Binary not found at $BIN"

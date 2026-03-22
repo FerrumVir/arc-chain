@@ -18,6 +18,14 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// Maximum number of simultaneous peer connections.
+const MAX_PEERS: u32 = 128;
+
+/// Per-peer message rate limit (messages per second).
+const PEER_MSG_RATE_LIMIT: u32 = 500;
+/// Rate limit window in seconds.
+const RATE_LIMIT_WINDOW_SECS: u64 = 1;
+
 // ─── Channel Types ──────────────────────────────────────────────────────────
 
 /// Messages the transport sends TO consensus.
@@ -312,6 +320,46 @@ fn verify_handshake(msg: &HandshakeMessage) -> anyhow::Result<()> {
     Ok(())
 }
 
+// ─── Per-Peer Rate Limiter ───────────────────────────────────────────────────
+
+/// Per-peer rate limiting: address -> (message_count, window_start_epoch_secs)
+struct PeerRateLimiter {
+    counters: DashMap<Hash256, (u32, u64)>,
+}
+
+impl PeerRateLimiter {
+    fn new() -> Self {
+        Self { counters: DashMap::new() }
+    }
+
+    /// Returns true if the message should be allowed, false if rate-limited.
+    fn allow(&self, peer: &Hash256) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut entry = self.counters.entry(*peer).or_insert((0, now));
+        let (count, window_start) = entry.value_mut();
+
+        if now - *window_start >= RATE_LIMIT_WINDOW_SECS {
+            // Reset window
+            *count = 1;
+            *window_start = now;
+            true
+        } else if *count >= PEER_MSG_RATE_LIMIT {
+            false
+        } else {
+            *count += 1;
+            true
+        }
+    }
+
+    fn remove_peer(&self, peer: &Hash256) {
+        self.counters.remove(peer);
+    }
+}
+
 // ─── Peer Connection Map ────────────────────────────────────────────────────
 
 /// Metadata for a connected peer (dial address + stake).
@@ -397,6 +445,7 @@ pub async fn run_transport(
     info!("P2P transport listening on {}", listen_addr);
 
     let connections = Arc::new(PeerConnections::new());
+    let rate_limiter = Arc::new(PeerRateLimiter::new());
     let keypair = Arc::new(local_keypair);
 
     // ── PEX auto-dial channel ───────────────────────────────────────────
@@ -417,6 +466,7 @@ pub async fn run_transport(
             &inbound_tx,
             &peer_count,
             &pex_dial_tx,
+            &rate_limiter,
         )
         .await
         {
@@ -446,6 +496,7 @@ pub async fn run_transport(
             &inbound_tx,
             &peer_count,
             &pex_dial_tx,
+            &rate_limiter,
         )
         .await
         {
@@ -525,11 +576,18 @@ pub async fn run_transport(
                 let remote_addr = conn.remote_address();
                 info!("Incoming connection from {}", remote_addr);
 
+                // Enforce connection limit
+                if peer_count.load(Ordering::Relaxed) >= MAX_PEERS {
+                    warn!("Connection limit reached ({MAX_PEERS}), rejecting {}", remote_addr);
+                    continue;
+                }
+
                 let connections_clone = connections.clone();
                 let inbound_clone = inbound_tx.clone();
                 let peer_count_clone = peer_count.clone();
                 let keypair_clone = keypair.clone();
                 let pex_dial_clone = pex_dial_tx.clone();
+                let rate_limiter_clone = rate_limiter.clone();
 
                 tokio::spawn(async move {
                     let handshake_msg = make_signed_handshake(
@@ -543,6 +601,7 @@ pub async fn run_transport(
                         &inbound_clone,
                         &peer_count_clone,
                         &pex_dial_clone,
+                        &rate_limiter_clone,
                     )
                     .await
                     {
@@ -590,8 +649,9 @@ pub async fn run_transport(
                         let pc = peer_count.clone();
                         let ep = endpoint.clone();
                         let pdt = pex_dial_tx.clone();
+                        let rl = rate_limiter.clone();
                         tokio::spawn(async move {
-                            match dial_peer(&ep, peer_addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt).await {
+                            match dial_peer(&ep, peer_addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl).await {
                                 Ok(()) => info!("PEX: connected to {}", peer_addr),
                                 Err(e) => debug!("PEX: failed to dial {}: {}", peer_addr, e),
                             }
@@ -615,8 +675,9 @@ pub async fn run_transport(
                         let pc = peer_count.clone();
                         let ep = endpoint.clone();
                         let pdt = pex_dial_tx.clone();
+                        let rl = rate_limiter.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt).await {
+                            if let Err(e) = dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl).await {
                                 debug!("Reconnect to {} failed: {}", addr, e);
                             }
                         });
@@ -638,6 +699,7 @@ async fn dial_peer(
     inbound_tx: &mpsc::Sender<InboundMessage>,
     peer_count: &Arc<AtomicU32>,
     pex_dial_tx: &mpsc::Sender<SocketAddr>,
+    rate_limiter: &Arc<PeerRateLimiter>,
 ) -> anyhow::Result<()> {
     let conn = endpoint.connect(peer_addr, "localhost")?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -692,8 +754,10 @@ async fn dial_peer(
     let connections_ref = connections.clone();
     let peer_count_clone = peer_count.clone();
     let pex_dial_clone = pex_dial_tx.clone();
+    let rate_limiter_clone = rate_limiter.clone();
     tokio::spawn(async move {
-        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref).await;
+        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref, &rate_limiter_clone).await;
+        rate_limiter_clone.remove_peer(&peer_addr_hash);
         connections_ref.peers.remove(&peer_addr_hash.0);
         connections_ref.meta.remove(&peer_addr_hash.0);
         peer_count_clone.fetch_sub(1, Ordering::Relaxed);
@@ -717,6 +781,7 @@ async fn accept_peer(
     inbound_tx: &mpsc::Sender<InboundMessage>,
     peer_count: &Arc<AtomicU32>,
     pex_dial_tx: &mpsc::Sender<SocketAddr>,
+    rate_limiter: &Arc<PeerRateLimiter>,
 ) -> anyhow::Result<()> {
     let (mut send, mut recv) = conn.accept_bi().await?;
 
@@ -766,8 +831,10 @@ async fn accept_peer(
     let connections_ref = connections.clone();
     let peer_count_clone = peer_count.clone();
     let pex_dial_clone = pex_dial_tx.clone();
+    let rate_limiter_clone = rate_limiter.clone();
     tokio::spawn(async move {
-        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref).await;
+        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref, &rate_limiter_clone).await;
+        rate_limiter_clone.remove_peer(&peer_addr_hash);
         connections_ref.peers.remove(&peer_addr_hash.0);
         connections_ref.meta.remove(&peer_addr_hash.0);
         peer_count_clone.fetch_sub(1, Ordering::Relaxed);
@@ -790,6 +857,7 @@ async fn handle_peer_recv(
     inbound_tx: &mpsc::Sender<InboundMessage>,
     pex_dial_tx: &mpsc::Sender<SocketAddr>,
     connections: &Arc<PeerConnections>,
+    rate_limiter: &Arc<PeerRateLimiter>,
 ) {
     loop {
         let (msg_type, data) = match read_message(&mut recv).await {
@@ -799,6 +867,11 @@ async fn handle_peer_recv(
                 break;
             }
         };
+
+        if !rate_limiter.allow(&peer_address) {
+            warn!("Rate limiting peer {}", peer_address);
+            continue; // skip this message
+        }
 
         match msg_type {
             MessageType::DagBlockWithTxs => {

@@ -314,7 +314,7 @@ impl Pipeline {
                                     .map(|&j| ed_sigs[j]).collect();
                                 let vks: Vec<ed25519_dalek::VerifyingKey> = uncached_task_indices.iter()
                                     .map(|&j| ed_vks[j]).collect();
-                                let results = arc_gpu::gpu_batch_verify_ed25519(
+                                let results = arc_gpu::cpu_batch_verify_ed25519(
                                     &msg_refs, &sigs, &vks,
                                 );
                                 for (k, &valid) in results.iter().enumerate() {

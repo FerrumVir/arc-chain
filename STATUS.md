@@ -3,7 +3,7 @@
 > **Version**: 0.3.0 (pre-mainnet, L1 scaling)
 > **Last updated**: 2026-03-21
 > **Codebase**: 77,244 LOC Rust (11 crates) · 1,944 LOC Solidity · 4,699 LOC SDKs · 7,552 LOC explorer/docs
-> **Tests**: 1,054 passing, 0 failures
+> **Tests**: 1,066 passing, 0 failures
 > **TX Types**: 23 (16 core + 5 L1 scaling + 2 inference)
 > **Benchmark**: 183K TPS single-node peak (M2 Ultra, CPU verify + Sequential) · 33.2K multi-node (2 validators, real QUIC + DAG)
 
@@ -28,10 +28,10 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 | **arc-crypto** | 11,680 | 220 | Production | Ed25519, Secp256k1, BLS (blst), BLAKE3, ML-DSA, Falcon-512, VRF, threshold crypto, Merkle trees, Pedersen commitments, ZK circuits, Stwo STARK prover |
 | **arc-types** | 14,490 | 264 | Production | 23 transaction types (16 core + 5 L1 scaling + 2 inference), block/header, protocol versioning, governance, economics (no-burn 40/25/15/20 fee distribution), validator roles (Proposer/Verifier/Observer), bootstrap fund (40M ARC/2yr), state rent, bridge types, account abstraction, multisig, social recovery, batch settlement, state channels, shard proofs, inference attestation/challenge |
 | **arc-state** | 13,203 | 147 | Production | DashMap state, JMT with inclusion + non-membership proofs + auto-pruning (every 100 blocks, keeps 1000 versions), segmented WAL with auto-rotate at 256MB (CRC32 + LZ4), pruning after snapshots, adaptive BlockSTM (auto-selects Sequential vs parallel), GPU-resident state cache (Metal unified memory / CPU fallback), receipt pruning, state rent collection, light client proofs, state sync |
-| **arc-vm** | 8,439 | 145 | Production | Wasmer 6.0 WASM runtime, revm 19 EVM, gas metering, host imports, 11 precompiles (Ed25519/Secp256k1/BLS/BLAKE3/SHA256/VRF/Oracle/Merkle/Falcon/ZK-verify/AI-inference), AI inference oracle, formal verification model-checker |
+| **arc-vm** | 8,439 | 145 | Production | Wasmer 6.0 WASM runtime, revm 19 EVM, gas metering with storage write costs (5K base + 10/byte, 256KB cap), host imports, 11 precompiles, event/log emission limits (1024/exec), StateDB-backed storage reads + balance queries, formal verification model-checker |
 | **arc-mempool** | 876 | 17 | Production | SegQueue FIFO, deduplication, encrypted mempool (BLS threshold, wired into ConsensusManager), capacity limits |
 | **arc-consensus** | 7,971 | 137 | Production | Mysticeti-inspired DAG, 2-round finality, beacon chain shard coordinator (global root, validator assignment, epoch management), stake tiers (Spark/Arc/Core), slashing (equivocation + liveness), cross-shard coordination, canonical TX ordering (MEV protection), epoch transitions |
-| **arc-net** | 2,355 | 26 | Production | QUIC transport (quinn), shred propagation with XOR FEC, TX gossip, challenge-response peer auth, stake-weighted peer selection, PEX (peer exchange protocol) |
+| **arc-net** | 2,355 | 26 | Production | QUIC transport (quinn), shred propagation with XOR FEC, TX gossip, challenge-response peer auth, stake-weighted peer selection, PEX, MAX_PEERS=128 connection limit, per-peer rate limiting (500 msg/sec), bounded TX hash dedup (1M max, auto-evict) |
 | **arc-node** | 8,424 | 61 | Production | Consensus manager with VRF proposer selection + adaptive execution (auto-selects Sequential vs BlockSTM), signature verification pipeline, RPC API (30 HTTP + ETH JSON-RPC), propose-verify mode, STARK proof generation, DA erasure coding, encrypted mempool integration |
 | **arc-gpu** | 3,810 | 37 | Production | Metal MSL + WGSL Ed25519 batch verification, branchless Shamir's trick, buffer pool, async dispatch, SigVerifyCache, GPU account buffer (unified/managed/CPU-only memory) |
 | **arc-bench** | 5,336 | — | Tool | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
@@ -147,13 +147,13 @@ A high-performance Layer 1 blockchain purpose-built for AI agent settlements. DA
 |---------|--------|-------|
 | Ed25519 (+ batch verify) | DONE | ed25519-dalek, ~2x batch speedup |
 | Secp256k1 (ECDSA recovery) | DONE | k256, MetaMask compatible |
-| BLS12-381 (aggregate sigs) | DONE | blst (supranational), threshold t-of-n |
+| BLS12-381 (aggregate sigs) | DONE | blst (supranational), threshold t-of-n, Result-based error handling (no panics in hot paths) |
 | ML-DSA (FIPS 204) | DONE | Post-quantum digital signatures |
 | Falcon-512 | DONE | Post-quantum, faster signing |
 | BLAKE3 hashing | DONE | Domain-separated, GPU-accelerated |
 | Pedersen commitments | DONE | Homomorphic, privacy-preserving |
 | VRF | DONE | Verifiable random function for proposer selection |
-| Threshold encryption | DONE | Shamir secret sharing, verifiable shares |
+| Threshold encryption | DONE | Shamir secret sharing, verifiable shares, secret key zeroization on drop (zeroize crate) |
 | Stwo STARK prover | DONE | Circuit building, proof aggregation, recursive composition |
 | GPU Ed25519 (Metal + WGSL) | DONE | Branchless Shamir, buffer pool, async dispatch |
 | GPU account buffer | DONE | 128-byte aligned GpuAccountRepr, unified/managed/CPU-only memory paths, secure shutdown (2026-03-13) |

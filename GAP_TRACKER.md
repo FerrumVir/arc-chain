@@ -2,7 +2,7 @@
 
 > Last updated: 2026-03-21
 > Verified by code audit agents against actual codebase.
-> All 21 gaps implemented and verified: 1,054 tests pass, 0 failures.
+> All 21 gaps implemented and verified: 1,066 tests pass, 0 failures.
 
 ## Status Legend
 - [ ] NOT STARTED
@@ -250,3 +250,20 @@
   - BatchSettle gas scaling security fix
   - 40M ARC bootstrap fund
   - TPS-aware fee scaling
+- **Security audit fixes** (2026-03-21):
+  - VM: storage reads now query StateDB on cache miss + pre-populate contract storage
+  - VM: balance reads pre-populated from StateDB (caller + self)
+  - VM: storage write gas metering (5000 base + 10/byte, 256KB max value)
+  - VM: event/log emission capped at 1024 per execution
+  - VM: negative gas amounts now flag out-of-gas
+  - Networking: MAX_PEERS=128 connection limit enforced
+  - Networking: per-peer rate limiting (500 msg/sec token bucket)
+  - Networking: TX hash dedup auto-eviction at 1M entries
+  - Crypto: secret key zeroization on drop (zeroize crate for ML-DSA/Falcon sk_bytes)
+  - Crypto: BLS aggregate_signatures/aggregate_public_keys return Result (no .expect() panics)
+  - Consensus: cross-shard locks expire by round count (100 rounds) in addition to wall time
+  - State: dirty account atomic drain (collect+remove instead of iter+clear race)
+  - GPU: renamed cpu_batch_verify_ed25519 (was misleadingly named gpu_batch_verify_ed25519)
+  - Dockerfile: nightly Rust + --features stwo-prover for real STARK proofs in production
+  - Deploy scripts: auto-detect nightly for stwo-prover builds
+  - Integration test: multi_node.rs fixed for 10-arg run_transport signature

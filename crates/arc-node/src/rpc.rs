@@ -112,6 +112,9 @@ pub async fn serve(
         // ETH-compatible JSON-RPC (MetaMask, Hardhat, Foundry)
         .route("/eth", post(eth_json_rpc))
         .layer(DefaultBodyLimit::max(256 * 1024 * 1024)) // 256 MB
+        // CORS: permissive is correct for a public blockchain RPC node.
+        // All major L1s (Ethereum, Solana, Sui) use permissive CORS for RPC.
+        // There are no authenticated endpoints to protect.
         .layer(CorsLayer::permissive())
         .with_state(node);
 
@@ -125,6 +128,9 @@ pub async fn serve(
 pub async fn serve_eth(addr: &str, node: NodeState) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", post(eth_json_rpc))
+        // CORS: permissive is correct for a public blockchain RPC node.
+        // All major L1s (Ethereum, Solana, Sui) use permissive CORS for RPC.
+        // There are no authenticated endpoints to protect.
         .layer(CorsLayer::permissive())
         .with_state(node);
 

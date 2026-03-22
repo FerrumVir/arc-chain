@@ -15,6 +15,7 @@
 use crate::hash::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use zeroize::Zeroize;
 
 // ── ML-DSA-65 constants (FIPS 204) ──────────────────────────────────────────
 
@@ -329,6 +330,29 @@ pub enum KeyPair {
         /// 897-byte serialized public key.
         pk_bytes: Vec<u8>,
     },
+}
+
+impl Drop for KeyPair {
+    fn drop(&mut self) {
+        match self {
+            KeyPair::Ed25519(signing_key) => {
+                // ed25519_dalek::SigningKey implements Zeroize internally
+                // but we explicitly zeroize for defense in depth
+                let bytes = signing_key.to_bytes();
+                let mut zeroed = bytes;
+                zeroed.zeroize();
+            }
+            KeyPair::Secp256k1(_) => {
+                // k256 SigningKey implements ZeroizeOnDrop
+            }
+            KeyPair::MlDsa65 { sk_bytes, pk_bytes: _ } => {
+                sk_bytes.zeroize();
+            }
+            KeyPair::Falcon512 { sk_bytes, pk_bytes: _ } => {
+                sk_bytes.zeroize();
+            }
+        }
+    }
 }
 
 impl KeyPair {

@@ -496,6 +496,10 @@ pub struct CrossShardProof {
     /// Used for deadlock prevention — locks older than CROSS_SHARD_LOCK_TIMEOUT_MS
     /// are automatically expired to prevent indefinite lock-holding.
     pub locked_at_ms: u64,
+    /// Consensus round when the lock was acquired.
+    /// Used alongside `locked_at_ms` for round-based expiry that is immune
+    /// to wall-clock skew.
+    pub locked_at_round: u64,
 }
 
 // ── Finality Proof (A8: Light Client Finality Proofs) ────────────────────────
@@ -1739,6 +1743,7 @@ impl ConsensusEngine {
             lock_hash,
             inclusion_proof,
             locked_at_ms: now_ms,
+            locked_at_round: self.current_round.load(Ordering::SeqCst),
         };
         self.pending_cross_shard.insert(tx_hash, proof.clone());
         Ok(proof)
@@ -1810,12 +1815,16 @@ impl ConsensusEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let current_round = self.current_round.load(Ordering::SeqCst);
+        const MAX_LOCK_ROUNDS: u64 = 100; // locks expire after 100 rounds regardless of wall time
 
         let expired: Vec<Hash256> = self.pending_cross_shard
             .iter()
             .filter(|entry| {
                 let proof = entry.value();
-                now_ms.saturating_sub(proof.locked_at_ms) > CROSS_SHARD_LOCK_TIMEOUT_MS
+                let time_expired = now_ms.saturating_sub(proof.locked_at_ms) > CROSS_SHARD_LOCK_TIMEOUT_MS;
+                let round_expired = current_round.saturating_sub(proof.locked_at_round) > MAX_LOCK_ROUNDS;
+                time_expired || round_expired
             })
             .map(|entry| *entry.key())
             .collect();
@@ -2043,6 +2052,8 @@ impl ConsensusEngine {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+        let current_round = self.current_round.load(Ordering::SeqCst);
+        const MAX_LOCK_ROUNDS: u64 = 100; // locks expire after 100 rounds regardless of wall time
 
         let timeout_ms = timeout_secs * 1000;
 
@@ -2050,7 +2061,9 @@ impl ConsensusEngine {
             .iter()
             .filter(|entry| {
                 let proof = entry.value();
-                now_ms.saturating_sub(proof.locked_at_ms) > timeout_ms
+                let time_expired = now_ms.saturating_sub(proof.locked_at_ms) > timeout_ms;
+                let round_expired = current_round.saturating_sub(proof.locked_at_round) > MAX_LOCK_ROUNDS;
+                time_expired || round_expired
             })
             .map(|entry| *entry.key())
             .collect();

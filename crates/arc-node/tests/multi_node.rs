@@ -133,6 +133,7 @@ impl TestNode {
             transport_inbound_tx,
             transport_peer_count,
             transport_keypair,
+            String::new(), // data_dir: empty for tests (no peer persistence)
         ));
 
         // Start consensus — no pre-populated peers (matches main.rs behavior).
@@ -256,6 +257,7 @@ async fn test_two_nodes_connect() {
         inbound_tx_a,
         pc_a,
         kp_a,
+        String::new(), // data_dir: empty for tests (no peer persistence)
     ));
 
     // Let Node A bind and start listening.
@@ -279,6 +281,7 @@ async fn test_two_nodes_connect() {
         inbound_tx_b,
         pc_b,
         kp_b,
+        String::new(), // data_dir: empty for tests (no peer persistence)
     ));
 
     // Wait for both sides to register a connected peer.
@@ -630,6 +633,7 @@ async fn test_genesis_mismatch_rejected() {
         inbound_tx_a,
         pc_a,
         keypair_a,
+        String::new(), // data_dir: empty for tests (no peer persistence)
     ));
 
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -651,6 +655,7 @@ async fn test_genesis_mismatch_rejected() {
         inbound_tx_b,
         pc_b,
         keypair_b,
+        String::new(), // data_dir: empty for tests (no peer persistence)
     ));
 
     // Wait for the connection attempt to complete (and fail).
@@ -727,6 +732,7 @@ async fn test_transaction_gossip() {
         inbound_tx_a,
         pc_a,
         keypair_a,
+        String::new(), // data_dir: empty for tests (no peer persistence)
     ));
 
     // Let Node A bind.
@@ -749,6 +755,7 @@ async fn test_transaction_gossip() {
         inbound_tx_b,
         pc_b,
         keypair_b,
+        String::new(), // data_dir: empty for tests (no peer persistence)
     ));
 
     // Wait for both sides to connect.

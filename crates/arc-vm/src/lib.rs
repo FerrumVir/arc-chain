@@ -161,6 +161,11 @@ struct VmHostEnv {
     // Writes: key -> value (accumulated during execution, flushed to StateDB after)
     storage_writes: Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>,
 
+    // Contract address for StateDB lookups
+    contract_address: [u8; 32],
+    // Optional reference to StateDB for storage reads on cache miss
+    state_db: Option<Arc<StateDB>>,
+
     // Reference to WASM memory (set after instantiation via `init_with_instance`)
     memory: Option<Memory>,
 }
@@ -189,6 +194,8 @@ impl VmHostEnv {
             self_balance: self_bal,
             storage_cache: Arc::new(Mutex::new(HashMap::new())),
             storage_writes: Arc::new(Mutex::new(Vec::new())),
+            contract_address: ctx.self_address.0,
+            state_db: None,
             memory: None,
         }
     }
@@ -211,6 +218,8 @@ impl VmHostEnv {
             self_balance: 0,
             storage_cache: Arc::new(Mutex::new(HashMap::new())),
             storage_writes: Arc::new(Mutex::new(Vec::new())),
+            contract_address: [0u8; 32],
+            state_db: None,
             memory: None,
         }
     }
@@ -224,6 +233,8 @@ impl VmHostEnv {
 fn host_use_gas(mut env: FunctionEnvMut<'_, VmHostEnv>, amount: i64) {
     let data = env.data_mut();
     if amount < 0 {
+        // Negative gas amounts are invalid — treat as protocol violation
+        *data.out_of_gas.lock().unwrap() = true;
         return;
     }
     let prev = data.gas_used.fetch_add(amount as u64, Ordering::Relaxed);
@@ -241,6 +252,10 @@ const MAX_HOST_ALLOC: usize = 10 * 1024 * 1024;
 /// `log(ptr: i32, len: i32)` — read a UTF-8 string from WASM memory and push to logs.
 fn host_log(mut env: FunctionEnvMut<'_, VmHostEnv>, ptr: i32, len: i32) {
     let (data, store) = env.data_and_store_mut();
+    const MAX_LOGS_PER_EXECUTION: usize = 1024;
+    if data.logs.lock().unwrap().len() >= MAX_LOGS_PER_EXECUTION {
+        return;
+    }
     if len < 0 || (len as usize) > MAX_HOST_ALLOC {
         return;
     }
@@ -296,7 +311,28 @@ fn host_storage_get(mut env: FunctionEnvMut<'_, VmHostEnv>, key_ptr: i32, val_pt
         return val.len() as i32;
     }
 
-    // Not in cache — return -1 (caller should pre-populate for stateful exec)
+    // Not in cache — try loading from StateDB
+    if let Some(ref state_db) = data.state_db {
+        let addr = Hash256(data.contract_address);
+        let key_hash = Hash256(key);
+        let result = state_db.get_storage(&addr, &key_hash);
+        let mut cache = data.storage_cache.lock().unwrap();
+        match result {
+            Some(val) => {
+                cache.insert(key, Some(val.clone()));
+                // Write value to WASM memory
+                let view = memory.view(&store);
+                if view.write(val_ptr as u64, &val).is_err() {
+                    return -1;
+                }
+                return val.len() as i32;
+            }
+            None => {
+                cache.insert(key, None); // mark as absent
+                return -1;
+            }
+        }
+    }
     -1
 }
 
@@ -325,6 +361,22 @@ fn host_storage_set(
     }
     let mut val = vec![0u8; val_len as usize];
     if view.read(val_ptr as u64, &mut val).is_err() {
+        return;
+    }
+
+    // Gas cost: 5000 base + 10 per byte of value (storage writes are expensive)
+    const STORAGE_WRITE_BASE_GAS: u64 = 5000;
+    const STORAGE_WRITE_PER_BYTE_GAS: u64 = 10;
+    const MAX_STORAGE_VALUE_SIZE: usize = 256 * 1024; // 256 KB max per value
+
+    if val.len() > MAX_STORAGE_VALUE_SIZE {
+        return; // reject oversized values
+    }
+
+    let write_gas = STORAGE_WRITE_BASE_GAS + STORAGE_WRITE_PER_BYTE_GAS * (val.len() as u64);
+    let prev = data.gas_used.fetch_add(write_gas, Ordering::Relaxed);
+    if prev + write_gas > data.gas_limit {
+        *data.out_of_gas.lock().unwrap() = true;
         return;
     }
 
@@ -409,6 +461,14 @@ fn host_emit_event(
     data_len: i32,
 ) {
     let (data, store) = env.data_and_store_mut();
+
+    const MAX_EVENTS_PER_EXECUTION: usize = 1024;
+
+    let events = &data.events;
+    if events.lock().unwrap().len() >= MAX_EVENTS_PER_EXECUTION {
+        return; // silently drop events beyond limit
+    }
+
     let memory = match data.memory {
         Some(ref m) => m.clone(),
         None => return,
@@ -549,16 +609,25 @@ impl ArcVM {
         // Build the host environment with context + pre-loaded state
         let host_env = VmHostEnv::new_for_context(context, state);
 
-        // Pre-populate the storage cache with all known storage for this contract
-        // so that storage_get can read from it without needing StateDB access
-        // during host function calls.
-        // (Lazy approach: we leave the cache empty and storage_get returns -1
-        //  for uncached keys. For a production system you'd snapshot storage.)
-        // However, we DO pre-populate from StateDB to make it actually useful:
-        // We iterate through known keys via the cache — but StateDB doesn't
-        // expose key iteration, so we rely on storage_set writes being cached,
-        // and reads returning -1 for unknown keys. The contract can call
-        // storage_set first, then storage_get to read back.
+        // Pre-populate storage cache from StateDB so contracts can read existing state
+        {
+            let entries = state.get_contract_storage(&context.self_address);
+            let mut cache = host_env.storage_cache.lock().unwrap();
+            for (key, value) in entries {
+                cache.insert(key.0, Some(value));
+            }
+        }
+
+        // Pre-populate balances from StateDB so contracts can query any account balance
+        {
+            let mut bals = host_env.balances.lock().unwrap();
+            // Always include caller's balance
+            if let Some(caller_acct) = state.get_account(&context.caller) {
+                bals.insert(context.caller.0, caller_acct.balance);
+            }
+            // Include self balance (already set as self_balance field)
+            bals.insert(context.self_address.0, host_env.self_balance);
+        }
 
         // Capture Arc handles for post-execution extraction
         let gas_used_handle = host_env.gas_used.clone();

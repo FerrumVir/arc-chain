@@ -128,8 +128,14 @@ fi
 step "Building ARC Chain (release mode — this may take a few minutes)"
 
 cd "$REPO_DIR"
-cargo build --release -p arc-node 2>&1 | tail -1
-ok "Build complete: $REPO_DIR/target/release/arc-node"
+# Use nightly + stwo-prover for real STARK proofs if available, fall back to stable
+if rustup run nightly cargo --version >/dev/null 2>&1; then
+    rustup run nightly cargo build --release -p arc-node --features stwo-prover 2>&1 | tail -1
+    ok "Build complete (nightly + Stwo STARK): $REPO_DIR/target/release/arc-node"
+else
+    cargo build --release -p arc-node 2>&1 | tail -1
+    ok "Build complete (stable, mock prover — install nightly for real STARKs): $REPO_DIR/target/release/arc-node"
+fi
 
 ARC_BIN="$REPO_DIR/target/release/arc-node"
 

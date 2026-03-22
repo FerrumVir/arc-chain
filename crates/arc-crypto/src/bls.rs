@@ -9,6 +9,18 @@
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+#[derive(Debug, thiserror::Error)]
+pub enum BlsError {
+    #[error("invalid signature bytes")]
+    InvalidSignature,
+    #[error("invalid public key bytes")]
+    InvalidPublicKey,
+    #[error("aggregation failed")]
+    AggregationFailed,
+    #[error("empty input")]
+    EmptyInput,
+}
+
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Compressed G1 point length (BLS12-381 public key).
@@ -230,19 +242,21 @@ pub fn bls_verify(pk: &BlsPublicKey, message: &[u8], sig: &BlsSignature) -> bool
 ///
 /// # Returns
 /// A single `BlsSignature` representing the aggregate (compressed G2 point).
-pub fn aggregate_signatures(sigs: &[BlsSignature]) -> BlsSignature {
-    assert!(!sigs.is_empty(), "cannot aggregate empty signature list");
+pub fn aggregate_signatures(sigs: &[BlsSignature]) -> Result<BlsSignature, BlsError> {
+    if sigs.is_empty() {
+        return Err(BlsError::EmptyInput);
+    }
 
     let blst_sigs: Vec<blst::min_pk::Signature> = sigs
         .iter()
-        .map(|s| blst::min_pk::Signature::uncompress(&s.0).expect("invalid signature bytes"))
-        .collect();
+        .map(|s| blst::min_pk::Signature::uncompress(&s.0).map_err(|_| BlsError::InvalidSignature))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let sig_refs: Vec<&blst::min_pk::Signature> = blst_sigs.iter().collect();
     let agg = blst::min_pk::AggregateSignature::aggregate(&sig_refs, true)
-        .expect("signature aggregation failed");
+        .map_err(|_| BlsError::AggregationFailed)?;
 
-    BlsSignature(agg.to_signature().compress())
+    Ok(BlsSignature(agg.to_signature().compress()))
 }
 
 /// Aggregate multiple public keys into one.
@@ -254,22 +268,24 @@ pub fn aggregate_signatures(sigs: &[BlsSignature]) -> BlsSignature {
 ///
 /// # Returns
 /// An `AggregatePublicKey` with the combined key and participant count.
-pub fn aggregate_public_keys(pks: &[BlsPublicKey]) -> AggregatePublicKey {
-    assert!(!pks.is_empty(), "cannot aggregate empty public key list");
+pub fn aggregate_public_keys(pks: &[BlsPublicKey]) -> Result<AggregatePublicKey, BlsError> {
+    if pks.is_empty() {
+        return Err(BlsError::EmptyInput);
+    }
 
     let blst_pks: Vec<blst::min_pk::PublicKey> = pks
         .iter()
-        .map(|pk| blst::min_pk::PublicKey::uncompress(&pk.0).expect("invalid public key bytes"))
-        .collect();
+        .map(|pk| blst::min_pk::PublicKey::uncompress(&pk.0).map_err(|_| BlsError::InvalidPublicKey))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let pk_refs: Vec<&blst::min_pk::PublicKey> = blst_pks.iter().collect();
     let agg = blst::min_pk::AggregatePublicKey::aggregate(&pk_refs, true)
-        .expect("public key aggregation failed");
+        .map_err(|_| BlsError::AggregationFailed)?;
 
-    AggregatePublicKey {
+    Ok(AggregatePublicKey {
         key: BlsPublicKey(agg.to_public_key().compress()),
         participant_count: pks.len(),
-    }
+    })
 }
 
 /// Verify an aggregated signature against an aggregated public key.
@@ -315,27 +331,29 @@ pub fn verify_aggregate(
 ///
 /// # Returns
 /// An `AggregateSignature` with the combined signature and signer metadata.
-pub fn create_aggregate(sigs: &[(usize, BlsSignature)]) -> AggregateSignature {
-    assert!(!sigs.is_empty(), "cannot aggregate empty signature list");
+pub fn create_aggregate(sigs: &[(usize, BlsSignature)]) -> Result<AggregateSignature, BlsError> {
+    if sigs.is_empty() {
+        return Err(BlsError::EmptyInput);
+    }
 
     let mut signers = Vec::with_capacity(sigs.len());
     let blst_sigs: Vec<blst::min_pk::Signature> = sigs
         .iter()
         .map(|(idx, sig)| {
             signers.push(*idx);
-            blst::min_pk::Signature::uncompress(&sig.0).expect("invalid signature bytes")
+            blst::min_pk::Signature::uncompress(&sig.0).map_err(|_| BlsError::InvalidSignature)
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let sig_refs: Vec<&blst::min_pk::Signature> = blst_sigs.iter().collect();
     let agg = blst::min_pk::AggregateSignature::aggregate(&sig_refs, true)
-        .expect("signature aggregation failed");
+        .map_err(|_| BlsError::AggregationFailed)?;
 
-    AggregateSignature {
+    Ok(AggregateSignature {
         signature: BlsSignature(agg.to_signature().compress()),
         signers,
         signer_count: sigs.len(),
-    }
+    })
 }
 
 /// Create a verifiable aggregate from individual signatures and public keys.
@@ -354,38 +372,37 @@ pub fn create_aggregate(sigs: &[(usize, BlsSignature)]) -> AggregateSignature {
 pub fn create_verifiable_aggregate(
     keypairs_and_sigs: &[(usize, &BlsPublicKey, &BlsSignature)],
     _message: &[u8],
-) -> (AggregatePublicKey, AggregateSignature) {
-    assert!(
-        !keypairs_and_sigs.is_empty(),
-        "cannot aggregate empty list"
-    );
+) -> Result<(AggregatePublicKey, AggregateSignature), BlsError> {
+    if keypairs_and_sigs.is_empty() {
+        return Err(BlsError::EmptyInput);
+    }
 
     let mut signers = Vec::with_capacity(keypairs_and_sigs.len());
 
     let blst_pks: Vec<blst::min_pk::PublicKey> = keypairs_and_sigs
         .iter()
         .map(|(_, pk, _)| {
-            blst::min_pk::PublicKey::uncompress(&pk.0).expect("invalid public key bytes")
+            blst::min_pk::PublicKey::uncompress(&pk.0).map_err(|_| BlsError::InvalidPublicKey)
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let blst_sigs: Vec<blst::min_pk::Signature> = keypairs_and_sigs
         .iter()
         .map(|(idx, _, sig)| {
             signers.push(*idx);
-            blst::min_pk::Signature::uncompress(&sig.0).expect("invalid signature bytes")
+            blst::min_pk::Signature::uncompress(&sig.0).map_err(|_| BlsError::InvalidSignature)
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let pk_refs: Vec<&blst::min_pk::PublicKey> = blst_pks.iter().collect();
     let agg_pk = blst::min_pk::AggregatePublicKey::aggregate(&pk_refs, true)
-        .expect("public key aggregation failed");
+        .map_err(|_| BlsError::AggregationFailed)?;
 
     let sig_refs: Vec<&blst::min_pk::Signature> = blst_sigs.iter().collect();
     let agg_sig = blst::min_pk::AggregateSignature::aggregate(&sig_refs, true)
-        .expect("signature aggregation failed");
+        .map_err(|_| BlsError::AggregationFailed)?;
 
-    (
+    Ok((
         AggregatePublicKey {
             key: BlsPublicKey(agg_pk.to_public_key().compress()),
             participant_count: keypairs_and_sigs.len(),
@@ -395,7 +412,7 @@ pub fn create_verifiable_aggregate(
             signers,
             signer_count: keypairs_and_sigs.len(),
         },
-    )
+    ))
 }
 
 // ── Threshold ─────────────────────────────────────────────────────────────────
@@ -517,7 +534,7 @@ mod tests {
             .enumerate()
             .map(|(i, (kp, sig))| (i, &kp.public, sig))
             .collect();
-        let (agg_pk, agg_sig) = create_verifiable_aggregate(&refs, message);
+        let (agg_pk, agg_sig) = create_verifiable_aggregate(&refs, message).unwrap();
 
         // Aggregate should verify
         assert!(verify_aggregate(&agg_pk, message, &agg_sig));
@@ -563,7 +580,7 @@ mod tests {
 
         let indexed_sigs: Vec<(usize, BlsSignature)> =
             sigs.into_iter().enumerate().collect();
-        let agg = create_aggregate(&indexed_sigs);
+        let agg = create_aggregate(&indexed_sigs).unwrap();
 
         assert!(meets_threshold(&agg, &config));
     }
@@ -578,7 +595,7 @@ mod tests {
         // Only 1 signer participates
         let kp = bls_keygen(b"lone-validator");
         let sig = bls_sign(&kp.secret, b"threshold fail");
-        let agg = create_aggregate(&[(0, sig)]);
+        let agg = create_aggregate(&[(0, sig)]).unwrap();
 
         assert!(!meets_threshold(&agg, &config));
         assert_eq!(agg.signer_count, 1);
@@ -620,7 +637,7 @@ mod tests {
             .enumerate()
             .map(|(i, (kp, sig))| (i, &kp.public, sig))
             .collect();
-        let (agg_pk, agg_sig) = create_verifiable_aggregate(&refs, message);
+        let (agg_pk, agg_sig) = create_verifiable_aggregate(&refs, message).unwrap();
 
         // Should verify
         assert!(verify_aggregate(&agg_pk, message, &agg_sig));
@@ -653,7 +670,7 @@ mod tests {
         assert_eq!(sig, sig_back);
 
         // AggregateSignature roundtrip
-        let agg = create_aggregate(&[(0, sig)]);
+        let agg = create_aggregate(&[(0, sig)]).unwrap();
         let agg_json = serde_json::to_string(&agg).unwrap();
         let agg_back: AggregateSignature = serde_json::from_str(&agg_json).unwrap();
         assert_eq!(agg.signer_count, agg_back.signer_count);
@@ -712,7 +729,7 @@ mod tests {
             .enumerate()
             .map(|(i, (kp, sig))| (i, &kp.public, sig))
             .collect();
-        let (agg_pk, agg_sig) = create_verifiable_aggregate(&refs, message);
+        let (agg_pk, agg_sig) = create_verifiable_aggregate(&refs, message).unwrap();
 
         // Correct message verifies
         assert!(verify_aggregate(&agg_pk, message, &agg_sig));
