@@ -410,9 +410,13 @@ impl PeerManager {
         self.known_tx_hashes.contains_key(hash)
     }
 
-    /// Mark a transaction hash as seen (for dedup).
+    /// Mark a transaction hash as seen. Auto-evicts oldest entries when capacity exceeds limit.
     pub fn mark_tx_known(&self, hash: Hash256) {
+        const MAX_KNOWN_TX_HASHES: usize = 1_000_000;
         self.known_tx_hashes.insert(hash, ());
+        if self.known_tx_hashes.len() > MAX_KNOWN_TX_HASHES {
+            self.evict_tx_hashes(MAX_KNOWN_TX_HASHES / 2);
+        }
     }
 
     /// Select propagation targets for a given shard, sorted by descending

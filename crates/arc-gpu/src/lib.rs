@@ -457,10 +457,10 @@ pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
 /// individual verifications across all CPU cores.  For batches >= 1024,
 /// this achieves near-linear scaling.
 ///
-/// **Future**: Replace with Metal/CUDA MSM compute shader for 10-40× on GPU.
-/// The Metal shader requires Pippenger bucket MSM for the `R + H(R,A,M)*A`
-/// check — a complex implementation that deserves its own dedicated sprint.
-pub fn gpu_batch_verify_ed25519(
+/// **Note**: This is a CPU-parallel fallback used when the Metal/CUDA GPU
+/// pipeline is not available (non-macOS platforms or small batches).
+/// The actual GPU verification path is in `metal_verify::MetalVerifier`.
+pub fn cpu_batch_verify_ed25519(
     messages: &[&[u8]],
     signatures: &[ed25519_dalek::Signature],
     verifying_keys: &[ed25519_dalek::VerifyingKey],
@@ -591,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_batch_verify_ed25519() {
+    fn test_cpu_batch_verify_ed25519() {
         use ed25519_dalek::Signer;
         let mut rng = rand::thread_rng();
 
@@ -611,13 +611,13 @@ mod tests {
             keypairs.iter().map(|kp| kp.verifying_key()).collect();
         let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
 
-        let results = gpu_batch_verify_ed25519(&msg_refs, &sigs, &vks);
+        let results = cpu_batch_verify_ed25519(&msg_refs, &sigs, &vks);
         assert_eq!(results.len(), 100);
         assert!(results.iter().all(|&v| v), "all signatures should be valid");
     }
 
     #[test]
-    fn test_gpu_batch_verify_detects_invalid() {
+    fn test_cpu_batch_verify_detects_invalid() {
         use ed25519_dalek::Signer;
         let mut rng = rand::thread_rng();
 
@@ -628,7 +628,7 @@ mod tests {
         let vk = kp.verifying_key();
 
         // Valid then invalid
-        let results = gpu_batch_verify_ed25519(
+        let results = cpu_batch_verify_ed25519(
             &[msg.as_slice(), bad_msg.as_slice()],
             &[sig, sig],
             &[vk, vk],

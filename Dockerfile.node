@@ -1,6 +1,6 @@
 # ── Stage 1: Build ────────────────────────────────────────────
-# Rust 1.85+ required for edition = "2024"
-FROM rust:1.85-bookworm AS builder
+# Nightly required for Stwo Circle STARK prover (array_chunks_mut).
+FROM rustlang/rust:nightly-bookworm AS builder
 
 # System deps for wgpu (Vulkan/Mesa) and wasmer
 RUN apt-get update && apt-get install -y \
@@ -17,8 +17,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY config.toml genesis.toml ./
 
-# Build all binaries in release mode
-RUN cargo build --release -p arc-node -p arc-bench -p arc-cli
+# Build with real Stwo Circle STARK prover enabled
+RUN cargo build --release -p arc-node -p arc-bench -p arc-cli --features arc-node/stwo-prover
 
 # ── Stage 2: Runtime ─────────────────────────────────────────
 FROM debian:bookworm-slim

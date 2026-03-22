@@ -511,7 +511,8 @@ impl ThresholdEncryption {
         assert!(!sig_shares.is_empty(), "need at least one BLS signature share");
 
         // Aggregate all provided BLS signatures (real G2 point addition via blst).
-        let agg_sig = crate::bls::aggregate_signatures(sig_shares);
+        let agg_sig = crate::bls::aggregate_signatures(sig_shares)
+            .expect("BLS signature aggregation failed in derive_slot_key");
 
         // Derive a 32-byte symmetric key from the aggregated signature + slot.
         let mut material = Vec::with_capacity(96 + 8);
