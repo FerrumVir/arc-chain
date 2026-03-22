@@ -374,6 +374,18 @@ impl ConsensusManager {
             let current_round = self.engine.current_round();
             let already_proposed = last_proposed_round == Some(current_round);
 
+            // ── Pre-feed benchmark transactions into mempool ──────────────
+            // Do this BEFORE the propose check so transactions are always
+            // available regardless of round/parent state.
+            if self.benchmark && multi_validator {
+                if let Some(ref pool) = benchmark_pool {
+                    let signed_txs = pool.drain(10_000);
+                    for tx in signed_txs {
+                        let _ = mempool.insert(tx);
+                    }
+                }
+            }
+
             // ── 1. Propose a block ─────────────────────────────────────────
             // In multi-validator mode, propose every round (even empty) so the
             // DAG advances and the 2-round commit rule can fire.
