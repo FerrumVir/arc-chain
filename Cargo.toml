@@ -13,6 +13,8 @@ members = [
     "crates/arc-consensus",
     "crates/arc-net",
     "crates/arc-cli",
+    "crates/arc-channel",
+    "crates/arc-inference",
     "agents",
     "relayer",
 ]

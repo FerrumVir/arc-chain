@@ -1,6 +1,6 @@
 # Architecture Deep Dive
 
-ARC Chain is structured as a five-layer blockchain stack, implemented across 10 Rust crates totaling ~70,600 lines of code. Each layer is a distinct crate with clean dependency boundaries.
+ARC Chain is structured as a five-layer blockchain stack, implemented across 13 Rust crates totaling ~80,683 lines of code. Each layer is a distinct crate with clean dependency boundaries.
 
 ---
 
