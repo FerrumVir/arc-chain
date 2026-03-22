@@ -492,7 +492,9 @@ impl ConsensusManager {
                     }
 
                     // ── Normal path: drain mempool ──────────────────────────────
-                    let transactions = mempool.drain(50_000);
+                    // Limit to 500 txs per DAG block to keep broadcast payload small
+                    // (~100KB). Larger payloads fail to propagate across the network.
+                    let transactions = mempool.drain(500);
                     if !transactions.is_empty() {
                         info!("Drained {} txs from mempool for DAG proposal", transactions.len());
                     }
@@ -556,11 +558,15 @@ impl ConsensusManager {
 
                                 // Broadcast to peers
                                 if let Some(ref tx_chan) = outbound_tx {
-                                    let _ =
-                                        tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
-                                            block: block.clone(),
-                                            transactions: transactions.clone(),
-                                        });
+                                    match tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
+                                        block: block.clone(),
+                                        transactions: transactions.clone(),
+                                    }) {
+                                        Ok(()) => {},
+                                        Err(e) => warn!("Failed to broadcast DAG block: {} (channel full or closed)", e),
+                                    }
+                                } else {
+                                    warn!("No outbound channel — cannot broadcast DAG block");
                                 }
                             }
                             Err(e) => {
