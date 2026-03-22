@@ -561,6 +561,14 @@ impl StateDB {
             .and_then(|map| map.get(key).map(|v| v.clone()))
     }
 
+    /// Get all storage entries for a contract (snapshot for VM execution).
+    pub fn get_contract_storage(&self, contract: &Address) -> HashMap<Hash256, Vec<u8>> {
+        self.storage
+            .get(&contract.0)
+            .map(|map| map.iter().map(|e| (*e.key(), e.value().clone())).collect())
+            .unwrap_or_default()
+    }
+
     /// Delete a storage value for a contract.
     pub fn delete_storage(&self, contract: &Address, key: &Hash256) {
         if let Some(map) = self.storage.get(&contract.0) {
@@ -4138,8 +4146,17 @@ impl StateDB {
         }
 
         let mut tree = self.incremental_merkle.lock();
-        let dirty_keys: Vec<[u8; 32]> = self.dirty_accounts.iter().map(|k| *k).collect();
-        self.dirty_accounts.clear();
+        // Atomically collect and remove all dirty keys.
+        // We remove only the keys we collected so that any new keys added
+        // between iter() and remove() remain in the set for the next root
+        // computation (avoids the iter()+clear() race condition).
+        let dirty_keys: Vec<[u8; 32]> = {
+            let keys: Vec<[u8; 32]> = self.dirty_accounts.iter().map(|k| *k).collect();
+            for k in &keys {
+                self.dirty_accounts.remove(k);
+            }
+            keys
+        };
 
         let cold_start = tree.is_empty() && !self.accounts.is_empty();
 
@@ -4206,8 +4223,17 @@ impl StateDB {
     /// does, so only one of the two should be called per block.
     fn compute_state_root_jmt(&self) -> Hash256 {
         let mut jmt = self.jmt.lock();
-        let dirty_keys: Vec<[u8; 32]> = self.dirty_accounts.iter().map(|k| *k).collect();
-        self.dirty_accounts.clear();
+        // Atomically collect and remove all dirty keys.
+        // We remove only the keys we collected so that any new keys added
+        // between iter() and remove() remain in the set for the next root
+        // computation (avoids the iter()+clear() race condition).
+        let dirty_keys: Vec<[u8; 32]> = {
+            let keys: Vec<[u8; 32]> = self.dirty_accounts.iter().map(|k| *k).collect();
+            for k in &keys {
+                self.dirty_accounts.remove(k);
+            }
+            keys
+        };
 
         if dirty_keys.is_empty() && !jmt.is_empty() {
             return jmt.root_hash();

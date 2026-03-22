@@ -27,6 +27,7 @@ serde_json.workspace = true
 hex.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
+zeroize.workspace = true
 # Stwo STARK prover (optional — requires nightly Rust)
 stwo = { workspace = true, optional = true }
 stwo-constraint-framework = { workspace = true, optional = true }
