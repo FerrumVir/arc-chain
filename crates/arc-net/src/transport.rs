@@ -451,28 +451,41 @@ pub async fn run_transport(
     // ── PEX auto-dial channel ───────────────────────────────────────────
     let (pex_dial_tx, mut pex_dial_rx) = mpsc::channel::<SocketAddr>(64);
 
-    // ── Dial bootstrap peers ────────────────────────────────────────────
-    for peer_addr in &bootstrap_peers {
-        info!("Dialing bootstrap peer {}", peer_addr);
-        let handshake_msg = make_signed_handshake(
-            local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
-        );
-        match dial_peer(
-            &endpoint,
-            *peer_addr,
-            &handshake_msg,
-            local_address,
-            &connections,
-            &inbound_tx,
-            &peer_count,
-            &pex_dial_tx,
-            &rate_limiter,
-        )
-        .await
-        {
-            Ok(()) => info!("Connected to bootstrap peer {}", peer_addr),
-            Err(e) => warn!("Failed to connect to {}: {}", peer_addr, e),
+    // ── Dial bootstrap peers (concurrent with 5s timeout each) ──────────
+    {
+        let mut dial_handles = Vec::new();
+        for peer_addr in &bootstrap_peers {
+            // Skip self
+            if peer_addr.ip().is_loopback() || peer_addr == &listen_addr {
+                continue;
+            }
+            info!("Dialing bootstrap peer {}", peer_addr);
+            let ep = endpoint.clone();
+            let addr = *peer_addr;
+            let handshake_msg = make_signed_handshake(
+                local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+            );
+            let c = connections.clone();
+            let itx = inbound_tx.clone();
+            let pc = peer_count.clone();
+            let pdt = pex_dial_tx.clone();
+            let rl = rate_limiter.clone();
+            dial_handles.push(tokio::spawn(async move {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl),
+                ).await {
+                    Ok(Ok(())) => info!("Connected to bootstrap peer {}", addr),
+                    Ok(Err(e)) => warn!("Failed to connect to {}: {}", addr, e),
+                    Err(_) => warn!("Timeout connecting to {} (5s)", addr),
+                }
+            }));
         }
+        // Wait for all dials to complete (or timeout)
+        for h in dial_handles {
+            let _ = h.await;
+        }
+        info!("Bootstrap dial phase complete, {} peers connected", peer_count.load(Ordering::Relaxed));
     }
 
     // ── Dial persisted peers (from previous sessions) ───────────────────
