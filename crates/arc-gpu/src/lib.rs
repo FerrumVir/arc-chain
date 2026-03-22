@@ -1,5 +1,9 @@
+pub mod hardware_detect;
 pub mod metal_verify;
 pub mod gpu_memory;
+pub mod avx512_verify;
+pub mod neon_verify;
+pub mod cuda_verify;
 
 pub use gpu_memory::{GpuAccountBuffer, GpuAccountRepr, MemoryModel as GpuMemoryModel, ACCOUNT_SLOT_SIZE};
 

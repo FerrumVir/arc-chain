@@ -67,11 +67,38 @@ pub enum VerifyMode {
     /// GPU-accelerated verification via Metal (Apple Silicon) with automatic
     /// fallback to CPU for small batches or non-Apple platforms.
     GpuMetal,
+    /// GPU-accelerated verification via CUDA (NVIDIA GPUs).
+    /// Falls back to CPU until the CUDA kernel is implemented (week 3-5).
+    GpuCuda,
+    /// CPU SIMD verification using AVX-512 intrinsics (x86_64).
+    /// Falls back to scalar CPU until the AVX-512 kernel is implemented (week 6-7).
+    CpuAvx512,
+    /// CPU SIMD verification using ARM NEON intrinsics (aarch64).
+    /// Falls back to scalar CPU until the NEON kernel is implemented (week 8).
+    CpuNeon,
 }
 
 impl Default for VerifyMode {
     fn default() -> Self {
         Self::Cpu
+    }
+}
+
+/// Auto-detect the best verification mode based on runtime hardware probing.
+///
+/// Priority: CUDA → Metal → AVX-512 → NEON → CPU (scalar).
+fn auto_detect_verify_mode() -> VerifyMode {
+    let hw = arc_gpu::hardware_detect::detect();
+    if hw.cuda_available {
+        VerifyMode::GpuCuda
+    } else if hw.metal_available {
+        VerifyMode::GpuMetal
+    } else if hw.avx512_available {
+        VerifyMode::CpuAvx512
+    } else if hw.neon_available {
+        VerifyMode::CpuNeon
+    } else {
+        VerifyMode::Cpu
     }
 }
 
@@ -98,11 +125,7 @@ impl Default for PipelineConfig {
     fn default() -> Self {
         Self {
             execution_mode: ExecutionMode::BlockSTM,
-            verify_mode: if cfg!(target_os = "macos") {
-                VerifyMode::GpuMetal
-            } else {
-                VerifyMode::Cpu
-            },
+            verify_mode: auto_detect_verify_mode(),
             coalesce_enabled: false,
             batch_size: 10_000,
             gpu_state_enabled: true,
@@ -208,12 +231,25 @@ impl Pipeline {
         thread::Builder::new()
             .name("pipeline-verify".into())
             .spawn(move || {
-                // If GPU mode requested, create a Metal verifier for this thread.
-                let mut metal_verifier = if verify_mode == VerifyMode::GpuMetal {
-                    Some(arc_gpu::metal_verify::MetalVerifier::new())
-                } else {
-                    None
+                // Initialize the backend-specific verifier for this thread.
+                let mut metal_verifier = match verify_mode {
+                    VerifyMode::GpuMetal => Some(arc_gpu::metal_verify::MetalVerifier::new()),
+                    _ => None,
                 };
+                let mut cuda_verifier = match verify_mode {
+                    VerifyMode::GpuCuda => Some(arc_gpu::cuda_verify::CudaVerifier::new()),
+                    _ => None,
+                };
+                let mut avx512_verifier = match verify_mode {
+                    VerifyMode::CpuAvx512 => Some(arc_gpu::avx512_verify::Avx512Verifier::new()),
+                    _ => None,
+                };
+                let mut neon_verifier = match verify_mode {
+                    VerifyMode::CpuNeon => Some(arc_gpu::neon_verify::NeonVerifier::new()),
+                    _ => None,
+                };
+
+                info!(mode = ?verify_mode, "Pipeline: verify backend initialized");
 
                 while let Ok(batch) = rx_receive.recv() {
                     let n = batch.transactions.len();
@@ -288,37 +324,109 @@ impl Pipeline {
                                 "Pipeline: pre-verified cache hits");
                         }
 
-                        // Verify remaining uncached signatures
+                        // Verify remaining uncached signatures via the selected backend.
                         if !uncached_task_indices.is_empty() {
-                            if let Some(ref mut verifier) = metal_verifier {
-                                // GPU Metal path: build VerifyTasks for uncached only
-                                let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
-                                    .iter()
-                                    .map(|&j| arc_gpu::metal_verify::VerifyTask {
-                                        message: ed_msgs[j].clone(),
-                                        public_key: *ed_vks[j].as_bytes(),
-                                        signature: ed_sigs[j].to_bytes(),
-                                    })
-                                    .collect();
-                                let result = verifier.batch_verify(&tasks);
-                                let invalid_set: std::collections::HashSet<usize> =
-                                    result.invalid_indices.iter().copied().collect();
-                                for (k, &j) in uncached_task_indices.iter().enumerate() {
-                                    sig_valid[ed_indices[j]] = !invalid_set.contains(&k);
-                                }
-                            } else {
-                                // CPU path: rayon parallel verification
-                                let msg_refs: Vec<&[u8]> = uncached_task_indices.iter()
-                                    .map(|&j| ed_msgs[j].as_slice()).collect();
-                                let sigs: Vec<ed25519_dalek::Signature> = uncached_task_indices.iter()
-                                    .map(|&j| ed_sigs[j]).collect();
-                                let vks: Vec<ed25519_dalek::VerifyingKey> = uncached_task_indices.iter()
-                                    .map(|&j| ed_vks[j]).collect();
+                            // Helper: CPU rayon fallback path (used by CPU mode and
+                            // as fallback for not-yet-implemented kernel modes).
+                            let cpu_verify = |indices: &[usize],
+                                              msgs: &[Vec<u8>],
+                                              sigs: &[ed25519_dalek::Signature],
+                                              vks: &[ed25519_dalek::VerifyingKey],
+                                              ed_idx: &[usize],
+                                              out: &mut [bool]| {
+                                let msg_refs: Vec<&[u8]> = indices.iter()
+                                    .map(|&j| msgs[j].as_slice()).collect();
+                                let s: Vec<ed25519_dalek::Signature> = indices.iter()
+                                    .map(|&j| sigs[j]).collect();
+                                let v: Vec<ed25519_dalek::VerifyingKey> = indices.iter()
+                                    .map(|&j| vks[j]).collect();
                                 let results = arc_gpu::cpu_batch_verify_ed25519(
-                                    &msg_refs, &sigs, &vks,
+                                    &msg_refs, &s, &v,
                                 );
                                 for (k, &valid) in results.iter().enumerate() {
-                                    sig_valid[ed_indices[uncached_task_indices[k]]] = valid;
+                                    out[ed_idx[indices[k]]] = valid;
+                                }
+                            };
+
+                            match verify_mode {
+                                VerifyMode::GpuMetal if metal_verifier.is_some() => {
+                                    // GPU Metal path
+                                    let verifier = metal_verifier.as_mut().unwrap();
+                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
+                                        .iter()
+                                        .map(|&j| arc_gpu::metal_verify::VerifyTask {
+                                            message: ed_msgs[j].clone(),
+                                            public_key: *ed_vks[j].as_bytes(),
+                                            signature: ed_sigs[j].to_bytes(),
+                                        })
+                                        .collect();
+                                    let result = verifier.batch_verify(&tasks);
+                                    let invalid_set: std::collections::HashSet<usize> =
+                                        result.invalid_indices.iter().copied().collect();
+                                    for (k, &j) in uncached_task_indices.iter().enumerate() {
+                                        sig_valid[ed_indices[j]] = !invalid_set.contains(&k);
+                                    }
+                                }
+                                VerifyMode::GpuCuda => {
+                                    // CUDA kernel dispatch
+                                    let verifier = cuda_verifier.as_mut().unwrap();
+                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
+                                        .iter()
+                                        .map(|&j| arc_gpu::metal_verify::VerifyTask {
+                                            message: ed_msgs[j].clone(),
+                                            public_key: *ed_vks[j].as_bytes(),
+                                            signature: ed_sigs[j].to_bytes(),
+                                        })
+                                        .collect();
+                                    let result = verifier.batch_verify(&tasks);
+                                    let invalid_set: std::collections::HashSet<usize> =
+                                        result.invalid_indices.iter().copied().collect();
+                                    for (k, &j) in uncached_task_indices.iter().enumerate() {
+                                        sig_valid[ed_indices[j]] = !invalid_set.contains(&k);
+                                    }
+                                }
+                                VerifyMode::CpuAvx512 => {
+                                    // AVX-512 kernel dispatch
+                                    let verifier = avx512_verifier.as_mut().unwrap();
+                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
+                                        .iter()
+                                        .map(|&j| arc_gpu::metal_verify::VerifyTask {
+                                            message: ed_msgs[j].clone(),
+                                            public_key: *ed_vks[j].as_bytes(),
+                                            signature: ed_sigs[j].to_bytes(),
+                                        })
+                                        .collect();
+                                    let result = verifier.batch_verify(&tasks);
+                                    let invalid_set: std::collections::HashSet<usize> =
+                                        result.invalid_indices.iter().copied().collect();
+                                    for (k, &j) in uncached_task_indices.iter().enumerate() {
+                                        sig_valid[ed_indices[j]] = !invalid_set.contains(&k);
+                                    }
+                                }
+                                VerifyMode::CpuNeon => {
+                                    // NEON kernel dispatch
+                                    let verifier = neon_verifier.as_mut().unwrap();
+                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
+                                        .iter()
+                                        .map(|&j| arc_gpu::metal_verify::VerifyTask {
+                                            message: ed_msgs[j].clone(),
+                                            public_key: *ed_vks[j].as_bytes(),
+                                            signature: ed_sigs[j].to_bytes(),
+                                        })
+                                        .collect();
+                                    let result = verifier.batch_verify(&tasks);
+                                    let invalid_set: std::collections::HashSet<usize> =
+                                        result.invalid_indices.iter().copied().collect();
+                                    for (k, &j) in uncached_task_indices.iter().enumerate() {
+                                        sig_valid[ed_indices[j]] = !invalid_set.contains(&k);
+                                    }
+                                }
+                                _ => {
+                                    // CPU scalar path (default)
+                                    cpu_verify(
+                                        &uncached_task_indices, &ed_msgs, &ed_sigs, &ed_vks,
+                                        &ed_indices, &mut sig_valid,
+                                    );
                                 }
                             }
                         }
@@ -602,7 +710,8 @@ impl Pipeline {
                                 | TxBody::ChannelClose(_) | TxBody::ChannelDispute(_)
                                 | TxBody::ShardProof(_)
                                 | TxBody::InferenceAttestation(_)
-                                | TxBody::InferenceChallenge(_) => {}
+                                | TxBody::InferenceChallenge(_)
+                                | TxBody::InferenceRegister(_) => {}
                             }
                         }
 

@@ -71,6 +71,9 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             // Escrow address depends on attestation hash (not known statically);
             // sender account is already included.
         }
+        TxBody::InferenceRegister(_) => {
+            // Sender account is already included; inference registry is global state.
+        }
     }
 
     TxAccessSet { accounts }

@@ -45,6 +45,10 @@ path = "src/multinode_bench.rs"
 name = "arc-bench-gpu-state"
 path = "src/gpu_state_bench_main.rs"
 
+[[bin]]
+name = "arc-bench-inference"
+path = "src/inference_bench.rs"
+
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }

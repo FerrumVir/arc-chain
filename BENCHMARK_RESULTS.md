@@ -4,7 +4,7 @@
 **Version**: v1.2
 **Hardware**: Apple M2 Ultra, 24 CPU cores (16P+8E), 64 GB unified memory
 **Previous**: Apple M4, 10 CPU cores, 16 GB unified memory
-**Codebase**: 77,244 LOC Rust | 1,054 tests | 11 crates
+**Codebase**: 80,683 LOC Rust | 1,117 tests | 13 crates
 
 ---
 
@@ -57,18 +57,20 @@ Users / AI Agents
 
 | Crate | LOC | Tests | Purpose |
 |-------|-----|-------|---------|
-| `arc-types` | 14,490 | 264 | 23 transaction types, blocks, accounts, staking, governance, bridge, account abstraction, social recovery, inference attestation/challenge, state rent |
+| `arc-types` | 14,490 | 264 | 24 transaction types, blocks, accounts, staking, governance, bridge, account abstraction, social recovery, inference attestation/challenge, state rent |
 | `arc-crypto` | 11,680 | 240 | Ed25519, Secp256k1, BLS12-381, BLAKE3, Falcon-512, ML-DSA, VRF, threshold crypto, Pedersen commitments, Stwo STARK prover |
 | `arc-state` | 13,203 | 147 | DashMap state DB, Jellyfish Merkle Tree, segmented WAL with auto-rotate, adaptive BlockSTM, GPU-resident state cache, JMT auto-pruning, receipt pruning, state rent, state sync |
 | `arc-vm` | 8,439 | 145 | WASM runtime (Wasmer 6.0), EVM interpreter (revm 19), gas metering, host imports, 11 precompiles, AI inference oracle |
 | `arc-node` | 8,424 | 61 | Block producer, adaptive execution (Sequential/BlockSTM), RPC server (30 HTTP + ETH JSON-RPC), consensus manager, STARK proof generation, DA erasure coding |
 | `arc-consensus` | 7,971 | 137 | DAG consensus engine, beacon chain shard coordinator, validator roles, 2-round commit rule, slashing, cross-shard coordination |
 | `arc-bench` | 5,336 | — | 10 benchmark binaries (multinode, parallel, signed, soak, production, mixed, node, propose-verify, gpu-state) |
-| `arc-gpu` | 3,810 | 37 | Metal MSL + WGSL GPU Ed25519 batch verification, GPU account buffer, unified/managed memory, buffer pooling |
+| `arc-gpu` | 5,250 | 45 | Metal MSL + WGSL GPU Ed25519 batch verification, GPU account buffer, hardware auto-detection, AVX-512/NEON/CUDA kernels |
 | `arc-net` | 2,355 | 26 | QUIC transport (quinn), shred propagation, XOR FEC, TX gossip, peer exchange, challenge-response auth |
 | `arc-mempool` | 876 | 17 | Lock-free SegQueue + DashSet deduplication, encrypted mempool (BLS threshold) |
 | `arc-cli` | 660 | — | CLI client: keygen, RPC queries, transaction submission |
-| **Total** | **77,244** | **1,054** | **11 crates** |
+| `arc-inference` | 620 | 17 | INT4 inference runtime, VRF committee selection, EIP-1559 inference gas lane |
+| `arc-channel` | 480 | 10 | Off-chain bilateral payment channels, ChannelStateMachine, BLAKE3 commitments |
+| **Total** | **80,683** | **1,117** | **13 crates** |
 
 Additional code outside `/crates`:
 - Python SDK: 2,688 LOC
@@ -408,7 +410,7 @@ A complete transaction goes through these stages:
 
 ## 9. Transaction Types
 
-ARC Chain supports 23 native transaction types:
+ARC Chain supports 24 native transaction types:
 
 | Type | Code | Description |
 |------|------|-------------|
@@ -545,8 +547,8 @@ cargo test --workspace
 | Metric | Value |
 |--------|-------|
 | **Language** | Rust (100% core) |
-| **Codebase** | 76,255 LOC Rust, 11 crates |
-| **Tests** | 1,031 passing, 0 failing |
+| **Codebase** | 80,683 LOC Rust, 13 crates |
+| **Tests** | 1,117 passing, 0 failing |
 | **Consensus** | DAG (Mysticeti-inspired), 2-round finality |
 | **Measured TPS** | 69.3K (single-node peak, M4), 27K (2-node sustained) |
 | **Projected TPS** | 300K-1.3M (A100/H100 server, single shard) |
@@ -554,7 +556,7 @@ cargo test --workspace
 | **State lookups** | 15.2M/sec (GPU-resident cache, Metal unified) |
 | **Commit rate** | 100% (500K/500K) |
 | **GPU support** | Metal, Vulkan, CUDA, DirectX 12, WebGPU (via wgpu) |
-| **TX types** | 23 native types (16 core + 5 L1 scaling + 2 inference) |
+| **TX types** | 24 native types (16 core + 5 L1 scaling + 3 inference) |
 | **Precompiles** | 11 (BLAKE3, Ed25519, VRF, Oracle, Merkle, BlockInfo, Identity, Falcon-512, ZK-verify, AI-inference, BLS-verify) |
 | **Smart contracts** | WASM (Wasmer 6.0) + EVM (revm 19) |
 | **Signatures** | Ed25519, Secp256k1, BLS12-381, Falcon-512 (post-quantum), ML-DSA |

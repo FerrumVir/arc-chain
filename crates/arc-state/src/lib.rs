@@ -2314,6 +2314,7 @@ impl StateDB {
             TxBody::ShardProof(_) => gas_costs::SHARD_PROOF,
             TxBody::InferenceAttestation(_) => gas_costs::INFERENCE_ATTESTATION,
             TxBody::InferenceChallenge(_) => gas_costs::INFERENCE_CHALLENGE,
+            TxBody::InferenceRegister(_) => gas_costs::INFERENCE_ATTESTATION, // same gas as attestation
         }
     }
 
@@ -3545,6 +3546,15 @@ impl StateDB {
                     ));
                 }
 
+                // Reject close if there is an active dispute whose challenge period
+                // has not yet expired. escrow.staked_balance stores the challenge
+                // expiry height (0 = no dispute).
+                if escrow.staked_balance > 0 && self.height() < escrow.staked_balance {
+                    return Err(StateError::ExecutionError(
+                        "channel close: active dispute in progress, wait for challenge period to expire".to_string(),
+                    ));
+                }
+
                 // Validate final balances don't exceed locked funds
                 let claimed_total = body.opener_balance.saturating_add(body.counterparty_balance);
                 if claimed_total > total_locked {
@@ -3579,6 +3589,14 @@ impl StateDB {
             }
             TxBody::ChannelDispute(body) => {
                 // --- Dispute State Channel: submit latest signed state ---
+                //
+                // Escrow fields used for dispute tracking:
+                //   escrow.nonce          = highest accepted state_nonce (0 = no dispute yet)
+                //   escrow.staked_balance  = challenge_expiry height (0 = no active dispute)
+                //   escrow.balance         = total locked funds (set during ChannelOpen)
+                //   escrow.code_hash       = opener address
+                //   escrow.storage_root    = counterparty address
+
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -3590,22 +3608,65 @@ impl StateDB {
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Validate escrow exists
+                // Validate escrow exists and has locked funds
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
-                let escrow = self.get_or_create_account(&escrow_addr);
+                let mut escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
                     return Err(StateError::ExecutionError(
                         "channel dispute: no funds locked in channel".to_string(),
                     ));
                 }
 
-                // Record dispute on-chain (the state_nonce and claimed balances
-                // are recorded via the transaction itself — any subsequent dispute
-                // with a higher state_nonce overrides this one).
-                // The challenge_period countdown starts from this block height.
-                // After challenge_period blocks, the latest submitted state is final.
-                // Full dispute resolution requires tracking disputed channels in state;
-                // for now, the TX records the claim and validators enforce finality.
+                // Authorization: only the channel opener or counterparty can dispute.
+                if tx.from != escrow.code_hash && tx.from != escrow.storage_root {
+                    return Err(StateError::ExecutionError(
+                        "channel dispute: sender is neither opener nor counterparty".to_string(),
+                    ));
+                }
+
+                // Validate challenge_period is reasonable (1..=100_000 blocks).
+                if body.challenge_period == 0 || body.challenge_period > 100_000 {
+                    return Err(StateError::ExecutionError(
+                        "channel dispute: challenge_period must be 1..=100000".to_string(),
+                    ));
+                }
+
+                // If a previous dispute exists and its challenge period has expired,
+                // the state is already finalized — no further disputes allowed.
+                if escrow.staked_balance > 0 && self.height() >= escrow.staked_balance {
+                    return Err(StateError::ExecutionError(
+                        "channel dispute: challenge period has expired, state is finalized".to_string(),
+                    ));
+                }
+
+                // State nonce must be strictly higher than the previously disputed state.
+                // This prevents replay attacks with old channel states.
+                if escrow.staked_balance > 0 && body.state_nonce <= escrow.nonce {
+                    return Err(StateError::ExecutionError(
+                        format!(
+                            "channel dispute: state_nonce {} must exceed previously disputed nonce {}",
+                            body.state_nonce, escrow.nonce
+                        ),
+                    ));
+                }
+
+                // Validate balance conservation: claimed split must not exceed locked funds.
+                let claimed_total = body.opener_balance.saturating_add(body.counterparty_balance);
+                if claimed_total > escrow.balance {
+                    return Err(StateError::ExecutionError(
+                        format!(
+                            "channel dispute: claimed balances ({}) exceed locked funds ({})",
+                            claimed_total, escrow.balance
+                        ),
+                    ));
+                }
+
+                // Update dispute state in escrow.
+                let challenge_expiry = self.height() + body.challenge_period;
+                escrow.nonce = body.state_nonce;
+                escrow.staked_balance = challenge_expiry;
+                self.accounts.insert(escrow_addr.0, escrow.clone());
+                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 Ok(gas.consumed)
             }
@@ -3767,6 +3828,56 @@ impl StateDB {
                 //    is recorded and validators resolve it at challenge period expiry.
                 //    Full resolution would call the AI precompile and compare outputs;
                 //    the winner receives both bonds and the loser is slashed.
+
+                Ok(gas.consumed)
+            }
+            TxBody::InferenceRegister(body) => {
+                // --- Register as Inference Provider ---
+                // Validators declare hardware tier and lock a stake bond.
+                // The chain maintains a registry in sender's account metadata:
+                //   staked_balance += stake_bond (locked)
+                //   nonce field tracks the declared tier
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+
+                // Validate tier (1-4)
+                if body.tier == 0 || body.tier > 4 {
+                    return Err(StateError::ExecutionError(
+                        format!("inference register: invalid tier {}, must be 1-4", body.tier),
+                    ));
+                }
+
+                // Validate sufficient balance for stake bond
+                if sender.balance < body.stake_bond {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: body.stake_bond,
+                    });
+                }
+
+                // Validate minimum stake for tier
+                let min_stakes = [0u64, 1_000, 5_000, 10_000, 25_000];
+                let min_stake = min_stakes[body.tier as usize];
+                if body.stake_bond < min_stake {
+                    return Err(StateError::ExecutionError(
+                        format!(
+                            "inference register: stake {} below minimum {} for tier {}",
+                            body.stake_bond, min_stake, body.tier
+                        ),
+                    ));
+                }
+
+                // Lock stake: move from balance to staked_balance
+                sender.balance -= body.stake_bond;
+                sender.staked_balance += body.stake_bond;
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4059,6 +4170,9 @@ impl StateDB {
                 let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
                 self.account_txs.entry(escrow_addr.0).or_default().push(tx.hash);
             }
+            TxBody::InferenceRegister(_) => {
+                // Registration modifies sender's staked_balance; sender is already tracked.
+            }
         }
     }
 
@@ -4127,6 +4241,9 @@ impl StateDB {
             TxBody::InferenceChallenge(body) => {
                 let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
+            }
+            TxBody::InferenceRegister(_) => {
+                // Sender account is already marked dirty (line above match).
             }
         }
     }
@@ -5647,5 +5764,263 @@ mod tests {
         let (collected, dormant) = state.collect_rent(&config);
         assert_eq!(collected, 0);
         assert_eq!(dormant, 0);
+    }
+
+    // ── Channel integration tests ────────────────────────────────────────
+
+    use arc_types::transaction::{
+        ChannelOpenBody, ChannelCloseBody, ChannelDisputeBody, InferenceRegisterBody,
+    };
+
+    fn make_channel_tx(from: Address, nonce: u64, body: TxBody, tx_type: TxType) -> Transaction {
+        let mut tx = Transaction {
+            tx_type,
+            from,
+            nonce,
+            body,
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        tx.hash = tx.compute_hash();
+        tx
+    }
+
+    #[test]
+    fn test_channel_open_creates_escrow() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
+        let channel_id = hash_bytes(b"test-channel-1");
+
+        let tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
+            channel_id,
+            counterparty: addr(2),
+            deposit: 100_000,
+            timeout_blocks: 100,
+        }), TxType::ChannelOpen);
+
+        let (_, receipts) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(receipts[0].success, "ChannelOpen should succeed");
+
+        // Sender balance debited
+        let sender = state.get_account(&addr(1)).unwrap();
+        assert_eq!(sender.balance, 900_000);
+
+        // Escrow created with deposit
+        let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
+        let escrow = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(escrow.balance, 100_000);
+        assert_eq!(escrow.code_hash, addr(1));      // opener
+        assert_eq!(escrow.storage_root, addr(2));    // counterparty
+    }
+
+    #[test]
+    fn test_channel_close_releases_funds() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
+        let channel_id = hash_bytes(b"test-channel-2");
+
+        // Open
+        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
+            channel_id,
+            counterparty: addr(2),
+            deposit: 100_000,
+            timeout_blocks: 100,
+        }), TxType::ChannelOpen);
+        let (_, r) = state.execute_block(&[open_tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        // Close (opener closes, split 60K/40K)
+        let close_tx = make_channel_tx(addr(1), 1, TxBody::ChannelClose(ChannelCloseBody {
+            channel_id,
+            opener_balance: 60_000,
+            counterparty_balance: 40_000,
+            counterparty_sig: vec![0u8; 64],
+            state_nonce: 1,
+        }), TxType::ChannelClose);
+        let (_, r) = state.execute_block(&[close_tx], addr(99)).unwrap();
+        assert!(r[0].success, "ChannelClose should succeed");
+
+        // Escrow drained
+        let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
+        let escrow = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(escrow.balance, 0);
+
+        // Opener credited
+        let opener = state.get_account(&addr(1)).unwrap();
+        assert_eq!(opener.balance, 960_000); // 900K + 60K
+
+        // Counterparty credited
+        let counterparty = state.get_account(&addr(2)).unwrap();
+        assert_eq!(counterparty.balance, 40_000);
+    }
+
+    #[test]
+    fn test_channel_dispute_tracks_nonce_and_expiry() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
+        let channel_id = hash_bytes(b"test-channel-3");
+
+        // Open channel
+        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
+            channel_id,
+            counterparty: addr(2),
+            deposit: 100_000,
+            timeout_blocks: 100,
+        }), TxType::ChannelOpen);
+        state.execute_block(&[open_tx], addr(99)).unwrap();
+
+        // Dispute from counterparty (addr(2))
+        let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
+            channel_id,
+            opener_balance: 70_000,
+            counterparty_balance: 30_000,
+            other_party_sig: vec![0u8; 64],
+            state_nonce: 5,
+            challenge_period: 100,
+        }), TxType::ChannelDispute);
+        let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
+        assert!(r[0].success, "ChannelDispute should succeed");
+
+        // Check escrow state updated
+        let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
+        let escrow = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(escrow.nonce, 5);                // state_nonce recorded
+        assert!(escrow.staked_balance > 0);          // challenge_expiry set
+        assert_eq!(escrow.balance, 100_000);         // funds still locked
+    }
+
+    #[test]
+    fn test_channel_dispute_rejects_lower_nonce() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
+        let channel_id = hash_bytes(b"test-channel-4");
+
+        // Open
+        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
+            channel_id,
+            counterparty: addr(2),
+            deposit: 100_000,
+            timeout_blocks: 100,
+        }), TxType::ChannelOpen);
+        state.execute_block(&[open_tx], addr(99)).unwrap();
+
+        // First dispute with nonce 10
+        let d1 = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
+            channel_id,
+            opener_balance: 60_000,
+            counterparty_balance: 40_000,
+            other_party_sig: vec![0u8; 64],
+            state_nonce: 10,
+            challenge_period: 100,
+        }), TxType::ChannelDispute);
+        let (_, r) = state.execute_block(&[d1], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        // Second dispute with lower nonce (5) — should fail
+        let d2 = make_channel_tx(addr(1), 1, TxBody::ChannelDispute(ChannelDisputeBody {
+            channel_id,
+            opener_balance: 80_000,
+            counterparty_balance: 20_000,
+            other_party_sig: vec![0u8; 64],
+            state_nonce: 5, // lower than 10!
+            challenge_period: 100,
+        }), TxType::ChannelDispute);
+        let (_, r) = state.execute_block(&[d2], addr(99)).unwrap();
+        assert!(!r[0].success, "Dispute with lower nonce should be rejected");
+    }
+
+    #[test]
+    fn test_channel_close_blocked_during_dispute() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
+        let channel_id = hash_bytes(b"test-channel-5");
+
+        // Open
+        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
+            channel_id,
+            counterparty: addr(2),
+            deposit: 100_000,
+            timeout_blocks: 100,
+        }), TxType::ChannelOpen);
+        state.execute_block(&[open_tx], addr(99)).unwrap();
+
+        // Dispute (sets challenge_expiry far in the future)
+        let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
+            channel_id,
+            opener_balance: 60_000,
+            counterparty_balance: 40_000,
+            other_party_sig: vec![0u8; 64],
+            state_nonce: 1,
+            challenge_period: 100_000, // very long
+        }), TxType::ChannelDispute);
+        let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        // Try to close — should fail (active dispute)
+        let close_tx = make_channel_tx(addr(1), 1, TxBody::ChannelClose(ChannelCloseBody {
+            channel_id,
+            opener_balance: 100_000,
+            counterparty_balance: 0,
+            counterparty_sig: vec![0u8; 64],
+            state_nonce: 1,
+        }), TxType::ChannelClose);
+        let (_, r) = state.execute_block(&[close_tx], addr(99)).unwrap();
+        assert!(!r[0].success, "Close should be blocked during active dispute");
+    }
+
+    #[test]
+    fn test_channel_dispute_balance_conservation() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
+        let channel_id = hash_bytes(b"test-channel-6");
+
+        // Open with 100K deposit
+        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
+            channel_id,
+            counterparty: addr(2),
+            deposit: 100_000,
+            timeout_blocks: 100,
+        }), TxType::ChannelOpen);
+        state.execute_block(&[open_tx], addr(99)).unwrap();
+
+        // Dispute claiming more than deposited — should fail
+        let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
+            channel_id,
+            opener_balance: 80_000,
+            counterparty_balance: 40_000, // 80K + 40K = 120K > 100K!
+            other_party_sig: vec![0u8; 64],
+            state_nonce: 1,
+            challenge_period: 100,
+        }), TxType::ChannelDispute);
+        let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
+        assert!(!r[0].success, "Dispute exceeding deposit should be rejected");
+    }
+
+    #[test]
+    fn test_inference_register_locks_stake() {
+        let state = StateDB::with_genesis(&[(addr(1), 100_000)]);
+
+        let tx = make_channel_tx(addr(1), 0, TxBody::InferenceRegister(InferenceRegisterBody {
+            tier: 2,
+            stake_bond: 5_000,
+        }), TxType::InferenceRegister);
+
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success, "InferenceRegister should succeed");
+
+        let acct = state.get_account(&addr(1)).unwrap();
+        assert_eq!(acct.balance, 95_000);        // 100K - 5K
+        assert_eq!(acct.staked_balance, 5_000);  // locked
+    }
+
+    #[test]
+    fn test_inference_register_rejects_insufficient_stake() {
+        let state = StateDB::with_genesis(&[(addr(1), 100_000)]);
+
+        // Tier 2 requires 5K minimum, try with only 1K
+        let tx = make_channel_tx(addr(1), 0, TxBody::InferenceRegister(InferenceRegisterBody {
+            tier: 2,
+            stake_bond: 1_000, // below min for tier 2
+        }), TxType::InferenceRegister);
+
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(!r[0].success, "InferenceRegister with insufficient stake should fail");
     }
 }

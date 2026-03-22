@@ -105,7 +105,7 @@ signature = kp.sign(b"hello")
 
 ## TransactionBuilder
 
-Build and sign any of ARC Chain's 23 transaction types.
+Build and sign any of ARC Chain's 24 transaction types.
 
 ```python
 from arc_sdk import TransactionBuilder, KeyPair
@@ -265,7 +265,7 @@ from arc_sdk.types import (
 |--------|------|-------------|
 | `ArcClient` | class | RPC client with typed methods |
 | `KeyPair` | class | Ed25519 key generation and signing |
-| `TransactionBuilder` | class | Build and sign all 23 TX types |
+| `TransactionBuilder` | class | Build and sign all 24 TX types |
 | `AgentRunner` | class | Connect any AI model to ARC Chain |
 | `openai_runner` | factory | Pre-configured OpenAI runner |
 | `anthropic_runner` | factory | Pre-configured Anthropic runner |

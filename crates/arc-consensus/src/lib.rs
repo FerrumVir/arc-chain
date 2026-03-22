@@ -1563,6 +1563,7 @@ impl ConsensusEngine {
             TxBody::ShardProof(_) => false,  // Shard-local proof recording
             TxBody::InferenceAttestation(_) => false,  // Escrow is local to sender's shard
             TxBody::InferenceChallenge(_) => false,  // Resolved on attestation's shard
+            TxBody::InferenceRegister(_) => false,  // Local to sender's shard
         }
     }
 

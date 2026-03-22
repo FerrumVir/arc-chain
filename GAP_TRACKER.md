@@ -2,7 +2,7 @@
 
 > Last updated: 2026-03-21
 > Verified by code audit agents against actual codebase.
-> All 21 gaps implemented and verified: 1,066 tests pass, 0 failures.
+> All 21 gaps implemented and verified: 1,117 tests pass, 0 failures.
 
 ## Status Legend
 - [ ] NOT STARTED
@@ -229,17 +229,17 @@
 ## Verification
 
 - **Workspace build**: `cargo check --workspace` — clean (warnings only in benchmarks)
-- **Test suite**: 1,054 tests pass, 0 failures
-- **New files**: 8 created (1 shell script, 4 Solidity contracts, 1 TOML config, 2 SDK modules)
+- **Test suite**: 1,117 tests pass, 0 failures
+- **New files**: 8 created (1 shell script, 4 Solidity contracts, 1 TOML config, 2 SDK modules) + 10 new files (2026-03-21: 3 kernel modules, 2 new crates, 2 SDK channel classes, hardware_detect, committee, gas lane)
 - **Modified files**: 14+ Rust source files across arc-types, arc-state, arc-node, arc-net, arc-consensus
-- **TX types**: 23 total (16 original + 5 L1 scaling + 2 inference)
+- **TX types**: 24 total (16 original + 5 L1 scaling + 3 inference)
 - **Independent audit**: 5 agents verified all 5 new types exist with execution logic, gas costs, access sets, RPC serialization, and shard routing
 - **Post-audit fixes** (2026-03-07):
   - ChannelClose: Added authorization (only opener/counterparty can close), counterparty crediting, dirty account tracking
   - ShardProof: Wired to `stwo_air::verify_recursive_proof()` behind `stwo-prover` feature gate
   - Added `stwo-prover` feature to `arc-state/Cargo.toml` forwarding to `arc-crypto/stwo-prover`
   - Developer documentation: 9 docs (85KB) — quickstart, architecture, RPC API, SDKs, smart contracts, testnet, benchmarking
-  - Explorer blockchain page: Product landing page with all 23 TX types, correct gas costs, architecture overview
+  - Explorer blockchain page: Product landing page with all 24 TX types, correct gas costs, architecture overview
   - Staking tiers fixed to real values: Spark (500K), Arc (5M), Core (50M)
   - 10 independent verification agents confirmed zero remaining issues
 - **P4 additions** (2026-03-20):
