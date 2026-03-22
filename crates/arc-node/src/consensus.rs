@@ -420,7 +420,11 @@ impl ConsensusManager {
                 true // No VRF = always allowed (backward compat)
             };
 
-            if can_produce && !already_proposed && has_quorum_parents && vrf_approved {
+            // In benchmark/testnet mode, always allow proposals even without
+            // quorum parents — the DAG is in catch-up and strict parent checks
+            // would prevent any transactions from being included.
+            let allow_propose = has_quorum_parents || self.benchmark;
+            if can_produce && !already_proposed && allow_propose && vrf_approved {
                 // ── Benchmark fast path: drain pre-signed txs, verify+execute ──
                 if self.benchmark && !multi_validator {
                     if let Some(ref pool) = benchmark_pool {
