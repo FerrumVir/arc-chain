@@ -1031,10 +1031,19 @@ impl ConsensusEngine {
         }
         // else: legacy/test mode — accept unsigned blocks
 
-        // 4. Round check: block cannot be too far in the future
+        // 4. Round check: if block is ahead, fast-forward to catch up (testnet round sync).
+        //    In production, this would require a proper state-sync protocol.
+        //    For now, allow peers to pull us forward so nodes that start at
+        //    different times can converge.
         let current = self.current_round.load(Ordering::SeqCst);
         if block.round > current + 1 {
-            return Err(ConsensusError::InvalidRound);
+            // Fast-forward: jump to block.round - 1 so we can accept this block
+            let new_round = block.round.saturating_sub(1);
+            self.current_round.store(new_round, Ordering::SeqCst);
+            tracing::info!(
+                "Round catch-up: fast-forwarded from {} to {} (peer block at round {})",
+                current, new_round, block.round
+            );
         }
 
         // 5. Parent validation
@@ -2495,13 +2504,16 @@ mod tests {
     }
 
     #[test]
-    fn test_receive_block_future_round_rejected() {
+    fn test_receive_block_future_round_catchup() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
-        // Current round is 0, block in round 5 should be rejected (> current + 1)
+        // Current round is 0, block in round 5 — should fast-forward and accept
         let block = make_block(test_addr(1), 5, vec![], vec![], 1000);
         let result = engine.receive_block(&block);
-        assert_eq!(result.unwrap_err(), ConsensusError::InvalidRound);
+        // Block is accepted (round catch-up), though it may fail parent validation
+        // The key is that it does NOT return InvalidRound
+        assert_ne!(result.clone().err(), Some(ConsensusError::InvalidRound),
+            "Future blocks should trigger round catch-up, not InvalidRound: {:?}", result);
     }
 
     // ── 4. Commit Rule ───────────────────────────────────────────────────────
