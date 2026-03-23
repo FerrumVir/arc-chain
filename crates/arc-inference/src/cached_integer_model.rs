@@ -303,8 +303,8 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
     output
 }
 
-/// AVX2 i8×i8→i32 SIMD matmul — sign-extend + i32 accumulation (no i16 saturation).
-/// Uses chunked parallelism (64 rows per chunk) to reduce rayon overhead.
+/// x86 SIMD matmul — auto-selects AVX-512 (64 i8/iter) or AVX2 (32 i8/iter).
+/// Uses sign-extend + _mm(256|512)_madd_epi16 for i32 accumulation, no saturation.
 #[cfg(target_arch = "x86_64")]
 fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     use std::arch::x86_64::*;
@@ -312,6 +312,8 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
     if !is_x86_feature_detected!("avx2") {
         return matmul_i8_par(weights, input, in_size, out_size);
     }
+
+    let use_avx512 = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
 
     let input_abs_max = input.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
     let input_scale_factor = (input_abs_max / 127).max(1);
@@ -329,42 +331,114 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
         for (local_i, out) in chunk.iter_mut().enumerate() {
             let i = start + local_i;
             let row = unsafe { data.as_ptr().add(i * in_size) };
+            let inp_ptr = inp_slice.as_ptr();
             let mut acc: i64 = 0;
-            let simd_len = in_size / 32 * 32;
 
-            unsafe {
-                let mut vacc = _mm256_setzero_si256();
-                let mut vacc2 = _mm256_setzero_si256();
+            if use_avx512 {
+                // AVX-512 path: process 64 i8 elements per iteration
+                let simd_len = in_size / 64 * 64;
+                unsafe {
+                    let mut vacc0 = _mm512_setzero_si512();
+                    let mut vacc1 = _mm512_setzero_si512();
 
-                let mut j = 0usize;
-                while j < simd_len {
-                    let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
-                    let vi = _mm256_loadu_si256(inp_slice.as_ptr().add(j) as *const __m256i);
+                    let mut j = 0usize;
+                    while j < simd_len {
+                        // Load 64 i8 weights and inputs
+                        let vw = _mm512_loadu_si512(row.add(j) as *const i32);
+                        let vi = _mm512_loadu_si512(inp_ptr.add(j) as *const i32);
 
-                    let vw_lo = _mm256_castsi256_si128(vw);
-                    let vw_hi = _mm256_extracti128_si256(vw, 1);
-                    let vi_lo = _mm256_castsi256_si128(vi);
-                    let vi_hi = _mm256_extracti128_si256(vi, 1);
+                        // Split into two 256-bit halves
+                        let vw_lo = _mm512_castsi512_si256(vw);
+                        let vw_hi = _mm512_extracti64x4_epi64(vw, 1);
+                        let vi_lo = _mm512_castsi512_si256(vi);
+                        let vi_hi = _mm512_extracti64x4_epi64(vi, 1);
 
-                    vacc = _mm256_add_epi32(vacc, _mm256_madd_epi16(
-                        _mm256_cvtepi8_epi16(vw_lo), _mm256_cvtepi8_epi16(vi_lo)));
-                    vacc2 = _mm256_add_epi32(vacc2, _mm256_madd_epi16(
-                        _mm256_cvtepi8_epi16(vw_hi), _mm256_cvtepi8_epi16(vi_hi)));
-                    j += 32;
+                        // Each 256-bit half → sign-extend to 512-bit i16 → madd to i32
+                        let vw16_lo = _mm512_cvtepi8_epi16(vw_lo);
+                        let vi16_lo = _mm512_cvtepi8_epi16(vi_lo);
+                        let vw16_hi = _mm512_cvtepi8_epi16(vw_hi);
+                        let vi16_hi = _mm512_cvtepi8_epi16(vi_hi);
+
+                        // 32 i16 × 32 i16 → 16 i32 pairwise products
+                        vacc0 = _mm512_add_epi32(vacc0, _mm512_madd_epi16(vw16_lo, vi16_lo));
+                        vacc1 = _mm512_add_epi32(vacc1, _mm512_madd_epi16(vw16_hi, vi16_hi));
+                        j += 64;
+                    }
+
+                    vacc0 = _mm512_add_epi32(vacc0, vacc1);
+                    acc = _mm512_reduce_add_epi32(vacc0) as i64;
+
+                    // AVX2 cleanup for 32-element remainder
+                    let avx2_start = simd_len;
+                    let avx2_len = (in_size - avx2_start) / 32 * 32;
+                    if avx2_len > 0 {
+                        let mut va = _mm256_setzero_si256();
+                        let mut j = avx2_start;
+                        while j < avx2_start + avx2_len {
+                            let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
+                            let vi = _mm256_loadu_si256(inp_ptr.add(j) as *const __m256i);
+                            let vw_lo = _mm256_castsi256_si128(vw);
+                            let vw_hi = _mm256_extracti128_si256(vw, 1);
+                            let vi_lo = _mm256_castsi256_si128(vi);
+                            let vi_hi = _mm256_extracti128_si256(vi, 1);
+                            va = _mm256_add_epi32(va, _mm256_madd_epi16(
+                                _mm256_cvtepi8_epi16(vw_lo), _mm256_cvtepi8_epi16(vi_lo)));
+                            va = _mm256_add_epi32(va, _mm256_madd_epi16(
+                                _mm256_cvtepi8_epi16(vw_hi), _mm256_cvtepi8_epi16(vi_hi)));
+                            j += 32;
+                        }
+                        let lo = _mm256_extracti128_si256(va, 0);
+                        let hi = _mm256_extracti128_si256(va, 1);
+                        let s = _mm_add_epi32(lo, hi);
+                        let s = _mm_hadd_epi32(s, s);
+                        let s = _mm_hadd_epi32(s, s);
+                        acc += _mm_extract_epi32(s, 0) as i64;
+                    }
+
+                    // Scalar remainder
+                    let mut jj = avx2_start + avx2_len;
+                    while jj < in_size {
+                        acc += (*row.add(jj) as i64) * (*inp_ptr.add(jj) as i64);
+                        jj += 1;
+                    }
                 }
+            } else {
+                // AVX2 path: process 32 i8 elements per iteration
+                let simd_len = in_size / 32 * 32;
+                unsafe {
+                    let mut vacc = _mm256_setzero_si256();
+                    let mut vacc2 = _mm256_setzero_si256();
 
-                vacc = _mm256_add_epi32(vacc, vacc2);
-                let lo = _mm256_extracti128_si256(vacc, 0);
-                let hi = _mm256_extracti128_si256(vacc, 1);
-                let sum128 = _mm_add_epi32(lo, hi);
-                let sum128 = _mm_hadd_epi32(sum128, sum128);
-                let sum128 = _mm_hadd_epi32(sum128, sum128);
-                acc = _mm_extract_epi32(sum128, 0) as i64;
+                    let mut j = 0usize;
+                    while j < simd_len {
+                        let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
+                        let vi = _mm256_loadu_si256(inp_ptr.add(j) as *const __m256i);
 
-                let mut jj = simd_len;
-                while jj < in_size {
-                    acc += (*row.add(jj) as i64) * (*inp_slice.as_ptr().add(jj) as i64);
-                    jj += 1;
+                        let vw_lo = _mm256_castsi256_si128(vw);
+                        let vw_hi = _mm256_extracti128_si256(vw, 1);
+                        let vi_lo = _mm256_castsi256_si128(vi);
+                        let vi_hi = _mm256_extracti128_si256(vi, 1);
+
+                        vacc = _mm256_add_epi32(vacc, _mm256_madd_epi16(
+                            _mm256_cvtepi8_epi16(vw_lo), _mm256_cvtepi8_epi16(vi_lo)));
+                        vacc2 = _mm256_add_epi32(vacc2, _mm256_madd_epi16(
+                            _mm256_cvtepi8_epi16(vw_hi), _mm256_cvtepi8_epi16(vi_hi)));
+                        j += 32;
+                    }
+
+                    vacc = _mm256_add_epi32(vacc, vacc2);
+                    let lo = _mm256_extracti128_si256(vacc, 0);
+                    let hi = _mm256_extracti128_si256(vacc, 1);
+                    let sum128 = _mm_add_epi32(lo, hi);
+                    let sum128 = _mm_hadd_epi32(sum128, sum128);
+                    let sum128 = _mm_hadd_epi32(sum128, sum128);
+                    acc = _mm_extract_epi32(sum128, 0) as i64;
+
+                    let mut jj = simd_len;
+                    while jj < in_size {
+                        acc += (*row.add(jj) as i64) * (*inp_ptr.add(jj) as i64);
+                        jj += 1;
+                    }
                 }
             }
 
