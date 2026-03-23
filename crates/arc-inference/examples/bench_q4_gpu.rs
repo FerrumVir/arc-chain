@@ -103,7 +103,7 @@ fn main() {
 
     // GPU test
     println!("\n=== GPU Matmul ===");
-    match arc_gpu::gpu_matmul::GpuMatmul::new() {
+    match arc_gpu::gpu_matmul::GpuMatmul::new(dff, cfg.vocab_size) {
         Ok(gpu) => {
             let gw = gpu.upload_weights(&model.layers[0].wq.data, d, d);
             let input_i8: Vec<i8> = input_d_q.data.clone();
