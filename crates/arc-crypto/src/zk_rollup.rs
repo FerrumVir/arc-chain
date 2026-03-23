@@ -259,8 +259,9 @@ impl RollupVerifier {
             return false;
         }
 
-        // Simulate verification: BLAKE3 of proof_data must have leading zero
-        // nibble (trivial PoW stand-in for real ZK verification).
+        // Mock verification: BLAKE3 of proof_data must have leading zero
+        // nibble. This is NOT a ZK proof — it's a trivial PoW check for
+        // pipeline testing. Real STARK verification is in `stwo_air.rs`.
         let h = blake3::hash(&proof.proof_data);
         h.as_bytes()[0] < 0x10
     }

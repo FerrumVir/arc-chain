@@ -202,17 +202,16 @@ impl Int4Runtime {
             });
         }
 
-        // Deterministic INT4 forward pass.
+        // Deterministic inference dispatch.
         //
-        // When candle integration is complete (week 11-12), this will:
-        // 1. Load GGUF quantized weights from content-addressed storage
-        // 2. Unpack INT4 → i8
-        // 3. Matrix multiply using i32 accumulation (exact on all hardware)
-        // 4. Apply integer-rational scaling: out = acc * numerator / denominator
-        // 5. Argmax for next token (deterministic tie-breaking by index)
+        // The real integer-only inference engine is in `integer_engine.rs`
+        // and `cached_integer_model.rs` (i64 fixed-point, NEON/AVX2 SIMD,
+        // bitwise deterministic across platforms). The GGUF loading path
+        // is in `gguf_integer.rs` behind the `candle` feature flag.
         //
-        // For now, use deterministic hash-based output generation that
-        // produces consistent output given the same model + input.
+        // This Int4Runtime entry point currently uses a hash-based mock
+        // for integration testing. Connect to CachedIntegerModel for real
+        // transformer inference.
         let output = deterministic_mock_inference(
             &request.model_id,
             &request.input,
