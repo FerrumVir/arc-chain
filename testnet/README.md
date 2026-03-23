@@ -56,7 +56,7 @@ bash scripts/monitor-testnet.sh localhost:9090 localhost:9190 localhost:9290 loc
 | Parameter | Value |
 |-----------|-------|
 | Chain ID | 0x415243 ("ARC") |
-| Block time | ~2s (finality ~4.3s, 2-round DAG) |
+| Block time | ~12ms/round (finality ~24ms, 2-round DAG) |
 | Consensus | DAG (Mysticeti-inspired), 2-round finality |
 | Min stake (Observer) | 50,000 ARC |
 | Min stake (Verifier) | 500,000 ARC |
