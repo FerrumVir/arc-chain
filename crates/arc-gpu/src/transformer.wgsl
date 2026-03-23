@@ -68,20 +68,44 @@ fn matmul(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let packed_cols = mm_params.in_size / 4u;
     let row_off = row * packed_cols;
-    var acc: i32 = 0;
+    var acc0: i32 = 0;
+    var acc1: i32 = 0;
+    var acc2: i32 = 0;
+    var acc3: i32 = 0;
 
-    for (var j: u32 = 0u; j < packed_cols; j = j + 1u) {
+    // 4-way ILP: process 4 packed u32s (16 i8 values) per iteration
+    let quads = packed_cols / 4u;
+    for (var j: u32 = 0u; j < quads; j = j + 1u) {
+        let j4 = j * 4u;
+        let w0 = mm_weights[row_off + j4];
+        let w1 = mm_weights[row_off + j4 + 1u];
+        let w2 = mm_weights[row_off + j4 + 2u];
+        let w3 = mm_weights[row_off + j4 + 3u];
+        let i0 = mm_input[j4];
+        let i1 = mm_input[j4 + 1u];
+        let i2 = mm_input[j4 + 2u];
+        let i3 = mm_input[j4 + 3u];
+        acc0 += ext_i8(w0, 0u) * ext_i8(i0, 0u) + ext_i8(w0, 1u) * ext_i8(i0, 1u)
+              + ext_i8(w0, 2u) * ext_i8(i0, 2u) + ext_i8(w0, 3u) * ext_i8(i0, 3u);
+        acc1 += ext_i8(w1, 0u) * ext_i8(i1, 0u) + ext_i8(w1, 1u) * ext_i8(i1, 1u)
+              + ext_i8(w1, 2u) * ext_i8(i1, 2u) + ext_i8(w1, 3u) * ext_i8(i1, 3u);
+        acc2 += ext_i8(w2, 0u) * ext_i8(i2, 0u) + ext_i8(w2, 1u) * ext_i8(i2, 1u)
+              + ext_i8(w2, 2u) * ext_i8(i2, 2u) + ext_i8(w2, 3u) * ext_i8(i2, 3u);
+        acc3 += ext_i8(w3, 0u) * ext_i8(i3, 0u) + ext_i8(w3, 1u) * ext_i8(i3, 1u)
+              + ext_i8(w3, 2u) * ext_i8(i3, 2u) + ext_i8(w3, 3u) * ext_i8(i3, 3u);
+    }
+    var acc = acc0 + acc1 + acc2 + acc3;
+
+    // Remainder
+    for (var j = quads * 4u; j < packed_cols; j = j + 1u) {
         let w = mm_weights[row_off + j];
-        let inp = mm_input[j];
-        acc += ext_i8(w, 0u) * ext_i8(inp, 0u);
-        acc += ext_i8(w, 1u) * ext_i8(inp, 1u);
-        acc += ext_i8(w, 2u) * ext_i8(inp, 2u);
-        acc += ext_i8(w, 3u) * ext_i8(inp, 3u);
+        let i = mm_input[j];
+        acc += ext_i8(w, 0u) * ext_i8(i, 0u) + ext_i8(w, 1u) * ext_i8(i, 1u)
+             + ext_i8(w, 2u) * ext_i8(i, 2u) + ext_i8(w, 3u) * ext_i8(i, 3u);
     }
 
-    // Apply per-row scale: result = acc * scale (scale already includes input_scale)
     let scale = mm_scales[mm_params.scale_offset + row];
-    mm_output[row] = acc * (scale >> 8); // reduced precision to avoid overflow
+    mm_output[row] = acc * (scale >> 8);
 }
 
 // ─── Kernel: LayerNorm ────────────────────────────────────────────────────────
