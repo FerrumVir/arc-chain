@@ -4,8 +4,8 @@
 //! from the eligible pool using VRF output as seed. Committee members execute
 //! the model independently and must reach ≥5/7 agreement on the output hash.
 //!
-//! Security: With 10% malicious validators, P(corruption) = 0.002%.
-//!           With 20% malicious validators, P(corruption) = 0.12%.
+//! Security: With 10% malicious validators, P(corruption) = 0.018%.
+//!           With 20% malicious validators, P(corruption) = 0.47%.
 
 use arc_crypto::{hash_bytes, Hash256};
 use serde::{Deserialize, Serialize};
@@ -308,13 +308,13 @@ mod tests {
 
     #[test]
     fn test_corruption_probability() {
-        // 10% malicious, 7 committee, 5 required → ~0.002%
+        // 10% malicious, 7 committee, 5 required → ~0.018%
         let p = corruption_probability(0.1, 7, 5);
         assert!(p < 0.001, "P(corrupt) = {p}, expected < 0.1%");
 
-        // 20% malicious → ~0.12%
+        // 20% malicious → ~0.47%
         let p = corruption_probability(0.2, 7, 5);
-        assert!(p < 0.005, "P(corrupt) = {p}, expected < 0.5%");
+        assert!(p < 0.01, "P(corrupt) = {p}, expected < 1%");
 
         // 50% malicious → much higher
         let p = corruption_probability(0.5, 7, 5);

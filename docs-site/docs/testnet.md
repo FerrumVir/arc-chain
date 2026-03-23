@@ -61,7 +61,7 @@ Most community members run as Observers. The desktop app handles this automatica
 | Parameter | Value |
 |-----------|-------|
 | Chain ID | 0x415243 ("ARC") |
-| Finality | ~400ms |
+| Finality | ~4.3s (2-round DAG commit) |
 | Consensus | DAG (Mysticeti-inspired) |
 | Block explorer | [ARC Scan](https://dist-three-amber-39.vercel.app) |
 | Faucet | Built into every node at `/faucet/claim` |

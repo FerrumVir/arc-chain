@@ -291,26 +291,26 @@ def generate_paper_tables(all_results):
     md += "| Metric | Value |\n|--------|-------|\n"
     md += "| Sustained TPS (2-node) | 33,230 |\n"
     md += "| Peak TPS (single-node) | 183,000 |\n"
-    md += "| Finality | ~400ms (2-round DAG) |\n"
+    md += "| Finality | ~4.3s (2-round DAG) |\n"
     md += "| Transaction types | 24 native |\n"
     md += "| Codebase | 80,683 LOC Rust |\n"
-    md += "| Tests | 1,128 passing |\n\n"
+    md += "| Tests | 1,185 passing |\n\n"
 
     # Table 4: Security (VRF Committee)
     md += "## Table: VRF Committee Corruption Probability (k=7, t=5)\n\n"
     md += "| Malicious Fraction | P(corrupt) |\n|-------------------|------------|\n"
-    md += "| 5% | 0.00004% |\n"
-    md += "| 10% | 0.0017% |\n"
-    md += "| 20% | 0.115% |\n"
-    md += "| 33% | 2.57% |\n\n"
+    md += "| 5% | 0.0006% |\n"
+    md += "| 10% | 0.018% |\n"
+    md += "| 20% | 0.47% |\n"
+    md += "| 33% | 4.34% |\n\n"
 
     # Table 5: Gas Lane DoS Resistance
     md += "## Table: Inference Gas Lane Fee Escalation\n\n"
     md += "| Consecutive Full Blocks | Fee Multiplier |\n|------------------------|----------------|\n"
     md += "| 10 | 3.25x |\n"
     md += "| 20 | 10.5x |\n"
-    md += "| 50 | 245x |\n"
-    md += "| 100 | 60,163x |\n\n"
+    md += "| 50 | 361x |\n"
+    md += "| 100 | 130,392x |\n\n"
 
     return md
 

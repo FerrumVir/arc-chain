@@ -157,6 +157,17 @@ pub struct ModelConfig {
     pub max_seq: usize,
 }
 
+/// Pre-converted Q4 layer weights (optional, converted at runtime).
+pub struct Q4Layer {
+    pub wq: Q4WeightsX86,
+    pub wk: Q4WeightsX86,
+    pub wv: Q4WeightsX86,
+    pub wo: Q4WeightsX86,
+    pub w_gate: Q4WeightsX86,
+    pub w_up: Q4WeightsX86,
+    pub w_down: Q4WeightsX86,
+}
+
 /// Fully cached integer model with per-row INT8 weights.
 pub struct CachedIntegerModel {
     pub config: ModelConfig,
@@ -165,6 +176,27 @@ pub struct CachedIntegerModel {
     pub final_norm: Vec<i64>,
     pub output_weight: I8Weights, // [vocab × d_model]
     pub vocab: Vec<String>,
+    /// Q4 weights — converted from I8 on enable_q4(). Halves bandwidth.
+    pub q4_layers: Option<Vec<Q4Layer>>,
+    pub q4_output: Option<Q4WeightsX86>,
+}
+
+impl CachedIntegerModel {
+    /// Convert all weights to Q4 (4-bit). Halves memory bandwidth.
+    /// Call once after loading model. Original I8 weights kept for fallback.
+    pub fn enable_q4(&mut self) {
+        let q4_layers: Vec<Q4Layer> = self.layers.iter().map(|l| Q4Layer {
+            wq: Q4WeightsX86::from_i8(&l.wq),
+            wk: Q4WeightsX86::from_i8(&l.wk),
+            wv: Q4WeightsX86::from_i8(&l.wv),
+            wo: Q4WeightsX86::from_i8(&l.wo),
+            w_gate: Q4WeightsX86::from_i8(&l.w_gate),
+            w_up: Q4WeightsX86::from_i8(&l.w_up),
+            w_down: Q4WeightsX86::from_i8(&l.w_down),
+        }).collect();
+        self.q4_output = Some(Q4WeightsX86::from_i8(&self.output_weight));
+        self.q4_layers = Some(q4_layers);
+    }
 }
 
 // ─── Cached Input Quantization ────────────────────────────────────────────────
@@ -1462,6 +1494,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
         },
         embedding, layers, final_norm, output_weight, vocab,
+        q4_layers: None, q4_output: None,
     })
 }
 
@@ -1539,6 +1572,7 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
             vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
         },
         embedding, layers, final_norm, output_weight, vocab,
+        q4_layers: None, q4_output: None,
     })
 }
 
@@ -1587,6 +1621,7 @@ mod tests {
             },
             embedding, layers, final_norm: vec![ONE; d], output_weight,
             vocab: (0..vs).map(|i| format!("tok_{}", i)).collect(),
+            q4_layers: None, q4_output: None,
         }
     }
 
