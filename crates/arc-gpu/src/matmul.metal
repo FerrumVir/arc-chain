@@ -1,9 +1,14 @@
 #include <metal_stdlib>
 using namespace metal;
 
-/// Native Metal i8 matmul — NO u32 packing overhead.
-/// Uses char/char4 for direct i8 memory access.
-/// Each thread: one output row. Input in threadgroup shared memory.
+// llama.cpp-style tiled matmul adapted for integer-only per-row INT8.
+//
+// Pattern from ggml-metal.metal (MIT license) with f16→int32 arithmetic:
+// - 4 simdgroups per threadgroup (128 threads total)
+// - Each simdgroup handles 1 output row
+// - 32 threads split the inner dimension (simd_sum for reduction)
+// - char4 vector loads (4 i8 per instruction, no u32 packing)
+// - simd_sum hardware reduction (~2 cycles vs manual workgroup barrier)
 
 struct MatmulParams {
     uint in_size;
@@ -18,48 +23,43 @@ kernel void matmul_i8(
     device int* output [[buffer(2)]],
     constant MatmulParams& params [[buffer(3)]],
     device const int* scales [[buffer(4)]],
-    uint gid [[thread_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]],
+    ushort sgitg [[simdgroup_index_in_threadgroup]]
 ) {
-    // Load input into shared memory (max 11008 bytes)
-    threadgroup char shared_input[11008];
-    for (uint i = lid; i < params.in_size; i += tg_size) {
-        shared_input[i] = input[i];
+    // Each simdgroup handles one row, 4 simdgroups per threadgroup = 4 rows
+    const int row = tgpig.x * 4 + sgitg;
+    if (row >= (int)params.out_size) return;
+
+    const uint in_sz = params.in_size;
+    device const char* w = weights + row * in_sz;
+
+    // 32 threads split inner dimension: each handles in_size/32 elements
+    const uint chunk = in_sz / 32;
+    const uint start = tiisg * chunk;
+    const uint end = start + chunk;
+
+    int acc = 0;
+
+    // char4 vector loads: 4 i8 per load, no extraction overhead
+    const uint vec_end = start + (chunk / 4 * 4);
+    for (uint j = start; j < vec_end; j += 4) {
+        char4 wv = *reinterpret_cast<device const char4*>(w + j);
+        char4 iv = *reinterpret_cast<device const char4*>(input + j);
+        acc += int(wv.x)*int(iv.x) + int(wv.y)*int(iv.y)
+             + int(wv.z)*int(iv.z) + int(wv.w)*int(iv.w);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (gid >= params.out_size) return;
-
-    uint row_off = gid * params.in_size;
-    int acc0 = 0, acc1 = 0, acc2 = 0, acc3 = 0;
-
-    // Process 16 chars per iteration using char4 vector loads
-    uint vec_len = params.in_size / 16 * 16;
-    for (uint j = 0; j < vec_len; j += 16) {
-        char4 w0 = *reinterpret_cast<device const char4*>(weights + row_off + j);
-        char4 w1 = *reinterpret_cast<device const char4*>(weights + row_off + j + 4);
-        char4 w2 = *reinterpret_cast<device const char4*>(weights + row_off + j + 8);
-        char4 w3 = *reinterpret_cast<device const char4*>(weights + row_off + j + 12);
-
-        char4 i0 = *reinterpret_cast<threadgroup const char4*>(shared_input + j);
-        char4 i1 = *reinterpret_cast<threadgroup const char4*>(shared_input + j + 4);
-        char4 i2 = *reinterpret_cast<threadgroup const char4*>(shared_input + j + 8);
-        char4 i3 = *reinterpret_cast<threadgroup const char4*>(shared_input + j + 12);
-
-        acc0 += int(w0.x)*int(i0.x) + int(w0.y)*int(i0.y) + int(w0.z)*int(i0.z) + int(w0.w)*int(i0.w);
-        acc1 += int(w1.x)*int(i1.x) + int(w1.y)*int(i1.y) + int(w1.z)*int(i1.z) + int(w1.w)*int(i1.w);
-        acc2 += int(w2.x)*int(i2.x) + int(w2.y)*int(i2.y) + int(w2.z)*int(i2.z) + int(w2.w)*int(i2.w);
-        acc3 += int(w3.x)*int(i3.x) + int(w3.y)*int(i3.y) + int(w3.z)*int(i3.z) + int(w3.w)*int(i3.w);
-    }
-
-    int acc = acc0 + acc1 + acc2 + acc3;
-
     // Scalar remainder
-    for (uint j = vec_len; j < params.in_size; j++) {
-        acc += int(weights[row_off + j]) * int(shared_input[j]);
+    for (uint j = vec_end; j < end; j++) {
+        acc += int(w[j]) * int(input[j]);
     }
 
-    int scale = scales[params.scale_offset + gid];
-    output[gid] = acc * (scale >> 8);
+    // simd_sum: hardware reduction across 32 threads in ~2 cycles
+    int total = simd_sum(acc);
+
+    // Thread 0 writes the scaled result
+    if (tiisg == 0) {
+        int scale = scales[params.scale_offset + row];
+        output[row] = total * (scale >> 8);
+    }
 }
