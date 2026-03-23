@@ -116,6 +116,12 @@ struct Cli {
     /// Defines prefunded accounts and initial validators for custom deployments.
     #[arg(long)]
     genesis: Option<String>,
+
+    /// Path to a GGUF model file for on-chain inference.
+    /// Loads the model into INT8 cached memory at startup.
+    /// Enables the /inference/run RPC endpoint with real deterministic inference.
+    #[arg(long)]
+    model: Option<String>,
 }
 
 #[tokio::main]
@@ -384,6 +390,34 @@ async fn main() -> Result<()> {
 
     let mempool = Arc::new(Mempool::new(10_000_000));
 
+    // ── Load inference model (if --model provided) ──────────────────────
+    let inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>> =
+        if let Some(model_path) = &cli.model {
+            tracing::info!("Loading GGUF model from {} into INT8 cache...", model_path);
+            let load_start = Instant::now();
+            match arc_inference::cached_integer_model::load_cached_model(model_path) {
+                Ok(model) => {
+                    let elapsed = load_start.elapsed();
+                    let mem_mb = model.memory_bytes() / (1024 * 1024);
+                    tracing::info!(
+                        "Model loaded in {:.1}s — {} MB INT8, {} layers, vocab {}",
+                        elapsed.as_secs_f64(),
+                        mem_mb,
+                        model.config.n_layers,
+                        model.config.vocab_size,
+                    );
+                    Some(Arc::new(model))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to load model: {}", e);
+                    tracing::warn!("Node will start without inference capability");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     // ── Record boot time for uptime tracking ──────────────────────────
     let boot_time = Instant::now();
 
@@ -469,6 +503,7 @@ async fn main() -> Result<()> {
             stake,
             boot_time,
             peer_count.clone(),
+            inference_model.clone(),
         );
         tracing::info!("ETH RPC    : {} (MetaMask/Hardhat/Foundry)", eth_addr);
         tokio::spawn(async move {
@@ -479,6 +514,9 @@ async fn main() -> Result<()> {
     }
 
     // ── Start RPC server ────────────────────────────────────────────────
+    if inference_model.is_some() {
+        tracing::info!("Inference  : ENABLED (INT8 integer engine, deterministic)");
+    }
     tracing::info!("RPC server listening on {}", rpc_addr);
     rpc::serve(
         &rpc_addr,
@@ -488,6 +526,7 @@ async fn main() -> Result<()> {
         stake,
         boot_time,
         peer_count,
+        inference_model,
     )
     .await?;
 

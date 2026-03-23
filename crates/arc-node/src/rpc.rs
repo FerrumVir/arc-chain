@@ -36,6 +36,8 @@ pub struct NodeState {
     pub faucet_claims: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
     /// Total faucet claims since boot.
     pub faucet_claims_total: Arc<AtomicU32>,
+    /// Cached INT8 inference model (if --model was provided).
+    pub inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
 }
 
 /// Build a `NodeState` from components.
@@ -46,6 +48,7 @@ pub fn build_node_state(
     stake: u64,
     boot_time: Instant,
     peer_count: Arc<AtomicU32>,
+    inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
 ) -> NodeState {
     let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
     NodeState {
@@ -58,6 +61,7 @@ pub fn build_node_state(
         peer_count,
         faucet_claims: Arc::new(Mutex::new(HashMap::new())),
         faucet_claims_total: Arc::new(AtomicU32::new(0)),
+        inference_model,
     }
 }
 
@@ -70,8 +74,9 @@ pub async fn serve(
     stake: u64,
     boot_time: Instant,
     peer_count: Arc<AtomicU32>,
+    inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
 ) -> anyhow::Result<()> {
-    let node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count);
+    let node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model);
 
     let app = Router::new()
         .route("/", get(index))
@@ -2431,29 +2436,26 @@ async fn channel_state(
 
 // ─── Inference Endpoints ─────────────────────────────────────────────────────
 
-/// Run inference and record attestation on-chain.
+/// Run inference through the cached INT8 integer model and record attestation on-chain.
 ///
 /// POST /inference/run
-/// Body: { "model_id": "0x...", "input": "prompt text", "bond": 1000 }
+/// Body: { "input": "What is 2+2?", "max_tokens": 64, "bond": 1000 }
 ///
-/// This endpoint:
-/// 1. Runs inference through the InferenceEngine (precompile 0x0A path)
-/// 2. Computes output hash
-/// 3. Creates an InferenceAttestation transaction
-/// 4. Submits it to the mempool
-/// 5. Returns the attestation details + TX hash
+/// If --model was provided at startup, runs real deterministic inference through
+/// the cached INT8 integer engine. Pure i64 arithmetic — identical output hash
+/// on ARM, x86, RISC-V, any platform.
 ///
-/// The attestation will appear in the next block and is visible in the explorer.
+/// Returns the query, response text, output hash, ms/token, and attestation TX.
 async fn inference_run(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
-    let model_id_hex = req.get("model_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
     let input_text = req.get("input")
         .and_then(|v| v.as_str())
         .unwrap_or("Hello, world!");
+    let max_tokens = req.get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(64) as u32;
     let bond = req.get("bond")
         .and_then(|v| v.as_u64())
         .unwrap_or(1000);
@@ -2461,56 +2463,49 @@ async fn inference_run(
         .and_then(|v| v.as_u64())
         .unwrap_or(100);
 
-    // Parse model_id
-    let model_id_bytes = hex::decode(model_id_hex.trim_start_matches("0x"))
-        .unwrap_or_else(|_| vec![0u8; 32]);
-    let mut model_id = [0u8; 32];
-    let len = model_id_bytes.len().min(32);
-    model_id[..len].copy_from_slice(&model_id_bytes[..len]);
-    let model_id_hash = arc_crypto::Hash256(model_id);
-
-    // Run inference through the engine
-    let start = std::time::Instant::now();
-
-    // Compute hashes for the attestation
-    let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
-
-    // Execute through precompile-style engine
-    let mut engine = arc_vm::inference::InferenceEngine::new(arc_vm::inference::InferenceConfig {
-        max_loaded_models: 16,
-        default_timeout_ms: 5_000,
-        max_tokens: 256,
-        temperature: 0.0,
-    });
-
-    let request = arc_vm::inference::InferenceRequest {
-        model_id: model_id,
-        input: arc_vm::inference::InferenceInput::Text(input_text.to_string()),
-        params: arc_vm::inference::InferenceParams {
-            max_tokens: 256,
-            temperature: 0.0,
-            top_p: 1.0,
-            stop_sequences: vec![],
-        },
-    };
-
-    let (output_text, output_hash, inference_ms) = match engine.run_inference(&request) {
-        Ok(resp) => {
-            let output_str = match &resp.output {
-                arc_vm::inference::InferenceOutput::Text(s) => s.clone(),
-                other => format!("{:?}", other),
-            };
-            let out_hash = arc_crypto::hash_bytes(output_str.as_bytes());
-            let ms = start.elapsed().as_millis() as u64;
-            (output_str, out_hash, ms)
-        }
-        Err(e) => {
+    // Check if we have a loaded model
+    let model = match &node.inference_model {
+        Some(m) => m.clone(),
+        None => {
             return Ok(Json(json!({
                 "success": false,
-                "error": format!("Inference failed: {e}"),
+                "error": "No model loaded. Start node with --model /path/to/model.gguf",
             })));
         }
     };
+
+    let start = std::time::Instant::now();
+
+    // Encode input text to tokens
+    let prompt_tokens = model.encode(input_text);
+    let encode_ms = start.elapsed().as_millis() as u64;
+
+    if prompt_tokens.is_empty() {
+        return Ok(Json(json!({
+            "success": false,
+            "error": "Failed to encode input text to tokens",
+        })));
+    }
+
+    // Run inference through the cached INT8 integer engine
+    // EOS tokens for Llama: 2 (</s>), 0 (<unk>)
+    let eos_tokens = vec![2u32, 0];
+    let (generated_tokens, output_hash) = model.generate(&prompt_tokens, max_tokens, &eos_tokens);
+    let inference_ms = start.elapsed().as_millis() as u64;
+    let tokens_generated = generated_tokens.len() as u64;
+    let ms_per_token = if tokens_generated > 0 { inference_ms / tokens_generated } else { 0 };
+
+    // Decode output tokens to text
+    let output_text = model.decode(&generated_tokens);
+
+    // Compute model ID from model config hash
+    let model_id_data = format!(
+        "arc-int8-{}L-{}d-{}h-{}v",
+        model.config.n_layers, model.config.d_model,
+        model.config.n_heads, model.config.vocab_size
+    );
+    let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
+    let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
 
     // Create InferenceAttestation transaction
     let attester = node.validator_address;
@@ -2541,18 +2536,25 @@ async fn inference_run(
     let tx_hash = tx.compute_hash();
 
     // Submit to mempool
-    let submit_result = node.mempool.insert(tx);
+    let _submit_result = node.mempool.insert(tx);
 
     Ok(Json(json!({
         "success": true,
         "inference": {
-            "model_id": format!("0x{}", hex::encode(&model_id)),
+            "model": model_id_data,
+            "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
             "input": input_text,
+            "input_tokens": prompt_tokens.len(),
             "input_hash": format!("0x{}", hex::encode(&input_hash.0)),
             "output": output_text,
+            "output_tokens": generated_tokens,
             "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+            "tokens_generated": tokens_generated,
             "inference_ms": inference_ms,
+            "ms_per_token": ms_per_token,
+            "encode_ms": encode_ms,
             "deterministic": true,
+            "engine": "INT8 integer (cross-platform deterministic)",
         },
         "attestation": {
             "tx_hash": format!("0x{}", hex::encode(&tx_hash.0)),

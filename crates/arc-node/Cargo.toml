@@ -23,6 +23,7 @@ arc-vm = { path = "../arc-vm" }
 arc-mempool = { path = "../arc-mempool" }
 arc-gpu = { path = "../arc-gpu" }
 arc-consensus = { path = "../arc-consensus" }
+arc-inference = { path = "../arc-inference", features = ["candle"] }
 arc-net = { path = "../arc-net" }
 tokio.workspace = true
 axum.workspace = true

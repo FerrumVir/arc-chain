@@ -310,14 +310,48 @@ function TransactionBodyDetails({ body }: { body: TransactionBody }) {
               AI Inference Attestation
             </span>
           </DetailRow>
-          <DetailRow label="Model ID">
-            <span className="font-mono text-xs break-all">{body.model_id}</span>
+          <DetailRow label="Model">
+            <span className="font-mono text-xs break-all">{body.model_name || body.model_id}</span>
           </DetailRow>
+          {body.input_text && (
+            <DetailRow label="Query">
+              <div className="bg-arc-surface p-3 rounded border border-arc-border-subtle">
+                <span className="text-sm text-arc-white whitespace-pre-wrap">{body.input_text}</span>
+              </div>
+            </DetailRow>
+          )}
+          {body.output_text && (
+            <DetailRow label="Response">
+              <div className="bg-arc-surface p-3 rounded border border-arc-border-subtle">
+                <span className="text-sm text-arc-white whitespace-pre-wrap">{body.output_text}</span>
+              </div>
+            </DetailRow>
+          )}
           <DetailRow label="Input Hash">
             <span className="font-mono text-xs break-all">{body.input_hash}</span>
           </DetailRow>
           <DetailRow label="Output Hash">
             <span className="font-mono text-xs break-all">{body.output_hash}</span>
+          </DetailRow>
+          {body.tokens_generated > 0 && (
+            <DetailRow label="Performance">
+              <span className="text-sm">
+                {body.tokens_generated} tokens in {body.inference_ms}ms
+                ({body.ms_per_token}ms/token)
+              </span>
+            </DetailRow>
+          )}
+          <DetailRow label="Verification">
+            <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${
+              body.verified ? 'bg-green-100 text-green-800' : 'bg-yellow-100 text-yellow-800'
+            }`}>
+              {body.verified ? 'Verified by validators' : 'Pending verification'}
+            </span>
+          </DetailRow>
+          <DetailRow label="Engine">
+            <span className="text-xs text-arc-grey-400">
+              {body.engine || 'INT8 integer (cross-platform deterministic)'}
+            </span>
           </DetailRow>
           <DetailRow label="Challenge Period">{body.challenge_period} blocks</DetailRow>
           <DetailRow label="Bond">{body.bond.toLocaleString()} ARC</DetailRow>
