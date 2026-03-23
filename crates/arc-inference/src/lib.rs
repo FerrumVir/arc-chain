@@ -10,6 +10,7 @@ pub mod gas;
 pub mod candle_backend;
 pub mod integer_lut;
 pub mod integer_engine;
+pub mod gguf_integer;
 
 use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};
