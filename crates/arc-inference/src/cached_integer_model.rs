@@ -326,11 +326,15 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
 
     let use_avx512 = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
 
+    // Quantize input once — reused across all output rows
     let input_abs_max = input.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
     let input_scale_factor = (input_abs_max / 127).max(1);
-    let input_i8: Vec<i8> = input.iter()
-        .map(|&x| (x / input_scale_factor).clamp(-127, 127) as i8)
-        .collect();
+    // Align to 64 bytes for AVX-512 loads (pad with zeros)
+    let aligned_len = (in_size + 63) & !63;
+    let mut input_i8 = vec![0i8; aligned_len];
+    for (i, &x) in input.iter().enumerate() {
+        input_i8[i] = (x / input_scale_factor).clamp(-127, 127) as i8;
+    }
 
     let data = &weights.data;
     let inp_slice = &input_i8;
@@ -346,110 +350,142 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
             let mut acc: i64 = 0;
 
             if use_avx512 {
-                // AVX-512 path: process 64 i8 elements per iteration
-                let simd_len = in_size / 64 * 64;
+                // AVX-512: 4 independent 512-bit accumulators for ILP
+                // + software prefetch 256 bytes ahead
+                let simd_len = in_size / 128 * 128; // process 128 per iteration
                 unsafe {
                     let mut vacc0 = _mm512_setzero_si512();
                     let mut vacc1 = _mm512_setzero_si512();
+                    let mut vacc2 = _mm512_setzero_si512();
+                    let mut vacc3 = _mm512_setzero_si512();
 
                     let mut j = 0usize;
                     while j < simd_len {
-                        // Load 64 i8 weights and inputs
+                        // Prefetch next iteration's data into L1
+                        _mm_prefetch(row.add(j + 256) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(inp_ptr.add(j + 256) as *const i8, _MM_HINT_T0);
+
+                        // First 64 elements
+                        let vw0 = _mm512_loadu_si512(row.add(j) as *const __m512i);
+                        let vi0 = _mm512_loadu_si512(inp_ptr.add(j) as *const __m512i);
+                        let vw0_lo = _mm512_castsi512_si256(vw0);
+                        let vw0_hi = _mm512_extracti64x4_epi64(vw0, 1);
+                        let vi0_lo = _mm512_castsi512_si256(vi0);
+                        let vi0_hi = _mm512_extracti64x4_epi64(vi0, 1);
+                        vacc0 = _mm512_add_epi32(vacc0, _mm512_madd_epi16(
+                            _mm512_cvtepi8_epi16(vw0_lo), _mm512_cvtepi8_epi16(vi0_lo)));
+                        vacc1 = _mm512_add_epi32(vacc1, _mm512_madd_epi16(
+                            _mm512_cvtepi8_epi16(vw0_hi), _mm512_cvtepi8_epi16(vi0_hi)));
+
+                        // Second 64 elements (independent accumulators for ILP)
+                        let vw1 = _mm512_loadu_si512(row.add(j + 64) as *const __m512i);
+                        let vi1 = _mm512_loadu_si512(inp_ptr.add(j + 64) as *const __m512i);
+                        let vw1_lo = _mm512_castsi512_si256(vw1);
+                        let vw1_hi = _mm512_extracti64x4_epi64(vw1, 1);
+                        let vi1_lo = _mm512_castsi512_si256(vi1);
+                        let vi1_hi = _mm512_extracti64x4_epi64(vi1, 1);
+                        vacc2 = _mm512_add_epi32(vacc2, _mm512_madd_epi16(
+                            _mm512_cvtepi8_epi16(vw1_lo), _mm512_cvtepi8_epi16(vi1_lo)));
+                        vacc3 = _mm512_add_epi32(vacc3, _mm512_madd_epi16(
+                            _mm512_cvtepi8_epi16(vw1_hi), _mm512_cvtepi8_epi16(vi1_hi)));
+                        j += 128;
+                    }
+
+                    vacc0 = _mm512_add_epi32(_mm512_add_epi32(vacc0, vacc1),
+                                             _mm512_add_epi32(vacc2, vacc3));
+                    acc = _mm512_reduce_add_epi32(vacc0) as i64;
+
+                    // 64-element remainder
+                    if j + 64 <= in_size {
                         let vw = _mm512_loadu_si512(row.add(j) as *const __m512i);
                         let vi = _mm512_loadu_si512(inp_ptr.add(j) as *const __m512i);
-
-                        // Split into two 256-bit halves
                         let vw_lo = _mm512_castsi512_si256(vw);
                         let vw_hi = _mm512_extracti64x4_epi64(vw, 1);
                         let vi_lo = _mm512_castsi512_si256(vi);
                         let vi_hi = _mm512_extracti64x4_epi64(vi, 1);
-
-                        // Each 256-bit half → sign-extend to 512-bit i16 → madd to i32
-                        let vw16_lo = _mm512_cvtepi8_epi16(vw_lo);
-                        let vi16_lo = _mm512_cvtepi8_epi16(vi_lo);
-                        let vw16_hi = _mm512_cvtepi8_epi16(vw_hi);
-                        let vi16_hi = _mm512_cvtepi8_epi16(vi_hi);
-
-                        // 32 i16 × 32 i16 → 16 i32 pairwise products
-                        vacc0 = _mm512_add_epi32(vacc0, _mm512_madd_epi16(vw16_lo, vi16_lo));
-                        vacc1 = _mm512_add_epi32(vacc1, _mm512_madd_epi16(vw16_hi, vi16_hi));
+                        let mut vr = _mm512_madd_epi16(
+                            _mm512_cvtepi8_epi16(vw_lo), _mm512_cvtepi8_epi16(vi_lo));
+                        vr = _mm512_add_epi32(vr, _mm512_madd_epi16(
+                            _mm512_cvtepi8_epi16(vw_hi), _mm512_cvtepi8_epi16(vi_hi)));
+                        acc += _mm512_reduce_add_epi32(vr) as i64;
                         j += 64;
                     }
 
-                    vacc0 = _mm512_add_epi32(vacc0, vacc1);
-                    acc = _mm512_reduce_add_epi32(vacc0) as i64;
-
-                    // AVX2 cleanup for 32-element remainder
-                    let avx2_start = simd_len;
-                    let avx2_len = (in_size - avx2_start) / 32 * 32;
-                    if avx2_len > 0 {
-                        let mut va = _mm256_setzero_si256();
-                        let mut j = avx2_start;
-                        while j < avx2_start + avx2_len {
-                            let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
-                            let vi = _mm256_loadu_si256(inp_ptr.add(j) as *const __m256i);
-                            let vw_lo = _mm256_castsi256_si128(vw);
-                            let vw_hi = _mm256_extracti128_si256(vw, 1);
-                            let vi_lo = _mm256_castsi256_si128(vi);
-                            let vi_hi = _mm256_extracti128_si256(vi, 1);
-                            va = _mm256_add_epi32(va, _mm256_madd_epi16(
-                                _mm256_cvtepi8_epi16(vw_lo), _mm256_cvtepi8_epi16(vi_lo)));
-                            va = _mm256_add_epi32(va, _mm256_madd_epi16(
-                                _mm256_cvtepi8_epi16(vw_hi), _mm256_cvtepi8_epi16(vi_hi)));
-                            j += 32;
-                        }
-                        let lo = _mm256_extracti128_si256(va, 0);
-                        let hi = _mm256_extracti128_si256(va, 1);
-                        let s = _mm_add_epi32(lo, hi);
-                        let s = _mm_hadd_epi32(s, s);
-                        let s = _mm_hadd_epi32(s, s);
-                        acc += _mm_extract_epi32(s, 0) as i64;
-                    }
-
                     // Scalar remainder
-                    let mut jj = avx2_start + avx2_len;
-                    while jj < in_size {
-                        acc += (*row.add(jj) as i64) * (*inp_ptr.add(jj) as i64);
-                        jj += 1;
+                    while j < in_size {
+                        acc += (*row.add(j) as i64) * (*inp_ptr.add(j) as i64);
+                        j += 1;
                     }
                 }
             } else {
-                // AVX2 path: llama.cpp sign trick — 32 i8 at once, no sign extension
-                // sign(w,w)=abs(w), sign(i,w)=i*sign(w), then maddubs(abs_w, signed_i)
-                // Safe: max pairwise sum = 127*127 + 127*127 = 32258 < 32767 (i16 max)
-                let simd_len = in_size / 32 * 32;
+                // AVX2: 4 independent accumulators + sign trick + prefetch
+                let simd_len = in_size / 128 * 128; // 4×32 per iteration for ILP
                 unsafe {
-                    let mut vacc = _mm256_setzero_si256();
+                    let mut vacc0 = _mm256_setzero_si256();
+                    let mut vacc1 = _mm256_setzero_si256();
+                    let mut vacc2 = _mm256_setzero_si256();
+                    let mut vacc3 = _mm256_setzero_si256();
                     let ones = _mm256_set1_epi16(1);
 
                     let mut j = 0usize;
                     while j < simd_len {
+                        _mm_prefetch(row.add(j + 256) as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(inp_ptr.add(j + 256) as *const i8, _MM_HINT_T0);
+
+                        // 4 independent 32-element blocks per iteration
+                        let vw0 = _mm256_loadu_si256(row.add(j) as *const __m256i);
+                        let vi0 = _mm256_loadu_si256(inp_ptr.add(j) as *const __m256i);
+                        let ax0 = _mm256_sign_epi8(vw0, vw0);
+                        let sy0 = _mm256_sign_epi8(vi0, vw0);
+                        vacc0 = _mm256_add_epi32(vacc0, _mm256_madd_epi16(_mm256_maddubs_epi16(ax0, sy0), ones));
+
+                        let vw1 = _mm256_loadu_si256(row.add(j + 32) as *const __m256i);
+                        let vi1 = _mm256_loadu_si256(inp_ptr.add(j + 32) as *const __m256i);
+                        let ax1 = _mm256_sign_epi8(vw1, vw1);
+                        let sy1 = _mm256_sign_epi8(vi1, vw1);
+                        vacc1 = _mm256_add_epi32(vacc1, _mm256_madd_epi16(_mm256_maddubs_epi16(ax1, sy1), ones));
+
+                        let vw2 = _mm256_loadu_si256(row.add(j + 64) as *const __m256i);
+                        let vi2 = _mm256_loadu_si256(inp_ptr.add(j + 64) as *const __m256i);
+                        let ax2 = _mm256_sign_epi8(vw2, vw2);
+                        let sy2 = _mm256_sign_epi8(vi2, vw2);
+                        vacc2 = _mm256_add_epi32(vacc2, _mm256_madd_epi16(_mm256_maddubs_epi16(ax2, sy2), ones));
+
+                        let vw3 = _mm256_loadu_si256(row.add(j + 96) as *const __m256i);
+                        let vi3 = _mm256_loadu_si256(inp_ptr.add(j + 96) as *const __m256i);
+                        let ax3 = _mm256_sign_epi8(vw3, vw3);
+                        let sy3 = _mm256_sign_epi8(vi3, vw3);
+                        vacc3 = _mm256_add_epi32(vacc3, _mm256_madd_epi16(_mm256_maddubs_epi16(ax3, sy3), ones));
+
+                        j += 128;
+                    }
+
+                    // Merge 4 accumulators
+                    vacc0 = _mm256_add_epi32(_mm256_add_epi32(vacc0, vacc1),
+                                             _mm256_add_epi32(vacc2, vacc3));
+
+                    // 32-element remainder blocks
+                    while j + 32 <= in_size {
                         let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
                         let vi = _mm256_loadu_si256(inp_ptr.add(j) as *const __m256i);
-
-                        // llama.cpp sign trick: convert signed×signed → unsigned×signed
-                        let ax = _mm256_sign_epi8(vw, vw);  // abs(weights)
-                        let sy = _mm256_sign_epi8(vi, vw);   // input * sign(weights)
-
-                        // u8×s8→i16 pairwise sum (32 elements → 16 i16)
-                        let dot16 = _mm256_maddubs_epi16(ax, sy);
-                        // i16 pairs → i32 (16 i16 → 8 i32)
-                        let dot32 = _mm256_madd_epi16(dot16, ones);
-                        vacc = _mm256_add_epi32(vacc, dot32);
+                        let ax = _mm256_sign_epi8(vw, vw);
+                        let sy = _mm256_sign_epi8(vi, vw);
+                        vacc0 = _mm256_add_epi32(vacc0, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), ones));
                         j += 32;
                     }
 
-                    let lo = _mm256_extracti128_si256(vacc, 0);
-                    let hi = _mm256_extracti128_si256(vacc, 1);
+                    // Horizontal sum
+                    let lo = _mm256_extracti128_si256(vacc0, 0);
+                    let hi = _mm256_extracti128_si256(vacc0, 1);
                     let sum128 = _mm_add_epi32(lo, hi);
                     let sum128 = _mm_hadd_epi32(sum128, sum128);
                     let sum128 = _mm_hadd_epi32(sum128, sum128);
                     acc = _mm_extract_epi32(sum128, 0) as i64;
 
-                    let mut jj = simd_len;
-                    while jj < in_size {
-                        acc += (*row.add(jj) as i64) * (*inp_ptr.add(jj) as i64);
-                        jj += 1;
+                    // Scalar remainder
+                    while j < in_size {
+                        acc += (*row.add(j) as i64) * (*inp_ptr.add(j) as i64);
+                        j += 1;
                     }
                 }
             }
