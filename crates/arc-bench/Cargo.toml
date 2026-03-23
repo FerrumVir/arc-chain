@@ -61,6 +61,10 @@ path = "src/integer_bench.rs"
 name = "arc-bench-gguf-integer"
 path = "src/gguf_integer_bench.rs"
 
+[[bin]]
+name = "arc-bench-cached-integer"
+path = "src/cached_integer_bench.rs"
+
 [features]
 candle = ["arc-inference/candle"]
 
