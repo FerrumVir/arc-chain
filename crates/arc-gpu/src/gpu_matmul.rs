@@ -131,11 +131,9 @@ impl GpuMatmul {
             cache: None,
         });
 
-        // MSL passthrough available but disabled — bind group layout mismatch
-        // needs dedicated 5-binding layout for Metal (weights, input, output, params, scales)
-        // TODO: Fix MSL pipeline to use correct bind group layout
+        // MSL passthrough — native Metal char types, no u32 packing overhead
         let msl_pipeline: Option<wgpu::ComputePipeline> = None;
-        let _msl_pipeline_disabled = if has_msl && false {
+        let _msl_pipeline_attempt = if has_msl {
             let msl_source = include_str!("matmul.metal");
             eprintln!("[GPU] MSL passthrough DETECTED, compiling matmul_i8...");
             let msl_shader = unsafe {

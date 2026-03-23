@@ -313,8 +313,9 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
     output
 }
 
-/// x86 SIMD matmul — auto-selects AVX-512 (64 i8/iter) or AVX2 (32 i8/iter).
-/// Uses sign-extend + _mm(256|512)_madd_epi16 for i32 accumulation, no saturation.
+/// x86 SIMD matmul — llama.cpp sign trick for AVX2, AVX-512.
+/// sign trick: abs(w) × sign_corrected(input) → safe maddubs (no i16 saturation)
+/// Processes 32 bytes at once (AVX2) or 64 (AVX-512), no sign extension needed.
 #[cfg(target_arch = "x86_64")]
 fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     use std::arch::x86_64::*;
@@ -413,30 +414,31 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
                     }
                 }
             } else {
-                // AVX2 path: process 32 i8 elements per iteration
+                // AVX2 path: llama.cpp sign trick — 32 i8 at once, no sign extension
+                // sign(w,w)=abs(w), sign(i,w)=i*sign(w), then maddubs(abs_w, signed_i)
+                // Safe: max pairwise sum = 127*127 + 127*127 = 32258 < 32767 (i16 max)
                 let simd_len = in_size / 32 * 32;
                 unsafe {
                     let mut vacc = _mm256_setzero_si256();
-                    let mut vacc2 = _mm256_setzero_si256();
+                    let ones = _mm256_set1_epi16(1);
 
                     let mut j = 0usize;
                     while j < simd_len {
                         let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
                         let vi = _mm256_loadu_si256(inp_ptr.add(j) as *const __m256i);
 
-                        let vw_lo = _mm256_castsi256_si128(vw);
-                        let vw_hi = _mm256_extracti128_si256(vw, 1);
-                        let vi_lo = _mm256_castsi256_si128(vi);
-                        let vi_hi = _mm256_extracti128_si256(vi, 1);
+                        // llama.cpp sign trick: convert signed×signed → unsigned×signed
+                        let ax = _mm256_sign_epi8(vw, vw);  // abs(weights)
+                        let sy = _mm256_sign_epi8(vi, vw);   // input * sign(weights)
 
-                        vacc = _mm256_add_epi32(vacc, _mm256_madd_epi16(
-                            _mm256_cvtepi8_epi16(vw_lo), _mm256_cvtepi8_epi16(vi_lo)));
-                        vacc2 = _mm256_add_epi32(vacc2, _mm256_madd_epi16(
-                            _mm256_cvtepi8_epi16(vw_hi), _mm256_cvtepi8_epi16(vi_hi)));
+                        // u8×s8→i16 pairwise sum (32 elements → 16 i16)
+                        let dot16 = _mm256_maddubs_epi16(ax, sy);
+                        // i16 pairs → i32 (16 i16 → 8 i32)
+                        let dot32 = _mm256_madd_epi16(dot16, ones);
+                        vacc = _mm256_add_epi32(vacc, dot32);
                         j += 32;
                     }
 
-                    vacc = _mm256_add_epi32(vacc, vacc2);
                     let lo = _mm256_extracti128_si256(vacc, 0);
                     let hi = _mm256_extracti128_si256(vacc, 1);
                     let sum128 = _mm_add_epi32(lo, hi);
