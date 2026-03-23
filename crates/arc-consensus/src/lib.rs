@@ -1607,9 +1607,9 @@ impl ConsensusEngine {
 
     /// View-change timeout in milliseconds.
     /// If the round is stalled for this long, force-advance to prevent halts.
-    /// 1000ms balances propagation latency (100-300ms cross-continent) with throughput.
-    /// Production with optimized networking: 200-500ms.
-    const VIEW_CHANGE_TIMEOUT_MS: u128 = 1000;
+    /// 2000ms for global testnet (100-300ms cross-continent RTT needs margin).
+    /// Production with optimized networking: 500-1000ms.
+    const VIEW_CHANGE_TIMEOUT_MS: u128 = 2000;
 
     /// Check if the current round's proposer has timed out.
     ///
