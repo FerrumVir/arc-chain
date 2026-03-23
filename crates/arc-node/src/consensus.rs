@@ -492,9 +492,9 @@ impl ConsensusManager {
                     }
 
                     // ── Normal path: drain mempool ──────────────────────────────
-                    // Limit to 500 txs per DAG block to keep broadcast payload small
-                    // (~100KB). Larger payloads fail to propagate across the network.
-                    let transactions = mempool.drain(500);
+                    // 5000 txs per DAG block ≈ 1MB payload — fits QUIC streams.
+                    // Higher values possible with better serialization or compression.
+                    let transactions = mempool.drain(5_000);
                     if !transactions.is_empty() {
                         info!("Drained {} txs from mempool for DAG proposal", transactions.len());
                     }
