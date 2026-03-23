@@ -41,6 +41,7 @@ pub struct GpuForward {
     queue: wgpu::Queue,
     // Pipelines for each kernel
     matmul_pipeline: wgpu::ComputePipeline,
+    msl_matmul_pipeline: Option<wgpu::ComputePipeline>,
     layernorm_pipeline: wgpu::ComputePipeline,
     quantize_pipeline: wgpu::ComputePipeline,
     rope_pipeline: wgpu::ComputePipeline,
@@ -185,12 +186,19 @@ impl GpuForward {
             return Err(format!("Software GPU: {}", info.name));
         }
 
-        info!("GPU forward: {} ({:?})", info.name, info.backend);
+        let has_msl = adapter.features().contains(wgpu::Features::MSL_SHADER_PASSTHROUGH);
+        info!("GPU forward: {} ({:?}), msl={}", info.name, info.backend, has_msl);
+
+        let required_features = if has_msl {
+            wgpu::Features::MSL_SHADER_PASSTHROUGH
+        } else {
+            wgpu::Features::empty()
+        };
 
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("ARC GPU Forward"),
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits {
                     max_storage_buffer_binding_size: 512 * 1024 * 1024, // 512MB
                     max_buffer_size: 512 * 1024 * 1024,
@@ -271,11 +279,48 @@ impl GpuForward {
         let residual_pipeline = make_pipeline(&residual_bgl, "residual_add");
         let argmax_pipeline = make_pipeline(&argmax_bgl, "argmax");
 
-        info!("All 8 GPU compute pipelines compiled");
+        // Native Metal matmul: char4 vector loads + simd_sum, no u32 extraction
+        let msl_matmul_pipeline = if has_msl {
+            let msl_source = include_str!("matmul.metal");
+            let msl_shader = unsafe {
+                device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::Msl(
+                        wgpu::ShaderModuleDescriptorMsl {
+                            entry_point: "matmul_i8".to_string(),
+                            label: Some("matmul_metal"),
+                            num_workgroups: (128, 1, 1), // 4 simdgroups × 32 threads
+                            source: Cow::Borrowed(msl_source),
+                        },
+                    ),
+                )
+            };
+            let matmul_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None, bind_group_layouts: &[&matmul_bgl], push_constant_ranges: &[],
+            });
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("matmul_msl"), layout: Some(&matmul_pl), module: &msl_shader,
+                    entry_point: Some("matmul_i8"), compilation_options: Default::default(), cache: None,
+                })
+            })) {
+                Ok(p) => {
+                    info!("Native Metal matmul pipeline READY (char4, simd_sum)");
+                    Some(p)
+                }
+                Err(e) => {
+                    info!("MSL matmul failed, using WGSL: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        info!("All {} GPU compute pipelines compiled", if msl_matmul_pipeline.is_some() { "9 (8 WGSL + 1 Metal)" } else { "8 WGSL" });
 
         Ok(Self {
             device, queue,
-            matmul_pipeline, layernorm_pipeline, quantize_pipeline,
+            matmul_pipeline, msl_matmul_pipeline, layernorm_pipeline, quantize_pipeline,
             rope_pipeline, attention_pipeline, silu_pipeline,
             residual_pipeline, argmax_pipeline,
             matmul_bgl, layernorm_bgl, quantize_bgl,
@@ -542,36 +587,51 @@ impl GpuForward {
 
         let rt = (model.n_heads * (dh / 2) + 255) / 256; // RoPE Q workgroups
         let rtk = (model.n_kv_heads * (dh / 2) + 255) / 256; // RoPE K
-        let wd = (d + 255) / 256;
-        let wf = (dff + 255) / 256;
-        let wv = (model.vocab_size + 255) / 256;
+
+        // Matmul workgroup counts depend on shader:
+        // WGSL: 1 thread per row, 256 per workgroup → (out_size + 255) / 256
+        // Metal: 4 rows per threadgroup (4 simdgroups × 32 threads) → (out_size + 3) / 4
+        let mm_pipeline = self.msl_matmul_pipeline.as_ref().unwrap_or(&self.matmul_pipeline);
+        let use_metal = self.msl_matmul_pipeline.is_some();
+        let mm_wg = |out_size: u32| -> u32 {
+            if use_metal { (out_size + 3) / 4 } else { (out_size + 255) / 256 }
+        };
+
+        let wd = mm_wg(d);
+        let wkv = mm_wg(model.d_kv);
+        let wf = mm_wg(dff);
+        let wv = mm_wg(model.vocab_size);
+
+        // Non-matmul workgroup counts (unchanged, WGSL kernels)
+        let wd_wgsl = (d + 255) / 256;
+        let wf_wgsl = (dff + 255) / 256;
 
         for i in 0..model.n_layers as usize {
             let bg = &model.layer_bgs[i];
             dispatch(&mut encoder, &self.layernorm_pipeline, &bg.ln_attn, 1);
             dispatch(&mut encoder, &self.quantize_pipeline, &bg.quantize_normed, 1);
-            dispatch(&mut encoder, &self.matmul_pipeline, &bg.mm_q, wd);
-            dispatch(&mut encoder, &self.matmul_pipeline, &bg.mm_k, (model.d_kv + 255) / 256);
-            dispatch(&mut encoder, &self.matmul_pipeline, &bg.mm_v, (model.d_kv + 255) / 256);
+            dispatch(&mut encoder, mm_pipeline, &bg.mm_q, wd);
+            dispatch(&mut encoder, mm_pipeline, &bg.mm_k, wkv);
+            dispatch(&mut encoder, mm_pipeline, &bg.mm_v, wkv);
             dispatch(&mut encoder, &self.rope_pipeline, &bg.rope_q, rt);
             dispatch(&mut encoder, &self.rope_pipeline, &bg.rope_k, rtk);
             dispatch(&mut encoder, &self.attention_pipeline, &bg.attn, model.n_heads);
             dispatch(&mut encoder, &self.quantize_pipeline, &bg.quantize_attn, 1);
-            dispatch(&mut encoder, &self.matmul_pipeline, &bg.mm_wo, wd);
-            dispatch(&mut encoder, &self.residual_pipeline, &bg.residual_attn, wd);
+            dispatch(&mut encoder, mm_pipeline, &bg.mm_wo, wd);
+            dispatch(&mut encoder, &self.residual_pipeline, &bg.residual_attn, wd_wgsl);
             dispatch(&mut encoder, &self.layernorm_pipeline, &bg.ln_ffn, 1);
             dispatch(&mut encoder, &self.quantize_pipeline, &bg.quantize_ffn, 1);
-            dispatch(&mut encoder, &self.matmul_pipeline, &bg.mm_gate, wf);
-            dispatch(&mut encoder, &self.matmul_pipeline, &bg.mm_up, wf);
-            dispatch(&mut encoder, &self.silu_pipeline, &bg.silu, wf);
+            dispatch(&mut encoder, mm_pipeline, &bg.mm_gate, wf);
+            dispatch(&mut encoder, mm_pipeline, &bg.mm_up, wf);
+            dispatch(&mut encoder, &self.silu_pipeline, &bg.silu, wf_wgsl);
             dispatch(&mut encoder, &self.quantize_pipeline, &bg.quantize_gated, 1);
-            dispatch(&mut encoder, &self.matmul_pipeline, &bg.mm_down, wd);
-            dispatch(&mut encoder, &self.residual_pipeline, &bg.residual_ffn, wd);
+            dispatch(&mut encoder, mm_pipeline, &bg.mm_down, wd);
+            dispatch(&mut encoder, &self.residual_pipeline, &bg.residual_ffn, wd_wgsl);
         }
 
         dispatch(&mut encoder, &self.layernorm_pipeline, &model.final_ln_bg, 1);
         dispatch(&mut encoder, &self.quantize_pipeline, &model.final_quantize_bg, 1);
-        dispatch(&mut encoder, &self.matmul_pipeline, &model.lm_head_bg, wv);
+        dispatch(&mut encoder, mm_pipeline, &model.lm_head_bg, wv);
         dispatch(&mut encoder, &self.argmax_pipeline, &model.argmax_bg, 1);
 
         // ── Copy result to staging for readback ──────────────────────

@@ -34,23 +34,28 @@ kernel void matmul_i8(
     const uint in_sz = params.in_size;
     device const char* w = weights + row * in_sz;
 
-    // 32 threads split inner dimension: each handles in_size/32 elements
-    const uint chunk = in_sz / 32;
+    // 32 threads split inner dimension: ceil division handles small sizes
+    const uint chunk = (in_sz + 31u) / 32u;
     const uint start = tiisg * chunk;
-    const uint end = start + chunk;
+    const uint end = min(start + chunk, in_sz);
 
     int acc = 0;
 
-    // char4 vector loads: 4 i8 per load, no extraction overhead
-    const uint vec_end = start + (chunk / 4 * 4);
-    for (uint j = start; j < vec_end; j += 4) {
+    // Walk through [start, end) with char4 vector loads where aligned
+    uint j = start;
+    // Scalar prefix: align to 4-byte boundary
+    for (; j < end && (j & 3u) != 0u; j++) {
+        acc += int(w[j]) * int(input[j]);
+    }
+    // char4 vector body: 4 i8 per load, no extraction overhead
+    for (; j + 4u <= end; j += 4u) {
         char4 wv = *reinterpret_cast<device const char4*>(w + j);
         char4 iv = *reinterpret_cast<device const char4*>(input + j);
         acc += int(wv.x)*int(iv.x) + int(wv.y)*int(iv.y)
              + int(wv.z)*int(iv.z) + int(wv.w)*int(iv.w);
     }
-    // Scalar remainder
-    for (uint j = vec_end; j < end; j++) {
+    // Scalar suffix
+    for (; j < end; j++) {
         acc += int(w[j]) * int(input[j]);
     }
 
