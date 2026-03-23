@@ -49,7 +49,15 @@ path = "src/gpu_state_bench_main.rs"
 name = "arc-bench-inference"
 path = "src/inference_bench.rs"
 
+[[bin]]
+name = "arc-bench-gguf"
+path = "src/gguf_bench.rs"
+
+[features]
+candle = ["arc-inference/candle"]
+
 [dependencies]
+arc-inference = { path = "../arc-inference" }
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }
 arc-state = { path = "../arc-state" }
