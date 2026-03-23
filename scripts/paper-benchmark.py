@@ -294,7 +294,7 @@ def generate_paper_tables(all_results):
     md += "| Finality | ~4.3s (2-round DAG) |\n"
     md += "| Transaction types | 24 native |\n"
     md += "| Codebase | 80,683 LOC Rust |\n"
-    md += "| Tests | 1,185 passing |\n\n"
+    md += "| Tests | 1,185+ passing |\n\n"
 
     # Table 4: Security (VRF Committee)
     md += "## Table: VRF Committee Corruption Probability (k=7, t=5)\n\n"

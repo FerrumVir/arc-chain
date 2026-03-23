@@ -27,7 +27,7 @@ pub struct GgufEngine {
 struct LoadedGgufModel {
     /// Path to the GGUF file (for reference).
     path: String,
-    /// Model ID = BLAKE3(file contents).
+    /// Model ID = BLAKE3(first 1MB of file || file_size).
     model_id: Hash256,
     /// Quantized model weights loaded via candle.
     model: candle_transformers::models::quantized_llama::ModelWeights,
@@ -46,8 +46,9 @@ impl GgufEngine {
 
     /// Load a GGUF quantized model from a file path.
     ///
-    /// The model_id is computed as BLAKE3(file_contents), ensuring all
-    /// validators loading the same file get the same model_id.
+    /// The model_id is computed as BLAKE3(first_1MB || file_size), ensuring all
+    /// validators loading the same file get the same model_id. Hashing only the
+    /// header + size avoids reading entire multi-GB GGUF files at load time.
     #[cfg(feature = "candle")]
     pub fn load_gguf_file(&self, path: &str) -> Result<Hash256, InferenceError> {
         use candle_core::Device;

@@ -49,7 +49,7 @@ This approach provides:
     \item \textbf{DoS resistance}: A separate EIP-1559-style fee market for inference transactions prevents computational denial-of-service attacks.
 \end{itemize}
 
-To our knowledge, this is the first protocol to combine VRF-based random committee selection with tiered AI inference capabilities in a production blockchain. We implement the full system in Rust (80,683 lines of code, 13 crates, 1,128 tests) as part of ARC Chain, a Layer 1 blockchain designed for AI agent coordination.
+To our knowledge, this is the first protocol to combine VRF-based random committee selection with tiered AI inference capabilities in a production blockchain. We implement the full system in Rust (80,683 lines of code, 14 crates, 1,185 tests) as part of ARC Chain, a Layer 1 blockchain designed for AI agent coordination.
 
 % ══════════════════════════════════════════════════════════════════════════════
 \section{System Model}
@@ -226,7 +226,7 @@ An adaptive adversary who corrupts validators \emph{after} seeing the committee 
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Implementation}
 
-We implement the VRF inference committee protocol in ARC Chain, a sender-sharded DAG blockchain written in Rust. The implementation spans 13 crates totaling 80,683 lines of code with 1,128 passing tests.
+We implement the VRF inference committee protocol in ARC Chain, a sender-sharded DAG blockchain written in Rust. The implementation spans 14 crates totaling 80,683 lines of code with 1,128 passing tests.
 
 \subsection{Transaction Types}
 
