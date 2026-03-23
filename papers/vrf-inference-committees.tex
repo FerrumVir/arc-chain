@@ -15,7 +15,7 @@
 \begin{abstract}
 We present a mechanism for trustless on-chain AI inference using Verifiable Random Function (VRF) selected validator committees. In decentralized networks, ensuring that AI model inference is executed correctly without a trusted third party is an open problem. Existing approaches rely on either full re-execution by every validator (infeasible for large models) or optimistic fraud proofs with long challenge periods. We introduce a middle path: for each inference request, a committee of $k$ validators is deterministically selected from the eligible pool using VRF output as a random seed. Committee members independently execute the model and submit output hashes. If $\geq t$ of $k$ members agree, the result is finalized in a single consensus round. If they disagree, the system falls back to an existing fraud-proof mechanism.
 
-We implement this protocol in ARC Chain, a sender-sharded DAG blockchain with 24 native transaction types. Our implementation includes a four-tier hardware registry where validators declare their inference capabilities, an EIP-1559-style separate gas market for inference transactions, and per-address rate limiting. Security analysis shows that with 10\% malicious validators and a 7-member committee requiring 5/7 agreement, the probability of corruption is 0.018\%. We provide a complete implementation with 1,128 passing tests.
+We implement this protocol in ARC Chain, a sender-sharded DAG blockchain with 24 native transaction types. Our implementation includes a four-tier hardware registry where validators declare their inference capabilities, an EIP-1559-style separate gas market for inference transactions, and per-address rate limiting. Security analysis shows that with 10\% malicious validators and a 7-member committee requiring 5/7 agreement, the probability of corruption is 0.018\%. We provide a complete implementation with 1,185 passing tests.
 \end{abstract}
 
 \begin{CCSXML}
@@ -226,7 +226,7 @@ An adaptive adversary who corrupts validators \emph{after} seeing the committee 
 % ══════════════════════════════════════════════════════════════════════════════
 \section{Implementation}
 
-We implement the VRF inference committee protocol in ARC Chain, a sender-sharded DAG blockchain written in Rust. The implementation spans 14 crates totaling 80,683 lines of code with 1,128 passing tests.
+We implement the VRF inference committee protocol in ARC Chain, a sender-sharded DAG blockchain written in Rust. The implementation spans 14 crates totaling 80,683 lines of code with 1,185 passing tests.
 
 \subsection{Transaction Types}
 
