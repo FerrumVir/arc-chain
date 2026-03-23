@@ -344,8 +344,8 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
                     let mut j = 0usize;
                     while j < simd_len {
                         // Load 64 i8 weights and inputs
-                        let vw = _mm512_loadu_si512(row.add(j) as *const i32);
-                        let vi = _mm512_loadu_si512(inp_ptr.add(j) as *const i32);
+                        let vw = _mm512_loadu_si512(row.add(j) as *const __m512i);
+                        let vi = _mm512_loadu_si512(inp_ptr.add(j) as *const __m512i);
 
                         // Split into two 256-bit halves
                         let vw_lo = _mm512_castsi512_si256(vw);
