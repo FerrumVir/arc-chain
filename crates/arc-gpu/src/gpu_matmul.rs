@@ -353,6 +353,10 @@ fn bgl_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
+pub fn pack_i8_to_u32_pub(data: &[i8]) -> Vec<u32> {
+    pack_i8_to_u32(data)
+}
+
 fn pack_i8_to_u32(data: &[i8]) -> Vec<u32> {
     let padded_len = (data.len() + 3) / 4 * 4;
     let mut packed = Vec::with_capacity(padded_len / 4);
