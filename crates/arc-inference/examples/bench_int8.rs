@@ -2,28 +2,33 @@
 //!
 //! Usage: cargo run --example bench_int8 --features candle --release -- /path/to/model.gguf [num_tokens]
 
-use arc_inference::cached_integer_model::load_cached_model;
+use arc_inference::cached_integer_model::{load_cached_model, load_cached_model_binary};
 use std::time::Instant;
 
 fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: {} <model.gguf> [num_tokens]", args[0]);
+        eprintln!("Usage: {} <model.gguf|model.arc-int8> [num_tokens] [--save path]", args[0]);
         std::process::exit(1);
     }
 
     let model_path = &args[1];
     let num_tokens = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8u32);
+    let save_path = args.iter().position(|a| a == "--save").and_then(|i| args.get(i + 1));
 
     println!("=== ARC Chain INT8 Inference Benchmark ===");
     println!("Model: {}", model_path);
     println!("Tokens to generate: {}", num_tokens);
     println!();
 
-    // Load model
+    // Load model (GGUF or binary)
     let load_start = Instant::now();
-    let model = load_cached_model(model_path).expect("Failed to load model");
+    let model = if model_path.ends_with(".arc-int8") {
+        load_cached_model_binary(model_path).expect("Failed to load binary model")
+    } else {
+        load_cached_model(model_path).expect("Failed to load GGUF model")
+    };
     let load_time = load_start.elapsed();
     let mem_mb = model.memory_bytes() / (1024 * 1024);
 
@@ -34,6 +39,18 @@ fn main() {
         model.config.n_kv_heads, model.config.d_ff, model.config.vocab_size);
     println!("Vocab entries: {}", model.vocab.len());
     println!();
+
+    // Weight hash (for cross-platform verification)
+    let whash = model.weight_hash();
+    println!("Weight hash: 0x{}", hex::encode(&whash.0[..16]));
+
+    // Save binary weights if requested
+    if let Some(save_to) = save_path {
+        println!("\nSaving INT8 weights to {}...", save_to);
+        model.save_weights(save_to).expect("Failed to save weights");
+        let file_size = std::fs::metadata(save_to).map(|m| m.len()).unwrap_or(0);
+        println!("Saved: {} MB", file_size / (1024 * 1024));
+    }
 
     // Test prompt
     let prompt_text = "What is 2+2?";
