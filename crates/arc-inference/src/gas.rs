@@ -9,7 +9,7 @@
 //! - Per-address rate limit: 1 inference call per 10 blocks
 //!
 //! Combined with stake-gated access, sustained attack becomes economically
-//! impossible: after 20 full blocks, fee is ~10.5× base; after 50, ~245× base.
+//! impossible: after 20 full blocks, fee is ~10.5× base; after 50, ~361× base.
 
 use serde::{Deserialize, Serialize};
 
@@ -230,7 +230,7 @@ mod tests {
             "After 20 full blocks fee should be >10x: {fee_20}"
         );
 
-        // After 50 full blocks: fee ~245x base
+        // After 50 full blocks: fee ~361x base
         let fee_50 = InferenceGasLane::fee_after_full_blocks(100_000, 50);
         assert!(
             fee_50 > 20_000_000,
