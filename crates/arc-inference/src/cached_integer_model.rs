@@ -338,13 +338,11 @@ fn matmul_i8xi8_simd(
     }).collect()
 }
 
-/// Dispatch to SIMD or scalar based on platform and size.
+/// Dispatch matmul — uses scalar i8×i64 path for cross-platform determinism.
+/// The SIMD i8×i8 path is available (matmul_i8xi8_simd) but introduces
+/// platform-specific rounding due to input quantization and i16 saturation.
+/// For consensus, determinism > speed. Use scalar path everywhere.
 pub fn matmul_fast(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
-    // Use SIMD for large matmuls where the quantization overhead is worth it
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if in_size >= 512 && out_size >= 256 {
-        return matmul_i8xi8_simd(weights, input, in_size, out_size);
-    }
     matmul_i8(weights, input, in_size, out_size)
 }
 
