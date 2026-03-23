@@ -631,6 +631,203 @@ fn matmul_simd_preq_x86(weights: &I8Weights, input_q: &QuantizedInput, in_size: 
     });
 }
 
+// ─── Q4 Weights (4-bit, half bandwidth) ──────────────────────────────────────
+
+/// Q4 weight matrix: 4-bit signed values packed 2 per byte.
+/// Byte layout: [hi_nibble(4b) | lo_nibble(4b)], both signed [-8, 7].
+/// Buffer is half the size of I8Weights → 2x bandwidth reduction.
+pub struct Q4WeightsX86 {
+    pub data: Vec<u8>,       // packed Q4 bytes (n_rows × n_cols / 2)
+    pub scales: Vec<i64>,    // per-row scale factors (same as I8Weights)
+    pub n_rows: usize,
+    pub n_cols: usize,
+}
+
+impl Q4WeightsX86 {
+    /// Total memory in bytes.
+    pub fn memory_bytes(&self) -> usize {
+        self.data.len() + self.scales.len() * 8
+    }
+
+    /// Convert I8Weights to Q4WeightsX86. Clamps values to [-8, 7].
+    pub fn from_i8(w: &I8Weights) -> Self {
+        let n = w.data.len();
+        let mut data = Vec::with_capacity((n + 1) / 2);
+        for pair in w.data.chunks(2) {
+            let lo = (pair[0].max(-8).min(7) as u8) & 0x0F;
+            let hi = if pair.len() > 1 { (pair[1].max(-8).min(7) as u8) & 0x0F } else { 0 };
+            data.push(lo | (hi << 4));
+        }
+        // Adjust scales: Q4 values are ~16x smaller than Q8, so multiply scales
+        // Q8 range: [-127, 127], Q4 range: [-8, 7]
+        // For a value x in Q8: x_q8 ≈ x / scale_q8 * 127
+        // Equivalent Q4: x_q4 ≈ x / scale_q4 * 7
+        // So scale_q4 ≈ scale_q8 * 127 / 7 ≈ scale_q8 * 18
+        // But since we're just clamping, the effective scale needs adjusting
+        let scales = w.scales.iter().map(|&s| {
+            // Q4 has ~18x less precision per value, compensate in scale
+            s * 18
+        }).collect();
+        Q4WeightsX86 { data, scales, n_rows: w.n_rows, n_cols: w.n_cols }
+    }
+}
+
+/// Q4×Q8 matmul with pre-quantized input. AVX2/AVX-512 + sign trick.
+/// Reads HALF the weight data of matmul_i8xi8 → 2x bandwidth improvement.
+#[cfg(target_arch = "x86_64")]
+pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
+    use std::arch::x86_64::*;
+
+    if !is_x86_feature_detected!("avx2") {
+        // Scalar fallback
+        matmul_q4_scalar(q4, input_q, output);
+        return;
+    }
+
+    let in_size = q4.n_cols;
+    let byte_cols = in_size / 2;
+    let data = &q4.data;
+    let inp = &input_q.data;
+    let scales = &q4.scales;
+    let isf = input_q.scale_factor;
+
+    output.par_chunks_mut(64).enumerate().for_each(|(ci, chunk)| {
+        let base = ci * 64;
+        for (li, out) in chunk.iter_mut().enumerate() {
+            let i = base + li;
+            let row = unsafe { data.as_ptr().add(i * byte_cols) };
+            let ip = inp.as_ptr();
+            let mut acc: i64 = 0;
+
+            unsafe {
+                // AVX2: process 16 Q4 bytes (32 values) per iteration
+                // Unpack nibbles → sign-extend → multiply with Q8 input via sign trick
+                let simd_len = byte_cols / 64 * 64; // 4×16 per iteration for ILP
+                let mask_lo = _mm_set1_epi8(0x0F);
+                let bias = _mm256_set1_epi8(8);
+                let ones = _mm256_set1_epi16(1);
+                let mut vacc0 = _mm256_setzero_si256();
+                let mut vacc1 = _mm256_setzero_si256();
+                let mut vacc2 = _mm256_setzero_si256();
+                let mut vacc3 = _mm256_setzero_si256();
+
+                let mut j = 0usize;
+                while j < simd_len {
+                    _mm_prefetch(row.add(j + 128) as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(ip.add(j * 2 + 256) as *const i8, _MM_HINT_T0);
+
+                    // Block 0: 16 Q4 bytes → 32 i8 weights × 32 i8 input
+                    let packed0 = _mm_loadu_si128(row.add(j) as *const __m128i);
+                    let lo0 = _mm_and_si128(packed0, mask_lo);
+                    let hi0 = _mm_and_si128(_mm_srli_epi16(packed0, 4), mask_lo);
+                    let interleaved0 = _mm256_sub_epi8(
+                        _mm256_set_m128i(_mm_unpackhi_epi8(lo0, hi0), _mm_unpacklo_epi8(lo0, hi0)),
+                        bias);
+                    let vi0 = _mm256_loadu_si256(ip.add(j * 2) as *const __m256i);
+                    let ax0 = _mm256_sign_epi8(interleaved0, interleaved0);
+                    let sy0 = _mm256_sign_epi8(vi0, interleaved0);
+                    vacc0 = _mm256_add_epi32(vacc0, _mm256_madd_epi16(_mm256_maddubs_epi16(ax0, sy0), ones));
+
+                    // Block 1
+                    let packed1 = _mm_loadu_si128(row.add(j + 16) as *const __m128i);
+                    let lo1 = _mm_and_si128(packed1, mask_lo);
+                    let hi1 = _mm_and_si128(_mm_srli_epi16(packed1, 4), mask_lo);
+                    let interleaved1 = _mm256_sub_epi8(
+                        _mm256_set_m128i(_mm_unpackhi_epi8(lo1, hi1), _mm_unpacklo_epi8(lo1, hi1)),
+                        bias);
+                    let vi1 = _mm256_loadu_si256(ip.add(j * 2 + 32) as *const __m256i);
+                    let ax1 = _mm256_sign_epi8(interleaved1, interleaved1);
+                    let sy1 = _mm256_sign_epi8(vi1, interleaved1);
+                    vacc1 = _mm256_add_epi32(vacc1, _mm256_madd_epi16(_mm256_maddubs_epi16(ax1, sy1), ones));
+
+                    // Block 2
+                    let packed2 = _mm_loadu_si128(row.add(j + 32) as *const __m128i);
+                    let lo2 = _mm_and_si128(packed2, mask_lo);
+                    let hi2 = _mm_and_si128(_mm_srli_epi16(packed2, 4), mask_lo);
+                    let interleaved2 = _mm256_sub_epi8(
+                        _mm256_set_m128i(_mm_unpackhi_epi8(lo2, hi2), _mm_unpacklo_epi8(lo2, hi2)),
+                        bias);
+                    let vi2 = _mm256_loadu_si256(ip.add(j * 2 + 64) as *const __m256i);
+                    let ax2 = _mm256_sign_epi8(interleaved2, interleaved2);
+                    let sy2 = _mm256_sign_epi8(vi2, interleaved2);
+                    vacc2 = _mm256_add_epi32(vacc2, _mm256_madd_epi16(_mm256_maddubs_epi16(ax2, sy2), ones));
+
+                    // Block 3
+                    let packed3 = _mm_loadu_si128(row.add(j + 48) as *const __m128i);
+                    let lo3 = _mm_and_si128(packed3, mask_lo);
+                    let hi3 = _mm_and_si128(_mm_srli_epi16(packed3, 4), mask_lo);
+                    let interleaved3 = _mm256_sub_epi8(
+                        _mm256_set_m128i(_mm_unpackhi_epi8(lo3, hi3), _mm_unpacklo_epi8(lo3, hi3)),
+                        bias);
+                    let vi3 = _mm256_loadu_si256(ip.add(j * 2 + 96) as *const __m256i);
+                    let ax3 = _mm256_sign_epi8(interleaved3, interleaved3);
+                    let sy3 = _mm256_sign_epi8(vi3, interleaved3);
+                    vacc3 = _mm256_add_epi32(vacc3, _mm256_madd_epi16(_mm256_maddubs_epi16(ax3, sy3), ones));
+
+                    j += 64;
+                }
+
+                vacc0 = _mm256_add_epi32(_mm256_add_epi32(vacc0, vacc1),
+                                         _mm256_add_epi32(vacc2, vacc3));
+
+                // 16-byte remainder
+                while j + 16 <= byte_cols {
+                    let packed = _mm_loadu_si128(row.add(j) as *const __m128i);
+                    let lo = _mm_and_si128(packed, mask_lo);
+                    let hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_lo);
+                    let interleaved = _mm256_sub_epi8(
+                        _mm256_set_m128i(_mm_unpackhi_epi8(lo, hi), _mm_unpacklo_epi8(lo, hi)),
+                        bias);
+                    let vi = _mm256_loadu_si256(ip.add(j * 2) as *const __m256i);
+                    let ax = _mm256_sign_epi8(interleaved, interleaved);
+                    let sy = _mm256_sign_epi8(vi, interleaved);
+                    vacc0 = _mm256_add_epi32(vacc0, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), ones));
+                    j += 16;
+                }
+
+                let lo128 = _mm256_extracti128_si256(vacc0, 0);
+                let hi128 = _mm256_extracti128_si256(vacc0, 1);
+                let sum128 = _mm_add_epi32(lo128, hi128);
+                let sum128 = _mm_hadd_epi32(sum128, sum128);
+                let sum128 = _mm_hadd_epi32(sum128, sum128);
+                acc = _mm_extract_epi32(sum128, 0) as i64;
+
+                // Scalar remainder
+                while j < byte_cols {
+                    let byte = *row.add(j);
+                    let w_lo = (byte & 0x0F) as i8 - 8;
+                    let w_hi = ((byte >> 4) & 0x0F) as i8 - 8;
+                    acc += (w_lo as i64) * (*ip.add(j * 2) as i64)
+                         + (w_hi as i64) * (*ip.add(j * 2 + 1) as i64);
+                    j += 1;
+                }
+            }
+            *out = acc * ((scales[i] * isf) >> FRAC_BITS);
+        }
+    });
+}
+
+fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
+    let byte_cols = q4.n_cols / 2;
+    let data = &q4.data;
+    let inp = &input_q.data;
+    let scales = &q4.scales;
+    let isf = input_q.scale_factor;
+
+    for (i, out) in output.iter_mut().enumerate() {
+        let mut acc: i64 = 0;
+        let row_off = i * byte_cols;
+        for j in 0..byte_cols {
+            let byte = data[row_off + j];
+            let w_lo = (byte & 0x0F) as i8 - 8;
+            let w_hi = ((byte >> 4) & 0x0F) as i8 - 8;
+            acc += (w_lo as i64) * (inp[j * 2] as i64)
+                 + (w_hi as i64) * (inp[j * 2 + 1] as i64);
+        }
+        *out = acc * ((scales[i] * isf) >> FRAC_BITS);
+    }
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
