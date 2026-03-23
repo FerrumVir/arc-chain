@@ -15,6 +15,26 @@ use bytemuck::{Pod, Zeroable};
 use std::borrow::Cow;
 use tracing::info;
 
+// Param structs matching WGSL uniforms (must be Pod + Zeroable)
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct MatmulParams { in_size: u32, out_size: u32, scale_offset: u32, _pad: u32 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct LayerNormParams { size: u32, _p1: u32, _p2: u32, _p3: u32 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct RopeParams { pos: u32, d_head: u32, n_heads: u32, _pad: u32 }
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct AttnParams {
+    d_head: u32, n_heads: u32, n_kv_heads: u32, seq_len: u32,
+    d_kv: u32, attn_scale: i32, _p1: u32, _p2: u32,
+}
+
 /// GPU-resident transformer engine.
 pub struct GpuForward {
     device: wgpu::Device,
@@ -367,6 +387,382 @@ impl GpuForward {
 
         info!("GPU model uploaded: {} layers, d={}, vocab={}", n_layers, d_model, vocab_size);
         model
+    }
+}
+
+impl GpuForward {
+    /// Run one token through the full GPU-resident forward pass.
+    /// Encodes ALL layer computations into a SINGLE command buffer.
+    /// Only reads back the final token ID (4 bytes).
+    /// Returns the predicted next token.
+    pub fn forward_one_token(
+        &self,
+        model: &GpuModel,
+        token: u32,
+        seq_pos: u32,
+    ) -> u32 {
+        let d = model.d_model;
+        let dff = model.d_ff;
+        let dh = model.d_head;
+        let dkv = model.d_kv;
+
+        // Write embedding for this token into hidden_buf
+        // Embedding is packed i8; we need to dequant to i32 on GPU.
+        // For now: CPU-side embedding lookup, upload i32 hidden state.
+        // (Embedding lookup is O(d) — negligible vs matmul.)
+        // This is the ONE CPU→GPU transfer per token.
+        // TODO: move embedding lookup to GPU kernel
+        let emb_placeholder: Vec<i32> = vec![0i32; d as usize]; // will be set by caller
+        self.queue.write_buffer(&model.hidden_buf, 0, bytemuck::cast_slice(&emb_placeholder));
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        for layer in 0..model.n_layers as usize {
+            let lw = &model.layer_weights[layer];
+            let ls = &model.layer_scales[layer];
+
+            // ── LayerNorm (hidden → normed) ──────────────────────────
+            let ln_params = LayerNormParams { size: d, _p1: 0, _p2: 0, _p3: 0 };
+            let ln_params_buf = self.buf_inline(&ln_params);
+            let ln_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.layernorm_bgl,
+                entries: &[
+                    bg_entry(0, &model.hidden_buf),
+                    bg_entry(1, &model.normed_buf),
+                    bg_entry(2, &model.layer_attn_norm[layer]),
+                    bg_entry(3, &ln_params_buf),
+                ],
+            });
+            dispatch(&mut encoder, &self.layernorm_pipeline, &ln_bg, 1); // 1 workgroup for reduction
+
+            // ── Quantize normed → packed i8 ──────────────────────────
+            let q_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.quantize_bgl,
+                entries: &[
+                    bg_entry(0, &model.normed_buf),
+                    bg_entry(1, &model.normed_packed),
+                    bg_entry(2, &model.quant_scale),
+                ],
+            });
+            dispatch(&mut encoder, &self.quantize_pipeline, &q_bg, 1);
+
+            // ── Q/K/V Matmuls ────────────────────────────────────────
+            for (w_buf, s_buf, out_buf, out_size) in [
+                (&lw.wq, &ls.sq, &model.q_buf, d),
+                (&lw.wk, &ls.sk, &model.k_buf, dkv),
+                (&lw.wv, &ls.sv, &model.v_buf, dkv),
+            ] {
+                let mm_params = MatmulParams { in_size: d, out_size, scale_offset: 0, _pad: 0 };
+                let mm_params_buf = self.buf_inline(&mm_params);
+                let mm_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None, layout: &self.matmul_bgl,
+                    entries: &[
+                        bg_entry(0, w_buf),
+                        bg_entry(1, &model.normed_packed),
+                        bg_entry(2, out_buf),
+                        bg_entry(3, &mm_params_buf),
+                        bg_entry(4, s_buf),
+                    ],
+                });
+                dispatch(&mut encoder, &self.matmul_pipeline, &mm_bg, (out_size + 255) / 256);
+            }
+
+            // ── RoPE on Q ────────────────────────────────────────────
+            let rope_params_q = RopeParams { pos: seq_pos, d_head: dh, n_heads: model.n_heads, _pad: 0 };
+            let rp_buf = self.buf_inline(&rope_params_q);
+            let rope_bg_q = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.rope_bgl,
+                entries: &[
+                    bg_entry(0, &model.q_buf),
+                    bg_entry(1, &model.rope_cos_buf),
+                    bg_entry(2, &model.rope_sin_buf),
+                    bg_entry(3, &rp_buf),
+                ],
+            });
+            let rope_threads = model.n_heads * (dh / 2);
+            dispatch(&mut encoder, &self.rope_pipeline, &rope_bg_q, (rope_threads + 255) / 256);
+
+            // ── RoPE on K ────────────────────────────────────────────
+            let rope_params_k = RopeParams { pos: seq_pos, d_head: dh, n_heads: model.n_kv_heads, _pad: 0 };
+            let rpk_buf = self.buf_inline(&rope_params_k);
+            let rope_bg_k = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.rope_bgl,
+                entries: &[
+                    bg_entry(0, &model.k_buf),
+                    bg_entry(1, &model.rope_cos_buf),
+                    bg_entry(2, &model.rope_sin_buf),
+                    bg_entry(3, &rpk_buf),
+                ],
+            });
+            let rope_k_threads = model.n_kv_heads * (dh / 2);
+            dispatch(&mut encoder, &self.rope_pipeline, &rope_bg_k, (rope_k_threads + 255) / 256);
+
+            // ── Store K/V to cache (TODO: GPU-side quantize+store) ───
+            // For now: KV cache operations handled externally
+            // The attention kernel reads from kv_k_bufs/kv_v_bufs
+
+            // ── Attention ────────────────────────────────────────────
+            let attn_params = AttnParams {
+                d_head: dh, n_heads: model.n_heads, n_kv_heads: model.n_kv_heads,
+                seq_len: seq_pos + 1, d_kv: dkv, attn_scale: model.attn_scale,
+                _p1: 0, _p2: 0,
+            };
+            let ap_buf = self.buf_inline(&attn_params);
+            let attn_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.attention_bgl,
+                entries: &[
+                    bg_entry(0, &model.q_buf),
+                    bg_entry(1, &model.kv_k_bufs[layer]),
+                    bg_entry(2, &model.kv_v_bufs[layer]),
+                    bg_entry(3, &model.kv_k_scales[layer]),
+                    bg_entry(4, &model.kv_v_scales[layer]),
+                    bg_entry(5, &model.attn_out_buf),
+                    bg_entry(6, &ap_buf),
+                ],
+            });
+            dispatch(&mut encoder, &self.attention_pipeline, &attn_bg, model.n_heads);
+
+            // ── Wo projection ────────────────────────────────────────
+            // Quantize attn_out → packed i8
+            let q_bg2 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.quantize_bgl,
+                entries: &[
+                    bg_entry(0, &model.attn_out_buf),
+                    bg_entry(1, &model.normed_packed), // reuse buffer
+                    bg_entry(2, &model.quant_scale),
+                ],
+            });
+            dispatch(&mut encoder, &self.quantize_pipeline, &q_bg2, 1);
+
+            let mm_wo = MatmulParams { in_size: d, out_size: d, scale_offset: 0, _pad: 0 };
+            let mm_wo_buf = self.buf_inline(&mm_wo);
+            let wo_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.matmul_bgl,
+                entries: &[
+                    bg_entry(0, &lw.wo),
+                    bg_entry(1, &model.normed_packed),
+                    bg_entry(2, &model.projected_buf),
+                    bg_entry(3, &mm_wo_buf),
+                    bg_entry(4, &ls.so),
+                ],
+            });
+            dispatch(&mut encoder, &self.matmul_pipeline, &wo_bg, (d + 255) / 256);
+
+            // ── Residual: hidden += projected ────────────────────────
+            let res_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.residual_bgl,
+                entries: &[
+                    bg_entry(0, &model.hidden_buf),
+                    bg_entry(1, &model.projected_buf),
+                ],
+            });
+            dispatch(&mut encoder, &self.residual_pipeline, &res_bg, (d + 255) / 256);
+
+            // ── FFN LayerNorm ────────────────────────────────────────
+            let ln2_params = LayerNormParams { size: d, _p1: 0, _p2: 0, _p3: 0 };
+            let ln2_buf = self.buf_inline(&ln2_params);
+            let ln2_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.layernorm_bgl,
+                entries: &[
+                    bg_entry(0, &model.hidden_buf),
+                    bg_entry(1, &model.normed_buf),
+                    bg_entry(2, &model.layer_ffn_norm[layer]),
+                    bg_entry(3, &ln2_buf),
+                ],
+            });
+            dispatch(&mut encoder, &self.layernorm_pipeline, &ln2_bg, 1);
+
+            // ── Quantize normed_ff ───────────────────────────────────
+            let q_bg3 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.quantize_bgl,
+                entries: &[
+                    bg_entry(0, &model.normed_buf),
+                    bg_entry(1, &model.normed_packed),
+                    bg_entry(2, &model.quant_scale),
+                ],
+            });
+            dispatch(&mut encoder, &self.quantize_pipeline, &q_bg3, 1);
+
+            // ── Gate + Up matmuls ────────────────────────────────────
+            let mm_gate = MatmulParams { in_size: d, out_size: dff, scale_offset: 0, _pad: 0 };
+            let mg_buf = self.buf_inline(&mm_gate);
+            let gate_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.matmul_bgl,
+                entries: &[
+                    bg_entry(0, &lw.w_gate),
+                    bg_entry(1, &model.normed_packed),
+                    bg_entry(2, &model.gate_buf),
+                    bg_entry(3, &mg_buf),
+                    bg_entry(4, &ls.s_gate),
+                ],
+            });
+            dispatch(&mut encoder, &self.matmul_pipeline, &gate_bg, (dff + 255) / 256);
+
+            let mm_up = MatmulParams { in_size: d, out_size: dff, scale_offset: 0, _pad: 0 };
+            let mu_buf = self.buf_inline(&mm_up);
+            let up_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.matmul_bgl,
+                entries: &[
+                    bg_entry(0, &lw.w_up),
+                    bg_entry(1, &model.normed_packed),
+                    bg_entry(2, &model.up_buf),
+                    bg_entry(3, &mu_buf),
+                    bg_entry(4, &ls.s_up),
+                ],
+            });
+            dispatch(&mut encoder, &self.matmul_pipeline, &up_bg, (dff + 255) / 256);
+
+            // ── SiLU gate * up ───────────────────────────────────────
+            let silu_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.silu_bgl,
+                entries: &[
+                    bg_entry(0, &model.gate_buf),
+                    bg_entry(1, &model.up_buf),
+                ],
+            });
+            dispatch(&mut encoder, &self.silu_pipeline, &silu_bg, (dff + 255) / 256);
+
+            // ── Quantize gated for down matmul ───────────────────────
+            let q_bg4 = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.quantize_bgl,
+                entries: &[
+                    bg_entry(0, &model.gate_buf), // gate_buf now holds SiLU result
+                    bg_entry(1, &model.normed_packed),
+                    bg_entry(2, &model.quant_scale),
+                ],
+            });
+            dispatch(&mut encoder, &self.quantize_pipeline, &q_bg4, 1);
+
+            // ── Down matmul ──────────────────────────────────────────
+            let mm_down = MatmulParams { in_size: dff, out_size: d, scale_offset: 0, _pad: 0 };
+            let md_buf = self.buf_inline(&mm_down);
+            let down_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.matmul_bgl,
+                entries: &[
+                    bg_entry(0, &lw.w_down),
+                    bg_entry(1, &model.normed_packed),
+                    bg_entry(2, &model.ff_out_buf),
+                    bg_entry(3, &md_buf),
+                    bg_entry(4, &ls.s_down),
+                ],
+            });
+            dispatch(&mut encoder, &self.matmul_pipeline, &down_bg, (d + 255) / 256);
+
+            // ── Residual: hidden += ff_out ───────────────────────────
+            let res2_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &self.residual_bgl,
+                entries: &[
+                    bg_entry(0, &model.hidden_buf),
+                    bg_entry(1, &model.ff_out_buf),
+                ],
+            });
+            dispatch(&mut encoder, &self.residual_pipeline, &res2_bg, (d + 255) / 256);
+        }
+
+        // ── Final LayerNorm ──────────────────────────────────────────
+        let fln_params = LayerNormParams { size: d, _p1: 0, _p2: 0, _p3: 0 };
+        let fln_buf = self.buf_inline(&fln_params);
+        let fln_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.layernorm_bgl,
+            entries: &[
+                bg_entry(0, &model.hidden_buf),
+                bg_entry(1, &model.normed_buf),
+                bg_entry(2, &model.final_norm_buf),
+                bg_entry(3, &fln_buf),
+            ],
+        });
+        dispatch(&mut encoder, &self.layernorm_pipeline, &fln_bg, 1);
+
+        // ── Quantize for LM head ─────────────────────────────────────
+        let q_final = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.quantize_bgl,
+            entries: &[
+                bg_entry(0, &model.normed_buf),
+                bg_entry(1, &model.normed_packed),
+                bg_entry(2, &model.quant_scale),
+            ],
+        });
+        dispatch(&mut encoder, &self.quantize_pipeline, &q_final, 1);
+
+        // ── LM Head matmul → logits ──────────────────────────────────
+        let mm_lm = MatmulParams {
+            in_size: d, out_size: model.vocab_size, scale_offset: 0, _pad: 0,
+        };
+        let mlm_buf = self.buf_inline(&mm_lm);
+        let lm_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.matmul_bgl,
+            entries: &[
+                bg_entry(0, &model.output_weight_buf),
+                bg_entry(1, &model.normed_packed),
+                bg_entry(2, &model.logits_buf),
+                bg_entry(3, &mlm_buf),
+                bg_entry(4, &model.output_scales),
+            ],
+        });
+        dispatch(&mut encoder, &self.matmul_pipeline, &lm_bg, (model.vocab_size + 255) / 256);
+
+        // ── Argmax → token ID ────────────────────────────────────────
+        let argmax_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None, layout: &self.argmax_bgl,
+            entries: &[
+                bg_entry(0, &model.logits_buf),
+                bg_entry(1, &model.result_buf),
+            ],
+        });
+        dispatch(&mut encoder, &self.argmax_pipeline, &argmax_bg, 1);
+
+        // ── Copy result to staging for readback ──────────────────────
+        encoder.copy_buffer_to_buffer(&model.result_buf, 0, &model.staging_buf, 0, 4);
+
+        // ── Single submit for ENTIRE forward pass ────────────────────
+        self.queue.submit([encoder.finish()]);
+
+        // ── Read back token ID (4 bytes) ─────────────────────────────
+        let slice = model.staging_buf.slice(..4);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::PollType::wait());
+        rx.recv().unwrap().unwrap();
+
+        let mapped = slice.get_mapped_range();
+        let token_id = bytemuck::cast_slice::<u8, u32>(&mapped)[0];
+        drop(mapped);
+        model.staging_buf.unmap();
+
+        token_id
+    }
+
+    /// Create a small uniform buffer inline.
+    fn buf_inline<T: Pod>(&self, data: &T) -> wgpu::Buffer {
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: std::mem::size_of::<T>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buf, 0, bytemuck::bytes_of(data));
+        buf
+    }
+}
+
+/// Helper: dispatch a compute pass with the given pipeline and bind group.
+fn dispatch(
+    encoder: &mut wgpu::CommandEncoder,
+    pipeline: &wgpu::ComputePipeline,
+    bind_group: &wgpu::BindGroup,
+    workgroups: u32,
+) {
+    let mut pass = encoder.begin_compute_pass(&Default::default());
+    pass.set_pipeline(pipeline);
+    pass.set_bind_group(0, bind_group, &[]);
+    pass.dispatch_workgroups(workgroups, 1, 1);
+}
+
+/// Helper: create a bind group entry.
+fn bg_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry {
+    wgpu::BindGroupEntry {
+        binding,
+        resource: buffer.as_entire_binding(),
     }
 }
 
