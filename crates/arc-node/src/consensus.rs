@@ -378,9 +378,9 @@ impl ConsensusManager {
             // Do this BEFORE the propose check so transactions are always
             // available regardless of round/parent state.
             // Cap mempool at 50K to prevent unbounded memory growth.
-            if self.benchmark && multi_validator && mempool.len() < 50_000 {
+            if self.benchmark && multi_validator && mempool.len() < 5_000 {
                 if let Some(ref pool) = benchmark_pool {
-                    let signed_txs = pool.drain(2_000);
+                    let signed_txs = pool.drain(200);
                     let fed = signed_txs.len();
                     for tx in signed_txs {
                         let _ = mempool.insert(tx);
@@ -493,8 +493,9 @@ impl ConsensusManager {
                     }
 
                     // ── Normal path: drain mempool ──────────────────────────────
-                    // 2000 txs per DAG block ≈ 400KB payload — reliable across global QUIC.
-                    let transactions = mempool.drain(2_000);
+                    // 100 txs per DAG block ≈ 28KB payload. Low enough for reliable
+                    // cross-continent QUIC on 2-vCPU nodes. Scale up with better hardware.
+                    let transactions = mempool.drain(100);
                     if !transactions.is_empty() {
                         info!("Drained {} txs from mempool for DAG proposal", transactions.len());
                     }
