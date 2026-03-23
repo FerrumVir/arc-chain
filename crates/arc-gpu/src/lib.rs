@@ -2,6 +2,7 @@ pub mod hardware_detect;
 pub mod metal_verify;
 pub mod gpu_memory;
 pub mod gpu_matmul;
+pub mod gpu_forward;
 pub mod avx512_verify;
 pub mod neon_verify;
 pub mod cuda_verify;
