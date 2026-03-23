@@ -131,43 +131,38 @@ impl GpuMatmul {
             cache: None,
         });
 
-        // Native Metal shader via MSL passthrough — char (i8) types, no u32 packing
-        let msl_pipeline = if has_msl {
+        // MSL passthrough available but disabled — bind group layout mismatch
+        // needs dedicated 5-binding layout for Metal (weights, input, output, params, scales)
+        // TODO: Fix MSL pipeline to use correct bind group layout
+        let msl_pipeline: Option<wgpu::ComputePipeline> = None;
+        let _msl_pipeline_disabled = if has_msl && false {
             let msl_source = include_str!("matmul.metal");
-            let msl_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let msl_shader = unsafe {
-                    device.create_shader_module_passthrough(
-                        wgpu::ShaderModuleDescriptorPassthrough::Msl(
-                            wgpu::ShaderModuleDescriptorMsl {
-                                entry_point: "matmul_i8".to_string(),
-                                label: Some("matmul_metal"),
-                                num_workgroups: (256, 1, 1),
-                                source: std::borrow::Cow::Borrowed(msl_source),
-                            },
-                        ),
-                    )
-                };
-                info!("Native Metal matmul shader compiled");
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("matmul_msl"),
-                    layout: Some(&pl),
-                    module: &msl_shader,
-                    entry_point: Some("matmul_i8"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                })
-            }));
-            match msl_result {
-                Ok(p) => {
-                    info!("Metal matmul pipeline ready");
-                    Some(p)
-                }
-                Err(_) => {
-                    info!("MSL matmul compilation failed, using WGSL");
-                    None
-                }
-            }
+            eprintln!("[GPU] MSL passthrough DETECTED, compiling matmul_i8...");
+            let msl_shader = unsafe {
+                device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::Msl(
+                        wgpu::ShaderModuleDescriptorMsl {
+                            entry_point: "matmul_i8".to_string(),
+                            label: Some("matmul_metal"),
+                            num_workgroups: (256, 1, 1),
+                            source: std::borrow::Cow::Borrowed(msl_source),
+                        },
+                    ),
+                )
+            };
+            info!("MSL shader module created, creating pipeline...");
+            let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("matmul_msl"),
+                layout: Some(&pl),
+                module: &msl_shader,
+                entry_point: Some("matmul_i8"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            info!("Native Metal matmul pipeline READY (char4, no u32 packing)");
+            Some(p)
         } else {
+            info!("MSL passthrough not available, using WGSL");
             None
         };
 
