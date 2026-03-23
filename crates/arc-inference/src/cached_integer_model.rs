@@ -167,10 +167,30 @@ pub struct CachedIntegerModel {
     pub vocab: Vec<String>,
 }
 
+// ─── Cached Input Quantization ────────────────────────────────────────────────
+
+/// Pre-quantized i8 input — computed once, reused for multiple matmuls.
+pub struct QuantizedInput {
+    pub data: Vec<i8>,
+    pub scale_factor: i64,
+}
+
+impl QuantizedInput {
+    /// Quantize i64 Q16 input to i8. Call once, pass to multiple matmuls.
+    #[inline]
+    pub fn from_i64(input: &[i64]) -> Self {
+        let abs_max = input.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
+        let scale_factor = (abs_max / 127).max(1);
+        let data: Vec<i8> = input.iter()
+            .map(|&x| (x / scale_factor).clamp(-127, 127) as i8)
+            .collect();
+        Self { data, scale_factor }
+    }
+}
+
 // ─── INT8 Matmul (Per-Row Scale, Optimized) ───────────────────────────────────
 
-/// Core i8×i64 dot product for a single row. Unsafe for speed (no bounds checks).
-/// 8-element unroll for ILP. This is the hot inner loop.
+/// Core i8×i64 dot product. Unsafe, 8-element unroll, 4 independent accumulators.
 #[inline(always)]
 unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
     let mut acc0: i64 = 0;
@@ -198,18 +218,13 @@ unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
     acc
 }
 
-// Wrapper to send raw pointers across rayon threads (data lives for duration of call)
-struct SendPtr<T>(*const T);
-unsafe impl<T> Send for SendPtr<T> {}
-unsafe impl<T> Sync for SendPtr<T> {}
-
-/// Per-row INT8 × i64 parallel matmul — optimized with chunked parallelism.
-fn matmul_i8_par(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
+/// Write matmul result into pre-allocated output buffer (zero-alloc).
+/// Parallel with 512-row chunks to minimize rayon scheduling overhead.
+fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
     let data = &weights.data;
     let scales = &weights.scales;
-    let mut output = vec![0i64; out_size];
-    output.par_chunks_mut(64).enumerate().for_each(|(chunk_idx, chunk)| {
-        let start = chunk_idx * 64;
+    output.par_chunks_mut(512).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start = chunk_idx * 512;
         for (local_i, out) in chunk.iter_mut().enumerate() {
             let i = start + local_i;
             let acc = unsafe {
@@ -218,27 +233,22 @@ fn matmul_i8_par(weights: &I8Weights, input: &[i64], in_size: usize, out_size: u
             *out = (acc * scales[i]) >> FRAC_BITS;
         }
     });
-    output
 }
 
-/// Sequential variant for small dimensions.
-fn matmul_i8_seq(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
-    let data = &weights.data;
-    let scales = &weights.scales;
-    let mut output = Vec::with_capacity(out_size);
-    for i in 0..out_size {
-        let acc = unsafe { dot_i8_i64(data.as_ptr().add(i * in_size), input.as_ptr(), in_size) };
-        output.push((acc * scales[i]) >> FRAC_BITS);
-    }
-    output
-}
-
+/// Allocating matmul (for compatibility and small outputs).
 fn matmul_i8(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
+    let mut output = vec![0i64; out_size];
     if out_size >= 256 {
-        matmul_i8_par(weights, input, in_size, out_size)
+        matmul_i8_into(weights, input, in_size, &mut output);
     } else {
-        matmul_i8_seq(weights, input, in_size, out_size)
+        let data = &weights.data;
+        let scales = &weights.scales;
+        for i in 0..out_size {
+            let acc = unsafe { dot_i8_i64(data.as_ptr().add(i * in_size), input.as_ptr(), in_size) };
+            output[i] = (acc * scales[i]) >> FRAC_BITS;
+        }
     }
+    output
 }
 
 // ─── SIMD INT8 Matmul (Cross-Platform Deterministic) ──────────────────────────
@@ -457,6 +467,130 @@ pub fn matmul_fast(weights: &I8Weights, input: &[i64], in_size: usize, out_size:
         return matmul_i8xi8_simd(weights, input, in_size, out_size);
     }
     matmul_i8(weights, input, in_size, out_size)
+}
+
+/// Zero-alloc matmul with pre-quantized input. Quantize ONCE, reuse for Q/K/V or gate/up.
+pub fn matmul_fast_preq(weights: &I8Weights, input_q: &QuantizedInput, input_raw: &[i64], in_size: usize, output: &mut [i64]) {
+    let out_size = output.len();
+    // Use SIMD i8xi8 with pre-quantized input for large matmuls
+    #[cfg(target_arch = "aarch64")]
+    if in_size >= 512 && out_size >= 256 {
+        matmul_simd_preq_neon(weights, input_q, in_size, output);
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if in_size >= 512 && out_size >= 256 && is_x86_feature_detected!("avx2") {
+        matmul_simd_preq_x86(weights, input_q, in_size, output);
+        return;
+    }
+    // Scalar fallback
+    matmul_i8_into(weights, input_raw, in_size, output);
+}
+
+#[cfg(target_arch = "aarch64")]
+fn matmul_simd_preq_neon(weights: &I8Weights, input_q: &QuantizedInput, in_size: usize, output: &mut [i64]) {
+    use std::arch::aarch64::*;
+    let data = &weights.data;
+    let inp = &input_q.data;
+    let scales = &weights.scales;
+    let isf = input_q.scale_factor;
+
+    output.par_chunks_mut(512).enumerate().for_each(|(ci, chunk)| {
+        let base = ci * 512;
+        for (li, out) in chunk.iter_mut().enumerate() {
+            let i = base + li;
+            let row = unsafe { data.as_ptr().add(i * in_size) };
+            let simd_len = in_size / 32 * 32;
+            let mut acc: i64;
+            unsafe {
+                let mut v0 = vdupq_n_s32(0);
+                let mut v1 = vdupq_n_s32(0);
+                let mut v2 = vdupq_n_s32(0);
+                let mut v3 = vdupq_n_s32(0);
+                let mut j = 0usize;
+                while j < simd_len {
+                    let w0 = vld1q_s8(row.add(j));
+                    let i0 = vld1q_s8(inp.as_ptr().add(j));
+                    v0 = vpadalq_s16(v0, vmull_s8(vget_low_s8(w0), vget_low_s8(i0)));
+                    v1 = vpadalq_s16(v1, vmull_s8(vget_high_s8(w0), vget_high_s8(i0)));
+                    let w1 = vld1q_s8(row.add(j + 16));
+                    let i1 = vld1q_s8(inp.as_ptr().add(j + 16));
+                    v2 = vpadalq_s16(v2, vmull_s8(vget_low_s8(w1), vget_low_s8(i1)));
+                    v3 = vpadalq_s16(v3, vmull_s8(vget_high_s8(w1), vget_high_s8(i1)));
+                    j += 32;
+                }
+                v0 = vaddq_s32(vaddq_s32(v0, v1), vaddq_s32(v2, v3));
+                acc = vaddvq_s32(v0) as i64;
+                while j < in_size { acc += (*row.add(j) as i64) * (*inp.as_ptr().add(j) as i64); j += 1; }
+            }
+            *out = acc * ((scales[i] * isf) >> FRAC_BITS);
+        }
+    });
+}
+
+#[cfg(target_arch = "x86_64")]
+fn matmul_simd_preq_x86(weights: &I8Weights, input_q: &QuantizedInput, in_size: usize, output: &mut [i64]) {
+    use std::arch::x86_64::*;
+    let data = &weights.data;
+    let inp = &input_q.data;
+    let scales = &weights.scales;
+    let isf = input_q.scale_factor;
+    let use512 = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
+
+    output.par_chunks_mut(512).enumerate().for_each(|(ci, chunk)| {
+        let base = ci * 512;
+        for (li, out) in chunk.iter_mut().enumerate() {
+            let i = base + li;
+            let row = unsafe { data.as_ptr().add(i * in_size) };
+            let ip = inp.as_ptr();
+            let mut acc: i64 = 0;
+            unsafe {
+                if use512 {
+                    let sl = in_size / 64 * 64;
+                    let mut a0 = _mm512_setzero_si512();
+                    let mut a1 = _mm512_setzero_si512();
+                    let mut j = 0usize;
+                    while j < sl {
+                        let vw = _mm512_loadu_si512(row.add(j) as *const __m512i);
+                        let vi = _mm512_loadu_si512(ip.add(j) as *const __m512i);
+                        a0 = _mm512_add_epi32(a0, _mm512_madd_epi16(
+                            _mm512_cvtepi8_epi16(_mm512_castsi512_si256(vw)),
+                            _mm512_cvtepi8_epi16(_mm512_castsi512_si256(vi))));
+                        a1 = _mm512_add_epi32(a1, _mm512_madd_epi16(
+                            _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(vw, 1)),
+                            _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(vi, 1))));
+                        j += 64;
+                    }
+                    acc = _mm512_reduce_add_epi32(_mm512_add_epi32(a0, a1)) as i64;
+                    while j < in_size { acc += (*row.add(j) as i64) * (*ip.add(j) as i64); j += 1; }
+                } else {
+                    let sl = in_size / 32 * 32;
+                    let mut a0 = _mm256_setzero_si256();
+                    let mut a1 = _mm256_setzero_si256();
+                    let mut j = 0usize;
+                    while j < sl {
+                        let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
+                        let vi = _mm256_loadu_si256(ip.add(j) as *const __m256i);
+                        a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(
+                            _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vw)),
+                            _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vi))));
+                        a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(
+                            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vw, 1)),
+                            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vi, 1))));
+                        j += 32;
+                    }
+                    let v = _mm256_add_epi32(a0, a1);
+                    let lo = _mm256_extracti128_si256(v, 0);
+                    let hi = _mm256_extracti128_si256(v, 1);
+                    let s = _mm_hadd_epi32(_mm_add_epi32(lo, hi), _mm_setzero_si128());
+                    let s = _mm_hadd_epi32(s, _mm_setzero_si128());
+                    acc = _mm_extract_epi32(s, 0) as i64;
+                    while j < in_size { acc += (*row.add(j) as i64) * (*ip.add(j) as i64); j += 1; }
+                }
+            }
+            *out = acc * ((scales[i] * isf) >> FRAC_BITS);
+        }
+    });
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -743,8 +877,10 @@ impl CachedIntegerModel {
         tokens
     }
 
-    /// Forward pass for a single new token.
-    /// i8 KV cache (8x less memory), standard attention, separate layernorm.
+    /// Forward pass — zero-alloc matmuls with cached input quantization.
+    /// Quantize input ONCE, reuse for Q/K/V (3 matmuls) and gate/up (2 matmuls).
+    /// Saves 4 input quantizations per layer × 32 layers = 128 saved quantizations.
+    /// Uses pre-allocated buffers (q/k/v/attn_out/gate/up/gated/ff_out).
     pub fn forward_one_token(&self, token: u32, cache: &mut KVCache) -> Vec<i64> {
         let cfg = &self.config;
         let d = cfg.d_model;
@@ -757,29 +893,41 @@ impl CachedIntegerModel {
         let mut hidden: Vec<i64> = self.embedding.data[emb_start..emb_start + d]
             .iter().map(|&w| (w as i64) * emb_scale).collect();
 
+        // Pre-allocate buffers (reused across layers)
+        let mut q = vec![0i64; d];
+        let mut k_buf = vec![0i64; cfg.d_kv];
+        let mut v_buf = vec![0i64; cfg.d_kv];
+        let mut attn_out = vec![0i64; d];
+        let mut projected = vec![0i64; d];
+        let mut gate = vec![0i64; cfg.d_ff];
+        let mut up = vec![0i64; cfg.d_ff];
+        let mut ff_out = vec![0i64; d];
+
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            // LayerNorm (compute once, reuse for Q/K/V — 32KB fits in L1)
+            // LayerNorm once — result fits in L1 (32KB)
             let normed = layernorm(&hidden, &layer.attn_norm);
 
-            // Q/K/V projections
-            let mut q = matmul_fast(&layer.wq, &normed, d, d);
-            let k = matmul_fast(&layer.wk, &normed, d, cfg.d_kv);
-            let v = matmul_fast(&layer.wv, &normed, d, cfg.d_kv);
+            // Quantize normed input ONCE, reuse for Q, K, V projections
+            let normed_q = QuantizedInput::from_i64(&normed);
+
+            // Q/K/V with zero-alloc + cached quantized input
+            matmul_fast_preq(&layer.wq, &normed_q, &normed, d, &mut q);
+            matmul_fast_preq(&layer.wk, &normed_q, &normed, d, &mut k_buf);
+            matmul_fast_preq(&layer.wv, &normed_q, &normed, d, &mut v_buf);
 
             // RoPE
             for h in 0..cfg.n_heads {
                 apply_rope(&mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
                     pos, cfg.d_head, &cfg.rope_cos, &cfg.rope_sin);
             }
-            let mut k = k;
             for h in 0..cfg.n_kv_heads {
-                apply_rope(&mut k[h * cfg.d_head..(h + 1) * cfg.d_head],
+                apply_rope(&mut k_buf[h * cfg.d_head..(h + 1) * cfg.d_head],
                     pos, cfg.d_head, &cfg.rope_cos, &cfg.rope_sin);
             }
 
-            // Store K/V in INT8 quantized cache (8x less memory)
-            cache.push_k(layer_idx, &k);
-            cache.push_v(layer_idx, &v);
+            // Store K/V in i8 cache
+            cache.push_k(layer_idx, &k_buf);
+            cache.push_v(layer_idx, &v_buf);
 
             // Attention with i8 KV cache
             let full_seq = pos + 1;
@@ -788,8 +936,6 @@ impl CachedIntegerModel {
                 let dh = cfg.d_head;
                 let q_head = &q[h * dh..(h + 1) * dh];
 
-                // Attention scores: Q · K with i8 K cache
-                // Factor scale out of inner loop: dot = (sum(q[d]*k_i8[d])) * k_scale
                 let mut scores = Vec::with_capacity(full_seq);
                 for j in 0..full_seq {
                     let k_off = j * cfg.d_kv + kv_h * dh;
@@ -798,45 +944,48 @@ impl CachedIntegerModel {
                     for dd in 0..dh {
                         dot_raw += q_head[dd] * (cache.k_data[layer_idx][k_off + dd] as i64);
                     }
-                    // dot_raw is Q16 * unitless(i8). Multiply by k_scale then shift.
                     let dot = (dot_raw >> FRAC_BITS) * k_scale;
                     scores.push((dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS);
                 }
 
                 let attn_weights = softmax_i64(&scores);
 
-                // Weighted V sum with i8 V cache
                 let mut out = vec![0i64; dh];
                 for j in 0..full_seq {
                     let v_off = j * cfg.d_kv + kv_h * dh;
                     let v_scale = cache.v_scales[layer_idx][j];
                     let w = attn_weights[j];
                     for dd in 0..dh {
-                        // v_val = v_i8 * v_scale (reconstructed Q16-ish)
-                        let v_val = (cache.v_data[layer_idx][v_off + dd] as i64) * v_scale;
-                        out[dd] += (w * v_val) >> FRAC_BITS;
+                        out[dd] += (w * ((cache.v_data[layer_idx][v_off + dd] as i64) * v_scale)) >> FRAC_BITS;
                     }
                 }
                 out
             }).collect();
 
-            let mut attn_out = vec![0i64; d];
+            for val in attn_out.iter_mut() { *val = 0; }
             for (h, head_out) in head_results.iter().enumerate() {
                 attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(head_out);
             }
 
-            let projected = matmul_fast(&layer.wo, &attn_out, d, d);
+            // Wo projection + residual (zero-alloc)
+            matmul_fast_preq(&layer.wo, &QuantizedInput::from_i64(&attn_out), &attn_out, d, &mut projected);
             for i in 0..d { hidden[i] += projected[i]; }
 
-            // FFN
+            // FFN: quantize normed_ff ONCE for gate+up
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
-            let gate = matmul_fast(&layer.w_gate, &normed_ff, d, cfg.d_ff);
-            let up = matmul_fast(&layer.w_up, &normed_ff, d, cfg.d_ff);
+            let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
 
-            let gated: Vec<i64> = gate.iter().zip(up.iter())
-                .map(|(&g, &u)| (silu_i64(g) * u) >> FRAC_BITS).collect();
+            matmul_fast_preq(&layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
+            matmul_fast_preq(&layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
 
-            let ff_out = matmul_fast(&layer.w_down, &gated, cfg.d_ff, d);
+            // SiLU gate * up (in-place)
+            for j in 0..cfg.d_ff {
+                gate[j] = (silu_i64(gate[j]) * up[j]) >> FRAC_BITS;
+            }
+
+            // W_down + residual
+            let gate_q = QuantizedInput::from_i64(&gate);
+            matmul_fast_preq(&layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
             for i in 0..d { hidden[i] += ff_out[i]; }
         }
 
@@ -1266,7 +1415,7 @@ mod tests {
         );
         let input: Vec<i64> = (0..512).map(|i| (i as i64 - 256) * ONE / 256).collect();
 
-        let scalar = matmul_i8_par(&weights, &input, 512, 1024);
+        let scalar = matmul_i8(&weights, &input, 512, 1024);
         let simd = matmul_i8xi8_simd(&weights, &input, 512, 1024);
 
         for i in 0..1024 {
