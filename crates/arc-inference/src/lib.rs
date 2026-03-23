@@ -8,6 +8,8 @@
 pub mod committee;
 pub mod gas;
 pub mod candle_backend;
+pub mod integer_lut;
+pub mod integer_engine;
 
 use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};
