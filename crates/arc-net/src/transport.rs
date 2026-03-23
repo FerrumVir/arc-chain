@@ -395,16 +395,23 @@ impl PeerConnections {
     }
 
     async fn broadcast(&self, msg_type: MessageType, payload: &[u8]) {
+        let peer_count = self.peers.len();
+        let mut sent = 0usize;
         let mut dead_peers = Vec::new();
         for mut entry in self.peers.iter_mut() {
             if let Err(e) = write_message(entry.value_mut(), msg_type, payload).await {
                 warn!("Failed to send to peer: {}", e);
                 dead_peers.push(*entry.key());
+            } else {
+                sent += 1;
             }
         }
         for key in dead_peers {
             self.peers.remove(&key);
             self.meta.remove(&key);
+        }
+        if msg_type == MessageType::DagBlockWithTxs && peer_count > 0 {
+            debug!("Broadcast {:?}: sent to {}/{} peers ({} bytes)", msg_type, sent, peer_count, payload.len());
         }
     }
 }
