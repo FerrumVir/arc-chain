@@ -291,7 +291,7 @@ def generate_paper_tables(all_results):
     md += "| Metric | Value |\n|--------|-------|\n"
     md += "| Sustained TPS (2-node) | 33,230 |\n"
     md += "| Peak TPS (single-node) | 183,000 |\n"
-    md += "| Finality | ~4.3s (2-round DAG) |\n"
+    md += "| Finality | ~24ms (2-round DAG, ~12ms/round) |\n"
     md += "| Transaction types | 24 native |\n"
     md += "| Codebase | 80,683 LOC Rust |\n"
     md += "| Tests | 1,185+ passing |\n\n"
