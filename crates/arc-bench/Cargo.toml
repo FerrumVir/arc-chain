@@ -53,6 +53,10 @@ path = "src/inference_bench.rs"
 name = "arc-bench-gguf"
 path = "src/gguf_bench.rs"
 
+[[bin]]
+name = "arc-bench-integer"
+path = "src/integer_bench.rs"
+
 [features]
 candle = ["arc-inference/candle"]
 
