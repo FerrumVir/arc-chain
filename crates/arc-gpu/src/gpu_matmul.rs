@@ -37,6 +37,7 @@ pub struct GpuMatmul {
     queue: Arc<wgpu::Queue>,
     pipeline: wgpu::ComputePipeline,
     msl_pipeline: Option<wgpu::ComputePipeline>,
+    msl_q4_pipeline: Option<wgpu::ComputePipeline>,
     bind_group_layout: wgpu::BindGroupLayout,
     pool: BufferPool,
     pub is_metal: bool,
@@ -49,6 +50,7 @@ pub struct GpuWeights {
     scales_buffer: wgpu::Buffer,
     pub n_rows: usize,
     pub n_cols: usize,
+    pub is_q4: bool,
 }
 
 impl GpuMatmul {
@@ -188,6 +190,32 @@ impl GpuMatmul {
             None
         };
 
+        // Q4 Metal matmul: 4-bit weights × 8-bit input, half bandwidth
+        let msl_q4_pipeline = if has_msl && !force_wgsl {
+            let fused_src = include_str!("fused_kernels.metal");
+            let q4_shader = unsafe {
+                device.create_shader_module_passthrough(
+                    wgpu::ShaderModuleDescriptorPassthrough::Msl(
+                        wgpu::ShaderModuleDescriptorMsl {
+                            entry_point: "matmul_i4".to_string(),
+                            label: Some("matmul_q4_metal"),
+                            num_workgroups: (128, 1, 1),
+                            source: std::borrow::Cow::Borrowed(fused_src),
+                        },
+                    ),
+                )
+            };
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("matmul_q4_msl"), layout: Some(&pl), module: &q4_shader,
+                    entry_point: Some("matmul_i4"), compilation_options: Default::default(), cache: None,
+                })
+            })) {
+                Ok(p) => { info!("Native Metal Q4 matmul pipeline READY"); Some(p) }
+                Err(_) => { info!("MSL Q4 matmul failed"); None }
+            }
+        } else { None };
+
         // Pre-allocate buffer pool
         let pool = BufferPool {
             input_buf: device.create_buffer(&wgpu::BufferDescriptor {
@@ -224,8 +252,8 @@ impl GpuMatmul {
             max_out_size: max_out,
         };
 
-        info!("GPU matmul ready: pool for {}×{}, MSL={}", max_out, max_in, msl_pipeline.is_some());
-        Ok(Self { device, queue, pipeline, msl_pipeline, bind_group_layout, pool, is_metal, has_msl })
+        info!("GPU matmul ready: pool for {}×{}, MSL={}, Q4={}", max_out, max_in, msl_pipeline.is_some(), msl_q4_pipeline.is_some());
+        Ok(Self { device, queue, pipeline, msl_pipeline, msl_q4_pipeline, bind_group_layout, pool, is_metal, has_msl })
     }
 
     /// Upload weight matrix to GPU. Call once per weight at model load.
@@ -263,7 +291,35 @@ impl GpuMatmul {
         });
         self.queue.write_buffer(&scales_buffer, 0, bytemuck::cast_slice(scale_data));
 
-        GpuWeights { buffer, scales_buffer, n_rows, n_cols }
+        GpuWeights { buffer, scales_buffer, n_rows, n_cols, is_q4: false }
+    }
+
+    /// Upload Q4 weights (4-bit, 2 values per byte). Requires Metal MSL.
+    /// `data`: raw i8 weights (will be quantized to Q4 on CPU).
+    /// Returns Q4 GpuWeights with half the buffer size.
+    pub fn upload_weights_q4(&self, data: &[i8], n_rows: usize, n_cols: usize, scales: Option<&[i32]>) -> GpuWeights {
+        // Quantize i8 → Q4: clamp to [-8, 7] and pack 2 per byte
+        let q4_data = pack_i8_to_q4(data);
+
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("weights_q4"),
+            size: q4_data.len() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buffer, 0, &q4_data);
+
+        let default_scales: Vec<i32> = vec![256; n_rows];
+        let scale_data = scales.unwrap_or(&default_scales);
+        let scales_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("weight_scales_q4"),
+            size: (scale_data.len() * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&scales_buffer, 0, bytemuck::cast_slice(scale_data));
+
+        GpuWeights { buffer, scales_buffer, n_rows, n_cols, is_q4: true }
     }
 
     /// Zero-alloc matmul dispatch using pre-allocated pool.
@@ -302,8 +358,15 @@ impl GpuMatmul {
         });
 
         // Dispatch with correct workgroup count per shader
-        let active = self.msl_pipeline.as_ref().unwrap_or(&self.pipeline);
-        let wg_count = if self.msl_pipeline.is_some() {
+        // Q4 weights use Q4 pipeline, Q8 uses Q8 pipeline, WGSL fallback
+        let active = if weights.is_q4 {
+            self.msl_q4_pipeline.as_ref().unwrap_or(&self.pipeline)
+        } else {
+            self.msl_pipeline.as_ref().unwrap_or(&self.pipeline)
+        };
+        let use_metal_dispatch = weights.is_q4 && self.msl_q4_pipeline.is_some()
+            || !weights.is_q4 && self.msl_pipeline.is_some();
+        let wg_count = if use_metal_dispatch {
             // Metal: 4 rows per threadgroup (4 simdgroups × 32 threads)
             (n_rows as u32 + 3) / 4
         } else {
@@ -407,6 +470,18 @@ fn bgl_entry(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 
 pub fn pack_i8_to_u32_pub(data: &[i8]) -> Vec<u32> {
     pack_i8_to_u32(data)
+}
+
+/// Pack i8 weights to Q4 (4-bit signed, 2 values per byte).
+/// Values clamped to [-8, 7]. Byte layout: [high_nibble | low_nibble].
+pub fn pack_i8_to_q4(data: &[i8]) -> Vec<u8> {
+    let mut packed = Vec::with_capacity((data.len() + 1) / 2);
+    for pair in data.chunks(2) {
+        let lo = (pair[0].max(-8).min(7) as u8) & 0x0F;
+        let hi = if pair.len() > 1 { (pair[1].max(-8).min(7) as u8) & 0x0F } else { 0 };
+        packed.push(lo | (hi << 4));
+    }
+    packed
 }
 
 fn pack_i8_to_u32(data: &[i8]) -> Vec<u32> {
@@ -655,6 +730,45 @@ mod tests {
                 assert_eq!(result[0], 20); // (1+2+3+4) * 2
                 assert_eq!(result[1], 78); // (5+6+7+8) * 3
                 println!("GPU matmul with scales PASSED");
+            }
+            Err(e) => println!("No GPU: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_q4_pack() {
+        let data: Vec<i8> = vec![1, -2, 3, -4, 7, -8];
+        let packed = pack_i8_to_q4(&data);
+        assert_eq!(packed.len(), 3);
+        // Byte 0: lo=1(0x01), hi=-2(0x0E) → 0xE1
+        assert_eq!(packed[0], 0x01 | (0x0E << 4)); // 0xE1
+        // Byte 1: lo=3(0x03), hi=-4(0x0C) → 0xC3
+        assert_eq!(packed[1], 0x03 | (0x0C << 4)); // 0xC3
+        // Byte 2: lo=7(0x07), hi=-8(0x08) → 0x87
+        assert_eq!(packed[2], 0x07 | (0x08 << 4)); // 0x87
+    }
+
+    #[test]
+    fn test_gpu_matmul_q4() {
+        match GpuMatmul::new(16, 8) {
+            Ok(gpu) => {
+                if gpu.msl_q4_pipeline.is_none() {
+                    println!("SKIP: no Q4 Metal pipeline");
+                    return;
+                }
+                // Weights in [-8, 7] range for Q4
+                // Row 0: [1, 2, 3, 4], Row 1: [5, 6, 7, -8]
+                let weights: Vec<i8> = vec![1, 2, 3, 4, 5, 6, 7, -8];
+                let input: Vec<i8> = vec![1, 1, 1, 1];
+                // Identity scales
+                let gw = gpu.upload_weights_q4(&weights, 2, 4, None);
+                let result = gpu.matmul(&gw, &input);
+                // Row 0: 1+2+3+4 = 10
+                // Row 1: 5+6+7+(-8) = 10
+                println!("Q4 matmul result: [{}, {}] (expect [10, 10])", result[0], result[1]);
+                assert_eq!(result[0], 10);
+                assert_eq!(result[1], 10);
+                println!("GPU Q4 matmul PASSED");
             }
             Err(e) => println!("No GPU: {}", e),
         }
