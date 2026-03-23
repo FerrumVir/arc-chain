@@ -15,6 +15,7 @@ members = [
     "crates/arc-cli",
     "crates/arc-channel",
     "crates/arc-inference",
+    "crates/arc-olm",
     "agents",
     "relayer",
 ]
