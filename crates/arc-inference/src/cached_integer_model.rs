@@ -1148,10 +1148,34 @@ impl CachedIntegerModel {
     /// Quantize input ONCE, reuse for Q/K/V (3 matmuls) and gate/up (2 matmuls).
     /// Saves 4 input quantizations per layer × 32 layers = 128 saved quantizations.
     /// Uses pre-allocated buffers (q/k/v/attn_out/gate/up/gated/ff_out).
+    /// When Q4 weights are enabled (via enable_q4), uses 4-bit matmul on x86_64.
     pub fn forward_one_token(&self, token: u32, cache: &mut KVCache) -> Vec<i64> {
         let cfg = &self.config;
         let d = cfg.d_model;
         let pos = cache.seq_len;
+
+        // Helper macro: dispatch to Q4 matmul on x86_64 when available, else I8.
+        // $q4w: Option<&Q4WeightsX86>, $i8w: &I8Weights, $inq: &QuantizedInput,
+        // $raw: &[i64], $in_sz: input dim, $out: &mut [i64]
+        macro_rules! dispatch_matmul {
+            ($q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
+                {
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if let Some(q4w) = $q4w {
+                            matmul_q4_preq_x86(q4w, $inq, $out);
+                        } else {
+                            matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
+                        }
+                    }
+                    #[cfg(not(target_arch = "x86_64"))]
+                    {
+                        let _ = $q4w; // suppress unused warning
+                        matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
+                    }
+                }
+            };
+        }
 
         // Embed
         let idx = (token as usize).min(cfg.vocab_size - 1);
@@ -1171,16 +1195,19 @@ impl CachedIntegerModel {
         let mut ff_out = vec![0i64; d];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // Get Q4 layer ref if available
+            let q4_layer = self.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
+
             // LayerNorm once — result fits in L1 (32KB)
             let normed = layernorm(&hidden, &layer.attn_norm);
 
             // Quantize normed input ONCE, reuse for Q, K, V projections
             let normed_q = QuantizedInput::from_i64(&normed);
 
-            // Q/K/V with zero-alloc + cached quantized input
-            matmul_fast_preq(&layer.wq, &normed_q, &normed, d, &mut q);
-            matmul_fast_preq(&layer.wk, &normed_q, &normed, d, &mut k_buf);
-            matmul_fast_preq(&layer.wv, &normed_q, &normed, d, &mut v_buf);
+            // Q/K/V with zero-alloc + cached quantized input (Q4 or I8)
+            dispatch_matmul!(q4_layer.map(|l| &l.wq), &layer.wq, &normed_q, &normed, d, &mut q);
+            dispatch_matmul!(q4_layer.map(|l| &l.wk), &layer.wk, &normed_q, &normed, d, &mut k_buf);
+            dispatch_matmul!(q4_layer.map(|l| &l.wv), &layer.wv, &normed_q, &normed, d, &mut v_buf);
 
             // RoPE
             for h in 0..cfg.n_heads {
@@ -1235,15 +1262,16 @@ impl CachedIntegerModel {
             }
 
             // Wo projection + residual (zero-alloc)
-            matmul_fast_preq(&layer.wo, &QuantizedInput::from_i64(&attn_out), &attn_out, d, &mut projected);
+            let attn_out_q = QuantizedInput::from_i64(&attn_out);
+            dispatch_matmul!(q4_layer.map(|l| &l.wo), &layer.wo, &attn_out_q, &attn_out, d, &mut projected);
             for i in 0..d { hidden[i] += projected[i]; }
 
             // FFN: quantize normed_ff ONCE for gate+up
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
             let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
 
-            matmul_fast_preq(&layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
-            matmul_fast_preq(&layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
+            dispatch_matmul!(q4_layer.map(|l| &l.w_gate), &layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
+            dispatch_matmul!(q4_layer.map(|l| &l.w_up), &layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
 
             // SiLU gate * up (in-place)
             for j in 0..cfg.d_ff {
@@ -1252,12 +1280,23 @@ impl CachedIntegerModel {
 
             // W_down + residual
             let gate_q = QuantizedInput::from_i64(&gate);
-            matmul_fast_preq(&layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
+            dispatch_matmul!(q4_layer.map(|l| &l.w_down), &layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
             for i in 0..d { hidden[i] += ff_out[i]; }
         }
 
         cache.seq_len = pos + 1;
         let normed = layernorm(&hidden, &self.final_norm);
+
+        // LM head: Q4 output path if available
+        #[cfg(target_arch = "x86_64")]
+        if let Some(q4_out) = &self.q4_output {
+            let normed_q = QuantizedInput::from_i64(&normed);
+            let mut logits = vec![0i64; cfg.vocab_size];
+            matmul_q4_preq_x86(q4_out, &normed_q, &mut logits);
+            return logits;
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        { let _ = &self.q4_output; } // suppress unused warning
         matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
     }
 
