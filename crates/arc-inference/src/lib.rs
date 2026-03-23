@@ -11,6 +11,7 @@ pub mod candle_backend;
 pub mod integer_lut;
 pub mod integer_engine;
 pub mod gguf_integer;
+pub mod cached_integer_model;
 
 use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};

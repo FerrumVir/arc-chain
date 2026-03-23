@@ -152,6 +152,198 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         }
     }
 
+    // Grid + Color → Indices (ofcolor)
+    for &c in colors {
+        let name: &'static str = Box::leak(format!("ofcolor_{c}").into_boxed_str());
+        cat.push(TypedPrimitive {
+            name,
+            input_types: vec![DagType::Grid],
+            output_type: DagType::Indices,
+            apply: Box::new(move |args| {
+                let g = args[0].as_grid()?;
+                Some(DagValue::Indices(grid::ofcolor(g, c)))
+            }),
+        });
+    }
+
+    // Indices → Indices transformations
+    cat.push(TypedPrimitive {
+        name: "idx_backdrop",
+        input_types: vec![DagType::Indices],
+        output_type: DagType::Indices,
+        apply: Box::new(|args| {
+            if let DagValue::Indices(idx) = &args[0] {
+                // Backdrop of indices = bounding box
+                if idx.is_empty() { return Some(DagValue::Indices(PosSet::new())); }
+                let min_r = idx.iter().map(|p| p.0).min().unwrap();
+                let max_r = idx.iter().map(|p| p.0).max().unwrap();
+                let min_c = idx.iter().map(|p| p.1).min().unwrap();
+                let max_c = idx.iter().map(|p| p.1).max().unwrap();
+                let mut bd = PosSet::new();
+                for r in min_r..=max_r { for c in min_c..=max_c { bd.insert((r, c)); } }
+                Some(DagValue::Indices(bd))
+            } else { None }
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "idx_delta",
+        input_types: vec![DagType::Indices],
+        output_type: DagType::Indices,
+        apply: Box::new(|args| {
+            if let DagValue::Indices(idx) = &args[0] {
+                if idx.is_empty() { return Some(DagValue::Indices(PosSet::new())); }
+                let min_r = idx.iter().map(|p| p.0).min().unwrap();
+                let max_r = idx.iter().map(|p| p.0).max().unwrap();
+                let min_c = idx.iter().map(|p| p.1).min().unwrap();
+                let max_c = idx.iter().map(|p| p.1).max().unwrap();
+                let mut d = PosSet::new();
+                for r in min_r..=max_r { for c in min_c..=max_c {
+                    if !idx.contains(&(r, c)) { d.insert((r, c)); }
+                }}
+                Some(DagValue::Indices(d))
+            } else { None }
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "idx_neighbors",
+        input_types: vec![DagType::Indices],
+        output_type: DagType::Indices,
+        apply: Box::new(|args| {
+            if let DagValue::Indices(idx) = &args[0] {
+                Some(DagValue::Indices(object::mapply_neighbors(idx)))
+            } else { None }
+        }),
+    });
+
+    // Object → Indices (more region functions)
+    for (name, f) in [
+        ("obj_box", object::obj_box as fn(&crate::Object) -> PosSet),
+        ("corners", object::corners as fn(&crate::Object) -> PosSet),
+        ("inbox", object::inbox as fn(&crate::Object) -> PosSet),
+        ("outbox", object::outbox as fn(&crate::Object) -> PosSet),
+    ] {
+        cat.push(TypedPrimitive {
+            name,
+            input_types: vec![DagType::Object],
+            output_type: DagType::Indices,
+            apply: Box::new(move |args| {
+                if let DagValue::Object(obj) = &args[0] {
+                    Some(DagValue::Indices(f(obj)))
+                } else { None }
+            }),
+        });
+    }
+
+    // Objects → merged Indices via region functions
+    for (name, region_fn) in [
+        ("mapply_delta", object::delta as fn(&crate::Object) -> PosSet),
+        ("mapply_backdrop", object::backdrop as fn(&crate::Object) -> PosSet),
+        ("mapply_box", object::obj_box as fn(&crate::Object) -> PosSet),
+        ("mapply_corners", object::corners as fn(&crate::Object) -> PosSet),
+        ("mapply_inbox", object::inbox as fn(&crate::Object) -> PosSet),
+        ("mapply_outbox", object::outbox as fn(&crate::Object) -> PosSet),
+    ] {
+        cat.push(TypedPrimitive {
+            name,
+            input_types: vec![DagType::Objects],
+            output_type: DagType::Indices,
+            apply: Box::new(move |args| {
+                if let DagValue::Objects(objs) = &args[0] {
+                    let mut all = PosSet::new();
+                    for obj in objs { all.extend(region_fn(obj)); }
+                    Some(DagValue::Indices(all))
+                } else { None }
+            }),
+        });
+    }
+
+    // Objects → merged neighbor indices
+    cat.push(TypedPrimitive {
+        name: "mapply_neighbors",
+        input_types: vec![DagType::Objects],
+        output_type: DagType::Indices,
+        apply: Box::new(|args| {
+            if let DagValue::Objects(objs) = &args[0] {
+                let mut all = PosSet::new();
+                for obj in objs {
+                    all.extend(object::mapply_neighbors(&obj.positions()));
+                }
+                Some(DagValue::Indices(all))
+            } else { None }
+        }),
+    });
+
+    // Indices + Grid + Color → Grid (fill)
+    for &c in colors {
+        let name: &'static str = Box::leak(format!("fill_idx_{c}").into_boxed_str());
+        cat.push(TypedPrimitive {
+            name,
+            input_types: vec![DagType::Indices, DagType::Grid],
+            output_type: DagType::Grid,
+            apply: Box::new(move |args| {
+                if let (DagValue::Indices(idx), DagValue::Grid(g)) = (&args[0], &args[1]) {
+                    Some(DagValue::Grid(grid::fill(g, c, idx)))
+                } else { None }
+            }),
+        });
+        let name: &'static str = Box::leak(format!("underfill_idx_{c}").into_boxed_str());
+        cat.push(TypedPrimitive {
+            name,
+            input_types: vec![DagType::Indices, DagType::Grid],
+            output_type: DagType::Grid,
+            apply: Box::new(move |args| {
+                if let (DagValue::Indices(idx), DagValue::Grid(g)) = (&args[0], &args[1]) {
+                    Some(DagValue::Grid(grid::underfill(g, c, idx)))
+                } else { None }
+            }),
+        });
+    }
+
+    // Objects → Object: colorfilter + first/argmax
+    for &c in colors {
+        let name: &'static str = Box::leak(format!("cf{c}_argmax").into_boxed_str());
+        cat.push(TypedPrimitive {
+            name,
+            input_types: vec![DagType::Objects],
+            output_type: DagType::Object,
+            apply: Box::new(move |args| {
+                if let DagValue::Objects(objs) = &args[0] {
+                    let filtered = object::colorfilter(objs, c);
+                    object::argmax_size(&filtered).cloned().map(DagValue::Object)
+                } else { None }
+            }),
+        });
+    }
+
+    // Object → Grid: cover (erase object)
+    cat.push(TypedPrimitive {
+        name: "cover",
+        input_types: vec![DagType::Object, DagType::Grid],
+        output_type: DagType::Grid,
+        apply: Box::new(|args| {
+            if let (DagValue::Object(obj), DagValue::Grid(g)) = (&args[0], &args[1]) {
+                Some(DagValue::Grid(object::cover(g, obj)))
+            } else { None }
+        }),
+    });
+
+    // Object movement (fixed offsets)
+    for (dr, dc, name) in [
+        (1isize, 0isize, "move_down"), (-1, 0, "move_up"),
+        (0, 1, "move_right"), (0, -1, "move_left"),
+    ] {
+        cat.push(TypedPrimitive {
+            name,
+            input_types: vec![DagType::Object, DagType::Grid],
+            output_type: DagType::Grid,
+            apply: Box::new(move |args| {
+                if let (DagValue::Object(obj), DagValue::Grid(g)) = (&args[0], &args[1]) {
+                    Some(DagValue::Grid(object::move_obj(g, obj, dr, dc)))
+                } else { None }
+            }),
+        });
+    }
+
     // Upscale/downscale
     for factor in [2usize, 3, 4, 5] {
         let name: &'static str = Box::leak(format!("upscale_{factor}").into_boxed_str());

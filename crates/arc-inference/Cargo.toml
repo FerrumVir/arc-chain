@@ -19,6 +19,7 @@ thiserror.workspace = true
 tracing.workspace = true
 dashmap.workspace = true
 hex.workspace = true
+rayon.workspace = true
 
 # Optional: real INT4/GGUF inference via Hugging Face candle
 candle-core = { version = "0.8", optional = true }
