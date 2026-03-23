@@ -181,8 +181,8 @@ impl GgufEngine {
             generated_tokens.push(next_token);
             all_tokens.push(next_token);
 
-            // Stop on EOS (token 2 for Llama)
-            if next_token == 2 {
+            // Stop on EOS (token 2 for Llama-2, 128001/128009 for Llama-3)
+            if next_token == 2 || next_token == 128001 || next_token == 128009 {
                 break;
             }
 

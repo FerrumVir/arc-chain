@@ -45,16 +45,37 @@ fn main() {
     eprintln!("  Load time:  {:.2}s", load_time.as_secs_f64());
     eprintln!();
 
-    // Input: Llama-2-Chat format "[INST] What is 2+2? [/INST]"
-    // Token IDs for Llama-2 tokenizer:
-    // 1=BOS, 518=[, 25580=INST, 29962=], 1724=What, 338=is, 29871= ,
-    // 29906=2, 29974=+, 29973=?, 518=[, 29914=/, 25580=INST, 29962=]
-    let input_tokens: Vec<u32> = vec![
-        1,      // BOS
-        518, 25580, 29962,  // [INST]
-        1724, 338, 29871, 29906, 29974, 29906, 29973,  // What is 2+2?
-        518, 29914, 25580, 29962,  // [/INST]
-    ];
+    // Detect model type from path and use appropriate prompt tokens.
+    // Llama-3 uses a different chat template than Llama-2.
+    let is_llama3 = model_path.contains("3.1") || model_path.contains("llama-3")
+        || model_path.contains("Llama-3");
+
+    let input_tokens: Vec<u32> = if is_llama3 {
+        // Llama-3.1 Instruct format:
+        // <|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\nWhat is 2+2?<|eot_id|>
+        // <|start_header_id|>assistant<|end_header_id|>\n\n
+        vec![
+            128000,  // <|begin_of_text|>
+            128006,  // <|start_header_id|>
+            882,     // user
+            128007,  // <|end_header_id|>
+            271,     // \n\n
+            3923, 374, 220, 17, 10, 17, 30,  // What is 2+2?
+            128009,  // <|eot_id|>
+            128006,  // <|start_header_id|>
+            78191,   // assistant
+            128007,  // <|end_header_id|>
+            271,     // \n\n
+        ]
+    } else {
+        // Llama-2-Chat format: [INST] What is 2+2? [/INST]
+        vec![
+            1,      // BOS
+            518, 25580, 29962,  // [INST]
+            1724, 338, 29871, 29906, 29974, 29906, 29973,  // What is 2+2?
+            518, 29914, 25580, 29962,  // [/INST]
+        ]
+    };
     eprintln!("  Input tokens: {:?}", input_tokens);
     eprintln!();
 
