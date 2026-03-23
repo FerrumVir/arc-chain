@@ -395,7 +395,12 @@ async fn main() -> Result<()> {
         if let Some(model_path) = &cli.model {
             tracing::info!("Loading GGUF model from {} into INT8 cache...", model_path);
             let load_start = Instant::now();
-            match arc_inference::cached_integer_model::load_cached_model(model_path) {
+            let load_result = if model_path.ends_with(".arc-int8") {
+                arc_inference::cached_integer_model::load_cached_model_binary(model_path)
+            } else {
+                arc_inference::cached_integer_model::load_cached_model(model_path)
+            };
+            match load_result {
                 Ok(model) => {
                     let elapsed = load_start.elapsed();
                     let mem_mb = model.memory_bytes() / (1024 * 1024);
