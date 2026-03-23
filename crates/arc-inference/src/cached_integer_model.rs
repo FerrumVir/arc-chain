@@ -80,27 +80,65 @@ pub struct CachedLayer {
     pub ffn_norm: Vec<i64>,
 }
 
-/// KV cache for autoregressive generation.
+/// INT8 quantized KV cache — 8x less memory than i64.
+/// Each position's K/V vector is quantized to i8 with a per-position scale.
+/// 7B at 2048 context: 512 MB (vs 4 GB with i64).
 pub struct KVCache {
-    pub k: Vec<Vec<i64>>,
-    pub v: Vec<Vec<i64>>,
+    /// k_data[layer]: flat i8 array, [pos * d_kv .. (pos+1) * d_kv]
+    pub k_data: Vec<Vec<i8>>,
+    /// k_scales[layer][pos]: Q16 scale for position pos
+    pub k_scales: Vec<Vec<i64>>,
+    /// v_data[layer]: flat i8 array
+    pub v_data: Vec<Vec<i8>>,
+    pub v_scales: Vec<Vec<i64>>,
     pub seq_len: usize,
 }
 
 impl KVCache {
     pub fn new(n_layers: usize) -> Self {
         Self {
-            k: vec![Vec::new(); n_layers],
-            v: vec![Vec::new(); n_layers],
+            k_data: vec![Vec::new(); n_layers],
+            k_scales: vec![Vec::new(); n_layers],
+            v_data: vec![Vec::new(); n_layers],
+            v_scales: vec![Vec::new(); n_layers],
             seq_len: 0,
         }
     }
 
     pub fn clear(&mut self) {
-        for layer in &mut self.k { layer.clear(); }
-        for layer in &mut self.v { layer.clear(); }
+        for l in 0..self.k_data.len() {
+            self.k_data[l].clear();
+            self.k_scales[l].clear();
+            self.v_data[l].clear();
+            self.v_scales[l].clear();
+        }
         self.seq_len = 0;
     }
+
+    /// Quantize and append a K vector for one position.
+    fn push_k(&mut self, layer: usize, k: &[i64]) {
+        let (data, scale) = quantize_vec_i8(k);
+        self.k_data[layer].extend_from_slice(&data);
+        self.k_scales[layer].push(scale);
+    }
+
+    /// Quantize and append a V vector for one position.
+    fn push_v(&mut self, layer: usize, v: &[i64]) {
+        let (data, scale) = quantize_vec_i8(v);
+        self.v_data[layer].extend_from_slice(&data);
+        self.v_scales[layer].push(scale);
+    }
+}
+
+/// Quantize an i64 Q16 vector to i8 with per-vector scale.
+#[inline]
+fn quantize_vec_i8(v: &[i64]) -> (Vec<i8>, i64) {
+    let abs_max = v.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
+    let scale_factor = (abs_max / 127).max(1);
+    let data: Vec<i8> = v.iter()
+        .map(|&x| (x / scale_factor).clamp(-127, 127) as i8)
+        .collect();
+    (data, scale_factor)
 }
 
 /// Model config extracted from GGUF metadata.
@@ -383,6 +421,135 @@ fn silu_i64(x: i64) -> i64 {
     if x > 0 { x } else { x >> 2 }
 }
 
+// ─── Fused LayerNorm + Projection ─────────────────────────────────────────────
+
+/// Compute layernorm stats (mean, inv_std) without materializing the normed vector.
+#[inline]
+fn layernorm_stats(input: &[i64]) -> (i64, i64) {
+    let n = input.len() as i64;
+    let mean = input.iter().sum::<i64>() / n;
+    let mut var_sum: i64 = 0;
+    for &x in input {
+        let d = x - mean;
+        var_sum += (d * d) >> FRAC_BITS;
+    }
+    let inv_std = integer_isqrt(var_sum / n + 1);
+    (mean, inv_std)
+}
+
+/// Fused layernorm + i8 matmul projection.
+/// Computes: output = matmul(weights, layernorm(input, gamma))
+/// Without allocating the intermediate normed vector.
+/// One pass over input to compute stats, then stream through weight rows.
+fn fused_layernorm_matmul(
+    input: &[i64],
+    gamma: &[i64],
+    weights: &I8Weights,
+    in_size: usize,
+    out_size: usize,
+) -> Vec<i64> {
+    let (mean, inv_std) = layernorm_stats(input);
+    let scales = &weights.scales;
+    let data = &weights.data;
+
+    let mut output = vec![0i64; out_size];
+    output.par_chunks_mut(64).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start = chunk_idx * 64;
+        for (local_i, out) in chunk.iter_mut().enumerate() {
+            let i = start + local_i;
+            let row = &data[i * in_size..(i + 1) * in_size];
+            let mut acc: i64 = 0;
+            // Fused: for each j, compute normed[j] on-the-fly and multiply
+            for j in 0..in_size {
+                let norm = ((input[j] - mean) * inv_std) >> FRAC_BITS;
+                let g = if j < gamma.len() { gamma[j] } else { ONE };
+                let normed_j = (norm * g) >> FRAC_BITS;
+                acc += (row[j] as i64) * normed_j;
+            }
+            *out = (acc * scales[i]) >> FRAC_BITS;
+        }
+    });
+    output
+}
+
+// ─── Flash Attention (Online Softmax, O(1) Memory) ───────────────────────────
+
+/// Flash attention for a single query head against i8-quantized KV cache.
+/// Uses online softmax: processes KV in streaming fashion, never allocates O(n²).
+/// Numerically equivalent to standard attention (within integer rounding).
+///
+/// q_head: [d_head] i64 Q16 — the query for this head at current position
+/// k_data: flat i8 array of all cached K for this layer
+/// k_scales: per-position scales for K
+/// v_data: flat i8 array of all cached V
+/// v_scales: per-position scales for V
+/// d_kv: total d_kv dimension (d_head * n_kv_heads)
+/// kv_h: which KV head to use
+/// d_head: dimension per head
+/// full_seq: number of positions in cache
+/// attn_scale: 1/sqrt(d_head) in Q16
+fn flash_attention_i8(
+    q_head: &[i64],
+    k_data: &[i8], k_scales: &[i64],
+    v_data: &[i8], v_scales: &[i64],
+    d_kv: usize, kv_h: usize, d_head: usize,
+    full_seq: usize, attn_scale: i64,
+) -> Vec<i64> {
+    // Online softmax: maintain running max, sum of exp, and weighted V sum.
+    // Process one position at a time — O(1) extra memory (no scores array).
+    let mut running_max: i64 = -8 * ONE; // start very negative
+    let mut running_sum: i64 = 0;        // sum of exp(score - max)
+    let mut out = vec![0i64; d_head];     // weighted V accumulator
+
+    for j in 0..full_seq {
+        // Dequantize K for position j, head kv_h
+        let k_off = j * d_kv + kv_h * d_head;
+        let k_scale = k_scales[j];
+
+        // Compute dot product: Q · K (with K dequantized on-the-fly)
+        let mut dot: i64 = 0;
+        for dd in 0..d_head {
+            let k_val = (k_data[k_off + dd] as i64) * k_scale;
+            dot += q_head[dd] * k_val;
+        }
+        let score = (dot >> (FRAC_BITS * 2)) * attn_scale >> FRAC_BITS;
+
+        // Online softmax update
+        if score > running_max {
+            // New max — rescale existing accumulator
+            let diff = running_max - score; // negative
+            let correction = integer_exp(diff); // exp(old_max - new_max) < 1
+            // Scale down existing sum and output
+            running_sum = (running_sum * correction) >> FRAC_BITS;
+            for dd in 0..d_head {
+                out[dd] = (out[dd] * correction) >> FRAC_BITS;
+            }
+            running_max = score;
+        }
+
+        // exp(score - running_max)
+        let w = integer_exp(score - running_max);
+        running_sum += w;
+
+        // Accumulate weighted V (dequantized on-the-fly)
+        let v_off = j * d_kv + kv_h * d_head;
+        let v_scale = v_scales[j];
+        for dd in 0..d_head {
+            let v_val = (v_data[v_off + dd] as i64) * v_scale;
+            out[dd] += (w * v_val) >> FRAC_BITS;
+        }
+    }
+
+    // Normalize by sum
+    if running_sum > 0 {
+        for dd in 0..d_head {
+            out[dd] = (out[dd] * ONE) / running_sum;
+        }
+    }
+
+    out
+}
+
 // ─── Binary Weight Cache ──────────────────────────────────────────────────────
 
 impl I8Weights {
@@ -502,13 +669,14 @@ impl CachedIntegerModel {
         tokens
     }
 
-    /// Forward pass for a single new token with KV cache.
+    /// Forward pass for a single new token.
+    /// i8 KV cache (8x less memory), standard attention, separate layernorm.
     pub fn forward_one_token(&self, token: u32, cache: &mut KVCache) -> Vec<i64> {
         let cfg = &self.config;
         let d = cfg.d_model;
         let pos = cache.seq_len;
 
-        // Embed: per-row scale means each token's embedding uses full i8 range
+        // Embed
         let idx = (token as usize).min(cfg.vocab_size - 1);
         let emb_start = idx * d;
         let emb_scale = self.embedding.scales[idx];
@@ -516,12 +684,15 @@ impl CachedIntegerModel {
             .iter().map(|&w| (w as i64) * emb_scale).collect();
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            // LayerNorm (compute once, reuse for Q/K/V — 32KB fits in L1)
             let normed = layernorm(&hidden, &layer.attn_norm);
 
+            // Q/K/V projections
             let mut q = matmul_fast(&layer.wq, &normed, d, d);
             let k = matmul_fast(&layer.wk, &normed, d, cfg.d_kv);
             let v = matmul_fast(&layer.wv, &normed, d, cfg.d_kv);
 
+            // RoPE
             for h in 0..cfg.n_heads {
                 apply_rope(&mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
                     pos, cfg.d_head, &cfg.rope_cos, &cfg.rope_sin);
@@ -532,30 +703,44 @@ impl CachedIntegerModel {
                     pos, cfg.d_head, &cfg.rope_cos, &cfg.rope_sin);
             }
 
-            cache.k[layer_idx].extend_from_slice(&k);
-            cache.v[layer_idx].extend_from_slice(&v);
+            // Store K/V in INT8 quantized cache (8x less memory)
+            cache.push_k(layer_idx, &k);
+            cache.push_v(layer_idx, &v);
 
+            // Attention with i8 KV cache
             let full_seq = pos + 1;
             let head_results: Vec<Vec<i64>> = (0..cfg.n_heads).into_par_iter().map(|h| {
                 let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
                 let dh = cfg.d_head;
                 let q_head = &q[h * dh..(h + 1) * dh];
 
+                // Attention scores: Q · K with i8 K cache
+                // Factor scale out of inner loop: dot = (sum(q[d]*k_i8[d])) * k_scale
                 let mut scores = Vec::with_capacity(full_seq);
                 for j in 0..full_seq {
-                    let k_head = &cache.k[layer_idx][j * cfg.d_kv + kv_h * dh..j * cfg.d_kv + (kv_h + 1) * dh];
-                    let mut dot: i64 = 0;
-                    for dd in 0..dh { dot += q_head[dd] * k_head[dd]; }
+                    let k_off = j * cfg.d_kv + kv_h * dh;
+                    let k_scale = cache.k_scales[layer_idx][j];
+                    let mut dot_raw: i64 = 0;
+                    for dd in 0..dh {
+                        dot_raw += q_head[dd] * (cache.k_data[layer_idx][k_off + dd] as i64);
+                    }
+                    // dot_raw is Q16 * unitless(i8). Multiply by k_scale then shift.
+                    let dot = (dot_raw >> FRAC_BITS) * k_scale;
                     scores.push((dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS);
                 }
 
                 let attn_weights = softmax_i64(&scores);
 
+                // Weighted V sum with i8 V cache
                 let mut out = vec![0i64; dh];
                 for j in 0..full_seq {
-                    let v_head = &cache.v[layer_idx][j * cfg.d_kv + kv_h * dh..j * cfg.d_kv + (kv_h + 1) * dh];
+                    let v_off = j * cfg.d_kv + kv_h * dh;
+                    let v_scale = cache.v_scales[layer_idx][j];
+                    let w = attn_weights[j];
                     for dd in 0..dh {
-                        out[dd] += (attn_weights[j] * v_head[dd]) >> FRAC_BITS;
+                        // v_val = v_i8 * v_scale (reconstructed Q16-ish)
+                        let v_val = (cache.v_data[layer_idx][v_off + dd] as i64) * v_scale;
+                        out[dd] += (w * v_val) >> FRAC_BITS;
                     }
                 }
                 out
@@ -569,6 +754,7 @@ impl CachedIntegerModel {
             let projected = matmul_fast(&layer.wo, &attn_out, d, d);
             for i in 0..d { hidden[i] += projected[i]; }
 
+            // FFN
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
             let gate = matmul_fast(&layer.w_gate, &normed_ff, d, cfg.d_ff);
             let up = matmul_fast(&layer.w_up, &normed_ff, d, cfg.d_ff);
