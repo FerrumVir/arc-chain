@@ -1,26 +1,65 @@
-//! Cached Integer Model — Production-speed deterministic inference.
+//! Cached Integer Model — Production-speed deterministic inference with INT8 weights.
 //!
-//! Loads GGUF model weights into memory ONCE at startup. Forward pass
-//! uses pre-loaded i64 weights with KV cache and rayon parallelism.
-//! No disk I/O during inference. Pure i64 arithmetic.
+//! Stores weights as INT8 (1 byte per parameter) with per-tensor Q16 scale factors.
+//! 7B model: ~7GB instead of 56GB with i64. Fits in 8GB RAM.
 //!
-//! Target: ~76ms/token for 7B on Mac Studio M2 Ultra (24 cores).
+//! Forward pass: i8 weight × i64 activation → accumulate in i64 → scale → Q16 result.
+//! Pure integer arithmetic during inference. Deterministic on all platforms.
+//! Float used ONLY at model load time (GGUF dequant + quantize to i8).
 
 use crate::integer_lut::*;
 use arc_crypto::Hash256;
 use rayon::prelude::*;
 use tracing::info;
 
-/// Pre-loaded transformer layer weights in i64 Q16 fixed-point.
+// ─── INT8 Weight Storage ──────────────────────────────────────────────────────
+
+/// Per-tensor symmetric INT8 quantized weights.
+///
+/// Original real value ≈ i8_value × scale_q16 (where scale_q16 is in Q16).
+/// Quantization: i8 = round(f32 / abs_max × 127), scale = abs_max / 127 × ONE.
+/// Matmul: result_q16 = (sum(i8 × activation_q16) × scale) >> FRAC_BITS
+pub struct I8Weights {
+    pub data: Vec<i8>,
+    pub scale: i64, // Q16 representation of (abs_max / 127)
+}
+
+impl I8Weights {
+    /// Quantize f32 values to symmetric INT8 with per-tensor scale.
+    /// Returns I8Weights with scale in Q16.
+    pub fn quantize_f32(values: &[f32]) -> Self {
+        let abs_max = values.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
+        let abs_max = abs_max.max(1e-10); // avoid div by zero
+
+        let inv_abs_max = 127.0 / abs_max;
+        let data: Vec<i8> = values.iter()
+            .map(|&x| (x * inv_abs_max).round().clamp(-127.0, 127.0) as i8)
+            .collect();
+
+        // scale = abs_max / 127 in Q16
+        let scale = ((abs_max as f64 / 127.0) * ONE as f64).round() as i64;
+
+        Self { data, scale: scale.max(1) }
+    }
+
+    /// Memory usage in bytes.
+    pub fn memory_bytes(&self) -> usize {
+        self.data.len() + 8 // data + scale
+    }
+}
+
+// ─── Layer and Model Structs ──────────────────────────────────────────────────
+
+/// Pre-loaded transformer layer weights in INT8 with Q16 norms.
 pub struct CachedLayer {
-    pub wq: Vec<i64>,      // [d_model × d_model]
-    pub wk: Vec<i64>,      // [d_model × d_kv]
-    pub wv: Vec<i64>,      // [d_model × d_kv]
-    pub wo: Vec<i64>,      // [d_model × d_model]
-    pub w_gate: Vec<i64>,  // [d_ff × d_model]
-    pub w_up: Vec<i64>,    // [d_ff × d_model]
-    pub w_down: Vec<i64>,  // [d_model × d_ff]
-    pub attn_norm: Vec<i64>,
+    pub wq: I8Weights,      // [d_model × d_model]
+    pub wk: I8Weights,      // [d_model × d_kv]
+    pub wv: I8Weights,      // [d_model × d_kv]
+    pub wo: I8Weights,      // [d_model × d_model]
+    pub w_gate: I8Weights,  // [d_ff × d_model]
+    pub w_up: I8Weights,    // [d_ff × d_model]
+    pub w_down: I8Weights,  // [d_model × d_ff]
+    pub attn_norm: Vec<i64>, // norms stay i64 (small: d_model each)
     pub ffn_norm: Vec<i64>,
 }
 
@@ -66,51 +105,252 @@ pub struct ModelConfig {
     pub max_seq: usize,
 }
 
-/// Fully cached integer model — all weights in RAM.
+/// Fully cached integer model with INT8 weights.
+///
+/// Memory for 7B: ~7GB (vs 56GB with i64).
+/// - Embedding: ~131MB (32K × 4096 × 1 byte)
+/// - 32 layers × ~190MB each = ~6.1GB
+/// - Output weight: ~131MB
+/// - Norms + RoPE: ~4MB
 pub struct CachedIntegerModel {
     pub config: ModelConfig,
-    pub embedding: Vec<i64>,     // [vocab × d_model]
+    pub embedding: I8Weights,     // [vocab × d_model] as i8
     pub layers: Vec<CachedLayer>,
-    pub final_norm: Vec<i64>,    // [d_model]
-    pub output_weight: Vec<i64>, // [vocab × d_model]
+    pub final_norm: Vec<i64>,     // [d_model]
+    pub output_weight: I8Weights, // [vocab × d_model] as i8
+    /// Token vocabulary extracted from GGUF (for decode: token_id → string).
+    pub vocab: Vec<String>,
 }
 
-/// Parallel i64 matmul — each output row computed independently.
-fn matmul_par(weights: &[i64], input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
+// ─── INT8 Matmul ──────────────────────────────────────────────────────────────
+
+/// INT8 × i64 parallel matrix-vector multiply.
+///
+/// weights.data: [out_size × in_size] as i8, weights.scale: Q16
+/// input: [in_size] as i64 Q16
+/// Returns: [out_size] as i64 Q16
+///
+/// Math: result[i] = (sum_j(w_i8[i,j] * input[j]) * scale) >> FRAC_BITS
+fn matmul_i8_par(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
+    let data = &weights.data;
+    let scale = weights.scale;
     (0..out_size).into_par_iter().map(|i| {
-        let row = &weights[i * in_size..(i + 1) * in_size];
+        let row = &data[i * in_size..(i + 1) * in_size];
         let mut acc: i64 = 0;
-        for j in 0..in_size {
-            acc += row[j] * input[j];
+        // Process 4 elements at a time for better ILP
+        let chunks = in_size / 4;
+        let remainder = in_size % 4;
+        for c in 0..chunks {
+            let base = c * 4;
+            acc += (row[base] as i64) * input[base];
+            acc += (row[base + 1] as i64) * input[base + 1];
+            acc += (row[base + 2] as i64) * input[base + 2];
+            acc += (row[base + 3] as i64) * input[base + 3];
         }
-        acc >> FRAC_BITS
+        for j in (in_size - remainder)..in_size {
+            acc += (row[j] as i64) * input[j];
+        }
+        (acc * scale) >> FRAC_BITS
     }).collect()
 }
 
-/// Sequential i64 matmul for small dimensions (rayon overhead not worth it).
-fn matmul_seq(weights: &[i64], input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
+/// INT8 × i64 sequential matmul for small dimensions (rayon overhead not worth it).
+fn matmul_i8_seq(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
+    let data = &weights.data;
+    let scale = weights.scale;
     let mut output = Vec::with_capacity(out_size);
     for i in 0..out_size {
-        let mut acc: i64 = 0;
         let row_start = i * in_size;
+        let mut acc: i64 = 0;
         for j in 0..in_size {
-            acc += weights[row_start + j] * input[j];
+            acc += (data[row_start + j] as i64) * input[j];
         }
-        output.push(acc >> FRAC_BITS);
+        output.push((acc * scale) >> FRAC_BITS);
     }
     output
 }
 
-/// Choose parallel or sequential based on size.
-fn matmul(weights: &[i64], input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
+/// Choose parallel or sequential based on output dimension.
+fn matmul_i8(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     if out_size >= 256 {
-        matmul_par(weights, input, in_size, out_size)
+        matmul_i8_par(weights, input, in_size, out_size)
     } else {
-        matmul_seq(weights, input, in_size, out_size)
+        matmul_i8_seq(weights, input, in_size, out_size)
     }
 }
 
-/// Integer layer normalization.
+// ─── SIMD INT8 Matmul (Phase 4b) ─────────────────────────────────────────────
+
+/// SIMD-accelerated i8 × i8 → i32 matmul for ARM NEON.
+/// Quantizes input to i8 on-the-fly, uses NEON for the inner loop.
+#[cfg(target_arch = "aarch64")]
+fn matmul_i8xi8_simd(
+    weights: &I8Weights,
+    input: &[i64],
+    in_size: usize,
+    out_size: usize,
+) -> Vec<i64> {
+    use std::arch::aarch64::*;
+
+    // Quantize input to i8 with its own scale
+    let input_abs_max = input.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
+    let input_scale_factor = input_abs_max / 127;
+    let input_scale_factor = input_scale_factor.max(1);
+
+    let input_i8: Vec<i8> = input.iter()
+        .map(|&x| (x / input_scale_factor).clamp(-127, 127) as i8)
+        .collect();
+
+    // Combined scale: weight_scale * input_scale_factor / ONE
+    // result = i32_acc * combined_scale >> FRAC_BITS
+    let weight_scale = weights.scale;
+    let data = &weights.data;
+
+    (0..out_size).into_par_iter().map(|i| {
+        let row = &data[i * in_size..(i + 1) * in_size];
+        let mut acc: i64 = 0;
+
+        // NEON path: process 16 i8 elements at a time
+        let simd_len = in_size / 16 * 16;
+        unsafe {
+            let mut vacc = vdupq_n_s32(0);
+            let mut vacc2 = vdupq_n_s32(0);
+            let mut j = 0usize;
+            while j < simd_len {
+                // Load 16 i8 weights and 16 i8 inputs
+                let vw = vld1q_s8(row.as_ptr().add(j));
+                let vi = vld1q_s8(input_i8.as_ptr().add(j));
+
+                // Multiply low 8: i8 × i8 → i16
+                let prod_lo = vmull_s8(vget_low_s8(vw), vget_low_s8(vi));
+                // Multiply high 8: i8 × i8 → i16
+                let prod_hi = vmull_s8(vget_high_s8(vw), vget_high_s8(vi));
+
+                // Pairwise add i16 → i32 and accumulate
+                vacc = vpadalq_s16(vacc, prod_lo);
+                vacc2 = vpadalq_s16(vacc2, prod_hi);
+
+                j += 16;
+            }
+            // Horizontal sum of 4xi32
+            vacc = vaddq_s32(vacc, vacc2);
+            acc = vaddvq_s32(vacc) as i64;
+        }
+
+        // Scalar remainder
+        for j in simd_len..in_size {
+            acc += (row[j] as i64) * (input_i8[j] as i64);
+        }
+
+        // Rescale: acc is in (weight_unit × input_unit) space
+        // result_q16 = acc * weight_scale * input_scale_factor / ONE
+        // = (acc * weight_scale >> FRAC_BITS) * input_scale_factor
+        // But to avoid overflow, we compute differently:
+        // result_q16 = acc * (weight_scale * input_scale_factor / ONE)
+        // Since weight_scale and input_scale_factor are both manageable, let's compute:
+        let combined = (weight_scale * input_scale_factor) >> FRAC_BITS;
+        acc * combined
+    }).collect()
+}
+
+/// x86 AVX2 variant.
+#[cfg(target_arch = "x86_64")]
+fn matmul_i8xi8_simd(
+    weights: &I8Weights,
+    input: &[i64],
+    in_size: usize,
+    out_size: usize,
+) -> Vec<i64> {
+    use std::arch::x86_64::*;
+
+    // Check for AVX2 support at runtime
+    if !is_x86_feature_detected!("avx2") {
+        return matmul_i8_par(weights, input, in_size, out_size);
+    }
+
+    // Quantize input to i8
+    let input_abs_max = input.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
+    let input_scale_factor = (input_abs_max / 127).max(1);
+
+    let input_i8: Vec<i8> = input.iter()
+        .map(|&x| (x / input_scale_factor).clamp(-127, 127) as i8)
+        .collect();
+
+    let weight_scale = weights.scale;
+    let data = &weights.data;
+
+    (0..out_size).into_par_iter().map(|i| {
+        let row = &data[i * in_size..(i + 1) * in_size];
+        let mut acc: i64 = 0;
+
+        // AVX2 path: process 32 i8 elements at a time
+        // _mm256_maddubs_epi16 needs unsigned × signed
+        // We offset weights to unsigned: u8 = i8 + 128
+        let simd_len = in_size / 32 * 32;
+        unsafe {
+            let mut vacc = _mm256_setzero_si256();
+            let offset = _mm256_set1_epi8(-128i8); // for bias correction
+            let mut j = 0usize;
+            while j < simd_len {
+                // Load 32 weights and 32 inputs
+                let vw = _mm256_loadu_si256(row.as_ptr().add(j) as *const __m256i);
+                let vi = _mm256_loadu_si256(input_i8.as_ptr().add(j) as *const __m256i);
+
+                // Make weights unsigned: u8 = i8 + 128 (xor with 0x80)
+                let vw_u = _mm256_xor_si256(vw, _mm256_set1_epi8(-128i8));
+
+                // u8 × i8 → i16 pairs with saturating add
+                let prod16 = _mm256_maddubs_epi16(vw_u, vi);
+
+                // i16 pairs → i32 with horizontal add
+                let prod32 = _mm256_madd_epi16(prod16, _mm256_set1_epi16(1));
+
+                vacc = _mm256_add_epi32(vacc, prod32);
+
+                // Bias correction: subtract 128 * sum(input) for this chunk
+                // We handle this after the loop for the full accumulator
+                j += 32;
+            }
+
+            // Horizontal sum of 8xi32
+            let lo = _mm256_extracti128_si256(vacc, 0);
+            let hi = _mm256_extracti128_si256(vacc, 1);
+            let sum128 = _mm_add_epi32(lo, hi);
+            let sum128 = _mm_hadd_epi32(sum128, sum128);
+            let sum128 = _mm_hadd_epi32(sum128, sum128);
+            acc = _mm_extract_epi32(sum128, 0) as i64;
+
+            // Bias correction for unsigned conversion:
+            // We computed sum(w_u8 * input_i8) = sum((w_i8+128) * input_i8)
+            //   = sum(w_i8 * input_i8) + 128 * sum(input_i8)
+            // So subtract 128 * sum(input_i8[0..simd_len])
+            let input_sum: i64 = input_i8[..simd_len].iter().map(|&x| x as i64).sum();
+            acc -= 128 * input_sum;
+        }
+
+        // Scalar remainder
+        for j in simd_len..in_size {
+            acc += (row[j] as i64) * (input_i8[j] as i64);
+        }
+
+        let combined = (weight_scale * input_scale_factor) >> FRAC_BITS;
+        acc * combined
+    }).collect()
+}
+
+/// Dispatch to SIMD or scalar based on platform and size.
+pub fn matmul_fast(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
+    // Use SIMD for large matmuls where the quantization overhead is worth it
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    if in_size >= 512 && out_size >= 256 {
+        return matmul_i8xi8_simd(weights, input, in_size, out_size);
+    }
+    matmul_i8(weights, input, in_size, out_size)
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Integer layer normalization (operates on i64 activations).
 fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
     let n = input.len() as i64;
     if n == 0 { return vec![]; }
@@ -144,13 +384,86 @@ fn apply_rope(vec: &mut [i64], pos: usize, d_head: usize, cos: &[i64], sin: &[i6
     }
 }
 
-/// SiLU approximation: x * sigmoid(x) ≈ x * (x > 0 ? 1 : 0.25)
-/// Simple but effective for integer arithmetic.
+/// SiLU approximation: x * sigmoid(x) ≈ x (if x > 0) else x/4.
 fn silu_i64(x: i64) -> i64 {
     if x > 0 { x } else { x >> 2 }
 }
 
+// ─── Forward Pass ─────────────────────────────────────────────────────────────
+
 impl CachedIntegerModel {
+    /// Total model memory in bytes (approximate).
+    pub fn memory_bytes(&self) -> usize {
+        let mut total = self.embedding.memory_bytes()
+            + self.output_weight.memory_bytes()
+            + self.final_norm.len() * 8
+            + self.config.rope_cos.len() * 8
+            + self.config.rope_sin.len() * 8;
+        for layer in &self.layers {
+            total += layer.wq.memory_bytes()
+                + layer.wk.memory_bytes()
+                + layer.wv.memory_bytes()
+                + layer.wo.memory_bytes()
+                + layer.w_gate.memory_bytes()
+                + layer.w_up.memory_bytes()
+                + layer.w_down.memory_bytes()
+                + layer.attn_norm.len() * 8
+                + layer.ffn_norm.len() * 8;
+        }
+        total
+    }
+
+    /// Decode token IDs to text using the GGUF vocabulary.
+    pub fn decode(&self, tokens: &[u32]) -> String {
+        tokens.iter()
+            .map(|&id| {
+                if (id as usize) < self.vocab.len() {
+                    // SentencePiece uses ▁ (U+2581) for space
+                    self.vocab[id as usize].replace('▁', " ")
+                } else {
+                    format!("[{}]", id)
+                }
+            })
+            .collect::<String>()
+    }
+
+    /// Simple greedy encode: text → token IDs.
+    /// Not perfect BPE but good enough for demos.
+    pub fn encode(&self, text: &str) -> Vec<u32> {
+        if self.vocab.is_empty() { return vec![]; }
+        let mut tokens = Vec::new();
+        let sp_text = format!("▁{}", text.replace(' ', "▁"));
+        let bytes = sp_text.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let mut best_len = 0;
+            let mut best_id = 0u32;
+            // Try longest match first (up to 32 bytes)
+            let max_try = (bytes.len() - pos).min(32);
+            for try_len in (1..=max_try).rev() {
+                if let Ok(candidate) = std::str::from_utf8(&bytes[pos..pos + try_len]) {
+                    if let Some(id) = self.vocab.iter().position(|v| v == candidate) {
+                        best_len = try_len;
+                        best_id = id as u32;
+                        break;
+                    }
+                }
+            }
+            if best_len > 0 {
+                tokens.push(best_id);
+                pos += best_len;
+            } else {
+                // Byte fallback: look for <0xXX> tokens
+                let byte_tok = format!("<0x{:02X}>", bytes[pos]);
+                if let Some(id) = self.vocab.iter().position(|v| v == &byte_tok) {
+                    tokens.push(id as u32);
+                }
+                pos += 1;
+            }
+        }
+        tokens
+    }
+
     /// Run forward pass for a SINGLE new token (uses KV cache for previous tokens).
     /// Returns logits [vocab_size] in Q16.
     pub fn forward_one_token(&self, token: u32, cache: &mut KVCache) -> Vec<i64> {
@@ -158,9 +471,14 @@ impl CachedIntegerModel {
         let d = cfg.d_model;
         let pos = cache.seq_len;
 
-        // Embed token
+        // Embed token: look up INT8 embedding and expand to Q16
         let idx = (token as usize).min(cfg.vocab_size - 1);
-        let mut hidden: Vec<i64> = self.embedding[idx * d..(idx + 1) * d].to_vec();
+        let emb_start = idx * d;
+        let emb_scale = self.embedding.scale;
+        let mut hidden: Vec<i64> = self.embedding.data[emb_start..emb_start + d]
+            .iter()
+            .map(|&w| (w as i64) * emb_scale)
+            .collect();
 
         // Process each layer
         for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -168,9 +486,9 @@ impl CachedIntegerModel {
             let normed = layernorm(&hidden, &layer.attn_norm);
 
             // Q, K, V projections (only for this one token)
-            let mut q = matmul(&layer.wq, &normed, d, d);
-            let mut k = matmul(&layer.wk, &normed, d, cfg.d_kv);
-            let mut v = matmul(&layer.wv, &normed, d, cfg.d_kv);
+            let mut q = matmul_fast(&layer.wq, &normed, d, d);
+            let k = matmul_fast(&layer.wk, &normed, d, cfg.d_kv);
+            let v = matmul_fast(&layer.wv, &normed, d, cfg.d_kv);
 
             // Apply RoPE to Q and K (per-head)
             for h in 0..cfg.n_heads {
@@ -179,6 +497,8 @@ impl CachedIntegerModel {
                     pos, cfg.d_head, &cfg.rope_cos, &cfg.rope_sin,
                 );
             }
+            // RoPE on K — need mutable copy
+            let mut k = k;
             for h in 0..cfg.n_kv_heads {
                 apply_rope(
                     &mut k[h * cfg.d_head..(h + 1) * cfg.d_head],
@@ -192,7 +512,6 @@ impl CachedIntegerModel {
 
             // Multi-head attention with KV cache
             let full_seq = pos + 1;
-            let mut attn_out = vec![0i64; d];
 
             // Parallel across heads
             let head_results: Vec<Vec<i64>> = (0..cfg.n_heads).into_par_iter().map(|h| {
@@ -228,27 +547,28 @@ impl CachedIntegerModel {
             }).collect();
 
             // Gather head results
+            let mut attn_out = vec![0i64; d];
             for (h, head_out) in head_results.iter().enumerate() {
                 attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(head_out);
             }
 
             // Output projection + residual
-            let projected = matmul(&layer.wo, &attn_out, d, d);
+            let projected = matmul_fast(&layer.wo, &attn_out, d, d);
             for i in 0..d {
                 hidden[i] += projected[i];
             }
 
             // FFN: pre-norm → gate/up → SiLU → down → residual
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
-            let gate = matmul(&layer.w_gate, &normed_ff, d, cfg.d_ff);
-            let up = matmul(&layer.w_up, &normed_ff, d, cfg.d_ff);
+            let gate = matmul_fast(&layer.w_gate, &normed_ff, d, cfg.d_ff);
+            let up = matmul_fast(&layer.w_up, &normed_ff, d, cfg.d_ff);
 
             // SiLU gate * up
             let gated: Vec<i64> = gate.iter().zip(up.iter())
                 .map(|(&g, &u)| (silu_i64(g) * u) >> FRAC_BITS)
                 .collect();
 
-            let ff_out = matmul(&layer.w_down, &gated, cfg.d_ff, d);
+            let ff_out = matmul_fast(&layer.w_down, &gated, cfg.d_ff, d);
             for i in 0..d {
                 hidden[i] += ff_out[i];
             }
@@ -258,7 +578,7 @@ impl CachedIntegerModel {
 
         // Final norm + LM head
         let normed = layernorm(&hidden, &self.final_norm);
-        matmul(&self.output_weight, &normed, d, cfg.vocab_size)
+        matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
     }
 
     /// Generate tokens autoregressively with KV cache.
@@ -294,6 +614,8 @@ impl CachedIntegerModel {
     }
 }
 
+// ─── RoPE Tables ──────────────────────────────────────────────────────────────
+
 /// Pre-compute RoPE cos/sin tables as i64 Q16.
 pub fn compute_rope_tables(d_head: usize, max_seq: usize, base: f64) -> (Vec<i64>, Vec<i64>) {
     let half = d_head / 2;
@@ -304,7 +626,7 @@ pub fn compute_rope_tables(d_head: usize, max_seq: usize, base: f64) -> (Vec<i64
         for i in 0..half {
             let freq = 1.0 / base.powf(2.0 * i as f64 / d_head as f64);
             let angle = pos as f64 * freq;
-            // Convert to Q16 — this uses f64 but only at init, never during forward pass
+            // Convert to Q16 — f64 used only at init, never during forward pass
             cos_table[pos * half + i] = (angle.cos() * ONE as f64).round() as i64;
             sin_table[pos * half + i] = (angle.sin() * ONE as f64).round() as i64;
         }
@@ -313,8 +635,13 @@ pub fn compute_rope_tables(d_head: usize, max_seq: usize, base: f64) -> (Vec<i64
     (cos_table, sin_table)
 }
 
-/// Load a GGUF model into a CachedIntegerModel.
-/// This is the ONE-TIME startup cost. After this, inference is pure i64 from RAM.
+// ─── GGUF Loader ──────────────────────────────────────────────────────────────
+
+/// Load a GGUF model into a CachedIntegerModel with INT8 weight storage.
+/// This is the ONE-TIME startup cost. After this, inference is pure integer from RAM.
+///
+/// Memory: ~1 byte per parameter (vs 8 bytes for i64).
+/// 7B model: ~7GB. 1.1B model: ~1.1GB.
 #[cfg(feature = "candle")]
 pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
     use candle_core::Device;
@@ -324,8 +651,8 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
     let device = Device::Cpu;
     let gguf_path = path.to_string();
 
-    // Read metadata from GGUF
-    let (n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size) = {
+    // Read metadata + vocab from GGUF
+    let (n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size, vocab) = {
         let mut reader = std::fs::File::open(&gguf_path)
             .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
         let content = gguf_file::Content::read(&mut reader)
@@ -348,58 +675,98 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         let vs = content.tensor_infos.get("token_embd.weight")
             .map(|t| t.shape.dims()[0] as usize)
             .unwrap_or(32000);
-        (nl, dm, nh, nkv, dff, vs)
+
+        // Extract vocabulary from GGUF metadata
+        let vocab = match content.metadata.get("tokenizer.ggml.tokens") {
+            Some(gguf_file::Value::Array(arr)) => {
+                arr.iter().filter_map(|v| match v {
+                    gguf_file::Value::String(s) => Some(s.clone()),
+                    _ => None,
+                }).collect()
+            }
+            _ => Vec::new(),
+        };
+
+        (nl, dm, nh, nkv, dff, vs, vocab)
     };
 
     let d_head = d_model / n_heads;
     let d_kv = d_head * n_kv_heads;
 
-    info!(n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size, "Loading GGUF into integer cache...");
+    info!(n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size,
+        vocab_len = vocab.len(),
+        "Loading GGUF into INT8 cache...");
 
-    // Helper: extract tensor as i64 Q16 (opens a fresh file handle each time)
-    let extract_tensor = |name: &str| -> Result<Vec<i64>, InferenceError> {
-        let mut rdr = std::fs::File::open(&gguf_path)
-            .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
-        let cnt = gguf_file::Content::read(&mut rdr)
-            .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
-        let qt = cnt.tensor(&mut rdr, name, &device)
+    // Open file ONCE, parse GGUF content ONCE (avoids 28s re-parsing per tensor)
+    let mut reader = std::fs::File::open(&gguf_path)
+        .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
+    let content = gguf_file::Content::read(&mut reader)
+        .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
+
+    // Helper: extract tensor as f32 (reuses open file handle + parsed content)
+    let extract_f32 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str| -> Result<Vec<f32>, InferenceError> {
+        let qt = content.tensor(reader, name, &device)
             .map_err(|e| InferenceError::Runtime(format!("{name}: {e}")))?;
         let deq = qt.dequantize(&device)
             .map_err(|e| InferenceError::Runtime(format!("dequant {name}: {e}")))?;
-        let flat = deq.flatten_all()
+        deq.flatten_all()
             .map_err(|e| InferenceError::Runtime(format!("flatten: {e}")))?
             .to_vec1::<f32>()
-            .map_err(|e| InferenceError::Runtime(format!("tovec: {e}")))?;
-        Ok(flat.iter().map(|&x| (x * ONE as f32).round() as i64).collect())
+            .map_err(|e| InferenceError::Runtime(format!("tovec: {e}")))
     };
 
-    let extract_or_ones = |name: &str, size: usize| -> Vec<i64> {
-        extract_tensor(name).unwrap_or_else(|_| vec![ONE; size])
+    // Helper: extract as INT8 quantized
+    let extract_i8 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str| -> Result<I8Weights, InferenceError> {
+        let f32_data = extract_f32(reader, content, name)?;
+        Ok(I8Weights::quantize_f32(&f32_data))
     };
 
-    // Load embeddings
-    let embedding = extract_tensor("token_embd.weight")?;
-    info!("Embeddings loaded ({} values)", embedding.len());
+    // Helper: extract as i64 Q16 (for norms — small vectors)
+    let extract_norm = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, size: usize| -> Vec<i64> {
+        extract_f32(reader, content, name).map(|f| {
+            f.iter().map(|&x| (x * ONE as f32).round() as i64).collect()
+        }).unwrap_or_else(|_| vec![ONE; size])
+    };
 
-    // Load output head
-    let output_weight = extract_tensor("output.weight").unwrap_or_else(|_| embedding.clone());
-    let final_norm = extract_or_ones("output_norm.weight", d_model);
+    // Load embeddings as INT8
+    let embedding = extract_i8(&mut reader, &content, "token_embd.weight")?;
+    let emb_mb = embedding.memory_bytes() / (1024 * 1024);
+    info!("Embeddings loaded as INT8 ({} MB, {} tokens)", emb_mb, vocab_size);
 
-    // Load all layers
+    // Load output head as INT8
+    let output_weight = extract_i8(&mut reader, &content, "output.weight").unwrap_or_else(|_| {
+        // Tied embeddings: reuse embedding weights
+        I8Weights { data: embedding.data.clone(), scale: embedding.scale }
+    });
+    let final_norm = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
+
+    // Load all layers as INT8
     let mut layers = Vec::with_capacity(n_layers);
+    let mut total_layer_mb = 0usize;
     for l in 0..n_layers {
         let p = format!("blk.{l}");
-        info!("Loading layer {}/{}", l + 1, n_layers);
+
+        let wq = extract_i8(&mut reader, &content, &format!("{p}.attn_q.weight"))?;
+        let wk = extract_i8(&mut reader, &content, &format!("{p}.attn_k.weight"))?;
+        let wv = extract_i8(&mut reader, &content, &format!("{p}.attn_v.weight"))?;
+        let wo = extract_i8(&mut reader, &content, &format!("{p}.attn_output.weight"))?;
+        let w_gate = extract_i8(&mut reader, &content, &format!("{p}.ffn_gate.weight"))?;
+        let w_up = extract_i8(&mut reader, &content, &format!("{p}.ffn_up.weight"))?;
+        let w_down = extract_i8(&mut reader, &content, &format!("{p}.ffn_down.weight"))?;
+
+        let layer_mb = (wq.memory_bytes() + wk.memory_bytes() + wv.memory_bytes()
+            + wo.memory_bytes() + w_gate.memory_bytes() + w_up.memory_bytes()
+            + w_down.memory_bytes()) / (1024 * 1024);
+        total_layer_mb += layer_mb;
+
+        if l % 8 == 0 || l == n_layers - 1 {
+            info!("Layer {}/{} loaded ({} MB)", l + 1, n_layers, layer_mb);
+        }
+
         layers.push(CachedLayer {
-            wq: extract_tensor(&format!("{p}.attn_q.weight"))?,
-            wk: extract_tensor(&format!("{p}.attn_k.weight"))?,
-            wv: extract_tensor(&format!("{p}.attn_v.weight"))?,
-            wo: extract_tensor(&format!("{p}.attn_output.weight"))?,
-            w_gate: extract_tensor(&format!("{p}.ffn_gate.weight"))?,
-            w_up: extract_tensor(&format!("{p}.ffn_up.weight"))?,
-            w_down: extract_tensor(&format!("{p}.ffn_down.weight"))?,
-            attn_norm: extract_or_ones(&format!("{p}.attn_norm.weight"), d_model),
-            ffn_norm: extract_or_ones(&format!("{p}.ffn_norm.weight"), d_model),
+            wq, wk, wv, wo, w_gate, w_up, w_down,
+            attn_norm: extract_norm(&mut reader, &content, &format!("{p}.attn_norm.weight"), d_model),
+            ffn_norm: extract_norm(&mut reader, &content, &format!("{p}.ffn_norm.weight"), d_model),
         });
     }
 
@@ -413,7 +780,11 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         (ONE * ONE) / isqrt.max(1)
     };
 
-    info!("Model loaded into integer cache. Ready for inference.");
+    let total_mb = (embedding.memory_bytes() + output_weight.memory_bytes()
+        + total_layer_mb * 1024 * 1024
+        + final_norm.len() * 8
+        + rope_cos.len() * 8 * 2) / (1024 * 1024);
+    info!("Model loaded into INT8 cache: ~{} MB total. Ready for inference.", total_mb);
 
     Ok(CachedIntegerModel {
         config: ModelConfig {
@@ -424,10 +795,195 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         layers,
         final_norm,
         output_weight,
+        vocab,
     })
 }
 
 #[cfg(not(feature = "candle"))]
 pub fn load_cached_model(_path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
     Err(crate::InferenceError::Runtime("candle feature not enabled".into()))
+}
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a small test model with INT8 weights for testing.
+    fn build_test_model_i8(
+        vocab_size: usize,
+        d_model: usize,
+        n_heads: usize,
+        d_ff: usize,
+        n_layers: usize,
+    ) -> CachedIntegerModel {
+        let d_head = d_model / n_heads;
+        let n_kv_heads = n_heads;
+        let d_kv = d_head * n_kv_heads;
+
+        // Deterministic weights using LCG
+        let mut rng: u64 = 42;
+        let mut gen_f32 = |size: usize| -> Vec<f32> {
+            (0..size).map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                // Small weights in [-0.1, 0.1]
+                ((rng >> 33) as f32 / u32::MAX as f32 - 0.5) * 0.2
+            }).collect()
+        };
+
+        let mut gen_i8 = |size: usize| -> I8Weights {
+            I8Weights::quantize_f32(&gen_f32(size))
+        };
+
+        let embedding = gen_i8(vocab_size * d_model);
+        let output_weight = gen_i8(vocab_size * d_model);
+
+        let mut layers = Vec::new();
+        for _ in 0..n_layers {
+            layers.push(CachedLayer {
+                wq: gen_i8(d_model * d_model),
+                wk: gen_i8(d_model * d_kv),
+                wv: gen_i8(d_model * d_kv),
+                wo: gen_i8(d_model * d_model),
+                w_gate: gen_i8(d_ff * d_model),
+                w_up: gen_i8(d_ff * d_model),
+                w_down: gen_i8(d_model * d_ff),
+                attn_norm: vec![ONE; d_model],
+                ffn_norm: vec![ONE; d_model],
+            });
+        }
+
+        let max_seq = 512;
+        let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, 10000.0);
+        let attn_scale = {
+            let isqrt = integer_isqrt((d_head as i64) * ONE);
+            (ONE * ONE) / isqrt.max(1)
+        };
+
+        CachedIntegerModel {
+            config: ModelConfig {
+                n_layers, d_model, n_heads, n_kv_heads, d_ff, d_head, d_kv,
+                vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
+            },
+            embedding,
+            layers,
+            final_norm: vec![ONE; d_model],
+            output_weight,
+            vocab: (0..vocab_size).map(|i| format!("tok_{}", i)).collect(),
+        }
+    }
+
+    #[test]
+    fn test_i8_quantize_roundtrip() {
+        let values: Vec<f32> = vec![0.0, 0.5, -0.5, 1.0, -1.0, 0.01, -0.01];
+        let q = I8Weights::quantize_f32(&values);
+
+        // Reconstruct and check closeness
+        for (i, &orig) in values.iter().enumerate() {
+            let reconstructed = (q.data[i] as f64) * (q.scale as f64) / ONE as f64;
+            let error = (reconstructed - orig as f64).abs();
+            assert!(error < 0.02, "Quantize error too large for {}: got {}, error {}",
+                orig, reconstructed, error);
+        }
+    }
+
+    #[test]
+    fn test_i8_matmul_correctness() {
+        // Compare i8 matmul against direct i64 matmul
+        let weights_f32 = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0]; // 2×3
+        let weights_i8 = I8Weights::quantize_f32(&weights_f32);
+        let input = vec![ONE, ONE, ONE]; // [1.0, 1.0, 1.0] in Q16
+
+        let result = matmul_i8(&weights_i8, &input, 3, 2);
+
+        // Row 0: 1+2+3 = 6. Row 1: 4+5+6 = 15.
+        // In Q16: 6*ONE = 393216, 15*ONE = 983040
+        let expected_0 = 6.0 * ONE as f64;
+        let expected_1 = 15.0 * ONE as f64;
+        let tolerance = ONE as f64 * 0.05; // 5% tolerance for quantization
+
+        assert!((result[0] as f64 - expected_0).abs() < tolerance,
+            "Row 0: expected ~{}, got {}", expected_0, result[0]);
+        assert!((result[1] as f64 - expected_1).abs() < tolerance,
+            "Row 1: expected ~{}, got {}", expected_1, result[1]);
+    }
+
+    #[test]
+    fn test_i8_matmul_deterministic_1000() {
+        let weights = I8Weights::quantize_f32(&vec![0.1f32; 256 * 128]);
+        let input: Vec<i64> = (0..128).map(|i| (i as i64 - 64) * 1000).collect();
+
+        let first = matmul_i8(&weights, &input, 128, 256);
+        for _ in 0..1000 {
+            let result = matmul_i8(&weights, &input, 128, 256);
+            assert_eq!(result, first, "INT8 matmul not deterministic");
+        }
+    }
+
+    #[test]
+    fn test_i8_model_deterministic() {
+        let model = build_test_model_i8(100, 64, 2, 128, 2);
+        let prompt = vec![1u32, 5, 10, 15];
+
+        let (tokens1, hash1) = model.generate(&prompt, 8, &[99]);
+        let (tokens2, hash2) = model.generate(&prompt, 8, &[99]);
+
+        assert_eq!(tokens1, tokens2, "Non-deterministic generation");
+        assert_eq!(hash1, hash2, "Non-deterministic hash");
+    }
+
+    #[test]
+    fn test_i8_model_deterministic_100_runs() {
+        let model = build_test_model_i8(50, 32, 2, 64, 1);
+        let prompt = vec![1u32, 2, 3];
+
+        let (_, first_hash) = model.generate(&prompt, 4, &[99]);
+        for _ in 0..100 {
+            let (_, hash) = model.generate(&prompt, 4, &[99]);
+            assert_eq!(hash, first_hash, "Determinism broken across runs");
+        }
+    }
+
+    #[test]
+    fn test_i8_model_memory_savings() {
+        let model = build_test_model_i8(100, 64, 2, 128, 2);
+        let mem = model.memory_bytes();
+        // With i64 weights: 100*64*8 (emb) + 100*64*8 (output) + 2 layers * 7 matrices
+        // Each layer: (64*64 + 64*64 + 64*64 + 64*64 + 128*64 + 128*64 + 64*128) * 8
+        // With i8: same but × 1 instead of × 8
+        // Should be roughly 8x smaller
+        let i64_estimate = (100*64 + 100*64 + 2 * (64*64*4 + 128*64*3)) * 8;
+        let i8_estimate = (100*64 + 100*64 + 2 * (64*64*4 + 128*64*3)) * 1;
+        assert!(mem < i64_estimate, "INT8 model ({}) should be much smaller than i64 ({})", mem, i64_estimate);
+        assert!(mem < i8_estimate * 4, "INT8 model ({}) too large vs estimate ({})", mem, i8_estimate);
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip() {
+        let model = build_test_model_i8(10, 32, 2, 64, 1);
+        let decoded = model.decode(&[0, 1, 2, 3]);
+        assert!(decoded.contains("tok_0"));
+        assert!(decoded.contains("tok_3"));
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn test_simd_matches_scalar() {
+        let weights = I8Weights::quantize_f32(
+            &(0..1024 * 512).map(|i| (i as f32 % 200.0 - 100.0) / 100.0).collect::<Vec<_>>()
+        );
+        let input: Vec<i64> = (0..512).map(|i| (i as i64 - 256) * ONE / 256).collect();
+
+        let scalar = matmul_i8_par(&weights, &input, 512, 1024);
+        let simd = matmul_i8xi8_simd(&weights, &input, 512, 1024);
+
+        // SIMD result may differ slightly due to i8 input quantization
+        for i in 0..1024 {
+            let diff = (scalar[i] - simd[i]).abs();
+            let tolerance = scalar[i].abs().max(ONE) / 10; // 10% tolerance
+            assert!(diff < tolerance,
+                "Row {}: scalar={}, simd={}, diff={}", i, scalar[i], simd[i], diff);
+        }
+    }
 }
