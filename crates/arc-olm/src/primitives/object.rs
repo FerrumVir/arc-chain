@@ -158,6 +158,181 @@ pub fn paint(grid: &Grid, obj: &Object) -> Grid {
     out
 }
 
+/// Box: outline of the bounding box.
+pub fn obj_box(obj: &Object) -> PosSet {
+    let (min_r, min_c, max_r, max_c) = bbox(obj);
+    let mut result = PosSet::new();
+    for r in min_r..=max_r {
+        result.insert((r, min_c));
+        result.insert((r, max_c));
+    }
+    for c in min_c..=max_c {
+        result.insert((min_r, c));
+        result.insert((max_r, c));
+    }
+    result
+}
+
+/// Corners of the bounding box.
+pub fn corners(obj: &Object) -> PosSet {
+    let (min_r, min_c, max_r, max_c) = bbox(obj);
+    let mut result = PosSet::new();
+    result.insert((min_r, min_c));
+    result.insert((min_r, max_c));
+    result.insert((max_r, min_c));
+    result.insert((max_r, max_c));
+    result
+}
+
+/// Inbox: inner border of bounding box.
+pub fn inbox(obj: &Object) -> PosSet {
+    let (min_r, min_c, max_r, max_c) = bbox(obj);
+    if max_r <= min_r + 1 || max_c <= min_c + 1 { return PosSet::new(); }
+    let ir = min_r + 1;
+    let ic = min_c + 1;
+    let er = max_r - 1;
+    let ec = max_c - 1;
+    let mut result = PosSet::new();
+    for r in ir..=er { result.insert((r, ic)); result.insert((r, ec)); }
+    for c in ic..=ec { result.insert((ir, c)); result.insert((er, c)); }
+    result
+}
+
+/// Outbox: outer border of bounding box.
+pub fn outbox(obj: &Object) -> PosSet {
+    let (min_r, min_c, max_r, max_c) = bbox(obj);
+    let or = if min_r > 0 { min_r - 1 } else { 0 };
+    let oc = if min_c > 0 { min_c - 1 } else { 0 };
+    let er = max_r + 1;
+    let ec = max_c + 1;
+    let mut result = PosSet::new();
+    for r in or..=er { result.insert((r, oc)); result.insert((r, ec)); }
+    for c in oc..=ec { result.insert((or, c)); result.insert((er, c)); }
+    result
+}
+
+/// Shift an object by (dr, dc).
+pub fn shift(obj: &Object, dr: isize, dc: isize) -> Object {
+    let cells = obj.cells.iter().filter_map(|&(color, (r, c))| {
+        let nr = r as isize + dr;
+        let nc = c as isize + dc;
+        if nr >= 0 && nc >= 0 {
+            Some((color, (nr as usize, nc as usize)))
+        } else {
+            None
+        }
+    }).collect();
+    Object { cells }
+}
+
+/// Move object on grid: cover old position, paint at new position.
+pub fn move_obj(grid: &Grid, obj: &Object, dr: isize, dc: isize) -> Grid {
+    let covered = cover(grid, obj);
+    let shifted = shift(obj, dr, dc);
+    paint(&covered, &shifted)
+}
+
+/// Merge multiple objects into one.
+pub fn merge_objects(objs: &[Object]) -> Object {
+    let mut cells = BTreeSet::new();
+    for obj in objs {
+        cells.extend(&obj.cells);
+    }
+    Object { cells }
+}
+
+/// Height of an object.
+pub fn obj_height(obj: &Object) -> usize {
+    let (min_r, _, max_r, _) = bbox(obj);
+    max_r - min_r + 1
+}
+
+/// Width of an object.
+pub fn obj_width(obj: &Object) -> usize {
+    let (_, min_c, _, max_c) = bbox(obj);
+    max_c - min_c + 1
+}
+
+/// Connect two positions with a line.
+pub fn connect(a: (usize, usize), b: (usize, usize)) -> PosSet {
+    let mut result = PosSet::new();
+    if a.0 == b.0 {
+        // Horizontal line
+        let (start, end) = if a.1 <= b.1 { (a.1, b.1) } else { (b.1, a.1) };
+        for c in start..=end { result.insert((a.0, c)); }
+    } else if a.1 == b.1 {
+        // Vertical line
+        let (start, end) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
+        for r in start..=end { result.insert((r, a.1)); }
+    } else {
+        // Diagonal
+        let dr: isize = if b.0 > a.0 { 1 } else { -1 };
+        let dc: isize = if b.1 > a.1 { 1 } else { -1 };
+        let mut r = a.0 as isize;
+        let mut c = a.1 as isize;
+        let steps = (b.0 as isize - a.0 as isize).unsigned_abs().max(
+            (b.1 as isize - a.1 as isize).unsigned_abs()
+        );
+        for _ in 0..=steps {
+            if r >= 0 && c >= 0 { result.insert((r as usize, c as usize)); }
+            r += dr; c += dc;
+        }
+    }
+    result
+}
+
+/// Shoot a ray from a position in a direction (up to 30 cells).
+pub fn shoot(start: (usize, usize), dr: isize, dc: isize) -> PosSet {
+    let mut result = PosSet::new();
+    let mut r = start.0 as isize;
+    let mut c = start.1 as isize;
+    for _ in 0..30 {
+        if r >= 0 && c >= 0 { result.insert((r as usize, c as usize)); }
+        r += dr; c += dc;
+    }
+    result
+}
+
+/// Neighbors: 4-adjacent positions.
+pub fn dneighbors(pos: (usize, usize)) -> PosSet {
+    let mut result = PosSet::new();
+    let (r, c) = pos;
+    if r > 0 { result.insert((r - 1, c)); }
+    result.insert((r + 1, c));
+    if c > 0 { result.insert((r, c - 1)); }
+    result.insert((r, c + 1));
+    result
+}
+
+/// Neighbors: 8-adjacent positions.
+pub fn neighbors(pos: (usize, usize)) -> PosSet {
+    let mut result = dneighbors(pos);
+    let (r, c) = pos;
+    if r > 0 && c > 0 { result.insert((r - 1, c - 1)); }
+    if r > 0 { result.insert((r - 1, c + 1)); }
+    if c > 0 { result.insert((r + 1, c - 1)); }
+    result.insert((r + 1, c + 1));
+    result
+}
+
+/// All neighbor positions of all cells in a position set.
+pub fn mapply_neighbors(positions: &PosSet) -> PosSet {
+    let mut result = PosSet::new();
+    for &pos in positions {
+        result.extend(neighbors(pos));
+    }
+    result
+}
+
+/// All 4-neighbor positions of all cells in a position set.
+pub fn mapply_dneighbors(positions: &PosSet) -> PosSet {
+    let mut result = PosSet::new();
+    for &pos in positions {
+        result.extend(dneighbors(pos));
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
