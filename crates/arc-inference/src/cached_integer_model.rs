@@ -129,30 +129,58 @@ pub struct CachedIntegerModel {
     pub vocab: Vec<String>,
 }
 
-// ─── INT8 Matmul (Per-Row Scale) ──────────────────────────────────────────────
+// ─── INT8 Matmul (Per-Row Scale, Optimized) ───────────────────────────────────
 
-/// Per-row INT8 × i64 parallel matmul.
-/// Each output row uses its own scale factor.
+/// Core i8×i64 dot product for a single row. Unsafe for speed (no bounds checks).
+/// 8-element unroll for ILP. This is the hot inner loop.
+#[inline(always)]
+unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
+    let mut acc0: i64 = 0;
+    let mut acc1: i64 = 0;
+    let mut acc2: i64 = 0;
+    let mut acc3: i64 = 0;
+    let full = len / 8 * 8;
+    let mut j = 0usize;
+    while j < full {
+        acc0 += (*row.add(j) as i64) * (*input.add(j));
+        acc1 += (*row.add(j + 1) as i64) * (*input.add(j + 1));
+        acc2 += (*row.add(j + 2) as i64) * (*input.add(j + 2));
+        acc3 += (*row.add(j + 3) as i64) * (*input.add(j + 3));
+        acc0 += (*row.add(j + 4) as i64) * (*input.add(j + 4));
+        acc1 += (*row.add(j + 5) as i64) * (*input.add(j + 5));
+        acc2 += (*row.add(j + 6) as i64) * (*input.add(j + 6));
+        acc3 += (*row.add(j + 7) as i64) * (*input.add(j + 7));
+        j += 8;
+    }
+    let mut acc = acc0 + acc1 + acc2 + acc3;
+    while j < len {
+        acc += (*row.add(j) as i64) * (*input.add(j));
+        j += 1;
+    }
+    acc
+}
+
+// Wrapper to send raw pointers across rayon threads (data lives for duration of call)
+struct SendPtr<T>(*const T);
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+/// Per-row INT8 × i64 parallel matmul — optimized with chunked parallelism.
 fn matmul_i8_par(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     let data = &weights.data;
     let scales = &weights.scales;
-    (0..out_size).into_par_iter().map(|i| {
-        let row = &data[i * in_size..(i + 1) * in_size];
-        let mut acc: i64 = 0;
-        let chunks = in_size / 4;
-        let remainder = in_size % 4;
-        for c in 0..chunks {
-            let base = c * 4;
-            acc += (row[base] as i64) * input[base];
-            acc += (row[base + 1] as i64) * input[base + 1];
-            acc += (row[base + 2] as i64) * input[base + 2];
-            acc += (row[base + 3] as i64) * input[base + 3];
+    let mut output = vec![0i64; out_size];
+    output.par_chunks_mut(64).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start = chunk_idx * 64;
+        for (local_i, out) in chunk.iter_mut().enumerate() {
+            let i = start + local_i;
+            let acc = unsafe {
+                dot_i8_i64(data.as_ptr().add(i * in_size), input.as_ptr(), in_size)
+            };
+            *out = (acc * scales[i]) >> FRAC_BITS;
         }
-        for j in (in_size - remainder)..in_size {
-            acc += (row[j] as i64) * input[j];
-        }
-        (acc * scales[i]) >> FRAC_BITS
-    }).collect()
+    });
+    output
 }
 
 /// Sequential variant for small dimensions.
@@ -161,11 +189,7 @@ fn matmul_i8_seq(weights: &I8Weights, input: &[i64], in_size: usize, out_size: u
     let scales = &weights.scales;
     let mut output = Vec::with_capacity(out_size);
     for i in 0..out_size {
-        let row_start = i * in_size;
-        let mut acc: i64 = 0;
-        for j in 0..in_size {
-            acc += (data[row_start + j] as i64) * input[j];
-        }
+        let acc = unsafe { dot_i8_i64(data.as_ptr().add(i * in_size), input.as_ptr(), in_size) };
         output.push((acc * scales[i]) >> FRAC_BITS);
     }
     output
@@ -182,7 +206,7 @@ fn matmul_i8(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize
 // ─── SIMD INT8 Matmul (Cross-Platform Deterministic) ──────────────────────────
 
 /// NEON i8×i8→i32 SIMD matmul with per-row scales.
-/// Uses vmull_s8 + vpadalq_s16 — no saturation risk on NEON.
+/// Processes 32 elements per iteration (2 × 16-byte NEON loads).
 #[cfg(target_arch = "aarch64")]
 fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     use std::arch::aarch64::*;
@@ -194,42 +218,55 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
         .collect();
 
     let data = &weights.data;
+    let inp_slice = &input_i8;
     let scales = &weights.scales;
 
-    (0..out_size).into_par_iter().map(|i| {
-        let row = &data[i * in_size..(i + 1) * in_size];
-        let mut acc: i64 = 0;
-        let simd_len = in_size / 16 * 16;
+    let mut output = vec![0i64; out_size];
+    output.par_chunks_mut(64).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start = chunk_idx * 64;
+        for (local_i, out) in chunk.iter_mut().enumerate() {
+            let i = start + local_i;
+            let row = unsafe { data.as_ptr().add(i * in_size) };
+            let mut acc: i64;
+            let simd_len = in_size / 32 * 32;
 
-        unsafe {
-            let mut vacc = vdupq_n_s32(0);
-            let mut vacc2 = vdupq_n_s32(0);
-            let mut j = 0usize;
-            while j < simd_len {
-                let vw = vld1q_s8(row.as_ptr().add(j));
-                let vi = vld1q_s8(input_i8.as_ptr().add(j));
-                let prod_lo = vmull_s8(vget_low_s8(vw), vget_low_s8(vi));
-                let prod_hi = vmull_s8(vget_high_s8(vw), vget_high_s8(vi));
-                vacc = vpadalq_s16(vacc, prod_lo);
-                vacc2 = vpadalq_s16(vacc2, prod_hi);
-                j += 16;
+            unsafe {
+                let mut vacc0 = vdupq_n_s32(0);
+                let mut vacc1 = vdupq_n_s32(0);
+                let mut vacc2 = vdupq_n_s32(0);
+                let mut vacc3 = vdupq_n_s32(0);
+                let mut j = 0usize;
+                while j < simd_len {
+                    let vw0 = vld1q_s8(row.add(j));
+                    let vi0 = vld1q_s8(inp_slice.as_ptr().add(j));
+                    vacc0 = vpadalq_s16(vacc0, vmull_s8(vget_low_s8(vw0), vget_low_s8(vi0)));
+                    vacc1 = vpadalq_s16(vacc1, vmull_s8(vget_high_s8(vw0), vget_high_s8(vi0)));
+                    let vw1 = vld1q_s8(row.add(j + 16));
+                    let vi1 = vld1q_s8(inp_slice.as_ptr().add(j + 16));
+                    vacc2 = vpadalq_s16(vacc2, vmull_s8(vget_low_s8(vw1), vget_low_s8(vi1)));
+                    vacc3 = vpadalq_s16(vacc3, vmull_s8(vget_high_s8(vw1), vget_high_s8(vi1)));
+                    j += 32;
+                }
+                vacc0 = vaddq_s32(vacc0, vacc1);
+                vacc2 = vaddq_s32(vacc2, vacc3);
+                vacc0 = vaddq_s32(vacc0, vacc2);
+                acc = vaddvq_s32(vacc0) as i64;
+
+                while j < in_size {
+                    acc += (*row.add(j) as i64) * (*inp_slice.as_ptr().add(j) as i64);
+                    j += 1;
+                }
             }
-            vacc = vaddq_s32(vacc, vacc2);
-            acc = vaddvq_s32(vacc) as i64;
-        }
 
-        for j in simd_len..in_size {
-            acc += (row[j] as i64) * (input_i8[j] as i64);
+            let combined = (scales[i] * input_scale_factor) >> FRAC_BITS;
+            *out = acc * combined;
         }
-
-        // Per-row rescale: result = acc * row_scale * input_scale / ONE
-        let combined = (scales[i] * input_scale_factor) >> FRAC_BITS;
-        acc * combined
-    }).collect()
+    });
+    output
 }
 
-/// AVX2 i8×i8→i32 SIMD matmul — FIXED: uses sign-extend + i32 accumulation.
-/// No unsigned conversion, no i16 saturation. Cross-platform deterministic.
+/// AVX2 i8×i8→i32 SIMD matmul — sign-extend + i32 accumulation (no i16 saturation).
+/// Uses chunked parallelism (64 rows per chunk) to reduce rayon overhead.
 #[cfg(target_arch = "x86_64")]
 fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     use std::arch::x86_64::*;
@@ -245,63 +282,59 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
         .collect();
 
     let data = &weights.data;
+    let inp_slice = &input_i8;
     let scales = &weights.scales;
 
-    (0..out_size).into_par_iter().map(|i| {
-        let row = &data[i * in_size..(i + 1) * in_size];
-        let mut acc: i64 = 0;
+    let mut output = vec![0i64; out_size];
+    output.par_chunks_mut(64).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start = chunk_idx * 64;
+        for (local_i, out) in chunk.iter_mut().enumerate() {
+            let i = start + local_i;
+            let row = unsafe { data.as_ptr().add(i * in_size) };
+            let mut acc: i64 = 0;
+            let simd_len = in_size / 32 * 32;
 
-        // Process 32 elements per iteration in two batches of 16.
-        // Sign-extend i8→i16, then _mm256_madd_epi16 for i16×i16→i32 accumulation.
-        // No saturation, no unsigned conversion.
-        let simd_len = in_size / 32 * 32;
-        unsafe {
-            let mut vacc = _mm256_setzero_si256();
+            unsafe {
+                let mut vacc = _mm256_setzero_si256();
+                let mut vacc2 = _mm256_setzero_si256();
 
-            let mut j = 0usize;
-            while j < simd_len {
-                // Load 32 i8 weights and inputs
-                let vw = _mm256_loadu_si256(row.as_ptr().add(j) as *const __m256i);
-                let vi = _mm256_loadu_si256(input_i8.as_ptr().add(j) as *const __m256i);
+                let mut j = 0usize;
+                while j < simd_len {
+                    let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
+                    let vi = _mm256_loadu_si256(inp_slice.as_ptr().add(j) as *const __m256i);
 
-                // Split into low/high 128-bit halves (16 i8 each)
-                let vw_lo = _mm256_castsi256_si128(vw);
-                let vw_hi = _mm256_extracti128_si256(vw, 1);
-                let vi_lo = _mm256_castsi256_si128(vi);
-                let vi_hi = _mm256_extracti128_si256(vi, 1);
+                    let vw_lo = _mm256_castsi256_si128(vw);
+                    let vw_hi = _mm256_extracti128_si256(vw, 1);
+                    let vi_lo = _mm256_castsi256_si128(vi);
+                    let vi_hi = _mm256_extracti128_si256(vi, 1);
 
-                // Sign-extend i8→i16 (128-bit → 256-bit): 16 elements each
-                let vw16_lo = _mm256_cvtepi8_epi16(vw_lo);
-                let vi16_lo = _mm256_cvtepi8_epi16(vi_lo);
-                let vw16_hi = _mm256_cvtepi8_epi16(vw_hi);
-                let vi16_hi = _mm256_cvtepi8_epi16(vi_hi);
+                    vacc = _mm256_add_epi32(vacc, _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(vw_lo), _mm256_cvtepi8_epi16(vi_lo)));
+                    vacc2 = _mm256_add_epi32(vacc2, _mm256_madd_epi16(
+                        _mm256_cvtepi8_epi16(vw_hi), _mm256_cvtepi8_epi16(vi_hi)));
+                    j += 32;
+                }
 
-                // _mm256_madd_epi16: multiply adjacent i16 pairs, add to i32
-                // (w0*i0 + w1*i1), (w2*i2 + w3*i3), ... → 8 i32 values
-                let prod32_lo = _mm256_madd_epi16(vw16_lo, vi16_lo);
-                let prod32_hi = _mm256_madd_epi16(vw16_hi, vi16_hi);
+                vacc = _mm256_add_epi32(vacc, vacc2);
+                let lo = _mm256_extracti128_si256(vacc, 0);
+                let hi = _mm256_extracti128_si256(vacc, 1);
+                let sum128 = _mm_add_epi32(lo, hi);
+                let sum128 = _mm_hadd_epi32(sum128, sum128);
+                let sum128 = _mm_hadd_epi32(sum128, sum128);
+                acc = _mm_extract_epi32(sum128, 0) as i64;
 
-                vacc = _mm256_add_epi32(vacc, prod32_lo);
-                vacc = _mm256_add_epi32(vacc, prod32_hi);
-                j += 32;
+                let mut jj = simd_len;
+                while jj < in_size {
+                    acc += (*row.add(jj) as i64) * (*inp_slice.as_ptr().add(jj) as i64);
+                    jj += 1;
+                }
             }
 
-            // Horizontal sum of 8×i32
-            let lo = _mm256_extracti128_si256(vacc, 0);
-            let hi = _mm256_extracti128_si256(vacc, 1);
-            let sum128 = _mm_add_epi32(lo, hi);
-            let sum128 = _mm_hadd_epi32(sum128, sum128);
-            let sum128 = _mm_hadd_epi32(sum128, sum128);
-            acc = _mm_extract_epi32(sum128, 0) as i64;
+            let combined = (scales[i] * input_scale_factor) >> FRAC_BITS;
+            *out = acc * combined;
         }
-
-        for j in simd_len..in_size {
-            acc += (row[j] as i64) * (input_i8[j] as i64);
-        }
-
-        let combined = (scales[i] * input_scale_factor) >> FRAC_BITS;
-        acc * combined
-    }).collect()
+    });
+    output
 }
 
 /// Dispatch: SIMD for large matmuls, scalar for small.
