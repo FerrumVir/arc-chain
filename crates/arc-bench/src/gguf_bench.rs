@@ -45,9 +45,16 @@ fn main() {
     eprintln!("  Load time:  {:.2}s", load_time.as_secs_f64());
     eprintln!();
 
-    // Input: "What is 2+2?" as simple token IDs
-    // Using raw token IDs (1=BOS, common Llama tokens)
-    let input_tokens: Vec<u32> = vec![1, 1724, 338, 29871, 29906, 29974, 29906, 29973];
+    // Input: Llama-2-Chat format "[INST] What is 2+2? [/INST]"
+    // Token IDs for Llama-2 tokenizer:
+    // 1=BOS, 518=[, 25580=INST, 29962=], 1724=What, 338=is, 29871= ,
+    // 29906=2, 29974=+, 29973=?, 518=[, 29914=/, 25580=INST, 29962=]
+    let input_tokens: Vec<u32> = vec![
+        1,      // BOS
+        518, 25580, 29962,  // [INST]
+        1724, 338, 29871, 29906, 29974, 29906, 29973,  // What is 2+2?
+        518, 29914, 25580, 29962,  // [/INST]
+    ];
     eprintln!("  Input tokens: {:?}", input_tokens);
     eprintln!();
 
