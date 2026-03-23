@@ -320,7 +320,7 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
     use std::arch::x86_64::*;
 
     if !is_x86_feature_detected!("avx2") {
-        return matmul_i8_par(weights, input, in_size, out_size);
+        return matmul_i8(weights, input, in_size, out_size);
     }
 
     let use_avx512 = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
