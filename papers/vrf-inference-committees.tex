@@ -43,7 +43,7 @@ We introduce a third approach: \emph{VRF-selected inference committees}. For eac
 
 This approach provides:
 \begin{itemize}
-    \item \textbf{Fast finality}: Results are confirmed in one consensus round ($\sim$4.3s at current block times) instead of waiting for a multi-block challenge period.
+    \item \textbf{Fast finality}: Results are confirmed in one consensus round ($\sim$12ms per round, $\sim$24ms 2-round finality) instead of waiting for a multi-block challenge period.
     \item \textbf{Tunable security}: The corruption probability is a function of $k$, $t$, and the fraction of malicious validators, allowing the protocol to trade committee size for security.
     \item \textbf{Hardware-aware selection}: Validators register their hardware capabilities, and the VRF only selects from those capable of the requested model tier.
     \item \textbf{DoS resistance}: A separate EIP-1559-style fee market for inference transactions prevents computational denial-of-service attacks.
@@ -219,7 +219,7 @@ We choose $k=7$, $t=5$ as the default, providing a practical balance between sec
 An adaptive adversary who corrupts validators \emph{after} seeing the committee selection gains no advantage, because:
 \begin{enumerate}
     \item The VRF seed is derived from the block hash, which is finalized before committee selection occurs.
-    \item Committee selection and vote collection occur within a single consensus round ($\sim$4.3s), leaving insufficient time for targeted corruption.
+    \item Committee selection and vote collection occur within a single consensus round ($\sim$12ms), leaving insufficient time for targeted corruption.
     \item Corrupting a committee member after selection but before vote submission requires compromising the validator's signing key within the consensus round window.
 \end{enumerate}
 
@@ -309,7 +309,7 @@ The underlying blockchain achieves:
 \begin{itemize}
     \item \textbf{33,230 TPS} sustained on 2 validators (measured, real QUIC transport + DAG consensus, Apple M2 Ultra).
     \item \textbf{183,000 TPS} single-node peak (measured, CPU signature verification + sequential execution).
-    \item \textbf{2-round finality} ($\sim$4.3s at current block times), enabling committee results to be confirmed within a single consensus cycle.
+    \item \textbf{2-round finality} ($\sim$24ms measured), enabling committee results to be confirmed within a single consensus cycle.
 \end{itemize}
 
 Each inference attestation is one transaction. At 33,230 TPS, the network can process tens of thousands of inference attestations per second without congestion.

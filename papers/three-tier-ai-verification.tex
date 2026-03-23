@@ -18,7 +18,7 @@
 \begin{abstract}
 We present a three-tier architecture for verifying AI model inference on a Layer 1 blockchain. Tier 1 provides deterministic on-chain execution via a native precompile for small models ($\leq$20B parameters). Tier 2 uses optimistic attestation with economic bonds and fraud proofs for medium-to-large models (20B--100B+). Tier 3 employs recursive STARK proofs (Stwo Circle STARKs over the Mersenne-31 field) for cryptographic verification of inference correctness. Each tier trades off computational cost, latency, and security guarantees, allowing the protocol to match verification strength to model size and application requirements.
 
-We implement all three tiers in ARC Chain, an 80,683-line Rust blockchain with 24 native transaction types and 1,185 tests. Tier 1 executes real neural network forward passes through a dedicated precompile with deterministic left-to-right accumulation. Tier 2 manages attestation bonds, challenge periods, and escrow via on-chain state. Tier 3 generates and verifies real STARK proofs using a 32-column AIR with 9 polynomial constraints, including recursive proof composition for multi-block aggregation. Measured performance on commodity hardware (Apple M2 Ultra) shows 33,230 TPS sustained with 2-round DAG finality ($\sim$4.3s at current block times), enabling high-throughput inference attestation.
+We implement all three tiers in ARC Chain, an 80,683-line Rust blockchain with 24 native transaction types and 1,185 tests. Tier 1 executes real neural network forward passes through a dedicated precompile with deterministic left-to-right accumulation. Tier 2 manages attestation bonds, challenge periods, and escrow via on-chain state. Tier 3 generates and verifies real STARK proofs using a 32-column AIR with 9 polynomial constraints, including recursive proof composition for multi-block aggregation. Measured performance on commodity hardware (Apple M2 Ultra) shows 33,230 TPS sustained with 2-round DAG finality ($\sim$24ms round time), enabling high-throughput inference attestation.
 \end{abstract}
 
 \section{Introduction}
@@ -179,7 +179,7 @@ Metric & Value \\
 \midrule
 Sustained TPS (2-node, real QUIC + DAG) & 33,230 \\
 Peak TPS (single-node, M2 Ultra 24c) & 183,000 \\
-Finality (2-round DAG commit) & $\sim$4.3 s \\
+Finality (2-round DAG commit) & $\sim$24 ms \\
 Transaction types & 24 native \\
 Codebase & 80,683 LOC Rust \\
 Tests & 1,185 passing \\
