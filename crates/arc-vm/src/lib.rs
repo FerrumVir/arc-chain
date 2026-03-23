@@ -498,8 +498,9 @@ fn host_emit_event(
 ///
 /// Gas cost: 1000 base + 10 per input byte + 10 per output byte.
 ///
-/// In testnet mode, this returns a deterministic mock response (BLAKE3 hash of input).
-/// In production, this would route to a TEE-enclosed model runtime.
+/// Currently returns a deterministic mock response (BLAKE3 hash of input).
+/// The real inference engine is in `arc-inference` (`integer_engine.rs`,
+/// `cached_integer_model.rs`) — not yet wired into this WASM host import.
 fn host_ai_inference(
     mut env: FunctionEnvMut<'_, VmHostEnv>,
     model_ptr: i32,

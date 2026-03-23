@@ -29,8 +29,9 @@ use std::time::Instant;
 /// A STARK proof for a single block.
 ///
 /// Attests that applying the transactions in a block to `prev_state_root`
-/// yields `post_state_root`. In production, `proof_data` contains a serialized
-/// Plonky3 STARK proof; here it holds a mock witness commitment.
+/// yields `post_state_root`. With the `stwo-prover` feature, `proof_data`
+/// contains a real Stwo Circle STARK proof receipt. Without the feature,
+/// it holds a BLAKE3-based mock witness commitment (no ZK properties).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockProof {
     pub block_height: u64,

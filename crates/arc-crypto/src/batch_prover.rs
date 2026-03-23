@@ -2,8 +2,8 @@
 //!
 //! Queues proving tasks, executes them in priority order, and collects results
 //! with timing statistics. Proofs are BLAKE3-based mock proofs suitable for
-//! integration testing and pipeline validation. In production, the `prove_next`
-//! method would delegate to a Plonky3 or SP1 proving backend.
+//! integration testing and pipeline validation. For real STARK proofs, use
+//! the `stwo-prover` feature which routes through `stwo_air.rs`.
 //!
 //! ## Pipeline flow
 //!

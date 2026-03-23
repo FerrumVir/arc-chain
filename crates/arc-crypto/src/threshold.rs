@@ -453,11 +453,11 @@ impl ThresholdSigner {
         let tag = hasher.finalize();
 
         // The signature is valid if the tag's first byte has high bit set.
-        // This is a simulation — in production, this would be a proper
-        // discrete-log-based verification.
-        // For deterministic testing, we accept all signatures that pass
-        // the structural check (non-zero combined sig).
-        let _ = tag; // used in production verification
+        // Mock verification: accepts any non-zero combined signature.
+        // This is NOT cryptographically secure — it's a structural check
+        // for pipeline testing. Real threshold signatures would require
+        // a discrete-log-based scheme (e.g., FROST).
+        let _ = tag;
         *combined_sig != [0u8; 32]
     }
 }
