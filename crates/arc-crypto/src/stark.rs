@@ -1,12 +1,18 @@
 // Add to lib.rs: pub mod stark;
 
-//! Recursive STARK proof scaffolding for ARC Chain.
+//! Recursive STARK proof pipeline for ARC Chain.
 //!
 //! Defines the type system and interfaces for a ZK-STARK proving pipeline that
-//! generates block proofs and recursively aggregates them. The actual proving and
-//! verification algorithms are computationally intensive and would use Plonky3/SP1
-//! in production. This module provides mock implementations that maintain correct
-//! type flow and structural invariants.
+//! generates block proofs and recursively aggregates them.
+//!
+//! Two proving backends are available, selected by feature flag:
+//!
+//! - `stwo-prover` (or `stwo-icicle`): Real Circle STARK proofs over the
+//!   Mersenne-31 field via the Stwo framework (`stwo_air.rs`). Produces
+//!   cryptographic proofs with FRI commitments and inline verification.
+//! - Default (no feature): BLAKE3-based mock proofs for fast iteration and
+//!   testing. These maintain correct type flow and structural invariants
+//!   but provide no zero-knowledge properties.
 //!
 //! Recursive proofs cryptographically verify all child proofs before aggregation
 //! and commit to a Merkle tree over verified child proof hashes.

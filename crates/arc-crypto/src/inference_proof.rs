@@ -251,10 +251,14 @@ pub fn verify_dense_trace(trace: &[Vec<i64>]) -> Result<(), String> {
     Ok(())
 }
 
-/// Prove and verify a Dense layer forward pass (reference implementation).
+/// Prove and verify a Dense layer forward pass.
 ///
-/// When stwo-prover is available, this generates a real STARK proof.
-/// Otherwise, uses CPU trace verification + BLAKE3 binding hash.
+/// Generates the 11-column execution trace, verifies all AIR constraints
+/// (multiplication correctness, accumulation, output), and produces a
+/// BLAKE3 binding hash committing to the verified trace. The binding hash
+/// and input/output hashes are used by `prove_folded_inference()` to chain
+/// layers, which can then be composed via `stwo_air::prove_recursive()`
+/// for a full Circle STARK proof of the folded inference.
 pub fn prove_dense_layer(layer: &DenseLayerInput) -> Result<DenseLayerProof, String> {
     let start = Instant::now();
 
