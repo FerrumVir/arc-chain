@@ -389,6 +389,56 @@ fn silu_i64(x: i64) -> i64 {
     if x > 0 { x } else { x >> 2 }
 }
 
+// ─── Binary weight cache for cross-platform determinism ───────────────────────
+
+impl I8Weights {
+    fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+        w.write_all(&(self.data.len() as u64).to_le_bytes())?;
+        w.write_all(&self.scale.to_le_bytes())?;
+        // Safety: i8 and u8 have the same layout
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(self.data.as_ptr() as *const u8, self.data.len())
+        };
+        w.write_all(bytes)
+    }
+
+    fn read_from(r: &mut impl std::io::Read) -> std::io::Result<Self> {
+        let mut buf8 = [0u8; 8];
+        r.read_exact(&mut buf8)?;
+        let len = u64::from_le_bytes(buf8) as usize;
+        r.read_exact(&mut buf8)?;
+        let scale = i64::from_le_bytes(buf8);
+        let mut data_bytes = vec![0u8; len];
+        r.read_exact(&mut data_bytes)?;
+        // Safety: i8 and u8 have the same layout
+        let data: Vec<i8> = unsafe {
+            let mut d = std::mem::ManuallyDrop::new(data_bytes);
+            Vec::from_raw_parts(d.as_mut_ptr() as *mut i8, d.len(), d.capacity())
+        };
+        Ok(Self { data, scale })
+    }
+}
+
+fn write_i64_vec(w: &mut impl std::io::Write, v: &[i64]) -> std::io::Result<()> {
+    w.write_all(&(v.len() as u64).to_le_bytes())?;
+    for &x in v {
+        w.write_all(&x.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+fn read_i64_vec(r: &mut impl std::io::Read) -> std::io::Result<Vec<i64>> {
+    let mut buf8 = [0u8; 8];
+    r.read_exact(&mut buf8)?;
+    let len = u64::from_le_bytes(buf8) as usize;
+    let mut v = Vec::with_capacity(len);
+    for _ in 0..len {
+        r.read_exact(&mut buf8)?;
+        v.push(i64::from_le_bytes(buf8));
+    }
+    Ok(v)
+}
+
 // ─── Forward Pass ─────────────────────────────────────────────────────────────
 
 impl CachedIntegerModel {
@@ -612,6 +662,168 @@ impl CachedIntegerModel {
         let hash = arc_crypto::hash_bytes(&output_bytes);
         (generated, hash)
     }
+
+    /// Save all INT8 weights to a binary file for cross-platform determinism.
+    /// Load once from GGUF on any platform, save to .arc-int8, distribute to all nodes.
+    pub fn save_weights(&self, path: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+
+        // Magic + version
+        f.write_all(b"ARC-INT8\x01\x00")?;
+
+        // Config
+        let cfg = &self.config;
+        for &v in &[cfg.n_layers, cfg.d_model, cfg.n_heads, cfg.n_kv_heads,
+                     cfg.d_ff, cfg.d_head, cfg.d_kv, cfg.vocab_size, cfg.max_seq] {
+            f.write_all(&(v as u64).to_le_bytes())?;
+        }
+        f.write_all(&cfg.attn_scale.to_le_bytes())?;
+
+        // RoPE tables
+        write_i64_vec(&mut f, &cfg.rope_cos)?;
+        write_i64_vec(&mut f, &cfg.rope_sin)?;
+
+        // Embedding + output + final_norm
+        self.embedding.write_to(&mut f)?;
+        self.output_weight.write_to(&mut f)?;
+        write_i64_vec(&mut f, &self.final_norm)?;
+
+        // Layers
+        for layer in &self.layers {
+            layer.wq.write_to(&mut f)?;
+            layer.wk.write_to(&mut f)?;
+            layer.wv.write_to(&mut f)?;
+            layer.wo.write_to(&mut f)?;
+            layer.w_gate.write_to(&mut f)?;
+            layer.w_up.write_to(&mut f)?;
+            layer.w_down.write_to(&mut f)?;
+            write_i64_vec(&mut f, &layer.attn_norm)?;
+            write_i64_vec(&mut f, &layer.ffn_norm)?;
+        }
+
+        // Vocab
+        let vocab_json = serde_json::to_string(&self.vocab).unwrap_or_default();
+        let vocab_bytes = vocab_json.as_bytes();
+        f.write_all(&(vocab_bytes.len() as u64).to_le_bytes())?;
+        f.write_all(vocab_bytes)?;
+
+        f.flush()?;
+        Ok(())
+    }
+
+    /// Compute hash of all weights (for verifying cross-platform identity).
+    pub fn weight_hash(&self) -> arc_crypto::Hash256 {
+        use std::io::Write;
+        let mut hasher = blake3::Hasher::new();
+
+        // Hash embedding
+        let emb_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(self.embedding.data.as_ptr() as *const u8, self.embedding.data.len())
+        };
+        hasher.update(emb_bytes);
+        hasher.update(&self.embedding.scale.to_le_bytes());
+
+        // Hash all layer weights
+        for layer in &self.layers {
+            for w in [&layer.wq, &layer.wk, &layer.wv, &layer.wo,
+                      &layer.w_gate, &layer.w_up, &layer.w_down] {
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(w.data.as_ptr() as *const u8, w.data.len())
+                };
+                hasher.update(bytes);
+                hasher.update(&w.scale.to_le_bytes());
+            }
+        }
+
+        let hash = hasher.finalize();
+        arc_crypto::Hash256(*hash.as_bytes())
+    }
+}
+
+/// Load model from pre-quantized binary file (cross-platform deterministic).
+pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
+    use crate::InferenceError;
+    use std::io::Read;
+
+    let mut f = std::io::BufReader::new(
+        std::fs::File::open(path)
+            .map_err(|e| InferenceError::Runtime(format!("Open binary: {e}")))?
+    );
+
+    // Magic + version
+    let mut magic = [0u8; 10];
+    f.read_exact(&mut magic).map_err(|e| InferenceError::Runtime(format!("Read magic: {e}")))?;
+    if &magic[..8] != b"ARC-INT8" {
+        return Err(InferenceError::Runtime("Not an ARC-INT8 file".into()));
+    }
+
+    let mut buf8 = [0u8; 8];
+    let read_u64 = |f: &mut std::io::BufReader<std::fs::File>| -> Result<u64, InferenceError> {
+        let mut b = [0u8; 8];
+        f.read_exact(&mut b).map_err(|e| InferenceError::Runtime(format!("Read: {e}")))?;
+        Ok(u64::from_le_bytes(b))
+    };
+
+    // Config
+    let n_layers = read_u64(&mut f)? as usize;
+    let d_model = read_u64(&mut f)? as usize;
+    let n_heads = read_u64(&mut f)? as usize;
+    let n_kv_heads = read_u64(&mut f)? as usize;
+    let d_ff = read_u64(&mut f)? as usize;
+    let d_head = read_u64(&mut f)? as usize;
+    let d_kv = read_u64(&mut f)? as usize;
+    let vocab_size = read_u64(&mut f)? as usize;
+    let max_seq = read_u64(&mut f)? as usize;
+    f.read_exact(&mut buf8).map_err(|e| InferenceError::Runtime(format!("Read: {e}")))?;
+    let attn_scale = i64::from_le_bytes(buf8);
+
+    // RoPE
+    let rope_cos = read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("RoPE cos: {e}")))?;
+    let rope_sin = read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("RoPE sin: {e}")))?;
+
+    // Weights
+    let embedding = I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("Embedding: {e}")))?;
+    let output_weight = I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("Output: {e}")))?;
+    let final_norm = read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("Norm: {e}")))?;
+
+    let mut layers = Vec::with_capacity(n_layers);
+    for l in 0..n_layers {
+        layers.push(CachedLayer {
+            wq: I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l} wq: {e}")))?,
+            wk: I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l} wk: {e}")))?,
+            wv: I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l} wv: {e}")))?,
+            wo: I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l} wo: {e}")))?,
+            w_gate: I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l} gate: {e}")))?,
+            w_up: I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l} up: {e}")))?,
+            w_down: I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l} down: {e}")))?,
+            attn_norm: read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l} anorm: {e}")))?,
+            ffn_norm: read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("L{l} fnorm: {e}")))?,
+        });
+        if l % 8 == 0 || l == n_layers - 1 {
+            info!("Layer {}/{} loaded from binary", l + 1, n_layers);
+        }
+    }
+
+    // Vocab
+    let vocab_len = {
+        let mut b = [0u8; 8];
+        f.read_exact(&mut b).map_err(|e| InferenceError::Runtime(format!("Vocab len: {e}")))?;
+        u64::from_le_bytes(b) as usize
+    };
+    let mut vocab_bytes = vec![0u8; vocab_len];
+    f.read_exact(&mut vocab_bytes).map_err(|e| InferenceError::Runtime(format!("Vocab: {e}")))?;
+    let vocab: Vec<String> = serde_json::from_slice(&vocab_bytes).unwrap_or_default();
+
+    info!("Binary model loaded: {} layers, d={}, vocab={}", n_layers, d_model, vocab_size);
+
+    Ok(CachedIntegerModel {
+        config: ModelConfig {
+            n_layers, d_model, n_heads, n_kv_heads, d_ff, d_head, d_kv,
+            vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
+        },
+        embedding, layers, final_norm, output_weight, vocab,
+    })
 }
 
 // ─── RoPE Tables ──────────────────────────────────────────────────────────────
