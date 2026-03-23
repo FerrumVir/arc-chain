@@ -38,8 +38,10 @@ fn main() {
         let layer_count = cfg.n_layers;
         for l in 0..layer_count {
             let kv_len = cfg.d_kv;
-            cache.k[l].truncate(cache.seq_len * kv_len);
-            cache.v[l].truncate(cache.seq_len * kv_len);
+            cache.k_data[l].truncate(cache.seq_len * kv_len);
+            cache.k_scales[l].truncate(cache.seq_len);
+            cache.v_data[l].truncate(cache.seq_len * kv_len);
+            cache.v_scales[l].truncate(cache.seq_len);
         }
     }
 
