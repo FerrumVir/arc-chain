@@ -412,3 +412,101 @@ fn argmax(
         argmax_result[0] = argmax_shared_idx[0];
     }
 }
+
+// ─── Kernel: Fused LayerNorm + Quantize ─────────────────────────────────────
+// Combines layernorm + quantize_i32_to_i8 into a single dispatch.
+// Bindings: input(ro), packed_output(rw), gamma(ro), params(uniform), scale(rw)
+
+@group(0) @binding(0) var<storage, read> lnq_input: array<i32>;
+@group(0) @binding(1) var<storage, read_write> lnq_output: array<u32>;
+@group(0) @binding(2) var<storage, read> lnq_gamma: array<i32>;
+@group(0) @binding(3) var<uniform> lnq_params: LayerNormParams;
+@group(0) @binding(4) var<storage, read_write> lnq_scale: array<i32>;
+
+var<workgroup> lnq_shared: array<i32, 256>;
+
+@compute @workgroup_size(256)
+fn layernorm_quantize(
+    @builtin(local_invocation_id) lid: vec3<u32>,
+) {
+    let size = lnq_params.size;
+    let tid = lid.x;
+
+    // Phase 1: compute partial sums for mean
+    var local_sum: i32 = 0;
+    for (var i = tid; i < size; i = i + 256u) {
+        local_sum += lnq_input[i];
+    }
+    lnq_shared[tid] = local_sum;
+    workgroupBarrier();
+
+    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            lnq_shared[tid] += lnq_shared[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let mean = lnq_shared[0] / i32(size);
+    workgroupBarrier();
+
+    // Phase 2: compute variance
+    var local_var: i32 = 0;
+    for (var i = tid; i < size; i = i + 256u) {
+        let d = lnq_input[i] - mean;
+        local_var += (d * d) >> 16;
+    }
+    lnq_shared[tid] = local_var;
+    workgroupBarrier();
+
+    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            lnq_shared[tid] += lnq_shared[tid + stride];
+        }
+        workgroupBarrier();
+    }
+    let variance = lnq_shared[0] / i32(size);
+    let inv_std = 65536 / max(1, i32(sqrt(f32(max(1, variance + 1)))));
+    workgroupBarrier();
+
+    // Phase 3: find absmax of normalized values (for quantization scale)
+    var local_max: i32 = 0;
+    for (var i = tid; i < size; i = i + 256u) {
+        let norm = ((lnq_input[i] - mean) * inv_std) >> 16;
+        let val = (norm * lnq_gamma[i]) >> 16;
+        let av = select(-val, val, val >= 0);
+        local_max = max(local_max, av);
+    }
+    lnq_shared[tid] = local_max;
+    workgroupBarrier();
+
+    for (var stride = 128u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            lnq_shared[tid] = max(lnq_shared[tid], lnq_shared[tid + stride]);
+        }
+        workgroupBarrier();
+    }
+    let abs_max = max(1, lnq_shared[0]);
+    let scale_factor = max(1, abs_max / 127);
+
+    if (tid == 0u) {
+        lnq_scale[0] = scale_factor;
+    }
+    workgroupBarrier();
+
+    // Phase 4: normalize, scale by gamma, quantize and pack into u32
+    let packed_count = (size + 3u) / 4u;
+    for (var i = tid; i < packed_count; i = i + 256u) {
+        let base = i * 4u;
+        var packed: u32 = 0u;
+        for (var k = 0u; k < 4u; k = k + 1u) {
+            let idx = base + k;
+            if (idx < size) {
+                let norm = ((lnq_input[idx] - mean) * inv_std) >> 16;
+                let val = (norm * lnq_gamma[idx]) >> 16;
+                let q = clamp(val / scale_factor, -127, 127);
+                packed |= (u32(q) & 0xFFu) << (k * 8u);
+            }
+        }
+        lnq_output[i] = packed;
+    }
+}

@@ -42,6 +42,9 @@ pub struct GpuForward {
     // Pipelines for each kernel
     matmul_pipeline: wgpu::ComputePipeline,
     msl_matmul_pipeline: Option<wgpu::ComputePipeline>,
+    msl_matmul_q4_pipeline: Option<wgpu::ComputePipeline>,
+    fused_lnq_pipeline: wgpu::ComputePipeline,
+    msl_fused_lnq_pipeline: Option<wgpu::ComputePipeline>,
     layernorm_pipeline: wgpu::ComputePipeline,
     quantize_pipeline: wgpu::ComputePipeline,
     rope_pipeline: wgpu::ComputePipeline,
@@ -51,6 +54,7 @@ pub struct GpuForward {
     argmax_pipeline: wgpu::ComputePipeline,
     // Bind group layouts
     matmul_bgl: wgpu::BindGroupLayout,
+    fused_lnq_bgl: wgpu::BindGroupLayout,
     layernorm_bgl: wgpu::BindGroupLayout,
     quantize_bgl: wgpu::BindGroupLayout,
     rope_bgl: wgpu::BindGroupLayout,
@@ -62,6 +66,8 @@ pub struct GpuForward {
 
 /// Pre-built bind groups for one layer — created once, reused every token.
 struct LayerBindGroups {
+    fused_lnq_attn: wgpu::BindGroup,
+    fused_lnq_ffn: wgpu::BindGroup,
     ln_attn: wgpu::BindGroup,
     quantize_normed: wgpu::BindGroup,
     mm_q: wgpu::BindGroup,
@@ -108,6 +114,7 @@ pub struct GpuModel {
     kv_v_scales: Vec<wgpu::Buffer>,
     // Pre-built bind groups (created once at upload, reused per token)
     layer_bgs: Vec<LayerBindGroups>,
+    fused_final_lnq_bg: wgpu::BindGroup,
     final_ln_bg: wgpu::BindGroup,
     final_quantize_bg: wgpu::BindGroup,
     lm_head_bg: wgpu::BindGroup,
@@ -245,6 +252,8 @@ impl GpuForward {
 
         // Matmul: weights, input, output, params, scales
         let matmul_bgl = make_bgl(&[storage_ro(0), storage_ro(1), storage_rw(2), uniform(3), storage_ro(4)]);
+        // Fused LayerNorm+Quantize: input, packed_output, gamma, params, scale
+        let fused_lnq_bgl = make_bgl(&[storage_ro(0), storage_rw(1), storage_ro(2), uniform(3), storage_rw(4)]);
         // LayerNorm: input, output, gamma, params
         let layernorm_bgl = make_bgl(&[storage_ro(0), storage_rw(1), storage_ro(2), uniform(3)]);
         // Quantize: input, output, scale
@@ -278,6 +287,7 @@ impl GpuForward {
         let silu_pipeline = make_pipeline(&silu_bgl, "silu_mul");
         let residual_pipeline = make_pipeline(&residual_bgl, "residual_add");
         let argmax_pipeline = make_pipeline(&argmax_bgl, "argmax");
+        let fused_lnq_pipeline = make_pipeline(&fused_lnq_bgl, "layernorm_quantize");
 
         // Native Metal matmul: char4 vector loads + simd_sum, no u32 extraction
         let msl_matmul_pipeline = if has_msl {
@@ -316,14 +326,95 @@ impl GpuForward {
             None
         };
 
-        info!("All {} GPU compute pipelines compiled", if msl_matmul_pipeline.is_some() { "9 (8 WGSL + 1 Metal)" } else { "8 WGSL" });
+        // Native Metal fused LN+Q and Q4 matmul pipelines
+        let (msl_fused_lnq_pipeline, msl_matmul_q4_pipeline) = if has_msl {
+            let fused_source = include_str!("fused_kernels.metal");
+
+            let fused_lnq = {
+                let msl_shader = unsafe {
+                    device.create_shader_module_passthrough(
+                        wgpu::ShaderModuleDescriptorPassthrough::Msl(
+                            wgpu::ShaderModuleDescriptorMsl {
+                                entry_point: "layernorm_quantize".to_string(),
+                                label: Some("fused_lnq_metal"),
+                                num_workgroups: (1, 1, 1),
+                                source: Cow::Borrowed(fused_source),
+                            },
+                        ),
+                    )
+                };
+                let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None, bind_group_layouts: &[&fused_lnq_bgl], push_constant_ranges: &[],
+                });
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("fused_lnq_msl"), layout: Some(&pl), module: &msl_shader,
+                        entry_point: Some("layernorm_quantize"), compilation_options: Default::default(), cache: None,
+                    })
+                })) {
+                    Ok(p) => {
+                        info!("Native Metal fused LN+Q pipeline READY");
+                        Some(p)
+                    }
+                    Err(e) => {
+                        info!("MSL fused LN+Q failed, using WGSL: {:?}", e);
+                        None
+                    }
+                }
+            };
+
+            let q4_matmul = {
+                let msl_shader = unsafe {
+                    device.create_shader_module_passthrough(
+                        wgpu::ShaderModuleDescriptorPassthrough::Msl(
+                            wgpu::ShaderModuleDescriptorMsl {
+                                entry_point: "matmul_i4".to_string(),
+                                label: Some("matmul_q4_metal"),
+                                num_workgroups: (128, 1, 1),
+                                source: Cow::Borrowed(fused_source),
+                            },
+                        ),
+                    )
+                };
+                let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: None, bind_group_layouts: &[&matmul_bgl], push_constant_ranges: &[],
+                });
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("matmul_q4_msl"), layout: Some(&pl), module: &msl_shader,
+                        entry_point: Some("matmul_i4"), compilation_options: Default::default(), cache: None,
+                    })
+                })) {
+                    Ok(p) => {
+                        info!("Native Metal Q4 matmul pipeline READY (4-bit weights)");
+                        Some(p)
+                    }
+                    Err(e) => {
+                        info!("MSL Q4 matmul failed, using Q8: {:?}", e);
+                        None
+                    }
+                }
+            };
+
+            (fused_lnq, q4_matmul)
+        } else {
+            (None, None)
+        };
+
+        let n_msl = [&msl_matmul_pipeline, &msl_fused_lnq_pipeline, &msl_matmul_q4_pipeline]
+            .iter().filter(|p| p.is_some()).count();
+        let n_wgsl = 9; // matmul, layernorm, quantize, rope, attention, silu, residual, argmax, fused_lnq
+        info!("All {} GPU compute pipelines compiled ({} WGSL + {} Metal)",
+            n_wgsl + n_msl, n_wgsl, n_msl);
 
         Ok(Self {
             device, queue,
-            matmul_pipeline, msl_matmul_pipeline, layernorm_pipeline, quantize_pipeline,
+            matmul_pipeline, msl_matmul_pipeline, msl_matmul_q4_pipeline,
+            fused_lnq_pipeline, msl_fused_lnq_pipeline,
+            layernorm_pipeline, quantize_pipeline,
             rope_pipeline, attention_pipeline, silu_pipeline,
             residual_pipeline, argmax_pipeline,
-            matmul_bgl, layernorm_bgl, quantize_bgl,
+            matmul_bgl, fused_lnq_bgl, layernorm_bgl, quantize_bgl,
             rope_bgl, attention_bgl, silu_bgl, residual_bgl, argmax_bgl,
         })
     }
@@ -336,6 +427,7 @@ impl GpuForward {
     pub fn device_ref(&self) -> &wgpu::Device { &self.device }
     pub fn queue_ref(&self) -> &wgpu::Queue { &self.queue }
     pub fn matmul_bgl_ref(&self) -> &wgpu::BindGroupLayout { &self.matmul_bgl }
+    pub fn fused_lnq_bgl_ref(&self) -> &wgpu::BindGroupLayout { &self.fused_lnq_bgl }
 
     /// Create a GPU buffer with initial data.
     fn buf(&self, label: &str, data: &[u8], usage: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -386,6 +478,18 @@ impl GpuForward {
         let sto = wgpu::BufferUsages::STORAGE;
         let sto_rw = wgpu::BufferUsages::STORAGE;
 
+        let use_q4 = self.msl_matmul_q4_pipeline.is_some();
+        // Q4: pack weights as 4-bit (2 per byte, half size)
+        // Q8: pack as u32 (4 per u32, compatible with both WGSL and Metal char*)
+        let pack_weights = |data: &[i8]| -> Vec<u8> {
+            if use_q4 {
+                super::gpu_matmul::pack_i8_to_q4(data)
+            } else {
+                let packed = super::gpu_matmul::pack_i8_to_u32_pub(data);
+                bytemuck::cast_slice(&packed).to_vec()
+            }
+        };
+        // Activations always packed as u32 (quantize kernel outputs u32)
         let pack_i8 = |data: &[i8]| -> Vec<u8> {
             let packed = super::gpu_matmul::pack_i8_to_u32_pub(data);
             bytemuck::cast_slice(&packed).to_vec()
@@ -403,15 +507,19 @@ impl GpuForward {
         let mut layer_attn_norm = Vec::new();
         let mut layer_ffn_norm = Vec::new();
 
+        if use_q4 {
+            info!("Using Q4 weights (4-bit, half bandwidth)");
+        }
+
         for (i, l) in layers.iter().enumerate() {
             layer_weights.push(LayerWeightBuffers {
-                wq: self.buf(&format!("L{i}_wq"), &pack_i8(l.0), sto),
-                wk: self.buf(&format!("L{i}_wk"), &pack_i8(l.2), sto),
-                wv: self.buf(&format!("L{i}_wv"), &pack_i8(l.4), sto),
-                wo: self.buf(&format!("L{i}_wo"), &pack_i8(l.6), sto),
-                w_gate: self.buf(&format!("L{i}_gate"), &pack_i8(l.8), sto),
-                w_up: self.buf(&format!("L{i}_up"), &pack_i8(l.10), sto),
-                w_down: self.buf(&format!("L{i}_down"), &pack_i8(l.12), sto),
+                wq: self.buf(&format!("L{i}_wq"), &pack_weights(l.0), sto),
+                wk: self.buf(&format!("L{i}_wk"), &pack_weights(l.2), sto),
+                wv: self.buf(&format!("L{i}_wv"), &pack_weights(l.4), sto),
+                wo: self.buf(&format!("L{i}_wo"), &pack_weights(l.6), sto),
+                w_gate: self.buf(&format!("L{i}_gate"), &pack_weights(l.8), sto),
+                w_up: self.buf(&format!("L{i}_up"), &pack_weights(l.10), sto),
+                w_down: self.buf(&format!("L{i}_down"), &pack_weights(l.12), sto),
             });
             layer_scales.push(LayerScaleBuffers {
                 sq: self.buf(&format!("L{i}_sq"), &pack_i64(l.1), sto),
@@ -435,7 +543,7 @@ impl GpuForward {
         let u32_size = |n: u32| ((n as usize + 3) / 4) * 4;
 
         // Create all buffers as local variables first
-        let output_weight_buf = self.buf("out_w", &pack_i8(output_data), sto);
+        let output_weight_buf = self.buf("out_w", &pack_weights(output_data), sto);
         let output_scales = self.buf("out_s", &pack_i64(output_scales), sto);
         let final_norm_buf = self.buf("fnorm", &pack_i64(final_norm), sto);
         let hidden_buf = self.empty_buf("hidden", i32_size(d_model), sto_rw | wgpu::BufferUsages::COPY_DST);
@@ -500,6 +608,8 @@ impl GpuForward {
             }), wgpu::BufferUsages::UNIFORM);
 
             layer_bgs_vec.push(LayerBindGroups {
+                fused_lnq_attn: mk_bg(&[be(0, &hidden_buf), be(1, &normed_packed), be(2, &layer_attn_norm[i]), be(3, &ln_params_buf), be(4, &quant_scale)], &self.fused_lnq_bgl),
+                fused_lnq_ffn: mk_bg(&[be(0, &hidden_buf), be(1, &normed_packed), be(2, &layer_ffn_norm[i]), be(3, &ln_params_buf), be(4, &quant_scale)], &self.fused_lnq_bgl),
                 ln_attn: mk_bg(&[be(0, &hidden_buf), be(1, &normed_buf), be(2, &layer_attn_norm[i]), be(3, &ln_params_buf)], &self.layernorm_bgl),
                 quantize_normed: mk_bg(&[be(0, &normed_buf), be(1, &normed_packed), be(2, &quant_scale)], &self.quantize_bgl),
                 mm_q: mk_bg(&[be(0, &lw.wq), be(1, &normed_packed), be(2, &q_buf), be(3, &mm_q_params), be(4, &ls.sq)], &self.matmul_bgl),
@@ -526,6 +636,7 @@ impl GpuForward {
             attn_params_bufs_vec.push(atp);
         }
 
+        let fused_final_lnq_bg = mk_bg(&[be(0, &hidden_buf), be(1, &normed_packed), be(2, &final_norm_buf), be(3, &ln_params_buf), be(4, &quant_scale)], &self.fused_lnq_bgl);
         let final_ln_bg = mk_bg(&[be(0, &hidden_buf), be(1, &normed_buf), be(2, &final_norm_buf), be(3, &ln_params_buf)], &self.layernorm_bgl);
         let final_quantize_bg = mk_bg(&[be(0, &normed_buf), be(1, &normed_packed), be(2, &quant_scale)], &self.quantize_bgl);
         let lm_head_bg = mk_bg(&[be(0, &output_weight_buf), be(1, &normed_packed), be(2, &logits_buf), be(3, &mm_lm_params), be(4, &output_scales)], &self.matmul_bgl);
@@ -540,7 +651,7 @@ impl GpuForward {
             gate_buf, up_buf, ff_out_buf, logits_buf, result_buf, staging_buf,
             kv_k_bufs, kv_v_bufs, kv_k_scales, kv_v_scales,
             layer_bgs: layer_bgs_vec,
-            final_ln_bg, final_quantize_bg, lm_head_bg, argmax_bg,
+            fused_final_lnq_bg, final_ln_bg, final_quantize_bg, lm_head_bg, argmax_bg,
             rope_q_params: rope_q_params_bufs,
             rope_k_params: rope_k_params_bufs,
             attn_params_bufs: attn_params_bufs_vec,
@@ -588,11 +699,12 @@ impl GpuForward {
         let rt = (model.n_heads * (dh / 2) + 255) / 256; // RoPE Q workgroups
         let rtk = (model.n_kv_heads * (dh / 2) + 255) / 256; // RoPE K
 
-        // Matmul workgroup counts depend on shader:
-        // WGSL: 1 thread per row, 256 per workgroup → (out_size + 255) / 256
-        // Metal: 4 rows per threadgroup (4 simdgroups × 32 threads) → (out_size + 3) / 4
-        let mm_pipeline = self.msl_matmul_pipeline.as_ref().unwrap_or(&self.matmul_pipeline);
-        let use_metal = self.msl_matmul_pipeline.is_some();
+        // Matmul pipeline: prefer Q4 Metal → Q8 Metal → WGSL
+        // Q4 and Q8 Metal both use same dispatch pattern (4 rows/threadgroup)
+        let mm_pipeline = self.msl_matmul_q4_pipeline.as_ref()
+            .or(self.msl_matmul_pipeline.as_ref())
+            .unwrap_or(&self.matmul_pipeline);
+        let use_metal = self.msl_matmul_q4_pipeline.is_some() || self.msl_matmul_pipeline.is_some();
         let mm_wg = |out_size: u32| -> u32 {
             if use_metal { (out_size + 3) / 4 } else { (out_size + 255) / 256 }
         };
