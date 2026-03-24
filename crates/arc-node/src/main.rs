@@ -390,44 +390,12 @@ async fn main() -> Result<()> {
 
     let mempool = Arc::new(Mempool::new(10_000_000));
 
-    // ── Load inference model (if --model provided) ──────────────────────
-    let inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>> =
-        if let Some(model_path) = &cli.model {
-            tracing::info!("Loading GGUF model from {} into INT8 cache...", model_path);
-            let load_start = Instant::now();
-            let load_result = if model_path.ends_with(".arc-int8") {
-                arc_inference::cached_integer_model::load_cached_model_binary(model_path)
-            } else {
-                arc_inference::cached_integer_model::load_cached_model(model_path)
-            };
-            match load_result {
-                Ok(model) => {
-                    let elapsed = load_start.elapsed();
-                    let mem_mb = model.memory_bytes() / (1024 * 1024);
-                    tracing::info!(
-                        "Model loaded in {:.1}s — {} MB INT8, {} layers, vocab {}",
-                        elapsed.as_secs_f64(),
-                        mem_mb,
-                        model.config.n_layers,
-                        model.config.vocab_size,
-                    );
-                    Some(Arc::new(model))
-                }
-                Err(e) => {
-                    tracing::error!("Failed to load model: {}", e);
-                    tracing::warn!("Node will start without inference capability");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-    // ── Initialize candle float backend (for coherent inference) ──────
+    // ── Initialize candle float backend FIRST (for coherent inference) ──────
+    // For GGUF files, load candle FIRST (lightweight Q4), then load tokenizer-only
+    // from the same GGUF. This avoids loading 7GB INT8 weights on 8GB nodes.
     let (candle_engine, candle_model_id): (Option<Arc<arc_inference::candle_backend::GgufEngine>>, Option<arc_crypto::Hash256>) =
         if let Some(model_path) = &cli.model {
             if !model_path.ends_with(".arc-int8") {
-                // GGUF file — load via candle for coherent float inference
                 let engine = Arc::new(arc_inference::candle_backend::GgufEngine::new(120_000));
                 match engine.load_gguf_file(model_path) {
                     Ok(mid) => {
@@ -435,7 +403,7 @@ async fn main() -> Result<()> {
                         (Some(engine), Some(mid))
                     }
                     Err(e) => {
-                        tracing::warn!("Candle backend failed: {} — using integer engine", e);
+                        tracing::warn!("Candle backend failed: {} — falling back to INT8", e);
                         (None, None)
                     }
                 }
@@ -444,6 +412,49 @@ async fn main() -> Result<()> {
             }
         } else {
             (None, None)
+        };
+
+    // ── Load tokenizer model (lightweight: vocab-only from TinyLlama if available, else from GGUF) ──
+    let inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>> =
+        if let Some(model_path) = &cli.model {
+            // If candle is handling inference via GGUF, we only need the tokenizer.
+            // Try loading a small tokenizer model first (tinyllama), fall back to full GGUF.
+            let tokenizer_path = if candle_engine.is_some() {
+                // Check for a small tokenizer model alongside the main model
+                let dir = std::path::Path::new(model_path).parent().unwrap_or(std::path::Path::new("."));
+                let tiny = dir.join("tinyllama-1.1b.arc-int8");
+                if tiny.exists() {
+                    tracing::info!("Using TinyLlama tokenizer (lightweight)");
+                    tiny.to_string_lossy().to_string()
+                } else {
+                    model_path.clone()
+                }
+            } else {
+                model_path.clone()
+            };
+
+            tracing::info!("Loading model from {}...", tokenizer_path);
+            let load_start = Instant::now();
+            let load_result = if tokenizer_path.ends_with(".arc-int8") {
+                arc_inference::cached_integer_model::load_cached_model_binary(&tokenizer_path)
+            } else {
+                arc_inference::cached_integer_model::load_cached_model(&tokenizer_path)
+            };
+            match load_result {
+                Ok(model) => {
+                    let elapsed = load_start.elapsed();
+                    tracing::info!("Model loaded in {:.1}s — {} MB, {} layers, vocab {}",
+                        elapsed.as_secs_f64(), model.memory_bytes() / (1024*1024),
+                        model.config.n_layers, model.config.vocab_size);
+                    Some(Arc::new(model))
+                }
+                Err(e) => {
+                    tracing::error!("Failed to load model: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
         };
 
     // ── Record boot time for uptime tracking ──────────────────────────
