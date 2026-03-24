@@ -2,6 +2,7 @@
 
 use crate::Grid;
 use crate::search::beam::{beam_search, BeamConfig, SearchResult};
+use crate::search::solver::{self, SolverConfig, SolveResult};
 use std::path::Path;
 use serde::Deserialize;
 

@@ -52,6 +52,16 @@ pub fn beam_search(
     test_inputs: &[Grid],
     config: &BeamConfig,
 ) -> Option<SearchResult> {
+    beam_search_steered(train_pairs, test_inputs, config, None)
+}
+
+/// Beam search with optional neural steering model.
+pub fn beam_search_steered(
+    train_pairs: &[(Grid, Grid)],
+    test_inputs: &[Grid],
+    config: &BeamConfig,
+    steering: Option<&super::steering::SteeringModel>,
+) -> Option<SearchResult> {
     if train_pairs.is_empty() { return None; }
 
     let start = std::time::Instant::now();
@@ -94,7 +104,43 @@ pub fn beam_search(
             .flat_map(|partial| {
                 let mut expansions = Vec::new();
 
-                for prim in &catalog {
+                // If steering model available, score and sort primitives
+                let prim_order: Vec<usize> = if let Some(model) = steering {
+                    let scores = super::steering::steer(
+                        model,
+                        &partial.current_value,
+                        target_output,
+                        &partial.current_type,
+                    );
+                    // Map scored names to catalog indices with fuzzy matching
+                    // Hodel names don't match Rust catalog exactly:
+                    //   "objects" → "obj_TTT", "obj_TFT", "obj_FTT", ...
+                    //   "replace" → "replace_1_3", "replace_0_2", ...
+                    //   "fill" → "fill_idx_0", "fill_idx_1", ...
+                    let mut ordered: Vec<usize> = Vec::new();
+                    for (name, _score) in &scores {
+                        for (idx, prim) in catalog.iter().enumerate() {
+                            if ordered.contains(&idx) { continue; }
+                            let matches = prim.name == name.as_str()
+                                || matches_hodel_name(prim.name, name);
+                            if matches {
+                                ordered.push(idx);
+                            }
+                        }
+                    }
+                    // Add any catalog entries not covered by the model
+                    for idx in 0..catalog.len() {
+                        if !ordered.contains(&idx) {
+                            ordered.push(idx);
+                        }
+                    }
+                    ordered
+                } else {
+                    (0..catalog.len()).collect()
+                };
+
+                for &prim_idx in &prim_order {
+                    let prim = &catalog[prim_idx];
                     // Type check: does this primitive accept the current type?
                     if prim.input_types.len() == 1 && prim.input_types[0] == partial.current_type {
                         let args = vec![partial.current_value.clone()];
@@ -259,6 +305,37 @@ fn apply_program(
         Some(g)
     } else {
         None
+    }
+}
+
+/// Match a Hodel operation name to a Rust catalog entry name.
+/// Hodel uses names like "objects", "replace", "fill", "ofcolor".
+/// Rust catalog uses parameterized names like "obj_TTT", "replace_1_3", "fill_idx_2".
+fn matches_hodel_name(catalog_name: &str, hodel_name: &str) -> bool {
+    match hodel_name {
+        "objects" => catalog_name.starts_with("obj_"),
+        "replace" => catalog_name.starts_with("replace_"),
+        "switch" => catalog_name.starts_with("switch_"),
+        "fill" => catalog_name.starts_with("fill_idx_") || catalog_name.starts_with("underfill_idx_"),
+        "ofcolor" => catalog_name.starts_with("ofcolor_"),
+        "paint" => catalog_name.starts_with("paint_all_") || catalog_name == "cover",
+        "upscale" => catalog_name.starts_with("upscale_"),
+        "crop" => catalog_name == "trim" || catalog_name.starts_with("crop"),
+        "hconcat" => catalog_name.starts_with("hconcat"),
+        "vconcat" => catalog_name.starts_with("vconcat"),
+        "hsplit" => catalog_name.starts_with("hsplit"),
+        "vsplit" => catalog_name.starts_with("vsplit"),
+        "partition" | "fgpartition" => catalog_name.starts_with("obj_"),
+        "frontiers" => catalog_name.starts_with("obj_"),
+        "asindices" => catalog_name == "obj_positions" || catalog_name.starts_with("ofcolor_"),
+        "asobject" => false, // not in catalog yet
+        "occurrences" => false,
+        "hupscale" | "vupscale" => catalog_name.starts_with("upscale_"),
+        "compress" => catalog_name == "compress",
+        _ => {
+            // Direct name match or prefix match
+            catalog_name == hodel_name || catalog_name.starts_with(hodel_name)
+        }
     }
 }
 
