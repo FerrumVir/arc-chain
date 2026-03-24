@@ -80,17 +80,15 @@ pub struct CachedLayer {
     pub ffn_norm: Vec<i64>,
 }
 
-/// INT8 quantized KV cache — 8x less memory than i64.
-/// Each position's K/V vector is quantized to i8 with a per-position scale.
-/// 7B at 2048 context: 512 MB (vs 4 GB with i64).
+/// KV cache — full i64 precision for deterministic attention.
+/// i8 quantization loses too much precision for attention dot products,
+/// causing the model to attend to wrong positions after a few tokens.
+/// Memory: 7B at 2048 context: ~4 GB. Fits on Mac Studio, tight on 8GB Vultr.
 pub struct KVCache {
-    /// k_data[layer]: flat i8 array, [pos * d_kv .. (pos+1) * d_kv]
-    pub k_data: Vec<Vec<i8>>,
-    /// k_scales[layer][pos]: Q16 scale for position pos
-    pub k_scales: Vec<Vec<i64>>,
-    /// v_data[layer]: flat i8 array
-    pub v_data: Vec<Vec<i8>>,
-    pub v_scales: Vec<Vec<i64>>,
+    /// k_data[layer]: flat i64 array, [pos * d_kv .. (pos+1) * d_kv]
+    pub k_data: Vec<Vec<i64>>,
+    /// v_data[layer]: flat i64 array
+    pub v_data: Vec<Vec<i64>>,
     pub seq_len: usize,
 }
 
@@ -98,9 +96,7 @@ impl KVCache {
     pub fn new(n_layers: usize) -> Self {
         Self {
             k_data: vec![Vec::new(); n_layers],
-            k_scales: vec![Vec::new(); n_layers],
             v_data: vec![Vec::new(); n_layers],
-            v_scales: vec![Vec::new(); n_layers],
             seq_len: 0,
         }
     }
@@ -108,25 +104,17 @@ impl KVCache {
     pub fn clear(&mut self) {
         for l in 0..self.k_data.len() {
             self.k_data[l].clear();
-            self.k_scales[l].clear();
             self.v_data[l].clear();
-            self.v_scales[l].clear();
         }
         self.seq_len = 0;
     }
 
-    /// Quantize and append a K vector for one position.
     fn push_k(&mut self, layer: usize, k: &[i64]) {
-        let (data, scale) = quantize_vec_i8(k);
-        self.k_data[layer].extend_from_slice(&data);
-        self.k_scales[layer].push(scale);
+        self.k_data[layer].extend_from_slice(k);
     }
 
-    /// Quantize and append a V vector for one position.
     fn push_v(&mut self, layer: usize, v: &[i64]) {
-        let (data, scale) = quantize_vec_i8(v);
-        self.v_data[layer].extend_from_slice(&data);
-        self.v_scales[layer].push(scale);
+        self.v_data[layer].extend_from_slice(v);
     }
 }
 
@@ -1444,7 +1432,7 @@ impl CachedIntegerModel {
             cache.push_k(layer_idx, &k_buf);
             cache.push_v(layer_idx, &v_buf);
 
-            // Attention with i8 KV cache (full precision dot products)
+            // Attention with full-precision i64 KV cache
             let full_seq = pos + 1;
             let head_results: Vec<Vec<i64>> = (0..cfg.n_heads).into_par_iter().map(|h| {
                 let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
@@ -1454,13 +1442,12 @@ impl CachedIntegerModel {
                 let mut scores = Vec::with_capacity(full_seq);
                 for j in 0..full_seq {
                     let k_off = j * cfg.d_kv + kv_h * dh;
-                    let k_scale = cache.k_scales[layer_idx][j];
-                    // Full precision: i64 × i8 dot product (no quantization of q_head)
-                    let mut dot_raw: i64 = 0;
+                    // Q16 × Q16 → Q32 dot product, then shift to Q16
+                    let mut dot: i64 = 0;
                     for dd in 0..dh {
-                        dot_raw += q_head[dd] * (cache.k_data[layer_idx][k_off + dd] as i64);
+                        dot += q_head[dd] * cache.k_data[layer_idx][k_off + dd];
                     }
-                    let dot = (dot_raw >> FRAC_BITS) * k_scale;
+                    // dot is Q32. Shift to Q16, then apply 1/sqrt(d_head) scale
                     scores.push((dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS);
                 }
 
@@ -1469,10 +1456,9 @@ impl CachedIntegerModel {
                 let mut out = vec![0i64; dh];
                 for j in 0..full_seq {
                     let v_off = j * cfg.d_kv + kv_h * dh;
-                    let v_scale = cache.v_scales[layer_idx][j];
                     let w = attn_weights[j];
                     for dd in 0..dh {
-                        out[dd] += (w * ((cache.v_data[layer_idx][v_off + dd] as i64) * v_scale)) >> FRAC_BITS;
+                        out[dd] += (w * cache.v_data[layer_idx][v_off + dd]) >> FRAC_BITS;
                     }
                 }
                 out
