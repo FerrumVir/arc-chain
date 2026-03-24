@@ -147,13 +147,9 @@ kernel void matmul_i4(
     for (uint j = start; j < end; j++) {
         uchar packed = w[j];
 
-        // Low nibble: bits 0-3, 2's complement signed [-8, 7]
-        int w_lo = int(packed & 0xFu);
-        w_lo -= (w_lo >> 3) * 16; // sign extend: if bit 3 set, subtract 16
-
-        // High nibble: bits 4-7
-        int w_hi = int((packed >> 4u) & 0xFu);
-        w_hi -= (w_hi >> 3) * 16;
+        // Bias-8 encoding: nibble [0,15] → signed [-8, 7] by subtracting 8
+        int w_lo = int(packed & 0xFu) - 8;
+        int w_hi = int((packed >> 4u) & 0xFu) - 8;
 
         acc += w_lo * int(input[j * 2u]) + w_hi * int(input[j * 2u + 1u]);
     }
