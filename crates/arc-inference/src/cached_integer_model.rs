@@ -171,7 +171,11 @@ pub struct Q4Layer {
 /// Fully cached integer model with per-row INT8 weights.
 pub struct CachedIntegerModel {
     pub config: ModelConfig,
-    pub embedding: I8Weights,     // [vocab × d_model]
+    /// Embeddings stored at full Q16 precision (not INT8).
+    /// Embedding values can be extremely small (1e-6) and INT8 destroys them.
+    /// This is just a lookup table, not a matmul — no performance impact.
+    pub embedding_q16: Vec<i64>,  // [vocab × d_model] in Q16
+    pub embedding_i8: I8Weights,  // kept for weight_hash and save_weights
     pub layers: Vec<CachedLayer>,
     pub final_norm: Vec<i64>,
     pub output_weight: I8Weights, // [vocab × d_model]
@@ -530,30 +534,18 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
 }
 
 /// Dispatch: SIMD i8×i8 for large matmuls, scalar for small.
-/// Both NEON and AVX2 use identical pairwise-to-i32 accumulation → cross-platform deterministic.
+/// NOTE: SIMD path quantizes input to i8 which causes double-quantization precision loss.
+/// For models with small weight distributions, use scalar path (i8×i64, full input precision).
 pub fn matmul_fast(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    if in_size >= 512 && out_size >= 256 {
-        return matmul_i8xi8_simd(weights, input, in_size, out_size);
-    }
+    // Use scalar i8×i64 path for full precision — SIMD i8×i8 loses too much
+    // precision for small models like TinyLlama where weights are near-zero.
     matmul_i8(weights, input, in_size, out_size)
 }
 
-/// Zero-alloc matmul with pre-quantized input. Quantize ONCE, reuse for Q/K/V or gate/up.
-pub fn matmul_fast_preq(weights: &I8Weights, input_q: &QuantizedInput, input_raw: &[i64], in_size: usize, output: &mut [i64]) {
-    let out_size = output.len();
-    // Use SIMD i8xi8 with pre-quantized input for large matmuls
-    #[cfg(target_arch = "aarch64")]
-    if in_size >= 512 && out_size >= 256 {
-        matmul_simd_preq_neon(weights, input_q, in_size, output);
-        return;
-    }
-    #[cfg(target_arch = "x86_64")]
-    if in_size >= 512 && out_size >= 256 && is_x86_feature_detected!("avx2") {
-        matmul_simd_preq_x86(weights, input_q, in_size, output);
-        return;
-    }
-    // Scalar fallback
+/// Zero-alloc matmul — uses scalar i8×i64 for full precision.
+pub fn matmul_fast_preq(weights: &I8Weights, _input_q: &QuantizedInput, input_raw: &[i64], in_size: usize, output: &mut [i64]) {
+    // Use scalar i8×i64 path for full input precision.
+    // The SIMD i8×i8 path loses too much via double quantization.
     matmul_i8_into(weights, input_raw, in_size, output);
 }
 
@@ -970,19 +962,21 @@ fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
+/// RMSNorm (what Llama uses — no mean subtraction, just root-mean-square).
+/// output[i] = (input[i] / rms) * gamma[i]
+/// where rms = sqrt(mean(x²))
 fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
     let n = input.len() as i64;
     if n == 0 { return vec![]; }
-    let mean = input.iter().sum::<i64>() / n;
-    let mut var_sum: i64 = 0;
+    // RMSNorm: compute mean of squares (NOT variance around mean)
+    let mut sq_sum: i64 = 0;
     for &x in input {
-        let d = x - mean;
-        var_sum += (d * d) >> FRAC_BITS;
+        sq_sum += (x * x) >> FRAC_BITS;
     }
-    let variance = var_sum / n;
-    let inv_std = integer_isqrt(variance + 1);
+    let mean_sq = sq_sum / n;
+    let inv_rms = integer_isqrt(mean_sq + 1); // 1/sqrt(mean_sq) in Q16
     input.iter().enumerate().map(|(i, &x)| {
-        let norm = ((x - mean) * inv_std) >> FRAC_BITS;
+        let norm = (x * inv_rms) >> FRAC_BITS;
         let g = if i < gamma.len() { gamma[i] } else { ONE };
         (norm * g) >> FRAC_BITS
     }).collect()
@@ -1000,8 +994,19 @@ fn apply_rope(vec: &mut [i64], pos: usize, d_head: usize, cos: &[i64], sin: &[i6
     }
 }
 
+/// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+/// Uses the integer exp LUT for sigmoid computation.
 fn silu_i64(x: i64) -> i64 {
-    if x > 0 { x } else { x >> 2 }
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    let sig = if x >= 0 {
+        let exp_neg = integer_exp(-x);
+        (ONE * ONE) / (ONE + exp_neg).max(1)
+    } else {
+        let exp_pos = integer_exp(x);
+        (exp_pos * ONE) / (ONE + exp_pos).max(1)
+    };
+    // SiLU = x * sigmoid(x)
+    (x * sig) >> FRAC_BITS
 }
 
 // ─── Fused LayerNorm + Projection ─────────────────────────────────────────────
@@ -1292,7 +1297,7 @@ fn read_i64_vec(r: &mut impl std::io::Read) -> std::io::Result<Vec<i64>> {
 
 impl CachedIntegerModel {
     pub fn memory_bytes(&self) -> usize {
-        let mut total = self.embedding.memory_bytes()
+        let mut total = self.embedding_i8.memory_bytes() + self.embedding_q16.len() * 8
             + self.output_weight.memory_bytes()
             + self.final_norm.len() * 8
             + self.config.rope_cos.len() * 8 * 2;
@@ -1395,12 +1400,10 @@ impl CachedIntegerModel {
             };
         }
 
-        // Embed
+        // Embed — use full Q16 precision (INT8 destroys tiny embedding values)
         let idx = (token as usize).min(cfg.vocab_size - 1);
         let emb_start = idx * d;
-        let emb_scale = self.embedding.scales[idx];
-        let mut hidden: Vec<i64> = self.embedding.data[emb_start..emb_start + d]
-            .iter().map(|&w| (w as i64) * emb_scale).collect();
+        let mut hidden: Vec<i64> = self.embedding_q16[emb_start..emb_start + d].to_vec();
 
         // Pre-allocate buffers (reused across layers)
         let mut q = vec![0i64; d];
@@ -1441,23 +1444,22 @@ impl CachedIntegerModel {
             cache.push_k(layer_idx, &k_buf);
             cache.push_v(layer_idx, &v_buf);
 
-            // Attention with i8 KV cache (SIMD-vectorized dot products)
+            // Attention with i8 KV cache (full precision dot products)
             let full_seq = pos + 1;
             let head_results: Vec<Vec<i64>> = (0..cfg.n_heads).into_par_iter().map(|h| {
                 let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
                 let dh = cfg.d_head;
                 let q_head = &q[h * dh..(h + 1) * dh];
 
-                // Quantize Q head to i8 ONCE, reuse for all positions
-                let (q_i8, q_sf) = quantize_for_dot(q_head);
-
                 let mut scores = Vec::with_capacity(full_seq);
                 for j in 0..full_seq {
                     let k_off = j * cfg.d_kv + kv_h * dh;
                     let k_scale = cache.k_scales[layer_idx][j];
-                    // SIMD i8×i8 dot product
-                    let dot_i32 = dot_i8_kv(&q_i8, &cache.k_data[layer_idx], k_off, dh);
-                    let dot_raw = (dot_i32 as i64) * q_sf;
+                    // Full precision: i64 × i8 dot product (no quantization of q_head)
+                    let mut dot_raw: i64 = 0;
+                    for dd in 0..dh {
+                        dot_raw += q_head[dd] * (cache.k_data[layer_idx][k_off + dd] as i64);
+                    }
                     let dot = (dot_raw >> FRAC_BITS) * k_scale;
                     scores.push((dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS);
                 }
@@ -1526,6 +1528,9 @@ impl CachedIntegerModel {
         let mut cache = KVCache::new(self.config.n_layers);
         let mut generated = Vec::new();
 
+        // Prepend BOS token (1) — Llama requires it
+        let _ = self.forward_one_token(1, &mut cache);
+
         for &tok in prompt {
             let _logits = self.forward_one_token(tok, &mut cache);
         }
@@ -1533,7 +1538,22 @@ impl CachedIntegerModel {
         for _ in 0..max_tokens {
             let last_token = generated.last().copied()
                 .unwrap_or(*prompt.last().unwrap_or(&0));
-            let logits = self.forward_one_token(last_token, &mut cache);
+            let mut logits = self.forward_one_token(last_token, &mut cache);
+
+            // Repetition penalty: penalize recently generated tokens deterministically.
+            // This prevents INT8 quantized models from getting stuck in loops.
+            // Penalty factor: divide logit by 1.2 (multiply by ONE*5/6) for repeated tokens.
+            for &prev_tok in generated.iter().rev().take(64) {
+                let idx = prev_tok as usize;
+                if idx < logits.len() {
+                    if logits[idx] > 0 {
+                        logits[idx] = logits[idx] * 5 / 6; // reduce positive logit
+                    } else {
+                        logits[idx] = logits[idx] * 6 / 5; // increase negative logit (make more negative)
+                    }
+                }
+            }
+
             let next = argmax_i64(&logits) as u32;
             generated.push(next);
             if eos_tokens.contains(&next) { break; }
@@ -1560,7 +1580,7 @@ impl CachedIntegerModel {
         write_i64_vec(&mut f, &cfg.rope_cos)?;
         write_i64_vec(&mut f, &cfg.rope_sin)?;
 
-        self.embedding.write_to(&mut f)?;
+        self.embedding_i8.write_to(&mut f)?;
         self.output_weight.write_to(&mut f)?;
         write_i64_vec(&mut f, &self.final_norm)?;
 
@@ -1593,7 +1613,7 @@ impl CachedIntegerModel {
             h.update(bytes);
             for &s in &w.scales { h.update(&s.to_le_bytes()); }
         };
-        hash_i8w(&mut hasher, &self.embedding);
+        hash_i8w(&mut hasher, &self.embedding_i8);
         hash_i8w(&mut hasher, &self.output_weight);
         for layer in &self.layers {
             for w in [&layer.wq, &layer.wk, &layer.wv, &layer.wo,
@@ -1704,13 +1724,19 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         }).unwrap_or_else(|_| vec![ONE; size])
     };
 
-    let embedding = extract_i8(&mut reader, &content, "token_embd.weight", vocab_size, d_model)?;
-    info!("Embeddings loaded: {} MB per-row INT8", embedding.memory_bytes() / (1024 * 1024));
+    let embedding_i8 = extract_i8(&mut reader, &content, "token_embd.weight", vocab_size, d_model)?;
+    // Also store embeddings at full Q16 precision — INT8 destroys tiny values (common in 1B models)
+    let embedding_q16: Vec<i64> = {
+        let f = extract_f32(&mut reader, &content, "token_embd.weight")?;
+        f.iter().map(|&x| (x as f64 * ONE as f64).round() as i64).collect()
+    };
+    info!("Embeddings loaded: {} MB Q16 + {} MB INT8",
+        embedding_q16.len() * 8 / (1024 * 1024), embedding_i8.memory_bytes() / (1024 * 1024));
 
     let output_weight = extract_i8(&mut reader, &content, "output.weight", vocab_size, d_model)
         .unwrap_or_else(|_| I8Weights {
-            data: embedding.data.clone(), scales: embedding.scales.clone(),
-            n_rows: embedding.n_rows, n_cols: embedding.n_cols,
+            data: embedding_i8.data.clone(), scales: embedding_i8.scales.clone(),
+            n_rows: embedding_i8.n_rows, n_cols: embedding_i8.n_cols,
         });
     let final_norm = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
 
@@ -1738,10 +1764,8 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
 
     let max_seq = 2048;
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, 10000.0);
-    let attn_scale = {
-        let isqrt = integer_isqrt((d_head as i64) * ONE);
-        (ONE * ONE) / isqrt.max(1)
-    };
+    // 1/sqrt(d_head) in Q16 — integer_isqrt already returns ONE/sqrt(x/ONE)
+    let attn_scale = integer_isqrt((d_head as i64) * ONE);
 
     info!("Model loaded: ~{} MB per-row INT8", layers.iter()
         .map(|l| l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
@@ -1754,7 +1778,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             n_layers, d_model, n_heads, n_kv_heads, d_ff, d_head, d_kv,
             vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
         },
-        embedding, layers, final_norm, output_weight, vocab,
+        embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
     })
 }
@@ -1801,7 +1825,18 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
     let rope_cos = read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("Cos: {e}")))?;
     let rope_sin = read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("Sin: {e}")))?;
 
-    let embedding = I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("Emb: {e}")))?;
+    let embedding_i8 = I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("Emb: {e}")))?;
+    // Reconstruct Q16 embeddings from i8 + per-row scale
+    let embedding_q16: Vec<i64> = {
+        let mut q16 = Vec::with_capacity(embedding_i8.n_rows * embedding_i8.n_cols);
+        for i in 0..embedding_i8.n_rows {
+            let scale = embedding_i8.scales[i];
+            for j in 0..embedding_i8.n_cols {
+                q16.push((embedding_i8.data[i * embedding_i8.n_cols + j] as i64) * scale);
+            }
+        }
+        q16
+    };
     let output_weight = I8Weights::read_from(&mut f).map_err(|e| InferenceError::Runtime(format!("Out: {e}")))?;
     let final_norm = read_i64_vec(&mut f).map_err(|e| InferenceError::Runtime(format!("Norm: {e}")))?;
 
@@ -1832,7 +1867,7 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
             n_layers, d_model, n_heads, n_kv_heads, d_ff, d_head, d_kv,
             vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
         },
-        embedding, layers, final_norm, output_weight, vocab,
+        embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
     })
 }
@@ -1859,7 +1894,18 @@ mod tests {
             I8Weights::quantize_f32(&gen_f32(rows * cols), rows, cols)
         };
 
-        let embedding = gen_i8(vs, d);
+        let embedding_i8 = gen_i8(vs, d);
+        // For tests, Q16 embedding = i8 * scale (same as real loading)
+        let embedding_q16: Vec<i64> = {
+            let mut q16 = Vec::with_capacity(vs * d);
+            for i in 0..vs {
+                let scale = embedding_i8.scales[i];
+                for j in 0..d {
+                    q16.push((embedding_i8.data[i * d + j] as i64) * scale);
+                }
+            }
+            q16
+        };
         let output_weight = gen_i8(vs, d);
         let mut layers = Vec::new();
         for _ in 0..nl {
@@ -1880,7 +1926,7 @@ mod tests {
                 d_ff: dff, d_head: dh, d_kv: dkv, vocab_size: vs,
                 attn_scale, rope_cos, rope_sin, max_seq: 512,
             },
-            embedding, layers, final_norm: vec![ONE; d], output_weight,
+            embedding_q16, embedding_i8, layers, final_norm: vec![ONE; d], output_weight,
             vocab: (0..vs).map(|i| format!("tok_{}", i)).collect(),
             q4_layers: None, q4_output: None,
         }

@@ -38,6 +38,10 @@ pub struct NodeState {
     pub faucet_claims_total: Arc<AtomicU32>,
     /// Cached INT8 inference model (if --model was provided).
     pub inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
+    /// Candle GGUF float inference engine (coherent output).
+    pub candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
+    /// Model ID for candle engine.
+    pub candle_model_id: Option<arc_crypto::Hash256>,
 }
 
 /// Build a `NodeState` from components.
@@ -49,6 +53,8 @@ pub fn build_node_state(
     boot_time: Instant,
     peer_count: Arc<AtomicU32>,
     inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
+    candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
+    candle_model_id: Option<arc_crypto::Hash256>,
 ) -> NodeState {
     let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
     NodeState {
@@ -62,6 +68,8 @@ pub fn build_node_state(
         faucet_claims: Arc::new(Mutex::new(HashMap::new())),
         faucet_claims_total: Arc::new(AtomicU32::new(0)),
         inference_model,
+        candle_engine,
+        candle_model_id,
     }
 }
 
@@ -75,8 +83,10 @@ pub async fn serve(
     boot_time: Instant,
     peer_count: Arc<AtomicU32>,
     inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
+    candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
+    candle_model_id: Option<arc_crypto::Hash256>,
 ) -> anyhow::Result<()> {
-    let node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model);
+    let node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
 
     let app = Router::new()
         .route("/", get(index))
@@ -2463,7 +2473,7 @@ async fn inference_run(
         .and_then(|v| v.as_u64())
         .unwrap_or(100);
 
-    // Check if we have a loaded model
+    // Check if we have a loaded model (prefer candle float backend for quality)
     let model = match &node.inference_model {
         Some(m) => m.clone(),
         None => {
@@ -2476,7 +2486,7 @@ async fn inference_run(
 
     let start = std::time::Instant::now();
 
-    // Encode input text to tokens
+    // Encode input text to tokens using the tokenizer
     let prompt_tokens = model.encode(input_text);
     let encode_ms = start.elapsed().as_millis() as u64;
 
@@ -2487,10 +2497,25 @@ async fn inference_run(
         })));
     }
 
-    // Run inference through the cached INT8 integer engine
-    // EOS tokens for Llama: 2 (</s>), 0 (<unk>)
-    let eos_tokens = vec![2u32, 0];
-    let (generated_tokens, output_hash) = model.generate(&prompt_tokens, max_tokens, &eos_tokens);
+    // Run inference — use candle float backend if available, else integer engine
+    let (generated_tokens, output_hash, engine_name) = if let (Some(engine), Some(mid)) = (&node.candle_engine, &node.candle_model_id) {
+        // Candle Q4 float backend — coherent output, deterministic on same arch
+        let mut tokens_with_bos = vec![1u32]; // BOS
+        tokens_with_bos.extend(&prompt_tokens);
+        let result = engine.generate(mid, &tokens_with_bos, max_tokens)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let gen_tokens: Vec<u32> = result.output.chunks(4)
+            .map(|c| u32::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0),
+                c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]))
+            .collect();
+        (gen_tokens, result.output_hash, "candle Q4 (float, deterministic per-arch)")
+    } else {
+        // Integer engine fallback
+        let eos_tokens = vec![2u32, 0];
+        let (generated, hash) = model.generate(&prompt_tokens, max_tokens, &eos_tokens);
+        (generated, hash, "INT8 integer (cross-platform deterministic)")
+    };
+
     let inference_ms = start.elapsed().as_millis() as u64;
     let tokens_generated = generated_tokens.len() as u64;
     let ms_per_token = if tokens_generated > 0 { inference_ms / tokens_generated } else { 0 };
@@ -2498,9 +2523,9 @@ async fn inference_run(
     // Decode output tokens to text
     let output_text = model.decode(&generated_tokens);
 
-    // Compute model ID from model config hash
+    // Compute model ID
     let model_id_data = format!(
-        "arc-int8-{}L-{}d-{}h-{}v",
+        "arc-{}L-{}d-{}h-{}v",
         model.config.n_layers, model.config.d_model,
         model.config.n_heads, model.config.vocab_size
     );
@@ -2554,7 +2579,7 @@ async fn inference_run(
             "ms_per_token": ms_per_token,
             "encode_ms": encode_ms,
             "deterministic": true,
-            "engine": "INT8 integer (cross-platform deterministic)",
+            "engine": engine_name,
         },
         "attestation": {
             "tx_hash": format!("0x{}", hex::encode(&tx_hash.0)),

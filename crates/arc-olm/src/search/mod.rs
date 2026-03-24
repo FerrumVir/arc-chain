@@ -1,3 +1,9 @@
 pub mod beam;
+pub mod diff_synth;
 pub mod enumerate;
 pub mod eval;
+pub mod augmentation;
+pub mod synthesizer;
+pub mod evolution;
+pub mod solver;
+pub mod steering;

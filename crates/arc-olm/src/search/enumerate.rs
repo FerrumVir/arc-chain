@@ -89,6 +89,10 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
         (true, false, true, "obj_TFT"),
         (false, true, true, "obj_FTT"),
         (false, false, true, "obj_FFT"),
+        (true, true, false, "obj_TTF"),
+        (true, false, false, "obj_TFF"),
+        (false, true, false, "obj_FTF"),
+        (false, false, false, "obj_FFF"),
     ] {
         let name: &'static str = name;
         cat.push(TypedPrimitive {
@@ -342,6 +346,209 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
                 } else { None }
             }),
         });
+    }
+
+    // Object → Int (height, width, size)
+    cat.push(TypedPrimitive {
+        name: "obj_height",
+        input_types: vec![DagType::Object],
+        output_type: DagType::Int,
+        apply: Box::new(|args| {
+            if let DagValue::Object(obj) = &args[0] {
+                Some(DagValue::Int(object::obj_height(obj)))
+            } else { None }
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "obj_width",
+        input_types: vec![DagType::Object],
+        output_type: DagType::Int,
+        apply: Box::new(|args| {
+            if let DagValue::Object(obj) = &args[0] {
+                Some(DagValue::Int(object::obj_width(obj)))
+            } else { None }
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "obj_size",
+        input_types: vec![DagType::Object],
+        output_type: DagType::Int,
+        apply: Box::new(|args| {
+            if let DagValue::Object(obj) = &args[0] {
+                Some(DagValue::Int(obj.size()))
+            } else { None }
+        }),
+    });
+
+    // Object → Color
+    cat.push(TypedPrimitive {
+        name: "obj_color",
+        input_types: vec![DagType::Object],
+        output_type: DagType::Color,
+        apply: Box::new(|args| {
+            if let DagValue::Object(obj) = &args[0] {
+                Some(DagValue::Color(obj.primary_color()))
+            } else { None }
+        }),
+    });
+
+    // Grid → Int (height, width)
+    cat.push(TypedPrimitive {
+        name: "grid_height",
+        input_types: vec![DagType::Grid],
+        output_type: DagType::Int,
+        apply: Box::new(|args| {
+            Some(DagValue::Int(args[0].as_grid()?.len()))
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "grid_width",
+        input_types: vec![DagType::Grid],
+        output_type: DagType::Int,
+        apply: Box::new(|args| {
+            let g = args[0].as_grid()?;
+            Some(DagValue::Int(if g.is_empty() { 0 } else { g[0].len() }))
+        }),
+    });
+
+    // Grid → Color (most/least common)
+    cat.push(TypedPrimitive {
+        name: "mostcolor",
+        input_types: vec![DagType::Grid],
+        output_type: DagType::Color,
+        apply: Box::new(|args| {
+            Some(DagValue::Color(grid::mostcolor(args[0].as_grid()?)))
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "leastcolor",
+        input_types: vec![DagType::Grid],
+        output_type: DagType::Color,
+        apply: Box::new(|args| {
+            Some(DagValue::Color(grid::leastcolor(args[0].as_grid()?)))
+        }),
+    });
+
+    // Object selectors by height/width
+    cat.push(TypedPrimitive {
+        name: "argmax_height",
+        input_types: vec![DagType::Objects],
+        output_type: DagType::Object,
+        apply: Box::new(|args| {
+            if let DagValue::Objects(objs) = &args[0] {
+                objs.iter().max_by_key(|o| object::obj_height(o)).cloned().map(DagValue::Object)
+            } else { None }
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "argmin_height",
+        input_types: vec![DagType::Objects],
+        output_type: DagType::Object,
+        apply: Box::new(|args| {
+            if let DagValue::Objects(objs) = &args[0] {
+                objs.iter().min_by_key(|o| object::obj_height(o)).cloned().map(DagValue::Object)
+            } else { None }
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "argmax_width",
+        input_types: vec![DagType::Objects],
+        output_type: DagType::Object,
+        apply: Box::new(|args| {
+            if let DagValue::Objects(objs) = &args[0] {
+                objs.iter().max_by_key(|o| object::obj_width(o)).cloned().map(DagValue::Object)
+            } else { None }
+        }),
+    });
+
+    // First/last object
+    cat.push(TypedPrimitive {
+        name: "first_obj",
+        input_types: vec![DagType::Objects],
+        output_type: DagType::Object,
+        apply: Box::new(|args| {
+            if let DagValue::Objects(objs) = &args[0] {
+                objs.first().cloned().map(DagValue::Object)
+            } else { None }
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "last_obj",
+        input_types: vec![DagType::Objects],
+        output_type: DagType::Object,
+        apply: Box::new(|args| {
+            if let DagValue::Objects(objs) = &args[0] {
+                objs.last().cloned().map(DagValue::Object)
+            } else { None }
+        }),
+    });
+
+    // Object → Indices (delta, backdrop, positions)
+    cat.push(TypedPrimitive {
+        name: "obj_delta",
+        input_types: vec![DagType::Object],
+        output_type: DagType::Indices,
+        apply: Box::new(|args| {
+            if let DagValue::Object(obj) = &args[0] {
+                Some(DagValue::Indices(object::delta(obj)))
+            } else { None }
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "obj_backdrop",
+        input_types: vec![DagType::Object],
+        output_type: DagType::Indices,
+        apply: Box::new(|args| {
+            if let DagValue::Object(obj) = &args[0] {
+                Some(DagValue::Indices(object::backdrop(obj)))
+            } else { None }
+        }),
+    });
+    cat.push(TypedPrimitive {
+        name: "obj_positions",
+        input_types: vec![DagType::Object],
+        output_type: DagType::Indices,
+        apply: Box::new(|args| {
+            if let DagValue::Object(obj) = &args[0] {
+                Some(DagValue::Indices(obj.positions()))
+            } else { None }
+        }),
+    });
+
+    // Objects + Grid → Grid (paint all objects with a color)
+    for &c in colors {
+        let name: &'static str = Box::leak(format!("paint_all_{c}").into_boxed_str());
+        cat.push(TypedPrimitive {
+            name,
+            input_types: vec![DagType::Objects, DagType::Grid],
+            output_type: DagType::Grid,
+            apply: Box::new(move |args| {
+                if let (DagValue::Objects(objs), DagValue::Grid(g)) = (&args[0], &args[1]) {
+                    let mut result = g.clone();
+                    for obj in objs {
+                        let positions = obj.positions();
+                        result = grid::fill(&result, c, &positions);
+                    }
+                    Some(DagValue::Grid(result))
+                } else { None }
+            }),
+        });
+    }
+
+    // switch_colors (symmetric, c1 < c2)
+    for &c1 in colors {
+        for &c2 in colors {
+            if c1 >= c2 { continue; }
+            let name: &'static str = Box::leak(format!("switch_{c1}_{c2}").into_boxed_str());
+            cat.push(TypedPrimitive {
+                name,
+                input_types: vec![DagType::Grid],
+                output_type: DagType::Grid,
+                apply: Box::new(move |args| {
+                    Some(DagValue::Grid(grid::switch_colors(args[0].as_grid()?, c1, c2)))
+                }),
+            });
+        }
     }
 
     // Upscale/downscale

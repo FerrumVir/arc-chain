@@ -13,6 +13,7 @@ path = "src/main.rs"
 # Dev builds on stable use mock BLAKE3 verifier — proofs are structurally identical.
 [features]
 default = []
+candle = ["arc-inference/candle"]
 stwo-prover = ["arc-crypto/stwo-prover", "arc-state/stwo-prover"]
 
 [dependencies]

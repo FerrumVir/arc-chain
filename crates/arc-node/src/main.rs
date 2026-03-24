@@ -423,6 +423,29 @@ async fn main() -> Result<()> {
             None
         };
 
+    // ── Initialize candle float backend (for coherent inference) ──────
+    let (candle_engine, candle_model_id): (Option<Arc<arc_inference::candle_backend::GgufEngine>>, Option<arc_crypto::Hash256>) =
+        if let Some(model_path) = &cli.model {
+            if !model_path.ends_with(".arc-int8") {
+                // GGUF file — load via candle for coherent float inference
+                let engine = Arc::new(arc_inference::candle_backend::GgufEngine::new(120_000));
+                match engine.load_gguf_file(model_path) {
+                    Ok(mid) => {
+                        tracing::info!("Candle float inference ENABLED (Q4 GGUF)");
+                        (Some(engine), Some(mid))
+                    }
+                    Err(e) => {
+                        tracing::warn!("Candle backend failed: {} — using integer engine", e);
+                        (None, None)
+                    }
+                }
+            } else {
+                (None, None) // .arc-int8 files use integer engine only
+            }
+        } else {
+            (None, None)
+        };
+
     // ── Record boot time for uptime tracking ──────────────────────────
     let boot_time = Instant::now();
 
@@ -509,6 +532,8 @@ async fn main() -> Result<()> {
             boot_time,
             peer_count.clone(),
             inference_model.clone(),
+            candle_engine.clone(),
+            candle_model_id,
         );
         tracing::info!("ETH RPC    : {} (MetaMask/Hardhat/Foundry)", eth_addr);
         tokio::spawn(async move {
@@ -519,8 +544,10 @@ async fn main() -> Result<()> {
     }
 
     // ── Start RPC server ────────────────────────────────────────────────
-    if inference_model.is_some() {
-        tracing::info!("Inference  : ENABLED (INT8 integer engine, deterministic)");
+    if candle_engine.is_some() {
+        tracing::info!("Inference  : ENABLED (candle Q4 float, coherent output)");
+    } else if inference_model.is_some() {
+        tracing::info!("Inference  : ENABLED (INT8 integer engine)");
     }
     tracing::info!("RPC server listening on {}", rpc_addr);
     rpc::serve(
@@ -532,6 +559,8 @@ async fn main() -> Result<()> {
         boot_time,
         peer_count,
         inference_model,
+        candle_engine,
+        candle_model_id,
     )
     .await?;
 
