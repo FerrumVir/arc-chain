@@ -53,7 +53,7 @@ fn main() {
     }
 
     // Test prompt
-    let prompt_text = "What is 2+2?";
+    let prompt_text = "[INST] What is 2+2? [/INST]";
     let prompt_tokens = model.encode(prompt_text);
     println!("Prompt: \"{}\"", prompt_text);
     println!("Encoded: {:?} ({} tokens)", prompt_tokens, prompt_tokens.len());
