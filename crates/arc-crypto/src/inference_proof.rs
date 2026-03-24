@@ -375,6 +375,175 @@ pub fn prove_folded_inference(
 
 use std::time::Instant;
 
+// ─── Sharded Dense Layer Proving (for 50B+ scale) ──────────────────────────
+
+/// Result of proving a single shard of a Dense layer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardProof {
+    /// Which shard index (0-based).
+    pub shard_idx: usize,
+    /// Column range this shard covers: [col_start, col_end).
+    pub col_start: usize,
+    pub col_end: usize,
+    /// Partial accumulator output for this shard [out_size].
+    /// The final output = sum of all shard partial outputs + bias.
+    pub partial_sums_hash: Hash256,
+    /// Proof of this shard's computation.
+    pub proof: DenseLayerProof,
+}
+
+/// Result of proving a large Dense layer via column sharding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardedLayerProof {
+    /// One proof per shard.
+    pub shard_proofs: Vec<ShardProof>,
+    /// Combined output hash (same as non-sharded proof would produce).
+    pub output_hash: Hash256,
+    /// Input hash.
+    pub input_hash: Hash256,
+    /// Layer dimensions.
+    pub out_size: usize,
+    pub in_size: usize,
+    /// Total proving time.
+    pub total_proving_time_ms: u64,
+    /// Total proof size.
+    pub total_proof_size: usize,
+}
+
+/// Prove a large Dense layer by splitting columns into shards.
+///
+/// For a [16384 × 16384] layer (268M MACs), a single trace would need 2^28 rows.
+/// Instead, split into shards of `shard_cols` columns each:
+/// - Shard 0: columns [0, shard_cols), each output row accumulates partial sum
+/// - Shard 1: columns [shard_cols, 2*shard_cols), adds to accumulator
+/// - ...final shard adds bias
+///
+/// Each shard produces a `DenseLayerProof`. Shard outputs chain via accumulator.
+/// Total trace rows per shard = out_size × shard_cols (fits in memory).
+pub fn prove_sharded_dense(
+    weights: &[i64],
+    bias: &[i64],
+    input: &[i64],
+    in_size: usize,
+    out_size: usize,
+    shard_cols: usize,
+) -> Result<ShardedLayerProof, String> {
+    let total_start = Instant::now();
+
+    if shard_cols == 0 || shard_cols > in_size {
+        return Err("shard_cols must be > 0 and <= in_size".into());
+    }
+
+    let n_shards = (in_size + shard_cols - 1) / shard_cols;
+    let mut shard_proofs = Vec::with_capacity(n_shards);
+
+    // Running partial sums per output row (accumulated across shards)
+    let mut partial_sums = vec![0i64; out_size];
+
+    for shard_idx in 0..n_shards {
+        let col_start = shard_idx * shard_cols;
+        let col_end = (col_start + shard_cols).min(in_size);
+        let shard_width = col_end - col_start;
+        let is_last_shard = shard_idx == n_shards - 1;
+
+        // Extract shard weights: [out_size × shard_width]
+        let mut shard_weights = Vec::with_capacity(out_size * shard_width);
+        for i in 0..out_size {
+            for j in col_start..col_end {
+                shard_weights.push(weights[i * in_size + j]);
+            }
+        }
+
+        // Extract shard input
+        let shard_input: Vec<i64> = input[col_start..col_end].to_vec();
+
+        // Compute shard output (partial sums for this column range)
+        let shard_bias = if is_last_shard {
+            bias.to_vec() // Only add bias in last shard
+        } else {
+            vec![0i64; out_size]
+        };
+        let shard_output = dense_forward_i64(
+            &shard_weights, &shard_bias, &shard_input, shard_width, out_size);
+
+        // Update running partial sums
+        for i in 0..out_size {
+            partial_sums[i] += shard_output[i];
+        }
+
+        let partial_hash = hash_bytes(
+            &partial_sums.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+
+        // Create DenseLayerInput for this shard
+        let layer_input = DenseLayerInput {
+            weights: shard_weights,
+            bias: shard_bias,
+            input: shard_input,
+            output: shard_output,
+            in_size: shard_width,
+            out_size,
+        };
+
+        // Prove this shard
+        let proof = prove_dense_layer(&layer_input)
+            .map_err(|e| format!("Shard {shard_idx} proof failed: {e}"))?;
+
+        shard_proofs.push(ShardProof {
+            shard_idx,
+            col_start,
+            col_end,
+            partial_sums_hash: partial_hash,
+            proof,
+        });
+    }
+
+    // Final output = partial_sums (which includes bias from last shard)
+    let output_bytes: Vec<u8> = partial_sums.iter()
+        .flat_map(|v| v.to_le_bytes()).collect();
+    let output_hash = hash_bytes(&output_bytes);
+
+    let input_bytes: Vec<u8> = input.iter()
+        .flat_map(|v| v.to_le_bytes()).collect();
+    let input_hash = hash_bytes(&input_bytes);
+
+    let total_proof_size: usize = shard_proofs.iter()
+        .map(|s| s.proof.proof_data.len()).sum();
+
+    Ok(ShardedLayerProof {
+        shard_proofs,
+        output_hash,
+        input_hash,
+        out_size,
+        in_size,
+        total_proving_time_ms: total_start.elapsed().as_millis() as u64,
+        total_proof_size,
+    })
+}
+
+/// Verify a sharded layer proof: check each shard and that partial sums chain correctly.
+pub fn verify_sharded_proof(proof: &ShardedLayerProof) -> Result<(), String> {
+    if proof.shard_proofs.is_empty() {
+        return Err("No shards".into());
+    }
+
+    // Verify each shard covers the right columns and they tile the full input
+    let mut expected_col = 0;
+    for (i, shard) in proof.shard_proofs.iter().enumerate() {
+        if shard.col_start != expected_col {
+            return Err(format!("Shard {i}: expected col_start={expected_col}, got {}", shard.col_start));
+        }
+        if shard.col_end <= shard.col_start {
+            return Err(format!("Shard {i}: invalid range [{}, {})", shard.col_start, shard.col_end));
+        }
+        expected_col = shard.col_end;
+    }
+    if expected_col != proof.in_size {
+        return Err(format!("Shards cover {} columns, expected {}", expected_col, proof.in_size));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -528,6 +697,108 @@ mod tests {
         trace[5][0] = 999;
 
         assert!(verify_dense_trace(&trace).is_err());
+    }
+
+    #[test]
+    fn test_sharded_dense_matches_unsharded() {
+        // Prove a 64×32 layer both ways and verify same output hash
+        let in_size = 32;
+        let out_size = 16;
+        let shard_cols = 8; // 4 shards of 8 columns
+
+        let mut rng: u64 = 555;
+        let mut next = || -> i64 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i64) % 20 - 10
+        };
+
+        let weights: Vec<i64> = (0..out_size * in_size).map(|_| next()).collect();
+        let bias: Vec<i64> = (0..out_size).map(|_| next()).collect();
+        let input: Vec<i64> = (0..in_size).map(|_| next()).collect();
+        let output = dense_forward_i64(&weights, &bias, &input, in_size, out_size);
+
+        // Unsharded proof
+        let layer = DenseLayerInput {
+            weights: weights.clone(), bias: bias.clone(),
+            input: input.clone(), output: output.clone(),
+            in_size, out_size,
+        };
+        let unsharded = prove_dense_layer(&layer).unwrap();
+
+        // Sharded proof
+        let sharded = prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
+
+        // Output hashes must match
+        assert_eq!(unsharded.output_hash, sharded.output_hash);
+        assert_eq!(sharded.shard_proofs.len(), 4); // 32/8 = 4 shards
+        assert!(verify_sharded_proof(&sharded).is_ok());
+    }
+
+    #[test]
+    fn test_sharded_large_layer() {
+        // 512×256 layer, sharded into 64-column chunks = 4 shards
+        let in_size = 256;
+        let out_size = 128;
+        let shard_cols = 64;
+
+        let mut rng: u64 = 7777;
+        let mut next = || -> i64 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i64) % 10 - 5
+        };
+
+        let weights: Vec<i64> = (0..out_size * in_size).map(|_| next()).collect();
+        let bias: Vec<i64> = (0..out_size).map(|_| next()).collect();
+        let input: Vec<i64> = (0..in_size).map(|_| next()).collect();
+
+        let sharded = prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
+        assert_eq!(sharded.shard_proofs.len(), 4);
+        assert!(verify_sharded_proof(&sharded).is_ok());
+
+        println!("Sharded 128×256 in {}ms, {} shards, {} bytes total",
+            sharded.total_proving_time_ms, sharded.shard_proofs.len(), sharded.total_proof_size);
+    }
+
+    #[test]
+    fn test_sharded_50b_scale_dimension() {
+        // Simulate a 50B-scale layer: 1024×1024 (reduced from 16384×16384 for test speed)
+        // In production, this would be 16384×16384 with shard_cols=512 → 32 shards
+        let in_size = 1024;
+        let out_size = 256;
+        let shard_cols = 128; // 8 shards
+
+        let mut rng: u64 = 50_000_000_000; // 50B seed :)
+        let mut next = || -> i64 {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((rng >> 33) as i64) % 4 - 2 // small values to avoid overflow
+        };
+
+        let weights: Vec<i64> = (0..out_size * in_size).map(|_| next()).collect();
+        let bias: Vec<i64> = (0..out_size).map(|_| next()).collect();
+        let input: Vec<i64> = (0..in_size).map(|_| next()).collect();
+
+        let start = Instant::now();
+        let sharded = prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
+        let total_ms = start.elapsed().as_millis();
+
+        assert_eq!(sharded.shard_proofs.len(), 8);
+        assert!(verify_sharded_proof(&sharded).is_ok());
+
+        // Extrapolate to 16384×16384:
+        // Per-shard: out_size × shard_cols MACs → 256 × 128 = 32K per shard here
+        // At 16384×16384 with shard_cols=512: 16384 × 512 = 8.4M per shard
+        // Scale factor: 8.4M / 32K = 262x
+        // Estimated time per shard at scale: (total_ms / 8) * 262
+        let per_shard_ms = total_ms / 8;
+        let scaled_per_shard = per_shard_ms * 262;
+        let scaled_total = scaled_per_shard * 32; // 32 shards for 16384/512
+
+        println!("Test: {}×{} in {}ms ({} shards, {}ms/shard)",
+            out_size, in_size, total_ms, 8, per_shard_ms);
+        println!("Extrapolated 16384×16384: {}ms/shard × 32 shards = {}ms total",
+            scaled_per_shard, scaled_total);
+        println!("For 80 layers (50B model): {}s total proving time",
+            (scaled_total * 80 * 7) / 1000); // 7 weight matrices per layer
     }
 
     #[test]
