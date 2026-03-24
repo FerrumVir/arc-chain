@@ -681,26 +681,41 @@ impl Q4WeightsX86 {
         self.data.len() + self.scales.len() * 8
     }
 
-    /// Convert I8Weights to Q4WeightsX86. Clamps values to [-8, 7].
+    /// Convert I8Weights to Q4WeightsX86 with per-row scaling.
+    /// Each i8 row is rescaled to use the full Q4 range [-8, 7].
+    /// Per-row q4_per_unit = ceil(abs_max / 7) ensures minimal clamping loss.
+    /// Encoding: bias +8 (stored [0, 15], decode by subtracting 8).
     pub fn from_i8(w: &I8Weights) -> Self {
-        let n = w.data.len();
-        let mut data = Vec::with_capacity((n + 1) / 2);
-        for pair in w.data.chunks(2) {
-            let lo = (pair[0].max(-8).min(7) as u8) & 0x0F;
-            let hi = if pair.len() > 1 { (pair[1].max(-8).min(7) as u8) & 0x0F } else { 0 };
-            data.push(lo | (hi << 4));
+        let n_rows = w.n_rows;
+        let n_cols = w.n_cols;
+        let mut data = Vec::with_capacity(w.data.len() / 2);
+        let mut scales = Vec::with_capacity(n_rows);
+
+        for i in 0..n_rows {
+            let row = &w.data[i * n_cols..(i + 1) * n_cols];
+
+            // Per-row abs_max of i8 values
+            let abs_max = row.iter().map(|&x| (x as i16).abs() as u8).max().unwrap_or(1).max(1);
+            // How many i8 units per Q4 step: ceil(abs_max / 7)
+            let q4_per_unit = ((abs_max as i64 + 6) / 7).max(1);
+
+            for pair in row.chunks(2) {
+                // Divide by q4_per_unit to use full Q4 range, then clamp
+                let v0 = ((pair[0] as i16) / q4_per_unit as i16).clamp(-8, 7);
+                let v1 = if pair.len() > 1 {
+                    ((pair[1] as i16) / q4_per_unit as i16).clamp(-8, 7)
+                } else { 0 };
+                // Bias encoding: store value + 8 in nibble [0, 15]
+                let lo = ((v0 + 8) as u8) & 0x0F;
+                let hi = ((v1 + 8) as u8) & 0x0F;
+                data.push(lo | (hi << 4));
+            }
+
+            // Combined scale: original i8 scale × q4_per_unit
+            scales.push(w.scales[i] * q4_per_unit);
         }
-        // Adjust scales: Q4 values are ~16x smaller than Q8, so multiply scales
-        // Q8 range: [-127, 127], Q4 range: [-8, 7]
-        // For a value x in Q8: x_q8 ≈ x / scale_q8 * 127
-        // Equivalent Q4: x_q4 ≈ x / scale_q4 * 7
-        // So scale_q4 ≈ scale_q8 * 127 / 7 ≈ scale_q8 * 18
-        // But since we're just clamping, the effective scale needs adjusting
-        let scales = w.scales.iter().map(|&s| {
-            // Q4 has ~18x less precision per value, compensate in scale
-            s * 18
-        }).collect();
-        Q4WeightsX86 { data, scales, n_rows: w.n_rows, n_cols: w.n_cols }
+
+        Q4WeightsX86 { data, scales, n_rows, n_cols }
     }
 }
 
@@ -839,6 +854,99 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
     });
 }
 
+/// Q4×Q8 matmul with NEON SIMD. Same algorithm as x86 AVX2 but uses
+/// NEON nibble extraction: vand + vshr for low/high, vsub for bias-8.
+/// Processes 16 packed bytes (32 Q4 values) per iteration.
+#[cfg(target_arch = "aarch64")]
+pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
+    use std::arch::aarch64::*;
+
+    let in_size = q4.n_cols;
+    let byte_cols = in_size / 2;
+    let data = &q4.data;
+    let inp = &input_q.data;
+    let scales = &q4.scales;
+    let isf = input_q.scale_factor;
+
+    output.par_chunks_mut(512).enumerate().for_each(|(ci, chunk)| {
+        let base = ci * 512;
+        for (li, out) in chunk.iter_mut().enumerate() {
+            let i = base + li;
+            let row_off = i * byte_cols;
+            let mut acc: i64;
+
+            unsafe {
+                let simd_len = byte_cols / 16 * 16; // 16 bytes = 32 Q4 values
+                let bias = vdupq_n_s8(8);
+                let mask_lo = vdupq_n_u8(0x0F);
+                let mut vacc0 = vdupq_n_s32(0);
+                let mut vacc1 = vdupq_n_s32(0);
+                let mut vacc2 = vdupq_n_s32(0);
+                let mut vacc3 = vdupq_n_s32(0);
+
+                let mut j = 0usize;
+                while j < simd_len {
+                    // Load 16 packed Q4 bytes = 32 weight values
+                    let packed = vld1q_u8(data.as_ptr().add(row_off + j));
+
+                    // Extract low nibbles [0,15] and high nibbles [0,15]
+                    let lo = vreinterpretq_s8_u8(vandq_u8(packed, mask_lo));
+                    let hi = vreinterpretq_s8_u8(vshrq_n_u8(packed, 4));
+
+                    // Subtract bias 8 → signed [-8, 7]
+                    let q_lo = vsubq_s8(lo, bias);
+                    let q_hi = vsubq_s8(hi, bias);
+
+                    // Load 32 input i8 values (lo input for lo nibbles, hi for hi)
+                    // Layout: lo nibble = even cols, hi nibble = odd cols
+                    // Need to interleave: input[j*2], input[j*2+1], input[j*2+2], ...
+                    // lo[k] pairs with input[j*2 + k*2], hi[k] with input[j*2 + k*2 + 1]
+                    // But NEON zip can interleave: q_lo[0],q_hi[0],q_lo[1],q_hi[1],...
+                    // to match sequential input layout
+
+                    // Interleave weights to match sequential input
+                    let wlo_lo = vget_low_s8(q_lo);   // 8 low nibbles (even cols)
+                    let whi_lo = vget_low_s8(q_hi);   // 8 high nibbles (odd cols)
+                    let wlo_hi = vget_high_s8(q_lo);
+                    let whi_hi = vget_high_s8(q_hi);
+
+                    let w_interleaved_0 = vzip1q_s8(
+                        vcombine_s8(wlo_lo, wlo_hi),
+                        vcombine_s8(whi_lo, whi_hi));
+                    let w_interleaved_1 = vzip2q_s8(
+                        vcombine_s8(wlo_lo, wlo_hi),
+                        vcombine_s8(whi_lo, whi_hi));
+
+                    let i0 = vld1q_s8(inp.as_ptr().add(j * 2));
+                    let i1 = vld1q_s8(inp.as_ptr().add(j * 2 + 16));
+
+                    // i8×i8 → i16 → pairwise add to i32
+                    vacc0 = vpadalq_s16(vacc0, vmull_s8(vget_low_s8(w_interleaved_0), vget_low_s8(i0)));
+                    vacc1 = vpadalq_s16(vacc1, vmull_s8(vget_high_s8(w_interleaved_0), vget_high_s8(i0)));
+                    vacc2 = vpadalq_s16(vacc2, vmull_s8(vget_low_s8(w_interleaved_1), vget_low_s8(i1)));
+                    vacc3 = vpadalq_s16(vacc3, vmull_s8(vget_high_s8(w_interleaved_1), vget_high_s8(i1)));
+
+                    j += 16;
+                }
+
+                vacc0 = vaddq_s32(vaddq_s32(vacc0, vacc1), vaddq_s32(vacc2, vacc3));
+                acc = vaddvq_s32(vacc0) as i64;
+
+                // Scalar remainder
+                while j < byte_cols {
+                    let byte = data[row_off + j];
+                    let w_lo = (byte & 0x0F) as i8 - 8;
+                    let w_hi = ((byte >> 4) & 0x0F) as i8 - 8;
+                    acc += (w_lo as i64) * (inp[j * 2] as i64)
+                         + (w_hi as i64) * (inp[j * 2 + 1] as i64);
+                    j += 1;
+                }
+            }
+            *out = acc * ((scales[i] * isf) >> FRAC_BITS);
+        }
+    });
+}
+
 fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
     let byte_cols = q4.n_cols / 2;
     let data = &q4.data;
@@ -947,6 +1055,106 @@ fn fused_layernorm_matmul(
     output
 }
 
+// ─── SIMD Attention KV Dot Products ──────────────────────────────────────────
+
+/// Quantize a Q16 i64 vector to i8 for SIMD dot products.
+/// Returns (i8 data, scale factor).
+#[inline]
+fn quantize_for_dot(v: &[i64]) -> (Vec<i8>, i64) {
+    let abs_max = v.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
+    let sf = (abs_max / 127).max(1);
+    let data: Vec<i8> = v.iter().map(|&x| (x / sf).clamp(-127, 127) as i8).collect();
+    (data, sf)
+}
+
+/// SIMD i8×i8 dot product for attention K scores.
+/// q_i8: query head quantized to i8, k_ptr: pointer into KV cache i8 data.
+/// Returns i32 dot product (caller applies scales).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn dot_i8_kv_neon(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i32 {
+    use std::arch::aarch64::*;
+    unsafe {
+        let simd_len = d_head / 32 * 32;
+        let mut vacc0 = vdupq_n_s32(0);
+        let mut vacc1 = vdupq_n_s32(0);
+        let mut vacc2 = vdupq_n_s32(0);
+        let mut vacc3 = vdupq_n_s32(0);
+        let mut j = 0usize;
+        while j < simd_len {
+            let vq0 = vld1q_s8(q_i8.add(j));
+            let vk0 = vld1q_s8(k_ptr.add(j));
+            vacc0 = vpadalq_s16(vacc0, vmull_s8(vget_low_s8(vq0), vget_low_s8(vk0)));
+            vacc1 = vpadalq_s16(vacc1, vmull_s8(vget_high_s8(vq0), vget_high_s8(vk0)));
+            let vq1 = vld1q_s8(q_i8.add(j + 16));
+            let vk1 = vld1q_s8(k_ptr.add(j + 16));
+            vacc2 = vpadalq_s16(vacc2, vmull_s8(vget_low_s8(vq1), vget_low_s8(vk1)));
+            vacc3 = vpadalq_s16(vacc3, vmull_s8(vget_high_s8(vq1), vget_high_s8(vk1)));
+            j += 32;
+        }
+        vacc0 = vaddq_s32(vaddq_s32(vacc0, vacc1), vaddq_s32(vacc2, vacc3));
+        let mut acc = vaddvq_s32(vacc0);
+        while j < d_head {
+            acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
+            j += 1;
+        }
+        acc
+    }
+}
+
+/// AVX2 i8×i8 dot for attention K scores with sign trick.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn dot_i8_kv_avx2(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i32 {
+    use std::arch::x86_64::*;
+    if !is_x86_feature_detected!("avx2") {
+        let mut acc: i32 = 0;
+        for j in 0..d_head {
+            acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
+        }
+        return acc;
+    }
+    let simd_len = d_head / 32 * 32;
+    let ones = _mm256_set1_epi16(1);
+    let mut vacc = _mm256_setzero_si256();
+    let mut j = 0usize;
+    while j < simd_len {
+        let vq = _mm256_loadu_si256(q_i8.add(j) as *const __m256i);
+        let vk = _mm256_loadu_si256(k_ptr.add(j) as *const __m256i);
+        let ax = _mm256_sign_epi8(vq, vq);
+        let sy = _mm256_sign_epi8(vk, vq);
+        vacc = _mm256_add_epi32(vacc, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), ones));
+        j += 32;
+    }
+    let lo = _mm256_extracti128_si256(vacc, 0);
+    let hi = _mm256_extracti128_si256(vacc, 1);
+    let sum128 = _mm_hadd_epi32(_mm_add_epi32(lo, hi), _mm_setzero_si128());
+    let sum128 = _mm_hadd_epi32(sum128, _mm_setzero_si128());
+    let mut acc = _mm_extract_epi32(sum128, 0);
+    while j < d_head {
+        acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
+        j += 1;
+    }
+    acc
+}
+
+/// Cross-platform SIMD dot product dispatch for attention.
+#[inline]
+fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    { unsafe { dot_i8_kv_neon(q_i8.as_ptr(), k_ptr.as_ptr().add(k_offset), d_head) } }
+    #[cfg(target_arch = "x86_64")]
+    { unsafe { dot_i8_kv_avx2(q_i8.as_ptr(), k_ptr.as_ptr().add(k_offset), d_head) } }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let mut acc: i32 = 0;
+        for dd in 0..d_head {
+            acc += (q_i8[dd] as i32) * (k_ptr[k_offset + dd] as i32);
+        }
+        acc
+    }
+}
+
 // ─── Flash Attention (Online Softmax, O(1) Memory) ───────────────────────────
 
 /// Flash attention for a single query head against i8-quantized KV cache.
@@ -976,17 +1184,16 @@ fn flash_attention_i8(
     let mut running_sum: i64 = 0;        // sum of exp(score - max)
     let mut out = vec![0i64; d_head];     // weighted V accumulator
 
+    // Quantize Q to i8 ONCE for SIMD dot products across all positions
+    let (q_i8, q_sf) = quantize_for_dot(q_head);
+
     for j in 0..full_seq {
-        // Dequantize K for position j, head kv_h
         let k_off = j * d_kv + kv_h * d_head;
         let k_scale = k_scales[j];
 
-        // Compute dot product: Q · K (with K dequantized on-the-fly)
-        let mut dot: i64 = 0;
-        for dd in 0..d_head {
-            let k_val = (k_data[k_off + dd] as i64) * k_scale;
-            dot += q_head[dd] * k_val;
-        }
+        // SIMD dot product: Q_i8 · K_i8 (both already quantized)
+        let dot_i32 = dot_i8_kv(&q_i8, k_data, k_off, d_head);
+        let dot = (dot_i32 as i64) * q_sf * k_scale;
         let score = (dot >> (FRAC_BITS * 2)) * attn_scale >> FRAC_BITS;
 
         // Online softmax update
@@ -1168,10 +1375,21 @@ impl CachedIntegerModel {
                             matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
                         }
                     }
-                    #[cfg(not(target_arch = "x86_64"))]
+                    #[cfg(target_arch = "aarch64")]
                     {
-                        let _ = $q4w; // suppress unused warning
-                        matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
+                        if let Some(q4w) = $q4w {
+                            matmul_q4_preq_neon(q4w, $inq, $out);
+                        } else {
+                            matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
+                        }
+                    }
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                    {
+                        if let Some(q4w) = $q4w {
+                            matmul_q4_scalar(q4w, $inq, $out);
+                        } else {
+                            matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
+                        }
                     }
                 }
             };
@@ -1223,21 +1441,23 @@ impl CachedIntegerModel {
             cache.push_k(layer_idx, &k_buf);
             cache.push_v(layer_idx, &v_buf);
 
-            // Attention with i8 KV cache
+            // Attention with i8 KV cache (SIMD-vectorized dot products)
             let full_seq = pos + 1;
             let head_results: Vec<Vec<i64>> = (0..cfg.n_heads).into_par_iter().map(|h| {
                 let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
                 let dh = cfg.d_head;
                 let q_head = &q[h * dh..(h + 1) * dh];
 
+                // Quantize Q head to i8 ONCE, reuse for all positions
+                let (q_i8, q_sf) = quantize_for_dot(q_head);
+
                 let mut scores = Vec::with_capacity(full_seq);
                 for j in 0..full_seq {
                     let k_off = j * cfg.d_kv + kv_h * dh;
                     let k_scale = cache.k_scales[layer_idx][j];
-                    let mut dot_raw: i64 = 0;
-                    for dd in 0..dh {
-                        dot_raw += q_head[dd] * (cache.k_data[layer_idx][k_off + dd] as i64);
-                    }
+                    // SIMD i8×i8 dot product
+                    let dot_i32 = dot_i8_kv(&q_i8, &cache.k_data[layer_idx], k_off, dh);
+                    let dot_raw = (dot_i32 as i64) * q_sf;
                     let dot = (dot_raw >> FRAC_BITS) * k_scale;
                     scores.push((dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS);
                 }
@@ -1288,15 +1508,17 @@ impl CachedIntegerModel {
         let normed = layernorm(&hidden, &self.final_norm);
 
         // LM head: Q4 output path if available
-        #[cfg(target_arch = "x86_64")]
         if let Some(q4_out) = &self.q4_output {
             let normed_q = QuantizedInput::from_i64(&normed);
             let mut logits = vec![0i64; cfg.vocab_size];
-            matmul_q4_preq_x86(q4_out, &normed_q, &mut logits);
+            #[cfg(target_arch = "x86_64")]
+            { matmul_q4_preq_x86(q4_out, &normed_q, &mut logits); }
+            #[cfg(target_arch = "aarch64")]
+            { matmul_q4_preq_neon(q4_out, &normed_q, &mut logits); }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            { matmul_q4_scalar(q4_out, &normed_q, &mut logits); }
             return logits;
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        { let _ = &self.q4_output; } // suppress unused warning
         matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
     }
 
