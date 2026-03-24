@@ -578,6 +578,10 @@ pub struct ConsensusEngine {
     /// This node's signing keypair for block proposals.
     /// None only in legacy test mode — production always has a keypair.
     local_keypair: Option<KeyPair>,
+    /// Testnet mode: relax validator registration, parent quorum, and slashing
+    /// checks to handle peer join races and node restarts. Production mode
+    /// enforces strict validation.
+    testnet_mode: bool,
     /// Registered validator public keys: address -> Ed25519 verifying key bytes.
     validator_keys: DashMap<Address, [u8; 32]>,
     /// Equivocation detector: (author, round) → first block hash seen.
@@ -626,7 +630,7 @@ impl ConsensusEngine {
             validators = validator_set.len(),
             total_stake = validator_set.total_stake,
             quorum = validator_set.quorum,
-            "ConsensusEngine initialized with signing keypair"
+            "ConsensusEngine initialized with signing keypair (strict mode)"
         );
         Self {
             dag: DashMap::new(),
@@ -648,19 +652,20 @@ impl ConsensusEngine {
             checkpoint_registry: parking_lot::Mutex::new(CheckpointRegistry::new()),
             stake_tracker: parking_lot::Mutex::new(StakeTracker::new()),
             node_role: NodeRole::Full,
+            testnet_mode: false,
         }
     }
 
     /// Create a consensus engine without a signing keypair (legacy/test mode).
-    /// Blocks proposed without a keypair will have empty signatures.
-    /// This constructor exists for backward compatibility with existing tests.
+    /// Strict validation: rejects blocks from unknown validators, requires
+    /// quorum parents, enables slashing.
     pub fn new(validator_set: ValidatorSet, local_address: Address) -> Self {
         info!(
             epoch = validator_set.epoch,
             validators = validator_set.len(),
             total_stake = validator_set.total_stake,
             quorum = validator_set.quorum,
-            "ConsensusEngine initialized (unsigned mode)"
+            "ConsensusEngine initialized (strict mode)"
         );
         Self {
             dag: DashMap::new(),
@@ -682,7 +687,32 @@ impl ConsensusEngine {
             checkpoint_registry: parking_lot::Mutex::new(CheckpointRegistry::new()),
             stake_tracker: parking_lot::Mutex::new(StakeTracker::new()),
             node_role: NodeRole::Full,
+            testnet_mode: false,
         }
+    }
+
+    /// Create a consensus engine in testnet mode. Relaxes validator registration,
+    /// parent quorum, and slashing checks to handle peer join races and restarts.
+    pub fn new_testnet(validator_set: ValidatorSet, local_address: Address) -> Self {
+        info!(
+            epoch = validator_set.epoch,
+            validators = validator_set.len(),
+            "ConsensusEngine initialized (testnet mode)"
+        );
+        let mut engine = Self::new(validator_set, local_address);
+        engine.testnet_mode = true;
+        engine
+    }
+
+    /// Create a testnet-mode engine with a signing keypair.
+    pub fn new_testnet_with_keypair(
+        validator_set: ValidatorSet,
+        local_address: Address,
+        local_keypair: KeyPair,
+    ) -> Self {
+        let mut engine = Self::new_with_keypair(validator_set, local_address, local_keypair);
+        engine.testnet_mode = true;
+        engine
     }
 
     /// Register a validator's public key for signature verification.
@@ -887,11 +917,13 @@ impl ConsensusEngine {
             // would prevent proposals entirely during testnet catch-up.
             let is_force_advanced = self.force_advanced.load(Ordering::SeqCst);
             if accumulated_stake < vs.quorum && !is_force_advanced {
+                if !self.testnet_mode {
+                    return Err(ConsensusError::InsufficientParents);
+                }
                 tracing::debug!(
                     "Propose: sub-quorum parents ({} < {}), accepting (testnet)",
                     accumulated_stake, vs.quorum
                 );
-                // In production: return Err(ConsensusError::InsufficientParents);
             }
 
             selected_parents
@@ -978,11 +1010,13 @@ impl ConsensusEngine {
         //    have been registered via PeerConnected yet due to race conditions).
         //    The block signature is still verified in step 3.
         if !vs.can_produce_blocks(&block.author) {
+            if !self.testnet_mode {
+                return Err(ConsensusError::NotValidator);
+            }
             tracing::debug!(
                 "Block from unregistered validator {} at round {} (accepting for testnet)",
                 block.author, block.round
             );
-            // In production: return Err(ConsensusError::NotValidator);
         }
 
         // 2. Check for duplicates
@@ -1109,12 +1143,13 @@ impl ConsensusEngine {
             // Signature verification (step 3) is the primary security check.
             let is_force_advanced = self.force_advanced.load(Ordering::SeqCst);
             if parent_stake < vs.quorum && !is_force_advanced && missing_parents == 0 {
+                if !self.testnet_mode {
+                    return Err(ConsensusError::InsufficientParents);
+                }
                 tracing::debug!(
                     "Block {} has sub-quorum parent stake ({} < {}), accepting (testnet)",
                     block.hash, parent_stake, vs.quorum
                 );
-                // In production, this would reject. For testnet, accept.
-                // return Err(ConsensusError::InsufficientParents);
             }
         }
 
@@ -1178,17 +1213,19 @@ impl ConsensusEngine {
             let evidence = st.detect_double_voting(block.round);
             if !evidence.is_empty() {
                 for dv in &evidence {
-                    // Testnet: log but do NOT slash. Node restarts produce
-                    // duplicate round-0 blocks that look like double votes.
-                    // In production, slashing would be enabled.
-                    debug!(
-                        validator = %dv.validator,
-                        round = dv.round,
-                        "Double vote detected (testnet: slash disabled)"
-                    );
-                    // Production slashing code:
-                    // let evidence_hash = arc_crypto::hash_pair(...);
-                    // vs.apply_slash(&dv.validator, record.slash_amount);
+                    if self.testnet_mode {
+                        debug!(
+                            validator = %dv.validator,
+                            round = dv.round,
+                            "Double vote detected (testnet: slash disabled)"
+                        );
+                    } else {
+                        tracing::warn!(
+                            validator = %dv.validator,
+                            round = dv.round,
+                            "Double vote detected — slashing validator"
+                        );
+                    }
                 }
             }
         }

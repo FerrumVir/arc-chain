@@ -473,12 +473,13 @@ pub fn pack_i8_to_u32_pub(data: &[i8]) -> Vec<u32> {
 }
 
 /// Pack i8 weights to Q4 (4-bit signed, 2 values per byte).
-/// Values clamped to [-8, 7]. Byte layout: [high_nibble | low_nibble].
+/// Values clamped to [-8, 7], stored with bias +8 encoding [0, 15].
+/// Decode: value = nibble - 8.
 pub fn pack_i8_to_q4(data: &[i8]) -> Vec<u8> {
     let mut packed = Vec::with_capacity((data.len() + 1) / 2);
     for pair in data.chunks(2) {
-        let lo = (pair[0].max(-8).min(7) as u8) & 0x0F;
-        let hi = if pair.len() > 1 { (pair[1].max(-8).min(7) as u8) & 0x0F } else { 0 };
+        let lo = ((pair[0].max(-8).min(7) + 8) as u8) & 0x0F;
+        let hi = if pair.len() > 1 { ((pair[1].max(-8).min(7) + 8) as u8) & 0x0F } else { 8 };
         packed.push(lo | (hi << 4));
     }
     packed
@@ -740,12 +741,19 @@ mod tests {
         let data: Vec<i8> = vec![1, -2, 3, -4, 7, -8];
         let packed = pack_i8_to_q4(&data);
         assert_eq!(packed.len(), 3);
-        // Byte 0: lo=1(0x01), hi=-2(0x0E) → 0xE1
-        assert_eq!(packed[0], 0x01 | (0x0E << 4)); // 0xE1
-        // Byte 1: lo=3(0x03), hi=-4(0x0C) → 0xC3
-        assert_eq!(packed[1], 0x03 | (0x0C << 4)); // 0xC3
-        // Byte 2: lo=7(0x07), hi=-8(0x08) → 0x87
-        assert_eq!(packed[2], 0x07 | (0x08 << 4)); // 0x87
+        // Bias-8 encoding: stored = value + 8
+        // Byte 0: lo=1+8=9(0x09), hi=-2+8=6(0x06) → 0x69
+        assert_eq!(packed[0], 0x09 | (0x06 << 4));
+        // Byte 1: lo=3+8=11(0x0B), hi=-4+8=4(0x04) → 0x4B
+        assert_eq!(packed[1], 0x0B | (0x04 << 4));
+        // Byte 2: lo=7+8=15(0x0F), hi=-8+8=0(0x00) → 0x0F
+        assert_eq!(packed[2], 0x0F | (0x00 << 4));
+        // Verify decode: nibble - 8 recovers original value
+        for (i, &orig) in data.iter().enumerate() {
+            let byte = packed[i / 2];
+            let nibble = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+            assert_eq!(nibble as i8 - 8, orig);
+        }
     }
 
     #[test]

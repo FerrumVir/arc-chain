@@ -53,14 +53,14 @@ impl ConsensusManager {
     /// Panics if `stake` is below the minimum Spark threshold (500 000 ARC).
     pub fn new(validator_address: Hash256, stake: u64, num_shards: u16, benchmark: bool, peer_validators: &[(Hash256, u64)]) -> Self {
         let (validator_set, tier) = Self::build_validator_set(validator_address, stake, peer_validators);
-        let engine = Arc::new(ConsensusEngine::new(validator_set, validator_address));
+        let engine = Arc::new(ConsensusEngine::new_testnet(validator_set, validator_address));
 
         info!(
             address = %validator_address,
             stake = stake,
             tier = ?tier,
             shards = num_shards,
-            "ConsensusManager initialized (no keypair — test mode)"
+            "ConsensusManager initialized (testnet mode, no keypair)"
         );
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
@@ -80,7 +80,7 @@ impl ConsensusManager {
         keypair: KeyPair,
     ) -> Self {
         let (validator_set, tier) = Self::build_validator_set(validator_address, stake, peer_validators);
-        let engine = Arc::new(ConsensusEngine::new_with_keypair(validator_set, validator_address, keypair));
+        let engine = Arc::new(ConsensusEngine::new_testnet_with_keypair(validator_set, validator_address, keypair));
 
         info!(
             address = %validator_address,

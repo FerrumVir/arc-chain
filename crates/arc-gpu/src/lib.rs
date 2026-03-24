@@ -6,6 +6,7 @@ pub mod gpu_forward;
 pub mod avx512_verify;
 pub mod neon_verify;
 pub mod cuda_verify;
+pub mod metal_icb;
 
 pub use gpu_memory::{GpuAccountBuffer, GpuAccountRepr, MemoryModel as GpuMemoryModel, ACCOUNT_SLOT_SIZE};
 
