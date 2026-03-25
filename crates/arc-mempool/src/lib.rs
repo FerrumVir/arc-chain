@@ -51,25 +51,23 @@ impl Mempool {
     /// Add a transaction to the mempool.
     /// Returns error if duplicate or mempool is full.
     pub fn insert(&self, tx: Transaction) -> Result<(), MempoolError> {
-        // Check capacity
-        {
-            let count = self.count.read();
-            if *count >= self.capacity {
-                return Err(MempoolError::Full(self.capacity));
-            }
-        }
-
-        // Check deduplication
+        // Dedup check first (cheap, no lock needed — DashMap is concurrent)
         if self.seen.contains_key(&tx.hash.0) {
             return Err(MempoolError::Duplicate(tx.hash));
         }
 
+        // Hold write lock across capacity check + increment to prevent TOCTOU race.
+        // Without this, two threads could both pass the capacity check and both insert,
+        // exceeding the intended limit.
+        let mut count = self.count.write();
+        if *count >= self.capacity {
+            return Err(MempoolError::Full(self.capacity));
+        }
+        *count += 1;
+        drop(count);
+
         self.seen.insert(tx.hash.0, ());
         self.queue.push(tx);
-        {
-            let mut count = self.count.write();
-            *count += 1;
-        }
 
         Ok(())
     }
