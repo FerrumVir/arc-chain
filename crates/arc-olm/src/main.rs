@@ -17,8 +17,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!("Usage:");
-        eprintln!("  arc-olm eval <task_dir> [--max-tasks N] [--timeout-ms N] [--verbose]");
-        eprintln!("  arc-olm solve <task.json>");
+        eprintln!("  arc-olm eval <task_dir> [--max-tasks N] [--timeout-ms N] [--llm] [--verbose]");
+        eprintln!("  arc-olm solve <task.json> [--llm] [--timeout-ms N] [--verbose]");
         std::process::exit(1);
     }
 
@@ -36,6 +36,7 @@ fn main() {
             "--max-depth" => { config.max_depth = args.get(i+1).and_then(|s| s.parse().ok()).unwrap_or(6); i += 2; }
             "--no-aug" => { config.use_augmentation = false; i += 1; }
             "--no-evo" => { config.use_evolution = false; i += 1; }
+            "--llm" => { config.use_llm = true; i += 1; }
             "--verbose" | "-v" => { config.verbose = true; i += 1; }
             "--model" => {
                 if let Some(path) = args.get(i+1) {
@@ -78,9 +79,10 @@ fn run_eval(dir: &str, config: &SolverConfig, max_tasks: Option<usize>) {
     println!("ARC-OLM Multi-Engine Solver");
     println!("  Tasks: {}", total);
     println!("  Timeout: {}ms", config.timeout_ms);
-    println!("  Engines: synth + beam + aug({}) + evo({})",
+    println!("  Engines: synth + beam + aug({}) + evo({}) + llm({})",
         if config.use_augmentation { "on" } else { "off" },
-        if config.use_evolution { "on" } else { "off" });
+        if config.use_evolution { "on" } else { "off" },
+        if config.use_llm { "on" } else { "off" });
     println!();
 
     for (i, path) in paths.iter().enumerate() {

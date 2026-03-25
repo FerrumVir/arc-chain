@@ -1,4 +1,4 @@
-//! Multi-engine solver — orchestrates synthesizer, diff-synth, beam search, augmentation, and evolution.
+//! Multi-engine solver — orchestrates synthesizer, diff-synth, beam search, augmentation, evolution, and LLM.
 //!
 //! Runs each engine in sequence with a time budget.  Returns as soon as any
 //! engine finds a program that maps every training input to its expected output.
@@ -9,6 +9,7 @@
 //! 2. **Beam search** (~10%) — fitness-guided parallel search
 //! 3. **Augmented beam search** (~30%) — D4 + PoE voting over beam search
 //! 4. **Evolution** (~30%) — genetic refinement of partial solutions
+//! 5. **LLM-guided** (remaining time) — Ollama LLM picks operations step by step
 
 use crate::Grid;
 use crate::search::beam::{beam_search, beam_search_steered, BeamConfig};
@@ -17,6 +18,7 @@ use crate::search::synthesizer;
 use crate::search::steering;
 use crate::search::augmentation;
 use crate::search::evolution::{self, EvolutionConfig};
+use crate::search::llm_engine::{self, LlmConfig};
 use std::time::Instant;
 
 // ============================================================
@@ -27,6 +29,7 @@ pub struct SolverConfig {
     pub timeout_ms: u64,         // total wall-clock timeout per task (default 30_000)
     pub use_augmentation: bool,  // enable D4 + color perm + PoE (default true)
     pub use_evolution: bool,     // enable evolutionary refinement (default true)
+    pub use_llm: bool,           // enable LLM-guided search via Ollama (default false)
     pub beam_width: usize,       // beam search width (default 200)
     pub max_depth: usize,        // beam search max depth (default 6)
     pub verbose: bool,
@@ -39,6 +42,7 @@ impl Default for SolverConfig {
             timeout_ms: 30_000,
             use_augmentation: true,
             use_evolution: true,
+            use_llm: false,
             beam_width: 200,
             max_depth: 6,
             verbose: false,
@@ -310,6 +314,40 @@ pub fn solve(
                 test_outputs: er.test_outputs,
                 engine: "evolution",
                 program: er.steps,
+                time_ms: elapsed(),
+            });
+        }
+    }
+
+    if remaining() == 0 {
+        return None;
+    }
+
+    // ----------------------------------------------------------
+    // Engine 5: LLM-guided search (remaining time)
+    // ----------------------------------------------------------
+    if config.use_llm {
+        let llm_budget = remaining();
+        if config.verbose {
+            eprintln!("[solver] engine 5: LLM-guided search (budget={}ms)", llm_budget);
+        }
+
+        let llm_config = LlmConfig {
+            timeout_ms: llm_budget,
+            ..LlmConfig::default()
+        };
+
+        if let Some(lr) = llm_engine::llm_guided_search(train_pairs, test_inputs, &llm_config, config.verbose) {
+            if config.verbose {
+                eprintln!(
+                    "[solver] LLM solved in {}ms (attempt {}): {:?}",
+                    elapsed(), lr.attempt, lr.program
+                );
+            }
+            return Some(SolveResult {
+                test_outputs: lr.test_outputs,
+                engine: "llm",
+                program: lr.program,
                 time_ms: elapsed(),
             });
         }

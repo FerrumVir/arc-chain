@@ -948,6 +948,33 @@ fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i
     }
 }
 
+/// Q4 × i64 matmul with FULL input precision (no pre-quantization).
+/// This avoids the double-quantization precision loss of the SIMD path.
+fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
+    let byte_cols = q4.n_cols / 2;
+    let data = &q4.data;
+    let scales = &q4.scales;
+
+    output.par_chunks_mut(512).enumerate().for_each(|(ci, chunk)| {
+        let base = ci * 512;
+        for (li, out) in chunk.iter_mut().enumerate() {
+            let i = base + li;
+            let row_off = i * byte_cols;
+            let mut acc: i64 = 0;
+
+            for j in 0..byte_cols {
+                let byte = data[row_off + j];
+                let w_lo = (byte & 0x0F) as i64 - 8;
+                let w_hi = ((byte >> 4) as i64) - 8;
+                acc += w_lo * input[j * 2]
+                     + w_hi * input[j * 2 + 1];
+            }
+            // scales already include q4_per_unit factor from from_i8()
+            *out = (acc * scales[i]) >> FRAC_BITS;
+        }
+    });
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 /// RMSNorm (what Llama uses — no mean subtraction, just root-mean-square).
@@ -1360,29 +1387,11 @@ impl CachedIntegerModel {
         macro_rules! dispatch_matmul {
             ($q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
                 {
-                    #[cfg(target_arch = "x86_64")]
-                    {
-                        if let Some(q4w) = $q4w {
-                            matmul_q4_preq_x86(q4w, $inq, $out);
-                        } else {
-                            matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
-                        }
-                    }
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        if let Some(q4w) = $q4w {
-                            matmul_q4_preq_neon(q4w, $inq, $out);
-                        } else {
-                            matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
-                        }
-                    }
-                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-                    {
-                        if let Some(q4w) = $q4w {
-                            matmul_q4_scalar(q4w, $inq, $out);
-                        } else {
-                            matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
-                        }
+                    if let Some(q4w) = $q4w {
+                        // Q4 with full i64 input precision — no double quantization
+                        matmul_q4_full(q4w, $raw, $out);
+                    } else {
+                        matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
                     }
                 }
             };
@@ -1495,16 +1504,10 @@ impl CachedIntegerModel {
         cache.seq_len = pos + 1;
         let normed = layernorm(&hidden, &self.final_norm);
 
-        // LM head: Q4 output path if available
+        // LM head: Q4 output path if available (full precision)
         if let Some(q4_out) = &self.q4_output {
-            let normed_q = QuantizedInput::from_i64(&normed);
             let mut logits = vec![0i64; cfg.vocab_size];
-            #[cfg(target_arch = "x86_64")]
-            { matmul_q4_preq_x86(q4_out, &normed_q, &mut logits); }
-            #[cfg(target_arch = "aarch64")]
-            { matmul_q4_preq_neon(q4_out, &normed_q, &mut logits); }
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            { matmul_q4_scalar(q4_out, &normed_q, &mut logits); }
+            matmul_q4_full(q4_out, &normed, &mut logits);
             return logits;
         }
         matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
