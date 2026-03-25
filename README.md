@@ -8,17 +8,19 @@ The fastest Layer 1 blockchain for AI. Deterministic inference, zero-fee agent s
 
 ## Why Build on ARC
 
-| Feature | ARC | Other L1s |
-|---------|-----|-----------|
-| **AI inference on-chain** | 76 ms/token deterministic, bitwise identical on all hardware | Not available |
-| **Agent settlements** | Zero fees. Always. | Gas fees on every tx |
-| **Inference verification** | Cryptographic proof via hash comparison or STARK | Trust the operator |
-| **Smart contracts** | EVM (Solidity) AND WASM (Rust, C, Go, anything) | Usually one or the other |
-| **Signatures** | Ed25519, Falcon-512 (post-quantum), BLS, ML-DSA, secp256k1 | Usually 1-2 options |
-| **TPS** | 183,000 single-node measured | Claims without benchmarks |
-| **Finality** | 2-round DAG, ~200ms | Seconds to minutes |
-| **MEV protection** | BLS threshold encrypted mempool | Exposed or partial |
-| **Post-quantum** | Falcon-512 + ML-DSA production ready | Roadmap item |
+| Feature | ARC | Everyone Else |
+|---------|-----|---------------|
+| **On-chain AI inference** | 76 ms/token, deterministic, identical on every chip on earth | Does not exist on any other chain |
+| **Agent settlements** | Zero fees forever. Agents are first-class citizens. | No chain offers zero-fee agent transactions |
+| **Verified inference** | Cryptographic proof that a specific model produced a specific output. STARK proofs up to 70B+ parameter models. | No other chain can verify inference at all |
+| **Smart contracts** | Both EVM (Solidity) and WASM (Rust, C, Go) natively. Pick your stack. | One or the other, not both |
+| **Quantum resistant** | Falcon-512 + ML-DSA in production today. Not a roadmap item. Ships now. | No production chain has post-quantum signatures |
+| **Multi-node TPS** | 33,230 measured with real consensus, real QUIC, real DAG | Ethereum: ~15. Solana: ~4,000 sustained |
+| **Single-node TPS** | 183,000 measured | Most chains don't publish single-node benchmarks |
+| **Finality** | ~200ms, 2-round DAG commit | Ethereum: ~12 min. Solana: ~400ms. Most chains: seconds |
+| **MEV protection** | BLS threshold encrypted mempool. Transactions are encrypted until committed. | Exposed or partially mitigated |
+| **Signatures** | 5 algorithms: Ed25519, Falcon-512, BLS12-381, ML-DSA, secp256k1 | Most chains support 1 or 2 |
+| **ZK proofs** | Circle STARKs (Stwo) over Mersenne-31. No trusted setup. Post-quantum. Proven at 7B model scale. | SNARKs with trusted setup, limited to ~10M parameter models |
 
 ---
 
