@@ -665,8 +665,11 @@ async fn faucet_claim(
         }
     }
 
-    // Get faucet account (validator address) and check balance
-    let faucet_addr = node.validator_address;
+    // Use genesis account 0 (blake3::hash(&[0])) as the faucet source.
+    // This account exists on ALL nodes with the same address and balance,
+    // so faucet transactions propagated via DAG consensus will execute
+    // correctly on every node.
+    let faucet_addr = arc_crypto::hash_bytes(&[0u8]);
     let faucet_account = node.state
         .get_account(&faucet_addr)
         .ok_or_else(|| {
@@ -741,11 +744,12 @@ async fn faucet_claim(
 async fn faucet_status(
     AxumState(node): AxumState<NodeState>,
 ) -> Json<FaucetStatusResponse> {
-    let balance = node.state.get_account(&node.validator_address)
+    let faucet_addr = arc_crypto::hash_bytes(&[0u8]);
+    let balance = node.state.get_account(&faucet_addr)
         .map(|a| a.balance)
         .unwrap_or(0);
     Json(FaucetStatusResponse {
-        address: node.validator_address.to_hex(),
+        address: faucet_addr.to_hex(),
         node_url: format!("http://localhost:9090"),
         claims_today: node.faucet_claims_total.load(Ordering::Relaxed),
         claim_amount: FAUCET_CLAIM_AMOUNT,
