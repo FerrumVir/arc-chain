@@ -490,7 +490,7 @@ Theorem 15 predicts this result: since all operations are integer arithmetic wit
 
 == Multi-Node Inference Consensus
 
-To demonstrate consensus-grade inference at scale, we deploy Llama-2-7B-Chat across four geographically distributed nodes using two backends: the ARC integer engine (cross-platform, Section 9.1) and the candle Q4_K_M float backend (same-architecture baseline).
+We demonstrate multi-node inference at two levels. First, the ARC integer engine produces bitwise identical Llama-2-7B outputs across an ARM node (Mac Studio M2 Ultra) and an x86 node (Vultr LAX), with matching hashes confirmed over 7 consecutive runs per platform (Table 1). This is the strongest result: deterministic cross-architecture multi-node inference of a 7B model. Second, to demonstrate consensus at broader geographic scale, we deploy Llama-2-7B-Chat across four nodes on three continents using the candle Q4_K_M float backend:
 
 #figure(
   table(
