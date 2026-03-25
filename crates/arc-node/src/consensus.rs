@@ -201,7 +201,14 @@ impl ConsensusManager {
         let pipeline = Pipeline::new(Arc::clone(&state));
 
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            // Single-validator: 1ms tight loop for max TPS.
+            // Multi-validator: 50ms to give peer blocks time to arrive
+            // before re-checking quorum parents. This amortizes the
+            // cross-continent latency (~100-300ms) without sacrificing
+            // throughput — rounds advance when peers are ready, not on
+            // a fixed timer.
+            let tick = if self.is_multi_validator() && !self.benchmark { 50 } else { 1 };
+            tokio::time::sleep(tokio::time::Duration::from_millis(tick)).await;
 
             // ── Drain pipeline results ──────────────────────────────────
             while let Some(result) = pipeline.try_recv() {
@@ -584,13 +591,33 @@ impl ConsensusManager {
                             }
                         }
 
-                        // After proposing, try to advance the round.
-                        let _ = self.engine.advance_round();
+                        // After proposing, advance the round ONLY if we have enough
+                        // peer blocks in the current round. Without this gate, the node
+                        // races ahead of its peers (advancing every 1ms) while peer
+                        // blocks take 100-300ms to arrive across continents. The 2-round
+                        // commit rule then can't fire because parent references are stale.
+                        //
+                        // In single-validator or benchmark mode, advance immediately
+                        // (no peers to wait for).
+                        if !multi_validator || self.benchmark {
+                            let _ = self.engine.advance_round();
+                        }
+                        // Multi-validator: round advancement happens below when
+                        // has_quorum_parents becomes true on the NEXT iteration.
 
                         // Advance the encrypted mempool slot each round so that
                         // new encrypted transactions target the next slot key.
                         if let Some(ref emp) = self.encrypted_mempool {
                             emp.advance_slot();
+                        }
+
+                        // In multi-validator mode, advance round AFTER proposing
+                        // and ONLY when we have quorum parent blocks. This ensures
+                        // we wait for peer blocks before moving forward.
+                        if multi_validator && !self.benchmark && already_proposed {
+                            if has_quorum_parents {
+                                let _ = self.engine.advance_round();
+                            }
                         }
 
                         if multi_validator {
