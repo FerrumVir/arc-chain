@@ -300,9 +300,93 @@ open explorer/index-live.html
 | GET | `/validators` | Current validator set |
 | GET | `/agents` | Registered AI agents |
 
+| POST | `/inference/run` | Run deterministic inference (returns output + hash + ms/token) |
+| GET | `/inference/attestations` | All inference attestations on-chain |
+| POST | `/faucet/claim` | Claim testnet tokens |
+| GET | `/faucet/status` | Faucet status and rate limits |
+| GET | `/sync/snapshot` | State sync snapshot for new nodes |
+| POST | `/contract/{address}/call` | Call a smart contract |
+| GET | `/channel/{id}/state` | Payment channel state |
+
 ETH JSON-RPC: `eth_blockNumber`, `eth_getBalance`, `eth_call`, `eth_estimateGas`, `eth_getLogs`
 
 ---
+
+## Transaction Types (24)
+
+| Type | Code | Description |
+|------|------|-------------|
+| Transfer | `0x01` | Send ARC between accounts |
+| Stake | `0x02` | Stake ARC to become a validator |
+| Unstake | `0x03` | Begin unstaking (with cooldown) |
+| Deploy | `0x04` | Deploy WASM or EVM smart contract |
+| Call | `0x05` | Call a deployed contract |
+| Settle | `0x06` | Zero-fee AI agent settlement |
+| RegisterAgent | `0x07` | Register an AI agent on-chain |
+| Governance | `0x08` | Submit or vote on governance proposal |
+| Bridge Lock/Unlock | `0x09-0x0B` | Cross-chain bridge operations |
+| Channel Open/Close | `0x0C-0x0E` | Payment channel lifecycle |
+| ShardProof | `0x15` | Submit STARK proof of computation |
+| InferenceAttestation | `0x16` | Attest to off-chain inference result with bond |
+| InferenceChallenge | `0x17` | Challenge an attestation (dispute) |
+| InferenceRegister | `0x18` | Register validator inference capabilities |
+| + 10 more | | Batch, social recovery, state rent, etc. |
+
+## Cryptographic Signatures
+
+| Algorithm | Use | Status |
+|-----------|-----|--------|
+| **Ed25519** | Primary transaction signing (118K sigs/sec) | Production |
+| **Falcon-512** | Post-quantum signatures (NIST selected) | Production |
+| **BLS12-381** | Aggregate validator signatures (N sigs → 1 verify) | Production |
+| **ML-DSA** | Post-quantum (NIST ML-DSA / Dilithium) | Production |
+| **ECDSA secp256k1** | Ethereum compatibility | Production |
+
+## Smart Contracts
+
+Dual runtime — deploy in Solidity (EVM) or any language that compiles to WASM:
+
+| Contract Standard | Description |
+|-------------------|-------------|
+| **ARC20** | Fungible token (ERC-20 equivalent) |
+| **ARC721** | NFT (ERC-721 equivalent) |
+| **ARC1155** | Multi-token (ERC-1155 equivalent) |
+| **UUPSProxy** | Upgradeable proxy pattern |
+| **ARCStaking** | Staking with tier system |
+| **ArcBridge** | Cross-chain bridge contract |
+| **ArcStateRoot** | State root commitments for rollups |
+
+## Testnet Faucet
+
+Get testnet ARC tokens to start experimenting:
+
+```bash
+# Claim tokens (one claim per address per hour)
+curl -X POST http://localhost:9090/faucet/claim \
+  -H 'Content-Type: application/json' \
+  -d '{"address":"0x<your-address>"}'
+
+# Or run the standalone faucet with web UI
+cd faucet && cargo run --release
+```
+
+## Staking (Coming Soon)
+
+Staking is implemented in the protocol but not yet active on testnet. For now, anyone can:
+- **Run a node** and join the testnet immediately
+- **Deploy smart contracts** (EVM or WASM)
+- **Run inference** and see on-chain attestations
+- **Test all 24 transaction types** via the RPC API
+
+When staking activates on mainnet, three tiers will be available:
+
+| Tier | Role | Stake | Fee Share |
+|------|------|-------|-----------|
+| **Spark** | Observer | 500K ARC | 15% |
+| **Arc** | Verifier | 5M ARC | 25% |
+| **Core** | Proposer | 50M ARC | 40% |
+
+No tokens are ever burned. Fixed supply of 1.03B ARC.
 
 ---
 
@@ -319,26 +403,6 @@ ARC Chain supports three tiers of AI inference execution, each with different tr
 - **Tier 1**: Inference runs inside the EVM/WASM VM via the `ai_inference` precompile at address `0x0A`. Fully deterministic, every validator re-executes.
 - **Tier 2**: Inference runs off-chain. The result is posted on-chain via `InferenceAttestation` (`0x16`). Anyone can challenge with `InferenceChallenge` (`0x17`) during the dispute window. Optimistic — accepted unless challenged.
 - **Tier 3**: Inference runs off-chain with a STARK proof of correct execution. The proof is submitted via `ShardProof` (`0x15`) and verified on-chain. No dispute window needed.
-
----
-
-## Home Node Support
-
-ARC Chain is designed so regular people can participate in network validation from home hardware:
-
-| Role | Hardware | Stake | Fee Share | Est. Cost |
-|------|----------|-------|-----------|-----------|
-| **Observer** | Raspberry Pi / laptop | 50,000 ARC | 15% of fees | ~$1/mo electricity |
-| **Verifier** | Mac Mini / desktop | 500,000 ARC | 25% of fees | ~$3/mo electricity |
-| **Proposer** | GPU server | 5,000,000 ARC | 40% of fees | Server-class hardware |
-
-- **Observers** monitor the network, attest to block validity, and earn 15% of total fees. Minimal hardware requirements — a Raspberry Pi is sufficient.
-- **Verifiers** validate transactions, check state transitions, and earn 25% of total fees. A Mac Mini or equivalent desktop handles the workload.
-- **Proposers** produce blocks, run full execution, and earn 40% of total fees. Requires GPU-capable server hardware.
-- **Treasury** receives the remaining 20% for protocol development and ecosystem grants.
-- **Bootstrap fund**: 40M ARC allocated over 2 years for early validator subsidies to ensure profitability before fee volume ramps up.
-
-No tokens are ever burned. The fixed supply of 1.03B ARC is fully preserved.
 
 ---
 
@@ -385,12 +449,16 @@ arc-chain/
 
 ## License
 
-BUSL-1.1 (Business Source License 1.1). Code is public.
+Code is public. Anyone can use it.
 
-**Build on ARC: no limits.** Deploy contracts, launch tokens, run agents, build L2s, rollups, subnets — any size, any revenue, zero restrictions. If it settles on ARC, you're free.
+**Under $10M revenue:** Full production rights. Build whatever you want — no fees, no restrictions, no approval needed.
 
-**Run ARC: no limits.** Validators, node operators, inference providers — always free.
+**Over $10M revenue:** A reasonable commercial license with a reasonable fee. We're not trying to gouge anyone — reach out and we'll work something out. tj@arc.ai
 
-**Fork ARC to launch your own chain: no.** This is 99,000+ lines of original Rust built from scratch. These terms exist to prevent grift — don't take the code and repackage it as your own chain. If you want to work together, reach out: tj@arc.ai
+**Build on ARC:** Always free, any size. Deploy contracts, launch tokens, run agents, build L2s, rollups, subnets. If it settles on ARC, you have zero restrictions regardless of your revenue.
 
-Converts to Apache 2.0 on March 25, 2030. See [LICENSE](LICENSE) for full terms.
+**Run ARC:** Always free. Validators, node operators, inference providers.
+
+**Fork ARC to launch a competing chain:** No. This is 99,000+ lines of original Rust built from scratch by one person. Don't take it and repackage it as your own. If you want to work with us, reach out — we'd rather partner than litigate.
+
+Becomes fully open source (Apache 2.0) on March 25, 2030. See [LICENSE](LICENSE) for full terms.
