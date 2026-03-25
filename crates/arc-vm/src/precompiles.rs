@@ -478,6 +478,16 @@ impl PrecompileRegistry {
                     let pubkey = &input[..897];
                     let sig_len = u16::from_le_bytes([input[897], input[898]]) as usize;
 
+                    // Reject unreasonable signature lengths (Falcon-512 max is 752 bytes)
+                    if sig_len == 0 || sig_len > 1024 {
+                        return PrecompileResult {
+                            success: true,
+                            output: vec![0],
+                            gas_used: 5000,
+                            error: Some(format!("invalid Falcon signature length: {}", sig_len)),
+                        };
+                    }
+
                     if input.len() < 899 + sig_len {
                         return PrecompileResult {
                             success: true,
@@ -526,7 +536,15 @@ impl PrecompileRegistry {
 
                     let circuit_id: [u8; 32] = input[..32].try_into().unwrap();
                     let count = input[32] as usize;
-                    let pi_end = 33 + count * 8;
+                    let pi_end = match 33usize.checked_add(count.checked_mul(8).unwrap_or(usize::MAX)) {
+                        Some(v) => v,
+                        None => return PrecompileResult {
+                            success: false,
+                            output: vec![],
+                            gas_used: 100_000,
+                            error: Some("public input count overflow".into()),
+                        },
+                    };
                     if input.len() < pi_end {
                         return PrecompileResult {
                             success: false,
