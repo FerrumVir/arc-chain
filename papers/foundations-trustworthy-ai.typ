@@ -488,7 +488,9 @@ We additionally confirm cross-platform determinism on TinyLlama-1.1B with 72 pro
 
 Theorem 15 predicts this result: since all operations are integer arithmetic with fixed evaluation order, _any_ mismatch would indicate a hardware or implementation bug rather than an inherent limitation. The 82/82 cross-architecture result is not a statistical sample but a validation of a mathematical guarantee.
 
-== Multi-Node Deterministic Inference
+== Multi-Node Inference Consensus
+
+To demonstrate consensus-grade inference at scale, we deploy Llama-2-7B-Chat across four geographically distributed nodes using two backends: the ARC integer engine (cross-platform, Section 9.1) and the candle Q4_K_M float backend (same-architecture baseline).
 
 #figure(
   table(
@@ -504,10 +506,10 @@ Theorem 15 predicts this result: since all operations are integer arithmetic wit
     table.hline(),
     [*Total*], [*30*], [*30/30 (100%)*], [],
   ),
-  caption: [Multi-node deterministic inference: 4 nodes across 3 continents (US West, Europe $times$2, Asia). Llama-2-7B-Chat @touvron2023, Q4_K_M quantization via candle backend. All nodes produce identical BLAKE3 output hashes for all prompts up to 64 tokens.],
+  caption: [Multi-node inference: 4 nodes across 3 continents (US West, Europe $times$2, Asia). Llama-2-7B-Chat @touvron2023 via candle Q4_K_M backend. All nodes produce identical BLAKE3 output hashes for prompts up to 64 tokens; diverges at 128+ tokens due to floating-point accumulation.],
 ) <tab:multinode>
 
-Using the candle quantized inference backend with Llama-2-7B-Chat (3.9 GB, Q4_K_M), four geographically distributed nodes produce identical coherent outputs across 30 prompts spanning math, factual questions, code generation, and natural language explanation.
+Using the candle float backend, four geographically distributed nodes produce identical coherent outputs across 30 prompts spanning math, factual questions, code generation, and natural language explanation. The ARC integer engine achieves cross-platform determinism for Llama-2-7B between ARM and x86 at all sequence lengths (Table 1); the multi-node candle results confirm that even floating-point inference agrees across same-architecture nodes for short sequences, further validating the underlying model and infrastructure.
 
 Representative outputs (identical across all 4 nodes):
 - _"Sure! The answer is 2+2 = 4."_
