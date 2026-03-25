@@ -23,9 +23,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-license = "BUSL-1.1"
+license = "Apache-2.0"
 authors = ["ARC Chain Contributors"]
-repository = "https://github.com/arc-chain/arc"
+repository = "https://github.com/FerrumVir/arc-chain"
 
 [workspace.dependencies]
 # Crypto
