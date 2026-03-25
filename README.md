@@ -16,6 +16,24 @@ Read the paper: [On the Foundations of Trustworthy Artificial Intelligence](pape
 
 ---
 
+<p align="center">
+  <img src="assets/trust-stack.svg" alt="The Trust Stack" width="550"/>
+</p>
+
+<p align="center">
+  <img src="assets/tps-comparison.svg" alt="TPS Comparison" width="650"/>
+</p>
+
+---
+
+## Architecture
+
+<p align="center">
+  <img src="assets/architecture.svg" alt="ARC Chain Architecture" width="650"/>
+</p>
+
+---
+
 ## Why Build on ARC
 
 | Feature | ARC | Everyone Else |
