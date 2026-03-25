@@ -638,7 +638,7 @@ async fn faucet_claim(
 
     // Rate limiting: check if this address claimed recently
     {
-        let claims = node.faucet_claims.lock().unwrap();
+        let claims = node.faucet_claims.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(last_claim) = claims.get(&to.0) {
             let elapsed = last_claim.elapsed().as_secs();
             if elapsed < FAUCET_RATE_LIMIT_SECS {
@@ -707,7 +707,7 @@ async fn faucet_claim(
 
     // Record claim time
     {
-        let mut claims = node.faucet_claims.lock().unwrap();
+        let mut claims = node.faucet_claims.lock().unwrap_or_else(|p| p.into_inner());
         claims.insert(to.0, Instant::now());
     }
     node.faucet_claims_total.fetch_add(1, Ordering::Relaxed);
@@ -1465,7 +1465,7 @@ async fn call_contract(
         block_height: node.state.height(),
         block_timestamp: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_millis() as u64,
     };
 
@@ -2007,19 +2007,19 @@ mod rlp {
     }
 
     impl RlpItem {
-        /// Extract as byte slice. Panics if this is a List.
-        pub fn as_bytes(&self) -> &[u8] {
+        /// Extract as byte slice. Returns error if this is a List.
+        pub fn as_bytes(&self) -> Result<&[u8], String> {
             match self {
-                RlpItem::Bytes(b) => b,
-                RlpItem::List(_) => panic!("expected RLP bytes, got list"),
+                RlpItem::Bytes(b) => Ok(b),
+                RlpItem::List(_) => Err("expected RLP bytes, got list".into()),
             }
         }
 
-        /// Extract as list. Panics if this is Bytes.
-        pub fn as_list(&self) -> &[RlpItem] {
+        /// Extract as list. Returns error if this is Bytes.
+        pub fn as_list(&self) -> Result<&[RlpItem], String> {
             match self {
-                RlpItem::List(items) => items,
-                RlpItem::Bytes(_) => panic!("expected RLP list, got bytes"),
+                RlpItem::List(items) => Ok(items),
+                RlpItem::Bytes(_) => Err("expected RLP list, got bytes".into()),
             }
         }
     }
@@ -2251,16 +2251,24 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         );
     }
 
-    // --- Extract fields ---
-    let nonce_bytes = fields[0].as_bytes();
-    let gas_price_bytes = fields[1].as_bytes();
-    let gas_limit_bytes = fields[2].as_bytes();
-    let to_bytes = fields[3].as_bytes();
-    let value_bytes = fields[4].as_bytes();
-    let data_bytes = fields[5].as_bytes();
-    let v_bytes = fields[6].as_bytes();
-    let r_bytes = fields[7].as_bytes();
-    let s_bytes = fields[8].as_bytes();
+    // --- Extract fields (all must be byte items, not nested lists) ---
+    macro_rules! rlp_bytes {
+        ($idx:expr, $name:expr) => {
+            match fields[$idx].as_bytes() {
+                Ok(b) => b,
+                Err(_) => return eth_rpc_error(id, -32602, &format!("RLP field {} must be bytes, not list", $name)),
+            }
+        };
+    }
+    let nonce_bytes = rlp_bytes!(0, "nonce");
+    let gas_price_bytes = rlp_bytes!(1, "gasPrice");
+    let gas_limit_bytes = rlp_bytes!(2, "gasLimit");
+    let to_bytes = rlp_bytes!(3, "to");
+    let value_bytes = rlp_bytes!(4, "value");
+    let data_bytes = rlp_bytes!(5, "data");
+    let v_bytes = rlp_bytes!(6, "v");
+    let r_bytes = rlp_bytes!(7, "r");
+    let s_bytes = rlp_bytes!(8, "s");
 
     let nonce = be_bytes_to_u64(nonce_bytes);
     let gas_limit = be_bytes_to_u64(gas_limit_bytes);
@@ -2562,7 +2570,8 @@ async fn inference_run(
         .unwrap_or("Hello, world!");
     let max_tokens = req.get("max_tokens")
         .and_then(|v| v.as_u64())
-        .unwrap_or(64) as u32;
+        .unwrap_or(64)
+        .min(4096) as u32; // Cap at 4K tokens to prevent resource exhaustion
     let bond = req.get("bond")
         .and_then(|v| v.as_u64())
         .unwrap_or(1000);

@@ -79,7 +79,7 @@ All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
 
 ### See it live right now (zero install)
 
-The testnet is running across 4 nodes on 2 continents. Try it:
+The testnet is running across 8 nodes on 6 continents. Try it:
 
 ```bash
 # Chain stats from a live node
@@ -107,7 +107,7 @@ make join          # Join testnet
 make inference     # Join with inference (downloads TinyLlama 1.1B)
 make stats         # Check live chain stats
 make health        # Check live node health
-make test          # Run 1,231 tests
+make test          # Run 1,209 tests
 make explorer      # Open block explorer
 make faucet        # Run testnet faucet
 ```
@@ -135,7 +135,7 @@ curl http://localhost:9090/inference/attestations
 ```bash
 curl -X POST http://localhost:9090/faucet/claim \
   -H 'Content-Type: application/json' \
-  -d '{"address":"0x<your-address>"}'
+  -d '{"address":"<your-64-char-hex-address>"}'
 
 # Or run the faucet with a web UI
 cd faucet && cargo run --release
@@ -275,7 +275,7 @@ On testnet, use the faucet to get test tokens and start building now.
 
 ## Codebase
 
-**99,600+ lines of Rust** across 14 crates with **1,231 tests**.
+**99,600+ lines of Rust** across 14 crates with **1,209 tests**.
 
 | Crate | LOC | Tests | What It Does |
 |-------|-----|-------|-------------|

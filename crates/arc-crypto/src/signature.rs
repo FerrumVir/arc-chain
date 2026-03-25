@@ -182,6 +182,9 @@ impl Signature {
                 let uncompressed = recovered_vk.to_encoded_point(false);
                 let point_bytes = uncompressed.as_bytes();
                 // Skip the 0x04 uncompressed prefix → 64 raw bytes
+                if point_bytes.len() < 65 {
+                    return Err(SignatureError::InvalidPublicKey);
+                }
                 let derived = address_from_secp256k1_pubkey(&point_bytes[1..65]);
                 if derived != *expected_address {
                     return Err(SignatureError::AddressMismatch {
@@ -248,7 +251,7 @@ impl Signature {
                 };
 
                 // Length checks
-                if signature.len() > FALCON_SIG_MAX_LEN {
+                if signature.is_empty() || signature.len() > FALCON_SIG_MAX_LEN {
                     return Err(SignatureError::InvalidLength {
                         expected: FALCON_SIG_MAX_LEN,
                         got: signature.len(),
@@ -404,6 +407,8 @@ impl KeyPair {
                 let vk = sk.verifying_key();
                 let uncompressed = vk.to_encoded_point(false);
                 let point_bytes = uncompressed.as_bytes();
+                // Uncompressed secp256k1 point: 0x04 || x (32 bytes) || y (32 bytes) = 65 bytes
+                debug_assert!(point_bytes.len() >= 65, "secp256k1 uncompressed point too short");
                 address_from_secp256k1_pubkey(&point_bytes[1..65])
             }
             KeyPair::MlDsa65 { pk_bytes, .. } => {
