@@ -31,7 +31,7 @@ class ArcClient:
 
     Usage::
 
-        client = ArcClient("http://localhost:9000")
+        client = ArcClient("http://localhost:9090")
         info = client.get_chain_info()
         print(info["block_height"])
     """
@@ -47,7 +47,7 @@ class ArcClient:
         Initialize the ARC client.
 
         Args:
-            rpc_url: Base URL of the ARC Chain RPC node (e.g. http://localhost:9000).
+            rpc_url: Base URL of the ARC Chain RPC node (e.g. http://localhost:9090).
             timeout: Request timeout in seconds (default 30).
             headers: Optional extra HTTP headers.
         """
