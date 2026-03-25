@@ -635,6 +635,7 @@ pub async fn run_transport(
                 let peer_list: Vec<crate::protocol::PexPeerInfo> = conn_pex
                     .meta
                     .iter()
+                    .take(64) // Cap PEX broadcast to prevent amplification with large peer sets
                     .map(|entry| crate::protocol::PexPeerInfo {
                         address: Hash256(*entry.key()),
                         socket_addr: entry.value().dial_addr.to_string(),
@@ -954,12 +955,15 @@ async fn handle_peer_recv(
             MessageType::PeerExchange => {
                 match bincode::deserialize::<crate::protocol::PeerExchangeMessage>(&data) {
                     Ok(msg) => {
+                        if msg.peers.len() > 128 {
+                            warn!("PEX from {} has {} peers (>128), truncating", peer_address, msg.peers.len());
+                        }
                         debug!(
                             "Received PEX with {} peers from {}",
                             msg.peers.len(),
                             peer_address
                         );
-                        for pex_peer in &msg.peers {
+                        for pex_peer in msg.peers.iter().take(128) {
                             // Skip self
                             if pex_peer.address == local_address {
                                 continue;

@@ -299,6 +299,9 @@ impl CheckpointRegistry {
             // No checkpoints yet — any fork point is acceptable.
             return true;
         }
+        // Fork at or after the checkpoint round is valid. In DAG consensus,
+        // multiple blocks can exist at the same round (different validators).
+        // The checkpoint finalizes the committed ordering, not a single block.
         round >= self.latest_round
     }
 
