@@ -78,7 +78,7 @@ export interface ArcClientOptions {
  *
  * Usage:
  * ```ts
- * const client = new ArcClient("http://localhost:9000");
+ * const client = new ArcClient("http://localhost:9090");
  * const info = await client.getChainInfo();
  * console.log(info.block_height);
  * ```
