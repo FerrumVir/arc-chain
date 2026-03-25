@@ -109,11 +109,11 @@ impl KVCache {
         self.seq_len = 0;
     }
 
-    fn push_k(&mut self, layer: usize, k: &[i64]) {
+    pub fn push_k(&mut self, layer: usize, k: &[i64]) {
         self.k_data[layer].extend_from_slice(k);
     }
 
-    fn push_v(&mut self, layer: usize, v: &[i64]) {
+    pub fn push_v(&mut self, layer: usize, v: &[i64]) {
         self.v_data[layer].extend_from_slice(v);
     }
 }
@@ -1011,7 +1011,7 @@ fn apply_rope(vec: &mut [i64], pos: usize, d_head: usize, cos: &[i64], sin: &[i6
 
 /// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
 /// Uses the integer exp LUT for sigmoid computation.
-fn silu_i64(x: i64) -> i64 {
+pub fn silu_i64(x: i64) -> i64 {
     // sigmoid(x) = 1 / (1 + exp(-x))
     let sig = if x >= 0 {
         let exp_neg = integer_exp(-x);
@@ -1255,7 +1255,7 @@ fn flash_attention_i8(
 // ─── Binary Weight Cache ──────────────────────────────────────────────────────
 
 impl I8Weights {
-    fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
+    pub fn write_to(&self, w: &mut impl std::io::Write) -> std::io::Result<()> {
         w.write_all(&(self.n_rows as u64).to_le_bytes())?;
         w.write_all(&(self.n_cols as u64).to_le_bytes())?;
         // Per-row scales
@@ -1269,7 +1269,7 @@ impl I8Weights {
         w.write_all(bytes)
     }
 
-    fn read_from(r: &mut impl std::io::Read) -> std::io::Result<Self> {
+    pub fn read_from(r: &mut impl std::io::Read) -> std::io::Result<Self> {
         let mut buf8 = [0u8; 8];
         r.read_exact(&mut buf8)?;
         let n_rows = u64::from_le_bytes(buf8) as usize;
