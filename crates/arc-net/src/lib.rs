@@ -482,10 +482,9 @@ impl Default for PeerManager {
 
 /// Top-level network node that orchestrates shred broadcasts and tx gossip.
 ///
-/// Actual QUIC connections are not yet wired — this layer manages peers and
-/// prepares messages. The `broadcast_*` methods return the messages that
-/// *would* be sent so callers (or a future QUIC transport layer) can dispatch
-/// them.
+/// This layer manages peers and prepares messages. The `broadcast_*` methods
+/// return serialized messages that the QUIC transport layer (`transport.rs`)
+/// dispatches over the network.
 pub struct NetworkNode {
     /// Peer table and tx dedup.
     pub peer_manager: PeerManager,
@@ -535,7 +534,7 @@ impl NetworkNode {
     /// Broadcast shreds to propagation targets in the given shard.
     ///
     /// Returns the list of targets and prepared messages. Actual send happens
-    /// at the QUIC transport layer (not yet wired).
+    /// at the QUIC transport layer (see `transport.rs`).
     pub fn broadcast_shreds(
         &self,
         shreds: Vec<ShredMessage>,

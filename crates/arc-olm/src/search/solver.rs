@@ -1,18 +1,19 @@
-//! Multi-engine solver — orchestrates synthesizer, diff-synth, beam search, augmentation, evolution, and LLM.
+//! Multi-engine solver — orchestrates synthesizer, diff-synth, exhaustive, beam search, augmentation, evolution, and LLM.
 //!
 //! Runs each engine in sequence with a time budget.  Returns as soon as any
 //! engine finds a program that maps every training input to its expected output.
 //!
 //! Engine priority (with default time budgets):
-//! 1. **Synthesizer** (~10%) — exhaustive DFS up to depth 5, fast for simple tasks
-//! 1.5 **Diff-synth** (~20%) — diff-guided synthesis: analyze how output differs from input
-//! 2. **Beam search** (~10%) — fitness-guided parallel search
-//! 3. **Augmented beam search** (~30%) — D4 + PoE voting over beam search
-//! 4. **Evolution** (~30%) — genetic refinement of partial solutions
-//! 5. **LLM-guided** (remaining time) — Ollama LLM picks operations step by step
+//! 1.   **Synthesizer** (~10%) — exhaustive DFS up to depth 5, fast for simple tasks
+//! 1.5  **Diff-synth** (~20%) — diff-guided synthesis: analyze how output differs from input
+//! 1.8  **Exhaustive** (~15%) — deterministic DFS over ALL type-valid programs, no pruning
+//! 2.   **Beam search** (~10%) — fitness-guided parallel search
+//! 3.   **Augmented beam search** (~30%) — D4 + PoE voting over beam search
+//! 4.   **Evolution** (~30%) — genetic refinement of partial solutions
+//! 5.   **LLM-guided** (remaining time) — Ollama LLM picks operations step by step
 
 use crate::Grid;
-use crate::search::beam::{beam_search, beam_search_steered, BeamConfig};
+use crate::search::beam::{beam_search, beam_search_steered, exhaustive_search, BeamConfig};
 use crate::search::diff_synth;
 use crate::search::synthesizer;
 use crate::search::steering;
@@ -71,6 +72,7 @@ pub struct SolveResult {
 /// Engine priority:
 /// 1.   Synthesizer (5-level, ~10% time budget) -- fast, covers simple tasks
 /// 1.5  Diff-synth (~20% time budget) -- diff-guided synthesis
+/// 1.8  Exhaustive (~15% time budget) -- all type-valid programs, no pruning
 /// 2.   Beam search (~10% time budget) -- type-driven parallel search
 /// 3.   Augmented beam search (~30% time budget) -- D4 + PoE over beam search
 /// 4.   Evolution (~30% time budget) -- refine partial solutions
@@ -187,6 +189,34 @@ pub fn solve(
                 "[solver] diff_synth found {} but failed CV, skipping",
                 dr.program_desc
             );
+        }
+    }
+
+    if remaining() == 0 {
+        return None;
+    }
+
+    // ----------------------------------------------------------
+    // Engine 1.8: Exhaustive deterministic search (~15%)
+    // ----------------------------------------------------------
+    let exhaust_budget = config.timeout_ms * 5 / 100; // only 5% — fast depth-3 search
+    if config.verbose {
+        eprintln!("[solver] engine 1.8: exhaustive search (budget={}ms, depth=3)", exhaust_budget);
+    }
+
+    if let Some(sr) = exhaustive_search(train_pairs, test_inputs, 3, exhaust_budget) {
+        let program: Vec<String> = sr.program.iter().map(|s| s.to_string()).collect();
+        if config.verbose {
+            eprintln!("[solver] exhaustive search solved in {}ms: {:?}", elapsed(), program);
+        }
+        // Apply program to all test inputs
+        if let Some(test_outputs) = apply_to_all_tests(&program, train_pairs, test_inputs) {
+            return Some(SolveResult {
+                test_outputs,
+                engine: "exhaustive",
+                program,
+                time_ms: elapsed(),
+            });
         }
     }
 
