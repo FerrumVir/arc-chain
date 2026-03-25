@@ -711,7 +711,7 @@ Trust in artificial intelligence has been a question of faith. With deterministi
 #line(length: 100%, stroke: 0.5pt + rgb("#ccc"))
 #v(0.5em)
 #text(size: 9pt, fill: rgb("#666"))[
-  Our implementation is available as open-source Rust (99,000+ lines, 1,231 tests), with a live testnet and block explorer for independent verification.
+  Code and reproduction instructions: #text(fill: rgb("#4466cc"))[https://github.com/FerrumVir/arc-chain] \ 99,000+ lines of Rust, 1,231 tests, live testnet with block explorer.
 ]
 
 #pagebreak()
