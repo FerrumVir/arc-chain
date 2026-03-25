@@ -1,377 +1,188 @@
 <!DOCTYPE html>
-<html lang="en">
-<head>
+<html><head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ARC Chain Explorer</title>
 <style>
-* { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #0a0e17; color: #e0e6ed; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; }
-.container { max-width: 1200px; margin: 0 auto; padding: 20px; }
-header { text-align: center; padding: 30px 0 20px; border-bottom: 1px solid #1e2d3d; margin-bottom: 20px; }
-header h1 { font-size: 28px; color: #60a5fa; letter-spacing: 2px; }
-header p { color: #64748b; margin-top: 5px; font-size: 12px; }
-.status-bar { display: flex; gap: 20px; justify-content: center; margin: 15px 0; flex-wrap: wrap; }
-.status-item { background: #111827; border: 1px solid #1e2d3d; border-radius: 8px; padding: 12px 20px; text-align: center; min-width: 140px; }
-.status-item .label { color: #64748b; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; }
-.status-item .value { color: #60a5fa; font-size: 22px; font-weight: bold; margin-top: 4px; }
-.status-item .value.green { color: #34d399; }
-.status-item .value.yellow { color: #fbbf24; }
-.section { background: #111827; border: 1px solid #1e2d3d; border-radius: 8px; margin: 15px 0; padding: 20px; }
-.section h2 { color: #60a5fa; font-size: 16px; margin-bottom: 12px; border-bottom: 1px solid #1e2d3d; padding-bottom: 8px; }
-.node-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; }
-.node-card { background: #0d1117; border: 1px solid #1e2d3d; border-radius: 6px; padding: 12px; }
-.node-card .name { color: #34d399; font-weight: bold; }
-.node-card .detail { color: #64748b; font-size: 12px; margin-top: 3px; }
-.node-card.down { border-color: #ef4444; opacity: 0.6; }
-.node-card.down .name { color: #ef4444; }
-.inference-card { background: #0d1117; border: 1px solid #1e2d3d; border-radius: 6px; padding: 15px; margin: 8px 0; }
-.inference-card .query { color: #fbbf24; }
-.inference-card .response { color: #34d399; margin: 5px 0; }
-.inference-card .hash { color: #64748b; font-size: 11px; word-break: break-all; }
-.inference-card .meta { color: #64748b; font-size: 12px; margin-top: 5px; }
-.determinism-row { display: flex; gap: 10px; align-items: center; padding: 6px 0; border-bottom: 1px solid #0d1117; font-size: 12px; }
-.determinism-row .match { color: #34d399; }
-.determinism-row .mismatch { color: #ef4444; }
-.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
-.badge.green { background: #064e3b; color: #34d399; }
-.badge.blue { background: #1e3a5f; color: #60a5fa; }
-.badge.red { background: #7f1d1d; color: #ef4444; }
-.live-dot { display: inline-block; width: 8px; height: 8px; background: #34d399; border-radius: 50%; margin-right: 6px; animation: pulse 2s infinite; }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
-table { width: 100%; border-collapse: collapse; }
-th { text-align: left; color: #64748b; font-size: 11px; text-transform: uppercase; padding: 8px; border-bottom: 1px solid #1e2d3d; }
-td { padding: 8px; border-bottom: 1px solid #0d1117; font-size: 13px; }
-#error { color: #ef4444; text-align: center; padding: 10px; display: none; }
-.footer { text-align: center; color: #334155; margin-top: 30px; font-size: 11px; }
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0e17;color:#c0c8d4;font-family:'SF Mono','Fira Code','Courier New',monospace;font-size:13px;padding:20px;max-width:960px;margin:0 auto}
+h1{color:#60a5fa;font-size:20px;text-align:center;margin-bottom:4px}
+.sub{color:#475569;font-size:11px;text-align:center;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}
+.box{background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:12px;text-align:center}
+.box .label{color:#475569;font-size:10px;text-transform:uppercase;letter-spacing:1px}
+.box .val{color:#60a5fa;font-size:24px;font-weight:bold;margin-top:2px}
+.box .val.green{color:#34d399}
+.box .val.yellow{color:#fbbf24}
+.sec{background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:14px;margin-bottom:12px}
+.sec h2{color:#60a5fa;font-size:13px;margin-bottom:8px;border-bottom:1px solid #1e2d3d;padding-bottom:6px}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;animation:pulse 2s infinite}
+.dot.on{background:#34d399}
+.dot.off{background:#ef4444}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.nodes{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.node{padding:6px 8px;border-radius:4px;font-size:11px;background:#0d1117;border:1px solid #1e2d3d}
+.node.off{opacity:.4;border-color:#ef4444}
+.node b{color:#34d399}
+.node.off b{color:#ef4444}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;color:#475569;font-size:10px;text-transform:uppercase;padding:4px 6px;border-bottom:1px solid #1e2d3d}
+td{padding:4px 6px;border-bottom:1px solid #0d1117;font-size:12px}
+tr.click:hover{background:#1e2d3d;cursor:pointer}
+.hash{color:#60a5fa;font-size:11px}
+.ok{color:#34d399}.fail{color:#ef4444}
+.inf-card{background:#0d1117;border:1px solid #1e2d3d;border-radius:4px;padding:10px;margin:6px 0}
+.inf-q{color:#fbbf24;font-size:12px}.inf-a{color:#34d399;font-size:12px;margin:3px 0}
+.inf-meta{color:#475569;font-size:10px}
+#modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:10}
+#modal-inner{max-width:600px;margin:80px auto;background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:16px}
+#modal-close{float:right;cursor:pointer;color:#475569;font-size:18px}
+#modal-body td:first-child{color:#475569;width:100px}
 </style>
-</head>
-<body>
-<div class="container">
-<header>
-  <h1>ARC CHAIN</h1>
-  <p>Agent Runtime Chain &mdash; Deterministic On-Chain Inference</p>
-</header>
+</head><body>
+<h1>ARC CHAIN</h1>
+<p class="sub">Agent Runtime Chain &mdash; 8 Nodes &bull; 6 Continents &bull; DAG Consensus</p>
 
-<div class="status-bar">
-  <div class="status-item"><div class="label">Block Height</div><div class="value" id="height">-</div></div>
-  <div class="status-item"><div class="label">Live TPS</div><div class="value green" id="tps">-</div></div>
-  <div class="status-item"><div class="label">Nodes</div><div class="value green" id="peers">-</div></div>
-  <div class="status-item"><div class="label">Transactions</div><div class="value" id="txcount">-</div></div>
-  <div class="status-item"><div class="label">Accounts</div><div class="value" id="accounts">-</div></div>
-  <div class="status-item"><div class="label">Uptime</div><div class="value yellow" id="uptime">-</div></div>
+<div class="grid">
+  <div class="box"><div class="label">Block Height</div><div class="val" id="height">-</div></div>
+  <div class="box"><div class="label">Live TPS</div><div class="val green" id="tps">-</div></div>
+  <div class="box"><div class="label">Transactions</div><div class="val" id="txcount">-</div></div>
+</div>
+<div class="grid">
+  <div class="box"><div class="label">Nodes Online</div><div class="val green" id="nodes-up">-</div></div>
+  <div class="box"><div class="label">Validators</div><div class="val" id="vals">-</div></div>
+  <div class="box"><div class="label">Uptime</div><div class="val yellow" id="uptime">-</div></div>
 </div>
 
-<div id="error"></div>
-
-<div class="section">
-  <h2><span class="live-dot"></span>Network Nodes (Global Testnet &mdash; 6 Continents)</h2>
-  <div class="node-grid" id="nodes"></div>
+<div class="sec">
+  <h2>Nodes</h2>
+  <div class="nodes" id="node-grid"></div>
 </div>
 
-<div class="section">
-  <h2><span class="live-dot"></span>Recent Transactions</h2>
-  <p style="color:#64748b;margin-bottom:10px;font-size:12px">Click any transaction to view full details</p>
-  <div id="recent-txs"><p style="color:#64748b">Loading...</p></div>
+<div class="sec">
+  <h2>Recent Transactions</h2>
+  <table><thead><tr><th>Hash</th><th>Type</th><th>Amount</th><th>Status</th></tr></thead>
+  <tbody id="tx-list"><tr><td colspan="4" style="color:#475569">Loading...</td></tr></tbody></table>
 </div>
 
-<div class="section">
+<div class="sec">
   <h2>Inference Attestations</h2>
-  <p style="color:#64748b;margin-bottom:10px;font-size:12px">On-chain AI inference with cryptographic output verification</p>
-  <div id="attestations"><p style="color:#64748b">Loading...</p></div>
+  <div id="inf-list"><span style="color:#475569">Loading...</span></div>
 </div>
 
-<div class="section">
-  <h2>Latest Block</h2>
-  <div id="latest-block"><p style="color:#64748b">Loading...</p></div>
-</div>
-
-<div id="tx-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:100;overflow-y:auto">
-  <div style="max-width:700px;margin:60px auto;background:#111827;border:1px solid #1e2d3d;border-radius:8px;padding:20px">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px">
-      <h2 style="color:#60a5fa;font-size:16px;margin:0">Transaction Details</h2>
-      <span onclick="document.getElementById('tx-modal').style.display='none'" style="cursor:pointer;color:#64748b;font-size:20px">&times;</span>
-    </div>
-    <div id="tx-modal-body"></div>
-  </div>
-</div>
-
-<div class="footer">
-  ARC Chain v0.1.0 &mdash; 99,600+ LOC Rust &mdash; Circle STARK ZK Proofs &mdash; github.com/FerrumVir/arc-chain
-</div>
-</div>
+<div id="modal"><div id="modal-inner">
+  <span id="modal-close" onclick="document.getElementById('modal').style.display='none'">&times;</span>
+  <h2 style="color:#60a5fa;font-size:13px;margin-bottom:10px">Transaction</h2>
+  <table id="modal-body"></table>
+</div></div>
 
 <script>
-// Configuration: change RPC_URL to your node
-const RPC_URL = window.location.hostname === 'localhost'
-  ? 'http://localhost:9090'
-  : `http://${window.location.hostname}:9090`;
-
-const NODES = [
-  { name: 'NYC (Newark)', ip: '149.28.32.76', region: 'US East' },
-  { name: 'LAX (Los Angeles)', ip: '140.82.16.112', region: 'US West' },
-  { name: 'AMS (Amsterdam)', ip: '136.244.109.1', region: 'Europe' },
-  { name: 'LHR (London)', ip: '104.238.171.11', region: 'Europe' },
-  { name: 'NRT (Tokyo)', ip: '202.182.107.41', region: 'Asia' },
-  { name: 'SGP (Singapore)', ip: '149.28.153.31', region: 'Asia' },
-  { name: 'SAO (Sao Paulo)', ip: '216.238.120.27', region: 'S. America' },
-  { name: 'JNB (Johannesburg)', ip: '139.84.237.49', region: 'Africa' },
+const NODES=[
+  {n:'NYC',ip:'149.28.32.76',r:'US East'},
+  {n:'LAX',ip:'140.82.16.112',r:'US West'},
+  {n:'AMS',ip:'136.244.109.1',r:'Europe'},
+  {n:'LHR',ip:'104.238.171.11',r:'Europe'},
+  {n:'NRT',ip:'202.182.107.41',r:'Asia'},
+  {n:'SGP',ip:'149.28.153.31',r:'Asia'},
+  {n:'SAO',ip:'216.238.120.27',r:'S. America'},
+  {n:'JNB',ip:'139.84.237.49',r:'Africa'},
 ];
+const RPC=`http://${NODES[1].ip}:9090`; // LAX as primary
 
-async function fetchJSON(url, timeout = 5000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeout);
-  try {
-    const r = await fetch(url, { signal: controller.signal });
-    clearTimeout(id);
-    return await r.json();
-  } catch(e) {
-    clearTimeout(id);
-    return null;
+function f(url,ms=3000){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(url,{signal:c.signal}).then(r=>{clearTimeout(t);return r.json()}).catch(()=>{clearTimeout(t);return null})}
+function sh(h){return h?h.slice(0,8)+'...'+h.slice(-6):'?'}
+function fmt(n){return n?n.toLocaleString():'0'}
+function uptime(s){if(!s)return'-';if(s<3600)return Math.floor(s/60)+'m';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
+
+let prevTx=0,prevT=Date.now();
+
+async function tick(){
+  // Query only LAX (fast, single request)
+  const [stats,health,vals]=await Promise.all([f(RPC+'/stats'),f(RPC+'/health'),f(RPC+'/validators')]);
+  if(stats){
+    const now=Date.now();const dt=(now-prevT)/1000;const dtx=stats.total_transactions-prevTx;
+    const tps=(prevTx>0&&dt>0)?Math.round(dtx/dt):0;
+    prevTx=stats.total_transactions;prevT=now;
+    document.getElementById('height').textContent=fmt(stats.block_height);
+    document.getElementById('tps').textContent=fmt(tps);
+    document.getElementById('txcount').textContent=fmt(stats.total_transactions);
   }
+  if(health){document.getElementById('uptime').textContent=uptime(health.uptime_secs)}
+  if(vals){document.getElementById('vals').textContent=vals.count+' / '+fmt(vals.total_stake)+' ARC'}
 }
 
-function formatUptime(secs) {
-  if (secs < 60) return `${secs}s`;
-  if (secs < 3600) return `${Math.floor(secs/60)}m`;
-  return `${Math.floor(secs/3600)}h ${Math.floor((secs%3600)/60)}m`;
+async function updateNodes(){
+  const g=document.getElementById('node-grid');
+  const ps=NODES.map(n=>f(`http://${n.ip}:9090/health`,2000));
+  const hs=await Promise.all(ps);
+  let up=0;
+  g.innerHTML=NODES.map((n,i)=>{
+    const h=hs[i];
+    if(h){up++;return `<div class="node"><span class="dot on"></span><b>${n.n}</b> ${n.r}<br>Peers:${h.peers} Up:${uptime(h.uptime_secs)}</div>`}
+    return `<div class="node off"><span class="dot off"></span><b>${n.n}</b> ${n.r}<br>OFFLINE</div>`
+  }).join('');
+  document.getElementById('nodes-up').textContent=up+'/8';
 }
 
-let lastTxCount = 0;
-let lastTxTime = Date.now();
-
-async function updateStatus() {
-  // Aggregate across ALL nodes — use highest values
-  let maxHeight = 0, maxTx = 0, maxAccounts = 0, maxUptime = 0, onlineCount = 0;
-
-  const results = await Promise.allSettled(
-    NODES.map(n => fetchJSON(`http://${n.ip}:9090/stats`, 3000))
-  );
-  const healths = await Promise.allSettled(
-    NODES.map(n => fetchJSON(`http://${n.ip}:9090/health`, 3000))
-  );
-
-  for (let i = 0; i < NODES.length; i++) {
-    const s = results[i].status === 'fulfilled' ? results[i].value : null;
-    const h = healths[i].status === 'fulfilled' ? healths[i].value : null;
-    if (s) {
-      maxHeight = Math.max(maxHeight, s.block_height || 0);
-      maxTx = Math.max(maxTx, s.total_transactions || 0);
-      maxAccounts = Math.max(maxAccounts, s.total_accounts || 0);
-    }
-    if (h) {
-      maxUptime = Math.max(maxUptime, h.uptime_secs || 0);
-      onlineCount++;
-    }
-  }
-
-  // Compute live TPS from transaction delta
-  const now = Date.now();
-  const dt = (now - lastTxTime) / 1000;
-  const dtx = maxTx - lastTxCount;
-  const tps = (lastTxCount > 0 && dt > 0) ? Math.round(dtx / dt) : 0;
-  lastTxCount = maxTx;
-  lastTxTime = now;
-
-  document.getElementById('height').textContent = maxHeight.toLocaleString();
-  document.getElementById('tps').textContent = tps > 0 ? tps.toLocaleString() : '0';
-  document.getElementById('peers').textContent = onlineCount + '/8';
-  document.getElementById('txcount').textContent = maxTx.toLocaleString();
-  document.getElementById('accounts').textContent = maxAccounts.toLocaleString();
-  document.getElementById('uptime').textContent = formatUptime(maxUptime);
-  document.getElementById('error').style.display = 'none';
+async function showTx(hash){
+  const m=document.getElementById('modal');const b=document.getElementById('modal-body');
+  b.innerHTML='<tr><td colspan="2" style="color:#475569">Loading...</td></tr>';m.style.display='block';
+  const tx=await f(RPC+'/tx/'+hash+'/full',5000);
+  if(!tx||!tx.tx_type){b.innerHTML='<tr><td colspan="2" style="color:#ef4444">Not found</td></tr>';return}
+  const s=tx.success?'<span class="ok">SUCCESS</span>':'<span class="fail">FAILED</span>';
+  const amt=tx.body&&tx.body.amount?fmt(tx.body.amount)+' ARC':'—';
+  const to=tx.body&&tx.body.to?tx.body.to:'—';
+  b.innerHTML=`
+    <tr><td>Hash</td><td style="word-break:break-all;font-size:11px">${tx.tx_hash}</td></tr>
+    <tr><td>Status</td><td>${s}</td></tr>
+    <tr><td>Type</td><td>${tx.tx_type}</td></tr>
+    <tr><td>From</td><td style="word-break:break-all;font-size:11px">${tx.from}</td></tr>
+    <tr><td>To</td><td style="word-break:break-all;font-size:11px">${to}</td></tr>
+    <tr><td>Amount</td><td style="color:#34d399">${amt}</td></tr>
+    <tr><td>Nonce</td><td>${tx.nonce}</td></tr>
+    <tr><td>Gas</td><td>${fmt(tx.gas_used)}</td></tr>
+    <tr><td>Block</td><td>${tx.block_height||'—'}</td></tr>`;
 }
 
-async function updateNodes() {
-  const grid = document.getElementById('nodes');
-  const cards = [];
-
-  for (const node of NODES) {
-    const health = await fetchJSON(`http://${node.ip}:9090/health`, 3000);
-    const stats = await fetchJSON(`http://${node.ip}:9090/stats`, 3000);
-    const vals = await fetchJSON(`http://${node.ip}:9090/validators`, 3000);
-    if (health) {
-      const txCount = stats ? stats.total_transactions.toLocaleString() : '?';
-      const valCount = vals ? vals.count : '?';
-      cards.push(`<div class="node-card">
-        <div class="name">${node.name}</div>
-        <div class="detail">${node.region} &bull; Peers: ${health.peers} &bull; Validators: ${valCount}</div>
-        <div class="detail">Txs: ${txCount} &bull; Uptime: ${formatUptime(health.uptime_secs)} &bull; <span class="badge green">ONLINE</span></div>
-      </div>`);
-    } else {
-      cards.push(`<div class="node-card down">
-        <div class="name">${node.name}</div>
-        <div class="detail">${node.region} &bull; <span class="badge red">OFFLINE</span></div>
-      </div>`);
-    }
+async function updateTxs(){
+  const el=document.getElementById('tx-list');
+  // Get tx hashes from genesis account 0 (faucet source — has all tx history)
+  const txs=await f(RPC+'/account/2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213/txs',3000);
+  if(!txs||!txs.tx_hashes||txs.tx_hashes.length===0){el.innerHTML='<tr><td colspan="4" style="color:#475569">No transactions yet</td></tr>';return}
+  const recent=txs.tx_hashes.slice(-12).reverse();
+  const rows=[];
+  for(const h of recent){
+    const tx=await f(RPC+'/tx/'+h+'/full',2000);
+    const type=tx?tx.tx_type:'?';
+    const amt=tx&&tx.body&&tx.body.amount?fmt(tx.body.amount):'—';
+    const s=tx?(tx.success?'<span class="ok">OK</span>':'<span class="fail">FAIL</span>'):'?';
+    rows.push(`<tr class="click" onclick="showTx('${h}')"><td class="hash">${sh(h)}</td><td>${type}</td><td>${amt}</td><td>${s}</td></tr>`);
   }
-  grid.innerHTML = cards.join('');
+  el.innerHTML=rows.join('');
 }
 
-async function updateBlock() {
-  const block = await fetchJSON(`${RPC_URL}/block/latest`);
-  if (block && block.header) {
-    const h = block.header;
-    document.getElementById('latest-block').innerHTML = `
-      <table>
-        <tr><td style="color:#64748b">Height</td><td>${h.height}</td></tr>
-        <tr><td style="color:#64748b">Hash</td><td style="font-size:11px;word-break:break-all">${block.hash}</td></tr>
-        <tr><td style="color:#64748b">Parent</td><td style="font-size:11px;word-break:break-all">${h.parent_hash}</td></tr>
-        <tr><td style="color:#64748b">TX Count</td><td>${h.tx_count}</td></tr>
-        <tr><td style="color:#64748b">Producer</td><td style="font-size:11px;word-break:break-all">${h.producer}</td></tr>
-        <tr><td style="color:#64748b">State Root</td><td style="font-size:11px;word-break:break-all">${h.state_root}</td></tr>
-        <tr><td style="color:#64748b">Time</td><td>${new Date(h.timestamp).toLocaleString()}</td></tr>
-      </table>`;
-  }
-}
-
-function shortHash(h) { return h ? h.substring(0, 10) + '...' + h.substring(h.length - 6) : '?'; }
-function shortAddr(a) { return a ? a.substring(0, 8) + '...' + a.substring(a.length - 6) : '?'; }
-
-async function showTxDetail(hash) {
-  const modal = document.getElementById('tx-modal');
-  const body = document.getElementById('tx-modal-body');
-  body.innerHTML = '<p style="color:#64748b">Loading...</p>';
-  modal.style.display = 'block';
-
-  // Try each node until we find the tx
-  let tx = null;
-  for (const node of NODES) {
-    tx = await fetchJSON(`http://${node.ip}:9090/tx/${hash}/full`, 5000);
-    if (tx && tx.tx_type) break;
-  }
-
-  if (!tx || !tx.tx_type) {
-    body.innerHTML = '<p style="color:#ef4444">Transaction not found on any node</p>';
-    return;
-  }
-
-  const statusBadge = tx.success
-    ? '<span class="badge green">SUCCESS</span>'
-    : '<span class="badge red">FAILED</span>';
-
-  let bodyHtml = '';
-  if (tx.body) {
-    if (tx.body.type === 'Transfer') {
-      bodyHtml = `<tr><td>To</td><td style="word-break:break-all">${tx.body.to || '?'}</td></tr>
-        <tr><td>Amount</td><td style="color:#34d399">${(tx.body.amount || 0).toLocaleString()} ARC</td></tr>`;
-    } else {
-      bodyHtml = `<tr><td>Body</td><td style="font-size:11px">${JSON.stringify(tx.body).substring(0, 200)}</td></tr>`;
+async function updateInference(){
+  const el=document.getElementById('inf-list');
+  // Try nodes that might have models
+  for(const node of NODES){
+    const r=await f(`http://${node.ip}:9090/inference/attestations`,3000);
+    if(r&&r.attestations&&r.attestations.length>0){
+      el.innerHTML=r.attestations.slice(-5).reverse().map(a=>`
+        <div class="inf-card">
+          <div class="inf-q">Q: ${a.input||'—'}</div>
+          <div class="inf-a">A: ${a.output||'—'}</div>
+          <div class="inf-meta">Hash: ${sh(a.output_hash||'')} | ${a.ms_per_token||'?'} ms/tok | Model: ${sh(a.model_hash||'')}</div>
+        </div>`).join('');
+      return;
     }
   }
-
-  body.innerHTML = `<table style="width:100%">
-    <tr><td style="color:#64748b;width:120px">Hash</td><td style="word-break:break-all;font-size:12px">${tx.tx_hash}</td></tr>
-    <tr><td style="color:#64748b">Type</td><td><span class="badge blue">${tx.tx_type}</span></td></tr>
-    <tr><td style="color:#64748b">Status</td><td>${statusBadge}</td></tr>
-    <tr><td style="color:#64748b">From</td><td style="word-break:break-all;font-size:12px">${tx.from}</td></tr>
-    ${bodyHtml}
-    <tr><td style="color:#64748b">Nonce</td><td>${tx.nonce}</td></tr>
-    <tr><td style="color:#64748b">Gas Used</td><td>${(tx.gas_used || 0).toLocaleString()}</td></tr>
-    <tr><td style="color:#64748b">Block</td><td>${tx.block_height || '?'}</td></tr>
-  </table>`;
+  el.innerHTML='<span style="color:#475569">No inference attestations on-chain yet</span>';
 }
 
-async function updateRecentTxs() {
-  const el = document.getElementById('recent-txs');
-  // Get recent blocks and extract tx hashes
-  let allTxs = [];
-  const stats = await fetchJSON(`${RPC_URL}/stats`, 3000);
-  if (!stats) return;
-  const h = stats.block_height || 0;
-  if (h === 0 && stats.total_transactions > 0) {
-    // Direct-apply mode — get txs from faucet account history
-    const genesis0 = '2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213';
-    const txList = await fetchJSON(`${RPC_URL}/account/${genesis0}/txs`, 3000);
-    if (txList && txList.tx_hashes) {
-      allTxs = txList.tx_hashes.slice(-10).reverse();
-    }
-  } else {
-    // Block mode — get from recent blocks
-    const from = Math.max(0, h - 5);
-    const blocks = await fetchJSON(`${RPC_URL}/blocks?from=${from}&to=${h}&limit=5`, 3000);
-    if (blocks && blocks.blocks) {
-      for (const b of blocks.blocks.reverse()) {
-        if (b.tx_count > 0) {
-          const full = await fetchJSON(`${RPC_URL}/block/${b.height}`, 3000);
-          if (full && full.tx_hashes) {
-            for (const th of full.tx_hashes) {
-              if (th !== '0000000000000000000000000000000000000000000000000000000000000000') {
-                allTxs.push(th);
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  if (allTxs.length === 0) {
-    el.innerHTML = '<p style="color:#64748b">No transactions yet</p>';
-    return;
-  }
-
-  let html = '<table><tr><th>Hash</th><th>Type</th><th>Amount</th><th>Status</th></tr>';
-  for (const hash of allTxs.slice(0, 15)) {
-    let tx = await fetchJSON(`${RPC_URL}/tx/${hash}/full`, 3000);
-    if (!tx) { tx = await fetchJSON(`${RPC_URL}/tx/${hash}`, 3000); }
-    const type = tx ? (tx.tx_type || 'Transfer') : '?';
-    const amount = tx && tx.body ? (tx.body.amount || 0) : 0;
-    const success = tx ? tx.success : null;
-    const badge = success === true ? '<span class="badge green">OK</span>'
-      : success === false ? '<span class="badge red">FAIL</span>' : '';
-    html += `<tr style="cursor:pointer" onclick="showTxDetail('${hash}')">
-      <td style="color:#60a5fa;font-size:12px">${shortHash(hash)}</td>
-      <td><span class="badge blue">${type}</span></td>
-      <td>${amount > 0 ? amount.toLocaleString() + ' ARC' : '-'}</td>
-      <td>${badge}</td>
-    </tr>`;
-  }
-  html += '</table>';
-  el.innerHTML = html;
-}
-
-async function updateInference() {
-  const el = document.getElementById('attestations');
-  // Try to get inference attestations from any node with a model
-  let found = false;
-  for (const node of NODES) {
-    const att = await fetchJSON(`http://${node.ip}:9090/inference/attestations`, 3000);
-    if (att && att.attestations && att.attestations.length > 0) {
-      let html = '<table><tr><th>Input</th><th>Output</th><th>Hash</th><th>ms/tok</th><th>Model</th></tr>';
-      for (const a of att.attestations.slice(-10).reverse()) {
-        html += `<tr>
-          <td style="color:#fbbf24;max-width:200px;overflow:hidden;text-overflow:ellipsis">${a.input || '?'}</td>
-          <td style="color:#34d399;max-width:200px;overflow:hidden;text-overflow:ellipsis">${a.output || '?'}</td>
-          <td style="font-size:11px;color:#64748b">${shortHash(a.output_hash || '')}</td>
-          <td>${a.ms_per_token || '?'}</td>
-          <td style="font-size:11px">${shortHash(a.model_hash || '')}</td>
-        </tr>`;
-      }
-      html += '</table>';
-      el.innerHTML = html;
-      found = true;
-      break;
-    }
-  }
-  if (!found) {
-    el.innerHTML = '<p style="color:#64748b">No inference attestations on-chain yet. Inference nodes loading models...</p>';
-  }
-}
-
-// Initial load
-updateStatus();
-updateNodes();
-updateBlock();
-updateRecentTxs();
-updateInference();
-
-// Auto-refresh
-setInterval(updateStatus, 3000);
-setInterval(updateBlock, 5000);
-setInterval(updateRecentTxs, 10000);
-setInterval(updateInference, 15000);
-setInterval(updateNodes, 30000);
+// Boot
+tick();updateNodes();updateTxs();updateInference();
+setInterval(tick,3000);
+setInterval(updateNodes,15000);
+setInterval(updateTxs,10000);
+setInterval(updateInference,20000);
 </script>
-</body>
-</html>
+</body></html>
