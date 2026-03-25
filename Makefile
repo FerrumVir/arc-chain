@@ -22,7 +22,9 @@ inference:
 
 # Run the block explorer
 explorer:
-	open explorer/index-live.html
+	@if [ "$$(uname)" = "Darwin" ]; then open explorer/index-live.html; \
+	elif command -v xdg-open >/dev/null; then xdg-open explorer/index-live.html; \
+	else echo "Open explorer/index-live.html in your browser"; fi
 
 # Run the testnet faucet
 faucet:

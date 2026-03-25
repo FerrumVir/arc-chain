@@ -1566,7 +1566,34 @@ async fn eth_json_rpc(
         "eth_getCode" => eth_get_code(&node, &params, &req.id),
         "eth_getStorageAt" => eth_get_storage_at(&node, &params, &req.id),
         "eth_getBlockByNumber" => eth_get_block_by_number(&node, &params, &req.id),
-        "eth_getBlockByHash" => eth_rpc_result(&req.id, json!(null)), // TODO: index by hash
+        "eth_getBlockByHash" => {
+            let hash_str = match params.get(0).and_then(|v| v.as_str()) {
+                Some(h) => h.strip_prefix("0x").unwrap_or(h),
+                None => return eth_rpc_error(&req.id, -32602, "Missing block hash parameter"),
+            };
+            let hash = match Hash256::from_hex(hash_str) {
+                Ok(h) => h,
+                Err(_) => return eth_rpc_error(&req.id, -32602, "Invalid block hash"),
+            };
+            match node.state.get_block_by_hash(&hash.0) {
+                Some(block) => {
+                    let txs = json!(block.tx_hashes.iter().map(|h| format!("0x{}", h.to_hex())).collect::<Vec<_>>());
+                    eth_rpc_result(&req.id, json!({
+                        "number": format!("0x{:x}", block.header.height),
+                        "hash": format!("0x{}", block.hash.to_hex()),
+                        "parentHash": format!("0x{}", block.header.parent_hash.to_hex()),
+                        "stateRoot": format!("0x{}", block.header.state_root.to_hex()),
+                        "transactionsRoot": format!("0x{}", block.header.tx_root.to_hex()),
+                        "miner": format!("0x{}", hex::encode(&block.header.producer.0[..20])),
+                        "timestamp": format!("0x{:x}", block.header.timestamp / 1000),
+                        "transactions": txs,
+                        "gasUsed": "0x0",
+                        "gasLimit": "0xffffffffffffffff",
+                    }))
+                }
+                None => eth_rpc_result(&req.id, json!(null)),
+            }
+        }
         "eth_getTransactionByHash" => eth_get_tx_by_hash(&node, &params, &req.id),
         "eth_getTransactionReceipt" => eth_get_tx_receipt(&node, &params, &req.id),
         "eth_call" => eth_call(&node, &params, &req.id),

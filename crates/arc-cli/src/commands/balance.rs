@@ -4,6 +4,9 @@ use anyhow::Result;
 use crate::rpc::RpcClient;
 
 pub async fn run(rpc: &RpcClient, address: &str) -> Result<()> {
+    if let Err(e) = super::validate_address(address) {
+        anyhow::bail!("{}", e);
+    }
     let data = match rpc.get_account(address).await {
         Ok(d) => d,
         Err(e) => {

@@ -699,6 +699,19 @@ impl StateDB {
         self.blocks.get(&height).map(|b| b.clone())
     }
 
+    /// Look up a block by its hash. Scans from latest to earliest.
+    pub fn get_block_by_hash(&self, hash: &[u8; 32]) -> Option<Block> {
+        let h = self.height();
+        for height in (0..=h).rev() {
+            if let Some(block) = self.blocks.get(&height) {
+                if block.hash.0 == *hash {
+                    return Some(block.clone());
+                }
+            }
+        }
+        None
+    }
+
     /// Execute a batch of transactions, produce a block, and update state.
     /// Returns the new block and receipts for each transaction.
     pub fn execute_block(
