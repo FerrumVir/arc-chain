@@ -42,6 +42,8 @@ pub struct NodeState {
     pub candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
     /// Model ID for candle engine.
     pub candle_model_id: Option<arc_crypto::Hash256>,
+    /// Live DAG validator set (updated by consensus loop via PeerConnected).
+    pub dag_validators: Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>,
 }
 
 /// Build a `NodeState` from components.
@@ -70,6 +72,7 @@ pub fn build_node_state(
         inference_model,
         candle_engine,
         candle_model_id,
+        dag_validators: Arc::new(parking_lot::RwLock::new(vec![(validator_address, stake)])),
     }
 }
 
@@ -85,8 +88,12 @@ pub async fn serve(
     inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
     candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
     candle_model_id: Option<arc_crypto::Hash256>,
+    dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
 ) -> anyhow::Result<()> {
-    let node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
+    let mut node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
+    if let Some(dv) = dag_validators {
+        node.dag_validators = dv;
+    }
 
     let app = Router::new()
         .route("/", get(index))
@@ -401,6 +408,9 @@ async fn submit_tx(
     node.state.account_txs.entry(from.0).or_default().push(tx.hash);
     node.state.account_txs.entry(to.0).or_default().push(tx.hash);
 
+    // Also insert into mempool for DAG consensus propagation to other nodes
+    let _ = node.mempool.insert(tx);
+
     Ok(Json(SubmitTxResponse {
         tx_hash: hash,
         status: "confirmed".to_string(),
@@ -499,16 +509,18 @@ struct ValidatorsResponse {
 async fn get_validators(
     AxumState(node): AxumState<NodeState>,
 ) -> Json<ValidatorsResponse> {
-    let staked = node.state.get_staked_accounts();
-    let mut validators: Vec<ValidatorInfoResponse> = staked
-        .into_iter()
-        .map(|(addr, account)| {
-            let tier = StakeTier::from_stake(account.staked_balance)
+    // Show live DAG validator set (updated by consensus loop via PeerConnected).
+    // Falls back to staked accounts from state if DAG set is single-validator.
+    let dag_vals = node.dag_validators.read().clone();
+    let mut validators: Vec<ValidatorInfoResponse> = dag_vals
+        .iter()
+        .map(|(addr, stake)| {
+            let tier = StakeTier::from_stake(*stake)
                 .map(|t| format!("{:?}", t))
                 .unwrap_or_else(|| "Below minimum".to_string());
             ValidatorInfoResponse {
                 address: addr.to_hex(),
-                stake: account.staked_balance,
+                stake: *stake,
                 tier,
             }
         })
@@ -704,6 +716,9 @@ async fn faucet_claim(
     // Index for account tx history
     node.state.account_txs.entry(faucet_addr.0).or_default().push(tx.hash);
     node.state.account_txs.entry(to.0).or_default().push(tx.hash);
+
+    // Also insert into mempool for DAG consensus propagation to other nodes
+    let _ = node.mempool.insert(tx);
 
     // Record claim time
     {

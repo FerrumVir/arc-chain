@@ -39,6 +39,8 @@ pub struct ConsensusManager {
     /// Encrypted mempool for MEV-protected commit-reveal transactions.
     /// Runs alongside the regular mempool when `Some`.
     encrypted_mempool: Option<Arc<EncryptedMempool>>,
+    /// Shared validator list for RPC — updated on PeerConnected/Disconnected.
+    pub dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
 }
 
 impl ConsensusManager {
@@ -65,7 +67,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))) }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None }
     }
 
     /// Create a consensus manager with a signing keypair (production mode).
@@ -92,7 +94,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))) }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None }
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -261,6 +263,13 @@ impl ConsensusManager {
                                     was_single = was_single,
                                     "Peer connected — ValidatorSet updated"
                                 );
+
+                                // Update shared validator list for RPC
+                                if let Some(ref dv) = self.dag_validators {
+                                    let vs = self.engine.validator_set();
+                                    let mut list = dv.write();
+                                    *list = vs.validators.iter().map(|v| (v.address, v.stake)).collect();
+                                }
                             }
                         }
                         InboundMessage::PeerDisconnected { address } => {
