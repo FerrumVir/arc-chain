@@ -112,7 +112,7 @@ This paper makes five contributions:
 
 + We formalize the Determinism Thesis with precise definitions of platform-deterministic inference and trustworthy AI, and prove that determinism is both _necessary_ (Theorem 4) and _sufficient_ (Theorem 5) for trustworthiness (Section 2).
 
-+ We prove that IEEE 754 floating-point arithmetic with hardware-dependent reduction order is _fundamentally incompatible_ with trustworthy AI (Theorem 7), and confirm this experimentally with controlled divergence tests (Section 3).
++ We prove that IEEE 754 floating-point arithmetic with hardware-dependent reduction order is _fundamentally incompatible_ with trustworthy AI (Theorem 9), and confirm this experimentally with controlled divergence tests (Section 3).
 
 + We construct the ARC engine, a pure integer arithmetic inference engine that achieves _bitwise identical output_ across ARM and x86 architectures for Llama-2-7B (6.7B parameters), validated in 82 cross-architecture tests with zero mismatches across sequences up to 1,024 tokens (Sections 7, 9).
 
@@ -195,11 +195,39 @@ We formalize the relationship between determinism and trust in AI systems. The d
 
 This corollary has a consequence that is easy to state but difficult to overstate: _approximate determinism provides exactly zero verification guarantee._ An inference function that produces outputs agreeing in 99.999% of bits but disagreeing in one is exactly as unverifiable as one disagreeing in every bit---the hash check fails identically. Approaches that _reduce_ floating-point divergence without _eliminating_ it---constraining SIMD width, pinning thread counts, using Kahan summation---cannot achieve verifiable inference. For the purpose of cryptographic trust, determinism is all-or-nothing.
 
+== The Trust Dependency Hierarchy
+
+The Determinism Thesis has consequences beyond inference engineering. Every major trust property studied in the AI safety and governance literature presupposes platform-deterministic inference---often without stating this assumption.
+
+#theorem("Trust Dependency Hierarchy")[
+  The following trust properties of AI systems each presuppose platform-deterministic inference:
+
+  *(i)* Fairness Auditing $=>$ R and A $=>$ Determinism. \
+  *(ii)* Robustness Certification $=>$ C $=>$ Determinism. \
+  *(iii)* Privacy Compliance $=>$ V $=>$ Determinism. \
+  *(iv)* Safety Certification $=>$ R and C $=>$ Determinism. \
+  *(v)* Alignment Verification $=>$ V and R $=>$ Determinism.
+
+  Therefore, platform-deterministic inference is a necessary condition for all independently verifiable trust properties of AI systems.
+]
+
+*(i) Fairness.* Auditing a model for bias requires reproducing the computation that produced a decision (R) and reconstructing the computational trace to identify which features influenced the output (A). Without determinism, the auditor's re-execution produces different intermediate values, making attribution of bias impossible.
+
+*(ii) Robustness.* Certifying robustness to adversarial inputs requires testing on one platform and transferring certification to all platforms (C). Without determinism, a model certified as robust on $h_1$ may behave differently on $h_2$.
+
+*(iii) Privacy.* Verifying that differential privacy guarantees were correctly applied requires verifying the computation (V). Without determinism, re-execution produces different results, and the verifier cannot distinguish "privacy was applied" from "hardware differences mask the difference."
+
+*(iv) Safety.* Safety testing for autonomous vehicles, medical AI, and avionics requires reproducibility (R) and certifiability (C). Without determinism, a fleet of heterogeneous robots requires per-unit certification @eu_ai_act, scaling cost with deployment size rather than model complexity.
+
+*(v) Alignment.* Verifying that an AI system's behavior matches its stated objectives requires verifying what computation it performed (V) and reproducing it independently (R). Without determinism, no external verifier can distinguish intentional misalignment from hardware-induced divergence.
+
+#corollary("Determinism as Foundation")[
+  Determinism is not one desirable property among many. It is the computational foundation without which no other trust property is independently verifiable. Every proposal for trustworthy AI that does not address platform determinism implicitly assumes it.
+]
+
 == Historical Context
 
-Three prior paradigm shifts in computing followed an identical pattern: a physical requirement for trust was replaced by a mathematical one. In 1976, Diffie and Hellman replaced physical key exchange with trapdoor functions @diffie1976, enabling secure communication without shared secrets. In 1982, Lamport, Shostak, and Pease replaced trusted intermediaries with Byzantine fault tolerance @lamport1982, enabling reliable distributed systems without trusted nodes. In 2008, Nakamoto composed cryptographic hashing with economic incentives @nakamoto2008, enabling a global ledger without a central authority.
-
-Each paradigm shift made trust _computable_---derivable from mathematical properties rather than physical arrangements. We identify a fourth instance. The physical requirement is that all hardware executing an AI model must be identical: same chip, same microcode, same SIMD width, same reduction order. The mathematical replacement is integer arithmetic, which produces identical results across _all_ two's complement architectures by algebraic necessity. This elimination of the hardware identity constraint is what makes deterministic inference a paradigm shift rather than an engineering optimization.
+Three prior paradigm shifts in computing followed an identical pattern: a physical requirement for trust was replaced by a mathematical one. Diffie and Hellman @diffie1976 replaced physical key exchange with trapdoor functions. Lamport, Shostak, and Pease @lamport1982 replaced trusted intermediaries with Byzantine fault tolerance. Nakamoto @nakamoto2008 composed cryptographic hashing with economic incentives, enabling a global ledger without a central authority. Each made trust _computable_. We identify a fourth instance: the physical requirement that all hardware executing an AI model must be identical (same chip, same SIMD width, same reduction order) is replaced by integer arithmetic, which produces identical results across _all_ two's complement architectures by algebraic necessity.
 
 
 // ============================================================================
@@ -400,7 +428,7 @@ INT8 weight quantization introduces quantization noise relative to the original 
 = From Determinism to Verifiability
 // ============================================================================
 
-The Determinism-Verification Collapse (Theorem 14) proves that deterministic inference is verifiable via $O(1)$ hash comparison after re-execution. This section constructs the complete _trust stack_---from deterministic arithmetic through on-chain attestation and consensus---showing how determinism enables a fully trustless verification pipeline where re-execution is the proof.
+The Determinism-Verification Collapse (Theorem 16) proves that deterministic inference is verifiable via $O(1)$ hash comparison after re-execution. This section constructs the complete _trust stack_---from deterministic arithmetic through on-chain attestation and consensus---showing how determinism enables a fully trustless verification pipeline where re-execution is the proof.
 
 == The Trust Stack
 
@@ -437,7 +465,7 @@ Each inference execution produces an `InferenceAttestation` containing:
 - *Economic bond:* stake committed by the attester
 - *Challenge period:* window during which any party may dispute by re-execution
 
-By Theorem 15 (Integer Sufficiency), honest nodes always produce the same $H(y)$ for the same $(m, x)$. A dispute is resolved by re-execution on _any_ hardware: the re-executor either produces the same hash (confirming the attestation) or a different hash (impossible for honest attesters, by determinism). The economic bond ensures that dishonest attestations are unprofitable.
+By Theorem 17 (Integer Sufficiency), honest nodes always produce the same $H(y)$ for the same $(m, x)$. A dispute is resolved by re-execution on _any_ hardware: the re-executor either produces the same hash (confirming the attestation) or a different hash (impossible for honest attesters, by determinism). The economic bond ensures that dishonest attestations are unprofitable.
 
 == Multi-Node Consensus
 
@@ -447,7 +475,7 @@ This design separates _consensus on the output_ (achieved through DAG block fina
 
 == Toward Efficient Verification: STARK Proofs
 
-The primary verification mechanism in this system is _re-execution_: any party loads the same model, runs the same integer forward pass, and checks the output hash. By the Determinism-Verification Collapse (Theorem 14), this is sound and complete. However, re-execution requires loading the full model, which is expensive for light clients, cross-chain bridges, or resource-constrained verifiers.
+The primary verification mechanism in this system is _re-execution_: any party loads the same model, runs the same integer forward pass, and checks the output hash. By the Determinism-Verification Collapse (Theorem 16), this is sound and complete. However, re-execution requires loading the full model, which is expensive for light clients, cross-chain bridges, or resource-constrained verifiers.
 
 For these settings, we implement Circle STARK proofs @bensasson2018 @stwo over the Mersenne-31 field as a path toward succinct verification of dense layer computations. The AIR has 6 trace columns and 4 constraints of degree $<= 2$, enabling proving of matrix multiplications at 7B-scale layer dimensions. Proofs are verified inline during generation, and a 152-byte commitment receipt is recorded on-chain. Because the underlying computation is deterministic, any party can independently regenerate and verify the full proof.
 
@@ -486,7 +514,7 @@ The ARC engine produces _bitwise identical_ outputs across ARM and x86 for all 6
 
 We additionally confirm cross-platform determinism on TinyLlama-1.1B with 72 prompts (8--1,024 tokens, all matching) and x86-to-x86 determinism across independent Vultr data centers with 4 additional tests. Combined total: *82 cross-platform tests, zero mismatches, spanning two model sizes and three hardware configurations.*
 
-Theorem 15 predicts this result: since all operations are integer arithmetic with fixed evaluation order, _any_ mismatch would indicate a hardware or implementation bug rather than an inherent limitation. The 82/82 cross-architecture result is not a statistical sample but a validation of a mathematical guarantee.
+Theorem 17 predicts this result: since all operations are integer arithmetic with fixed evaluation order, _any_ mismatch would indicate a hardware or implementation bug rather than an inherent limitation. The 82/82 cross-architecture result is not a statistical sample but a validation of a mathematical guarantee.
 
 == Multi-Node Inference Consensus
 
@@ -518,7 +546,7 @@ Representative outputs (identical across all 4 nodes):
 
 Each inference produces an on-chain `InferenceAttestation` transaction finalized through DAG consensus (200,000+ rounds during the evaluation period). A total of 356 attestation transactions were recorded on-chain.
 
-*Floating-point divergence as controlled experiment.* At 128+ tokens, the candle Q4 backend diverges across nodes due to floating-point accumulation differences between CPU microarchitectures. This is _predicted_ by Theorem 7: different x86 processors use different SIMD reduction orders, producing different rounding sequences. The ARC engine does not diverge at any length (@tab:crossplatform). This pair of results---float diverges, integer does not---constitutes a controlled experimental confirmation of the Determinism Thesis: the arithmetic substrate, not the model or architecture, determines whether trust is possible.
+*Floating-point divergence as controlled experiment.* At 128+ tokens, the candle Q4 backend diverges across nodes due to floating-point accumulation differences between CPU microarchitectures. This is _predicted_ by Theorem 9: different x86 processors use different SIMD reduction orders, producing different rounding sequences. The ARC engine does not diverge at any length (@tab:crossplatform). This pair of results---float diverges, integer does not---constitutes a controlled experimental confirmation of the Determinism Thesis: the arithmetic substrate, not the model or architecture, determines whether trust is possible.
 
 == STARK Proofs of Dense Layer Computation
 
@@ -579,18 +607,12 @@ A critical question is whether deterministic integer inference preserves the _ca
   *Input:* _"[INST] What is 2+2? [/INST]"_ \
   *Output:* "Sure! The answer is 2+2 = 4."
   #v(0.3em)
-  *Input:* _"[INST] What is the capital of France? [/INST]"_ \
-  *Output:* "The capital of France is Paris."
-  #v(0.3em)
   *Input:* _"[INST] Write a Python function to check if a number is prime [/INST]"_ \
   *Output:* `def is_prime(n): if n <= 1 or n % 2 == 0: return False for i in range(3, int(n**0.5)+1, 2): ...`
-  #v(0.3em)
-  *Input:* _"[INST] Explain what a blockchain is in two sentences [/INST]"_ \
-  *Output:* "A blockchain is a decentralized, distributed digital ledger that records transactions across a network of computers in a secure and transparent manner."
 ]
 #v(0.3em)
 
-These are not degraded or garbled outputs. They are factually correct, grammatically fluent, and indistinguishable from floating-point inference by inspection. The critical property: every output above is _bitwise identical_ across ARM and x86 hardware, across all four nodes, across every run.
+These outputs are factually correct, grammatically fluent, and indistinguishable from floating-point inference. The critical property: every output is _bitwise identical_ across ARM and x86 hardware, across all nodes, across every run. Additional examples are provided in Appendix A.3.
 
 *Distribution calibration.* We separately measure perplexity (PPL) on WikiText-2, which quantifies the calibration of the full probability distribution---not whether the model selects the right token, but whether it assigns the right _probability_ to every token.
 
@@ -612,38 +634,8 @@ The calibration gap is a property of the INT8 bit-width, not of deterministic in
 
 
 // ============================================================================
-= Implications for Trustworthy AI Research
+= Implications
 // ============================================================================
-
-The Determinism Thesis has consequences beyond inference engineering. We show that every major trust property studied in the AI safety and governance literature presupposes platform-deterministic inference---often without stating this assumption.
-
-#theorem("Trust Dependency Hierarchy")[
-  The following trust properties of AI systems each presuppose platform-deterministic inference:
-
-  *(i)* Fairness Auditing $=>$ R and A $=>$ Determinism. \
-  *(ii)* Robustness Certification $=>$ C $=>$ Determinism. \
-  *(iii)* Privacy Compliance $=>$ V $=>$ Determinism. \
-  *(iv)* Safety Certification $=>$ R and C $=>$ Determinism. \
-  *(v)* Alignment Verification $=>$ V and R $=>$ Determinism.
-
-  Therefore, platform-deterministic inference is a necessary condition for all independently verifiable trust properties of AI systems.
-]
-
-*(i) Fairness.* Auditing a model for bias requires reproducing the computation that produced a decision (R) and reconstructing the computational trace to identify which features influenced the output (A). Without determinism, the auditor's re-execution produces different intermediate values, making attribution of bias impossible. Fairness auditing without determinism is theater---the auditor cannot verify whether disparate outcomes arose from the model's learned biases or from hardware-induced differences.
-
-*(ii) Robustness.* Certifying that a model is robust to adversarial inputs requires testing on a specific hardware platform and transferring that certification to all deployment platforms (C). Without determinism, a model certified as robust on platform $h_1$ may exhibit different behavior on $h_2$, where a previously-benign perturbation now crosses the decision boundary. Robustness certification becomes per-platform, not per-model.
-
-*(iii) Privacy.* Verifying that differential privacy or federated learning guarantees were correctly applied requires verifying the computation (V). Without determinism, the verifier cannot confirm that the claimed privacy mechanism was executed---re-execution produces different results, and the verifier cannot distinguish "privacy was applied" from "privacy was not applied but hardware differences mask the difference."
-
-*(iv) Safety.* Safety testing for autonomous vehicles, medical AI, and avionics requires both reproducibility (R)---the same test produces the same result---and certifiability (C)---certification on test hardware transfers to deployment hardware. Without determinism, a fleet of heterogeneous robots requires per-unit safety certification @eu_ai_act, scaling cost with deployment size rather than model complexity.
-
-*(v) Alignment.* Verifying that an AI system's behavior matches its stated objectives requires verifying what computation it actually performed (V) and reproducing that computation independently (R). Without determinism, an AI system could produce different behavior on different hardware, and no external verifier could distinguish intentional misalignment from hardware-induced divergence.
-
-#corollary("Determinism as Foundation")[
-  Determinism is not one desirable property among many. It is the computational foundation without which no other trust property is independently verifiable. Every proposal for trustworthy AI that does not address platform determinism implicitly assumes it.
-]
-
-== Additional Implications
 
 *Multi-agent coordination.* When multiple AI agents must reach consensus---autonomous vehicles negotiating right-of-way, trading algorithms settling a contract---non-deterministic inference requires an external oracle. Deterministic inference eliminates the oracle: all agents compute the same output by mathematical necessity.
 
@@ -703,7 +695,7 @@ The Determinism Thesis opens a research program spanning cryptography, systems, 
 = Conclusion
 // ============================================================================
 
-We have established the mathematical foundations of trustworthy artificial intelligence. Determinism is both necessary and sufficient for trust (Theorems 4--5). Floating-point arithmetic fundamentally prevents it (Theorem 7). Integer arithmetic provides it (Theorem 15). Trust entropy quantifies the cost of non-determinism exactly (Theorem 9). Floating-point divergence grows exponentially through residual networks (Theorem 11). Verification complexity collapses to $O(1)$ under determinism and becomes intractable without it (Theorem 14). And every major trust property---fairness, robustness, privacy, safety, alignment---presupposes determinism as its computational foundation (Theorem 16).
+We have established the mathematical foundations of trustworthy artificial intelligence. Determinism is both necessary and sufficient for trust (Theorems 4--5). Every major trust property---fairness, robustness, privacy, safety, alignment---presupposes determinism (Theorem 7). Floating-point arithmetic fundamentally prevents it (Theorem 9). Trust entropy quantifies the cost of non-determinism exactly (Theorem 11). Floating-point divergence grows exponentially through residual networks (Theorem 13). Verification complexity collapses to $O(1)$ under determinism and becomes intractable without it (Theorem 16). Integer arithmetic provides determinism by algebraic necessity (Theorem 17).
 
 We demonstrated these results in practice: 82 cross-platform tests with zero hash mismatches across ARM and x86---including Llama-2-7B at 512 tokens---and multi-node consensus across four servers on three continents producing identical outputs verified by 356 on-chain attestation transactions.
 
