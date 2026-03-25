@@ -315,20 +315,18 @@ ARC Chain is in active development. This is a testnet. Do not use real funds. Th
 
 ## License
 
-Code is public. Open source in spirit.
+All source code is public. Read it, learn from it, build with it.
 
-**Under $10M revenue:** Full production rights. Build whatever you want. No fees, no restrictions, no approval.
+**What you can do:**
 
-**Over $10M revenue using the code:** Commercial license starting at $50,000/year. Fair compensation for original work. Reach out: tj@arc.ai
+- Use ARC for any project if your org is under $10M revenue. Full production rights. No approval needed.
+- Build anything on the ARC chain at any scale, any revenue. Contracts, tokens, agents, L2s, rollups, subnets. If it runs on ARC, it's free forever.
+- Run a validator, node, or inference provider. Always free.
+- Use it for research, education, personal projects. Always free.
+- Fork it, modify it, experiment with it.
 
-**Building on the ARC chain:** Always free. No revenue limit. No size limit. No exceptions. Deploy contracts, launch tokens, run agents, build L2s, rollups, subnets. If your project runs on or settles to ARC, you have zero restrictions regardless of how big you get.
+If your org is over $10M revenue and you want to use the code outside the ARC ecosystem, reach out for a commercial license (starts at $50K/year). We're friendly about it: tj@arc.ai
 
-**Blockchain projects joining the ARC ecosystem:** Always free. Crypto project of any size, any market cap. If you want to build on ARC, deploy on ARC, or integrate with ARC, you are welcome. We want you here.
+**The one rule:** Don't take this codebase and launch a competing L1. I built this solo from scratch, every line, and I just don't want to see it repackaged as someone else's chain. Everything else is fair game. If you want to work together on something, I'm open to it.
 
-**Running ARC infrastructure:** Always free. Validators, node operators, inference providers.
-
-**Using any component of this code without a license:** Not permitted. You cannot extract the consensus engine, inference runtime, cryptographic primitives, or any other part and use it in your own project without a license. The license covers the full codebase and all its components.
-
-**Forking ARC to launch your own chain:** Not permitted. Don't take this code and repackage it as your own network. If you want to work together, reach out. We would rather partner than litigate.
-
-Becomes fully open source (Apache 2.0) on March 25, 2030. See [LICENSE](LICENSE) for full terms.
+Becomes fully open source (Apache 2.0) on March 25, 2030. See [LICENSE](LICENSE) for details.
