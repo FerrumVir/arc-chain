@@ -12,7 +12,7 @@ set -e
 #
 # What you'll see:
 #   - Live chain: block height, TPS, consensus rounds
-#   - Peer connections to seed nodes across 3 continents
+#   - Peer connections to seed nodes across 6 continents
 #   - (with --with-inference) Run deterministic inference and verify output hash
 #
 # Requirements: Rust nightly, ~2GB disk for build, ~4GB for model
@@ -76,7 +76,7 @@ if [[ -n "$MODEL_FLAG" ]]; then
     echo ""
 fi
 
-echo -e "${CYAN}Connecting to ARC testnet seeds across 3 continents...${NC}"
+echo -e "${CYAN}Connecting to ARC testnet seeds across 6 continents...${NC}"
 echo "Press Ctrl+C to stop."
 echo ""
 
