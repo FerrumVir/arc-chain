@@ -319,8 +319,13 @@ impl ConsensusManager {
                         } => {
                             // Insert the full transactions into pending_txs
                             // so we can resolve them when this block commits.
+                            // Mark as sig_verified — the proposing node validated
+                            // them at the RPC layer, and sig_verified doesn't
+                            // survive serde roundtrip (defaults to false).
                             for tx in &transactions {
-                                pending_txs.insert(tx.hash.0, tx.clone());
+                                let mut tx_copy = tx.clone();
+                                tx_copy.sig_verified = true;
+                                pending_txs.insert(tx_copy.hash.0, tx_copy);
                             }
                             // Feed block into consensus engine
                             match self.engine.receive_block(&block) {
