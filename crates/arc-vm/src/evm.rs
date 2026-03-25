@@ -180,9 +180,14 @@ fn apply_state_changes(
             continue;
         }
 
-        // Update balance and nonce
+        // Update balance and nonce (clamp U256 to u64 range)
         let mut acct = state.get_or_create_account(&arc_addr);
-        acct.balance = account.info.balance.as_limbs()[0];
+        acct.balance = if account.info.balance > revm::primitives::U256::from(u64::MAX) {
+            tracing::warn!("EVM balance exceeds u64::MAX for {:?}, clamping", arc_addr);
+            u64::MAX
+        } else {
+            account.info.balance.as_limbs()[0]
+        };
         acct.nonce = account.info.nonce;
         state.update_account(&arc_addr, acct);
 
