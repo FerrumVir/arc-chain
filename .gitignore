@@ -35,3 +35,5 @@ explorer/public/benchmark-data/
 deploy/.node-ips
 desktop/src-tauri/target/
 rustc-ice*
+__pycache__/
+*.pyc
