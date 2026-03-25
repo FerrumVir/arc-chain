@@ -315,18 +315,25 @@ ARC Chain is in active development. This is a testnet. Do not use real funds. Th
 
 ## License
 
-All source code is public. Read it, learn from it, build with it.
+Open source in spirit. All source code is public. Read it, learn from it, build with it.
 
 **What you can do:**
 
 - Use ARC for any project if your org is under $10M revenue. Full production rights. No approval needed.
 - Build anything on the ARC chain at any scale, any revenue. Contracts, tokens, agents, L2s, rollups, subnets. If it runs on ARC, it's free forever.
+- Join the ARC ecosystem. Crypto projects of any size, any market cap. If you want to build on ARC, deploy on ARC, or integrate with ARC, you are welcome. We want you here.
 - Run a validator, node, or inference provider. Always free.
 - Use it for research, education, personal projects. Always free.
 - Fork it, modify it, experiment with it.
 
 If your org is over $10M revenue and you want to use the code outside the ARC ecosystem, reach out for a commercial license (starts at $50K/year). We're friendly about it: tj@arc.ai
 
-**The one rule:** Don't take this codebase and launch a competing L1. I built this solo from scratch, every line, and I just don't want to see it repackaged as someone else's chain. Everything else is fair game. If you want to work together on something, I'm open to it.
+**What you can't do:**
+
+- Fork this codebase and launch a competing L1 blockchain
+- Extract components (consensus, inference, crypto) to use in a competing network
+- Repackage or rebrand this code as your own chain
+
+I built this solo from scratch, every line. I just don't want to see it taken and passed off as someone else's work. Everything else is fair game. If you want to work together on something, I'm open to it: tj@arc.ai
 
 Becomes fully open source (Apache 2.0) on March 25, 2030. See [LICENSE](LICENSE) for details.
