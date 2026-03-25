@@ -61,14 +61,32 @@ impl GgufEngine {
         let mut file = std::fs::File::open(path)
             .map_err(|e| InferenceError::Runtime(format!("Failed to open {path}: {e}")))?;
 
-        // For model_id: hash the first 1MB + file size (faster than hashing 4GB)
+        // For model_id: hash first 1MB + last 1MB + file size.
+        // Hashing the full multi-GB file is too slow for startup, but sampling
+        // both ends catches corrupted/tampered weight data that a header-only
+        // hash would miss.
         let file_size = file.metadata()
             .map_err(|e| InferenceError::Runtime(format!("Failed to stat {path}: {e}")))?
             .len();
 
-        let mut header_buf = vec![0u8; (1024 * 1024).min(file_size as usize)];
+        let head_size = (1024 * 1024).min(file_size as usize);
+        let mut header_buf = vec![0u8; head_size];
         file.read_exact(&mut header_buf)
             .map_err(|e| InferenceError::Runtime(format!("Failed to read {path}: {e}")))?;
+
+        // Also read the last 1MB (or less for small files)
+        let tail_size = (1024 * 1024).min(file_size as usize);
+        let tail_offset = (file_size as usize).saturating_sub(tail_size);
+        if tail_offset > head_size {
+            use std::io::Seek;
+            file.seek(std::io::SeekFrom::Start(tail_offset as u64))
+                .map_err(|e| InferenceError::Runtime(format!("Failed to seek {path}: {e}")))?;
+            let mut tail_buf = vec![0u8; tail_size];
+            file.read_exact(&mut tail_buf)
+                .map_err(|e| InferenceError::Runtime(format!("Failed to read tail of {path}: {e}")))?;
+            header_buf.extend_from_slice(&tail_buf);
+        }
+
         header_buf.extend_from_slice(&file_size.to_le_bytes());
         let model_id = arc_crypto::hash_bytes(&header_buf);
 
