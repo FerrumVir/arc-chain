@@ -970,10 +970,10 @@ impl StateDB {
                     let orig_idx = sorted_indices[sorted_idx];
                     let tx = &transactions[orig_idx];
                     self.mark_tx_accounts_dirty(tx);
-                    let result = if tx.is_unsigned() {
+                    let result = if tx.sig_verified {
+                        self.execute_tx(tx) // Pre-verified (faucet/RPC) — skip sig check
+                    } else if tx.is_unsigned() {
                         Err(StateError::ExecutionError("unsigned transaction".into()))
-                    } else if tx.sig_verified {
-                        self.execute_tx(tx)
                     } else if tx.verify_signature().is_err() {
                         Err(StateError::ExecutionError("invalid signature".into()))
                     } else {
@@ -1147,11 +1147,11 @@ impl StateDB {
         // or batch-verified above.
         for (i, tx) in transactions.iter().enumerate() {
             self.mark_tx_accounts_dirty(tx);
-            let result = if tx.is_unsigned() {
-                Err(StateError::ExecutionError("unsigned transaction".into()))
-            } else if tx.sig_verified {
-                // Already verified at mempool insertion — skip costly re-verification
+            let result = if tx.sig_verified {
+                // Pre-verified (faucet/RPC) — skip sig check
                 self.execute_tx(tx)
+            } else if tx.is_unsigned() {
+                Err(StateError::ExecutionError("unsigned transaction".into()))
             } else if let Some(valid) = batch_sig_valid[i] {
                 // Batch-verified above
                 if valid {
