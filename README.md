@@ -236,9 +236,11 @@ Three tiers of AI inference, each with different trust/cost tradeoffs:
 
 ## ARC Token
 
-ARC currently exists as an ERC-20 on Ethereum (`0x...f499`). Tokens will migrate to the ARC Chain mainnet. Fixed supply of 1.03B ARC. No tokens are ever burned.
+ARC exists today as an ERC-20 on Ethereum: [`0x672fdba7055bddfa8fd6bd45b1455ce5eb97f499`](https://etherscan.io/token/0x672fdba7055bddfa8fd6bd45b1455ce5eb97f499)
 
-On testnet, use the faucet to get test tokens and experiment with all features.
+When ARC Chain mainnet launches, ERC-20 holders will migrate to native ARC tokens via a bridge contract. Fixed supply of 1.03B ARC. No tokens are ever burned. No inflation.
+
+On testnet, use the faucet to get test tokens and start building now.
 
 ---
 
