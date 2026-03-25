@@ -65,24 +65,35 @@ td { padding: 8px; border-bottom: 1px solid #0d1117; font-size: 13px; }
 <div id="error"></div>
 
 <div class="section">
-  <h2><span class="live-dot"></span>Network Nodes (Global Testnet)</h2>
+  <h2><span class="live-dot"></span>Network Nodes (Global Testnet &mdash; 6 Continents)</h2>
   <div class="node-grid" id="nodes"></div>
 </div>
 
 <div class="section">
-  <h2>Recent Inference Attestations</h2>
-  <div id="attestations"><p style="color:#64748b">Run inference via POST /inference/run to see attestations here</p></div>
+  <h2><span class="live-dot"></span>Recent Transactions</h2>
+  <p style="color:#64748b;margin-bottom:10px;font-size:12px">Click any transaction to view full details</p>
+  <div id="recent-txs"><p style="color:#64748b">Loading...</p></div>
 </div>
 
 <div class="section">
-  <h2>Cross-Platform Determinism Proof</h2>
-  <p style="color:#64748b;margin-bottom:10px;font-size:12px">Same model, same input &rarr; identical output hash on ARM (Mac Studio M2 Ultra) and x86 (Vultr cloud)</p>
-  <div id="determinism"><p style="color:#64748b">Loading proof data...</p></div>
+  <h2>Inference Attestations</h2>
+  <p style="color:#64748b;margin-bottom:10px;font-size:12px">On-chain AI inference with cryptographic output verification</p>
+  <div id="attestations"><p style="color:#64748b">Loading...</p></div>
 </div>
 
 <div class="section">
   <h2>Latest Block</h2>
   <div id="latest-block"><p style="color:#64748b">Loading...</p></div>
+</div>
+
+<div id="tx-modal" style="display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:100;overflow-y:auto">
+  <div style="max-width:700px;margin:60px auto;background:#111827;border:1px solid #1e2d3d;border-radius:8px;padding:20px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px">
+      <h2 style="color:#60a5fa;font-size:16px;margin:0">Transaction Details</h2>
+      <span onclick="document.getElementById('tx-modal').style.display='none'" style="cursor:pointer;color:#64748b;font-size:20px">&times;</span>
+    </div>
+    <div id="tx-modal-body"></div>
+  </div>
 </div>
 
 <div class="footer">
@@ -177,11 +188,15 @@ async function updateNodes() {
 
   for (const node of NODES) {
     const health = await fetchJSON(`http://${node.ip}:9090/health`, 3000);
+    const stats = await fetchJSON(`http://${node.ip}:9090/stats`, 3000);
+    const vals = await fetchJSON(`http://${node.ip}:9090/validators`, 3000);
     if (health) {
+      const txCount = stats ? stats.total_transactions.toLocaleString() : '?';
+      const valCount = vals ? vals.count : '?';
       cards.push(`<div class="node-card">
         <div class="name">${node.name}</div>
-        <div class="detail">${node.region} &bull; Height: ${health.height} &bull; Peers: ${health.peers}</div>
-        <div class="detail">Uptime: ${formatUptime(health.uptime_secs)} &bull; <span class="badge green">ONLINE</span></div>
+        <div class="detail">${node.region} &bull; Peers: ${health.peers} &bull; Validators: ${valCount}</div>
+        <div class="detail">Txs: ${txCount} &bull; Uptime: ${formatUptime(health.uptime_secs)} &bull; <span class="badge green">ONLINE</span></div>
       </div>`);
     } else {
       cards.push(`<div class="node-card down">
@@ -210,43 +225,137 @@ async function updateBlock() {
   }
 }
 
-async function testInference() {
-  const result = await fetchJSON(`${RPC_URL}/inference/run`, 60000);
-  // This would need a POST — just show the endpoint info
+function shortHash(h) { return h ? h.substring(0, 10) + '...' + h.substring(h.length - 6) : '?'; }
+function shortAddr(a) { return a ? a.substring(0, 8) + '...' + a.substring(a.length - 6) : '?'; }
+
+async function showTxDetail(hash) {
+  const modal = document.getElementById('tx-modal');
+  const body = document.getElementById('tx-modal-body');
+  body.innerHTML = '<p style="color:#64748b">Loading...</p>';
+  modal.style.display = 'block';
+
+  // Try each node until we find the tx
+  let tx = null;
+  for (const node of NODES) {
+    tx = await fetchJSON(`http://${node.ip}:9090/tx/${hash}/full`, 5000);
+    if (tx && tx.tx_type) break;
+  }
+
+  if (!tx || !tx.tx_type) {
+    body.innerHTML = '<p style="color:#ef4444">Transaction not found on any node</p>';
+    return;
+  }
+
+  const statusBadge = tx.success
+    ? '<span class="badge green">SUCCESS</span>'
+    : '<span class="badge red">FAILED</span>';
+
+  let bodyHtml = '';
+  if (tx.body) {
+    if (tx.body.type === 'Transfer') {
+      bodyHtml = `<tr><td>To</td><td style="word-break:break-all">${tx.body.to || '?'}</td></tr>
+        <tr><td>Amount</td><td style="color:#34d399">${(tx.body.amount || 0).toLocaleString()} ARC</td></tr>`;
+    } else {
+      bodyHtml = `<tr><td>Body</td><td style="font-size:11px">${JSON.stringify(tx.body).substring(0, 200)}</td></tr>`;
+    }
+  }
+
+  body.innerHTML = `<table style="width:100%">
+    <tr><td style="color:#64748b;width:120px">Hash</td><td style="word-break:break-all;font-size:12px">${tx.tx_hash}</td></tr>
+    <tr><td style="color:#64748b">Type</td><td><span class="badge blue">${tx.tx_type}</span></td></tr>
+    <tr><td style="color:#64748b">Status</td><td>${statusBadge}</td></tr>
+    <tr><td style="color:#64748b">From</td><td style="word-break:break-all;font-size:12px">${tx.from}</td></tr>
+    ${bodyHtml}
+    <tr><td style="color:#64748b">Nonce</td><td>${tx.nonce}</td></tr>
+    <tr><td style="color:#64748b">Gas Used</td><td>${(tx.gas_used || 0).toLocaleString()}</td></tr>
+    <tr><td style="color:#64748b">Block</td><td>${tx.block_height || '?'}</td></tr>
+  </table>`;
 }
 
-// Load determinism proof data if available
-async function loadDeterminism() {
-  // Try to load from a served file, or show hardcoded results
-  const el = document.getElementById('determinism');
-  try {
-    const resp = await fetch('/determinism-proof.jsonl');
-    if (!resp.ok) throw new Error('not found');
-    const text = await resp.text();
-    const lines = text.trim().split('\n').map(l => JSON.parse(l));
-    const matches = lines.filter(l => l.status === 'MATCH');
-    const total = lines.filter(l => l.status === 'MATCH' || l.status === 'MISMATCH');
-
-    let html = `<p style="margin-bottom:10px"><span class="badge green">${matches.length}/${total.length} MATCH</span> &mdash; All output hashes identical across ARM and x86</p>`;
-    html += '<table><tr><th>#</th><th>Category</th><th>Tokens</th><th>Hash</th><th>ARM ms/tok</th><th>x86 ms/tok</th><th>Status</th></tr>';
-    for (const r of total.slice(0, 30)) {
-      const badge = r.match ? '<span class="badge green">MATCH</span>' : '<span class="badge red">MISMATCH</span>';
-      html += `<tr>
-        <td>${r.idx}</td>
-        <td>${r.category}</td>
-        <td>${r.max_tokens}</td>
-        <td style="font-size:11px">${(r.arm_hash || '').substring(0, 18)}...</td>
-        <td>${r.arm_ms_per_token || '?'}</td>
-        <td>${r.x86_ms_per_token || '?'}</td>
-        <td>${badge}</td>
-      </tr>`;
+async function updateRecentTxs() {
+  const el = document.getElementById('recent-txs');
+  // Get recent blocks and extract tx hashes
+  let allTxs = [];
+  const stats = await fetchJSON(`${RPC_URL}/stats`, 3000);
+  if (!stats) return;
+  const h = stats.block_height || 0;
+  if (h === 0 && stats.total_transactions > 0) {
+    // Direct-apply mode — get txs from faucet account history
+    const genesis0 = '2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213';
+    const txList = await fetchJSON(`${RPC_URL}/account/${genesis0}/txs`, 3000);
+    if (txList && txList.tx_hashes) {
+      allTxs = txList.tx_hashes.slice(-10).reverse();
     }
-    if (total.length > 30) html += `<tr><td colspan="7" style="color:#64748b">...and ${total.length - 30} more</td></tr>`;
-    html += '</table>';
-    el.innerHTML = html;
-  } catch(e) {
-    el.innerHTML = `<p style="color:#64748b">Determinism proof data not yet available. Run prove_determinism.py to generate.</p>
-    <p style="color:#34d399;margin-top:8px;font-size:12px">Preview: 70/100 prompts tested, ALL hashes match ARM vs x86 (TinyLlama 1.1B INT8)</p>`;
+  } else {
+    // Block mode — get from recent blocks
+    const from = Math.max(0, h - 5);
+    const blocks = await fetchJSON(`${RPC_URL}/blocks?from=${from}&to=${h}&limit=5`, 3000);
+    if (blocks && blocks.blocks) {
+      for (const b of blocks.blocks.reverse()) {
+        if (b.tx_count > 0) {
+          const full = await fetchJSON(`${RPC_URL}/block/${b.height}`, 3000);
+          if (full && full.tx_hashes) {
+            for (const th of full.tx_hashes) {
+              if (th !== '0000000000000000000000000000000000000000000000000000000000000000') {
+                allTxs.push(th);
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (allTxs.length === 0) {
+    el.innerHTML = '<p style="color:#64748b">No transactions yet</p>';
+    return;
+  }
+
+  let html = '<table><tr><th>Hash</th><th>Type</th><th>Amount</th><th>Status</th></tr>';
+  for (const hash of allTxs.slice(0, 15)) {
+    let tx = await fetchJSON(`${RPC_URL}/tx/${hash}/full`, 3000);
+    if (!tx) { tx = await fetchJSON(`${RPC_URL}/tx/${hash}`, 3000); }
+    const type = tx ? (tx.tx_type || 'Transfer') : '?';
+    const amount = tx && tx.body ? (tx.body.amount || 0) : 0;
+    const success = tx ? tx.success : null;
+    const badge = success === true ? '<span class="badge green">OK</span>'
+      : success === false ? '<span class="badge red">FAIL</span>' : '';
+    html += `<tr style="cursor:pointer" onclick="showTxDetail('${hash}')">
+      <td style="color:#60a5fa;font-size:12px">${shortHash(hash)}</td>
+      <td><span class="badge blue">${type}</span></td>
+      <td>${amount > 0 ? amount.toLocaleString() + ' ARC' : '-'}</td>
+      <td>${badge}</td>
+    </tr>`;
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+async function updateInference() {
+  const el = document.getElementById('attestations');
+  // Try to get inference attestations from any node with a model
+  let found = false;
+  for (const node of NODES) {
+    const att = await fetchJSON(`http://${node.ip}:9090/inference/attestations`, 3000);
+    if (att && att.attestations && att.attestations.length > 0) {
+      let html = '<table><tr><th>Input</th><th>Output</th><th>Hash</th><th>ms/tok</th><th>Model</th></tr>';
+      for (const a of att.attestations.slice(-10).reverse()) {
+        html += `<tr>
+          <td style="color:#fbbf24;max-width:200px;overflow:hidden;text-overflow:ellipsis">${a.input || '?'}</td>
+          <td style="color:#34d399;max-width:200px;overflow:hidden;text-overflow:ellipsis">${a.output || '?'}</td>
+          <td style="font-size:11px;color:#64748b">${shortHash(a.output_hash || '')}</td>
+          <td>${a.ms_per_token || '?'}</td>
+          <td style="font-size:11px">${shortHash(a.model_hash || '')}</td>
+        </tr>`;
+      }
+      html += '</table>';
+      el.innerHTML = html;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    el.innerHTML = '<p style="color:#64748b">No inference attestations on-chain yet. Inference nodes loading models...</p>';
   }
 }
 
@@ -254,11 +363,14 @@ async function loadDeterminism() {
 updateStatus();
 updateNodes();
 updateBlock();
-loadDeterminism();
+updateRecentTxs();
+updateInference();
 
 // Auto-refresh
-setInterval(updateStatus, 2000);
+setInterval(updateStatus, 3000);
 setInterval(updateBlock, 5000);
+setInterval(updateRecentTxs, 10000);
+setInterval(updateInference, 15000);
 setInterval(updateNodes, 30000);
 </script>
 </body>
