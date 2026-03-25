@@ -661,6 +661,11 @@ impl ConsensusManager {
                         let mut committed_txs: Vec<Transaction> = Vec::new();
                         for tx_hash in &dag_block.transactions {
                             if let Some((_, tx)) = pending_txs.remove(&tx_hash.0) {
+                                // Skip transactions already applied via direct RPC path
+                                // (faucet claims, /tx/submit). They're already in receipts.
+                                if state.receipts.contains_key(&tx.hash.0) {
+                                    continue;
+                                }
                                 committed_txs.push(tx);
                             }
                         }
