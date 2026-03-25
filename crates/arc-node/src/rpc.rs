@@ -1630,7 +1630,13 @@ fn parse_block_number(node: &NodeState, param: Option<&Value>) -> u64 {
         Some("earliest") => 0,
         Some(hex) => {
             let hex = hex.strip_prefix("0x").unwrap_or(hex);
-            u64::from_str_radix(hex, 16).unwrap_or(0)
+            match u64::from_str_radix(hex, 16) {
+                Ok(n) => n,
+                Err(_) => {
+                    tracing::warn!("Invalid block number hex '{}', defaulting to latest", hex);
+                    node.state.height().saturating_sub(1)
+                }
+            }
         }
     }
 }

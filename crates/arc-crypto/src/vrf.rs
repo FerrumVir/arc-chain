@@ -89,21 +89,25 @@ pub fn vrf_prove(
     // so gamma is a clean 32-byte value.
     let gamma = {
         let mut h = blake3::Hasher::new_derive_key("ARC-vrf-gamma-derive-v1");
+        // Include scheme discriminant to prevent cross-scheme collisions
         match &gamma_sig {
             Signature::Ed25519 {
                 public_key,
                 signature,
             } => {
+                h.update(&[0u8]); // scheme tag
                 h.update(public_key);
                 h.update(signature);
             }
             Signature::Secp256k1 { signature } => {
+                h.update(&[1u8]); // scheme tag
                 h.update(signature);
             }
             Signature::MlDsa65 {
                 public_key,
                 signature,
             } => {
+                h.update(&[2u8]); // scheme tag
                 h.update(public_key);
                 h.update(signature);
             }
@@ -111,6 +115,7 @@ pub fn vrf_prove(
                 public_key,
                 signature,
             } => {
+                h.update(&[3u8]); // scheme tag
                 h.update(public_key);
                 h.update(signature);
             }
