@@ -7,3 +7,4 @@ pub mod synthesizer;
 pub mod evolution;
 pub mod solver;
 pub mod steering;
+pub mod llm_engine;
