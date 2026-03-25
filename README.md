@@ -1,8 +1,12 @@
 # ARC Chain - Testnet
 
-The fastest Layer 1 blockchain for AI. Deterministic inference, zero-fee agent settlements, dual VM (EVM + WASM), post-quantum cryptography. Built from scratch in Rust.
+**The blockchain for the agentic economy.**
 
-**Not a fork. Not a copy. Every line is original. 99,000+ lines. One person.**
+On-chain AI inference was previously thought impossible because floating-point arithmetic produces different results on different hardware. We solved it. The ARC engine uses pure integer arithmetic to achieve bitwise identical inference outputs across every chip, every architecture, every device on earth. This means AI outputs can be cryptographically verified for the first time. Agents can trust each other. Inference can be proven. The agentic economy can be built.
+
+Read the paper: [On the Foundations of Trustworthy Artificial Intelligence](papers/foundations-trustworthy-ai.pdf)
+
+99,000+ lines of Rust. Built from scratch.
 
 ---
 
@@ -10,17 +14,16 @@ The fastest Layer 1 blockchain for AI. Deterministic inference, zero-fee agent s
 
 | Feature | ARC | Everyone Else |
 |---------|-----|---------------|
-| **On-chain AI inference** | 76 ms/token, deterministic, identical on every chip on earth | Does not exist on any other chain |
-| **Agent settlements** | Zero fees forever. Agents are first-class citizens. | No chain offers zero-fee agent transactions |
-| **Verified inference** | Cryptographic proof that a specific model produced a specific output. STARK proofs up to 70B+ parameter models. | No other chain can verify inference at all |
-| **Smart contracts** | Both EVM (Solidity) and WASM (Rust, C, Go) natively. Pick your stack. | One or the other, not both |
-| **Quantum resistant** | Falcon-512 + ML-DSA in production today. Not a roadmap item. Ships now. | No production chain has post-quantum signatures |
-| **Multi-node TPS** | 33,230 measured with real consensus, real QUIC, real DAG | Ethereum: ~15. Solana: ~4,000 sustained |
-| **Single-node TPS** | 183,000 measured | Most chains don't publish single-node benchmarks |
-| **Finality** | ~200ms, 2-round DAG commit | Ethereum: ~12 min. Solana: ~400ms. Most chains: seconds |
-| **MEV protection** | BLS threshold encrypted mempool. Transactions are encrypted until committed. | Exposed or partially mitigated |
-| **Signatures** | 5 algorithms: Ed25519, Falcon-512, BLS12-381, ML-DSA, secp256k1 | Most chains support 1 or 2 |
-| **ZK proofs** | Circle STARKs (Stwo) over Mersenne-31. No trusted setup. Post-quantum. Proven at 7B model scale. | SNARKs with trusted setup, limited to ~10M parameter models |
+| **On-chain AI inference** | 76 ms/token, deterministic, identical on every chip on earth | Does not exist. Previously thought impossible. |
+| **Verified inference** | Cryptographic proof that a specific model produced a specific output. Proven at 7B parameters, 700x larger than any prior ZK-verified model. Attested through multi-node DAG consensus. | No chain can verify AI inference. |
+| **Agent settlements** | Zero fees forever. Agents are first-class citizens with dedicated transaction types. | No chain offers zero-fee agent transactions. |
+| **Smart contracts** | Both EVM (Solidity) and WASM (Rust, C, Go) natively. Pick your stack. | One or the other, not both. |
+| **Quantum resistant** | Falcon-512 + ML-DSA implemented and shipping. Not a roadmap item. | No production chain has post-quantum signatures. |
+| **Multi-node TPS** | 33,230 measured with real DAG consensus over real QUIC networking. Throughput increases with more validators (DAG consensus scales horizontally). | Ethereum: ~15 TPS. Solana: ~4,000 non-vote TPS sustained. |
+| **Finality** | ~200ms, 2-round DAG commit | Ethereum: ~12 min. Solana: ~400ms. |
+| **MEV protection** | BLS threshold encrypted mempool. Transactions encrypted until block is committed. | Exposed or partially mitigated. |
+| **Signatures** | 5 algorithms: Ed25519, Falcon-512, BLS12-381, ML-DSA, secp256k1 | 1 or 2 options. |
+| **ZK proofs** | Circle STARKs (Stwo). No trusted setup. Post-quantum secure. Verified at 700x the scale of any prior ZK-ML system. | SNARKs requiring trusted setup, limited to small models. |
 
 ---
 
@@ -306,18 +309,18 @@ ARC Chain is in active development. This is a testnet. Do not use real funds. Th
 
 Code is public. Open source in spirit.
 
-**Individuals and small companies (under $10M revenue):** Full production rights. Build whatever you want. No fees, no restrictions, no approval needed.
+**Under $10M revenue:** Full production rights. Build whatever you want. No fees, no restrictions, no approval.
 
-**Large companies (over $10M revenue) using code outside ARC:** Commercial license starting at $50,000/year. Not trying to be predatory. Just fair compensation for 99,000 lines of original work. Reach out: tj@arc.ai
+**Over $10M revenue using the code:** Commercial license starting at $50,000/year. Fair compensation for original work. Reach out: tj@arc.ai
 
-**Building ON the ARC chain:** Always free. No revenue limit. No size limit. Deploy contracts, launch tokens, run agents, build L2s, rollups, subnets. If your project runs on or settles to ARC, you have zero restrictions regardless of how big you get. A $10B project building on ARC pays nothing.
+**Building on the ARC chain:** Always free. No revenue limit. No size limit. No exceptions. Deploy contracts, launch tokens, run agents, build L2s, rollups, subnets. If your project runs on or settles to ARC, you have zero restrictions regardless of how big you get.
+
+**Blockchain projects joining the ARC ecosystem:** Always free. Crypto project of any size, any market cap. If you want to build on ARC, deploy on ARC, or integrate with ARC, you are welcome. We want you here.
 
 **Running ARC infrastructure:** Always free. Validators, node operators, inference providers.
 
-**Blockchain projects joining the ARC ecosystem:** Always free. If you're a crypto project of any size and you want to build on ARC, deploy on ARC, or integrate with ARC, you are welcome with no fees and no licensing. We want you here.
+**Using any component of this code without a license:** Not permitted. You cannot extract the consensus engine, inference runtime, cryptographic primitives, or any other part and use it in your own project without a license. The license covers the full codebase and all its components.
 
-**Forking ARC to launch a competing chain:** Not permitted. You cannot take this code and launch your own L1 or independent network. This is 99,000+ lines of original Rust built from scratch. Don't repackage it as your own. If you want to work together, reach out. We would rather partner than litigate.
-
-**Can you extract pieces of the code?** The license applies to the Licensed Work and derivative works. You cannot pull out the consensus engine, the inference runtime, or any other component and use it in a competing product without a license.
+**Forking ARC to launch your own chain:** Not permitted. Don't take this code and repackage it as your own network. If you want to work together, reach out. We would rather partner than litigate.
 
 Becomes fully open source (Apache 2.0) on March 25, 2030. See [LICENSE](LICENSE) for full terms.
