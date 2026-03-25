@@ -191,20 +191,30 @@ async function updateTxs(){
 
 async function updateInference(){
   const el=document.getElementById('inf-list');
-  // Try nodes that might have models
+  // Try all nodes for attestations
+  let best=null;
   for(const node of NODES){
-    const r=await f(`http://${node.ip}:9090/inference/attestations`,3000);
-    if(r&&r.attestations&&r.attestations.length>0){
-      el.innerHTML=r.attestations.slice(-5).reverse().map(a=>`
-        <div class="inf-card">
-          <div class="inf-q">Q: ${a.input||'—'}</div>
-          <div class="inf-a">A: ${a.output||'—'}</div>
-          <div class="inf-meta">Hash: ${sh(a.output_hash||'')} | ${a.ms_per_token||'?'} ms/tok | Model: ${sh(a.model_hash||'')}</div>
-        </div>`).join('');
-      return;
-    }
+    const r=await f(`http://${node.ip}:9090/inference/attestations?limit=20`,3000);
+    if(r&&r.attestations&&r.attestations.length>0&&(!best||r.attestations.length>best.length)){best=r.attestations}
   }
-  el.innerHTML='<span style="color:#475569">No inference attestations on-chain yet</span>';
+  if(!best||best.length===0){el.innerHTML='<span style="color:#475569">No attestations on-chain yet</span>';return}
+
+  let html='<table><tr><th>Block</th><th>Hash</th><th>Type</th><th>Amount</th><th>Status</th></tr>';
+  for(const a of best.slice(0,15)){
+    const s=a.success?'<span class="ok">OK</span>':'<span class="fail">FAIL</span>';
+    const type=a.tx_type||'Transfer';
+    const amt=a.amount?fmt(a.amount)+' ARC':'—';
+    const hash=a.tx_hash?a.tx_hash.replace('0x',''):'';
+    html+=`<tr class="click" onclick="showTx('${hash}')">
+      <td>${a.block_height||'?'}</td>
+      <td class="hash">${sh(hash)}</td>
+      <td>${type}</td>
+      <td>${amt}</td>
+      <td>${s}</td>
+    </tr>`;
+  }
+  html+='</table>';
+  el.innerHTML=html;
 }
 
 // Boot
