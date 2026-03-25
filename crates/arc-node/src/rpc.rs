@@ -355,17 +355,55 @@ async fn submit_tx(
         }
     }
 
-    // No signature provided — reject in production mode
-    // For backward compatibility, still accept unsigned in testnet
-    // TODO: Remove unsigned path before mainnet
+    // No signature — apply transfer directly to state for testnet.
+    // Verify sender has sufficient balance.
+    let sender_account = node.state.get_account(&from)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("Sender account {} not found", req.from)))?;
+
+    if sender_account.balance < req.amount {
+        return Err((StatusCode::BAD_REQUEST, format!(
+            "Insufficient balance: have {} ARC, need {} ARC",
+            sender_account.balance, req.amount
+        )));
+    }
+
     let tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
     let hash = tx.hash.to_hex();
 
-    node.mempool.insert(tx).map_err(|_| (StatusCode::CONFLICT, "duplicate transaction".to_string()))?;
+    // Apply transfer directly to state (testnet immediate settlement)
+    {
+        let mut sender = sender_account.clone();
+        sender.balance -= req.amount;
+        sender.nonce += 1;
+        node.state.update_account(&from, sender);
+
+        let mut recipient = node.state.get_or_create_account(&to);
+        recipient.balance += req.amount;
+        node.state.update_account(&to, recipient);
+    }
+
+    // Record transaction and receipt
+    let receipt = TxReceipt {
+        tx_hash: tx.hash,
+        block_height: node.state.height(),
+        block_hash: node.state.get_block(node.state.height())
+            .map(|b| b.hash)
+            .unwrap_or(Hash256::ZERO),
+        index: 0,
+        success: true,
+        gas_used: 21_000,
+        value_commitment: None,
+        inclusion_proof: None,
+        logs: vec![],
+    };
+    node.state.receipts.insert(tx.hash.0, receipt);
+    node.state.full_transactions.insert(tx.hash.0, tx.clone());
+    node.state.account_txs.entry(from.0).or_default().push(tx.hash);
+    node.state.account_txs.entry(to.0).or_default().push(tx.hash);
 
     Ok(Json(SubmitTxResponse {
         tx_hash: hash,
-        status: "pending (unsigned — will fail execution, use SDK for signed TXs)".to_string(),
+        status: "confirmed".to_string(),
     }))
 }
 
@@ -666,9 +704,6 @@ async fn faucet_claim(
     // Index for account tx history
     node.state.account_txs.entry(faucet_addr.0).or_default().push(tx.hash);
     node.state.account_txs.entry(to.0).or_default().push(tx.hash);
-
-    // Insert into mempool for propagation
-    let _ = node.mempool.insert(tx);
 
     // Record claim time
     {

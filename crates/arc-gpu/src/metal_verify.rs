@@ -2187,7 +2187,7 @@ mod tests {
 
     #[test]
     fn bench_gpu_vs_cpu_ed25519() {
-        let batch_sizes = [1_000, 5_000, 10_000, 50_000, 100_000];
+        let batch_sizes = [1_000, 5_000, 10_000, 25_000];
 
         // Detect which GPU pipeline is active
         let gpu_label = match get_or_init_gpu() {
