@@ -1081,7 +1081,7 @@ impl ConsensusEngine {
         //    For now, allow peers to pull us forward so nodes that start at
         //    different times can converge.
         let current = self.current_round.load(Ordering::SeqCst);
-        const MAX_ROUND_JUMP: u64 = 100; // Prevent DoS via arbitrarily large round values
+        const MAX_ROUND_JUMP: u64 = 10_000; // Prevent DoS via arbitrarily large round values
         if block.round > current + MAX_ROUND_JUMP {
             return Err(ConsensusError::InvalidRound);
         }
