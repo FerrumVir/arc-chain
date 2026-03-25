@@ -626,12 +626,24 @@ impl ConsensusManager {
                             }
                         } else if has_txs {
                             // ── Pipeline path: single-validator mode ─────────
-                            pipeline.submit(PipelineBatch {
-                                transactions: transactions.clone(),
-                                producer: self.validator_address,
-                            }).unwrap_or_else(|e| {
-                                warn!("Pipeline submit failed: {:?}", e);
-                            });
+                            // Filter out transactions already applied via RPC
+                            // (faucet/submit direct-apply). Without this filter,
+                            // the pipeline re-executes them → double nonce
+                            // increment and double balance deduction.
+                            let fresh_txs: Vec<Transaction> = transactions
+                                .iter()
+                                .filter(|tx| !state.receipts.contains_key(&tx.hash.0))
+                                .cloned()
+                                .collect();
+
+                            if !fresh_txs.is_empty() {
+                                pipeline.submit(PipelineBatch {
+                                    transactions: fresh_txs,
+                                    producer: self.validator_address,
+                                }).unwrap_or_else(|e| {
+                                    warn!("Pipeline submit failed: {:?}", e);
+                                });
+                            }
 
                             // Clean up pending index — pipeline owns them now
                             for tx in &transactions {
