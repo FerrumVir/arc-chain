@@ -526,8 +526,10 @@ async fn main() -> Result<()> {
     // ── Start DAG consensus in background ─────────────────────────────
     // Each node starts single-validator; peers added dynamically via P2P PeerConnected.
     // In benchmark mode this keeps the fast path active (no DAG quorum needed).
+    let dag_validators = Arc::new(parking_lot::RwLock::new(vec![(validator_address, stake)]));
     let mut consensus =
         ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &[], validator_keypair);
+    consensus.dag_validators = Some(dag_validators.clone());
     consensus.set_proposer_mode(cli.proposer_mode);
     let state_clone = state.clone();
     let mempool_clone = mempool.clone();
@@ -584,6 +586,7 @@ async fn main() -> Result<()> {
         inference_model,
         candle_engine,
         candle_model_id,
+        Some(dag_validators),
     )
     .await?;
 
