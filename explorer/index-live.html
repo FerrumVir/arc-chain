@@ -55,6 +55,7 @@ td { padding: 8px; border-bottom: 1px solid #0d1117; font-size: 13px; }
 
 <div class="status-bar">
   <div class="status-item"><div class="label">Block Height</div><div class="value" id="height">-</div></div>
+  <div class="status-item"><div class="label">Live TPS</div><div class="value green" id="tps">-</div></div>
   <div class="status-item"><div class="label">Nodes</div><div class="value green" id="peers">-</div></div>
   <div class="status-item"><div class="label">Transactions</div><div class="value" id="txcount">-</div></div>
   <div class="status-item"><div class="label">Accounts</div><div class="value" id="accounts">-</div></div>
@@ -125,24 +126,49 @@ function formatUptime(secs) {
   return `${Math.floor(secs/3600)}h ${Math.floor((secs%3600)/60)}m`;
 }
 
+let lastTxCount = 0;
+let lastTxTime = Date.now();
+
 async function updateStatus() {
-  const health = await fetchJSON(`${RPC_URL}/health`);
-  const stats = await fetchJSON(`${RPC_URL}/stats`);
+  // Aggregate across ALL nodes — use highest values
+  let maxHeight = 0, maxTx = 0, maxAccounts = 0, maxUptime = 0, onlineCount = 0;
 
-  if (health) {
-    document.getElementById('height').textContent = health.height.toLocaleString();
-    document.getElementById('peers').textContent = health.peers;
-    document.getElementById('uptime').textContent = formatUptime(health.uptime_secs);
-    document.getElementById('error').style.display = 'none';
-  } else {
-    document.getElementById('error').textContent = `Cannot reach node at ${RPC_URL}`;
-    document.getElementById('error').style.display = 'block';
+  const results = await Promise.allSettled(
+    NODES.map(n => fetchJSON(`http://${n.ip}:9090/stats`, 3000))
+  );
+  const healths = await Promise.allSettled(
+    NODES.map(n => fetchJSON(`http://${n.ip}:9090/health`, 3000))
+  );
+
+  for (let i = 0; i < NODES.length; i++) {
+    const s = results[i].status === 'fulfilled' ? results[i].value : null;
+    const h = healths[i].status === 'fulfilled' ? healths[i].value : null;
+    if (s) {
+      maxHeight = Math.max(maxHeight, s.block_height || 0);
+      maxTx = Math.max(maxTx, s.total_transactions || 0);
+      maxAccounts = Math.max(maxAccounts, s.total_accounts || 0);
+    }
+    if (h) {
+      maxUptime = Math.max(maxUptime, h.uptime_secs || 0);
+      onlineCount++;
+    }
   }
 
-  if (stats) {
-    document.getElementById('txcount').textContent = stats.total_transactions?.toLocaleString() || '0';
-    document.getElementById('accounts').textContent = stats.total_accounts?.toLocaleString() || '0';
-  }
+  // Compute live TPS from transaction delta
+  const now = Date.now();
+  const dt = (now - lastTxTime) / 1000;
+  const dtx = maxTx - lastTxCount;
+  const tps = (lastTxCount > 0 && dt > 0) ? Math.round(dtx / dt) : 0;
+  lastTxCount = maxTx;
+  lastTxTime = now;
+
+  document.getElementById('height').textContent = maxHeight.toLocaleString();
+  document.getElementById('tps').textContent = tps > 0 ? tps.toLocaleString() : '0';
+  document.getElementById('peers').textContent = onlineCount + '/8';
+  document.getElementById('txcount').textContent = maxTx.toLocaleString();
+  document.getElementById('accounts').textContent = maxAccounts.toLocaleString();
+  document.getElementById('uptime').textContent = formatUptime(maxUptime);
+  document.getElementById('error').style.display = 'none';
 }
 
 async function updateNodes() {
