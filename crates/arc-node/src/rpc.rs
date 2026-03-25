@@ -374,7 +374,8 @@ async fn submit_tx(
         )));
     }
 
-    let tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
+    let mut tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
+    tx.sig_verified = true; // Testnet direct-submit — skip sig check on consensus execution
     let hash = tx.hash.to_hex();
 
     // Apply transfer directly to state (testnet immediate settlement)
@@ -685,7 +686,8 @@ async fn faucet_claim(
     }
 
     // Create transfer transaction from faucet to recipient
-    let tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, faucet_account.nonce);
+    let mut tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, faucet_account.nonce);
+    tx.sig_verified = true; // Faucet is a trusted internal operation — skip sig check on all nodes
     let hash = tx.hash.to_hex();
 
     // Apply the transfer directly to state (immediate settlement for testnet faucet)
