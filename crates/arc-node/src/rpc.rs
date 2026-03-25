@@ -2766,28 +2766,39 @@ async fn inference_list_attestations(
     let height = node.state.height();
     let mut attestations = Vec::new();
 
-    // Scan recent blocks for InferenceAttestation transactions
+    // Scan recent blocks for transactions and enrich with full body details.
+    // For inference attestations, include model/input/output hashes.
     for h in (1..=height).rev().take(100) {
         if let Some(block) = node.state.get_block(h) {
             for tx_hash in &block.tx_hashes {
+                if tx_hash.0 == [0u8; 32] { continue; } // Skip zero hashes
                 if let Some(receipt) = node.state.get_receipt(&tx_hash.0) {
-                    if receipt.success {
-                        attestations.push(json!({
-                            "tx_hash": format!("0x{}", hex::encode(&tx_hash.0)),
-                            "block_height": h,
-                            "success": true,
-                            "gas_used": receipt.gas_used,
-                        }));
-                        if attestations.len() >= limit {
-                            break;
+                    let mut entry = json!({
+                        "tx_hash": format!("0x{}", hex::encode(&tx_hash.0)),
+                        "block_height": h,
+                        "success": receipt.success,
+                        "gas_used": receipt.gas_used,
+                    });
+                    // Enrich with full transaction body if available
+                    if let Some(tx) = node.state.full_transactions.get(&tx_hash.0) {
+                        entry["tx_type"] = json!(match &tx.body {
+                            TxBody::Transfer(_) => "Transfer",
+                            TxBody::Settle(_) => "Settle",
+                            TxBody::InferenceAttestation(_) => "InferenceAttestation",
+                            _ => "Other",
+                        });
+                        entry["from"] = json!(tx.from.to_hex());
+                        if let TxBody::Transfer(b) = &tx.body {
+                            entry["to"] = json!(b.to.to_hex());
+                            entry["amount"] = json!(b.amount);
                         }
                     }
+                    attestations.push(entry);
+                    if attestations.len() >= limit { break; }
                 }
             }
         }
-        if attestations.len() >= limit {
-            break;
-        }
+        if attestations.len() >= limit { break; }
     }
 
     Ok(Json(json!({
