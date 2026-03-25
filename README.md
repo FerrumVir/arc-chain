@@ -1,6 +1,6 @@
-# ARC Chain
+# ARC Chain — Testnet
 
-A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built for AI agent coordination with zero-fee settlements, DAG consensus, GPU-accelerated execution, and post-quantum cryptography.
+A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built for AI agent coordination with deterministic inference, zero-fee settlements, DAG consensus, GPU-accelerated execution, and post-quantum cryptography.
 
 **Not a fork. Not a copy. Every line is original.**
 
@@ -18,7 +18,7 @@ A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built 
 | **GPU Ed25519 verify** | **379,000/sec** | Metal compute shader, 13.68x over CPU |
 | **Ed25519 signing** | **82,800/sec** | Single-core, ed25519-dalek |
 
-All numbers measured on Apple M2 Ultra Mac Studio (24 cores, 64 GB). See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full methodology.
+All numbers measured on Apple M2 Ultra Mac Studio (24 cores, 64 GB).
 
 ---
 
@@ -61,7 +61,7 @@ Users / AI Agents
 
 ## Codebase
 
-**80,683 LOC Rust** | **1,117 tests** | **13 crates**
+**99,600+ LOC Rust** | **1,231 tests** | **14 crates**
 
 | Crate | LOC | Tests | What It Does |
 |-------|-----|-------|-------------|
@@ -131,26 +131,114 @@ Users / AI Agents
 
 ## Quick Start
 
-### One-Click Install (recommended)
-
-```bash
-curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-node.sh | bash
-```
-
-This will install Rust (if needed), clone the repo, build the node, generate a validator keypair, and start the node as a background service. Works on Linux (systemd) and macOS (launchd), Intel and ARM.
-
 ### Prerequisites
 
-- Rust 1.85+ (edition 2024)
-- Node.js 22+ (for explorer)
+- Rust nightly (`rustup default nightly`)
+- ~2 GB disk for build, ~4 GB with model
+- Node.js 22+ (for explorer, optional)
 
-### Build and test
+### See it live right now (zero install)
+
+The testnet is running. Try it:
+
+```bash
+# Chain stats from a live node (US West)
+curl http://140.82.16.112:9090/stats
+
+# Node health + peers + uptime
+curl http://140.82.16.112:9090/health
+
+# Chain info + GPU status
+curl http://140.82.16.112:9090/info
+```
+
+### Join the testnet (one command)
 
 ```bash
 git clone https://github.com/FerrumVir/arc-chain.git
 cd arc-chain
+./scripts/join-testnet.sh
+```
+
+This builds the node, connects to seed peers across 3 continents, and starts syncing. Once running:
+
+```bash
+# Check chain stats (block height, TPS, peers)
+curl http://localhost:9090/stats
+
+# Check node health
+curl http://localhost:9090/health
+
+# Run verified inference (downloads TinyLlama 1.1B, ~638 MB)
+./scripts/join-testnet.sh --with-inference
+
+# Test inference via RPC
+curl -X POST http://localhost:9090/inference/run \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":16}'
+```
+
+The inference output hash is deterministic — you'll get the same hash on any hardware (ARM, x86, GPU). Every inference is recorded as an `InferenceAttestation` transaction on-chain.
+
+### What you'll see
+
+```bash
+# Live chain stats
+curl http://localhost:9090/stats
+# → {"block_height":245,"total_accounts":100,"total_transactions":356,"mempool_size":0}
+
+# Node info (GPU detected, peers connected)
+curl http://localhost:9090/info
+# → {"chain":"ARC Chain","version":"0.1.0","block_height":245,"gpu":{"available":true}}
+
+# All inference attestations recorded on-chain
+curl http://localhost:9090/inference/attestations
+# → {"attestations":[{"model_id":"0x...","input_hash":"0x...","output_hash":"0x..."}],"count":356}
+
+# Run deterministic inference — same hash on every machine on earth
+curl -X POST http://localhost:9090/inference/run \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":16}'
+# → {"output":"Sure! The answer is 2+2 = 4.","output_hash":"0x...","ms_per_token":76}
+# 76 ms/token on GPU, 139 ms/token on CPU — faster than floating-point
+# The output_hash is identical on ARM, x86, and GPU. Verify it yourself.
+```
+
+### Testnet faucet
+
+```bash
+cd faucet && cargo run --release
+# Distributes testnet ARC tokens to new addresses
+```
+
+### AI agents
+
+Three agent types ship with the chain:
+
+```bash
+cd agents && cargo run --release
+```
+
+- **Oracle agent** — submits inference attestations with economic bonds
+- **Router agent** — routes inference requests to capable nodes
+- **Sentiment agent** — on-chain sentiment analysis via deterministic inference
+
+### Block explorer
+
+With your node running, open the explorer in a browser:
+
+```bash
+open explorer/index-live.html
+# Or navigate to: file:///path/to/arc-chain/explorer/index-live.html
+```
+
+Live dashboard showing blocks, transactions, accounts, inference attestations, and validator status. Polls your local node's RPC automatically.
+
+### Build and test
+
+```bash
 cargo build --release
-cargo test --workspace --lib    # 1,031 tests
+cargo test --workspace --lib    # 1,231 tests
 ```
 
 ### Run benchmarks
@@ -186,8 +274,8 @@ cargo run --release -p arc-node
 ### Run the explorer
 
 ```bash
-cd explorer && npm install && npm run dev
-# Explorer at http://localhost:3100
+open explorer/index-live.html
+# Opens live dashboard that polls your local node
 ```
 
 ---
@@ -215,25 +303,6 @@ cd explorer && npm install && npm run dev
 ETH JSON-RPC: `eth_blockNumber`, `eth_getBalance`, `eth_call`, `eth_estimateGas`, `eth_getLogs`
 
 ---
-
-## Scaling Projections
-
-Compound scaling from measured 27K TPS baseline:
-
-| Optimization | Multiplier | Status |
-|-------------|------------|--------|
-| More CPU cores (96 vs 10) | 6-10x | Ready (Rayon) |
-| GPU batch sig verification | 2-3x | Implemented |
-| BlockSTM parallel execution | 3-5x | Implemented |
-| GPU-resident state | 2-4x | Implemented |
-| Pipelined block production | 1.5-2x | Implemented |
-| STARK proof generation | per-block | Implemented (mock + Stwo) |
-| DA erasure coding | per-block | Implemented |
-| Inference Tier 2 (optimistic) | Off-chain AI with fraud proofs | Implemented |
-| Inference Tier 3 (STARK-verified) | ZK-proven off-chain AI | Implemented |
-
-**Measured single-node:** 69.3K TPS (M4), **Projected:** 300K-1.3M TPS (A100/H100)
-**Projected multi-node:** 1B+ TPS (100 H100 nodes with sharding)
 
 ---
 
@@ -273,25 +342,6 @@ No tokens are ever burned. The fixed supply of 1.03B ARC is fully preserved.
 
 ---
 
-## Deployment
-
-### Docker Compose
-
-```bash
-docker compose up -d --build
-# Node: http://localhost:9090
-# Explorer: http://localhost:3100
-```
-
-### Bare Metal (Ubuntu/Debian)
-
-```bash
-git clone https://github.com/FerrumVir/arc-chain.git /opt/arc-chain
-cd /opt/arc-chain && bash deploy.sh
-```
-
-Creates systemd services for `arc-node` and `arc-explorer` with automatic restart.
-
 ---
 
 ## Project Structure
@@ -318,12 +368,9 @@ arc-chain/
 +-- sdks/
 |   +-- python/           # arc_sdk: tx building, signing, RPC, ABI
 |   +-- typescript/       # @arc-chain/sdk: tx building, signing, RPC, ABI
-+-- explorer/             # Next.js block explorer with client-side verification
++-- explorer/             # Live block explorer (single-page HTML, polls RPC)
 +-- faucet/               # Rust testnet faucet
-+-- docs/                 # 9 developer guides
-+-- SPEC.md               # L1 technical specification
-+-- BENCHMARK_RESULTS.md  # Performance report with methodology
-+-- STATUS.md             # Feature completeness matrix
++-- papers/               # Research papers
 ```
 
 ---
@@ -332,18 +379,18 @@ arc-chain/
 
 | Document | Description |
 |----------|-------------|
-| [SPEC.md](SPEC.md) | Full L1 technical specification |
-| [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) | Measured performance, scaling projections, methodology |
-| [STATUS.md](STATUS.md) | Feature completeness matrix — what's done, what's next |
-| [docs/quickstart.md](docs/quickstart.md) | Getting started guide |
-| [docs/architecture.md](docs/architecture.md) | System architecture deep-dive |
-| [docs/rpc-api.md](docs/rpc-api.md) | RPC endpoint reference |
-| [docs/smart-contracts.md](docs/smart-contracts.md) | Contract development guide |
-| [docs/sdk-python.md](docs/sdk-python.md) | Python SDK reference |
-| [docs/sdk-typescript.md](docs/sdk-typescript.md) | TypeScript SDK reference |
+| [papers/](papers/) | Research papers: foundations of trustworthy AI, three-tier verification |
 
 ---
 
 ## License
 
-BUSL-1.1 — Business Source License 1.1
+BUSL-1.1 (Business Source License 1.1). Code is public.
+
+**Build on ARC: no limits.** Deploy contracts, launch tokens, run agents, build L2s, rollups, subnets — any size, any revenue, zero restrictions. If it settles on ARC, you're free.
+
+**Run ARC: no limits.** Validators, node operators, inference providers — always free.
+
+**Fork ARC to launch your own chain: no.** This is 99,000+ lines of original Rust built from scratch. These terms exist to prevent grift — don't take the code and repackage it as your own chain. If you want to work together, reach out: tj@arc.ai
+
+Converts to Apache 2.0 on March 25, 2030. See [LICENSE](LICENSE) for full terms.

@@ -1,0 +1,7 @@
+# ARC Testnet Seed Nodes
+# Public nodes across 3 continents. Your node connects to these on startup.
+
+149.28.32.76:9091    # NYC (US East)
+140.82.16.112:9091   # LAX (US West)
+136.244.109.1:9091   # AMS (Amsterdam)
+104.238.171.11:9091  # LHR (London)

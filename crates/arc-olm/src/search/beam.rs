@@ -339,6 +339,211 @@ fn matches_hodel_name(catalog_name: &str, hodel_name: &str) -> bool {
     }
 }
 
+// ============================================================
+// Exhaustive deterministic search
+// ============================================================
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+/// Global iteration counter for amortized timeout checking.
+static EXHAUST_ITER_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Exhaustive deterministic search — try ALL type-valid programs up to max_depth.
+/// No pruning, no beam width. Uses hash dedup and iterative deepening.
+pub fn exhaustive_search(
+    train_pairs: &[(Grid, Grid)],
+    test_inputs: &[Grid],
+    max_depth: usize,
+    timeout_ms: u64,
+) -> Option<SearchResult> {
+    if train_pairs.is_empty() || test_inputs.is_empty() {
+        return None;
+    }
+
+    let start = Instant::now();
+
+    // Reset the global iteration counter
+    EXHAUST_ITER_COUNT.store(0, Ordering::Relaxed);
+
+    // Collect colors from all training grids
+    let mut colors: Vec<u8> = Vec::new();
+    for (inp, out) in train_pairs {
+        for row in inp {
+            for &c in row {
+                if !colors.contains(&c) {
+                    colors.push(c);
+                }
+            }
+        }
+        for row in out {
+            for &c in row {
+                if !colors.contains(&c) {
+                    colors.push(c);
+                }
+            }
+        }
+    }
+    colors.sort();
+
+    let catalog = build_primitive_catalog(&colors);
+
+    let target = &train_pairs[0].1;
+    let input = &train_pairs[0].0;
+    let mut seen = HashSet::new();
+    seen.insert(quick_hash(input));
+
+    // Iterative deepening: depth 1, 2, 3, ... up to max_depth
+    for depth in 1..=max_depth {
+        if start.elapsed().as_millis() as u64 > timeout_ms {
+            break;
+        }
+
+        let mut steps: Vec<&'static str> = Vec::new();
+        let initial = DagValue::Grid(input.clone());
+
+        if let Some(result) = exhaustive_dfs(
+            &initial,
+            &DagType::Grid,
+            input,
+            target,
+            &catalog,
+            &mut steps,
+            depth,
+            &mut seen,
+            train_pairs,
+            test_inputs,
+            &start,
+            timeout_ms,
+        ) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+/// Recursive DFS worker for exhaustive search.
+/// Tries every type-valid primitive at each level, no pruning.
+fn exhaustive_dfs(
+    current: &DagValue,
+    current_type: &DagType,
+    input_grid: &Grid,
+    target: &Grid,
+    catalog: &[TypedPrimitive],
+    steps: &mut Vec<&'static str>,
+    remaining_depth: usize,
+    seen: &mut HashSet<u64>,
+    train_pairs: &[(Grid, Grid)],
+    test_inputs: &[Grid],
+    start: &Instant,
+    timeout_ms: u64,
+) -> Option<SearchResult> {
+    if remaining_depth == 0 {
+        return None;
+    }
+
+    for prim in catalog {
+        // Amortized timeout check: every 5,000 iterations
+        let count = EXHAUST_ITER_COUNT.fetch_add(1, Ordering::Relaxed);
+        if count % 5_000 == 0 && count > 0 {
+            if start.elapsed().as_millis() as u64 > timeout_ms {
+                return None;
+            }
+        }
+
+        // Type check: unary or binary
+        let accepts = (prim.input_types.len() == 1 && prim.input_types[0] == *current_type)
+            || (prim.input_types.len() == 2
+                && prim.input_types[0] == *current_type
+                && prim.input_types[1] == DagType::Grid);
+
+        if !accepts {
+            continue;
+        }
+
+        // Build args: unary or binary (second arg is original input grid)
+        let args = if prim.input_types.len() == 1 {
+            vec![current.clone()]
+        } else {
+            vec![current.clone(), DagValue::Grid(input_grid.clone())]
+        };
+
+        // Apply with panic safety
+        let result = std::panic::catch_unwind(
+            std::panic::AssertUnwindSafe(|| (prim.apply)(&args)),
+        );
+
+        let new_value = match result {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+
+        steps.push(prim.name);
+
+        // If result is a Grid: check hash dedup, then verify against target
+        if let DagValue::Grid(ref g) = new_value {
+            let h = quick_hash(g);
+            if !seen.contains(&h) {
+                seen.insert(h);
+
+                // Check if matches the first training pair target
+                if g == target {
+                    // Verify on ALL training pairs
+                    if verify_on_all_pairs(steps, catalog, train_pairs) {
+                        // Apply to test inputs
+                        let mut test_outputs = Vec::new();
+                        let mut all_ok = true;
+                        for test_in in test_inputs {
+                            if let Some(out) = apply_program(steps, catalog, test_in) {
+                                test_outputs.push(out);
+                            } else {
+                                all_ok = false;
+                                break;
+                            }
+                        }
+                        if all_ok && !test_outputs.is_empty() {
+                            let result = SearchResult {
+                                program: steps.clone(),
+                                output: test_outputs[0].clone(),
+                                depth: steps.len(),
+                                fitness: 1.0,
+                            };
+                            steps.pop();
+                            return Some(result);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recurse deeper
+        if remaining_depth > 1 {
+            let new_type = new_value.dag_type();
+            if let Some(result) = exhaustive_dfs(
+                &new_value,
+                &new_type,
+                input_grid,
+                target,
+                catalog,
+                steps,
+                remaining_depth - 1,
+                seen,
+                train_pairs,
+                test_inputs,
+                start,
+                timeout_ms,
+            ) {
+                return Some(result);
+            }
+        }
+
+        steps.pop();
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +578,44 @@ mod tests {
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().output, output);
+    }
+
+    #[test]
+    fn test_exhaustive_search_rot90() {
+        let input = vec![vec![1, 0], vec![0, 0]];
+        let output = vec![vec![0, 1], vec![0, 0]];
+
+        let result = exhaustive_search(
+            &[(input.clone(), output.clone())],
+            &[input],
+            3,
+            5000,
+        );
+
+        assert!(result.is_some());
+        let r = result.unwrap();
+        assert_eq!(r.output, output);
+        assert_eq!(r.fitness, 1.0);
+    }
+
+    #[test]
+    fn test_exhaustive_search_replace_color() {
+        let input = vec![vec![1, 0, 2], vec![2, 1, 0]];
+        let output = vec![vec![3, 0, 2], vec![2, 3, 0]];
+
+        let result = exhaustive_search(
+            &[(input.clone(), output.clone())],
+            &[input],
+            3,
+            5000,
+        );
+
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().output, output);
+    }
+
+    #[test]
+    fn test_exhaustive_search_empty_input() {
+        assert!(exhaustive_search(&[], &[], 3, 5000).is_none());
     }
 }
