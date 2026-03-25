@@ -367,7 +367,7 @@ impl Pipeline {
                                         sig_valid[ed_indices[j]] = !invalid_set.contains(&k);
                                     }
                                 }
-                                VerifyMode::GpuCuda => {
+                                VerifyMode::GpuCuda if cuda_verifier.is_some() => {
                                     // CUDA kernel dispatch
                                     let verifier = cuda_verifier.as_mut().unwrap();
                                     let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
@@ -385,7 +385,7 @@ impl Pipeline {
                                         sig_valid[ed_indices[j]] = !invalid_set.contains(&k);
                                     }
                                 }
-                                VerifyMode::CpuAvx512 => {
+                                VerifyMode::CpuAvx512 if avx512_verifier.is_some() => {
                                     // AVX-512 kernel dispatch
                                     let verifier = avx512_verifier.as_mut().unwrap();
                                     let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
@@ -403,7 +403,7 @@ impl Pipeline {
                                         sig_valid[ed_indices[j]] = !invalid_set.contains(&k);
                                     }
                                 }
-                                VerifyMode::CpuNeon => {
+                                VerifyMode::CpuNeon if neon_verifier.is_some() => {
                                     // NEON kernel dispatch
                                     let verifier = neon_verifier.as_mut().unwrap();
                                     let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices

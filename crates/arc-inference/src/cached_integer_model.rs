@@ -51,8 +51,10 @@ impl I8Weights {
                 data.push((x * inv_abs_max).round().clamp(-127.0, 127.0) as i8);
             }
 
-            // Per-row scale = abs_max / 127 in Q16
-            let scale = ((abs_max as f64 / 127.0) * ONE as f64).round() as i64;
+            // Per-row scale = abs_max / 127 in Q16 (pure integer — no f64 rounding)
+            // scale = ceil(abs_max * ONE / 127) to avoid underflow
+            let abs_max_i64 = abs_max as i64;
+            let scale = ((abs_max_i64 * ONE) + 126) / 127;
             scales.push(scale.max(1));
         }
 
