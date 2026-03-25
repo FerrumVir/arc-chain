@@ -1,3 +1,9 @@
+![Rust](https://img.shields.io/badge/Rust-99%2C000%2B_LOC-orange)
+![Tests](https://img.shields.io/badge/tests-1%2C231_passing-brightgreen)
+![License](https://img.shields.io/badge/license-BUSL--1.1-blue)
+![Inference](https://img.shields.io/badge/inference-76ms%2Ftok_deterministic-purple)
+![Testnet](https://img.shields.io/badge/testnet-live-green)
+
 # ARC Chain - Testnet
 
 **The blockchain for the agentic economy.**
