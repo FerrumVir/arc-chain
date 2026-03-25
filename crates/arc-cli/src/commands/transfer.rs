@@ -5,6 +5,11 @@ use crate::keygen;
 use crate::rpc::RpcClient;
 
 pub async fn run(rpc: &RpcClient, from_keyfile: &str, to: &str, amount: u64) -> Result<()> {
+    // 0. Validate recipient address
+    if let Err(e) = super::validate_address(to) {
+        anyhow::bail!("{}", e);
+    }
+
     // 1. Load sender keypair
     let keypair = keygen::load_keyfile(from_keyfile)
         .with_context(|| format!("failed to load keyfile '{}'", from_keyfile))?;
