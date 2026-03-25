@@ -86,7 +86,9 @@ const NODES=[
   {n:'SAO',ip:'216.238.120.27',r:'S. America'},
   {n:'JNB',ip:'139.84.237.49',r:'Africa'},
 ];
-const RPC=`http://${NODES[1].ip}:9090`; // LAX as primary
+// Use LHR as primary — has real tx receipts and inference attestations.
+// LAX runs benchmark mode with 19M+ synthetic txs that aren't individually indexed.
+const RPC=`http://${NODES[3].ip}:9090`;
 
 function f(url,ms=3000){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(url,{signal:c.signal}).then(r=>{clearTimeout(t);return r.json()}).catch(()=>{clearTimeout(t);return null})}
 function sh(h){return h?h.slice(0,8)+'...'+h.slice(-6):'?'}
@@ -126,7 +128,8 @@ async function updateNodes(){
 async function showTx(hash){
   const m=document.getElementById('modal');const b=document.getElementById('modal-body');
   b.innerHTML='<tr><td colspan="2" style="color:#475569">Loading...</td></tr>';m.style.display='block';
-  const tx=await f(RPC+'/tx/'+hash+'/full',5000);
+  let tx=await f(RPC+'/tx/'+hash+'/full',3000);
+  if(!tx||!tx.tx_type){for(const node of NODES){tx=await f(`http://${node.ip}:9090/tx/${hash}/full`,2000);if(tx&&tx.tx_type)break}}
   if(!tx||!tx.tx_type){b.innerHTML='<tr><td colspan="2" style="color:#ef4444">Not found</td></tr>';return}
   const s=tx.success?'<span class="ok">SUCCESS</span>':'<span class="fail">FAILED</span>';
   const amt=tx.body&&tx.body.amount?fmt(tx.body.amount)+' ARC':'—';
@@ -145,16 +148,42 @@ async function showTx(hash){
 
 async function updateTxs(){
   const el=document.getElementById('tx-list');
-  // Get tx hashes from genesis account 0 (faucet source — has all tx history)
-  const txs=await f(RPC+'/account/2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213/txs',3000);
-  if(!txs||!txs.tx_hashes||txs.tx_hashes.length===0){el.innerHTML='<tr><td colspan="4" style="color:#475569">No transactions yet</td></tr>';return}
-  const recent=txs.tx_hashes.slice(-12).reverse();
+  // Pull transactions from recent blocks
+  const stats=await f(RPC+'/stats',2000);
+  if(!stats||stats.block_height<1){el.innerHTML='<tr><td colspan="4" style="color:#475569">No blocks yet</td></tr>';return}
+  const h=stats.block_height;
+  const from=Math.max(1,h-10);
+  const blocks=await f(RPC+`/blocks?from=${from}&to=${h}&limit=10`,3000);
+  if(!blocks||!blocks.blocks){el.innerHTML='<tr><td colspan="4" style="color:#475569">Loading blocks...</td></tr>';return}
+
+  // Collect tx hashes from blocks
+  const allHashes=[];
+  for(const b of blocks.blocks.reverse()){
+    if(b.tx_count>0){
+      const full=await f(RPC+'/block/'+b.height,2000);
+      if(full&&full.tx_hashes){
+        for(const th of full.tx_hashes){
+          if(th!=='0000000000000000000000000000000000000000000000000000000000000000')allHashes.push(th);
+        }
+      }
+    }
+  }
+  if(allHashes.length===0){
+    // Fallback: try any node's account tx history
+    for(const node of NODES){
+      const txs=await f(`http://${node.ip}:9090/account/2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213/txs`,2000);
+      if(txs&&txs.tx_hashes&&txs.tx_hashes.length>0){allHashes.push(...txs.tx_hashes.slice(-10));break}
+    }
+  }
+  if(allHashes.length===0){el.innerHTML='<tr><td colspan="4" style="color:#475569">No individual transactions indexed (benchmark mode active)</td></tr>';return}
+
   const rows=[];
-  for(const h of recent){
-    const tx=await f(RPC+'/tx/'+h+'/full',2000);
-    const type=tx?tx.tx_type:'?';
+  for(const h of allHashes.slice(0,12)){
+    let tx=await f(RPC+'/tx/'+h+'/full',2000);
+    if(!tx){for(const node of NODES){tx=await f(`http://${node.ip}:9090/tx/${h}/full`,2000);if(tx&&tx.tx_type)break}}
+    const type=tx?tx.tx_type:'Transfer';
     const amt=tx&&tx.body&&tx.body.amount?fmt(tx.body.amount):'—';
-    const s=tx?(tx.success?'<span class="ok">OK</span>':'<span class="fail">FAIL</span>'):'?';
+    const s=tx?(tx.success?'<span class="ok">OK</span>':'<span class="fail">FAIL</span>'):'';
     rows.push(`<tr class="click" onclick="showTx('${h}')"><td class="hash">${sh(h)}</td><td>${type}</td><td>${amt}</td><td>${s}</td></tr>`);
   }
   el.innerHTML=rows.join('');
