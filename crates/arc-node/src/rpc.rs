@@ -164,6 +164,17 @@ async fn index() -> &'static str {
     "ARC Chain — Agent Runtime Chain — Testnet v0.1.0"
 }
 
+/// JSON error response body returned by endpoints that fail with 4xx/5xx.
+#[derive(Serialize)]
+struct ApiError {
+    error: String,
+}
+
+/// Helper to create a (StatusCode, Json<ApiError>) pair.
+fn api_error(code: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ApiError>) {
+    (code, Json(ApiError { error: msg.into() }))
+}
+
 // ---------------------------------------------------------------------------
 // Health & Node Info
 // ---------------------------------------------------------------------------
@@ -258,22 +269,23 @@ async fn get_latest_block(
 async fn get_block(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
-) -> Result<Json<Block>, StatusCode> {
+) -> Result<Json<Block>, (StatusCode, Json<ApiError>)> {
     node.state
         .get_block(height)
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Block at height {} not found", height)))
 }
 
 async fn get_account(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address): axum::extract::Path<String>,
-) -> Result<Json<Account>, StatusCode> {
-    let addr = Hash256::from_hex(&address).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<Account>, (StatusCode, Json<ApiError>)> {
+    let addr = Hash256::from_hex(&address)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid address. Must be 64 hex characters."))?;
     node.state
         .get_account(&addr)
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Account {} not found", address)))
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +584,7 @@ struct FaucetStatusResponse {
     claims_today: u32,
     claim_amount: u64,
     rate_limit_secs: u64,
+    balance: u64,
 }
 
 async fn faucet_claim(
@@ -602,23 +615,60 @@ async fn faucet_claim(
         }
     }
 
-    // Get faucet account (validator address) nonce
+    // Get faucet account (validator address) and check balance
     let faucet_addr = node.validator_address;
-    let faucet_nonce = node.state
+    let faucet_account = node.state
         .get_account(&faucet_addr)
-        .map(|a| a.nonce)
-        .unwrap_or(0);
+        .ok_or_else(|| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
+                error: "Faucet account not funded. Node misconfiguration.".to_string(),
+            }))
+        })?;
+
+    if faucet_account.balance < FAUCET_CLAIM_AMOUNT {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(FaucetErrorResponse {
+            error: "Faucet balance too low. Please try another node.".to_string(),
+        })));
+    }
 
     // Create transfer transaction from faucet to recipient
-    let tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, faucet_nonce);
+    let tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, faucet_account.nonce);
     let hash = tx.hash.to_hex();
 
-    // Insert into mempool
-    node.mempool.insert(tx).map_err(|_| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
-            error: "Failed to submit faucet transaction. Try again later.".to_string(),
-        }))
-    })?;
+    // Apply the transfer directly to state (immediate settlement for testnet faucet)
+    {
+        let mut sender = faucet_account.clone();
+        sender.balance -= FAUCET_CLAIM_AMOUNT;
+        sender.nonce += 1;
+        node.state.update_account(&faucet_addr, sender);
+
+        let mut recipient = node.state.get_or_create_account(&to);
+        recipient.balance += FAUCET_CLAIM_AMOUNT;
+        node.state.update_account(&to, recipient);
+    }
+
+    // Record transaction and receipt in state for lookup
+    let receipt = TxReceipt {
+        tx_hash: tx.hash,
+        block_height: node.state.height(),
+        block_hash: node.state.get_block(node.state.height())
+            .map(|b| b.hash)
+            .unwrap_or(Hash256::ZERO),
+        index: 0,
+        success: true,
+        gas_used: 21_000,
+        value_commitment: None,
+        inclusion_proof: None,
+        logs: vec![],
+    };
+    node.state.receipts.insert(tx.hash.0, receipt);
+    node.state.full_transactions.insert(tx.hash.0, tx.clone());
+    // Index for account tx history
+    node.state.account_txs.entry(faucet_addr.0).or_default().push(tx.hash);
+    node.state.account_txs.entry(to.0).or_default().push(tx.hash);
+
+    // Insert into mempool for propagation
+    let _ = node.mempool.insert(tx);
 
     // Record claim time
     {
@@ -641,12 +691,16 @@ async fn faucet_claim(
 async fn faucet_status(
     AxumState(node): AxumState<NodeState>,
 ) -> Json<FaucetStatusResponse> {
+    let balance = node.state.get_account(&node.validator_address)
+        .map(|a| a.balance)
+        .unwrap_or(0);
     Json(FaucetStatusResponse {
         address: node.validator_address.to_hex(),
-        node_url: "http://localhost:9090".to_string(),
+        node_url: format!("http://localhost:9090"),
         claims_today: node.faucet_claims_total.load(Ordering::Relaxed),
         claim_amount: FAUCET_CLAIM_AMOUNT,
         rate_limit_secs: FAUCET_RATE_LIMIT_SECS,
+        balance,
     })
 }
 
@@ -655,10 +709,10 @@ async fn faucet_status(
 // ---------------------------------------------------------------------------
 
 /// Parse a 64-char hex string into a [u8; 32] array.
-fn parse_hash(hex_str: &str) -> Result<[u8; 32], StatusCode> {
+fn parse_hash(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
     Hash256::from_hex(hex_str)
         .map(|h| h.0)
-        .map_err(|_| StatusCode::BAD_REQUEST)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid hash. Must be 64 hex characters."))
 }
 
 /// GET /tx/{hash} — Look up a transaction receipt by its hash.
@@ -666,7 +720,7 @@ fn parse_hash(hex_str: &str) -> Result<[u8; 32], StatusCode> {
 async fn get_transaction(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
-) -> Result<Json<TxReceipt>, StatusCode> {
+) -> Result<Json<TxReceipt>, (StatusCode, Json<ApiError>)> {
     let tx_hash = parse_hash(&hash)?;
     // Try indexed receipts first
     if let Some(receipt) = node.state.get_receipt(&tx_hash) {
@@ -676,7 +730,7 @@ async fn get_transaction(
     node.state
         .get_benchmark_receipt_by_hash(&tx_hash)
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Transaction {} not found", hash)))
 }
 
 /// GET /tx/{hash}/proof — Return a full verification bundle for a transaction.
@@ -684,7 +738,7 @@ async fn get_transaction(
 async fn get_tx_proof(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let tx_hash = parse_hash(&hash)?;
 
     // Try indexed receipt with stored proof first
@@ -722,12 +776,12 @@ async fn get_tx_proof(
     let (height, idx) = node
         .state
         .get_tx_location(&tx_hash)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Transaction {} not found", hash)))?;
 
     let merkle_proof = node
         .state
         .reconstruct_benchmark_proof(height, idx)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Could not reconstruct proof for transaction"))?;
 
     let siblings: Vec<Value> = merkle_proof
         .siblings
@@ -765,11 +819,11 @@ async fn get_tx_proof(
 async fn get_block_proofs(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let block = node
         .state
         .get_block(height)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Block at height {} not found", height)))?;
 
     let mut proofs = Vec::new();
     for tx_hash in &block.tx_hashes {
@@ -861,11 +915,11 @@ async fn get_block_txs(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
     Query(params): Query<BlockTxsQuery>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let block = node
         .state
         .get_block(height)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Block at height {} not found", height)))?;
 
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(1000);
@@ -931,7 +985,7 @@ async fn get_block_txs(
 async fn get_account_txs(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let addr = parse_hash(&address)?;
     let tx_hashes = node.state.get_account_txs(&addr);
 
@@ -1097,14 +1151,14 @@ async fn sync_status(
 async fn get_full_transaction(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(hash): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let tx_hash = parse_hash(&hash)?;
 
     let tx = node
         .state
         .get_transaction(&tx_hash)
         .or_else(|| node.state.get_benchmark_tx_by_hash(&tx_hash))
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Transaction {} not found", hash)))?;
 
     let receipt = node
         .state
@@ -1313,13 +1367,14 @@ async fn get_full_transaction(
 async fn get_contract_info(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address): axum::extract::Path<String>,
-) -> Result<Json<Value>, StatusCode> {
-    let addr = Hash256::from_hex(&address).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let addr = Hash256::from_hex(&address)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid contract address."))?;
 
     let bytecode = node
         .state
         .get_contract(&addr)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Contract {} not found", address)))?;
 
     let code_hash = hex::encode(arc_crypto::hash_bytes(&bytecode).0);
 
@@ -1344,13 +1399,14 @@ async fn call_contract(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address): axum::extract::Path<String>,
     Json(req): Json<ContractCallRequest>,
-) -> Result<Json<Value>, StatusCode> {
-    let contract_addr = Hash256::from_hex(&address).map_err(|_| StatusCode::BAD_REQUEST)?;
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let contract_addr = Hash256::from_hex(&address)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid contract address."))?;
 
     let bytecode = node
         .state
         .get_contract(&contract_addr)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Contract {} not found", address)))?;
 
     let caller = req
         .from
@@ -1609,7 +1665,8 @@ fn eth_get_block_by_number(node: &NodeState, params: &Value, id: &Value) -> Json
     match node.state.get_block(block_num) {
         Some(block) => {
             let txs: Value = if full_txs {
-                json!(block.tx_hashes.iter().map(|h| h.to_hex()).collect::<Vec<_>>())
+                // Full tx objects would go here; for now return hashes with 0x prefix
+                json!(block.tx_hashes.iter().map(|h| format!("0x{}", h.to_hex())).collect::<Vec<_>>())
             } else {
                 json!(block.tx_hashes.iter().map(|h| format!("0x{}", h.to_hex())).collect::<Vec<_>>())
             };
@@ -2458,8 +2515,13 @@ async fn channel_state(
 /// Returns the query, response text, output hash, ms/token, and attestation TX.
 async fn inference_run(
     AxumState(node): AxumState<NodeState>,
-    Json(req): Json<Value>,
-) -> Result<Json<Value>, StatusCode> {
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let req = match body {
+        Some(Json(v)) => v,
+        None => return Err(api_error(StatusCode::BAD_REQUEST, "Request body required. Send JSON with 'input' and 'max_tokens' fields.")),
+    };
+
     let input_text = req.get("input")
         .and_then(|v| v.as_str())
         .unwrap_or("Hello, world!");
@@ -2503,7 +2565,7 @@ async fn inference_run(
         let mut tokens_with_bos = vec![1u32]; // BOS
         tokens_with_bos.extend(&prompt_tokens);
         let result = engine.generate(mid, &tokens_with_bos, max_tokens)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Inference failed: {}", e)))?;
         let gen_tokens: Vec<u32> = result.output.chunks(4)
             .map(|c| u32::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0),
                 c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]))

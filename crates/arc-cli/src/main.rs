@@ -107,7 +107,7 @@ async fn main() {
         Commands::Faucet { address, faucet_url } => {
             let url = faucet_url
                 .or_else(|| std::env::var("ARC_FAUCET_URL").ok())
-                .unwrap_or_else(|| "http://localhost:3001".to_string());
+                .unwrap_or_else(|| format!("{}/faucet", rpc_url));
             commands::faucet::run(&rpc_client, &address, &url).await
         }
     };

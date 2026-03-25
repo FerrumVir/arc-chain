@@ -340,6 +340,18 @@ async fn main() -> Result<()> {
             .collect()
     };
 
+    // ── Ensure the validator/faucet address is funded ───────────────────
+    // The faucet sends tokens from the validator address. If it's not already
+    // a genesis account, add it so the faucet can actually fund new users.
+    let genesis_accounts = {
+        let mut accounts = genesis_accounts;
+        if !accounts.iter().any(|(addr, _)| *addr == validator_address) {
+            tracing::info!("Adding validator {} to genesis with faucet balance", validator_address);
+            accounts.push((validator_address, 1_000_000_000_000));
+        }
+        accounts
+    };
+
     let state = Arc::new({
         let mut db = StateDB::with_genesis_persistent(&genesis_accounts, &data_dir)
             .expect("Failed to initialize state with WAL persistence");

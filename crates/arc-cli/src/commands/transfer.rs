@@ -10,12 +10,14 @@ pub async fn run(rpc: &RpcClient, from_keyfile: &str, to: &str, amount: u64) -> 
         .with_context(|| format!("failed to load keyfile '{}'", from_keyfile))?;
     let sender_addr = keypair.address().to_hex();
 
-    // 2. Get sender's current nonce
-    let account_data = rpc.get_account(&sender_addr).await
-        .with_context(|| "failed to fetch sender account")?;
-    let nonce = account_data.get("nonce")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    // 2. Get sender's current nonce (0 if account not yet on chain)
+    let nonce = match rpc.get_account(&sender_addr).await {
+        Ok(data) => data.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0),
+        Err(e) => {
+            let msg = format!("{:#}", e);
+            if msg.contains("404") { 0 } else { return Err(e).context("failed to fetch sender account"); }
+        }
+    };
 
     // 3. Build transfer request
     //    For the initial version, we submit to /tx/submit which handles

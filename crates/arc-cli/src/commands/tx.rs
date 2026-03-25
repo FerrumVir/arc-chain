@@ -36,16 +36,23 @@ pub async fn run(rpc: &RpcClient, hash: &str) -> Result<()> {
         print_body(tx_type, body);
     }
 
-    // Print receipt if present
-    if let Some(receipt) = data.get("receipt") {
-        let success = receipt.get("success")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let gas_used = receipt.get("gas_used")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        println!("  Status: {}", if success { "Success" } else { "Failed" });
-        println!("  Gas:    {}", gas_used);
+    // Print status — may be at top level or nested under "receipt"
+    let (success, gas_used) = if let Some(receipt) = data.get("receipt") {
+        (
+            receipt.get("success").and_then(|v| v.as_bool()),
+            receipt.get("gas_used").and_then(|v| v.as_u64()),
+        )
+    } else {
+        (
+            data.get("success").and_then(|v| v.as_bool()),
+            data.get("gas_used").and_then(|v| v.as_u64()),
+        )
+    };
+    if let Some(ok) = success {
+        println!("  Status: {}", if ok { "Success" } else { "Failed" });
+    }
+    if let Some(gas) = gas_used {
+        println!("  Gas:    {}", gas);
     }
 
     Ok(())
