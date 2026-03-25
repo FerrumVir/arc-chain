@@ -4,7 +4,26 @@ use anyhow::Result;
 use crate::rpc::RpcClient;
 
 pub async fn run(rpc: &RpcClient, address: &str) -> Result<()> {
-    let data = rpc.get_account(address).await?;
+    let data = match rpc.get_account(address).await {
+        Ok(d) => d,
+        Err(e) => {
+            // 404 means account doesn't exist yet — show zero balance
+            let msg = format!("{:#}", e);
+            if msg.contains("404") {
+                let short_addr = if address.len() > 16 {
+                    format!("{}...{}", &address[..8], &address[address.len()-8..])
+                } else {
+                    address.to_string()
+                };
+                println!("Account: {}", short_addr);
+                println!("Balance: 0 ARC");
+                println!("Nonce:   0");
+                println!("(Account not yet created on chain)");
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
 
     let balance = data.get("balance")
         .and_then(|v| v.as_u64())
