@@ -44,6 +44,8 @@ pub struct NodeState {
     pub candle_model_id: Option<arc_crypto::Hash256>,
     /// Live DAG validator set (updated by consensus loop via PeerConnected).
     pub dag_validators: Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>,
+    /// Inference results indexed by attestation tx hash — for explorer display.
+    pub inference_results: Arc<dashmap::DashMap<String, Value>>,
 }
 
 /// Build a `NodeState` from components.
@@ -73,6 +75,7 @@ pub fn build_node_state(
         candle_engine,
         candle_model_id,
         dag_validators: Arc::new(parking_lot::RwLock::new(vec![(validator_address, stake)])),
+        inference_results: Arc::new(dashmap::DashMap::new()),
     }
 }
 
@@ -134,6 +137,7 @@ pub async fn serve(
         // Inference — run model and record attestation on-chain
         .route("/inference/run", post(inference_run))
         .route("/inference/attestations", get(inference_list_attestations))
+        .route("/inference/results", get(inference_list_results))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -2723,6 +2727,20 @@ async fn inference_run(
     // Submit to mempool
     let _submit_result = node.mempool.insert(tx);
 
+    // Store inference result for explorer display
+    let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
+    node.inference_results.insert(tx_hash_hex.clone(), json!({
+        "input": input_text,
+        "output": &output_text,
+        "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+        "model": &model_id_data,
+        "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
+        "ms_per_token": ms_per_token,
+        "tokens_generated": tokens_generated,
+        "engine": &engine_name,
+        "deterministic": true,
+    }));
+
     Ok(Json(json!({
         "success": true,
         "inference": {
@@ -2742,7 +2760,7 @@ async fn inference_run(
             "engine": engine_name,
         },
         "attestation": {
-            "tx_hash": format!("0x{}", hex::encode(&tx_hash.0)),
+            "tx_hash": tx_hash_hex,
             "bond": bond,
             "challenge_period": challenge_period,
             "status": "submitted_to_mempool",
@@ -2789,6 +2807,11 @@ async fn inference_list_attestations(
                 att["amount"] = json!(b.amount);
             }
         }
+        // Enrich with inference result if this tx has one
+        let tx_hex = format!("0x{}", hex::encode(hash));
+        if let Some(inf) = node.inference_results.get(&tx_hex) {
+            att["inference"] = inf.value().clone();
+        }
         attestations.push(att);
         if attestations.len() >= limit { break; }
     }
@@ -2798,4 +2821,21 @@ async fn inference_list_attestations(
         "count": attestations.len(),
         "chain_height": height,
     })))
+}
+
+/// GET /inference/results — list stored inference results (input, output, hash, model).
+async fn inference_list_results(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let results: Vec<Value> = node.inference_results.iter()
+        .map(|entry| {
+            let mut r = entry.value().clone();
+            r["tx_hash"] = json!(entry.key().clone());
+            r
+        })
+        .collect();
+    Json(json!({
+        "results": results,
+        "count": results.len(),
+    }))
 }
