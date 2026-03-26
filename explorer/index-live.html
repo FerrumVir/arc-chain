@@ -96,9 +96,10 @@ function sa(a){return a?(a.length>16?a.slice(0,6)+'..'+a.slice(-4):a):'?'}
 function fmt(n){return n!=null?Number(n).toLocaleString():'0'}
 function up(s){if(!s)return'-';if(s<3600)return Math.floor(s/60)+'m';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
 function txType(a){
-  const amt=a.amount||0;
-  if(a.inference)return '<span class="tag inf">INFERENCE</span>';
-  if(amt>=10000)return '<span class="tag faucet">FAUCET</span>';
+  const t=a.tx_type||'';
+  if(t==='Inference'||a.inference)return '<span class="tag inf">INFERENCE</span>';
+  if(t==='Faucet'||a.amount>=10000)return '<span class="tag faucet">FAUCET</span>';
+  if(t==='Settle')return '<span class="tag inf">SETTLE</span>';
   return '<span class="tag tx">TRANSFER</span>';
 }
 
@@ -139,28 +140,52 @@ async function showTx(hash){
   const s=tx.success?'<span class="tag ok">SUCCESS</span>':'<span class="tag fail">FAILED</span>';
   const to=tx.body&&tx.body.to?tx.body.to:'—';
   const amt=tx.body&&tx.body.amount?fmt(tx.body.amount)+' ARC':'—';
-  b.innerHTML=
+  let rows=
     '<tr><td>Hash</td><td>'+tx.tx_hash+'</td></tr>'+
     '<tr><td>Status</td><td>'+s+'</td></tr>'+
     '<tr><td>Type</td><td>'+tx.tx_type+'</td></tr>'+
     '<tr><td>From</td><td>'+tx.from+'</td></tr>'+
     '<tr><td>To</td><td>'+to+'</td></tr>'+
     '<tr><td>Amount</td><td style="color:#34d399">'+amt+'</td></tr>'+
-    '<tr><td>Nonce</td><td>'+tx.nonce+'</td></tr>'+
+    '<tr><td>Nonce</td><td>'+(tx.nonce!=null?tx.nonce:'—')+'</td></tr>'+
     '<tr><td>Gas</td><td>'+fmt(tx.gas_used)+'</td></tr>'+
-    '<tr><td>Block</td><td>'+tx.block_height+'</td></tr>';
+    '<tr><td>Block</td><td>'+(tx.block_height||'—')+'</td></tr>';
+
+  // Check if this tx has inference data (query /inference/results)
+  const infRes=await f(RPC+'/inference/results',3000);
+  if(infRes&&infRes.results){
+    const inf=infRes.results.find(r=>(r.tx_hash||'').replace('0x','')===hash);
+    if(inf){
+      rows+='<tr><td colspan="2" style="border-top:1px solid #1e2d3d;padding-top:8px;color:#a78bfa;font-weight:bold">AI Inference Details</td></tr>'+
+        '<tr><td>Input</td><td style="color:#fbbf24">'+inf.input+'</td></tr>'+
+        '<tr><td>Output</td><td style="color:#34d399">'+inf.output+'</td></tr>'+
+        '<tr><td>Output Hash</td><td>'+inf.output_hash+'</td></tr>'+
+        '<tr><td>Model</td><td>'+inf.model+'</td></tr>'+
+        '<tr><td>Model Hash</td><td>'+(inf.model_hash||'')+'</td></tr>'+
+        '<tr><td>Speed</td><td>'+inf.ms_per_token+' ms/tok ('+inf.tokens_generated+' tokens)</td></tr>'+
+        '<tr><td>Engine</td><td>'+inf.engine+'</td></tr>'+
+        '<tr><td>Deterministic</td><td>'+(inf.deterministic?'<span class="tag ok">YES — identical on every platform</span>':'No')+'</td></tr>';
+    }
+  }
+  b.innerHTML=rows;
 }
 
 async function updateTxs(){
   const el=document.getElementById('tx-list');
   const att=await f(RPC+'/inference/attestations',4000);
   if(!att||!att.attestations||att.attestations.length===0){el.innerHTML='<tr><td colspan="6" style="color:#475569">No transactions yet</td></tr>';return}
-  el.innerHTML=att.attestations.slice(0,15).map(a=>{
+  // Sort: inference first, then faucet, then transfers
+  const sorted=att.attestations.sort((a,b)=>{
+    const rank=x=>(x.inference||x.tx_type==='Inference')?0:(x.tx_type==='Faucet'||x.amount>=10000)?1:2;
+    return rank(a)-rank(b);
+  });
+  el.innerHTML=sorted.slice(0,20).map(a=>{
     const h=(a.tx_hash||'').replace('0x','');
     const s=a.success?'<span class="tag ok">OK</span>':'<span class="tag fail">FAIL</span>';
-    const to=a.to?sa(a.to):'—';
-    const amt=a.amount?fmt(a.amount)+' ARC':'—';
-    return '<tr class="cl" onclick="showTx(\''+h+'\')"><td class="hash">'+sh(h)+'</td><td>'+txType(a)+'</td><td class="hash">'+sa(a.from||'')+'</td><td class="hash">'+to+'</td><td>'+amt+'</td><td>'+s+'</td></tr>';
+    const to=a.to?sa(a.to):(a.inference?'AI Model':'—');
+    const amt=a.amount?fmt(a.amount)+' ARC':(a.inference?a.inference.ms_per_token+' ms/tok':'—');
+    const from=a.from?sa(a.from):(a.inference?'Validator':'—');
+    return '<tr class="cl" onclick="showTx(\''+h+'\')"><td class="hash">'+sh(h)+'</td><td>'+txType(a)+'</td><td class="hash">'+from+'</td><td class="hash">'+to+'</td><td>'+amt+'</td><td>'+s+'</td></tr>';
   }).join('');
 }
 

@@ -2784,36 +2784,64 @@ async fn inference_list_attestations(
     let height = node.state.height();
     let mut attestations = Vec::new();
 
-    // Scan all receipts (covers both direct-apply and DAG-committed txs).
-    for entry in node.state.receipts.iter() {
-        let hash = entry.key();
-        let receipt = entry.value();
+    // First: add inference results (highest priority — these are what users want to see)
+    for entry in node.inference_results.iter() {
+        let tx_hex = entry.key().clone();
+        let inf = entry.value().clone();
+        let hash_clean = tx_hex.trim_start_matches("0x");
         let mut att = json!({
-            "tx_hash": format!("0x{}", hex::encode(hash)),
-            "block_height": receipt.block_height,
-            "success": receipt.success,
-            "gas_used": receipt.gas_used,
+            "tx_hash": tx_hex,
+            "tx_type": "Inference",
+            "success": true,
+            "inference": inf,
         });
-        if let Some(tx) = node.state.full_transactions.get(hash) {
-            att["tx_type"] = json!(match &tx.body {
-                TxBody::Transfer(_) => "Transfer",
-                TxBody::Settle(_) => "Settle",
-                TxBody::InferenceAttestation(_) => "InferenceAttestation",
-                _ => "Other",
-            });
-            att["from"] = json!(tx.from.to_hex());
-            if let TxBody::Transfer(b) = &tx.body {
-                att["to"] = json!(b.to.to_hex());
-                att["amount"] = json!(b.amount);
+        // Enrich with receipt data if available
+        if let Ok(hash_bytes) = hex::decode(hash_clean) {
+            if hash_bytes.len() == 32 {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&hash_bytes);
+                if let Some(receipt) = node.state.get_receipt(&key) {
+                    att["block_height"] = json!(receipt.block_height);
+                    att["gas_used"] = json!(receipt.gas_used);
+                }
             }
-        }
-        // Enrich with inference result if this tx has one
-        let tx_hex = format!("0x{}", hex::encode(hash));
-        if let Some(inf) = node.inference_results.get(&tx_hex) {
-            att["inference"] = inf.value().clone();
         }
         attestations.push(att);
         if attestations.len() >= limit { break; }
+    }
+
+    // Then: add successful transactions with full body data (faucet claims, transfers)
+    for entry in node.state.full_transactions.iter() {
+        if attestations.len() >= limit { break; }
+        let hash = entry.key();
+        let tx = entry.value();
+        let tx_hex = format!("0x{}", hex::encode(hash));
+        // Skip if already added as inference
+        if node.inference_results.contains_key(&tx_hex) { continue; }
+
+        if let Some(receipt) = node.state.get_receipt(hash) {
+            if !receipt.success { continue; } // Only show successful txs
+
+            let (tx_type, to, amount) = match &tx.body {
+                TxBody::Transfer(b) => {
+                    let label = if b.amount >= 10_000 { "Faucet" } else { "Transfer" };
+                    (label, Some(b.to.to_hex()), Some(b.amount))
+                }
+                TxBody::Settle(b) => ("Settle", Some(b.agent_id.to_hex()), Some(b.amount)),
+                _ => ("Other", None, None),
+            };
+            let mut att = json!({
+                "tx_hash": tx_hex,
+                "tx_type": tx_type,
+                "from": tx.from.to_hex(),
+                "success": true,
+                "block_height": receipt.block_height,
+                "gas_used": receipt.gas_used,
+            });
+            if let Some(to) = to { att["to"] = json!(to); }
+            if let Some(amt) = amount { att["amount"] = json!(amt); }
+            attestations.push(att);
+        }
     }
 
     Ok(Json(json!({
