@@ -514,9 +514,10 @@ impl ConsensusManager {
                     }
 
                     // ── Normal path: drain mempool ──────────────────────────────
-                    // 100 txs per DAG block ≈ 28KB payload. Low enough for reliable
-                    // cross-continent QUIC on 2-vCPU nodes. Scale up with better hardware.
-                    let transactions = mempool.drain(100);
+                    // In benchmark mode, drain aggressively for max TPS.
+                    // In normal mode, 100 per block keeps QUIC payload small.
+                    let drain_limit = if self.benchmark { 50_000 } else { 100 };
+                    let transactions = mempool.drain(drain_limit);
                     if !transactions.is_empty() {
                         info!("Drained {} txs from mempool for DAG proposal", transactions.len());
                     }
