@@ -87,8 +87,11 @@ const NODES=[
   {n:'SAO',ip:'216.238.120.27',r:'S. America'},
   {n:'JNB',ip:'139.84.237.49',r:'Africa'},
 ];
-// LAX for stats/TPS (benchmark mode), LHR for inference results
-const RPC_STATS='http://'+NODES[1].ip+':9090';  // LAX — benchmark TPS
+// Mac Studio for TPS (benchmark), LHR for inference results
+// If opened locally on Mac, use localhost:29090 for max TPS.
+// If opened remotely, fall back to LAX.
+const isLocal=window.location.hostname==='localhost'||window.location.hostname==='127.0.0.1'||window.location.protocol==='file:';
+const RPC_STATS=isLocal?'http://localhost:29090':'http://'+NODES[1].ip+':9090';
 const RPC_INF='http://'+NODES[3].ip+':9090';    // LHR — inference + receipts
 
 function f(u,ms=3000){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(u,{signal:c.signal}).then(r=>{clearTimeout(t);return r.json()}).catch(()=>{clearTimeout(t);return null})}
