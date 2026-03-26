@@ -87,8 +87,9 @@ const NODES=[
   {n:'SAO',ip:'216.238.120.27',r:'S. America'},
   {n:'JNB',ip:'139.84.237.49',r:'Africa'},
 ];
-// LHR has model + receipts + inference results
-const RPC='http://'+NODES[3].ip+':9090';
+// LAX for stats/TPS (benchmark mode), LHR for inference results
+const RPC_STATS='http://'+NODES[1].ip+':9090';  // LAX — benchmark TPS
+const RPC_INF='http://'+NODES[3].ip+':9090';    // LHR — inference + receipts
 
 function f(u,ms=3000){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(u,{signal:c.signal}).then(r=>{clearTimeout(t);return r.json()}).catch(()=>{clearTimeout(t);return null})}
 function sh(h){return h?(h.length>16?h.slice(0,8)+'...'+h.slice(-6):h):'?'}
@@ -106,7 +107,7 @@ function txType(a){
 let pTx=0,pT=Date.now();
 
 async function tick(){
-  const[stats,health,vals]=await Promise.all([f(RPC+'/stats'),f(RPC+'/health'),f(RPC+'/validators')]);
+  const[stats,health,vals]=await Promise.all([f(RPC_STATS+'/stats'),f(RPC_STATS+'/health'),f(RPC_STATS+'/validators')]);
   if(stats){
     const now=Date.now(),dt=(now-pT)/1000,dx=stats.total_transactions-pTx;
     const tps=(pTx>0&&dt>0)?Math.round(dx/dt):0;
@@ -142,7 +143,7 @@ async function showTx(hash){
   const cached=cachedAttestations.find(a=>(a.tx_hash||'').replace('0x','')===hash);
 
   // Try /tx/{hash}/full for on-chain tx details
-  let tx=await f(RPC+'/tx/'+hash+'/full',3000);
+  let tx=await f(RPC_INF+'/tx/'+hash+'/full',3000);
   if(!tx||!tx.tx_type){for(const n of NODES){tx=await f('http://'+n.ip+':9090/tx/'+hash+'/full',2000);if(tx&&tx.tx_type)break}}
 
   // If no on-chain record but we have cached attestation data, use that
@@ -168,7 +169,7 @@ async function showTx(hash){
   // Show inference details from cached attestation or /inference/results
   let inf=cached&&cached.inference?cached.inference:null;
   if(!inf){
-    const infRes=await f(RPC+'/inference/results',3000);
+    const infRes=await f(RPC_INF+'/inference/results',3000);
     if(infRes&&infRes.results)inf=infRes.results.find(r=>(r.tx_hash||'').replace('0x','')===hash);
   }
   if(inf){
@@ -187,7 +188,7 @@ async function showTx(hash){
 
 async function updateTxs(){
   const el=document.getElementById('tx-list');
-  const att=await f(RPC+'/inference/attestations',4000);
+  const att=await f(RPC_INF+'/inference/attestations',4000);
   if(!att||!att.attestations||att.attestations.length===0){el.innerHTML='<tr><td colspan="6" style="color:#475569">No transactions yet</td></tr>';return}
   cachedAttestations=att.attestations; // Cache for click lookups
   // Sort: inference first, then faucet, then transfers
