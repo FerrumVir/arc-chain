@@ -4,75 +4,76 @@
 <title>ARC Chain Explorer</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0e17;color:#c0c8d4;font-family:'SF Mono','Fira Code','Courier New',monospace;font-size:13px;padding:20px;max-width:960px;margin:0 auto}
-h1{color:#60a5fa;font-size:20px;text-align:center;margin-bottom:4px}
-.sub{color:#475569;font-size:11px;text-align:center;margin-bottom:20px}
-.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}
-.box{background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:12px;text-align:center}
-.box .label{color:#475569;font-size:10px;text-transform:uppercase;letter-spacing:1px}
-.box .val{color:#60a5fa;font-size:24px;font-weight:bold;margin-top:2px}
-.box .val.green{color:#34d399}
-.box .val.yellow{color:#fbbf24}
-.sec{background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:14px;margin-bottom:12px}
-.sec h2{color:#60a5fa;font-size:13px;margin-bottom:8px;border-bottom:1px solid #1e2d3d;padding-bottom:6px}
-.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px;animation:pulse 2s infinite}
-.dot.on{background:#34d399}
-.dot.off{background:#ef4444}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.nodes{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
-.node{padding:6px 8px;border-radius:4px;font-size:11px;background:#0d1117;border:1px solid #1e2d3d}
-.node.off{opacity:.4;border-color:#ef4444}
-.node b{color:#34d399}
-.node.off b{color:#ef4444}
+body{background:#0a0e17;color:#c0c8d4;font-family:'SF Mono','Fira Code','Courier New',monospace;font-size:13px;padding:16px;max-width:1000px;margin:0 auto}
+a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}
+h1{color:#60a5fa;font-size:20px;text-align:center;margin-bottom:2px}
+.sub{color:#475569;font-size:11px;text-align:center;margin-bottom:16px}
+.grid{display:grid;gap:8px;margin-bottom:12px}
+.g3{grid-template-columns:repeat(3,1fr)}.g6{grid-template-columns:repeat(6,1fr)}
+.box{background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:10px;text-align:center}
+.box .l{color:#475569;font-size:9px;text-transform:uppercase;letter-spacing:1px}
+.box .v{color:#60a5fa;font-size:20px;font-weight:bold;margin-top:2px}
+.box .v.g{color:#34d399}.box .v.y{color:#fbbf24}.box .v.r{color:#ef4444}
+.sec{background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:12px;margin-bottom:10px}
+.sec h2{color:#60a5fa;font-size:12px;margin-bottom:6px;border-bottom:1px solid #1e2d3d;padding-bottom:4px}
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
+.on{background:#34d399}.off{background:#ef4444}
+.nodes{display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
+.nd{padding:5px 7px;border-radius:3px;font-size:10px;background:#0d1117;border:1px solid #1e2d3d}
+.nd.dead{opacity:.4;border-color:#ef4444}
 table{width:100%;border-collapse:collapse}
-th{text-align:left;color:#475569;font-size:10px;text-transform:uppercase;padding:4px 6px;border-bottom:1px solid #1e2d3d}
-td{padding:4px 6px;border-bottom:1px solid #0d1117;font-size:12px}
-tr.click:hover{background:#1e2d3d;cursor:pointer}
-.hash{color:#60a5fa;font-size:11px}
-.ok{color:#34d399}.fail{color:#ef4444}
-.inf-card{background:#0d1117;border:1px solid #1e2d3d;border-radius:4px;padding:10px;margin:6px 0}
-.inf-q{color:#fbbf24;font-size:12px}.inf-a{color:#34d399;font-size:12px;margin:3px 0}
-.inf-meta{color:#475569;font-size:10px}
-#modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:10}
-#modal-inner{max-width:600px;margin:80px auto;background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:16px}
-#modal-close{float:right;cursor:pointer;color:#475569;font-size:18px}
-#modal-body td:first-child{color:#475569;width:100px}
+th{text-align:left;color:#475569;font-size:9px;text-transform:uppercase;padding:3px 5px;border-bottom:1px solid #1e2d3d}
+td{padding:4px 5px;border-bottom:1px solid #0d1117;font-size:11px}
+tr.cl:hover{background:#1e2d3d;cursor:pointer}
+.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:bold}
+.tag.ok{background:#064e3b;color:#34d399}.tag.fail{background:#7f1d1d;color:#ef4444}
+.tag.tx{background:#1e3a5f;color:#60a5fa}.tag.inf{background:#4c1d95;color:#a78bfa}
+.tag.faucet{background:#713f12;color:#fbbf24}
+.hash{color:#60a5fa;font-size:10px}
+.inf-card{background:#0d1117;border:1px solid #1e2d3d;border-radius:4px;padding:10px;margin:5px 0}
+.inf-q{color:#fbbf24;font-size:11px;margin-bottom:3px}
+.inf-a{color:#34d399;font-size:12px;margin-bottom:4px}
+.inf-meta{color:#475569;font-size:9px;display:flex;gap:12px;flex-wrap:wrap}
+.inf-meta span{white-space:nowrap}
+#modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:10;overflow-y:auto}
+#m-inner{max-width:650px;margin:50px auto;background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:16px}
+#m-close{float:right;cursor:pointer;color:#475569;font-size:18px}
+#m-body td:first-child{color:#475569;width:90px;font-size:10px}
+#m-body td{font-size:11px;word-break:break-all;padding:3px 5px}
 </style>
 </head><body>
-<h1>ARC CHAIN</h1>
-<p class="sub">Agent Runtime Chain &mdash; 8 Nodes &bull; 6 Continents &bull; DAG Consensus</p>
+<h1>ARC CHAIN EXPLORER</h1>
+<p class="sub">8 Nodes &bull; 6 Continents &bull; DAG Consensus &bull; Deterministic AI Inference</p>
 
-<div class="grid">
-  <div class="box"><div class="label">Block Height</div><div class="val" id="height">-</div></div>
-  <div class="box"><div class="label">Live TPS</div><div class="val green" id="tps">-</div></div>
-  <div class="box"><div class="label">Transactions</div><div class="val" id="txcount">-</div></div>
-</div>
-<div class="grid">
-  <div class="box"><div class="label">Nodes Online</div><div class="val green" id="nodes-up">-</div></div>
-  <div class="box"><div class="label">Validators</div><div class="val" id="vals">-</div></div>
-  <div class="box"><div class="label">Uptime</div><div class="val yellow" id="uptime">-</div></div>
+<div class="grid g6">
+  <div class="box"><div class="l">Height</div><div class="v" id="height">-</div></div>
+  <div class="box"><div class="l">TPS</div><div class="v g" id="tps">-</div></div>
+  <div class="box"><div class="l">Transactions</div><div class="v" id="txcount">-</div></div>
+  <div class="box"><div class="l">Nodes</div><div class="v g" id="nodes-up">-</div></div>
+  <div class="box"><div class="l">Validators</div><div class="v" id="vals">-</div></div>
+  <div class="box"><div class="l">Uptime</div><div class="v y" id="uptime">-</div></div>
 </div>
 
 <div class="sec">
-  <h2>Nodes</h2>
+  <h2><span class="dot on"></span> Network</h2>
   <div class="nodes" id="node-grid"></div>
 </div>
 
 <div class="sec">
-  <h2>Recent Transactions</h2>
-  <table><thead><tr><th>Hash</th><th>Type</th><th>Amount</th><th>Status</th></tr></thead>
-  <tbody id="tx-list"><tr><td colspan="4" style="color:#475569">Loading...</td></tr></tbody></table>
-</div>
-
-<div class="sec">
-  <h2>Inference Attestations</h2>
+  <h2><span class="dot on"></span> AI Inference (Live On-Chain)</h2>
   <div id="inf-list"><span style="color:#475569">Loading...</span></div>
 </div>
 
-<div id="modal"><div id="modal-inner">
-  <span id="modal-close" onclick="document.getElementById('modal').style.display='none'">&times;</span>
-  <h2 style="color:#60a5fa;font-size:13px;margin-bottom:10px">Transaction</h2>
-  <table id="modal-body"></table>
+<div class="sec">
+  <h2>Recent Transactions</h2>
+  <table><thead><tr><th>Hash</th><th>Type</th><th>From</th><th>To / Details</th><th>Amount</th><th>Status</th></tr></thead>
+  <tbody id="tx-list"><tr><td colspan="6" style="color:#475569">Loading...</td></tr></tbody></table>
+</div>
+
+<div id="modal"><div id="m-inner">
+  <span id="m-close" onclick="document.getElementById('modal').style.display='none'">&times;</span>
+  <h2 style="color:#60a5fa;font-size:13px;margin-bottom:8px">Transaction Details</h2>
+  <table id="m-body"></table>
 </div></div>
 
 <script>
@@ -86,142 +87,115 @@ const NODES=[
   {n:'SAO',ip:'216.238.120.27',r:'S. America'},
   {n:'JNB',ip:'139.84.237.49',r:'Africa'},
 ];
-// Use LHR as primary — has real tx receipts and inference attestations.
-// LAX runs benchmark mode with 19M+ synthetic txs that aren't individually indexed.
-const RPC=`http://${NODES[3].ip}:9090`;
+// LHR has model + receipts + inference results
+const RPC='http://'+NODES[3].ip+':9090';
 
-function f(url,ms=3000){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(url,{signal:c.signal}).then(r=>{clearTimeout(t);return r.json()}).catch(()=>{clearTimeout(t);return null})}
-function sh(h){return h?h.slice(0,8)+'...'+h.slice(-6):'?'}
-function fmt(n){return n?n.toLocaleString():'0'}
-function uptime(s){if(!s)return'-';if(s<3600)return Math.floor(s/60)+'m';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
+function f(u,ms=3000){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(u,{signal:c.signal}).then(r=>{clearTimeout(t);return r.json()}).catch(()=>{clearTimeout(t);return null})}
+function sh(h){return h?(h.length>16?h.slice(0,8)+'...'+h.slice(-6):h):'?'}
+function sa(a){return a?(a.length>16?a.slice(0,6)+'..'+a.slice(-4):a):'?'}
+function fmt(n){return n!=null?Number(n).toLocaleString():'0'}
+function up(s){if(!s)return'-';if(s<3600)return Math.floor(s/60)+'m';return Math.floor(s/3600)+'h '+Math.floor((s%3600)/60)+'m'}
+function txType(a){
+  const amt=a.amount||0;
+  if(a.inference)return '<span class="tag inf">INFERENCE</span>';
+  if(amt>=10000)return '<span class="tag faucet">FAUCET</span>';
+  return '<span class="tag tx">TRANSFER</span>';
+}
 
-let prevTx=0,prevT=Date.now();
+let pTx=0,pT=Date.now();
 
 async function tick(){
-  // Query only LAX (fast, single request)
-  const [stats,health,vals]=await Promise.all([f(RPC+'/stats'),f(RPC+'/health'),f(RPC+'/validators')]);
+  const[stats,health,vals]=await Promise.all([f(RPC+'/stats'),f(RPC+'/health'),f(RPC+'/validators')]);
   if(stats){
-    const now=Date.now();const dt=(now-prevT)/1000;const dtx=stats.total_transactions-prevTx;
-    const tps=(prevTx>0&&dt>0)?Math.round(dtx/dt):0;
-    prevTx=stats.total_transactions;prevT=now;
+    const now=Date.now(),dt=(now-pT)/1000,dx=stats.total_transactions-pTx;
+    const tps=(pTx>0&&dt>0)?Math.round(dx/dt):0;
+    pTx=stats.total_transactions;pT=now;
     document.getElementById('height').textContent=fmt(stats.block_height);
     document.getElementById('tps').textContent=fmt(tps);
     document.getElementById('txcount').textContent=fmt(stats.total_transactions);
   }
-  if(health){document.getElementById('uptime').textContent=uptime(health.uptime_secs)}
-  if(vals){document.getElementById('vals').textContent=vals.count}
+  if(health)document.getElementById('uptime').textContent=up(health.uptime_secs);
+  if(vals)document.getElementById('vals').textContent=vals.count;
 }
 
 async function updateNodes(){
   const g=document.getElementById('node-grid');
-  const ps=NODES.map(n=>f(`http://${n.ip}:9090/health`,2000));
-  const hs=await Promise.all(ps);
+  const hs=await Promise.all(NODES.map(n=>f('http://'+n.ip+':9090/health',2000)));
   let up=0;
   g.innerHTML=NODES.map((n,i)=>{
     const h=hs[i];
-    if(h){up++;return `<div class="node"><span class="dot on"></span><b>${n.n}</b> ${n.r}<br>Peers:${h.peers} Up:${uptime(h.uptime_secs)}</div>`}
-    return `<div class="node off"><span class="dot off"></span><b>${n.n}</b> ${n.r}<br>OFFLINE</div>`
+    if(h){up++;return '<div class="nd"><span class="dot on"></span><b>'+n.n+'</b> '+n.r+'<br>Peers:'+h.peers+'</div>'}
+    return '<div class="nd dead"><span class="dot off"></span><b>'+n.n+'</b> '+n.r+'</div>'
   }).join('');
   document.getElementById('nodes-up').textContent=up+'/8';
 }
 
 async function showTx(hash){
-  const m=document.getElementById('modal');const b=document.getElementById('modal-body');
+  const m=document.getElementById('modal'),b=document.getElementById('m-body');
   b.innerHTML='<tr><td colspan="2" style="color:#475569">Loading...</td></tr>';m.style.display='block';
-  let tx=await f(RPC+'/tx/'+hash+'/full',3000);
-  if(!tx||!tx.tx_type){for(const node of NODES){tx=await f(`http://${node.ip}:9090/tx/${hash}/full`,2000);if(tx&&tx.tx_type)break}}
+  let tx=await f(RPC+'/tx/'+hash+'/full',5000);
+  if(!tx||!tx.tx_type){for(const n of NODES){tx=await f('http://'+n.ip+':9090/tx/'+hash+'/full',2000);if(tx&&tx.tx_type)break}}
   if(!tx||!tx.tx_type){b.innerHTML='<tr><td colspan="2" style="color:#ef4444">Not found</td></tr>';return}
-  const s=tx.success?'<span class="ok">SUCCESS</span>':'<span class="fail">FAILED</span>';
-  const amt=tx.body&&tx.body.amount?fmt(tx.body.amount)+' ARC':'—';
+  const s=tx.success?'<span class="tag ok">SUCCESS</span>':'<span class="tag fail">FAILED</span>';
   const to=tx.body&&tx.body.to?tx.body.to:'—';
-  b.innerHTML=`
-    <tr><td>Hash</td><td style="word-break:break-all;font-size:11px">${tx.tx_hash}</td></tr>
-    <tr><td>Status</td><td>${s}</td></tr>
-    <tr><td>Type</td><td>${tx.tx_type}</td></tr>
-    <tr><td>From</td><td style="word-break:break-all;font-size:11px">${tx.from}</td></tr>
-    <tr><td>To</td><td style="word-break:break-all;font-size:11px">${to}</td></tr>
-    <tr><td>Amount</td><td style="color:#34d399">${amt}</td></tr>
-    <tr><td>Nonce</td><td>${tx.nonce}</td></tr>
-    <tr><td>Gas</td><td>${fmt(tx.gas_used)}</td></tr>
-    <tr><td>Block</td><td>${tx.block_height||'—'}</td></tr>`;
+  const amt=tx.body&&tx.body.amount?fmt(tx.body.amount)+' ARC':'—';
+  b.innerHTML=
+    '<tr><td>Hash</td><td>'+tx.tx_hash+'</td></tr>'+
+    '<tr><td>Status</td><td>'+s+'</td></tr>'+
+    '<tr><td>Type</td><td>'+tx.tx_type+'</td></tr>'+
+    '<tr><td>From</td><td>'+tx.from+'</td></tr>'+
+    '<tr><td>To</td><td>'+to+'</td></tr>'+
+    '<tr><td>Amount</td><td style="color:#34d399">'+amt+'</td></tr>'+
+    '<tr><td>Nonce</td><td>'+tx.nonce+'</td></tr>'+
+    '<tr><td>Gas</td><td>'+fmt(tx.gas_used)+'</td></tr>'+
+    '<tr><td>Block</td><td>'+tx.block_height+'</td></tr>';
 }
 
 async function updateTxs(){
   const el=document.getElementById('tx-list');
-  // Pull transactions from recent blocks
-  const stats=await f(RPC+'/stats',2000);
-  if(!stats||stats.block_height<1){el.innerHTML='<tr><td colspan="4" style="color:#475569">No blocks yet</td></tr>';return}
-  const h=stats.block_height;
-  const from=Math.max(1,h-10);
-  const blocks=await f(RPC+`/blocks?from=${from}&to=${h}&limit=10`,3000);
-  if(!blocks||!blocks.blocks){el.innerHTML='<tr><td colspan="4" style="color:#475569">Loading blocks...</td></tr>';return}
-
-  // Collect tx hashes from blocks
-  const allHashes=[];
-  for(const b of blocks.blocks.reverse()){
-    if(b.tx_count>0){
-      const full=await f(RPC+'/block/'+b.height,2000);
-      if(full&&full.tx_hashes){
-        for(const th of full.tx_hashes){
-          if(th!=='0000000000000000000000000000000000000000000000000000000000000000')allHashes.push(th);
-        }
-      }
-    }
-  }
-  if(allHashes.length===0){
-    // Fallback: try any node's account tx history
-    for(const node of NODES){
-      const txs=await f(`http://${node.ip}:9090/account/2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213/txs`,2000);
-      if(txs&&txs.tx_hashes&&txs.tx_hashes.length>0){allHashes.push(...txs.tx_hashes.slice(-10));break}
-    }
-  }
-  if(allHashes.length===0){el.innerHTML='<tr><td colspan="4" style="color:#475569">No individual transactions indexed (benchmark mode active)</td></tr>';return}
-
-  const rows=[];
-  for(const h of allHashes.slice(0,12)){
-    let tx=await f(RPC+'/tx/'+h+'/full',2000);
-    if(!tx){for(const node of NODES){tx=await f(`http://${node.ip}:9090/tx/${h}/full`,2000);if(tx&&tx.tx_type)break}}
-    const type=tx?tx.tx_type:'Transfer';
-    const amt=tx&&tx.body&&tx.body.amount?fmt(tx.body.amount):'—';
-    const s=tx?(tx.success?'<span class="ok">OK</span>':'<span class="fail">FAIL</span>'):'';
-    rows.push(`<tr class="click" onclick="showTx('${h}')"><td class="hash">${sh(h)}</td><td>${type}</td><td>${amt}</td><td>${s}</td></tr>`);
-  }
-  el.innerHTML=rows.join('');
+  const att=await f(RPC+'/inference/attestations',4000);
+  if(!att||!att.attestations||att.attestations.length===0){el.innerHTML='<tr><td colspan="6" style="color:#475569">No transactions yet</td></tr>';return}
+  el.innerHTML=att.attestations.slice(0,15).map(a=>{
+    const h=(a.tx_hash||'').replace('0x','');
+    const s=a.success?'<span class="tag ok">OK</span>':'<span class="tag fail">FAIL</span>';
+    const to=a.to?sa(a.to):'—';
+    const amt=a.amount?fmt(a.amount)+' ARC':'—';
+    return '<tr class="cl" onclick="showTx(\''+h+'\')"><td class="hash">'+sh(h)+'</td><td>'+txType(a)+'</td><td class="hash">'+sa(a.from||'')+'</td><td class="hash">'+to+'</td><td>'+amt+'</td><td>'+s+'</td></tr>';
+  }).join('');
 }
 
 async function updateInference(){
   const el=document.getElementById('inf-list');
-  // Try all nodes for attestations
-  let best=null;
-  for(const node of NODES){
-    const r=await f(`http://${node.ip}:9090/inference/attestations?limit=20`,3000);
-    if(r&&r.attestations&&r.attestations.length>0&&(!best||r.attestations.length>best.length)){best=r.attestations}
+  // Try all nodes for inference results
+  let results=null;
+  for(const n of NODES){
+    const r=await f('http://'+n.ip+':9090/inference/results',3000);
+    if(r&&r.results&&r.results.length>0){results=r.results;break}
   }
-  if(!best||best.length===0){el.innerHTML='<span style="color:#475569">No attestations on-chain yet</span>';return}
-
-  let html='<table><tr><th>Block</th><th>Hash</th><th>Type</th><th>Amount</th><th>Status</th></tr>';
-  for(const a of best.slice(0,15)){
-    const s=a.success?'<span class="ok">OK</span>':'<span class="fail">FAIL</span>';
-    const type=a.tx_type||'Transfer';
-    const amt=a.amount?fmt(a.amount)+' ARC':'—';
-    const hash=a.tx_hash?a.tx_hash.replace('0x',''):'';
-    html+=`<tr class="click" onclick="showTx('${hash}')">
-      <td>${a.block_height||'?'}</td>
-      <td class="hash">${sh(hash)}</td>
-      <td>${type}</td>
-      <td>${amt}</td>
-      <td>${s}</td>
-    </tr>`;
+  if(!results||results.length===0){
+    el.innerHTML='<span style="color:#475569">No inference runs yet. Waiting for model to process queries...</span>';
+    return;
   }
-  html+='</table>';
-  el.innerHTML=html;
+  el.innerHTML=results.slice(0,10).map(r=>{
+    const h=(r.tx_hash||'').replace('0x','');
+    return '<div class="inf-card" style="cursor:pointer" onclick="showTx(\''+h+'\')">'+
+      '<div class="inf-q">Q: '+(r.input||'—')+'</div>'+
+      '<div class="inf-a">A: '+(r.output||'—')+'</div>'+
+      '<div class="inf-meta">'+
+        '<span>Hash: '+sh(r.output_hash||'')+'</span>'+
+        '<span>Model: '+(r.model||'—')+'</span>'+
+        '<span>'+r.ms_per_token+' ms/tok</span>'+
+        '<span>'+r.tokens_generated+' tokens</span>'+
+        '<span>'+(r.deterministic?'DETERMINISTIC':'')+'</span>'+
+        '<span>Engine: '+(r.engine||'')+'</span>'+
+      '</div></div>';
+  }).join('');
 }
 
-// Boot
 tick();updateNodes();updateTxs();updateInference();
 setInterval(tick,3000);
-setInterval(updateNodes,15000);
-setInterval(updateTxs,10000);
-setInterval(updateInference,20000);
+setInterval(updateNodes,20000);
+setInterval(updateTxs,8000);
+setInterval(updateInference,10000);
 </script>
 </body></html>
