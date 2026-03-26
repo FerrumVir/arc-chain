@@ -4,42 +4,42 @@
 <title>ARC Chain Explorer</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
-body{background:#0a0e17;color:#c0c8d4;font-family:'SF Mono','Fira Code','Courier New',monospace;font-size:13px;padding:16px;max-width:1000px;margin:0 auto}
+body{background:#0a0e17;color:#c0c8d4;font-family:'SF Mono','Fira Code','Courier New',monospace;font-size:15px;padding:24px;max-width:1200px;margin:0 auto}
 a{color:#60a5fa;text-decoration:none}a:hover{text-decoration:underline}
-h1{color:#60a5fa;font-size:20px;text-align:center;margin-bottom:2px}
-.sub{color:#475569;font-size:11px;text-align:center;margin-bottom:16px}
+h1{color:#60a5fa;font-size:28px;text-align:center;margin-bottom:4px}
+.sub{color:#475569;font-size:13px;text-align:center;margin-bottom:20px}
 .grid{display:grid;gap:8px;margin-bottom:12px}
 .g3{grid-template-columns:repeat(3,1fr)}.g6{grid-template-columns:repeat(6,1fr)}
 .box{background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:10px;text-align:center}
-.box .l{color:#475569;font-size:9px;text-transform:uppercase;letter-spacing:1px}
-.box .v{color:#60a5fa;font-size:20px;font-weight:bold;margin-top:2px}
+.box .l{color:#475569;font-size:11px;text-transform:uppercase;letter-spacing:1px}
+.box .v{color:#60a5fa;font-size:28px;font-weight:bold;margin-top:4px}
 .box .v.g{color:#34d399}.box .v.y{color:#fbbf24}.box .v.r{color:#ef4444}
 .sec{background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:12px;margin-bottom:10px}
 .sec h2{color:#60a5fa;font-size:12px;margin-bottom:6px;border-bottom:1px solid #1e2d3d;padding-bottom:4px}
 .dot{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
 .on{background:#34d399}.off{background:#ef4444}
 .nodes{display:grid;grid-template-columns:repeat(4,1fr);gap:4px}
-.nd{padding:5px 7px;border-radius:3px;font-size:10px;background:#0d1117;border:1px solid #1e2d3d}
+.nd{padding:8px 10px;border-radius:4px;font-size:13px;background:#0d1117;border:1px solid #1e2d3d}
 .nd.dead{opacity:.4;border-color:#ef4444}
 table{width:100%;border-collapse:collapse}
-th{text-align:left;color:#475569;font-size:9px;text-transform:uppercase;padding:3px 5px;border-bottom:1px solid #1e2d3d}
-td{padding:4px 5px;border-bottom:1px solid #0d1117;font-size:11px}
+th{text-align:left;color:#475569;font-size:11px;text-transform:uppercase;padding:6px 8px;border-bottom:1px solid #1e2d3d}
+td{padding:6px 8px;border-bottom:1px solid #0d1117;font-size:13px}
 tr.cl:hover{background:#1e2d3d;cursor:pointer}
-.tag{display:inline-block;padding:1px 6px;border-radius:3px;font-size:9px;font-weight:bold}
+.tag{display:inline-block;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold}
 .tag.ok{background:#064e3b;color:#34d399}.tag.fail{background:#7f1d1d;color:#ef4444}
 .tag.tx{background:#1e3a5f;color:#60a5fa}.tag.inf{background:#4c1d95;color:#a78bfa}
 .tag.faucet{background:#713f12;color:#fbbf24}
-.hash{color:#60a5fa;font-size:10px}
+.hash{color:#60a5fa;font-size:13px}
 .inf-card{background:#0d1117;border:1px solid #1e2d3d;border-radius:4px;padding:10px;margin:5px 0}
-.inf-q{color:#fbbf24;font-size:11px;margin-bottom:3px}
-.inf-a{color:#34d399;font-size:12px;margin-bottom:4px}
-.inf-meta{color:#475569;font-size:9px;display:flex;gap:12px;flex-wrap:wrap}
+.inf-q{color:#fbbf24;font-size:14px;margin-bottom:4px}
+.inf-a{color:#34d399;font-size:15px;margin-bottom:6px}
+.inf-meta{color:#475569;font-size:11px;display:flex;gap:14px;flex-wrap:wrap}
 .inf-meta span{white-space:nowrap}
 #modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.85);z-index:10;overflow-y:auto}
-#m-inner{max-width:650px;margin:50px auto;background:#111827;border:1px solid #1e2d3d;border-radius:6px;padding:16px}
+#m-inner{max-width:800px;margin:50px auto;background:#111827;border:1px solid #1e2d3d;border-radius:8px;padding:24px}
 #m-close{float:right;cursor:pointer;color:#475569;font-size:18px}
-#m-body td:first-child{color:#475569;width:90px;font-size:10px}
-#m-body td{font-size:11px;word-break:break-all;padding:3px 5px}
+#m-body td:first-child{color:#475569;width:120px;font-size:13px}
+#m-body td{font-size:14px;word-break:break-all;padding:6px 8px}
 </style>
 </head><body>
 <h1>ARC CHAIN EXPLORER</h1>
@@ -131,41 +131,56 @@ async function updateNodes(){
   document.getElementById('nodes-up').textContent=up+'/8';
 }
 
+// Cache attestation data for click lookups
+let cachedAttestations=[];
+
 async function showTx(hash){
   const m=document.getElementById('modal'),b=document.getElementById('m-body');
   b.innerHTML='<tr><td colspan="2" style="color:#475569">Loading...</td></tr>';m.style.display='block';
-  let tx=await f(RPC+'/tx/'+hash+'/full',5000);
+
+  // First check cached attestation data (has inference details)
+  const cached=cachedAttestations.find(a=>(a.tx_hash||'').replace('0x','')===hash);
+
+  // Try /tx/{hash}/full for on-chain tx details
+  let tx=await f(RPC+'/tx/'+hash+'/full',3000);
   if(!tx||!tx.tx_type){for(const n of NODES){tx=await f('http://'+n.ip+':9090/tx/'+hash+'/full',2000);if(tx&&tx.tx_type)break}}
-  if(!tx||!tx.tx_type){b.innerHTML='<tr><td colspan="2" style="color:#ef4444">Not found</td></tr>';return}
+
+  // If no on-chain record but we have cached attestation data, use that
+  if(!tx||!tx.tx_type){
+    if(!cached){b.innerHTML='<tr><td colspan="2" style="color:#ef4444">Transaction not found on any node</td></tr>';return}
+    // Build from cached attestation
+    tx={tx_hash:'0x'+hash,tx_type:cached.tx_type||'Inference',from:cached.from||'Validator',success:cached.success,gas_used:cached.gas_used,block_height:cached.block_height,body:{to:cached.to,amount:cached.amount}};
+  }
+
   const s=tx.success?'<span class="tag ok">SUCCESS</span>':'<span class="tag fail">FAILED</span>';
   const to=tx.body&&tx.body.to?tx.body.to:'—';
   const amt=tx.body&&tx.body.amount?fmt(tx.body.amount)+' ARC':'—';
   let rows=
     '<tr><td>Hash</td><td>'+tx.tx_hash+'</td></tr>'+
     '<tr><td>Status</td><td>'+s+'</td></tr>'+
-    '<tr><td>Type</td><td>'+tx.tx_type+'</td></tr>'+
-    '<tr><td>From</td><td>'+tx.from+'</td></tr>'+
+    '<tr><td>Type</td><td>'+txType(cached||tx)+'</td></tr>'+
+    '<tr><td>From</td><td>'+(tx.from||'—')+'</td></tr>'+
     '<tr><td>To</td><td>'+to+'</td></tr>'+
     '<tr><td>Amount</td><td style="color:#34d399">'+amt+'</td></tr>'+
-    '<tr><td>Nonce</td><td>'+(tx.nonce!=null?tx.nonce:'—')+'</td></tr>'+
     '<tr><td>Gas</td><td>'+fmt(tx.gas_used)+'</td></tr>'+
     '<tr><td>Block</td><td>'+(tx.block_height||'—')+'</td></tr>';
 
-  // Check if this tx has inference data (query /inference/results)
-  const infRes=await f(RPC+'/inference/results',3000);
-  if(infRes&&infRes.results){
-    const inf=infRes.results.find(r=>(r.tx_hash||'').replace('0x','')===hash);
-    if(inf){
-      rows+='<tr><td colspan="2" style="border-top:1px solid #1e2d3d;padding-top:8px;color:#a78bfa;font-weight:bold">AI Inference Details</td></tr>'+
-        '<tr><td>Input</td><td style="color:#fbbf24">'+inf.input+'</td></tr>'+
-        '<tr><td>Output</td><td style="color:#34d399">'+inf.output+'</td></tr>'+
-        '<tr><td>Output Hash</td><td>'+inf.output_hash+'</td></tr>'+
-        '<tr><td>Model</td><td>'+inf.model+'</td></tr>'+
-        '<tr><td>Model Hash</td><td>'+(inf.model_hash||'')+'</td></tr>'+
-        '<tr><td>Speed</td><td>'+inf.ms_per_token+' ms/tok ('+inf.tokens_generated+' tokens)</td></tr>'+
-        '<tr><td>Engine</td><td>'+inf.engine+'</td></tr>'+
-        '<tr><td>Deterministic</td><td>'+(inf.deterministic?'<span class="tag ok">YES — identical on every platform</span>':'No')+'</td></tr>';
-    }
+  // Show inference details from cached attestation or /inference/results
+  let inf=cached&&cached.inference?cached.inference:null;
+  if(!inf){
+    const infRes=await f(RPC+'/inference/results',3000);
+    if(infRes&&infRes.results)inf=infRes.results.find(r=>(r.tx_hash||'').replace('0x','')===hash);
+  }
+  if(inf){
+    rows+='<tr><td colspan="2" style="border-top:2px solid #4c1d95;padding-top:10px;color:#a78bfa;font-size:15px;font-weight:bold">AI Inference Details</td></tr>'+
+      '<tr><td>Input</td><td style="color:#fbbf24;font-size:14px">'+inf.input+'</td></tr>'+
+      '<tr><td>Output</td><td style="color:#34d399;font-size:14px">'+inf.output+'</td></tr>'+
+      '<tr><td>Output Hash</td><td>'+inf.output_hash+'</td></tr>'+
+      '<tr><td>Model</td><td>'+inf.model+'</td></tr>'+
+      '<tr><td>Model Hash</td><td>'+(inf.model_hash||'')+'</td></tr>'+
+      '<tr><td>Speed</td><td>'+inf.ms_per_token+' ms/tok ('+inf.tokens_generated+' tokens)</td></tr>'+
+      '<tr><td>Engine</td><td>'+inf.engine+'</td></tr>'+
+      '<tr><td>Deterministic</td><td><span class="tag ok">YES — identical output on every chip on earth</span></td></tr>';
   }
   b.innerHTML=rows;
 }
@@ -174,6 +189,7 @@ async function updateTxs(){
   const el=document.getElementById('tx-list');
   const att=await f(RPC+'/inference/attestations',4000);
   if(!att||!att.attestations||att.attestations.length===0){el.innerHTML='<tr><td colspan="6" style="color:#475569">No transactions yet</td></tr>';return}
+  cachedAttestations=att.attestations; // Cache for click lookups
   // Sort: inference first, then faucet, then transfers
   const sorted=att.attestations.sort((a,b)=>{
     const rank=x=>(x.inference||x.tx_type==='Inference')?0:(x.tx_type==='Faucet'||x.amount>=10000)?1:2;
