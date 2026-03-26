@@ -109,7 +109,7 @@ async function tick(){
     document.getElementById('txcount').textContent=fmt(stats.total_transactions);
   }
   if(health){document.getElementById('uptime').textContent=uptime(health.uptime_secs)}
-  if(vals){document.getElementById('vals').textContent=vals.count+' / '+fmt(vals.total_stake)+' ARC'}
+  if(vals){document.getElementById('vals').textContent=vals.count}
 }
 
 async function updateNodes(){
