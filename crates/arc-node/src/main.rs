@@ -363,7 +363,33 @@ async fn main() -> Result<()> {
     });
 
     // ── State Sync Protocol (A5) — bootstrap from peer snapshot ─────
-    if let Some(peer) = &cli.sync_from {
+    // Auto-sync: if this node has peers configured and state is fresh (height 0),
+    // automatically sync state from the first reachable peer. This allows new
+    // nodes to join an existing network without manual --sync-from.
+    let sync_peer = if cli.sync_from.is_some() {
+        cli.sync_from.clone()
+    } else if state.height() == 0 && !peers.is_empty() {
+        // Try each peer until one responds
+        let mut found = None;
+        for peer_addr in &peers {
+            let peer_rpc = peer_addr.replace(":9091", ":9090");
+            let url = format!("http://{}/health", peer_rpc);
+            tracing::info!("Auto-sync: checking peer {}", url);
+            match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    tracing::info!("Auto-sync: peer {} is reachable, will sync state", peer_rpc);
+                    found = Some(peer_rpc);
+                    break;
+                }
+                _ => continue,
+            }
+        }
+        found
+    } else {
+        None
+    };
+
+    if let Some(peer) = &sync_peer {
         tracing::info!("Bootstrapping from peer: {}", peer);
 
         let sync_mgr = arc_node::state_sync::StateSyncManager::new();
