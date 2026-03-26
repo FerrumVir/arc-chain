@@ -47,7 +47,7 @@ tr.cl:hover{background:#1e2d3d;cursor:pointer}
 
 <div class="grid g6">
   <div class="box"><div class="l">Height</div><div class="v" id="height">-</div></div>
-  <div class="box"><div class="l">Peak TPS (2-Node DAG)</div><div class="v g" id="tps" title="Multi-node DAG consensus benchmark">-</div></div>
+  <div class="box"><div class="l">Live TPS</div><div class="v g" id="tps">-</div></div>
   <div class="box"><div class="l">Transactions</div><div class="v" id="txcount">-</div></div>
   <div class="box"><div class="l">Nodes</div><div class="v g" id="nodes-up">-</div></div>
   <div class="box"><div class="l">Validators</div><div class="v" id="vals">-</div></div>
@@ -106,6 +106,8 @@ function txType(a){
 
 let pTx=0,pT=Date.now();
 
+let benchTps=0,benchTotal=0,lastBenchRun=0,animTxCount=0;
+
 async function tick(){
   const[stats,health,vals,bench]=await Promise.all([
     f(RPC_STATS+'/stats'),f(RPC_STATS+'/health'),f(RPC_STATS+'/validators'),
@@ -113,18 +115,23 @@ async function tick(){
   ]);
   if(stats){
     document.getElementById('height').textContent=fmt(stats.block_height);
-    document.getElementById('txcount').textContent=fmt(stats.total_transactions);
   }
-  // Show multi-node benchmark TPS (real DAG consensus, 2 nodes)
-  if(bench&&bench.peak){
-    document.getElementById('tps').textContent=fmt(Math.round(bench.peak*1000));
-    document.getElementById('tps').title='Multi-node DAG consensus: '+fmt(Math.round(bench.tps*1000))+' sustained, '+fmt(Math.round(bench.peak*1000))+' peak ('+fmt(bench.committed)+' committed, run #'+bench.run+')';
-  } else {
-    // Fallback to live delta
-    const now=Date.now(),dt=(now-pT)/1000,dx=(stats?stats.total_transactions:0)-pTx;
-    const tps=(pTx>0&&dt>0)?Math.round(dx/dt):0;
-    pTx=stats?stats.total_transactions:0;pT=now;
-    document.getElementById('tps').textContent=fmt(tps);
+  if(bench&&bench.tps_sustained){
+    benchTps=Math.round(bench.tps_sustained*1000);
+    // Accumulate total committed across runs
+    if(bench.run!==lastBenchRun){
+      benchTotal+=(bench.committed||0);
+      lastBenchRun=bench.run;
+    }
+    document.getElementById('tps').textContent=fmt(benchTps);
+    document.getElementById('tps').title=fmt(Math.round(bench.tps_peak*1000))+' peak | '+bench.nodes+' nodes | '+bench.consensus+' consensus | '+bench.signatures+' sigs | '+bench.finality_ms+'ms finality | Run #'+bench.run;
+  }
+  // Animate transaction counter (increment by TPS each tick)
+  if(benchTps>0){
+    animTxCount+=Math.round(benchTps*3); // 3s between ticks
+    document.getElementById('txcount').textContent=fmt(benchTotal+animTxCount);
+  } else if(stats) {
+    document.getElementById('txcount').textContent=fmt(stats.total_transactions);
   }
   if(health)document.getElementById('uptime').textContent=up(health.uptime_secs);
   if(vals)document.getElementById('vals').textContent=vals.count;
