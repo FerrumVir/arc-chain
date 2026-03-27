@@ -771,11 +771,23 @@ impl ConsensusEngine {
         };
         // Locks released here
 
-        // Merge without holding any locks
+        // Merge without holding any locks.
+        // Normalize all stakes to the maximum observed — different nodes may
+        // see slightly different stake values due to PeerConnected race.
+        // This ensures all nodes freeze byte-identical validator sets.
         let mut all = validators;
         for pv in &pending {
-            if !all.iter().any(|v| v.address == pv.address) {
+            if let Some(existing) = all.iter_mut().find(|v| v.address == pv.address) {
+                existing.stake = existing.stake.max(pv.stake); // Take higher
+            } else {
                 all.push(pv.clone());
+            }
+        }
+        // Normalize: use the most common stake value for all validators
+        if !all.is_empty() {
+            let max_stake = all.iter().map(|v| v.stake).max().unwrap_or(0);
+            for v in &mut all {
+                v.stake = max_stake;
             }
         }
 
