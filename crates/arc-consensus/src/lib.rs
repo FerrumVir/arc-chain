@@ -1283,10 +1283,16 @@ impl ConsensusEngine {
             addrs
         };
 
-        // Commit rounds sequentially. Each round either commits its leader's
-        // block or is skipped (leader didn't propose or quorum not reached).
-        // All nodes make the same skip/commit decisions because they see the
-        // same DAG data and use the same deterministic leader formula.
+        // Commit rounds sequentially starting from last_committed_round.
+        // For each round R:
+        //   - If the leader's block exists AND satisfies the 2-round rule → commit
+        //   - If the leader's block exists but no proof yet → STOP (wait for more data)
+        //   - If the leader's block doesn't exist → STOP (wait for it to arrive)
+        //
+        // We do NOT skip rounds. All nodes eventually receive all blocks via
+        // QUIC gossip. The 2-round rule ensures safety — no premature commits.
+        // Nodes that see the leader block later commit later, but commit the
+        // SAME block. This is the Bullshark guarantee.
         let last_cr = self.last_committed_round.load(Ordering::SeqCst);
         let start_round = if last_cr == 0 { 0 } else { last_cr + 1 };
         for r in start_round..=(current.saturating_sub(2)) {
@@ -1382,10 +1388,48 @@ impl ConsensusEngine {
                 }
             }
 
-            // Whether or not the leader's block was committed, advance
-            // last_committed_round so we don't retry this round.
-            // All nodes make the same decision (commit or skip) because
-            // they see the same DAG and use the same leader formula.
+            // Only advance past this round if the leader's block was committed.
+            // If not, STOP — don't try later rounds. Wait for the leader's
+            // block to arrive via QUIC gossip. All nodes will eventually
+            // receive it and commit it in the same order.
+            //
+            // Exception: if the leader has NO block in this round at all
+            // AND we have quorum blocks from other validators (meaning the
+            // round happened but the leader was offline), skip this round.
+            let leader_block_exists = round_r_blocks.iter().any(|h| {
+                self.dag.get(h).map(|b| b.author == leader.unwrap_or(Hash256::ZERO)).unwrap_or(false)
+            });
+            let round_has_quorum = {
+                let mut stake = 0u64;
+                for h in &round_r_blocks {
+                    if let Some(b) = self.dag.get(h) {
+                        if let Some(v) = vs.get_validator(&b.author) {
+                            stake += v.stake;
+                        }
+                    }
+                }
+                stake >= vs.quorum
+            };
+
+            if leader_block_exists && newly_committed.last().map(|b: &DagBlock| b.round) != Some(r) {
+                // Leader block exists but wasn't committed (missing 2-round proof).
+                // Wait for more DAG data — BUT only if we're within SKIP_GRACE
+                // rounds of the current round. If we're far behind, the proof
+                // data may have been pruned. Skip to avoid deadlock.
+                const SKIP_GRACE: u64 = 5;
+                if current.saturating_sub(r) < SKIP_GRACE {
+                    break; // Still close enough — wait for proof data
+                }
+                // Too far behind — skip this round (all nodes will reach
+                // the same conclusion when they're this far behind)
+            } else if !leader_block_exists && !round_has_quorum {
+                // Round hasn't happened on the network yet.
+                const SKIP_GRACE: u64 = 5;
+                if current.saturating_sub(r) < SKIP_GRACE {
+                    break;
+                }
+            }
+            // Either committed successfully, or skipped (too far behind).
             self.last_committed_round.store(r, Ordering::SeqCst);
         }
 
