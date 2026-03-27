@@ -1359,19 +1359,11 @@ impl ConsensusEngine {
         // round. This is deterministic because all nodes see the same DAG blocks
         // (eventually), so they compute the same set of authors per round.
 
-        // Commit rounds sequentially starting from last_committed_round.
-        // For each round R:
-        //   - If the leader's block exists AND satisfies the 2-round rule → commit
-        //   - If the leader's block exists but no proof yet → STOP (wait for more data)
-        //   - If the leader's block doesn't exist → STOP (wait for it to arrive)
-        //
-        // We do NOT skip rounds. All nodes eventually receive all blocks via
-        // QUIC gossip. The 2-round rule ensures safety — no premature commits.
-        // Nodes that see the leader block later commit later, but commit the
-        // SAME block. This is the Bullshark guarantee.
-        let last_cr = self.last_committed_round.load(Ordering::SeqCst);
-        let start_round = if last_cr == 0 { 0 } else { last_cr + 1 };
-        for r in start_round..=(current.saturating_sub(2)) {
+        // Scan ALL uncommitted rounds on every call. Do NOT skip or advance
+        // past rounds — blocks may arrive later via QUIC. The commit is
+        // purely structural: it depends on what's IN the DAG, not on timing.
+        // All nodes that eventually see the same DAG make the same decisions.
+        for r in 0..=(current.saturating_sub(2)) {
             let round_r_blocks = self.blocks_in_round(r);
 
             // Leader for this round: use the FROZEN validator set.
@@ -1462,8 +1454,6 @@ impl ConsensusEngine {
                                 );
 
                                 newly_committed.push(block_b.clone());
-                                // Update last committed round
-                                self.last_committed_round.store(r, Ordering::SeqCst);
                             }
                             // Once committed via one certifier, no need to check others
                             break;
@@ -1495,30 +1485,10 @@ impl ConsensusEngine {
                 stake >= vs.quorum
             };
 
-            if leader_block_exists && newly_committed.last().map(|b: &DagBlock| b.round) != Some(r) {
-                // Leader block exists but wasn't committed (missing 2-round proof).
-                // Wait for more DAG data — BUT only if we're within SKIP_GRACE
-                // rounds of the current round. If we're far behind, the proof
-                // data may have been pruned. Skip to avoid deadlock.
-                // Grace period: wait this many rounds before skipping.
-                // 10 rounds at 50ms/tick = 500ms — enough for cross-continent QUIC.
-                const SKIP_GRACE: u64 = 10;
-                if current.saturating_sub(r) < SKIP_GRACE {
-                    break; // Still close enough — wait for proof data
-                }
-                // Too far behind — skip this round (all nodes will reach
-                // the same conclusion when they're this far behind)
-            } else if !leader_block_exists && !round_has_quorum {
-                // Round hasn't happened on the network yet.
-                // Grace period: wait this many rounds before skipping.
-                // 10 rounds at 50ms/tick = 500ms — enough for cross-continent QUIC.
-                const SKIP_GRACE: u64 = 10;
-                if current.saturating_sub(r) < SKIP_GRACE {
-                    break;
-                }
-            }
-            // Either committed successfully, or skipped (too far behind).
-            self.last_committed_round.store(r, Ordering::SeqCst);
+            // No skip, no grace period. If the leader's block isn't here yet
+            // or doesn't have a 2-round proof, just move to the next round.
+            // We'll retry this round on the next try_commit() call when
+            // more blocks have arrived via QUIC.
         }
 
         // Add newly committed blocks to the committed list
