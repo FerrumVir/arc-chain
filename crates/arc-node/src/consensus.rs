@@ -207,12 +207,8 @@ impl ConsensusManager {
             // cross-continent latency (~100-300ms) without sacrificing
             // throughput — rounds advance when peers are ready, not on
             // a fixed timer.
-            // Multi-validator: 200ms tick gives RPC server time to handle requests.
-            // 50ms was too aggressive on 2-4 vCPU boxes — starved the HTTP server.
             let tick = if self.is_multi_validator() && !self.benchmark { 200 } else { 1 };
             tokio::time::sleep(tokio::time::Duration::from_millis(tick)).await;
-            // Explicitly yield to let other tokio tasks (RPC, networking) run
-            tokio::task::yield_now().await;
 
             // ── Drain pipeline results ──────────────────────────────────
             while let Some(result) = pipeline.try_recv() {
