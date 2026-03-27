@@ -1283,12 +1283,13 @@ impl ConsensusEngine {
             addrs
         };
 
-        // Commit rounds SEQUENTIALLY starting from last_committed_round + 1.
-        // This ensures all nodes commit the same rounds in the same order.
-        // Without sequential ordering, nodes that process DAG blocks at
-        // different speeds would commit different rounds first.
+        // Commit rounds sequentially. Each round either commits its leader's
+        // block or is skipped (leader didn't propose or quorum not reached).
+        // All nodes make the same skip/commit decisions because they see the
+        // same DAG data and use the same deterministic leader formula.
         let last_cr = self.last_committed_round.load(Ordering::SeqCst);
-        for r in last_cr..=(current.saturating_sub(2)) {
+        let start_round = if last_cr == 0 { 0 } else { last_cr + 1 };
+        for r in start_round..=(current.saturating_sub(2)) {
             let round_r_blocks = self.blocks_in_round(r);
 
             // Leader for this round
@@ -1380,6 +1381,12 @@ impl ConsensusEngine {
                     }
                 }
             }
+
+            // Whether or not the leader's block was committed, advance
+            // last_committed_round so we don't retry this round.
+            // All nodes make the same decision (commit or skip) because
+            // they see the same DAG and use the same leader formula.
+            self.last_committed_round.store(r, Ordering::SeqCst);
         }
 
         // Add newly committed blocks to the committed list
