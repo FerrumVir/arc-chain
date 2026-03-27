@@ -569,6 +569,10 @@ pub struct ConsensusEngine {
     rounds: DashMap<u64, Vec<Hash256>>,
     /// Committed block hashes in finalized order.
     committed: RwLock<Vec<Hash256>>,
+    /// Last DAG round that produced a committed chain block.
+    /// try_commit only looks at last_committed_round + 1, ensuring
+    /// all nodes commit rounds in the same sequential order.
+    last_committed_round: AtomicU64,
     /// Current DAG round.
     current_round: AtomicU64,
     /// Active validator set.
@@ -636,6 +640,7 @@ impl ConsensusEngine {
             dag: DashMap::new(),
             rounds: DashMap::new(),
             committed: RwLock::new(Vec::new()),
+            last_committed_round: AtomicU64::new(0),
             current_round: AtomicU64::new(0),
             validator_set: RwLock::new(validator_set),
             local_address,
@@ -671,6 +676,7 @@ impl ConsensusEngine {
             dag: DashMap::new(),
             rounds: DashMap::new(),
             committed: RwLock::new(Vec::new()),
+            last_committed_round: AtomicU64::new(0),
             current_round: AtomicU64::new(0),
             validator_set: RwLock::new(validator_set),
             local_address,
@@ -1277,9 +1283,12 @@ impl ConsensusEngine {
             addrs
         };
 
-        // Check all rounds up to current - 2 for committable blocks
-        // (a block in round R needs R+1 and R+2 data)
-        for r in 0..=(current.saturating_sub(2)) {
+        // Commit rounds SEQUENTIALLY starting from last_committed_round + 1.
+        // This ensures all nodes commit the same rounds in the same order.
+        // Without sequential ordering, nodes that process DAG blocks at
+        // different speeds would commit different rounds first.
+        let last_cr = self.last_committed_round.load(Ordering::SeqCst);
+        for r in last_cr..=(current.saturating_sub(2)) {
             let round_r_blocks = self.blocks_in_round(r);
 
             // Leader for this round
@@ -1362,6 +1371,8 @@ impl ConsensusEngine {
                                 );
 
                                 newly_committed.push(block_b.clone());
+                                // Update last committed round
+                                self.last_committed_round.store(r, Ordering::SeqCst);
                             }
                             // Once committed via one certifier, no need to check others
                             break;
