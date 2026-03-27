@@ -1313,9 +1313,13 @@ impl ConsensusEngine {
     /// # Returns
     /// Newly committed blocks in causal order.
     pub fn try_commit(&self) -> Vec<DagBlock> {
-        // Use FROZEN validator set for commit decisions — this is the same
-        // on all nodes within an epoch, ensuring deterministic leader selection.
+        // Before first epoch freeze (epoch=0), DON'T commit — wait for
+        // the validator set to stabilize. This prevents nodes from
+        // committing their own blocks with a 1-validator frozen set.
         let vs = self.frozen_validator_set.read();
+        if vs.epoch == 0 {
+            return Vec::new(); // Wait for first freeze
+        }
         let current = self.current_round.load(Ordering::SeqCst);
         let mut newly_committed = Vec::new();
 
