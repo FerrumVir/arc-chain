@@ -676,7 +676,11 @@ impl ConsensusManager {
             }
 
             // ── 2. Try to commit finalized DAG blocks (multi-validator) ──────
-            let committed = self.engine.try_commit();
+            let mut committed = self.engine.try_commit();
+            // Sort by round to ensure all nodes process in the same order.
+            // Without this, nodes discover committed blocks at different times
+            // and produce chain blocks in different sequences.
+            committed.sort_by_key(|b| b.round);
             if !committed.is_empty() {
                 for dag_block in &committed {
                     info!(
