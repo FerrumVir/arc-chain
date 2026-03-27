@@ -656,14 +656,13 @@ impl ConsensusManager {
                 }
             }
 
-            // Always advance round after proposing. The engine's advance_round()
-            // checks quorum which deadlocks when frozen set > active validators.
-            // Force-advance instead — the 200ms tick + Bullshark commit rule
-            // handle safety.
+            // Advance round ONLY when quorum parents exist. If peer blocks
+            // haven't arrived yet (100-300ms cross-continent), wait. The 200ms
+            // tick gives them time. force_advance_round() was causing nodes to
+            // race ahead of their peers, breaking parent references needed for
+            // the 2-round commit rule.
             if already_proposed {
-                if !self.engine.advance_round() {
-                    self.engine.force_advance_round();
-                }
+                let _ = self.engine.advance_round();
             }
 
             // ── 2. Try to commit finalized DAG blocks (multi-validator) ──────
