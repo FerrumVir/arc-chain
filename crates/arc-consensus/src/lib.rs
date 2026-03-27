@@ -1274,14 +1274,10 @@ impl ConsensusEngine {
             committed.iter().copied().collect()
         };
 
-        // Deterministic leader selection: for each round, the leader is chosen
-        // by round number mod validator count. Only the leader's block becomes
-        // a chain block. This ensures all nodes agree on the same chain.
-        let sorted_validators = {
-            let mut addrs: Vec<Address> = vs.validators.iter().map(|v| v.address).collect();
-            addrs.sort_by(|a, b| a.0.cmp(&b.0));
-            addrs
-        };
+        // Leader selection uses the genesis validator set (round 0 block authors)
+        // or, for later rounds, the authors who produced blocks in the PREVIOUS
+        // round. This is deterministic because all nodes see the same DAG blocks
+        // (eventually), so they compute the same set of authors per round.
 
         // Commit rounds sequentially starting from last_committed_round.
         // For each round R:
@@ -1298,11 +1294,21 @@ impl ConsensusEngine {
         for r in start_round..=(current.saturating_sub(2)) {
             let round_r_blocks = self.blocks_in_round(r);
 
-            // Leader for this round
-            let leader = if sorted_validators.is_empty() {
+            // Leader for this round: determined by who produced blocks in round R.
+            // Take all block authors in this round, sort them, pick by round mod count.
+            // All nodes see the same DAG blocks → same authors → same leader.
+            let round_authors: Vec<Address> = {
+                let mut authors: Vec<Address> = round_r_blocks.iter()
+                    .filter_map(|h| self.dag.get(h).map(|b| b.author))
+                    .collect();
+                authors.sort_by(|a, b| a.0.cmp(&b.0));
+                authors.dedup();
+                authors
+            };
+            let leader = if round_authors.is_empty() {
                 None
             } else {
-                Some(sorted_validators[r as usize % sorted_validators.len()])
+                Some(round_authors[r as usize % round_authors.len()])
             };
 
             for block_b_hash in &round_r_blocks {
@@ -1416,7 +1422,9 @@ impl ConsensusEngine {
                 // Wait for more DAG data — BUT only if we're within SKIP_GRACE
                 // rounds of the current round. If we're far behind, the proof
                 // data may have been pruned. Skip to avoid deadlock.
-                const SKIP_GRACE: u64 = 5;
+                // Grace period: wait this many rounds before skipping.
+                // 10 rounds at 50ms/tick = 500ms — enough for cross-continent QUIC.
+                const SKIP_GRACE: u64 = 10;
                 if current.saturating_sub(r) < SKIP_GRACE {
                     break; // Still close enough — wait for proof data
                 }
@@ -1424,7 +1432,9 @@ impl ConsensusEngine {
                 // the same conclusion when they're this far behind)
             } else if !leader_block_exists && !round_has_quorum {
                 // Round hasn't happened on the network yet.
-                const SKIP_GRACE: u64 = 5;
+                // Grace period: wait this many rounds before skipping.
+                // 10 rounds at 50ms/tick = 500ms — enough for cross-continent QUIC.
+                const SKIP_GRACE: u64 = 10;
                 if current.saturating_sub(r) < SKIP_GRACE {
                     break;
                 }

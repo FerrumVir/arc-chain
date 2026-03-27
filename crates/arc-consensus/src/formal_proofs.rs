@@ -591,7 +591,7 @@ mod formal_tests {
         assert!(current >= 3, "Should be at round 3 or later, got {}", current);
 
         // Build rounds manually for the recovered validator set
-        for round_offset in 0..3 {
+        for round_offset in 0..15 {
             let round = current + round_offset;
             let parents = engine.blocks_in_round(round.saturating_sub(1));
 
