@@ -883,14 +883,20 @@ impl ConsensusManager {
                 last_proposed_round = None;
             }
 
-            // ── 4. Epoch management: periodically freeze the validator set ───
-            // Every 100 rounds, freeze the current validator set so all nodes
-            // have the same frozen set for leader selection. This handles the
-            // case where peers connect at different times — after the freeze,
-            // all nodes agree on validators regardless of connection order.
-            // Freeze every 1000 rounds (~50s at 50ms/tick). This gives
-            // enough time for all peers to connect before the first freeze.
-            if multi_validator && current_round > 0 && current_round % 1000 == 0 {
+            // ── 4. Epoch management: freeze validator set when stable ─────
+            // Freeze when: multi-validator AND we have 3+ validators AND
+            // epoch is still 0 (first freeze) OR every 1000 rounds after.
+            // The "3+ validators" check ensures we don't freeze too early
+            // with only 1-2 peers.
+            let frozen_epoch = self.engine.frozen_validator_set().epoch;
+            let should_freeze = if frozen_epoch == 0 {
+                // First freeze: wait for at least 3 validators
+                self.engine.validator_set().len() >= 3 && current_round > 10
+            } else {
+                // Subsequent freezes: every 1000 rounds
+                current_round % 1000 == 0
+            };
+            if multi_validator && should_freeze {
                 self.engine.freeze_epoch();
             }
 
