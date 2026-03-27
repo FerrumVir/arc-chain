@@ -256,11 +256,11 @@ impl ConsensusManager {
                                 let new_set = ValidatorSet::new(validators, current_vs.epoch);
                                 self.engine.update_validator_set(new_set);
 
-                                // On first peer connection, freeze the epoch immediately
-                                // so leader selection starts working. Subsequent joins
-                                // are queued for the next epoch freeze.
+                                // On first peer connection, reset DAG but DON'T freeze
+                                // the epoch yet — more peers will connect in the next
+                                // 30-60s. The periodic freeze (every 100 rounds) will
+                                // capture the full validator set once peers stabilize.
                                 if was_single {
-                                    self.engine.freeze_epoch();
                                     self.engine.reset_dag();
                                     pending_txs.clear();
                                     last_proposed_round = None;
@@ -888,7 +888,9 @@ impl ConsensusManager {
             // have the same frozen set for leader selection. This handles the
             // case where peers connect at different times — after the freeze,
             // all nodes agree on validators regardless of connection order.
-            if multi_validator && current_round > 0 && current_round % 100 == 0 {
+            // Freeze every 1000 rounds (~50s at 50ms/tick). This gives
+            // enough time for all peers to connect before the first freeze.
+            if multi_validator && current_round > 0 && current_round % 1000 == 0 {
                 self.engine.freeze_epoch();
             }
 
