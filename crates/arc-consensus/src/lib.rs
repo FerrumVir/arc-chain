@@ -1362,21 +1362,19 @@ impl ConsensusEngine {
         for r in start_round..=(current.saturating_sub(2)) {
             let round_r_blocks = self.blocks_in_round(r);
 
-            // Leader for this round: determined by who produced blocks in round R.
-            // Take all block authors in this round, sort them, pick by round mod count.
-            // All nodes see the same DAG blocks → same authors → same leader.
-            let round_authors: Vec<Address> = {
-                let mut authors: Vec<Address> = round_r_blocks.iter()
-                    .filter_map(|h| self.dag.get(h).map(|b| b.author))
-                    .collect();
-                authors.sort_by(|a, b| a.0.cmp(&b.0));
-                authors.dedup();
-                authors
+            // Leader for this round: use the FROZEN validator set.
+            // The frozen set is the same on all nodes (frozen at the same epoch
+            // boundary). This guarantees deterministic leader selection.
+            let frozen_vals = {
+                let fvs = self.frozen_validator_set.read();
+                let mut addrs: Vec<Address> = fvs.validators.iter().map(|v| v.address).collect();
+                addrs.sort_by(|a, b| a.0.cmp(&b.0));
+                addrs
             };
-            let leader = if round_authors.is_empty() {
+            let leader = if frozen_vals.is_empty() {
                 None
             } else {
-                Some(round_authors[r as usize % round_authors.len()])
+                Some(frozen_vals[r as usize % frozen_vals.len()])
             };
 
             for block_b_hash in &round_r_blocks {
