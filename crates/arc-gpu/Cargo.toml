@@ -27,7 +27,7 @@ parking_lot.workspace = true
 pollster = "0.4"
 
 # Native Metal API for indirect command buffers (macOS only)
-metal = { version = "0.29", optional = true }
+metal = { version = "0.33", optional = true }
 objc = { version = "0.2", optional = true }
 
 [dev-dependencies]
