@@ -660,24 +660,12 @@ impl ConsensusManager {
                 }
             }
 
-            // ── Multi-validator round advancement ─────────────────────────
-            // After proposing (or skipping because already_proposed), check if
-            // we have enough peer blocks in the current round to advance.
-            // This makes round speed track network latency, not CPU speed.
-            if multi_validator && !self.benchmark && already_proposed {
-                let vs = self.engine.validator_set();
-                let prev_blocks = self.engine.blocks_in_round(current_round);
-                let mut round_stake = 0u64;
-                for hash in &prev_blocks {
-                    if let Some(block) = self.engine.get_block(&hash) {
-                        if let Some(validator) = vs.get_validator(&block.author) {
-                            round_stake += validator.stake;
-                        }
-                    }
-                }
-                if round_stake >= vs.quorum {
-                    let _ = self.engine.advance_round();
-                }
+            // Always advance round after proposing. The 200ms tick + epoch
+            // freeze + Bullshark commit rule handle safety. Quorum-gated
+            // round advancement was causing deadlocks when the frozen set
+            // had more validators than were actively producing blocks.
+            if already_proposed {
+                let _ = self.engine.advance_round();
             }
 
             // ── 2. Try to commit finalized DAG blocks (multi-validator) ──────
