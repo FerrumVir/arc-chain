@@ -25,7 +25,7 @@ libc = "0.2"
 
 # Optional: real INT4/GGUF inference via Hugging Face candle
 candle-core = { version = "0.8", optional = true }
-candle-nn = { version = "0.8", optional = true }
+candle-nn = { version = "0.9", optional = true }
 candle-transformers = { version = "0.8", optional = true }
 
 [dev-dependencies]
