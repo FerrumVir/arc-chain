@@ -150,7 +150,12 @@ pub async fn serve(
         .layer(CorsLayer::permissive())
         .with_state(node);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // SO_REUSEADDR: allow immediate rebind after process restart.
+    // Without this, the port stays in TIME_WAIT for 60s after kill.
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr.parse()?)?;
+    let listener = socket.listen(1024)?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -166,7 +171,12 @@ pub async fn serve_eth(addr: &str, node: NodeState) -> anyhow::Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(node);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // SO_REUSEADDR: allow immediate rebind after process restart.
+    // Without this, the port stays in TIME_WAIT for 60s after kill.
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr.parse()?)?;
+    let listener = socket.listen(1024)?;
     axum::serve(listener, app).await?;
     Ok(())
 }
