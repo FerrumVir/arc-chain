@@ -36,7 +36,7 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 fips204 = "0.4"
 pqcrypto-falcon = { version = "0.4", features = ["std"] }
 pqcrypto-traits = "0.3"
-sha2 = "0.10"
+sha2 = "0.11"
 sha3 = "0.10"
 blst = { version = "0.3", features = ["portable"] }
 # STARK prover (Stwo — StarkWare's Circle STARK)
