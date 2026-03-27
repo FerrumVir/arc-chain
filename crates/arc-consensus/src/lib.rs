@@ -575,8 +575,15 @@ pub struct ConsensusEngine {
     last_committed_round: AtomicU64,
     /// Current DAG round.
     current_round: AtomicU64,
-    /// Active validator set.
+    /// Active validator set (updated live by PeerConnected — used for
+    /// block acceptance and round advancement only).
     validator_set: RwLock<ValidatorSet>,
+    /// Frozen validator set for leader selection and commit decisions.
+    /// Updated ONLY at epoch boundaries. All nodes freeze the same set
+    /// at the same height → deterministic leader selection → same chain.
+    frozen_validator_set: RwLock<ValidatorSet>,
+    /// Validators queued for the next epoch (from PeerConnected).
+    pending_validators: RwLock<Vec<Validator>>,
     /// This node's validator address.
     local_address: Address,
     /// This node's signing keypair for block proposals.
@@ -636,6 +643,7 @@ impl ConsensusEngine {
             quorum = validator_set.quorum,
             "ConsensusEngine initialized with signing keypair (strict mode)"
         );
+        let frozen = validator_set.clone();
         Self {
             dag: DashMap::new(),
             rounds: DashMap::new(),
@@ -643,6 +651,8 @@ impl ConsensusEngine {
             last_committed_round: AtomicU64::new(0),
             current_round: AtomicU64::new(0),
             validator_set: RwLock::new(validator_set),
+            frozen_validator_set: RwLock::new(frozen),
+            pending_validators: RwLock::new(Vec::new()),
             local_address,
             local_keypair: Some(local_keypair),
             validator_keys: DashMap::new(),
@@ -672,6 +682,7 @@ impl ConsensusEngine {
             quorum = validator_set.quorum,
             "ConsensusEngine initialized (strict mode)"
         );
+        let frozen = validator_set.clone();
         Self {
             dag: DashMap::new(),
             rounds: DashMap::new(),
@@ -679,6 +690,8 @@ impl ConsensusEngine {
             last_committed_round: AtomicU64::new(0),
             current_round: AtomicU64::new(0),
             validator_set: RwLock::new(validator_set),
+            frozen_validator_set: RwLock::new(frozen),
+            pending_validators: RwLock::new(Vec::new()),
             local_address,
             local_keypair: None,
             validator_keys: DashMap::new(),
@@ -730,6 +743,46 @@ impl ConsensusEngine {
     /// Get the current round number.
     pub fn current_round(&self) -> u64 {
         self.current_round.load(Ordering::SeqCst)
+    }
+
+    /// Get the frozen validator set (used for leader selection and commit decisions).
+    pub fn frozen_validator_set(&self) -> parking_lot::RwLockReadGuard<ValidatorSet> {
+        self.frozen_validator_set.read()
+    }
+
+    /// Queue a validator for the next epoch.
+    pub fn queue_validator(&self, validator: Validator) {
+        let mut pending = self.pending_validators.write();
+        if !pending.iter().any(|v| v.address == validator.address) {
+            pending.push(validator);
+        }
+    }
+
+    /// Transition to a new epoch: freeze the current validator set + pending.
+    /// All nodes call this at the same committed height → deterministic.
+    pub fn freeze_epoch(&self) {
+        let current_vs = self.validator_set.read();
+        let pending = self.pending_validators.read();
+
+        // Merge current + pending validators
+        let mut all = current_vs.validators.clone();
+        for pv in pending.iter() {
+            if !all.iter().any(|v| v.address == pv.address) {
+                all.push(pv.clone());
+            }
+        }
+
+        let new_epoch = current_vs.epoch + 1;
+        let new_set = ValidatorSet::new(all, new_epoch);
+        info!(
+            epoch = new_epoch,
+            validators = new_set.len(),
+            total_stake = new_set.total_stake,
+            quorum = new_set.quorum,
+            "Epoch transition: frozen validator set updated"
+        );
+        *self.frozen_validator_set.write() = new_set;
+        self.pending_validators.write().clear();
     }
 
     /// Get a snapshot of the validator set.
@@ -1260,7 +1313,9 @@ impl ConsensusEngine {
     /// # Returns
     /// Newly committed blocks in causal order.
     pub fn try_commit(&self) -> Vec<DagBlock> {
-        let vs = self.validator_set.read();
+        // Use FROZEN validator set for commit decisions — this is the same
+        // on all nodes within an epoch, ensuring deterministic leader selection.
+        let vs = self.frozen_validator_set.read();
         let current = self.current_round.load(Ordering::SeqCst);
         let mut newly_committed = Vec::new();
 
