@@ -69,7 +69,7 @@ rustls = { version = "0.23", features = ["ring"] }
 wasmer = "6.0"
 
 # EVM runtime
-revm = { version = "19", default-features = false, features = ["std"] }
+revm = { version = "36", default-features = false, features = ["std"] }
 
 # GPU compute
 wgpu = "25.0"
