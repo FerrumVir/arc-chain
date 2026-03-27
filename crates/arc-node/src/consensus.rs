@@ -237,29 +237,30 @@ impl ConsensusManager {
                                     "Peer reconnected — already in validator set, keeping DAG state"
                                 );
                             } else {
-                                // New peer: rebuild validator set including all
-                                // existing validators plus the new one.
+                                // New peer: add to live validator set (for block
+                                // acceptance/round advance) AND queue for epoch
+                                // freeze (for deterministic leader selection).
                                 let current_vs = self.engine.validator_set();
                                 let mut validators: Vec<Validator> = current_vs.validators.clone();
                                 if let Some(v) = Validator::new(address, stake, 0) {
-                                    validators.push(v);
+                                    validators.push(v.clone());
+                                    // Queue for next epoch freeze
+                                    self.engine.queue_validator(v);
                                 }
-                                // Ensure local validator is present
                                 if !validators.iter().any(|v| v.address == self.validator_address) {
                                     if let Some(v) = Validator::new(self.validator_address, self.stake, 0) {
                                         validators.push(v);
                                     }
                                 }
                                 let was_single = current_vs.len() <= 1;
-                                let new_set = ValidatorSet::new(validators, 0);
+                                let new_set = ValidatorSet::new(validators, current_vs.epoch);
                                 self.engine.update_validator_set(new_set);
 
-                                // Only reset DAG when transitioning from single to
-                                // multi-validator. Previous single-validator blocks
-                                // were already executed via fast path, so nothing is lost.
-                                // In multi-to-multi transitions (adding a 3rd validator),
-                                // preserve existing DAG progress.
+                                // On first peer connection, freeze the epoch immediately
+                                // so leader selection starts working. Subsequent joins
+                                // are queued for the next epoch freeze.
                                 if was_single {
+                                    self.engine.freeze_epoch();
                                     self.engine.reset_dag();
                                     pending_txs.clear();
                                     last_proposed_round = None;
@@ -879,8 +880,16 @@ impl ConsensusManager {
                     "Round stalled — forcing view-change (advancing round)"
                 );
                 self.engine.force_advance_round();
-                // force_advance_round() already resets the round timer internally
-                last_proposed_round = None; // Allow proposing in the new round
+                last_proposed_round = None;
+            }
+
+            // ── 4. Epoch management: periodically freeze the validator set ───
+            // Every 100 rounds, freeze the current validator set so all nodes
+            // have the same frozen set for leader selection. This handles the
+            // case where peers connect at different times — after the freeze,
+            // all nodes agree on validators regardless of connection order.
+            if multi_validator && current_round > 0 && current_round % 100 == 0 {
+                self.engine.freeze_epoch();
             }
 
             // ── 4. Periodic memory eviction ──────────────────────────────────
