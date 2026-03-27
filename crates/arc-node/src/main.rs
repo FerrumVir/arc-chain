@@ -370,14 +370,15 @@ async fn main() -> Result<()> {
         cli.sync_from.clone()
     } else if state.height() == 0 && !peers.is_empty() {
         // Try each peer until one responds
+        // Quick check — try first 3 peers with 1s timeout each.
+        // Don't block startup for unreachable peers.
         let mut found = None;
-        for peer_addr in &peers {
+        for peer_addr in peers.iter().take(3) {
             let peer_rpc = peer_addr.replace(":9091", ":9090");
             let url = format!("http://{}/health", peer_rpc);
-            tracing::info!("Auto-sync: checking peer {}", url);
-            match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+            match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(1)).send().await {
                 Ok(resp) if resp.status().is_success() => {
-                    tracing::info!("Auto-sync: peer {} is reachable, will sync state", peer_rpc);
+                    tracing::info!("Auto-sync: peer {} reachable", peer_rpc);
                     found = Some(peer_rpc);
                     break;
                 }
