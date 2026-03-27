@@ -1268,15 +1268,42 @@ impl ConsensusEngine {
             committed.iter().copied().collect()
         };
 
+        // Deterministic leader selection: for each round, the leader is chosen
+        // by round number mod validator count. Only the leader's block becomes
+        // a chain block. This ensures all nodes agree on the same chain.
+        let sorted_validators = {
+            let mut addrs: Vec<Address> = vs.validators.iter().map(|v| v.address).collect();
+            addrs.sort_by(|a, b| a.0.cmp(&b.0));
+            addrs
+        };
+
         // Check all rounds up to current - 2 for committable blocks
         // (a block in round R needs R+1 and R+2 data)
         for r in 0..=(current.saturating_sub(2)) {
             let round_r_blocks = self.blocks_in_round(r);
 
+            // Leader for this round
+            let leader = if sorted_validators.is_empty() {
+                None
+            } else {
+                Some(sorted_validators[r as usize % sorted_validators.len()])
+            };
+
             for block_b_hash in &round_r_blocks {
                 // Skip if already committed
                 if committed_set.contains(block_b_hash) {
                     continue;
+                }
+
+                // Only commit the leader's block for this round.
+                // Other blocks are valid DAG nodes (needed for parent references)
+                // but only the leader's block carries transactions to the chain.
+                if let Some(leader_addr) = leader {
+                    if let Some(block_b) = self.dag.get(block_b_hash) {
+                        if block_b.author != leader_addr {
+                            continue; // Not the leader — skip
+                        }
+                    }
                 }
 
                 // Step 1: Find a block C in round R+1 that references B
