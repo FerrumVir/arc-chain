@@ -760,19 +760,26 @@ impl ConsensusEngine {
 
     /// Transition to a new epoch: freeze the current validator set + pending.
     /// All nodes call this at the same committed height → deterministic.
+    /// Uses clone + swap to avoid holding write lock during merge (prevents
+    /// deadlock with RPC threads reading frozen_validator_set).
     pub fn freeze_epoch(&self) {
-        let current_vs = self.validator_set.read();
-        let pending = self.pending_validators.read();
+        // Clone data under short read locks
+        let (validators, pending, old_epoch) = {
+            let vs = self.validator_set.read();
+            let pv = self.pending_validators.read();
+            (vs.validators.clone(), pv.clone(), vs.epoch)
+        };
+        // Locks released here
 
-        // Merge current + pending validators
-        let mut all = current_vs.validators.clone();
-        for pv in pending.iter() {
+        // Merge without holding any locks
+        let mut all = validators;
+        for pv in &pending {
             if !all.iter().any(|v| v.address == pv.address) {
                 all.push(pv.clone());
             }
         }
 
-        let new_epoch = current_vs.epoch + 1;
+        let new_epoch = old_epoch + 1;
         let new_set = ValidatorSet::new(all, new_epoch);
         info!(
             epoch = new_epoch,
@@ -781,6 +788,8 @@ impl ConsensusEngine {
             quorum = new_set.quorum,
             "Epoch transition: frozen validator set updated"
         );
+
+        // Short write locks
         *self.frozen_validator_set.write() = new_set;
         self.pending_validators.write().clear();
     }
