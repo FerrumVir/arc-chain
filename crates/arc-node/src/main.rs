@@ -550,11 +550,34 @@ async fn main() -> Result<()> {
     };
 
     // ── Start DAG consensus in background ─────────────────────────────
-    // Each node starts single-validator; peers added dynamically via P2P PeerConnected.
-    // In benchmark mode this keeps the fast path active (no DAG quorum needed).
-    let dag_validators = Arc::new(parking_lot::RwLock::new(vec![(validator_address, stake)]));
+    // Initialize with ALL known validators from seeds file. This ensures
+    // all nodes have the same validator set from boot — critical for
+    // deterministic leader selection. Without this, nodes that connect
+    // peers at different speeds have different validator counts, causing
+    // different leader selection for the same round.
+    let seed_validators: Vec<(Hash256, u64)> = peers.iter().map(|p| {
+        // Derive validator address from seed hostname (same as --validator-seed)
+        // The seed addresses in the file are IP:port, but the validator address
+        // is derived from the seed name. For testnet, use the IP as the seed.
+        let seed_str = p.split(':').next().unwrap_or(p);
+        let seed_bytes = blake3::derive_key("ARC-chain-validator-keypair-v1", seed_str.as_bytes());
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
+        let kp = KeyPair::Ed25519(sk);
+        (kp.address(), stake) // Assume same stake as local
+    }).collect();
+    let mut all_validators = vec![(validator_address, stake)];
+    for (addr, s) in &seed_validators {
+        if *addr != validator_address {
+            all_validators.push((*addr, *s));
+        }
+    }
+    let dag_validators = Arc::new(parking_lot::RwLock::new(all_validators.clone()));
+    let peer_vals: Vec<(Hash256, u64)> = all_validators.iter()
+        .filter(|(a, _)| *a != validator_address)
+        .cloned()
+        .collect();
     let mut consensus =
-        ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &[], validator_keypair);
+        ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &peer_vals, validator_keypair);
     consensus.dag_validators = Some(dag_validators.clone());
     consensus.set_proposer_mode(cli.proposer_mode);
     let state_clone = state.clone();
