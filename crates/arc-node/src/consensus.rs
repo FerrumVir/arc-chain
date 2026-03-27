@@ -660,12 +660,14 @@ impl ConsensusManager {
                 }
             }
 
-            // Always advance round after proposing. The 200ms tick + epoch
-            // freeze + Bullshark commit rule handle safety. Quorum-gated
-            // round advancement was causing deadlocks when the frozen set
-            // had more validators than were actively producing blocks.
+            // Always advance round after proposing. The engine's advance_round()
+            // checks quorum which deadlocks when frozen set > active validators.
+            // Force-advance instead — the 200ms tick + Bullshark commit rule
+            // handle safety.
             if already_proposed {
-                let _ = self.engine.advance_round();
+                if !self.engine.advance_round() {
+                    self.engine.force_advance_round();
+                }
             }
 
             // ── 2. Try to commit finalized DAG blocks (multi-validator) ──────
