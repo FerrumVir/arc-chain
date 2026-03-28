@@ -222,7 +222,11 @@ impl ConsensusManager {
             // cross-continent latency (~100-300ms) without sacrificing
             // throughput — rounds advance when peers are ready, not on
             // a fixed timer.
-            let tick = if self.is_multi_validator() && !self.benchmark { 200 } else { 1 };
+            // Multi-validator: 200ms normal, 50ms benchmark (fast but peers can keep up).
+            // Single-validator: 1ms for max local TPS.
+            let tick = if self.is_multi_validator() {
+                if self.benchmark { 50 } else { 200 }
+            } else { 1 };
             tokio::time::sleep(tokio::time::Duration::from_millis(tick)).await;
 
             // ── Drain pipeline results ──────────────────────────────────
