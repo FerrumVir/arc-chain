@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ARC Chain — Live Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#08080e;color:#e0e0e0;min-height:100vh}
+.header{text-align:center;padding:24px 16px 16px;border-bottom:1px solid #1a1a2e}
+.header h1{font-size:22px;color:#fff;margin-bottom:4px}
+.header h1 span{color:#6366f1}
+.header .sub{color:#666;font-size:13px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:16px;max-width:1200px;margin:0 auto}
+.card{background:#10101a;border:1px solid #1a1a2e;border-radius:10px;padding:16px}
+.card h2{font-size:12px;color:#666;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
+.metric{font-size:28px;font-weight:700;color:#fff}
+.metric small{font-size:13px;color:#888;font-weight:400}
+.metric.purple{color:#6366f1}
+.metric.green{color:#4ade80}
+.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #0f0f1a;font-size:13px}
+.row:last-child{border:none}
+.row .label{color:#888}
+.row .val{color:#fff;font-weight:500;font-family:monospace}
+.node-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
+.node{background:#0c0c16;border:1px solid #1a1a2e;border-radius:8px;padding:10px;text-align:center;font-size:12px}
+.node .name{font-weight:700;color:#fff;margin-bottom:2px}
+.node .loc{color:#666;font-size:11px}
+.node .round{color:#6366f1;font-family:monospace;margin-top:4px}
+.node .status{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
+.node .status.up{background:#4ade80}
+.node .status.down{background:#f87171}
+.tx-list{max-height:300px;overflow-y:auto}
+.tx{padding:8px 0;border-bottom:1px solid #111120;font-size:12px}
+.tx .hash{color:#6366f1;font-family:monospace}
+.tx .type{background:#1a1a3a;color:#818cf8;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600}
+.tx .type.inference{background:#1a2e1a;color:#4ade80}
+.tx .amount{float:right;font-weight:600;color:#fff}
+.refresh{color:#444;font-size:11px;text-align:center;padding:8px}
+.links{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+.links a{color:#6366f1;font-size:11px;text-decoration:none;background:#13131f;padding:4px 8px;border-radius:4px;border:1px solid #1e1e3a}
+.links a:hover{border-color:#6366f1}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1><span>ARC</span> Chain — Live Dashboard</h1>
+  <div class="sub" id="subtitle">Connecting to testnet...</div>
+</div>
+
+<div class="grid">
+  <!-- Overview -->
+  <div class="card">
+    <h2>Consensus</h2>
+    <div class="metric purple" id="dagRound">—</div>
+    <div style="color:#888;font-size:12px;margin-bottom:8px">DAG Round</div>
+    <div class="row"><span class="label">Committed Blocks</span><span class="val" id="committed">—</span></div>
+    <div class="row"><span class="label">Block Height</span><span class="val" id="height">—</span></div>
+    <div class="row"><span class="label">Transactions</span><span class="val" id="totalTx">—</span></div>
+    <div class="row"><span class="label">Accounts</span><span class="val" id="accounts">—</span></div>
+    <div class="row"><span class="label">Mempool</span><span class="val" id="mempool">—</span></div>
+  </div>
+
+  <!-- Network -->
+  <div class="card">
+    <h2>Network</h2>
+    <div class="metric green" id="validatorCount">—</div>
+    <div style="color:#888;font-size:12px;margin-bottom:8px">Validators Online</div>
+    <div class="row"><span class="label">Connected Peers</span><span class="val" id="peers">—</span></div>
+    <div class="row"><span class="label">Uptime</span><span class="val" id="uptime">—</span></div>
+    <div class="row"><span class="label">Rounds/sec</span><span class="val" id="rps">—</span></div>
+    <div class="row"><span class="label">Version</span><span class="val" id="version">—</span></div>
+  </div>
+
+  <!-- Nodes (full width) -->
+  <div class="card" style="grid-column:1/-1">
+    <h2>8 Nodes — 6 Continents</h2>
+    <div class="node-grid" id="nodeGrid"></div>
+  </div>
+
+  <!-- Inference -->
+  <div class="card">
+    <h2>AI Inference Attestations</h2>
+    <div id="inferenceList" class="tx-list"><div style="color:#555;font-size:13px">Loading...</div></div>
+  </div>
+
+  <!-- Recent Transactions -->
+  <div class="card">
+    <h2>Recent Transactions</h2>
+    <div id="txList" class="tx-list"><div style="color:#555;font-size:13px">Loading...</div></div>
+  </div>
+</div>
+
+<div class="refresh" id="lastUpdate">Last updated: —</div>
+<div style="text-align:center;padding:8px">
+  <div class="links">
+    <a href="http://140.82.16.112:3100" target="_blank">Web Wallet</a>
+    <a href="http://140.82.16.112:9090/stats" target="_blank">Stats API</a>
+    <a href="http://140.82.16.112:9090/health" target="_blank">Health API</a>
+    <a href="http://140.82.16.112:9090/validators" target="_blank">Validators API</a>
+    <a href="http://140.82.16.112:9090/inference/attestations" target="_blank">Inference API</a>
+    <a href="https://github.com/FerrumVir/arc-chain" target="_blank">GitHub</a>
+  </div>
+</div>
+
+<script>
+const NODES = [
+  {name:'NYC',ip:'149.28.32.76',loc:'New York'},
+  {name:'LAX',ip:'140.82.16.112',loc:'Los Angeles'},
+  {name:'AMS',ip:'136.244.109.1',loc:'Amsterdam'},
+  {name:'LHR',ip:'104.238.171.11',loc:'London'},
+  {name:'NRT',ip:'202.182.107.41',loc:'Tokyo'},
+  {name:'SGP',ip:'149.28.153.31',loc:'Singapore'},
+  {name:'SAO',ip:'216.238.120.27',loc:'São Paulo'},
+  {name:'JNB',ip:'139.84.237.49',loc:'Johannesburg'},
+];
+
+let lastRound = 0, lastTime = Date.now();
+
+async function refresh() {
+  // Stats from primary node
+  try {
+    const r = await fetch('http://140.82.16.112:9090/stats',{signal:AbortSignal.timeout(5000)});
+    const d = await r.json();
+    const now = Date.now();
+    const rps = lastRound > 0 ? ((d.dag_round - lastRound) / ((now - lastTime)/1000)).toFixed(1) : '—';
+    lastRound = d.dag_round; lastTime = now;
+
+    document.getElementById('dagRound').textContent = d.dag_round.toLocaleString();
+    document.getElementById('committed').textContent = d.dag_committed.toLocaleString();
+    document.getElementById('height').textContent = d.block_height;
+    document.getElementById('totalTx').textContent = d.total_transactions;
+    document.getElementById('accounts').textContent = d.total_accounts;
+    document.getElementById('mempool').textContent = d.mempool_size;
+    document.getElementById('validatorCount').textContent = d.validators;
+    document.getElementById('peers').textContent = d.connected_peers;
+    document.getElementById('version').textContent = d.version;
+    document.getElementById('rps').textContent = rps;
+    const mins = Math.floor(d.uptime_secs/60);
+    const hrs = Math.floor(mins/60);
+    document.getElementById('uptime').textContent = hrs > 0 ? `${hrs}h ${mins%60}m` : `${mins}m`;
+    document.getElementById('subtitle').textContent = `Live — ${d.validators} validators, round ${d.dag_round.toLocaleString()}, ${d.dag_committed.toLocaleString()} committed blocks`;
+  } catch(e) {
+    document.getElementById('subtitle').textContent = 'Error connecting to testnet';
+  }
+
+  // All nodes
+  const grid = document.getElementById('nodeGrid');
+  grid.innerHTML = '';
+  for (const n of NODES) {
+    const el = document.createElement('div');
+    el.className = 'node';
+    try {
+      const r = await fetch(`http://${n.ip}:9090/health`,{signal:AbortSignal.timeout(3000)});
+      const d = await r.json();
+      el.innerHTML = `<span class="status up"></span><span class="name">${n.name}</span>
+        <div class="loc">${n.loc}</div>
+        <div class="round">r${d.dag_round.toLocaleString()}</div>
+        <div style="color:#888;font-size:10px">${d.peers}p · ${Math.floor(d.uptime_secs/60)}m</div>`;
+    } catch(e) {
+      el.innerHTML = `<span class="status down"></span><span class="name">${n.name}</span>
+        <div class="loc">${n.loc}</div>
+        <div class="round" style="color:#f87171">offline</div>`;
+    }
+    grid.appendChild(el);
+  }
+
+  // Inference attestations
+  try {
+    const r = await fetch('http://140.82.16.112:9090/inference/attestations',{signal:AbortSignal.timeout(5000)});
+    const d = await r.json();
+    const list = document.getElementById('inferenceList');
+    if (d.attestations && d.attestations.length > 0) {
+      list.innerHTML = d.attestations.slice(0,10).map(a => `<div class="tx">
+        <span class="type inference">Inference</span>
+        <span class="amount">${(a.amount||0).toLocaleString()} ARC</span>
+        <div style="margin-top:4px"><span class="hash">${(a.tx_hash||a.from||'').slice(0,20)}...</span></div>
+        <div style="color:#555;font-size:11px">height ${a.block_height||'?'}</div>
+      </div>`).join('');
+    } else {
+      list.innerHTML = '<div style="color:#555;font-size:13px">No inference attestations yet. Run a node with --with-inference to submit.</div>';
+    }
+  } catch(e) {
+    document.getElementById('inferenceList').innerHTML = `<div style="color:#f87171;font-size:12px">${e.message}</div>`;
+  }
+
+  // Recent transactions (from receipts)
+  try {
+    const r = await fetch('http://140.82.16.112:9090/blocks?limit=5',{signal:AbortSignal.timeout(5000)});
+    if (r.ok) {
+      const blocks = await r.json();
+      const list = document.getElementById('txList');
+      let txHtml = '';
+      for (const b of (blocks.blocks || blocks || []).slice(0,5)) {
+        if (b.transactions) {
+          for (const tx of b.transactions.slice(0,3)) {
+            txHtml += `<div class="tx">
+              <span class="type">Transfer</span>
+              <span class="amount">${(tx.amount||0).toLocaleString()} ARC</span>
+              <div style="margin-top:4px"><span class="hash">${(tx.hash||tx.tx_hash||'').slice(0,20)}...</span></div>
+            </div>`;
+          }
+        }
+      }
+      if (!txHtml) txHtml = '<div style="color:#555;font-size:13px">Transactions appear here when tokens are sent via the wallet or faucet.</div>';
+      list.innerHTML = txHtml;
+    }
+  } catch(e) {
+    // Blocks endpoint may not exist, show faucet-based txs
+    document.getElementById('txList').innerHTML = '<div style="color:#555;font-size:13px">Send tokens via the <a href="http://140.82.16.112:3100" style="color:#6366f1">Web Wallet</a> to see transactions here.</div>';
+  }
+
+  document.getElementById('lastUpdate').textContent = `Last updated: ${new Date().toLocaleTimeString()} — refreshes every 5s`;
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
