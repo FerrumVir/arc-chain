@@ -133,6 +133,20 @@ async function renderNodes(){
       return{n,d:await r.json(),ok:true};
     }catch(e){return{n,ok:false}}
   }));
+  // Compute best values across ALL nodes (not just one RPC)
+  let maxRound=0,maxCommitted=0,maxPeers=0,nodesUp=0;
+  for(const{value:v}of results){
+    if(v.ok){
+      nodesUp++;
+      if(v.d.dag_round>maxRound)maxRound=v.d.dag_round;
+      if(v.d.dag_committed>maxCommitted)maxCommitted=v.d.dag_committed;
+      if(v.d.peers>maxPeers)maxPeers=v.d.peers;
+    }
+  }
+  // Update hero stats from best node data (fixes "Finalized: 0" when RPC node hasn't committed)
+  if(maxRound>0) document.getElementById('dagRound').textContent=maxRound.toLocaleString();
+  if(maxCommitted>0) document.getElementById('committed').textContent=maxCommitted.toLocaleString();
+
   grid.innerHTML='';
   for(const{value:v}of results){
     const el=document.createElement('div');
