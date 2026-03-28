@@ -779,10 +779,18 @@ impl ConsensusManager {
                                     txs
                                 })
                             };
-                            // Await pre-verification (overlaps with any prior commit work)
-                            committed_txs = match pre_verify_handle.await {
-                                Ok(verified_txs) => verified_txs,
-                                Err(_) => committed_txs, // fallback: use unverified
+                            // Await pre-verification with timeout to prevent deadlock.
+                            // If the spawned task hangs (runtime starvation), fall
+                            // back to unverified txs after 5 seconds.
+                            committed_txs = match tokio::time::timeout(
+                                tokio::time::Duration::from_secs(5),
+                                pre_verify_handle,
+                            ).await {
+                                Ok(Ok(verified_txs)) => verified_txs,
+                                _ => {
+                                    warn!("Pre-verify timeout or error — using unverified txs");
+                                    committed_txs
+                                }
                             };
 
                             let start = std::time::Instant::now();
