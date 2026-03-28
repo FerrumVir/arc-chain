@@ -728,6 +728,13 @@ pub async fn run_transport(
                         }
                     });
                 }
+
+                // Sync peer_count atomic with actual DashMap size.
+                // The counter can drift from the truth when connections
+                // race (dedup rejects after increment, cleanup decrements
+                // wrong entry, etc.). The DashMap is the source of truth.
+                let actual = connections.peers.len() as u32;
+                peer_count.store(actual, Ordering::Relaxed);
             }
         }
     }
@@ -774,6 +781,13 @@ async fn dial_peer(
 
     // Compute dialable address: remote IP + their listen port
     let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
+
+    // Reject self-connections. The seeds file includes our own IP,
+    // and 0.0.0.0 != our public IP, so the bootstrap skip-self check misses it.
+    if remote.validator_address == local_address {
+        debug!("Rejected self-connection (dial) to {}", remote.validator_address);
+        return Ok(());
+    }
 
     // Skip if already connected — prevents the dual-dial race where both
     // nodes dial each other and the second insert overwrites the first's
@@ -862,6 +876,12 @@ async fn accept_peer(
 
     // Compute dialable address: remote IP + their listen port
     let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
+
+    // Reject self-connections
+    if remote.validator_address == local_address {
+        debug!("Rejected self-connection (accept) from {}", remote.validator_address);
+        return Ok(());
+    }
 
     // Skip if already connected (dual-dial dedup)
     if connections.is_connected(&remote.validator_address.0) {
