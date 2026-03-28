@@ -527,7 +527,10 @@ impl ConsensusManager {
                 // reflects actual execution throughput (20K+ TPS on decent hardware).
                 if self.benchmark {
                     if let Some(ref pool) = benchmark_pool {
-                        let batch_size = if multi_validator { 10_000 } else { 1_000_000 };
+                        // Multi-validator: 1500 per tick (fits in 50ms at 33K TPS).
+                        // Larger batches block the consensus thread too long,
+                        // preventing peer message processing → 0 peers.
+                        let batch_size = if multi_validator { 1_500 } else { 1_000_000 };
                         let signed_txs = pool.drain(batch_size);
                         if !signed_txs.is_empty() {
                             let tx_count = signed_txs.len() as u64;
