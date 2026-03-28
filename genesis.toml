@@ -1,15 +1,6 @@
 # ARC Chain Genesis Configuration
-# ─────────────────────────────────────────────────────────────────────────
-# Defines the initial chain state for custom deployments.
-# The hardcoded fallback (100 blake3-hashed accounts) is used when this file
-# is not provided via --genesis.
-#
-# This template includes 10 prefunded accounts with real blake3 addresses.
-# Add more accounts as needed for your deployment.
-#
-# Address derivation: blake3::hash(&[i]) for i in 0..N
-# Each balance is 1 trillion ARC (1_000_000_000_000).
-#
+# Defines the initial chain state: prefunded accounts and validators.
+# All nodes MUST use the same genesis config for consensus to work.
 # Usage: arc-node --genesis genesis.toml
 
 [chain]
@@ -17,71 +8,61 @@ name = "arc-testnet"
 chain_id = "0x415243"  # "ARC" in ASCII hex
 
 # ── Prefunded Genesis Accounts ──────────────────────────────────────────
+# blake3::hash(&[i]) for i in 0..10, each with 1 trillion ARC
 
-# Account 0 — blake3::hash(&[0])
 [[accounts]]
 address = "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
 balance = 1_000_000_000_000
 
-# Account 1 — blake3::hash(&[1])
 [[accounts]]
 address = "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
 balance = 1_000_000_000_000
 
-# Account 2 — blake3::hash(&[2])
 [[accounts]]
 address = "ab13bedf42e84bae0f7c62c7dd6a8ada571e8829bed6ea558217f0361b5e25d0"
 balance = 1_000_000_000_000
 
-# Account 3 — blake3::hash(&[3])
 [[accounts]]
 address = "e1e0e81d6ea39b0cf8b86ffd440921011f57400cbc3f76a8a171906a9b8d7505"
 balance = 1_000_000_000_000
 
-# Account 4 — blake3::hash(&[4])
 [[accounts]]
 address = "0c389a743e34fda435fbd575bb889dbc0d3e66b9f9d81e00be33b7188509e7eb"
 balance = 1_000_000_000_000
 
-# Account 5 — blake3::hash(&[5])
-[[accounts]]
-address = "84cb40e74f0e856bb4bb91233e3cb74113533dca78a74f36f59edaa41895c946"
-balance = 1_000_000_000_000
-
-# Account 6 — blake3::hash(&[6])
-[[accounts]]
-address = "1c310b6bdadd69991cd4e5dbef96c2638536c32b534e3ed64785846bfcebd206"
-balance = 1_000_000_000_000
-
-# Account 7 — blake3::hash(&[7])
-[[accounts]]
-address = "448bd8dd9624154a690f8e84dc52d6f633ba7cd545c4d3c9b4e0f6a2f6fa71f4"
-balance = 1_000_000_000_000
-
-# Account 8 — blake3::hash(&[8])
-[[accounts]]
-address = "2ef3e0dda5293bda965d0adcedfc7d387244ac736a6014a720c1d63fa0ede02f"
-balance = 1_000_000_000_000
-
-# Account 9 — blake3::hash(&[9])
-[[accounts]]
-address = "7219aa1099ced7445c5bf949990ff7d9f6b71a94b8ec02b3eb61fb175a66ba25"
-balance = 1_000_000_000_000
-
-# ── Genesis Validators ──────────────────────────────────────────────────
+# ── Genesis Validators (Testnet) ──────────────────────────────────────
+# These seeds MUST match the --validator-seed flag each node uses.
+# All nodes load this file → all nodes have the same validator set from
+# round 0 → deterministic leader selection → consensus.
 
 [[validators]]
-seed = "arc-validator-0"
+seed = "NYC"
 stake = 5_000_000
 
 [[validators]]
-seed = "arc-validator-1"
+seed = "LAX"
 stake = 5_000_000
 
 [[validators]]
-seed = "arc-validator-2"
+seed = "AMS"
 stake = 5_000_000
 
 [[validators]]
-seed = "arc-validator-3"
+seed = "LHR"
+stake = 5_000_000
+
+[[validators]]
+seed = "NRT"
+stake = 5_000_000
+
+[[validators]]
+seed = "SGP"
+stake = 5_000_000
+
+[[validators]]
+seed = "SAO"
+stake = 5_000_000
+
+[[validators]]
+seed = "JNB"
 stake = 5_000_000
