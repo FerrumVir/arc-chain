@@ -224,8 +224,12 @@ impl ConsensusManager {
             // a fixed timer.
             // Multi-validator: 200ms normal, 50ms benchmark (fast but peers can keep up).
             // Single-validator: 1ms for max local TPS.
+            // Tick interval determines max rounds/sec:
+            // 100ms = 10 rounds/sec (was 200ms = 5 rounds/sec).
+            // Cross-continent blocks arrive within 300ms; the view-change
+            // timer (10s) handles stragglers. 100ms doubles throughput.
             let tick = if self.is_multi_validator() {
-                if self.benchmark { 50 } else { 200 }
+                if self.benchmark { 50 } else { 100 }
             } else { 1 };
             tokio::time::sleep(tokio::time::Duration::from_millis(tick)).await;
 
@@ -575,9 +579,11 @@ impl ConsensusManager {
                     // In normal mode, 100 per block keeps QUIC payload small.
                     // Multi-validator benchmark: 1000 per block (RPC-friendly).
                     // Single-validator benchmark: 50K (max local TPS).
+                    // 500 txs per block in normal mode (was 100).
+                    // At 10 rounds/sec = 5,000 tx/sec consensus throughput.
                     let drain_limit = if self.benchmark && multi_validator { 1_000 }
                         else if self.benchmark { 50_000 }
-                        else { 100 };
+                        else { 500 };
                     let transactions = mempool.drain(drain_limit);
                     if !transactions.is_empty() {
                         info!("Drained {} txs from mempool for DAG proposal", transactions.len());
