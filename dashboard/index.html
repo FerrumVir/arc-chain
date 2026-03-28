@@ -124,6 +124,32 @@ const NODES=[
 
 let lastRound=0,lastTime=Date.now(),lastTxCount=0;
 
+// Fetch all 8 nodes in PARALLEL (no sequential blocking)
+async function renderNodes(){
+  const grid=document.getElementById('nodeGrid');
+  const results=await Promise.allSettled(NODES.map(async n=>{
+    try{
+      const r=await fetch(`http://${n.ip}:9090/health`,{signal:AbortSignal.timeout(3000)});
+      return{n,d:await r.json(),ok:true};
+    }catch(e){return{n,ok:false}}
+  }));
+  grid.innerHTML='';
+  for(const{value:v}of results){
+    const el=document.createElement('div');
+    if(v.ok){
+      const d=v.d,n=v.n;
+      el.className='bg-surface-3 border border-surface-4 rounded-lg p-2.5 text-center hover:border-arc-500/30 transition cursor-pointer';
+      el.onclick=()=>showModal(n.name+' — '+n.loc,[['Status','🟢 Online'],['Block',d.dag_round.toLocaleString()],['Finalized',d.dag_committed.toLocaleString()],['Peers',d.peers],['Validators',d.validators],['Uptime',Math.floor(d.uptime_secs/60)+'m'],['RPC','http://'+n.ip+':9090','http://'+n.ip+':9090/health']]);
+      el.innerHTML=`<div class="flex items-center justify-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span><span class="text-white font-semibold text-xs">${n.name}</span></div><div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div><div class="mono text-arc-400 text-[11px] mt-1">#${d.dag_round.toLocaleString()}</div>`;
+    }else{
+      const n=v.n;
+      el.className='bg-surface-3 border border-red-900/30 rounded-lg p-2.5 text-center';
+      el.innerHTML=`<div class="flex items-center justify-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-red-400"></span><span class="text-white font-semibold text-xs">${n.name}</span></div><div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div><div class="text-red-400 text-[11px] mt-1">offline</div>`;
+    }
+    grid.appendChild(el);
+  }
+}
+
 // Modal
 function showModal(title,rows){
   document.getElementById('modalTitle').textContent=title;
@@ -168,6 +194,9 @@ function showInferenceDetail(a){
 }
 
 async function refresh(){
+  // Render nodes FIRST (each fetches independently, no RPC dependency)
+  renderNodes();
+
   try{
     const r=await fetch(RPC+'/stats',{signal:AbortSignal.timeout(5000)});
     const d=await r.json();
@@ -193,29 +222,7 @@ async function refresh(){
     document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live — block ${d.dag_round.toLocaleString()} · ${d.dag_committed.toLocaleString()} finalized · ${d.total_transactions} txs`;
   }catch(e){}
 
-  // Nodes
-  const grid=document.getElementById('nodeGrid');grid.innerHTML='';
-  for(const n of NODES){
-    const el=document.createElement('div');
-    try{
-      const r=await fetch(`http://${n.ip}:9090/health`,{signal:AbortSignal.timeout(3000)});
-      const d=await r.json();
-      el.className='bg-surface-3 border border-surface-4 rounded-lg p-2.5 text-center hover:border-arc-500/30 transition cursor-pointer';
-      el.onclick=()=>showModal(n.name+' — '+n.loc,[
-        ['Status','🟢 Online'],['Block',d.dag_round.toLocaleString()],['Finalized',d.dag_committed.toLocaleString()],
-        ['Peers',d.peers],['Validators',d.validators],['Uptime',Math.floor(d.uptime_secs/60)+'m'],
-        ['RPC',`http://${n.ip}:9090`,`http://${n.ip}:9090/health`]
-      ]);
-      el.innerHTML=`<div class="flex items-center justify-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span><span class="text-white font-semibold text-xs">${n.name}</span></div>
-        <div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div>
-        <div class="mono text-arc-400 text-[11px] mt-1">#${d.dag_round.toLocaleString()}</div>`;
-    }catch(e){
-      el.className='bg-surface-3 border border-red-900/30 rounded-lg p-2.5 text-center';
-      el.innerHTML=`<div class="flex items-center justify-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-red-400"></span><span class="text-white font-semibold text-xs">${n.name}</span></div>
-        <div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div><div class="text-red-400 text-[11px] mt-1">offline</div>`;
-    }
-    grid.appendChild(el);
-  }
+  // Nodes — fetched by renderNodes() above (runs in parallel, no blocking)
 
   // Inference
   try{
