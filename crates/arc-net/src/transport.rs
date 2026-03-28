@@ -637,20 +637,27 @@ pub async fn run_transport(
                 let rate_limiter_clone = rate_limiter.clone();
 
                 tokio::spawn(async move {
+                    // 10-second handshake timeout — prevents attackers from
+                    // holding connection slots with incomplete handshakes.
                     let handshake_msg = make_signed_handshake(
                         local_address, local_stake, listen_addr.port(), genesis_hash, &keypair_clone,
                     );
-                    if let Err(e) = accept_peer(
-                        conn,
-                        &handshake_msg,
-                        local_address,
-                        &connections_clone,
-                        &inbound_clone,
-                        &peer_count_clone,
-                        &pex_dial_clone,
-                        &rate_limiter_clone,
-                    )
-                    .await
+                    let result = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        accept_peer(
+                            conn,
+                            &handshake_msg,
+                            local_address,
+                            &connections_clone,
+                            &inbound_clone,
+                            &peer_count_clone,
+                            &pex_dial_clone,
+                            &rate_limiter_clone,
+                        )
+                    ).await;
+                    if let Err(_) = result {
+                        warn!("Handshake timeout from {}", remote_addr);
+                    } else if let Ok(Err(e)) = result
                     {
                         warn!("Failed to accept peer from {}: {}", remote_addr, e);
                     }
