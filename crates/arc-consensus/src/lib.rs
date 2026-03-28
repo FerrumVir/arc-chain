@@ -1167,7 +1167,22 @@ impl ConsensusEngine {
             ));
         }
         if block.round > current + 1 {
-            // Fast-forward: jump to block.round - 1 so we can accept this block
+            let gap = block.round - current;
+            if gap > PRUNE_DEPTH * 2 {
+                // Large gap (>200 rounds) — likely a network partition healed.
+                // Fast-forwarding would skip thousands of empty rounds that
+                // try_commit scans. Update last_committed_round to avoid
+                // scanning the gap, which would waste CPU and never commit.
+                let new_committed = block.round.saturating_sub(PRUNE_DEPTH);
+                let old_committed = self.last_committed_round.load(Ordering::SeqCst);
+                if new_committed > old_committed {
+                    self.last_committed_round.store(new_committed, Ordering::SeqCst);
+                }
+                tracing::warn!(
+                    "Large round gap ({} rounds) — partition healed? Fast-forwarding and skipping empty gap.",
+                    gap
+                );
+            }
             let new_round = block.round.saturating_sub(1);
             self.current_round.store(new_round, Ordering::SeqCst);
             tracing::info!(
