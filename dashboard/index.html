@@ -228,27 +228,43 @@ async function refresh(){
     }
   }catch(e){}
 
-  // Recent transactions from receipts
+  // Recent transactions — show live stats + recent faucet/transfer activity
   try{
-    const r=await fetch(RPC+'/inference/attestations',{signal:AbortSignal.timeout(5000)});
-    const d=await r.json();
     const list=document.getElementById('txList');
-    const txs=d.attestations||[];
-    if(txs.length>0){
-      list.innerHTML=txs.slice(0,10).map(tx=>`
-        <div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition" onclick="showTxDetail('${tx.tx_hash||tx.from||''}')">
+    const statsR=await fetch(RPC+'/stats',{signal:AbortSignal.timeout(5000)});
+    const stats=await statsR.json();
+    const bench=stats.benchmark_executed||0;
+    const total=stats.total_transactions||0;
+    const tps=stats.benchmark_tps||0;
+    let html='';
+    if(bench>0){
+      html+=`<div class="flex items-center justify-between py-2 border-b border-surface-4">
+        <div class="flex items-center gap-2">
+          <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-yellow-500/10 text-yellow-400 border border-yellow-500/20">BENCH</span>
+          <span class="text-[11px] text-gray-400">Signed benchmark transactions</span>
+        </div>
+        <div class="text-right">
+          <span class="mono text-xs text-white font-medium">${bench.toLocaleString()} txs</span>
+          <div class="text-[10px] text-emerald-400">${tps.toLocaleString()} TPS</div>
+        </div>
+      </div>`;
+    }
+    // Show any faucet/transfer attestations
+    try{
+      const ar=await fetch(RPC+'/inference/attestations',{signal:AbortSignal.timeout(3000)});
+      const ad=await ar.json();
+      (ad.attestations||[]).slice(0,8).forEach(tx=>{
+        html+=`<div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition" onclick="showTxDetail('${tx.tx_hash||tx.from||''}')">
           <div class="flex items-center gap-2">
             <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-arc-500/10 text-arc-400 border border-arc-500/20">TX</span>
             <span class="mono text-[11px] text-gray-400">${(tx.tx_hash||tx.from||'').slice(0,20)}...</span>
           </div>
-          <div class="text-right">
-            <span class="mono text-xs text-white font-medium">${(tx.amount||0).toLocaleString()} ARC</span>
-            <div class="text-[10px] text-gray-600">h=${tx.block_height||'?'}</div>
-          </div>
-        </div>`).join('');
-    }else{
-      list.innerHTML='<p class="text-gray-600 text-sm">Send tokens via the <a href="http://140.82.16.112:3100" class="text-arc-400 hover:underline">Wallet</a> to see transactions.</p>';
-    }
+          <span class="mono text-xs text-white font-medium">${(tx.amount||0).toLocaleString()} ARC</span>
+        </div>`;
+      });
+    }catch(e2){}
+    if(!html) html='<p class="text-gray-600 text-sm">Send tokens via the <a href="http://140.82.16.112:3100" class="text-arc-400 hover:underline">Wallet</a></p>';
+    list.innerHTML=html;
   }catch(e){}
 
   document.getElementById('lastUpdate').textContent=`Updated ${new Date().toLocaleTimeString()} · auto-refreshes every 5s`;

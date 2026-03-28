@@ -198,7 +198,8 @@ function createWallet() {
   // Show private key in a copyable modal instead of alert()
   showKeyModal(wallet.privKey, wallet.address);
   showApp();
-  claimFaucet();
+  // Auto-claim faucet, then refresh balance after it succeeds
+  claimFaucet().then(() => { setTimeout(refreshBalance, 1000); });
 }
 
 function showKeyModal(privKey, address) {
