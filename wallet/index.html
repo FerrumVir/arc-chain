@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ARC Wallet</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0a0a0f;color:#e0e0e0;min-height:100vh}
+.container{max-width:480px;margin:0 auto;padding:20px}
+h1{font-size:24px;text-align:center;margin:20px 0;color:#fff}
+h1 span{color:#6366f1}
+.card{background:#13131f;border:1px solid #1e1e3a;border-radius:12px;padding:20px;margin-bottom:16px}
+.card h2{font-size:14px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:12px}
+.balance{font-size:36px;font-weight:700;color:#fff}
+.balance small{font-size:14px;color:#888;font-weight:400}
+.addr{font-size:11px;color:#6366f1;word-break:break-all;cursor:pointer;margin-top:8px}
+.addr:hover{color:#818cf8}
+input,select{width:100%;padding:12px;background:#0a0a0f;border:1px solid #2a2a4a;border-radius:8px;color:#fff;font-size:14px;margin-bottom:10px;outline:none}
+input:focus{border-color:#6366f1}
+button{width:100%;padding:12px;background:#6366f1;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;margin-bottom:8px}
+button:hover{background:#4f46e5}
+button:disabled{background:#333;cursor:not-allowed}
+button.secondary{background:transparent;border:1px solid #2a2a4a;color:#888}
+button.secondary:hover{border-color:#6366f1;color:#fff}
+.status{font-size:12px;padding:8px 12px;border-radius:6px;margin-top:8px}
+.status.ok{background:#0a2e1a;color:#4ade80;border:1px solid #166534}
+.status.err{background:#2e0a0a;color:#f87171;border:1px solid #7f1d1d}
+.status.info{background:#0a1a2e;color:#60a5fa;border:1px solid #1e3a5f}
+.tx-list{max-height:200px;overflow-y:auto}
+.tx-item{padding:8px 0;border-bottom:1px solid #1a1a2f;font-size:12px}
+.tx-item .hash{color:#6366f1;font-family:monospace}
+.tx-item .amount{float:right;font-weight:600}
+.tx-item .amount.plus{color:#4ade80}
+.tx-item .amount.minus{color:#f87171}
+.net{display:flex;gap:8px;align-items:center;justify-content:center;margin-bottom:16px;font-size:12px}
+.net .dot{width:8px;height:8px;border-radius:50%;background:#4ade80;display:inline-block}
+.net .dot.off{background:#f87171}
+.tabs{display:flex;gap:8px;margin-bottom:16px}
+.tab{flex:1;padding:10px;text-align:center;background:#13131f;border:1px solid #1e1e3a;border-radius:8px;cursor:pointer;font-size:13px;color:#888}
+.tab.active{border-color:#6366f1;color:#fff}
+#app{display:none}
+#setup{text-align:center;padding:40px 20px}
+#setup p{color:#888;margin:16px 0}
+</style>
+</head>
+<body>
+<div class="container">
+<h1><span>ARC</span> Wallet</h1>
+
+<div class="net">
+  <span class="dot" id="netDot"></span>
+  <span id="netStatus">Connecting...</span>
+</div>
+
+<!-- Setup (no wallet) -->
+<div id="setup">
+  <div class="card">
+    <h2>Get Started</h2>
+    <p>Create a new wallet or import an existing one to start using ARC Chain testnet.</p>
+    <button onclick="createWallet()">Create New Wallet</button>
+    <button class="secondary" onclick="showImport()">Import Private Key</button>
+    <div id="importBox" style="display:none;margin-top:12px">
+      <input type="password" id="importKey" placeholder="Paste 64-char hex private key">
+      <button onclick="importWallet()">Import</button>
+    </div>
+  </div>
+</div>
+
+<!-- Main app -->
+<div id="app">
+  <!-- Balance -->
+  <div class="card">
+    <h2>Balance</h2>
+    <div class="balance" id="bal">0 <small>ARC</small></div>
+    <div class="addr" id="myAddr" onclick="copyAddr()" title="Click to copy"></div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('send',this)">Send</div>
+    <div class="tab" onclick="switchTab('faucet',this)">Faucet</div>
+    <div class="tab" onclick="switchTab('txs',this)">History</div>
+  </div>
+
+  <!-- Send -->
+  <div id="tab-send" class="card">
+    <h2>Send ARC</h2>
+    <input id="sendTo" placeholder="Recipient address (64 hex chars)">
+    <input id="sendAmt" type="number" placeholder="Amount" min="1">
+    <button onclick="sendTx()">Send</button>
+    <div id="sendStatus"></div>
+  </div>
+
+  <!-- Faucet -->
+  <div id="tab-faucet" class="card" style="display:none">
+    <h2>Claim Testnet Tokens</h2>
+    <p style="color:#888;font-size:13px;margin-bottom:12px">Get 10,000 free ARC tokens for testing. One claim per hour.</p>
+    <button onclick="claimFaucet()">Claim 10,000 ARC</button>
+    <div id="faucetStatus"></div>
+  </div>
+
+  <!-- History -->
+  <div id="tab-txs" class="card" style="display:none">
+    <h2>Recent Transactions</h2>
+    <div class="tx-list" id="txList"><p style="color:#666;font-size:13px">No transactions yet</p></div>
+  </div>
+
+  <button class="secondary" onclick="logout()" style="margin-top:8px;font-size:12px">Disconnect Wallet</button>
+</div>
+</div>
+
+<script>
+// ── Config ──
+const NODES = [
+  {name:'LAX', ip:'140.82.16.112'},
+  {name:'AMS', ip:'136.244.109.1'},
+  {name:'NRT', ip:'202.182.107.41'},
+  {name:'NYC', ip:'149.28.32.76'},
+  {name:'LHR', ip:'104.238.171.11'},
+  {name:'SGP', ip:'149.28.153.31'},
+  {name:'SAO', ip:'216.238.120.27'},
+  {name:'JNB', ip:'139.84.237.49'},
+];
+let RPC = '';
+let wallet = null; // {privKey, address}
+
+// ── Startup ──
+(async function init() {
+  // Find a live node
+  for (const n of NODES) {
+    try {
+      const r = await fetch(`http://${n.ip}:9090/health`, {signal: AbortSignal.timeout(3000)});
+      if (r.ok) { RPC = `http://${n.ip}:9090`; break; }
+    } catch(e) {}
+  }
+  if (RPC) {
+    document.getElementById('netDot').className = 'dot';
+    const h = await (await fetch(RPC+'/health')).json();
+    document.getElementById('netStatus').textContent =
+      `Connected to ARC Testnet (${h.validators} validators, round ${h.dag_round.toLocaleString()})`;
+  } else {
+    document.getElementById('netDot').className = 'dot off';
+    document.getElementById('netStatus').textContent = 'Testnet unreachable';
+  }
+  // Check saved wallet
+  const saved = localStorage.getItem('arc_wallet');
+  if (saved) {
+    wallet = JSON.parse(saved);
+    showApp();
+  }
+})();
+
+// ── Crypto (minimal Ed25519-like using BLAKE3 for demo) ──
+// For testnet: address = first 32 bytes of SHA-256(privkey)
+// Real wallet would use proper Ed25519 keypair generation
+async function generateKeypair() {
+  const privBytes = crypto.getRandomValues(new Uint8Array(32));
+  const privKey = Array.from(privBytes).map(b=>b.toString(16).padStart(2,'0')).join('');
+  const hashBuf = await crypto.subtle.digest('SHA-256', privBytes);
+  const address = Array.from(new Uint8Array(hashBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+  return {privKey, address};
+}
+
+function createWallet() {
+  generateKeypair().then(kp => {
+    wallet = kp;
+    localStorage.setItem('arc_wallet', JSON.stringify(wallet));
+    // Show private key once
+    alert(`SAVE YOUR PRIVATE KEY (shown only once):\n\n${wallet.privKey}\n\nAddress: ${wallet.address}`);
+    showApp();
+    claimFaucet(); // Auto-claim on creation
+  });
+}
+
+function showImport() {
+  document.getElementById('importBox').style.display = 'block';
+}
+
+async function importWallet() {
+  const key = document.getElementById('importKey').value.trim();
+  if (key.length !== 64 || !/^[0-9a-f]+$/i.test(key)) {
+    alert('Invalid key — must be 64 hex characters');
+    return;
+  }
+  const privBytes = new Uint8Array(key.match(/.{2}/g).map(b=>parseInt(b,16)));
+  const hashBuf = await crypto.subtle.digest('SHA-256', privBytes);
+  const address = Array.from(new Uint8Array(hashBuf)).map(b=>b.toString(16).padStart(2,'0')).join('');
+  wallet = {privKey: key, address};
+  localStorage.setItem('arc_wallet', JSON.stringify(wallet));
+  showApp();
+}
+
+function showApp() {
+  document.getElementById('setup').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  document.getElementById('myAddr').textContent = wallet.address;
+  refreshBalance();
+}
+
+function logout() {
+  localStorage.removeItem('arc_wallet');
+  wallet = null;
+  document.getElementById('setup').style.display = 'block';
+  document.getElementById('app').style.display = 'none';
+}
+
+function copyAddr() {
+  navigator.clipboard.writeText(wallet.address);
+  document.getElementById('myAddr').textContent = 'Copied!';
+  setTimeout(() => document.getElementById('myAddr').textContent = wallet.address, 1500);
+}
+
+// ── Balance ──
+async function refreshBalance() {
+  if (!wallet || !RPC) return;
+  try {
+    const r = await fetch(`${RPC}/account/${wallet.address}`);
+    if (r.ok) {
+      const d = await r.json();
+      document.getElementById('bal').innerHTML =
+        `${(d.balance||0).toLocaleString()} <small>ARC</small>`;
+    }
+  } catch(e) {}
+}
+setInterval(refreshBalance, 5000);
+
+// ── Send ──
+async function sendTx() {
+  const to = document.getElementById('sendTo').value.trim();
+  const amt = parseInt(document.getElementById('sendAmt').value);
+  const el = document.getElementById('sendStatus');
+  if (!to || to.length!==64) { el.innerHTML='<div class="status err">Invalid address</div>'; return; }
+  if (!amt || amt<=0) { el.innerHTML='<div class="status err">Invalid amount</div>'; return; }
+  el.innerHTML='<div class="status info">Sending...</div>';
+  try {
+    const r = await fetch(`${RPC}/tx/submit`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({from:wallet.address, to, amount:amt, nonce:0})
+    });
+    const d = await r.json();
+    if (r.ok) {
+      el.innerHTML=`<div class="status ok">Sent! TX: ${d.tx_hash?.slice(0,16)}...</div>`;
+      addTxToHistory({hash:d.tx_hash, to, amount:-amt});
+      document.getElementById('sendTo').value='';
+      document.getElementById('sendAmt').value='';
+      refreshBalance();
+    } else {
+      el.innerHTML=`<div class="status err">${d.error||d.message||JSON.stringify(d)}</div>`;
+    }
+  } catch(e) { el.innerHTML=`<div class="status err">${e.message}</div>`; }
+}
+
+// ── Faucet ──
+async function claimFaucet() {
+  const el = document.getElementById('faucetStatus');
+  el.innerHTML='<div class="status info">Claiming...</div>';
+  try {
+    const r = await fetch(`${RPC}/faucet/claim`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({address:wallet.address})
+    });
+    const d = await r.json();
+    if (r.ok && d.tx_hash) {
+      el.innerHTML=`<div class="status ok">Received ${d.amount||10000} ARC!</div>`;
+      addTxToHistory({hash:d.tx_hash, from:'faucet', amount:d.amount||10000});
+      refreshBalance();
+    } else {
+      el.innerHTML=`<div class="status err">${d.error||d.message||JSON.stringify(d)}</div>`;
+    }
+  } catch(e) { el.innerHTML=`<div class="status err">${e.message}</div>`; }
+}
+
+// ── Tabs ──
+function switchTab(name, el) {
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  el.classList.add('active');
+  ['send','faucet','txs'].forEach(t=>{
+    document.getElementById('tab-'+t).style.display = t===name?'block':'none';
+  });
+  if (name==='txs') loadHistory();
+}
+
+// ── History ──
+let txHistory = JSON.parse(localStorage.getItem('arc_txs')||'[]');
+
+function addTxToHistory(tx) {
+  tx.time = Date.now();
+  txHistory.unshift(tx);
+  if (txHistory.length>50) txHistory=txHistory.slice(0,50);
+  localStorage.setItem('arc_txs', JSON.stringify(txHistory));
+}
+
+function loadHistory() {
+  const el = document.getElementById('txList');
+  if (!txHistory.length) { el.innerHTML='<p style="color:#666;font-size:13px">No transactions yet</p>'; return; }
+  el.innerHTML = txHistory.map(tx=>{
+    const isIn = tx.amount > 0;
+    const time = new Date(tx.time).toLocaleTimeString();
+    return `<div class="tx-item">
+      <span class="hash">${(tx.hash||'').slice(0,12)}...</span>
+      <span class="amount ${isIn?'plus':'minus'}">${isIn?'+':''}${tx.amount} ARC</span>
+      <br><span style="color:#555">${time}</span>
+    </div>`;
+  }).join('');
+}
+</script>
+</body>
+</html>
