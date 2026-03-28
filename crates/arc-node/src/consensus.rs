@@ -443,7 +443,26 @@ impl ConsensusManager {
                         | InboundMessage::SnapshotChunkRequest { .. }
                         | InboundMessage::SnapshotManifestResponse { .. }
                         | InboundMessage::SnapshotChunkResponse { .. } => {
-                            debug!("Received state sync message via P2P (handled by RPC layer)");
+                            debug!("State sync message (handled by RPC layer)");
+                        }
+                        InboundMessage::InferenceRequest { request_id, input, max_tokens, requester } => {
+                            // Community GPU node received an inference request.
+                            // TODO: Run model locally and send response via outbound_tx.
+                            info!(
+                                request_id = %request_id,
+                                tokens = max_tokens,
+                                "Received inference request from network"
+                            );
+                        }
+                        InboundMessage::InferenceResponse { request_id, output, output_hash, model_hash, ms_per_token, responder } => {
+                            // Seed node received inference result from community GPU.
+                            // Store for the waiting RPC handler to pick up.
+                            info!(
+                                request_id = %request_id,
+                                responder = %responder,
+                                ms_per_token = ms_per_token,
+                                "Received inference response from community node"
+                            );
                         }
                     }
                 }

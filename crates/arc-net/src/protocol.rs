@@ -32,6 +32,10 @@ pub enum MessageType {
     SnapshotChunkRequest = 0x09,
     /// State Sync — response with a snapshot chunk.
     SnapshotChunkResponse = 0x0A,
+    /// Inference request — routed to peers with GPU/model capability.
+    InferenceRequest = 0x0B,
+    /// Inference response — result from a community GPU node.
+    InferenceResponse = 0x0C,
 }
 
 impl MessageType {
@@ -47,6 +51,8 @@ impl MessageType {
             0x08 => Some(Self::SnapshotManifestResponse),
             0x09 => Some(Self::SnapshotChunkRequest),
             0x0A => Some(Self::SnapshotChunkResponse),
+            0x0B => Some(Self::InferenceRequest),
+            0x0C => Some(Self::InferenceResponse),
             _ => None,
         }
     }
@@ -131,6 +137,36 @@ pub struct SnapshotChunkRequestMessage {
 pub struct SnapshotChunkResponseMessage {
     /// The snapshot chunk data (includes BLAKE3 proof for verification).
     pub chunk: arc_state::StateSnapshot,
+}
+
+/// Inference request — broadcast to peers with model capability.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceRequestMessage {
+    /// Unique request ID (BLAKE3 hash of input + timestamp).
+    pub request_id: Hash256,
+    /// The input prompt / tokens.
+    pub input: String,
+    /// Max tokens to generate.
+    pub max_tokens: u32,
+    /// Requester's validator address (for response routing).
+    pub requester: Hash256,
+}
+
+/// Inference response — result from a community GPU node.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceResponseMessage {
+    /// Matches the request_id from InferenceRequestMessage.
+    pub request_id: Hash256,
+    /// Generated output text.
+    pub output: String,
+    /// BLAKE3 hash of the output (deterministic — identical on all hardware).
+    pub output_hash: Hash256,
+    /// Model hash (identifies which model produced this output).
+    pub model_hash: Hash256,
+    /// Milliseconds per token.
+    pub ms_per_token: u64,
+    /// Responder's validator address.
+    pub responder: Hash256,
 }
 
 /// Compact peer info exchanged via PEX protocol.
