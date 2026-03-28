@@ -701,9 +701,19 @@ async fn faucet_claim(
         })));
     }
 
-    // Create transfer transaction from faucet to recipient
-    let mut tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, faucet_account.nonce);
-    tx.sig_verified = true; // Faucet is a trusted internal operation — skip sig check on all nodes
+    // Use atomic nonce to prevent TOCTOU: two concurrent claims reading
+    // the same nonce from state would create duplicate-nonce transactions.
+    // fetch_add ensures each claim gets a unique nonce.
+    static FAUCET_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = FAUCET_NONCE.fetch_add(1, Ordering::SeqCst);
+    // Sync atomic with state nonce on first use
+    if nonce == 0 {
+        FAUCET_NONCE.store(faucet_account.nonce + 1, Ordering::SeqCst);
+    }
+    let actual_nonce = if nonce == 0 { faucet_account.nonce } else { nonce };
+
+    let mut tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, actual_nonce);
+    tx.sig_verified = true; // Faucet is a trusted internal operation
     let hash = tx.hash.to_hex();
 
     // Write receipt FIRST — the consensus thread uses receipts.contains_key()
