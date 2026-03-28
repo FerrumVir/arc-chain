@@ -70,6 +70,22 @@ pub enum InboundMessage {
         source: Hash256,
         chunk: arc_state::StateSnapshot,
     },
+    /// Inference request from another node — run model and respond.
+    InferenceRequest {
+        request_id: Hash256,
+        input: String,
+        max_tokens: u32,
+        requester: Hash256,
+    },
+    /// Inference response from a community GPU node.
+    InferenceResponse {
+        request_id: Hash256,
+        output: String,
+        output_hash: Hash256,
+        model_hash: Hash256,
+        ms_per_token: u64,
+        responder: Hash256,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -85,6 +101,22 @@ pub enum OutboundMessage {
         block_hash: Hash256,
         diff: arc_types::StateDiff,
         block_height: u64,
+    },
+    /// Broadcast inference request to all peers with model capability.
+    BroadcastInferenceRequest {
+        request_id: Hash256,
+        input: String,
+        max_tokens: u32,
+        requester: Hash256,
+    },
+    /// Send inference response back to the requester.
+    SendInferenceResponse {
+        request_id: Hash256,
+        output: String,
+        output_hash: Hash256,
+        model_hash: Hash256,
+        ms_per_token: u64,
+        responder: Hash256,
     },
 }
 
@@ -585,6 +617,22 @@ pub async fn run_transport(
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
                         conn_out.broadcast(MessageType::StateDiff, &bytes).await;
+                    }
+                }
+                OutboundMessage::BroadcastInferenceRequest { request_id, input, max_tokens, requester } => {
+                    let payload = crate::protocol::InferenceRequestMessage {
+                        request_id, input, max_tokens, requester,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out.broadcast(MessageType::InferenceRequest, &bytes).await;
+                    }
+                }
+                OutboundMessage::SendInferenceResponse { request_id, output, output_hash, model_hash, ms_per_token, responder } => {
+                    let payload = crate::protocol::InferenceResponseMessage {
+                        request_id, output, output_hash, model_hash, ms_per_token, responder,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out.broadcast(MessageType::InferenceResponse, &bytes).await;
                     }
                 }
             }
@@ -1181,6 +1229,40 @@ async fn handle_peer_recv(
                     Err(e) => {
                         warn!("Failed to deserialize SnapshotChunkResponse from {}: {}", peer_address, e);
                     }
+                }
+            }
+            MessageType::InferenceRequest => {
+                match bincode::deserialize::<crate::protocol::InferenceRequestMessage>(&data) {
+                    Ok(msg) => {
+                        info!("Inference request from {} ({})", peer_address, msg.request_id);
+                        let _ = inbound_tx
+                            .send(InboundMessage::InferenceRequest {
+                                request_id: msg.request_id,
+                                input: msg.input,
+                                max_tokens: msg.max_tokens,
+                                requester: msg.requester,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad InferenceRequest from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::InferenceResponse => {
+                match bincode::deserialize::<crate::protocol::InferenceResponseMessage>(&data) {
+                    Ok(msg) => {
+                        info!("Inference response from {} for {}", peer_address, msg.request_id);
+                        let _ = inbound_tx
+                            .send(InboundMessage::InferenceResponse {
+                                request_id: msg.request_id,
+                                output: msg.output,
+                                output_hash: msg.output_hash,
+                                model_hash: msg.model_hash,
+                                ms_per_token: msg.ms_per_token,
+                                responder: msg.responder,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad InferenceResponse from {}: {}", peer_address, e),
                 }
             }
             other => {
