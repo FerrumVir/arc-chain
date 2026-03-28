@@ -79,22 +79,49 @@ All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
 
 ### See it live right now (zero install)
 
-The testnet is running across 8 nodes on 6 continents with DAG consensus. Try it:
+The testnet is running across 8 nodes on 6 continents with DAG consensus.
+
+**Web Wallet (no install):** [http://140.82.16.112:3100](http://140.82.16.112:3100)
+Create a wallet, claim free tokens, and send transfers — all in your browser.
+
+**Live endpoints — try them now:**
+
+| What | URL |
+|------|-----|
+| **Web Wallet** | [http://140.82.16.112:3100](http://140.82.16.112:3100) |
+| **Chain Stats** | [http://140.82.16.112:9090/stats](http://140.82.16.112:9090/stats) |
+| **Node Health** | [http://140.82.16.112:9090/health](http://140.82.16.112:9090/health) |
+| **Validators** | [http://140.82.16.112:9090/validators](http://140.82.16.112:9090/validators) |
+| **Inference Attestations** | [http://140.82.16.112:9090/inference/attestations](http://140.82.16.112:9090/inference/attestations) |
+| **Account Lookup** | `http://140.82.16.112:9090/account/{address}` |
+| **Faucet (POST)** | `http://140.82.16.112:9090/faucet/claim` |
+
+**All 8 nodes** have the same API on port 9090:
+
+| Node | Location | RPC |
+|------|----------|-----|
+| NYC | New York | `http://149.28.32.76:9090` |
+| LAX | Los Angeles | `http://140.82.16.112:9090` |
+| AMS | Amsterdam | `http://136.244.109.1:9090` |
+| LHR | London | `http://104.238.171.11:9090` |
+| NRT | Tokyo | `http://202.182.107.41:9090` |
+| SGP | Singapore | `http://149.28.153.31:9090` |
+| SAO | Sao Paulo | `http://216.238.120.27:9090` |
+| JNB | Johannesburg | `http://139.84.237.49:9090` |
+
+> **Ports**: 9090 = RPC API (curl, browser, wallet), 9091 = P2P consensus (nodes talk to each other). You only need 9090.
 
 ```bash
-# Chain stats — includes live DAG round, committed blocks, validators
+# Quick test from terminal
 curl http://140.82.16.112:9090/stats
 
-# Node health — peers, consensus round, uptime
-curl http://140.82.16.112:9090/health
-
-# Get free testnet tokens
+# Claim free testnet tokens
 curl -X POST http://140.82.16.112:9090/faucet/claim \
   -H 'Content-Type: application/json' \
   -d '{"address":"your-64-char-hex-address-here"}'
 ```
 
-### Join the testnet
+### Join the testnet (run your own node)
 
 ```bash
 git clone https://github.com/FerrumVir/arc-chain.git
@@ -316,6 +343,40 @@ Staking is implemented in the protocol but not yet active on testnet. Right now,
 - Test all 24 transaction types
 - Run AI agents with zero-fee settlements
 - Use the faucet for test tokens
+
+---
+
+## What's Done
+
+Everything below is implemented, deployed, and running on the live testnet:
+
+| Feature | Status | Details |
+|---------|--------|---------|
+| DAG consensus (2-round commit) | Live | 8 nodes, 6 continents, matching block hashes verified |
+| EVM (Solidity) | Live | revm 19, deploy + execute contracts, ETH JSON-RPC |
+| WASM (Rust/C/Go) | Live | Wasmer 6.0 runtime |
+| Deterministic inference | Live | INT8 + GGUF backends, 76 ms/token GPU |
+| Data availability | Live | Reed-Solomon erasure coding, DAS sampling |
+| Validator slashing | Live | Equivocation, liveness, invalid proposals |
+| State sync | Live | Chunked snapshots with BLAKE3 verification |
+| Cross-shard transactions | Live | 2-phase lock/commit protocol |
+| DAG persistence (WAL) | Live | Segmented WAL files, survives restarts |
+| Web wallet | Live | [http://140.82.16.112:3100](http://140.82.16.112:3100) |
+| 5 signature algorithms | Live | Ed25519, Falcon-512, BLS, ML-DSA, secp256k1 |
+| Encrypted mempool | Live | BLS threshold commit-reveal |
+| Block explorer | Live | `explorer/index-live.html` |
+
+## Roadmap (What's Next)
+
+| Priority | Feature | Description |
+|----------|---------|-------------|
+| 1 | HTTPS for wallet | TLS certificate for the web wallet (currently HTTP) |
+| 2 | Mobile wallet | Native Android/iOS app or PWA |
+| 3 | DAG WAL replay | Replay persisted DAG blocks on node restart for faster recovery |
+| 4 | Load testing | Prove 30K+ TPS with real signed transfers through DAG consensus |
+| 5 | Desktop app | Electron or Tauri app for Mac/Windows/Linux |
+| 6 | SDK improvements | Python + TypeScript SDK with wallet, signing, contract deployment |
+| 7 | Mainnet preparation | Genesis ceremony, validator onboarding, bridge contract |
 
 ---
 
