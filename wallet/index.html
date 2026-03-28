@@ -195,9 +195,29 @@ function generateKeypair() {
 function createWallet() {
   wallet = generateKeypair();
   localStorage.setItem('arc_wallet', JSON.stringify(wallet));
-  alert(`SAVE YOUR PRIVATE KEY (shown only once):\n\n${wallet.privKey}\n\nAddress: ${wallet.address}`);
+  // Show private key in a copyable modal instead of alert()
+  showKeyModal(wallet.privKey, wallet.address);
   showApp();
   claimFaucet();
+}
+
+function showKeyModal(privKey, address) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.85);z-index:1000;display:flex;align-items:center;justify-content:center;padding:20px';
+  overlay.innerHTML = `<div style="background:#13131f;border:1px solid #6366f1;border-radius:12px;padding:24px;max-width:440px;width:100%">
+    <h3 style="color:#f87171;font-size:16px;margin-bottom:12px">Save Your Private Key</h3>
+    <p style="color:#888;font-size:13px;margin-bottom:16px">This is shown only once. Copy it now and store it safely.</p>
+    <div style="background:#0a0a0f;border:1px solid #2a2a4a;border-radius:8px;padding:12px;margin-bottom:12px">
+      <div style="color:#888;font-size:11px;margin-bottom:4px">PRIVATE KEY (tap to copy)</div>
+      <div id="pkDisplay" onclick="navigator.clipboard.writeText('${privKey}');this.style.color='#4ade80';this.textContent='Copied!';setTimeout(()=>{this.textContent='${privKey}';this.style.color='#f87171'},1500)" style="font-family:monospace;font-size:11px;color:#f87171;word-break:break-all;cursor:pointer;user-select:all">${privKey}</div>
+    </div>
+    <div style="background:#0a0a0f;border:1px solid #2a2a4a;border-radius:8px;padding:12px;margin-bottom:16px">
+      <div style="color:#888;font-size:11px;margin-bottom:4px">YOUR ADDRESS</div>
+      <div style="font-family:monospace;font-size:11px;color:#6366f1;word-break:break-all;user-select:all">${address}</div>
+    </div>
+    <button onclick="this.parentElement.parentElement.remove()" style="width:100%;padding:12px;background:#6366f1;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer">I've Saved My Key</button>
+  </div>`;
+  document.body.appendChild(overlay);
 }
 
 function showImport() {
