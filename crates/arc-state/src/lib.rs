@@ -480,38 +480,53 @@ impl StateDB {
 
     /// Take a snapshot of current state.
     pub fn snapshot(&self) -> Snapshot {
-        let accounts: Vec<(Address, Account)> = self
-            .accounts
-            .iter()
-            .map(|e| (Hash256(*e.key()), e.value().clone()))
-            .collect();
+        // Take a consistent snapshot by recording the height before and after
+        // collecting data. If a block was applied mid-snapshot, retry.
+        // This avoids adding a lock to the hot execution path.
+        loop {
+            let height_before = self.height();
+            let accounts: Vec<(Address, Account)> = self
+                .accounts
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect();
 
-        let storage: Vec<(Address, Vec<(Hash256, Vec<u8>)>)> = self
-            .storage
-            .iter()
-            .map(|e| {
-                let entries: Vec<(Hash256, Vec<u8>)> = e
-                    .value()
-                    .iter()
-                    .map(|se| (*se.key(), se.value().clone()))
-                    .collect();
-                (Hash256(*e.key()), entries)
-            })
-            .collect();
+            let storage: Vec<(Address, Vec<(Hash256, Vec<u8>)>)> = self
+                .storage
+                .iter()
+                .map(|e| {
+                    let entries: Vec<(Hash256, Vec<u8>)> = e
+                        .value()
+                        .iter()
+                        .map(|se| (*se.key(), se.value().clone()))
+                        .collect();
+                    (Hash256(*e.key()), entries)
+                })
+                .collect();
 
-        let contracts: Vec<(Address, Vec<u8>)> = self
-            .contracts
-            .iter()
-            .map(|e| (Hash256(*e.key()), e.value().clone()))
-            .collect();
+            let contracts: Vec<(Address, Vec<u8>)> = self
+                .contracts
+                .iter()
+                .map(|e| (Hash256(*e.key()), e.value().clone()))
+                .collect();
 
-        Snapshot {
-            block_height: self.height(),
-            state_root: self.compute_state_root(),
-            wal_sequence: 0, // Will be set by caller
-            accounts,
-            storage,
-            contracts,
+            let height_after = self.height();
+            if height_before != height_after {
+                tracing::warn!(
+                    "Snapshot height changed ({} → {}), retrying for consistency",
+                    height_before, height_after
+                );
+                continue; // Retry — a block was applied during iteration
+            }
+
+            return Snapshot {
+                block_height: height_after,
+                state_root: self.compute_state_root(),
+                wal_sequence: 0, // Will be set by caller
+                accounts,
+                storage,
+                contracts,
+            };
         }
     }
 
