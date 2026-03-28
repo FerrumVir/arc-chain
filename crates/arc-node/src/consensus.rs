@@ -250,9 +250,20 @@ impl ConsensusManager {
                                     "Peer reconnected — already in validator set, keeping DAG state"
                                 );
                             } else {
-                                // New peer: add to live validator set (for block
-                                // acceptance/round advance) AND queue for epoch
-                                // freeze (for deterministic leader selection).
+                                // New peer: only add if it's a known genesis
+                                // validator. Unknown peers (e.g., old systemd
+                                // processes with different seeds) would pollute
+                                // the validator set and break leader selection.
+                                let frozen = self.engine.frozen_validator_set();
+                                let is_genesis = frozen.validators.iter().any(|v| v.address == address);
+                                drop(frozen);
+                                if !is_genesis {
+                                    info!(
+                                        peer = %address,
+                                        "Ignoring non-genesis peer (not in frozen validator set)"
+                                    );
+                                    continue;
+                                }
                                 let current_vs = self.engine.validator_set();
                                 let mut validators: Vec<Validator> = current_vs.validators.clone();
                                 if let Some(v) = Validator::new(address, stake, 0) {
