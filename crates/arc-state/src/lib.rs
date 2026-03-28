@@ -475,6 +475,10 @@ impl StateDB {
             WalOp::Checkpoint(_) => {
                 // Checkpoints are informational — no state change
             }
+            WalOp::SetDagBlock(_, _) | WalOp::SetDagRound(_) | WalOp::CommitDagBlock(_) => {
+                // DAG operations are replayed by the consensus engine, not StateDB.
+                // StateDB just needs to not crash when encountering these in the WAL.
+            }
         }
     }
 
