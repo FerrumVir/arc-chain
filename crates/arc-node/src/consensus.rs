@@ -41,6 +41,10 @@ pub struct ConsensusManager {
     encrypted_mempool: Option<Arc<EncryptedMempool>>,
     /// Shared validator list for RPC — updated on PeerConnected/Disconnected.
     pub dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
+    /// Shared DAG round counter for health endpoint.
+    pub dag_round: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// Shared DAG committed block counter for health endpoint.
+    pub dag_committed: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl ConsensusManager {
@@ -67,7 +71,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None }
     }
 
     /// Create a consensus manager with a signing keypair (production mode).
@@ -103,7 +107,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None }
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -878,6 +882,16 @@ impl ConsensusManager {
                             }
                         }
                     }
+                }
+            }
+
+            // ── Update shared health counters for /health endpoint ─────────
+            if let Some(ref r) = self.dag_round {
+                r.store(current_round, std::sync::atomic::Ordering::Relaxed);
+            }
+            if !committed.is_empty() {
+                if let Some(ref c) = self.dag_committed {
+                    c.fetch_add(committed.len() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
             }
 
