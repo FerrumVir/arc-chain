@@ -178,7 +178,9 @@ async function refresh(){
     document.getElementById('validatorCount').textContent=d.validators;
     document.getElementById('peers').textContent=d.connected_peers;
     document.getElementById('rps').textContent=rps;
-    document.getElementById('tps').textContent=tps;
+    // Show benchmark TPS if available (internal engine speed), otherwise HTTP TPS
+    const benchTps = d.benchmark_tps || 0;
+    document.getElementById('tps').textContent = benchTps > 0 ? benchTps.toLocaleString() : tps;
     const mins=Math.floor(d.uptime_secs/60);const hrs=Math.floor(mins/60);
     document.getElementById('uptime').textContent=hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`;
     document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live — round ${d.dag_round.toLocaleString()} · ${d.total_transactions} txs`;
