@@ -81,16 +81,17 @@ All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
 
 The testnet is running across 8 nodes on 6 continents with DAG consensus.
 
-**Web Wallet (no install):** [http://140.82.16.112:3100](http://140.82.16.112:3100)
+**Live Dashboard:** [http://140.82.16.112:3200](http://140.82.16.112:3200)
+All 8 nodes, consensus rounds, inference attestations, transactions — one screen.
+
+**Web Wallet:** [http://140.82.16.112:3100](http://140.82.16.112:3100)
 Create a wallet, claim free tokens, and send transfers — all in your browser.
 
-| Create Wallet | Active Wallet |
-|:---:|:---:|
-| ![Wallet Setup](docs/screenshots/wallet.png) | ![Wallet Active](docs/screenshots/wallet-active.png) |
+![Live Dashboard](docs/screenshots/dashboard.png)
 
-| Chain Stats | Health |
+| Web Wallet | Private Key (copyable) |
 |:---:|:---:|
-| ![Stats](docs/screenshots/stats.png) | ![Health](docs/screenshots/health.png) |
+| ![Wallet](docs/screenshots/wallet-active.png) | ![Key Modal](docs/screenshots/key-modal.png) |
 
 **Live endpoints — try them now:**
 
