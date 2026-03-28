@@ -468,8 +468,13 @@ pub async fn run_transport(
     {
         let mut dial_handles = Vec::new();
         for peer_addr in &bootstrap_peers {
-            // Skip self
+            // Skip self — check loopback, listen_addr, AND local interfaces
+            // (our public IP is in the seeds file but listen_addr is 0.0.0.0)
             if peer_addr.ip().is_loopback() || peer_addr == &listen_addr {
+                continue;
+            }
+            if std::net::UdpSocket::bind(SocketAddr::new(peer_addr.ip(), 0)).is_ok() {
+                info!("Skipping self-dial to {} (local interface)", peer_addr);
                 continue;
             }
             info!("Dialing bootstrap peer {}", peer_addr);
@@ -705,8 +710,21 @@ pub async fn run_transport(
                     .map(|e| e.value().dial_addr)
                     .collect();
 
+                // Skip self-addresses. The seeds file includes our own
+                // public IP, but listen_addr is 0.0.0.0 so the bootstrap
+                // skip-self check misses it. Detect by trying to bind to
+                // the candidate IP — succeeds only for local interfaces.
                 let disconnected: Vec<SocketAddr> = candidates.into_iter()
                     .filter(|a| !connected_addrs.contains(a))
+                    .filter(|a| {
+                        if a.ip().is_loopback() { return false; }
+                        // If we can bind a UDP socket to this IP, it's ours
+                        let test_addr = SocketAddr::new(a.ip(), 0);
+                        if std::net::UdpSocket::bind(test_addr).is_ok() {
+                            return false; // Local IP — skip self-dial
+                        }
+                        true
+                    })
                     .collect();
 
                 if !disconnected.is_empty() {
