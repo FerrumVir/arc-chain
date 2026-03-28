@@ -706,19 +706,9 @@ async fn faucet_claim(
     tx.sig_verified = true; // Faucet is a trusted internal operation — skip sig check on all nodes
     let hash = tx.hash.to_hex();
 
-    // Apply the transfer directly to state (immediate settlement for testnet faucet)
-    {
-        let mut sender = faucet_account.clone();
-        sender.balance -= FAUCET_CLAIM_AMOUNT;
-        sender.nonce += 1;
-        node.state.update_account(&faucet_addr, sender);
-
-        let mut recipient = node.state.get_or_create_account(&to);
-        recipient.balance = recipient.balance.saturating_add(FAUCET_CLAIM_AMOUNT);
-        node.state.update_account(&to, recipient);
-    }
-
-    // Record transaction and receipt in state for lookup
+    // Write receipt FIRST — the consensus thread uses receipts.contains_key()
+    // to dedup. If we write state before receipt, there's a race window where
+    // the DAG commit thread could execute the same tx again (double credit).
     let receipt = TxReceipt {
         tx_hash: tx.hash,
         block_height: node.state.height(),
@@ -733,6 +723,18 @@ async fn faucet_claim(
         logs: vec![],
     };
     node.state.receipts.insert(tx.hash.0, receipt);
+
+    // Now apply the transfer to state (receipt already marks it as done)
+    {
+        let mut sender = faucet_account.clone();
+        sender.balance -= FAUCET_CLAIM_AMOUNT;
+        sender.nonce += 1;
+        node.state.update_account(&faucet_addr, sender);
+
+        let mut recipient = node.state.get_or_create_account(&to);
+        recipient.balance = recipient.balance.saturating_add(FAUCET_CLAIM_AMOUNT);
+        node.state.update_account(&to, recipient);
+    }
     node.state.full_transactions.insert(tx.hash.0, tx.clone());
     // Index for account tx history
     node.state.account_txs.entry(faucet_addr.0).or_default().push(tx.hash);
