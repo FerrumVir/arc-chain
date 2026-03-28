@@ -574,7 +574,11 @@ impl ConsensusManager {
                     // ── Normal path: drain mempool ──────────────────────────────
                     // In benchmark mode, drain aggressively for max TPS.
                     // In normal mode, 100 per block keeps QUIC payload small.
-                    let drain_limit = if self.benchmark { 50_000 } else { 100 };
+                    // Multi-validator benchmark: 1000 per block (RPC-friendly).
+                    // Single-validator benchmark: 50K (max local TPS).
+                    let drain_limit = if self.benchmark && multi_validator { 1_000 }
+                        else if self.benchmark { 50_000 }
+                        else { 100 };
                     let transactions = mempool.drain(drain_limit);
                     if !transactions.is_empty() {
                         info!("Drained {} txs from mempool for DAG proposal", transactions.len());
