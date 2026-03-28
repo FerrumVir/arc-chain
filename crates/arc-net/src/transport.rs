@@ -1002,6 +1002,15 @@ async fn handle_peer_recv(
                             if pex_peer.socket_addr.is_empty() {
                                 continue;
                             }
+                            // Only dial peers whose address we've seen in a
+                            // verified handshake (meta has dial_addr from
+                            // prior connections). This prevents an attacker
+                            // from injecting arbitrary IPs via PEX to fill
+                            // our connection slots with sybil nodes.
+                            if !connections.meta.contains_key(&pex_peer.address.0) {
+                                debug!("PEX: ignoring unknown peer {} (not in verified meta)", pex_peer.address);
+                                continue;
+                            }
                             // Queue for dialing
                             if let Ok(addr) = pex_peer.socket_addr.parse::<SocketAddr>() {
                                 debug!("PEX: queueing discovered peer {} at {}", pex_peer.address, addr);
