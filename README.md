@@ -84,6 +84,14 @@ The testnet is running across 8 nodes on 6 continents with DAG consensus.
 **Web Wallet (no install):** [http://140.82.16.112:3100](http://140.82.16.112:3100)
 Create a wallet, claim free tokens, and send transfers — all in your browser.
 
+| Create Wallet | Active Wallet |
+|:---:|:---:|
+| ![Wallet Setup](docs/screenshots/wallet.png) | ![Wallet Active](docs/screenshots/wallet-active.png) |
+
+| Chain Stats | Health |
+|:---:|:---:|
+| ![Stats](docs/screenshots/stats.png) | ![Health](docs/screenshots/health.png) |
+
 **Live endpoints — try them now:**
 
 | What | URL |
