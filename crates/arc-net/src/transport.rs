@@ -688,27 +688,45 @@ pub async fn run_transport(
             }
 
             // ── Reconnect timer (every 30s) ────────────────────────────
+            // Reconnect to bootstrap peers + known peers that dropped.
+            // The old check only looked at meta (which persists after
+            // disconnect). Now we check the actual peers DashMap to see
+            // if the send stream is still alive.
             _ = reconnect_interval.tick() => {
-                let known = load_peers_from_disk(&data_dir);
-                for addr in known {
-                    let already = conn_pex.meta.iter().any(|e| e.value().dial_addr == addr);
-                    if !already {
-                        debug!("Reconnect: trying {}", addr);
-                        let handshake_msg = make_signed_handshake(
-                            local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
-                        );
-                        let c = connections.clone();
-                        let itx = inbound_tx.clone();
-                        let pc = peer_count.clone();
-                        let ep = endpoint.clone();
-                        let pdt = pex_dial_tx.clone();
-                        let rl = rate_limiter.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl).await {
-                                debug!("Reconnect to {} failed: {}", addr, e);
-                            }
-                        });
-                    }
+                // Combine bootstrap peers + disk-persisted peers
+                let mut candidates: Vec<SocketAddr> = bootstrap_peers.clone();
+                candidates.extend(load_peers_from_disk(&data_dir));
+                candidates.sort();
+                candidates.dedup();
+
+                // Check which ones are actually connected (have live SendStream)
+                let connected_addrs: std::collections::HashSet<SocketAddr> = conn_pex.meta.iter()
+                    .filter(|e| conn_pex.peers.contains_key(e.key()))
+                    .map(|e| e.value().dial_addr)
+                    .collect();
+
+                let disconnected: Vec<SocketAddr> = candidates.into_iter()
+                    .filter(|a| !connected_addrs.contains(a))
+                    .collect();
+
+                if !disconnected.is_empty() {
+                    info!("Reconnect: {} peers disconnected, retrying", disconnected.len());
+                }
+                for addr in disconnected {
+                    let handshake_msg = make_signed_handshake(
+                        local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+                    );
+                    let c = connections.clone();
+                    let itx = inbound_tx.clone();
+                    let pc = peer_count.clone();
+                    let ep = endpoint.clone();
+                    let pdt = pex_dial_tx.clone();
+                    let rl = rate_limiter.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl).await {
+                            debug!("Reconnect to {} failed: {}", addr, e);
+                        }
+                    });
                 }
             }
         }
