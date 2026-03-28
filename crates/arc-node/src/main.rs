@@ -578,24 +578,38 @@ async fn main() -> Result<()> {
     // Run consensus on a dedicated thread with its own tokio runtime.
     // This prevents broadcast/transport/RPC tasks from starving the
     // consensus loop (the root cause of random freezes at ~4000 rounds).
+    // If the consensus thread panics, log the error and exit the process —
+    // a node without consensus is useless and should restart via systemd.
     std::thread::Builder::new()
         .name("consensus".into())
         .spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("consensus runtime");
-            rt.block_on(async move {
-                consensus
-                    .run_consensus_loop(
-                        state_clone,
-                        mempool_clone,
-                        Some(inbound_rx),
-                        Some(outbound_tx),
-                        pool_clone,
-                    )
-                    .await;
-            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("consensus runtime");
+                rt.block_on(async move {
+                    consensus
+                        .run_consensus_loop(
+                            state_clone,
+                            mempool_clone,
+                            Some(inbound_rx),
+                            Some(outbound_tx),
+                            pool_clone,
+                        )
+                        .await;
+                });
+            }));
+            match result {
+                Ok(()) => {
+                    tracing::error!("Consensus loop exited unexpectedly — shutting down");
+                }
+                Err(panic_info) => {
+                    tracing::error!("CONSENSUS THREAD PANICKED: {:?}", panic_info);
+                }
+            }
+            // Exit the process — a node without consensus must restart
+            std::process::exit(1);
         })
         .expect("spawn consensus thread");
 
