@@ -1,0 +1,18 @@
+PASS: NYC /health: r=6532 c=5802 p=7 v=8
+PASS: LAX /health: r=6532 c=5802 p=7 v=8
+PASS: AMS /health: r=6532 c=5802 p=7 v=8
+PASS: LHR /health: r=6532 c=5802 p=7 v=8
+PASS: NRT /health: r=3578 c=3428 p=7 v=8
+PASS: SGP /health: r=6514 c=5395 p=7 v=8
+PASS: SAO /health: r=4978 c=4619 p=7 v=8
+PASS: JNB /health: r=6514 c=5800 p=7 v=8
+PASS: /stats: chain=ARC Chain round=6532 validators=8
+FAIL: /validators: undefined validators returned
+PASS: Faucet: tx_hash=b5a1b0f35984c8c2... amount=10000
+PASS: Account: balance=10000 nonce=0
+PASS: Inference attestations: 4 attestations
+PASS: Screenshot: stats.png
+PASS: Screenshot: health.png
+PASS: Screenshot: wallet.png
+PASS: Screenshot: wallet-active.png (with balance)
+PASS: Screenshot: validators.png
