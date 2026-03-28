@@ -13,7 +13,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
@@ -44,6 +44,13 @@ pub struct NodeState {
     pub candle_model_id: Option<arc_crypto::Hash256>,
     /// Live DAG validator set (updated by consensus loop via PeerConnected).
     pub dag_validators: Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>,
+    /// Per-sender rate limiter for tx submission: sender_address → last submit time.
+    /// Limits to 10 tx/sec per sender to prevent mempool flood DoS.
+    pub tx_rate_limit: Arc<dashmap::DashMap<[u8; 32], Instant>>,
+    /// DAG consensus round (updated by consensus loop).
+    pub dag_round: Arc<AtomicU64>,
+    /// DAG committed block count (updated by consensus loop).
+    pub dag_committed: Arc<AtomicU64>,
     /// Inference results indexed by attestation tx hash — for explorer display.
     pub inference_results: Arc<dashmap::DashMap<String, Value>>,
 }
@@ -75,6 +82,9 @@ pub fn build_node_state(
         candle_engine,
         candle_model_id,
         dag_validators: Arc::new(parking_lot::RwLock::new(vec![(validator_address, stake)])),
+        tx_rate_limit: Arc::new(dashmap::DashMap::new()),
+        dag_round: Arc::new(AtomicU64::new(0)),
+        dag_committed: Arc::new(AtomicU64::new(0)),
         inference_results: Arc::new(dashmap::DashMap::new()),
     }
 }
@@ -207,15 +217,22 @@ struct HealthResponse {
     height: u64,
     peers: u32,
     uptime_secs: u64,
+    dag_round: u64,
+    dag_committed: u64,
+    validators: usize,
 }
 
 async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
+    let validators = node.dag_validators.read().len();
     Json(HealthResponse {
         status: "ok".to_string(),
         version: "0.1.0".to_string(),
         height: node.state.height(),
         peers: node.peer_count.load(Ordering::Relaxed),
         uptime_secs: node.boot_time.elapsed().as_secs(),
+        dag_round: node.dag_round.load(Ordering::Relaxed),
+        dag_committed: node.dag_committed.load(Ordering::Relaxed),
+        validators,
     })
 }
 
@@ -338,6 +355,14 @@ async fn submit_tx(
 ) -> Result<Json<SubmitTxResponse>, (StatusCode, String)> {
     let from = Hash256::from_hex(&req.from).map_err(|_| (StatusCode::BAD_REQUEST, "invalid from address".to_string()))?;
     let to = Hash256::from_hex(&req.to).map_err(|_| (StatusCode::BAD_REQUEST, "invalid to address".to_string()))?;
+
+    // Per-sender rate limit: 10 tx/sec (100ms cooldown)
+    if let Some(last) = node.tx_rate_limit.get(&from.0) {
+        if last.elapsed().as_millis() < 100 {
+            return Err((StatusCode::TOO_MANY_REQUESTS, "rate limited: max 10 tx/sec per sender".to_string()));
+        }
+    }
+    node.tx_rate_limit.insert(from.0, Instant::now());
 
     // Check if a signature was provided
     if let Some(ref sig_hex) = req.signature {
@@ -739,10 +764,14 @@ async fn faucet_claim(
     // Also insert into mempool for DAG consensus propagation to other nodes
     let _ = node.mempool.insert(tx);
 
-    // Record claim time
+    // Record claim time + evict stale entries to prevent unbounded growth
     {
         let mut claims = node.faucet_claims.lock().unwrap_or_else(|p| p.into_inner());
         claims.insert(to.0, Instant::now());
+        // Evict entries older than 2 hours (well past the 1-hour rate limit)
+        if claims.len() > 10_000 {
+            claims.retain(|_, v| v.elapsed().as_secs() < 7200);
+        }
     }
     node.faucet_claims_total.fetch_add(1, Ordering::Relaxed);
 
