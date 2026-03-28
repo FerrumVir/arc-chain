@@ -575,17 +575,29 @@ async fn main() -> Result<()> {
     let state_clone = state.clone();
     let mempool_clone = mempool.clone();
     let pool_clone = benchmark_pool.clone();
-    tokio::spawn(async move {
-        consensus
-            .run_consensus_loop(
-                state_clone,
-                mempool_clone,
-                Some(inbound_rx),
-                Some(outbound_tx),
-                pool_clone,
-            )
-            .await;
-    });
+    // Run consensus on a dedicated thread with its own tokio runtime.
+    // This prevents broadcast/transport/RPC tasks from starving the
+    // consensus loop (the root cause of random freezes at ~4000 rounds).
+    std::thread::Builder::new()
+        .name("consensus".into())
+        .spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("consensus runtime");
+            rt.block_on(async move {
+                consensus
+                    .run_consensus_loop(
+                        state_clone,
+                        mempool_clone,
+                        Some(inbound_rx),
+                        Some(outbound_tx),
+                        pool_clone,
+                    )
+                    .await;
+            });
+        })
+        .expect("spawn consensus thread");
 
     // ── Start ETH JSON-RPC server (MetaMask, Hardhat, Foundry) ──────────
     if eth_rpc_port > 0 {
