@@ -102,7 +102,15 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
 </footer>
 
 <script>
-const RPC='http://140.82.16.112:9090';
+// Try multiple nodes — use first one that responds
+let RPC='http://140.82.16.112:9090';
+const RPC_FALLBACKS=['http://136.244.109.1:9090','http://139.84.237.49:9090','http://104.238.171.11:9090','http://149.28.32.76:9090'];
+(async()=>{
+  try{await fetch(RPC+'/health',{signal:AbortSignal.timeout(3000)});return}catch(e){}
+  for(const fb of RPC_FALLBACKS){
+    try{const r=await fetch(fb+'/health',{signal:AbortSignal.timeout(3000)});if(r.ok){RPC=fb;return}}catch(e){}
+  }
+})();
 const NODES=[
   {name:'NYC',ip:'149.28.32.76',loc:'New York',flag:'🇺🇸'},
   {name:'LAX',ip:'140.82.16.112',loc:'Los Angeles',flag:'🇺🇸'},
