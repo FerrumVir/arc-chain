@@ -361,14 +361,17 @@ impl ConsensusManager {
                                         txs = block.transactions.len(),
                                         "Received DAG block from peer"
                                     );
-                                    let _ = self.engine.advance_round();
-                                    // After receiving a peer block, reset the
-                                    // round timer. Blocks arriving proves the
-                                    // round is active — don't view-change.
-                                    self.engine.reset_round_timer();
-                                    // If we haven't proposed for this round yet,
-                                    // mark as needing a proposal so we contribute
-                                    // our block ASAP (speeds convergence).
+                                    let round_before = self.engine.current_round();
+                                    let advanced = self.engine.advance_round();
+                                    // Only reset the view-change timer if the
+                                    // round actually advanced or the block is
+                                    // for our current round. Resetting on every
+                                    // received block prevented view-change from
+                                    // ever firing when stuck (blocks arrive but
+                                    // don't form quorum in our round).
+                                    if advanced || block.round == round_before {
+                                        self.engine.reset_round_timer();
+                                    }
                                     let peer_round = self.engine.current_round();
                                     if last_proposed_round != Some(peer_round) {
                                         // Will propose on the very next tick
