@@ -20,6 +20,10 @@ join:
 inference:
 	./scripts/join-testnet.sh --with-inference
 
+# Join as an inference node (GPU recommended, earn ARC)
+inference-node:
+	./scripts/join-inference.sh
+
 # Run the block explorer
 explorer:
 	@if [ "$$(uname)" = "Darwin" ]; then open explorer/index-live.html; \
