@@ -52,7 +52,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Finalized</p><p class="text-2xl font-extrabold text-white mono mt-1" id="committed">—</p></div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Validators</p><p class="text-2xl font-extrabold text-emerald-400 mono mt-1" id="validatorCount">—</p></div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Blocks/sec</p><p class="text-2xl font-extrabold text-white mono mt-1" id="rps">—</p></div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Transactions</p><p class="text-2xl font-extrabold text-yellow-400 mono mt-1" id="tps">—</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">TPS</p><p class="text-2xl font-extrabold text-yellow-400 mono mt-1" id="tps">—</p></div>
   </div>
 
   <!-- Chain + Nodes -->
@@ -230,7 +230,11 @@ async function refresh(){
     document.getElementById('peers').textContent=d.connected_peers;
     document.getElementById('rps').textContent=rps;
     // Show total transaction count (more meaningful than instantaneous TPS)
-    document.getElementById('tps').textContent = d.total_transactions.toLocaleString();
+    // Show benchmark TPS if running, otherwise total transactions
+    const benchTps = d.benchmark_tps || 0;
+    document.getElementById('tps').textContent = benchTps > 0
+      ? benchTps.toLocaleString()
+      : d.total_transactions.toLocaleString();
     const mins=Math.floor(d.uptime_secs/60);const hrs=Math.floor(mins/60);
     document.getElementById('uptime').textContent=hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`;
     document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live — block ${d.dag_round.toLocaleString()} · ${d.dag_committed.toLocaleString()} finalized · ${d.total_transactions} txs`;
