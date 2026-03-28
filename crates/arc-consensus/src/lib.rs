@@ -1271,8 +1271,26 @@ impl ConsensusEngine {
             drop(vs);
             // Still insert the equivocating block (the DAG handles it)
             // but the validator has been penalized.
-        } else if !self.author_round_blocks.contains_key(&key) {
-            self.author_round_blocks.insert(key, block.hash);
+        } else {
+            // Atomic insert-if-absent: use entry() API to avoid TOCTOU race
+            // where two concurrent receive_block calls both pass contains_key
+            // and insert different blocks for the same (author, round).
+            use dashmap::mapref::entry::Entry;
+            match self.author_round_blocks.entry(key) {
+                Entry::Vacant(e) => { e.insert(block.hash); }
+                Entry::Occupied(e) => {
+                    if *e.get() != block.hash {
+                        // Late-detected equivocation (lost the TOCTOU race)
+                        warn!(
+                            author = %block.author,
+                            round = block.round,
+                            existing = %e.get(),
+                            new = %block.hash,
+                            "Late equivocation detected via atomic check"
+                        );
+                    }
+                }
+            }
         }
 
         // All checks passed: insert

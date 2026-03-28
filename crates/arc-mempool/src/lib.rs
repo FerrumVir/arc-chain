@@ -51,22 +51,26 @@ impl Mempool {
     /// Add a transaction to the mempool.
     /// Returns error if duplicate or mempool is full.
     pub fn insert(&self, tx: Transaction) -> Result<(), MempoolError> {
-        // Dedup check first (cheap, no lock needed — DashMap is concurrent)
-        if self.seen.contains_key(&tx.hash.0) {
-            return Err(MempoolError::Duplicate(tx.hash));
-        }
-
-        // Hold write lock across capacity check + increment to prevent TOCTOU race.
-        // Without this, two threads could both pass the capacity check and both insert,
-        // exceeding the intended limit.
+        // Atomic dedup: insert into seen map FIRST (under the count lock)
+        // to prevent the TOCTOU race where two threads both pass contains_key
+        // and both push the same tx into the queue.
         let mut count = self.count.write();
         if *count >= self.capacity {
             return Err(MempoolError::Full(self.capacity));
         }
+        // Atomic insert-if-absent via entry API
+        use dashmap::mapref::entry::Entry;
+        match self.seen.entry(tx.hash.0) {
+            Entry::Occupied(_) => {
+                return Err(MempoolError::Duplicate(tx.hash));
+            }
+            Entry::Vacant(e) => {
+                e.insert(());
+            }
+        }
         *count += 1;
         drop(count);
 
-        self.seen.insert(tx.hash.0, ());
         self.queue.push(tx);
 
         Ok(())
