@@ -1,220 +1,260 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ARC Chain — Live Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = {
+  darkMode: 'class',
+  theme: {
+    extend: {
+      colors: {
+        arc: { 50:'#eef2ff',100:'#e0e7ff',200:'#c7d2fe',300:'#a5b4fc',400:'#818cf8',500:'#6366f1',600:'#4f46e5',700:'#4338ca',800:'#3730a3',900:'#312e81',950:'#1e1b4b' },
+        surface: { 1:'#09090f', 2:'#0f0f19', 3:'#141420', 4:'#1a1a2e', 5:'#22223a' }
+      }
+    }
+  }
+}
+</script>
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#08080e;color:#e0e0e0;min-height:100vh}
-.header{text-align:center;padding:24px 16px 16px;border-bottom:1px solid #1a1a2e}
-.header h1{font-size:22px;color:#fff;margin-bottom:4px}
-.header h1 span{color:#6366f1}
-.header .sub{color:#666;font-size:13px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;padding:16px;max-width:1200px;margin:0 auto}
-.card{background:#10101a;border:1px solid #1a1a2e;border-radius:10px;padding:16px}
-.card h2{font-size:12px;color:#666;text-transform:uppercase;letter-spacing:1px;margin-bottom:10px}
-.metric{font-size:28px;font-weight:700;color:#fff}
-.metric small{font-size:13px;color:#888;font-weight:400}
-.metric.purple{color:#6366f1}
-.metric.green{color:#4ade80}
-.row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #0f0f1a;font-size:13px}
-.row:last-child{border:none}
-.row .label{color:#888}
-.row .val{color:#fff;font-weight:500;font-family:monospace}
-.node-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px}
-.node{background:#0c0c16;border:1px solid #1a1a2e;border-radius:8px;padding:10px;text-align:center;font-size:12px}
-.node .name{font-weight:700;color:#fff;margin-bottom:2px}
-.node .loc{color:#666;font-size:11px}
-.node .round{color:#6366f1;font-family:monospace;margin-top:4px}
-.node .status{display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:4px}
-.node .status.up{background:#4ade80}
-.node .status.down{background:#f87171}
-.tx-list{max-height:300px;overflow-y:auto}
-.tx{padding:8px 0;border-bottom:1px solid #111120;font-size:12px}
-.tx .hash{color:#6366f1;font-family:monospace}
-.tx .type{background:#1a1a3a;color:#818cf8;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:600}
-.tx .type.inference{background:#1a2e1a;color:#4ade80}
-.tx .amount{float:right;font-weight:600;color:#fff}
-.refresh{color:#444;font-size:11px;text-align:center;padding:8px}
-.links{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
-.links a{color:#6366f1;font-size:11px;text-decoration:none;background:#13131f;padding:4px 8px;border-radius:4px;border:1px solid #1e1e3a}
-.links a:hover{border-color:#6366f1}
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+body { font-family: 'Inter', sans-serif; }
+.mono { font-family: 'JetBrains Mono', monospace; }
+.glow { box-shadow: 0 0 40px rgba(99,102,241,0.08); }
+.pulse-dot { animation: pulse 2s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+.fade-in { animation: fadeIn 0.5s ease-out; }
+@keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:transparent} ::-webkit-scrollbar-thumb{background:#2a2a4a;border-radius:4px}
 </style>
 </head>
-<body>
-<div class="header">
-  <h1><span>ARC</span> Chain — Live Dashboard</h1>
-  <div class="sub" id="subtitle">Connecting to testnet...</div>
-</div>
+<body class="bg-surface-1 text-gray-300 min-h-screen">
 
-<div class="grid">
-  <!-- Overview -->
-  <div class="card">
-    <h2>Consensus</h2>
-    <div class="metric purple" id="dagRound">—</div>
-    <div style="color:#888;font-size:12px;margin-bottom:8px">DAG Round</div>
-    <div class="row"><span class="label">Committed Blocks</span><span class="val" id="committed">—</span></div>
-    <div class="row"><span class="label">Block Height</span><span class="val" id="height">—</span></div>
-    <div class="row"><span class="label">Transactions</span><span class="val" id="totalTx">—</span></div>
-    <div class="row"><span class="label">Accounts</span><span class="val" id="accounts">—</span></div>
-    <div class="row"><span class="label">Mempool</span><span class="val" id="mempool">—</span></div>
+<!-- Header -->
+<header class="border-b border-surface-4 bg-surface-2/80 backdrop-blur-sm sticky top-0 z-50">
+  <div class="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg bg-arc-500 flex items-center justify-center">
+        <span class="text-white font-bold text-sm">A</span>
+      </div>
+      <div>
+        <h1 class="text-lg font-bold text-white">ARC Chain</h1>
+        <p class="text-xs text-gray-500" id="subtitle">Connecting...</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-3">
+      <a href="http://140.82.16.112:3100" target="_blank" class="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-arc-500 hover:bg-arc-600 text-white text-xs font-semibold transition">
+        Open Wallet
+      </a>
+      <a href="https://github.com/FerrumVir/arc-chain" target="_blank" class="text-gray-500 hover:text-white transition">
+        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+      </a>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+
+  <!-- Hero Stats -->
+  <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5 glow fade-in">
+      <p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">DAG Round</p>
+      <p class="text-2xl sm:text-3xl font-extrabold text-arc-400 mono mt-1" id="dagRound">—</p>
+    </div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5 fade-in">
+      <p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Committed</p>
+      <p class="text-2xl sm:text-3xl font-extrabold text-white mono mt-1" id="committed">—</p>
+    </div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5 fade-in">
+      <p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Validators</p>
+      <p class="text-2xl sm:text-3xl font-extrabold text-emerald-400 mono mt-1" id="validatorCount">—</p>
+    </div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5 fade-in">
+      <p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Rounds/sec</p>
+      <p class="text-2xl sm:text-3xl font-extrabold text-white mono mt-1" id="rps">—</p>
+    </div>
   </div>
 
-  <!-- Network -->
-  <div class="card">
-    <h2>Network</h2>
-    <div class="metric green" id="validatorCount">—</div>
-    <div style="color:#888;font-size:12px;margin-bottom:8px">Validators Online</div>
-    <div class="row"><span class="label">Connected Peers</span><span class="val" id="peers">—</span></div>
-    <div class="row"><span class="label">Uptime</span><span class="val" id="uptime">—</span></div>
-    <div class="row"><span class="label">Rounds/sec</span><span class="val" id="rps">—</span></div>
-    <div class="row"><span class="label">Version</span><span class="val" id="version">—</span></div>
+  <!-- Chain Details + Network -->
+  <div class="grid lg:grid-cols-2 gap-4">
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Chain</h2>
+      <div class="space-y-3">
+        <div class="flex justify-between"><span class="text-gray-500 text-sm">Block Height</span><span class="text-white font-medium mono text-sm" id="height">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500 text-sm">Transactions</span><span class="text-white font-medium mono text-sm" id="totalTx">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500 text-sm">Accounts</span><span class="text-white font-medium mono text-sm" id="accounts">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500 text-sm">Mempool</span><span class="text-white font-medium mono text-sm" id="mempool">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500 text-sm">Connected Peers</span><span class="text-white font-medium mono text-sm" id="peers">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500 text-sm">Uptime</span><span class="text-white font-medium mono text-sm" id="uptime">—</span></div>
+      </div>
+    </div>
+
+    <!-- Node Grid -->
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Nodes — 6 Continents</h2>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2" id="nodeGrid"></div>
+    </div>
   </div>
 
-  <!-- Nodes (full width) -->
-  <div class="card" style="grid-column:1/-1">
-    <h2>8 Nodes — 6 Continents</h2>
-    <div class="node-grid" id="nodeGrid"></div>
+  <!-- Inference + Transactions -->
+  <div class="grid lg:grid-cols-2 gap-4">
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1.5"></span>
+        AI Inference Attestations
+      </h2>
+      <div class="space-y-2 max-h-[280px] overflow-y-auto" id="inferenceList">
+        <p class="text-gray-600 text-sm">Loading...</p>
+      </div>
+    </div>
+
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">
+        <span class="inline-block w-2 h-2 rounded-full bg-arc-400 mr-1.5"></span>
+        Recent Transactions
+      </h2>
+      <div class="space-y-2 max-h-[280px] overflow-y-auto" id="txList">
+        <p class="text-gray-600 text-sm">Loading...</p>
+      </div>
+    </div>
   </div>
 
-  <!-- Inference -->
-  <div class="card">
-    <h2>AI Inference Attestations</h2>
-    <div id="inferenceList" class="tx-list"><div style="color:#555;font-size:13px">Loading...</div></div>
-  </div>
+</main>
 
-  <!-- Recent Transactions -->
-  <div class="card">
-    <h2>Recent Transactions</h2>
-    <div id="txList" class="tx-list"><div style="color:#555;font-size:13px">Loading...</div></div>
+<!-- Footer -->
+<footer class="border-t border-surface-4 mt-8 py-4">
+  <div class="max-w-7xl mx-auto px-4 sm:px-6 flex flex-wrap items-center justify-between gap-2">
+    <p class="text-[11px] text-gray-600" id="lastUpdate">Refreshes every 5s</p>
+    <div class="flex gap-2 flex-wrap">
+      <a href="http://140.82.16.112:3100" target="_blank" class="text-[11px] px-2.5 py-1 rounded-md bg-surface-3 border border-surface-4 text-gray-400 hover:text-white hover:border-arc-500 transition">Wallet</a>
+      <a href="http://140.82.16.112:9090/stats" target="_blank" class="text-[11px] px-2.5 py-1 rounded-md bg-surface-3 border border-surface-4 text-gray-400 hover:text-white hover:border-arc-500 transition">Stats API</a>
+      <a href="http://140.82.16.112:9090/health" target="_blank" class="text-[11px] px-2.5 py-1 rounded-md bg-surface-3 border border-surface-4 text-gray-400 hover:text-white hover:border-arc-500 transition">Health API</a>
+      <a href="http://140.82.16.112:9090/inference/attestations" target="_blank" class="text-[11px] px-2.5 py-1 rounded-md bg-surface-3 border border-surface-4 text-gray-400 hover:text-white hover:border-arc-500 transition">Inference API</a>
+    </div>
   </div>
-</div>
-
-<div class="refresh" id="lastUpdate">Last updated: —</div>
-<div style="text-align:center;padding:8px">
-  <div class="links">
-    <a href="http://140.82.16.112:3100" target="_blank">Web Wallet</a>
-    <a href="http://140.82.16.112:9090/stats" target="_blank">Stats API</a>
-    <a href="http://140.82.16.112:9090/health" target="_blank">Health API</a>
-    <a href="http://140.82.16.112:9090/validators" target="_blank">Validators API</a>
-    <a href="http://140.82.16.112:9090/inference/attestations" target="_blank">Inference API</a>
-    <a href="https://github.com/FerrumVir/arc-chain" target="_blank">GitHub</a>
-  </div>
-</div>
+</footer>
 
 <script>
-const NODES = [
-  {name:'NYC',ip:'149.28.32.76',loc:'New York'},
-  {name:'LAX',ip:'140.82.16.112',loc:'Los Angeles'},
-  {name:'AMS',ip:'136.244.109.1',loc:'Amsterdam'},
-  {name:'LHR',ip:'104.238.171.11',loc:'London'},
-  {name:'NRT',ip:'202.182.107.41',loc:'Tokyo'},
-  {name:'SGP',ip:'149.28.153.31',loc:'Singapore'},
-  {name:'SAO',ip:'216.238.120.27',loc:'São Paulo'},
-  {name:'JNB',ip:'139.84.237.49',loc:'Johannesburg'},
+const NODES=[
+  {name:'NYC',ip:'149.28.32.76',loc:'New York',flag:'🇺🇸'},
+  {name:'LAX',ip:'140.82.16.112',loc:'Los Angeles',flag:'🇺🇸'},
+  {name:'AMS',ip:'136.244.109.1',loc:'Amsterdam',flag:'🇳🇱'},
+  {name:'LHR',ip:'104.238.171.11',loc:'London',flag:'🇬🇧'},
+  {name:'NRT',ip:'202.182.107.41',loc:'Tokyo',flag:'🇯🇵'},
+  {name:'SGP',ip:'149.28.153.31',loc:'Singapore',flag:'🇸🇬'},
+  {name:'SAO',ip:'216.238.120.27',loc:'São Paulo',flag:'🇧🇷'},
+  {name:'JNB',ip:'139.84.237.49',loc:'Johannesburg',flag:'🇿🇦'},
 ];
 
-let lastRound = 0, lastTime = Date.now();
+let lastRound=0,lastTime=Date.now();
 
-async function refresh() {
-  // Stats from primary node
-  try {
-    const r = await fetch('http://140.82.16.112:9090/stats',{signal:AbortSignal.timeout(5000)});
-    const d = await r.json();
-    const now = Date.now();
-    const rps = lastRound > 0 ? ((d.dag_round - lastRound) / ((now - lastTime)/1000)).toFixed(1) : '—';
-    lastRound = d.dag_round; lastTime = now;
-
-    document.getElementById('dagRound').textContent = d.dag_round.toLocaleString();
-    document.getElementById('committed').textContent = d.dag_committed.toLocaleString();
-    document.getElementById('height').textContent = d.block_height;
-    document.getElementById('totalTx').textContent = d.total_transactions;
-    document.getElementById('accounts').textContent = d.total_accounts;
-    document.getElementById('mempool').textContent = d.mempool_size;
-    document.getElementById('validatorCount').textContent = d.validators;
-    document.getElementById('peers').textContent = d.connected_peers;
-    document.getElementById('version').textContent = d.version;
-    document.getElementById('rps').textContent = rps;
-    const mins = Math.floor(d.uptime_secs/60);
-    const hrs = Math.floor(mins/60);
-    document.getElementById('uptime').textContent = hrs > 0 ? `${hrs}h ${mins%60}m` : `${mins}m`;
-    document.getElementById('subtitle').textContent = `Live — ${d.validators} validators, round ${d.dag_round.toLocaleString()}, ${d.dag_committed.toLocaleString()} committed blocks`;
-  } catch(e) {
-    document.getElementById('subtitle').textContent = 'Error connecting to testnet';
+async function refresh(){
+  try{
+    const r=await fetch('http://140.82.16.112:9090/stats',{signal:AbortSignal.timeout(5000)});
+    const d=await r.json();
+    const now=Date.now();
+    const rps=lastRound>0?((d.dag_round-lastRound)/((now-lastTime)/1000)).toFixed(1):'—';
+    lastRound=d.dag_round;lastTime=now;
+    document.getElementById('dagRound').textContent=d.dag_round.toLocaleString();
+    document.getElementById('committed').textContent=d.dag_committed.toLocaleString();
+    document.getElementById('height').textContent=d.block_height;
+    document.getElementById('totalTx').textContent=d.total_transactions;
+    document.getElementById('accounts').textContent=d.total_accounts;
+    document.getElementById('mempool').textContent=d.mempool_size;
+    document.getElementById('validatorCount').textContent=d.validators;
+    document.getElementById('peers').textContent=d.connected_peers;
+    document.getElementById('rps').textContent=rps;
+    const mins=Math.floor(d.uptime_secs/60);const hrs=Math.floor(mins/60);
+    document.getElementById('uptime').textContent=hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`;
+    document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live — round ${d.dag_round.toLocaleString()}`;
+  }catch(e){
+    document.getElementById('subtitle').textContent='Connecting...';
   }
 
-  // All nodes
-  const grid = document.getElementById('nodeGrid');
-  grid.innerHTML = '';
-  for (const n of NODES) {
-    const el = document.createElement('div');
-    el.className = 'node';
-    try {
-      const r = await fetch(`http://${n.ip}:9090/health`,{signal:AbortSignal.timeout(3000)});
-      const d = await r.json();
-      el.innerHTML = `<span class="status up"></span><span class="name">${n.name}</span>
-        <div class="loc">${n.loc}</div>
-        <div class="round">r${d.dag_round.toLocaleString()}</div>
-        <div style="color:#888;font-size:10px">${d.peers}p · ${Math.floor(d.uptime_secs/60)}m</div>`;
-    } catch(e) {
-      el.innerHTML = `<span class="status down"></span><span class="name">${n.name}</span>
-        <div class="loc">${n.loc}</div>
-        <div class="round" style="color:#f87171">offline</div>`;
+  // Nodes
+  const grid=document.getElementById('nodeGrid');
+  grid.innerHTML='';
+  for(const n of NODES){
+    const el=document.createElement('div');
+    try{
+      const r=await fetch(`http://${n.ip}:9090/health`,{signal:AbortSignal.timeout(3000)});
+      const d=await r.json();
+      el.className='bg-surface-3 border border-surface-4 rounded-lg p-3 text-center hover:border-arc-500/30 transition';
+      el.innerHTML=`
+        <div class="flex items-center justify-center gap-1.5 mb-1">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+          <span class="text-white font-semibold text-xs">${n.name}</span>
+        </div>
+        <div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div>
+        <div class="mono text-arc-400 text-[11px] mt-1.5">r${d.dag_round.toLocaleString()}</div>
+        <div class="text-[10px] text-gray-600">${d.peers}p · ${Math.floor(d.uptime_secs/60)}m</div>`;
+    }catch(e){
+      el.className='bg-surface-3 border border-red-900/30 rounded-lg p-3 text-center';
+      el.innerHTML=`
+        <div class="flex items-center justify-center gap-1.5 mb-1">
+          <span class="w-1.5 h-1.5 rounded-full bg-red-400"></span>
+          <span class="text-white font-semibold text-xs">${n.name}</span>
+        </div>
+        <div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div>
+        <div class="text-red-400 text-[11px] mt-1.5">offline</div>`;
     }
     grid.appendChild(el);
   }
 
-  // Inference attestations
-  try {
-    const r = await fetch('http://140.82.16.112:9090/inference/attestations',{signal:AbortSignal.timeout(5000)});
-    const d = await r.json();
-    const list = document.getElementById('inferenceList');
-    if (d.attestations && d.attestations.length > 0) {
-      list.innerHTML = d.attestations.slice(0,10).map(a => `<div class="tx">
-        <span class="type inference">Inference</span>
-        <span class="amount">${(a.amount||0).toLocaleString()} ARC</span>
-        <div style="margin-top:4px"><span class="hash">${(a.tx_hash||a.from||'').slice(0,20)}...</span></div>
-        <div style="color:#555;font-size:11px">height ${a.block_height||'?'}</div>
-      </div>`).join('');
-    } else {
-      list.innerHTML = '<div style="color:#555;font-size:13px">No inference attestations yet. Run a node with --with-inference to submit.</div>';
+  // Inference
+  try{
+    const r=await fetch('http://140.82.16.112:9090/inference/attestations',{signal:AbortSignal.timeout(5000)});
+    const d=await r.json();
+    const list=document.getElementById('inferenceList');
+    if(d.attestations&&d.attestations.length>0){
+      list.innerHTML=d.attestations.slice(0,8).map(a=>`
+        <div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0">
+          <div>
+            <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Inference</span>
+            <span class="mono text-[11px] text-gray-500 ml-2">${(a.tx_hash||a.from||'').slice(0,16)}...</span>
+          </div>
+          <span class="mono text-xs text-white font-medium">${(a.amount||0).toLocaleString()} ARC</span>
+        </div>`).join('');
+    }else{
+      list.innerHTML='<p class="text-gray-600 text-sm">No attestations yet. Run a node with <code class="mono text-arc-400">--with-inference</code></p>';
     }
-  } catch(e) {
-    document.getElementById('inferenceList').innerHTML = `<div style="color:#f87171;font-size:12px">${e.message}</div>`;
-  }
+  }catch(e){}
 
-  // Recent transactions (from receipts)
-  try {
-    const r = await fetch('http://140.82.16.112:9090/blocks?limit=5',{signal:AbortSignal.timeout(5000)});
-    if (r.ok) {
-      const blocks = await r.json();
-      const list = document.getElementById('txList');
-      let txHtml = '';
-      for (const b of (blocks.blocks || blocks || []).slice(0,5)) {
-        if (b.transactions) {
-          for (const tx of b.transactions.slice(0,3)) {
-            txHtml += `<div class="tx">
-              <span class="type">Transfer</span>
-              <span class="amount">${(tx.amount||0).toLocaleString()} ARC</span>
-              <div style="margin-top:4px"><span class="hash">${(tx.hash||tx.tx_hash||'').slice(0,20)}...</span></div>
-            </div>`;
+  // Transactions
+  try{
+    const r=await fetch('http://140.82.16.112:9090/blocks?limit=5',{signal:AbortSignal.timeout(5000)});
+    if(r.ok){
+      const blocks=await r.json();
+      const list=document.getElementById('txList');
+      let html='';
+      for(const b of(blocks.blocks||blocks||[]).slice(0,5)){
+        if(b.transactions){
+          for(const tx of b.transactions.slice(0,3)){
+            html+=`
+              <div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0">
+                <div>
+                  <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold bg-arc-500/10 text-arc-400 border border-arc-500/20">Transfer</span>
+                  <span class="mono text-[11px] text-gray-500 ml-2">${(tx.hash||tx.tx_hash||'').slice(0,16)}...</span>
+                </div>
+                <span class="mono text-xs text-white font-medium">${(tx.amount||0).toLocaleString()} ARC</span>
+              </div>`;
           }
         }
       }
-      if (!txHtml) txHtml = '<div style="color:#555;font-size:13px">Transactions appear here when tokens are sent via the wallet or faucet.</div>';
-      list.innerHTML = txHtml;
+      if(!html)html='<p class="text-gray-600 text-sm">Send tokens via the <a href="http://140.82.16.112:3100" class="text-arc-400 hover:underline">Wallet</a> to see transactions.</p>';
+      list.innerHTML=html;
     }
-  } catch(e) {
-    // Blocks endpoint may not exist, show faucet-based txs
-    document.getElementById('txList').innerHTML = '<div style="color:#555;font-size:13px">Send tokens via the <a href="http://140.82.16.112:3100" style="color:#6366f1">Web Wallet</a> to see transactions here.</div>';
+  }catch(e){
+    document.getElementById('txList').innerHTML='<p class="text-gray-600 text-sm">Send tokens via the <a href="http://140.82.16.112:3100" class="text-arc-400 hover:underline">Wallet</a> to see transactions.</p>';
   }
 
-  document.getElementById('lastUpdate').textContent = `Last updated: ${new Date().toLocaleTimeString()} — refreshes every 5s`;
+  document.getElementById('lastUpdate').textContent=`Updated ${new Date().toLocaleTimeString()} · refreshes every 5s`;
 }
 
 refresh();
-setInterval(refresh, 5000);
+setInterval(refresh,5000);
 </script>
 </body>
 </html>
