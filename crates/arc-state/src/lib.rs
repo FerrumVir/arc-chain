@@ -692,6 +692,16 @@ impl StateDB {
             remaining = self.full_transactions.len(),
             "Evicted old transaction bodies from memory"
         );
+
+        // Prune old WAL segments. The WAL grows unbounded because
+        // delete_segments_before() was never called. Keep segments
+        // from the last 1000 entries for crash recovery.
+        let wal_seq = self.wal.sequence();
+        if wal_seq > 1000 {
+            if let Err(e) = self.wal.delete_segments_before(wal_seq - 1000) {
+                tracing::warn!("WAL segment cleanup failed: {}", e);
+            }
+        }
     }
 
     /// Get a block by height.
@@ -4117,11 +4127,16 @@ impl StateDB {
     }
 
     /// Index a transaction's sender and recipient addresses for `account_txs` lookups.
+    /// Caps per-account history at 10K entries to prevent unbounded memory growth.
     fn index_account_tx(&self, tx: &Transaction) {
-        self.account_txs
-            .entry(tx.from.0)
-            .or_default()
-            .push(tx.hash);
+        const MAX_TX_HISTORY: usize = 10_000;
+        let mut entry = self.account_txs.entry(tx.from.0).or_default();
+        if entry.len() >= MAX_TX_HISTORY {
+            // Remove oldest 10% to amortize truncation cost
+            let drain_count = MAX_TX_HISTORY / 10;
+            entry.drain(..drain_count);
+        }
+        entry.push(tx.hash);
 
         match &tx.body {
             TxBody::Transfer(body) => {

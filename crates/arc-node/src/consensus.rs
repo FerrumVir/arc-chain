@@ -911,12 +911,32 @@ impl ConsensusManager {
             }
 
             // ── 4. Periodic memory eviction ──────────────────────────────────
-            // Cap in-memory tx bodies to prevent OOM in long-running nodes.
+            // Cap in-memory data to prevent OOM in long-running nodes.
             // Run every ~100 iterations to amortize overhead.
             static EVICTION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let count = EVICTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if count % 100 == 0 {
                 state.evict_transactions(1_000_000); // Keep last ~1M tx bodies
+
+                // Evict stale pending data (txs, diffs, encrypted batches).
+                // These accumulate when blocks are proposed but never committed
+                // (e.g., during network partitions). Cap at 50K entries each.
+                if pending_txs.len() > 50_000 {
+                    let excess = pending_txs.len() - 25_000;
+                    let keys: Vec<[u8; 32]> = pending_txs.iter()
+                        .take(excess).map(|e| *e.key()).collect();
+                    for k in keys { pending_txs.remove(&k); }
+                }
+                if pending_encrypted.len() > 10_000 {
+                    let keys: Vec<[u8; 32]> = pending_encrypted.iter()
+                        .take(5_000).map(|e| *e.key()).collect();
+                    for k in keys { pending_encrypted.remove(&k); }
+                }
+                if self.pending_diffs.len() > 10_000 {
+                    let keys: Vec<[u8; 32]> = self.pending_diffs.iter()
+                        .take(5_000).map(|e| *e.key()).collect();
+                    for k in keys { self.pending_diffs.remove(&k); }
+                }
             }
         }
     }

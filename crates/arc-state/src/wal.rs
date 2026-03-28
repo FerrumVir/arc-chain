@@ -178,6 +178,11 @@ impl WalWriter {
 
     /// Returns true if this WAL writer is active (not null).
     #[inline]
+    /// Current WAL sequence number (monotonically increasing entry counter).
+    pub fn sequence(&self) -> u64 {
+        self.sequence.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn is_active(&self) -> bool {
         self.handle.is_some()
     }

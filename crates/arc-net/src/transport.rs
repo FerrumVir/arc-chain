@@ -395,15 +395,21 @@ impl PeerConnections {
     }
 
     async fn broadcast(&self, msg_type: MessageType, payload: &[u8]) {
-        let peer_count = self.peers.len();
+        // Snapshot peer keys first — do NOT hold DashMap shard locks during
+        // network I/O. The old code held iter_mut() locks for the entire
+        // broadcast, which blocked peer insert/remove operations for seconds.
+        let peer_keys: Vec<[u8; 32]> = self.peers.iter().map(|e| *e.key()).collect();
+        let peer_count = peer_keys.len();
         let mut sent = 0usize;
         let mut dead_peers = Vec::new();
-        for mut entry in self.peers.iter_mut() {
-            if let Err(e) = write_message(entry.value_mut(), msg_type, payload).await {
-                warn!("Failed to send to peer: {}", e);
-                dead_peers.push(*entry.key());
-            } else {
-                sent += 1;
+        for key in &peer_keys {
+            if let Some(mut entry) = self.peers.get_mut(key) {
+                if let Err(e) = write_message(entry.value_mut(), msg_type, payload).await {
+                    warn!("Failed to send to peer: {}", e);
+                    dead_peers.push(*key);
+                } else {
+                    sent += 1;
+                }
             }
         }
         for key in dead_peers {
@@ -751,6 +757,17 @@ async fn dial_peer(
     // Compute dialable address: remote IP + their listen port
     let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
 
+    // Skip if already connected — prevents the dual-dial race where both
+    // nodes dial each other and the second insert overwrites the first's
+    // SendStream. The old recv handler's cleanup then removes the new entry.
+    if connections.is_connected(&remote.validator_address.0) {
+        info!(
+            "Already connected to {} (dial), skipping duplicate",
+            remote.validator_address
+        );
+        return Ok(());
+    }
+
     info!(
         "Handshake verified with {} (stake: {}, dial: {})",
         remote.validator_address, remote.stake, dial_addr
@@ -827,6 +844,15 @@ async fn accept_peer(
 
     // Compute dialable address: remote IP + their listen port
     let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
+
+    // Skip if already connected (dual-dial dedup)
+    if connections.is_connected(&remote.validator_address.0) {
+        info!(
+            "Already connected to {} (accept), skipping duplicate",
+            remote.validator_address
+        );
+        return Ok(());
+    }
 
     info!(
         "Accepted verified peer {} (stake: {}, dial: {})",
