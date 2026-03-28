@@ -79,17 +79,19 @@ All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
 
 ### See it live right now (zero install)
 
-The testnet is running across 8 nodes on 6 continents. Try it:
+The testnet is running across 8 nodes on 6 continents with DAG consensus. Try it:
 
 ```bash
-# Chain stats from a live node
+# Chain stats — includes live DAG round, committed blocks, validators
 curl http://140.82.16.112:9090/stats
 
-# Node health, peers, uptime
+# Node health — peers, consensus round, uptime
 curl http://140.82.16.112:9090/health
 
-# Chain info with GPU status
-curl http://140.82.16.112:9090/info
+# Get free testnet tokens
+curl -X POST http://140.82.16.112:9090/faucet/claim \
+  -H 'Content-Type: application/json' \
+  -d '{"address":"your-64-char-hex-address-here"}'
 ```
 
 ### Join the testnet
@@ -115,11 +117,17 @@ make faucet        # Run testnet faucet
 ### What you'll see
 
 ```bash
-# Live chain stats
+# Live chain stats (includes DAG consensus metrics)
 curl http://localhost:9090/stats
-# {"block_height":245,"total_accounts":100,"total_transactions":356}
+# {"block_height":8,"dag_round":6827,"dag_committed":5671,"validators":8,
+#  "connected_peers":7,"total_accounts":7,"total_transactions":9}
 
-# Run deterministic inference
+# Node health with consensus status
+curl http://localhost:9090/health
+# {"status":"ok","height":8,"peers":7,"dag_round":6827,
+#  "dag_committed":5671,"validators":8,"uptime_secs":1997}
+
+# Run deterministic inference (requires --with-inference flag)
 curl -X POST http://localhost:9090/inference/run \
   -H 'Content-Type: application/json' \
   -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":16}'
@@ -129,6 +137,8 @@ curl -X POST http://localhost:9090/inference/run \
 # View all inference attestations on-chain
 curl http://localhost:9090/inference/attestations
 ```
+
+> **Ports**: 9090 = RPC API (curl, browser), 9091 = P2P consensus (nodes talk to each other). You only need 9090.
 
 ### Get testnet tokens
 
