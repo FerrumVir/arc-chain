@@ -34,8 +34,16 @@ echo -e "${NC}"
 
 # ─── Build ───────────────────────────────────────────────────────────────────
 echo -e "${YELLOW}[1/4] Building arc-node (release mode)...${NC}"
+echo "  This takes 5-15 minutes on first build. You'll see compiler output below."
+echo ""
 if [ ! -f target/release/arc-node ]; then
-    cargo build --release -p arc-node 2>&1 | tail -3
+    cargo build --release -p arc-node 2>&1
+    if [ $? -ne 0 ]; then
+        echo -e "${YELLOW}Build failed. Make sure you have Rust nightly: rustup default nightly${NC}"
+        exit 1
+    fi
+    echo ""
+    echo -e "${GREEN}  Build complete!${NC}"
 else
     echo "  Binary exists. Rebuild with: cargo build --release -p arc-node"
 fi
@@ -80,9 +88,12 @@ echo -e "${CYAN}Connecting to ARC testnet seeds across 6 continents...${NC}"
 echo "Press Ctrl+C to stop."
 echo ""
 
-exec ./target/release/arc-node \
+./target/release/arc-node \
     --rpc 0.0.0.0:9090 \
     --seeds-file testnet-seeds.txt \
     --genesis genesis.toml \
     --validator-seed "$SEED" \
     $MODEL_FLAG
+
+echo ""
+echo -e "${YELLOW}Node exited. To restart: ./scripts/join-testnet.sh${NC}"
