@@ -1114,6 +1114,10 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let indexed_receipts = node.state.receipts.len();
     let indexed_hashes = node.state.tx_index.len();
     let executed = node.state.benchmark_tx_count.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let dag_round = node.dag_round.load(std::sync::atomic::Ordering::Relaxed);
+    let dag_committed = node.dag_committed.load(std::sync::atomic::Ordering::Relaxed);
+    let validators = node.dag_validators.read().len();
+    let peers = node.peer_count.load(Ordering::Relaxed);
     Json(json!({
         "chain": "ARC Chain",
         "version": "0.1.0",
@@ -1123,6 +1127,11 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "total_transactions": indexed_receipts + executed,
         "indexed_hashes": indexed_hashes,
         "indexed_receipts": indexed_receipts,
+        "dag_round": dag_round,
+        "dag_committed": dag_committed,
+        "validators": validators,
+        "connected_peers": peers,
+        "uptime_secs": node.boot_time.elapsed().as_secs(),
     }))
 }
 
