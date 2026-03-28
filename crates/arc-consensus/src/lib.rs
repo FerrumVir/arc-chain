@@ -1379,22 +1379,22 @@ impl ConsensusEngine {
         // round. This is deterministic because all nodes see the same DAG blocks
         // (eventually), so they compute the same set of authors per round.
 
-        // Scan ALL uncommitted rounds on every call. Do NOT skip or advance
-        // past rounds — blocks may arrive later via QUIC. The commit is
-        // purely structural: it depends on what's IN the DAG, not on timing.
-        // All nodes that eventually see the same DAG make the same decisions.
-        for r in 0..=(current.saturating_sub(2)) {
-            let round_r_blocks = self.blocks_in_round(r);
+        // Cache frozen validator addresses ONCE (same for all rounds).
+        // Old code re-read + re-sorted on every round iteration — O(n*k log k).
+        let frozen_vals = {
+            let fvs = self.frozen_validator_set.read();
+            let mut addrs: Vec<Address> = fvs.validators.iter().map(|v| v.address).collect();
+            addrs.sort_by(|a, b| a.0.cmp(&b.0));
+            addrs
+        };
 
-            // Leader for this round: use the FROZEN validator set.
-            // The frozen set is the same on all nodes (frozen at the same epoch
-            // boundary). This guarantees deterministic leader selection.
-            let frozen_vals = {
-                let fvs = self.frozen_validator_set.read();
-                let mut addrs: Vec<Address> = fvs.validators.iter().map(|v| v.address).collect();
-                addrs.sort_by(|a, b| a.0.cmp(&b.0));
-                addrs
-            };
+        // Scan uncommitted rounds. Start from last_committed_round to skip
+        // rounds that are already finalized (was scanning from 0 every time).
+        let scan_start = self.last_committed_round.load(Ordering::SeqCst);
+        for r in scan_start..=(current.saturating_sub(2)) {
+            let round_r_blocks = self.blocks_in_round(r);
+            if round_r_blocks.is_empty() { continue; } // Skip empty rounds early
+
             let leader = if frozen_vals.is_empty() {
                 None
             } else {
