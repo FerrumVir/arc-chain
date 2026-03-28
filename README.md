@@ -146,15 +146,32 @@ cd arc-chain
 ./scripts/join-testnet.sh
 ```
 
-Or use the Makefile:
+### Run an inference node (GPU recommended)
+
+Earn ARC by running AI inference for the network. Your IP stays private.
 
 ```bash
-make join          # Join testnet
-make inference     # Join with inference (downloads TinyLlama 1.1B)
-make stats         # Check live chain stats
-make health        # Check live node health
-make test          # Run 1,209 tests
-make explorer      # Open block explorer
+./scripts/join-inference.sh              # Downloads TinyLlama 1.1B + joins testnet
+./scripts/join-inference.sh --model FILE # Use your own GGUF model
+```
+
+Once running, test inference locally:
+```bash
+curl -X POST http://localhost:9090/inference/run \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":32}'
+```
+
+### Makefile commands
+
+```bash
+make join            # Join testnet (no inference)
+make inference       # Join with inference enabled
+make inference-node  # Run a dedicated inference node (GPU)
+make stats           # Check live chain stats
+make health          # Check live node health
+make test            # Run 1,209 tests
+make explorer        # Open block explorer
 make faucet        # Run testnet faucet
 ```
 
