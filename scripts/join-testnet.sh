@@ -83,5 +83,6 @@ echo ""
 exec ./target/release/arc-node \
     --rpc 0.0.0.0:9090 \
     --seeds-file testnet-seeds.txt \
+    --genesis genesis.toml \
     --validator-seed "$SEED" \
     $MODEL_FLAG

@@ -310,6 +310,21 @@ async fn main() -> Result<()> {
     // Priority: --genesis file > hardcoded defaults.
     // In benchmark mode (without --genesis), use deterministic ed25519
     // keypair-derived addresses so signatures can be verified.
+    // Extract genesis validators (for consensus) if --genesis is provided.
+    // All nodes MUST use the same genesis → same validator set from round 0.
+    let genesis_validators: Vec<(Hash256, u64)> = if let Some(genesis_path) = &cli.genesis {
+        let genesis_cfg = config::load_genesis(genesis_path)
+            .expect("Failed to load genesis config");
+        genesis_cfg.validators.iter().map(|v| {
+            let seed_bytes = blake3::derive_key("ARC-chain-validator-keypair-v1", v.seed.as_bytes());
+            let sk = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
+            let kp = KeyPair::Ed25519(sk);
+            (kp.address(), v.stake)
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
     let genesis_accounts: Vec<(Hash256, u64)> = if let Some(genesis_path) = &cli.genesis {
         let genesis_cfg = config::load_genesis(genesis_path)
             .expect("Failed to load genesis config");
@@ -556,18 +571,22 @@ async fn main() -> Result<()> {
     // deterministic leader selection. Without this, nodes that connect
     // peers at different speeds have different validator counts, causing
     // different leader selection for the same round.
-    // Start with just this node. Peers are added dynamically via PeerConnected.
-    // The key insight: we DON'T pre-populate from seeds because we can't know
-    // the validator addresses of seed nodes (they depend on --validator-seed
-    // which varies per node). Instead, we wait for PeerConnected messages
-    // which carry the actual validator address + stake.
-    //
-    // To ensure all nodes converge on the same validator set quickly, the
-    // Bullshark commit rule waits (SKIP_GRACE rounds) before committing.
-    // This gives time for all PeerConnected messages to arrive.
-    let dag_validators = Arc::new(parking_lot::RwLock::new(vec![(validator_address, stake)]));
+    // If genesis validators are provided, use them. This ensures ALL nodes
+    // have the SAME validator set from round 0 — the key to consensus.
+    // Without this, nodes discover peers at different times → different
+    // validator counts → different epoch freezes → different leaders.
+    let peer_vals: Vec<(Hash256, u64)> = genesis_validators.iter()
+        .filter(|(addr, _)| *addr != validator_address)
+        .cloned()
+        .collect();
+    let all_vals: Vec<(Hash256, u64)> = {
+        let mut v = vec![(validator_address, stake)];
+        v.extend(&peer_vals);
+        v
+    };
+    let dag_validators = Arc::new(parking_lot::RwLock::new(all_vals));
     let mut consensus =
-        ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &[], validator_keypair);
+        ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &peer_vals, validator_keypair);
     consensus.dag_validators = Some(dag_validators.clone());
     consensus.set_proposer_mode(cli.proposer_mode);
     let state_clone = state.clone();
