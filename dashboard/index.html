@@ -6,92 +6,68 @@
 <title>ARC Chain — Live Dashboard</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
-tailwind.config = {
-  darkMode: 'class',
-  theme: {
-    extend: {
-      colors: {
-        arc: { 50:'#eef2ff',100:'#e0e7ff',200:'#c7d2fe',300:'#a5b4fc',400:'#818cf8',500:'#6366f1',600:'#4f46e5',700:'#4338ca',800:'#3730a3',900:'#312e81',950:'#1e1b4b' },
-        surface: { 1:'#09090f', 2:'#0f0f19', 3:'#141420', 4:'#1a1a2e', 5:'#22223a' }
-      }
-    }
-  }
-}
+tailwind.config={darkMode:'class',theme:{extend:{colors:{
+  arc:{400:'#818cf8',500:'#6366f1',600:'#4f46e5'},
+  surface:{1:'#09090f',2:'#0f0f19',3:'#141420',4:'#1a1a2e',5:'#22223a'}
+}}}}
 </script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
-body { font-family: 'Inter', sans-serif; }
-.mono { font-family: 'JetBrains Mono', monospace; }
-.glow { box-shadow: 0 0 40px rgba(99,102,241,0.08); }
-.pulse-dot { animation: pulse 2s infinite; }
-@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
-.fade-in { animation: fadeIn 0.5s ease-out; }
-@keyframes fadeIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
-::-webkit-scrollbar{width:4px} ::-webkit-scrollbar-track{background:transparent} ::-webkit-scrollbar-thumb{background:#2a2a4a;border-radius:4px}
+body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace}
+.pulse-dot{animation:pulse 2s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#2a2a4a;border-radius:4px}
 </style>
 </head>
 <body class="bg-surface-1 text-gray-300 min-h-screen">
 
+<!-- TX Detail Modal -->
+<div id="modal" class="fixed inset-0 bg-black/80 z-50 hidden items-center justify-center p-4" onclick="if(event.target===this)closeModal()">
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-6 max-w-lg w-full max-h-[80vh] overflow-y-auto">
+    <div class="flex justify-between items-center mb-4">
+      <h3 class="text-white font-bold text-lg" id="modalTitle">Transaction</h3>
+      <button onclick="closeModal()" class="text-gray-500 hover:text-white text-xl">&times;</button>
+    </div>
+    <div id="modalBody" class="space-y-3"></div>
+  </div>
+</div>
+
 <!-- Header -->
-<header class="border-b border-surface-4 bg-surface-2/80 backdrop-blur-sm sticky top-0 z-50">
+<header class="border-b border-surface-4 bg-surface-2/80 backdrop-blur-sm sticky top-0 z-40">
   <div class="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
     <div class="flex items-center gap-3">
-      <div class="w-8 h-8 rounded-lg bg-arc-500 flex items-center justify-center">
-        <span class="text-white font-bold text-sm">A</span>
-      </div>
+      <div class="w-8 h-8 rounded-lg bg-arc-500 flex items-center justify-center"><span class="text-white font-bold text-sm">A</span></div>
       <div>
         <h1 class="text-lg font-bold text-white">ARC Chain</h1>
         <p class="text-xs text-gray-500" id="subtitle">Connecting...</p>
       </div>
     </div>
-    <div class="flex items-center gap-3">
-      <a href="http://140.82.16.112:3100" target="_blank" class="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-arc-500 hover:bg-arc-600 text-white text-xs font-semibold transition">
-        Open Wallet
-      </a>
-      <a href="https://github.com/FerrumVir/arc-chain" target="_blank" class="text-gray-500 hover:text-white transition">
-        <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
-      </a>
-    </div>
+    <a href="http://140.82.16.112:3100" target="_blank" class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-arc-500 hover:bg-arc-600 text-white text-xs font-semibold transition">Open Wallet</a>
   </div>
 </header>
 
-<main class="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
-
+<main class="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
   <!-- Hero Stats -->
-  <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5 glow fade-in">
-      <p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">DAG Round</p>
-      <p class="text-2xl sm:text-3xl font-extrabold text-arc-400 mono mt-1" id="dagRound">—</p>
-    </div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5 fade-in">
-      <p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Committed</p>
-      <p class="text-2xl sm:text-3xl font-extrabold text-white mono mt-1" id="committed">—</p>
-    </div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5 fade-in">
-      <p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Validators</p>
-      <p class="text-2xl sm:text-3xl font-extrabold text-emerald-400 mono mt-1" id="validatorCount">—</p>
-    </div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5 fade-in">
-      <p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Rounds/sec</p>
-      <p class="text-2xl sm:text-3xl font-extrabold text-white mono mt-1" id="rps">—</p>
-    </div>
+  <div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">DAG Round</p><p class="text-2xl font-extrabold text-arc-400 mono mt-1" id="dagRound">—</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Committed</p><p class="text-2xl font-extrabold text-white mono mt-1" id="committed">—</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Validators</p><p class="text-2xl font-extrabold text-emerald-400 mono mt-1" id="validatorCount">—</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Rounds/sec</p><p class="text-2xl font-extrabold text-white mono mt-1" id="rps">—</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Live TPS</p><p class="text-2xl font-extrabold text-yellow-400 mono mt-1" id="tps">—</p></div>
   </div>
 
-  <!-- Chain Details + Network -->
+  <!-- Chain + Nodes -->
   <div class="grid lg:grid-cols-2 gap-4">
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
       <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Chain</h2>
-      <div class="space-y-3">
-        <div class="flex justify-between"><span class="text-gray-500 text-sm">Block Height</span><span class="text-white font-medium mono text-sm" id="height">—</span></div>
-        <div class="flex justify-between"><span class="text-gray-500 text-sm">Transactions</span><span class="text-white font-medium mono text-sm" id="totalTx">—</span></div>
-        <div class="flex justify-between"><span class="text-gray-500 text-sm">Accounts</span><span class="text-white font-medium mono text-sm" id="accounts">—</span></div>
-        <div class="flex justify-between"><span class="text-gray-500 text-sm">Mempool</span><span class="text-white font-medium mono text-sm" id="mempool">—</span></div>
-        <div class="flex justify-between"><span class="text-gray-500 text-sm">Connected Peers</span><span class="text-white font-medium mono text-sm" id="peers">—</span></div>
-        <div class="flex justify-between"><span class="text-gray-500 text-sm">Uptime</span><span class="text-white font-medium mono text-sm" id="uptime">—</span></div>
+      <div class="space-y-2.5 text-sm">
+        <div class="flex justify-between"><span class="text-gray-500">Block Height</span><span class="text-white font-medium mono" id="height">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Transactions</span><span class="text-white font-medium mono" id="totalTx">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Accounts</span><span class="text-white font-medium mono" id="accounts">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Mempool</span><span class="text-white font-medium mono" id="mempool">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Peers</span><span class="text-white font-medium mono" id="peers">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Uptime</span><span class="text-white font-medium mono" id="uptime">—</span></div>
       </div>
     </div>
-
-    <!-- Node Grid -->
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
       <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Nodes — 6 Continents</h2>
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-2" id="nodeGrid"></div>
@@ -102,41 +78,31 @@ body { font-family: 'Inter', sans-serif; }
   <div class="grid lg:grid-cols-2 gap-4">
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
       <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">
-        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1.5"></span>
-        AI Inference Attestations
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1.5"></span>AI Inference Attestations
       </h2>
-      <div class="space-y-2 max-h-[280px] overflow-y-auto" id="inferenceList">
-        <p class="text-gray-600 text-sm">Loading...</p>
-      </div>
+      <div class="space-y-1 max-h-[320px] overflow-y-auto" id="inferenceList"><p class="text-gray-600 text-sm">Loading...</p></div>
     </div>
-
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
       <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">
-        <span class="inline-block w-2 h-2 rounded-full bg-arc-400 mr-1.5"></span>
-        Recent Transactions
+        <span class="inline-block w-2 h-2 rounded-full bg-arc-400 mr-1.5"></span>Recent Transactions
       </h2>
-      <div class="space-y-2 max-h-[280px] overflow-y-auto" id="txList">
-        <p class="text-gray-600 text-sm">Loading...</p>
-      </div>
+      <div class="space-y-1 max-h-[320px] overflow-y-auto" id="txList"><p class="text-gray-600 text-sm">Loading...</p></div>
     </div>
   </div>
-
 </main>
 
-<!-- Footer -->
-<footer class="border-t border-surface-4 mt-8 py-4">
+<footer class="border-t border-surface-4 mt-6 py-3">
   <div class="max-w-7xl mx-auto px-4 sm:px-6 flex flex-wrap items-center justify-between gap-2">
     <p class="text-[11px] text-gray-600" id="lastUpdate">Refreshes every 5s</p>
     <div class="flex gap-2 flex-wrap">
       <a href="http://140.82.16.112:3100" target="_blank" class="text-[11px] px-2.5 py-1 rounded-md bg-surface-3 border border-surface-4 text-gray-400 hover:text-white hover:border-arc-500 transition">Wallet</a>
-      <a href="http://140.82.16.112:9090/stats" target="_blank" class="text-[11px] px-2.5 py-1 rounded-md bg-surface-3 border border-surface-4 text-gray-400 hover:text-white hover:border-arc-500 transition">Stats API</a>
-      <a href="http://140.82.16.112:9090/health" target="_blank" class="text-[11px] px-2.5 py-1 rounded-md bg-surface-3 border border-surface-4 text-gray-400 hover:text-white hover:border-arc-500 transition">Health API</a>
-      <a href="http://140.82.16.112:9090/inference/attestations" target="_blank" class="text-[11px] px-2.5 py-1 rounded-md bg-surface-3 border border-surface-4 text-gray-400 hover:text-white hover:border-arc-500 transition">Inference API</a>
+      <a href="http://140.82.16.112:9090/stats" target="_blank" class="text-[11px] px-2.5 py-1 rounded-md bg-surface-3 border border-surface-4 text-gray-400 hover:text-white hover:border-arc-500 transition">API</a>
     </div>
   </div>
 </footer>
 
 <script>
+const RPC='http://140.82.16.112:9090';
 const NODES=[
   {name:'NYC',ip:'149.28.32.76',loc:'New York',flag:'🇺🇸'},
   {name:'LAX',ip:'140.82.16.112',loc:'Los Angeles',flag:'🇺🇸'},
@@ -148,15 +114,61 @@ const NODES=[
   {name:'JNB',ip:'139.84.237.49',loc:'Johannesburg',flag:'🇿🇦'},
 ];
 
-let lastRound=0,lastTime=Date.now();
+let lastRound=0,lastTime=Date.now(),lastTxCount=0;
+
+// Modal
+function showModal(title,rows){
+  document.getElementById('modalTitle').textContent=title;
+  document.getElementById('modalBody').innerHTML=rows.map(([k,v,link])=>
+    `<div class="flex flex-col sm:flex-row sm:justify-between gap-1 py-2 border-b border-surface-4 last:border-0">
+      <span class="text-gray-500 text-sm">${k}</span>
+      ${link?`<a href="${link}" target="_blank" class="mono text-sm text-arc-400 hover:underline break-all">${v}</a>`
+            :`<span class="mono text-sm text-white break-all">${v}</span>`}
+    </div>`
+  ).join('');
+  const m=document.getElementById('modal');m.classList.remove('hidden');m.classList.add('flex');
+}
+function closeModal(){const m=document.getElementById('modal');m.classList.add('hidden');m.classList.remove('flex')}
+
+function showTxDetail(hash){
+  fetch(`${RPC}/tx/${hash}`).then(r=>r.json()).then(d=>{
+    const tx=d.transaction||d;const rc=d.receipt||{};
+    showModal('Transaction Details',[
+      ['Hash',hash,`${RPC}/tx/${hash}`],
+      ['From',tx.from||'—'],
+      ['To',tx.to||(tx.body?.to)||'—'],
+      ['Amount',`${(tx.amount||tx.body?.amount||0).toLocaleString()} ARC`],
+      ['Nonce',tx.nonce||0],
+      ['Status',rc.success?'✅ Success':'⏳ Pending'],
+      ['Block Height',rc.block_height||'—'],
+      ['Type',tx.tx_type||tx.body_type||'Transfer'],
+    ]);
+  }).catch(()=>{
+    showModal('Transaction',[['Hash',hash,`${RPC}/tx/${hash}`],['Status','Click link to view raw JSON']]);
+  });
+}
+
+function showInferenceDetail(a){
+  showModal('Inference Attestation',[
+    ['TX Hash',(a.tx_hash||a.from||'').slice(0,40)+'...',a.tx_hash?`${RPC}/tx/${a.tx_hash}`:null],
+    ['Amount',`${(a.amount||0).toLocaleString()} ARC`],
+    ['Block Height',a.block_height||'—'],
+    ['From',(a.from||'—').slice(0,40)+'...'],
+    ['Model',a.model||'TinyLlama 1.1B'],
+    ['Type','InferenceAttestation'],
+  ]);
+}
 
 async function refresh(){
   try{
-    const r=await fetch('http://140.82.16.112:9090/stats',{signal:AbortSignal.timeout(5000)});
+    const r=await fetch(RPC+'/stats',{signal:AbortSignal.timeout(5000)});
     const d=await r.json();
     const now=Date.now();
     const rps=lastRound>0?((d.dag_round-lastRound)/((now-lastTime)/1000)).toFixed(1):'—';
-    lastRound=d.dag_round;lastTime=now;
+    const txDiff=lastTxCount>0?(d.total_transactions-lastTxCount):0;
+    const tps=lastTxCount>0&&(now-lastTime)>0?(txDiff/((now-lastTime)/1000)).toFixed(1):'0';
+    lastRound=d.dag_round;lastTime=now;lastTxCount=d.total_transactions;
+
     document.getElementById('dagRound').textContent=d.dag_round.toLocaleString();
     document.getElementById('committed').textContent=d.dag_committed.toLocaleString();
     document.getElementById('height').textContent=d.block_height;
@@ -166,54 +178,47 @@ async function refresh(){
     document.getElementById('validatorCount').textContent=d.validators;
     document.getElementById('peers').textContent=d.connected_peers;
     document.getElementById('rps').textContent=rps;
+    document.getElementById('tps').textContent=tps;
     const mins=Math.floor(d.uptime_secs/60);const hrs=Math.floor(mins/60);
     document.getElementById('uptime').textContent=hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`;
-    document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live — round ${d.dag_round.toLocaleString()}`;
-  }catch(e){
-    document.getElementById('subtitle').textContent='Connecting...';
-  }
+    document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live — round ${d.dag_round.toLocaleString()} · ${d.total_transactions} txs`;
+  }catch(e){}
 
   // Nodes
-  const grid=document.getElementById('nodeGrid');
-  grid.innerHTML='';
+  const grid=document.getElementById('nodeGrid');grid.innerHTML='';
   for(const n of NODES){
     const el=document.createElement('div');
     try{
       const r=await fetch(`http://${n.ip}:9090/health`,{signal:AbortSignal.timeout(3000)});
       const d=await r.json();
-      el.className='bg-surface-3 border border-surface-4 rounded-lg p-3 text-center hover:border-arc-500/30 transition';
-      el.innerHTML=`
-        <div class="flex items-center justify-center gap-1.5 mb-1">
-          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-          <span class="text-white font-semibold text-xs">${n.name}</span>
-        </div>
+      el.className='bg-surface-3 border border-surface-4 rounded-lg p-2.5 text-center hover:border-arc-500/30 transition cursor-pointer';
+      el.onclick=()=>showModal(n.name+' — '+n.loc,[
+        ['Status','🟢 Online'],['Round',d.dag_round.toLocaleString()],['Committed',d.dag_committed.toLocaleString()],
+        ['Peers',d.peers],['Validators',d.validators],['Uptime',Math.floor(d.uptime_secs/60)+'m'],
+        ['RPC',`http://${n.ip}:9090`,`http://${n.ip}:9090/health`]
+      ]);
+      el.innerHTML=`<div class="flex items-center justify-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span><span class="text-white font-semibold text-xs">${n.name}</span></div>
         <div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div>
-        <div class="mono text-arc-400 text-[11px] mt-1.5">r${d.dag_round.toLocaleString()}</div>
-        <div class="text-[10px] text-gray-600">${d.peers}p · ${Math.floor(d.uptime_secs/60)}m</div>`;
+        <div class="mono text-arc-400 text-[11px] mt-1">r${d.dag_round.toLocaleString()}</div>`;
     }catch(e){
-      el.className='bg-surface-3 border border-red-900/30 rounded-lg p-3 text-center';
-      el.innerHTML=`
-        <div class="flex items-center justify-center gap-1.5 mb-1">
-          <span class="w-1.5 h-1.5 rounded-full bg-red-400"></span>
-          <span class="text-white font-semibold text-xs">${n.name}</span>
-        </div>
-        <div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div>
-        <div class="text-red-400 text-[11px] mt-1.5">offline</div>`;
+      el.className='bg-surface-3 border border-red-900/30 rounded-lg p-2.5 text-center';
+      el.innerHTML=`<div class="flex items-center justify-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-red-400"></span><span class="text-white font-semibold text-xs">${n.name}</span></div>
+        <div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div><div class="text-red-400 text-[11px] mt-1">offline</div>`;
     }
     grid.appendChild(el);
   }
 
   // Inference
   try{
-    const r=await fetch('http://140.82.16.112:9090/inference/attestations',{signal:AbortSignal.timeout(5000)});
+    const r=await fetch(RPC+'/inference/attestations',{signal:AbortSignal.timeout(5000)});
     const d=await r.json();
     const list=document.getElementById('inferenceList');
     if(d.attestations&&d.attestations.length>0){
-      list.innerHTML=d.attestations.slice(0,8).map(a=>`
-        <div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0">
-          <div>
-            <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">Inference</span>
-            <span class="mono text-[11px] text-gray-500 ml-2">${(a.tx_hash||a.from||'').slice(0,16)}...</span>
+      list.innerHTML=d.attestations.slice(0,10).map(a=>`
+        <div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition" onclick='showInferenceDetail(${JSON.stringify(a)})'>
+          <div class="flex items-center gap-2">
+            <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">AI</span>
+            <span class="mono text-[11px] text-gray-400">${(a.tx_hash||a.from||'').slice(0,20)}...</span>
           </div>
           <span class="mono text-xs text-white font-medium">${(a.amount||0).toLocaleString()} ARC</span>
         </div>`).join('');
@@ -222,35 +227,30 @@ async function refresh(){
     }
   }catch(e){}
 
-  // Transactions
+  // Recent transactions from receipts
   try{
-    const r=await fetch('http://140.82.16.112:9090/blocks?limit=5',{signal:AbortSignal.timeout(5000)});
-    if(r.ok){
-      const blocks=await r.json();
-      const list=document.getElementById('txList');
-      let html='';
-      for(const b of(blocks.blocks||blocks||[]).slice(0,5)){
-        if(b.transactions){
-          for(const tx of b.transactions.slice(0,3)){
-            html+=`
-              <div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0">
-                <div>
-                  <span class="inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold bg-arc-500/10 text-arc-400 border border-arc-500/20">Transfer</span>
-                  <span class="mono text-[11px] text-gray-500 ml-2">${(tx.hash||tx.tx_hash||'').slice(0,16)}...</span>
-                </div>
-                <span class="mono text-xs text-white font-medium">${(tx.amount||0).toLocaleString()} ARC</span>
-              </div>`;
-          }
-        }
-      }
-      if(!html)html='<p class="text-gray-600 text-sm">Send tokens via the <a href="http://140.82.16.112:3100" class="text-arc-400 hover:underline">Wallet</a> to see transactions.</p>';
-      list.innerHTML=html;
+    const r=await fetch(RPC+'/inference/attestations',{signal:AbortSignal.timeout(5000)});
+    const d=await r.json();
+    const list=document.getElementById('txList');
+    const txs=d.attestations||[];
+    if(txs.length>0){
+      list.innerHTML=txs.slice(0,10).map(tx=>`
+        <div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition" onclick="showTxDetail('${tx.tx_hash||tx.from||''}')">
+          <div class="flex items-center gap-2">
+            <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-arc-500/10 text-arc-400 border border-arc-500/20">TX</span>
+            <span class="mono text-[11px] text-gray-400">${(tx.tx_hash||tx.from||'').slice(0,20)}...</span>
+          </div>
+          <div class="text-right">
+            <span class="mono text-xs text-white font-medium">${(tx.amount||0).toLocaleString()} ARC</span>
+            <div class="text-[10px] text-gray-600">h=${tx.block_height||'?'}</div>
+          </div>
+        </div>`).join('');
+    }else{
+      list.innerHTML='<p class="text-gray-600 text-sm">Send tokens via the <a href="http://140.82.16.112:3100" class="text-arc-400 hover:underline">Wallet</a> to see transactions.</p>';
     }
-  }catch(e){
-    document.getElementById('txList').innerHTML='<p class="text-gray-600 text-sm">Send tokens via the <a href="http://140.82.16.112:3100" class="text-arc-400 hover:underline">Wallet</a> to see transactions.</p>';
-  }
+  }catch(e){}
 
-  document.getElementById('lastUpdate').textContent=`Updated ${new Date().toLocaleTimeString()} · refreshes every 5s`;
+  document.getElementById('lastUpdate').textContent=`Updated ${new Date().toLocaleTimeString()} · auto-refreshes every 5s`;
 }
 
 refresh();
