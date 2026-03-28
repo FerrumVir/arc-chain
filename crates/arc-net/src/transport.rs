@@ -750,10 +750,13 @@ pub async fn run_transport(
                     })
                     .collect();
 
-                if !disconnected.is_empty() {
-                    info!("Reconnect: {} peers disconnected, retrying", disconnected.len());
+                // Limit concurrent reconnect dials to 5 to prevent
+                // overwhelming the QUIC endpoint when many peers drop.
+                let reconnect_batch: Vec<_> = disconnected.into_iter().take(5).collect();
+                if !reconnect_batch.is_empty() {
+                    info!("Reconnect: {} peers to retry (max 5/cycle)", reconnect_batch.len());
                 }
-                for addr in disconnected {
+                for addr in reconnect_batch {
                     let handshake_msg = make_signed_handshake(
                         local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
                     );
