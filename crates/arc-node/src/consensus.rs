@@ -456,11 +456,14 @@ impl ConsensusManager {
             };
 
             // ── VRF proposer eligibility check ──────────────────────────
-            // Use a deterministic hash of (round, validator_address) as a VRF
-            // output proxy. Full VRF proofs (with keypair-based computation)
-            // are verified when receiving blocks from peers; this local check
-            // uses the same threshold arithmetic to decide "should I propose?".
-            let vrf_approved = if let Some(ref selector) = self.vrf_selector {
+            // In DAG consensus, ALL validators propose every round — that's
+            // what builds the DAG. The leader is selected at commit time, not
+            // at proposal time. VRF selection (EXPECTED_PROPOSERS_PER_SLOT=1)
+            // would filter out 7/8 validators per round, preventing quorum.
+            // Skip VRF in multi-validator DAG mode.
+            let vrf_approved = if multi_validator {
+                true // DAG: all validators propose every round
+            } else if let Some(ref selector) = self.vrf_selector {
                 let mut vrf_input = [0u8; 40];
                 vrf_input[..8].copy_from_slice(&current_round.to_le_bytes());
                 vrf_input[8..40].copy_from_slice(&self.validator_address.0);
