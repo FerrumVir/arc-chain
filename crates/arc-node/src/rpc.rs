@@ -1118,6 +1118,8 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let dag_committed = node.dag_committed.load(std::sync::atomic::Ordering::Relaxed);
     let validators = node.dag_validators.read().len();
     let peers = node.peer_count.load(Ordering::Relaxed);
+    let uptime = node.boot_time.elapsed().as_secs();
+    let bench_tps = if uptime > 0 { executed as u64 / uptime } else { 0 };
     Json(json!({
         "chain": "ARC Chain",
         "version": "0.1.0",
@@ -1125,13 +1127,15 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "total_accounts": node.state.account_count(),
         "mempool_size": node.mempool.len(),
         "total_transactions": indexed_receipts + executed,
+        "benchmark_executed": executed,
+        "benchmark_tps": bench_tps,
         "indexed_hashes": indexed_hashes,
         "indexed_receipts": indexed_receipts,
         "dag_round": dag_round,
         "dag_committed": dag_committed,
         "validators": validators,
         "connected_peers": peers,
-        "uptime_secs": node.boot_time.elapsed().as_secs(),
+        "uptime_secs": uptime,
     }))
 }
 
