@@ -232,6 +232,10 @@ struct HealthResponse {
 
 async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
     let validators = node.dag_validators.read().len();
+    // Periodic cleanup: evict stale tx rate limit entries (>60s old)
+    if node.tx_rate_limit.len() > 1000 {
+        node.tx_rate_limit.retain(|_, v| v.elapsed().as_secs() < 60);
+    }
     Json(HealthResponse {
         status: "ok".to_string(),
         version: "0.1.0".to_string(),
