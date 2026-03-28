@@ -669,7 +669,12 @@ pub async fn run_transport(
                 let peer_list: Vec<crate::protocol::PexPeerInfo> = conn_pex
                     .meta
                     .iter()
-                    .take(64) // Cap PEX broadcast to prevent amplification with large peer sets
+                    .take(64)
+                    // Only share BOOTSTRAP peer IPs in PEX — never leak community
+                    // member IPs. Community nodes connect outbound to seeds only.
+                    .filter(|entry| {
+                        bootstrap_peers.iter().any(|bp| bp == &entry.value().dial_addr)
+                    })
                     .map(|entry| crate::protocol::PexPeerInfo {
                         address: Hash256(*entry.key()),
                         socket_addr: entry.value().dial_addr.to_string(),
