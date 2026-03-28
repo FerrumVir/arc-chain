@@ -1796,7 +1796,7 @@ impl ConsensusEngine {
     /// If the round is stalled for this long, force-advance to prevent halts.
     /// 2000ms for global testnet (100-300ms cross-continent RTT needs margin).
     /// Production with optimized networking: 500-1000ms.
-    const VIEW_CHANGE_TIMEOUT_MS: u128 = 2000;
+    const VIEW_CHANGE_TIMEOUT_MS: u128 = 10_000;
 
     /// Check if the current round's proposer has timed out.
     ///
