@@ -72,7 +72,15 @@ All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
 
 ## Quick Start
 
-### Prerequisites
+### Not technical? Start here
+
+1. Open the **[Web Wallet](http://140.82.16.112:3100)** in your browser (phone or desktop)
+2. Click **"Create New Wallet"** — save your private key
+3. You now have **10,000 ARC** — send tokens, check balance, explore
+4. View the live network on the **[Dashboard](http://140.82.16.112:3200)** — 8 nodes across 6 continents
+5. Run `./scripts/monitor-testnet.sh` to see all nodes in your terminal
+
+### Prerequisites (for running your own node)
 
 - Rust nightly (`rustup default nightly`)
 - ~2 GB disk for build, ~4 GB with model
@@ -153,38 +161,38 @@ make faucet        # Run testnet faucet
 ### What you'll see
 
 ```bash
-# Live chain stats (includes DAG consensus metrics)
+# Chain stats
 curl http://localhost:9090/stats
-# {"block_height":8,"dag_round":6827,"dag_committed":5671,"validators":8,
-#  "connected_peers":7,"total_accounts":7,"total_transactions":9}
+# {"chain":"ARC Chain","dag_round":937,"dag_committed":570,"validators":8,
+#  "connected_peers":7,"total_transactions":42,"benchmark_tps":9000}
 
-# Node health with consensus status
+# Node health
 curl http://localhost:9090/health
-# {"status":"ok","height":8,"peers":7,"dag_round":6827,
-#  "dag_committed":5671,"validators":8,"uptime_secs":1997}
+# {"status":"ok","peers":7,"dag_round":937,"dag_committed":570,
+#  "validators":8,"uptime_secs":3600}
 
-# Run deterministic inference (requires --with-inference flag)
+# Run AI inference (requires --with-inference flag at startup)
 curl -X POST http://localhost:9090/inference/run \
   -H 'Content-Type: application/json' \
   -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":16}'
-# {"output":"Sure! The answer is 2+2 = 4.","output_hash":"0x...","ms_per_token":76}
-# That output_hash is identical on ARM, x86, and GPU. Verify it yourself.
+# Returns: output text, output hash (identical on ALL hardware), ms/token
 
-# View all inference attestations on-chain
+# View inference attestations on-chain
 curl http://localhost:9090/inference/attestations
-```
 
-> **Ports**: 9090 = RPC API (curl, browser), 9091 = P2P consensus (nodes talk to each other). You only need 9090.
+# Monitor all 8 testnet nodes in your terminal
+./scripts/monitor-testnet.sh
+```
 
 ### Get testnet tokens
 
+**Easiest way (no install):** Open the [Web Wallet](http://140.82.16.112:3100), click "Create New Wallet", and you'll get 10,000 ARC automatically.
+
+**From terminal:**
 ```bash
 curl -X POST http://localhost:9090/faucet/claim \
   -H 'Content-Type: application/json' \
-  -d '{"address":"<your-64-char-hex-address>"}'
-
-# Or run the faucet with a web UI
-cd faucet && cargo run --release
+  -d '{"address":"your-wallet-address-from-the-web-wallet"}'
 ```
 
 ### Deploy a smart contract
