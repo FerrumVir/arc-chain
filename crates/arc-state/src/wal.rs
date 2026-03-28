@@ -50,6 +50,13 @@ pub enum WalOp {
     /// Checkpoint: marks a consistent state root at this point.
     /// Used for crash recovery — replay starts from the last checkpoint.
     Checkpoint(Hash256),
+    /// Store a DAG consensus block (hash → serialized DagBlock).
+    /// Enables consensus state recovery after restart.
+    SetDagBlock(Hash256, Vec<u8>),
+    /// Record a DAG round advancement (current round number).
+    SetDagRound(u64),
+    /// Record a DAG block commit (hash of committed block).
+    CommitDagBlock(Hash256),
 }
 
 /// Internal command for the WAL background thread.

@@ -45,6 +45,8 @@ pub struct ConsensusManager {
     pub dag_round: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Shared DAG committed block counter for health endpoint.
     pub dag_committed: Option<Arc<std::sync::atomic::AtomicU64>>,
+    /// WAL writer for DAG persistence — enables consensus recovery after restart.
+    pub dag_wal: Option<Arc<arc_state::WalWriter>>,
 }
 
 impl ConsensusManager {
@@ -71,7 +73,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None }
     }
 
     /// Create a consensus manager with a signing keypair (production mode).
@@ -107,7 +109,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None }
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -355,6 +357,15 @@ impl ConsensusManager {
                             // Feed block into consensus engine
                             match self.engine.receive_block(&block) {
                                 Ok(()) => {
+                                    // Persist DAG block to WAL for crash recovery
+                                    if let Some(ref wal) = self.dag_wal {
+                                        if let Ok(bytes) = bincode::serialize(&block) {
+                                            wal.append(
+                                                arc_state::WalOp::SetDagBlock(block.hash, bytes),
+                                                block.round,
+                                            );
+                                        }
+                                    }
                                     debug!(
                                         author = %block.author,
                                         round = block.round,
@@ -609,6 +620,15 @@ impl ConsensusManager {
 
                         match self.engine.propose_block(tx_hashes, timestamp) {
                             Ok(block) => {
+                                // Persist our own proposed block to WAL
+                                if let Some(ref wal) = self.dag_wal {
+                                    if let Ok(bytes) = bincode::serialize(&block) {
+                                        wal.append(
+                                            arc_state::WalOp::SetDagBlock(block.hash, bytes),
+                                            block.round,
+                                        );
+                                    }
+                                }
                                 info!(
                                     round = block.round,
                                     txs = block.transactions.len(),
@@ -715,6 +735,13 @@ impl ConsensusManager {
             committed.sort_by_key(|b| b.round);
             if !committed.is_empty() {
                 for dag_block in &committed {
+                    // Persist commit to WAL
+                    if let Some(ref wal) = self.dag_wal {
+                        wal.append(
+                            arc_state::WalOp::CommitDagBlock(dag_block.hash),
+                            dag_block.round,
+                        );
+                    }
                     info!(
                         round = dag_block.round,
                         hash = %dag_block.hash,
@@ -793,6 +820,35 @@ impl ConsensusManager {
                                 }
                             };
 
+                            // Cross-shard: lock cross-shard transactions before execution.
+                            // Single-shard txs execute directly. Cross-shard txs use
+                            // the 2-phase lock protocol for atomicity across shards.
+                            // Cross-shard: identify and lock cross-shard transactions
+                            let cross_shard_hashes: Vec<Hash256> = committed_txs.iter()
+                                .filter(|tx| {
+                                    if let arc_types::TxBody::Transfer(ref body) = tx.body {
+                                        arc_consensus::is_cross_shard(&tx.from, &body.to, self.num_shards)
+                                    } else {
+                                        false
+                                    }
+                                })
+                                .map(|tx| tx.hash)
+                                .collect();
+                            if !cross_shard_hashes.is_empty() {
+                                for tx in committed_txs.iter() {
+                                    if let arc_types::TxBody::Transfer(ref body) = tx.body {
+                                        let src = arc_consensus::assign_shard(&tx.from, self.num_shards);
+                                        let tgt = arc_consensus::assign_shard(&body.to, self.num_shards);
+                                        if src != tgt {
+                                            let _ = self.engine.lock_cross_shard(
+                                                tx.hash, src, tgt, dag_block.hash, dag_block.round,
+                                            );
+                                        }
+                                    }
+                                }
+                                debug!("{} cross-shard txs locked", cross_shard_hashes.len());
+                            }
+
                             let start = std::time::Instant::now();
 
                             // Check if we have a state diff from a proposer.
@@ -837,6 +893,11 @@ impl ConsensusManager {
                                         }
                                         if !block_logs.is_empty() {
                                             state.store_event_logs(block.header.height, block_logs);
+                                        }
+
+                                        // Commit cross-shard locks after successful execution
+                                        for cs_hash in &cross_shard_hashes {
+                                            let _ = self.engine.commit_cross_shard(*cs_hash);
                                         }
 
                                         // Export state diff and broadcast to verifiers.

@@ -571,6 +571,13 @@ async fn main() -> Result<()> {
     consensus.dag_validators = Some(dag_validators.clone());
     consensus.dag_round = Some(dag_round.clone());
     consensus.dag_committed = Some(dag_committed.clone());
+    // DAG persistence WAL — survives restarts
+    let dag_wal_path = format!("{}/dag-wal", data_dir);
+    std::fs::create_dir_all(&dag_wal_path).ok();
+    if let Ok(dag_wal) = arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
+        consensus.dag_wal = Some(Arc::new(dag_wal));
+        tracing::info!("DAG persistence WAL enabled: {}", dag_wal_path);
+    }
     consensus.set_proposer_mode(cli.proposer_mode);
     let state_clone = state.clone();
     let mempool_clone = mempool.clone();
