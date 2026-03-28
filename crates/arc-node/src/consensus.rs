@@ -901,15 +901,12 @@ impl ConsensusManager {
             // epoch is still 0 (first freeze) OR every 1000 rounds after.
             // The "3+ validators" check ensures we don't freeze too early
             // with only 1-2 peers.
-            let frozen_epoch = self.engine.frozen_validator_set().epoch;
-            let should_freeze = if frozen_epoch == 0 {
-                // First freeze: wait for at least 3 validators
-                self.engine.validator_set().len() >= 3 && current_round > 10
-            } else {
-                // Subsequent freezes: every 1000 rounds
-                current_round % 1000 == 0
-            };
-            if multi_validator && should_freeze {
+            // Epoch management: the genesis set is frozen at construction
+            // (epoch 1). Re-freeze only at round 1000, 2000, etc. to
+            // absorb new validators that joined via staking.
+            // CRITICAL: do NOT freeze at round 0 — that would overwrite the
+            // genesis freeze with whatever PeerConnected events arrived.
+            if multi_validator && current_round >= 1000 && current_round % 1000 == 0 {
                 self.engine.freeze_epoch();
             }
 
