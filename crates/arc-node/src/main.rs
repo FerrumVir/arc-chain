@@ -564,9 +564,13 @@ async fn main() -> Result<()> {
         v
     };
     let dag_validators = Arc::new(parking_lot::RwLock::new(all_vals));
+    let dag_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut consensus =
         ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &peer_vals, validator_keypair);
     consensus.dag_validators = Some(dag_validators.clone());
+    consensus.dag_round = Some(dag_round.clone());
+    consensus.dag_committed = Some(dag_committed.clone());
     consensus.set_proposer_mode(cli.proposer_mode);
     let state_clone = state.clone();
     let mempool_clone = mempool.clone();
@@ -624,6 +628,8 @@ async fn main() -> Result<()> {
         candle_engine,
         candle_model_id,
         Some(dag_validators),
+        Some(dag_round),
+        Some(dag_committed),
     )
     .await?;
 

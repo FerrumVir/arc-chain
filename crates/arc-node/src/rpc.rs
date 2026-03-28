@@ -102,10 +102,18 @@ pub async fn serve(
     candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
     candle_model_id: Option<arc_crypto::Hash256>,
     dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
+    dag_round: Option<Arc<AtomicU64>>,
+    dag_committed: Option<Arc<AtomicU64>>,
 ) -> anyhow::Result<()> {
     let mut node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
+    }
+    if let Some(r) = dag_round {
+        node.dag_round = r;
+    }
+    if let Some(c) = dag_committed {
+        node.dag_committed = c;
     }
 
     let app = Router::new()
