@@ -1157,13 +1157,15 @@ impl ConsensusEngine {
         // else: legacy/test mode — accept unsigned blocks
 
         // 4. Round check: if block is ahead, fast-forward to catch up (testnet round sync).
-        //    In production, this would require a proper state-sync protocol.
-        //    For now, allow peers to pull us forward so nodes that start at
-        //    different times can converge.
         let current = self.current_round.load(Ordering::SeqCst);
-        // Allow unlimited round catch-up in testnet mode. Nodes that restart
-        // need to fast-forward to the network's current round. In production,
-        // large jumps would use state sync instead of fast-forward.
+        // Cap round jumps to prevent a malicious peer from sending round=u64::MAX
+        // which would stall the node (huge prune computation, stuck at max round).
+        const MAX_ROUND_JUMP: u64 = 50_000;
+        if block.round > current + MAX_ROUND_JUMP {
+            return Err(ConsensusError::InvalidBlock(
+                format!("round {} is too far ahead (current={}, max jump={})", block.round, current, MAX_ROUND_JUMP)
+            ));
+        }
         if block.round > current + 1 {
             // Fast-forward: jump to block.round - 1 so we can accept this block
             let new_round = block.round.saturating_sub(1);
@@ -1612,11 +1614,37 @@ impl ConsensusEngine {
             committed.retain(|hash| self.dag.contains_key(hash));
         }
 
+        // Prune finality proofs for blocks no longer in DAG
+        if pruned_blocks > 0 {
+            let stale_proofs: Vec<Hash256> = self.finality_proofs
+                .iter()
+                .filter(|e| !self.dag.contains_key(e.key()))
+                .map(|e| *e.key())
+                .collect();
+            for h in &stale_proofs {
+                self.finality_proofs.remove(h);
+            }
+            // Prune DA commitments and cross-shard proofs for pruned blocks
+            let stale_da: Vec<Hash256> = self.da_commitments
+                .iter()
+                .filter(|e| !self.dag.contains_key(e.key()))
+                .map(|e| *e.key())
+                .collect();
+            for h in &stale_da { self.da_commitments.remove(h); }
+            let stale_cs: Vec<Hash256> = self.completed_cross_shard
+                .iter()
+                .filter(|e| !self.dag.contains_key(e.key()))
+                .map(|e| *e.key())
+                .collect();
+            for h in &stale_cs { self.completed_cross_shard.remove(h); }
+        }
+
         if pruned_rounds > 0 {
             debug!(
                 pruned_rounds,
                 pruned_blocks,
                 dag_size = self.dag.len(),
+                finality_proofs = self.finality_proofs.len(),
                 "DAG pruned old rounds"
             );
         }
