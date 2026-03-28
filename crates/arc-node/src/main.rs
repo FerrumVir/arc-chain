@@ -414,30 +414,9 @@ async fn main() -> Result<()> {
                 tracing::info!("State sync complete, height = {}", height);
             }
             Err(e) => {
-                tracing::warn!("Chunked sync failed ({}), falling back to monolithic snapshot", e);
-                // Fallback: try file-based snapshot
-                let snapshot_path = format!("{}/snapshot.lz4", data_dir);
-                let snapshot = arc_state::Snapshot::read_from(&snapshot_path)
-                    .unwrap_or_else(|e| {
-                        tracing::error!("Failed to read snapshot from {}: {}", snapshot_path, e);
-                        tracing::error!(
-                            "Ensure the peer is running and reachable, or place a snapshot.lz4 \
-                             file in the data directory."
-                        );
-                        std::process::exit(1);
-                    });
-                tracing::info!(
-                    height = snapshot.block_height,
-                    accounts = snapshot.accounts.len(),
-                    state_root = %snapshot.state_root,
-                    "Importing snapshot from file"
-                );
-                state.import_snapshot(&snapshot, snapshot.state_root)
-                    .unwrap_or_else(|e| {
-                        tracing::error!("Snapshot verification failed: {}", e);
-                        std::process::exit(1);
-                    });
-                tracing::info!("Snapshot imported and verified, height = {}", state.height());
+                tracing::warn!("Sync from peer failed ({}), continuing from genesis state", e);
+                // Don't crash — the node will start from genesis and catch
+                // up via DAG consensus. This is fine for testnet.
             }
         }
     }
