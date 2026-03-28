@@ -413,60 +413,9 @@ async fn submit_tx(
         }
     }
 
-    // No signature — apply transfer directly to state for testnet.
-    // Verify sender has sufficient balance.
-    let sender_account = node.state.get_account(&from)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!("Sender account {} not found", req.from)))?;
-
-    if sender_account.balance < req.amount {
-        return Err((StatusCode::BAD_REQUEST, format!(
-            "Insufficient balance: have {} ARC, need {} ARC",
-            sender_account.balance, req.amount
-        )));
-    }
-
-    let mut tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
-    tx.sig_verified = true; // Testnet direct-submit — skip sig check on consensus execution
-    let hash = tx.hash.to_hex();
-
-    // Apply transfer directly to state (testnet immediate settlement)
-    {
-        let mut sender = sender_account.clone();
-        sender.balance -= req.amount;
-        sender.nonce += 1;
-        node.state.update_account(&from, sender);
-
-        let mut recipient = node.state.get_or_create_account(&to);
-        recipient.balance += req.amount;
-        node.state.update_account(&to, recipient);
-    }
-
-    // Record transaction and receipt
-    let receipt = TxReceipt {
-        tx_hash: tx.hash,
-        block_height: node.state.height(),
-        block_hash: node.state.get_block(node.state.height())
-            .map(|b| b.hash)
-            .unwrap_or(Hash256::ZERO),
-        index: 0,
-        success: true,
-        gas_used: 21_000,
-        value_commitment: None,
-        inclusion_proof: None,
-        logs: vec![],
-    };
-    node.state.receipts.insert(tx.hash.0, receipt);
-    node.state.full_transactions.insert(tx.hash.0, tx.clone());
-    node.state.account_txs.entry(from.0).or_default().push(tx.hash);
-    node.state.account_txs.entry(to.0).or_default().push(tx.hash);
-
-    // Also insert into mempool for DAG consensus propagation to other nodes
-    let _ = node.mempool.insert(tx);
-
-    Ok(Json(SubmitTxResponse {
-        tx_hash: hash,
-        status: "confirmed".to_string(),
-    }))
+    // No signature provided — reject. Unsigned transfers are a security hole
+    // (anyone could drain any account). Require a signature for all transfers.
+    Err((StatusCode::BAD_REQUEST, "Signature required. Provide 'signature' and 'public_key' fields. Use the wallet at http://140.82.16.112:3100 to send tokens.".to_string()))
 }
 
 #[derive(Deserialize)]
@@ -701,6 +650,22 @@ async fn faucet_claim(
     })?;
 
     // Rate limiting: check if this address claimed recently
+    // Global rate limit: max 100 faucet claims per minute (prevents infinite mint via address generation)
+    {
+        let total = node.faucet_claims_total.load(Ordering::Relaxed);
+        if total > 100 {
+            // Check if we've had >100 claims in the last minute
+            let claims = node.faucet_claims.lock().unwrap_or_else(|p| p.into_inner());
+            let recent = claims.values().filter(|t| t.elapsed().as_secs() < 60).count();
+            if recent > 100 {
+                return Err((StatusCode::TOO_MANY_REQUESTS, Json(FaucetErrorResponse {
+                    error: "Faucet busy. Too many claims globally. Try again in a minute.".to_string(),
+                })));
+            }
+        }
+    }
+
+    // Per-address rate limit: 1 claim per hour
     {
         let claims = node.faucet_claims.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(last_claim) = claims.get(&to.0) {
@@ -749,7 +714,7 @@ async fn faucet_claim(
         node.state.update_account(&faucet_addr, sender);
 
         let mut recipient = node.state.get_or_create_account(&to);
-        recipient.balance += FAUCET_CLAIM_AMOUNT;
+        recipient.balance = recipient.balance.saturating_add(FAUCET_CLAIM_AMOUNT);
         node.state.update_account(&to, recipient);
     }
 
