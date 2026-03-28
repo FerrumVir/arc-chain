@@ -520,48 +520,46 @@ impl ConsensusManager {
             // no proposals → no blocks → no quorum → no advance → no proposals.
             // The 2-round commit rule handles safety (won't commit without quorum).
             let allow_propose = true;
-            if can_produce && !already_proposed && allow_propose && vrf_approved {
-                // ── Benchmark: execute pre-signed txs at full speed ──────────
-                // Runs in BOTH single and multi-validator modes. In multi-validator,
-                // the DAG consensus runs in parallel (below). The benchmark_tx_count
-                // reflects actual execution throughput (20K+ TPS on decent hardware).
-                if self.benchmark {
-                    if let Some(ref pool) = benchmark_pool {
-                        // Multi-validator: 1500 per tick (fits in 50ms at 33K TPS).
-                        // Larger batches block the consensus thread too long,
-                        // preventing peer message processing → 0 peers.
-                        let batch_size = if multi_validator { 1_500 } else { 1_000_000 };
-                        let signed_txs = pool.drain(batch_size);
-                        if !signed_txs.is_empty() {
-                            let tx_count = signed_txs.len() as u64;
-                            let start = std::time::Instant::now();
-                            match state.execute_block_signed_benchmark(
-                                &signed_txs,
-                                self.validator_address,
-                            ) {
-                                Ok(block) => {
-                                    let elapsed = start.elapsed();
-                                    let tps = if elapsed.as_secs_f64() > 0.0 {
-                                        tx_count as f64 / elapsed.as_secs_f64()
-                                    } else {
-                                        tx_count as f64
-                                    };
-                                    info!(
-                                        height = block.header.height,
-                                        txs = tx_count,
-                                        elapsed_ms = elapsed.as_millis(),
-                                        tps = format!("{:.0}", tps),
-                                        "Signed benchmark block produced"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!("Benchmark block failed: {}", e);
-                                }
+            // ── Benchmark: execute pre-signed txs EVERY TICK ─────────────
+            // Runs independently of proposals. In multi-validator, DAG consensus
+            // runs in parallel. The benchmark_tx_count reflects actual execution
+            // throughput (20K+ TPS sustained). Batch size is tuned so each
+            // execution takes <40ms, leaving time for peer messages.
+            if self.benchmark && can_produce {
+                if let Some(ref pool) = benchmark_pool {
+                    let batch_size = if multi_validator { 1_500 } else { 1_000_000 };
+                    let signed_txs = pool.drain(batch_size);
+                    if !signed_txs.is_empty() {
+                        let tx_count = signed_txs.len() as u64;
+                        let start = std::time::Instant::now();
+                        match state.execute_block_signed_benchmark(
+                            &signed_txs,
+                            self.validator_address,
+                        ) {
+                            Ok(block) => {
+                                let elapsed = start.elapsed();
+                                let tps = if elapsed.as_secs_f64() > 0.0 {
+                                    tx_count as f64 / elapsed.as_secs_f64()
+                                } else {
+                                    tx_count as f64
+                                };
+                                debug!(
+                                    height = block.header.height,
+                                    txs = tx_count,
+                                    elapsed_ms = elapsed.as_millis(),
+                                    tps = format!("{:.0}", tps),
+                                    "Benchmark block"
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Benchmark block failed: {}", e);
                             }
                         }
                     }
                 }
+            }
 
+            if can_produce && !already_proposed && allow_propose && vrf_approved {
                 if !multi_validator && self.benchmark {
                     // Single-validator: just advance DAG round for tracking
                     let timestamp = SystemTime::now()
