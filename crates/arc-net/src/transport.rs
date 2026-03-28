@@ -444,12 +444,28 @@ pub async fn run_transport(
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // ── Bind QUIC endpoint ──────────────────────────────────────────────
+    // Retry binding up to 5 times with 2s delay — the old process may
+    // not have fully released the UDP port yet after killall -9.
     let server_config = make_server_config();
-    let mut endpoint = match quinn::Endpoint::server(server_config, listen_addr) {
-        Ok(ep) => ep,
-        Err(e) => {
-            error!("Failed to bind QUIC endpoint on {}: {}", listen_addr, e);
-            return;
+    let mut endpoint = {
+        let mut last_err = None;
+        let mut ep_opt = None;
+        for attempt in 0..5 {
+            match quinn::Endpoint::server(server_config.clone(), listen_addr) {
+                Ok(ep) => { ep_opt = Some(ep); break; }
+                Err(e) => {
+                    warn!("QUIC bind attempt {} failed: {} — retrying in 2s", attempt + 1, e);
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+            }
+        }
+        match ep_opt {
+            Some(ep) => ep,
+            None => {
+                error!("Failed to bind QUIC endpoint on {} after 5 attempts: {:?}", listen_addr, last_err);
+                return;
+            }
         }
     };
     // Set client config for outgoing connections on the same endpoint
