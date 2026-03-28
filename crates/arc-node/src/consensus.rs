@@ -84,6 +84,15 @@ impl ConsensusManager {
         let (validator_set, tier) = Self::build_validator_set(validator_address, stake, peer_validators);
         let engine = Arc::new(ConsensusEngine::new_testnet_with_keypair(validator_set, validator_address, keypair));
 
+        // Freeze the genesis validator set immediately at epoch 1.
+        // This ensures ALL nodes have the EXACT same frozen set from round 0,
+        // which is critical for deterministic leader selection. Without this,
+        // nodes that receive PeerConnected events before the freeze would add
+        // extra validators, causing different frozen sets → different leaders.
+        if !peer_validators.is_empty() {
+            engine.freeze_epoch();
+        }
+
         info!(
             address = %validator_address,
             stake = stake,
