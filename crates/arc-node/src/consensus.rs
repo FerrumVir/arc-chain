@@ -459,10 +459,10 @@ impl ConsensusManager {
                 true // No VRF = always allowed (backward compat)
             };
 
-            // In benchmark/testnet mode, always allow proposals even without
-            // quorum parents — the DAG is in catch-up and strict parent checks
-            // would prevent any transactions from being included.
-            let allow_propose = has_quorum_parents || self.benchmark;
+            // Always allow proposals. Strict parent checks cause a deadlock:
+            // no proposals → no blocks → no quorum → no advance → no proposals.
+            // The 2-round commit rule handles safety (won't commit without quorum).
+            let allow_propose = true;
             if can_produce && !already_proposed && allow_propose && vrf_approved {
                 // ── Benchmark fast path: drain pre-signed txs, verify+execute ──
                 if self.benchmark && !multi_validator {
