@@ -1868,7 +1868,7 @@ impl StateDB {
                 s.nonce += txs_per_sender;
             }
             if let Some(mut r) = self.accounts.get_mut(&receiver.0) {
-                r.balance += txs_per_sender;
+                r.balance = txs_per_sender;
             }
         }
 
@@ -2423,7 +2423,7 @@ impl StateDB {
                     let mut receiver = self.accounts
                         .entry(body.to.0)
                         .or_insert_with(|| Account::new(body.to, 0));
-                    receiver.balance += body.amount;
+                    receiver.balance = receiver.balance.saturating_add(body.amount);
                     // Eagerly update JMT leaf for receiver.
                     if self.use_jmt {
                         let recv_hash = hash_bytes(&bincode::serialize(receiver.value()).unwrap_or_default());
@@ -2458,7 +2458,7 @@ impl StateDB {
                 self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 let mut agent = self.get_or_create_account(&body.agent_id);
-                agent.balance += body.amount;
+                agent.balance = agent.balance.saturating_add(body.amount);
                 self.accounts.insert(body.agent_id.0, agent.clone());
                 self.wal.append(WalOp::SetAccount(body.agent_id, agent), self.height());
 
@@ -2486,10 +2486,10 @@ impl StateDB {
                     });
                 }
                 sender.balance -= body.offer_amount;
-                sender.balance += body.receive_amount;
+                sender.balance = sender.balance.saturating_add(body.receive_amount);
                 sender.nonce += 1;
                 counterparty.balance -= body.receive_amount;
-                counterparty.balance += body.offer_amount;
+                counterparty.balance = counterparty.balance.saturating_add(body.offer_amount);
 
                 self.accounts.insert(tx.from.0, sender);
                 self.accounts.insert(body.counterparty.0, counterparty);
@@ -2513,7 +2513,7 @@ impl StateDB {
                     sender.balance -= body.amount;
                 } else {
                     let mut beneficiary = self.get_or_create_account(&body.beneficiary);
-                    beneficiary.balance += body.amount;
+                    beneficiary.balance = beneficiary.balance.saturating_add(body.amount);
                     self.accounts.insert(body.beneficiary.0, beneficiary);
                 }
                 sender.nonce += 1;
@@ -2545,7 +2545,7 @@ impl StateDB {
                         .get(&tx.from.0)
                         .map(|v| *v)
                         .unwrap_or(0);
-                    let new_stake = prev_stake + body.amount;
+                    let new_stake = prev_stake.saturating_add(body.amount);
                     self.validators.insert(tx.from.0, new_stake);
 
                     // Update global staking pool
@@ -2570,7 +2570,7 @@ impl StateDB {
                         });
                     }
                     sender.staked_balance -= body.amount;
-                    sender.balance += body.amount;
+                    sender.balance = body.amount;
 
                     // Update validator tracking
                     let prev_stake = self.validators
@@ -2656,7 +2656,7 @@ impl StateDB {
                         sender.balance -= body.value;
 
                         let mut contract_acct = self.get_or_create_account(&body.contract);
-                        contract_acct.balance += body.value;
+                        contract_acct.balance = body.value;
                         self.accounts.insert(body.contract.0, contract_acct.clone());
                         self.wal.append(WalOp::SetAccount(body.contract, contract_acct), self.height());
                     }
@@ -2903,7 +2903,7 @@ impl StateDB {
                                 // Revert: do NOT flush storage writes
                                 // Revert value transfer if any
                                 if body.value > 0 {
-                                    sender.balance += body.value;
+                                    sender.balance = body.value;
                                     // Persist reverted sender balance
                                     self.accounts.insert(tx.from.0, sender.clone());
 
@@ -3279,7 +3279,7 @@ impl StateDB {
                     .unwrap_or(0);
                 if staked > 0 {
                     sender.staked_balance = sender.staked_balance.saturating_sub(staked);
-                    sender.balance += staked;
+                    sender.balance = staked;
                     self.staking_pool.fetch_sub(
                         staked.min(self.staking_pool.load(Ordering::Relaxed)),
                         Ordering::Relaxed,
@@ -3341,7 +3341,7 @@ impl StateDB {
                     // Decreasing stake: return difference to balance
                     let diff = current_stake - body.new_stake;
                     sender.staked_balance = sender.staked_balance.saturating_sub(diff);
-                    sender.balance += diff;
+                    sender.balance = diff;
                     self.staking_pool.fetch_sub(
                         diff.min(self.staking_pool.load(Ordering::Relaxed)),
                         Ordering::Relaxed,
@@ -3419,7 +3419,7 @@ impl StateDB {
                 // Credit bridge escrow account (well-known address)
                 let escrow_addr = hash_bytes(b"ARC-bridge-escrow");
                 let mut escrow = self.get_or_create_account(&escrow_addr);
-                escrow.balance += body.amount;
+                escrow.balance = body.amount;
                 self.accounts.insert(escrow_addr.0, escrow.clone());
                 self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
@@ -3455,7 +3455,7 @@ impl StateDB {
 
                 // Credit recipient
                 let mut recipient = self.get_or_create_account(&body.recipient);
-                recipient.balance += body.amount;
+                recipient.balance = body.amount;
                 self.accounts.insert(body.recipient.0, recipient.clone());
                 self.wal.append(WalOp::SetAccount(body.recipient, recipient), self.height());
 
@@ -3516,7 +3516,7 @@ impl StateDB {
                 for (agent_addr, net_amount) in &net_credits {
                     let agent_address = Hash256(*agent_addr);
                     let mut agent = self.get_or_create_account(&agent_address);
-                    agent.balance += net_amount;
+                    agent.balance = agent.balance.saturating_add(*net_amount);
                     self.accounts.insert(*agent_addr, agent.clone());
                     self.wal.append(WalOp::SetAccount(agent_address, agent), self.height());
                 }
@@ -3549,7 +3549,7 @@ impl StateDB {
                 // Channel escrow = BLAKE3("arc-channel" || channel_id)
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
                 let mut escrow = self.get_or_create_account(&escrow_addr);
-                escrow.balance += body.deposit;
+                escrow.balance = body.deposit;
                 // Store channel participants in escrow metadata:
                 //   code_hash  = opener address (tx.from)
                 //   storage_root = counterparty address
@@ -3612,7 +3612,7 @@ impl StateDB {
                 self.wal.append(WalOp::SetAccount(escrow_addr, escrow_mut), self.height());
 
                 // Credit opener
-                sender.balance += body.opener_balance;
+                sender.balance = body.opener_balance;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
 
@@ -3622,7 +3622,7 @@ impl StateDB {
                 let counterparty_addr = escrow.storage_root;
                 if body.counterparty_balance > 0 && counterparty_addr != Hash256::ZERO {
                     let mut counterparty = self.get_or_create_account(&counterparty_addr);
-                    counterparty.balance += body.counterparty_balance;
+                    counterparty.balance = body.counterparty_balance;
                     self.accounts.insert(counterparty_addr.0, counterparty.clone());
                     self.wal.append(WalOp::SetAccount(counterparty_addr, counterparty), self.height());
                 }
@@ -3807,7 +3807,7 @@ impl StateDB {
                 // 4. Lock bond in deterministic escrow: BLAKE3("arc-inference" || attestation_hash)
                 let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
                 let mut escrow = self.get_or_create_account(&escrow_addr);
-                escrow.balance += body.bond;
+                escrow.balance = body.bond;
                 // Store model_id fingerprint in nonce (for lookup)
                 escrow.nonce = u64::from_le_bytes(body.model_id.0[..8].try_into().unwrap_or([0u8; 8]));
                 // Store the current block height in storage_root (as metadata)
