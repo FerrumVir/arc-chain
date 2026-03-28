@@ -258,15 +258,15 @@ impl ConsensusManager {
                             } else {
                                 // New peer: only add if it's a known genesis
                                 // validator. Unknown peers (e.g., old systemd
-                                // processes with different seeds) would pollute
-                                // the validator set and break leader selection.
-                                let frozen = self.engine.frozen_validator_set();
-                                let is_genesis = frozen.validators.iter().any(|v| v.address == address);
-                                drop(frozen);
-                                if !is_genesis {
+                                // Accept new validators if they have sufficient stake.
+                                // Genesis validators are always accepted. New validators
+                                // join the live set immediately and the frozen set at the
+                                // next epoch boundary (round 1000, 2000, etc.).
+                                if stake < 500_000 {
                                     info!(
                                         peer = %address,
-                                        "Ignoring non-genesis peer (not in frozen validator set)"
+                                        stake = stake,
+                                        "Ignoring peer with insufficient stake (need 500K+ ARC)"
                                     );
                                     continue;
                                 }
