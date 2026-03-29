@@ -1332,7 +1332,14 @@ impl CachedIntegerModel {
         tokens.iter()
             .map(|&id| {
                 if (id as usize) < self.vocab.len() {
-                    self.vocab[id as usize].replace('▁', " ")
+                    let token = &self.vocab[id as usize];
+                    // Handle byte fallback tokens: <0x0A> → \n, <0x0D> → \r, etc.
+                    if token.starts_with("<0x") && token.ends_with('>') && token.len() == 6 {
+                        if let Ok(byte) = u8::from_str_radix(&token[3..5], 16) {
+                            return String::from(byte as char);
+                        }
+                    }
+                    token.replace('▁', " ").to_string()
                 } else {
                     format!("[{}]", id)
                 }
