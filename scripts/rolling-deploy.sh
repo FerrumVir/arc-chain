@@ -52,14 +52,15 @@ for entry in "${NODES[@]}"; do
         continue  # Skip build node
     fi
     echo -n "  ${seed} (${ip})... "
-    # Pull code (for genesis.toml, seeds, scripts) + copy binary
+    # Pull code (for genesis.toml, seeds, scripts) + copy binary via pipe
     ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "
         cd /root/arc-chain
         git fetch origin main && git reset --hard origin/main
     " 2>/dev/null
-    scp -o StrictHostKeyChecking=no -i "$SSH_KEY" \
-        "root@${BUILD_NODE}:/root/arc-chain/target/release/arc-node" \
-        "root@${ip}:/root/arc-chain/target/release/arc-node" 2>/dev/null
+    # Pipe binary through localhost to avoid remote-to-remote scp issues.
+    # Write to .new first (avoids "text file busy" if old binary is running).
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@${BUILD_NODE}" "cat /root/arc-chain/target/release/arc-node" \
+        | ssh $SSH_OPTS -i "$SSH_KEY" "root@${ip}" "cat > /root/arc-chain/target/release/arc-node.new && chmod +x /root/arc-chain/target/release/arc-node.new && mv -f /root/arc-chain/target/release/arc-node.new /root/arc-chain/target/release/arc-node" 2>/dev/null
     echo -e "${GREEN}OK${NC}"
 done
 
