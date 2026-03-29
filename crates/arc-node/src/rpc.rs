@@ -112,6 +112,8 @@ pub async fn serve(
     dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
     dag_round: Option<Arc<AtomicU64>>,
     dag_committed: Option<Arc<AtomicU64>>,
+    inference_pending: Option<Arc<dashmap::DashMap<String, (String, u32, std::time::Instant)>>>,
+    inference_responses: Option<Arc<dashmap::DashMap<String, Value>>>,
 ) -> anyhow::Result<()> {
     let mut node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
     if let Some(dv) = dag_validators {
@@ -122,6 +124,12 @@ pub async fn serve(
     }
     if let Some(c) = dag_committed {
         node.dag_committed = c;
+    }
+    if let Some(p) = inference_pending {
+        node.inference_pending = p;
+    }
+    if let Some(r) = inference_responses {
+        node.inference_responses = r;
     }
 
     let app = Router::new()

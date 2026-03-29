@@ -47,6 +47,10 @@ pub struct ConsensusManager {
     pub dag_committed: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// WAL writer for DAG persistence — enables consensus recovery after restart.
     pub dag_wal: Option<Arc<arc_state::WalWriter>>,
+    /// Shared inference pending requests (RPC writes, consensus loop reads + broadcasts).
+    pub inference_pending: Option<Arc<dashmap::DashMap<String, (String, u32, std::time::Instant)>>>,
+    /// Shared inference responses (consensus loop writes, RPC reads).
+    pub inference_responses: Option<Arc<dashmap::DashMap<String, serde_json::Value>>>,
 }
 
 impl ConsensusManager {
@@ -73,7 +77,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None }
     }
 
     /// Create a consensus manager with a signing keypair (production mode).
@@ -109,7 +113,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None }
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -449,23 +453,24 @@ impl ConsensusManager {
                             debug!("State sync message (handled by RPC layer)");
                         }
                         InboundMessage::InferenceRequest { request_id, input, max_tokens, requester } => {
-                            // Community GPU node received an inference request.
-                            // TODO: Run model locally and send response via outbound_tx.
-                            info!(
-                                request_id = %request_id,
-                                tokens = max_tokens,
-                                "Received inference request from network"
-                            );
+                            info!(request_id = %request_id, "Inference request from network");
+                            // If we have a model, run inference and respond
+                            // (handled by RPC layer — inference_run endpoint)
                         }
                         InboundMessage::InferenceResponse { request_id, output, output_hash, model_hash, ms_per_token, responder } => {
-                            // Seed node received inference result from community GPU.
                             // Store for the waiting RPC handler to pick up.
-                            info!(
-                                request_id = %request_id,
-                                responder = %responder,
-                                ms_per_token = ms_per_token,
-                                "Received inference response from community node"
-                            );
+                            info!(request_id = %request_id, responder = %responder, "Inference response from worker");
+                            if let Some(ref responses) = self.inference_responses {
+                                responses.insert(request_id.to_hex(), serde_json::json!({
+                                    "success": true,
+                                    "output": output,
+                                    "output_hash": output_hash.to_hex(),
+                                    "model_hash": model_hash.to_hex(),
+                                    "ms_per_token": ms_per_token,
+                                    "responder": responder.to_hex(),
+                                    "source": "community_worker",
+                                }));
+                            }
                         }
                     }
                 }
@@ -1010,6 +1015,28 @@ impl ConsensusManager {
             if !committed.is_empty() {
                 if let Some(ref c) = self.dag_committed {
                     c.fetch_add(committed.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+
+            // ── Drain pending inference requests and broadcast to workers ──
+            if let Some(ref pending) = self.inference_pending {
+                let reqs: Vec<_> = pending.iter()
+                    .filter(|e| e.value().2.elapsed().as_secs() < 30) // Only fresh requests
+                    .map(|e| (e.key().clone(), e.value().0.clone(), e.value().1))
+                    .take(5) // Max 5 per tick
+                    .collect();
+                for (req_id, input, max_tokens) in reqs {
+                    if let Some(ref tx_chan) = outbound_tx {
+                        let _ = tx_chan.try_send(
+                            arc_net::transport::OutboundMessage::BroadcastInferenceRequest {
+                                request_id: arc_crypto::hash_bytes(req_id.as_bytes()),
+                                input,
+                                max_tokens,
+                                requester: self.validator_address,
+                            }
+                        );
+                    }
+                    pending.remove(&req_id); // Remove after broadcast
                 }
             }
 

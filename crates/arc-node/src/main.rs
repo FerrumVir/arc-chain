@@ -571,6 +571,11 @@ async fn main() -> Result<()> {
     consensus.dag_validators = Some(dag_validators.clone());
     consensus.dag_round = Some(dag_round.clone());
     consensus.dag_committed = Some(dag_committed.clone());
+    // Shared inference queues — RPC writes requests, consensus broadcasts + collects
+    let inference_pending = Arc::new(dashmap::DashMap::new());
+    let inference_responses = Arc::new(dashmap::DashMap::new());
+    consensus.inference_pending = Some(inference_pending.clone());
+    consensus.inference_responses = Some(inference_responses.clone());
     // DAG persistence WAL — survives restarts
     let dag_wal_path = format!("{}/dag-wal", data_dir);
     std::fs::create_dir_all(&dag_wal_path).ok();
@@ -663,6 +668,8 @@ async fn main() -> Result<()> {
         Some(dag_validators),
         Some(dag_round),
         Some(dag_committed),
+        Some(inference_pending),
+        Some(inference_responses),
     )
     .await?;
 
