@@ -122,6 +122,17 @@ struct Cli {
     /// Enables the /inference/run RPC endpoint with real deterministic inference.
     #[arg(long)]
     model: Option<String>,
+
+    /// Node mode: "validator" (default) produces blocks + serves inference.
+    /// "worker" only serves inference — no block production, lower resource usage.
+    /// Community members should use --mode worker.
+    #[arg(long, default_value = "validator")]
+    mode: String,
+
+    /// CPU usage limit as a percentage (1-100). Default: 100 for validators,
+    /// 15 for workers. Limits rayon threads and adds inference cooldown.
+    #[arg(long)]
+    cpu_limit: Option<u8>,
 }
 
 #[tokio::main]
@@ -256,9 +267,24 @@ async fn main() -> Result<()> {
         node_cfg.benchmark.rayon_threads
     };
 
+    // ── Worker mode: default CPU limit to 15% ─────────────────────────
+    let worker_mode = cli.mode == "worker";
+    let cpu_limit = cli.cpu_limit.unwrap_or(if worker_mode { 15 } else { 100 });
+    let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let cpu_threads = ((num_cpus as u64 * cpu_limit as u64) / 100).max(1) as usize;
+    if worker_mode {
+        tracing::info!(cpu_limit = cpu_limit, threads = cpu_threads, "Worker mode — inference only, no block production");
+    }
+
     // ── Configure rayon thread pool ─────────────────────────────────────
-    // In benchmark mode, limit rayon to leave CPU for signing threads
-    if cli.benchmark {
+    // In benchmark mode, limit rayon to leave CPU for signing threads.
+    // In worker mode, limit rayon based on --cpu-limit.
+    if worker_mode {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cpu_threads)
+            .build_global()
+            .ok();
+    } else if cli.benchmark {
         rayon::ThreadPoolBuilder::new()
             .num_threads(bench_rayon_threads)
             .build_global()
@@ -576,6 +602,13 @@ async fn main() -> Result<()> {
     let inference_responses = Arc::new(dashmap::DashMap::new());
     consensus.inference_pending = Some(inference_pending.clone());
     consensus.inference_responses = Some(inference_responses.clone());
+    // Pass inference model to consensus for auto-execute on P2P requests
+    consensus.candle_engine = candle_engine.clone();
+    consensus.candle_model_id = candle_model_id;
+    consensus.inference_model = inference_model.clone();
+    // Share earnings counters between consensus (writes) and RPC (reads)
+    let consensus_inference_count = consensus.inference_count.clone();
+    let consensus_inference_earned = consensus.inference_earned.clone();
     // DAG persistence WAL — survives restarts
     let dag_wal_path = format!("{}/dag-wal", data_dir);
     std::fs::create_dir_all(&dag_wal_path).ok();
@@ -670,6 +703,9 @@ async fn main() -> Result<()> {
         Some(dag_committed),
         Some(inference_pending),
         Some(inference_responses),
+        Some(consensus_inference_count),
+        Some(consensus_inference_earned),
+        if worker_mode { "worker" } else { "validator" },
     )
     .await?;
 

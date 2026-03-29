@@ -51,6 +51,15 @@ pub struct ConsensusManager {
     pub inference_pending: Option<Arc<dashmap::DashMap<String, (String, u32, std::time::Instant)>>>,
     /// Shared inference responses (consensus loop writes, RPC reads).
     pub inference_responses: Option<Arc<dashmap::DashMap<String, serde_json::Value>>>,
+    /// Candle Q4 float inference engine (if model loaded).
+    pub candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
+    /// Model ID from candle engine (BLAKE3 of model metadata).
+    pub candle_model_id: Option<arc_crypto::Hash256>,
+    /// Integer tokenizer model (for encode/decode even when candle handles generation).
+    pub inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
+    /// Worker earnings counters (inference count + ARC earned).
+    pub inference_count: Arc<std::sync::atomic::AtomicU64>,
+    pub inference_earned: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ConsensusManager {
@@ -77,7 +86,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)) }
     }
 
     /// Create a consensus manager with a signing keypair (production mode).
@@ -113,7 +122,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)) }
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -453,9 +462,70 @@ impl ConsensusManager {
                             debug!("State sync message (handled by RPC layer)");
                         }
                         InboundMessage::InferenceRequest { request_id, input, max_tokens, requester } => {
-                            info!(request_id = %request_id, "Inference request from network");
-                            // If we have a model, run inference and respond
-                            // (handled by RPC layer — inference_run endpoint)
+                            info!(request_id = %request_id, requester = %requester, "Inference request from network");
+
+                            // If we have a model loaded, execute inference and respond
+                            if let Some(ref model) = self.inference_model {
+                                let prompt_tokens = model.encode(&input);
+                                if prompt_tokens.is_empty() {
+                                    warn!("Failed to encode inference input");
+                                } else {
+                                    let start = std::time::Instant::now();
+                                    let (output_text, output_hash, model_hash) =
+                                        if let (Some(engine), Some(mid)) = (&self.candle_engine, &self.candle_model_id) {
+                                            // Candle Q4 float backend
+                                            let mut tokens = vec![1u32]; // BOS
+                                            tokens.extend(&prompt_tokens);
+                                            match engine.generate(mid, &tokens, max_tokens) {
+                                                Ok(result) => {
+                                                    let gen_tokens: Vec<u32> = result.output.chunks(4)
+                                                        .map(|c| u32::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0),
+                                                            c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]))
+                                                        .collect();
+                                                    (model.decode(&gen_tokens), result.output_hash, *mid)
+                                                }
+                                                Err(e) => {
+                                                    warn!("Candle inference failed: {}", e);
+                                                    continue;
+                                                }
+                                            }
+                                        } else {
+                                            // INT8 integer engine fallback
+                                            let eos_tokens = vec![2u32, 0];
+                                            let (generated, hash) = model.generate(&prompt_tokens, max_tokens, &eos_tokens);
+                                            let model_id_data = format!("arc-{}L-{}d-{}h-{}v",
+                                                model.config.n_layers, model.config.d_model,
+                                                model.config.n_heads, model.config.vocab_size);
+                                            (model.decode(&generated), hash, arc_crypto::hash_bytes(model_id_data.as_bytes()))
+                                        };
+
+                                    let elapsed = start.elapsed();
+                                    let ms_per_token = if max_tokens > 0 { elapsed.as_millis() as u64 / max_tokens as u64 } else { 0 };
+
+                                    info!(request_id = %request_id, tokens = max_tokens,
+                                        ms = elapsed.as_millis(), "Inference executed — sending response");
+
+                                    // Send response back via P2P
+                                    if let Some(ref tx_chan) = outbound_tx {
+                                        let _ = tx_chan.try_send(
+                                            arc_net::transport::OutboundMessage::SendInferenceResponse {
+                                                request_id,
+                                                output: output_text,
+                                                output_hash,
+                                                model_hash,
+                                                ms_per_token,
+                                                responder: self.validator_address,
+                                            }
+                                        );
+                                    }
+
+                                    // Track earnings
+                                    self.inference_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    // Reward: 100 ARC per inference (testnet rate — production
+                                    // will use block-reward-funded inference pool with halving)
+                                    self.inference_earned.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            }
                         }
                         InboundMessage::InferenceResponse { request_id, output, output_hash, model_hash, ms_per_token, responder } => {
                             // Store for the waiting RPC handler to pick up.

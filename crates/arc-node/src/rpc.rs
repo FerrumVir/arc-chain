@@ -59,6 +59,12 @@ pub struct NodeState {
     /// Inference responses from community workers.
     /// Key: request_id (hex), Value: JSON response
     pub inference_responses: Arc<dashmap::DashMap<String, Value>>,
+    /// Worker earnings: total inference count (shared with consensus).
+    pub inference_count: Arc<AtomicU64>,
+    /// Worker earnings: total ARC earned (shared with consensus).
+    pub inference_earned: Arc<AtomicU64>,
+    /// Node mode: "validator" or "worker".
+    pub node_mode: String,
 }
 
 /// Build a `NodeState` from components.
@@ -94,6 +100,9 @@ pub fn build_node_state(
         inference_results: Arc::new(dashmap::DashMap::new()),
         inference_pending: Arc::new(dashmap::DashMap::new()),
         inference_responses: Arc::new(dashmap::DashMap::new()),
+        inference_count: Arc::new(AtomicU64::new(0)),
+        inference_earned: Arc::new(AtomicU64::new(0)),
+        node_mode: "validator".to_string(),
     }
 }
 
@@ -114,6 +123,9 @@ pub async fn serve(
     dag_committed: Option<Arc<AtomicU64>>,
     inference_pending: Option<Arc<dashmap::DashMap<String, (String, u32, std::time::Instant)>>>,
     inference_responses: Option<Arc<dashmap::DashMap<String, Value>>>,
+    inference_count: Option<Arc<AtomicU64>>,
+    inference_earned: Option<Arc<AtomicU64>>,
+    node_mode: &str,
 ) -> anyhow::Result<()> {
     let mut node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
     if let Some(dv) = dag_validators {
@@ -131,6 +143,13 @@ pub async fn serve(
     if let Some(r) = inference_responses {
         node.inference_responses = r;
     }
+    if let Some(c) = inference_count {
+        node.inference_count = c;
+    }
+    if let Some(e) = inference_earned {
+        node.inference_earned = e;
+    }
+    node.node_mode = node_mode.to_string();
 
     let app = Router::new()
         .route("/", get(index))
@@ -172,6 +191,8 @@ pub async fn serve(
         .route("/inference/run", post(inference_run))
         .route("/inference/attestations", get(inference_list_attestations))
         .route("/inference/results", get(inference_list_results))
+        // Worker earnings + status (community inference nodes)
+        .route("/worker/earnings", get(worker_earnings))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -2942,5 +2963,45 @@ async fn inference_list_results(
     Json(json!({
         "results": results,
         "count": results.len(),
+    }))
+}
+
+/// Worker earnings and status.
+///
+/// GET /worker/earnings
+///
+/// Returns the node's inference activity and earnings since boot.
+/// Earnings use a testnet rate of 100 ARC per inference. Production will use
+/// a block-reward-funded inference pool with halvings matching the token supply
+/// schedule — ensuring inference rewards never exceed the planned emission curve.
+async fn worker_earnings(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let count = node.inference_count.load(std::sync::atomic::Ordering::Relaxed);
+    let earned = node.inference_earned.load(std::sync::atomic::Ordering::Relaxed);
+    let uptime = node.boot_time.elapsed();
+    let peers = node.peer_count.load(std::sync::atomic::Ordering::Relaxed);
+    let has_model = node.candle_engine.is_some() || node.inference_model.is_some();
+
+    Json(json!({
+        "address": format!("0x{}", node.validator_address.to_hex()),
+        "mode": node.node_mode,
+        "total_inferences": count,
+        "earnings": {
+            "confirmed_arc": earned,
+            "pending_arc": 0,
+            "total_arc": earned,
+            "rate": "100 ARC/inference (testnet)",
+        },
+        "tokenomics": {
+            "reward_source": "block_reward_inference_pool",
+            "halving_schedule": "follows_token_emission_curve",
+            "slashing": "bond_lost_if_challenge_succeeds",
+            "bond_per_inference": 500,
+        },
+        "uptime_hours": uptime.as_secs_f64() / 3600.0,
+        "connected_peers": peers,
+        "model_loaded": has_model,
+        "status": if has_model && peers > 0 { "active" } else if peers > 0 { "connected_no_model" } else { "disconnected" },
     }))
 }
