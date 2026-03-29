@@ -76,7 +76,7 @@
 )[
   #text(weight: "bold", size: 9.5pt)[Abstract.]
   #text(size: 9.5pt)[
-  We prove that determinism is both necessary and sufficient for trustworthy artificial intelligence. We formalize this as the _Determinism Thesis_: an AI system can be verified, reproduced, audited, and certified across hardware platforms if and only if its inference function is platform-deterministic. We introduce _trust entropy_ (Rényi collision entropy over execution outputs) and prove that verification failure probability is exactly $1 - 2^(-H_T)$, establishing a precise quantitative link between non-determinism and trust. We prove a _Determinism-Verification Collapse_: verification of deterministic computation requires only $O(1)$ hash comparison, while verification of non-deterministic computation requires solving an intractable membership problem over combinatorially many valid outputs. We show that IEEE 754 floating-point arithmetic fundamentally violates the determinism requirement, and that this violation propagates exponentially through residual transformer layers. We resolve the barrier by constructing the _ARC engine_, a pure integer arithmetic inference engine that achieves bitwise identical output across ARM and x86 architectures. In 82 cross-architecture tests on Llama-2-7B (6.7B parameters) and TinyLlama-1.1B spanning 8 to 1,024 generated tokens, we observe zero hash mismatches. We demonstrate multi-node deterministic inference through DAG consensus, where four geographically distributed nodes independently execute Llama-2-7B-Chat and produce identical outputs, verified by 356 on-chain attestation transactions. We prove that every major trust property of AI systems---fairness, robustness, privacy, safety, and alignment---presupposes platform determinism. Our system---99,000 lines of Rust deployed on a live testnet across three continents---establishes that the problem of AI trust is not a question of alignment or interpretability alone, but of arithmetic.
+  We prove that determinism is both necessary and sufficient for trustworthy artificial intelligence. We formalize this as the _Determinism Thesis_: an AI system can be verified, reproduced, audited, and certified across hardware platforms if and only if its inference function is platform-deterministic. We introduce _trust entropy_ (Rényi collision entropy over execution outputs) and prove that verification failure probability is exactly $1 - 2^(-H_T)$, establishing a precise quantitative link between non-determinism and trust. We prove a _Determinism-Verification Collapse_: verification of deterministic computation requires only $O(1)$ hash comparison, while verification of non-deterministic computation requires solving an intractable membership problem over combinatorially many valid outputs. We show that IEEE 754 floating-point arithmetic fundamentally violates the determinism requirement, and that this violation propagates exponentially through residual transformer layers. We resolve the barrier by constructing the _ARC engine_, a pure integer arithmetic inference engine that achieves bitwise identical output across ARM and x86 architectures. In 82 cross-architecture tests on Llama-2-7B (6.7B parameters) and TinyLlama-1.1B spanning 8 to 1,024 generated tokens, we observe zero hash mismatches. We demonstrate multi-node deterministic inference through DAG consensus, where four geographically distributed nodes independently execute Llama-2-7B-Chat and produce identical outputs, verified by 356 on-chain attestation transactions. We prove that every major trust property of AI systems (fairness, robustness, privacy, safety, and alignment) presupposes platform determinism. Our system, comprising 99,000 lines of Rust deployed on a live testnet across three continents, establishes that the problem of AI trust is not a question of alignment or interpretability alone, but of arithmetic.
   ]
 ]
 #v(0.3em)
@@ -94,19 +94,19 @@
 
 Every major proposal for trustworthy artificial intelligence rests on an unstated assumption: that a given model, presented with a given input, produces a given output. On modern hardware, this assumption is false.
 
-Neural network inference is non-deterministic on commodity processors @nondeterminism. The same transformer @vaswani2017, executed with the same weights on the same input, produces different outputs on different hardware---and in some configurations, different outputs on the _same_ hardware across runs. The cause is not the neural network but the arithmetic: IEEE 754 floating-point addition is non-associative @floating_point @ieee754, and different processors parallelize accumulation differently. When a matrix multiplication is distributed across 128-bit NEON lanes on ARM versus 256-bit AVX2 lanes on x86, the partial-sum reduction trees differ, producing different rounding in the least significant bits. Over the millions of multiply-accumulate operations in a single forward pass through dozens of transformer layers, these bit-level differences compound through nonlinear activations and softmax normalization, producing outputs that diverge not by a rounding error but by entirely different token sequences.
+Neural network inference is non-deterministic on commodity processors @nondeterminism. The same transformer @vaswani2017, executed with the same weights on the same input, produces different outputs on different hardware, and in some configurations, different outputs on the _same_ hardware across runs. The cause is not the neural network but the arithmetic: IEEE 754 floating-point addition is non-associative @floating_point @ieee754, and different processors parallelize accumulation differently. When a matrix multiplication is distributed across 128-bit NEON lanes on ARM versus 256-bit AVX2 lanes on x86, the partial-sum reduction trees differ, producing different rounding in the least significant bits. Over the millions of multiply-accumulate operations in a single forward pass through dozens of transformer layers, these bit-level differences compound through nonlinear activations and softmax normalization, producing outputs that diverge not by a rounding error but by entirely different token sequences.
 
-This non-determinism has been treated as a minor nuisance---an artifact of hardware that is irrelevant in practice. We argue it is the single largest unaddressed obstacle to trustworthy AI, because it silently invalidates four capabilities that every trust framework requires:
+This non-determinism has been treated as a minor nuisance, an artifact of hardware irrelevant in practice. We argue it is the single largest unaddressed obstacle to trustworthy AI, because it silently invalidates four capabilities that every trust framework requires:
 
 *Verification.* If an AI system claims to have produced output $y$ from input $x$ using model $m$, any independent party should be able to confirm this. When inference is non-deterministic, re-execution produces $y' eq.not y$, and the verifier cannot distinguish a dishonest claim from a hardware-induced divergence. Verification becomes impossible.
 
 *Reproducibility.* The machine learning reproducibility crisis is well-documented @reproducibility. Benchmark evaluations, published results, and safety tests are only meaningful if they can be independently reproduced. Non-deterministic inference makes every published result contingent on the unreported details of the hardware on which it was run.
 
-*Auditability.* When regulators audit an AI system's decision @eu_ai_act #sym.dash.em a loan denial, a medical diagnosis, a parole recommendation #sym.dash.em they require the ability to reconstruct the computation that produced the decision. Non-deterministic inference means the computation cannot be reconstructed: the auditor's hardware will produce a different trace.
+*Auditability.* When regulators audit an AI system's decision @eu_ai_act, such as a loan denial, a medical diagnosis, or a parole recommendation, they require the ability to reconstruct the computation that produced the decision. Non-deterministic inference means the computation cannot be reconstructed: the auditor's hardware will produce a different trace.
 
-*Certification.* Safety-critical deployment---autonomous vehicles, surgical robots, power grid controllers---requires certification that a model's behavior has been tested and approved. When inference is non-deterministic, certification on one hardware platform does not transfer to another. A certified ARM deployment provides no guarantee about the same model on x86.
+*Certification.* Safety-critical deployment (autonomous vehicles, surgical robots, power grid controllers) requires certification that a model's behavior has been tested and approved. When inference is non-deterministic, certification on one hardware platform does not transfer to another. A certified ARM deployment provides no guarantee about the same model on x86.
 
-We propose and prove the *Determinism Thesis*: _an AI system can be verified, reproduced, audited, and certified across hardware platforms if and only if its inference function is deterministic._ Determinism is not merely helpful for trustworthy AI. It is both necessary and sufficient.
+We propose and prove the *Determinism Thesis*: _an AI system can be verified, reproduced, audited, and certified across hardware platforms if and only if its inference function is deterministic._ We prove both directions: determinism is necessary _and_ sufficient.
 
 This paper makes five contributions:
 
@@ -120,14 +120,14 @@ This paper makes five contributions:
 
 + We provide Circle STARK proofs @bensasson2018 @stwo of inference layer computations with 152-byte on-chain commitment receipts, enabling any party to independently verify correctness through deterministic re-proving (Sections 8, 9).
 
-The resulting system---99,000 lines of Rust with 1,231 tests, deployed on a live testnet across three continents---demonstrates that the gap between AI inference and cryptographic verifiability can be closed. The fundamental insight is simple: _integer arithmetic is associative on all hardware, and associativity is all that determinism requires._
+The resulting system, 99,000 lines of Rust with 1,231 tests deployed on a live testnet across three continents, demonstrates that the gap between AI inference and cryptographic verifiability can be closed. _Integer arithmetic is associative on all hardware, and at the arithmetic level, associativity is all that determinism requires._
 
 
 // ============================================================================
 = The Determinism Thesis
 // ============================================================================
 
-We formalize the relationship between determinism and trust in AI systems. The definitions and theorems in this section provide the theoretical foundation for the rest of the paper.
+We formalize the relationship between determinism and trust in AI systems.
 
 == Definitions
 
@@ -145,7 +145,7 @@ We formalize the relationship between determinism and trust in AI systems. The d
   An AI system $S$ with inference function $f$ is _trustworthy_ if it satisfies four properties:
   - *(V) Verifiability:* For any claimed computation $(m, x, y)$, any independent party can efficiently determine whether $y = f(m, x)$.
   - *(R) Reproducibility:* Executing $f(m, x)$ yields the same output $y$ regardless of when, where, or on what hardware it is executed.
-  - *(A) Auditability:* The complete computational trace of $f(m, x)$---every intermediate activation, every attention score---can be independently reconstructed from $(m, x)$ alone.
+  - *(A) Auditability:* The complete computational trace of $f(m, x)$, including every intermediate activation and every attention score, can be independently reconstructed from $(m, x)$ alone.
   - *(C) Certifiability:* Verification of $f$'s input-output behavior on any single platform constitutes verification for _all_ platforms.
 ]
 
@@ -180,7 +180,7 @@ We formalize the relationship between determinism and trust in AI systems. The d
 
   *Attestation.* The prover computes $y = f(m, x)$ and publishes the attestation $alpha = (H(m), H(x), H(y))$.
 
-  *Verification by re-execution.* Any verifier loads $m$ (verified by checking $H(m)$), executes $f(m, x)$ on any available hardware, and checks $H(f(m,x)) = H(y)$. Since $f$ is platform-deterministic, $f(m,x)$ yields the same $y$ on all platforms, so the check succeeds for honest attestations. By collision resistance of $H$, the check fails with overwhelming probability ($1 - 2^(-256)$ for BLAKE3) for dishonest attestations where $y eq.not f(m,x)$.
+  *Verification by re-execution.* Any verifier loads $m$ (verified by checking $H(m)$), executes $f(m, x)$ on any available hardware, and checks $H(f(m,x)) = H(y)$. Since $f$ is platform-deterministic, $f(m,x)$ yields the same $y$ on all platforms, so the check succeeds for honest attestations. By second-preimage resistance of $H$ (implied by collision resistance), the check fails with overwhelming probability ($1 - 2^(-256)$ for BLAKE3) for dishonest attestations where $y eq.not f(m,x)$.
 
   *Efficient verification.* For verifiers unable to re-execute $f$, the prover generates a succinct proof $pi$ (e.g., a STARK @bensasson2018) of the statement $y = f(m, x)$. Verification of $pi$ requires time sublinear in the computation size and does not require access to $m$.
 
@@ -193,11 +193,11 @@ We formalize the relationship between determinism and trust in AI systems. The d
   For any collision-resistant hash $H$: either $f$ is platform-deterministic and $H(f_(h_1)(m,x)) = H(f_(h_2)(m,x))$ for all valid $(m, x, h_1, h_2)$, or there exist inputs for which $H(f_(h_1)(m,x)) eq.not H(f_(h_2)(m,x))$. No intermediate state exists.
 ]
 
-This corollary has a consequence that is easy to state but difficult to overstate: _approximate determinism provides exactly zero verification guarantee._ An inference function that produces outputs agreeing in 99.999% of bits but disagreeing in one is exactly as unverifiable as one disagreeing in every bit---the hash check fails identically. Approaches that _reduce_ floating-point divergence without _eliminating_ it---constraining SIMD width, pinning thread counts, using Kahan summation---cannot achieve verifiable inference. For the purpose of cryptographic trust, determinism is all-or-nothing.
+A direct consequence: _approximate determinism provides exactly zero verification guarantee._ An inference function that produces outputs agreeing in 99.999% of bits but disagreeing in one is exactly as unverifiable as one disagreeing in every bit; the hash check fails identically. Approaches that _reduce_ floating-point divergence without _eliminating_ it (constraining SIMD width, pinning thread counts, using Kahan summation) cannot achieve verifiable inference. For the purpose of cryptographic trust, determinism is all-or-nothing.
 
 == The Trust Dependency Hierarchy
 
-The Determinism Thesis has consequences beyond inference engineering. Every major trust property studied in the AI safety and governance literature presupposes platform-deterministic inference---often without stating this assumption.
+The Determinism Thesis has consequences beyond inference engineering. Every major trust property studied in the AI safety and governance literature presupposes platform-deterministic inference, often without stating this assumption.
 
 #theorem("Trust Dependency Hierarchy")[
   The following trust properties of AI systems each presuppose platform-deterministic inference:
@@ -211,18 +211,18 @@ The Determinism Thesis has consequences beyond inference engineering. Every majo
   Therefore, platform-deterministic inference is a necessary condition for all independently verifiable trust properties of AI systems.
 ]
 
-*(i) Fairness.* Auditing a model for bias requires reproducing the computation that produced a decision (R) and reconstructing the computational trace to identify which features influenced the output (A). Without determinism, the auditor's re-execution produces different intermediate values, making attribution of bias impossible.
+*(i) Fairness.* Individual-decision auditing (e.g., explaining why a specific loan application was denied) requires reproducing the computation that produced that decision (R) and reconstructing the computational trace to identify which features influenced the output (A). Without determinism, the auditor's re-execution produces different intermediate values, making causal attribution impossible. (Statistical fairness audits over populations do not require per-decision reproducibility; the dependency applies to decision-level accountability.)
 
 *(ii) Robustness.* Certifying robustness to adversarial inputs requires testing on one platform and transferring certification to all platforms (C). Without determinism, a model certified as robust on $h_1$ may behave differently on $h_2$.
 
-*(iii) Privacy.* Verifying that differential privacy guarantees were correctly applied requires verifying the computation (V). Without determinism, re-execution produces different results, and the verifier cannot distinguish "privacy was applied" from "hardware differences mask the difference."
+*(iii) Privacy.* Verifying that a specific execution correctly applied differential privacy mechanisms requires verifying the computation (V). Without determinism, re-execution produces different results, and the verifier cannot distinguish "privacy noise was correctly injected" from "hardware-induced divergence altered the output." (Verification of the DP mechanism design itself does not require determinism; verification of its faithful execution does.)
 
 *(iv) Safety.* Safety testing for autonomous vehicles, medical AI, and avionics requires reproducibility (R) and certifiability (C). Without determinism, a fleet of heterogeneous robots requires per-unit certification @eu_ai_act, scaling cost with deployment size rather than model complexity.
 
-*(v) Alignment.* Verifying that an AI system's behavior matches its stated objectives requires verifying what computation it performed (V) and reproducing it independently (R). Without determinism, no external verifier can distinguish intentional misalignment from hardware-induced divergence.
+*(v) Alignment.* Externally verifying that a specific AI decision was computed faithfully, rather than that a different computation was substituted, requires verifying the computation (V) and reproducing it independently (R). Without determinism, no external verifier can distinguish intentional misalignment from hardware-induced divergence.
 
 #corollary("Determinism as Foundation")[
-  Determinism is not one desirable property among many. It is the computational foundation without which no other trust property is independently verifiable. Every proposal for trustworthy AI that does not address platform determinism implicitly assumes it.
+  Determinism is the computational foundation without which no other trust property is independently verifiable. Every proposal for trustworthy AI that does not address platform determinism implicitly assumes it.
 ]
 
 == Historical Context
@@ -250,7 +250,7 @@ in general, because each addition rounds to the nearest representable value, and
   ]
 ]
 
-Each tree produces different intermediate rounding, yielding different least-significant bits. For a single dot product, the difference is in the ULP (unit in the last place). But a transformer forward pass chains millions of these operations through nonlinear functions---softmax, SiLU, RMSNorm---that amplify small differences. After 32 transformer layers, the accumulated divergence determines different argmax token selections.
+Each tree produces different intermediate rounding, yielding different least-significant bits. For a single dot product, the difference is in the ULP (unit in the last place). But a transformer forward pass chains millions of these operations through nonlinear functions (softmax, SiLU, RMSNorm) that amplify small differences. After 32 transformer layers, the accumulated divergence determines different argmax token selections.
 
 == Impossibility
 
@@ -259,7 +259,7 @@ Each tree produces different intermediate rounding, yielding different least-sig
 ]
 
 #proof-block[
-  Construct a concrete counterexample. Let $bold(v) = (1.0, 2^(-24), 2^(-24), 2^(-24))$ in FP32. The sum depends on accumulation order: left-to-right accumulation yields $1.0 + 2^(-24) = 1.0$ (rounded, since $2^(-24)$ equals exactly half the ULP of $1.0$ in FP32 where ULP $= 2^(-23)$, and round-to-nearest-even rounds down), so $sum = 1.0$. Pairwise accumulation yields $(1.0 + 2^(-24)) + (2^(-24) + 2^(-24)) = 1.0 + 2^(-23) = 1.0000001192...$, since the pair $2^(-24) + 2^(-24) = 2^(-23)$ is exact, and $1.0 + 2^(-23)$ rounds to the next representable FP32 value above $1.0$. Since SIMD width determines accumulation order and SIMD width differs across platforms ($cal(H)$ includes both NEON and AVX2 processors), there exist $h_1, h_2$ producing different values from the same input. A single such divergence in any dot product of any layer suffices: after propagation through subsequent nonlinear layers, the output tokens diverge.
+  Construct a concrete counterexample. Let $bold(v) = (1.0, 2^(-24), 2^(-24), 2^(-24))$ in FP32. The sum depends on accumulation order: left-to-right accumulation yields $1.0 + 2^(-24) = 1.0$ (rounded, since $2^(-24)$ equals exactly half the ULP of $1.0$ in FP32 where ULP $= 2^(-23)$, and round-to-nearest-even rounds down), so $sum = 1.0$. Pairwise accumulation yields $(1.0 + 2^(-24)) + (2^(-24) + 2^(-24)) = 1.0 + 2^(-23) = 1.0000001192...$, since the pair $2^(-24) + 2^(-24) = 2^(-23)$ is exact, and $1.0 + 2^(-23)$ rounds to the next representable FP32 value above $1.0$. Since SIMD width determines accumulation order and SIMD width differs across platforms ($cal(H)$ includes both NEON and AVX2 processors), there exist $h_1, h_2$ producing different values from the same input. This exhibits a concrete computation (a single dot product) that produces different results on different platforms, establishing that the inference function is not platform-deterministic. In full transformer models, such per-layer divergences compound through nonlinear activations with the exponential amplification formalized in Section 4.
 ]
 
 == Experimental Confirmation
@@ -296,7 +296,7 @@ Trust entropy is zero when all platforms produce the same output (one equivalenc
   Independently of $H_T$, if the hash function is $lambda$-collision-resistant, a dishonest prover is rejected with probability $>= 1 - 2^(-lambda)$. Soundness derives from cryptographic hardness; completeness derives from determinism. These are independent properties.
 ]
 
-This separation is fundamental. _Soundness_ (detecting dishonest provers) is a cryptographic property that holds regardless of whether inference is deterministic. _Completeness_ (never rejecting honest provers) is a computational property that holds if and only if $H_T = 0$. No amount of cryptographic engineering can compensate for non-zero trust entropy: if honest parties can produce different outputs, verification has a false-rejection rate that is inherent to the arithmetic, not the protocol.
+Soundness and completeness derive from independent sources. _Soundness_ (detecting dishonest provers) is a cryptographic property that holds regardless of whether inference is deterministic. _Completeness_ (never rejecting honest provers) is a computational property that holds if and only if $H_T = 0$. No amount of cryptographic engineering can compensate for non-zero trust entropy: if honest parties can produce different outputs, verification has a false-rejection rate that is inherent to the arithmetic, not the protocol.
 
 // ============================================================================
 = Compositional Determinism Decay
@@ -319,7 +319,7 @@ We now characterize _how_ floating-point non-determinism accumulates through dee
 *Concrete instantiation.* For a 32-layer transformer with typical sub-layer Lipschitz $lambda approx 0.3$ and per-layer FP32 divergence $epsilon approx 10^(-5)$ (from $O(sqrt(4096)) dot 2^(-23)$ scaled by signal magnitude):
 $ Delta approx 10^(-5) dot ((1.3)^(32) - 1) / 0.3 approx 0.15 $
 
-This upper bound of $tilde 15%$ relative divergence per forward pass is conservative (the actual Lipschitz constants of well-regularized sub-layers are often smaller); the qualitative conclusion is what matters. Even modest per-layer floating-point divergence accumulates exponentially through depth, eventually flipping a token selection and cascading into complete output divergence---consistent with empirical observations of floating-point divergence at 50--200 tokens in our multi-node experiments. For integer arithmetic ($epsilon = 0$): $Delta = 0$ regardless of depth, precisely as observed in our 512-token 7B cross-platform tests.
+This upper bound of $tilde 15%$ relative divergence per forward pass is illustrative (the actual Lipschitz constants vary by layer type; feed-forward sub-layers are typically below 0.3, while attention layers with sharp softmax distributions can exceed 1.0); the qualitative conclusion is what matters. Even modest per-layer floating-point divergence accumulates exponentially through depth, eventually flipping a token selection and cascading into complete output divergence, consistent with empirical observations of floating-point divergence at 50--200 tokens in our multi-node experiments. For integer arithmetic ($epsilon = 0$): $Delta = 0$ regardless of depth, precisely as observed in our 512-token 7B cross-platform tests.
 
 // ============================================================================
 = The Determinism-Verification Collapse
@@ -340,11 +340,11 @@ We now state our central theoretical result: a general theorem characterizing th
 #theorem("Determinism-Verification Collapse")[
   Let $f$ be a computation expressible as a composition of elementary arithmetic operations. Let $H$ be a collision-resistant hash with security parameter $lambda$.
 
-  *(i)* If $|E(f,m,x)| = 1$ for all $(m, x)$ (platform-deterministic): there exists a verification scheme with proof size $|pi| = O(1)$ (a single hash $pi = H(y)$) and verification cost equal to one re-execution of $f$ plus $O(1)$ hash comparison. The verification is sound ($P("accept dishonest") <= 2^(-lambda)$) and complete ($P("reject honest") = 0$). Crucially, the verifier needs no knowledge of the prover's platform, execution environment, or reduction order---re-execution on _any_ hardware suffices.
+  *(i)* If $|E(f,m,x)| = 1$ for all $(m, x)$ (platform-deterministic): there exists a verification scheme with proof size $|pi| = O(1)$ (a single hash $pi = H(y)$) and verification cost equal to one re-execution of $f$ plus $O(1)$ hash comparison. The verification is sound ($P("accept dishonest") <= 2^(-lambda)$) and complete ($P("reject honest") = 0$). The verifier needs no knowledge of the prover's platform, execution environment, or reduction order; re-execution on _any_ hardware suffices.
 
-  *(ii)* If $|E(f,m,x)| > 1$ for some $(m, x)$: any verification scheme that accepts all valid outputs must solve the _membership problem_ $y in.small E(f,m,x)$, which requires knowledge of the prover's execution semantics (SIMD width, reduction order, thread schedule).
+  *(ii)* If $|E(f,m,x)| > 1$ for some $(m, x)$: any verification scheme that accepts all valid outputs must solve the _membership problem_ $y in.small E(f,m,x)$. In the absence of exploitable algebraic structure in the set $E$, this requires knowledge of the prover's execution semantics (SIMD width, reduction order, thread schedule).
 
-  *(iii)* For transformer inference with embedding dimension $d$ and $L$ layers under IEEE 754 with platform-dependent operation ordering, $|E(f,m,x)|$ grows combinatorially in $d$ and $L$. No compact characterization of $E(f,m,x)$ exists independent of the execution schedule.
+  *(iii)* For transformer inference with embedding dimension $d$ and $L$ layers under IEEE 754 with platform-dependent operation ordering, $|E(f,m,x)|$ is bounded above by a quantity that grows combinatorially in $d$ and $L$. No compact characterization of $E(f,m,x)$ exists independent of the execution schedule.
 ]
 
 #proof-block[
@@ -352,10 +352,10 @@ We now state our central theoretical result: a general theorem characterizing th
 
   *(ii)* When $|E(f,m,x)| > 1$, the verifier must determine whether the claimed $y$ is _some_ valid execution. The set $E(f,m,x)$ depends on which reduction orders, SIMD widths, and thread schedules are valid. Without specifying the prover's platform, the verifier cannot distinguish $y in E$ from $y in.not E$ except by exhaustive enumeration or simulation of the prover's execution environment.
 
-  *(iii)* Each dot product of dimension $d$ admits $C(d-1)$ distinct binary reduction trees, where $C(n)$ is the $n$-th Catalan number ($C(n) tilde 4^n \/ (n^(3\/2) sqrt(pi))$, growing exponentially). A single transformer layer performs $O(d)$ dot products. Over $L$ layers, the number of distinct valid outputs grows super-exponentially in $d$ and $L$.
+  *(iii)* Each dot product of dimension $d$ admits $C(d-1)$ distinct binary reduction trees, where $C(n)$ is the $n$-th Catalan number ($C(n) tilde 4^n \/ (n^(3\/2) sqrt(pi))$, growing exponentially). A single transformer layer performs $O(d)$ dot products. Over $L$ layers, the number of distinct valid outputs is bounded above by a quantity that grows super-exponentially in $d$ and $L$. (The bound may not be tight: many distinct trees can produce the same floating-point result.)
 ]
 
-The theorem reveals that _verification is a property of arithmetic, not of algorithms._ A computation is efficiently verifiable if and only if its arithmetic substrate produces canonical results---that is, if and only if the substrate forms a ring where addition and multiplication are associative. IEEE 754 floating-point does not form such a ring. The integers do.
+The theorem reveals that _verification is a property of arithmetic, not of algorithms._ A computation is efficiently verifiable if and only if its arithmetic substrate produces canonical results: if and only if the substrate forms a ring where addition and multiplication are associative. IEEE 754 floating-point does not form such a ring; the integers do.
 
 // ============================================================================
 = Constructing Deterministic Inference
@@ -370,20 +370,20 @@ The preceding theorems establish that platform-deterministic inference is necess
 ]
 
 #proof-block[
-  Two's complement integer addition and multiplication are defined by the ring $ZZ \/ 2^n ZZ$ for $n$-bit integers. The ring axioms (commutativity, associativity, distributivity) hold exactly---there is no rounding, no representation error, no hardware-dependent approximation. Given a fixed program (fixed sequence of integer operations with fixed data dependencies), the output is fully determined by the input bits. Since the ring operations produce identical results on all conforming hardware (ARM, x86, RISC-V, or any two's complement implementation), the inference function is platform-deterministic.
+  Two's complement integer addition and multiplication are defined by the ring $ZZ \/ 2^n ZZ$ for $n$-bit integers. The ring axioms (commutativity, associativity, distributivity) hold exactly: there is no rounding, no representation error, no hardware-dependent approximation. Given a fixed program (fixed sequence of integer operations with fixed data dependencies), the output is fully determined by the input bits. Since the ring operations produce identical results on all conforming hardware (ARM, x86, RISC-V, or any two's complement implementation), the inference function is platform-deterministic.
 ]
 
 This theorem reduces the engineering problem to: _implement every operation in a transformer forward pass using only integer arithmetic._ We now show this is achievable.
 
 == Architecture
 
-Our engine loads any model distributed in the GGUF format (the standard interchange format used by llama.cpp @llama_cpp and the broader open-weight ecosystem). Model dimensions---layer count, embedding width, head count, feed-forward width, vocabulary size---are read from GGUF metadata at load time. There are no hard-coded limits on model size: 1B, 7B, 13B, 70B, or any future architecture that fits in the GGUF specification can be loaded and executed deterministically, subject only to available memory.
+Our engine loads any model distributed in the GGUF format (the standard interchange format used by llama.cpp @llama_cpp and the broader open-weight ecosystem). Model dimensions (layer count, embedding width, head count, feed-forward width, vocabulary size) are read from GGUF metadata at load time. There are no hard-coded limits on model size: 1B, 7B, 13B, 70B, or any future architecture that fits in the GGUF specification can be loaded and executed deterministically, subject only to available memory.
 
 Weights are stored as INT8 (1 byte per parameter) with per-row scale factors in Q16 fixed-point representation (16 fractional bits, $"ONE" = 2^(16) = 65536$). The forward pass for a dense layer computes:
 
 $ "output"[i] = (sum_j w_("i8")[i,j] dot x_("q16")[j]) dot s[i] >> 16 $
 
-where $w_("i8") in [-127, 127]$ is the quantized weight, $x_("q16")$ is the activation in Q16, $s[i]$ is the per-row scale factor, and $>> 16$ denotes arithmetic right shift. The inner product accumulates in 64-bit integers, providing 48 bits of headroom above Q16 precision---sufficient for dot products of dimension 8192 without overflow.
+where $w_("i8") in [-127, 127]$ is the quantized weight, $x_("q16")$ is the activation in Q16, $s[i]$ is the per-row scale factor, and $>> 16$ denotes arithmetic right shift. The inner product accumulates in 64-bit integers, providing sufficient range for dot products of dimension 8192 without overflow (worst-case accumulator magnitude for $d = 8192$ is approximately $2^(36)$, well within the $2^(63)$ signed limit).
 
 The scale factor is computed during quantization as $s = max(|bold(w)_"row"|) \/ 127$, stored in Q16. This per-row scheme @jacob2018 preserves the relative magnitudes within each row while fitting all weights in a single byte.
 
@@ -401,7 +401,7 @@ Rotary Position Embedding encodes position through rotation:
 
 $ x'_i = x_i dot cos(theta_("pos")) - x_(i+d\/2) dot sin(theta_("pos")) $
 
-We precompute cosine and sine tables at model load time (the _only_ floating-point operation in the entire system) and store them as Q16 fixed-point integers. Since the tables are computed once and stored identically on all platforms, subsequent lookups and multiplications are pure integer operations. The tables cover all positions up to the model's maximum context length.
+We precompute cosine and sine tables at model load time and store them as Q16 fixed-point integers; subsequent lookups and multiplications are pure integer operations. This is the only use of floating-point in the system. IEEE 754 does not mandate correctly-rounded transcendental functions, but any implementation-dependent differences in FP64 cos/sin (bounded by 1 ULP $approx 2^(-52)$) vanish under Q16 rounding (resolution $2^(-16)$), yielding identical integer tables across all tested platforms. For deployments requiring formal guarantees beyond this empirical margin, the tables can be distributed as a binary artifact alongside the model weights, eliminating the floating-point dependency entirely. The tables cover all positions up to the model's maximum context length.
 
 == Integer SiLU
 
@@ -421,14 +421,14 @@ Attention heads are computed in parallel via Rayon (Rust's data-parallelism libr
 
 == The Determinism--Precision Tradeoff
 
-INT8 weight quantization introduces quantization noise relative to the original FP16 or FP32 weights. This noise is most consequential in attention score computation, where small differences in query-key dot products can shift the argmax of the softmax distribution. The tradeoff is not inherent to the deterministic approach but to the chosen bit-width: INT16 weights (2 bytes per parameter) would provide $256 times$ more precision while maintaining determinism, at the cost of doubled memory. Mixed-precision approaches---INT8 for feed-forward layers (where individual weight precision matters less) and INT16 for attention (where it matters most)---represent a clear path to closing the quality gap while preserving the determinism guarantee.
+INT8 weight quantization introduces quantization noise relative to the original FP16 or FP32 weights. This noise is most consequential in attention score computation, where small differences in query-key dot products can shift the argmax of the softmax distribution. The tradeoff is not inherent to the deterministic approach but to the chosen bit-width: INT16 weights (2 bytes per parameter) would provide $256 times$ more precision while maintaining determinism, at the cost of doubled memory. Mixed-precision approaches, such as INT8 for feed-forward layers (where individual weight precision matters less) and INT16 for attention (where it matters most), represent a clear path to closing the quality gap while preserving the determinism guarantee.
 
 
 // ============================================================================
 = From Determinism to Verifiability
 // ============================================================================
 
-The Determinism-Verification Collapse (Theorem 16) proves that deterministic inference is verifiable via $O(1)$ hash comparison after re-execution. This section constructs the complete _trust stack_---from deterministic arithmetic through on-chain attestation and consensus---showing how determinism enables a fully trustless verification pipeline where re-execution is the proof.
+The Determinism-Verification Collapse (Theorem 16) proves that deterministic inference is verifiable via $O(1)$ hash comparison after re-execution. This section constructs the complete _trust stack_, from deterministic arithmetic through on-chain attestation and consensus, showing how determinism enables a fully trustless verification pipeline where re-execution is the proof.
 
 == The Trust Stack
 
@@ -453,7 +453,7 @@ Our verification architecture consists of five layers, each enabled by the one b
       ]
     ]
   ),
-  caption: [The trust stack. Each layer is a logical consequence of the layer below it. The foundation---integer arithmetic---is the only engineering requirement; everything above follows from the mathematics.],
+  caption: [The trust stack. Each layer is a logical consequence of the layer below it. The foundation (integer arithmetic) is the only engineering requirement; everything above follows from the mathematics.],
 ) <fig:truststack>
 
 == Cryptographic Attestation
@@ -469,7 +469,7 @@ By Theorem 17 (Integer Sufficiency), honest nodes always produce the same $H(y)$
 
 == Multi-Node Consensus
 
-Attestation transactions are finalized through DAG consensus @dag_consensus, where multiple validators propose blocks concurrently, forming a directed acyclic graph committed via a two-round rule. Since our inference engine is deterministic, honest nodes independently compute the same output from the same input. Consensus on the output hash is reached without requiring every validator to re-execute the inference---a single honest re-executor suffices to verify or dispute any attestation.
+Attestation transactions are finalized through DAG consensus @dag_consensus, where multiple validators propose blocks concurrently, forming a directed acyclic graph committed via a two-round rule. Since our inference engine is deterministic, honest nodes independently compute the same output from the same input. Consensus on the output hash is reached without requiring every validator to re-execute the inference; a single honest re-executor suffices to verify or dispute any attestation.
 
 This design separates _consensus on the output_ (achieved through DAG block finality) from _correctness of the output_ (guaranteed by determinism and enforceable through dispute). The consensus layer need not understand or execute the inference; it need only finalize the attestation transactions.
 
@@ -514,7 +514,7 @@ The ARC engine produces _bitwise identical_ outputs across ARM and x86 for all 6
 
 We additionally confirm cross-platform determinism on TinyLlama-1.1B with 72 prompts (8--1,024 tokens, all matching) and x86-to-x86 determinism across independent Vultr data centers with 4 additional tests. Combined total: *82 cross-platform tests, zero mismatches, spanning two model sizes and three hardware configurations.*
 
-Theorem 17 predicts this result: since all operations are integer arithmetic with fixed evaluation order, _any_ mismatch would indicate a hardware or implementation bug rather than an inherent limitation. The 82/82 cross-architecture result is not a statistical sample but a validation of a mathematical guarantee.
+Theorem 17 predicts this result: since all operations are integer arithmetic with fixed evaluation order, _any_ mismatch would indicate a hardware or implementation bug rather than an inherent limitation. Since the guarantee is mathematical, the 82/82 result validates the implementation rather than sampling a distribution.
 
 == Multi-Node Inference Consensus
 
@@ -546,7 +546,7 @@ Representative outputs (identical across all 4 nodes):
 
 Each inference produces an on-chain `InferenceAttestation` transaction finalized through DAG consensus (200,000+ rounds during the evaluation period). A total of 356 attestation transactions were recorded on-chain.
 
-*Floating-point divergence as controlled experiment.* At 128+ tokens, the candle Q4 backend diverges across nodes due to floating-point accumulation differences between CPU microarchitectures. This is _predicted_ by Theorem 9: different x86 processors use different SIMD reduction orders, producing different rounding sequences. The ARC engine does not diverge at any length (@tab:crossplatform). This pair of results---float diverges, integer does not---constitutes a controlled experimental confirmation of the Determinism Thesis: the arithmetic substrate, not the model or architecture, determines whether trust is possible.
+*Floating-point divergence as controlled experiment.* At 128+ tokens, the candle Q4 backend diverges across nodes due to floating-point accumulation differences between CPU microarchitectures. This is _predicted_ by Theorem 9: different x86 processors use different SIMD reduction orders, producing different rounding sequences. The ARC engine does not diverge at any length (@tab:crossplatform). This pair of results (float diverges, integer does not) constitutes a controlled experimental confirmation of the Determinism Thesis: the arithmetic substrate, not the model or architecture, determines whether trust is possible.
 
 == STARK Proofs of Dense Layer Computation
 
@@ -568,7 +568,7 @@ We generate 60 proofs across layer dimensions representative of models from 1B t
 
 *Proof structure.* Each proof generates a full Circle STARK (FRI proximity proof, Merkle commitments, constraint evaluations) which is verified inline by the Stwo verifier @stwo. The on-chain attestation stores a 152-byte _commitment receipt_ containing: 24 bytes of header (version, trace log-size, security parameters), 96 bytes of Merkle commitment roots (3 $times$ 32-byte roots from the Stwo proof commitment scheme), and a 32-byte BLAKE3 binding hash tying the commitments to the block data.
 
-*Why 152 bytes suffices.* The full STARK proof need not be transferred or stored because _the inference is deterministic._ Any verifier who wishes to check the computation can independently load the same model, execute the same integer forward pass, construct the same trace, and run the same prover---producing an identical proof with identical commitments. The commitment receipt serves as a concise, tamper-evident fingerprint: it binds a specific computation to a specific block, and any party can regenerate the full proof to confirm the binding. This is a direct consequence of the Determinism Thesis: when the computation is reproducible, the proof is reproducible.
+*Why 152 bytes suffices.* The full STARK proof need not be transferred or stored because _the inference is deterministic._ Any verifier who wishes to check the computation can independently load the same model, execute the same integer forward pass, construct the same trace, and run the same prover, producing an identical proof with identical commitments. The commitment receipt serves as a concise, tamper-evident fingerprint: it binds a specific computation to a specific block, and any party can regenerate the full proof to confirm the binding. This is a direct consequence of the Determinism Thesis: when the computation is reproducible, the proof is reproducible.
 
 For layers exceeding the NTT (Number Theoretic Transform) trace size limit ($tilde 2^(24)$ rows), we split the computation into column shards. Each shard is proved independently, and the shard commitments are composed into a root hash. For Llama-2-7B FFN layers ($4096 times 11008$, 45M MACs), sharding into 1024-column chunks produces 11 shard proofs, each verified inline.
 
@@ -590,15 +590,15 @@ For layers exceeding the NTT (Number Theoretic Transform) trace size limit ($til
   caption: [Inference and consensus performance. The ARC engine is faster than optimized floating-point on identical hardware: 2.3$times$ faster on GPU, 1.26$times$ faster on CPU, while providing cross-platform determinism that the float backend lacks.],
 ) <tab:perf>
 
-The ARC engine with GPU-resident integer inference is *2.3$times$ faster* than the optimized floating-point backend on identical hardware: 76 ms/token versus 175 ms/token. Deterministic inference is not a performance sacrifice---it is a performance advantage. Integer arithmetic avoids the overhead of floating-point denormals, NaN propagation, and rounding-mode management, while exploiting the full throughput of GPU integer pipelines. On CPU-only hardware, the engine achieves 139 ms/token---20% faster than the 175 ms/token floating-point baseline---due to the efficiency of native integer operations and the elimination of FP32 dequantization overhead. Deterministic inference is faster on every backend tested.
+The ARC engine with GPU-resident integer inference is *2.3$times$ faster* than the optimized floating-point backend on identical hardware: 76 ms/token versus 175 ms/token. In practice, deterministic inference is faster. Integer arithmetic avoids the overhead of floating-point denormals, NaN propagation, and rounding-mode management, while exploiting the full throughput of GPU integer pipelines. On CPU-only hardware, the engine achieves 139 ms/token, 20% faster than the 175 ms/token floating-point baseline, due to the efficiency of native integer operations and the elimination of FP32 dequantization overhead. The integer engine is faster on every backend tested.
 
-The GPU engine executes the same integer arithmetic as the CPU engine---INT8 weights, Q16 activations, fixed evaluation order---through 8 cross-platform WGSL compute shaders dispatched in a single command buffer. Because GPU integer arithmetic obeys the same ring axioms as CPU integer arithmetic, the GPU produces bitwise identical output hashes to ARM NEON and x86 AVX2. The determinism guarantee is hardware-agnostic: CPU, GPU, and any future accelerator with two's complement integer support produce the same result.
+The GPU engine executes the same integer arithmetic as the CPU engine (INT8 weights, Q16 activations, fixed evaluation order) through 9 cross-platform WGSL compute shaders dispatched in a single command buffer. Because GPU integer arithmetic obeys the same ring axioms as CPU integer arithmetic, the GPU produces bitwise identical output hashes to ARM NEON and x86 AVX2. The determinism guarantee is hardware-agnostic: CPU, GPU, and any future accelerator with two's complement integer support produce the same result.
 
-*Hardware convergence.* The industry's pursuit of inference performance through integer quantization @gptq @awq @dettmers2022 is inadvertently building the hardware substrate for deterministic inference. Every INT8 accelerator deployed for efficiency is also an accelerator for trust. Native INT8 tensor cores (NVIDIA H100, Google TPU v4, Apple Neural Engine) perform integer matrix multiplication at throughputs exceeding their floating-point modes @dettmers2022 ---the path to single-digit millisecond deterministic inference is a kernel optimization problem, not a research problem.
+*Hardware convergence.* The industry's pursuit of inference performance through integer quantization @gptq @awq @dettmers2022 is inadvertently building the hardware substrate for deterministic inference. Every INT8 accelerator deployed for efficiency is also an accelerator for trust. Native INT8 tensor cores (NVIDIA H100, Google TPU v4, Apple Neural Engine) perform integer matrix multiplication at throughputs exceeding their floating-point modes @dettmers2022. Reaching single-digit millisecond deterministic inference requires only kernel-level optimization of these existing integer units.
 
 == Quality Evaluation
 
-A critical question is whether deterministic integer inference preserves the _capability_ of the original model---whether the engine produces correct, useful outputs for practical tasks.
+A critical question is whether deterministic integer inference preserves the _capability_ of the original model: whether the engine produces correct, useful outputs for practical tasks.
 
 *Generation quality.* As demonstrated in Section 9.2, the ARC engine produces coherent, factually correct outputs across math, factual Q&A, code generation, and natural language explanation (@tab:multinode). Four geographically distributed nodes running Llama-2-7B-Chat independently produce _identical_ responses. We reproduce verbatim outputs here (each confirmed identical across all 4 nodes on 3 continents):
 
@@ -614,7 +614,7 @@ A critical question is whether deterministic integer inference preserves the _ca
 
 These outputs are factually correct, grammatically fluent, and indistinguishable from floating-point inference. The critical property: every output is _bitwise identical_ across ARM and x86 hardware, across all nodes, across every run. Additional examples are provided in Appendix A.3.
 
-*Distribution calibration.* We separately measure perplexity (PPL) on WikiText-2, which quantifies the calibration of the full probability distribution---not whether the model selects the right token, but whether it assigns the right _probability_ to every token.
+*Distribution calibration.* We separately measure perplexity (PPL) on WikiText-2, which quantifies the calibration of the full probability distribution, not whether the model selects the right token, but whether it assigns the right _probability_ to every token.
 
 #figure(
   table(
@@ -625,23 +625,23 @@ These outputs are factually correct, grammatically fluent, and indistinguishable
     [Llama-2-7B-Chat], [ARC engine (INT8)], [144], [Yes (all platforms)],
     [Llama-2-7B (base)], [FP16 (published)], [5.47], [No],
   ),
-  caption: [Perplexity on WikiText-2 (512 tokens). INT8 per-row quantization degrades _distribution calibration_ relative to FP16, while preserving _output capability_ (correct generation via argmax). Published baseline from Touvron et al. @touvron2023.],
+  caption: [Perplexity on WikiText-2 (512 tokens). Note: the two rows compare different model variants (Chat vs. base) and different precisions (INT8 vs. FP16); the perplexity gap reflects both effects. Published baseline from Touvron et al. @touvron2023.],
 ) <tab:ppl>
 
-The distinction between _capability_ and _calibration_ is essential. Perplexity measures whether the model assigns exactly the right probability mass to every token in a 32,000-entry vocabulary. INT8 quantization adds noise to the logit distribution, spreading probability mass across the tail. This worsens perplexity but does not change the argmax---the most probable token remains correct. For every application targeted by this paper (verified generation, multi-agent consensus, certified outputs, trustless serving), output correctness is what matters. The model produces the right answer; determinism guarantees that every platform agrees on it.
+Two caveats apply to this comparison. First, the table compares a Chat-finetuned model (INT8) against a base model (FP16); chat models exhibit inherently higher perplexity on general corpora because instruction tuning shifts the output distribution away from next-word prediction of encyclopedia text. The quantization-attributable degradation is therefore smaller than the raw 144 vs. 5.47 ratio suggests. Second, perplexity measures calibration of the full probability distribution across a 32,000-entry vocabulary, not top-1 token accuracy. INT8 quantization adds noise to the logit distribution, spreading probability mass across the tail, which degrades perplexity without necessarily changing the argmax. For well-separated logit distributions (where the top token has a clear margin), INT8 noise does not flip the selection, as confirmed by the cross-platform experiments in Section 9.2. For distributions where multiple tokens have near-equal probability, INT8 noise can alter the selection; the mixed-precision schemes discussed below would reduce this sensitivity.
 
-The calibration gap is a property of the INT8 bit-width, not of deterministic inference. INT16 weights (2 bytes per parameter) would provide $256 times$ finer resolution in the logit space. Mixed-precision schemes---INT16 for attention projections and INT8 for feed-forward layers---would close the calibration gap while preserving the determinism guarantee. The current INT8 engine is a proof that determinism is achievable; higher precision is an engineering optimization within the same framework.
+The calibration gap is a property of the INT8 bit-width, not of deterministic inference. INT16 weights (2 bytes per parameter) would provide $256 times$ finer resolution in the logit space. Mixed-precision schemes (INT16 for attention projections, INT8 for feed-forward layers) would close the calibration gap while preserving the determinism guarantee. The current INT8 engine is a proof that determinism is achievable; higher precision is an engineering optimization within the same framework.
 
 
 // ============================================================================
 = Implications
 // ============================================================================
 
-*Multi-agent coordination.* When multiple AI agents must reach consensus---autonomous vehicles negotiating right-of-way, trading algorithms settling a contract---non-deterministic inference requires an external oracle. Deterministic inference eliminates the oracle: all agents compute the same output by mathematical necessity.
+*Multi-agent coordination.* When multiple AI agents must reach consensus, whether autonomous vehicles negotiating right-of-way or trading algorithms settling a contract, non-deterministic inference requires an external oracle. Deterministic inference eliminates the oracle: all agents compute the same output by mathematical necessity.
 
-*Trustless model serving.* Model-as-a-service providers ask users to trust that the advertised model produced the returned output. Deterministic inference enables trustless serving: the provider publishes $H(m)$, the user can verify any output by re-execution on any hardware. The operator's honesty becomes irrelevant---only the hash matters.
+*Trustless model serving.* Model-as-a-service providers ask users to trust that the advertised model produced the returned output. Deterministic inference enables trustless serving: the provider publishes $H(m)$, the user can verify any output by re-execution on any hardware. The operator's honesty becomes irrelevant; only the hash matters.
 
-*Reproducible science.* The reproducibility crisis @reproducibility in machine learning is not a crisis of methodology but of arithmetic. Every forward pass in our system produces a deterministic hash---a cryptographic commitment verifiable by any party on any hardware. Change the arithmetic, and the crisis dissolves.
+*Reproducible science.* The reproducibility crisis @reproducibility in machine learning is not a crisis of methodology but of arithmetic. Every forward pass in our system produces a deterministic hash, a cryptographic commitment verifiable by any party on any hardware. Deterministic arithmetic eliminates this problem at its source.
 
 
 // ============================================================================
@@ -664,7 +664,7 @@ The calibration gap is a property of the INT8 bit-width, not of deterministic in
     [ORA @ora], [Unbounded], [Optimistic], [N/A], [No],
     [*ARC (ours)*], [*7B (proven)*], [*Re-execution + STARK*], [*No*], [*Yes*],
   ),
-  caption: [Comparison with prior verifiable inference systems. The ARC engine operates at 7B parameters #sym.dash.em 700$times$ beyond prior ZK-proven model sizes #sym.dash.em with transparent proofs (no trusted setup) and cross-platform determinism.],
+  caption: [Comparison with prior verifiable inference systems. The ARC engine operates at 7B parameters (700$times$ beyond prior ZK-proven model sizes) with transparent proofs (no trusted setup) and cross-platform determinism.],
 ) <tab:scale>
 
 *On-chain AI.* Ritual @ritual and ORA @ora provide optimistic verification for off-chain AI computation via rollups with economic security. Our approach integrates deterministic re-execution at the L1 consensus layer: any validator can re-execute and verify, not just economically incentivized challengers. The security guarantee derives from mathematical determinism, not from game-theoretic assumptions about rational actors.
@@ -680,32 +680,32 @@ The calibration gap is a property of the INT8 bit-width, not of deterministic in
 
 The Determinism Thesis opens a research program spanning cryptography, systems, and AI safety. We outline the most consequential directions.
 
-*End-to-end STARK proofs of full inference.* Our proofs currently cover dense layer computations. Extending the AIR to cover attention (including integer softmax), RMSNorm, RoPE, and activation functions would enable a single STARK proof attesting that a complete forward pass was executed correctly. Combined with recursive composition, this would provide cryptographic attestation of AI decision provenance---a verifiable chain from input to output---for models at 50B+ parameters.
+*End-to-end STARK proofs of full inference.* Our proofs currently cover dense layer computations. Extending the AIR to cover attention (including integer softmax), RMSNorm, RoPE, and activation functions would enable a single STARK proof attesting that a complete forward pass was executed correctly. Combined with recursive composition, this would provide cryptographic attestation of AI decision provenance, a verifiable chain from input to output, for models at 50B+ parameters.
 
-*Deterministic training.* This work addresses inference. Extending determinism to training---where stochastic gradient descent, data shuffling, and distributed all-reduce introduce additional non-determinism sources---is a natural next step with implications for reproducibility and model provenance.
+*Deterministic training.* This work addresses inference. Extending determinism to training, where stochastic gradient descent, data shuffling, and distributed all-reduce introduce additional non-determinism sources, is a natural next step with implications for reproducibility and model provenance.
 
 *Higher-precision deterministic quantization.* Mixed-precision integer arithmetic (INT16 for attention, INT8 for feed-forward) would close the calibration gap while preserving the determinism guarantee. The optimal precision allocation per layer type and the interaction between precision and context length are open optimization problems with direct impact on production deployment.
 
-*Native accelerator kernels.* Our GPU implementation uses cross-platform WGSL shaders via wgpu. Native kernel implementations---Metal compute shaders on Apple Silicon, CUDA integer kernels on NVIDIA hardware---would exploit hardware-specific INT8 tensor cores and reduce dispatch overhead. The integer arithmetic framework applies directly; only the kernel language differs. Our Metal shader prototype (using `char4` types and `simd_sum` intrinsics) suggests single-digit millisecond per-token latency is achievable.
+*Native accelerator kernels.* Our GPU implementation uses cross-platform WGSL shaders via wgpu. Native kernel implementations (Metal compute shaders on Apple Silicon, CUDA integer kernels on NVIDIA hardware) would exploit hardware-specific INT8 tensor cores and reduce dispatch overhead. The integer arithmetic framework applies directly; only the kernel language differs. Our Metal shader prototype (using `char4` types and `simd_sum` intrinsics) suggests single-digit millisecond per-token latency is achievable.
 
-*Formal verification and standards.* A machine-checked proof (Coq, Lean) that the ARC engine correctly implements the integer inference specification would provide the highest assurance level. The concepts formalized here---platform-deterministic inference, the trust stack, cryptographic attestation of AI computation---could form the basis for industry standards analogous to FIPS 140 for cryptographic modules or DO-178C for avionics software.
+*Formal verification and standards.* A machine-checked proof (Coq, Lean) that the ARC engine correctly implements the integer inference specification would provide the highest assurance level. The concepts formalized here (platform-deterministic inference, the trust stack, cryptographic attestation of AI computation) could form the basis for industry standards analogous to FIPS 140 for cryptographic modules or DO-178C for avionics software.
 
 
 // ============================================================================
 = Conclusion
 // ============================================================================
 
-We have established the mathematical foundations of trustworthy artificial intelligence. Determinism is both necessary and sufficient for trust (Theorems 4--5). Every major trust property---fairness, robustness, privacy, safety, alignment---presupposes determinism (Theorem 7). Floating-point arithmetic fundamentally prevents it (Theorem 9). Trust entropy quantifies the cost of non-determinism exactly (Theorem 11). Floating-point divergence grows exponentially through residual networks (Theorem 13). Verification complexity collapses to $O(1)$ under determinism and becomes intractable without it (Theorem 16). Integer arithmetic provides determinism by algebraic necessity (Theorem 17).
+We have established the mathematical foundations of trustworthy artificial intelligence. Determinism is both necessary and sufficient for trust (Theorems 4--5). Every major trust property (fairness, robustness, privacy, safety, alignment) presupposes determinism (Theorem 7). Floating-point arithmetic fundamentally prevents it (Theorem 9). Trust entropy quantifies the cost of non-determinism exactly (Theorem 11). Floating-point divergence grows exponentially through residual networks (Theorem 13). Verification complexity collapses to $O(1)$ under determinism and becomes intractable without it (Theorem 16). Integer arithmetic provides determinism by algebraic necessity (Theorem 17).
 
-We demonstrated these results in practice: 82 cross-platform tests with zero hash mismatches across ARM and x86---including Llama-2-7B at 512 tokens---and multi-node consensus across four servers on three continents producing identical outputs verified by 356 on-chain attestation transactions.
+We demonstrated these results in practice: 82 cross-platform tests with zero hash mismatches across ARM and x86, including Llama-2-7B at 512 tokens, and multi-node consensus across four servers on three continents producing identical outputs verified by 356 on-chain attestation transactions.
 
-The contribution is not an optimization or an engineering improvement. It is a change of foundation. Every layer of the AI trust stack---from verification to reproducibility to auditability to certification---rests on a single property of the arithmetic substrate: associativity. Floating-point arithmetic lacks this property. Integer arithmetic has it.
+The contribution targets the arithmetic substrate itself, not any particular algorithm or protocol above it. Every layer of the AI trust stack, from verification to reproducibility to auditability to certification, rests on a single property of the arithmetic substrate: associativity. Floating-point arithmetic lacks this property; integer arithmetic has it by algebraic necessity.
 
 The implications extend to every domain where AI must be trusted. Deterministic inference makes fairness auditable, robustness certifiable, privacy verifiable, safety transferable across platforms, and alignment externally checkable. The industry's ongoing migration to integer quantization for performance reasons is inadvertently building the infrastructure for trustworthy AI.
 
-For fifty years, the rounding errors of floating-point arithmetic have been dismissed as negligible. In an era where AI systems make consequential decisions, control physical systems, and operate under regulatory scrutiny, these rounding errors have become the single largest obstacle to trust. We have shown that removing the obstacle requires only a change of arithmetic.
+For fifty years, the rounding errors of floating-point arithmetic have been dismissed as negligible. In an era where AI systems make consequential decisions, control physical systems, and operate under regulatory scrutiny, these rounding errors have become the single largest obstacle to trust. Removing the obstacle requires only a change of arithmetic.
 
-Trust in artificial intelligence has been a question of faith. With deterministic inference, it becomes a question of mathematics.
+With deterministic inference, trust in artificial intelligence becomes a question not of faith, but of mathematics.
 
 #v(1em)
 #line(length: 100%, stroke: 0.5pt + rgb("#ccc"))
