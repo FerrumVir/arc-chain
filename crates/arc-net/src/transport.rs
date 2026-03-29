@@ -692,7 +692,7 @@ pub async fn run_transport(
                 let incoming = match incoming_opt {
                     Some(inc) => inc,
                     None => {
-                        info!("QUIC endpoint closed");
+                        error!("QUIC endpoint closed unexpectedly — transport loop exiting");
                         break;
                     }
                 };

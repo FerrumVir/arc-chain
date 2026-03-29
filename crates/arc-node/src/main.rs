@@ -536,20 +536,28 @@ async fn main() -> Result<()> {
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", p2p_port).parse()?;
 
     // ── Start P2P transport in background ──────────────────────────────
+    // If transport exits (QUIC endpoint closes unexpectedly), the entire
+    // node loses P2P. Rather than silently dying, log and exit the process
+    // so systemd/launchd can restart us with a fresh QUIC endpoint.
     let peer_count_transport = peer_count.clone();
     let transport_keypair = validator_keypair.clone();
-    tokio::spawn(run_transport(
-        listen_addr,
-        bootstrap_peers,
-        validator_address,
-        stake,
-        genesis_hash,
-        outbound_rx,
-        inbound_tx,
-        peer_count_transport,
-        transport_keypair,
-        data_dir.clone(),
-    ));
+    let transport_data_dir = data_dir.clone();
+    tokio::spawn(async move {
+        run_transport(
+            listen_addr,
+            bootstrap_peers,
+            validator_address,
+            stake,
+            genesis_hash,
+            outbound_rx,
+            inbound_tx,
+            peer_count_transport,
+            transport_keypair,
+            transport_data_dir,
+        ).await;
+        tracing::error!("Transport task exited — node cannot function without P2P. Shutting down for restart.");
+        std::process::exit(1);
+    });
 
     // ── Start benchmark signing pool + indexer (if benchmark mode) ─────
     let benchmark_pool = if cli.benchmark {
