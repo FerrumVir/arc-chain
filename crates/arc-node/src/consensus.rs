@@ -1097,9 +1097,13 @@ impl ConsensusManager {
                     .collect();
                 for (req_id, input, max_tokens) in reqs {
                     if let Some(ref tx_chan) = outbound_tx {
+                        // req_id is already a hex-encoded Hash256 from the RPC layer.
+                        // Parse it back — do NOT hash it again or the response key won't match.
+                        let request_hash = arc_crypto::Hash256::from_hex(&req_id)
+                            .unwrap_or_else(|_| arc_crypto::hash_bytes(req_id.as_bytes()));
                         let _ = tx_chan.try_send(
                             arc_net::transport::OutboundMessage::BroadcastInferenceRequest {
-                                request_id: arc_crypto::hash_bytes(req_id.as_bytes()),
+                                request_id: request_hash,
                                 input,
                                 max_tokens,
                                 requester: self.validator_address,
