@@ -224,13 +224,11 @@ impl ConsensusManager {
             // a fixed timer.
             // Multi-validator: 200ms normal, 50ms benchmark (fast but peers can keep up).
             // Single-validator: 1ms for max local TPS.
-            // Tick interval determines max rounds/sec:
-            // 100ms = 10 rounds/sec (was 200ms = 5 rounds/sec).
-            // Cross-continent blocks arrive within 300ms; the view-change
-            // timer (10s) handles stragglers. 100ms doubles throughput.
-            let tick = if self.is_multi_validator() {
-                if self.benchmark { 50 } else { 100 }
-            } else { 1 };
+            // 50ms tick for all multi-validator modes.
+            // advance_round() returns immediately if quorum exists.
+            // At 50ms, rounds advance as fast as blocks propagate
+            // (~100-200ms cross-continent = 5-10 rounds/sec actual).
+            let tick = if self.is_multi_validator() { 50 } else { 1 };
             tokio::time::sleep(tokio::time::Duration::from_millis(tick)).await;
 
             // ── Drain pipeline results ──────────────────────────────────
