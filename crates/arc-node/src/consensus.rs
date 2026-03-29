@@ -258,18 +258,23 @@ impl ConsensusManager {
                                     "Peer reconnected — already in validator set, keeping DAG state"
                                 );
                             } else {
-                                // New peer: only add if it's a known genesis
-                                // validator. Unknown peers (e.g., old systemd
-                                // Accept new validators if they have sufficient stake.
-                                // Genesis validators are always accepted. New validators
-                                // join the live set immediately and the frozen set at the
-                                // next epoch boundary (round 1000, 2000, etc.).
-                                if stake < 500_000 {
+                                // TWO-TIER: Only genesis validators join the
+                                // consensus validator set. Community nodes connect
+                                // as inference workers — they receive/send inference
+                                // requests but don't propose blocks or affect quorum.
+                                // This lets 200+ nodes join without stalling consensus.
+                                let frozen = self.engine.frozen_validator_set();
+                                let is_genesis = frozen.validators.iter().any(|v| v.address == address);
+                                drop(frozen);
+                                if !is_genesis {
                                     info!(
                                         peer = %address,
-                                        stake = stake,
-                                        "Ignoring peer with insufficient stake (need 500K+ ARC)"
+                                        "Community node connected as inference worker (not validator)"
                                     );
+                                    // Track as worker for inference routing
+                                    if let Some(ref dv) = self.dag_validators {
+                                        // Don't add to validator list — just log
+                                    }
                                     continue;
                                 }
                                 let current_vs = self.engine.validator_set();

@@ -19,7 +19,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Maximum number of simultaneous peer connections.
-const MAX_PEERS: u32 = 128;
+// 512 peers: 8 validators + up to 504 inference workers.
+// Each seed node handles ~60 community connections (504/8).
+const MAX_PEERS: u32 = 512;
 
 /// Per-peer message rate limit (messages per second).
 const PEER_MSG_RATE_LIMIT: u32 = 500;
