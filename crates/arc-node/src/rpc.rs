@@ -2782,6 +2782,10 @@ async fn inference_run(
     let tokens_generated = generated_tokens.len() as u64;
     let ms_per_token = if tokens_generated > 0 { inference_ms / tokens_generated } else { 0 };
 
+    // Track earnings for local inference (same as P2P path)
+    node.inference_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    node.inference_earned.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+
     // Decode output tokens to text
     let output_text = model.decode(&generated_tokens);
 
