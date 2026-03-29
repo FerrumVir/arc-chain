@@ -40,7 +40,8 @@ for entry in "${NODES[@]}"; do
         cargo build --release -p arc-node 2>&1 | tail -1
         killall -9 arc-node 2>/dev/null
         sleep 2
-        rm -rf arc-data
+        # Keep state data across restarts (WAL, accounts, blocks).
+        # Only wipe on explicit --clean flag.
         nohup target/release/arc-node \
             --rpc 0.0.0.0:9090 --validator-seed $seed \
             --seeds-file /root/.arc-chain/seeds.txt \
