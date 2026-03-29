@@ -53,6 +53,12 @@ pub struct NodeState {
     pub dag_committed: Arc<AtomicU64>,
     /// Inference results indexed by attestation tx hash — for explorer display.
     pub inference_results: Arc<dashmap::DashMap<String, Value>>,
+    /// Pending inference requests to broadcast to community workers.
+    /// Key: request_id (hex), Value: (input, max_tokens, timestamp)
+    pub inference_pending: Arc<dashmap::DashMap<String, (String, u32, std::time::Instant)>>,
+    /// Inference responses from community workers.
+    /// Key: request_id (hex), Value: JSON response
+    pub inference_responses: Arc<dashmap::DashMap<String, Value>>,
 }
 
 /// Build a `NodeState` from components.
@@ -86,6 +92,8 @@ pub fn build_node_state(
         dag_round: Arc::new(AtomicU64::new(0)),
         dag_committed: Arc::new(AtomicU64::new(0)),
         inference_results: Arc::new(dashmap::DashMap::new()),
+        inference_pending: Arc::new(dashmap::DashMap::new()),
+        inference_responses: Arc::new(dashmap::DashMap::new()),
     }
 }
 
@@ -2682,9 +2690,29 @@ async fn inference_run(
     let model = match &node.inference_model {
         Some(m) => m.clone(),
         None => {
+            // No local model — queue request for community inference workers.
+            // The consensus loop picks this up, broadcasts via P2P, and
+            // workers with models respond. We poll for the response.
+            let req_id = arc_crypto::hash_bytes(
+                format!("{}:{}", input_text, std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()).as_bytes()
+            );
+            let req_hex = req_id.to_hex();
+            node.inference_pending.insert(req_hex.clone(), (input_text.to_string(), max_tokens, std::time::Instant::now()));
+
+            // Poll for response (up to 30 seconds)
+            for _ in 0..60 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                if let Some(resp) = node.inference_responses.remove(&req_hex) {
+                    return Ok(Json(resp.1));
+                }
+            }
+            // Timeout — no worker responded
+            node.inference_pending.remove(&req_hex);
             return Ok(Json(json!({
                 "success": false,
-                "error": "No model loaded. Start node with --model /path/to/model.gguf",
+                "error": "No inference workers available. Community members can join with: ./scripts/join-inference.sh",
+                "request_id": req_hex,
             })));
         }
     };
