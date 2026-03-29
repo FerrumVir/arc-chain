@@ -461,11 +461,22 @@ impl PeerConnections {
         let mut dead_peers = Vec::new();
         for key in &peer_keys {
             if let Some(mut entry) = self.peers.get_mut(key) {
-                if let Err(e) = write_message(entry.value_mut(), msg_type, payload).await {
-                    warn!("Failed to send to peer: {}", e);
-                    dead_peers.push(*key);
-                } else {
-                    sent += 1;
+                // Timeout writes to prevent dead peers from blocking broadcast.
+                // A healthy peer completes writes in <100ms; dead peers hang
+                // for up to max_idle_timeout (300s).
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    write_message(entry.value_mut(), msg_type, payload),
+                ).await {
+                    Ok(Ok(())) => { sent += 1; }
+                    Ok(Err(e)) => {
+                        warn!("Failed to send to peer: {}", e);
+                        dead_peers.push(*key);
+                    }
+                    Err(_) => {
+                        warn!("Write timeout to peer — marking dead");
+                        dead_peers.push(*key);
+                    }
                 }
             }
         }
@@ -770,7 +781,15 @@ pub async fn run_transport(
                     let pex_msg = crate::protocol::PeerExchangeMessage { peers: peer_list };
                     if let Ok(bytes) = bincode::serialize(&pex_msg) {
                         debug!("Broadcasting PEX with {} peers", pex_msg.peers.len());
-                        conn_pex.broadcast(MessageType::PeerExchange, &bytes).await;
+                        // Spawn PEX broadcast — MUST NOT run in select! body.
+                        // broadcast() writes to all peers including dead ones, and
+                        // dead peer writes block for up to 300s (idle timeout).
+                        // This was starving the reconnect timer the same way
+                        // incoming.await did.
+                        let pex_conn = conn_pex.clone();
+                        tokio::spawn(async move {
+                            pex_conn.broadcast(MessageType::PeerExchange, &bytes).await;
+                        });
                     }
                 }
 
@@ -1085,7 +1104,7 @@ async fn handle_peer_recv(
         let (msg_type, data) = match read_message(&mut recv).await {
             Ok(m) => m,
             Err(e) => {
-                debug!("Peer {} stream closed: {}", peer_address, e);
+                warn!("Peer {} stream closed: {}", peer_address, e);
                 break;
             }
         };

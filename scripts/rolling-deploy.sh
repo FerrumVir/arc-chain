@@ -1,7 +1,7 @@
 #!/bin/bash
 # ─── ARC Chain: Rolling Deploy (zero-downtime) ─────────────────────────────
 # Upgrades nodes ONE AT A TIME so consensus never drops below 6/8 quorum.
-# Each node: pull → rebuild → restart → wait for peers → next node.
+# Build ONCE on first node, distribute binary to all others.
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
@@ -23,39 +23,75 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-echo -e "${YELLOW}Rolling deploy — one node at a time, consensus stays live${NC}"
+BUILD_NODE="${NODES[0]%%:*}"  # Build on first node (NYC)
+BUILD_NAME="${NODES[0]##*:}"
+
+echo -e "${YELLOW}Rolling deploy — build once, distribute to all${NC}"
+echo ""
+
+# ── Step 1: Build on first node ──────────────────────────────────────────
+echo -e "${YELLOW}[${BUILD_NAME}] Building on ${BUILD_NODE}...${NC}"
+ssh $SSH_OPTS -i "$SSH_KEY" "root@${BUILD_NODE}" "
+    export PATH=/root/.cargo/bin:\$PATH
+    cd /root/arc-chain
+    git fetch origin main && git reset --hard origin/main
+    cargo build --release -p arc-node 2>&1 | tail -3
+    ls -la target/release/arc-node
+" 2>&1 | sed "s/^/  /"
+
+BINARY_HASH=$(ssh $SSH_OPTS -i "$SSH_KEY" "root@${BUILD_NODE}" "sha256sum /root/arc-chain/target/release/arc-node | cut -d' ' -f1")
+echo -e "  Binary hash: ${BINARY_HASH}"
+
+# ── Step 2: Distribute binary to all other nodes ────────────────────────
+echo ""
+echo -e "${YELLOW}Distributing binary to all nodes...${NC}"
+for entry in "${NODES[@]}"; do
+    ip="${entry%%:*}"
+    seed="${entry##*:}"
+    if [ "$ip" = "$BUILD_NODE" ]; then
+        continue  # Skip build node
+    fi
+    echo -n "  ${seed} (${ip})... "
+    # Pull code (for genesis.toml, seeds, scripts) + copy binary
+    ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "
+        cd /root/arc-chain
+        git fetch origin main && git reset --hard origin/main
+    " 2>/dev/null
+    scp -o StrictHostKeyChecking=no -i "$SSH_KEY" \
+        "root@${BUILD_NODE}:/root/arc-chain/target/release/arc-node" \
+        "root@${ip}:/root/arc-chain/target/release/arc-node" 2>/dev/null
+    echo -e "${GREEN}OK${NC}"
+done
+
+# ── Step 3: Rolling restart — one at a time ─────────────────────────────
+echo ""
+echo -e "${YELLOW}Rolling restart — one node at a time${NC}"
 echo ""
 
 for entry in "${NODES[@]}"; do
     ip="${entry%%:*}"
     seed="${entry##*:}"
 
-    echo -e "${YELLOW}[$seed] Upgrading $ip...${NC}"
+    echo -e "${YELLOW}[$seed] Restarting $ip...${NC}"
 
-    # Pull + rebuild + restart
     ssh $SSH_OPTS -i "$SSH_KEY" "root@$ip" "
-        export PATH=/root/.cargo/bin:\$PATH
         cd /root/arc-chain
-        git fetch origin main && git reset --hard origin/main
-        cargo build --release -p arc-node 2>&1 | tail -1
         killall -9 arc-node 2>/dev/null
         sleep 2
-        # Keep state data across restarts (WAL, accounts, blocks).
-        # Only wipe on explicit --clean flag.
         nohup target/release/arc-node \
             --rpc 0.0.0.0:9090 --validator-seed $seed \
             --seeds-file /root/.arc-chain/seeds.txt \
             --genesis genesis.toml --stake 5000000 --eth-rpc-port 0 \
             </dev/null >/tmp/arc-node.log 2>&1 &
-        sleep 5
+        sleep 3
         echo 'PID: '\$(pgrep -f 'arc-node.*validator' | head -1)
     " 2>&1 | sed "s/^/  /"
 
-    # Wait for node to rejoin consensus (get peers)
+    # Wait for node to rejoin consensus
     echo -n "  Waiting for peers..."
     for i in $(seq 1 12); do
         sleep 5
-        peers=$(curl -sf --max-time 3 "http://$ip:9090/health" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers',0))" 2>/dev/null || echo 0)
+        peers=$(curl -sf --max-time 3 "http://$ip:9090/health" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('peer_count',0))" 2>/dev/null || echo 0)
         if [ "$peers" -ge 3 ] 2>/dev/null; then
             echo -e " ${GREEN}$peers peers — OK${NC}"
             break
@@ -66,4 +102,4 @@ for entry in "${NODES[@]}"; do
     echo ""
 done
 
-echo -e "${GREEN}All 8 nodes upgraded. Consensus maintained throughout.${NC}"
+echo -e "${GREEN}All 8 nodes upgraded. Binary hash: ${BINARY_HASH}${NC}"
