@@ -137,6 +137,44 @@ elif command -v ss &>/dev/null; then
     fi
 fi
 
+# Auto-open firewall for UDP 9091 (P2P port) — don't ask, just do it
+if [[ "$(uname -s)" == "Linux" ]]; then
+    # ufw
+    if command -v ufw &>/dev/null; then
+        if ufw status 2>/dev/null | grep -q "Status: active"; then
+            if ! ufw status 2>/dev/null | grep -q "9091/udp"; then
+                if [[ "$(id -u)" -eq 0 ]]; then
+                    ufw allow 9091/udp >/dev/null 2>&1 && ok "Firewall: opened UDP 9091 (ufw)"
+                else
+                    sudo ufw allow 9091/udp >/dev/null 2>&1 && ok "Firewall: opened UDP 9091 (ufw)" || warn "Could not open UDP 9091 — try: sudo ufw allow 9091/udp"
+                fi
+            fi
+        fi
+    fi
+    # firewalld
+    if command -v firewall-cmd &>/dev/null; then
+        if firewall-cmd --state 2>/dev/null | grep -q "running"; then
+            if [[ "$(id -u)" -eq 0 ]]; then
+                firewall-cmd --permanent --add-port=9091/udp >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1 && ok "Firewall: opened UDP 9091 (firewalld)"
+            else
+                sudo firewall-cmd --permanent --add-port=9091/udp >/dev/null 2>&1 && sudo firewall-cmd --reload >/dev/null 2>&1 && ok "Firewall: opened UDP 9091 (firewalld)" || true
+            fi
+        fi
+    fi
+    # iptables (fallback — only if neither ufw nor firewalld)
+    if ! command -v ufw &>/dev/null && ! command -v firewall-cmd &>/dev/null; then
+        if command -v iptables &>/dev/null; then
+            if [[ "$(id -u)" -eq 0 ]]; then
+                iptables -C INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null && ok "Firewall: opened UDP 9091 (iptables)"
+            else
+                sudo iptables -C INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null || sudo iptables -I INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null && ok "Firewall: opened UDP 9091 (iptables)" || true
+            fi
+        fi
+    fi
+fi
+# macOS doesn't typically block outbound UDP, and the application firewall
+# doesn't filter by port. No action needed.
+
 ok "Pre-flight checks passed"
 
 # ── Hardware-based model recommendation ────────────────

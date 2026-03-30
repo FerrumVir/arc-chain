@@ -81,11 +81,10 @@ body{font-family:'Inter',sans-serif}
       <div>
         <p class="text-sm font-semibold text-yellow-300">Low peer count — you may receive fewer inference jobs</p>
         <p class="text-xs text-yellow-400/70 mt-1">Your node is connected to <span id="warnPeerCount" class="font-bold text-yellow-300">0</span> of 8 seed validators. This is usually caused by a firewall blocking UDP traffic.</p>
-        <div class="mt-2 bg-black/30 rounded-lg p-3 space-y-1">
-          <p class="text-[11px] text-yellow-400/80 font-semibold">Fix it:</p>
-          <p class="text-[11px] mono text-yellow-400/60">Linux:&nbsp;&nbsp; <span class="text-yellow-300">sudo ufw allow 9091/udp</span></p>
-          <p class="text-[11px] mono text-yellow-400/60">Router:&nbsp; <span class="text-yellow-300">forward UDP port 9091</span> to this machine</p>
-          <p class="text-[11px] mono text-yellow-400/60">Cloud:&nbsp;&nbsp; <span class="text-yellow-300">allow inbound UDP 9091</span> in security group</p>
+        <div class="mt-2 bg-black/30 rounded-lg p-3 space-y-1.5">
+          <p class="text-[11px] text-yellow-400/80 font-semibold">Auto-fix: re-run the installer (it opens the firewall automatically)</p>
+          <p class="text-[11px] mono text-yellow-300">curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash</p>
+          <p class="text-[11px] text-yellow-400/60 mt-1">Or manually: <span class="mono text-yellow-400/80">sudo ufw allow 9091/udp</span></p>
         </div>
         <p class="text-[10px] text-yellow-400/50 mt-2">Your node still works — it just receives jobs from fewer sources. After fixing, peers will increase within 30 seconds.</p>
       </div>
