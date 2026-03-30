@@ -39,11 +39,11 @@ struct LoadedGgufModel {
     path: String,
     /// Model ID = BLAKE3(first 1MB of file || file_size).
     model_id: Hash256,
-    /// Template model — cloned for each inference to get fresh KV cache.
-    /// Candle's ModelWeights derives Clone; the quantized weights are
-    /// reference-counted Tensors, so cloning is cheap (~microseconds).
-    /// Only the KV cache (Option per layer) actually gets fresh copies.
-    model_template: candle_transformers::models::quantized_llama::ModelWeights,
+    /// The loaded model weights, used directly (not cloned) for inference.
+    /// KV cache resets automatically: candle's forward_attn ignores stale
+    /// cache when index_pos == 0 (the prefill phase of every new request).
+    /// This avoids the expensive model clone that caused the evo-9 regression.
+    model: candle_transformers::models::quantized_llama::ModelWeights,
     /// Tokenizer (simple byte-level for determinism).
     vocab_size: u32,
 }
@@ -127,7 +127,7 @@ impl GgufEngine {
         self.models.insert(model_id.0, LoadedGgufModel {
             path: path.to_string(),
             model_id,
-            model_template: model,
+            model: model,
             vocab_size,
         });
 
@@ -159,14 +159,15 @@ impl GgufEngine {
 
         let start = std::time::Instant::now();
 
-        let model_ref = self.models.get(&model_id.0)
+        let mut model_ref = self.models.get_mut(&model_id.0)
             .ok_or_else(|| InferenceError::ModelNotFound(hex::encode(&model_id.0[..8])))?;
 
-        // Clone model to get fresh KV cache for this request.
-        // Candle Tensors are Arc-backed, so this clones only the KV cache
-        // Option wrappers (None × n_layers), not the actual weight data.
-        let mut model = model_ref.model_template.clone();
-        drop(model_ref); // Release DashMap lock immediately
+        // Use the model in-place instead of cloning. Candle's forward_attn
+        // automatically discards the stale KV cache when index_pos == 0
+        // (the prefill phase), so each request starts fresh without needing
+        // a clone. This fixes the evo-9 speed regression (1035ms -> ~400ms/tok)
+        // caused by deep-cloning the entire ModelWeights struct per request.
+        let model = &mut model_ref.model;
 
         let device = best_device();
         let prompt_len = input_tokens.len();
