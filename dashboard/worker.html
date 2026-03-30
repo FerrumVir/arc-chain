@@ -74,6 +74,24 @@ body{font-family:'Inter',sans-serif}
 
 <main class="max-w-5xl mx-auto px-3 sm:px-4 py-4 sm:py-6 space-y-4 sm:space-y-5">
 
+  <!-- Connectivity Warning (hidden by default, shown when peers < 4) -->
+  <div id="connectWarning" class="hidden bg-yellow-900/30 border border-yellow-600/40 rounded-xl p-4 fade-in">
+    <div class="flex items-start gap-3">
+      <span class="text-yellow-400 text-lg flex-shrink-0">&#9888;</span>
+      <div>
+        <p class="text-sm font-semibold text-yellow-300">Low peer count — you may receive fewer inference jobs</p>
+        <p class="text-xs text-yellow-400/70 mt-1">Your node is connected to <span id="warnPeerCount" class="font-bold text-yellow-300">0</span> of 8 seed validators. This is usually caused by a firewall blocking UDP traffic.</p>
+        <div class="mt-2 bg-black/30 rounded-lg p-3 space-y-1">
+          <p class="text-[11px] text-yellow-400/80 font-semibold">Fix it:</p>
+          <p class="text-[11px] mono text-yellow-400/60">Linux:&nbsp;&nbsp; <span class="text-yellow-300">sudo ufw allow 9091/udp</span></p>
+          <p class="text-[11px] mono text-yellow-400/60">Router:&nbsp; <span class="text-yellow-300">forward UDP port 9091</span> to this machine</p>
+          <p class="text-[11px] mono text-yellow-400/60">Cloud:&nbsp;&nbsp; <span class="text-yellow-300">allow inbound UDP 9091</span> in security group</p>
+        </div>
+        <p class="text-[10px] text-yellow-400/50 mt-2">Your node still works — it just receives jobs from fewer sources. After fixing, peers will increase within 30 seconds.</p>
+      </div>
+    </div>
+  </div>
+
   <!-- Hero: Earnings -->
   <div class="bg-gradient-to-br from-surface-2 to-surface-3 border border-surface-4 rounded-2xl p-4 sm:p-6">
     <div class="flex items-start justify-between mb-1">
@@ -516,9 +534,23 @@ async function refresh() {
 
     // Stats row
     document.getElementById('uptime').textContent = fmtUptime(uptimeH);
-    document.getElementById('peers').textContent = earnings.connected_peers || health.peers || 0;
+    const peerNum = earnings.connected_peers || health.peers || 0;
+    const peersEl = document.getElementById('peers');
+    peersEl.textContent = peerNum;
+    peersEl.className = peerNum >= 4 ? 'text-lg sm:text-xl font-bold text-arc-400 mono'
+      : peerNum > 0 ? 'text-lg sm:text-xl font-bold text-yellow-400 mono'
+      : 'text-lg sm:text-xl font-bold text-red-400 mono';
     document.getElementById('modelName').textContent = earnings.model_loaded ? 'Loaded' : 'No Model';
     document.getElementById('nodeMode').textContent = (earnings.mode || 'worker').charAt(0).toUpperCase() + (earnings.mode || 'worker').slice(1);
+
+    // Show connectivity warning if fewer than 4 peers
+    const warnEl = document.getElementById('connectWarning');
+    if (peerNum < 4 && peerNum > 0) {
+      warnEl.classList.remove('hidden');
+      document.getElementById('warnPeerCount').textContent = peerNum;
+    } else {
+      warnEl.classList.add('hidden');
+    }
 
     // Node info
     const addr = earnings.address || '--';
