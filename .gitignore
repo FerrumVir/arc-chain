@@ -41,4 +41,3 @@ __pycache__/
 
 # Private evolution tracking — not public
 evolution/
-.github/workflows/release.yml
