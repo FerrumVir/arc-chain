@@ -98,6 +98,58 @@ body{font-family:'Inter',sans-serif}
     </div>
   </div>
 
+  <!-- Earnings History Chart -->
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-xs sm:text-sm font-semibold text-white uppercase tracking-wider">Earnings Over Time</h2>
+      <div class="flex gap-2">
+        <button onclick="setChartRange('1h')" id="btn1h" class="text-[10px] px-2 py-0.5 rounded bg-surface-3 text-gray-500 hover:text-white transition">1H</button>
+        <button onclick="setChartRange('6h')" id="btn6h" class="text-[10px] px-2 py-0.5 rounded bg-surface-3 text-gray-500 hover:text-white transition">6H</button>
+        <button onclick="setChartRange('24h')" id="btn24h" class="text-[10px] px-2 py-0.5 rounded bg-surface-3 text-gray-500 hover:text-white transition">24H</button>
+        <button onclick="setChartRange('all')" id="btnall" class="text-[10px] px-2 py-0.5 rounded bg-arc-500/20 text-arc-400 hover:text-white transition">All</button>
+      </div>
+    </div>
+    <div id="chartContainer" class="relative w-full" style="height:180px">
+      <svg id="earningsChart" class="w-full h-full" viewBox="0 0 600 180" preserveAspectRatio="none">
+        <defs>
+          <linearGradient id="chartGrad" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="rgba(99,102,241,0.3)"/>
+            <stop offset="100%" stop-color="rgba(99,102,241,0)"/>
+          </linearGradient>
+        </defs>
+        <!-- Grid lines drawn by JS -->
+        <g id="chartGrid"></g>
+        <!-- Fill area under line -->
+        <path id="chartArea" fill="url(#chartGrad)" d=""/>
+        <!-- Line -->
+        <path id="chartLine" fill="none" stroke="#6366f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" d=""/>
+        <!-- Hover dot -->
+        <circle id="chartDot" r="4" fill="#6366f1" stroke="#09090f" stroke-width="2" style="display:none"/>
+      </svg>
+      <!-- Y-axis labels -->
+      <div id="chartYLabels" class="absolute top-0 left-0 h-full flex flex-col justify-between pointer-events-none py-1">
+        <span class="text-[9px] mono text-gray-600" id="yMax">--</span>
+        <span class="text-[9px] mono text-gray-600" id="yMid">--</span>
+        <span class="text-[9px] mono text-gray-600" id="yMin">0</span>
+      </div>
+      <!-- X-axis labels -->
+      <div class="absolute bottom-0 left-0 w-full flex justify-between pointer-events-none px-1">
+        <span class="text-[9px] mono text-gray-600" id="xStart">--</span>
+        <span class="text-[9px] mono text-gray-600" id="xEnd">--</span>
+      </div>
+      <!-- Tooltip -->
+      <div id="chartTooltip" class="absolute hidden bg-surface-4 border border-surface-5 rounded px-2 py-1 pointer-events-none z-10" style="min-width:90px">
+        <p class="text-[10px] text-gray-400" id="ttTime">--</p>
+        <p class="text-xs font-bold text-arc-400 mono" id="ttArc">--</p>
+        <p class="text-[10px] text-gray-500" id="ttInf">--</p>
+      </div>
+      <!-- Empty state -->
+      <div id="chartEmpty" class="absolute inset-0 flex items-center justify-center">
+        <p class="text-xs text-gray-600">No earnings data yet — complete an inference to start tracking</p>
+      </div>
+    </div>
+  </div>
+
   <!-- Leaderboard -->
   <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5">
     <div class="flex items-center justify-between mb-3 sm:mb-4">
@@ -450,10 +502,11 @@ async function refresh() {
     document.getElementById('nodeVersion').textContent = health.version || '--';
     document.getElementById('dagRound').textContent = fmtNumber(health.dag_round || 0);
 
-    // Peer list + activity + leaderboard (async, don't block)
+    // Peer list + activity + leaderboard + chart (async, don't block)
     updatePeers();
     updateActivity();
     updateLeaderboard();
+    updateChart();
 
     // Network stats
     if (stats) {
@@ -637,6 +690,173 @@ async function updateLeaderboard() {
   } catch(e) {
     console.error('Leaderboard error:', e);
   }
+}
+
+// ── Earnings History Chart ──────────────────────────────────
+let chartData = [];
+let chartRange = 'all'; // '1h', '6h', '24h', 'all'
+let chartTimer = 0;
+
+function setChartRange(range) {
+  chartRange = range;
+  // Update button styles
+  ['1h','6h','24h','all'].forEach(r => {
+    const btn = document.getElementById('btn' + r);
+    if (r === range) {
+      btn.className = 'text-[10px] px-2 py-0.5 rounded bg-arc-500/20 text-arc-400 hover:text-white transition';
+    } else {
+      btn.className = 'text-[10px] px-2 py-0.5 rounded bg-surface-3 text-gray-500 hover:text-white transition';
+    }
+  });
+  renderChart();
+}
+
+async function updateChart() {
+  // Refresh chart data every 15s (same cadence as leaderboard)
+  chartTimer++;
+  if (chartTimer > 1 && chartTimer % 3 !== 0) {
+    return;
+  }
+  try {
+    const data = await fetch(RPC + '/worker/earnings/history').then(r => r.json());
+    chartData = data.history || [];
+    renderChart();
+  } catch(e) {
+    // Silently fail — chart will show empty state
+  }
+}
+
+function renderChart() {
+  const svg = document.getElementById('earningsChart');
+  const emptyEl = document.getElementById('chartEmpty');
+  const tooltipEl = document.getElementById('chartTooltip');
+
+  // Filter by time range
+  const now = Math.floor(Date.now() / 1000);
+  let filtered = chartData;
+  if (chartRange === '1h') {
+    filtered = chartData.filter(p => p.epoch_secs >= now - 3600);
+  } else if (chartRange === '6h') {
+    filtered = chartData.filter(p => p.epoch_secs >= now - 21600);
+  } else if (chartRange === '24h') {
+    filtered = chartData.filter(p => p.epoch_secs >= now - 86400);
+  }
+
+  if (filtered.length < 2) {
+    document.getElementById('chartLine').setAttribute('d', '');
+    document.getElementById('chartArea').setAttribute('d', '');
+    document.getElementById('chartGrid').innerHTML = '';
+    emptyEl.style.display = filtered.length === 0 ? 'flex' : 'none';
+    if (filtered.length === 1) {
+      emptyEl.style.display = 'flex';
+      emptyEl.querySelector('p').textContent = 'Need at least 2 data points — keep earning!';
+    } else {
+      emptyEl.querySelector('p').textContent = 'No earnings data yet — complete an inference to start tracking';
+    }
+    document.getElementById('yMax').textContent = '--';
+    document.getElementById('yMid').textContent = '--';
+    document.getElementById('xStart').textContent = '--';
+    document.getElementById('xEnd').textContent = '--';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+
+  // Chart dimensions (SVG viewBox is 600x180)
+  const W = 600, H = 160; // leave 20px bottom for x-labels
+  const padLeft = 40, padRight = 10, padTop = 10, padBottom = 25;
+  const plotW = W - padLeft - padRight;
+  const plotH = H - padTop - padBottom;
+
+  // Data range
+  const minT = filtered[0].epoch_secs;
+  const maxT = filtered[filtered.length - 1].epoch_secs;
+  const minArc = 0;
+  const maxArc = Math.max(...filtered.map(p => p.total_arc));
+  const rangeT = Math.max(maxT - minT, 1);
+  const rangeArc = Math.max(maxArc - minArc, 1);
+
+  // Generate points
+  const points = filtered.map(p => {
+    const x = padLeft + ((p.epoch_secs - minT) / rangeT) * plotW;
+    const y = padTop + plotH - ((p.total_arc - minArc) / rangeArc) * plotH;
+    return { x, y, data: p };
+  });
+
+  // Build SVG path for line
+  let linePath = 'M' + points.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' L');
+  document.getElementById('chartLine').setAttribute('d', linePath);
+
+  // Build SVG path for fill area
+  let areaPath = linePath +
+    ` L${points[points.length-1].x.toFixed(1)},${padTop + plotH}` +
+    ` L${points[0].x.toFixed(1)},${padTop + plotH} Z`;
+  document.getElementById('chartArea').setAttribute('d', areaPath);
+
+  // Grid lines (3 horizontal)
+  let gridHtml = '';
+  for (let i = 0; i <= 2; i++) {
+    const y = padTop + (plotH * i / 2);
+    gridHtml += `<line x1="${padLeft}" y1="${y}" x2="${W - padRight}" y2="${y}" stroke="rgba(255,255,255,0.05)" stroke-width="1"/>`;
+  }
+  document.getElementById('chartGrid').innerHTML = gridHtml;
+
+  // Y-axis labels
+  document.getElementById('yMax').textContent = fmtNumber(maxArc);
+  document.getElementById('yMid').textContent = fmtNumber(Math.round(maxArc / 2));
+  document.getElementById('yMin').textContent = '0';
+
+  // X-axis labels
+  const fmtTime = (epoch) => {
+    const d = new Date(epoch * 1000);
+    const hours = d.getHours().toString().padStart(2, '0');
+    const mins = d.getMinutes().toString().padStart(2, '0');
+    if (chartRange === 'all' && rangeT > 86400) {
+      return `${d.getMonth()+1}/${d.getDate()} ${hours}:${mins}`;
+    }
+    return `${hours}:${mins}`;
+  };
+  document.getElementById('xStart').textContent = fmtTime(minT);
+  document.getElementById('xEnd').textContent = fmtTime(maxT);
+
+  // Interactive hover — attach mouse event to SVG
+  svg.onmousemove = function(e) {
+    const rect = svg.getBoundingClientRect();
+    const scaleX = W / rect.width;
+    const mouseX = (e.clientX - rect.left) * scaleX;
+
+    // Find nearest data point
+    let closest = points[0], closestDist = Infinity;
+    for (const p of points) {
+      const dist = Math.abs(p.x - mouseX);
+      if (dist < closestDist) {
+        closestDist = dist;
+        closest = p;
+      }
+    }
+
+    if (closestDist < 30) {
+      const dot = document.getElementById('chartDot');
+      dot.setAttribute('cx', closest.x);
+      dot.setAttribute('cy', closest.y);
+      dot.style.display = '';
+
+      // Position tooltip
+      const ttX = (closest.x / W) * rect.width;
+      const ttY = (closest.y / H) * rect.height;
+      tooltipEl.style.display = 'block';
+      tooltipEl.style.left = Math.min(ttX + 10, rect.width - 100) + 'px';
+      tooltipEl.style.top = Math.max(ttY - 50, 0) + 'px';
+      document.getElementById('ttTime').textContent = new Date(closest.data.epoch_secs * 1000).toLocaleTimeString();
+      document.getElementById('ttArc').textContent = fmtNumber(closest.data.total_arc) + ' ARC';
+      document.getElementById('ttInf').textContent = closest.data.total_inferences + ' inferences';
+    }
+  };
+
+  svg.onmouseleave = function() {
+    document.getElementById('chartDot').style.display = 'none';
+    tooltipEl.style.display = 'none';
+  };
 }
 
 // ── Init ────────────────────────────────────────────────────

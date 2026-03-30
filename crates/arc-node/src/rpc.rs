@@ -206,6 +206,7 @@ pub async fn serve(
         // Worker dashboard + API (community inference nodes)
         .route("/worker/dashboard", get(worker_dashboard))
         .route("/worker/earnings", get(worker_earnings))
+        .route("/worker/earnings/history", get(worker_earnings_history))
         .route("/worker/activity", get(worker_activity))
         .route("/worker/peers", get(worker_peers))
         .route("/worker/leaderboard", get(worker_leaderboard))
@@ -3063,6 +3064,39 @@ async fn worker_earnings(
         "model_loaded": has_model,
         "status": if has_model && peers > 0 { "active" } else if peers > 0 { "connected_no_model" } else { "disconnected" },
         "persistence": node.earnings_tracker.is_some(),
+    }))
+}
+
+/// GET /worker/earnings/history
+///
+/// Returns timestamped earnings data points for charting earnings growth over time.
+/// Each point contains: timestamp, epoch_secs, total_arc, total_inferences.
+/// History survives restarts (persisted to earnings_history.json).
+/// Points are automatically downsampled when the log exceeds 1000 entries.
+async fn worker_earnings_history(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let history = if let Some(ref tracker) = node.earnings_tracker {
+        tracker.get_history()
+    } else {
+        Vec::new()
+    };
+
+    let count = history.len();
+
+    // Convert to JSON array
+    let points: Vec<Value> = history.into_iter().map(|p| {
+        json!({
+            "timestamp": p.timestamp,
+            "epoch_secs": p.epoch_secs,
+            "total_arc": p.total_arc,
+            "total_inferences": p.total_inferences,
+        })
+    }).collect();
+
+    Json(json!({
+        "history": points,
+        "count": count,
     }))
 }
 
