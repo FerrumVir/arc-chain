@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ════════════════════════════════════════════════════════════════
-#  ARC Network — Join in 60 Seconds
+#  ARC Chain — Join in 60 Seconds
 #
 #  Run AI inference on your device. Earn ARC tokens.
 #
@@ -80,7 +80,7 @@ spin()  {
 # ── Banner ──────────────────────────────────────────────
 echo ""
 echo -e "${W}  ╔═══════════════════════════════════════╗${N}"
-echo -e "${W}  ║${N}   ${C}ARC Network${N} — Decentralized AI      ${W}║${N}"
+echo -e "${W}  ║${N}   ${C}ARC Chain${N} — Decentralized AI      ${W}║${N}"
 echo -e "${W}  ║${N}   Run inference. Earn tokens.          ${W}║${N}"
 echo -e "${W}  ╚═══════════════════════════════════════╝${N}"
 echo ""

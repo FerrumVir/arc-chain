@@ -1,5 +1,5 @@
 # ════════════════════════════════════════════════════════════════
-#  ARC Network — Join in 60 Seconds (Windows)
+#  ARC Chain — Join in 60 Seconds (Windows)
 #
 #  Run AI inference on your device. Earn ARC tokens.
 #
@@ -15,7 +15,7 @@ $CpuLimit = 15
 
 Write-Host ""
 Write-Host "  ╔═══════════════════════════════════════╗" -ForegroundColor White
-Write-Host "  ║   ARC Network — Decentralized AI      ║" -ForegroundColor Cyan
+Write-Host "  ║   ARC Chain — Decentralized AI      ║" -ForegroundColor Cyan
 Write-Host "  ║   Run inference. Earn tokens.          ║" -ForegroundColor White
 Write-Host "  ╚═══════════════════════════════════════╝" -ForegroundColor White
 Write-Host ""
