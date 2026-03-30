@@ -181,57 +181,30 @@ else
 fi
 ok "Network configured (8 seed validators across 6 continents)"
 
-# ── Step 5: Stop old + start new ────────────────────────
-step 5 "Starting your inference node"
+# ── Step 5: Set up persistent service + start ───────────
+step 5 "Starting your inference node (persistent)"
 
-# Stop existing
-if [[ -f "${ARC_DIR}/node.pid" ]] && kill -0 "$(cat "${ARC_DIR}/node.pid")" 2>/dev/null; then
-    kill "$(cat "${ARC_DIR}/node.pid")" 2>/dev/null || true
-    sleep 2
-    ok "Stopped previous node"
+# Resolve absolute paths for service configs
+BINARY_ABS="$(cd "$(dirname "${BINARY}")" && pwd)/$(basename "${BINARY}")"
+GENESIS_ABS="$(cd "$(dirname "${GENESIS}")" && pwd)/$(basename "${GENESIS}")"
+MODEL_ABS=""
+if [[ -n "${MODEL_PATH}" && -f "${MODEL_PATH}" ]]; then
+    MODEL_ABS="$(cd "$(dirname "${MODEL_PATH}")" && pwd)/$(basename "${MODEL_PATH}")"
 fi
-
-# Build command
-CMD=("${BINARY}" --rpc 0.0.0.0:9090 --seeds-file "${ARC_DIR}/seeds.txt" --validator-seed "${SEED}" --stake 5000000 --mode worker --cpu-limit "${CPU_LIMIT}" --eth-rpc-port 0)
-if [[ -n "${GENESIS}" ]]; then CMD+=(--genesis "${GENESIS}"); fi
-if [[ -n "${MODEL_PATH}" && -f "${MODEL_PATH}" ]]; then CMD+=(--model "${MODEL_PATH}"); fi
-
-# Start
-cd "$(dirname "${GENESIS:-${BINARY}}")"
-nohup "${CMD[@]}" > "${ARC_DIR}/node.log" 2>&1 &
-NODE_PID=$!
-echo "${NODE_PID}" > "${ARC_DIR}/node.pid"
-
-# Wait for health
-for i in $(seq 1 20); do
-    if curl -sf http://localhost:9090/health >/dev/null 2>&1; then
-        PEERS=$(curl -sf http://localhost:9090/health 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers',0))" 2>/dev/null || echo "0")
-        ok "Node running (PID: ${NODE_PID}, Peers: ${PEERS})"
-        break
-    fi
-    sleep 1
-done
-
-# Faucet claim
-ADDR=$(curl -sf http://localhost:9090/worker/earnings 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('address',''))" 2>/dev/null || echo "")
-if [[ -n "${ADDR}" ]]; then
-    for seed_ip in 140.82.16.112 149.28.32.76 136.244.109.1; do
-        if curl -sf -X POST "http://${seed_ip}:9090/faucet/claim" -H "Content-Type: application/json" -d "{\"address\": \"${ADDR}\"}" >/dev/null 2>&1; then
-            ok "Testnet tokens claimed"
-            break
-        fi
-    done
-fi
-
-# ── Step 6: Auto-start + open dashboard ─────────────────
-step 6 "Setting up auto-start"
 
 if [[ "${OS}" == "Darwin" ]]; then
+    # ── macOS: use launchd as primary process manager ──
     PLIST_DIR="${HOME}/Library/LaunchAgents"
     PLIST="${PLIST_DIR}/com.arc.inference.plist"
     mkdir -p "${PLIST_DIR}"
-    BINARY_ABS="$(cd "$(dirname "${BINARY}")" && pwd)/$(basename "${BINARY}")"
-    GENESIS_ABS="$(cd "$(dirname "${GENESIS}")" && pwd)/$(basename "${GENESIS}")"
+
+    # Unload old if exists (ignore errors)
+    launchctl bootout "gui/$(id -u)/com.arc.inference" 2>/dev/null || true
+    # Also kill any leftover nohup processes
+    if [[ -f "${ARC_DIR}/node.pid" ]]; then
+        kill "$(cat "${ARC_DIR}/node.pid")" 2>/dev/null || true
+        sleep 1
+    fi
 
     cat > "${PLIST}" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -250,8 +223,7 @@ if [[ "${OS}" == "Darwin" ]]; then
         <string>--mode</string><string>worker</string>
         <string>--cpu-limit</string><string>${CPU_LIMIT}</string>
         <string>--eth-rpc-port</string><string>0</string>
-$(if [[ -n "${MODEL_PATH}" && -f "${MODEL_PATH}" ]]; then
-    MODEL_ABS="$(cd "$(dirname "${MODEL_PATH}")" && pwd)/$(basename "${MODEL_PATH}")"
+$(if [[ -n "${MODEL_ABS}" ]]; then
     echo "        <string>--model</string><string>${MODEL_ABS}</string>"
 fi)
     </array>
@@ -266,16 +238,30 @@ fi)
 </dict>
 </plist>
 PLIST
-    ok "Auto-start configured (launchd)"
-    echo -e "  ${D}Enable with: launchctl load ${PLIST}${N}"
+
+    # Load and start — launchd manages the process from now on.
+    # KeepAlive=true means it restarts on crash AND starts on boot.
+    launchctl load "${PLIST}" 2>/dev/null
+    ok "Persistent service installed (launchd)"
+    ok "Survives: close terminal, close browser, logout, reboot"
 
 elif [[ "${OS}" == "Linux" ]]; then
+    # ── Linux: use systemd user service ──
     SERVICE_DIR="${HOME}/.config/systemd/user"
     SERVICE="${SERVICE_DIR}/arc-inference.service"
     mkdir -p "${SERVICE_DIR}"
-    BINARY_ABS="$(readlink -f "${BINARY}")"
-    GENESIS_ABS="$(readlink -f "${GENESIS}")"
-    GENESIS_DIR="$(dirname "${GENESIS_ABS}")"
+
+    # Stop old
+    systemctl --user stop arc-inference 2>/dev/null || true
+    if [[ -f "${ARC_DIR}/node.pid" ]]; then
+        kill "$(cat "${ARC_DIR}/node.pid")" 2>/dev/null || true
+        sleep 1
+    fi
+
+    LINUX_BINARY="$(readlink -f "${BINARY}")"
+    LINUX_GENESIS="$(readlink -f "${GENESIS}")"
+    LINUX_MODEL=""
+    if [[ -n "${MODEL_ABS}" ]]; then LINUX_MODEL=" --model $(readlink -f "${MODEL_PATH}")"; fi
 
     cat > "${SERVICE}" <<SERVICE
 [Unit]
@@ -283,17 +269,58 @@ Description=ARC Community Inference Node
 After=network-online.target
 [Service]
 Type=simple
-ExecStart=${BINARY_ABS} --rpc 0.0.0.0:9090 --seeds-file ${ARC_DIR}/seeds.txt --genesis ${GENESIS_ABS} --validator-seed ${SEED} --stake 5000000 --mode worker --cpu-limit ${CPU_LIMIT} --eth-rpc-port 0$(if [[ -n "${MODEL_PATH}" && -f "${MODEL_PATH}" ]]; then echo " --model $(readlink -f "${MODEL_PATH}")"; fi)
+ExecStart=${LINUX_BINARY} --rpc 0.0.0.0:9090 --seeds-file ${ARC_DIR}/seeds.txt --genesis ${LINUX_GENESIS} --validator-seed ${SEED} --stake 5000000 --mode worker --cpu-limit ${CPU_LIMIT} --eth-rpc-port 0${LINUX_MODEL}
 Restart=always
 RestartSec=5
 CPUQuota=${CPU_LIMIT}%
-WorkingDirectory=${GENESIS_DIR}
+WorkingDirectory=$(dirname "${LINUX_GENESIS}")
 Environment=RUST_LOG=info
 [Install]
 WantedBy=default.target
 SERVICE
-    ok "Auto-start configured (systemd)"
-    echo -e "  ${D}Enable with: systemctl --user enable --now arc-inference${N}"
+
+    systemctl --user daemon-reload 2>/dev/null
+    systemctl --user enable --now arc-inference 2>/dev/null
+    # Enable lingering so the service runs even when logged out
+    loginctl enable-linger "$(whoami)" 2>/dev/null || true
+    ok "Persistent service installed (systemd)"
+    ok "Survives: close terminal, close browser, logout, reboot"
+
+else
+    # Fallback: nohup for unsupported OS
+    if [[ -f "${ARC_DIR}/node.pid" ]]; then
+        kill "$(cat "${ARC_DIR}/node.pid")" 2>/dev/null || true; sleep 1
+    fi
+    CMD=("${BINARY_ABS}" --rpc 0.0.0.0:9090 --seeds-file "${ARC_DIR}/seeds.txt" --validator-seed "${SEED}" --stake 5000000 --mode worker --cpu-limit "${CPU_LIMIT}" --eth-rpc-port 0)
+    if [[ -n "${GENESIS_ABS}" ]]; then CMD+=(--genesis "${GENESIS_ABS}"); fi
+    if [[ -n "${MODEL_ABS}" ]]; then CMD+=(--model "${MODEL_ABS}"); fi
+    cd "$(dirname "${GENESIS_ABS}")"
+    nohup "${CMD[@]}" > "${ARC_DIR}/node.log" 2>&1 &
+    echo $! > "${ARC_DIR}/node.pid"
+    warn "No launchd/systemd — using nohup (won't survive reboot)"
+fi
+
+# ── Step 6: Wait for health + claim faucet ────────────────
+step 6 "Connecting to network"
+
+for i in $(seq 1 30); do
+    if curl -sf http://localhost:9090/health >/dev/null 2>&1; then
+        PEERS=$(curl -sf http://localhost:9090/health 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers',0))" 2>/dev/null || echo "0")
+        ok "Connected to ${PEERS} peers"
+        break
+    fi
+    sleep 1
+done
+
+# Faucet claim
+ADDR=$(curl -sf http://localhost:9090/worker/earnings 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('address',''))" 2>/dev/null || echo "")
+if [[ -n "${ADDR}" ]]; then
+    for seed_ip in 140.82.16.112 149.28.32.76 136.244.109.1; do
+        if curl -sf -X POST "http://${seed_ip}:9090/faucet/claim" -H "Content-Type: application/json" -d "{\"address\": \"${ADDR}\"}" >/dev/null 2>&1; then
+            ok "Testnet tokens claimed"
+            break
+        fi
+    done
 fi
 
 # ── Open dashboard ──────────────────────────────────────
