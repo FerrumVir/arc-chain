@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARC Network — Earn by Running AI</title>
+    <meta name="description" content="Join the ARC Network. Run AI inference on your device and earn ARC tokens. One command to install.">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'arc-bg': '#03030A',
+                        'arc-surface': '#0d0d14',
+                        'arc-border': '#1a1a2e',
+                        'arc-dim': '#8e8e9d',
+                        'arc-accent': '#6F7CF4',
+                        'arc-accent2': '#002DDE',
+                        'arc-green': '#51EB8E',
+                    },
+                    fontFamily: {
+                        sans: ['Inter', 'system-ui', 'sans-serif'],
+                        mono: ['JetBrains Mono', 'SF Mono', 'monospace'],
+                    },
+                }
+            }
+        }
+    </script>
+    <style>
+        body { background: #03030A; }
+        @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:0.35} }
+        .dot-pulse { animation: pulse-dot 2s infinite; }
+        @keyframes fade-in { from{opacity:0;transform:translateY(12px)} to{opacity:1;transform:translateY(0)} }
+        .fade-in { animation: fade-in 0.6s ease-out forwards; }
+        .fade-in-delay-1 { animation-delay: 0.1s; opacity: 0; }
+        .fade-in-delay-2 { animation-delay: 0.2s; opacity: 0; }
+        .fade-in-delay-3 { animation-delay: 0.3s; opacity: 0; }
+        @keyframes gradient-shift {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+        .gradient-text {
+            background: linear-gradient(135deg, #6F7CF4, #002DDE, #6F7CF4);
+            background-size: 200% 200%;
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            animation: gradient-shift 6s ease infinite;
+        }
+        .glow-border:hover {
+            border-color: #6F7CF4;
+            box-shadow: 0 0 20px rgba(111,124,244,0.15);
+        }
+    </style>
+</head>
+<body class="text-white font-sans antialiased">
+
+<!-- Nav -->
+<nav class="border-b border-arc-border/50">
+    <div class="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
+        <div class="flex items-center gap-2">
+            <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-arc-accent to-arc-accent2 flex items-center justify-center font-bold text-sm">A</div>
+            <span class="font-semibold tracking-wide text-sm">ARC NETWORK</span>
+        </div>
+        <div class="flex items-center gap-4 text-xs text-arc-dim">
+            <a href="#how-it-works" class="hover:text-white transition-colors hidden sm:inline">How It Works</a>
+            <a href="#faq" class="hover:text-white transition-colors hidden sm:inline">FAQ</a>
+            <a href="https://github.com/FerrumVir/arc-chain" target="_blank" class="hover:text-white transition-colors flex items-center gap-1">
+                <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/></svg>
+                GitHub
+            </a>
+        </div>
+    </div>
+</nav>
+
+<!-- Hero -->
+<section class="max-w-6xl mx-auto px-4 sm:px-6 pt-16 sm:pt-24 pb-16 text-center">
+    <div class="fade-in">
+        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-arc-border text-xs text-arc-dim mb-6">
+            <span class="w-1.5 h-1.5 rounded-full bg-arc-green dot-pulse"></span>
+            <span id="hero-status">Network Live</span>
+        </div>
+        <h1 class="text-4xl sm:text-5xl md:text-6xl font-bold leading-tight tracking-tight">
+            Join the ARC Network<br>
+            <span class="gradient-text">Earn by Running AI</span>
+        </h1>
+        <p class="text-arc-dim text-base sm:text-lg max-w-xl mx-auto mt-5 leading-relaxed">
+            Run AI inference on your device. Earn ARC tokens for every task you complete. One command to install, zero configuration.
+        </p>
+    </div>
+
+    <!-- Platform Buttons -->
+    <div class="mt-10 fade-in fade-in-delay-1">
+        <div class="flex flex-wrap justify-center gap-3 mb-6">
+            <button onclick="selectPlatform('mac')" id="btn-mac"
+                class="platform-btn px-5 py-2.5 rounded-lg border border-arc-accent bg-arc-accent/10 text-white text-sm font-medium transition-all flex items-center gap-2">
+                <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
+                macOS
+            </button>
+            <button onclick="selectPlatform('linux')" id="btn-linux"
+                class="platform-btn px-5 py-2.5 rounded-lg border border-arc-border text-arc-dim text-sm font-medium transition-all hover:border-arc-accent/50 hover:text-white flex items-center gap-2">
+                <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M12.504 0c-.155 0-.315.008-.48.021-4.226.333-3.105 4.807-3.17 6.298-.076 1.092-.3 1.953-1.05 3.02-.885 1.051-2.127 2.75-2.716 4.521-.278.832-.41 1.684-.287 2.489a.424.424 0 00-.11.135c-.26.268-.45.6-.663.839-.199.199-.485.267-.797.4-.313.136-.658.269-.864.68-.09.189-.136.394-.132.602 0 .199.027.4.055.536.058.399.116.728.04.97-.249.68-.28 1.145-.106 1.484.174.334.535.47.94.601.81.2 1.91.135 2.774.6.926.466 1.866.67 2.616.47.526-.116.97-.464 1.208-.946.587-.003 1.23-.269 2.26-.334.699-.058 1.574.267 2.577.2.025.134.063.198.114.333l.003.003c.391.778 1.113 1.368 1.884 1.43.868.07 1.668-.97 1.303-1.334.363-.63.65-2.98-.126-5.333C18.89 14.682 18.3 13.725 17.4 12.98c-.197-2.41-.091-2.668-.091-3.253 0-3.097.885-4.281-.088-5.907C16.353 2.369 14.648.07 12.504 0z"/></svg>
+                Linux
+            </button>
+            <button onclick="selectPlatform('windows')" id="btn-windows"
+                class="platform-btn px-5 py-2.5 rounded-lg border border-arc-border text-arc-dim text-sm font-medium transition-all hover:border-arc-accent/50 hover:text-white flex items-center gap-2">
+                <svg class="w-4 h-4" fill="currentColor" viewBox="0 0 24 24"><path d="M0 3.449L9.75 2.1v9.451H0m10.949-9.602L24 0v11.4H10.949M0 12.6h9.75v9.451L0 20.699M10.949 12.6H24V24l-12.9-1.801"/></svg>
+                Windows
+            </button>
+        </div>
+
+        <!-- Install Command -->
+        <div class="max-w-2xl mx-auto">
+            <div class="bg-arc-surface border border-arc-border rounded-lg p-4 sm:p-5">
+                <div class="flex items-center justify-between gap-3 mb-2">
+                    <span class="text-xs text-arc-dim font-mono" id="cmd-label">Terminal (macOS / Linux)</span>
+                    <button onclick="copyCommand()" id="copy-btn"
+                        class="text-xs text-arc-accent hover:text-white transition-colors flex items-center gap-1 shrink-0">
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" stroke-width="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" stroke-width="2"/></svg>
+                        <span id="copy-text">Copy</span>
+                    </button>
+                </div>
+                <code class="block text-arc-accent font-mono text-xs sm:text-sm leading-relaxed break-all select-all" id="install-cmd">curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash</code>
+            </div>
+            <p class="text-xs text-arc-dim mt-2" id="cmd-hint">Requires macOS 12+ or Ubuntu 20+. Installs to ~/.arc. About 4 GB for the AI model.</p>
+        </div>
+    </div>
+</section>
+
+<!-- Live Network Stats -->
+<section class="border-y border-arc-border">
+    <div class="max-w-6xl mx-auto px-4 sm:px-6 py-10">
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-6 sm:gap-8 text-center">
+            <div>
+                <div class="text-2xl sm:text-3xl font-bold tabular-nums" id="stat-validators">--</div>
+                <div class="text-xs text-arc-dim uppercase tracking-wider mt-1">Active Nodes</div>
+            </div>
+            <div>
+                <div class="text-2xl sm:text-3xl font-bold tabular-nums" id="stat-tps">--</div>
+                <div class="text-xs text-arc-dim uppercase tracking-wider mt-1">Inferences / min</div>
+            </div>
+            <div>
+                <div class="text-2xl sm:text-3xl font-bold tabular-nums" id="stat-txns">--</div>
+                <div class="text-xs text-arc-dim uppercase tracking-wider mt-1">Total Inferences</div>
+            </div>
+            <div>
+                <div class="text-2xl sm:text-3xl font-bold tabular-nums gradient-text" id="stat-earned">--</div>
+                <div class="text-xs text-arc-dim uppercase tracking-wider mt-1">ARC Distributed</div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- How It Works -->
+<section id="how-it-works" class="max-w-6xl mx-auto px-4 sm:px-6 py-16 sm:py-24">
+    <h2 class="text-center text-xs uppercase tracking-[0.2em] text-arc-dim font-medium mb-12">How It Works</h2>
+    <div class="grid sm:grid-cols-3 gap-6 sm:gap-8">
+        <div class="bg-arc-surface border border-arc-border rounded-lg p-6 sm:p-8 text-center glow-border transition-all fade-in fade-in-delay-1">
+            <div class="w-12 h-12 mx-auto mb-4 rounded-xl bg-arc-accent/10 border border-arc-accent/20 flex items-center justify-center">
+                <svg class="w-6 h-6 text-arc-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6.75 7.5l3 2.25-3 2.25m4.5 0h3m-9 8.25h13.5A2.25 2.25 0 0021 18V6a2.25 2.25 0 00-2.25-2.25H5.25A2.25 2.25 0 003 6v12a2.25 2.25 0 002.25 2.25z"/></svg>
+            </div>
+            <div class="text-xs text-arc-accent font-mono mb-2">STEP 1</div>
+            <h3 class="font-semibold text-lg mb-2">Install</h3>
+            <p class="text-sm text-arc-dim leading-relaxed">One command. Downloads the ARC node binary and a 7B parameter AI model. Works on Mac, Linux, and Windows.</p>
+        </div>
+        <div class="bg-arc-surface border border-arc-border rounded-lg p-6 sm:p-8 text-center glow-border transition-all fade-in fade-in-delay-2">
+            <div class="w-12 h-12 mx-auto mb-4 rounded-xl bg-arc-green/10 border border-arc-green/20 flex items-center justify-center">
+                <svg class="w-6 h-6 text-arc-green" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M12 6v12m-3-2.818l.879.659c1.171.879 3.07.879 4.242 0 1.172-.879 1.172-2.303 0-3.182C13.536 12.219 12.768 12 12 12c-.725 0-1.45-.22-2.003-.659-1.106-.879-1.106-2.303 0-3.182s2.9-.879 4.006 0l.415.33M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            </div>
+            <div class="text-xs text-arc-green font-mono mb-2">STEP 2</div>
+            <h3 class="font-semibold text-lg mb-2">Earn</h3>
+            <p class="text-sm text-arc-dim leading-relaxed">Your node joins the network and starts processing AI inference tasks. You earn ARC tokens for every completed inference.</p>
+        </div>
+        <div class="bg-arc-surface border border-arc-border rounded-lg p-6 sm:p-8 text-center glow-border transition-all fade-in fade-in-delay-3">
+            <div class="w-12 h-12 mx-auto mb-4 rounded-xl bg-arc-accent2/20 border border-arc-accent2/30 flex items-center justify-center">
+                <svg class="w-6 h-6 text-arc-accent" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5"><path stroke-linecap="round" stroke-linejoin="round" d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 013 19.875v-6.75zM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V8.625zM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 01-1.125-1.125V4.125z"/></svg>
+            </div>
+            <div class="text-xs text-arc-accent font-mono mb-2">STEP 3</div>
+            <h3 class="font-semibold text-lg mb-2">Dashboard</h3>
+            <p class="text-sm text-arc-dim leading-relaxed">Track your earnings, inference count, and rank on the network leaderboard from your local dashboard at localhost:9090.</p>
+        </div>
+    </div>
+</section>
+
+<!-- Leaderboard -->
+<section class="max-w-6xl mx-auto px-4 sm:px-6 pb-16 sm:pb-24">
+    <div class="flex items-center justify-between mb-6">
+        <h2 class="text-xs uppercase tracking-[0.2em] text-arc-dim font-medium">Top Earners</h2>
+        <span class="text-xs text-arc-dim" id="lb-updated">--</span>
+    </div>
+    <div class="bg-arc-surface border border-arc-border rounded-lg overflow-hidden">
+        <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+                <thead>
+                    <tr class="border-b border-arc-border text-xs text-arc-dim uppercase tracking-wider">
+                        <th class="text-left py-3 px-4 sm:px-6">Rank</th>
+                        <th class="text-left py-3 px-4 sm:px-6">Node</th>
+                        <th class="text-right py-3 px-4 sm:px-6">Inferences</th>
+                        <th class="text-right py-3 px-4 sm:px-6">ARC Earned</th>
+                    </tr>
+                </thead>
+                <tbody id="leaderboard-body">
+                    <tr><td colspan="4" class="py-8 text-center text-arc-dim text-xs">Loading leaderboard...</td></tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+</section>
+
+<!-- FAQ -->
+<section id="faq" class="border-t border-arc-border">
+    <div class="max-w-3xl mx-auto px-4 sm:px-6 py-16 sm:py-24">
+        <h2 class="text-center text-xs uppercase tracking-[0.2em] text-arc-dim font-medium mb-12">Frequently Asked Questions</h2>
+        <div class="space-y-4">
+            <details class="group bg-arc-surface border border-arc-border rounded-lg" open>
+                <summary class="flex items-center justify-between cursor-pointer px-5 py-4 text-sm font-medium">
+                    What is the ARC Network?
+                    <svg class="w-4 h-4 text-arc-dim transition-transform group-open:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                </summary>
+                <div class="px-5 pb-4 text-sm text-arc-dim leading-relaxed">
+                    ARC is a decentralized AI inference network. Instead of relying on centralized cloud providers, ARC distributes AI workloads across a global network of community-run nodes. Every node contributes compute power and earns ARC tokens in return. The network uses GPU-accelerated BLAKE3 hashing for consensus and supports models like Llama 2 7B.
+                </div>
+            </details>
+            <details class="group bg-arc-surface border border-arc-border rounded-lg">
+                <summary class="flex items-center justify-between cursor-pointer px-5 py-4 text-sm font-medium">
+                    How do I earn ARC tokens?
+                    <svg class="w-4 h-4 text-arc-dim transition-transform group-open:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                </summary>
+                <div class="px-5 pb-4 text-sm text-arc-dim leading-relaxed">
+                    Once your node is running, it automatically connects to the network and begins processing inference requests. You earn 100 ARC tokens per completed inference. Your earnings are persisted to disk, so you never lose progress even if your machine restarts. Track your earnings at <code class="text-arc-accent">http://localhost:9090</code>.
+                </div>
+            </details>
+            <details class="group bg-arc-surface border border-arc-border rounded-lg">
+                <summary class="flex items-center justify-between cursor-pointer px-5 py-4 text-sm font-medium">
+                    Is it safe to run on my computer?
+                    <svg class="w-4 h-4 text-arc-dim transition-transform group-open:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                </summary>
+                <div class="px-5 pb-4 text-sm text-arc-dim leading-relaxed">
+                    Yes. The ARC node runs a sandboxed AI model locally on your machine. It does not access your files, passwords, or personal data. By default, it uses only 15% of your CPU so you can use your computer normally while it runs in the background. The installer is open source and auditable on GitHub. On Mac, it runs as a launchd service; on Linux, as a systemd service.
+                </div>
+            </details>
+            <details class="group bg-arc-surface border border-arc-border rounded-lg">
+                <summary class="flex items-center justify-between cursor-pointer px-5 py-4 text-sm font-medium">
+                    How much can I earn?
+                    <svg class="w-4 h-4 text-arc-dim transition-transform group-open:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                </summary>
+                <div class="px-5 pb-4 text-sm text-arc-dim leading-relaxed">
+                    Earnings depend on your hardware and uptime. Every completed inference earns 100 ARC. A typical Mac with an M-series chip completes an inference in about 1 second, meaning you can earn thousands of ARC per hour. Check the leaderboard above to see what top earners are making. The more powerful your hardware and the longer you run, the more you earn.
+                </div>
+            </details>
+            <details class="group bg-arc-surface border border-arc-border rounded-lg">
+                <summary class="flex items-center justify-between cursor-pointer px-5 py-4 text-sm font-medium">
+                    What hardware do I need?
+                    <svg class="w-4 h-4 text-arc-dim transition-transform group-open:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                </summary>
+                <div class="px-5 pb-4 text-sm text-arc-dim leading-relaxed">
+                    Minimum: 8 GB RAM and 5 GB free disk space. The node runs a quantized 7B parameter model (4.1 GB). Mac (Apple Silicon or Intel), Linux (x86_64 or ARM64), and Windows are all supported. Apple Silicon Macs, machines with NVIDIA GPUs, and high-core-count servers will earn faster, but any modern computer can participate.
+                </div>
+            </details>
+            <details class="group bg-arc-surface border border-arc-border rounded-lg">
+                <summary class="flex items-center justify-between cursor-pointer px-5 py-4 text-sm font-medium">
+                    How do I stop or uninstall?
+                    <svg class="w-4 h-4 text-arc-dim transition-transform group-open:rotate-180" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+                </summary>
+                <div class="px-5 pb-4 text-sm text-arc-dim leading-relaxed">
+                    On Mac: <code class="text-arc-accent">launchctl unload ~/Library/LaunchAgents/com.arc-chain.node.plist</code>. On Linux: <code class="text-arc-accent">sudo systemctl stop arc-node</code>. To fully uninstall, just remove the <code class="text-arc-accent">~/.arc</code> directory. Your earnings history is stored there, so back it up first if you want to keep it.
+                </div>
+            </details>
+        </div>
+    </div>
+</section>
+
+<!-- CTA -->
+<section class="border-t border-arc-border">
+    <div class="max-w-3xl mx-auto px-4 sm:px-6 py-16 sm:py-24 text-center">
+        <h2 class="text-2xl sm:text-3xl font-bold mb-4">Ready to earn?</h2>
+        <p class="text-arc-dim text-sm mb-8">Join the network in 60 seconds. No account required.</p>
+        <div class="bg-arc-surface border border-arc-border rounded-lg p-4 max-w-xl mx-auto">
+            <code class="block text-arc-accent font-mono text-xs sm:text-sm break-all select-all">curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash</code>
+        </div>
+    </div>
+</section>
+
+<!-- Footer -->
+<footer class="border-t border-arc-border">
+    <div class="max-w-6xl mx-auto px-4 sm:px-6 py-8 flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-arc-dim">
+        <div class="flex items-center gap-2">
+            <div class="w-5 h-5 rounded bg-gradient-to-br from-arc-accent to-arc-accent2 flex items-center justify-center font-bold text-[10px]">A</div>
+            <span>ARC Network</span>
+        </div>
+        <div class="flex items-center gap-4">
+            <a href="https://github.com/FerrumVir/arc-chain" target="_blank" class="hover:text-white transition-colors">GitHub</a>
+            <span>Agent Runtime Chain v0.1.0</span>
+            <span>GPU-accelerated BLAKE3</span>
+        </div>
+    </div>
+</footer>
+
+<script>
+const SEED = 'http://140.82.16.112:9090';
+
+const commands = {
+    mac: {
+        cmd: 'curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash',
+        label: 'Terminal (macOS / Linux)',
+        hint: 'Requires macOS 12+ or Ubuntu 20+. Installs to ~/.arc. About 4 GB for the AI model.'
+    },
+    linux: {
+        cmd: 'curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash',
+        label: 'Terminal (Linux)',
+        hint: 'Requires Ubuntu 20+ / Debian 11+ / Fedora 36+. Installs to ~/.arc. About 4 GB for the AI model.'
+    },
+    windows: {
+        cmd: 'irm https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.ps1 | iex',
+        label: 'PowerShell (Run as Administrator)',
+        hint: 'Requires Windows 10/11. Installs to %USERPROFILE%\\.arc. About 4 GB for the AI model.'
+    }
+};
+
+let currentPlatform = 'mac';
+
+function selectPlatform(p) {
+    currentPlatform = p;
+    document.getElementById('install-cmd').textContent = commands[p].cmd;
+    document.getElementById('cmd-label').textContent = commands[p].label;
+    document.getElementById('cmd-hint').textContent = commands[p].hint;
+    document.getElementById('copy-text').textContent = 'Copy';
+
+    document.querySelectorAll('.platform-btn').forEach(btn => {
+        btn.classList.remove('border-arc-accent', 'bg-arc-accent/10', 'text-white');
+        btn.classList.add('border-arc-border', 'text-arc-dim');
+    });
+    const active = document.getElementById('btn-' + p);
+    active.classList.remove('border-arc-border', 'text-arc-dim');
+    active.classList.add('border-arc-accent', 'bg-arc-accent/10', 'text-white');
+}
+
+function copyCommand() {
+    const cmd = commands[currentPlatform].cmd;
+    navigator.clipboard.writeText(cmd).then(() => {
+        const el = document.getElementById('copy-text');
+        el.textContent = 'Copied!';
+        setTimeout(() => el.textContent = 'Copy', 2000);
+    });
+}
+
+function fmt(n) {
+    if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
+    if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+    return n.toLocaleString();
+}
+
+function esc(s) {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+}
+
+function truncAddr(s) {
+    if (!s || s.length < 16) return s || '--';
+    return s.slice(0,8) + '...' + s.slice(-6);
+}
+
+// Fetch live stats
+async function fetchStats() {
+    try {
+        const r = await fetch(SEED + '/stats', { signal: AbortSignal.timeout(5000) });
+        if (!r.ok) return;
+        const d = await r.json();
+        if (d.validator_count !== undefined) document.getElementById('stat-validators').textContent = d.validator_count;
+        if (d.node_count !== undefined) document.getElementById('stat-validators').textContent = d.node_count;
+        if (d.tps !== undefined) document.getElementById('stat-tps').textContent = fmt(d.tps);
+        if (d.total_transactions !== undefined) document.getElementById('stat-txns').textContent = fmt(d.total_transactions);
+        if (d.total_inferences !== undefined) document.getElementById('stat-txns').textContent = fmt(d.total_inferences);
+        if (d.total_earned !== undefined) document.getElementById('stat-earned').textContent = fmt(d.total_earned) + ' ARC';
+        document.getElementById('hero-status').textContent = 'Network Live';
+    } catch(e) {
+        console.warn('Stats fetch failed:', e);
+    }
+}
+
+// Fetch leaderboard
+async function fetchLeaderboard() {
+    try {
+        const r = await fetch(SEED + '/worker/leaderboard', { signal: AbortSignal.timeout(5000) });
+        if (!r.ok) return;
+        const d = await r.json();
+        const entries = d.leaderboard || d.workers || d;
+        if (!Array.isArray(entries) || entries.length === 0) return;
+
+        const tbody = document.getElementById('leaderboard-body');
+        tbody.innerHTML = entries.slice(0, 10).map((w, i) => {
+            const rank = i + 1;
+            const medal = rank === 1 ? 'text-yellow-400' : rank === 2 ? 'text-gray-300' : rank === 3 ? 'text-amber-600' : 'text-arc-dim';
+            const name = w.hostname || w.node_id || w.address || w.identity || ('Node ' + rank);
+            const inferences = w.inference_count || w.inferences || 0;
+            const earned = w.total_earned || w.arc_earned || w.earned || (inferences * 100);
+            return `<tr class="border-b border-arc-border/50 hover:bg-arc-surface/50 transition-colors">
+                <td class="py-3 px-4 sm:px-6 font-mono font-medium ${medal}">#${rank}</td>
+                <td class="py-3 px-4 sm:px-6 font-mono text-xs">${esc(typeof name === 'string' ? name : String(name))}</td>
+                <td class="py-3 px-4 sm:px-6 text-right tabular-nums">${fmt(inferences)}</td>
+                <td class="py-3 px-4 sm:px-6 text-right tabular-nums text-arc-green font-medium">${fmt(earned)} ARC</td>
+            </tr>`;
+        }).join('');
+        document.getElementById('lb-updated').textContent = 'Updated just now';
+    } catch(e) {
+        console.warn('Leaderboard fetch failed:', e);
+    }
+}
+
+// Auto-detect platform
+function autoDetect() {
+    const ua = navigator.userAgent.toLowerCase();
+    if (ua.includes('win')) selectPlatform('windows');
+    else if (ua.includes('linux')) selectPlatform('linux');
+    else selectPlatform('mac');
+}
+
+// Init
+autoDetect();
+fetchStats();
+fetchLeaderboard();
+setInterval(fetchStats, 15000);
+setInterval(fetchLeaderboard, 30000);
+</script>
+
+</body>
+</html>
