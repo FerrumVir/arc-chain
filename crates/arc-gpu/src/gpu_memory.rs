@@ -221,13 +221,17 @@ impl GpuAccountBuffer {
                     mapped_at_creation: false,
                 });
 
+                // wgpu spec: MAP_READ can only combine with COPY_DST,
+                // MAP_WRITE can only combine with COPY_SRC.
+                // Previous code used all four flags, which crashed on
+                // non-Metal backends (Vulkan, SVGA3D/LLVM in VMs).
+                // Use MAP_WRITE + COPY_SRC for the staging buffer
+                // (we primarily write from CPU, copy to GPU).
                 let staging = device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("ARC GPU State (staging)"),
                     size: buf_size,
-                    usage: wgpu::BufferUsages::MAP_READ
-                        | wgpu::BufferUsages::MAP_WRITE
-                        | wgpu::BufferUsages::COPY_SRC
-                        | wgpu::BufferUsages::COPY_DST,
+                    usage: wgpu::BufferUsages::MAP_WRITE
+                        | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: true,
                 });
 

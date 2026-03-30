@@ -199,21 +199,33 @@ impl Pipeline {
     /// Spawns 3 background threads (verify, execute, commit).
     pub fn with_config(state: Arc<StateDB>, config: PipelineConfig) -> Self {
         // Enable GPU state cache if requested.
+        // Wrapped in catch_unwind: on VMs and weak GPUs, wgpu buffer creation
+        // panics with Validation Errors (e.g., SVGA3D doesn't support certain
+        // buffer usage combos). The node MUST NOT crash — just skip GPU cache.
         if config.gpu_state_enabled || config.execution_mode == ExecutionMode::GpuResident {
             let gpu_config = arc_state::gpu_state::GpuStateCacheConfig {
                 max_gpu_accounts: config.gpu_state_capacity,
                 ..Default::default()
             };
-            // Safety: we need &mut but state is behind Arc. The enable_gpu_cache
-            // is called once at startup before any concurrent access.
-            unsafe {
-                let state_ptr = Arc::as_ptr(&state) as *mut StateDB;
-                (*state_ptr).enable_gpu_cache(gpu_config);
-            }
-            info!(
-                capacity = config.gpu_state_capacity,
-                "Pipeline: GPU-resident state cache enabled"
-            );
+            let state_clone = state.clone();
+            let gpu_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // Safety: we need &mut but state is behind Arc. The enable_gpu_cache
+                // is called once at startup before any concurrent access.
+                unsafe {
+                    let state_ptr = Arc::as_ptr(&state_clone) as *mut StateDB;
+                    (*state_ptr).enable_gpu_cache(gpu_config);
+                }
+            }));
+            match gpu_result {
+                Ok(()) => info!(
+                    capacity = config.gpu_state_capacity,
+                    "Pipeline: GPU-resident state cache enabled"
+                ),
+                Err(e) => warn!(
+                    "GPU state cache failed to initialize (VM or unsupported GPU). Running CPU-only. Error: {:?}",
+                    e
+                ),
+            };
         }
 
         // Bounded channels between stages (capacity 2 to allow slight buffering
