@@ -178,3 +178,57 @@
 - `dashboard/worker.html` (SVG chart section + updateChart/renderChart JS + range buttons)
 - `evolution/log.md` (this entry)
 ---
+
+## Evolution 5 — 2026-03-30 03:10
+**Commit:** 772c005
+**Tag:** evolution-5
+**What:** README update documenting all new features + installer hardening
+
+### README (README.md)
+- Updated "Your dashboard shows" section: now lists animated earnings counter with glow, earnings-over-time chart (SVG with time range toggles), network leaderboard with medal icons, mobile responsiveness
+- Added "Earnings persist across restarts" callout
+- Added curl examples for `/worker/earnings/history` and `/worker/leaderboard`
+- Added "Installer options" section documenting `--tiny`, `--skip-model`, `--model PATH`, `--cpu-limit`
+- Added 4 new worker endpoints to RPC API table (38 total): `/worker/dashboard`, `/worker/earnings`, `/worker/earnings/history`, `/worker/leaderboard`
+- Added 5 new rows to "What's Done" table: Community worker mode, Worker dashboard, Persistent earnings, Earnings chart, Network leaderboard
+
+### Installer hardening (scripts/arc-community.sh)
+- Added `--help` / `-h` flag with full usage documentation
+- Added pre-flight checks section before Step 1:
+  - `curl` installed check (with OS-specific install instructions)
+  - `git` installed check (skipped if binary already cached)
+  - Disk space check: requires ~5 GB (or ~2 GB with `--skip-model`), reports available space
+  - Port 9090 conflict detection: uses `lsof` (Mac/Linux) or `ss` (Linux fallback). Distinguishes between an existing arc-node (warns, will restart) vs another process (fails with PID and process name)
+- Model download hardening: `curl --fail` flag prevents silent HTTP error pages being saved as the model file. Post-download file size check (must be >100 MB) catches truncated downloads. Cleanup of partial `.tmp` file on failure.
+- Git clone error handling: shows tail of clone output on failure instead of silently swallowing errors
+- Python3-free fallbacks: health check and faucet claim sections now use `grep`-based JSON parsing when `python3` is not available
+- Health check timeout: reports warning if node doesn't respond after 30s with log file path
+- OS-appropriate stop/restart commands in summary: `launchctl` on Mac, `systemctl` on Linux, `kill` fallback
+
+**Why:** The README documented zero of the features built in Evolutions 1-4. A new user reading it would miss persistent earnings, the earnings chart, the leaderboard, mobile responsiveness, and worker mode entirely. The installer failed silently on missing git/curl, had no help flag, didn't check disk space before a 4 GB download, and couldn't detect port conflicts. Both are high-surface-area user touchpoints that were lagging behind the actual capabilities of the live network.
+
+**Verified:**
+- Mac worker: earnings endpoint returns 15,800 ARC, 158 inferences, 8 peers, persistence=true
+- Mac worker: dashboard serves HTML with all Evolution 1-4 features
+- Mac worker: inference produces clean output ("Blockchain is a distributed ledger...")
+- Mac worker: leaderboard shows rank #1 of 9 nodes
+- Mac worker: earnings history returns 15+ data points
+- Installer `--help` works on Mac (local) and both NYC and AMS seeds (remote)
+- Installer syntax check passes (`bash -n`)
+- All 8 seeds upgraded via rolling-deploy.sh
+- NYC seed: leaderboard returns 8 nodes
+- LAX seed: dashboard serves HTML
+- Binary hash unchanged (no Rust code changes): 3d22d00fceb56210edb03a145b3c4b1b89f9ab292e74435e3fad5ca1a168c238
+
+**Known issue (pre-existing, NOT from this cycle):**
+- `peer_count` in `/health` shows 0 transiently after rolling restart due to QUIC UDP timeout cycling (~70s)
+- Inference still flows correctly during this period (verified in node logs)
+- Self-healing reconnection confirmed in NYC logs (new inbound connections replacing stale ones)
+
+**Rollback:** `git checkout evolution-4`
+
+**Files changed:**
+- `README.md` (documented all Evolution 1-4 features, added worker endpoints to API table, added installer options section, updated What's Done table)
+- `scripts/arc-community.sh` (--help flag, pre-flight checks, download validation, python3-free fallbacks, OS-appropriate stop/restart commands)
+- `evolution/log.md` (this entry)
+---
