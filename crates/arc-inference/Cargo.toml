@@ -8,6 +8,7 @@ license.workspace = true
 [features]
 default = []
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+metal = ["candle", "candle-core/metal"]
 
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }

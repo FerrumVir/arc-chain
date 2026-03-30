@@ -14,6 +14,7 @@ path = "src/main.rs"
 [features]
 default = []
 candle = ["arc-inference/candle"]
+metal = ["arc-inference/metal"]
 stwo-prover = ["arc-crypto/stwo-prover", "arc-state/stwo-prover"]
 
 [dependencies]

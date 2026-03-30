@@ -13,6 +13,16 @@ use crate::{InferenceError, InferenceResult};
 use arc_crypto::Hash256;
 use tracing::info;
 
+/// Select the compute device.
+/// For quantized (GGUF Q4) models, CPU is faster than Metal because:
+/// - Quantized matmuls dequantize on CPU before Metal can process them
+/// - CPU-GPU sync overhead dominates for single-token generation
+/// Metal would help for dense float models but not Q4_K_M GGUF.
+#[cfg(feature = "candle")]
+fn best_device() -> candle_core::Device {
+    candle_core::Device::Cpu
+}
+
 /// GGUF model inference engine.
 ///
 /// Loads quantized models from GGUF files and executes transformer
@@ -29,8 +39,11 @@ struct LoadedGgufModel {
     path: String,
     /// Model ID = BLAKE3(first 1MB of file || file_size).
     model_id: Hash256,
-    /// Quantized model weights loaded via candle.
-    model: candle_transformers::models::quantized_llama::ModelWeights,
+    /// Template model — cloned for each inference to get fresh KV cache.
+    /// Candle's ModelWeights derives Clone; the quantized weights are
+    /// reference-counted Tensors, so cloning is cheap (~microseconds).
+    /// Only the KV cache (Option per layer) actually gets fresh copies.
+    model_template: candle_transformers::models::quantized_llama::ModelWeights,
     /// Tokenizer (simple byte-level for determinism).
     vocab_size: u32,
 }
@@ -97,7 +110,7 @@ impl GgufEngine {
         let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut gguf_file)
             .map_err(|e| InferenceError::Runtime(format!("GGUF parse error: {e}")))?;
 
-        let device = Device::Cpu; // Metal: Device::new_metal(0)?
+        let device = best_device();
 
         // Build quantized model from GGUF
         let model = ModelWeights::from_gguf(gguf_content, &mut gguf_file, &device)
@@ -114,7 +127,7 @@ impl GgufEngine {
         self.models.insert(model_id.0, LoadedGgufModel {
             path: path.to_string(),
             model_id,
-            model,
+            model_template: model,
             vocab_size,
         });
 
@@ -142,73 +155,97 @@ impl GgufEngine {
         input_tokens: &[u32],
         max_tokens: u32,
     ) -> Result<InferenceResult, InferenceError> {
-        use candle_core::{Device, Tensor};
+        use candle_core::Tensor;
 
         let start = std::time::Instant::now();
 
-        let mut model_ref = self.models.get_mut(&model_id.0)
+        let model_ref = self.models.get(&model_id.0)
             .ok_or_else(|| InferenceError::ModelNotFound(hex::encode(&model_id.0[..8])))?;
 
-        let device = Device::Cpu;
+        // Clone model to get fresh KV cache for this request.
+        // Candle Tensors are Arc-backed, so this clones only the KV cache
+        // Option wrappers (None × n_layers), not the actual weight data.
+        let mut model = model_ref.model_template.clone();
+        drop(model_ref); // Release DashMap lock immediately
 
-        // Convert input tokens to tensor
-        let input_ids: Vec<u32> = input_tokens.to_vec();
-        let mut all_tokens = input_ids.clone();
-        let mut generated_tokens: Vec<u32> = Vec::new();
+        let device = best_device();
+        let prompt_len = input_tokens.len();
+
+        let mut generated_tokens: Vec<u32> = Vec::with_capacity(max_tokens as usize);
 
         // Autoregressive generation
         let tokens_to_generate = max_tokens.min(256);
-        for i in 0..tokens_to_generate {
-            let context = if i == 0 {
-                // First pass: use full input
-                Tensor::new(all_tokens.as_slice(), &device)
+
+        // --- Prompt prefill phase: process all input tokens at once ---
+        // This fills the KV cache with prompt context in a single forward pass.
+        let prompt_tensor = Tensor::new(input_tokens, &device)
+            .map_err(|e| InferenceError::Runtime(format!("Tensor: {e}")))?
+            .unsqueeze(0)
+            .map_err(|e| InferenceError::Runtime(format!("Unsqueeze: {e}")))?;
+
+        let logits = model.forward(&prompt_tensor, 0)
+            .map_err(|e| InferenceError::Runtime(format!("Forward prefill: {e}")))?;
+
+        // Extract logits for last prompt position to get first generated token
+        let logits = logits.squeeze(0)
+            .map_err(|e| InferenceError::Runtime(format!("Squeeze: {e}")))?;
+        let last_logits = if logits.dims().len() == 2 {
+            logits.get(logits.dim(0).unwrap() - 1)
+                .map_err(|e| InferenceError::Runtime(format!("Get: {e}")))?
+        } else {
+            logits
+        };
+
+        let first_token = last_logits.argmax(0)
+            .map_err(|e| InferenceError::Runtime(format!("Argmax: {e}")))?
+            .to_scalar::<u32>()
+            .map_err(|e| InferenceError::Runtime(format!("Scalar: {e}")))?;
+
+        generated_tokens.push(first_token);
+
+        // Check EOS
+        let is_eos = first_token == 2 || first_token == 128001 || first_token == 128009;
+
+        // --- Decode phase: one token at a time, KV cache offset = prompt_len + i ---
+        if !is_eos && tokens_to_generate > 1 {
+            for i in 1..tokens_to_generate {
+                let last_token = *generated_tokens.last().unwrap();
+                let token_tensor = Tensor::new(&[last_token], &device)
                     .map_err(|e| InferenceError::Runtime(format!("Tensor: {e}")))?
                     .unsqueeze(0)
-                    .map_err(|e| InferenceError::Runtime(format!("Unsqueeze: {e}")))?
-            } else {
-                // Subsequent: use only the last token (KV cache handles context)
-                let last = *all_tokens.last().unwrap();
-                Tensor::new(&[last], &device)
-                    .map_err(|e| InferenceError::Runtime(format!("Tensor: {e}")))?
-                    .unsqueeze(0)
-                    .map_err(|e| InferenceError::Runtime(format!("Unsqueeze: {e}")))?
-            };
+                    .map_err(|e| InferenceError::Runtime(format!("Unsqueeze: {e}")))?;
 
-            let seq_len = context.dim(1)
-                .map_err(|e| InferenceError::Runtime(format!("Dim: {e}")))?;
+                // seq_len_offset = prompt_len + tokens generated so far
+                // This tells candle where in the KV cache this token sits
+                let seq_offset = prompt_len + (i as usize);
+                let logits = model.forward(&token_tensor, seq_offset)
+                    .map_err(|e| InferenceError::Runtime(format!("Forward: {e}")))?;
 
-            // Forward pass through quantized transformer
-            let logits = model_ref.model.forward(&context, i as usize)
-                .map_err(|e| InferenceError::Runtime(format!("Forward: {e}")))?;
+                let logits = logits.squeeze(0)
+                    .map_err(|e| InferenceError::Runtime(format!("Squeeze: {e}")))?;
+                let last_logits = if logits.dims().len() == 2 {
+                    logits.get(logits.dim(0).unwrap() - 1)
+                        .map_err(|e| InferenceError::Runtime(format!("Get: {e}")))?
+                } else {
+                    logits
+                };
 
-            // Get logits for last position
-            let logits = logits.squeeze(0)
-                .map_err(|e| InferenceError::Runtime(format!("Squeeze: {e}")))?;
-            let last_logits = if logits.dims().len() == 2 {
-                logits.get(logits.dim(0).unwrap() - 1)
-                    .map_err(|e| InferenceError::Runtime(format!("Get: {e}")))?
-            } else {
-                logits
-            };
+                let next_token = last_logits.argmax(0)
+                    .map_err(|e| InferenceError::Runtime(format!("Argmax: {e}")))?
+                    .to_scalar::<u32>()
+                    .map_err(|e| InferenceError::Runtime(format!("Scalar: {e}")))?;
 
-            // Argmax (deterministic: lowest index wins on tie)
-            let next_token = last_logits.argmax(0)
-                .map_err(|e| InferenceError::Runtime(format!("Argmax: {e}")))?
-                .to_scalar::<u32>()
-                .map_err(|e| InferenceError::Runtime(format!("Scalar: {e}")))?;
+                generated_tokens.push(next_token);
 
-            generated_tokens.push(next_token);
-            all_tokens.push(next_token);
+                // Stop on EOS (token 2 for Llama-2, 128001/128009 for Llama-3)
+                if next_token == 2 || next_token == 128001 || next_token == 128009 {
+                    break;
+                }
 
-            // Stop on EOS (token 2 for Llama-2, 128001/128009 for Llama-3)
-            if next_token == 2 || next_token == 128001 || next_token == 128009 {
-                break;
-            }
-
-            // Timeout check
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            if elapsed_ms > self.timeout_ms {
-                break;
+                // Timeout check
+                if start.elapsed().as_millis() as u64 > self.timeout_ms {
+                    break;
+                }
             }
         }
 
