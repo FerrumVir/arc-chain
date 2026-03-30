@@ -3183,23 +3183,38 @@ async fn worker_peers(
             }
         }
     }
-    // Fallback: use validator list if peer_meta not wired
+    // Fallback: use seed list with IPs when peer_meta not wired.
+    // This gives the dashboard useful entries with IPs for latency display.
     if peers.is_empty() {
-        let validators = node.dag_validators.read();
-        for (addr, stake) in validators.iter() {
-            if *addr != node.validator_address {
-                peers.push(json!({
-                    "address": format!("0x{}", addr.to_hex()),
-                    "stake": stake,
-                    "label": "Validator",
-                }));
-            }
-        }
-        // For fallback peers (no IP known), measure all seed IPs for general
-        // network latency visibility
-        for &(ip, _) in seed_ips {
+        let validator_count = {
+            let validators = node.dag_validators.read();
+            validators.len().saturating_sub(1) // exclude self
+        };
+        // Show seed nodes with labels and IPs
+        for &(ip, label) in seed_ips {
+            peers.push(json!({
+                "address": format!("seed-{}", label.to_lowercase()),
+                "stake": 5_000_000u64,
+                "label": label,
+                "ip": ip,
+                "dial_addr": format!("{}:9090", ip),
+            }));
             if get_cached_latency(&node.peer_latency_cache, ip).is_none() {
                 peer_ips_to_measure.push(ip.to_string());
+            }
+        }
+        // If we have more validators than seeds, they're community nodes
+        if validator_count > seed_ips.len() {
+            let extra = validator_count - seed_ips.len();
+            let validators = node.dag_validators.read();
+            for (addr, stake) in validators.iter().take(extra) {
+                if *addr != node.validator_address {
+                    peers.push(json!({
+                        "address": format!("0x{}", addr.to_hex()),
+                        "stake": stake,
+                        "label": "Community",
+                    }));
+                }
             }
         }
     }
@@ -3241,9 +3256,19 @@ async fn worker_peers(
         p
     }).collect();
 
+    // Build seed latency map (label -> ms) for dashboard use when peers
+    // lack individual IPs (fallback/validator mode)
+    let mut seed_latency = serde_json::Map::new();
+    for &(ip, label) in seed_ips {
+        if let Some(ms) = get_cached_latency(&node.peer_latency_cache, ip) {
+            seed_latency.insert(label.to_string(), json!(ms));
+        }
+    }
+
     Json(json!({
         "peers": peers_with_latency,
         "count": peers_with_latency.len(),
+        "seed_latency": seed_latency,
     }))
 }
 

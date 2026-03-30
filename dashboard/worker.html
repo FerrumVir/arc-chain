@@ -578,6 +578,7 @@ async function updatePeers() {
   try {
     const data = await fetch(RPC + '/worker/peers').then(r => r.json());
     const peers = data.peers || [];
+    const seedLat = data.seed_latency || {};
     document.getElementById('peerCount').textContent = peers.length + ' peer' + (peers.length !== 1 ? 's' : '');
 
     if (peers.length === 0) {
@@ -589,7 +590,9 @@ async function updatePeers() {
     peers.forEach(p => {
       const flag = flagMap[p.label] || '';
       const isValidator = p.stake >= 5000000;
-      const lat = latencyColor(p.latency_ms);
+      // Use per-peer latency if available, fall back to seed_latency map by label
+      const ms = p.latency_ms !== undefined ? p.latency_ms : (seedLat[p.label] !== undefined ? seedLat[p.label] : null);
+      const lat = latencyColor(ms);
       html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
         <div class="flex items-center gap-1.5 sm:gap-2 min-w-0">
           <span class="w-1.5 h-1.5 rounded-full flex-shrink-0 ${lat.dot}"></span>
