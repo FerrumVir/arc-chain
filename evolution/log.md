@@ -403,3 +403,63 @@
 - `dashboard/worker.html` (latencyColor function, updated updatePeers with latency display + seed_latency fallback)
 - `evolution/log.md` (this entry)
 ---
+
+## Evolution 9 — 2026-03-30 06:45
+**Commit:** c98208b
+**Tag:** evolution-9
+**What:** Fix candle KV cache leak + RoPE position bug in inference engine
+
+### Bug Fix 1: KV Cache Memory Leak (candle_backend.rs)
+- **Root cause:** The candle `GgufEngine` stored a single mutable `ModelWeights` per model in a `DashMap`. Each `generate()` call used `get_mut()` and ran forward passes that appended to the model's internal KV cache. Since the KV cache was never cleared between requests, it grew unboundedly across inference calls.
+- **Symptom:** First inference: ~650ms/tok. After 10+ inferences: 1000-2000+ ms/tok and climbing. Each subsequent request computed attention over ALL tokens from ALL previous requests, not just the current one.
+- **Fix:** Changed storage from `model` to `model_template`. Each `generate()` call now clones the template to get a fresh KV cache. Candle Tensors are Arc-backed, so the clone copies only the KV cache `Option` wrappers (None per layer), not the weight data. Template reference is dropped immediately to release the DashMap lock.
+- **Result:** Consistent ~660ms/tok regardless of how many previous inferences were run.
+
+### Bug Fix 2: RoPE Position Encoding (candle_backend.rs)
+- **Root cause:** The decode loop passed `i as usize` (0, 1, 2, ...) as `index_pos` to candle's `forward()`. This value is used for Rotary Position Embedding (RoPE) — it determines which position in the cos/sin rotation tables is applied to Q/K projections. After the prompt prefill phase, the correct position for the first generated token is `prompt_len`, not `0`.
+- **Symptom:** Generated tokens received wrong rotary position embeddings, which degrades attention quality. The model still produced plausible text because Q4 attention is somewhat robust to position errors on short prompts, but longer prompts would show increasing degradation.
+- **Fix:** Separated prompt prefill (offset=0, full prompt tensor) from token decode (offset=prompt_len+i, single token tensor). The decode phase now uses `prompt_len + i` as `seq_len_offset`, giving each generated token its correct absolute position.
+
+### Infrastructure: Metal Feature Flag
+- Added `metal` feature to `arc-inference/Cargo.toml` and `arc-node/Cargo.toml`
+- Implemented `best_device()` function that selects Metal GPU on macOS when the `metal` feature is enabled
+- **Tested on M2 Ultra:** Metal was ~5% slower than CPU for Q4 quantized models. The bottleneck is CPU-side dequantization before Metal can process the data, plus synchronization overhead for single-token generation. Kept CPU as default.
+- Metal infrastructure remains for future use when candle improves quantized Metal support.
+
+### Code Cleanup
+- Removed redundant `input_ids` clone and unused `seq_len` variable
+- Replaced `all_tokens` growing vector with direct prompt_tensor construction
+- Pre-allocated `generated_tokens` with `Vec::with_capacity`
+- Released DashMap lock immediately after clone (was held for entire generation)
+
+**Why:** The KV cache leak was a critical performance bug -- it caused inference to slow down over time, eventually timing out after enough requests. Community workers running for hours would see steadily degrading inference times with no obvious cause. The RoPE fix improves output quality for non-trivial prompts. Together, these fixes make inference stable and correct for long-running worker nodes.
+
+**Verified:**
+- Mac worker: 5 consecutive inferences all at ~660ms/tok (no degradation)
+  - Run 1: 925ms (cold), Run 2: 667ms, Run 3: 667ms, Run 4: 1252ms (consensus spike), Run 5: 664ms
+  - Variance from consensus/P2P CPU contention, NOT from KV cache growth
+- Mac worker: output identical before/after ("Artificial intelligence (AI) is a field of computer science that focuses on creating intellig")
+- Mac worker: output hash unchanged (0xb713f25b...) confirming deterministic output
+- Mac worker: all endpoints verified post-rebuild:
+  - `/worker/earnings`: 31,900 ARC, 319 inferences, persistence=true, 8 peers
+  - `/worker/hardware`: M2 Ultra, 64GB RAM, Metal backend, 7b recommended
+  - `/worker/peers`: 8 peers with latency (LAX 87ms, JNB 576ms)
+  - `/worker/dashboard`: serves HTML
+- Metal tested and measured: linked Metal.framework + MetalPerformanceShaders. Q4 inference was ~690ms/tok (5% slower than CPU). Reverted to CPU default.
+- All 8 seeds upgraded via rolling-deploy.sh, all report 8 peers
+- `cargo test --lib -p arc-node`: 103 tests passed, 0 failed
+- Binary hash (Linux x86): 59681c94dc60221df332cf2a9ae7d124de5cc99a8658a802fd08f1760ce4adf4
+- Binary hash (Mac ARM): cea0f3c8e3a799e4147fc13abf1e959b0acc5b250b1f4671895fe5e56a5fc7ce
+
+**Known issue (pre-existing, NOT from this cycle):**
+- Inference timing variance (~660ms baseline, spikes to 900-1250ms) caused by CPU contention with consensus loop and P2P networking. Worker `--cpu-limit 15` sets rayon to 3 threads on M2 Ultra (24 cores), leaving 21 cores for consensus/P2P but creating memory bandwidth contention during inference.
+- Q4 quantized models don't benefit from Metal acceleration in candle 0.8.4. Future candle versions may add Metal-native quantized matmul kernels.
+
+**Rollback:** `git checkout evolution-8`
+
+**Files changed:**
+- `crates/arc-inference/src/candle_backend.rs` (KV cache reset via model clone, RoPE position fix, Metal infrastructure, code cleanup)
+- `crates/arc-inference/Cargo.toml` (added `metal` feature flag)
+- `crates/arc-node/Cargo.toml` (added `metal` feature flag)
+- `evolution/log.md` (this entry)
+---
