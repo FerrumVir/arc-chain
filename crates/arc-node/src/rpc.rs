@@ -73,6 +73,9 @@ pub struct NodeState {
     pub node_mode: String,
     /// Persistent earnings tracker — writes to disk on each inference.
     pub earnings_tracker: Option<Arc<EarningsTracker>>,
+    /// Peer latency cache: IP -> (latency_ms, measured_at).
+    /// Cached for 30 seconds to avoid hammering seed /health endpoints.
+    pub peer_latency_cache: Arc<dashmap::DashMap<String, (u64, Instant)>>,
 }
 
 /// Build a `NodeState` from components.
@@ -114,6 +117,7 @@ pub fn build_node_state(
         peer_meta: None,
         node_mode: "validator".to_string(),
         earnings_tracker: None,
+        peer_latency_cache: Arc::new(dashmap::DashMap::new()),
     }
 }
 
@@ -3116,18 +3120,49 @@ async fn worker_activity(
     }))
 }
 
-/// Connected peer list with metadata.
+/// Measure latency to a single peer by timing an HTTP GET to /health.
+/// Returns latency in milliseconds, or None on timeout/error.
+async fn measure_peer_latency(client: &reqwest::Client, ip: &str) -> Option<u64> {
+    let url = format!("http://{}:9090/health", ip);
+    let start = Instant::now();
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            Some(start.elapsed().as_millis() as u64)
+        }
+        _ => None,
+    }
+}
+
+/// Cache duration for peer latency measurements (30 seconds).
+const LATENCY_CACHE_SECS: u64 = 30;
+
+/// Look up cached latency for an IP, returning None if stale or missing.
+fn get_cached_latency(cache: &dashmap::DashMap<String, (u64, Instant)>, ip: &str) -> Option<u64> {
+    if let Some(entry) = cache.get(ip) {
+        let (ms, measured_at) = entry.value();
+        if measured_at.elapsed().as_secs() < LATENCY_CACHE_SECS {
+            return Some(*ms);
+        }
+    }
+    None
+}
+
+/// Connected peer list with metadata and latency.
 ///
 /// GET /worker/peers
 async fn worker_peers(
     AxumState(node): AxumState<NodeState>,
 ) -> Json<Value> {
     // Seed node labels for known IPs
-    let labels: std::collections::HashMap<&str, &str> = [
+    let seed_ips: &[(&str, &str)] = &[
         ("149.28.32.76", "NYC"), ("140.82.16.112", "LAX"), ("136.244.109.1", "AMS"),
         ("104.238.171.11", "LHR"), ("202.182.107.41", "NRT"), ("149.28.153.31", "SGP"),
         ("216.238.120.27", "SAO"), ("139.84.237.49", "JNB"),
-    ].into_iter().collect();
+    ];
+    let labels: std::collections::HashMap<&str, &str> = seed_ips.iter().copied().collect();
+
+    // Collect all peer IPs we need latency for
+    let mut peer_ips_to_measure: Vec<String> = Vec::new();
 
     let mut peers = Vec::new();
     if let Some(ref meta) = node.peer_meta {
@@ -3143,6 +3178,9 @@ async fn worker_peers(
                 "label": label,
                 "ip": ip,
             }));
+            if get_cached_latency(&node.peer_latency_cache, &ip).is_none() {
+                peer_ips_to_measure.push(ip);
+            }
         }
     }
     // Fallback: use validator list if peer_meta not wired
@@ -3157,10 +3195,55 @@ async fn worker_peers(
                 }));
             }
         }
+        // For fallback peers (no IP known), measure all seed IPs for general
+        // network latency visibility
+        for &(ip, _) in seed_ips {
+            if get_cached_latency(&node.peer_latency_cache, ip).is_none() {
+                peer_ips_to_measure.push(ip.to_string());
+            }
+        }
     }
+
+    // Measure latency for any stale/missing IPs (non-blocking, parallel)
+    if !peer_ips_to_measure.is_empty() {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_default();
+        let cache = node.peer_latency_cache.clone();
+        let mut handles = Vec::new();
+        for ip in peer_ips_to_measure {
+            let c = client.clone();
+            let cache_ref = cache.clone();
+            let ip_clone = ip.clone();
+            handles.push(tokio::spawn(async move {
+                if let Some(ms) = measure_peer_latency(&c, &ip_clone).await {
+                    cache_ref.insert(ip_clone.clone(), (ms, Instant::now()));
+                    Some((ip_clone, ms))
+                } else {
+                    None
+                }
+            }));
+        }
+        // Await all measurements (parallel, max 3s timeout each)
+        for handle in handles {
+            let _ = handle.await;
+        }
+    }
+
+    // Attach latency_ms to each peer from cache
+    let peers_with_latency: Vec<Value> = peers.into_iter().map(|mut p| {
+        if let Some(ip) = p.get("ip").and_then(|v| v.as_str()) {
+            if let Some(ms) = get_cached_latency(&node.peer_latency_cache, ip) {
+                p.as_object_mut().unwrap().insert("latency_ms".to_string(), json!(ms));
+            }
+        }
+        p
+    }).collect();
+
     Json(json!({
-        "peers": peers,
-        "count": peers.len(),
+        "peers": peers_with_latency,
+        "count": peers_with_latency.len(),
     }))
 }
 
@@ -3461,5 +3544,56 @@ mod tests {
             strip_special_tokens("</s></s></s>text</s></s>"),
             "text"
         );
+    }
+
+    // ── get_cached_latency tests ──────────────────────────────────────────
+
+    #[test]
+    fn cached_latency_returns_none_for_missing_ip() {
+        let cache = dashmap::DashMap::new();
+        assert_eq!(get_cached_latency(&cache, "1.2.3.4"), None);
+    }
+
+    #[test]
+    fn cached_latency_returns_value_when_fresh() {
+        let cache = dashmap::DashMap::new();
+        cache.insert("1.2.3.4".to_string(), (42u64, Instant::now()));
+        assert_eq!(get_cached_latency(&cache, "1.2.3.4"), Some(42));
+    }
+
+    #[test]
+    fn cached_latency_returns_none_when_stale() {
+        let cache = dashmap::DashMap::new();
+        // Insert with a timestamp 60 seconds in the past
+        let old_time = Instant::now() - std::time::Duration::from_secs(60);
+        cache.insert("1.2.3.4".to_string(), (42u64, old_time));
+        assert_eq!(get_cached_latency(&cache, "1.2.3.4"), None);
+    }
+
+    #[test]
+    fn cached_latency_different_ips_independent() {
+        let cache = dashmap::DashMap::new();
+        cache.insert("1.2.3.4".to_string(), (10u64, Instant::now()));
+        cache.insert("5.6.7.8".to_string(), (200u64, Instant::now()));
+        assert_eq!(get_cached_latency(&cache, "1.2.3.4"), Some(10));
+        assert_eq!(get_cached_latency(&cache, "5.6.7.8"), Some(200));
+        assert_eq!(get_cached_latency(&cache, "9.9.9.9"), None);
+    }
+
+    #[test]
+    fn cached_latency_boundary_just_under_30s() {
+        let cache = dashmap::DashMap::new();
+        let just_fresh = Instant::now() - std::time::Duration::from_secs(29);
+        cache.insert("1.2.3.4".to_string(), (55u64, just_fresh));
+        assert_eq!(get_cached_latency(&cache, "1.2.3.4"), Some(55));
+    }
+
+    #[test]
+    fn cached_latency_boundary_exactly_30s() {
+        let cache = dashmap::DashMap::new();
+        let exactly_stale = Instant::now() - std::time::Duration::from_secs(30);
+        cache.insert("1.2.3.4".to_string(), (55u64, exactly_stale));
+        // 30s elapsed == LATENCY_CACHE_SECS, so not < 30, should be stale
+        assert_eq!(get_cached_latency(&cache, "1.2.3.4"), None);
     }
 }

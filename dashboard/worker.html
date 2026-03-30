@@ -566,6 +566,13 @@ function setStatus(s) {
   }
 }
 
+function latencyColor(ms) {
+  if (ms === null || ms === undefined) return {dot: 'bg-gray-500', text: 'text-gray-500', label: '---'};
+  if (ms < 100) return {dot: 'bg-emerald-400', text: 'text-emerald-400', label: ms + 'ms'};
+  if (ms < 500) return {dot: 'bg-yellow-400', text: 'text-yellow-400', label: ms + 'ms'};
+  return {dot: 'bg-red-400', text: 'text-red-400', label: ms + 'ms'};
+}
+
 async function updatePeers() {
   const container = document.getElementById('peerList');
   try {
@@ -582,13 +589,17 @@ async function updatePeers() {
     peers.forEach(p => {
       const flag = flagMap[p.label] || '';
       const isValidator = p.stake >= 5000000;
+      const lat = latencyColor(p.latency_ms);
       html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
         <div class="flex items-center gap-1.5 sm:gap-2 min-w-0">
-          <span class="w-1.5 h-1.5 rounded-full flex-shrink-0 ${isValidator?'bg-emerald-400':'bg-arc-400'}"></span>
+          <span class="w-1.5 h-1.5 rounded-full flex-shrink-0 ${lat.dot}"></span>
           <span class="text-xs font-medium text-white">${p.label || 'Peer'}</span>
           ${flag ? `<span class="text-[10px] text-gray-500">${flag}</span>` : ''}
         </div>
-        <span class="mono text-[10px] text-gray-600 truncate ml-2 hidden sm:inline">${p.dial_addr || shortAddr(p.address)}</span>
+        <div class="flex items-center gap-2 sm:gap-3 flex-shrink-0">
+          <span class="mono text-[10px] ${lat.text} font-medium">${lat.label}</span>
+          <span class="mono text-[10px] text-gray-600 truncate hidden sm:inline">${p.dial_addr || shortAddr(p.address)}</span>
+        </div>
       </div>`;
     });
     container.innerHTML = html;
