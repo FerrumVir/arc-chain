@@ -368,11 +368,9 @@ async function refresh() {
     document.getElementById('nodeVersion').textContent = health.version || '--';
     document.getElementById('dagRound').textContent = fmtNumber(health.dag_round || 0);
 
-    // Peer list
-    updatePeers(health);
-
-    // Activity feed
-    updateActivity(earnings, inferences);
+    // Peer list + activity (async, don't block)
+    updatePeers();
+    updateActivity();
 
     // Network stats
     if (stats) {
@@ -405,53 +403,78 @@ function setStatus(s) {
   }
 }
 
-function updatePeers(health) {
+async function updatePeers() {
   const container = document.getElementById('peerList');
-  const peerCount = health.peers || 0;
-  document.getElementById('peerCount').textContent = peerCount + ' peer' + (peerCount !== 1 ? 's' : '');
+  try {
+    const data = await fetch(RPC + '/worker/peers').then(r => r.json());
+    const peers = data.peers || [];
+    document.getElementById('peerCount').textContent = peers.length + ' peer' + (peers.length !== 1 ? 's' : '');
 
-  // Show seed nodes with known labels
-  let html = '';
-  const flags = {'NYC':'US','LAX':'US','AMS':'NL','LHR':'GB','NRT':'JP','SGP':'SG','SAO':'BR','JNB':'ZA'};
-  SEEDS.forEach(s => {
-    html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
-      <div class="flex items-center gap-2">
-        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-        <span class="text-xs font-medium text-white">${s.name}</span>
-        <span class="text-[10px] text-gray-500">${s.flag}</span>
-      </div>
-      <span class="mono text-[10px] text-gray-600">${s.ip}</span>
-    </div>`;
-  });
-  if (peerCount > SEEDS.length) {
-    html += `<div class="py-1.5 px-2 text-xs text-gray-500">+ ${peerCount - SEEDS.length} community workers</div>`;
+    if (peers.length === 0) {
+      container.innerHTML = '<p class="text-xs text-gray-600">No peers connected</p>';
+      return;
+    }
+    const flagMap = {'NYC':'US','LAX':'US','AMS':'NL','LHR':'GB','NRT':'JP','SGP':'SG','SAO':'BR','JNB':'ZA'};
+    let html = '';
+    peers.forEach(p => {
+      const flag = flagMap[p.label] || '';
+      const isValidator = p.stake >= 5000000;
+      html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
+        <div class="flex items-center gap-2">
+          <span class="w-1.5 h-1.5 rounded-full ${isValidator?'bg-emerald-400':'bg-arc-400'}"></span>
+          <span class="text-xs font-medium text-white">${p.label || 'Peer'}</span>
+          ${flag ? `<span class="text-[10px] text-gray-500">${flag}</span>` : ''}
+        </div>
+        <span class="mono text-[10px] text-gray-600">${p.dial_addr || shortAddr(p.address)}</span>
+      </div>`;
+    });
+    container.innerHTML = html;
+  } catch(e) {
+    // Fallback to seed list
+    let html = '';
+    SEEDS.forEach(s => {
+      html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
+        <div class="flex items-center gap-2">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+          <span class="text-xs font-medium text-white">${s.name}</span>
+          <span class="text-[10px] text-gray-500">${s.flag}</span>
+        </div>
+        <span class="mono text-[10px] text-gray-600">${s.ip}</span>
+      </div>`;
+    });
+    container.innerHTML = html;
   }
-  container.innerHTML = html || '<p class="text-xs text-gray-600">No peers connected</p>';
 }
 
-function updateActivity(earnings, inferences) {
+async function updateActivity() {
   const container = document.getElementById('activityList');
-  document.getElementById('activityCount').textContent = inferences + ' job' + (inferences !== 1 ? 's' : '');
+  try {
+    const data = await fetch(RPC + '/worker/activity').then(r => r.json());
+    const items = data.activity || [];
+    document.getElementById('activityCount').textContent = items.length + ' job' + (items.length !== 1 ? 's' : '');
 
-  // We don't have per-request history yet — show summary
-  if (inferences === 0) {
-    container.innerHTML = '<p class="text-xs text-gray-600">Waiting for inference requests from the network...</p>';
-    return;
+    if (items.length === 0) {
+      container.innerHTML = '<p class="text-xs text-gray-600">Waiting for inference requests from the network...</p>';
+      return;
+    }
+    let html = '';
+    items.slice(0, 20).forEach(a => {
+      const time = a.timestamp ? new Date(a.timestamp).toLocaleTimeString() : '';
+      html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50 fade-in">
+        <div class="flex items-center gap-2">
+          <span class="text-earn-400 text-xs font-bold">+${a.earned_arc||100}</span>
+          <span class="text-xs text-gray-400 truncate max-w-[150px]">${a.input_preview||'Inference'}</span>
+        </div>
+        <div class="flex items-center gap-2">
+          <span class="text-[10px] text-gray-600">${a.tokens||'?'} tok</span>
+          <span class="text-[10px] text-gray-600">${time}</span>
+        </div>
+      </div>`;
+    });
+    container.innerHTML = html;
+  } catch(e) {
+    container.innerHTML = '<p class="text-xs text-gray-600">Waiting for inference requests...</p>';
   }
-
-  let html = '';
-  // Show last N inferences as generic entries (activity endpoint will provide real data later)
-  const shown = Math.min(inferences, 20);
-  for (let i = 0; i < shown; i++) {
-    html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
-      <div class="flex items-center gap-2">
-        <span class="text-earn-400 text-xs font-bold">+100</span>
-        <span class="text-xs text-gray-400">Inference #${inferences - i}</span>
-      </div>
-      <span class="text-[10px] text-gray-600">ARC earned</span>
-    </div>`;
-  }
-  container.innerHTML = html;
 }
 
 async function fetchSeedStats() {

@@ -63,6 +63,10 @@ pub struct NodeState {
     pub inference_count: Arc<AtomicU64>,
     /// Worker earnings: total ARC earned (shared with consensus).
     pub inference_earned: Arc<AtomicU64>,
+    /// Per-request inference activity log (bounded, most recent first).
+    pub inference_activity: Arc<Mutex<std::collections::VecDeque<Value>>>,
+    /// Shared peer metadata for /worker/peers endpoint.
+    pub peer_meta: Option<Arc<dashmap::DashMap<[u8; 32], (std::net::SocketAddr, u64)>>>,
     /// Node mode: "validator" or "worker".
     pub node_mode: String,
 }
@@ -102,6 +106,8 @@ pub fn build_node_state(
         inference_responses: Arc::new(dashmap::DashMap::new()),
         inference_count: Arc::new(AtomicU64::new(0)),
         inference_earned: Arc::new(AtomicU64::new(0)),
+        inference_activity: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(100))),
+        peer_meta: None,
         node_mode: "validator".to_string(),
     }
 }
@@ -191,9 +197,11 @@ pub async fn serve(
         .route("/inference/run", post(inference_run))
         .route("/inference/attestations", get(inference_list_attestations))
         .route("/inference/results", get(inference_list_results))
-        // Worker dashboard + earnings (community inference nodes)
+        // Worker dashboard + API (community inference nodes)
         .route("/worker/dashboard", get(worker_dashboard))
         .route("/worker/earnings", get(worker_earnings))
+        .route("/worker/activity", get(worker_activity))
+        .route("/worker/peers", get(worker_peers))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -2783,9 +2791,10 @@ async fn inference_run(
     let tokens_generated = generated_tokens.len() as u64;
     let ms_per_token = if tokens_generated > 0 { inference_ms / tokens_generated } else { 0 };
 
-    // Track earnings for local inference (same as P2P path)
+    // Track earnings + activity for local inference
     node.inference_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     node.inference_earned.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+    log_inference_activity(&node, &format!("local-{}", node.inference_count.load(std::sync::atomic::Ordering::Relaxed)), input_text, generated_tokens.len() as u32, inference_ms, "direct");
 
     // Decode output tokens to text
     let output_text = model.decode(&generated_tokens);
@@ -3016,4 +3025,85 @@ async fn worker_earnings(
         "model_loaded": has_model,
         "status": if has_model && peers > 0 { "active" } else if peers > 0 { "connected_no_model" } else { "disconnected" },
     }))
+}
+
+/// Recent inference activity log.
+///
+/// GET /worker/activity
+async fn worker_activity(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let activity = node.inference_activity.lock().unwrap();
+    let items: Vec<Value> = activity.iter().cloned().collect();
+    Json(json!({
+        "activity": items,
+        "count": items.len(),
+    }))
+}
+
+/// Connected peer list with metadata.
+///
+/// GET /worker/peers
+async fn worker_peers(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    // Seed node labels for known IPs
+    let labels: std::collections::HashMap<&str, &str> = [
+        ("149.28.32.76", "NYC"), ("140.82.16.112", "LAX"), ("136.244.109.1", "AMS"),
+        ("104.238.171.11", "LHR"), ("202.182.107.41", "NRT"), ("149.28.153.31", "SGP"),
+        ("216.238.120.27", "SAO"), ("139.84.237.49", "JNB"),
+    ].into_iter().collect();
+
+    let mut peers = Vec::new();
+    if let Some(ref meta) = node.peer_meta {
+        for entry in meta.iter() {
+            let addr_hex = hex::encode(entry.key());
+            let (dial_addr, stake) = entry.value();
+            let ip = dial_addr.ip().to_string();
+            let label = labels.get(ip.as_str()).copied().unwrap_or("Community");
+            peers.push(json!({
+                "address": format!("0x{}", addr_hex),
+                "stake": stake,
+                "dial_addr": dial_addr.to_string(),
+                "label": label,
+                "ip": ip,
+            }));
+        }
+    }
+    // Fallback: use validator list if peer_meta not wired
+    if peers.is_empty() {
+        let validators = node.dag_validators.read();
+        for (addr, stake) in validators.iter() {
+            if *addr != node.validator_address {
+                peers.push(json!({
+                    "address": format!("0x{}", addr.to_hex()),
+                    "stake": stake,
+                    "label": "Validator",
+                }));
+            }
+        }
+    }
+    Json(json!({
+        "peers": peers,
+        "count": peers.len(),
+    }))
+}
+
+/// Helper: log an inference activity entry. Call from both direct and P2P paths.
+pub fn log_inference_activity(node: &NodeState, request_id: &str, input: &str, tokens: u32, ms: u64, source: &str) {
+    let entry = json!({
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "request_id": request_id,
+        "input_preview": if input.len() > 60 { format!("{}...", &input[..57]) } else { input.to_string() },
+        "tokens": tokens,
+        "ms": ms,
+        "earned_arc": 100,
+        "source": source,
+    });
+    if let Ok(mut activity) = node.inference_activity.lock() {
+        activity.push_front(entry);
+        if activity.len() > 100 {
+            activity.pop_back();
+        }
+    }
 }

@@ -1,117 +1,155 @@
 #!/usr/bin/env bash
-# ────────────────────────────────────────────────────────────────
-# ARC Community Inference Node — One-Command Setup
+# ════════════════════════════════════════════════════════════════
+#  ARC Network — Join in 60 Seconds
 #
-# Join the ARC inference network in under 60 seconds.
-# Run AI inference, earn ARC tokens, auto-upgrade.
+#  Run AI inference on your device. Earn ARC tokens.
 #
-# Usage:
-#   curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash
-#   # OR
-#   bash scripts/arc-community.sh [--model /path/to/model.gguf] [--cpu-limit 15]
-# ────────────────────────────────────────────────────────────────
+#  Usage:
+#    curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash
+#
+#  Or with options:
+#    bash arc-community.sh --model /path/to/model.gguf --cpu-limit 20
+# ════════════════════════════════════════════════════════════════
 set -euo pipefail
 
 ARC_DIR="${HOME}/.arc"
-IDENTITY_FILE="${ARC_DIR}/identity.seed"
-LOG_FILE="${ARC_DIR}/node.log"
-PID_FILE="${ARC_DIR}/node.pid"
-SEEDS_FILE="${ARC_DIR}/seeds.txt"
-MODEL_URL="https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
-CPU_LIMIT="${ARC_CPU_LIMIT:-15}"
+REPO_URL="https://github.com/FerrumVir/arc-chain.git"
+MODEL_URL="https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf"
+MODEL_NAME="Llama 2 7B Chat"
+MODEL_SIZE="4.1 GB"
+CPU_LIMIT="15"
 MODEL_PATH=""
-BINARY=""
+SKIP_MODEL=""
 
-# ── Parse args ────────────────────────────────────────────────
+# ── Parse args ──────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case $1 in
         --model) MODEL_PATH="$2"; shift 2 ;;
         --cpu-limit) CPU_LIMIT="$2"; shift 2 ;;
-        --binary) BINARY="$2"; shift 2 ;;
-        *) echo "Unknown flag: $1"; exit 1 ;;
+        --skip-model) SKIP_MODEL=1; shift ;;
+        --tiny) MODEL_URL="https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"; MODEL_NAME="TinyLlama 1.1B"; MODEL_SIZE="638 MB"; shift ;;
+        *) echo "Unknown: $1"; exit 1 ;;
     esac
 done
 
-# ── Colors ────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
+# ── Colors + helpers ────────────────────────────────────
+R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; B='\033[0;34m'
+C='\033[0;36m'; W='\033[1;37m'; D='\033[0;90m'; N='\033[0m'
 
-info()  { echo -e "${GREEN}[ARC]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[ARC]${NC} $*"; }
-error() { echo -e "${RED}[ARC]${NC} $*"; exit 1; }
+step()  { echo -e "\n${C}[$1/6]${N} ${W}$2${N}"; }
+ok()    { echo -e "  ${G}✓${N} $1"; }
+warn()  { echo -e "  ${Y}!${N} $1"; }
+fail()  { echo -e "  ${R}✗${N} $1"; exit 1; }
+spin()  {
+    local pid=$1 msg=$2 chars='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    while kill -0 "$pid" 2>/dev/null; do
+        for (( i=0; i<${#chars}; i++ )); do
+            printf "\r  ${D}${chars:$i:1}${N} %s" "$msg"
+            sleep 0.1
+        done
+    done
+    printf "\r"
+}
 
-echo -e "${BOLD}"
-echo "  ╔═══════════════════════════════════════════╗"
-echo "  ║   ARC Community Inference Node            ║"
-echo "  ║   Serve AI. Earn ARC. Decentralize AI.    ║"
-echo "  ╚═══════════════════════════════════════════╝"
-echo -e "${NC}"
+# ── Banner ──────────────────────────────────────────────
+echo ""
+echo -e "${W}  ╔═══════════════════════════════════════╗${N}"
+echo -e "${W}  ║${N}   ${C}ARC Network${N} — Decentralized AI      ${W}║${N}"
+echo -e "${W}  ║${N}   Run inference. Earn tokens.          ${W}║${N}"
+echo -e "${W}  ╚═══════════════════════════════════════╝${N}"
+echo ""
 
-# ── Step 1: Create data directory ─────────────────────────────
-mkdir -p "${ARC_DIR}/bin"
-info "Data directory: ${ARC_DIR}"
+# ── Step 1: Create data directory + identity ────────────
+step 1 "Setting up your node identity"
+mkdir -p "${ARC_DIR}/bin" "${ARC_DIR}/data"
 
-# ── Step 2: Persistent identity ───────────────────────────────
-if [[ -f "${IDENTITY_FILE}" ]]; then
-    SEED=$(cat "${IDENTITY_FILE}")
-    info "Identity loaded: ${SEED}"
+if [[ -f "${ARC_DIR}/identity.seed" ]]; then
+    SEED=$(cat "${ARC_DIR}/identity.seed")
+    ok "Identity loaded: ${SEED}"
 else
-    SEED="arc-worker-$(openssl rand -hex 8)"
-    echo "${SEED}" > "${IDENTITY_FILE}"
-    chmod 600 "${IDENTITY_FILE}"
-    info "New identity created: ${SEED}"
+    SEED="arc-worker-$(openssl rand -hex 8 2>/dev/null || head -c 16 /dev/urandom | xxd -p)"
+    echo "${SEED}" > "${ARC_DIR}/identity.seed"
+    chmod 600 "${ARC_DIR}/identity.seed"
+    ok "New identity created: ${SEED}"
 fi
 
-# ── Step 3: Find or build binary ─────────────────────────────
-if [[ -n "${BINARY}" && -x "${BINARY}" ]]; then
-    info "Using binary: ${BINARY}"
-elif [[ -x "${ARC_DIR}/bin/arc-node" ]]; then
+# ── Step 2: Get the binary ──────────────────────────────
+step 2 "Getting the ARC node binary"
+
+BINARY=""
+OS="$(uname -s)"
+ARCH="$(uname -m)"
+
+# Check for existing binary
+if [[ -x "${ARC_DIR}/bin/arc-node" ]]; then
     BINARY="${ARC_DIR}/bin/arc-node"
-    info "Using cached binary: ${BINARY}"
-elif [[ -x "./target/release/arc-node" ]]; then
-    BINARY="./target/release/arc-node"
-    info "Using local build: ${BINARY}"
-elif command -v cargo &>/dev/null; then
-    info "Building from source (first time only, ~5 minutes)..."
-    if [[ -d ".git" && -f "Cargo.toml" ]]; then
-        cargo build --release -p arc-node 2>&1 | tail -3
-        BINARY="./target/release/arc-node"
-    elif [[ -d "${ARC_DIR}/src/arc-chain" ]]; then
-        cd "${ARC_DIR}/src/arc-chain"
-        git pull origin main
-        cargo build --release -p arc-node 2>&1 | tail -3
-        BINARY="./target/release/arc-node"
+    ok "Using cached binary"
+elif [[ -d "${ARC_DIR}/src/arc-chain" && -x "${ARC_DIR}/src/arc-chain/target/release/arc-node" ]]; then
+    BINARY="${ARC_DIR}/src/arc-chain/target/release/arc-node"
+    ok "Using existing build"
+else
+    # Need to build from source
+    if ! command -v cargo &>/dev/null; then
+        warn "Rust not installed. Installing now..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly 2>/dev/null
+        source "${HOME}/.cargo/env" 2>/dev/null || export PATH="${HOME}/.cargo/bin:${PATH}"
+        if ! command -v cargo &>/dev/null; then
+            fail "Failed to install Rust. Please install manually: https://rustup.rs"
+        fi
+        ok "Rust installed"
     else
-        info "Cloning ARC Chain..."
-        git clone https://github.com/FerrumVir/arc-chain.git "${ARC_DIR}/src/arc-chain"
-        cd "${ARC_DIR}/src/arc-chain"
-        cargo build --release -p arc-node 2>&1 | tail -3
-        BINARY="./target/release/arc-node"
+        ok "Rust found: $(rustc --version 2>/dev/null | head -1)"
     fi
-    # Cache for future runs
+
+    if [[ -d "${ARC_DIR}/src/arc-chain" ]]; then
+        echo -e "  ${D}Updating source...${N}"
+        cd "${ARC_DIR}/src/arc-chain"
+        git pull origin main --quiet 2>/dev/null || true
+    else
+        echo -e "  ${D}Cloning repository...${N}"
+        git clone --depth 1 "${REPO_URL}" "${ARC_DIR}/src/arc-chain" 2>/dev/null
+        cd "${ARC_DIR}/src/arc-chain"
+    fi
+
+    echo -e "  ${D}Building (first time takes 3-5 minutes)...${N}"
+    cargo build --release -p arc-node 2>&1 | tail -1 &
+    BUILD_PID=$!
+    spin $BUILD_PID "Building arc-node..."
+    wait $BUILD_PID || fail "Build failed. Check ${ARC_DIR}/src/arc-chain for errors."
+    BINARY="${ARC_DIR}/src/arc-chain/target/release/arc-node"
     cp "${BINARY}" "${ARC_DIR}/bin/arc-node"
-    info "Binary built and cached at ${ARC_DIR}/bin/arc-node"
-else
-    error "No binary found and Rust not installed. Install Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh"
+    ok "Build complete"
 fi
 
-# ── Step 4: Download model if needed ─────────────────────────
-if [[ -z "${MODEL_PATH}" ]]; then
+# Verify binary works
+if ! "${BINARY:-${ARC_DIR}/bin/arc-node}" --help &>/dev/null; then
+    fail "Binary is not working. Try rebuilding."
+fi
+BINARY="${BINARY:-${ARC_DIR}/bin/arc-node}"
+ok "Binary verified"
+
+# ── Step 3: Download AI model ───────────────────────────
+step 3 "Downloading AI model (${MODEL_NAME}, ${MODEL_SIZE})"
+
+if [[ -n "${MODEL_PATH}" && -f "${MODEL_PATH}" ]]; then
+    ok "Using provided model: ${MODEL_PATH}"
+elif [[ -n "${SKIP_MODEL}" ]]; then
+    MODEL_PATH=""
+    warn "Skipping model download (node will relay requests only)"
+elif [[ -f "${ARC_DIR}/model.gguf" ]]; then
     MODEL_PATH="${ARC_DIR}/model.gguf"
-fi
-
-if [[ ! -f "${MODEL_PATH}" ]]; then
-    info "Downloading TinyLlama 1.1B model (638 MB)..."
-    curl -L --progress-bar "${MODEL_URL}" -o "${MODEL_PATH}.tmp"
-    mv "${MODEL_PATH}.tmp" "${MODEL_PATH}"
-    info "Model downloaded: ${MODEL_PATH}"
+    ok "Model already downloaded"
 else
-    info "Model found: ${MODEL_PATH}"
+    MODEL_PATH="${ARC_DIR}/model.gguf"
+    curl -L --progress-bar "${MODEL_URL}" -o "${MODEL_PATH}.tmp" 2>&1
+    mv "${MODEL_PATH}.tmp" "${MODEL_PATH}"
+    ok "Model downloaded: ${MODEL_NAME}"
 fi
 
-# ── Step 5: Write seeds file ─────────────────────────────────
-cat > "${SEEDS_FILE}" <<'SEEDS'
-# ARC Testnet Seed Nodes — 8 validators across 6 continents
+# ── Step 4: Write seeds + genesis ───────────────────────
+step 4 "Configuring network connection"
+
+cat > "${ARC_DIR}/seeds.txt" <<'SEEDS'
 149.28.32.76:9091
 140.82.16.112:9091
 136.244.109.1:9091
@@ -122,157 +160,168 @@ cat > "${SEEDS_FILE}" <<'SEEDS'
 139.84.237.49:9091
 SEEDS
 
-# ── Step 6: Stop existing node if running ─────────────────────
-if [[ -f "${PID_FILE}" ]] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
-    warn "Stopping existing node (PID $(cat "${PID_FILE}"))..."
-    kill "$(cat "${PID_FILE}")" 2>/dev/null || true
+# Copy genesis if we have the source
+GENESIS=""
+if [[ -f "${ARC_DIR}/src/arc-chain/genesis.toml" ]]; then
+    GENESIS="${ARC_DIR}/src/arc-chain/genesis.toml"
+elif [[ -f "./genesis.toml" ]]; then
+    GENESIS="./genesis.toml"
+else
+    # Download genesis from a seed
+    for seed_ip in 140.82.16.112 149.28.32.76 136.244.109.1; do
+        if curl -sf "http://${seed_ip}:9090/" >/dev/null 2>&1; then
+            # Use the source checkout's genesis
+            warn "Genesis file not found locally. Using source checkout."
+            break
+        fi
+    done
+    if [[ -z "${GENESIS}" ]]; then
+        fail "Cannot find genesis.toml. Clone the repo first or run from the arc-chain directory."
+    fi
+fi
+ok "Network configured (8 seed validators across 6 continents)"
+
+# ── Step 5: Stop old + start new ────────────────────────
+step 5 "Starting your inference node"
+
+# Stop existing
+if [[ -f "${ARC_DIR}/node.pid" ]] && kill -0 "$(cat "${ARC_DIR}/node.pid")" 2>/dev/null; then
+    kill "$(cat "${ARC_DIR}/node.pid")" 2>/dev/null || true
     sleep 2
+    ok "Stopped previous node"
 fi
 
-# ── Step 7: Start the node ────────────────────────────────────
-info "Starting node in worker mode (CPU limit: ${CPU_LIMIT}%)..."
+# Build command
+CMD=("${BINARY}" --rpc 0.0.0.0:9090 --seeds-file "${ARC_DIR}/seeds.txt" --validator-seed "${SEED}" --stake 5000000 --mode worker --cpu-limit "${CPU_LIMIT}" --eth-rpc-port 0)
+if [[ -n "${GENESIS}" ]]; then CMD+=(--genesis "${GENESIS}"); fi
+if [[ -n "${MODEL_PATH}" && -f "${MODEL_PATH}" ]]; then CMD+=(--model "${MODEL_PATH}"); fi
 
-nohup "${BINARY}" \
-    --rpc 0.0.0.0:9090 \
-    --seeds-file "${SEEDS_FILE}" \
-    --genesis genesis.toml \
-    --validator-seed "${SEED}" \
-    --stake 5000000 \
-    --model "${MODEL_PATH}" \
-    --mode worker \
-    --cpu-limit "${CPU_LIMIT}" \
-    --eth-rpc-port 0 \
-    > "${LOG_FILE}" 2>&1 &
-
+# Start
+cd "$(dirname "${GENESIS:-${BINARY}}")"
+nohup "${CMD[@]}" > "${ARC_DIR}/node.log" 2>&1 &
 NODE_PID=$!
-echo "${NODE_PID}" > "${PID_FILE}"
-info "Node started (PID: ${NODE_PID})"
+echo "${NODE_PID}" > "${ARC_DIR}/node.pid"
 
-# ── Step 8: Wait for health ──────────────────────────────────
-info "Waiting for node to connect..."
-for i in $(seq 1 30); do
+# Wait for health
+for i in $(seq 1 20); do
     if curl -sf http://localhost:9090/health >/dev/null 2>&1; then
-        PEERS=$(curl -sf http://localhost:9090/health 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('peer_count',0))" 2>/dev/null || echo "0")
-        info "Node is up! Connected to ${PEERS} peers."
+        PEERS=$(curl -sf http://localhost:9090/health 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers',0))" 2>/dev/null || echo "0")
+        ok "Node running (PID: ${NODE_PID}, Peers: ${PEERS})"
         break
     fi
     sleep 1
 done
 
-# ── Step 9: Auto-claim from faucet ───────────────────────────
-ADDR=$(curl -sf http://localhost:9090/node/info 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('address',''))" 2>/dev/null || echo "")
+# Faucet claim
+ADDR=$(curl -sf http://localhost:9090/worker/earnings 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('address',''))" 2>/dev/null || echo "")
 if [[ -n "${ADDR}" ]]; then
-    # Claim from first reachable seed
-    for seed in 140.82.16.112 149.28.32.76 136.244.109.1; do
-        if curl -sf -X POST "http://${seed}:9090/faucet/claim" \
-            -H "Content-Type: application/json" \
-            -d "{\"address\": \"${ADDR}\"}" >/dev/null 2>&1; then
-            info "Faucet claim submitted for attestation bonds"
+    for seed_ip in 140.82.16.112 149.28.32.76 136.244.109.1; do
+        if curl -sf -X POST "http://${seed_ip}:9090/faucet/claim" -H "Content-Type: application/json" -d "{\"address\": \"${ADDR}\"}" >/dev/null 2>&1; then
+            ok "Testnet tokens claimed"
             break
         fi
     done
 fi
 
-# ── Step 10: Print summary ────────────────────────────────────
-echo ""
-echo -e "${BOLD}═══════════════════════════════════════════${NC}"
-echo -e "${GREEN}  Your ARC inference node is running!${NC}"
-echo -e "${BOLD}═══════════════════════════════════════════${NC}"
-echo ""
-echo -e "  ${BLUE}Address:${NC}  ${ADDR:-<starting...>}"
-echo -e "  ${BLUE}Mode:${NC}     Worker (inference only)"
-echo -e "  ${BLUE}CPU:${NC}      ${CPU_LIMIT}% limit"
-echo -e "  ${BLUE}Model:${NC}    $(basename "${MODEL_PATH}")"
-echo -e "  ${BLUE}Earnings:${NC} http://localhost:9090/worker/earnings"
-echo -e "  ${BLUE}Logs:${NC}     tail -f ${LOG_FILE}"
-echo ""
-echo -e "  ${YELLOW}Commands:${NC}"
-echo -e "    Status:   curl -s localhost:9090/worker/earnings | python3 -m json.tool"
-echo -e "    Logs:     tail -f ${LOG_FILE}"
-echo -e "    Stop:     kill \$(cat ${PID_FILE})"
-echo -e "    Restart:  bash scripts/arc-community.sh"
-echo ""
+# ── Step 6: Auto-start + open dashboard ─────────────────
+step 6 "Setting up auto-start"
 
-# ── Step 11: Set up launchd/systemd for auto-start ───────────
-OS="$(uname -s)"
 if [[ "${OS}" == "Darwin" ]]; then
     PLIST_DIR="${HOME}/Library/LaunchAgents"
-    PLIST_FILE="${PLIST_DIR}/com.arc.inference.plist"
+    PLIST="${PLIST_DIR}/com.arc.inference.plist"
     mkdir -p "${PLIST_DIR}"
-
     BINARY_ABS="$(cd "$(dirname "${BINARY}")" && pwd)/$(basename "${BINARY}")"
-    MODEL_ABS="$(cd "$(dirname "${MODEL_PATH}")" && pwd)/$(basename "${MODEL_PATH}")"
+    GENESIS_ABS="$(cd "$(dirname "${GENESIS}")" && pwd)/$(basename "${GENESIS}")"
 
-    cat > "${PLIST_FILE}" <<PLIST
+    cat > "${PLIST}" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>com.arc.inference</string>
+    <key>Label</key><string>com.arc.inference</string>
     <key>ProgramArguments</key>
     <array>
         <string>${BINARY_ABS}</string>
         <string>--rpc</string><string>0.0.0.0:9090</string>
-        <string>--seeds-file</string><string>${SEEDS_FILE}</string>
+        <string>--seeds-file</string><string>${ARC_DIR}/seeds.txt</string>
+        <string>--genesis</string><string>${GENESIS_ABS}</string>
         <string>--validator-seed</string><string>${SEED}</string>
         <string>--stake</string><string>5000000</string>
-        <string>--model</string><string>${MODEL_ABS}</string>
         <string>--mode</string><string>worker</string>
         <string>--cpu-limit</string><string>${CPU_LIMIT}</string>
         <string>--eth-rpc-port</string><string>0</string>
+$(if [[ -n "${MODEL_PATH}" && -f "${MODEL_PATH}" ]]; then
+    MODEL_ABS="$(cd "$(dirname "${MODEL_PATH}")" && pwd)/$(basename "${MODEL_PATH}")"
+    echo "        <string>--model</string><string>${MODEL_ABS}</string>"
+fi)
     </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>ProcessType</key>
-    <string>Background</string>
-    <key>Nice</key>
-    <integer>15</integer>
-    <key>LowPriorityBackgroundIO</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>${LOG_FILE}</string>
-    <key>StandardErrorPath</key>
-    <string>${LOG_FILE}</string>
-    <key>WorkingDirectory</key>
-    <string>${ARC_DIR}</string>
+    <key>WorkingDirectory</key><string>$(dirname "${GENESIS_ABS}")</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>Nice</key><integer>15</integer>
+    <key>LowPriorityBackgroundIO</key><true/>
+    <key>StandardOutPath</key><string>${ARC_DIR}/node.log</string>
+    <key>StandardErrorPath</key><string>${ARC_DIR}/node.log</string>
 </dict>
 </plist>
 PLIST
-
-    info "launchd plist written: ${PLIST_FILE}"
-    info "To enable auto-start on login: launchctl load ${PLIST_FILE}"
+    ok "Auto-start configured (launchd)"
+    echo -e "  ${D}Enable with: launchctl load ${PLIST}${N}"
 
 elif [[ "${OS}" == "Linux" ]]; then
     SERVICE_DIR="${HOME}/.config/systemd/user"
-    SERVICE_FILE="${SERVICE_DIR}/arc-inference.service"
+    SERVICE="${SERVICE_DIR}/arc-inference.service"
     mkdir -p "${SERVICE_DIR}"
-
     BINARY_ABS="$(readlink -f "${BINARY}")"
-    MODEL_ABS="$(readlink -f "${MODEL_PATH}")"
+    GENESIS_ABS="$(readlink -f "${GENESIS}")"
+    GENESIS_DIR="$(dirname "${GENESIS_ABS}")"
 
-    cat > "${SERVICE_FILE}" <<SERVICE
+    cat > "${SERVICE}" <<SERVICE
 [Unit]
 Description=ARC Community Inference Node
 After=network-online.target
-
 [Service]
 Type=simple
-ExecStart=${BINARY_ABS} --rpc 0.0.0.0:9090 --seeds-file ${SEEDS_FILE} --validator-seed ${SEED} --stake 5000000 --model ${MODEL_ABS} --mode worker --cpu-limit ${CPU_LIMIT} --eth-rpc-port 0
+ExecStart=${BINARY_ABS} --rpc 0.0.0.0:9090 --seeds-file ${ARC_DIR}/seeds.txt --genesis ${GENESIS_ABS} --validator-seed ${SEED} --stake 5000000 --mode worker --cpu-limit ${CPU_LIMIT} --eth-rpc-port 0$(if [[ -n "${MODEL_PATH}" && -f "${MODEL_PATH}" ]]; then echo " --model $(readlink -f "${MODEL_PATH}")"; fi)
 Restart=always
 RestartSec=5
 CPUQuota=${CPU_LIMIT}%
-WorkingDirectory=${ARC_DIR}
+WorkingDirectory=${GENESIS_DIR}
 Environment=RUST_LOG=info
-
 [Install]
 WantedBy=default.target
 SERVICE
-
-    info "systemd service written: ${SERVICE_FILE}"
-    info "To enable auto-start: systemctl --user enable arc-inference && systemctl --user start arc-inference"
+    ok "Auto-start configured (systemd)"
+    echo -e "  ${D}Enable with: systemctl --user enable --now arc-inference${N}"
 fi
 
-info "Done. Your node is earning ARC!"
+# ── Open dashboard ──────────────────────────────────────
+DASHBOARD_URL="http://localhost:9090/worker/dashboard"
+
+if [[ "${OS}" == "Darwin" ]]; then
+    open "${DASHBOARD_URL}" 2>/dev/null &
+elif command -v xdg-open &>/dev/null; then
+    xdg-open "${DASHBOARD_URL}" 2>/dev/null &
+fi
+
+# ── Summary ─────────────────────────────────────────────
+echo ""
+echo -e "${W}  ════════════════════════════════════════${N}"
+echo -e "${G}  Your ARC node is running!${N}"
+echo -e "${W}  ════════════════════════════════════════${N}"
+echo ""
+echo -e "  ${B}Dashboard${N}:  ${DASHBOARD_URL}"
+echo -e "  ${B}Address${N}:    ${ADDR:-starting...}"
+echo -e "  ${B}Model${N}:      ${MODEL_NAME}"
+echo -e "  ${B}CPU Limit${N}:  ${CPU_LIMIT}%"
+echo -e "  ${B}Logs${N}:       tail -f ${ARC_DIR}/node.log"
+echo ""
+echo -e "  ${Y}Commands${N}:"
+echo -e "    Status:   open ${DASHBOARD_URL}"
+echo -e "    Stop:     kill \$(cat ${ARC_DIR}/node.pid)"
+echo -e "    Restart:  bash $0"
+echo ""
+echo -e "  ${C}Share with friends${N}:"
+echo -e "    curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash"
+echo ""
