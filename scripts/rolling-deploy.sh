@@ -79,10 +79,16 @@ for entry in "${NODES[@]}"; do
         cd /root/arc-chain
         killall -9 arc-node 2>/dev/null
         sleep 2
+        # LAX runs benchmark mode for constant TPS on the explorer
+        BENCH_FLAGS=''
+        if [ '$seed' = 'LAX' ]; then
+            BENCH_FLAGS='--benchmark --bench-batch 500 --bench-interval 1000'
+        fi
         nohup target/release/arc-node \
             --rpc 0.0.0.0:9090 --validator-seed $seed \
             --seeds-file /root/.arc-chain/seeds.txt \
             --genesis genesis.toml --stake 5000000 --eth-rpc-port 0 \
+            \$BENCH_FLAGS \
             </dev/null >/tmp/arc-node.log 2>&1 &
         sleep 3
         echo 'PID: '\$(pgrep -f 'arc-node.*validator' | head -1)

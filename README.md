@@ -138,7 +138,44 @@ curl -X POST http://140.82.16.112:9090/faucet/claim \
   -d '{"address":"your-64-char-hex-address-here"}'
 ```
 
-### Join the testnet (run your own node)
+### Earn ARC — Run a Community Inference Node
+
+One command. Downloads a model, connects to the network, starts earning. Your IP stays private. Runs in background, survives reboots.
+
+**Mac / Linux:**
+```bash
+curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash
+```
+
+**Windows (PowerShell as Admin):**
+```powershell
+irm https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.ps1 | iex
+```
+
+**What happens:**
+1. Downloads Llama 2 7B Chat (4.1 GB) — runs on CPU, no GPU required
+2. Connects to 8 seed validators across 6 continents
+3. Starts serving AI inference requests from the network
+4. Earns 100 ARC per inference (testnet rate)
+5. Opens your dashboard at `http://localhost:9090/worker/dashboard`
+6. Runs persistently in background (launchd on Mac, systemd on Linux)
+7. Survives: close terminal, close browser, logout, reboot, kill -9
+
+**Your dashboard shows:** earnings, connected peers, activity feed, projected daily/monthly income.
+
+**Test inference on your node:**
+```bash
+curl -X POST http://localhost:9090/inference/run \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"[INST] What is the capital of France? [/INST]","max_tokens":30}'
+```
+
+**Check your earnings:**
+```bash
+curl http://localhost:9090/worker/earnings
+```
+
+### Join the testnet (validator node)
 
 ```bash
 git clone https://github.com/FerrumVir/arc-chain.git
@@ -146,33 +183,15 @@ cd arc-chain
 ./scripts/join-testnet.sh
 ```
 
-### Run an inference node (GPU recommended)
-
-Earn ARC by running AI inference for the network. Your IP stays private.
-
-```bash
-./scripts/join-inference.sh              # Downloads TinyLlama 1.1B + joins testnet
-./scripts/join-inference.sh --model FILE # Use your own GGUF model
-```
-
-Once running, test inference locally:
-```bash
-curl -X POST http://localhost:9090/inference/run \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":32}'
-```
-
 ### Makefile commands
 
 ```bash
 make join            # Join testnet (no inference)
 make inference       # Join with inference enabled
-make inference-node  # Run a dedicated inference node (GPU)
 make stats           # Check live chain stats
 make health          # Check live node health
 make test            # Run 1,209 tests
 make explorer        # Open block explorer
-make faucet        # Run testnet faucet
 ```
 
 ### What you'll see
