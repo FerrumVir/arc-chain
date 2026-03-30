@@ -28,7 +28,27 @@ while [[ $# -gt 0 ]]; do
         --cpu-limit) CPU_LIMIT="$2"; shift 2 ;;
         --skip-model) SKIP_MODEL=1; shift ;;
         --tiny) MODEL_URL="https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"; MODEL_NAME="TinyLlama 1.1B"; MODEL_SIZE="638 MB"; shift ;;
-        *) echo "Unknown: $1"; exit 1 ;;
+        --help|-h)
+            echo "ARC Community Node Installer"
+            echo ""
+            echo "Usage: bash arc-community.sh [OPTIONS]"
+            echo ""
+            echo "Options:"
+            echo "  --tiny          Use TinyLlama 1.1B (638 MB) instead of Llama 2 7B (4.1 GB)"
+            echo "  --skip-model    Skip model download (relay-only mode, no local inference)"
+            echo "  --model PATH    Use your own GGUF model file"
+            echo "  --cpu-limit N   Max CPU percentage (default: 15)"
+            echo "  --help, -h      Show this help"
+            echo ""
+            echo "Examples:"
+            echo "  bash arc-community.sh                  # Default: Llama 2 7B, 15% CPU"
+            echo "  bash arc-community.sh --tiny            # Smaller model, faster download"
+            echo "  bash arc-community.sh --cpu-limit 25    # Allow 25% CPU"
+            echo ""
+            echo "After install, your dashboard opens at http://localhost:9090/worker/dashboard"
+            exit 0
+            ;;
+        *) echo "Unknown option: $1 (run with --help to see usage)"; exit 1 ;;
     esac
 done
 
@@ -57,6 +77,61 @@ echo -e "${W}  ╔════════════════════�
 echo -e "${W}  ║${N}   ${C}ARC Network${N} — Decentralized AI      ${W}║${N}"
 echo -e "${W}  ║${N}   Run inference. Earn tokens.          ${W}║${N}"
 echo -e "${W}  ╚═══════════════════════════════════════╝${N}"
+echo ""
+
+# ── Pre-flight checks ──────────────────────────────────
+echo -e "  ${D}Running pre-flight checks...${N}"
+
+# Check curl is installed (needed for model download + API calls)
+if ! command -v curl &>/dev/null; then
+    fail "curl is not installed. Install it first:\n    macOS: xcode-select --install\n    Ubuntu/Debian: sudo apt install curl\n    Fedora/RHEL: sudo dnf install curl"
+fi
+
+# Check git is installed (needed to clone the repo for building)
+if [[ -z "${SKIP_MODEL}" ]] && ! command -v git &>/dev/null; then
+    if [[ ! -x "${HOME}/.arc/bin/arc-node" ]]; then
+        fail "git is not installed (needed to build from source). Install it first:\n    macOS: xcode-select --install\n    Ubuntu/Debian: sudo apt install git\n    Fedora/RHEL: sudo dnf install git"
+    fi
+fi
+
+# Check disk space (need ~5 GB for model + build artifacts)
+AVAILABLE_MB=0
+if command -v df &>/dev/null; then
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        AVAILABLE_MB=$(df -m "${HOME}" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
+    else
+        AVAILABLE_MB=$(df -m "${HOME}" 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
+    fi
+fi
+if [[ "${AVAILABLE_MB}" -gt 0 ]] 2>/dev/null; then
+    NEED_MB=5000
+    if [[ -n "${SKIP_MODEL}" ]]; then NEED_MB=2000; fi
+    if [[ "${AVAILABLE_MB}" -lt "${NEED_MB}" ]]; then
+        fail "Not enough disk space. Need ~$((NEED_MB / 1000)) GB, have $((AVAILABLE_MB / 1000)) GB free.\n    Free up space or use --tiny (638 MB model) or --skip-model."
+    fi
+    ok "Disk space: $((AVAILABLE_MB / 1000)) GB free"
+else
+    warn "Could not check disk space — continuing anyway"
+fi
+
+# Check if port 9090 is already in use by something else
+if command -v lsof &>/dev/null; then
+    PORT_PID=$(lsof -ti :9090 2>/dev/null | head -1 || true)
+    if [[ -n "${PORT_PID}" ]]; then
+        PORT_CMD=$(ps -p "${PORT_PID}" -o comm= 2>/dev/null || echo "unknown")
+        if [[ "${PORT_CMD}" == *"arc-node"* || "${PORT_CMD}" == *"arc_node"* ]]; then
+            warn "ARC node already running on port 9090 (PID ${PORT_PID}). Will restart it."
+        else
+            fail "Port 9090 is already in use by '${PORT_CMD}' (PID ${PORT_PID}).\n    Stop it first: kill ${PORT_PID}\n    Or check: lsof -i :9090"
+        fi
+    fi
+elif command -v ss &>/dev/null; then
+    if ss -tlnp 2>/dev/null | grep -q ':9090 '; then
+        warn "Port 9090 may be in use. If the node fails to start, check: ss -tlnp | grep 9090"
+    fi
+fi
+
+ok "Pre-flight checks passed"
 echo ""
 
 # ── Step 1: Create data directory + identity ────────────
@@ -104,10 +179,12 @@ else
     if [[ -d "${ARC_DIR}/src/arc-chain" ]]; then
         echo -e "  ${D}Updating source...${N}"
         cd "${ARC_DIR}/src/arc-chain"
-        git pull origin main --quiet 2>/dev/null || true
+        git pull origin main --quiet 2>/dev/null || warn "Could not update source (offline?). Building with existing code."
     else
         echo -e "  ${D}Cloning repository...${N}"
-        git clone --depth 1 "${REPO_URL}" "${ARC_DIR}/src/arc-chain" 2>/dev/null
+        if ! git clone --depth 1 "${REPO_URL}" "${ARC_DIR}/src/arc-chain" 2>&1 | tail -3; then
+            fail "Failed to clone repository. Check your internet connection and that git is installed.\n    Repo: ${REPO_URL}"
+        fi
         cd "${ARC_DIR}/src/arc-chain"
     fi
 
@@ -141,7 +218,16 @@ elif [[ -f "${ARC_DIR}/model.gguf" ]]; then
     ok "Model already downloaded"
 else
     MODEL_PATH="${ARC_DIR}/model.gguf"
-    curl -L --progress-bar "${MODEL_URL}" -o "${MODEL_PATH}.tmp" 2>&1
+    if ! curl -L --progress-bar --fail "${MODEL_URL}" -o "${MODEL_PATH}.tmp" 2>&1; then
+        rm -f "${MODEL_PATH}.tmp"
+        fail "Model download failed. Check your internet connection and try again.\n    You can also use --tiny for a smaller model, or --skip-model to skip."
+    fi
+    # Sanity check: model file should be at least 100 MB
+    FILE_SIZE=$(wc -c < "${MODEL_PATH}.tmp" 2>/dev/null || echo 0)
+    if [[ "${FILE_SIZE}" -lt 100000000 ]]; then
+        rm -f "${MODEL_PATH}.tmp"
+        fail "Downloaded model is too small (${FILE_SIZE} bytes) — likely a partial download.\n    Check disk space and internet connection, then try again."
+    fi
     mv "${MODEL_PATH}.tmp" "${MODEL_PATH}"
     ok "Model downloaded: ${MODEL_NAME}"
 fi
@@ -303,17 +389,35 @@ fi
 # ── Step 6: Wait for health + claim faucet ────────────────
 step 6 "Connecting to network"
 
+CONNECTED=0
 for i in $(seq 1 30); do
     if curl -sf http://localhost:9090/health >/dev/null 2>&1; then
-        PEERS=$(curl -sf http://localhost:9090/health 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers',0))" 2>/dev/null || echo "0")
+        PEERS="0"
+        HEALTH_JSON=$(curl -sf http://localhost:9090/health 2>/dev/null || echo "{}")
+        if command -v python3 &>/dev/null; then
+            PEERS=$(echo "${HEALTH_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('peers', json.load(open('/dev/stdin') if False else sys.stdin).get('peer_count',0)))" 2>/dev/null || echo "0")
+        else
+            # Fallback: extract peers with grep (no python needed)
+            PEERS=$(echo "${HEALTH_JSON}" | grep -o '"peer[s_]*count*":[0-9]*' | head -1 | grep -o '[0-9]*$' || echo "0")
+        fi
         ok "Connected to ${PEERS} peers"
+        CONNECTED=1
         break
     fi
     sleep 1
 done
+if [[ "${CONNECTED}" -eq 0 ]]; then
+    warn "Node didn't respond after 30s. Check logs: tail -f ${ARC_DIR}/node.log"
+fi
 
 # Faucet claim
-ADDR=$(curl -sf http://localhost:9090/worker/earnings 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('address',''))" 2>/dev/null || echo "")
+ADDR=""
+EARNINGS_JSON=$(curl -sf http://localhost:9090/worker/earnings 2>/dev/null || echo "{}")
+if command -v python3 &>/dev/null; then
+    ADDR=$(echo "${EARNINGS_JSON}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('address',''))" 2>/dev/null || echo "")
+else
+    ADDR=$(echo "${EARNINGS_JSON}" | grep -o '"address":"[^"]*"' | head -1 | sed 's/"address":"//;s/"//' || echo "")
+fi
 if [[ -n "${ADDR}" ]]; then
     for seed_ip in 140.82.16.112 149.28.32.76 136.244.109.1; do
         if curl -sf -X POST "http://${seed_ip}:9090/faucet/claim" -H "Content-Type: application/json" -d "{\"address\": \"${ADDR}\"}" >/dev/null 2>&1; then
@@ -346,8 +450,16 @@ echo -e "  ${B}Logs${N}:       tail -f ${ARC_DIR}/node.log"
 echo ""
 echo -e "  ${Y}Commands${N}:"
 echo -e "    Status:   open ${DASHBOARD_URL}"
+if [[ "${OS}" == "Darwin" ]]; then
+echo -e "    Stop:     launchctl bootout gui/\$(id -u)/com.arc.inference"
+echo -e "    Restart:  launchctl kickstart -k gui/\$(id -u)/com.arc.inference"
+elif [[ "${OS}" == "Linux" ]] && command -v systemctl &>/dev/null; then
+echo -e "    Stop:     systemctl --user stop arc-inference"
+echo -e "    Restart:  systemctl --user restart arc-inference"
+else
 echo -e "    Stop:     kill \$(cat ${ARC_DIR}/node.pid)"
 echo -e "    Restart:  bash $0"
+fi
 echo ""
 echo -e "  ${C}Share with friends${N}:"
 echo -e "    curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash"

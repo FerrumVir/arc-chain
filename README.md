@@ -161,7 +161,14 @@ irm https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-commu
 6. Runs persistently in background (launchd on Mac, systemd on Linux)
 7. Survives: close terminal, close browser, logout, reboot, kill -9
 
-**Your dashboard shows:** earnings, connected peers, activity feed, projected daily/monthly income.
+**Your dashboard shows:**
+- Live earnings counter with animated glow when you earn ARC
+- Earnings-over-time chart (SVG, toggle 1H / 6H / 24H / All)
+- Network leaderboard showing your rank vs all nodes (medal icons for top 3)
+- Connected peers, activity feed, projected daily/monthly income
+- Mobile responsive -- works on your phone
+
+**Earnings persist across restarts.** Close the terminal, reboot, even `kill -9` -- your inference count and ARC balance are saved to disk and resume automatically.
 
 **Test inference on your node:**
 ```bash
@@ -175,12 +182,38 @@ curl -X POST http://localhost:9090/inference/run \
 curl http://localhost:9090/worker/earnings
 ```
 
+**View your earnings history (for charting):**
+```bash
+curl http://localhost:9090/worker/earnings/history
+```
+
+**View the network leaderboard:**
+```bash
+curl http://localhost:9090/worker/leaderboard
+```
+
 ### Join the testnet (validator node)
 
 ```bash
 git clone https://github.com/FerrumVir/arc-chain.git
 cd arc-chain
 ./scripts/join-testnet.sh
+```
+
+### Installer options
+
+```bash
+# Use a smaller model (TinyLlama 1.1B, 638 MB) — great for testing
+curl -sSf .../arc-community.sh | bash -s -- --tiny
+
+# Skip model download entirely (relay-only mode)
+curl -sSf .../arc-community.sh | bash -s -- --skip-model
+
+# Use your own GGUF model file
+curl -sSf .../arc-community.sh | bash -s -- --model /path/to/your-model.gguf
+
+# Limit CPU usage (default: 15%)
+curl -sSf .../arc-community.sh | bash -s -- --cpu-limit 10
 ```
 
 ### Makefile commands
@@ -334,7 +367,7 @@ On testnet, use the faucet to get test tokens and start building now.
 
 ---
 
-## RPC API (34 endpoints)
+## RPC API (38 endpoints)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -360,6 +393,10 @@ On testnet, use the faucet to get test tokens and start building now.
 | POST | `/contract/{address}/call` | Call a smart contract |
 | GET | `/channel/{id}/state` | Payment channel state |
 | POST | `/eth` | ETH JSON-RPC (blockNumber, getBalance, call, estimateGas, getLogs) |
+| GET | `/worker/dashboard` | Interactive worker dashboard (HTML) |
+| GET | `/worker/earnings` | Worker earnings: total ARC, inference count, persistence status |
+| GET | `/worker/earnings/history` | Timestamped earnings data for time-series charting |
+| GET | `/worker/leaderboard` | Network-wide leaderboard: rank, ARC earned, inferences per node |
 
 ---
 
@@ -418,6 +455,11 @@ Everything below is implemented, deployed, and running on the live testnet:
 | 5 signature algorithms | Live | Ed25519, Falcon-512, BLS, ML-DSA, secp256k1 |
 | Encrypted mempool | Live | BLS threshold commit-reveal |
 | Block explorer | Live | `explorer/index-live.html` |
+| Community worker mode | Live | One-command install, background service, persistent across reboots |
+| Worker dashboard | Live | Mobile-responsive, animated earnings counter, earnings glow |
+| Persistent earnings | Live | Earnings saved to disk, survive restarts / kill / reboot |
+| Earnings chart | Live | SVG time-series with 1H/6H/24H/All range toggle |
+| Network leaderboard | Live | Ranked by ARC earned, medal icons for top 3, refreshes every 15s |
 
 ## Roadmap (What's Next)
 
