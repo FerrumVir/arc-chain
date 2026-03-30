@@ -191,7 +191,8 @@ pub async fn serve(
         .route("/inference/run", post(inference_run))
         .route("/inference/attestations", get(inference_list_attestations))
         .route("/inference/results", get(inference_list_results))
-        // Worker earnings + status (community inference nodes)
+        // Worker dashboard + earnings (community inference nodes)
+        .route("/worker/dashboard", get(worker_dashboard))
         .route("/worker/earnings", get(worker_earnings))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
@@ -2968,6 +2969,13 @@ async fn inference_list_results(
         "results": results,
         "count": results.len(),
     }))
+}
+
+/// Worker dashboard — serves the local web UI.
+///
+/// GET /worker/dashboard
+async fn worker_dashboard() -> axum::response::Html<&'static str> {
+    axum::response::Html(include_str!("../../../dashboard/worker.html"))
 }
 
 /// Worker earnings and status.

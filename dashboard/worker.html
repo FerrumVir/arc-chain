@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ARC Node — Your Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config={darkMode:'class',theme:{extend:{colors:{
+  arc:{400:'#818cf8',500:'#6366f1',600:'#4f46e5'},
+  surface:{1:'#09090f',2:'#0f0f19',3:'#141420',4:'#1a1a2e',5:'#22223a'},
+  earn:{400:'#4ade80',500:'#22c55e'}
+}}}}
+</script>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+body{font-family:'Inter',sans-serif}
+.mono{font-family:'JetBrains Mono',monospace}
+.pulse-dot{animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn .3s ease-out}
+@keyframes confetti{0%{transform:translateY(0) rotate(0)}100%{transform:translateY(100vh) rotate(720deg);opacity:0}}
+.confetti-piece{position:fixed;top:-10px;animation:confetti 2s ease-in forwards;pointer-events:none;z-index:100}
+::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#2a2a4a;border-radius:4px}
+.toast{animation:fadeIn .3s ease-out,fadeOut .3s ease-in 3s forwards}
+@keyframes fadeOut{to{opacity:0;transform:translateY(-8px)}}
+</style>
+</head>
+<body class="bg-surface-1 text-gray-300 min-h-screen">
+
+<!-- Toast Container -->
+<div id="toasts" class="fixed top-4 right-4 z-50 space-y-2"></div>
+
+<!-- Onboarding Modal -->
+<div id="onboarding" class="fixed inset-0 bg-black/90 z-50 hidden items-center justify-center p-4">
+  <div class="bg-surface-2 border border-surface-4 rounded-2xl p-8 max-w-md w-full text-center fade-in">
+    <div class="w-16 h-16 rounded-2xl bg-arc-500 flex items-center justify-center mx-auto mb-4"><span class="text-white font-bold text-2xl">A</span></div>
+    <h2 class="text-2xl font-bold text-white mb-2">Welcome to ARC Network</h2>
+    <p class="text-gray-400 mb-6">Your device is now part of a global AI inference network. You earn ARC tokens every time you help process an AI request.</p>
+    <div class="bg-surface-3 rounded-xl p-4 mb-6 text-left">
+      <p class="text-xs text-gray-500 uppercase tracking-wider mb-1">Your Address</p>
+      <p class="mono text-sm text-arc-400 break-all" id="onboardAddr">Loading...</p>
+    </div>
+    <button onclick="claimFaucet();closeOnboarding()" class="w-full py-3 bg-arc-500 hover:bg-arc-600 text-white font-semibold rounded-xl transition">Claim Free Testnet Tokens &amp; Start Earning</button>
+  </div>
+</div>
+
+<!-- Header -->
+<header class="border-b border-surface-4 bg-surface-2/80 backdrop-blur-sm sticky top-0 z-40">
+  <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-8 h-8 rounded-lg bg-arc-500 flex items-center justify-center"><span class="text-white font-bold text-sm">A</span></div>
+      <div>
+        <h1 class="text-lg font-bold text-white">ARC Node</h1>
+        <p class="text-xs text-gray-500" id="headerStatus">Connecting...</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="statusDot" class="w-2.5 h-2.5 rounded-full bg-gray-600"></span>
+      <span id="statusLabel" class="text-xs text-gray-500">Offline</span>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-5xl mx-auto px-4 py-6 space-y-5">
+
+  <!-- Hero: Earnings -->
+  <div class="bg-gradient-to-br from-surface-2 to-surface-3 border border-surface-4 rounded-2xl p-6">
+    <div class="flex items-start justify-between mb-1">
+      <p class="text-xs text-gray-500 uppercase tracking-wider">Total Earned</p>
+      <span class="text-xs text-earn-400 bg-earn-400/10 px-2 py-0.5 rounded-full" id="earnRate">--</span>
+    </div>
+    <p class="text-4xl font-extrabold text-white mono" id="totalEarned">0</p>
+    <p class="text-sm text-gray-500 mt-1">ARC tokens</p>
+    <div class="grid grid-cols-3 gap-4 mt-5">
+      <div>
+        <p class="text-xs text-gray-500">Inferences</p>
+        <p class="text-lg font-bold text-white mono" id="totalInferences">0</p>
+      </div>
+      <div>
+        <p class="text-xs text-gray-500">Projected / Day</p>
+        <p class="text-lg font-bold text-earn-400 mono" id="projectedDaily">0</p>
+      </div>
+      <div>
+        <p class="text-xs text-gray-500">Projected / Month</p>
+        <p class="text-lg font-bold text-earn-400 mono" id="projectedMonthly">0</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stats Row -->
+  <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4">
+      <p class="text-[11px] uppercase tracking-wider text-gray-500">Uptime</p>
+      <p class="text-xl font-bold text-white mono" id="uptime">--</p>
+    </div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4">
+      <p class="text-[11px] uppercase tracking-wider text-gray-500">Peers</p>
+      <p class="text-xl font-bold text-arc-400 mono" id="peers">0</p>
+    </div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4">
+      <p class="text-[11px] uppercase tracking-wider text-gray-500">Model</p>
+      <p class="text-sm font-semibold text-white truncate" id="modelName">--</p>
+    </div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4">
+      <p class="text-[11px] uppercase tracking-wider text-gray-500">Mode</p>
+      <p class="text-xl font-bold text-white" id="nodeMode">--</p>
+    </div>
+  </div>
+
+  <!-- Two-column: Peers + Activity -->
+  <div class="grid lg:grid-cols-2 gap-5">
+
+    <!-- Connected Peers -->
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-semibold text-white uppercase tracking-wider">Connected Peers</h2>
+        <span class="text-xs text-gray-500" id="peerCount">0 peers</span>
+      </div>
+      <div id="peerList" class="space-y-2 max-h-64 overflow-y-auto">
+        <p class="text-xs text-gray-600">Discovering peers...</p>
+      </div>
+    </div>
+
+    <!-- Activity Feed -->
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+      <div class="flex items-center justify-between mb-4">
+        <h2 class="text-sm font-semibold text-white uppercase tracking-wider">Recent Activity</h2>
+        <span class="text-xs text-gray-500" id="activityCount">0 jobs</span>
+      </div>
+      <div id="activityList" class="space-y-2 max-h-64 overflow-y-auto">
+        <p class="text-xs text-gray-600">Waiting for inference requests...</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Referral / Invite -->
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+    <h2 class="text-sm font-semibold text-white uppercase tracking-wider mb-3">Invite Friends</h2>
+    <p class="text-xs text-gray-500 mb-3">Share this command and earn referral bonuses when friends join the network.</p>
+    <div class="flex gap-2">
+      <input id="installCmd" readonly
+        class="flex-1 bg-surface-1 border border-surface-4 rounded-lg px-3 py-2 text-xs mono text-arc-400 focus:outline-none"
+        value="curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash">
+      <button onclick="copyInstall()" class="px-4 py-2 bg-arc-500 hover:bg-arc-600 text-white text-xs font-semibold rounded-lg transition" id="copyBtn">Copy</button>
+    </div>
+    <div class="mt-4 grid grid-cols-2 gap-3">
+      <div>
+        <p class="text-xs text-gray-500">Your Referral Code</p>
+        <p class="mono text-xs text-arc-400 truncate" id="referralCode">--</p>
+      </div>
+      <div>
+        <p class="text-xs text-gray-500">Devices Referred</p>
+        <p class="text-lg font-bold text-white" id="devicesReferred">0</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Network Overview -->
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+    <h2 class="text-sm font-semibold text-white uppercase tracking-wider mb-3">Network Overview</h2>
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div>
+        <p class="text-xs text-gray-500">Total Validators</p>
+        <p class="text-lg font-bold text-white mono" id="netValidators">--</p>
+      </div>
+      <div>
+        <p class="text-xs text-gray-500">Network TPS</p>
+        <p class="text-lg font-bold text-white mono" id="netTPS">--</p>
+      </div>
+      <div>
+        <p class="text-xs text-gray-500">Total Transactions</p>
+        <p class="text-lg font-bold text-white mono" id="netTxs">--</p>
+      </div>
+      <div>
+        <p class="text-xs text-gray-500">Your Contribution</p>
+        <p class="text-lg font-bold text-arc-400" id="netContribution">--%</p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Your Node Info -->
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+    <h2 class="text-sm font-semibold text-white uppercase tracking-wider mb-3">Your Node</h2>
+    <div class="space-y-2">
+      <div class="flex justify-between">
+        <span class="text-xs text-gray-500">Address</span>
+        <span class="mono text-xs text-arc-400 cursor-pointer hover:text-arc-500" onclick="copyAddr()" id="nodeAddr">--</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-xs text-gray-500">Version</span>
+        <span class="mono text-xs text-white" id="nodeVersion">--</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-xs text-gray-500">CPU Limit</span>
+        <span class="text-xs text-white" id="cpuLimit">--%</span>
+      </div>
+      <div class="flex justify-between">
+        <span class="text-xs text-gray-500">DAG Round</span>
+        <span class="mono text-xs text-white" id="dagRound">--</span>
+      </div>
+    </div>
+  </div>
+
+  <p class="text-center text-xs text-gray-600 py-4">ARC Network &mdash; Decentralized AI Inference &mdash; <a href="https://github.com/FerrumVir/arc-chain" target="_blank" class="text-arc-400 hover:text-arc-500">GitHub</a></p>
+</main>
+
+<script>
+const RPC = window.location.origin; // Same host as the node
+const SEEDS = [
+  {ip:'149.28.32.76',name:'NYC',flag:'US'},
+  {ip:'140.82.16.112',name:'LAX',flag:'US'},
+  {ip:'136.244.109.1',name:'AMS',flag:'NL'},
+  {ip:'104.238.171.11',name:'LHR',flag:'GB'},
+  {ip:'202.182.107.41',name:'NRT',flag:'JP'},
+  {ip:'149.28.153.31',name:'SGP',flag:'SG'},
+  {ip:'216.238.120.27',name:'SAO',flag:'BR'},
+  {ip:'139.84.237.49',name:'JNB',flag:'ZA'}
+];
+
+let lastInferences = 0;
+let prevEarnings = null;
+
+// ── Onboarding ──────────────────────────────────────────────
+function checkOnboarding() {
+  if (!localStorage.getItem('arc_onboarded')) {
+    document.getElementById('onboarding').style.display = 'flex';
+  }
+}
+function closeOnboarding() {
+  localStorage.setItem('arc_onboarded', '1');
+  document.getElementById('onboarding').style.display = 'none';
+}
+
+// ── Faucet Claim ────────────────────────────────────────────
+async function claimFaucet() {
+  try {
+    const info = await (await fetch(RPC + '/node/info')).json();
+    const addr = info.address;
+    for (const s of SEEDS) {
+      try {
+        await fetch(`http://${s.ip}:9090/faucet/claim`, {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({address: addr}), signal: AbortSignal.timeout(3000)
+        });
+        showToast('Testnet tokens claimed!', 'ok');
+        break;
+      } catch(e) { continue; }
+    }
+  } catch(e) {}
+}
+
+// ── Toast Notifications ─────────────────────────────────────
+function showToast(msg, type='info') {
+  const colors = {ok:'border-emerald-500 text-emerald-400',err:'border-red-500 text-red-400',info:'border-arc-500 text-arc-400'};
+  const div = document.createElement('div');
+  div.className = `toast bg-surface-2 border-l-4 ${colors[type]||colors.info} px-4 py-2 rounded-r-lg text-sm shadow-xl`;
+  div.textContent = msg;
+  document.getElementById('toasts').appendChild(div);
+  setTimeout(() => div.remove(), 4000);
+}
+
+// ── Confetti ────────────────────────────────────────────────
+function confetti() {
+  const colors = ['#6366f1','#818cf8','#4ade80','#fbbf24','#f87171'];
+  for (let i = 0; i < 30; i++) {
+    const el = document.createElement('div');
+    el.className = 'confetti-piece';
+    el.style.left = Math.random()*100+'vw';
+    el.style.background = colors[Math.floor(Math.random()*colors.length)];
+    el.style.width = el.style.height = (4+Math.random()*6)+'px';
+    el.style.animationDuration = (1.5+Math.random())+'s';
+    el.style.animationDelay = Math.random()*0.5+'s';
+    el.style.borderRadius = Math.random()>0.5?'50%':'0';
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 3000);
+  }
+}
+
+// ── Copy Helpers ────────────────────────────────────────────
+function copyInstall() {
+  navigator.clipboard.writeText(document.getElementById('installCmd').value);
+  const btn = document.getElementById('copyBtn');
+  btn.textContent = 'Copied!'; btn.classList.add('bg-earn-500');
+  setTimeout(() => { btn.textContent = 'Copy'; btn.classList.remove('bg-earn-500'); }, 2000);
+}
+function copyAddr() {
+  const addr = document.getElementById('nodeAddr').textContent;
+  if (addr && addr !== '--') {
+    navigator.clipboard.writeText(addr);
+    showToast('Address copied!', 'ok');
+  }
+}
+
+// ── Format Helpers ──────────────────────────────────────────
+function fmtUptime(hours) {
+  if (hours < 1) return Math.round(hours*60) + 'm';
+  if (hours < 24) return hours.toFixed(1) + 'h';
+  return (hours/24).toFixed(1) + 'd';
+}
+function fmtNumber(n) {
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
+  return n.toLocaleString();
+}
+function shortAddr(addr) {
+  if (!addr || addr.length < 12) return addr || '--';
+  return addr.slice(0,8) + '...' + addr.slice(-6);
+}
+
+// ── Main Refresh ────────────────────────────────────────────
+async function refresh() {
+  try {
+    // Fetch worker earnings + health in parallel
+    const [earnings, health, stats] = await Promise.all([
+      fetch(RPC + '/worker/earnings').then(r => r.json()).catch(() => null),
+      fetch(RPC + '/health').then(r => r.json()).catch(() => null),
+      // Try to get network stats from a seed
+      fetchSeedStats()
+    ]);
+
+    if (!earnings || !health) {
+      setStatus('offline');
+      return;
+    }
+
+    // Status
+    setStatus(earnings.status === 'active' ? 'active' :
+              earnings.connected_peers > 0 ? 'connected' : 'offline');
+
+    // Earnings
+    const earned = earnings.earnings?.total_arc || 0;
+    const inferences = earnings.total_inferences || 0;
+    document.getElementById('totalEarned').textContent = fmtNumber(earned);
+    document.getElementById('totalInferences').textContent = fmtNumber(inferences);
+    document.getElementById('earnRate').textContent = (earnings.earnings?.rate || '--');
+
+    // Projections based on current rate
+    const uptimeH = earnings.uptime_hours || 0.01;
+    const earnPerHour = earned / Math.max(uptimeH, 0.01);
+    document.getElementById('projectedDaily').textContent = fmtNumber(Math.round(earnPerHour * 24));
+    document.getElementById('projectedMonthly').textContent = fmtNumber(Math.round(earnPerHour * 24 * 30));
+
+    // First inference celebration
+    if (inferences > 0 && lastInferences === 0 && prevEarnings !== null) {
+      confetti();
+      showToast('First inference completed! +' + (earnings.earnings?.rate || '100 ARC'), 'ok');
+    }
+    // New inference notification
+    if (inferences > lastInferences && lastInferences > 0) {
+      showToast('+' + ((inferences - lastInferences) * 100) + ' ARC earned!', 'ok');
+    }
+    lastInferences = inferences;
+    prevEarnings = earnings;
+
+    // Stats row
+    document.getElementById('uptime').textContent = fmtUptime(uptimeH);
+    document.getElementById('peers').textContent = earnings.connected_peers || health.peers || 0;
+    document.getElementById('modelName').textContent = earnings.model_loaded ? 'Loaded' : 'No Model';
+    document.getElementById('nodeMode').textContent = (earnings.mode || 'worker').charAt(0).toUpperCase() + (earnings.mode || 'worker').slice(1);
+
+    // Node info
+    const addr = earnings.address || '--';
+    document.getElementById('nodeAddr').textContent = addr;
+    document.getElementById('referralCode').textContent = shortAddr(addr);
+    document.getElementById('onboardAddr').textContent = addr;
+    document.getElementById('nodeVersion').textContent = health.version || '--';
+    document.getElementById('dagRound').textContent = fmtNumber(health.dag_round || 0);
+
+    // Peer list
+    updatePeers(health);
+
+    // Activity feed
+    updateActivity(earnings, inferences);
+
+    // Network stats
+    if (stats) {
+      document.getElementById('netValidators').textContent = stats.validators || '--';
+      document.getElementById('netTPS').textContent = stats.tps || '--';
+      document.getElementById('netTxs').textContent = fmtNumber(stats.total_transactions || 0);
+    }
+
+  } catch(e) {
+    console.error('Refresh error:', e);
+  }
+}
+
+function setStatus(s) {
+  const dot = document.getElementById('statusDot');
+  const label = document.getElementById('statusLabel');
+  const header = document.getElementById('headerStatus');
+  if (s === 'active') {
+    dot.className = 'w-2.5 h-2.5 rounded-full bg-emerald-400 pulse-dot';
+    label.textContent = 'Active'; label.className = 'text-xs text-emerald-400';
+    header.textContent = 'Earning ARC';
+  } else if (s === 'connected') {
+    dot.className = 'w-2.5 h-2.5 rounded-full bg-yellow-400';
+    label.textContent = 'Connected'; label.className = 'text-xs text-yellow-400';
+    header.textContent = 'Connected (no model)';
+  } else {
+    dot.className = 'w-2.5 h-2.5 rounded-full bg-gray-600';
+    label.textContent = 'Offline'; label.className = 'text-xs text-gray-500';
+    header.textContent = 'Offline';
+  }
+}
+
+function updatePeers(health) {
+  const container = document.getElementById('peerList');
+  const peerCount = health.peers || 0;
+  document.getElementById('peerCount').textContent = peerCount + ' peer' + (peerCount !== 1 ? 's' : '');
+
+  // Show seed nodes with known labels
+  let html = '';
+  const flags = {'NYC':'US','LAX':'US','AMS':'NL','LHR':'GB','NRT':'JP','SGP':'SG','SAO':'BR','JNB':'ZA'};
+  SEEDS.forEach(s => {
+    html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
+      <div class="flex items-center gap-2">
+        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+        <span class="text-xs font-medium text-white">${s.name}</span>
+        <span class="text-[10px] text-gray-500">${s.flag}</span>
+      </div>
+      <span class="mono text-[10px] text-gray-600">${s.ip}</span>
+    </div>`;
+  });
+  if (peerCount > SEEDS.length) {
+    html += `<div class="py-1.5 px-2 text-xs text-gray-500">+ ${peerCount - SEEDS.length} community workers</div>`;
+  }
+  container.innerHTML = html || '<p class="text-xs text-gray-600">No peers connected</p>';
+}
+
+function updateActivity(earnings, inferences) {
+  const container = document.getElementById('activityList');
+  document.getElementById('activityCount').textContent = inferences + ' job' + (inferences !== 1 ? 's' : '');
+
+  // We don't have per-request history yet — show summary
+  if (inferences === 0) {
+    container.innerHTML = '<p class="text-xs text-gray-600">Waiting for inference requests from the network...</p>';
+    return;
+  }
+
+  let html = '';
+  // Show last N inferences as generic entries (activity endpoint will provide real data later)
+  const shown = Math.min(inferences, 20);
+  for (let i = 0; i < shown; i++) {
+    html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
+      <div class="flex items-center gap-2">
+        <span class="text-earn-400 text-xs font-bold">+100</span>
+        <span class="text-xs text-gray-400">Inference #${inferences - i}</span>
+      </div>
+      <span class="text-[10px] text-gray-600">ARC earned</span>
+    </div>`;
+  }
+  container.innerHTML = html;
+}
+
+async function fetchSeedStats() {
+  for (const s of SEEDS) {
+    try {
+      const r = await fetch(`http://${s.ip}:9090/stats`, {signal: AbortSignal.timeout(3000)});
+      return await r.json();
+    } catch(e) { continue; }
+  }
+  return null;
+}
+
+// ── Init ────────────────────────────────────────────────────
+checkOnboarding();
+refresh();
+setInterval(refresh, 5000);
+
+// Request notification permission
+if ('Notification' in window && Notification.permission === 'default') {
+  setTimeout(() => Notification.requestPermission(), 10000);
+}
+</script>
+</body>
+</html>
