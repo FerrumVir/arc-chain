@@ -290,3 +290,60 @@
 - `crates/arc-node/Cargo.toml` (tempfile dev-dependency)
 - `evolution/log.md` (this entry)
 ---
+
+## Evolution 7 — 2026-03-30 04:15
+**What:** Model auto-detection + hardware recommendation endpoint + dashboard card
+
+### Backend — hardware_detect.rs
+- Added `ram_gb: u64` field to `HardwareProfile` struct
+- Added `detect_ram_gb()` platform function: macOS via `sysctl hw.memsize`, Linux via `/proc/meminfo`
+- Added `recommended_model()` method: `<4GB -> "none"`, `4-7GB -> "tiny"`, `>=8GB -> "7b"`
+- Added `recommended_model_label()` for human-readable descriptions
+- RAM logged at startup alongside existing GPU/CPU/SIMD info
+- 3 new tests: `test_recommended_model_by_ram` (all 3 tiers), `test_ram_detection_runs`, updated `test_detect_returns_valid_profile`
+- Updated all 5 manually-constructed `HardwareProfile`s in existing tests with `ram_gb` field
+
+### API — rpc.rs
+- `GET /worker/hardware` endpoint returning JSON:
+  - `gpu`: `{name, cuda, metal, backend}`
+  - `cpu`: `{cores, avx512, neon}`
+  - `ram_gb`, `recommended_model`, `recommended_model_label`
+- Route registered at `/worker/hardware` in the main router
+- Uses `arc_gpu::hardware_detect::detect()` — no duplication of detection logic
+
+### Dashboard — worker.html
+- New "Hardware" card between Stats Row and Peers/Activity section
+- Shows: GPU name, CPU cores, RAM (GB), recommended model, backend badge
+- Fetches from `/worker/hardware` once on load (hardware doesn't change at runtime)
+- Card hidden until data loads (`style="display:none"` + JS reveal)
+- Mobile responsive: 2-column on phone, 4-column on desktop
+
+### Installer — arc-community.sh
+- After pre-flight checks, detects total RAM via `sysctl` (macOS) or `/proc/meminfo` (Linux)
+- `<4 GB RAM`: auto-switches to `--skip-model` (relay-only), warns user
+- `4-7 GB RAM`: auto-switches to TinyLlama 1.1B, warns user
+- `>=8 GB RAM`: keeps default Llama 2 7B, confirms in output
+- `--help` updated with "Hardware auto-detection" section documenting the 3 tiers
+- User can always override with `--tiny`, `--model PATH`, or `--skip-model`
+
+**Why:** New community workers on low-RAM machines (Raspberry Pi, cheap VPS, old laptops) would download the 4.1 GB Llama 2 model and either OOM-kill or crawl. Auto-detection picks the right model size, preventing failed installs. The `/worker/hardware` endpoint and dashboard card give users visibility into what hardware was detected, and the recommended model helps support troubleshooting ("your node recommends tiny but you're running 7B — that's why it's slow").
+
+**Verified:**
+- Mac worker: `/worker/hardware` returns `{gpu: "Apple M2 Ultra", cores: 24, ram_gb: 64, recommended_model: "7b"}`
+- Mac worker: Dashboard serves hardware card (2 `hardwareCard` references in HTML)
+- Mac worker: Earnings preserved across restart (21,100 ARC, 211 inferences, persistence=true)
+- Mac worker: Leaderboard shows #1 of 9 nodes, 8 peers
+- Installer syntax check: `bash -n` passes
+- Installer `--help`: shows hardware auto-detection section with 3 RAM tiers
+- `cargo test --lib -p arc-gpu -- hardware_detect`: 5 tests passed (including 3 new)
+- `cargo test --lib -p arc-node`: 97 tests passed, 0 failed
+
+**Rollback:** `git checkout evolution-6`
+
+**Files changed:**
+- `crates/arc-gpu/src/hardware_detect.rs` (ram_gb field, detect_ram_gb, recommended_model, 3 tests)
+- `crates/arc-node/src/rpc.rs` (worker_hardware handler + route registration)
+- `dashboard/worker.html` (hardware card HTML + updateHardware JS)
+- `scripts/arc-community.sh` (RAM auto-detection, model recommendation, --help update)
+- `evolution/log.md` (this entry)
+---

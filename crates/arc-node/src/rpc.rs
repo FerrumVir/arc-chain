@@ -2,6 +2,7 @@ use crate::earnings::EarningsTracker;
 use arc_consensus::StakeTier;
 use arc_crypto::{Hash256, MerkleProof};
 use arc_gpu::probe_gpu;
+use arc_gpu::hardware_detect;
 use arc_mempool::Mempool;
 use arc_state::StateDB;
 use arc_types::*;
@@ -210,6 +211,7 @@ pub async fn serve(
         .route("/worker/activity", get(worker_activity))
         .route("/worker/peers", get(worker_peers))
         .route("/worker/leaderboard", get(worker_leaderboard))
+        .route("/worker/hardware", get(worker_hardware))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -3284,6 +3286,36 @@ async fn worker_leaderboard(
         "your_rank": my_rank,
         "your_address": local_addr,
         "updated_at": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+/// Hardware profile — detected GPU, CPU, RAM, and recommended model.
+///
+/// GET /worker/hardware
+///
+/// Returns the hardware profile detected at startup: GPU name/backend,
+/// CPU core count, total RAM, SIMD capabilities, and the recommended
+/// model size for this machine.
+async fn worker_hardware(
+    AxumState(_node): AxumState<NodeState>,
+) -> Json<Value> {
+    let hw = hardware_detect::detect();
+
+    Json(json!({
+        "gpu": {
+            "name": hw.gpu_name.as_deref().unwrap_or("none"),
+            "cuda": hw.cuda_available,
+            "metal": hw.metal_available,
+            "backend": hw.best_backend_name(),
+        },
+        "cpu": {
+            "cores": hw.cpu_cores,
+            "avx512": hw.avx512_available,
+            "neon": hw.neon_available,
+        },
+        "ram_gb": hw.ram_gb,
+        "recommended_model": hw.recommended_model(),
+        "recommended_model_label": hw.recommended_model_label(),
     }))
 }
 

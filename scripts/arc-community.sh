@@ -40,9 +40,15 @@ while [[ $# -gt 0 ]]; do
             echo "  --cpu-limit N   Max CPU percentage (default: 15)"
             echo "  --help, -h      Show this help"
             echo ""
+            echo "Hardware auto-detection:"
+            echo "  RAM < 4 GB   -> relay-only mode (no model downloaded)"
+            echo "  RAM 4-7 GB   -> auto-selects TinyLlama 1.1B (638 MB)"
+            echo "  RAM >= 8 GB  -> default Llama 2 7B Chat (4.1 GB)"
+            echo "  Use --tiny or --model to override auto-detection."
+            echo ""
             echo "Examples:"
-            echo "  bash arc-community.sh                  # Default: Llama 2 7B, 15% CPU"
-            echo "  bash arc-community.sh --tiny            # Smaller model, faster download"
+            echo "  bash arc-community.sh                  # Auto-detect hardware, pick best model"
+            echo "  bash arc-community.sh --tiny            # Force smaller model"
             echo "  bash arc-community.sh --cpu-limit 25    # Allow 25% CPU"
             echo ""
             echo "After install, your dashboard opens at http://localhost:9090/worker/dashboard"
@@ -132,6 +138,39 @@ elif command -v ss &>/dev/null; then
 fi
 
 ok "Pre-flight checks passed"
+
+# ── Hardware-based model recommendation ────────────────
+# Auto-detect RAM and recommend optimal model if user didn't specify --tiny or --model
+if [[ -z "${MODEL_PATH}" && -z "${SKIP_MODEL}" ]]; then
+    TOTAL_RAM_MB=0
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        RAM_BYTES=$(sysctl -n hw.memsize 2>/dev/null || echo 0)
+        TOTAL_RAM_MB=$((RAM_BYTES / 1024 / 1024))
+    elif [[ -f /proc/meminfo ]]; then
+        RAM_KB=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 0)
+        TOTAL_RAM_MB=$((RAM_KB / 1024))
+    fi
+
+    if [[ "${TOTAL_RAM_MB}" -gt 0 ]]; then
+        TOTAL_RAM_GB=$((TOTAL_RAM_MB / 1024))
+        if [[ "${TOTAL_RAM_MB}" -lt 4096 ]]; then
+            warn "Low RAM detected (${TOTAL_RAM_GB} GB). Switching to relay-only mode (--skip-model)."
+            warn "Your node will relay inference requests to other workers."
+            SKIP_MODEL=1
+        elif [[ "${TOTAL_RAM_MB}" -lt 8192 ]]; then
+            # Check if user already explicitly chose --tiny (MODEL_NAME would be TinyLlama)
+            if [[ "${MODEL_NAME}" != "TinyLlama 1.1B" ]]; then
+                warn "Detected ${TOTAL_RAM_GB} GB RAM — auto-selecting TinyLlama 1.1B (638 MB) for best performance."
+                warn "To override: re-run without auto-detection by passing --model /path/to/model.gguf"
+                MODEL_URL="https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
+                MODEL_NAME="TinyLlama 1.1B"
+                MODEL_SIZE="638 MB"
+            fi
+        else
+            ok "Hardware: ${TOTAL_RAM_GB} GB RAM — Llama 2 7B Chat recommended"
+        fi
+    fi
+fi
 echo ""
 
 # ── Step 1: Create data directory + identity ────────────

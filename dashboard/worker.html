@@ -195,6 +195,32 @@ body{font-family:'Inter',sans-serif}
     </div>
   </div>
 
+  <!-- Hardware Info -->
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5" id="hardwareCard" style="display:none">
+    <div class="flex items-center justify-between mb-3">
+      <h2 class="text-xs sm:text-sm font-semibold text-white uppercase tracking-wider">Hardware</h2>
+      <span class="text-xs text-gray-500" id="hwBackend">--</span>
+    </div>
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div>
+        <p class="text-[10px] sm:text-[11px] uppercase tracking-wider text-gray-500">GPU</p>
+        <p class="text-xs sm:text-sm font-semibold text-white truncate" id="hwGpu">--</p>
+      </div>
+      <div>
+        <p class="text-[10px] sm:text-[11px] uppercase tracking-wider text-gray-500">CPU Cores</p>
+        <p class="text-lg sm:text-xl font-bold text-white mono" id="hwCores">--</p>
+      </div>
+      <div>
+        <p class="text-[10px] sm:text-[11px] uppercase tracking-wider text-gray-500">RAM</p>
+        <p class="text-lg sm:text-xl font-bold text-white mono" id="hwRam">--</p>
+      </div>
+      <div>
+        <p class="text-[10px] sm:text-[11px] uppercase tracking-wider text-gray-500">Recommended Model</p>
+        <p class="text-xs sm:text-sm font-semibold text-arc-400 truncate" id="hwModel">--</p>
+      </div>
+    </div>
+  </div>
+
   <!-- Two-column: Peers + Activity (stacks on mobile) -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-5">
 
@@ -502,11 +528,12 @@ async function refresh() {
     document.getElementById('nodeVersion').textContent = health.version || '--';
     document.getElementById('dagRound').textContent = fmtNumber(health.dag_round || 0);
 
-    // Peer list + activity + leaderboard + chart (async, don't block)
+    // Peer list + activity + leaderboard + chart + hardware (async, don't block)
     updatePeers();
     updateActivity();
     updateLeaderboard();
     updateChart();
+    updateHardware();
 
     // Network stats
     if (stats) {
@@ -709,6 +736,24 @@ function setChartRange(range) {
     }
   });
   renderChart();
+}
+
+let hwFetched = false;
+async function updateHardware() {
+  // Only fetch once — hardware doesn't change during runtime
+  if (hwFetched) return;
+  try {
+    const data = await fetch(RPC + '/worker/hardware').then(r => r.json());
+    if (!data) return;
+    hwFetched = true;
+    const card = document.getElementById('hardwareCard');
+    card.style.display = '';
+    document.getElementById('hwGpu').textContent = data.gpu?.name || 'none';
+    document.getElementById('hwCores').textContent = data.cpu?.cores || '--';
+    document.getElementById('hwRam').textContent = data.ram_gb ? data.ram_gb + ' GB' : '--';
+    document.getElementById('hwModel').textContent = data.recommended_model_label || '--';
+    document.getElementById('hwBackend').textContent = data.gpu?.backend || '--';
+  } catch(e) { /* silent — hardware is non-critical */ }
 }
 
 async function updateChart() {
