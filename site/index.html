@@ -126,7 +126,7 @@
                 </div>
                 <code class="block text-arc-accent font-mono text-xs sm:text-sm leading-relaxed break-all select-all" id="install-cmd">curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash</code>
             </div>
-            <p class="text-xs text-arc-dim mt-2" id="cmd-hint">Requires macOS 12+ or Ubuntu 20+. Installs to ~/.arc. About 4 GB for the AI model.</p>
+            <p class="text-xs text-arc-dim mt-2" id="cmd-hint">Requires macOS 12+ or Ubuntu 20+. No Rust required — pre-built binaries downloaded automatically. Installs to ~/.arc. About 4 GB for the AI model.</p>
         </div>
     </div>
 </section>
@@ -165,7 +165,7 @@
             </div>
             <div class="text-xs text-arc-accent font-mono mb-2">STEP 1</div>
             <h3 class="font-semibold text-lg mb-2">Install</h3>
-            <p class="text-sm text-arc-dim leading-relaxed">One command. Downloads the ARC node binary and a 7B parameter AI model. Works on Mac, Linux, and Windows.</p>
+            <p class="text-sm text-arc-dim leading-relaxed">One command. No Rust required — pre-built binaries downloaded automatically. Downloads the ARC node and a 7B parameter AI model. Works on Mac, Linux, and Windows.</p>
         </div>
         <div class="bg-arc-surface border border-arc-border rounded-lg p-6 sm:p-8 text-center glow-border transition-all fade-in fade-in-delay-2">
             <div class="w-12 h-12 mx-auto mb-4 rounded-xl bg-arc-green/10 border border-arc-green/20 flex items-center justify-center">
@@ -307,12 +307,12 @@ const commands = {
     mac: {
         cmd: 'curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash',
         label: 'Terminal (macOS / Linux)',
-        hint: 'Requires macOS 12+ or Ubuntu 20+. Installs to ~/.arc. About 4 GB for the AI model.'
+        hint: 'Requires macOS 12+ or Ubuntu 20+. No Rust required — pre-built binaries downloaded automatically. Installs to ~/.arc. About 4 GB for the AI model.'
     },
     linux: {
         cmd: 'curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash',
         label: 'Terminal (Linux)',
-        hint: 'Requires Ubuntu 20+ / Debian 11+ / Fedora 36+. Installs to ~/.arc. About 4 GB for the AI model.'
+        hint: 'Requires Ubuntu 20+ / Debian 11+ / Fedora 36+. No Rust required — pre-built binaries downloaded automatically. Installs to ~/.arc. About 4 GB for the AI model.'
     },
     windows: {
         cmd: 'irm https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.ps1 | iex',

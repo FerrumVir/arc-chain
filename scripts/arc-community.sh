@@ -93,12 +93,8 @@ if ! command -v curl &>/dev/null; then
     fail "curl is not installed. Install it first:\n    macOS: xcode-select --install\n    Ubuntu/Debian: sudo apt install curl\n    Fedora/RHEL: sudo dnf install curl"
 fi
 
-# Check git is installed (needed to clone the repo for building)
-if [[ -z "${SKIP_MODEL}" ]] && ! command -v git &>/dev/null; then
-    if [[ ! -x "${HOME}/.arc/bin/arc-node" ]]; then
-        fail "git is not installed (needed to build from source). Install it first:\n    macOS: xcode-select --install\n    Ubuntu/Debian: sudo apt install git\n    Fedora/RHEL: sudo dnf install git"
-    fi
-fi
+# Note: git is no longer required for most users — pre-built binaries are downloaded directly.
+# Git is only needed if the binary download fails and we fall back to source build.
 
 # Check disk space (need ~5 GB for model + build artifacts)
 AVAILABLE_MB=0
@@ -239,16 +235,51 @@ step 2 "Getting the ARC node binary"
 BINARY=""
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+RELEASE_BASE="https://github.com/FerrumVir/arc-chain/releases/latest/download"
 
-# Check for existing binary
+# Determine platform identifier for pre-built binary
+PLATFORM=""
+if [[ "${OS}" == "Darwin" && "${ARCH}" == "arm64" ]]; then
+    PLATFORM="macos-arm64"
+elif [[ "${OS}" == "Darwin" && "${ARCH}" == "x86_64" ]]; then
+    PLATFORM="macos-x86_64"
+elif [[ "${OS}" == "Linux" && "${ARCH}" == "x86_64" ]]; then
+    PLATFORM="linux-x86_64"
+fi
+
+# Check for existing cached binary first
 if [[ -x "${ARC_DIR}/bin/arc-node" ]]; then
     BINARY="${ARC_DIR}/bin/arc-node"
     ok "Using cached binary"
 elif [[ -d "${ARC_DIR}/src/arc-chain" && -x "${ARC_DIR}/src/arc-chain/target/release/arc-node" ]]; then
     BINARY="${ARC_DIR}/src/arc-chain/target/release/arc-node"
+    cp "${BINARY}" "${ARC_DIR}/bin/arc-node"
     ok "Using existing build"
-else
-    # Need to build from source
+elif [[ -n "${PLATFORM}" ]]; then
+    # Download pre-built binary from GitHub Releases (no Rust required)
+    DOWNLOAD_URL="${RELEASE_BASE}/arc-node-${PLATFORM}"
+    echo -e "  ${D}Downloading pre-built binary for ${PLATFORM}...${N}"
+    if curl -L --fail --progress-bar -o "${ARC_DIR}/bin/arc-node.tmp" "${DOWNLOAD_URL}" 2>&1; then
+        # Sanity check: binary should be at least 1 MB
+        DL_SIZE=$(wc -c < "${ARC_DIR}/bin/arc-node.tmp" 2>/dev/null || echo 0)
+        if [[ "${DL_SIZE}" -lt 1000000 ]]; then
+            rm -f "${ARC_DIR}/bin/arc-node.tmp"
+            warn "Downloaded binary too small (${DL_SIZE} bytes) — likely a partial download."
+        else
+            mv "${ARC_DIR}/bin/arc-node.tmp" "${ARC_DIR}/bin/arc-node"
+            chmod +x "${ARC_DIR}/bin/arc-node"
+            BINARY="${ARC_DIR}/bin/arc-node"
+            ok "Pre-built binary downloaded (no Rust needed)"
+        fi
+    else
+        rm -f "${ARC_DIR}/bin/arc-node.tmp"
+        warn "Binary download failed. Will try building from source."
+    fi
+fi
+
+# Fall back to building from source if no binary yet
+if [[ -z "${BINARY}" ]]; then
+    warn "Falling back to source build..."
     if ! command -v cargo &>/dev/null; then
         warn "Rust not installed. Installing now..."
         curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly 2>/dev/null
@@ -285,7 +316,7 @@ fi
 
 # Verify binary works
 if ! "${BINARY:-${ARC_DIR}/bin/arc-node}" --help &>/dev/null; then
-    fail "Binary is not working. Try rebuilding."
+    fail "Binary is not working. Try rebuilding:\n    rm ${ARC_DIR}/bin/arc-node && bash $0"
 fi
 BINARY="${BINARY:-${ARC_DIR}/bin/arc-node}"
 ok "Binary verified"
@@ -331,23 +362,23 @@ cat > "${ARC_DIR}/seeds.txt" <<'SEEDS'
 139.84.237.49:9091
 SEEDS
 
-# Copy genesis if we have the source
+# Get genesis.toml — check local sources first, download if needed
 GENESIS=""
-if [[ -f "${ARC_DIR}/src/arc-chain/genesis.toml" ]]; then
+if [[ -f "${ARC_DIR}/genesis.toml" ]]; then
+    GENESIS="${ARC_DIR}/genesis.toml"
+elif [[ -f "${ARC_DIR}/src/arc-chain/genesis.toml" ]]; then
     GENESIS="${ARC_DIR}/src/arc-chain/genesis.toml"
 elif [[ -f "./genesis.toml" ]]; then
     GENESIS="./genesis.toml"
 else
-    # Download genesis from a seed
-    for seed_ip in 140.82.16.112 149.28.32.76 136.244.109.1; do
-        if curl -sf "http://${seed_ip}:9090/" >/dev/null 2>&1; then
-            # Use the source checkout's genesis
-            warn "Genesis file not found locally. Using source checkout."
-            break
-        fi
-    done
-    if [[ -z "${GENESIS}" ]]; then
-        fail "Cannot find genesis.toml. Clone the repo first or run from the arc-chain directory."
+    # Download genesis.toml from the repo
+    GENESIS_URL="https://raw.githubusercontent.com/FerrumVir/arc-chain/main/genesis.toml"
+    echo -e "  ${D}Downloading genesis.toml...${N}"
+    if curl -sSf -L -o "${ARC_DIR}/genesis.toml" "${GENESIS_URL}" 2>/dev/null; then
+        GENESIS="${ARC_DIR}/genesis.toml"
+        ok "Genesis config downloaded"
+    else
+        fail "Cannot download genesis.toml. Check your internet connection.\n    URL: ${GENESIS_URL}"
     fi
 fi
 ok "Network configured (8 seed validators across 6 continents)"

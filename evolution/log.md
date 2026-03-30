@@ -600,3 +600,42 @@ git push  # requires token with workflow scope
 - `deploy/release-workflow.yml` (NEW -- release workflow staged for activation)
 - `evolution/log.md` (this entry)
 ---
+
+## Evolution 13 — 2026-03-30
+**Tag:** evolution-13
+**What:** Pre-built binary downloads in installer — eliminates Rust requirement for 99% of users
+
+### Installer (scripts/arc-community.sh)
+- Step 2 "Get the binary" now follows: cached binary -> download pre-built -> fall back to source build
+- Platform detection: Darwin arm64 -> macos-arm64, Darwin x86_64 -> macos-x86_64, Linux x86_64 -> linux-x86_64
+- Downloads from `https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-node-{platform}`
+- Atomic download with `.tmp` intermediary, size sanity check (must be >1 MB), `chmod +x`
+- Source build fallback preserved: if download fails or platform unsupported, installs Rust and builds
+- Removed hard git requirement from pre-flight checks — git only needed if falling back to source build
+- Genesis.toml: now downloaded from `https://raw.githubusercontent.com/FerrumVir/arc-chain/main/genesis.toml` when not found locally. Previously failed with "Cannot find genesis.toml" for users who didn't clone the repo.
+- Added `${ARC_DIR}/genesis.toml` as first check location (persists across runs after first download)
+
+### Landing Page (site/index.html)
+- Step 1 "Install" description: added "No Rust required — pre-built binaries downloaded automatically"
+- Updated install hint text for Mac and Linux platform tabs with same messaging
+- All three JS hint strings (mac, linux, default) updated
+
+### User impact
+Before: every new user had to install Rust (1-2 min) + build from source (3-5 min). Rust toolchain is ~500 MB.
+After: binary download takes 5-10 seconds. No Rust, no git, no compiler. Just curl.
+Fallback: if GitHub Releases are down or platform is unsupported, transparently falls back to source build.
+
+**Verified:**
+- `bash -n scripts/arc-community.sh` — syntax check passes
+- All 3 binary download URLs return HTTP 302 -> GitHub Release assets (verified with curl -sI -L)
+- genesis.toml download URL returns HTTP 200 (verified with curl -sI -L)
+- Platform detection logic: Darwin/arm64 -> macos-arm64, Darwin/x86_64 -> macos-x86_64, Linux/x86_64 -> linux-x86_64
+- No Rust code changed — no rolling-deploy.sh needed
+
+**Rollback:** `git checkout evolution-12`
+
+**Files changed:**
+- `scripts/arc-community.sh` (pre-built binary download, genesis download, removed git requirement)
+- `site/index.html` (updated install step description + hint text for all platforms)
+- `evolution/log.md` (this entry)
+---
