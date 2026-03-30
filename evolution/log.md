@@ -232,3 +232,61 @@
 - `scripts/arc-community.sh` (--help flag, pre-flight checks, download validation, python3-free fallbacks, OS-appropriate stop/restart commands)
 - `evolution/log.md` (this entry)
 ---
+
+## Evolution 6 — 2026-03-30 04:00
+**Commit:** a33b7fc
+**Tag:** evolution-6
+**What:** Unit tests for earnings tracker, strip_special_tokens, and downsampling
+
+### earnings.rs — 16 tests
+- `new_tracker_starts_at_zero` — fresh tracker has 0 count, 0 earned, empty history
+- `record_inference_increments_count_and_earned` — atomic counter correctness after 1 and 2 calls
+- `record_inference_appends_history_point` — each call adds a timestamped point with cumulative totals
+- `record_inference_with_custom_reward` — non-100 reward amounts accumulate correctly
+- `save_creates_earnings_json_on_disk` — earnings.json exists and deserializes correctly after record_inference
+- `save_creates_history_json_on_disk` — earnings_history.json written with correct point count
+- `load_restores_counters_from_disk` — drop + recreate tracker restores count and earned from disk
+- `load_restores_history_from_disk` — drop + recreate tracker restores history points from disk
+- `load_from_empty_dir_returns_zero` — no panic, returns zeros when no files exist
+- `load_from_corrupt_file_returns_zero` — graceful fallback when earnings files contain garbage
+- `downsample_noop_when_under_target` — points returned as-is when count < target
+- `downsample_reduces_point_count` — 100 points compressed to fewer after downsample
+- `downsample_preserves_recent_points` — newest half of points preserved at full resolution
+- `history_points_have_increasing_epoch` — epoch_secs monotonically non-decreasing
+- `no_tmp_file_left_after_save` — atomic write leaves no .json.tmp residue
+
+### rpc.rs strip_special_tokens — 16 tests
+- Individual token removal: `</s>`, `<s>`, `<unk>`, `<pad>`, `[INST]`/`[/INST]`, `<<SYS>>`/`<</SYS>>`, `[SPEAK]`/`[/SPEAK]`
+- Real-world: TinyLlama output format, Llama2-chat system prompt format
+- Whitespace: collapses multiple spaces to one, trims leading/trailing
+- Edge cases: empty string, all-tokens input, clean text passthrough, HTML tags preserved, angle brackets preserved, multiple consecutive occurrences
+
+### consensus.rs strip_special_tokens — 4 tests
+- All 10 known tokens stripped in a combined string
+- Empty input returns empty
+- Clean text passes through unchanged
+- Whitespace collapsed and trimmed after stripping
+
+### Infrastructure
+- Added `tempfile = "3.10"` as workspace dev-dependency for disk persistence tests
+- Added `[dev-dependencies] tempfile.workspace = true` to arc-node Cargo.toml
+
+**Why:** Evolutions 1-4 added ~500 lines of new functionality (earnings tracker, history, downsampling, strip_special_tokens) with zero test coverage. Any future evolution that touches earnings persistence or token stripping could silently break core UX (lost earnings, garbled output) with no safety net. These 36 tests lock down the correctness of all new code paths.
+
+**Verified:**
+- `cargo test --lib -p arc-node` — 97 passed, 0 failed (36 new + 61 pre-existing)
+- Mac worker: earnings endpoint returns 18,600+ ARC, 186+ inferences, persistence=true
+- Mac worker: inference returns clean output ("Hello! It's nice to meet you") — no special tokens
+- All 8 seeds upgraded via rolling-deploy.sh
+- Binary hash: d757a5ed6ebe0d453953967a2b158633ca47320feb84378b361fe0a6202b8329
+
+**Rollback:** `git checkout evolution-5`
+
+**Files changed:**
+- `crates/arc-node/src/earnings.rs` (added #[cfg(test)] mod tests — 16 tests)
+- `crates/arc-node/src/rpc.rs` (added #[cfg(test)] mod tests — 16 tests for strip_special_tokens)
+- `crates/arc-node/src/consensus.rs` (added 4 strip_special_tokens tests to existing test module)
+- `Cargo.toml` (tempfile workspace dependency)
+- `crates/arc-node/Cargo.toml` (tempfile dev-dependency)
+- `evolution/log.md` (this entry)
+---
