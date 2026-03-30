@@ -1230,4 +1230,35 @@ mod tests {
         let addr = hash_bytes(b"too-poor");
         ConsensusManager::new(addr, 100_000, 4, false, &[]);
     }
+
+    // ── strip_special_tokens ────────────────────────────────────────────
+
+    #[test]
+    fn strip_removes_all_known_tokens() {
+        let raw = "<s>[INST] <<SYS>> sys <</SYS>> prompt [/INST] response</s><unk><pad>[SPEAK]x[/SPEAK]";
+        let result = strip_special_tokens(raw);
+        // No space between </s> and [SPEAK], so "response" and "x" merge
+        assert_eq!(result, "sys prompt responsex");
+    }
+
+    #[test]
+    fn strip_empty_input() {
+        assert_eq!(strip_special_tokens(""), "");
+    }
+
+    #[test]
+    fn strip_clean_text_passes_through() {
+        assert_eq!(
+            strip_special_tokens("Hello, world!"),
+            "Hello, world!"
+        );
+    }
+
+    #[test]
+    fn strip_collapses_whitespace_and_trims() {
+        assert_eq!(
+            strip_special_tokens("  <s>  Hello   world  </s>  "),
+            "Hello world"
+        );
+    }
 }

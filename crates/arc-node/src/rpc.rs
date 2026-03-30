@@ -3305,3 +3305,129 @@ pub fn log_inference_activity(node: &NodeState, request_id: &str, input: &str, t
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── strip_special_tokens: individual tokens ─────────────────────────
+
+    #[test]
+    fn strip_removes_eos_token() {
+        assert_eq!(strip_special_tokens("Hello world</s>"), "Hello world");
+    }
+
+    #[test]
+    fn strip_removes_bos_token() {
+        assert_eq!(strip_special_tokens("<s>Hello world"), "Hello world");
+    }
+
+    #[test]
+    fn strip_removes_unk_token() {
+        assert_eq!(strip_special_tokens("Hello <unk> world"), "Hello world");
+    }
+
+    #[test]
+    fn strip_removes_pad_token() {
+        assert_eq!(strip_special_tokens("Hello<pad><pad>world"), "Helloworld");
+    }
+
+    #[test]
+    fn strip_removes_inst_tokens() {
+        assert_eq!(
+            strip_special_tokens("[INST] What is AI? [/INST] AI is..."),
+            "What is AI? AI is..."
+        );
+    }
+
+    #[test]
+    fn strip_removes_sys_tokens() {
+        assert_eq!(
+            strip_special_tokens("<<SYS>> You are helpful <</SYS>> Hello"),
+            "You are helpful Hello"
+        );
+    }
+
+    #[test]
+    fn strip_removes_speak_tokens() {
+        assert_eq!(
+            strip_special_tokens("[SPEAK] Hello there [/SPEAK]"),
+            "Hello there"
+        );
+    }
+
+    // ── strip_special_tokens: combined / real-world ─────────────────────
+
+    #[test]
+    fn strip_handles_tinyllama_output() {
+        // Typical TinyLlama raw output with multiple special tokens.
+        // "Hello" is user text between [INST]...[/INST], not a token itself,
+        // so it survives stripping.
+        let raw = "<s>[INST] Hello [/INST] Hi there! How can I help you today?</s>";
+        assert_eq!(strip_special_tokens(raw), "Hello Hi there! How can I help you today?");
+    }
+
+    #[test]
+    fn strip_handles_llama2_chat_format() {
+        let raw = "<s>[INST] <<SYS>> You are a helpful assistant. <</SYS>> What is Rust? [/INST] Rust is a systems programming language.</s>";
+        let expected = "You are a helpful assistant. What is Rust? Rust is a systems programming language.";
+        assert_eq!(strip_special_tokens(raw), expected);
+    }
+
+    #[test]
+    fn strip_collapses_whitespace_runs() {
+        // Stripping tokens can leave double/triple spaces
+        assert_eq!(
+            strip_special_tokens("Hello  <unk>  world"),
+            "Hello world"
+        );
+    }
+
+    #[test]
+    fn strip_trims_leading_trailing_whitespace() {
+        assert_eq!(
+            strip_special_tokens("  <s> Hello world </s>  "),
+            "Hello world"
+        );
+    }
+
+    // ── strip_special_tokens: edge cases ────────────────────────────────
+
+    #[test]
+    fn strip_empty_string_returns_empty() {
+        assert_eq!(strip_special_tokens(""), "");
+    }
+
+    #[test]
+    fn strip_only_tokens_returns_empty() {
+        assert_eq!(strip_special_tokens("<s></s><unk><pad>"), "");
+    }
+
+    #[test]
+    fn strip_clean_text_unchanged() {
+        let clean = "The quick brown fox jumps over the lazy dog.";
+        assert_eq!(strip_special_tokens(clean), clean);
+    }
+
+    #[test]
+    fn strip_preserves_angle_brackets_in_normal_text() {
+        // Only exact token matches should be stripped, not random angle brackets
+        let text = "x < 5 and y > 3";
+        assert_eq!(strip_special_tokens(text), "x < 5 and y > 3");
+    }
+
+    #[test]
+    fn strip_preserves_html_tags() {
+        // HTML-like tags that aren't special tokens should survive
+        let text = "<p>Hello</p> <b>world</b>";
+        assert_eq!(strip_special_tokens(text), "<p>Hello</p> <b>world</b>");
+    }
+
+    #[test]
+    fn strip_multiple_occurrences() {
+        assert_eq!(
+            strip_special_tokens("</s></s></s>text</s></s>"),
+            "text"
+        );
+    }
+}

@@ -241,3 +241,251 @@ impl EarningsTracker {
         buckets
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// Create an EarningsTracker using a fresh temp directory.
+    fn tracker_in_tmpdir() -> (EarningsTracker, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let tracker = EarningsTracker::new(dir.path().to_str().unwrap());
+        (tracker, dir)
+    }
+
+    // ── New tracker defaults ────────────────────────────────────────────
+
+    #[test]
+    fn new_tracker_starts_at_zero() {
+        let (tracker, _dir) = tracker_in_tmpdir();
+        assert_eq!(tracker.inference_count.load(Ordering::Relaxed), 0);
+        assert_eq!(tracker.inference_earned.load(Ordering::Relaxed), 0);
+        assert!(tracker.get_history().is_empty());
+    }
+
+    // ── record_inference ────────────────────────────────────────────────
+
+    #[test]
+    fn record_inference_increments_count_and_earned() {
+        let (tracker, _dir) = tracker_in_tmpdir();
+        tracker.record_inference(100);
+        assert_eq!(tracker.inference_count.load(Ordering::Relaxed), 1);
+        assert_eq!(tracker.inference_earned.load(Ordering::Relaxed), 100);
+
+        tracker.record_inference(100);
+        assert_eq!(tracker.inference_count.load(Ordering::Relaxed), 2);
+        assert_eq!(tracker.inference_earned.load(Ordering::Relaxed), 200);
+    }
+
+    #[test]
+    fn record_inference_appends_history_point() {
+        let (tracker, _dir) = tracker_in_tmpdir();
+        tracker.record_inference(100);
+        tracker.record_inference(100);
+        tracker.record_inference(100);
+
+        let history = tracker.get_history();
+        assert_eq!(history.len(), 3);
+        // Each point records cumulative totals
+        assert_eq!(history[0].total_arc, 100);
+        assert_eq!(history[0].total_inferences, 1);
+        assert_eq!(history[2].total_arc, 300);
+        assert_eq!(history[2].total_inferences, 3);
+    }
+
+    #[test]
+    fn record_inference_with_custom_reward() {
+        let (tracker, _dir) = tracker_in_tmpdir();
+        tracker.record_inference(250);
+        assert_eq!(tracker.inference_earned.load(Ordering::Relaxed), 250);
+        tracker.record_inference(50);
+        assert_eq!(tracker.inference_earned.load(Ordering::Relaxed), 300);
+    }
+
+    // ── Disk persistence ────────────────────────────────────────────────
+
+    #[test]
+    fn save_creates_earnings_json_on_disk() {
+        let (tracker, dir) = tracker_in_tmpdir();
+        tracker.record_inference(100);
+
+        let earnings_path = dir.path().join("earnings.json");
+        assert!(earnings_path.exists(), "earnings.json should be created after record_inference");
+
+        let contents = fs::read_to_string(&earnings_path).unwrap();
+        let data: EarningsData = serde_json::from_str(&contents).unwrap();
+        assert_eq!(data.inference_count, 1);
+        assert_eq!(data.inference_earned, 100);
+        assert!(!data.last_updated.is_empty());
+    }
+
+    #[test]
+    fn save_creates_history_json_on_disk() {
+        let (tracker, dir) = tracker_in_tmpdir();
+        tracker.record_inference(100);
+        tracker.record_inference(100);
+
+        let history_path = dir.path().join("earnings_history.json");
+        assert!(history_path.exists(), "earnings_history.json should be created");
+
+        let contents = fs::read_to_string(&history_path).unwrap();
+        let history: EarningsHistory = serde_json::from_str(&contents).unwrap();
+        assert_eq!(history.points.len(), 2);
+    }
+
+    #[test]
+    fn load_restores_counters_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+
+        // First tracker: record 5 inferences
+        {
+            let t = EarningsTracker::new(dir_str);
+            for _ in 0..5 {
+                t.record_inference(100);
+            }
+            assert_eq!(t.inference_count.load(Ordering::Relaxed), 5);
+            assert_eq!(t.inference_earned.load(Ordering::Relaxed), 500);
+        }
+        // Tracker dropped — simulates node shutdown
+
+        // Second tracker: should restore from disk
+        let t2 = EarningsTracker::new(dir_str);
+        assert_eq!(t2.inference_count.load(Ordering::Relaxed), 5);
+        assert_eq!(t2.inference_earned.load(Ordering::Relaxed), 500);
+    }
+
+    #[test]
+    fn load_restores_history_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_str().unwrap();
+
+        {
+            let t = EarningsTracker::new(dir_str);
+            t.record_inference(100);
+            t.record_inference(100);
+            t.record_inference(100);
+        }
+
+        let t2 = EarningsTracker::new(dir_str);
+        let history = t2.get_history();
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].total_arc, 300);
+    }
+
+    #[test]
+    fn load_from_empty_dir_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        // No files exist — should not panic, just return zeros
+        let t = EarningsTracker::new(dir.path().to_str().unwrap());
+        assert_eq!(t.inference_count.load(Ordering::Relaxed), 0);
+        assert_eq!(t.inference_earned.load(Ordering::Relaxed), 0);
+        assert!(t.get_history().is_empty());
+    }
+
+    #[test]
+    fn load_from_corrupt_file_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        // Write garbage to earnings.json
+        fs::write(dir.path().join("earnings.json"), "not valid json {{{").unwrap();
+        fs::write(dir.path().join("earnings_history.json"), "also garbage").unwrap();
+
+        let t = EarningsTracker::new(dir.path().to_str().unwrap());
+        assert_eq!(t.inference_count.load(Ordering::Relaxed), 0);
+        assert_eq!(t.inference_earned.load(Ordering::Relaxed), 0);
+        assert!(t.get_history().is_empty());
+    }
+
+    // ── Downsampling ────────────────────────────────────────────────────
+
+    #[test]
+    fn downsample_noop_when_under_target() {
+        let points: Vec<EarningsHistoryPoint> = (0..10)
+            .map(|i| EarningsHistoryPoint {
+                timestamp: format!("2026-01-01T00:00:{}Z", i),
+                epoch_secs: 1700000000 + i * 60,
+                total_arc: (i as u64 + 1) * 100,
+                total_inferences: i as u64 + 1,
+            })
+            .collect();
+
+        let result = EarningsTracker::downsample(&points, 20);
+        assert_eq!(result.len(), 10, "should not downsample when under target");
+    }
+
+    #[test]
+    fn downsample_reduces_point_count() {
+        // Create 100 points spanning a long time range (1 point per second)
+        let points: Vec<EarningsHistoryPoint> = (0..100)
+            .map(|i| EarningsHistoryPoint {
+                timestamp: format!("2026-01-01T00:00:{}Z", i),
+                epoch_secs: 1700000000 + i,
+                total_arc: (i as u64 + 1) * 100,
+                total_inferences: i as u64 + 1,
+            })
+            .collect();
+
+        let result = EarningsTracker::downsample(&points, 50);
+        assert!(
+            result.len() < 100,
+            "should have fewer points after downsampling, got {}",
+            result.len()
+        );
+        // Recent half (50 points) should be preserved at full resolution
+        // Old half (50 points within one 5-min bucket) should collapse
+    }
+
+    #[test]
+    fn downsample_preserves_recent_points() {
+        // 20 points: first 10 are old (same 5-min bucket), last 10 are recent
+        let points: Vec<EarningsHistoryPoint> = (0..20)
+            .map(|i| EarningsHistoryPoint {
+                timestamp: format!("t{}", i),
+                epoch_secs: if i < 10 {
+                    1700000000 + i // All within one 5-min bucket
+                } else {
+                    1700000000 + (i * 300) // Each in its own bucket
+                },
+                total_arc: (i as u64 + 1) * 100,
+                total_inferences: i as u64 + 1,
+            })
+            .collect();
+
+        let result = EarningsTracker::downsample(&points, 10);
+        // The recent 10 points should ALL be there (indices 10..20)
+        let recent_arcs: Vec<u64> = result.iter().rev().take(10).rev().map(|p| p.total_arc).collect();
+        let expected_arcs: Vec<u64> = (10..20).map(|i| (i + 1) * 100).collect();
+        assert_eq!(recent_arcs, expected_arcs, "recent points must be preserved exactly");
+    }
+
+    // ── History epoch_secs ordering ─────────────────────────────────────
+
+    #[test]
+    fn history_points_have_increasing_epoch() {
+        let (tracker, _dir) = tracker_in_tmpdir();
+        for _ in 0..5 {
+            tracker.record_inference(100);
+        }
+        let history = tracker.get_history();
+        for window in history.windows(2) {
+            assert!(
+                window[1].epoch_secs >= window[0].epoch_secs,
+                "history must be in chronological order"
+            );
+        }
+    }
+
+    // ── Atomic write safety ─────────────────────────────────────────────
+
+    #[test]
+    fn no_tmp_file_left_after_save() {
+        let (tracker, dir) = tracker_in_tmpdir();
+        tracker.record_inference(100);
+
+        let tmp_earnings = dir.path().join("earnings.json.tmp");
+        let tmp_history = dir.path().join("earnings_history.json.tmp");
+        assert!(!tmp_earnings.exists(), "temp file should be renamed away");
+        assert!(!tmp_history.exists(), "temp history file should be renamed away");
+    }
+}

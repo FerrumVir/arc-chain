@@ -97,6 +97,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 toml = "0.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
 
+# Testing
+tempfile = "3.10"
+
 # Misc
 hex = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
