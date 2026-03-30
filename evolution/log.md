@@ -517,3 +517,45 @@ Since every `generate()` call starts prefill at `index_pos = 0`, the stale KV ca
 - `crates/arc-inference/src/candle_backend.rs` (model_template -> model, get() + clone() -> get_mut(), removed unnecessary drop())
 - `evolution/log.md` (this entry)
 ---
+
+## Evolution 11 — 2026-03-30 07:00
+**Tag:** evolution-11
+**What:** Landing page + cross-platform release workflow
+
+### Landing Page — site/index.html
+- Full one-page site matching existing dashboard aesthetic (arc-indigo palette: #03030A bg, #6F7CF4 accent, #002DDE accent2, #51EB8E green)
+- Inter + JetBrains Mono fonts via Google Fonts, Tailwind CDN for utility classes
+- Hero section: "Join the ARC Network -- Earn by Running AI" with animated gradient text and pulsing live status indicator
+- Three platform toggle buttons (Mac, Linux, Windows) that switch the install command:
+  - Mac/Linux: `curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash`
+  - Windows: `irm https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.ps1 | iex`
+- One-click Copy button on install command
+- Auto-detects visitor's OS from User-Agent and pre-selects the right platform
+- Live network stats bar: fetches from seed node (140.82.16.112:9090/stats) every 15s -- shows active nodes, inferences/min, total inferences, ARC distributed
+- Leaderboard table: fetches from /worker/leaderboard every 30s, shows top 10 earners with rank medals, node name, inference count, ARC earned
+- "How It Works" -- 3-card grid: Install (terminal icon), Earn (dollar icon), Dashboard (chart icon)
+- FAQ section -- 6 collapsible questions: What is ARC, How to earn, Is it safe, How much can I earn, Hardware requirements, How to stop/uninstall
+- Bottom CTA repeats the install command
+- Footer with GitHub link
+- Fully responsive: mobile/tablet/desktop breakpoints
+- Fade-in animations, glow-border hover effects matching dashboard style
+
+### Release Workflow — .github/workflows/release.yml
+- Triggers on `v*` tag push
+- Matrix build for 4 targets: linux-x86_64, linux-aarch64, macos-arm64, macos-x86_64
+- Uses dtolnay/rust-toolchain@stable for Rust
+- Cross-compilation for aarch64-linux-gnu with gcc-aarch64-linux-gnu
+- Cargo caching keyed on target + Cargo.lock hash
+- Installs b3sum, computes BLAKE3 hash for each binary
+- Creates GitHub Release with auto-generated notes + install instructions
+- Includes BLAKE3 verification instructions
+
+**Why:** The network has 8 live nodes but zero way for a non-technical person to discover or join it. The landing page is the front door -- it explains the value prop (earn by running AI), shows social proof (live leaderboard), and gives a one-click install path for every platform. The release workflow enables proper versioned binary distribution so users can verify what they're running. Together, these are the minimum viable distribution layer for community growth.
+
+**Rollback:** `git checkout evolution-10`
+
+**Files changed:**
+- `site/index.html` (NEW -- landing page)
+- `.github/workflows/release.yml` (NEW -- cross-platform release CI)
+- `evolution/log.md` (this entry)
+---
