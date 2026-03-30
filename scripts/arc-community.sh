@@ -439,7 +439,16 @@ for i in $(seq 1 30); do
             # Fallback: extract peers with grep (no python needed)
             PEERS=$(echo "${HEALTH_JSON}" | grep -o '"peer[s_]*count*":[0-9]*' | head -1 | grep -o '[0-9]*$' || echo "0")
         fi
-        ok "Connected to ${PEERS} peers"
+        if [[ "${PEERS}" -lt 3 ]] 2>/dev/null; then
+            warn "Connected to only ${PEERS} peers (expected 8). Possible firewall issue."
+            echo -e "  ${D}ARC uses UDP port 9091 for P2P. If you have a firewall:${N}"
+            echo -e "  ${D}  Linux:   sudo ufw allow 9091/udp${N}"
+            echo -e "  ${D}  Router:  forward UDP port 9091 to this machine${N}"
+            echo -e "  ${D}  Cloud:   allow inbound UDP 9091 in your security group${N}"
+            echo -e "  ${D}Your node still works with fewer peers, just slower to receive jobs.${N}"
+        else
+            ok "Connected to ${PEERS} peers"
+        fi
         CONNECTED=1
         break
     fi

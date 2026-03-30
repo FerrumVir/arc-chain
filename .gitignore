@@ -38,3 +38,6 @@ rustc-ice*
 __pycache__/
 *.pyc
 .claude/
+
+# Private evolution tracking — not public
+evolution/
