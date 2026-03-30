@@ -559,3 +559,44 @@ Since every `generate()` call starts prefill at `index_pos = 0`, the stale KV ca
 - `.github/workflows/release.yml` (NEW -- cross-platform release CI)
 - `evolution/log.md` (this entry)
 ---
+
+## Evolution 12 — 2026-03-30 08:15
+**Tag:** evolution-12
+**What:** Release workflow (staged) + landing page already live from evo-11
+
+### Context
+Evolution 11 created both `site/index.html` (landing page) and `.github/workflows/release.yml`. The workflow push was rejected by GitHub because the OAuth token lacks `workflow` scope. A follow-up commit (bb138ec) removed the workflow to unblock the push. The landing page is live on HEAD and working.
+
+### Release Workflow — deploy/release-workflow.yml (staged for manual activation)
+- Stored in `deploy/` because GitHub rejects workflow file pushes without `workflow` scope on the token
+- Triggers on `v*` tag, matrix build for 4 targets (linux-x86_64, linux-aarch64, macos-arm64, macos-x86_64)
+- dtolnay/rust-toolchain@stable, cross-compilation for aarch64-linux, cargo caching
+- b3sum BLAKE3 hash per binary, uploaded as release assets
+- GitHub Release with install instructions in body
+- Also kept at `.github/workflows/release.yml` on disk for local reference
+
+**To activate:** From GitHub web UI or a token with `workflow` scope:
+```bash
+cp deploy/release-workflow.yml .github/workflows/release.yml
+git add .github/workflows/release.yml
+git commit -m "ci: activate release workflow"
+git push  # requires token with workflow scope
+```
+
+### Landing Page Status
+- `site/index.html` committed in 76035ff, live on HEAD
+- Dark theme, Tailwind CDN, Inter/JetBrains Mono fonts
+- Platform auto-detection (Mac/Linux/Windows) with copy-paste install commands
+- Live network stats from seed node (140.82.16.112:9090)
+- Leaderboard from /worker/leaderboard
+- FAQ, how-it-works, responsive design
+- Can serve via GitHub Pages from `site/` or any static host
+
+**Why:** The release workflow is required for proper binary distribution but blocked by token permissions. Staging it in `deploy/` preserves the work and makes activation a single copy command once the token is updated. The landing page from evo-11 is already live and functional.
+
+**Rollback:** `git checkout evolution-11`
+
+**Files changed:**
+- `deploy/release-workflow.yml` (NEW -- release workflow staged for activation)
+- `evolution/log.md` (this entry)
+---
