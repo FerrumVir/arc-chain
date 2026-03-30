@@ -15,6 +15,22 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+/// Strip LLM special tokens from decoded inference output (mirrors rpc.rs version).
+fn strip_special_tokens(text: &str) -> String {
+    let mut out = text.to_string();
+    for token in &["</s>", "<s>", "<unk>", "<pad>", "[INST]", "[/INST]",
+                    "<<SYS>>", "<</SYS>>", "[SPEAK]", "[/SPEAK]"] {
+        out = out.replace(token, "");
+    }
+    let mut prev_space = false;
+    let collapsed: String = out.chars().filter(|&c| {
+        if c == ' ' { if prev_space { return false; } prev_space = true; }
+        else { prev_space = false; }
+        true
+    }).collect();
+    collapsed.trim().to_string()
+}
+
 /// Orchestrates DAG consensus for a single validator node.
 pub struct ConsensusManager {
     /// The underlying DAG consensus engine.
@@ -484,7 +500,7 @@ impl ConsensusManager {
                                                         .map(|c| u32::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0),
                                                             c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]))
                                                         .collect();
-                                                    (model.decode(&gen_tokens), result.output_hash, *mid)
+                                                    (strip_special_tokens(&model.decode(&gen_tokens)), result.output_hash, *mid)
                                                 }
                                                 Err(e) => {
                                                     warn!("Candle inference failed: {}", e);
@@ -498,7 +514,7 @@ impl ConsensusManager {
                                             let model_id_data = format!("arc-{}L-{}d-{}h-{}v",
                                                 model.config.n_layers, model.config.d_model,
                                                 model.config.n_heads, model.config.vocab_size);
-                                            (model.decode(&generated), hash, arc_crypto::hash_bytes(model_id_data.as_bytes()))
+                                            (strip_special_tokens(&model.decode(&generated)), hash, arc_crypto::hash_bytes(model_id_data.as_bytes()))
                                         };
 
                                     let elapsed = start.elapsed();

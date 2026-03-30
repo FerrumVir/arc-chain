@@ -2697,6 +2697,33 @@ async fn channel_state(
 
 // ─── Inference Endpoints ─────────────────────────────────────────────────────
 
+/// Strip LLM special tokens (`<s>`, `</s>`, `<unk>`, `<pad>`, `[INST]`, `[/INST]`, `<<SYS>>`, etc.)
+/// from decoded inference output. These leak through the tokenizer on small models like TinyLlama.
+fn strip_special_tokens(text: &str) -> String {
+    let mut out = text.to_string();
+    // Order matters: longer patterns first to avoid partial matches
+    for token in &[
+        "</s>", "<s>", "<unk>", "<pad>",
+        "[INST]", "[/INST]",
+        "<<SYS>>", "<</SYS>>",
+        "[SPEAK]", "[/SPEAK]",
+    ] {
+        out = out.replace(token, "");
+    }
+    // Collapse runs of whitespace left behind by stripping, then trim
+    let mut prev_space = false;
+    let collapsed: String = out.chars().filter(|&c| {
+        if c == ' ' {
+            if prev_space { return false; }
+            prev_space = true;
+        } else {
+            prev_space = false;
+        }
+        true
+    }).collect();
+    collapsed.trim().to_string()
+}
+
 /// Run inference through the cached INT8 integer model and record attestation on-chain.
 ///
 /// POST /inference/run
@@ -2806,8 +2833,8 @@ async fn inference_run(
     }
     log_inference_activity(&node, &format!("local-{}", node.inference_count.load(std::sync::atomic::Ordering::Relaxed)), input_text, generated_tokens.len() as u32, inference_ms, "direct");
 
-    // Decode output tokens to text
-    let output_text = model.decode(&generated_tokens);
+    // Decode output tokens to text and strip special tokens (<s>, </s>, etc.)
+    let output_text = strip_special_tokens(&model.decode(&generated_tokens));
 
     // Compute model ID
     let model_id_data = format!(

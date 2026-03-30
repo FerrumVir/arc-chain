@@ -25,127 +25,136 @@ body{font-family:'Inter',sans-serif}
 ::-webkit-scrollbar{width:4px}::-webkit-scrollbar-thumb{background:#2a2a4a;border-radius:4px}
 .toast{animation:fadeIn .3s ease-out,fadeOut .3s ease-in 3s forwards}
 @keyframes fadeOut{to{opacity:0;transform:translateY(-8px)}}
+/* Earnings counter glow pulse when new earnings arrive */
+@keyframes earningGlow{
+  0%{text-shadow:0 0 0 transparent}
+  30%{text-shadow:0 0 20px rgba(74,222,128,0.6),0 0 40px rgba(74,222,128,0.3)}
+  100%{text-shadow:0 0 0 transparent}
+}
+.earning-glow{animation:earningGlow 1.2s ease-out}
+/* Smooth number transitions */
+.counter-digit{display:inline-block;transition:transform 0.15s ease-out}
 </style>
 </head>
 <body class="bg-surface-1 text-gray-300 min-h-screen">
 
 <!-- Toast Container -->
-<div id="toasts" class="fixed top-4 right-4 z-50 space-y-2"></div>
+<div id="toasts" class="fixed top-4 right-4 z-50 space-y-2 max-w-[90vw]"></div>
 
 <!-- Onboarding Modal -->
 <div id="onboarding" class="fixed inset-0 bg-black/90 z-50 hidden items-center justify-center p-4">
-  <div class="bg-surface-2 border border-surface-4 rounded-2xl p-8 max-w-md w-full text-center fade-in">
-    <div class="w-16 h-16 rounded-2xl bg-arc-500 flex items-center justify-center mx-auto mb-4"><span class="text-white font-bold text-2xl">A</span></div>
-    <h2 class="text-2xl font-bold text-white mb-2">Welcome to ARC Network</h2>
-    <p class="text-gray-400 mb-6">Your device is now part of a global AI inference network. You earn ARC tokens every time you help process an AI request.</p>
-    <div class="bg-surface-3 rounded-xl p-4 mb-6 text-left">
+  <div class="bg-surface-2 border border-surface-4 rounded-2xl p-6 sm:p-8 max-w-md w-full text-center fade-in">
+    <div class="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-arc-500 flex items-center justify-center mx-auto mb-4"><span class="text-white font-bold text-xl sm:text-2xl">A</span></div>
+    <h2 class="text-xl sm:text-2xl font-bold text-white mb-2">Welcome to ARC Network</h2>
+    <p class="text-sm sm:text-base text-gray-400 mb-6">Your device is now part of a global AI inference network. You earn ARC tokens every time you help process an AI request.</p>
+    <div class="bg-surface-3 rounded-xl p-3 sm:p-4 mb-6 text-left">
       <p class="text-xs text-gray-500 uppercase tracking-wider mb-1">Your Address</p>
-      <p class="mono text-sm text-arc-400 break-all" id="onboardAddr">Loading...</p>
+      <p class="mono text-xs sm:text-sm text-arc-400 break-all" id="onboardAddr">Loading...</p>
     </div>
-    <button onclick="claimFaucet();closeOnboarding()" class="w-full py-3 bg-arc-500 hover:bg-arc-600 text-white font-semibold rounded-xl transition">Claim Free Testnet Tokens &amp; Start Earning</button>
+    <button onclick="claimFaucet();closeOnboarding()" class="w-full py-3 bg-arc-500 hover:bg-arc-600 active:bg-arc-600 text-white font-semibold rounded-xl transition">Claim Free Testnet Tokens &amp; Start Earning</button>
   </div>
 </div>
 
 <!-- Header -->
 <header class="border-b border-surface-4 bg-surface-2/80 backdrop-blur-sm sticky top-0 z-40">
-  <div class="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
-    <div class="flex items-center gap-3">
-      <div class="w-8 h-8 rounded-lg bg-arc-500 flex items-center justify-center"><span class="text-white font-bold text-sm">A</span></div>
-      <div>
-        <h1 class="text-lg font-bold text-white">ARC Node</h1>
-        <p class="text-xs text-gray-500" id="headerStatus">Connecting...</p>
+  <div class="max-w-5xl mx-auto px-3 sm:px-4 py-3 flex items-center justify-between">
+    <div class="flex items-center gap-2 sm:gap-3 min-w-0">
+      <div class="w-8 h-8 rounded-lg bg-arc-500 flex items-center justify-center flex-shrink-0"><span class="text-white font-bold text-sm">A</span></div>
+      <div class="min-w-0">
+        <h1 class="text-base sm:text-lg font-bold text-white">ARC Node</h1>
+        <p class="text-xs text-gray-500 truncate" id="headerStatus">Connecting...</p>
       </div>
     </div>
-    <div class="flex items-center gap-2">
+    <div class="flex items-center gap-2 flex-shrink-0">
       <span id="statusDot" class="w-2.5 h-2.5 rounded-full bg-gray-600"></span>
       <span id="statusLabel" class="text-xs text-gray-500">Offline</span>
     </div>
   </div>
 </header>
 
-<main class="max-w-5xl mx-auto px-4 py-6 space-y-5">
+<main class="max-w-5xl mx-auto px-3 sm:px-4 py-4 sm:py-6 space-y-4 sm:space-y-5">
 
   <!-- Hero: Earnings -->
-  <div class="bg-gradient-to-br from-surface-2 to-surface-3 border border-surface-4 rounded-2xl p-6">
+  <div class="bg-gradient-to-br from-surface-2 to-surface-3 border border-surface-4 rounded-2xl p-4 sm:p-6">
     <div class="flex items-start justify-between mb-1">
       <p class="text-xs text-gray-500 uppercase tracking-wider">Total Earned</p>
       <span class="text-xs text-earn-400 bg-earn-400/10 px-2 py-0.5 rounded-full" id="earnRate">--</span>
     </div>
-    <p class="text-4xl font-extrabold text-white mono" id="totalEarned">0</p>
-    <p class="text-sm text-gray-500 mt-1">ARC tokens</p>
-    <div class="grid grid-cols-3 gap-4 mt-5">
+    <p class="text-3xl sm:text-4xl md:text-5xl font-extrabold text-white mono leading-tight" id="totalEarned">0</p>
+    <p class="text-xs sm:text-sm text-gray-500 mt-1">ARC tokens</p>
+    <div class="grid grid-cols-3 gap-2 sm:gap-4 mt-4 sm:mt-5">
       <div>
-        <p class="text-xs text-gray-500">Inferences</p>
-        <p class="text-lg font-bold text-white mono" id="totalInferences">0</p>
+        <p class="text-[10px] sm:text-xs text-gray-500">Inferences</p>
+        <p class="text-base sm:text-lg font-bold text-white mono" id="totalInferences">0</p>
       </div>
       <div>
-        <p class="text-xs text-gray-500">Projected / Day</p>
-        <p class="text-lg font-bold text-earn-400 mono" id="projectedDaily">0</p>
+        <p class="text-[10px] sm:text-xs text-gray-500">Projected / Day</p>
+        <p class="text-base sm:text-lg font-bold text-earn-400 mono" id="projectedDaily">0</p>
       </div>
       <div>
-        <p class="text-xs text-gray-500">Projected / Month</p>
-        <p class="text-lg font-bold text-earn-400 mono" id="projectedMonthly">0</p>
+        <p class="text-[10px] sm:text-xs text-gray-500">Projected / Month</p>
+        <p class="text-base sm:text-lg font-bold text-earn-400 mono" id="projectedMonthly">0</p>
       </div>
     </div>
   </div>
 
   <!-- Stats Row -->
-  <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4">
-      <p class="text-[11px] uppercase tracking-wider text-gray-500">Uptime</p>
-      <p class="text-xl font-bold text-white mono" id="uptime">--</p>
+  <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-3">
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-3 sm:p-4">
+      <p class="text-[10px] sm:text-[11px] uppercase tracking-wider text-gray-500">Uptime</p>
+      <p class="text-lg sm:text-xl font-bold text-white mono" id="uptime">--</p>
     </div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4">
-      <p class="text-[11px] uppercase tracking-wider text-gray-500">Peers</p>
-      <p class="text-xl font-bold text-arc-400 mono" id="peers">0</p>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-3 sm:p-4">
+      <p class="text-[10px] sm:text-[11px] uppercase tracking-wider text-gray-500">Peers</p>
+      <p class="text-lg sm:text-xl font-bold text-arc-400 mono" id="peers">0</p>
     </div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4">
-      <p class="text-[11px] uppercase tracking-wider text-gray-500">Model</p>
-      <p class="text-sm font-semibold text-white truncate" id="modelName">--</p>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-3 sm:p-4">
+      <p class="text-[10px] sm:text-[11px] uppercase tracking-wider text-gray-500">Model</p>
+      <p class="text-xs sm:text-sm font-semibold text-white truncate" id="modelName">--</p>
     </div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4">
-      <p class="text-[11px] uppercase tracking-wider text-gray-500">Mode</p>
-      <p class="text-xl font-bold text-white" id="nodeMode">--</p>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-3 sm:p-4">
+      <p class="text-[10px] sm:text-[11px] uppercase tracking-wider text-gray-500">Mode</p>
+      <p class="text-lg sm:text-xl font-bold text-white" id="nodeMode">--</p>
     </div>
   </div>
 
-  <!-- Two-column: Peers + Activity -->
-  <div class="grid lg:grid-cols-2 gap-5">
+  <!-- Two-column: Peers + Activity (stacks on mobile) -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-5">
 
     <!-- Connected Peers -->
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
-      <div class="flex items-center justify-between mb-4">
-        <h2 class="text-sm font-semibold text-white uppercase tracking-wider">Connected Peers</h2>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5">
+      <div class="flex items-center justify-between mb-3 sm:mb-4">
+        <h2 class="text-xs sm:text-sm font-semibold text-white uppercase tracking-wider">Connected Peers</h2>
         <span class="text-xs text-gray-500" id="peerCount">0 peers</span>
       </div>
-      <div id="peerList" class="space-y-2 max-h-64 overflow-y-auto">
+      <div id="peerList" class="space-y-1.5 sm:space-y-2 max-h-52 sm:max-h-64 overflow-y-auto">
         <p class="text-xs text-gray-600">Discovering peers...</p>
       </div>
     </div>
 
     <!-- Activity Feed -->
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
-      <div class="flex items-center justify-between mb-4">
-        <h2 class="text-sm font-semibold text-white uppercase tracking-wider">Recent Activity</h2>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5">
+      <div class="flex items-center justify-between mb-3 sm:mb-4">
+        <h2 class="text-xs sm:text-sm font-semibold text-white uppercase tracking-wider">Recent Activity</h2>
         <span class="text-xs text-gray-500" id="activityCount">0 jobs</span>
       </div>
-      <div id="activityList" class="space-y-2 max-h-64 overflow-y-auto">
+      <div id="activityList" class="space-y-1.5 sm:space-y-2 max-h-52 sm:max-h-64 overflow-y-auto">
         <p class="text-xs text-gray-600">Waiting for inference requests...</p>
       </div>
     </div>
   </div>
 
   <!-- Referral / Invite -->
-  <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
-    <h2 class="text-sm font-semibold text-white uppercase tracking-wider mb-3">Invite Friends</h2>
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5">
+    <h2 class="text-xs sm:text-sm font-semibold text-white uppercase tracking-wider mb-2 sm:mb-3">Invite Friends</h2>
     <p class="text-xs text-gray-500 mb-3">Share this command and earn referral bonuses when friends join the network.</p>
-    <div class="flex gap-2">
+    <div class="flex flex-col sm:flex-row gap-2">
       <input id="installCmd" readonly
-        class="flex-1 bg-surface-1 border border-surface-4 rounded-lg px-3 py-2 text-xs mono text-arc-400 focus:outline-none"
+        class="flex-1 bg-surface-1 border border-surface-4 rounded-lg px-3 py-2 text-[10px] sm:text-xs mono text-arc-400 focus:outline-none w-full"
         value="curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community.sh | bash">
-      <button onclick="copyInstall()" class="px-4 py-2 bg-arc-500 hover:bg-arc-600 text-white text-xs font-semibold rounded-lg transition" id="copyBtn">Copy</button>
+      <button onclick="copyInstall()" class="px-4 py-2 bg-arc-500 hover:bg-arc-600 active:bg-arc-600 text-white text-xs font-semibold rounded-lg transition flex-shrink-0" id="copyBtn">Copy</button>
     </div>
-    <div class="mt-4 grid grid-cols-2 gap-3">
+    <div class="mt-3 sm:mt-4 grid grid-cols-2 gap-3">
       <div>
         <p class="text-xs text-gray-500">Your Referral Code</p>
         <p class="mono text-xs text-arc-400 truncate" id="referralCode">--</p>
@@ -158,35 +167,35 @@ body{font-family:'Inter',sans-serif}
   </div>
 
   <!-- Network Overview -->
-  <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
-    <h2 class="text-sm font-semibold text-white uppercase tracking-wider mb-3">Network Overview</h2>
-    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3">
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5">
+    <h2 class="text-xs sm:text-sm font-semibold text-white uppercase tracking-wider mb-2 sm:mb-3">Network Overview</h2>
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-3">
       <div>
-        <p class="text-xs text-gray-500">Total Validators</p>
-        <p class="text-lg font-bold text-white mono" id="netValidators">--</p>
+        <p class="text-[10px] sm:text-xs text-gray-500">Total Validators</p>
+        <p class="text-base sm:text-lg font-bold text-white mono" id="netValidators">--</p>
       </div>
       <div>
-        <p class="text-xs text-gray-500">Network TPS</p>
-        <p class="text-lg font-bold text-white mono" id="netTPS">--</p>
+        <p class="text-[10px] sm:text-xs text-gray-500">Network TPS</p>
+        <p class="text-base sm:text-lg font-bold text-white mono" id="netTPS">--</p>
       </div>
       <div>
-        <p class="text-xs text-gray-500">Total Transactions</p>
-        <p class="text-lg font-bold text-white mono" id="netTxs">--</p>
+        <p class="text-[10px] sm:text-xs text-gray-500">Total Transactions</p>
+        <p class="text-base sm:text-lg font-bold text-white mono" id="netTxs">--</p>
       </div>
       <div>
-        <p class="text-xs text-gray-500">Your Contribution</p>
-        <p class="text-lg font-bold text-arc-400" id="netContribution">--%</p>
+        <p class="text-[10px] sm:text-xs text-gray-500">Your Contribution</p>
+        <p class="text-base sm:text-lg font-bold text-arc-400" id="netContribution">--%</p>
       </div>
     </div>
   </div>
 
   <!-- Your Node Info -->
-  <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
-    <h2 class="text-sm font-semibold text-white uppercase tracking-wider mb-3">Your Node</h2>
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5">
+    <h2 class="text-xs sm:text-sm font-semibold text-white uppercase tracking-wider mb-2 sm:mb-3">Your Node</h2>
     <div class="space-y-2">
-      <div class="flex justify-between">
-        <span class="text-xs text-gray-500">Address</span>
-        <span class="mono text-xs text-arc-400 cursor-pointer hover:text-arc-500" onclick="copyAddr()" id="nodeAddr">--</span>
+      <div class="flex justify-between items-start gap-2">
+        <span class="text-xs text-gray-500 flex-shrink-0">Address</span>
+        <span class="mono text-[10px] sm:text-xs text-arc-400 cursor-pointer hover:text-arc-500 break-all text-right" onclick="copyAddr()" id="nodeAddr">--</span>
       </div>
       <div class="flex justify-between">
         <span class="text-xs text-gray-500">Version</span>
@@ -221,6 +230,52 @@ const SEEDS = [
 
 let lastInferences = 0;
 let prevEarnings = null;
+
+// ── Animated Counter ────────────────────────────────────────
+// Smoothly animates a number from current displayed value to target.
+// Uses requestAnimationFrame for 60fps smoothness — slot-machine feel.
+const counterState = {};
+function animateCounter(elementId, targetValue, duration) {
+  duration = duration || 800;
+  const el = document.getElementById(elementId);
+  if (!el) return;
+
+  // Parse current displayed value
+  const key = elementId;
+  if (!(key in counterState)) {
+    counterState[key] = 0;
+  }
+  const startVal = counterState[key];
+  const diff = targetValue - startVal;
+  if (diff === 0) return;
+
+  // Add glow effect for earnings counter
+  if (elementId === 'totalEarned' && diff > 0) {
+    el.classList.remove('earning-glow');
+    void el.offsetWidth; // force reflow to restart animation
+    el.classList.add('earning-glow');
+  }
+
+  const startTime = performance.now();
+
+  function step(now) {
+    const elapsed = now - startTime;
+    const progress = Math.min(elapsed / duration, 1);
+    // Ease-out cubic for satisfying deceleration
+    const eased = 1 - Math.pow(1 - progress, 3);
+    const current = Math.round(startVal + diff * eased);
+    counterState[key] = current;
+    el.textContent = fmtNumber(current);
+
+    if (progress < 1) {
+      requestAnimationFrame(step);
+    } else {
+      counterState[key] = targetValue;
+      el.textContent = fmtNumber(targetValue);
+    }
+  }
+  requestAnimationFrame(step);
+}
 
 // ── Onboarding ──────────────────────────────────────────────
 function checkOnboarding() {
@@ -329,18 +384,20 @@ async function refresh() {
     setStatus(earnings.status === 'active' ? 'active' :
               earnings.connected_peers > 0 ? 'connected' : 'offline');
 
-    // Earnings
+    // Earnings — animate the counter
     const earned = earnings.earnings?.total_arc || 0;
     const inferences = earnings.total_inferences || 0;
-    document.getElementById('totalEarned').textContent = fmtNumber(earned);
-    document.getElementById('totalInferences').textContent = fmtNumber(inferences);
+    animateCounter('totalEarned', earned, 1000);
+    animateCounter('totalInferences', inferences, 600);
     document.getElementById('earnRate').textContent = (earnings.earnings?.rate || '--');
 
     // Projections based on current rate
     const uptimeH = earnings.uptime_hours || 0.01;
     const earnPerHour = earned / Math.max(uptimeH, 0.01);
-    document.getElementById('projectedDaily').textContent = fmtNumber(Math.round(earnPerHour * 24));
-    document.getElementById('projectedMonthly').textContent = fmtNumber(Math.round(earnPerHour * 24 * 30));
+    const dailyProjected = Math.round(earnPerHour * 24);
+    const monthlyProjected = Math.round(earnPerHour * 24 * 30);
+    animateCounter('projectedDaily', dailyProjected, 600);
+    animateCounter('projectedMonthly', monthlyProjected, 600);
 
     // First inference celebration
     if (inferences > 0 && lastInferences === 0 && prevEarnings !== null) {
@@ -420,12 +477,12 @@ async function updatePeers() {
       const flag = flagMap[p.label] || '';
       const isValidator = p.stake >= 5000000;
       html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
-        <div class="flex items-center gap-2">
-          <span class="w-1.5 h-1.5 rounded-full ${isValidator?'bg-emerald-400':'bg-arc-400'}"></span>
+        <div class="flex items-center gap-1.5 sm:gap-2 min-w-0">
+          <span class="w-1.5 h-1.5 rounded-full flex-shrink-0 ${isValidator?'bg-emerald-400':'bg-arc-400'}"></span>
           <span class="text-xs font-medium text-white">${p.label || 'Peer'}</span>
           ${flag ? `<span class="text-[10px] text-gray-500">${flag}</span>` : ''}
         </div>
-        <span class="mono text-[10px] text-gray-600">${p.dial_addr || shortAddr(p.address)}</span>
+        <span class="mono text-[10px] text-gray-600 truncate ml-2 hidden sm:inline">${p.dial_addr || shortAddr(p.address)}</span>
       </div>`;
     });
     container.innerHTML = html;
@@ -434,12 +491,12 @@ async function updatePeers() {
     let html = '';
     SEEDS.forEach(s => {
       html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50">
-        <div class="flex items-center gap-2">
-          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+        <div class="flex items-center gap-1.5 sm:gap-2">
+          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"></span>
           <span class="text-xs font-medium text-white">${s.name}</span>
           <span class="text-[10px] text-gray-500">${s.flag}</span>
         </div>
-        <span class="mono text-[10px] text-gray-600">${s.ip}</span>
+        <span class="mono text-[10px] text-gray-600 hidden sm:inline">${s.ip}</span>
       </div>`;
     });
     container.innerHTML = html;
@@ -461,13 +518,13 @@ async function updateActivity() {
     items.slice(0, 20).forEach(a => {
       const time = a.timestamp ? new Date(a.timestamp).toLocaleTimeString() : '';
       html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-surface-3/50 fade-in">
-        <div class="flex items-center gap-2">
-          <span class="text-earn-400 text-xs font-bold">+${a.earned_arc||100}</span>
-          <span class="text-xs text-gray-400 truncate max-w-[150px]">${a.input_preview||'Inference'}</span>
+        <div class="flex items-center gap-1.5 sm:gap-2 min-w-0">
+          <span class="text-earn-400 text-xs font-bold flex-shrink-0">+${a.earned_arc||100}</span>
+          <span class="text-xs text-gray-400 truncate max-w-[100px] sm:max-w-[150px]">${a.input_preview||'Inference'}</span>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-1 sm:gap-2 flex-shrink-0">
           <span class="text-[10px] text-gray-600">${a.tokens||'?'} tok</span>
-          <span class="text-[10px] text-gray-600">${time}</span>
+          <span class="text-[10px] text-gray-600 hidden sm:inline">${time}</span>
         </div>
       </div>`;
     });
