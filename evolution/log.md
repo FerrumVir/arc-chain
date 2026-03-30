@@ -116,3 +116,65 @@
 - `dashboard/worker.html` (leaderboard section HTML + updateLeaderboard() JS)
 - `evolution/log.md` (added missing Evolution 2 entry + this Evolution 3 entry)
 ---
+
+## Evolution 4 — 2026-03-30 02:15
+**Commit:** d8b7835
+**Tag:** evolution-4
+**What:** Earnings history chart — time-series tracking + dashboard visualization
+
+### Backend (crates/arc-node/src/earnings.rs)
+- Added `EarningsHistoryPoint` struct: timestamp, epoch_secs, total_arc, total_inferences
+- Added `EarningsHistory` struct for on-disk persistence
+- `EarningsTracker` now maintains an in-memory `Vec<EarningsHistoryPoint>` protected by `Mutex`
+- Every `record_inference()` appends a new timestamped data point
+- History persisted to `<data_dir>/earnings_history.json` using atomic write (tmp + rename)
+- Loaded from disk on startup (survives restarts)
+- Auto-downsampling: when history exceeds 1000 points, older half is merged into 5-minute buckets
+  - Recent points kept at full resolution, older points compressed
+  - Prevents unbounded file growth on high-throughput workers
+- New `get_history()` method returns clone of history for API consumption
+
+### API (crates/arc-node/src/rpc.rs)
+- `GET /worker/earnings/history` — returns timestamped earnings data for charting
+- Response: `{ "history": [{timestamp, epoch_secs, total_arc, total_inferences}], "count": N }`
+- Registered at `/worker/earnings/history` in the router
+
+### Dashboard (dashboard/worker.html)
+- Added SVG-based earnings chart between hero section and leaderboard (high visibility)
+- No external chart libraries — pure inline SVG keeps it dependency-free and fast
+- Time range buttons: 1H / 6H / 24H / All (default=All)
+- Gradient fill under the line (arc-500 color with opacity fade)
+- Interactive hover: tooltip shows exact ARC, inference count, and time
+- 3 horizontal grid lines + auto-scaled Y-axis labels
+- X-axis shows start/end timestamps, format adapts to range (time only vs date+time)
+- Empty state: "No earnings data yet — complete an inference to start tracking"
+- Refreshes every 15s (matches leaderboard cadence to avoid hammering API)
+- Mobile responsive: chart scales with viewBox, labels use tiny fonts on small screens
+
+**Why:** The dashboard showed a single number for total earnings — no sense of progress over time. Adding a time-series chart gives users a visual reward loop: they can see their earnings curve grow with each inference. This is the visual equivalent of watching a stock ticker go up — addictive engagement. Combined with the animated counter and leaderboard, the dashboard now has three distinct reward feedback mechanisms.
+
+**Verified:**
+- Mac worker: history endpoint returns 13 data points after 13 new inferences (147 total, 14,700 ARC)
+- Mac worker: `earnings_history.json` persisted to disk (468 bytes)
+- Mac worker: SIGTERM + restart preserves history (launchd auto-restart verified)
+- Dashboard serves chart section: "Earnings Over Time" header + SVG chart + range buttons
+- All 8 seeds upgraded via rolling-deploy.sh
+- NYC seed: history endpoint works (empty because seeds don't do inference)
+- AMS seed: dashboard has chart section
+- LHR seed: leaderboard still functional (8 nodes)
+- Mac worker: leaderboard shows #1 of 9, 8 peers connected
+- Binary hash: 3d22d00fceb56210edb03a145b3c4b1b89f9ab292e74435e3fad5ca1a168c238
+
+**Known issue (pre-existing, NOT from this cycle):**
+- QUIC peer connections cycle every ~70s due to VPS UDP timeout (handoff item #9)
+- After rolling restart, peer_count field shows 0 transiently while connections re-establish
+- Consensus was actively running (round 204+) during deploy verification
+
+**Rollback:** `git checkout evolution-3`
+
+**Files changed:**
+- `crates/arc-node/src/earnings.rs` (EarningsHistoryPoint, persistence, downsampling, get_history)
+- `crates/arc-node/src/rpc.rs` (worker_earnings_history handler + route registration)
+- `dashboard/worker.html` (SVG chart section + updateChart/renderChart JS + range buttons)
+- `evolution/log.md` (this entry)
+---
