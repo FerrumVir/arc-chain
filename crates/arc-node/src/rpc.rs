@@ -208,6 +208,7 @@ pub async fn serve(
         .route("/worker/earnings", get(worker_earnings))
         .route("/worker/activity", get(worker_activity))
         .route("/worker/peers", get(worker_peers))
+        .route("/worker/leaderboard", get(worker_leaderboard))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -3124,6 +3125,131 @@ async fn worker_peers(
     Json(json!({
         "peers": peers,
         "count": peers.len(),
+    }))
+}
+
+/// Network leaderboard — queries all seed nodes for earnings and returns a ranked list.
+///
+/// GET /worker/leaderboard
+///
+/// Queries all 8 seed nodes' `/worker/earnings` endpoints in parallel,
+/// merges with the local node's earnings, and returns a ranked list sorted
+/// by total ARC earned (descending). Includes the caller's rank.
+async fn worker_leaderboard(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    // Known seed nodes — same list used by the dashboard JS
+    let seeds: &[(&str, &str)] = &[
+        ("149.28.32.76", "NYC"), ("140.82.16.112", "LAX"), ("136.244.109.1", "AMS"),
+        ("104.238.171.11", "LHR"), ("202.182.107.41", "NRT"), ("149.28.153.31", "SGP"),
+        ("216.238.120.27", "SAO"), ("139.84.237.49", "JNB"),
+    ];
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap_or_default();
+
+    // Query all seeds in parallel
+    let mut handles = Vec::new();
+    for &(ip, label) in seeds {
+        let c = client.clone();
+        let url = format!("http://{}:9090/worker/earnings", ip);
+        let lbl = label.to_string();
+        handles.push(tokio::spawn(async move {
+            match c.get(&url).send().await {
+                Ok(resp) => {
+                    if let Ok(json) = resp.json::<Value>().await {
+                        Some((lbl, json))
+                    } else {
+                        None
+                    }
+                }
+                Err(_) => None,
+            }
+        }));
+    }
+
+    let mut entries: Vec<Value> = Vec::new();
+    let mut seen_addresses = std::collections::HashSet::new();
+
+    for handle in handles {
+        if let Ok(Some((label, data))) = handle.await {
+            let addr = data.get("address").and_then(|a| a.as_str()).unwrap_or("").to_string();
+            if addr.is_empty() || seen_addresses.contains(&addr) {
+                continue;
+            }
+            seen_addresses.insert(addr.clone());
+            let total_arc = data.get("earnings")
+                .and_then(|e| e.get("total_arc"))
+                .and_then(|t| t.as_u64())
+                .unwrap_or(0);
+            let inferences = data.get("total_inferences").and_then(|t| t.as_u64()).unwrap_or(0);
+            let uptime_h = data.get("uptime_hours").and_then(|t| t.as_f64()).unwrap_or(0.0);
+            let status = data.get("status").and_then(|s| s.as_str()).unwrap_or("unknown").to_string();
+            entries.push(json!({
+                "address": addr,
+                "label": label,
+                "total_arc": total_arc,
+                "inferences": inferences,
+                "uptime_hours": uptime_h,
+                "status": status,
+                "is_seed": true,
+            }));
+        }
+    }
+
+    // Add local node if not already in the list (community workers won't be seeds)
+    let local_addr = format!("0x{}", node.validator_address.to_hex());
+    if !seen_addresses.contains(&local_addr) {
+        let count = node.inference_count.load(Ordering::Relaxed);
+        let earned = node.inference_earned.load(Ordering::Relaxed);
+        let uptime_h = node.boot_time.elapsed().as_secs_f64() / 3600.0;
+        let has_model = node.candle_engine.is_some() || node.inference_model.is_some();
+        let peers = node.peer_count.load(Ordering::Relaxed);
+        entries.push(json!({
+            "address": local_addr.clone(),
+            "label": "You",
+            "total_arc": earned,
+            "inferences": count,
+            "uptime_hours": uptime_h,
+            "status": if has_model && peers > 0 { "active" } else if peers > 0 { "connected_no_model" } else { "disconnected" },
+            "is_seed": false,
+        }));
+    } else {
+        // Mark the local node in the list
+        for entry in &mut entries {
+            if entry.get("address").and_then(|a| a.as_str()) == Some(&local_addr) {
+                entry.as_object_mut().unwrap().insert("label".to_string(), json!("You"));
+            }
+        }
+    }
+
+    // Sort by total_arc descending, then by inferences descending
+    entries.sort_by(|a, b| {
+        let arc_a = a.get("total_arc").and_then(|v| v.as_u64()).unwrap_or(0);
+        let arc_b = b.get("total_arc").and_then(|v| v.as_u64()).unwrap_or(0);
+        let inf_a = a.get("inferences").and_then(|v| v.as_u64()).unwrap_or(0);
+        let inf_b = b.get("inferences").and_then(|v| v.as_u64()).unwrap_or(0);
+        arc_b.cmp(&arc_a).then(inf_b.cmp(&inf_a))
+    });
+
+    // Add rank numbers and find local rank
+    let mut my_rank = 0usize;
+    for (i, entry) in entries.iter_mut().enumerate() {
+        let rank = i + 1;
+        entry.as_object_mut().unwrap().insert("rank".to_string(), json!(rank));
+        if entry.get("address").and_then(|a| a.as_str()) == Some(&local_addr) {
+            my_rank = rank;
+        }
+    }
+
+    Json(json!({
+        "leaderboard": entries,
+        "total_nodes": entries.len(),
+        "your_rank": my_rank,
+        "your_address": local_addr,
+        "updated_at": chrono::Utc::now().to_rfc3339(),
     }))
 }
 

@@ -98,6 +98,31 @@ body{font-family:'Inter',sans-serif}
     </div>
   </div>
 
+  <!-- Leaderboard -->
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-4 sm:p-5">
+    <div class="flex items-center justify-between mb-3 sm:mb-4">
+      <h2 class="text-xs sm:text-sm font-semibold text-white uppercase tracking-wider">Network Leaderboard</h2>
+      <span class="text-xs text-gray-500" id="leaderboardRank">--</span>
+    </div>
+    <div id="leaderboardList" class="space-y-1 max-h-72 sm:max-h-80 overflow-y-auto">
+      <p class="text-xs text-gray-600">Loading leaderboard...</p>
+    </div>
+    <div class="mt-3 pt-3 border-t border-surface-4 grid grid-cols-3 gap-2 text-center">
+      <div>
+        <p class="text-[10px] sm:text-xs text-gray-500">Your Rank</p>
+        <p class="text-base sm:text-lg font-bold text-arc-400 mono" id="yourRank">--</p>
+      </div>
+      <div>
+        <p class="text-[10px] sm:text-xs text-gray-500">Total Nodes</p>
+        <p class="text-base sm:text-lg font-bold text-white mono" id="totalNodes">--</p>
+      </div>
+      <div>
+        <p class="text-[10px] sm:text-xs text-gray-500">Network ARC</p>
+        <p class="text-base sm:text-lg font-bold text-earn-400 mono" id="networkArc">--</p>
+      </div>
+    </div>
+  </div>
+
   <!-- Stats Row -->
   <div class="grid grid-cols-2 sm:grid-cols-2 lg:grid-cols-4 gap-2 sm:gap-3">
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-3 sm:p-4">
@@ -425,9 +450,10 @@ async function refresh() {
     document.getElementById('nodeVersion').textContent = health.version || '--';
     document.getElementById('dagRound').textContent = fmtNumber(health.dag_round || 0);
 
-    // Peer list + activity (async, don't block)
+    // Peer list + activity + leaderboard (async, don't block)
     updatePeers();
     updateActivity();
+    updateLeaderboard();
 
     // Network stats
     if (stats) {
@@ -542,6 +568,75 @@ async function fetchSeedStats() {
     } catch(e) { continue; }
   }
   return null;
+}
+
+// ── Leaderboard ──────────────────────────────────────────────
+let leaderboardTimer = 0;
+async function updateLeaderboard() {
+  // Only refresh leaderboard every 15s (3 refresh cycles) to avoid hammering seeds
+  leaderboardTimer++;
+  if (leaderboardTimer > 1 && leaderboardTimer % 3 !== 0) return;
+
+  const container = document.getElementById('leaderboardList');
+  try {
+    const data = await fetch(RPC + '/worker/leaderboard').then(r => r.json());
+    const board = data.leaderboard || [];
+    const myRank = data.your_rank || 0;
+    const totalNodes = data.total_nodes || 0;
+
+    document.getElementById('yourRank').textContent = myRank > 0 ? '#' + myRank : '--';
+    document.getElementById('totalNodes').textContent = totalNodes;
+    document.getElementById('leaderboardRank').textContent = myRank > 0 ? 'Rank #' + myRank + ' of ' + totalNodes : totalNodes + ' nodes';
+
+    // Total network ARC
+    let networkTotal = 0;
+    board.forEach(e => networkTotal += (e.total_arc || 0));
+    document.getElementById('networkArc').textContent = fmtNumber(networkTotal);
+
+    if (board.length === 0) {
+      container.innerHTML = '<p class="text-xs text-gray-600">No nodes reporting yet...</p>';
+      return;
+    }
+
+    const flagMap = {'NYC':'🇺🇸','LAX':'🇺🇸','AMS':'🇳🇱','LHR':'🇬🇧','NRT':'🇯🇵','SGP':'🇸🇬','SAO':'🇧🇷','JNB':'🇿🇦','You':'⭐'};
+    const statusColors = {'active':'bg-emerald-400','connected_no_model':'bg-yellow-400','disconnected':'bg-gray-600','unknown':'bg-gray-600'};
+
+    let html = '';
+    // Header row
+    html += `<div class="flex items-center justify-between py-1 px-2 text-[10px] text-gray-600 uppercase tracking-wider">
+      <div class="flex items-center gap-2"><span class="w-5">#</span><span>Node</span></div>
+      <div class="flex items-center gap-3 sm:gap-4"><span class="w-12 text-right">ARC</span><span class="w-10 text-right hidden sm:inline">Jobs</span></div>
+    </div>`;
+    board.forEach(e => {
+      const isYou = e.label === 'You';
+      const flag = flagMap[e.label] || '';
+      const dotColor = statusColors[e.status] || 'bg-gray-600';
+      const rowBg = isYou ? 'bg-arc-500/10 border border-arc-500/30' : 'hover:bg-surface-3/50';
+      const nameColor = isYou ? 'text-arc-400 font-bold' : 'text-white';
+      const arcColor = isYou ? 'text-arc-400' : (e.total_arc > 0 ? 'text-earn-400' : 'text-gray-500');
+
+      // Medal for top 3
+      let medal = '';
+      if (e.rank === 1) medal = '<span class="text-yellow-400">&#9679;</span>';
+      else if (e.rank === 2) medal = '<span class="text-gray-300">&#9679;</span>';
+      else if (e.rank === 3) medal = '<span class="text-amber-600">&#9679;</span>';
+
+      html += `<div class="flex items-center justify-between py-1.5 px-2 rounded-lg ${rowBg}">
+        <div class="flex items-center gap-1.5 sm:gap-2 min-w-0">
+          <span class="w-5 text-xs text-gray-500 mono text-center flex-shrink-0">${medal || e.rank}</span>
+          <span class="w-1.5 h-1.5 rounded-full flex-shrink-0 ${dotColor}"></span>
+          <span class="text-xs ${nameColor}">${flag ? flag + ' ' : ''}${e.label || shortAddr(e.address)}</span>
+        </div>
+        <div class="flex items-center gap-3 sm:gap-4 flex-shrink-0">
+          <span class="mono text-xs ${arcColor} w-12 text-right font-semibold">${fmtNumber(e.total_arc || 0)}</span>
+          <span class="mono text-[10px] text-gray-500 w-10 text-right hidden sm:inline">${e.inferences || 0}</span>
+        </div>
+      </div>`;
+    });
+    container.innerHTML = html;
+  } catch(e) {
+    console.error('Leaderboard error:', e);
+  }
 }
 
 // ── Init ────────────────────────────────────────────────────
