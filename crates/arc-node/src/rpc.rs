@@ -3176,17 +3176,22 @@ async fn worker_peers(
             let addr_hex = hex::encode(entry.key());
             let (dial_addr, stake) = entry.value();
             let ip = dial_addr.ip().to_string();
-            let label = labels.get(ip.as_str()).copied().unwrap_or("Community");
-            peers.push(json!({
+            let is_seed = labels.contains_key(ip.as_str());
+            let label = if is_seed { labels[ip.as_str()] } else { "Community" };
+            // PRIVACY: only expose IPs for seed nodes. Community worker IPs are NEVER shown.
+            let mut peer_json = json!({
                 "address": format!("0x{}", addr_hex),
                 "stake": stake,
-                "dial_addr": dial_addr.to_string(),
                 "label": label,
-                "ip": ip,
-            }));
-            if get_cached_latency(&node.peer_latency_cache, &ip).is_none() {
-                peer_ips_to_measure.push(ip);
+            });
+            if is_seed {
+                peer_json["ip"] = json!(ip);
+                peer_json["dial_addr"] = json!(dial_addr.to_string());
+                if get_cached_latency(&node.peer_latency_cache, &ip).is_none() {
+                    peer_ips_to_measure.push(ip);
+                }
             }
+            peers.push(peer_json);
         }
     }
     // Fallback: use seed list with IPs when peer_meta not wired.
