@@ -347,3 +347,59 @@
 - `scripts/arc-community.sh` (RAM auto-detection, model recommendation, --help update)
 - `evolution/log.md` (this entry)
 ---
+
+## Evolution 8 — 2026-03-30 05:30
+**Commit:** 3cf341d
+**Tag:** evolution-8
+**What:** Peer latency measurement + display
+
+### Backend (crates/arc-node/src/rpc.rs)
+- Added `measure_peer_latency()` — times HTTP GET to each seed's `/health` endpoint
+- Added `get_cached_latency()` — returns cached latency if measured within 30 seconds (LATENCY_CACHE_SECS)
+- Added `peer_latency_cache: Arc<DashMap<String, (u64, Instant)>>` to `NodeState`
+- Latency measured in parallel via `tokio::spawn` for all seeds with stale/missing cache entries
+- `reqwest::Client` with 3-second timeout prevents blocking on unreachable nodes
+- `/worker/peers` response now includes:
+  - `latency_ms` field per peer (when IP is known)
+  - `seed_latency` map (label -> ms) as fallback for dashboard when peers lack individual IPs
+- Fallback path (when peer_meta not wired) now lists seeds with IPs/labels instead of bare validator addresses, enabling latency display in all modes
+- 6 new unit tests for latency cache: fresh, stale, missing, boundary at 29s/30s, multi-IP independence
+
+### Dashboard (dashboard/worker.html)
+- Added `latencyColor()` helper: maps latency to colored dot + text class
+  - Green (`bg-emerald-400`): <100ms
+  - Yellow (`bg-yellow-400`): <500ms
+  - Red (`bg-red-400`): >=500ms
+  - Gray: no measurement available
+- Peer list dot color now reflects latency instead of static validator/arc color
+- Latency number (e.g., "86ms") shown next to each peer in colored text
+- Uses per-peer `latency_ms` when available, falls back to `seed_latency` map by label
+- Mobile responsive: latency number visible on all screen sizes, dial address hidden on mobile
+
+**Why:** Users running community worker nodes had no visibility into their network quality. A node in South Africa connecting to US seeds had 500ms+ RTT but the dashboard showed identical green dots for all peers. Latency display helps users understand which seeds are close/far, diagnose connectivity issues, and make informed decisions about which seeds to prioritize. The 30-second cache ensures the feature doesn't hammer seed nodes.
+
+**Verified:**
+- Mac worker: `/worker/peers` returns latency for all 8 seeds
+  - LAX: 86ms (GREEN), NYC: 99ms (GREEN), AMS: 258ms (YELLOW), LHR: 235ms (YELLOW)
+  - NRT: 293ms (YELLOW), SGP: 418ms (YELLOW), SAO: 305ms (YELLOW), JNB: 587ms (RED)
+- NYC seed: latency to self 0ms, LAX 118ms, AMS 157ms (geographic accuracy confirmed)
+- AMS seed: latency to self 0ms, LHR 14ms (nearby European hop), NYC 164ms (transatlantic)
+- Cache working: second request returns in 9ms (vs ~600ms for first call with measurements)
+- Dashboard serves latencyColor function on both Mac worker and all seeds (2 references)
+- All 8 seeds upgraded via rolling-deploy.sh, all report 8 peers
+- `cargo test --lib -p arc-node`: 103 tests passed (97 + 6 new latency cache tests)
+- Earnings preserved: 25,900 ARC, 259 inferences, persistence=true
+- Leaderboard, hardware, earnings history all functional post-deploy
+- Binary hash: 37691727a29d70986fa0033ff32ea5441bab52dc7e806b22c1c3221429e10859
+
+**Known issue (pre-existing, NOT from this cycle):**
+- `peer_count` in `/health` shows 0 transiently after rolling restart due to QUIC UDP timeout cycling (~70s)
+- peer_meta not wired in current node mode, so fallback path (seed list) is used for peer display
+
+**Rollback:** `git checkout evolution-7`
+
+**Files changed:**
+- `crates/arc-node/src/rpc.rs` (peer_latency_cache field, measure_peer_latency, get_cached_latency, updated worker_peers handler, 6 new tests)
+- `dashboard/worker.html` (latencyColor function, updated updatePeers with latency display + seed_latency fallback)
+- `evolution/log.md` (this entry)
+---
