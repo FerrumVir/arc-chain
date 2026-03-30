@@ -76,6 +76,10 @@ pub struct ConsensusManager {
     /// Worker earnings counters (inference count + ARC earned).
     pub inference_count: Arc<std::sync::atomic::AtomicU64>,
     pub inference_earned: Arc<std::sync::atomic::AtomicU64>,
+    /// Network-wide worker status map — collected from WorkerStatus P2P messages.
+    /// Key: worker address bytes, Value: JSON with earnings/model/uptime.
+    /// No IPs stored — only public addresses.
+    pub network_workers: Arc<dashmap::DashMap<[u8; 32], serde_json::Value>>,
     /// Persistent earnings tracker — saves to disk on each inference.
     pub earnings_tracker: Option<Arc<crate::earnings::EarningsTracker>>,
 }
@@ -104,7 +108,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)), earnings_tracker: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)), earnings_tracker: None, network_workers: Arc::new(dashmap::DashMap::new()) }
     }
 
     /// Create a consensus manager with a signing keypair (production mode).
@@ -140,7 +144,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)), earnings_tracker: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)), earnings_tracker: None, network_workers: Arc::new(dashmap::DashMap::new()) }
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -231,6 +235,7 @@ impl ConsensusManager {
         if !can_produce {
             info!("Validator is Spark tier — observing only (cannot produce blocks)");
         }
+        let consensus_start = std::time::Instant::now();
 
         // Pending transaction index: tx_hash → Transaction
         // Transactions live here between drain from mempool and execution.
@@ -561,6 +566,18 @@ impl ConsensusManager {
                                     "source": "community_worker",
                                 }));
                             }
+                        }
+                        InboundMessage::WorkerStatus { address, total_inferences, total_earned, model_loaded, uptime_secs, mode } => {
+                            // Store worker status for leaderboard — NO IP, only address.
+                            self.network_workers.insert(address.0, serde_json::json!({
+                                "address": format!("0x{}", address.to_hex()),
+                                "total_inferences": total_inferences,
+                                "total_arc": total_earned,
+                                "model_loaded": model_loaded,
+                                "uptime_secs": uptime_secs,
+                                "mode": mode,
+                                "last_seen": chrono::Utc::now().to_rfc3339(),
+                            }));
                         }
                     }
                 }
@@ -1136,6 +1153,25 @@ impl ConsensusManager {
 
             // ── 3. Liveness: view-change check ────────────────────────────────
             // If the round has been stalled too long, force-advance to prevent
+            // ── Broadcast worker status every ~60 rounds (~60s) ─────────
+            // Announces our address + earnings to the network so other nodes
+            // can build a complete peer list. NO IP is included.
+            if current_round % 60 == 0 && current_round > 0 {
+                if let Some(ref tx_chan) = outbound_tx {
+                    let has_model = self.candle_engine.is_some() || self.inference_model.is_some();
+                    let _ = tx_chan.try_send(
+                        arc_net::transport::OutboundMessage::BroadcastWorkerStatus {
+                            address: self.validator_address,
+                            total_inferences: self.inference_count.load(std::sync::atomic::Ordering::Relaxed),
+                            total_earned: self.inference_earned.load(std::sync::atomic::Ordering::Relaxed),
+                            model_loaded: has_model,
+                            uptime_secs: consensus_start.elapsed().as_secs(),
+                            mode: if can_produce { "validator".to_string() } else { "worker".to_string() },
+                        }
+                    );
+                }
+            }
+
             // indefinite halts (e.g. from a crashed proposer).
             // force_advance_round() sets the force_advanced flag, which relaxes
             // parent quorum checks in propose_block() and receive_block(),

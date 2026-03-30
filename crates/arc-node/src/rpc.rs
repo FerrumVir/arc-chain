@@ -69,6 +69,9 @@ pub struct NodeState {
     pub inference_activity: Arc<Mutex<std::collections::VecDeque<Value>>>,
     /// Shared peer metadata for /worker/peers endpoint.
     pub peer_meta: Option<Arc<dashmap::DashMap<[u8; 32], (std::net::SocketAddr, u64)>>>,
+    /// Network-wide worker status collected from P2P WorkerStatus messages.
+    /// No IPs — only addresses and stats.
+    pub network_workers: Option<Arc<dashmap::DashMap<[u8; 32], Value>>>,
     /// Node mode: "validator" or "worker".
     pub node_mode: String,
     /// Persistent earnings tracker — writes to disk on each inference.
@@ -115,6 +118,7 @@ pub fn build_node_state(
         inference_earned: Arc::new(AtomicU64::new(0)),
         inference_activity: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(100))),
         peer_meta: None,
+        network_workers: None,
         node_mode: "validator".to_string(),
         earnings_tracker: None,
         peer_latency_cache: Arc::new(dashmap::DashMap::new()),
@@ -142,6 +146,7 @@ pub async fn serve(
     inference_earned: Option<Arc<AtomicU64>>,
     node_mode: &str,
     earnings_tracker: Option<Arc<EarningsTracker>>,
+    network_workers: Option<Arc<dashmap::DashMap<[u8; 32], Value>>>,
 ) -> anyhow::Result<()> {
     let mut node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
     if let Some(dv) = dag_validators {
@@ -167,6 +172,7 @@ pub async fn serve(
     }
     node.node_mode = node_mode.to_string();
     node.earnings_tracker = earnings_tracker;
+    node.network_workers = network_workers;
 
     let app = Router::new()
         .route("/", get(index))
@@ -3340,6 +3346,29 @@ async fn worker_leaderboard(
                 "status": status,
                 "is_seed": true,
             }));
+        }
+    }
+
+    // Add community workers from P2P WorkerStatus broadcasts (no IPs — only addresses)
+    if let Some(ref workers) = node.network_workers {
+        for entry in workers.iter() {
+            let addr = entry.value().get("address").and_then(|a| a.as_str()).unwrap_or("").to_string();
+            if !seen_addresses.contains(&addr) && !addr.is_empty() {
+                seen_addresses.insert(addr.clone());
+                let total_arc = entry.value().get("total_arc").and_then(|v| v.as_u64()).unwrap_or(0);
+                let inferences = entry.value().get("total_inferences").and_then(|v| v.as_u64()).unwrap_or(0);
+                let model = entry.value().get("model_loaded").and_then(|v| v.as_bool()).unwrap_or(false);
+                let mode = entry.value().get("mode").and_then(|v| v.as_str()).unwrap_or("worker");
+                let status = if model { "active" } else { "connected_no_model" };
+                entries.push(json!({
+                    "address": addr,
+                    "label": "Community",
+                    "total_arc": total_arc,
+                    "inferences": inferences,
+                    "status": status,
+                    "is_seed": false,
+                }));
+            }
         }
     }
 

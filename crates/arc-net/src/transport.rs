@@ -88,6 +88,15 @@ pub enum InboundMessage {
         ms_per_token: u64,
         responder: Hash256,
     },
+    /// Worker status announcement — no IP, just address + stats.
+    WorkerStatus {
+        address: Hash256,
+        total_inferences: u64,
+        total_earned: u64,
+        model_loaded: bool,
+        uptime_secs: u64,
+        mode: String,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -119,6 +128,15 @@ pub enum OutboundMessage {
         model_hash: Hash256,
         ms_per_token: u64,
         responder: Hash256,
+    },
+    /// Broadcast worker status (earnings, capabilities) — no IP, just address.
+    BroadcastWorkerStatus {
+        address: Hash256,
+        total_inferences: u64,
+        total_earned: u64,
+        model_loaded: bool,
+        uptime_secs: u64,
+        mode: String,
     },
 }
 
@@ -670,6 +688,14 @@ pub async fn run_transport(
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
                         conn_out.broadcast(MessageType::InferenceResponse, &bytes).await;
+                    }
+                }
+                OutboundMessage::BroadcastWorkerStatus { address, total_inferences, total_earned, model_loaded, uptime_secs, mode } => {
+                    let payload = crate::protocol::WorkerStatusMessage {
+                        address, total_inferences, total_earned, model_loaded, uptime_secs, mode,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out.broadcast(MessageType::WorkerStatus, &bytes).await;
                     }
                 }
             }
@@ -1333,6 +1359,24 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => warn!("Bad InferenceResponse from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::WorkerStatus => {
+                match bincode::deserialize::<crate::protocol::WorkerStatusMessage>(&data) {
+                    Ok(msg) => {
+                        debug!("Worker status from {} ({}inf, {}ARC)", msg.address, msg.total_inferences, msg.total_earned);
+                        let _ = inbound_tx
+                            .send(InboundMessage::WorkerStatus {
+                                address: msg.address,
+                                total_inferences: msg.total_inferences,
+                                total_earned: msg.total_earned,
+                                model_loaded: msg.model_loaded,
+                                uptime_secs: msg.uptime_secs,
+                                mode: msg.mode,
+                            })
+                            .await;
+                    }
+                    Err(e) => warn!("Bad WorkerStatus from {}: {}", peer_address, e),
                 }
             }
             other => {

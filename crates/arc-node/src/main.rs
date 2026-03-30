@@ -624,6 +624,7 @@ async fn main() -> Result<()> {
     // Share earnings counters between consensus (writes) and RPC (reads)
     let consensus_inference_count = consensus.inference_count.clone();
     let consensus_inference_earned = consensus.inference_earned.clone();
+    let network_workers = consensus.network_workers.clone();
     // DAG persistence WAL — survives restarts
     let dag_wal_path = format!("{}/dag-wal", data_dir);
     std::fs::create_dir_all(&dag_wal_path).ok();
@@ -747,6 +748,7 @@ async fn main() -> Result<()> {
         Some(consensus_inference_earned),
         if worker_mode { "worker" } else { "validator" },
         Some(earnings_tracker.clone()),
+        Some(network_workers),
     )
     .await?;
 

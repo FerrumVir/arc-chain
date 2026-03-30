@@ -36,6 +36,9 @@ pub enum MessageType {
     InferenceRequest = 0x0B,
     /// Inference response — result from a community GPU node.
     InferenceResponse = 0x0C,
+    /// Worker status broadcast — workers announce earnings/capabilities to the network.
+    /// Contains NO IP address — only the worker's public address (hash), earnings, and model info.
+    WorkerStatus = 0x0D,
 }
 
 impl MessageType {
@@ -53,6 +56,7 @@ impl MessageType {
             0x0A => Some(Self::SnapshotChunkResponse),
             0x0B => Some(Self::InferenceRequest),
             0x0C => Some(Self::InferenceResponse),
+            0x0D => Some(Self::WorkerStatus),
             _ => None,
         }
     }
@@ -167,6 +171,25 @@ pub struct InferenceResponseMessage {
     pub ms_per_token: u64,
     /// Responder's validator address.
     pub responder: Hash256,
+}
+
+/// Worker status broadcast — announces a worker's presence and earnings to the network.
+/// Contains NO IP address — only the worker's public address (hash) and stats.
+/// Seeds collect these to build a complete network view for the leaderboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerStatusMessage {
+    /// Worker's address (BLAKE3 hash of public key). This is the ONLY identifier — no IP.
+    pub address: Hash256,
+    /// Total inferences completed since this worker started.
+    pub total_inferences: u64,
+    /// Total ARC earned.
+    pub total_earned: u64,
+    /// Whether this worker has a model loaded (can serve inference).
+    pub model_loaded: bool,
+    /// Uptime in seconds.
+    pub uptime_secs: u64,
+    /// Node mode: "validator" or "worker".
+    pub mode: String,
 }
 
 /// Compact peer info exchanged via PEX protocol.
