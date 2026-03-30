@@ -858,11 +858,22 @@ pub async fn run_transport(
                     })
                     .collect();
 
-                // Limit concurrent reconnect dials to 5 to prevent
-                // overwhelming the QUIC endpoint when many peers drop.
-                let reconnect_batch: Vec<_> = disconnected.into_iter().take(5).collect();
+                // Adaptive reconnect: when peers are low, be aggressive.
+                // Normal: 5 per cycle, 30s interval.
+                // Low peers (<4): all disconnected, 5s interval next cycle.
+                let live_count = conn_pex.peers.len();
+                let batch_limit = if live_count < 4 { disconnected.len() } else { 5 };
+                let reconnect_batch: Vec<_> = disconnected.into_iter().take(batch_limit).collect();
                 if !reconnect_batch.is_empty() {
-                    info!("Reconnect: {} peers to retry (max 5/cycle)", reconnect_batch.len());
+                    if live_count < 4 {
+                        warn!("Low peers ({}) — aggressive reconnect: dialing {} seeds", live_count, reconnect_batch.len());
+                        // Speed up next reconnect cycle when struggling
+                        reconnect_interval.reset_after(std::time::Duration::from_secs(5));
+                    } else {
+                        info!("Reconnect: {} peers to retry", reconnect_batch.len());
+                        // Normal cadence when healthy
+                        reconnect_interval.reset_after(std::time::Duration::from_secs(30));
+                    }
                 }
                 for addr in reconnect_batch {
                     let handshake_msg = make_signed_handshake(

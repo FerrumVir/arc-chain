@@ -164,10 +164,18 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     # iptables (fallback — only if neither ufw nor firewalld)
     if ! command -v ufw &>/dev/null && ! command -v firewall-cmd &>/dev/null; then
         if command -v iptables &>/dev/null; then
-            if [[ "$(id -u)" -eq 0 ]]; then
-                iptables -C INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null && ok "Firewall: opened UDP 9091 (iptables)"
-            else
-                sudo iptables -C INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null || sudo iptables -I INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null && ok "Firewall: opened UDP 9091 (iptables)" || true
+            SUDO_CMD=""
+            if [[ "$(id -u)" -ne 0 ]]; then SUDO_CMD="sudo"; fi
+            if ! $SUDO_CMD iptables -C INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null; then
+                $SUDO_CMD iptables -I INPUT -p udp --dport 9091 -j ACCEPT 2>/dev/null && ok "Firewall: opened UDP 9091 (iptables)" || true
+                # Persist iptables rule across reboots
+                if command -v iptables-save &>/dev/null; then
+                    if [[ -d /etc/iptables ]]; then
+                        $SUDO_CMD sh -c 'iptables-save > /etc/iptables/rules.v4' 2>/dev/null
+                    elif [[ -f /etc/sysconfig/iptables ]]; then
+                        $SUDO_CMD sh -c 'iptables-save > /etc/sysconfig/iptables' 2>/dev/null
+                    fi
+                fi
             fi
         fi
     fi
