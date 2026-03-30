@@ -60,6 +60,8 @@ pub struct ConsensusManager {
     /// Worker earnings counters (inference count + ARC earned).
     pub inference_count: Arc<std::sync::atomic::AtomicU64>,
     pub inference_earned: Arc<std::sync::atomic::AtomicU64>,
+    /// Persistent earnings tracker — saves to disk on each inference.
+    pub earnings_tracker: Option<Arc<crate::earnings::EarningsTracker>>,
 }
 
 impl ConsensusManager {
@@ -86,7 +88,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)) }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)), earnings_tracker: None }
     }
 
     /// Create a consensus manager with a signing keypair (production mode).
@@ -122,7 +124,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)) }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, inference_pending: None, inference_responses: None, candle_engine: None, candle_model_id: None, inference_model: None, inference_count: Arc::new(std::sync::atomic::AtomicU64::new(0)), inference_earned: Arc::new(std::sync::atomic::AtomicU64::new(0)), earnings_tracker: None }
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -519,11 +521,13 @@ impl ConsensusManager {
                                         );
                                     }
 
-                                    // Track earnings
-                                    self.inference_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    // Reward: 100 ARC per inference (testnet rate — production
-                                    // will use block-reward-funded inference pool with halving)
-                                    self.inference_earned.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+                                    // Track earnings (persists to disk via tracker)
+                                    if let Some(ref tracker) = self.earnings_tracker {
+                                        tracker.record_inference(100);
+                                    } else {
+                                        self.inference_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        self.inference_earned.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+                                    }
                                 }
                             }
                         }

@@ -4,7 +4,7 @@ use anyhow::Result;
 use arc_crypto::{hash_bytes, Hash256, KeyPair};
 use arc_mempool::Mempool;
 use arc_net::transport::{run_transport, InboundMessage, OutboundMessage};
-use arc_node::{benchmark::BenchmarkPool, consensus::ConsensusManager, rpc};
+use arc_node::{benchmark::BenchmarkPool, consensus::ConsensusManager, earnings::EarningsTracker, rpc};
 use arc_state::StateDB;
 use arc_types::Block;
 use clap::{CommandFactory, Parser};
@@ -600,6 +600,9 @@ async fn main() -> Result<()> {
     let dag_validators = Arc::new(parking_lot::RwLock::new(all_vals));
     let dag_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // ── Persistent earnings tracker — survives restarts ──────────────
+    let earnings_tracker = Arc::new(EarningsTracker::new(&data_dir));
+
     let mut consensus =
         ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &peer_vals, validator_keypair);
     consensus.dag_validators = Some(dag_validators.clone());
@@ -614,6 +617,10 @@ async fn main() -> Result<()> {
     consensus.candle_engine = candle_engine.clone();
     consensus.candle_model_id = candle_model_id;
     consensus.inference_model = inference_model.clone();
+    // Wire persistent earnings into consensus (replaces default in-memory atomics)
+    consensus.inference_count = earnings_tracker.inference_count.clone();
+    consensus.inference_earned = earnings_tracker.inference_earned.clone();
+    consensus.earnings_tracker = Some(earnings_tracker.clone());
     // Share earnings counters between consensus (writes) and RPC (reads)
     let consensus_inference_count = consensus.inference_count.clone();
     let consensus_inference_earned = consensus.inference_earned.clone();
@@ -688,6 +695,31 @@ async fn main() -> Result<()> {
         });
     }
 
+    // ── SIGTERM / SIGINT graceful shutdown handler ──────────────────────
+    // Saves earnings to disk before exiting so no data is lost on `kill`
+    // or `systemctl stop`. Without this, in-flight earnings since the last
+    // inference persist call would be lost.
+    {
+        let shutdown_tracker = earnings_tracker.clone();
+        tokio::spawn(async move {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            ).expect("failed to register SIGTERM handler");
+            let sigint = tokio::signal::ctrl_c();
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    tracing::info!("SIGTERM received — saving earnings and shutting down");
+                }
+                _ = sigint => {
+                    tracing::info!("SIGINT received — saving earnings and shutting down");
+                }
+            }
+            shutdown_tracker.save_to_disk();
+            tracing::info!("Earnings saved. Goodbye.");
+            std::process::exit(0);
+        });
+    }
+
     // ── Start RPC server ────────────────────────────────────────────────
     if candle_engine.is_some() {
         tracing::info!("Inference  : ENABLED (candle Q4 float, coherent output)");
@@ -714,6 +746,7 @@ async fn main() -> Result<()> {
         Some(consensus_inference_count),
         Some(consensus_inference_earned),
         if worker_mode { "worker" } else { "validator" },
+        Some(earnings_tracker.clone()),
     )
     .await?;
 

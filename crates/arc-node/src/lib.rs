@@ -2,6 +2,7 @@ pub mod benchmark;
 pub mod block_stm;
 pub mod coalesce;
 pub mod consensus;
+pub mod earnings;
 pub mod pipeline;
 pub mod producer;
 pub mod rpc;

@@ -1,3 +1,4 @@
+use crate::earnings::EarningsTracker;
 use arc_consensus::StakeTier;
 use arc_crypto::{Hash256, MerkleProof};
 use arc_gpu::probe_gpu;
@@ -69,6 +70,8 @@ pub struct NodeState {
     pub peer_meta: Option<Arc<dashmap::DashMap<[u8; 32], (std::net::SocketAddr, u64)>>>,
     /// Node mode: "validator" or "worker".
     pub node_mode: String,
+    /// Persistent earnings tracker — writes to disk on each inference.
+    pub earnings_tracker: Option<Arc<EarningsTracker>>,
 }
 
 /// Build a `NodeState` from components.
@@ -109,6 +112,7 @@ pub fn build_node_state(
         inference_activity: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(100))),
         peer_meta: None,
         node_mode: "validator".to_string(),
+        earnings_tracker: None,
     }
 }
 
@@ -132,6 +136,7 @@ pub async fn serve(
     inference_count: Option<Arc<AtomicU64>>,
     inference_earned: Option<Arc<AtomicU64>>,
     node_mode: &str,
+    earnings_tracker: Option<Arc<EarningsTracker>>,
 ) -> anyhow::Result<()> {
     let mut node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
     if let Some(dv) = dag_validators {
@@ -156,6 +161,7 @@ pub async fn serve(
         node.inference_earned = e;
     }
     node.node_mode = node_mode.to_string();
+    node.earnings_tracker = earnings_tracker;
 
     let app = Router::new()
         .route("/", get(index))
@@ -2791,9 +2797,13 @@ async fn inference_run(
     let tokens_generated = generated_tokens.len() as u64;
     let ms_per_token = if tokens_generated > 0 { inference_ms / tokens_generated } else { 0 };
 
-    // Track earnings + activity for local inference
-    node.inference_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    node.inference_earned.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+    // Track earnings + activity for local inference (persists to disk)
+    if let Some(ref tracker) = node.earnings_tracker {
+        tracker.record_inference(100);
+    } else {
+        node.inference_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        node.inference_earned.fetch_add(100, std::sync::atomic::Ordering::Relaxed);
+    }
     log_inference_activity(&node, &format!("local-{}", node.inference_count.load(std::sync::atomic::Ordering::Relaxed)), input_text, generated_tokens.len() as u32, inference_ms, "direct");
 
     // Decode output tokens to text
@@ -3024,6 +3034,7 @@ async fn worker_earnings(
         "connected_peers": peers,
         "model_loaded": has_model,
         "status": if has_model && peers > 0 { "active" } else if peers > 0 { "connected_no_model" } else { "disconnected" },
+        "persistence": node.earnings_tracker.is_some(),
     }))
 }
 
