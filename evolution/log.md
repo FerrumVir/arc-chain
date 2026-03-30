@@ -72,3 +72,47 @@
 - `crates/arc-node/src/rpc.rs` (strip_special_tokens function + applied to inference_run)
 - `crates/arc-node/src/consensus.rs` (strip_special_tokens function + applied to P2P inference)
 ---
+
+## Evolution 3 — 2026-03-29 20:45
+**Commit:** 70c3f00
+**Tag:** evolution-3
+**What:** Network leaderboard endpoint + dashboard leaderboard section
+
+### Backend (crates/arc-node/src/rpc.rs)
+- Added `GET /worker/leaderboard` endpoint
+- Queries all 8 seed nodes' `/worker/earnings` endpoints in parallel using `tokio::spawn` + `reqwest` with 3s timeout
+- Deduplicates by address (prevents double-counting if a node is both seed and local)
+- Adds the local node to the list if not already present (community workers won't be seeds)
+- Labels the local node "You" for easy identification
+- Sorts by total_arc descending, then inferences descending as tiebreaker
+- Returns ranked list with: rank, address, label, total_arc, inferences, uptime_hours, status, is_seed
+- Response includes `your_rank`, `total_nodes`, `your_address`, `updated_at`
+- Route registered at `/worker/leaderboard` in the main router
+
+### Dashboard (dashboard/worker.html)
+- Added leaderboard section between earnings hero and stats row (high visibility placement)
+- Shows ranked list of all network nodes with ARC earned, inference count, status dot
+- Top 3 get colored medal dots (gold, silver, bronze)
+- "You" row highlighted with arc-500/10 background and arc-500/30 border
+- Footer stats: Your Rank, Total Nodes, Network ARC (total across all nodes)
+- Leaderboard refreshes every 15s (every 3rd refresh cycle) to avoid hammering seed nodes
+- Country flags for seed nodes, status-colored dots (green=active, yellow=connected, gray=offline)
+- Mobile responsive: inference count column hidden on small screens, text scaling matches existing pattern
+
+**Why:** Leaderboards create competition and gamification — users want to see their rank and compare against others. This is the single highest-impact engagement feature for community workers. Seeing "Rank #1" or "Rank #42 of 200" creates retention and motivation to keep nodes running.
+
+**Verified:**
+- Mac worker: leaderboard shows 9 nodes, Mac at #1 with 13,400 ARC (134 inferences)
+- NYC seed: leaderboard shows 8 seeds, labels itself "You" at #1
+- AMS seed: leaderboard shows 8 seeds, labels itself "You" at #3
+- All 8 seeds upgraded via rolling-deploy.sh, all report 8 peers
+- Dashboard serves leaderboard section on both Mac worker and seeds (12 leaderboard references in HTML)
+- Binary hash: 91073e31d2243d988914893431209acf4687ae955b08ce0578b66ce296933d48
+
+**Rollback:** `git checkout evolution-2`
+
+**Files changed:**
+- `crates/arc-node/src/rpc.rs` (worker_leaderboard handler + route registration)
+- `dashboard/worker.html` (leaderboard section HTML + updateLeaderboard() JS)
+- `evolution/log.md` (added missing Evolution 2 entry + this Evolution 3 entry)
+---
