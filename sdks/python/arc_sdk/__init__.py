@@ -61,7 +61,6 @@ from .types import (
 from .agent_runner import (
     AgentRunner,
     openai_runner,
-    anthropic_runner,
     ollama_runner,
     openclaw_runner,
 )
@@ -75,7 +74,6 @@ __all__ = [
     # Agent Runner (connect any AI model to ARC Chain)
     "AgentRunner",
     "openai_runner",
-    "anthropic_runner",
     "ollama_runner",
     "openclaw_runner",
     # ABI encoding/decoding

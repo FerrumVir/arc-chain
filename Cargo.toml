@@ -24,7 +24,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "BUSL-1.1"
-authors = ["ARC Chain Contributors"]
+authors = ["FerrumVir"]
 repository = "https://github.com/FerrumVir/arc-chain"
 
 [workspace.dependencies]

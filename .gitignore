@@ -37,4 +37,3 @@ desktop/src-tauri/target/
 rustc-ice*
 __pycache__/
 *.pyc
-.claude/

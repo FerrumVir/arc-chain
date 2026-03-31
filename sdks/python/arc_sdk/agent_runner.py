@@ -1,7 +1,7 @@
 """
 ARC Chain Agent Runner — connect any AI model to ARC Chain.
 
-The AgentRunner is the bridge between off-chain AI models (GPT-4, Claude,
+The AgentRunner is the bridge between off-chain AI models (GPT-4,
 Llama, Ollama, OpenClaw, or any HTTP API) and ARC Chain's on-chain agent
 infrastructure (registration, inference attestation, settlement).
 
@@ -28,23 +28,6 @@ Usage with OpenAI::
         inference_fn=gpt4_inference,
     )
     await runner.start()
-
-Usage with Anthropic Claude::
-
-    import anthropic
-
-    claude = anthropic.AsyncAnthropic()
-
-    async def claude_inference(input_text: str, model_id: str) -> str:
-        msg = await claude.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            messages=[{"role": "user", "content": input_text}],
-        )
-        return msg.content[0].text
-
-    runner = AgentRunner(client=client, keypair=kp, name="claude-agent",
-                         inference_fn=claude_inference)
 
 Usage with local Ollama::
 
@@ -160,7 +143,7 @@ class AgentRunner:
     5. Settles payment via zero-fee Settle TX
     6. Repeats
 
-    The inference function is yours — GPT-4, Claude, Llama, Ollama, OpenClaw,
+    The inference function is yours — GPT-4, Llama, Ollama, OpenClaw,
     a local model, or anything that takes text in and returns text out.
     """
 
@@ -452,43 +435,6 @@ def openai_runner(
             )
             resp.raise_for_status()
             return resp.json()["choices"][0]["message"]["content"]
-
-    return AgentRunner(client=client, keypair=keypair, name=name,
-                       inference_fn=_infer, model_name=model, **kwargs)
-
-
-def anthropic_runner(
-    client: ArcClient,
-    keypair: KeyPair,
-    *,
-    model: str = "claude-sonnet-4-20250514",
-    api_key: Optional[str] = None,
-    name: str = "claude-agent",
-    **kwargs,
-) -> AgentRunner:
-    """Create an AgentRunner that calls Anthropic's API."""
-    import os
-    _api_key = api_key or os.getenv("ANTHROPIC_API_KEY", "")
-
-    async def _infer(input_text: str, model_id: str) -> str:
-        import httpx
-        async with httpx.AsyncClient() as http:
-            resp = await http.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": _api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json={
-                    "model": model,
-                    "max_tokens": 1024,
-                    "messages": [{"role": "user", "content": input_text}],
-                },
-                timeout=60.0,
-            )
-            resp.raise_for_status()
-            return resp.json()["content"][0]["text"]
 
     return AgentRunner(client=client, keypair=keypair, name=name,
                        inference_fn=_infer, model_name=model, **kwargs)
