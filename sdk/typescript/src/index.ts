@@ -4,7 +4,7 @@
 // Usage:
 //   import { ArcClient } from "@arc-chain/sdk";
 //
-//   const client = new ArcClient("http://localhost:9090");
+//   const client = new ArcClient("http://localhost:9944");
 //   const health = await client.getHealth();
 //   const block  = await client.getBlock(42);
 //   const tx     = await client.getTxFull(block.tx_hashes[0]);

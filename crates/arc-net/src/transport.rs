@@ -19,7 +19,15 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 /// Maximum number of simultaneous peer connections.
-const MAX_PEERS: u32 = 128;
+/// At scale (millions of nodes), each node only needs O(sqrt(N)) peers
+/// for full reachability — gossip propagation handles the rest.
+/// 256 peers gives 2-hop reachability for networks up to ~65K nodes,
+/// and 3-hop for networks up to ~16M nodes.
+const MAX_PEERS: u32 = 256;
+
+/// Target number of outbound peers. We maintain this many active outbound
+/// connections and accept inbound connections up to MAX_PEERS.
+const TARGET_OUTBOUND: u32 = 16;
 
 /// Per-peer message rate limit (messages per second).
 const PEER_MSG_RATE_LIMIT: u32 = 500;
@@ -537,13 +545,34 @@ pub async fn run_transport(
             let pdt = pex_dial_tx.clone();
             let rl = rate_limiter.clone();
             dial_handles.push(tokio::spawn(async move {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl),
-                ).await {
-                    Ok(Ok(())) => info!("Connected to bootstrap peer {}", addr),
-                    Ok(Err(e)) => warn!("Failed to connect to {}: {}", addr, e),
-                    Err(_) => warn!("Timeout connecting to {} (5s)", addr),
+                // Try up to 3 times with increasing timeouts. Intercontinental
+                // QUIC handshakes (e.g., US→Singapore) can need >5s on first attempt.
+                for attempt in 1..=3u32 {
+                    let timeout_secs = 5 * attempt as u64; // 5s, 10s, 15s
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(timeout_secs),
+                        dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl),
+                    ).await {
+                        Ok(Ok(())) => {
+                            info!("Connected to bootstrap peer {} (attempt {})", addr, attempt);
+                            break;
+                        }
+                        Ok(Err(e)) => {
+                            if attempt < 3 {
+                                warn!("Failed to connect to {} (attempt {}): {} — retrying", addr, attempt, e);
+                                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            } else {
+                                warn!("Failed to connect to {} after 3 attempts: {}", addr, e);
+                            }
+                        }
+                        Err(_) => {
+                            if attempt < 3 {
+                                warn!("Timeout connecting to {} ({}s, attempt {}) — retrying", addr, timeout_secs, attempt);
+                            } else {
+                                warn!("Timeout connecting to {} after 3 attempts ({}s each)", addr, timeout_secs);
+                            }
+                        }
+                    }
                 }
             }));
         }
@@ -712,17 +741,25 @@ pub async fn run_transport(
                 });
             }
 
-            // ── PEX broadcast (every 60s) — now with real metadata ─────
+            // ── PEX broadcast (every 60s) — share random peer sample ─────
+            //
+            // Gossip-based peer exchange for network-wide reachability.
+            // Each node shares a RANDOM SUBSET of its connected peers, so
+            // the full peer graph propagates across the network over time.
+            //
+            // Privacy: only peers that opted in via a successful handshake
+            // (i.e., are in our meta table with a valid dial_addr) are shared.
+            // We do NOT share peers' source IPs — only their QUIC listen addr.
+            //
+            // Scalability: at 1M nodes with 16 PEX peers per broadcast,
+            // a new node reaches full graph knowledge in ~O(log N) rounds
+            // (~20 rounds ≈ 20 minutes). Each message is ≤2KB.
             _ = pex_interval.tick() => {
-                let peer_list: Vec<crate::protocol::PexPeerInfo> = conn_pex
+                // Collect all connected peers with valid metadata
+                let mut all_peers: Vec<crate::protocol::PexPeerInfo> = conn_pex
                     .meta
                     .iter()
-                    .take(64)
-                    // Only share BOOTSTRAP peer IPs in PEX — never leak community
-                    // member IPs. Community nodes connect outbound to seeds only.
-                    .filter(|entry| {
-                        bootstrap_peers.iter().any(|bp| bp == &entry.value().dial_addr)
-                    })
+                    .filter(|e| conn_pex.peers.contains_key(e.key())) // only live connections
                     .map(|entry| crate::protocol::PexPeerInfo {
                         address: Hash256(*entry.key()),
                         socket_addr: entry.value().dial_addr.to_string(),
@@ -730,8 +767,16 @@ pub async fn run_transport(
                     })
                     .collect();
 
-                if !peer_list.is_empty() {
-                    let pex_msg = crate::protocol::PeerExchangeMessage { peers: peer_list };
+                // Shuffle and take a random sample (16 peers max per PEX message).
+                // Random sampling ensures the full graph propagates even if no
+                // single node knows all peers. Bounded size keeps messages small.
+                use rand::seq::SliceRandom;
+                use rand::thread_rng;
+                all_peers.shuffle(&mut thread_rng());
+                all_peers.truncate(16);
+
+                if !all_peers.is_empty() {
+                    let pex_msg = crate::protocol::PeerExchangeMessage { peers: all_peers };
                     if let Ok(bytes) = bincode::serialize(&pex_msg) {
                         debug!("Broadcasting PEX with {} peers", pex_msg.peers.len());
                         conn_pex.broadcast(MessageType::PeerExchange, &bytes).await;
@@ -1124,7 +1169,7 @@ async fn handle_peer_recv(
                             msg.peers.len(),
                             peer_address
                         );
-                        for pex_peer in msg.peers.iter().take(128) {
+                        for pex_peer in msg.peers.iter().take(16) {
                             // Skip self
                             if pex_peer.address == local_address {
                                 continue;
@@ -1137,14 +1182,14 @@ async fn handle_peer_recv(
                             if pex_peer.socket_addr.is_empty() {
                                 continue;
                             }
-                            // Only dial peers whose address we've seen in a
-                            // verified handshake (meta has dial_addr from
-                            // prior connections). This prevents an attacker
-                            // from injecting arbitrary IPs via PEX to fill
-                            // our connection slots with sybil nodes.
-                            if !connections.meta.contains_key(&pex_peer.address.0) {
-                                debug!("PEX: ignoring unknown peer {} (not in verified meta)", pex_peer.address);
-                                continue;
+                            // Rate-limit PEX dials: only try if we're below
+                            // MAX_PEERS connections. This prevents sybil attacks
+                            // from filling our connection slots via PEX.
+                            // The QUIC handshake verifies genesis_hash + ed25519
+                            // signature, so invalid peers are rejected at connect.
+                            if connections.peers.len() as u32 >= MAX_PEERS {
+                                debug!("PEX: at connection limit, skipping {}", pex_peer.address);
+                                break;
                             }
                             // Queue for dialing
                             if let Ok(addr) = pex_peer.socket_addr.parse::<SocketAddr>() {

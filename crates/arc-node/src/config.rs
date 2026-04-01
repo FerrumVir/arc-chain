@@ -132,7 +132,7 @@ fn default_chain_id() -> String {
 }
 
 fn default_rpc_listen() -> String {
-    "0.0.0.0:9090".to_string()
+    "0.0.0.0:9944".to_string()
 }
 
 fn default_eth_port() -> u16 {
@@ -140,7 +140,7 @@ fn default_eth_port() -> u16 {
 }
 
 fn default_p2p_port() -> u16 {
-    9091
+    9945
 }
 
 fn default_validator_seed() -> String {

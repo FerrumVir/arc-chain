@@ -145,6 +145,8 @@ pub struct ModelConfig {
     pub rope_cos: Vec<i64>,
     pub rope_sin: Vec<i64>,
     pub max_seq: usize,
+    /// EOS token IDs read from GGUF metadata. Defaults to LLaMA family tokens.
+    pub eos_tokens: Vec<u32>,
 }
 
 /// Pre-converted Q4 layer weights (optional, converted at runtime).
@@ -1363,11 +1365,23 @@ impl CachedIntegerModel {
                 tokens.push(best_id);
                 pos += best_len;
             } else {
-                let byte_tok = format!("<0x{:02X}>", bytes[pos]);
-                if let Some(id) = self.vocab.iter().position(|v| v == &byte_tok) {
-                    tokens.push(id as u32);
+                // Determine the length of the current UTF-8 character to emit
+                // all its bytes as individual byte tokens without splitting mid-char.
+                let char_len = match bytes[pos] {
+                    0x00..=0x7F => 1,
+                    0xC0..=0xDF => 2,
+                    0xE0..=0xEF => 3,
+                    0xF0..=0xF7 => 4,
+                    _ => 1, // continuation byte (shouldn't happen at valid char boundary)
+                };
+                let char_end = (pos + char_len).min(bytes.len());
+                for i in pos..char_end {
+                    let byte_tok = format!("<0x{:02X}>", bytes[i]);
+                    if let Some(id) = self.vocab.iter().position(|v| v == &byte_tok) {
+                        tokens.push(id as u32);
+                    }
                 }
-                pos += 1;
+                pos = char_end;
             }
         }
         tokens
@@ -1645,11 +1659,17 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
     let device = Device::Cpu;
     let gguf_path = path.to_string();
 
-    let (n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size, vocab) = {
+    let (n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size, vocab, rope_base, eos_tokens) = {
         let mut reader = std::fs::File::open(&gguf_path)
             .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
         let content = gguf_file::Content::read(&mut reader)
             .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
+
+        // Detect architecture from GGUF metadata (supports llama, mistral, phi, gemma, qwen, etc.)
+        let arch = match content.metadata.get("general.architecture") {
+            Some(gguf_file::Value::String(s)) => s.clone(),
+            _ => "llama".to_string(), // default for LLaMA-family models
+        };
 
         let get_u32 = |key: &str| -> u32 {
             match content.metadata.get(key) {
@@ -1660,13 +1680,39 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             }
         };
 
-        let nl = get_u32("llama.block_count") as usize;
-        let dm = get_u32("llama.embedding_length") as usize;
-        let nh = get_u32("llama.attention.head_count") as usize;
-        let nkv = { let v = get_u32("llama.attention.head_count_kv"); if v > 0 { v as usize } else { nh } };
-        let dff = get_u32("llama.feed_forward_length") as usize;
+        // Architecture-agnostic metadata keys: try {arch}.key first
+        let nl = get_u32(&format!("{arch}.block_count")) as usize;
+        let dm = get_u32(&format!("{arch}.embedding_length")) as usize;
+        let nh = get_u32(&format!("{arch}.attention.head_count")) as usize;
+        let nkv = {
+            let v = get_u32(&format!("{arch}.attention.head_count_kv"));
+            if v > 0 { v as usize } else { nh }
+        };
+        let dff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
         let vs = content.tensor_infos.get("token_embd.weight")
             .map(|t| t.shape.dims()[0] as usize).unwrap_or(32000);
+
+        // Read RoPE base frequency from metadata (LLaMA-3 uses 500000, most others use 10000)
+        // Handle both F32 and F64 storage — some quantizers write F64
+        let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
+            Some(gguf_file::Value::F32(v)) => *v as f64,
+            Some(gguf_file::Value::F64(v)) => *v,
+            _ => 10000.0,
+        };
+
+        // Read EOS tokens from tokenizer metadata (scalar or array)
+        let eos_tokens = match content.metadata.get("tokenizer.ggml.eos_token_id") {
+            Some(gguf_file::Value::U32(v)) => vec![*v],
+            Some(gguf_file::Value::U64(v)) => vec![*v as u32],
+            Some(gguf_file::Value::Array(arr)) => {
+                arr.iter().filter_map(|v| match v {
+                    gguf_file::Value::U32(n) => Some(*n),
+                    gguf_file::Value::U64(n) => Some(*n as u32),
+                    _ => None,
+                }).collect()
+            }
+            _ => vec![2, 128001, 128009], // LLaMA-2/3 defaults
+        };
 
         let vocab = match content.metadata.get("tokenizer.ggml.tokens") {
             Some(gguf_file::Value::Array(arr)) => {
@@ -1678,7 +1724,9 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             _ => Vec::new(),
         };
 
-        (nl, dm, nh, nkv, dff, vs, vocab)
+        info!(arch = %arch, rope_base = %rope_base, eos = ?eos_tokens, "GGUF architecture detected");
+
+        (nl, dm, nh, nkv, dff, vs, vocab, rope_base, eos_tokens)
     };
 
     let d_head = d_model / n_heads;
@@ -1754,7 +1802,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
     }
 
     let max_seq = 2048;
-    let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, 10000.0);
+    let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
     // 1/sqrt(d_head) in Q16 — integer_isqrt already returns ONE/sqrt(x/ONE)
     let attn_scale = integer_isqrt((d_head as i64) * ONE);
 
@@ -1768,6 +1816,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         config: ModelConfig {
             n_layers, d_model, n_heads, n_kv_heads, d_ff, d_head, d_kv,
             vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
+            eos_tokens: eos_tokens.clone(),
         },
         embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
@@ -1853,10 +1902,14 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
 
     info!("Binary model loaded: {} layers, d={}, vocab={}", n_layers, d_model, vocab_size);
 
+    // Binary format doesn't store EOS tokens; use LLaMA family defaults
+    let eos_tokens = vec![2u32, 128001, 128009];
+
     Ok(CachedIntegerModel {
         config: ModelConfig {
             n_layers, d_model, n_heads, n_kv_heads, d_ff, d_head, d_kv,
             vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
+            eos_tokens,
         },
         embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
@@ -1916,6 +1969,7 @@ mod tests {
                 n_layers: nl, d_model: d, n_heads: nh, n_kv_heads: nkv,
                 d_ff: dff, d_head: dh, d_kv: dkv, vocab_size: vs,
                 attn_scale, rope_cos, rope_sin, max_seq: 512,
+                eos_tokens: vec![2, 128001, 128009],
             },
             embedding_q16, embedding_i8, layers, final_norm: vec![ONE; d], output_weight,
             vocab: (0..vs).map(|i| format!("tok_{}", i)).collect(),

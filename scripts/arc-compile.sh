@@ -193,8 +193,8 @@ if solc "${SOLC_ARGS[@]}"; then
   echo "  CREATE2: addr = keccak256(0xff ++ deployer ++ salt ++ keccak256(init_code))[12:]"
   echo ""
   echo -e "${BOLD}Deploy to ARC Chain:${NC}"
-  echo "  Local:   cast send --rpc-url http://localhost:9090/eth --private-key \$KEY --create \$(cat ${OUTPUT_DIR}/${SOURCE_NAME}.bin)"
-  echo "  Testnet: cast send --rpc-url http://testnet.arc.ai:9090/eth --private-key \$KEY --create \$(cat ${OUTPUT_DIR}/${SOURCE_NAME}.bin)"
+  echo "  Local:   cast send --rpc-url http://localhost:9944/eth --private-key \$KEY --create \$(cat ${OUTPUT_DIR}/${SOURCE_NAME}.bin)"
+  echo "  Testnet: cast send --rpc-url http://testnet.arc.ai:9944/eth --private-key \$KEY --create \$(cat ${OUTPUT_DIR}/${SOURCE_NAME}.bin)"
 else
   echo ""
   err "Compilation failed."

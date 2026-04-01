@@ -126,7 +126,7 @@ Create a wallet, claim free tokens, and send transfers — all in your browser.
 | SAO | Sao Paulo | `http://216.238.120.27:9090` |
 | JNB | Johannesburg | `http://139.84.237.49:9090` |
 
-> **Ports**: 9090 = RPC API (curl, browser, wallet), 9091 = P2P consensus (nodes talk to each other). You only need 9090.
+> **Ports**: Default RPC is 9944 (configurable via `--rpc`), P2P is 9945 (configurable via `--p2p-port`). The live testnet above uses 9090 (legacy). You only need the RPC port.
 
 ```bash
 # Quick test from terminal
@@ -157,7 +157,7 @@ Earn ARC by running AI inference for the network. Your IP stays private.
 
 Once running, test inference locally:
 ```bash
-curl -X POST http://localhost:9090/inference/run \
+curl -X POST http://localhost:9944/inference/run \
   -H 'Content-Type: application/json' \
   -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":32}'
 ```
@@ -179,23 +179,23 @@ make faucet        # Run testnet faucet
 
 ```bash
 # Chain stats
-curl http://localhost:9090/stats
+curl http://localhost:9944/stats
 # {"chain":"ARC Chain","dag_round":937,"dag_committed":570,"validators":8,
 #  "connected_peers":7,"total_transactions":42,"benchmark_tps":9000}
 
 # Node health
-curl http://localhost:9090/health
+curl http://localhost:9944/health
 # {"status":"ok","peers":7,"dag_round":937,"dag_committed":570,
 #  "validators":8,"uptime_secs":3600}
 
 # Run AI inference (requires --with-inference flag at startup)
-curl -X POST http://localhost:9090/inference/run \
+curl -X POST http://localhost:9944/inference/run \
   -H 'Content-Type: application/json' \
   -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":16}'
 # Returns: output text, output hash (identical on ALL hardware), ms/token
 
 # View inference attestations on-chain
-curl http://localhost:9090/inference/attestations
+curl http://localhost:9944/inference/attestations
 
 # Monitor all 8 testnet nodes in your terminal
 ./scripts/monitor-testnet.sh
@@ -207,7 +207,7 @@ curl http://localhost:9090/inference/attestations
 
 **From terminal:**
 ```bash
-curl -X POST http://localhost:9090/faucet/claim \
+curl -X POST http://localhost:9944/faucet/claim \
   -H 'Content-Type: application/json' \
   -d '{"address":"your-wallet-address-from-the-web-wallet"}'
 ```

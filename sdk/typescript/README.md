@@ -15,7 +15,7 @@ npm install @arc-chain/sdk
 ```typescript
 import { ArcClient } from "@arc-chain/sdk";
 
-const client = new ArcClient("http://localhost:9090");
+const client = new ArcClient("http://localhost:9944");
 
 // Check node health
 const health = await client.getHealth();
@@ -177,7 +177,7 @@ console.log(claim.tx_hash, claim.amount, claim.message);
 
 ### ETH JSON-RPC Compatibility
 
-ARC Chain exposes an Ethereum-compatible JSON-RPC on `/eth` (port 9090) and port 8545.
+ARC Chain exposes an Ethereum-compatible JSON-RPC on `/eth` (port 9944) and port 8545.
 
 ```typescript
 // Raw JSON-RPC call

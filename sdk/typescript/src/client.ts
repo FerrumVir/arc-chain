@@ -68,7 +68,7 @@ export class ArcRpcError extends Error {
  * ```ts
  * import { ArcClient } from "@arc-chain/sdk";
  *
- * const client = new ArcClient("http://localhost:9090");
+ * const client = new ArcClient("http://localhost:9944");
  *
  * const health = await client.getHealth();
  * console.log(health.status); // "ok"
@@ -85,7 +85,7 @@ export class ArcClient {
   /**
    * Create a new ARC Chain RPC client.
    *
-   * @param rpcUrl - Base URL of the ARC Chain node (e.g. `"http://localhost:9090"`).
+   * @param rpcUrl - Base URL of the ARC Chain node (e.g. `"http://localhost:9944"`).
    * @param options - Optional configuration.
    * @param options.timeout - Request timeout in milliseconds (default: 30000).
    * @param options.headers - Additional headers to include on every request.

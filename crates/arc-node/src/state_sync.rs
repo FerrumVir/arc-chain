@@ -151,7 +151,7 @@ impl StateSyncManager {
                 }
             }
         }
-        Err(last_err.unwrap())
+        Err(last_err.unwrap_or(SyncError::ChunkVerificationFailed { index: chunk_index }))
     }
 
     /// Run the full state sync protocol:

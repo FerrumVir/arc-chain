@@ -13,8 +13,8 @@ echo "╚═══════════════════════�
 echo ""
 
 # Parse args
-RPC_PORT="${RPC_PORT:-9090}"
-P2P_PORT="${P2P_PORT:-9091}"  
+RPC_PORT="${RPC_PORT:-9944}"
+P2P_PORT="${P2P_PORT:-9945}"
 STAKE="${STAKE:-5000000}"
 DATA_DIR="${DATA_DIR:-$HOME/.arc-chain}"
 PEERS="${PEERS:-}"

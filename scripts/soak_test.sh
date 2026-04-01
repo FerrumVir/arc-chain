@@ -59,7 +59,7 @@ echo "[2/3] Starting $NODES validator nodes..."
 # Start nodes
 PIDS=()
 for i in $(seq 0 $((NODES - 1))); do
-    PORT_RPC=$((9090 + i))
+    PORT_RPC=$((9944 + i))
     PORT_P2P=$((9100 + i))
     NODE_LOG="$LOG_DIR/node-${i}.log"
 

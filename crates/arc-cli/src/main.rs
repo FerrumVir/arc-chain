@@ -82,7 +82,7 @@ async fn main() {
 
     let rpc_url = cli.rpc
         .or_else(|| std::env::var("ARC_RPC_URL").ok())
-        .unwrap_or_else(|| "http://localhost:9090".to_string());
+        .unwrap_or_else(|| "http://localhost:9944".to_string());
     let rpc_client = rpc::RpcClient::new(&rpc_url);
 
     let result = match cli.command {

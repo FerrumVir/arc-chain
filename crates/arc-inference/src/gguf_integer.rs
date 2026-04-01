@@ -89,15 +89,31 @@ pub fn generate_integer_from_gguf(
     let content = gguf_file::Content::read(&mut reader)
         .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
 
-    // Read model config from metadata
-    let n_layers = get_meta_u32(&content, "llama.block_count")? as usize;
-    let d_model = get_meta_u32(&content, "llama.embedding_length")? as usize;
-    let n_heads = get_meta_u32(&content, "llama.attention.head_count")? as usize;
-    let n_kv_heads = get_meta_u32(&content, "llama.attention.head_count_kv").unwrap_or(n_heads as u32) as usize;
-    let d_ff = get_meta_u32(&content, "llama.feed_forward_length")? as usize;
+    // Detect architecture from GGUF metadata (supports llama, mistral, phi, gemma, qwen, etc.)
+    let arch = match content.metadata.get("general.architecture") {
+        Some(gguf_file::Value::String(s)) => s.clone(),
+        _ => "llama".to_string(),
+    };
+
+    // Read model config from metadata using architecture-specific keys
+    let n_layers = get_meta_u32(&content, &format!("{arch}.block_count"))? as usize;
+    let d_model = get_meta_u32(&content, &format!("{arch}.embedding_length"))? as usize;
+    let n_heads = get_meta_u32(&content, &format!("{arch}.attention.head_count"))? as usize;
+    let n_kv_heads = get_meta_u32(&content, &format!("{arch}.attention.head_count_kv")).unwrap_or(n_heads as u32) as usize;
+    let d_ff = get_meta_u32(&content, &format!("{arch}.feed_forward_length"))? as usize;
     let vocab_size = content.tensor_infos.get("token_embd.weight")
         .map(|t| t.shape.dims()[0] as usize)
         .unwrap_or(32000);
+
+    // Read RoPE base frequency from metadata (LLaMA-3 uses 500000, most others use 10000)
+    // Handle both F32 and F64 storage — some quantizers write F64
+    let _rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
+        Some(gguf_file::Value::F32(v)) => *v as f64,
+        Some(gguf_file::Value::F64(v)) => *v,
+        _ => 10000.0,
+    };
+    // NOTE: RoPE not yet applied in this streaming forward pass (pre-existing gap).
+    // The CachedIntegerModel path (load_cached_model) does apply RoPE via precomputed tables.
     let d_head = d_model / n_heads;
     let d_kv = d_head * n_kv_heads;
 

@@ -18,8 +18,8 @@ TEST_ACCOUNT_BALANCE=1000000000000  # 1T ARC per test account
 FAUCET_BALANCE=100000000000000    # 100T ARC for faucet
 NUM_TEST_ACCOUNTS=100
 
-BASE_P2P_PORT=9091
-BASE_RPC_PORT=9090
+BASE_P2P_PORT=9945
+BASE_RPC_PORT=9944
 
 # ── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -169,7 +169,7 @@ SEED_ADDRESS="127.0.0.1:${SEED_P2P_PORT}"
 
 for i in $(seq 0 $((NUM_VALIDATORS - 1))); do
     local_p2p_port=$((BASE_P2P_PORT + i))
-    # RPC ports: 9090, 9190, 9290, 9390 (spaced by 100)
+    # RPC ports: 9944, 10044, 10144, 10244 (spaced by 100)
     local_rpc_port=$((BASE_RPC_PORT + i * 100))
 
     CONFIG_FILE="$OUTPUT_DIR/config-validator-${i}.toml"
@@ -261,5 +261,5 @@ echo -e "  3. Monitor the testnet:"
 echo -e "     ${DIM}./scripts/monitor-testnet.sh${NC}"
 echo ""
 echo -e "  4. Use the faucet to fund accounts:"
-echo -e "     ${DIM}curl -X POST http://127.0.0.1:9090/faucet -d '{\"address\": \"...\", \"amount\": 1000}'${NC}"
+echo -e "     ${DIM}curl -X POST http://127.0.0.1:9944/faucet -d '{\"address\": \"...\", \"amount\": 1000}'${NC}"
 echo ""

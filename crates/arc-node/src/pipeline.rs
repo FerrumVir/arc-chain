@@ -197,18 +197,19 @@ impl Pipeline {
     /// Create and start the pipeline with the given config.
     ///
     /// Spawns 3 background threads (verify, execute, commit).
-    pub fn with_config(state: Arc<StateDB>, config: PipelineConfig) -> Self {
+    pub fn with_config(mut state: Arc<StateDB>, config: PipelineConfig) -> Self {
         // Enable GPU state cache if requested.
         if config.gpu_state_enabled || config.execution_mode == ExecutionMode::GpuResident {
             let gpu_config = arc_state::gpu_state::GpuStateCacheConfig {
                 max_gpu_accounts: config.gpu_state_capacity,
                 ..Default::default()
             };
-            // Safety: we need &mut but state is behind Arc. The enable_gpu_cache
-            // is called once at startup before any concurrent access.
-            unsafe {
-                let state_ptr = Arc::as_ptr(&state) as *mut StateDB;
-                (*state_ptr).enable_gpu_cache(gpu_config);
+            // Safe: Arc::get_mut succeeds because no other Arcs or Weaks
+            // exist yet — this runs at startup before thread spawning below.
+            if let Some(state_mut) = Arc::get_mut(&mut state) {
+                state_mut.enable_gpu_cache(gpu_config);
+            } else {
+                warn!("Cannot enable GPU cache: Arc has multiple owners (startup ordering bug)");
             }
             info!(
                 capacity = config.gpu_state_capacity,

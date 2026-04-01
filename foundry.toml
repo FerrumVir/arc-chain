@@ -21,8 +21,8 @@ quote_style = "double"
 number_underscore = "thousands"
 
 [profile.default.rpc_endpoints]
-arc_local = "http://localhost:9090/eth"
-arc_testnet = "http://testnet.arc.ai:9090/eth"
+arc_local = "http://localhost:9944/eth"
+arc_testnet = "http://testnet.arc.ai:9944/eth"
 
 [etherscan]
 arc = { key = "", chain = 42069, url = "http://localhost:3000/api/verify" }

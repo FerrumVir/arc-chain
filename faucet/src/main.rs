@@ -47,7 +47,7 @@ mod hex {
 #[command(name = "arc-faucet", about = "ARC Chain testnet faucet")]
 struct Cli {
     /// ARC node RPC URL
-    #[arg(long, default_value = "http://localhost:9090")]
+    #[arg(long, default_value = "http://localhost:9944")]
     node_url: String,
 
     /// Faucet HTTP listen port

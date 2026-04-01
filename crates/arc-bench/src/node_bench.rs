@@ -8,8 +8,8 @@
 ///
 /// Usage:
 ///   arc-bench-node live [--port 8080]
-///   arc-bench-node worker [--port 9090] [--coord http://coordinator:8080]
-///   arc-bench-node coord --nodes http://node1:9090,http://node2:9090 [--n 1000000]
+///   arc-bench-node worker [--port 9944] [--coord http://coordinator:8080]
+///   arc-bench-node coord --nodes http://node1:9944,http://node2:9944 [--n 1000000]
 ///   arc-bench-node local [--n 1000000]
 
 use arc_crypto::*;
@@ -711,7 +711,7 @@ async fn main() {
         Some("worker") => {
             let port = get_arg(&args, "--port")
                 .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(9090);
+                .unwrap_or(9944);
             let coord = get_arg(&args, "--coord");
             run_worker(port, coord).await;
         }
@@ -735,7 +735,7 @@ async fn main() {
             eprintln!();
             eprintln!("Usage:");
             eprintln!("  arc-bench-node live     [--port 8080]                             Live dashboard coordinator");
-            eprintln!("  arc-bench-node worker   [--port 9090] [--coord http://host:8080]  Benchmark worker");
+            eprintln!("  arc-bench-node worker   [--port 9944] [--coord http://host:8080]  Benchmark worker");
             eprintln!("  arc-bench-node coord    --nodes url1,url2 [--n 1000000]           One-shot aggregation");
             eprintln!("  arc-bench-node local    [--n 1000000]                             Local benchmark");
         }

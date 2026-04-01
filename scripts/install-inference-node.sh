@@ -35,7 +35,7 @@ Type=simple
 User=$USER
 WorkingDirectory=$REPO_ROOT
 ExecStart=$REPO_ROOT/target/release/arc-node \\
-    --rpc 0.0.0.0:9090 \\
+    --rpc 0.0.0.0:9944 \\
     --seeds-file $REPO_ROOT/testnet-seeds.txt \\
     --genesis $REPO_ROOT/genesis.toml \\
     --validator-seed "$SEED" \\

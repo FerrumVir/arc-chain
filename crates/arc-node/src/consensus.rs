@@ -839,13 +839,20 @@ impl ConsensusManager {
                             // Await pre-verification with timeout to prevent deadlock.
                             // If the spawned task hangs (runtime starvation), fall
                             // back to unverified txs after 5 seconds.
+                            // All validators must execute the same tx set to agree on
+                            // state root. NEVER truncate — different validators could
+                            // truncate at different points, causing a consensus fork.
                             committed_txs = match tokio::time::timeout(
                                 tokio::time::Duration::from_secs(5),
                                 pre_verify_handle,
                             ).await {
                                 Ok(Ok(verified_txs)) => verified_txs,
-                                _ => {
-                                    warn!("Pre-verify timeout or error — using unverified txs");
+                                Ok(Err(e)) => {
+                                    warn!("Pre-verify error: {e} — proceeding with unverified txs");
+                                    committed_txs
+                                }
+                                Err(_) => {
+                                    warn!("Pre-verify timeout — proceeding with unverified txs");
                                     committed_txs
                                 }
                             };
@@ -978,19 +985,24 @@ impl ConsensusManager {
                                         elapsed_ms = start.elapsed().as_millis(),
                                         "Block verified (state diff applied)"
                                     );
+                                    if let Some(mut proof) = self.engine.finality_proofs.get_mut(&dag_block.hash) {
+                                        proof.height = state.height();
+                                    }
                                 } else {
-                                    // FRAUD DETECTED: proposer's state diff doesn't match.
+                                    // FRAUD DETECTED: proposer's state diff doesn't match
+                                    // our independent verification. Do NOT update finality
+                                    // proof — this block should not be considered verified.
+                                    // State was already mutated by apply_state_diff; the
+                                    // computed root is our ground truth (not the proposer's).
                                     warn!(
                                         hash = %dag_block.hash,
                                         expected = %diff.new_root,
                                         computed = %verified_root,
-                                        "FRAUD: state diff root mismatch — proposer may be malicious"
+                                        proposer = %dag_block.author,
+                                        "FRAUD: state diff root mismatch — block NOT finalized"
                                     );
-                                    // TODO: submit fraud proof, slash proposer
-                                }
-
-                                if let Some(mut proof) = self.engine.finality_proofs.get_mut(&dag_block.hash) {
-                                    proof.height = state.height();
+                                    // TODO: submit on-chain fraud proof for economic slashing
+                                    // TODO: re-execute from committed_txs to recover correct state
                                 }
                             }
                         }

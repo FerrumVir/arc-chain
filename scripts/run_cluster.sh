@@ -33,7 +33,7 @@ echo ""
 PIDS=()
 
 for i in $(seq 0 $((NUM_NODES - 1))); do
-    RPC_PORT=$((9090 + i))
+    RPC_PORT=$((9944 + i))
     P2P_PORT=$((9100 + i))
     SEED="arc-benchmark-validator-$i"
     SENDER_START=$((i * SENDERS_PER_NODE))
@@ -67,7 +67,7 @@ done
 
 echo ""
 echo "$NUM_NODES nodes launched."
-echo "RPC endpoints: http://127.0.0.1:9090 .. http://127.0.0.1:$((9090 + NUM_NODES - 1))"
+echo "RPC endpoints: http://127.0.0.1:9944 .. http://127.0.0.1:$((9944 + NUM_NODES - 1))"
 echo ""
 echo "Press Ctrl+C to stop all nodes, or run: $0 stop"
 echo ""

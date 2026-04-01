@@ -689,9 +689,11 @@ impl InferenceEngine {
         match input {
             InferenceInput::Text(text) => {
                 // Simple char-level tokenization → embedding indices → forward → decode.
+                // Use full Unicode codepoint (clamped to embedding table size) to
+                // preserve character identity for non-ASCII input (Cyrillic, CJK, etc.).
                 let char_indices: Vec<f32> = text
                     .chars()
-                    .map(|c| (c as u32 % 256) as f32)
+                    .map(|c| (c as u32).min(65535) as f32)
                     .collect();
                 let raw_output = net.forward(&char_indices);
                 // Interpret output as per-character logits and decode via argmax
@@ -724,20 +726,19 @@ impl InferenceEngine {
     }
 
     /// Decode a raw float vector into a string.
-    /// Each value is clamped to a printable ASCII char via argmax over
-    /// groups of `vocab_size` logits, or if the vector is short, each
-    /// value is mapped to a char directly.
+    /// Each value is mapped to a Unicode codepoint. Supports full BMP
+    /// (Basic Multilingual Plane) output including Cyrillic, CJK, etc.
     fn decode_output(output: &[f32]) -> String {
         if output.is_empty() {
             return String::new();
         }
-        // Simple: map each output float to a char index mod 256.
         output
             .iter()
-            .map(|&v| {
-                let idx = ((v.abs() * 100.0) as u32) % 128;
-                let ch = if idx < 32 { idx + 32 } else { idx };
-                char::from(ch as u8)
+            .filter_map(|&v| {
+                let idx = ((v.abs() * 100.0) as u32) % 65536;
+                // Clamp to printable range: skip control chars, use space as floor
+                let cp = if idx < 32 { idx + 32 } else { idx };
+                char::from_u32(cp)
             })
             .collect()
     }

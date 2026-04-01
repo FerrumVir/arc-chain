@@ -4,12 +4,12 @@
 # Peer addresses are populated by setup-testnet.sh after provisioning.
 
 [rpc]
-listen = "0.0.0.0:9090"
+listen = "0.0.0.0:9944"
 eth_port = 8545
 
 [p2p]
-port = 9091
-peers = ["__NODE_0_IP__:9091", "__NODE_1_IP__:9091", "__NODE_2_IP__:9091"]
+port = 9945
+peers = ["__NODE_0_IP__:9945", "__NODE_1_IP__:9945", "__NODE_2_IP__:9945"]
 
 [validator]
 seed = "arc-validator-3"

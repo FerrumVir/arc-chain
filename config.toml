@@ -6,12 +6,12 @@
 # Usage: arc-node --config config.toml
 
 [rpc]
-listen = "0.0.0.0:9090"
+listen = "0.0.0.0:9944"
 eth_port = 8545
 
 [p2p]
-port = 9091
-# peers = ["1.2.3.4:9091", "5.6.7.8:9091"]
+port = 9945
+# peers = ["1.2.3.4:9945", "5.6.7.8:9945"]
 
 [validator]
 seed = "arc-validator-0"

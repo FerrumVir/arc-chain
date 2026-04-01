@@ -9,7 +9,7 @@ Usage::
     from arc_sdk import ArcClient, KeyPair, TransactionBuilder
 
     # Connect to a node
-    client = ArcClient("http://localhost:9090")
+    client = ArcClient("http://localhost:9944")
 
     # Generate a key pair
     kp = KeyPair.generate()

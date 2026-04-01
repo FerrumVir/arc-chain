@@ -10,7 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 BIN="$PROJECT_DIR/target/release/arc-node"
 TESTNET_DIR="/tmp/arc-testnet"
-BASE_RPC_PORT=9090
+BASE_RPC_PORT=9944
 BASE_P2P_PORT=9190
 STAKE=5000000
 
@@ -61,8 +61,8 @@ usage() {
     echo "  testnet.sh bench [TPS]   Benchmark with a burst of transactions (default: 1000)"
     echo ""
     echo -e "${BOLD}Examples:${NC}"
-    echo "  testnet.sh start         # 4-node testnet on ports 9090-9093"
-    echo "  testnet.sh start 8       # 8-node testnet on ports 9090-9097"
+    echo "  testnet.sh start         # 4-node testnet on ports 9944-9947"
+    echo "  testnet.sh start 8       # 8-node testnet on ports 9944-9951"
     echo "  testnet.sh status        # Health-check all running nodes"
     echo "  testnet.sh bench 5000    # Send 5000 transactions to node 0"
     echo ""

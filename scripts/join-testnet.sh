@@ -71,14 +71,14 @@ echo -e "${YELLOW}[3/4] Validator identity: ${SEED}${NC}"
 # ─── Start node ──────────────────────────────────────────────────────────────
 echo -e "${YELLOW}[4/4] Starting node and connecting to testnet...${NC}"
 echo ""
-echo -e "${GREEN}  RPC:       http://localhost:9090${NC}"
-echo -e "${GREEN}  Health:    http://localhost:9090/health${NC}"
-echo -e "${GREEN}  Stats:     http://localhost:9090/stats${NC}"
+echo -e "${GREEN}  RPC:       http://localhost:9944${NC}"
+echo -e "${GREEN}  Health:    http://localhost:9944/health${NC}"
+echo -e "${GREEN}  Stats:     http://localhost:9944/stats${NC}"
 echo -e "${GREEN}  Explorer:  cd explorer && npm run dev → http://localhost:3100${NC}"
 echo ""
 
 if [[ -n "$MODEL_FLAG" ]]; then
-    echo -e "${GREEN}  Inference: curl -X POST http://localhost:9090/inference/run \\${NC}"
+    echo -e "${GREEN}  Inference: curl -X POST http://localhost:9944/inference/run \\${NC}"
     echo -e "${GREEN}    -H 'Content-Type: application/json' \\${NC}"
     echo -e "${GREEN}    -d '{\"input\":\"[INST] What is 2+2? [/INST]\",\"max_tokens\":16}'${NC}"
     echo ""
@@ -89,7 +89,7 @@ echo "Press Ctrl+C to stop."
 echo ""
 
 ./target/release/arc-node \
-    --rpc 0.0.0.0:9090 \
+    --rpc 0.0.0.0:9944 \
     --seeds-file testnet-seeds.txt \
     --genesis genesis.toml \
     --validator-seed "$SEED" \

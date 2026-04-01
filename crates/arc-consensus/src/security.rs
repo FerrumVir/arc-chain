@@ -437,8 +437,10 @@ impl StakeTracker {
             if hashes.len() >= 2 {
                 // Take the first two distinct hashes as evidence.
                 let mut iter = hashes.iter();
-                let vote1 = *iter.next().unwrap();
-                let vote2 = *iter.next().unwrap();
+                let (vote1, vote2) = match (iter.next(), iter.next()) {
+                    (Some(&v1), Some(&v2)) => (v1, v2),
+                    _ => continue,
+                };
 
                 warn!(
                     validator = %validator,

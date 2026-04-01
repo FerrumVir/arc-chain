@@ -6,7 +6,7 @@ use std::path::PathBuf;
 pub struct RelayerConfig {
     /// Ethereum JSON-RPC endpoint (e.g. "https://mainnet.infura.io/v3/...")
     pub eth_rpc_url: String,
-    /// ARC Chain RPC endpoint (e.g. "http://localhost:9090")
+    /// ARC Chain RPC endpoint (e.g. "http://localhost:9944")
     pub arc_rpc_url: String,
     /// ArcBridge.sol contract address on Ethereum
     pub bridge_contract: String,
@@ -26,7 +26,7 @@ impl Default for RelayerConfig {
     fn default() -> Self {
         Self {
             eth_rpc_url: "https://mainnet.infura.io/v3/YOUR_KEY".into(),
-            arc_rpc_url: "http://localhost:9090".into(),
+            arc_rpc_url: "http://localhost:9944".into(),
             bridge_contract: "0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499".into(),
             relayer_private_key: String::new(),
             eth_private_key: String::new(),

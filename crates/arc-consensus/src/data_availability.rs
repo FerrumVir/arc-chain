@@ -198,8 +198,11 @@ pub fn decode_block_data(encoding: &ErasureEncoding) -> Result<Vec<u8>, String> 
     // If all data chunks are present, fast path
     if available_data == k {
         let mut result = Vec::with_capacity(encoding.original_size);
-        for slot in &data_slots {
-            result.extend_from_slice(slot.as_ref().unwrap());
+        for (i, slot) in data_slots.iter().enumerate() {
+            match slot.as_ref() {
+                Some(data) => result.extend_from_slice(data),
+                None => return Err(format!("data slot {i} unexpectedly None despite count={available_data}")),
+            }
         }
         result.truncate(encoding.original_size);
         return Ok(result);

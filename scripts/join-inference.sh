@@ -81,12 +81,12 @@ echo -e "${YELLOW}[3/5] Your inference node ID: ${SEED}${NC}"
 echo -e "${YELLOW}[4/5] Connecting to ARC testnet...${NC}"
 echo ""
 echo -e "${GREEN}  Your node:${NC}"
-echo -e "${GREEN}    RPC:        http://localhost:9090${NC}"
-echo -e "${GREEN}    Health:     http://localhost:9090/health${NC}"
-echo -e "${GREEN}    Inference:  http://localhost:9090/inference/run${NC}"
+echo -e "${GREEN}    RPC:        http://localhost:9944${NC}"
+echo -e "${GREEN}    Health:     http://localhost:9944/health${NC}"
+echo -e "${GREEN}    Inference:  http://localhost:9944/inference/run${NC}"
 echo ""
 echo -e "${GREEN}  Try inference:${NC}"
-echo -e "${GREEN}    curl -X POST http://localhost:9090/inference/run \\${NC}"
+echo -e "${GREEN}    curl -X POST http://localhost:9944/inference/run \\${NC}"
 echo -e "${GREEN}      -H 'Content-Type: application/json' \\${NC}"
 echo -e "${GREEN}      -d '{\"input\":\"[INST] What is 2+2? [/INST]\",\"max_tokens\":32}'${NC}"
 echo ""
@@ -101,7 +101,7 @@ echo "Press Ctrl+C to stop."
 echo ""
 
 ./target/release/arc-node \
-    --rpc 0.0.0.0:9090 \
+    --rpc 0.0.0.0:9944 \
     --seeds-file testnet-seeds.txt \
     --genesis genesis.toml \
     --validator-seed "$SEED" \

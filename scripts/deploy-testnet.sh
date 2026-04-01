@@ -140,7 +140,7 @@ generate_seeds() {
     echo "# 8 nodes across 6 continents" >> "$SEEDS_FILE"
 
     while IFS=' ' read -r label ip; do
-        echo "$ip:9091  # $label" >> "$SEEDS_FILE"
+        echo "$ip:9945  # $label" >> "$SEEDS_FILE"
     done < "$IP_FILE"
 
     ok "Seeds file: $SEEDS_FILE"
@@ -185,11 +185,11 @@ cp /tmp/seeds.txt /root/.arc-chain/seeds.txt
 # Update config with seeds file path
 cat > /root/.arc-chain/config.toml <<'TOML'
 [rpc]
-listen = "0.0.0.0:9090"
+listen = "0.0.0.0:9944"
 eth_port = 8545
 
 [p2p]
-port = 9091
+port = 9945
 peers = []
 
 [validator]
@@ -202,8 +202,8 @@ data_dir = "/root/.arc-chain/data"
 TOML
 
 # Open firewall ports
-ufw allow 9090/tcp >/dev/null 2>&1 || true   # RPC
-ufw allow 9091/udp >/dev/null 2>&1 || true   # P2P QUIC
+ufw allow 9944/tcp >/dev/null 2>&1 || true   # RPC
+ufw allow 9945/udp >/dev/null 2>&1 || true   # P2P QUIC
 ufw allow 8545/tcp >/dev/null 2>&1 || true   # ETH RPC
 ufw allow 22/tcp   >/dev/null 2>&1 || true   # SSH
 

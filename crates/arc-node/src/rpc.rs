@@ -784,7 +784,7 @@ async fn faucet_status(
         .unwrap_or(0);
     Json(FaucetStatusResponse {
         address: faucet_addr.to_hex(),
-        node_url: format!("http://localhost:9090"),
+        node_url: format!("http://localhost:9944"),
         claims_today: node.faucet_claims_total.load(Ordering::Relaxed),
         claim_amount: FAUCET_CLAIM_AMOUNT,
         rate_limit_secs: FAUCET_RATE_LIMIT_SECS,
@@ -2667,6 +2667,15 @@ async fn inference_run(
     let input_text = req.get("input")
         .and_then(|v| v.as_str())
         .unwrap_or("Hello, world!");
+
+    // Validate input: reject null bytes, enforce max length
+    if input_text.len() > 32_768 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
+    }
+    if input_text.contains('\0') {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Input contains null bytes"));
+    }
+
     let max_tokens = req.get("max_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(64)
@@ -2716,8 +2725,7 @@ async fn inference_run(
         (gen_tokens, result.output_hash, "candle Q4 (float, deterministic per-arch)")
     } else {
         // Integer engine fallback
-        let eos_tokens = vec![2u32, 0];
-        let (generated, hash) = model.generate(&prompt_tokens, max_tokens, &eos_tokens);
+        let (generated, hash) = model.generate(&prompt_tokens, max_tokens, &model.config.eos_tokens);
         (generated, hash, "INT8 integer (cross-platform deterministic)")
     };
 

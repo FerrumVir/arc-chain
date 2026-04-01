@@ -18,12 +18,12 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "arc-node", version, about = "ARC Chain Node")]
 struct Cli {
-    /// RPC listen address
-    #[arg(long, default_value = "0.0.0.0:9090")]
+    /// RPC listen address (changed from 9090 to avoid Prometheus default port conflict)
+    #[arg(long, default_value = "0.0.0.0:9944")]
     rpc: String,
 
-    /// P2P listen port (QUIC)
-    #[arg(long, default_value_t = 9091)]
+    /// P2P listen port (QUIC) (changed from 9091 to avoid Transmission BitTorrent default)
+    #[arg(long, default_value_t = 9945)]
     p2p_port: u16,
 
     /// Validator stake in ARC (0 = observer node)

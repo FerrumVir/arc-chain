@@ -11,7 +11,7 @@ Usage with OpenAI::
     from arc_sdk.agent_runner import AgentRunner
     import openai
 
-    client = ArcClient("http://localhost:9090")
+    client = ArcClient("http://localhost:9944")
     kp = KeyPair.from_seed(blake3.blake3(b"my-agent-seed").digest())
 
     async def gpt4_inference(input_text: str, model_id: str) -> str:

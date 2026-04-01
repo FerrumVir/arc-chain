@@ -25,7 +25,7 @@ set -euo pipefail
 #
 # After running:
 #   - Explorer: http://YOUR_VPS_IP:3100 (or https://DOMAIN if set)
-#   - RPC API:  http://YOUR_VPS_IP:9090
+#   - RPC API:  http://YOUR_VPS_IP:9944
 #   - Node logs: journalctl -u arc-node -f
 #   - Explorer logs: journalctl -u arc-explorer -f
 # ══════════════════════════════════════════════════════════════════════════════
@@ -33,7 +33,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 DOMAIN="${DOMAIN:-}"
-NODE_PORT=9090
+NODE_PORT=9944
 EXPLORER_PORT=3100
 
 echo "═══════════════════════════════════════════════════════════"

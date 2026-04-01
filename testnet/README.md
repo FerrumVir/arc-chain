@@ -37,15 +37,15 @@ cargo run --release -p arc-node -- --config testnet/validator-1.toml --peers SEE
 ## Monitor
 
 ```bash
-bash scripts/monitor-testnet.sh localhost:9090 localhost:9190 localhost:9290 localhost:9390
+bash scripts/monitor-testnet.sh localhost:9944 localhost:9190 localhost:9290 localhost:9390
 ```
 
 ## Testnet Goals
 
 | Day | Target | How to Verify |
 |-----|--------|--------------|
-| 1 | 4+ nodes connected, producing blocks | `curl localhost:9090/health` shows peers > 0 |
-| 2 | Sustained 10K+ TPS across network | `curl localhost:9090/stats` shows tps > 10000 |
+| 1 | 4+ nodes connected, producing blocks | `curl localhost:9944/health` shows peers > 0 |
+| 2 | Sustained 10K+ TPS across network | `curl localhost:9944/stats` shows tps > 10000 |
 | 3 | AI agent deployed and running inference | Run sentiment-agent against testnet RPC |
 | 7 | No crashes, no forks, no stalls for 7 days | Monitor dashboard shows continuous operation |
 | 14 | 10+ community nodes joined | `/validators` endpoint shows 10+ validators |

@@ -1497,33 +1497,43 @@ impl ConsensusEngine {
                 }
             }
 
-            // Only advance past this round if the leader's block was committed.
-            // If not, STOP — don't try later rounds. Wait for the leader's
-            // block to arrive via QUIC gossip. All nodes will eventually
-            // receive it and commit it in the same order.
-            //
-            // Exception: if the leader has NO block in this round at all
-            // AND we have quorum blocks from other validators (meaning the
-            // round happened but the leader was offline), skip this round.
-            let leader_block_exists = round_r_blocks.iter().any(|h| {
-                self.dag.get(h).map(|b| b.author == leader.unwrap_or(Hash256::ZERO)).unwrap_or(false)
-            });
-            let round_has_quorum = {
-                let mut stake = 0u64;
-                for h in &round_r_blocks {
-                    if let Some(b) = self.dag.get(h) {
-                        if let Some(v) = vs.get_validator(&b.author) {
-                            stake += v.stake;
+            // Advance past this round if EITHER:
+            // (a) The leader's block was committed (normal path), OR
+            // (b) The leader has no block AND the round has quorum from
+            //     other validators (leader was offline — skip round).
+            // If neither, STOP scanning — wait for the leader's block
+            // to arrive via QUIC. All nodes will eventually receive it
+            // and commit in the same order.
+            let leader_block_committed = newly_committed.iter().any(|b| b.round == r);
+            if leader_block_committed {
+                // Leader's block committed — advance scan past this round
+                self.last_committed_round.store(r + 1, Ordering::SeqCst);
+            } else {
+                let leader_block_exists = round_r_blocks.iter().any(|h| {
+                    self.dag.get(h).map(|b| b.author == leader.unwrap_or(Hash256::ZERO)).unwrap_or(false)
+                });
+                if !leader_block_exists {
+                    // Leader has no block in this round. Check if we have quorum
+                    // from other validators (round happened, leader was offline).
+                    let mut stake = 0u64;
+                    for h in &round_r_blocks {
+                        if let Some(b) = self.dag.get(h) {
+                            if let Some(v) = vs.get_validator(&b.author) {
+                                stake += v.stake;
+                            }
                         }
                     }
+                    if stake >= vs.quorum {
+                        // Quorum without leader — skip this round
+                        self.last_committed_round.store(r + 1, Ordering::SeqCst);
+                    } else {
+                        // Not enough info yet — stop scanning, retry later
+                        break;
+                    }
                 }
-                stake >= vs.quorum
-            };
-
-            // No skip, no grace period. If the leader's block isn't here yet
-            // or doesn't have a 2-round proof, just move to the next round.
-            // We'll retry this round on the next try_commit() call when
-            // more blocks have arrived via QUIC.
+                // Leader block exists but wasn't committed (missing R+1/R+2 proof).
+                // Don't advance — retry on next try_commit() when more blocks arrive.
+            }
         }
 
         // Add newly committed blocks to the committed list
@@ -1997,7 +2007,10 @@ impl ConsensusEngine {
                 format!("tx {} already locked", tx_hash),
             ));
         }
-        let lock_hash = arc_crypto::hash_bytes(&bincode::serialize(&(&tx_hash, source_shard, target_shard)).unwrap());
+        let lock_hash = arc_crypto::hash_bytes(
+            &bincode::serialize(&(&tx_hash, source_shard, target_shard))
+                .map_err(|e| ConsensusError::CrossShardLockFailed(format!("serialize lock: {e}")))?
+        );
         let inclusion_proof = bincode::serialize(&(&tx_hash, &source_block_hash)).unwrap_or_default();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

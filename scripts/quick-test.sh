@@ -4,7 +4,7 @@ set -euo pipefail
 # ARC Chain Quick Test — build, start, submit tx, verify block, check receipt
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-RPC="http://127.0.0.1:9090"
+RPC="http://127.0.0.1:9944"
 NODE_PID=""
 
 cleanup() {
