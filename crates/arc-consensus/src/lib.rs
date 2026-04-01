@@ -1408,7 +1408,12 @@ impl ConsensusEngine {
         let scan_start = self.last_committed_round.load(Ordering::SeqCst);
         for r in scan_start..=(current.saturating_sub(2)) {
             let round_r_blocks = self.blocks_in_round(r);
-            if round_r_blocks.is_empty() { continue; } // Skip empty rounds early
+            if round_r_blocks.is_empty() {
+                // No blocks in this round at all — advance scan past it.
+                // Empty rounds can't produce commits, no point rescanning.
+                self.last_committed_round.store(r + 1, Ordering::SeqCst);
+                continue;
+            }
 
             let leader = if frozen_vals.is_empty() {
                 None
