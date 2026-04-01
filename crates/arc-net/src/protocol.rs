@@ -36,6 +36,9 @@ pub enum MessageType {
     InferenceRequest = 0x0B,
     /// Inference response — result from a community GPU node.
     InferenceResponse = 0x0C,
+    /// Heartbeat — lightweight liveness probe (empty payload).
+    /// Sent during reconnect to detect dead QUIC streams.
+    Heartbeat = 0x0D,
 }
 
 impl MessageType {
@@ -53,6 +56,7 @@ impl MessageType {
             0x0A => Some(Self::SnapshotChunkResponse),
             0x0B => Some(Self::InferenceRequest),
             0x0C => Some(Self::InferenceResponse),
+            0x0D => Some(Self::Heartbeat),
             _ => None,
         }
     }

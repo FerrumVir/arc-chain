@@ -727,6 +727,28 @@ pub async fn run_transport(
                         candidates.extend(load_peers_from_disk(&dd));
                         candidates.sort();
                         candidates.dedup();
+
+                        // Probe live connections: try writing a tiny heartbeat to each
+                        // peer stream. Dead QUIC streams fail immediately, letting us
+                        // prune stale entries that would otherwise block reconnect.
+                        {
+                            let peer_keys: Vec<[u8; 32]> = conn_bg.peers.iter().map(|e| *e.key()).collect();
+                            let mut dead = Vec::new();
+                            for key in &peer_keys {
+                                if let Some(mut entry) = conn_bg.peers.get_mut(key) {
+                                    // Write a Heartbeat message (type 0, empty payload)
+                                    if write_message(entry.value_mut(), MessageType::Heartbeat, &[]).await.is_err() {
+                                        dead.push(*key);
+                                    }
+                                }
+                            }
+                            for key in &dead {
+                                conn_bg.peers.remove(key);
+                                conn_bg.meta.remove(key);
+                                debug!("Pruned dead peer connection");
+                            }
+                        }
+
                         let connected_addrs: std::collections::HashSet<SocketAddr> = conn_bg.meta.iter()
                             .filter(|e| conn_bg.peers.contains_key(e.key()))
                             .map(|e| e.value().dial_addr)
@@ -1297,6 +1319,9 @@ async fn handle_peer_recv(
                     }
                     Err(e) => warn!("Bad InferenceResponse from {}: {}", peer_address, e),
                 }
+            }
+            MessageType::Heartbeat => {
+                // No-op — heartbeat is a liveness probe, no response needed
             }
             other => {
                 warn!("Unexpected message type {:?} from {}", other, peer_address);
