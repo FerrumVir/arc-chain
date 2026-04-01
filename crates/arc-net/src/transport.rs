@@ -668,7 +668,10 @@ pub async fn run_transport(
         }
     });
 
-    // ── Accept incoming connections + PEX + reconnect ──────────────────
+    // ── PEX + reconnect as independent background task ─────────────────
+    // Spawned separately so the accept loop can't starve timers.
+    // Without this, heavy inbound traffic or benchmark mode prevents
+    // reconnect/PEX timers from ever firing (tokio::select! starvation).
     let mut pex_interval = tokio::time::interval(std::time::Duration::from_secs(60));
     pex_interval.tick().await; // skip immediate fire
 
@@ -676,6 +679,99 @@ pub async fn run_transport(
     reconnect_interval.tick().await; // skip immediate fire
 
     let conn_pex = connections.clone();
+
+    // ── Spawn PEX + reconnect as independent task ──────────────────
+    // This prevents the accept loop from starving timer-driven work.
+    {
+        let conn_bg = connections.clone();
+        let bp = bootstrap_peers.clone();
+        let ep = endpoint.clone();
+        let kp = keypair.clone();
+        let itx = inbound_tx.clone();
+        let pc = peer_count.clone();
+        let pdt = pex_dial_tx.clone();
+        let rl = rate_limiter.clone();
+        let dd = data_dir.clone();
+        tokio::spawn(async move {
+            let mut pex_tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            pex_tick.tick().await;
+            let mut recon_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            recon_tick.tick().await;
+            loop {
+                tokio::select! {
+                    _ = pex_tick.tick() => {
+                        let mut all_peers: Vec<crate::protocol::PexPeerInfo> = conn_bg
+                            .meta.iter()
+                            .filter(|e| conn_bg.peers.contains_key(e.key()))
+                            .map(|entry| crate::protocol::PexPeerInfo {
+                                address: Hash256(*entry.key()),
+                                socket_addr: entry.value().dial_addr.to_string(),
+                                stake: entry.value().stake,
+                            })
+                            .collect();
+                        use rand::seq::SliceRandom;
+                        use rand::thread_rng;
+                        all_peers.shuffle(&mut thread_rng());
+                        all_peers.truncate(16);
+                        if !all_peers.is_empty() {
+                            let pex_msg = crate::protocol::PeerExchangeMessage { peers: all_peers };
+                            if let Ok(bytes) = bincode::serialize(&pex_msg) {
+                                debug!("Broadcasting PEX with {} peers", pex_msg.peers.len());
+                                conn_bg.broadcast(MessageType::PeerExchange, &bytes).await;
+                            }
+                        }
+                        save_peers_to_disk(&dd, &conn_bg);
+                    }
+                    _ = recon_tick.tick() => {
+                        let mut candidates: Vec<SocketAddr> = bp.clone();
+                        candidates.extend(load_peers_from_disk(&dd));
+                        candidates.sort();
+                        candidates.dedup();
+                        let connected_addrs: std::collections::HashSet<SocketAddr> = conn_bg.meta.iter()
+                            .filter(|e| conn_bg.peers.contains_key(e.key()))
+                            .map(|e| e.value().dial_addr)
+                            .collect();
+                        let disconnected: Vec<SocketAddr> = candidates.into_iter()
+                            .filter(|a| !connected_addrs.contains(a))
+                            .filter(|a| {
+                                if a.ip().is_loopback() { return false; }
+                                let test_addr = SocketAddr::new(a.ip(), 0);
+                                if std::net::UdpSocket::bind(test_addr).is_ok() { return false; }
+                                true
+                            })
+                            .collect();
+                        let reconnect_batch: Vec<_> = disconnected.into_iter().take(8).collect();
+                        if !reconnect_batch.is_empty() {
+                            info!("Reconnect: {} peers to retry", reconnect_batch.len());
+                        }
+                        for addr in reconnect_batch {
+                            let handshake_msg = make_signed_handshake(
+                                local_address, local_stake, listen_addr.port(), genesis_hash, &kp,
+                            );
+                            let c = conn_bg.clone();
+                            let itx2 = itx.clone();
+                            let pc2 = pc.clone();
+                            let ep2 = ep.clone();
+                            let pdt2 = pdt.clone();
+                            let rl2 = rl.clone();
+                            tokio::spawn(async move {
+                                match tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    dial_peer(&ep2, addr, &handshake_msg, local_address, &c, &itx2, &pc2, &pdt2, &rl2),
+                                ).await {
+                                    Ok(Ok(())) => info!("Reconnect: connected to {}", addr),
+                                    Ok(Err(e)) => debug!("Reconnect to {} failed: {}", addr, e),
+                                    Err(_) => debug!("Reconnect to {} timed out", addr),
+                                }
+                            });
+                        }
+                        let actual = conn_bg.peers.len() as u32;
+                        pc.store(actual, Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
 
     loop {
         tokio::select! {
@@ -741,51 +837,7 @@ pub async fn run_transport(
                 });
             }
 
-            // ── PEX broadcast (every 60s) — share random peer sample ─────
-            //
-            // Gossip-based peer exchange for network-wide reachability.
-            // Each node shares a RANDOM SUBSET of its connected peers, so
-            // the full peer graph propagates across the network over time.
-            //
-            // Privacy: only peers that opted in via a successful handshake
-            // (i.e., are in our meta table with a valid dial_addr) are shared.
-            // We do NOT share peers' source IPs — only their QUIC listen addr.
-            //
-            // Scalability: at 1M nodes with 16 PEX peers per broadcast,
-            // a new node reaches full graph knowledge in ~O(log N) rounds
-            // (~20 rounds ≈ 20 minutes). Each message is ≤2KB.
-            _ = pex_interval.tick() => {
-                // Collect all connected peers with valid metadata
-                let mut all_peers: Vec<crate::protocol::PexPeerInfo> = conn_pex
-                    .meta
-                    .iter()
-                    .filter(|e| conn_pex.peers.contains_key(e.key())) // only live connections
-                    .map(|entry| crate::protocol::PexPeerInfo {
-                        address: Hash256(*entry.key()),
-                        socket_addr: entry.value().dial_addr.to_string(),
-                        stake: entry.value().stake,
-                    })
-                    .collect();
-
-                // Shuffle and take a random sample (16 peers max per PEX message).
-                // Random sampling ensures the full graph propagates even if no
-                // single node knows all peers. Bounded size keeps messages small.
-                use rand::seq::SliceRandom;
-                use rand::thread_rng;
-                all_peers.shuffle(&mut thread_rng());
-                all_peers.truncate(16);
-
-                if !all_peers.is_empty() {
-                    let pex_msg = crate::protocol::PeerExchangeMessage { peers: all_peers };
-                    if let Ok(bytes) = bincode::serialize(&pex_msg) {
-                        debug!("Broadcasting PEX with {} peers", pex_msg.peers.len());
-                        conn_pex.broadcast(MessageType::PeerExchange, &bytes).await;
-                    }
-                }
-
-                // Persist known peers to disk
-                save_peers_to_disk(&data_dir, &conn_pex);
-            }
+            // PEX broadcast + reconnect are handled by the background task above.
 
             // ── PEX auto-dial (from handle_peer_recv) ──────────────────
             addr = pex_dial_rx.recv() => {
@@ -813,71 +865,7 @@ pub async fn run_transport(
                 }
             }
 
-            // ── Reconnect timer (every 30s) ────────────────────────────
-            // Reconnect to bootstrap peers + known peers that dropped.
-            // The old check only looked at meta (which persists after
-            // disconnect). Now we check the actual peers DashMap to see
-            // if the send stream is still alive.
-            _ = reconnect_interval.tick() => {
-                // Combine bootstrap peers + disk-persisted peers
-                let mut candidates: Vec<SocketAddr> = bootstrap_peers.clone();
-                candidates.extend(load_peers_from_disk(&data_dir));
-                candidates.sort();
-                candidates.dedup();
-
-                // Check which ones are actually connected (have live SendStream)
-                let connected_addrs: std::collections::HashSet<SocketAddr> = conn_pex.meta.iter()
-                    .filter(|e| conn_pex.peers.contains_key(e.key()))
-                    .map(|e| e.value().dial_addr)
-                    .collect();
-
-                // Skip self-addresses. The seeds file includes our own
-                // public IP, but listen_addr is 0.0.0.0 so the bootstrap
-                // skip-self check misses it. Detect by trying to bind to
-                // the candidate IP — succeeds only for local interfaces.
-                let disconnected: Vec<SocketAddr> = candidates.into_iter()
-                    .filter(|a| !connected_addrs.contains(a))
-                    .filter(|a| {
-                        if a.ip().is_loopback() { return false; }
-                        // If we can bind a UDP socket to this IP, it's ours
-                        let test_addr = SocketAddr::new(a.ip(), 0);
-                        if std::net::UdpSocket::bind(test_addr).is_ok() {
-                            return false; // Local IP — skip self-dial
-                        }
-                        true
-                    })
-                    .collect();
-
-                // Limit concurrent reconnect dials to 5 to prevent
-                // overwhelming the QUIC endpoint when many peers drop.
-                let reconnect_batch: Vec<_> = disconnected.into_iter().take(5).collect();
-                if !reconnect_batch.is_empty() {
-                    info!("Reconnect: {} peers to retry (max 5/cycle)", reconnect_batch.len());
-                }
-                for addr in reconnect_batch {
-                    let handshake_msg = make_signed_handshake(
-                        local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
-                    );
-                    let c = connections.clone();
-                    let itx = inbound_tx.clone();
-                    let pc = peer_count.clone();
-                    let ep = endpoint.clone();
-                    let pdt = pex_dial_tx.clone();
-                    let rl = rate_limiter.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl).await {
-                            debug!("Reconnect to {} failed: {}", addr, e);
-                        }
-                    });
-                }
-
-                // Sync peer_count atomic with actual DashMap size.
-                // The counter can drift from the truth when connections
-                // race (dedup rejects after increment, cleanup decrements
-                // wrong entry, etc.). The DashMap is the source of truth.
-                let actual = connections.peers.len() as u32;
-                peer_count.store(actual, Ordering::Relaxed);
-            }
+            // Reconnect is handled by the background task above.
         }
     }
 }
