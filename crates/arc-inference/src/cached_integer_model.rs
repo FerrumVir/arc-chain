@@ -147,6 +147,13 @@ pub struct ModelConfig {
     pub max_seq: usize,
     /// EOS token IDs read from GGUF metadata. Defaults to LLaMA family tokens.
     pub eos_tokens: Vec<u32>,
+    /// BOS token ID read from GGUF metadata.
+    pub bos_token: u32,
+    /// Chat template (Jinja2) from GGUF metadata. Used to wrap user prompts
+    /// in the correct format for the model (e.g., [INST]...[/INST] for LLaMA-2,
+    /// <|start_header_id|>user<|end_header_id|> for LLaMA-3, etc.).
+    /// Empty string means no template — use raw input.
+    pub chat_template: String,
 }
 
 /// Pre-converted Q4 layer weights (optional, converted at runtime).
@@ -1387,6 +1394,47 @@ impl CachedIntegerModel {
         tokens
     }
 
+    /// Apply the model's chat template to wrap user input in the correct format.
+    /// Parses common Jinja2 chat template patterns from GGUF metadata.
+    /// Falls back to raw input if no template or unrecognized format.
+    pub fn apply_chat_template(&self, user_input: &str) -> String {
+        let tmpl = &self.config.chat_template;
+        if tmpl.is_empty() {
+            return user_input.to_string();
+        }
+
+        // Detect common template patterns by content rather than parsing Jinja2.
+        // This handles the vast majority of HuggingFace models.
+        if tmpl.contains("[INST]") {
+            // LLaMA-2 / Mistral style
+            format!("[INST] {} [/INST]", user_input)
+        } else if tmpl.contains("<|start_header_id|>") {
+            // LLaMA-3 style
+            format!(
+                "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+                user_input
+            )
+        } else if tmpl.contains("<|im_start|>") {
+            // ChatML (Qwen, Yi, many finetunes)
+            format!(
+                "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                user_input
+            )
+        } else if tmpl.contains("<|user|>") {
+            // Phi style
+            format!("<|user|>\n{}<|end|>\n<|assistant|>\n", user_input)
+        } else if tmpl.contains("[turn_start]") {
+            // Gemma style
+            format!(
+                "<start_of_turn>user\n{}<end_of_turn>\n<start_of_turn>model\n",
+                user_input
+            )
+        } else {
+            // Unknown template — use raw input
+            user_input.to_string()
+        }
+    }
+
     /// Forward pass — zero-alloc matmuls with cached input quantization.
     /// Quantize input ONCE, reuse for Q/K/V (3 matmuls) and gate/up (2 matmuls).
     /// Saves 4 input quantizations per layer × 32 layers = 128 saved quantizations.
@@ -1659,7 +1707,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
     let device = Device::Cpu;
     let gguf_path = path.to_string();
 
-    let (n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size, vocab, rope_base, eos_tokens) = {
+    let (n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size, vocab, rope_base, eos_tokens, bos_token, chat_template) = {
         let mut reader = std::fs::File::open(&gguf_path)
             .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
         let content = gguf_file::Content::read(&mut reader)
@@ -1714,6 +1762,19 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             _ => vec![2, 128001, 128009], // LLaMA-2/3 defaults
         };
 
+        // Read BOS token ID
+        let bos_token = match content.metadata.get("tokenizer.ggml.bos_token_id") {
+            Some(gguf_file::Value::U32(v)) => *v,
+            Some(gguf_file::Value::U64(v)) => *v as u32,
+            _ => 1, // LLaMA default
+        };
+
+        // Read chat template (Jinja2 format) for correct prompt wrapping
+        let chat_template = match content.metadata.get("tokenizer.chat_template") {
+            Some(gguf_file::Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+
         let vocab = match content.metadata.get("tokenizer.ggml.tokens") {
             Some(gguf_file::Value::Array(arr)) => {
                 arr.iter().filter_map(|v| match v {
@@ -1724,9 +1785,11 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             _ => Vec::new(),
         };
 
-        info!(arch = %arch, rope_base = %rope_base, eos = ?eos_tokens, "GGUF architecture detected");
+        info!(arch = %arch, rope_base = %rope_base, eos = ?eos_tokens,
+            bos = bos_token, chat_template_len = chat_template.len(),
+            "GGUF architecture detected");
 
-        (nl, dm, nh, nkv, dff, vs, vocab, rope_base, eos_tokens)
+        (nl, dm, nh, nkv, dff, vs, vocab, rope_base, eos_tokens, bos_token, chat_template)
     };
 
     let d_head = d_model / n_heads;
@@ -1817,6 +1880,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             n_layers, d_model, n_heads, n_kv_heads, d_ff, d_head, d_kv,
             vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
             eos_tokens: eos_tokens.clone(),
+            bos_token, chat_template: chat_template.clone(),
         },
         embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
@@ -1902,14 +1966,14 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
 
     info!("Binary model loaded: {} layers, d={}, vocab={}", n_layers, d_model, vocab_size);
 
-    // Binary format doesn't store EOS tokens; use LLaMA family defaults
+    // Binary format doesn't store these; use LLaMA family defaults
     let eos_tokens = vec![2u32, 128001, 128009];
 
     Ok(CachedIntegerModel {
         config: ModelConfig {
             n_layers, d_model, n_heads, n_kv_heads, d_ff, d_head, d_kv,
             vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
-            eos_tokens,
+            eos_tokens, bos_token: 1, chat_template: String::new(),
         },
         embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
@@ -1970,6 +2034,7 @@ mod tests {
                 d_ff: dff, d_head: dh, d_kv: dkv, vocab_size: vs,
                 attn_scale, rope_cos, rope_sin, max_seq: 512,
                 eos_tokens: vec![2, 128001, 128009],
+                bos_token: 1, chat_template: String::new(),
             },
             embedding_q16, embedding_i8, layers, final_norm: vec![ONE; d], output_weight,
             vocab: (0..vs).map(|i| format!("tok_{}", i)).collect(),

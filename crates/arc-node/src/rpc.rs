@@ -2700,8 +2700,11 @@ async fn inference_run(
 
     let start = std::time::Instant::now();
 
-    // Encode input text to tokens using the tokenizer
-    let prompt_tokens = model.encode(input_text);
+    // Apply chat template from GGUF metadata (wraps input in model-specific format)
+    let templated_input = model.apply_chat_template(input_text);
+
+    // Encode templated text to tokens using the tokenizer
+    let prompt_tokens = model.encode(&templated_input);
     let encode_ms = start.elapsed().as_millis() as u64;
 
     if prompt_tokens.is_empty() {
@@ -2714,7 +2717,7 @@ async fn inference_run(
     // Run inference — use candle float backend if available, else integer engine
     let (generated_tokens, output_hash, engine_name) = if let (Some(engine), Some(mid)) = (&node.candle_engine, &node.candle_model_id) {
         // Candle Q4 float backend — coherent output, deterministic on same arch
-        let mut tokens_with_bos = vec![1u32]; // BOS
+        let mut tokens_with_bos = vec![model.config.bos_token];
         tokens_with_bos.extend(&prompt_tokens);
         let result = engine.generate(mid, &tokens_with_bos, max_tokens)
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Inference failed: {}", e)))?;
