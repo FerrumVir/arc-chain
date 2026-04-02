@@ -1,5 +1,5 @@
 ![Rust](https://img.shields.io/badge/Rust-99%2C000%2B_LOC-orange)
-![Tests](https://img.shields.io/badge/tests-1%2C231_passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-1%2C196_passing-brightgreen)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-blue)
 ![Inference](https://img.shields.io/badge/inference-76ms%2Ftok_deterministic-purple)
 ![Testnet](https://img.shields.io/badge/testnet-live-green)
@@ -28,7 +28,7 @@ Read the paper: [On the Foundations of Trustworthy Artificial Intelligence](pape
 | **Smart contracts** | Both EVM (Solidity) and WASM (Rust, C, Go) natively. Pick your stack. | One or the other, not both. |
 | **Quantum resistant** | Falcon-512 + ML-DSA implemented and shipping. Not a roadmap item. | No production chain has post-quantum signatures. |
 | **Multi-node TPS** | 33,230 measured with real DAG consensus over real QUIC networking. Throughput increases with more validators (DAG consensus scales horizontally). | Ethereum: ~15 TPS. Solana: ~4,000 non-vote TPS sustained. |
-| **Finality** | ~200ms, 2-round DAG commit | Ethereum: ~12 min. Solana: ~400ms. |
+| **Finality** | ~24ms, 2-round DAG commit (~12ms/round) | Ethereum: ~12 min. Solana: ~400ms. |
 | **MEV protection** | BLS threshold encrypted mempool. Transactions encrypted until block is committed. | Exposed or partially mitigated. |
 | **Signatures** | 5 algorithms: Ed25519, Falcon-512, BLS12-381, ML-DSA, secp256k1 | 1 or 2 options. |
 | **ZK proofs** | Circle STARKs (Stwo). No trusted setup. Post-quantum secure. Verified at 700x the scale of any prior ZK-ML system. | SNARKs requiring trusted setup, limited to small models. |
@@ -62,9 +62,9 @@ Read the paper: [On the Foundations of Trustworthy Artificial Intelligence](pape
 | Peak TPS | **350,000** | 1-second burst window |
 | Commit rate | **100%** | 500K/500K transactions committed |
 | GPU Ed25519 verify | **379,000/sec** | Metal compute shader |
-| Inference (GPU) | **76 ms/token** | Deterministic INT8, M2 Ultra |
-| Inference (CPU) | **139 ms/token** | Deterministic INT8, M2 Ultra |
-| DAG finality | **~200ms** | 2-round commit rule |
+| Inference (GPU) | **76 ms/token** | Deterministic INT16, M2 Ultra |
+| Inference (CPU) | **139 ms/token** | Deterministic INT16, M2 Ultra |
+| DAG finality | **~24ms** | 2-round commit rule (~12ms/round) |
 
 All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
 
@@ -170,7 +170,7 @@ make inference       # Join with inference enabled
 make inference-node  # Run a dedicated inference node (GPU)
 make stats           # Check live chain stats
 make health          # Check live node health
-make test            # Run 1,209 tests
+make test            # Run 1,196 tests
 make explorer        # Open block explorer
 make faucet        # Run testnet faucet
 ```
@@ -346,21 +346,24 @@ On testnet, use the faucet to get test tokens and start building now.
 
 ## Codebase
 
-**99,600+ lines of Rust** across 14 crates with **1,209 tests**.
+**99,600+ lines of Rust** across 16 crates with **1,196 tests**.
 
 | Crate | LOC | Tests | What It Does |
 |-------|-----|-------|-------------|
-| `arc-types` | 14,490 | 264 | 24 transaction types, blocks, accounts, governance, staking, bridge, inference |
-| `arc-state` | 13,203 | 147 | DashMap state, Jellyfish Merkle Tree, WAL, BlockSTM parallel execution, GPU cache |
-| `arc-crypto` | 11,680 | 220 | Ed25519, secp256k1, BLS, BLAKE3, Falcon-512, ML-DSA, VRF, STARK prover |
+| `arc-types` | 14,490 | 244 | 24 transaction types, blocks, accounts, governance, staking, bridge, inference |
+| `arc-state` | 13,203 | 154 | DashMap state, Jellyfish Merkle Tree, WAL, BlockSTM parallel execution, GPU cache |
+| `arc-crypto` | 11,680 | 230 | Ed25519, secp256k1, BLS, BLAKE3, Falcon-512, ML-DSA, VRF, STARK prover |
+| `arc-olm` | 9,760 | 55 | On-chain language model runtime, INT16 deterministic inference |
 | `arc-vm` | 8,439 | 145 | Wasmer WASM + revm EVM, gas metering, 11 precompiles, AI inference oracle |
 | `arc-node` | 8,424 | 61 | Block production, RPC (34 endpoints), consensus manager, STARK proofs |
 | `arc-consensus` | 7,971 | 137 | DAG consensus, 2-round finality, slashing, VRF, epoch transitions |
 | `arc-bench` | 5,336 | - | 10 benchmark binaries |
-| `arc-gpu` | 5,250 | 45 | Metal/WGSL Ed25519 batch verify (379K/sec), GPU memory, buffer pool |
+| `arc-gpu` | 5,250 | 64 | Metal/WGSL Ed25519 batch verify (379K/sec), GPU memory, buffer pool |
 | `arc-net` | 2,355 | 26 | QUIC transport, shred propagation, FEC, gossip, peer exchange |
+| `arc-relayer` | 1,076 | - | Bridge relayer between Ethereum and ARC Chain |
+| `arc-agents` | 1,061 | - | Sentiment, oracle, and router AI agent examples |
 | `arc-mempool` | 876 | 17 | Lock-free queue, deduplication, BLS threshold encrypted mempool |
-| `arc-inference` | 620 | 17 | INT4 runtime, VRF committee selection, EIP-1559 inference gas lane |
+| `arc-inference` | 620 | 53 | INT16 runtime (default), VRF committee selection, EIP-1559 inference gas lane |
 | `arc-channel` | 480 | 10 | Off-chain payment channels, BLAKE3 state commitments |
 | `arc-cli` | 660 | - | CLI: keygen, RPC, transaction submission |
 
@@ -389,7 +392,7 @@ Everything below is implemented, deployed, and running on the live testnet:
 | DAG consensus (2-round commit) | Live | 8 nodes, 6 continents, matching block hashes verified |
 | EVM (Solidity) | Live | revm 19, deploy + execute contracts, ETH JSON-RPC |
 | WASM (Rust/C/Go) | Live | Wasmer 6.0 runtime |
-| Deterministic inference | Live | INT8 + GGUF backends, 76 ms/token GPU |
+| Deterministic inference | Live | INT16 + GGUF backends, 76 ms/token GPU (32,767 levels per weight, deterministic) |
 | Data availability | Live | Reed-Solomon erasure coding, DAS sampling |
 | Validator slashing | Live | Equivocation, liveness, invalid proposals |
 | State sync | Live | Chunked snapshots with BLAKE3 verification |

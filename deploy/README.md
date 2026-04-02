@@ -96,7 +96,7 @@ cargo build --release -p arc-node
 Upload the binary to GitHub Releases, then update the download URL in `cloud-init.yml`:
 
 ```yaml
-BINARY_URL="https://github.com/FerrumVir/arc-chain/releases/download/v0.1.0/arc-node-linux-arm64"
+BINARY_URL="https://github.com/FerrumVir/arc-chain/releases/download/v0.2.1/arc-node-linux-arm64"
 ```
 
 ### 2. Configure (Optional)
