@@ -3611,8 +3611,8 @@ impl StateDB {
                 self.accounts.insert(escrow_addr.0, escrow_mut.clone());
                 self.wal.append(WalOp::SetAccount(escrow_addr, escrow_mut), self.height());
 
-                // Credit opener
-                sender.balance = body.opener_balance;
+                // Credit opener — ADD back their channel share to existing balance
+                sender.balance += body.opener_balance;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
 
@@ -3622,7 +3622,7 @@ impl StateDB {
                 let counterparty_addr = escrow.storage_root;
                 if body.counterparty_balance > 0 && counterparty_addr != Hash256::ZERO {
                     let mut counterparty = self.get_or_create_account(&counterparty_addr);
-                    counterparty.balance = body.counterparty_balance;
+                    counterparty.balance += body.counterparty_balance;
                     self.accounts.insert(counterparty_addr.0, counterparty.clone());
                     self.wal.append(WalOp::SetAccount(counterparty_addr, counterparty), self.height());
                 }

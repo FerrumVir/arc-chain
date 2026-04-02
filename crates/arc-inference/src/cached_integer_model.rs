@@ -438,14 +438,20 @@ unsafe fn dot_i16_i64(row: *const i16, input: *const i64, len: usize) -> i64 {
 fn matmul_i16_into(weights: &I16Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
     let data = &weights.data;
     let scales = &weights.scales;
-    for (i, out) in output.iter_mut().enumerate() {
-        let acc = unsafe {
-            dot_i16_i64(data.as_ptr().add(i * in_size), input.as_ptr(), in_size)
-        };
-        // Divide by 32767 first, then multiply by scale and shift.
-        // Order: divide first to avoid i64 overflow on large accumulations.
-        *out = ((acc / 32767) * scales[i]) >> FRAC_BITS;
-    }
+    // Parallel over 512-row chunks (matches INT8 path for consistency)
+    output.par_chunks_mut(512).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start = chunk_idx * 512;
+        for (local_i, out) in chunk.iter_mut().enumerate() {
+            let i = start + local_i;
+            let acc = unsafe {
+                dot_i16_i64(data.as_ptr().add(i * in_size), input.as_ptr(), in_size)
+            };
+            // Use i128 intermediate for full precision: avoids truncation from
+            // dividing first AND avoids i64 overflow from multiplying first.
+            let wide = (acc as i128) * (scales[i] as i128);
+            *out = ((wide / 32767) >> FRAC_BITS as i128) as i64;
+        }
+    });
 }
 
 /// Allocating i16 matmul (for compatibility and small outputs).
@@ -1177,7 +1183,7 @@ fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
     }).collect()
 }
 
-fn apply_rope(vec: &mut [i64], pos: usize, d_head: usize, cos: &[i64], sin: &[i64]) {
+pub fn apply_rope(vec: &mut [i64], pos: usize, d_head: usize, cos: &[i64], sin: &[i64]) {
     let half = d_head / 2;
     for i in 0..half {
         let cos_val = cos[pos * half + i];

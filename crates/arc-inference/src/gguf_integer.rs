@@ -13,6 +13,7 @@ use candle_core::quantized::gguf_file;
 
 use crate::integer_lut::*;
 use crate::integer_engine::*;
+use crate::cached_integer_model::{silu_i64, compute_rope_tables, apply_rope};
 use crate::InferenceError;
 
 /// Convert an f32 tensor to i64 Q16 fixed-point.
@@ -112,10 +113,12 @@ pub fn generate_integer_from_gguf(
         Some(gguf_file::Value::F64(v)) => *v,
         _ => 10000.0,
     };
-    // NOTE: RoPE not yet applied in this streaming forward pass (pre-existing gap).
-    // The CachedIntegerModel path (load_cached_model) does apply RoPE via precomputed tables.
     let d_head = d_model / n_heads;
     let d_kv = d_head * n_kv_heads;
+
+    // Precompute RoPE tables (matches CachedIntegerModel path)
+    let max_seq = 4096; // reasonable default, covers most contexts
+    let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, _rope_base);
 
     tracing::info!(
         n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size, d_head,
@@ -192,6 +195,20 @@ pub fn generate_integer_from_gguf(
                 all_v.extend(matmul_i64(&wv, &[], x, d_model, d_kv));
             }
 
+            // Apply RoPE to Q and K per position
+            for pos in 0..seq_len {
+                for h in 0..n_heads {
+                    let q_start = pos * d_model + h * d_head;
+                    apply_rope(&mut all_q[q_start..q_start + d_head],
+                        pos, d_head, &rope_cos, &rope_sin);
+                }
+                for h in 0..n_kv_heads {
+                    let k_start = pos * d_kv + h * d_head;
+                    apply_rope(&mut all_k[k_start..k_start + d_head],
+                        pos, d_head, &rope_cos, &rope_sin);
+                }
+            }
+
             // Multi-head attention (with GQA support)
             let mut attn_out = vec![0i64; seq_len * d_model];
             for h in 0..n_heads {
@@ -236,12 +253,10 @@ pub fn generate_integer_from_gguf(
                 let gate = matmul_i64(&w_gate, &[], &normed_ff, d_model, d_ff);
                 let up = matmul_i64(&w_up, &[], &normed_ff, d_model, d_ff);
 
-                // SiLU(x) = x * sigmoid(x) ≈ x * (x > 0 ? 1 : exp(x)) — approximate
-                // For integer: use ReLU as approximation (loses SiLU curve but is deterministic)
+                // SiLU(x) = x * sigmoid(x) — proper integer implementation via LUT
                 let mut gated = Vec::with_capacity(d_ff);
                 for i in 0..d_ff {
-                    let silu_approx = if gate[i] > 0 { gate[i] } else { gate[i] / 4 }; // leaky approximation
-                    gated.push((silu_approx * up[i]) >> FRAC_BITS);
+                    gated.push((silu_i64(gate[i]) * up[i]) >> FRAC_BITS);
                 }
 
                 let ff_out = matmul_i64(&w_down, &[], &gated, d_ff, d_model);

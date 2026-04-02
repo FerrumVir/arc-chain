@@ -139,15 +139,16 @@ pub fn m31_limbs_to_bytes32(limbs: &[M31; HASH_LIMBS]) -> [u8; 32] {
 /// For values < 2^47, both limbs fit in M31 (max 2^31 - 1).
 ///
 /// Returns `(lo, hi)`.
-pub fn u64_to_m31_limbs(value: u64) -> (M31, M31) {
+pub fn u64_to_m31_limbs(value: u64) -> Result<(M31, M31), String> {
     let lo = (value & 0xFFFF) as u32;
     let hi = (value >> 16) as u32;
-    debug_assert!(
-        hi < (1u32 << 31) - 1,
-        "u64_to_m31_limbs: value {value} too large (hi={hi} >= M31 modulus). \
-         Max safe value: {}", ((1u64 << 47) - (1u64 << 16) - 1)
-    );
-    (M31::from(lo), M31::from(hi))
+    if hi >= (1u32 << 31) - 1 {
+        return Err(format!(
+            "u64_to_m31_limbs: value {value} too large (hi={hi} >= M31 modulus). \
+             Max safe value: {}", (1u64 << 47) - (1u64 << 16) - 1
+        ));
+    }
+    Ok((M31::from(lo), M31::from(hi)))
 }
 
 /// Reconstruct a u64 from 2 M31 limbs (base-2^16).
@@ -670,15 +671,20 @@ pub fn generate_block_witness_trace(
         // Mark has_transfer
         transfer_cols[0][i] = M31::from(1u32);
 
-        let (sbb_lo, sbb_hi) = u64_to_m31_limbs(tw.sender_bal_before);
-        let (sba_lo, sba_hi) = u64_to_m31_limbs(tw.sender_bal_after);
-        let (rbb_lo, rbb_hi) = u64_to_m31_limbs(tw.receiver_bal_before);
-        let (rba_lo, rba_hi) = u64_to_m31_limbs(tw.receiver_bal_after);
-        let (amt_lo, amt_hi) = u64_to_m31_limbs(tw.amount);
+        let (sbb_lo, sbb_hi) = u64_to_m31_limbs(tw.sender_bal_before)
+            .expect("sender_bal_before overflow");
+        let (sba_lo, sba_hi) = u64_to_m31_limbs(tw.sender_bal_after)
+            .expect("sender_bal_after overflow");
+        let (rbb_lo, rbb_hi) = u64_to_m31_limbs(tw.receiver_bal_before)
+            .expect("receiver_bal_before overflow");
+        let (rba_lo, rba_hi) = u64_to_m31_limbs(tw.receiver_bal_after)
+            .expect("receiver_bal_after overflow");
+        let (amt_lo, amt_hi) = u64_to_m31_limbs(tw.amount)
+            .expect("amount overflow");
         let nonce_before = M31::from(tw.sender_nonce_before);
         let nonce_after = M31::from(tw.sender_nonce_after);
         let fee_val = {
-            debug_assert!(
+            assert!(
                 tw.fee < (1u64 << 31),
                 "fee {} exceeds M31 max",
                 tw.fee
@@ -1829,7 +1835,7 @@ mod tests {
             max_safe - 1,   // just below max safe
         ];
         for &v in &values {
-            let (lo, hi) = u64_to_m31_limbs(v);
+            let (lo, hi) = u64_to_m31_limbs(v).expect("test value overflow");
             let recovered = m31_limbs_to_u64(lo, hi);
             assert_eq!(v, recovered, "roundtrip failed for {v}");
         }

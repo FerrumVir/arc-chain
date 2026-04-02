@@ -111,14 +111,16 @@ impl NibblePath {
         self.num_nibbles == 0
     }
 
-    /// Get the nibble at position `i`.
-    fn get(&self, i: usize) -> u8 {
-        assert!(i < self.num_nibbles, "nibble index out of range");
+    /// Get the nibble at position `i`, or `None` if out of bounds.
+    fn get(&self, i: usize) -> Option<u8> {
+        if i >= self.num_nibbles {
+            return None;
+        }
         let byte = self.bytes[i / 2];
         if i % 2 == 0 {
-            byte >> 4
+            Some(byte >> 4)
         } else {
-            byte & 0x0F
+            Some(byte & 0x0F)
         }
     }
 
@@ -127,22 +129,25 @@ impl NibblePath {
         if start >= self.num_nibbles {
             return Self::empty();
         }
-        let nibbles: Vec<u8> = (start..self.num_nibbles).map(|i| self.get(i)).collect();
+        // Safety: iterating within num_nibbles bounds
+        let nibbles: Vec<u8> = (start..self.num_nibbles).map(|i| self.get(i).unwrap()).collect();
         Self::from_nibbles(&nibbles)
     }
 
     /// Return nibbles from 0 to `end` (exclusive).
     fn prefix(&self, end: usize) -> Self {
         let end = end.min(self.num_nibbles);
-        let nibbles: Vec<u8> = (0..end).map(|i| self.get(i)).collect();
+        // Safety: iterating within num_nibbles bounds
+        let nibbles: Vec<u8> = (0..end).map(|i| self.get(i).unwrap()).collect();
         Self::from_nibbles(&nibbles)
     }
 
     /// Concatenate this path with another.
     fn concat(&self, other: &NibblePath) -> Self {
-        let mut nibbles: Vec<u8> = (0..self.num_nibbles).map(|i| self.get(i)).collect();
+        // Safety: both loops iterate within respective num_nibbles bounds
+        let mut nibbles: Vec<u8> = (0..self.num_nibbles).map(|i| self.get(i).unwrap()).collect();
         for i in 0..other.num_nibbles {
-            nibbles.push(other.get(i));
+            nibbles.push(other.get(i).unwrap());
         }
         Self::from_nibbles(&nibbles)
     }
@@ -150,8 +155,9 @@ impl NibblePath {
     /// Prepend a single nibble to produce a new path.
     fn prepend_nibble(&self, nibble: u8) -> Self {
         let mut nibbles = vec![nibble];
+        // Safety: iterating within num_nibbles bounds
         for i in 0..self.num_nibbles {
-            nibbles.push(self.get(i));
+            nibbles.push(self.get(i).unwrap());
         }
         Self::from_nibbles(&nibbles)
     }
@@ -160,7 +166,8 @@ impl NibblePath {
     fn common_prefix_len(&self, other: &NibblePath) -> usize {
         let limit = self.num_nibbles.min(other.num_nibbles);
         for i in 0..limit {
-            if self.get(i) != other.get(i) {
+            // Safety: i < limit <= min(self.num_nibbles, other.num_nibbles)
+            if self.get(i).unwrap() != other.get(i).unwrap() {
                 return i;
             }
         }
@@ -169,23 +176,16 @@ impl NibblePath {
 
     /// Unpack all nibbles into a Vec.
     fn to_nibbles(&self) -> Vec<u8> {
-        (0..self.num_nibbles).map(|i| self.get(i)).collect()
+        // Safety: iterating within num_nibbles bounds
+        (0..self.num_nibbles).map(|i| self.get(i).unwrap()).collect()
     }
 
     /// Convert a full 64-nibble path back to an Address.
     fn to_address(path: &NibblePath) -> Address {
         let mut addr = [0u8; 32];
         for i in 0..32 {
-            let hi = if i * 2 < path.num_nibbles {
-                path.get(i * 2)
-            } else {
-                0
-            };
-            let lo = if i * 2 + 1 < path.num_nibbles {
-                path.get(i * 2 + 1)
-            } else {
-                0
-            };
+            let hi = path.get(i * 2).unwrap_or(0);
+            let lo = path.get(i * 2 + 1).unwrap_or(0);
             addr[i] = (hi << 4) | lo;
         }
         Hash256(addr)
@@ -501,7 +501,10 @@ impl JmtStore {
         // This is a simplified Merkle proof that avoids transmitting all 15
         // sibling hashes per level.
         for (depth, sibling) in proof.siblings.iter().enumerate() {
-            let nibble_idx = walk_path.get(proof.siblings.len() - 1 - depth);
+            let nibble_idx = match walk_path.get(proof.siblings.len() - 1 - depth) {
+                Some(n) => n,
+                None => return false, // malformed proof: path too short for siblings
+            };
             // Reconstruct: the internal node hash is hash_pair of the child
             // positioned at nibble_idx and the combined sibling hash, ordered
             // canonically.
@@ -673,7 +676,7 @@ impl JmtStore {
                     });
                 }
 
-                let nibble = path.get(depth) as usize;
+                let nibble = path.get(depth).expect("depth within path bounds") as usize;
                 let mut new_internal = internal.clone();
 
                 // Descend into the child at `nibble`.
@@ -723,8 +726,10 @@ impl JmtStore {
         new_path: &NibblePath,
         new_leaf: &LeafNode,
     ) -> Node {
-        let existing_nibble = existing_path.get(split_depth) as usize;
-        let new_nibble = new_path.get(split_depth) as usize;
+        let existing_nibble = existing_path.get(split_depth)
+            .expect("split_depth within existing path bounds") as usize;
+        let new_nibble = new_path.get(split_depth)
+            .expect("split_depth within new path bounds") as usize;
 
         // Create the two leaves with their remaining suffixes.
         let existing_new = Node::Leaf(LeafNode {
@@ -764,7 +769,7 @@ impl JmtStore {
         // between base_depth and split_depth (if any).
         // We build from split_depth back to base_depth.
         for d in (base_depth..split_depth).rev() {
-            let nibble = existing_path.get(d) as usize; // same for both at this prefix
+            let nibble = existing_path.get(d).expect("d within path bounds") as usize; // same for both at this prefix
             let current_hash = self.node_hash(&current);
 
             // Store the intermediate node.
@@ -822,7 +827,7 @@ impl JmtStore {
                 if depth >= path.len() {
                     return None;
                 }
-                let nibble = path.get(depth) as usize;
+                let nibble = path.get(depth).expect("depth within path bounds") as usize;
                 let (_, child_ver) = internal.children[nibble]?;
                 let child_key = NodeKey {
                     version: child_ver,
@@ -853,7 +858,7 @@ impl JmtStore {
                 if depth >= path.len() {
                     return;
                 }
-                let nibble = path.get(depth) as usize;
+                let nibble = path.get(depth).expect("depth within path bounds") as usize;
 
                 // Compute combined sibling hash (all children except `nibble`).
                 let mut hasher = blake3::Hasher::new();
