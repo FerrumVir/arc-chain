@@ -1,4 +1,4 @@
-.PHONY: build test node join inference explorer faucet bench clean
+.PHONY: build test node join inference explorer faucet bench eval-perplexity clean
 
 # Build everything
 build:
@@ -45,6 +45,10 @@ stats:
 # Check live node health
 health:
 	@curl -s http://140.82.16.112:9090/health | python3 -m json.tool
+
+# Run perplexity evaluation
+eval-perplexity:
+	./scripts/eval-perplexity.sh
 
 # Clean build artifacts
 clean:

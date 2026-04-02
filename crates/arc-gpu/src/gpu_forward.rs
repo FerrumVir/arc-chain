@@ -119,10 +119,10 @@ pub struct GpuModel {
     final_quantize_bg: wgpu::BindGroup,
     lm_head_bg: wgpu::BindGroup,
     argmax_bg: wgpu::BindGroup,
-    // Pre-created param buffers (updated per token via write_buffer)
-    rope_q_params: Vec<wgpu::Buffer>,  // per-layer, updated for position
-    rope_k_params: Vec<wgpu::Buffer>,
-    attn_params_bufs: Vec<wgpu::Buffer>,  // per-layer, updated for seq_len
+    // Shared param buffers (all layers use the same — updated once per token)
+    rope_q_params: wgpu::Buffer,
+    rope_k_params: wgpu::Buffer,
+    attn_params_bufs: wgpu::Buffer,
     // Static param buffers (never change)
     ln_params_buf: wgpu::Buffer,
     mm_q_params: wgpu::Buffer,
@@ -590,22 +590,17 @@ impl GpuForward {
         };
         let be = bg_entry; // shorthand
 
-        // Per-layer dynamic params (updated per token)
-        let mut rope_q_params_bufs = Vec::new();
-        let mut rope_k_params_bufs = Vec::new();
-        let mut attn_params_bufs_vec = Vec::new();
+        // Shared param buffers (all layers use the same — updated once per token)
+        let shared_rqp = self.buf("shared_rqp", bytemuck::bytes_of(&RopeParams { pos: 0, d_head, n_heads, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
+        let shared_rkp = self.buf("shared_rkp", bytemuck::bytes_of(&RopeParams { pos: 0, d_head, n_heads: n_kv_heads, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
+        let shared_atp = self.buf("shared_atp", bytemuck::bytes_of(&AttnParams {
+            d_head, n_heads, n_kv_heads, seq_len: 1, d_kv, attn_scale, _p1: 0, _p2: 0,
+        }), wgpu::BufferUsages::UNIFORM);
 
         let mut layer_bgs_vec = Vec::new();
         for i in 0..n_layers as usize {
             let lw = &layer_weights[i];
             let ls = &layer_scales[i];
-
-            // RoPE params (position updated per token)
-            let rqp = self.buf(&format!("rqp{i}"), bytemuck::bytes_of(&RopeParams { pos: 0, d_head, n_heads, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
-            let rkp = self.buf(&format!("rkp{i}"), bytemuck::bytes_of(&RopeParams { pos: 0, d_head, n_heads: n_kv_heads, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
-            let atp = self.buf(&format!("atp{i}"), bytemuck::bytes_of(&AttnParams {
-                d_head, n_heads, n_kv_heads, seq_len: 1, d_kv, attn_scale, _p1: 0, _p2: 0,
-            }), wgpu::BufferUsages::UNIFORM);
 
             layer_bgs_vec.push(LayerBindGroups {
                 fused_lnq_attn: mk_bg(&[be(0, &hidden_buf), be(1, &normed_packed), be(2, &layer_attn_norm[i]), be(3, &ln_params_buf), be(4, &quant_scale)], &self.fused_lnq_bgl),
@@ -615,9 +610,9 @@ impl GpuForward {
                 mm_q: mk_bg(&[be(0, &lw.wq), be(1, &normed_packed), be(2, &q_buf), be(3, &mm_q_params), be(4, &ls.sq)], &self.matmul_bgl),
                 mm_k: mk_bg(&[be(0, &lw.wk), be(1, &normed_packed), be(2, &k_buf), be(3, &mm_k_params), be(4, &ls.sk)], &self.matmul_bgl),
                 mm_v: mk_bg(&[be(0, &lw.wv), be(1, &normed_packed), be(2, &v_buf), be(3, &mm_v_params), be(4, &ls.sv)], &self.matmul_bgl),
-                rope_q: mk_bg(&[be(0, &q_buf), be(1, &rope_cos_buf), be(2, &rope_sin_buf), be(3, &rqp)], &self.rope_bgl),
-                rope_k: mk_bg(&[be(0, &k_buf), be(1, &rope_cos_buf), be(2, &rope_sin_buf), be(3, &rkp)], &self.rope_bgl),
-                attn: mk_bg(&[be(0, &q_buf), be(1, &kv_k_bufs[i]), be(2, &kv_v_bufs[i]), be(3, &kv_k_scales[i]), be(4, &kv_v_scales[i]), be(5, &attn_out_buf), be(6, &atp)], &self.attention_bgl),
+                rope_q: mk_bg(&[be(0, &q_buf), be(1, &rope_cos_buf), be(2, &rope_sin_buf), be(3, &shared_rqp)], &self.rope_bgl),
+                rope_k: mk_bg(&[be(0, &k_buf), be(1, &rope_cos_buf), be(2, &rope_sin_buf), be(3, &shared_rkp)], &self.rope_bgl),
+                attn: mk_bg(&[be(0, &q_buf), be(1, &kv_k_bufs[i]), be(2, &kv_v_bufs[i]), be(3, &kv_k_scales[i]), be(4, &kv_v_scales[i]), be(5, &attn_out_buf), be(6, &shared_atp)], &self.attention_bgl),
                 quantize_attn: mk_bg(&[be(0, &attn_out_buf), be(1, &normed_packed), be(2, &quant_scale)], &self.quantize_bgl),
                 mm_wo: mk_bg(&[be(0, &lw.wo), be(1, &normed_packed), be(2, &projected_buf), be(3, &mm_wo_params), be(4, &ls.so)], &self.matmul_bgl),
                 residual_attn: mk_bg(&[be(0, &hidden_buf), be(1, &projected_buf)], &self.residual_bgl),
@@ -631,9 +626,6 @@ impl GpuForward {
                 residual_ffn: mk_bg(&[be(0, &hidden_buf), be(1, &ff_out_buf)], &self.residual_bgl),
             });
 
-            rope_q_params_bufs.push(rqp);
-            rope_k_params_bufs.push(rkp);
-            attn_params_bufs_vec.push(atp);
         }
 
         let fused_final_lnq_bg = mk_bg(&[be(0, &hidden_buf), be(1, &normed_packed), be(2, &final_norm_buf), be(3, &ln_params_buf), be(4, &quant_scale)], &self.fused_lnq_bgl);
@@ -652,9 +644,9 @@ impl GpuForward {
             kv_k_bufs, kv_v_bufs, kv_k_scales, kv_v_scales,
             layer_bgs: layer_bgs_vec,
             fused_final_lnq_bg, final_ln_bg, final_quantize_bg, lm_head_bg, argmax_bg,
-            rope_q_params: rope_q_params_bufs,
-            rope_k_params: rope_k_params_bufs,
-            attn_params_bufs: attn_params_bufs_vec,
+            rope_q_params: shared_rqp,
+            rope_k_params: shared_rkp,
+            attn_params_bufs: shared_atp,
             ln_params_buf, mm_q_params, mm_k_params, mm_v_params,
             mm_wo_params, mm_gate_params, mm_up_params, mm_down_params, mm_lm_params,
             n_layers, d_model, d_ff, d_head, d_kv, n_heads, n_kv_heads, vocab_size, attn_scale,
@@ -677,19 +669,17 @@ impl GpuForward {
         let emb: Vec<i32> = vec![0i32; d as usize];
         self.queue.write_buffer(&model.hidden_buf, 0, bytemuck::cast_slice(&emb));
 
-        // Update per-token params (position, seq_len) — just write_buffer to existing bufs
-        for i in 0..model.n_layers as usize {
-            let rp = RopeParams { pos: seq_pos, d_head: dh, n_heads: model.n_heads, _pad: 0 };
-            self.queue.write_buffer(&model.rope_q_params[i], 0, bytemuck::bytes_of(&rp));
-            let rk = RopeParams { pos: seq_pos, d_head: dh, n_heads: model.n_kv_heads, _pad: 0 };
-            self.queue.write_buffer(&model.rope_k_params[i], 0, bytemuck::bytes_of(&rk));
-            let ap = AttnParams {
-                d_head: dh, n_heads: model.n_heads, n_kv_heads: model.n_kv_heads,
-                seq_len: seq_pos + 1, d_kv: model.d_kv, attn_scale: model.attn_scale,
-                _p1: 0, _p2: 0,
-            };
-            self.queue.write_buffer(&model.attn_params_bufs[i], 0, bytemuck::bytes_of(&ap));
-        }
+        // Update shared param buffers (3 writes instead of 96)
+        let rp = RopeParams { pos: seq_pos, d_head: dh, n_heads: model.n_heads, _pad: 0 };
+        self.queue.write_buffer(&model.rope_q_params, 0, bytemuck::bytes_of(&rp));
+        let rk = RopeParams { pos: seq_pos, d_head: dh, n_heads: model.n_kv_heads, _pad: 0 };
+        self.queue.write_buffer(&model.rope_k_params, 0, bytemuck::bytes_of(&rk));
+        let ap = AttnParams {
+            d_head: dh, n_heads: model.n_heads, n_kv_heads: model.n_kv_heads,
+            seq_len: seq_pos + 1, d_kv: model.d_kv, attn_scale: model.attn_scale,
+            _p1: 0, _p2: 0,
+        };
+        self.queue.write_buffer(&model.attn_params_bufs, 0, bytemuck::bytes_of(&ap));
 
         let t_params = t0.elapsed();
 

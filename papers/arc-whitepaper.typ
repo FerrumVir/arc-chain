@@ -29,7 +29,7 @@
 ]
 
 #text(weight: "bold")[Abstract.]
-We present ARC, a Layer 1 blockchain purpose-built for verifiable AI inference. ARC solves the fundamental problem that prevents AI computation from being trustlessly verified: the non-determinism of IEEE 754 floating-point arithmetic across hardware platforms. By constructing a pure integer inference engine that eliminates all floating-point operations from the neural network forward pass, ARC achieves bitwise identical inference output across ARM, x86, and GPU architectures. This platform determinism enables: (1) cryptographic verification of inference via hash comparison at O(1) cost, (2) distributed inference across untrusted heterogeneous devices without inter-node validation, (3) expert-parallel sharding of Mixture-of-Experts models across community GPU nodes at 15x lower cost than centralized providers, and (4) STARK proofs of neural network computation for cryptographic certainty. The system processes 33,230 transactions per second on a two-node network with DAG consensus, runs 7-billion parameter models at 76ms per token, and operates across 8 nodes on 6 continents producing identical output hashes. ARC introduces three inference verification tiers (all-execute, optimistic with fraud proofs, and STARK-proven), a VRF-based committee selection mechanism for large model verification, zero-fee AI agent settlements as first-class transaction types, and an EIP-1559-style inference gas lane. The system is implemented in 99,000 lines of Rust across 14 crates with 1,209 tests. A formal treatment of the underlying determinism requirement is given in our companion paper _On the Foundations of Trustworthy Artificial Intelligence_ (arXiv:2603.24904).
+We present ARC, a Layer 1 blockchain for verifiable AI inference. ARC constructs a pure integer inference engine that eliminates all floating-point operations from the neural network forward pass, achieving bitwise identical output across ARM, x86, and GPU architectures. This engineering enables: (1) cryptographic verification of inference via hash comparison at O(1) cost, (2) distributed inference across untrusted heterogeneous devices without inter-node validation, (3) a roadmap for expert-parallel sharding of Mixture-of-Experts models across community GPU nodes, and (4) STARK proofs of neural network layers with a path to full-inference proofs. The system processes 33,230 transactions per second on a two-node network with DAG consensus, runs 7-billion parameter models at 76ms per token, and operates across 8 nodes on 6 continents producing identical output hashes. ARC introduces three inference verification tiers (all-execute, optimistic with fraud proofs, and STARK-proven), a VRF-based committee selection mechanism for large model verification, zero-fee AI agent settlements as first-class transaction types, and an EIP-1559-style inference gas lane. The system is implemented in 99,000 lines of Rust across 14 crates with 1,209 tests. A formal treatment of the underlying determinism requirement is given in our companion paper _On the Foundations of Trustworthy Artificial Intelligence_ (arXiv:2603.24904).
 
 = Introduction
 
@@ -217,6 +217,49 @@ ARC is implemented in 99,000 lines of Rust across 14 crates:
 )
 
 The system passes 1,209 tests and operates on a live testnet across 8 nodes on 6 continents.
+
+= Implementation Status
+
+The following table summarizes the current implementation state. We distinguish shipped features (tested and deployed) from features under active development.
+
+#figure(
+  table(
+    columns: (auto, auto, auto),
+    stroke: 0.5pt,
+    inset: 6pt,
+    [*Feature*], [*Status*], [*Notes*],
+    [Integer inference engine], [Shipped], [CPU (NEON/AVX2) + GPU (Metal/WGSL), INT8 and Q4],
+    [Cross-platform determinism], [Shipped], [82 cross-architecture tests, 0 mismatches],
+    [DAG consensus], [Shipped], [Live testnet, 8 validators across 6 continents],
+    [STARK proofs (dense layers)], [Shipped], [60 proofs via Stwo Circle STARK],
+    [STARK proofs (full inference)], [In progress], [Attention, normalization, activations planned],
+    [Expert-parallel sharding], [Designed], [Architecture specified; implementation planned],
+    [Speculative decoding], [Projected], [0\% conflict rate under determinism (theoretical)],
+    [INT16 weights], [In progress], [258$times$ finer quantization than INT8],
+  ),
+  caption: [Implementation status as of March 2026.],
+)
+
+= Production Readiness
+
+INT8 quantization preserves the argmax (top-1 token selection) for well-separated logit distributions but degrades calibration of the full probability distribution. The following table summarizes readiness by use case.
+
+#figure(
+  table(
+    columns: (auto, auto, auto),
+    stroke: 0.5pt,
+    inset: 6pt,
+    [*Use Case*], [*INT8 Readiness*], [*Notes*],
+    [Classification / routing], [Production], [Argmax stable; distribution shape irrelevant],
+    [Code generation], [Production], [Syntax-sensitive; argmax dominant],
+    [Chatbot / assistant], [Production], [Top-$k$ sampling tolerates calibration noise],
+    [Factual Q\&A], [Production], [Answer selection argmax-dominated],
+    [Calibrated probabilities], [Requires INT16], [Distribution shape critical],
+    [Medical / legal decisions], [Requires INT16+], [Regulatory requirements on confidence],
+    [Fine-grained ranking], [Requires INT16], [Relative ordering sensitive to noise],
+  ),
+  caption: [Production readiness by use case under INT8 quantization.],
+)
 
 = Conclusion
 

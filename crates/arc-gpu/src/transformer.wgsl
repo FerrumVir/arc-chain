@@ -192,7 +192,7 @@ fn quantize_i32_to_i8(
 
     // Find abs max using workgroup reduction
     var local_max: i32 = 0;
-    for (var i = tid; i < 16384u; i = i + 256u) { // max d_ff
+    for (var i = tid; i < size; i = i + 256u) {
         let v = q_input[i];
         let av = select(-v, v, v >= 0);
         local_max = max(local_max, av);
@@ -215,7 +215,7 @@ fn quantize_i32_to_i8(
     workgroupBarrier();
 
     // Quantize and pack into u32
-    for (var i = tid; i < 4096u; i = i + 256u) { // packed count
+    for (var i = tid; i < (size + 3u) / 4u; i = i + 256u) {
         let base = i * 4u;
         var packed: u32 = 0u;
         for (var k = 0u; k < 4u; k = k + 1u) {
@@ -267,6 +267,7 @@ fn rope(@builtin(global_invocation_id) gid: vec3<u32>) {
 @group(0) @binding(6) var<uniform> attn_params: AttnParams;
 
 var<workgroup> attn_scores: array<i32, 2048>; // max seq len
+var<workgroup> smx_shared: array<i32, 32>;
 
 @compute @workgroup_size(32) // one thread per sequence position (up to 32)
 fn attention(
@@ -279,18 +280,15 @@ fn attention(
     let seq = attn_params.seq_len;
     let kv_h = head * attn_params.n_kv_heads / attn_params.n_heads;
 
-    // Each thread computes one attention score Q·K[j]
-    if (tid < seq) {
-        let j = tid;
+    // Each thread computes scores for multiple positions
+    for (var j = tid; j < seq; j = j + 32u) {
         var dot: i32 = 0;
         let q_off = head * dh;
         let k_off = j * attn_params.d_kv + kv_h * dh;
         let k_scale = attn_k_scales[j];
-
         let packed_dh = dh / 4u;
         for (var d = 0u; d < packed_dh; d = d + 1u) {
             let kp = attn_k_cache[k_off / 4u + d];
-            // Q is i32, K is packed i8 — do i32 × i8
             for (var k = 0u; k < 4u; k = k + 1u) {
                 dot += attn_q[q_off + d * 4u + k] * ext_i8(kp, k);
             }
@@ -299,29 +297,46 @@ fn attention(
     }
     workgroupBarrier();
 
-    // Softmax (thread 0 computes for the whole head)
-    if (tid == 0u) {
-        // Find max
-        var max_val: i32 = -999999;
-        for (var j = 0u; j < seq; j = j + 1u) {
-            max_val = max(max_val, attn_scores[j]);
+    // Phase 1: Parallel max-find
+    var local_max: i32 = -999999;
+    for (var j = tid; j < seq; j = j + 32u) {
+        local_max = max(local_max, attn_scores[j]);
+    }
+    smx_shared[tid] = local_max;
+    workgroupBarrier();
+    for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            smx_shared[tid] = max(smx_shared[tid], smx_shared[tid + stride]);
         }
+        workgroupBarrier();
+    }
+    let max_val = smx_shared[0];
+    workgroupBarrier();
 
-        // exp and sum (approximation: exp(x) ≈ max(0, 1 + x/65536) for small x)
-        var sum_exp: i32 = 0;
-        for (var j = 0u; j < seq; j = j + 1u) {
-            let x = attn_scores[j] - max_val;
-            // Simple exp approximation: piecewise linear
-            let e = select(0, 65536 + x, x > -65536 * 8);
-            attn_scores[j] = max(0, e);
-            sum_exp += max(0, e);
+    // Phase 2: Parallel exp + sum
+    var local_sum: i32 = 0;
+    for (var j = tid; j < seq; j = j + 32u) {
+        let x = attn_scores[j] - max_val;
+        let e = select(0, 65536 + x, x > -65536 * 8);
+        let ev = max(0, e);
+        attn_scores[j] = ev;
+        local_sum += ev;
+    }
+    smx_shared[tid] = local_sum;
+    workgroupBarrier();
+    for (var stride = 16u; stride > 0u; stride = stride >> 1u) {
+        if (tid < stride) {
+            smx_shared[tid] += smx_shared[tid + stride];
         }
+        workgroupBarrier();
+    }
+    let sum_exp = smx_shared[0];
+    workgroupBarrier();
 
-        // Normalize
-        if (sum_exp > 0) {
-            for (var j = 0u; j < seq; j = j + 1u) {
-                attn_scores[j] = (attn_scores[j] * 65536) / sum_exp;
-            }
+    // Phase 3: Parallel normalize
+    if (sum_exp > 0) {
+        for (var j = tid; j < seq; j = j + 32u) {
+            attn_scores[j] = (attn_scores[j] * 65536) / sum_exp;
         }
     }
     workgroupBarrier();

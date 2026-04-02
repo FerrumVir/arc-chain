@@ -616,6 +616,8 @@ These outputs are factually correct, grammatically fluent, and indistinguishable
 
 *Distribution calibration.* We separately measure perplexity (PPL) on WikiText-2, which quantifies the calibration of the full probability distribution, not whether the model selects the right token, but whether it assigns the right _probability_ to every token.
 
+*Methodological note.* The comparison below uses different model variants (Llama-2-7B-Chat for INT8 vs. Llama-2-7B base for FP16) _and_ different precisions. Chat-finetuned models exhibit inherently higher perplexity on general text corpora because instruction tuning shifts the output distribution away from next-word prediction. The raw 144 vs. 5.47 ratio therefore represents an _upper bound_ on INT8 degradation, not a controlled measurement. A controlled comparison using the same base model at both precisions is forthcoming.
+
 #figure(
   table(
     columns: (auto, auto, auto, auto),
@@ -625,10 +627,10 @@ These outputs are factually correct, grammatically fluent, and indistinguishable
     [Llama-2-7B-Chat], [ARC engine (INT8)], [144], [Yes (all platforms)],
     [Llama-2-7B (base)], [FP16 (published)], [5.47], [No],
   ),
-  caption: [Perplexity on WikiText-2 (512 tokens). Note: the two rows compare different model variants (Chat vs. base) and different precisions (INT8 vs. FP16); the perplexity gap reflects both effects. Published baseline from Touvron et al. @touvron2023.],
+  caption: [Perplexity on WikiText-2 (512 tokens). *Caution:* rows use different model variants and precisions; the gap reflects both effects. See methodological note above.],
 ) <tab:ppl>
 
-Two caveats apply to this comparison. First, the table compares a Chat-finetuned model (INT8) against a base model (FP16); chat models exhibit inherently higher perplexity on general corpora because instruction tuning shifts the output distribution away from next-word prediction of encyclopedia text. The quantization-attributable degradation is therefore smaller than the raw 144 vs. 5.47 ratio suggests. Second, perplexity measures calibration of the full probability distribution across a 32,000-entry vocabulary, not top-1 token accuracy. INT8 quantization adds noise to the logit distribution, spreading probability mass across the tail, which degrades perplexity without necessarily changing the argmax. For well-separated logit distributions (where the top token has a clear margin), INT8 noise does not flip the selection, as confirmed by the cross-platform experiments in Section 9.2. For distributions where multiple tokens have near-equal probability, INT8 noise can alter the selection; the mixed-precision schemes discussed below would reduce this sensitivity.
+As noted above, this comparison conflates model variant and precision effects. The key observation is that perplexity measures calibration of the full probability distribution across a 32,000-entry vocabulary, not top-1 token accuracy. INT8 quantization adds noise to the logit distribution, spreading probability mass across the tail, which degrades perplexity without necessarily changing the argmax. For well-separated logit distributions (where the top token has a clear margin), INT8 noise does not flip the selection, as confirmed by the cross-platform experiments in Section 9.2. For distributions where multiple tokens have near-equal probability, INT8 noise can alter the selection; the mixed-precision schemes discussed below would reduce this sensitivity.
 
 The calibration gap is a property of the INT8 bit-width, not of deterministic inference. INT16 weights (2 bytes per parameter) would provide $256 times$ finer resolution in the logit space. Mixed-precision schemes (INT16 for attention projections, INT8 for feed-forward layers) would close the calibration gap while preserving the determinism guarantee. The current INT8 engine is a proof that determinism is achievable; higher precision is an engineering optimization within the same framework.
 
