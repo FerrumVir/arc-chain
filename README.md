@@ -1,5 +1,5 @@
 ![Rust](https://img.shields.io/badge/Rust-99%2C000%2B_LOC-orange)
-![Tests](https://img.shields.io/badge/tests-1%2C196_passing-brightgreen)
+![Tests](https://img.shields.io/badge/tests-1%2C204_passing-brightgreen)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-blue)
 ![Inference](https://img.shields.io/badge/inference-76ms%2Ftok_deterministic-purple)
 ![Testnet](https://img.shields.io/badge/testnet-live-green)
@@ -70,30 +70,72 @@ All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
 
 ---
 
-## Quick Start
+## Run a Node
 
-### Not technical? Start here
+**One command. That's it.** Installs Rust, builds the binary, generates your validator key, starts the node, and connects to the testnet. Works on Linux and macOS. No subscription, no account, no sign-up. Free.
+
+```bash
+curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-node.sh | bash
+```
+
+Your node is now running. It auto-connects to the live testnet, syncs state from peers, and starts participating in consensus. You'll earn ARC for validating.
+
+**Check it's working:**
+```bash
+curl http://localhost:9944/health
+# {"status":"ok","peers":7,"dag_round":12345,"validators":8}
+```
+
+### Want to run AI inference too? (earn more ARC)
+
+Add a model and your node will execute AI inference for the network. Any laptop with 4GB+ RAM works. GPU optional.
+
+```bash
+# Already have a node running? Add inference:
+~/.arc-chain/arc-chain/scripts/join-inference.sh
+
+# Or start fresh with inference from the beginning:
+git clone https://github.com/FerrumVir/arc-chain.git && cd arc-chain
+./scripts/join-inference.sh
+```
+
+This downloads TinyLlama 1.1B (638 MB), starts your node, and connects to the testnet. Your node will begin processing inference requests from the network. Every verified inference earns ARC.
+
+### Already have the repo cloned?
+
+```bash
+cd arc-chain
+./scripts/join-testnet.sh                  # Validator only
+./scripts/join-testnet.sh --with-inference # Validator + AI inference
+```
+
+### What does it cost?
+
+Nothing. There is no subscription. No account. No sign-up. You run a binary on your own machine and you earn ARC for contributing compute to the network. The node software is open source.
+
+| Resource | Requirement |
+|----------|-------------|
+| **RAM** | 2 GB minimum, 4 GB+ for inference |
+| **Disk** | 2 GB for build, ~4 GB with model |
+| **CPU** | Any (x86, ARM, Apple Silicon all work) |
+| **GPU** | Optional (Metal, CUDA, or Vulkan for faster inference) |
+| **OS** | Linux or macOS |
+| **Network** | Any internet connection |
+| **Cost** | Free. Forever. |
+
+---
+
+## Quick Start (no install)
+
+Don't want to run a node? You can still use the network right now:
 
 1. Open the **[Web Wallet](http://140.82.16.112:3100)** in your browser (phone or desktop)
 2. Click **"Create New Wallet"** — save your private key
 3. You now have **10,000 ARC** — send tokens, check balance, explore
 4. View the live network on the **[Dashboard](http://140.82.16.112:3200)** — 8 nodes across 6 continents
-5. Run `./scripts/monitor-testnet.sh` to see all nodes in your terminal
-
-### Prerequisites (for running your own node)
-
-- Rust nightly (`rustup default nightly`)
-- ~2 GB disk for build, ~4 GB with model
-
-### See it live right now (zero install)
-
-The testnet is running across 8 nodes on 6 continents with DAG consensus.
 
 **Live Dashboard:** [http://140.82.16.112:3200](http://140.82.16.112:3200)
-All 8 nodes, consensus rounds, inference attestations, transactions — one screen.
-
 **Web Wallet:** [http://140.82.16.112:3100](http://140.82.16.112:3100)
-Create a wallet, claim free tokens, and send transfers — all in your browser.
 
 ![Live Dashboard](docs/screenshots/dashboard.png)
 
@@ -101,19 +143,21 @@ Create a wallet, claim free tokens, and send transfers — all in your browser.
 |:---:|:---:|
 | ![Wallet](docs/screenshots/wallet-active.png) | ![Key Modal](docs/screenshots/key-modal.png) |
 
-**Live endpoints — try them now:**
+```bash
+# Quick test from terminal — zero install needed
+curl http://140.82.16.112:9090/stats
 
-| What | URL |
-|------|-----|
-| **Web Wallet** | [http://140.82.16.112:3100](http://140.82.16.112:3100) |
-| **Chain Stats** | [http://140.82.16.112:9090/stats](http://140.82.16.112:9090/stats) |
-| **Node Health** | [http://140.82.16.112:9090/health](http://140.82.16.112:9090/health) |
-| **Validators** | [http://140.82.16.112:9090/validators](http://140.82.16.112:9090/validators) |
-| **Inference Attestations** | [http://140.82.16.112:9090/inference/attestations](http://140.82.16.112:9090/inference/attestations) |
-| **Account Lookup** | `http://140.82.16.112:9090/account/{address}` |
-| **Faucet (POST)** | `http://140.82.16.112:9090/faucet/claim` |
+# Claim free testnet tokens
+curl -X POST http://140.82.16.112:9090/faucet/claim \
+  -H 'Content-Type: application/json' \
+  -d '{"address":"your-64-char-hex-address-here"}'
+```
 
-**All 8 nodes** have the same API on port 9090:
+---
+
+## Network Endpoints
+
+**All 8 testnet nodes** have the same API on port 9090:
 
 | Node | Location | RPC |
 |------|----------|-----|
@@ -126,90 +170,39 @@ Create a wallet, claim free tokens, and send transfers — all in your browser.
 | SAO | Sao Paulo | `http://216.238.120.27:9090` |
 | JNB | Johannesburg | `http://139.84.237.49:9090` |
 
-> **Ports**: Default RPC is 9944 (configurable via `--rpc`), P2P is 9945 (configurable via `--p2p-port`). The live testnet above uses 9090 (legacy). You only need the RPC port.
+| Endpoint | URL |
+|----------|-----|
+| **Chain Stats** | [/stats](http://140.82.16.112:9090/stats) |
+| **Node Health** | [/health](http://140.82.16.112:9090/health) |
+| **Validators** | [/validators](http://140.82.16.112:9090/validators) |
+| **Inference Attestations** | [/inference/attestations](http://140.82.16.112:9090/inference/attestations) |
+| **Account Lookup** | `/account/{address}` |
+| **Faucet** | `POST /faucet/claim` |
+| **Run Inference** | `POST /inference/run` |
+| **DAG Sync State** | `/sync/dag_state` |
+
+> **Your node's ports**: RPC on 9944, P2P on 9945 (both configurable). The live testnet uses 9090 (legacy).
+
+### Makefile shortcuts
 
 ```bash
-# Quick test from terminal
-curl http://140.82.16.112:9090/stats
-
-# Claim free testnet tokens
-curl -X POST http://140.82.16.112:9090/faucet/claim \
-  -H 'Content-Type: application/json' \
-  -d '{"address":"your-64-char-hex-address-here"}'
-```
-
-### Join the testnet (run your own node)
-
-```bash
-git clone https://github.com/FerrumVir/arc-chain.git
-cd arc-chain
-./scripts/join-testnet.sh
-```
-
-### Run an inference node (GPU recommended)
-
-Earn ARC by running AI inference for the network. Your IP stays private.
-
-```bash
-./scripts/join-inference.sh              # Downloads TinyLlama 1.1B + joins testnet
-./scripts/join-inference.sh --model FILE # Use your own GGUF model
-```
-
-Once running, test inference locally:
-```bash
-curl -X POST http://localhost:9944/inference/run \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":32}'
-```
-
-### Makefile commands
-
-```bash
-make join            # Join testnet (no inference)
+make join            # Join testnet (validator only)
 make inference       # Join with inference enabled
-make inference-node  # Run a dedicated inference node (GPU)
 make stats           # Check live chain stats
 make health          # Check live node health
-make test            # Run 1,196 tests
+make test            # Run all tests
 make explorer        # Open block explorer
-make faucet        # Run testnet faucet
-```
-
-### What you'll see
-
-```bash
-# Chain stats
-curl http://localhost:9944/stats
-# {"chain":"ARC Chain","dag_round":937,"dag_committed":570,"validators":8,
-#  "connected_peers":7,"total_transactions":42,"benchmark_tps":9000}
-
-# Node health
-curl http://localhost:9944/health
-# {"status":"ok","peers":7,"dag_round":937,"dag_committed":570,
-#  "validators":8,"uptime_secs":3600}
-
-# Run AI inference (requires --with-inference flag at startup)
-curl -X POST http://localhost:9944/inference/run \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":16}'
-# Returns: output text, output hash (identical on ALL hardware), ms/token
-
-# View inference attestations on-chain
-curl http://localhost:9944/inference/attestations
-
-# Monitor all 8 testnet nodes in your terminal
-./scripts/monitor-testnet.sh
 ```
 
 ### Get testnet tokens
 
-**Easiest way (no install):** Open the [Web Wallet](http://140.82.16.112:3100), click "Create New Wallet", and you'll get 10,000 ARC automatically.
+**Easiest:** Open the [Web Wallet](http://140.82.16.112:3100) and create a wallet. You get 10,000 ARC automatically.
 
 **From terminal:**
 ```bash
 curl -X POST http://localhost:9944/faucet/claim \
   -H 'Content-Type: application/json' \
-  -d '{"address":"your-wallet-address-from-the-web-wallet"}'
+  -d '{"address":"your-wallet-address"}'
 ```
 
 ### Deploy a smart contract
@@ -302,6 +295,36 @@ Three tiers of AI inference, each with different trust/cost tradeoffs:
 | **Tier 1** | On-chain (precompile 0x0A) | Every validator re-executes | Small models, full trust |
 | **Tier 2** | Off-chain, optimistic | Fraud proofs + economic bonds | Large models, fast |
 | **Tier 3** | Off-chain, STARK-proven | Cryptographic proof | Maximum trust |
+
+---
+
+## Distributed Inference (v0.3.0)
+
+Run models that no single device could handle. A 670B model splits across nodes that each hold a piece and compute in parallel. You go from "can't run it" to running it at full quality.
+
+**How it works:**
+
+```
+Your laptop (layers 0-10)  -->  Friend's PC (layers 11-20)  -->  ...  -->  Gaming rig (final layers)
+    embed + compute               receive activations,              run last layers,
+    forward activations           compute, forward                  produce output token
+```
+
+Every activation is i64 fixed-point, serialized as little-endian bytes with a BLAKE3 integrity hash. The output is **mathematically identical** to running on a single machine. Not similar. Identical. Bit for bit.
+
+**For MoE (Mixture of Experts) models:** Experts compute simultaneously across nodes, not sequentially. More devices = more throughput. Speed scales with participants.
+
+**Deterministic caching:** Identical inputs always produce identical outputs (integer-only arithmetic). Repeated queries are instant across the entire network. The more people join, the faster and cheaper it gets.
+
+| Feature | Detail |
+|---------|--------|
+| **Sharding** | Pipeline-parallel at transformer layer boundaries |
+| **MoE** | Expert-parallel, round-robin assignment across nodes |
+| **Activation size** | 64 KB per layer boundary per token (d_model=8192) |
+| **Network overhead** | ~30ms per token over consumer internet (6 hops) |
+| **Integrity** | BLAKE3 hash on every activation transfer |
+| **Determinism** | Bit-for-bit identical: x86, ARM, GPU, any device |
+| **Verification** | VRF committee + challenge-response fraud proofs |
 
 ---
 
