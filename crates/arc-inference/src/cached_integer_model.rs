@@ -1136,7 +1136,7 @@ fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i
 
 /// Q4 × i64 matmul with FULL input precision (no pre-quantization).
 /// This avoids the double-quantization precision loss of the SIMD path.
-fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
+pub fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
     let byte_cols = q4.n_cols / 2;
     let data = &q4.data;
     let scales = &q4.scales;
@@ -1166,7 +1166,7 @@ fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
 /// RMSNorm (what Llama uses — no mean subtraction, just root-mean-square).
 /// output[i] = (input[i] / rms) * gamma[i]
 /// where rms = sqrt(mean(x²))
-fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
+pub fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
     let n = input.len() as i64;
     if n == 0 { return vec![]; }
     // RMSNorm: compute mean of squares (NOT variance around mean)

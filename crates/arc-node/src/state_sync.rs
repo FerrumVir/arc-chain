@@ -238,6 +238,66 @@ impl StateSyncManager {
 
         Ok(target_height)
     }
+
+    /// Fetch a peer's current DAG round state for consensus catch-up.
+    /// Returns (current_round, last_committed_round) so we can initialize
+    /// our consensus engine at the right round instead of starting from 0.
+    pub async fn fetch_dag_state(&self, peer_rpc: &str) -> Result<(u64, u64), SyncError> {
+        let url = format!("http://{}/sync/dag_state", peer_rpc);
+        info!("Fetching DAG state from {}", url);
+
+        let resp = self.client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+            .map_err(|e| SyncError::ManifestFetchFailed {
+                url: url.clone(),
+                source: e,
+            })?;
+
+        #[derive(serde::Deserialize)]
+        struct DagState {
+            current_round: u64,
+            last_committed_round: u64,
+        }
+
+        let state: DagState = resp.json().await
+            .map_err(|e| SyncError::ManifestFetchFailed { url, source: e })?;
+
+        info!(
+            "Peer DAG state: round={}, committed={}",
+            state.current_round, state.last_committed_round
+        );
+        Ok((state.current_round, state.last_committed_round))
+    }
+
+    /// Full sync: fetch state snapshot + DAG round from a peer.
+    /// This is the complete catch-up protocol for late-joining nodes.
+    pub async fn full_sync_from_peer(
+        &self,
+        peer_rpc: &str,
+        state: &Arc<StateDB>,
+        engine: &arc_consensus::ConsensusEngine,
+    ) -> Result<u64, SyncError> {
+        // 1. Sync account state
+        let height = self.sync_from_peer(peer_rpc, state).await?;
+
+        // 2. Sync DAG round state so consensus starts at the right round
+        match self.fetch_dag_state(peer_rpc).await {
+            Ok((round, committed)) => {
+                engine.set_initial_round(round, committed);
+                info!("DAG state synced: starting at round {} (committed {})", round, committed);
+            }
+            Err(e) => {
+                // Non-fatal: old peers may not have this endpoint yet.
+                // Node will catch up via round fast-forward on first block.
+                warn!("Could not sync DAG state (peer may be old version): {}", e);
+            }
+        }
+
+        Ok(height)
+    }
 }
 
 #[cfg(test)]

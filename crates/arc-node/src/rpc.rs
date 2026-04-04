@@ -152,6 +152,8 @@ pub async fn serve(
         .route("/sync/manifest", get(sync_manifest))
         .route("/sync/chunk/{index}", get(sync_chunk))
         .route("/sync/status", get(sync_status))
+        // DAG round sync — allows new nodes to start at the right round
+        .route("/sync/dag_state", get(sync_dag_state))
         // Inference — run model and record attestation on-chain
         .route("/inference/run", post(inference_run))
         .route("/inference/attestations", get(inference_list_attestations))
@@ -1240,6 +1242,24 @@ async fn sync_status(
             "total_chunks": manifest.total_chunks,
             "total_accounts": manifest.total_accounts,
         },
+    }))
+}
+
+/// GET /sync/dag_state — Returns the current DAG consensus round state.
+/// Used by new nodes to start at the right round instead of round 0.
+/// This prevents permanent partition from genesis round mismatch.
+async fn sync_dag_state(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let current_round = node.dag_round.load(std::sync::atomic::Ordering::Relaxed);
+    let last_committed_round = node.dag_committed.load(std::sync::atomic::Ordering::Relaxed);
+    let validator_count = node.dag_validators.read().len();
+
+    Json(json!({
+        "current_round": current_round,
+        "last_committed_round": last_committed_round,
+        "validator_count": validator_count,
+        "protocol_version": 2,
     }))
 }
 

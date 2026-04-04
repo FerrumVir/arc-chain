@@ -745,6 +745,27 @@ impl ConsensusEngine {
         self.current_round.load(Ordering::SeqCst)
     }
 
+    /// Get the last committed round number.
+    pub fn last_committed_round(&self) -> u64 {
+        self.last_committed_round.load(Ordering::SeqCst)
+    }
+
+    /// Set the initial round state from a peer sync.
+    /// Used when a node joins late and needs to start at the network's current round
+    /// instead of round 0. This prevents permanent partition from genesis round mismatch.
+    pub fn set_initial_round(&self, round: u64, committed: u64) {
+        let current = self.current_round.load(Ordering::SeqCst);
+        if round > current {
+            self.current_round.store(round, Ordering::SeqCst);
+            self.last_committed_round.store(committed, Ordering::SeqCst);
+            self.reset_round_timer();
+            tracing::info!(
+                "Set initial round from peer sync: round={}, committed={}",
+                round, committed
+            );
+        }
+    }
+
     /// Get the frozen validator set (used for leader selection and commit decisions).
     pub fn frozen_validator_set(&self) -> parking_lot::RwLockReadGuard<ValidatorSet> {
         self.frozen_validator_set.read()
@@ -1160,7 +1181,8 @@ impl ConsensusEngine {
         let current = self.current_round.load(Ordering::SeqCst);
         // Cap round jumps to prevent a malicious peer from sending round=u64::MAX
         // which would stall the node (huge prune computation, stuck at max round).
-        const MAX_ROUND_JUMP: u64 = 50_000;
+        // 1M allows ~46 hours of partition healing at 6 rounds/sec.
+        const MAX_ROUND_JUMP: u64 = 1_000_000;
         if block.round > current + MAX_ROUND_JUMP {
             return Err(ConsensusError::InvalidBlock(
                 format!("round {} is too far ahead (current={}, max jump={})", block.round, current, MAX_ROUND_JUMP)
@@ -1870,9 +1892,9 @@ impl ConsensusEngine {
 
     /// View-change timeout in milliseconds.
     /// If the round is stalled for this long, force-advance to prevent halts.
-    /// 2000ms for global testnet (100-300ms cross-continent RTT needs margin).
+    /// 5000ms for global testnet (100-300ms cross-continent RTT needs margin).
     /// Production with optimized networking: 500-1000ms.
-    const VIEW_CHANGE_TIMEOUT_MS: u128 = 10_000;
+    const VIEW_CHANGE_TIMEOUT_MS: u128 = 5_000;
 
     /// Check if the current round's proposer has timed out.
     ///

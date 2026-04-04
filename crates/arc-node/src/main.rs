@@ -288,7 +288,7 @@ async fn main() -> Result<()> {
 
     tracing::info!("╔═══════════════════════════════════════╗");
     tracing::info!("║   ARC Chain — Agent Runtime Chain     ║");
-    tracing::info!("║   Testnet Node v0.1.0                 ║");
+    tracing::info!("║   Testnet Node v0.3.0                 ║");
     tracing::info!("╚═══════════════════════════════════════╝");
     tracing::info!("Validator  : {}", validator_address);
     tracing::info!("Seed       : {}", validator_seed);
@@ -649,6 +649,43 @@ async fn main() -> Result<()> {
         tracing::info!("Inference  : ENABLED (INT8 integer engine)");
     }
     tracing::info!("RPC server listening on {}", rpc_addr);
+
+    // ── Graceful shutdown handler ───────────────────────────────────────
+    // On SIGTERM (from systemd stop / rolling upgrade), drain pending state
+    // and close connections before exiting. This prevents lost transactions
+    // and allows other validators to see a clean disconnect.
+    let shutdown_state = state.clone();
+    tokio::spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                tracing::info!("SIGINT received — initiating graceful shutdown...");
+            }
+            Err(e) => {
+                tracing::warn!("Failed to install SIGINT handler: {}", e);
+                return;
+            }
+        }
+        tracing::info!("Flushing WAL and pending state...");
+        shutdown_state.sync_wal();
+        tracing::info!("Graceful shutdown complete. Exiting.");
+        std::process::exit(0);
+    });
+
+    // Also handle SIGTERM (systemd sends this)
+    #[cfg(unix)]
+    {
+        let shutdown_state = state.clone();
+        tokio::spawn(async move {
+            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("SIGTERM handler");
+            sigterm.recv().await;
+            tracing::info!("SIGTERM received — initiating graceful shutdown...");
+            shutdown_state.sync_wal();
+            tracing::info!("Graceful shutdown complete. Exiting.");
+            std::process::exit(0);
+        });
+    }
+
     rpc::serve(
         &rpc_addr,
         state,

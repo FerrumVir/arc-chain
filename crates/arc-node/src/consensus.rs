@@ -462,6 +462,88 @@ impl ConsensusManager {
                                 "Received inference response from community node"
                             );
                         }
+                        // ── Partition detection via heartbeat round info ───
+                        InboundMessage::HeartbeatWithRound { peer, dag_round, committed_round } => {
+                            let my_round = self.engine.current_round();
+                            if dag_round > my_round + 10_000 {
+                                warn!(
+                                    "PARTITION DETECTED: peer {} at round {} but we are at {} (gap: {}). Triggering catch-up.",
+                                    peer, dag_round, my_round, dag_round - my_round
+                                );
+                                // Fast-forward our round to peer's round minus a small buffer
+                                let target_round = dag_round.saturating_sub(10);
+                                let target_committed = committed_round;
+                                self.engine.set_initial_round(target_round, target_committed);
+                            } else if my_round > dag_round + 10_000 {
+                                debug!(
+                                    "Peer {} is behind us by {} rounds (them: {}, us: {})",
+                                    peer, my_round - dag_round, dag_round, my_round
+                                );
+                            }
+                        }
+                        // ── Round sync request — respond with our state ───
+                        InboundMessage::RoundSyncRequest { peer, their_round, their_committed } => {
+                            let my_round = self.engine.current_round();
+                            let my_committed = self.engine.last_committed_round();
+                            let vs = self.engine.validator_set();
+                            if let Some(ref tx) = outbound_tx {
+                                let _ = tx.send(arc_net::transport::OutboundMessage::SendRoundSyncResponse {
+                                    target: peer,
+                                    current_round: my_round,
+                                    last_committed_round: my_committed,
+                                    validator_count: vs.len() as u32,
+                                    total_stake: vs.total_stake,
+                                }).await;
+                            }
+                            if their_round > my_round + 10_000 {
+                                warn!(
+                                    "Peer {} ahead by {} rounds. Catching up from {} to ~{}",
+                                    peer, their_round - my_round, my_round, their_round
+                                );
+                                self.engine.set_initial_round(their_round.saturating_sub(10), their_committed);
+                            }
+                        }
+                        // ── Round sync response — update our round if behind ───
+                        InboundMessage::RoundSyncResponse { current_round, last_committed_round } => {
+                            let my_round = self.engine.current_round();
+                            if current_round > my_round + 1000 {
+                                info!(
+                                    "Round sync: peer at round {}, we are at {} — catching up",
+                                    current_round, my_round
+                                );
+                                self.engine.set_initial_round(
+                                    current_round.saturating_sub(10),
+                                    last_committed_round,
+                                );
+                            }
+                        }
+                        // ── Shard messages (forwarded to inference engine) ───
+                        InboundMessage::ShardForward { request_id, model_id, next_layer, total_layers, token_position, activations, activation_hash } => {
+                            info!(
+                                request_id = %request_id,
+                                layer = next_layer,
+                                "Received shard forward — processing layers"
+                            );
+                            // Shard processing handled by inference coordinator (Phase 2)
+                        }
+                        InboundMessage::ShardResult { request_id, token_id, logits_hash, responder } => {
+                            info!(
+                                request_id = %request_id,
+                                token_id = token_id,
+                                responder = %responder,
+                                "Received shard result"
+                            );
+                        }
+                        InboundMessage::ShardAnnounce { model_id, start_layer, end_layer, expert_indices, node_address, available_memory, gpu_tier } => {
+                            info!(
+                                node = %node_address,
+                                model = %model_id,
+                                layers = %format!("[{}, {})", start_layer, end_layer),
+                                experts = expert_indices.len(),
+                                gpu_tier = gpu_tier,
+                                "Shard announcement received"
+                            );
+                        }
                     }
                 }
             }
@@ -1033,6 +1115,20 @@ impl ConsensusManager {
                 );
                 self.engine.force_advance_round();
                 last_proposed_round = None;
+            }
+
+            // ── 3b. Broadcast round-info heartbeat every ~30 seconds ─────
+            // Peers compare rounds to detect partitions early.
+            static HEARTBEAT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let hb_count = HEARTBEAT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let hb_interval = if self.is_multi_validator() { 600 } else { 6000 }; // ~30s at 50ms/600 or 1ms/6000
+            if hb_count % hb_interval == 0 {
+                if let Some(ref tx) = outbound_tx {
+                    let _ = tx.send(arc_net::transport::OutboundMessage::BroadcastHeartbeatWithRound {
+                        dag_round: current_round,
+                        committed_round: self.engine.last_committed_round(),
+                    }).await;
+                }
             }
 
             // ── 4. Epoch management: freeze validator set when stable ─────

@@ -36,9 +36,19 @@ pub enum MessageType {
     InferenceRequest = 0x0B,
     /// Inference response — result from a community GPU node.
     InferenceResponse = 0x0C,
-    /// Heartbeat — lightweight liveness probe (empty payload).
-    /// Sent during reconnect to detect dead QUIC streams.
+    /// Heartbeat — lightweight liveness probe with round info.
+    /// Sent during reconnect to detect dead QUIC streams and partitions.
     Heartbeat = 0x0D,
+    /// Shard activation forward — send layer activations to next shard holder.
+    ShardForward = 0x0E,
+    /// Shard result — final logits/token from last shard back to coordinator.
+    ShardResult = 0x0F,
+    /// Shard registration — announce which model layers this node holds.
+    ShardAnnounce = 0x10,
+    /// DAG round sync request — ask peer for their current round state.
+    RoundSyncRequest = 0x11,
+    /// DAG round sync response — reply with current round and committed round.
+    RoundSyncResponse = 0x12,
 }
 
 impl MessageType {
@@ -57,6 +67,11 @@ impl MessageType {
             0x0B => Some(Self::InferenceRequest),
             0x0C => Some(Self::InferenceResponse),
             0x0D => Some(Self::Heartbeat),
+            0x0E => Some(Self::ShardForward),
+            0x0F => Some(Self::ShardResult),
+            0x10 => Some(Self::ShardAnnounce),
+            0x11 => Some(Self::RoundSyncRequest),
+            0x12 => Some(Self::RoundSyncResponse),
             _ => None,
         }
     }
@@ -70,6 +85,11 @@ impl MessageType {
 /// The receiver verifies: (1) public_key hashes to validator_address,
 /// (2) challenge_sig is a valid Ed25519 signature over
 /// `BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash)`.
+/// Current wire protocol version. Bump on breaking changes.
+pub const PROTOCOL_VERSION: u32 = 2;
+/// Minimum protocol version we can talk to.
+pub const MIN_COMPATIBLE_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeMessage {
     pub validator_address: Hash256,
@@ -83,6 +103,16 @@ pub struct HandshakeMessage {
     /// Ed25519 signature over BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash).
     /// Proves the sender controls the private key for validator_address.
     pub challenge_sig: Vec<u8>,
+    /// Protocol version (added in v2). Old nodes deserializing via bincode
+    /// will use serde default (0) which we treat as v1.
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// Minimum version this node can interoperate with.
+    #[serde(default)]
+    pub min_compatible_version: u32,
+    /// Current DAG round (for partition detection on connect).
+    #[serde(default)]
+    pub dag_round: u64,
 }
 
 /// A DAG block bundled with the full transaction bodies it references,
@@ -181,6 +211,94 @@ pub struct PexPeerInfo {
     pub stake: u64,
 }
 
+// ─── Distributed Inference (Model Sharding) Messages ──────────────────────
+
+/// Forward activations from one shard holder to the next in pipeline-parallel inference.
+/// The coordinator assigns each node a range of transformer layers. After computing
+/// its layers, the node sends the hidden state to the next shard holder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardForwardMessage {
+    /// Unique inference request this activation belongs to.
+    pub request_id: Hash256,
+    /// Model being inferred (BLAKE3 of weights).
+    pub model_id: Hash256,
+    /// The layer index where the NEXT node should resume (exclusive end of sender's range).
+    pub next_layer: u32,
+    /// Total layers in the model (so receiver knows when it has the last shard).
+    pub total_layers: u32,
+    /// Current token position in the sequence.
+    pub token_position: u32,
+    /// Hidden state activations (i64 fixed-point Q16, little-endian bytes).
+    /// Size: d_model * 8 bytes.
+    pub activations: Vec<u8>,
+    /// BLAKE3 hash of `activations` for integrity verification.
+    pub activation_hash: Hash256,
+    /// KV cache entries for layers computed so far (compressed).
+    /// Empty on first forward; populated as pipeline progresses.
+    pub kv_cache_update: Vec<u8>,
+}
+
+/// Result from the final shard holder back to the coordinator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardResultMessage {
+    /// Matches the request_id from ShardForwardMessage.
+    pub request_id: Hash256,
+    /// The generated token ID (argmax of final logits).
+    pub token_id: u32,
+    /// BLAKE3 hash of the full logits vector (for determinism verification).
+    pub logits_hash: Hash256,
+    /// Responder's validator address.
+    pub responder: Hash256,
+}
+
+/// Announce which model layers/experts this node holds.
+/// Broadcast on join and when shard assignment changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShardAnnounceMessage {
+    /// The model this shard belongs to.
+    pub model_id: Hash256,
+    /// Layer range this node holds: [start_layer, end_layer).
+    pub start_layer: u32,
+    pub end_layer: u32,
+    /// For MoE: which expert indices this node holds (empty for dense models).
+    pub expert_indices: Vec<u32>,
+    /// Node's validator address.
+    pub node_address: Hash256,
+    /// Available memory (bytes) for additional shards.
+    pub available_memory: u64,
+    /// GPU capability tier (0 = CPU only, 1-4 per existing tier system).
+    pub gpu_tier: u8,
+}
+
+/// Request a peer's current DAG round state (for partition detection/healing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundSyncRequestMessage {
+    /// Requester's current round (so peer can see the gap).
+    pub my_round: u64,
+    pub my_committed: u64,
+}
+
+/// Response with current DAG round state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoundSyncResponseMessage {
+    pub current_round: u64,
+    pub last_committed_round: u64,
+    pub validator_count: u32,
+    pub total_stake: u64,
+}
+
+/// Heartbeat payload — now includes round info for partition detection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeartbeatMessage {
+    /// Sender's current DAG round.
+    pub dag_round: u64,
+    /// Sender's last committed round.
+    pub committed_round: u64,
+    /// Sender's protocol version.
+    #[serde(default)]
+    pub protocol_version: u32,
+}
+
 // ─── Framing ────────────────────────────────────────────────────────────────
 
 /// Maximum message payload size (16 MiB — generous for large blocks).
@@ -203,24 +321,40 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
 /// Read a framed message from a QUIC recv stream.
 ///
 /// Returns `(MessageType, payload_bytes)`.
+/// Unknown message types are properly skipped (reads and discards the payload)
+/// to keep the stream synchronized for forward compatibility.
 pub async fn read_message<R: AsyncRead + Unpin>(
     reader: &mut R,
 ) -> io::Result<(MessageType, Vec<u8>)> {
-    let type_byte = reader.read_u8().await?;
-    let msg_type = MessageType::from_u8(type_byte)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown message type"))?;
+    loop {
+        let type_byte = reader.read_u8().await?;
+        let len = reader.read_u32().await?;
+        if len > MAX_PAYLOAD_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("payload too large: {} bytes", len),
+            ));
+        }
 
-    let len = reader.read_u32().await?;
-    if len > MAX_PAYLOAD_SIZE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("payload too large: {} bytes", len),
-        ));
+        match MessageType::from_u8(type_byte) {
+            Some(msg_type) => {
+                let mut buf = vec![0u8; len as usize];
+                reader.read_exact(&mut buf).await?;
+                return Ok((msg_type, buf));
+            }
+            None => {
+                // Unknown message type from a newer protocol version.
+                // Read and discard the payload to keep the stream in sync,
+                // then continue reading the next message.
+                let mut discard = vec![0u8; len as usize];
+                reader.read_exact(&mut discard).await?;
+                tracing::debug!(
+                    "Skipped unknown message type 0x{:02x} ({} bytes) — peer may be newer version",
+                    type_byte, len
+                );
+            }
+        }
     }
-
-    let mut buf = vec![0u8; len as usize];
-    reader.read_exact(&mut buf).await?;
-    Ok((msg_type, buf))
 }
 
 #[cfg(test)]

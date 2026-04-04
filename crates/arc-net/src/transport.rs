@@ -94,6 +94,50 @@ pub enum InboundMessage {
         ms_per_token: u64,
         responder: Hash256,
     },
+    /// Heartbeat with round info (partition detection).
+    HeartbeatWithRound {
+        peer: Hash256,
+        dag_round: u64,
+        committed_round: u64,
+    },
+    /// Shard activation forward (pipeline-parallel inference).
+    ShardForward {
+        request_id: Hash256,
+        model_id: Hash256,
+        next_layer: u32,
+        total_layers: u32,
+        token_position: u32,
+        activations: Vec<u8>,
+        activation_hash: Hash256,
+    },
+    /// Shard result (final token from last shard).
+    ShardResult {
+        request_id: Hash256,
+        token_id: u32,
+        logits_hash: Hash256,
+        responder: Hash256,
+    },
+    /// Shard announcement (node declares its layer/expert holdings).
+    ShardAnnounce {
+        model_id: Hash256,
+        start_layer: u32,
+        end_layer: u32,
+        expert_indices: Vec<u32>,
+        node_address: Hash256,
+        available_memory: u64,
+        gpu_tier: u8,
+    },
+    /// Round sync request from a peer (partition detection).
+    RoundSyncRequest {
+        peer: Hash256,
+        their_round: u64,
+        their_committed: u64,
+    },
+    /// Round sync response — peer's current consensus state.
+    RoundSyncResponse {
+        current_round: u64,
+        last_committed_round: u64,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -125,6 +169,39 @@ pub enum OutboundMessage {
         model_hash: Hash256,
         ms_per_token: u64,
         responder: Hash256,
+    },
+    /// Forward activations to next shard holder in pipeline.
+    SendShardForward {
+        target: Hash256,
+        message: crate::protocol::ShardForwardMessage,
+    },
+    /// Send shard result back to coordinator.
+    SendShardResult {
+        target: Hash256,
+        message: crate::protocol::ShardResultMessage,
+    },
+    /// Broadcast shard announcement to all peers.
+    BroadcastShardAnnounce {
+        message: crate::protocol::ShardAnnounceMessage,
+    },
+    /// Send heartbeat with round info to all peers.
+    BroadcastHeartbeatWithRound {
+        dag_round: u64,
+        committed_round: u64,
+    },
+    /// Request round sync from a specific peer.
+    SendRoundSyncRequest {
+        target: Hash256,
+        my_round: u64,
+        my_committed: u64,
+    },
+    /// Respond to round sync request.
+    SendRoundSyncResponse {
+        target: Hash256,
+        current_round: u64,
+        last_committed_round: u64,
+        validator_count: u32,
+        total_stake: u64,
     },
 }
 
@@ -335,10 +412,14 @@ fn make_signed_handshake(
         public_key: keypair.public_key_bytes(),
         nonce,
         challenge_sig: sig_bytes,
+        protocol_version: crate::protocol::PROTOCOL_VERSION,
+        min_compatible_version: crate::protocol::MIN_COMPATIBLE_VERSION,
+        dag_round: 0, // filled in by caller if available
     }
 }
 
-/// Verify a peer's handshake: pubkey derives to claimed address, signature is valid.
+/// Verify a peer's handshake: pubkey derives to claimed address, signature is valid,
+/// and protocol version is compatible.
 fn verify_handshake(msg: &HandshakeMessage) -> anyhow::Result<()> {
     // 1. Verify public key derives to the claimed validator address
     let derived_address = hash_bytes(&msg.public_key);
@@ -356,6 +437,29 @@ fn verify_handshake(msg: &HandshakeMessage) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to deserialize challenge signature: {e}"))?;
     sig.verify(&challenge, &msg.validator_address)
         .map_err(|e| anyhow::anyhow!("challenge signature verification failed: {e}"))?;
+
+    // 3. Protocol version compatibility check.
+    // Treat version 0 as v1 (old nodes that don't send protocol_version).
+    let peer_version = if msg.protocol_version == 0 { 1 } else { msg.protocol_version };
+    let peer_min = if msg.min_compatible_version == 0 { 1 } else { msg.min_compatible_version };
+
+    if peer_min > crate::protocol::PROTOCOL_VERSION {
+        anyhow::bail!(
+            "peer requires protocol version >= {} but we are at {}",
+            peer_min, crate::protocol::PROTOCOL_VERSION
+        );
+    }
+    if peer_version < crate::protocol::MIN_COMPATIBLE_VERSION {
+        anyhow::bail!(
+            "peer protocol version {} is below our minimum {}",
+            peer_version, crate::protocol::MIN_COMPATIBLE_VERSION
+        );
+    }
+
+    tracing::debug!(
+        "Peer {} handshake OK: protocol v{}, dag_round={}",
+        msg.validator_address, peer_version, msg.dag_round
+    );
 
     Ok(())
 }
@@ -458,6 +562,19 @@ impl PeerConnections {
         }
         if msg_type == MessageType::DagBlockWithTxs && peer_count > 0 {
             debug!("Broadcast {:?}: sent to {}/{} peers ({} bytes)", msg_type, sent, peer_count, payload.len());
+        }
+    }
+
+    /// Send a message to a specific peer by validator address.
+    async fn send_to(&self, target: &Hash256, msg_type: MessageType, payload: &[u8]) {
+        if let Some(mut entry) = self.peers.get_mut(&target.0) {
+            if let Err(e) = write_message(entry.value_mut(), msg_type, payload).await {
+                warn!("Failed to send {:?} to {}: {}", msg_type, target, e);
+                self.peers.remove(&target.0);
+                self.meta.remove(&target.0);
+            }
+        } else {
+            debug!("send_to: peer {} not connected, cannot send {:?}", target, msg_type);
         }
     }
 }
@@ -662,6 +779,51 @@ pub async fn run_transport(
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
                         conn_out.broadcast(MessageType::InferenceResponse, &bytes).await;
+                    }
+                }
+                OutboundMessage::SendShardForward { target, message } => {
+                    if let Ok(bytes) = bincode::serialize(&message) {
+                        conn_out.send_to(&target, MessageType::ShardForward, &bytes).await;
+                    }
+                }
+                OutboundMessage::SendShardResult { target, message } => {
+                    if let Ok(bytes) = bincode::serialize(&message) {
+                        conn_out.send_to(&target, MessageType::ShardResult, &bytes).await;
+                    }
+                }
+                OutboundMessage::BroadcastShardAnnounce { message } => {
+                    if let Ok(bytes) = bincode::serialize(&message) {
+                        conn_out.broadcast(MessageType::ShardAnnounce, &bytes).await;
+                    }
+                }
+                OutboundMessage::BroadcastHeartbeatWithRound { dag_round, committed_round } => {
+                    let payload = crate::protocol::HeartbeatMessage {
+                        dag_round,
+                        committed_round,
+                        protocol_version: crate::protocol::PROTOCOL_VERSION,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out.broadcast(MessageType::Heartbeat, &bytes).await;
+                    }
+                }
+                OutboundMessage::SendRoundSyncRequest { target, my_round, my_committed } => {
+                    let payload = crate::protocol::RoundSyncRequestMessage {
+                        my_round,
+                        my_committed,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out.send_to(&target, MessageType::RoundSyncRequest, &bytes).await;
+                    }
+                }
+                OutboundMessage::SendRoundSyncResponse { target, current_round, last_committed_round, validator_count, total_stake } => {
+                    let payload = crate::protocol::RoundSyncResponseMessage {
+                        current_round,
+                        last_committed_round,
+                        validator_count,
+                        total_stake,
+                    };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out.send_to(&target, MessageType::RoundSyncResponse, &bytes).await;
                     }
                 }
             }
@@ -1321,10 +1483,89 @@ async fn handle_peer_recv(
                 }
             }
             MessageType::Heartbeat => {
-                // No-op — heartbeat is a liveness probe, no response needed
+                // Heartbeat now carries round info for partition detection.
+                // Old heartbeats (empty payload) are still valid — just skip parse.
+                if !data.is_empty() {
+                    if let Ok(hb) = bincode::deserialize::<crate::protocol::HeartbeatMessage>(&data) {
+                        let _ = inbound_tx.send(InboundMessage::HeartbeatWithRound {
+                            peer: peer_address,
+                            dag_round: hb.dag_round,
+                            committed_round: hb.committed_round,
+                        }).await;
+                    }
+                }
             }
-            other => {
-                warn!("Unexpected message type {:?} from {}", other, peer_address);
+            MessageType::ShardForward => {
+                match bincode::deserialize::<crate::protocol::ShardForwardMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx.send(InboundMessage::ShardForward {
+                            request_id: msg.request_id,
+                            model_id: msg.model_id,
+                            next_layer: msg.next_layer,
+                            total_layers: msg.total_layers,
+                            token_position: msg.token_position,
+                            activations: msg.activations,
+                            activation_hash: msg.activation_hash,
+                        }).await;
+                    }
+                    Err(e) => warn!("Bad ShardForward from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::ShardResult => {
+                match bincode::deserialize::<crate::protocol::ShardResultMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx.send(InboundMessage::ShardResult {
+                            request_id: msg.request_id,
+                            token_id: msg.token_id,
+                            logits_hash: msg.logits_hash,
+                            responder: msg.responder,
+                        }).await;
+                    }
+                    Err(e) => warn!("Bad ShardResult from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::ShardAnnounce => {
+                match bincode::deserialize::<crate::protocol::ShardAnnounceMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx.send(InboundMessage::ShardAnnounce {
+                            model_id: msg.model_id,
+                            start_layer: msg.start_layer,
+                            end_layer: msg.end_layer,
+                            expert_indices: msg.expert_indices,
+                            node_address: msg.node_address,
+                            available_memory: msg.available_memory,
+                            gpu_tier: msg.gpu_tier,
+                        }).await;
+                    }
+                    Err(e) => warn!("Bad ShardAnnounce from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::RoundSyncRequest => {
+                match bincode::deserialize::<crate::protocol::RoundSyncRequestMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx.send(InboundMessage::RoundSyncRequest {
+                            peer: peer_address,
+                            their_round: msg.my_round,
+                            their_committed: msg.my_committed,
+                        }).await;
+                    }
+                    Err(e) => warn!("Bad RoundSyncRequest from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::RoundSyncResponse => {
+                match bincode::deserialize::<crate::protocol::RoundSyncResponseMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx.send(InboundMessage::RoundSyncResponse {
+                            current_round: msg.current_round,
+                            last_committed_round: msg.last_committed_round,
+                        }).await;
+                    }
+                    Err(e) => warn!("Bad RoundSyncResponse from {}: {}", peer_address, e),
+                }
+            }
+            // Handshake messages are handled during connection setup, not here.
+            MessageType::Handshake | MessageType::HandshakeAck => {
+                debug!("Unexpected handshake message from {} in data loop", peer_address);
             }
         }
     }
