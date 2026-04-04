@@ -202,7 +202,7 @@ pub async fn serve_eth(addr: &str, node: NodeState) -> anyhow::Result<()> {
 }
 
 async fn index() -> &'static str {
-    "ARC Chain — Agent Runtime Chain — Testnet v0.1.0"
+    concat!("ARC Chain — Agent Runtime Chain — Testnet v", env!("CARGO_PKG_VERSION"))
 }
 
 /// JSON error response body returned by endpoints that fail with 4xx/5xx.
@@ -240,7 +240,7 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
     }
     Json(HealthResponse {
         status: "ok".to_string(),
-        version: "0.1.0".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         height: node.state.height(),
         peers: node.peer_count.load(Ordering::Relaxed),
         uptime_secs: node.boot_time.elapsed().as_secs(),
@@ -266,7 +266,7 @@ async fn node_info(AxumState(node): AxumState<NodeState>) -> Json<NodeInfoRespon
         stake: node.stake,
         tier: format!("{:?}", node.tier),
         height: node.state.height(),
-        version: "0.1.0".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         mempool_size: node.mempool.len(),
     })
 }
@@ -288,7 +288,7 @@ struct ChainInfoResponse {
 async fn chain_info(AxumState(node): AxumState<NodeState>) -> Json<ChainInfoResponse> {
     Json(ChainInfoResponse {
         chain: "ARC Chain".to_string(),
-        version: "0.1.0".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
         block_height: node.state.height(),
         account_count: node.state.account_count(),
         mempool_size: node.mempool.len(),
@@ -1101,7 +1101,7 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let bench_tps = if uptime > 0 { executed as u64 / uptime } else { 0 };
     Json(json!({
         "chain": "ARC Chain",
-        "version": "0.1.0",
+        "version": env!("CARGO_PKG_VERSION"),
         "block_height": node.state.height(),
         "total_accounts": node.state.account_count(),
         "mempool_size": node.mempool.len(),
@@ -1636,7 +1636,7 @@ async fn eth_json_rpc(
         "eth_chainId" => eth_rpc_result(&req.id, json!(format!("0x{:x}", ARC_CHAIN_ID))),
         "eth_blockNumber" => eth_rpc_result(&req.id, json!(format!("0x{:x}", node.state.height()))),
         "net_version" => eth_rpc_result(&req.id, json!(ARC_CHAIN_ID.to_string())),
-        "web3_clientVersion" => eth_rpc_result(&req.id, json!("ARC/v0.1.0")),
+        "web3_clientVersion" => eth_rpc_result(&req.id, json!(format!("ARC/v{}", env!("CARGO_PKG_VERSION")))),
         "eth_gasPrice" => eth_rpc_result(&req.id, json!("0x0")), // Zero-fee chain
         "net_listening" => eth_rpc_result(&req.id, json!(true)),
         "net_peerCount" => {
