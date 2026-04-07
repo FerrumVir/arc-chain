@@ -1038,28 +1038,37 @@ pub async fn run_transport(
             // PEX broadcast + reconnect are handled by the background task above.
 
             // ── PEX auto-dial (from handle_peer_recv) ──────────────────
+            // Spawn the entire processing into a separate task. The select body
+            // must NEVER iterate the DashMap (`conn_pex.meta.iter()`) because
+            // it can deadlock with another task holding a write lock on the
+            // same shard. The "already connected" check belongs inside the
+            // spawned task, not the select body.
             addr = pex_dial_rx.recv() => {
                 if let Some(peer_addr) = addr {
-                    // Skip if already connected to this address
-                    let already = conn_pex.meta.iter().any(|e| e.value().dial_addr == peer_addr);
-                    if !already {
+                    let handshake_msg = make_signed_handshake(
+                        local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+                    );
+                    let c = connections.clone();
+                    let conn_pex_clone = conn_pex.clone();
+                    let itx = inbound_tx.clone();
+                    let pc = peer_count.clone();
+                    let ep = endpoint.clone();
+                    let pdt = pex_dial_tx.clone();
+                    let rl = rate_limiter.clone();
+                    tokio::spawn(async move {
+                        // Skip if already connected (moved out of select body)
+                        let already = conn_pex_clone.meta.iter().any(|e| e.value().dial_addr == peer_addr);
+                        if already { return; }
                         info!("PEX: dialing discovered peer {}", peer_addr);
-                        let handshake_msg = make_signed_handshake(
-                            local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
-                        );
-                        let c = connections.clone();
-                        let itx = inbound_tx.clone();
-                        let pc = peer_count.clone();
-                        let ep = endpoint.clone();
-                        let pdt = pex_dial_tx.clone();
-                        let rl = rate_limiter.clone();
-                        tokio::spawn(async move {
-                            match dial_peer(&ep, peer_addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl).await {
-                                Ok(()) => info!("PEX: connected to {}", peer_addr),
-                                Err(e) => debug!("PEX: failed to dial {}: {}", peer_addr, e),
-                            }
-                        });
-                    }
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            dial_peer(&ep, peer_addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl),
+                        ).await {
+                            Ok(Ok(())) => info!("PEX: connected to {}", peer_addr),
+                            Ok(Err(e)) => debug!("PEX: failed to dial {}: {}", peer_addr, e),
+                            Err(_) => debug!("PEX: dial to {} timed out", peer_addr),
+                        }
+                    });
                 }
             }
 
