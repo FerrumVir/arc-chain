@@ -1527,10 +1527,10 @@ impl ConsensusEngine {
             // Advance past this round if EITHER:
             // (a) The leader's block was committed (normal path), OR
             // (b) The leader has no block AND the round has quorum from
-            //     other validators (leader was offline — skip round).
-            // If neither, STOP scanning — wait for the leader's block
-            // to arrive via QUIC. All nodes will eventually receive it
-            // and commit in the same order.
+            //     other validators (leader was offline — skip round), OR
+            // (c) We're lagging >50 rounds behind current (liveness fallback —
+            //     the 2-round rule's parent reference chain broke due to
+            //     cross-continent latency; skip and move on).
             let leader_block_committed = newly_committed.iter().any(|b| b.round == r);
             if leader_block_committed {
                 // Leader's block committed — advance scan past this round
@@ -1539,7 +1539,18 @@ impl ConsensusEngine {
                 let leader_block_exists = round_r_blocks.iter().any(|h| {
                     self.dag.get(h).map(|b| b.author == leader.unwrap_or(Hash256::ZERO)).unwrap_or(false)
                 });
-                if !leader_block_exists {
+                // Liveness fallback: if we're lagging too far behind current,
+                // advance unconditionally. Without this, the scan gets stuck
+                // indefinitely when the 2-round commit parent-reference chain
+                // breaks due to cross-continent asynchrony (blocks in R+2
+                // don't always see C in R+1 before producing, so quorum
+                // over references is never reached).
+                const MAX_COMMIT_LAG: u64 = 50;
+                let lag = current.saturating_sub(r);
+                if lag > MAX_COMMIT_LAG {
+                    // Forcing liveness: advance the scan to release stuck round.
+                    self.last_committed_round.store(r + 1, Ordering::SeqCst);
+                } else if !leader_block_exists {
                     // Leader has no block in this round. Check if we have quorum
                     // from other validators (round happened, leader was offline).
                     let mut stake = 0u64;
@@ -1558,8 +1569,7 @@ impl ConsensusEngine {
                         break;
                     }
                 }
-                // Leader block exists but wasn't committed (missing R+1/R+2 proof).
-                // Don't advance — retry on next try_commit() when more blocks arrive.
+                // Leader block exists, not lagging far — retry on next call.
             }
         }
 
