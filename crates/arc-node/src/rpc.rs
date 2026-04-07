@@ -2882,14 +2882,42 @@ async fn inference_list_attestations(
         if attestations.len() >= limit { break; }
     }
 
-    // Then: add successful transactions with full body data (faucet claims, transfers)
+    // Then: scan on-chain InferenceAttestation transactions (cross-device visibility).
+    // This lets nodes that didn't run the inference themselves still show the
+    // attestation in their /inference/attestations feed, enabling cross-device
+    // aggregation in the dashboard.
     for entry in node.state.full_transactions.iter() {
         if attestations.len() >= limit { break; }
         let hash = entry.key();
         let tx = entry.value();
         let tx_hex = format!("0x{}", hex::encode(hash));
-        // Skip if already added as inference
+        // Skip if already added from local inference_results cache
         if node.inference_results.contains_key(&tx_hex) { continue; }
+
+        // Inference attestations from other devices — include with hashes
+        if let TxBody::InferenceAttestation(body) = &tx.body {
+            let att = json!({
+                "tx_hash": tx_hex,
+                "tx_type": "Inference",
+                "success": true,
+                "from": tx.from.to_hex(),
+                "block_height": node.state.get_receipt(hash).map(|r| r.block_height),
+                "inference": {
+                    "model_hash": format!("0x{}", hex::encode(&body.model_id.0)),
+                    "input_hash": format!("0x{}", hex::encode(&body.input_hash.0)),
+                    "output_hash": format!("0x{}", hex::encode(&body.output_hash.0)),
+                    "bond": body.bond,
+                    "challenge_period": body.challenge_period,
+                    "deterministic": true,
+                    // input/output text not on-chain; hashes only
+                    "input": format!("[cross-device: hash {}]", hex::encode(&body.input_hash.0)[..16].to_string()),
+                    "output": format!("[hash {}]", hex::encode(&body.output_hash.0)[..16].to_string()),
+                    "model": "on-chain attestation",
+                }
+            });
+            attestations.push(att);
+            continue;
+        }
 
         if let Some(receipt) = node.state.get_receipt(hash) {
             if !receipt.success { continue; } // Only show successful txs
