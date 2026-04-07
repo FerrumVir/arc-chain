@@ -125,13 +125,20 @@ impl ConsensusManager {
         stake: u64,
         peer_validators: &[(Hash256, u64)],
     ) -> (ValidatorSet, StakeTier) {
-        let tier = StakeTier::from_stake(stake)
-            .expect("stake must be >= 500_000 ARC (Spark threshold)");
+        // Observer mode: stake=0 means this node serves inference but
+        // doesn't participate in consensus voting. We still need a tier
+        // for display, so we default to Spark (lowest) for observers.
+        let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
 
-        let validator = Validator::new(validator_address, stake, 0)
-            .expect("validator creation failed — stake below minimum");
-
-        let mut validators = vec![validator];
+        // Build validator set from peers only — observer isn't added.
+        // This keeps observers out of the quorum calculation so they
+        // don't break consensus when they go offline.
+        let mut validators = Vec::new();
+        if stake > 0 {
+            if let Some(v) = Validator::new(validator_address, stake, 0) {
+                validators.push(v);
+            }
+        }
         for (addr, peer_stake) in peer_validators {
             if let Some(v) = Validator::new(*addr, *peer_stake, 0) {
                 validators.push(v);

@@ -75,19 +75,34 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
     </div>
   </div>
 
-  <!-- Inference + Transactions -->
+  <!-- Cross-Device Inference Summary -->
+  <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
+    <div class="flex items-center justify-between mb-4">
+      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold">
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1.5 pulse-dot"></span>Cross-Device AI Inference
+      </h2>
+      <div class="flex gap-3 text-[11px]">
+        <span class="text-gray-500">Inferences: <span class="text-white font-semibold mono" id="infCount">—</span></span>
+        <span class="text-gray-500">Models: <span class="text-white font-semibold mono" id="modelCount">—</span></span>
+        <span class="text-gray-500">Workers: <span class="text-white font-semibold mono" id="workerCount">—</span></span>
+      </div>
+    </div>
+    <div id="modelBreakdown" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 mb-4"></div>
+  </div>
+
+  <!-- Inference Feed + Transactions -->
   <div class="grid lg:grid-cols-2 gap-4">
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
       <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">
-        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1.5"></span>AI Inference Attestations
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1.5"></span>Live Inference Feed
       </h2>
-      <div class="space-y-1 max-h-[320px] overflow-y-auto" id="inferenceList"><p class="text-gray-600 text-sm">Loading...</p></div>
+      <div class="space-y-1 max-h-[400px] overflow-y-auto" id="inferenceList"><p class="text-gray-600 text-sm">Loading...</p></div>
     </div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
       <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">
         <span class="inline-block w-2 h-2 rounded-full bg-arc-400 mr-1.5"></span>Recent Transactions
       </h2>
-      <div class="space-y-1 max-h-[320px] overflow-y-auto" id="txList"><p class="text-gray-600 text-sm">Loading...</p></div>
+      <div class="space-y-1 max-h-[400px] overflow-y-auto" id="txList"><p class="text-gray-600 text-sm">Loading...</p></div>
     </div>
   </div>
 </main>
@@ -243,24 +258,110 @@ async function refresh(){
 
   // Nodes — fetched by renderNodes() above (runs in parallel, no blocking)
 
-  // Inference
+  // Cross-device inference aggregation: fetch from ALL 8 seeds in parallel,
+  // dedupe by tx_hash, group by model, and show which device(s) saw each.
   try{
-    const r=await fetch(RPC+'/inference/attestations',{signal:AbortSignal.timeout(5000)});
-    const d=await r.json();
-    const list=document.getElementById('inferenceList');
-    if(d.attestations&&d.attestations.length>0){
-      list.innerHTML=d.attestations.slice(0,10).map(a=>`
-        <div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition" onclick='showInferenceDetail(${JSON.stringify(a)})'>
-          <div class="flex items-center gap-2">
-            <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">AI</span>
-            <span class="mono text-[11px] text-gray-400">${(a.tx_hash||a.from||'').slice(0,20)}...</span>
-          </div>
-          <span class="mono text-xs text-white font-medium">${(a.amount||0).toLocaleString()} ARC</span>
-        </div>`).join('');
-    }else{
-      list.innerHTML='<p class="text-gray-600 text-sm">No attestations yet. Run a node with <code class="mono text-arc-400">--with-inference</code></p>';
+    const results=await Promise.allSettled(NODES.map(async n=>{
+      try{
+        const r=await fetch(`http://${n.ip}:9090/inference/attestations?limit=50`,{signal:AbortSignal.timeout(3000)});
+        const d=await r.json();
+        return {node:n,attestations:d.attestations||[]};
+      }catch(e){return {node:n,attestations:[]}}
+    }));
+
+    // Dedupe by tx_hash, track which nodes saw each
+    const byHash={};
+    const modelStats={}; // model_hash → {count, name, workers:Set, latestMs}
+    const nodesWithInference=new Set();
+
+    for(const{value:v}of results){
+      if(!v||!v.attestations)continue;
+      for(const a of v.attestations){
+        const hash=a.tx_hash||a.from||'';
+        if(!hash)continue;
+        if(!byHash[hash]){
+          byHash[hash]={...a,seen_on:new Set()};
+        }
+        byHash[hash].seen_on.add(v.node.name);
+        // Track which nodes do inference (have attestations)
+        nodesWithInference.add(v.node.name);
+        // Track models
+        const inf=a.inference||{};
+        const modelHash=inf.model_hash||'unknown';
+        const modelName=inf.model||'unknown';
+        if(!modelStats[modelHash]){
+          modelStats[modelHash]={count:0,name:modelName,workers:new Set(),latestMs:0,modelHash};
+        }
+        modelStats[modelHash].count++;
+        modelStats[modelHash].workers.add(v.node.name);
+        if(inf.ms_per_token>modelStats[modelHash].latestMs){
+          modelStats[modelHash].latestMs=inf.ms_per_token;
+        }
+      }
     }
-  }catch(e){}
+
+    const allAttestations=Object.values(byHash).sort((a,b)=>{
+      // Sort by tx_hash for now (newer attestations naturally near top)
+      return 0;
+    });
+
+    // Update summary stats
+    document.getElementById('infCount').textContent=allAttestations.length.toLocaleString();
+    document.getElementById('modelCount').textContent=Object.keys(modelStats).length;
+    document.getElementById('workerCount').textContent=nodesWithInference.size;
+
+    // Render model breakdown cards
+    const breakdown=document.getElementById('modelBreakdown');
+    const models=Object.values(modelStats);
+    if(models.length>0){
+      breakdown.innerHTML=models.slice(0,6).map(m=>`
+        <div class="bg-surface-3 border border-surface-4 rounded-lg p-3 hover:border-emerald-500/30 transition">
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-white font-semibold text-xs truncate max-w-[180px]">${m.name}</span>
+            <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">${m.count} runs</span>
+          </div>
+          <div class="text-[10px] text-gray-500 mono truncate">${m.modelHash.slice(0,30)}</div>
+          <div class="flex items-center justify-between mt-2 text-[10px]">
+            <span class="text-gray-500">${[...m.workers].join(', ')}</span>
+            <span class="text-arc-400 mono">${m.latestMs} ms/tok</span>
+          </div>
+        </div>
+      `).join('');
+    }else{
+      breakdown.innerHTML='<div class="col-span-full text-gray-600 text-sm text-center py-4">No inference activity yet. Start a node with <code class="mono text-arc-400">./scripts/join-inference.sh --model path.gguf</code></div>';
+    }
+
+    // Render inference feed (recent attestations with cross-device badge)
+    const list=document.getElementById('inferenceList');
+    if(allAttestations.length>0){
+      list.innerHTML=allAttestations.slice(0,15).map(a=>{
+        const inf=a.inference||{};
+        const seenCount=a.seen_on.size;
+        const input=(inf.input||'—').slice(0,50);
+        const output=(inf.output||'—').slice(0,80);
+        const crossDeviceBadge=seenCount>1
+          ? `<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">✓ ${seenCount} devices</span>`
+          : `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surface-4 text-gray-400">1 device</span>`;
+        return `
+        <div class="py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition" onclick='showInferenceDetail(${JSON.stringify(a)})'>
+          <div class="flex items-center justify-between mb-1">
+            <div class="flex items-center gap-2">
+              <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">AI</span>
+              ${crossDeviceBadge}
+              <span class="text-[10px] text-gray-500 mono">${inf.ms_per_token||'?'}ms/tok</span>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 truncate">→ ${input}</div>
+          <div class="text-[11px] text-white truncate">← ${output}</div>
+          <div class="text-[9px] text-gray-600 mono mt-1">${(a.tx_hash||'').slice(0,40)}...</div>
+        </div>`;
+      }).join('');
+    }else{
+      list.innerHTML='<p class="text-gray-600 text-sm">No attestations yet. <a href="https://github.com/FerrumVir/arc-chain" class="text-arc-400 hover:underline">Run a node with inference →</a></p>';
+    }
+  }catch(e){
+    console.error('inference fetch failed',e);
+  }
 
   // Recent transactions — show live stats + recent faucet/transfer activity
   try{
