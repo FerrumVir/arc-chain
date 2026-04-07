@@ -1143,7 +1143,11 @@ async fn dial_peer(
         })
         .await;
 
-    // Spawn reader
+    // Spawn reader. CRITICAL: move `conn` into the spawn so the Quinn
+    // Connection stays alive for the duration of the recv loop. Previously,
+    // `conn` was dropped at the end of connect_peer, which closed the QUIC
+    // connection and made recv fail within microseconds, triggering a
+    // connect→disconnect cascade that prevented any block gossip.
     let peer_addr_hash = remote.validator_address;
     let inbound_clone = inbound_tx.clone();
     let connections_ref = connections.clone();
@@ -1151,6 +1155,7 @@ async fn dial_peer(
     let pex_dial_clone = pex_dial_tx.clone();
     let rate_limiter_clone = rate_limiter.clone();
     tokio::spawn(async move {
+        let _conn = conn; // keep Quinn Connection alive until recv loop exits
         handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref, &rate_limiter_clone).await;
         rate_limiter_clone.remove_peer(&peer_addr_hash);
         connections_ref.peers.remove(&peer_addr_hash.0);
@@ -1235,7 +1240,9 @@ async fn accept_peer(
         })
         .await;
 
-    // Spawn reader
+    // Spawn reader. CRITICAL: move `conn` into the spawn so the Quinn
+    // Connection stays alive for the duration of the recv loop. See
+    // matching comment in connect_peer for the full explanation.
     let peer_addr_hash = remote.validator_address;
     let inbound_clone = inbound_tx.clone();
     let connections_ref = connections.clone();
@@ -1243,6 +1250,7 @@ async fn accept_peer(
     let pex_dial_clone = pex_dial_tx.clone();
     let rate_limiter_clone = rate_limiter.clone();
     tokio::spawn(async move {
+        let _conn = conn; // keep Quinn Connection alive until recv loop exits
         handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref, &rate_limiter_clone).await;
         rate_limiter_clone.remove_peer(&peer_addr_hash);
         connections_ref.peers.remove(&peer_addr_hash.0);
