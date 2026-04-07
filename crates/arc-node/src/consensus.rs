@@ -487,13 +487,15 @@ impl ConsensusManager {
                             let my_committed = self.engine.last_committed_round();
                             let vs = self.engine.validator_set();
                             if let Some(ref tx) = outbound_tx {
-                                let _ = tx.send(arc_net::transport::OutboundMessage::SendRoundSyncResponse {
+                                // Use try_send to avoid blocking the consensus loop when
+                                // the outbound channel is full (root cause of P2P deadlock).
+                                let _ = tx.try_send(arc_net::transport::OutboundMessage::SendRoundSyncResponse {
                                     target: peer,
                                     current_round: my_round,
                                     last_committed_round: my_committed,
                                     validator_count: vs.len() as u32,
                                     total_stake: vs.total_stake,
-                                }).await;
+                                });
                             }
                             if their_round > my_round + 10_000 {
                                 warn!(
@@ -1124,10 +1126,12 @@ impl ConsensusManager {
             let hb_interval = if self.is_multi_validator() { 600 } else { 6000 }; // ~30s at 50ms/600 or 1ms/6000
             if hb_count % hb_interval == 0 {
                 if let Some(ref tx) = outbound_tx {
-                    let _ = tx.send(arc_net::transport::OutboundMessage::BroadcastHeartbeatWithRound {
+                    // Use try_send to avoid blocking the consensus loop when
+                    // the outbound channel is full (root cause of P2P deadlock).
+                    let _ = tx.try_send(arc_net::transport::OutboundMessage::BroadcastHeartbeatWithRound {
                         dag_round: current_round,
                         committed_round: self.engine.last_committed_round(),
-                    }).await;
+                    });
                 }
             }
 

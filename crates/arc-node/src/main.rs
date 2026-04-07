@@ -495,7 +495,7 @@ async fn main() -> Result<()> {
 
     // ── Create channels for P2P transport ↔ consensus ─────────────────
     let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(1000);
-    let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(1000);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(4000);
     let peer_count = Arc::new(AtomicU32::new(0));
 
     // Deterministic genesis hash (same for all nodes with same genesis config)

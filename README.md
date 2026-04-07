@@ -86,27 +86,54 @@ curl http://localhost:9944/health
 # {"status":"ok","peers":7,"dag_round":12345,"validators":8}
 ```
 
-### Want to run AI inference too? (earn more ARC)
+### Run AI Inference (earn ARC with your GPU)
 
-Add a model and your node will execute AI inference for the network. Any laptop with 4GB+ RAM works. GPU optional.
+Bring **any GGUF model** and start earning. Your node runs inference, results are cryptographically attested on-chain. Every verified inference earns ARC.
 
 ```bash
-# Already have a node running? Add inference:
-~/.arc-chain/arc-chain/scripts/join-inference.sh
-
-# Or start fresh with inference from the beginning:
 git clone https://github.com/FerrumVir/arc-chain.git && cd arc-chain
+
+# Use the default model (TinyLlama 1.1B, downloads 638 MB):
 ./scripts/join-inference.sh
+
+# Or bring your own model (any GGUF — Llama, Mistral, Phi, Gemma, Qwen):
+./scripts/join-inference.sh --model ~/models/llama-3-8b.Q4_K_M.gguf
 ```
 
-This downloads TinyLlama 1.1B (638 MB), starts your node, and connects to the testnet. Your node will begin processing inference requests from the network. Every verified inference earns ARC.
+Your node connects to the live testnet, loads the model, and starts serving inference. That's it.
+
+**Test it works:**
+```bash
+# Run inference (from your machine)
+curl -X POST http://localhost:9944/inference/run \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":32}'
+
+# Response includes:
+#   output          — the model's response
+#   output_hash     — BLAKE3 hash (deterministic, verifiable)
+#   model_hash      — identifies exactly which model ran
+#   attestation     — on-chain tx hash proving this inference happened
+#   ms_per_token    — speed
+```
+
+**Check on-chain attestations:**
+```bash
+# See all verified inferences on the network
+curl http://140.82.16.112:9090/inference/attestations?limit=10
+
+# Look up a specific attestation by tx hash
+curl http://140.82.16.112:9090/tx/{tx_hash}
+```
+
+**Verify determinism:** Run the same prompt on two different machines. The `output_hash` will be identical. That's the whole point — any machine can independently verify any inference.
 
 ### Already have the repo cloned?
 
 ```bash
 cd arc-chain
-./scripts/join-testnet.sh                  # Validator only
-./scripts/join-testnet.sh --with-inference # Validator + AI inference
+./scripts/join-inference.sh                           # Default model
+./scripts/join-inference.sh --model ~/my-model.gguf   # Your model
 ```
 
 ### What does it cost?

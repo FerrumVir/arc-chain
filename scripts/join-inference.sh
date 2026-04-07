@@ -17,7 +17,7 @@ set -e
 #   4. Starts serving inference requests
 #   5. Submits attestations on-chain (earns ARC)
 #
-# Requirements: Rust nightly, ~2GB disk, ~4GB RAM, GPU recommended
+# Requirements: Rust stable, ~2GB disk, ~4GB RAM, GPU recommended
 # ─────────────────────────────────────────────────────────────────────────────
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -49,14 +49,14 @@ echo -e "${YELLOW}[1/5] Building arc-node...${NC}"
 echo "  First build takes 5-15 minutes. You'll see compiler output below."
 echo ""
 if [ ! -f target/release/arc-node ]; then
-    cargo build --release -p arc-node 2>&1
+    cargo build --release -p arc-node --features candle 2>&1
     if [ $? -ne 0 ]; then
-        echo -e "${YELLOW}Build failed. Make sure you have Rust nightly: rustup default nightly${NC}"
+        echo -e "${YELLOW}Build failed. Make sure you have Rust: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh${NC}"
         exit 1
     fi
     echo -e "${GREEN}  Build complete!${NC}"
 else
-    echo "  Binary exists. Rebuild with: cargo build --release -p arc-node"
+    echo "  Binary exists. Rebuild with: cargo build --release -p arc-node --features candle"
 fi
 
 # ─── Model ─────────────────────────────────────────────────────────────────

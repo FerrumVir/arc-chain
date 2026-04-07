@@ -204,8 +204,17 @@ if [ "$OS" = "Linux" ]; then
     CURRENT_USER="$(whoami)"
     ARC_BIN_ABS="$(realpath "$ARC_BIN")"
     CONFIG_ABS="$(realpath "$CONFIG_FILE")"
+    SEEDS_ABS="$(realpath "$REPO_DIR/testnet-seeds.txt")"
+    GENESIS_ABS="$(realpath "$REPO_DIR/genesis.toml")"
 
-    # Write a user-specific service file (use current user, not hardcoded 'arc')
+    # Generate a unique validator seed if not already saved
+    SEED_FILE="$ARC_HOME/validator-seed.txt"
+    if [ ! -f "$SEED_FILE" ]; then
+        echo "arc-node-$(openssl rand -hex 4)" > "$SEED_FILE"
+    fi
+    VALIDATOR_SEED="$(cat "$SEED_FILE")"
+
+    # Write a user-specific service file with all required flags
     sudo tee "$SERVICE_DST" >/dev/null <<EOF
 [Unit]
 Description=ARC Chain Node
@@ -214,7 +223,7 @@ After=network.target
 [Service]
 Type=simple
 User=${CURRENT_USER}
-ExecStart=${ARC_BIN_ABS} --config ${CONFIG_ABS}
+ExecStart=${ARC_BIN_ABS} --config ${CONFIG_ABS} --validator-seed ${VALIDATOR_SEED} --seeds-file ${SEEDS_ABS} --genesis ${GENESIS_ABS}
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
@@ -241,6 +250,15 @@ elif [ "$OS" = "Darwin" ]; then
 
     ARC_BIN_ABS="$(realpath "$ARC_BIN" 2>/dev/null || echo "$ARC_BIN")"
     CONFIG_ABS="$(realpath "$CONFIG_FILE" 2>/dev/null || echo "$CONFIG_FILE")"
+    SEEDS_ABS="$(realpath "$REPO_DIR/testnet-seeds.txt" 2>/dev/null || echo "$REPO_DIR/testnet-seeds.txt")"
+    GENESIS_ABS="$(realpath "$REPO_DIR/genesis.toml" 2>/dev/null || echo "$REPO_DIR/genesis.toml")"
+
+    # Generate a unique validator seed if not already saved
+    SEED_FILE="$ARC_HOME/validator-seed.txt"
+    if [ ! -f "$SEED_FILE" ]; then
+        echo "arc-node-$(openssl rand -hex 4)" > "$SEED_FILE"
+    fi
+    VALIDATOR_SEED="$(cat "$SEED_FILE")"
 
     cat > "$PLIST_FILE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -256,6 +274,12 @@ elif [ "$OS" = "Darwin" ]; then
         <string>${ARC_BIN_ABS}</string>
         <string>--config</string>
         <string>${CONFIG_ABS}</string>
+        <string>--validator-seed</string>
+        <string>${VALIDATOR_SEED}</string>
+        <string>--seeds-file</string>
+        <string>${SEEDS_ABS}</string>
+        <string>--genesis</string>
+        <string>${GENESIS_ABS}</string>
     </array>
 
     <key>RunAtLoad</key>

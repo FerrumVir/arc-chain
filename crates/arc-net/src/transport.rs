@@ -548,11 +548,22 @@ impl PeerConnections {
         let mut dead_peers = Vec::new();
         for key in &peer_keys {
             if let Some(mut entry) = self.peers.get_mut(key) {
-                if let Err(e) = write_message(entry.value_mut(), msg_type, payload).await {
-                    warn!("Failed to send to peer: {}", e);
-                    dead_peers.push(*key);
-                } else {
-                    sent += 1;
+                // 5-second timeout per peer prevents one slow/dead peer from
+                // blocking the entire outbound fanout task, which was the
+                // secondary cause of the P2P channel filling up.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    write_message(entry.value_mut(), msg_type, payload),
+                ).await {
+                    Ok(Ok(())) => { sent += 1; }
+                    Ok(Err(e)) => {
+                        warn!("Failed to send to peer: {}", e);
+                        dead_peers.push(*key);
+                    }
+                    Err(_) => {
+                        warn!("Timeout writing to peer, removing dead connection");
+                        dead_peers.push(*key);
+                    }
                 }
             }
         }

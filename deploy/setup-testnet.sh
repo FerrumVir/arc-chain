@@ -186,7 +186,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     NAME="arc-node-${i}"
     echo -n "  $NAME ($IP): "
 
-    if curl -sf --connect-timeout 5 "http://${IP}:9090/health" &>/dev/null; then
+    if curl -sf --connect-timeout 5 "http://${IP}:9944/health" &>/dev/null; then
         echo -e "${GREEN}HEALTHY${NC}"
     else
         echo -e "${RED}UNREACHABLE${NC}"
@@ -207,7 +207,7 @@ for i in $(seq 0 $((NODE_COUNT - 1))); do
     IP="${SERVER_IPS[$i]}"
     echo -e "  ${BOLD}arc-node-${i}${NC}"
     echo "    IP:   $IP"
-    echo "    RPC:  http://${IP}:9090"
+    echo "    RPC:  http://${IP}:9944"
     echo "    P2P:  ${IP}:9091"
     echo "    SSH:  ssh root@${IP}"
     echo ""
@@ -222,7 +222,7 @@ fi
 
 echo ""
 echo -e "${CYAN}Quick commands:${NC}"
-echo "  Check health:   curl http://${SERVER_IPS[0]}:9090/health"
+echo "  Check health:   curl http://${SERVER_IPS[0]}:9944/health"
 echo "  View logs:       ssh root@${SERVER_IPS[0]} journalctl -u arc-node -f"
 echo "  Monitor all:     ./monitor.sh"
 echo "  Tear down:       ./teardown.sh"
