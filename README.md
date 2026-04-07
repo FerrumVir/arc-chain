@@ -70,34 +70,42 @@ All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
 
 ---
 
-## Run a Node
+## Run a Node — One Command
 
-**One command. That's it.** Installs Rust, builds the binary, generates your validator key, starts the node, and connects to the testnet. Works on Linux and macOS. No subscription, no account, no sign-up. Free.
+**Zero compile. Zero setup.** Pre-built binary downloads, auto-configures, joins testnet as inference observer. Bring any GGUF model.
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-node.sh | bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/sero-quickstart.sh | bash -s -- /path/to/your-model.gguf
 ```
 
-Your node is now running. It auto-connects to the live testnet, syncs state from peers, and starts participating in consensus. You'll earn ARC for validating.
+That's it. Your node:
+- Downloads the pre-built binary (16 MB) from GitHub releases
+- Auto-detects platform (macOS/Linux, arm64/x86_64)
+- Connects to 8 testnet seeds across 6 continents
+- Loads your GGUF model (Llama, Mistral, Phi, Gemma, Qwen — anything)
+- Starts serving inference with on-chain attestations
+
+No git clone, no Rust toolchain, no 15-minute compile.
+
+**No model? It downloads TinyLlama 1.1B for you:**
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/sero-quickstart.sh | bash
+```
 
 **Check it's working:**
 ```bash
 curl http://localhost:9944/health
-# {"status":"ok","peers":7,"dag_round":12345,"validators":8}
+# {"status":"ok","version":"0.3.1","peers":8,"dag_round":1234,"validators":9}
 ```
 
-### Run AI Inference (earn ARC with your GPU)
+### Build From Source (optional)
 
-Bring **any GGUF model** and start earning. Your node runs inference, results are cryptographically attested on-chain. Every verified inference earns ARC.
+If you want to compile yourself:
 
 ```bash
 git clone https://github.com/FerrumVir/arc-chain.git && cd arc-chain
-
-# Use the default model (TinyLlama 1.1B, downloads 638 MB):
-./scripts/join-inference.sh
-
-# Or bring your own model (any GGUF — Llama, Mistral, Phi, Gemma, Qwen):
-./scripts/join-inference.sh --model ~/models/llama-3-8b.Q4_K_M.gguf
+./scripts/join-inference.sh                                    # default TinyLlama
+./scripts/join-inference.sh --model ~/models/llama-3-8b.gguf  # bring your own
 ```
 
 Your node connects to the live testnet, loads the model, and starts serving inference. That's it.
