@@ -32,12 +32,15 @@ fail()  { printf "${RED}[FAIL]${RESET}  %s\n" "$*" >&2; exit 1; }
 
 BUILD_ONLY=false
 SKIP_BUILD=false
+RESET_STATE=false
 for arg in "$@"; do
     case "$arg" in
-        --build-only) BUILD_ONLY=true ;;
-        --skip-build) SKIP_BUILD=true ;;
+        --build-only)  BUILD_ONLY=true ;;
+        --skip-build)  SKIP_BUILD=true ;;
+        --reset-state) RESET_STATE=true ;;
     esac
 done
+export RESET_STATE
 
 BUILD_IP="${NODE_IPS[0]}"  # NYC
 
@@ -69,8 +72,9 @@ DEPLOYED=0
 for idx in $(seq 0 $((TOTAL - 1))); do
     NODE="${NODE_NAMES[$idx]}"
     IP="${NODE_IPS[$idx]}"
-    SEED_NAME="$(echo "$NODE" | tr '[:upper:]' '[:lower:]')"
-    VALIDATOR_SEED="arc-node-${SEED_NAME}"
+    # Validator seed MUST match genesis.toml [[validators]] seed (e.g. "NYC", "LAX")
+    # or the derived address won't match the genesis validator set.
+    VALIDATOR_SEED="${NODE}"
 
     DEPLOYED=$((DEPLOYED + 1))
     echo ""
@@ -93,13 +97,25 @@ for idx in $(seq 0 $((TOTAL - 1))); do
     # c. Move new binary into place
     ssh $SSH_OPTS "root@${IP}" "mv /tmp/arc-node-new /root/arc-chain/target/release/arc-node"
 
+    # c2. Optional: clear old state if --reset-state flag is passed.
+    # This is needed when switching validator identity (seed), since the
+    # persisted validator set won't match the new address.
+    if [ "${RESET_STATE:-false}" = "true" ]; then
+        info "Resetting state (dag-wal, state.wal, known_peers)..."
+        ssh $SSH_OPTS "root@${IP}" "rm -rf /root/arc-chain/arc-data/dag-wal /root/arc-chain/arc-data/state.wal /root/arc-chain/arc-data/known_peers.json"
+    fi
+
     # d. Sync seeds file and genesis
     rsync -az -e "ssh $SSH_OPTS" \
         "$HOME/arc-chain/testnet-seeds.txt" "$HOME/arc-chain/genesis.toml" \
         "root@${IP}:/root/arc-chain/"
 
-    # e. Start new node in screen
-    info "Starting new node..."
+    # e. Start new node in screen. Load model on LAX for inference demo.
+    MODEL_FLAG=""
+    if [ "$NODE" = "LAX" ]; then
+        MODEL_FLAG="--model model.gguf"
+    fi
+    info "Starting new node${MODEL_FLAG:+ with inference}..."
     ssh $SSH_OPTS "root@${IP}" "cd /root/arc-chain && screen -dmS arc ./target/release/arc-node \
         --rpc 0.0.0.0:${RPC_PORT} \
         --p2p-port ${P2P_PORT} \
@@ -107,7 +123,8 @@ for idx in $(seq 0 $((TOTAL - 1))); do
         --seeds-file testnet-seeds.txt \
         --genesis genesis.toml \
         --stake 5000000 \
-        --eth-rpc-port 0"
+        --eth-rpc-port 0 \
+        ${MODEL_FLAG}"
 
     # f. Wait for health (up to 60 seconds)
     info "Waiting for health check..."

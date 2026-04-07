@@ -313,7 +313,28 @@ impl ConsensusManager {
                             }
                         }
                         InboundMessage::PeerDisconnected { address } => {
-                            // Remove disconnected peer from validator set.
+                            // CRITICAL: genesis validators (those in the frozen set)
+                            // must NEVER be removed from the active validator set.
+                            // The transport layer emits PeerDisconnected for the OLD
+                            // connection during stale-connection replacement (epoch-guarded
+                            // swap), which fires microseconds after PeerConnected for the
+                            // NEW connection. Removing the validator in that case breaks
+                            // consensus quorum even though the peer is actually connected.
+                            //
+                            // For genesis validators, we keep them in the active set
+                            // regardless of connection churn. The block-level quorum check
+                            // will naturally handle the "can't get blocks from offline peer"
+                            // case by failing to commit until enough blocks are received.
+                            let is_genesis = self.engine.frozen_validator_set().is_validator(&address);
+                            if is_genesis {
+                                info!(
+                                    peer = %address,
+                                    "Peer transport disconnected (genesis validator — keeping in set)"
+                                );
+                                continue;
+                            }
+
+                            // Non-genesis peer: remove from active set as before.
                             let current_vs = self.engine.validator_set();
                             let remaining: Vec<Validator> = current_vs
                                 .validators
@@ -329,7 +350,7 @@ impl ConsensusManager {
                                 }
                             }
                             let now_single = validators.len() <= 1;
-                            let new_set = ValidatorSet::new(validators, 0);
+                            let new_set = ValidatorSet::new(validators, current_vs.epoch);
                             self.engine.update_validator_set(new_set);
 
                             // Only reset DAG when reverting to single-validator mode.
@@ -343,7 +364,7 @@ impl ConsensusManager {
                             info!(
                                 peer = %address,
                                 now_single = now_single,
-                                "Peer disconnected — validator removed"
+                                "Peer disconnected — non-genesis validator removed"
                             );
                         }
                         InboundMessage::DagBlockWithTxs {

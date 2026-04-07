@@ -106,7 +106,8 @@ echo ""
     --genesis genesis.toml \
     --validator-seed "$SEED" \
     --model "$MODEL_PATH" \
-    --stake 5000000
+    --stake 0 \
+    --min-stake 0
 
 echo ""
 echo -e "${YELLOW}Node stopped. To restart: ./scripts/join-inference.sh${NC}"
