@@ -868,10 +868,11 @@ pub async fn run_transport(
         tokio::spawn(async move {
             let mut pex_tick = tokio::time::interval(std::time::Duration::from_secs(60));
             pex_tick.tick().await;
-            // Reconnect every 10s (was 30s) so the network heals faster after
-            // a node restart. Cross-continent dial+handshake takes ~5s, so
-            // 10s gives ~50% headroom while keeping stale-peer detection fresh.
-            let mut recon_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+            // Reconnect every 30s. Tried 10s but that caused excessive dial
+            // churn — every restart triggered a flood of duplicate-accept
+            // events from the restarting node's peers, which then deadlocked
+            // accept_peer with consensus on shared DashMap shards.
+            let mut recon_tick = tokio::time::interval(std::time::Duration::from_secs(30));
             recon_tick.tick().await;
             loop {
                 tokio::select! {
