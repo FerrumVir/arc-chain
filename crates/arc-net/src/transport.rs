@@ -868,7 +868,10 @@ pub async fn run_transport(
         tokio::spawn(async move {
             let mut pex_tick = tokio::time::interval(std::time::Duration::from_secs(60));
             pex_tick.tick().await;
-            let mut recon_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            // Reconnect every 10s (was 30s) so the network heals faster after
+            // a node restart. Cross-continent dial+handshake takes ~5s, so
+            // 10s gives ~50% headroom while keeping stale-peer detection fresh.
+            let mut recon_tick = tokio::time::interval(std::time::Duration::from_secs(10));
             recon_tick.tick().await;
             loop {
                 tokio::select! {
