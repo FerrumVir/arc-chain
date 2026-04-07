@@ -102,31 +102,37 @@ git clone https://github.com/FerrumVir/arc-chain.git && cd arc-chain
 
 Your node connects to the live testnet, loads the model, and starts serving inference. That's it.
 
-**Test it works:**
+**Test it works (one command):**
 ```bash
-# Run inference (from your machine)
+./scripts/test-inference.sh "What is 2+2?"
+```
+This runs inference, shows the output, and prints the cryptographic hashes + on-chain attestation tx hash.
+
+**Check on-chain attestations:**
+```bash
+./scripts/check-attestations.sh                       # Your local node
+./scripts/check-attestations.sh 140.82.16.112:9090 10 # Remote node, last 10
+```
+
+**Raw curl (if you prefer):**
+```bash
+# Run inference
 curl -X POST http://localhost:9944/inference/run \
   -H 'Content-Type: application/json' \
   -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":32}'
 
-# Response includes:
-#   output          — the model's response
-#   output_hash     — BLAKE3 hash (deterministic, verifiable)
-#   model_hash      — identifies exactly which model ran
-#   attestation     — on-chain tx hash proving this inference happened
-#   ms_per_token    — speed
-```
-
-**Check on-chain attestations:**
-```bash
-# See all verified inferences on the network
+# See all attestations on the network
 curl http://140.82.16.112:9090/inference/attestations?limit=10
-
-# Look up a specific attestation by tx hash
-curl http://140.82.16.112:9090/tx/{tx_hash}
 ```
 
-**Verify determinism:** Run the same prompt on two different machines. The `output_hash` will be identical. That's the whole point — any machine can independently verify any inference.
+**Response fields:**
+- `output` — the model's response
+- `output_hash` — BLAKE3 hash of the output (deterministic, verifiable)
+- `model_hash` — identifies exactly which model produced it
+- `attestation.tx_hash` — on-chain tx proving this inference happened
+- `ms_per_token` — speed
+
+**Verify determinism:** Run the same prompt on two different machines. The `output_hash` will be **bit-for-bit identical**. That's the whole point — any machine can independently verify any inference.
 
 ### Already have the repo cloned?
 
