@@ -202,8 +202,10 @@ async fn main() -> Result<()> {
             Ok(contents) => {
                 let seed_peers: Vec<String> = contents
                     .lines()
-                    .map(|l| l.trim())
-                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    // Strip inline comments (everything after #) then trim whitespace.
+                    // Supports format: "149.28.32.76:9091    # NYC (US East)"
+                    .map(|l| l.split('#').next().unwrap_or("").trim())
+                    .filter(|l| !l.is_empty())
                     .map(|l| l.to_string())
                     .collect();
                 tracing::info!("Loaded {} seeds from {}", seed_peers.len(), seeds_path);
