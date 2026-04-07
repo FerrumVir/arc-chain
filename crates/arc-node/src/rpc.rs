@@ -2734,11 +2734,15 @@ async fn inference_run(
         })));
     }
 
+    // Both engines need BOS prepended — the model expects token 1 (<s>) at start.
+    // Without BOS, the integer engine produces incoherent output because the
+    // prompt starts in an undefined state.
+    let mut tokens_with_bos = vec![model.config.bos_token];
+    tokens_with_bos.extend(&prompt_tokens);
+
     // Run inference — use candle float backend if available, else integer engine
     let (generated_tokens, output_hash, engine_name) = if let (Some(engine), Some(mid)) = (&node.candle_engine, &node.candle_model_id) {
         // Candle Q4 float backend — coherent output, deterministic on same arch
-        let mut tokens_with_bos = vec![model.config.bos_token];
-        tokens_with_bos.extend(&prompt_tokens);
         let result = engine.generate(mid, &tokens_with_bos, max_tokens)
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Inference failed: {}", e)))?;
         let gen_tokens: Vec<u32> = result.output.chunks(4)
@@ -2747,8 +2751,8 @@ async fn inference_run(
             .collect();
         (gen_tokens, result.output_hash, "candle Q4 (float, deterministic per-arch)")
     } else {
-        // Integer engine fallback
-        let (generated, hash) = model.generate(&prompt_tokens, max_tokens, &model.config.eos_tokens);
+        // Integer engine fallback — bit-identical across architectures
+        let (generated, hash) = model.generate(&tokens_with_bos, max_tokens, &model.config.eos_tokens);
         (generated, hash, "INT8 integer (cross-platform deterministic)")
     };
 
