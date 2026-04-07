@@ -16,6 +16,47 @@ set -euo pipefail
 
 REPO="FerrumVir/arc-chain"
 ARC_DIR="${HOME}/.arc-quickstart"
+
+# Help flag
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+    cat <<HELP
+ARC Chain Sero Quickstart
+
+USAGE:
+  sero-quickstart.sh [MODEL_PATH]
+
+ARGUMENTS:
+  MODEL_PATH    Path to a GGUF model file (Llama, Mistral, Phi, Gemma, Qwen).
+                If omitted, downloads TinyLlama 1.1B (638 MB) automatically.
+
+EXAMPLES:
+  # Use a model you already have:
+  ./sero-quickstart.sh ~/models/llama-3-8b.Q4_K_M.gguf
+
+  # Auto-download default model:
+  ./sero-quickstart.sh
+
+  # Run via curl pipe:
+  curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/sero-quickstart.sh \\
+    | bash -s -- ~/models/your-model.gguf
+
+OUTPUT:
+  Node listens on:
+    http://localhost:9944        — RPC + inference endpoint
+    http://localhost:9944/health — health status
+
+  Test inference:
+    curl -X POST http://localhost:9944/inference/run \\
+      -H 'Content-Type: application/json' \\
+      -d '{"input":"[INST] Hello [/INST]","max_tokens":32}'
+
+  Live testnet dashboard:
+    http://140.82.16.112:3200
+
+HELP
+    exit 0
+fi
+
 MODEL_PATH="${1:-}"
 
 # Colors
