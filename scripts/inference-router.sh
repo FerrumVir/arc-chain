@@ -20,15 +20,46 @@ N="${1:-10}"
 PROMPT="${2:-What is the largest planet?}"
 MAX_TOKENS=15
 
-# Inference-enabled nodes (TinyLlama loaded on all)
-NODES=(
+# All 8 ARC seed nodes (TinyLlama loaded on all)
+ALL_NODES=(
     "NYC:149.28.32.76:9090"
     "LAX:140.82.16.112:9090"
     "AMS:136.244.109.1:9090"
     "LHR:104.238.171.11:9090"
+    "NRT:202.182.107.41:9090"
+    "SGP:149.28.153.31:9090"
+    "SAO:216.238.120.27:9090"
     "JNB:139.84.237.49:9090"
 )
+
+# Auto-discovery: probe each node, only include nodes that successfully serve inference
+echo "Discovering inference-capable nodes..."
+NODES=()
+for entry in "${ALL_NODES[@]}"; do
+    name="${entry%%:*}"
+    host="${entry#*:}"
+    if curl -sf -m 3 "http://${host}/health" >/dev/null 2>&1; then
+        # Probe inference endpoint — give 30s since busy nodes may queue
+        if curl -sf -m 30 -X POST "http://${host}/inference/run" \
+            -H 'Content-Type: application/json' \
+            -d '{"input":"hi","max_tokens":1}' 2>/dev/null | grep -q '"output_hash"'; then
+            NODES+=("$entry")
+            echo "  ✓ $name available"
+        else
+            echo "  ✗ $name (no model loaded or timed out)"
+        fi
+    else
+        echo "  ✗ $name (unreachable)"
+    fi
+done
+
+if [ ${#NODES[@]} -eq 0 ]; then
+    echo "ERROR: No inference-capable nodes available"
+    exit 1
+fi
+
 NUM_NODES=${#NODES[@]}
+echo ""
 
 BOLD=$'\033[1m' GREEN=$'\033[32m' CYAN=$'\033[36m' YELLOW=$'\033[33m' RESET=$'\033[0m'
 

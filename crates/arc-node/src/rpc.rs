@@ -20,7 +20,8 @@ use tower_http::cors::CorsLayer;
 
 /// Faucet configuration.
 const FAUCET_CLAIM_AMOUNT: u64 = 10_000;
-const FAUCET_RATE_LIMIT_SECS: u64 = 3600; // 1 hour per address
+const FAUCET_RATE_LIMIT_SECS: u64 = 60; // 1 minute per address (testnet — was 1 hour)
+const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute for testnet TPS demo
 
 /// Shared node state passed to all handlers.
 #[derive(Clone)]
@@ -652,14 +653,13 @@ async fn faucet_claim(
     })?;
 
     // Rate limiting: check if this address claimed recently
-    // Global rate limit: max 100 faucet claims per minute (prevents infinite mint via address generation)
+    // Global rate limit: 5000 faucet claims/minute (testnet only — production should be 100)
     {
         let total = node.faucet_claims_total.load(Ordering::Relaxed);
-        if total > 100 {
-            // Check if we've had >100 claims in the last minute
+        if total > FAUCET_GLOBAL_RATE_LIMIT as u32 {
             let claims = node.faucet_claims.lock().unwrap_or_else(|p| p.into_inner());
             let recent = claims.values().filter(|t| t.elapsed().as_secs() < 60).count();
-            if recent > 100 {
+            if recent > FAUCET_GLOBAL_RATE_LIMIT {
                 return Err((StatusCode::TOO_MANY_REQUESTS, Json(FaucetErrorResponse {
                     error: "Faucet busy. Too many claims globally. Try again in a minute.".to_string(),
                 })));

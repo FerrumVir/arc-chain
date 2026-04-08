@@ -21,16 +21,46 @@ N="${1:-10}"
 PROMPT="What is the largest planet?"
 MAX_TOKENS=15
 
-NODES=(
+ALL_NODES=(
     "NYC:149.28.32.76:9090"
     "LAX:140.82.16.112:9090"
     "AMS:136.244.109.1:9090"
     "LHR:104.238.171.11:9090"
+    "NRT:202.182.107.41:9090"
+    "SGP:149.28.153.31:9090"
+    "SAO:216.238.120.27:9090"
     "JNB:139.84.237.49:9090"
 )
-SINGLE_NODE="${NODES[1]}"  # LAX
+
+# Auto-discover live inference nodes
+echo "Discovering inference-capable nodes..."
+NODES=()
+for entry in "${ALL_NODES[@]}"; do
+    name="${entry%%:*}"
+    host="${entry#*:}"
+    if curl -sf -m 30 -X POST "http://${host}/inference/run" \
+        -H 'Content-Type: application/json' \
+        -d '{"input":"hi","max_tokens":1}' 2>/dev/null | grep -q '"output_hash"'; then
+        NODES+=("$entry")
+        echo "  ✓ $name"
+    else
+        echo "  ✗ $name (skipped)"
+    fi
+done
+
+if [ ${#NODES[@]} -lt 2 ]; then
+    echo "ERROR: Need at least 2 inference-capable nodes"
+    exit 1
+fi
+
+# Pick LAX if available, otherwise first node
+SINGLE_NODE="${NODES[0]}"
+for n in "${NODES[@]}"; do
+    if [[ "$n" == LAX:* ]]; then SINGLE_NODE="$n"; break; fi
+done
 SINGLE_HOST="${SINGLE_NODE#*:}"
 NUM_NODES=${#NODES[@]}
+echo ""
 
 BOLD=$'\033[1m' GREEN=$'\033[32m' CYAN=$'\033[36m' YELLOW=$'\033[33m' RED=$'\033[31m' RESET=$'\033[0m'
 

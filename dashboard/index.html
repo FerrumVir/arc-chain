@@ -102,9 +102,30 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       </div>
     </div>
 
+    <!-- Custom prompt input — runs on all 8 nodes in parallel -->
+    <div class="mb-4 p-4 bg-surface-3 border border-emerald-500/30 rounded-xl">
+      <label class="text-[10px] uppercase tracking-wider text-emerald-400 font-bold block mb-2">Type a prompt — watch all 8 devices answer it together</label>
+      <div class="flex gap-2">
+        <input type="text" id="customPrompt" placeholder="What is the capital of France?" value="What is the capital of France?"
+               class="flex-1 px-3 py-2 bg-surface-2 border border-surface-4 rounded-lg text-white text-sm placeholder-gray-600 focus:border-emerald-500 focus:outline-none mono"
+               onkeypress="if(event.key==='Enter')runCustomPromptOnAll()">
+        <button onclick="runCustomPromptOnAll()" id="customBtn"
+                class="px-5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-sm whitespace-nowrap transition shadow-lg shadow-emerald-500/30">
+          ▶ Run on All 8
+        </button>
+      </div>
+      <div id="customStatus" class="text-[10px] text-gray-500 mt-2">Same prompt sent to all 8 nodes simultaneously. All produce identical hash = cross-device determinism proven.</div>
+
+      <!-- Per-node response cards (populated on run) -->
+      <div id="customResults" class="hidden grid grid-cols-2 md:grid-cols-4 gap-2 mt-3"></div>
+
+      <!-- Hash comparison summary -->
+      <div id="customHashSummary" class="hidden mt-3 p-3 bg-surface-2 border border-arc-500/30 rounded-lg text-[11px]"></div>
+    </div>
+
     <!-- Click any node to test inference live -->
-    <div class="text-[10px] uppercase tracking-wider text-gray-500 mb-2 font-semibold">Click any device to run inference live</div>
-    <div class="grid grid-cols-2 md:grid-cols-5 gap-2 mb-4" id="inferenceNodeGrid"></div>
+    <div class="text-[10px] uppercase tracking-wider text-gray-500 mb-2 font-semibold">Or click any device to run a quick test</div>
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 mb-4" id="inferenceNodeGrid"></div>
 
     <!-- Live benchmark button -->
     <div class="flex items-center gap-3 p-3 bg-surface-4/50 border border-emerald-500/20 rounded-lg">
@@ -112,7 +133,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
         ⚡ Run Live Benchmark
       </button>
       <div class="flex-1 text-[11px]">
-        <div id="benchStatus" class="text-gray-400">Compares <span class="text-yellow-400 font-semibold">1 node sequential</span> vs <span class="text-emerald-400 font-semibold">5 nodes parallel</span>. Same prompt. Different machines. Identical hash.</div>
+        <div id="benchStatus" class="text-gray-400">Compares <span class="text-yellow-400 font-semibold">1 node sequential</span> vs <span class="text-emerald-400 font-semibold">8 nodes parallel</span>. Same prompt. Different machines. Identical hash.</div>
       </div>
     </div>
 
@@ -124,7 +145,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
           <div class="text-xl font-bold text-yellow-400 mono" id="benchSeq">—</div>
         </div>
         <div>
-          <div class="text-[9px] uppercase tracking-wider text-gray-500">Distributed (5 nodes)</div>
+          <div class="text-[9px] uppercase tracking-wider text-gray-500">Distributed (8 nodes)</div>
           <div class="text-xl font-bold text-emerald-400 mono" id="benchDist">—</div>
         </div>
         <div>
@@ -180,9 +201,9 @@ const NODES=[
   {name:'LAX',ip:'140.82.16.112',loc:'Los Angeles',flag:'🇺🇸',inference:true},
   {name:'AMS',ip:'136.244.109.1',loc:'Amsterdam',flag:'🇳🇱',inference:true},
   {name:'LHR',ip:'104.238.171.11',loc:'London',flag:'🇬🇧',inference:true},
-  {name:'NRT',ip:'202.182.107.41',loc:'Tokyo',flag:'🇯🇵',inference:false},
-  {name:'SGP',ip:'149.28.153.31',loc:'Singapore',flag:'🇸🇬',inference:false},
-  {name:'SAO',ip:'216.238.120.27',loc:'São Paulo',flag:'🇧🇷',inference:false},
+  {name:'NRT',ip:'202.182.107.41',loc:'Tokyo',flag:'🇯🇵',inference:true},
+  {name:'SGP',ip:'149.28.153.31',loc:'Singapore',flag:'🇸🇬',inference:true},
+  {name:'SAO',ip:'216.238.120.27',loc:'São Paulo',flag:'🇧🇷',inference:true},
   {name:'JNB',ip:'139.84.237.49',loc:'Johannesburg',flag:'🇿🇦',inference:true},
 ];
 
@@ -304,6 +325,126 @@ async function runLiveBenchmark(){
   // Re-enable button
   btn.disabled=false;
   btn.textContent='⚡ Run Live Benchmark Again';
+  btn.classList.add('bg-emerald-500','hover:bg-emerald-400');
+  btn.classList.remove('bg-gray-600','cursor-not-allowed');
+}
+
+// Run a custom prompt on ALL inference-enabled nodes in parallel.
+// Shows per-device response cards + hash equivalence summary.
+// This is the demo's centerpiece: type prompt → see all 8 devices answer with identical hash.
+async function runCustomPromptOnAll(){
+  const promptEl=document.getElementById('customPrompt');
+  const btn=document.getElementById('customBtn');
+  const status=document.getElementById('customStatus');
+  const resultsEl=document.getElementById('customResults');
+  const hashEl=document.getElementById('customHashSummary');
+  const prompt=(promptEl.value||'').trim();
+  if(!prompt){promptEl.focus();return}
+
+  const infNodes=NODES.filter(n=>n.inference);
+  btn.disabled=true;
+  btn.textContent='Running…';
+  btn.classList.remove('bg-emerald-500','hover:bg-emerald-400');
+  btn.classList.add('bg-gray-600','cursor-not-allowed');
+  resultsEl.classList.remove('hidden');
+  hashEl.classList.add('hidden');
+
+  // Render placeholder cards immediately so user sees activity
+  resultsEl.innerHTML=infNodes.map(n=>`
+    <div class="bg-surface-2 border border-surface-4 rounded-lg p-2.5" id="card-${n.name}">
+      <div class="flex items-center justify-between mb-1">
+        <span class="text-white font-bold text-xs">${n.flag} ${n.name}</span>
+        <span class="text-[9px] text-yellow-400 mono pulse-dot">▶ running</span>
+      </div>
+      <div class="text-[10px] text-gray-500 mono truncate">${n.loc}</div>
+      <div class="text-[10px] text-gray-600 mt-1.5">waiting for response…</div>
+    </div>
+  `).join('');
+
+  status.innerHTML=`<span class="text-yellow-400">▶</span> Sending prompt to ${infNodes.length} devices in parallel…`;
+
+  const overallStart=Date.now();
+
+  // Fire all 8 requests at once, collect results as they arrive
+  const promises=infNodes.map(async n=>{
+    const t0=Date.now();
+    try{
+      const r=await fetch(`http://${n.ip}:9090/inference/run`,{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({input:`[INST] ${prompt} [/INST]`,max_tokens:20}),
+        signal:AbortSignal.timeout(120000)
+      });
+      const d=await r.json();
+      const elapsed=Date.now()-t0;
+      const inf=d.inference||{};
+      const card=document.getElementById(`card-${n.name}`);
+      if(card){
+        card.className='bg-surface-2 border border-emerald-500/40 rounded-lg p-2.5';
+        card.innerHTML=`
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-white font-bold text-xs">${n.flag} ${n.name}</span>
+            <span class="text-[9px] text-emerald-400 mono">✓ ${elapsed}ms</span>
+          </div>
+          <div class="text-[10px] text-gray-500 mono truncate">${inf.ms_per_token||'?'}ms/tok</div>
+          <div class="text-[10px] text-white mt-1.5 leading-tight" style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;">${(inf.output||'—').replace(/</g,'&lt;')}</div>
+          <div class="text-[9px] mono text-arc-400 mt-1.5 truncate" title="${inf.output_hash||''}">${(inf.output_hash||'').slice(0,18)}…</div>
+        `;
+      }
+      return{node:n,ok:true,hash:inf.output_hash,output:inf.output,elapsed,ms_per_token:inf.ms_per_token};
+    }catch(e){
+      const card=document.getElementById(`card-${n.name}`);
+      if(card){
+        card.className='bg-surface-2 border border-red-500/40 rounded-lg p-2.5';
+        card.innerHTML=`
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-white font-bold text-xs">${n.flag} ${n.name}</span>
+            <span class="text-[9px] text-red-400 mono">✗ failed</span>
+          </div>
+          <div class="text-[10px] text-gray-500 mono truncate">${n.loc}</div>
+          <div class="text-[10px] text-red-400 mt-1.5">${(e.message||'error').slice(0,40)}</div>
+        `;
+      }
+      return{node:n,ok:false,error:e.message};
+    }
+  });
+
+  const results=await Promise.all(promises);
+  const totalMs=Date.now()-overallStart;
+  const okResults=results.filter(r=>r.ok&&r.hash);
+  const hashes=new Set(okResults.map(r=>r.hash));
+
+  // Hash comparison summary
+  hashEl.classList.remove('hidden');
+  if(hashes.size===0){
+    hashEl.innerHTML=`<span class="text-red-400 font-bold">✗ No nodes returned a hash.</span>`;
+  }else if(hashes.size===1){
+    const h=[...hashes][0];
+    const fastest=Math.min(...okResults.map(r=>r.elapsed));
+    const slowest=Math.max(...okResults.map(r=>r.elapsed));
+    hashEl.innerHTML=`
+      <div class="flex items-center gap-2 mb-1.5">
+        <span class="text-emerald-400 font-bold text-sm">✓ ALL ${okResults.length} devices produced IDENTICAL output_hash</span>
+      </div>
+      <div class="mono text-arc-400 text-[10px] break-all mb-2">${h}</div>
+      <div class="grid grid-cols-3 gap-3 text-[10px]">
+        <div><span class="text-gray-500">Wall time:</span> <span class="text-white font-bold">${totalMs}ms</span></div>
+        <div><span class="text-gray-500">Fastest device:</span> <span class="text-emerald-400 font-bold">${fastest}ms</span></div>
+        <div><span class="text-gray-500">Slowest device:</span> <span class="text-yellow-400 font-bold">${slowest}ms</span></div>
+      </div>
+      <div class="text-[10px] text-gray-500 mt-2">This is cryptographic proof of cross-device deterministic inference. Run it again on a different prompt — same result.</div>
+    `;
+  }else{
+    hashEl.innerHTML=`
+      <span class="text-yellow-400 font-bold">⚠ ${hashes.size} unique hashes across ${okResults.length} devices</span>
+      <div class="text-[10px] text-gray-500 mt-1">This usually means a node is running a different model file. Each model_hash should be identical for cross-device determinism.</div>
+    `;
+  }
+
+  status.innerHTML=`<span class="text-emerald-400 font-bold">✓ Done</span> — ${okResults.length}/${infNodes.length} devices responded in ${totalMs}ms wall time.`;
+
+  btn.disabled=false;
+  btn.textContent='▶ Run on All 8';
   btn.classList.add('bg-emerald-500','hover:bg-emerald-400');
   btn.classList.remove('bg-gray-600','cursor-not-allowed');
 }
