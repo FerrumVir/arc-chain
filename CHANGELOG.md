@@ -3,6 +3,17 @@
 All notable changes to ARC Chain are tracked here. This project follows
 [semantic versioning](https://semver.org/).
 
+## v0.4.5 — 2026-04-08
+
+**Unique attestation tx_hash for repeat prompts.** Identical inputs to
+`/inference/run_sharded` were producing identical attestation tx_hashes
+(same nonce + same body), and the mempool was de-duping the second
+submission. Now uses a monotonic `attestation_nonce: AtomicU64` on
+NodeState that bumps on every sharded run, so each submission gets a
+unique nonce → unique tx_hash → committed independently.
+
+Also: `/tx/{hash}` now accepts both `0x`-prefixed and bare 64-hex forms.
+
 ## v0.4.4 — 2026-04-08
 
 **Sharded runs now produce on-chain attestations.** Every successful

@@ -70,6 +70,10 @@ pub struct NodeState {
     pub sharded_runs_total: Arc<AtomicU64>,
     /// Total bytes of activations forwarded between shards since boot.
     pub sharded_bytes_total: Arc<AtomicU64>,
+    /// Monotonic counter for inference attestation nonces. Ensures repeat
+    /// submissions of the same prompt+output produce unique tx_hashes
+    /// (otherwise the mempool de-dups them).
+    pub attestation_nonce: Arc<AtomicU64>,
 }
 
 /// Describes which slice of a model a node holds.
@@ -131,6 +135,7 @@ pub fn build_node_state(
         shard_registry: Arc::new(dashmap::DashMap::new()),
         sharded_runs_total: Arc::new(AtomicU64::new(0)),
         sharded_bytes_total: Arc::new(AtomicU64::new(0)),
+        attestation_nonce: Arc::new(AtomicU64::new(0)),
     }
 }
 
@@ -3391,8 +3396,15 @@ async fn inference_run_sharded(
     // Submit an InferenceAttestation transaction so this sharded run is
     // recorded on-chain like single-node /inference/run does. Anyone reading
     // the chain later can verify model_id + input_hash + output_hash.
+    //
+    // Nonce strategy: bump the in-memory attestation_nonce counter and add
+    // it to the account's persisted nonce. Each sharded run gets a unique
+    // nonce → unique tx_hash → mempool accepts it (no dedupe collision
+    // even when the same prompt is run twice).
     let attester = node.validator_address;
-    let nonce = node.state.get_account(&attester).map(|a| a.nonce).unwrap_or(0);
+    let base_nonce = node.state.get_account(&attester).map(|a| a.nonce).unwrap_or(0);
+    let bump = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
+    let nonce = base_nonce + bump;
     let tx = arc_types::Transaction {
         tx_type: arc_types::TxType::InferenceAttestation,
         from: attester,
