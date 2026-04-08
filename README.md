@@ -12,6 +12,35 @@ A request flows through a pipeline of nodes. Each node holds a slice of the mode
 
 This is how a 7B model gets shared across 7 cheap VPS, and how a 70B model gets shared across 14 of them. No single node has enough RAM. The network does.
 
+```
+                  Llama-2-7B Q4 — 32 transformer layers, ~4 GB
+                              split 7 ways across the public internet
+
+   token id           hidden state         hidden state         token id
+      ↓                    ↓                    ↓                    ↑
+  ┌───────┐  ─────►  ┌───────┐  ─────►   ┌───────┐  ─────►   ┌───────┐
+  │ NYC   │          │ LAX   │           │ AMS   │           │ JNB   │
+  │ L 0–4 │  hidden  │ L 5–9 │  hidden   │L10–13 │   hidden  │L28–31 │
+  │ +EMBED│  +BLAKE3 │       │  +BLAKE3  │       │  +BLAKE3  │+LM HD │
+  │ ~1 GB │          │ ~1 GB │           │ ~1 GB │           │ ~1 GB │
+  └───────┘          └───────┘           └───────┘           └───────┘
+       │                  │                   │                   ↑
+       │                  │                   ▼                   │
+       │                  │            ┌───────┐  hidden          │
+       │                  │            │ LHR   │  +BLAKE3         │
+       │                  │            │L14–18 │  ─────►          │
+       │                  │            │ ~1 GB │                  │
+       │                  │            └───────┘                  │
+       │                  │                                       │
+       │                  │  ──── ... ────► NRT L19–22 ────►      │
+       │                  │                  SGP L23–27 ──────────┘
+       │                  │
+   port 9090         port 9090            port 9090           port 9090
+   149.28.32.76    140.82.16.112         136.244.109.1      139.84.237.49
+```
+
+Each → is a `POST /inference/forward_shard` to the next shard's RPC. Each shard verifies the previous shard's BLAKE3 hash before computing. The last shard runs `final_norm + LM head + argmax` and returns the next token id. The coordinator collects tokens until `max_tokens` or EOS.
+
 > **Live demo:** http://140.82.16.112:3200
 > Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the activation reaches it. The trace table shows compute_ms, wall_ms, and payload bytes per hop, and the output_hash matches every replay.
 
