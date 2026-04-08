@@ -124,6 +124,11 @@ impl I16Weights {
         Self { data, scales, n_rows, n_cols }
     }
 
+    /// Zero-memory placeholder used by sharded loading.
+    pub fn empty() -> Self {
+        Self { data: Vec::new(), scales: Vec::new(), n_rows: 0, n_cols: 0 }
+    }
+
     /// Convert from existing I8Weights (cast i8 -> i16, adjust scales).
     ///
     /// This does NOT improve precision — the i8 quantization loss is already baked in.
@@ -1953,14 +1958,30 @@ impl CachedIntegerModel {
             debug_assert!(layer.is_loaded(),
                 "Shard does not hold layer {} (range was [{}, {}))", layer_idx, start_layer, end);
 
+            // I16 layer ref (preferred — quantized from f32 with 258x finer
+            // granularity than I8, which is what makes output coherent on
+            // smaller models like Llama-7B)
+            let i16l = self.i16_layers.as_ref().map(|il| &il[layer_idx]);
+
+            // Local macro: prefer I16 (loaded directly from f32), fall back to I8.
+            macro_rules! dispatch {
+                ($i16_field:ident, $i8_field:ident, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
+                    if let Some(i16l) = i16l {
+                        matmul_i16_into(&i16l.$i16_field, $raw, $in_sz, $out);
+                    } else {
+                        matmul_fast_preq(&layer.$i8_field, $inq, $raw, $in_sz, $out);
+                    }
+                };
+            }
+
             // LayerNorm
             let normed = layernorm(&hidden, &layer.attn_norm);
             let normed_q = QuantizedInput::from_i64(&normed);
 
-            // Q/K/V projections (I8 path — sharded loader uses I8 only)
-            matmul_fast_preq(&layer.wq, &normed_q, &normed, d, &mut q);
-            matmul_fast_preq(&layer.wk, &normed_q, &normed, d, &mut k_buf);
-            matmul_fast_preq(&layer.wv, &normed_q, &normed, d, &mut v_buf);
+            // Q/K/V projections — I16 if loaded, else I8
+            dispatch!(wq, wq, &normed_q, &normed, d, &mut q);
+            dispatch!(wk, wk, &normed_q, &normed, d, &mut k_buf);
+            dispatch!(wv, wv, &normed_q, &normed, d, &mut v_buf);
 
             // RoPE on Q and K
             for h in 0..cfg.n_heads {
@@ -2016,19 +2037,19 @@ impl CachedIntegerModel {
 
             // Wo projection + residual
             let attn_out_q = QuantizedInput::from_i64(&attn_out);
-            matmul_fast_preq(&layer.wo, &attn_out_q, &attn_out, d, &mut projected);
+            dispatch!(wo, wo, &attn_out_q, &attn_out, d, &mut projected);
             for i in 0..d { hidden[i] += projected[i]; }
 
             // FFN: gate, up, down
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
             let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
-            matmul_fast_preq(&layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
-            matmul_fast_preq(&layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
+            dispatch!(w_gate, w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
+            dispatch!(w_up,   w_up,   &normed_ff_q, &normed_ff, d, &mut up);
             for j in 0..cfg.d_ff {
                 gate[j] = (silu_i64(gate[j]) * up[j]) >> FRAC_BITS;
             }
             let gate_q = QuantizedInput::from_i64(&gate);
-            matmul_fast_preq(&layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
+            dispatch!(w_down, w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
             for i in 0..d { hidden[i] += ff_out[i]; }
         }
 
@@ -2036,7 +2057,13 @@ impl CachedIntegerModel {
         if is_last {
             cache.seq_len = position + 1;
             let normed = layernorm(&hidden, &self.final_norm);
-            let logits = matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size);
+            let logits = if let Some(ref i16w) = self.i16_output {
+                let mut logits = vec![0i64; cfg.vocab_size];
+                matmul_i16_into(i16w, &normed, d, &mut logits);
+                logits
+            } else {
+                matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
+            };
             let token_id = argmax_i64(&logits) as u32;
             let logits_bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
             let logits_hash = arc_crypto::hash_bytes(&logits_bytes);
@@ -2419,9 +2446,16 @@ pub fn load_cached_model_shard(
             .map_err(|e| InferenceError::Runtime(format!("tovec: {e}")))
     };
 
-    let extract_i8 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, rows: usize, cols: usize| -> Result<I8Weights, InferenceError> {
+    // Extract f32 once and produce BOTH I8 (kept for compat / placeholder math)
+    // AND I16 (used by forward_shard_token for ~258x finer quantization).
+    // I16 directly from f32 is the only way to get real quality improvement —
+    // I16Weights::from_i8() preserves I8-level precision, I16Weights::quantize_f32
+    // doesn't.
+    let extract_i8_i16 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, rows: usize, cols: usize| -> Result<(I8Weights, I16Weights), InferenceError> {
         let f = extract_f32(reader, content, name)?;
-        Ok(I8Weights::quantize_f32(&f, rows, cols))
+        let i8w = I8Weights::quantize_f32(&f, rows, cols);
+        let i16w = I16Weights::quantize_f32(&f, rows, cols);
+        Ok((i8w, i16w))
     };
 
     let extract_norm = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, size: usize| -> Vec<i64> {
@@ -2432,11 +2466,9 @@ pub fn load_cached_model_shard(
 
     // ── Embeddings: ONLY on first shard ──────────────────────────────────────
     let (embedding_q16, embedding_i8) = if is_first {
-        let i8w = extract_i8(&mut reader, &content, "token_embd.weight", vocab_size, d_model)?;
-        let q16: Vec<i64> = {
-            let f = extract_f32(&mut reader, &content, "token_embd.weight")?;
-            f.iter().map(|&x| (x as f64 * ONE as f64).round() as i64).collect()
-        };
+        let f = extract_f32(&mut reader, &content, "token_embd.weight")?;
+        let i8w = I8Weights::quantize_f32(&f, vocab_size, d_model);
+        let q16: Vec<i64> = f.iter().map(|&x| (x as f64 * ONE as f64).round() as i64).collect();
         info!("Shard {}: embeddings loaded ({} MB Q16)", start_layer, q16.len() * 8 / (1024 * 1024));
         (q16, i8w)
     } else {
@@ -2444,34 +2476,56 @@ pub fn load_cached_model_shard(
     };
 
     // ── Output head + final norm: ONLY on last shard ─────────────────────────
-    let (output_weight, final_norm) = if is_last {
-        let ow = extract_i8(&mut reader, &content, "output.weight", vocab_size, d_model)
-            .or_else(|_| extract_i8(&mut reader, &content, "token_embd.weight", vocab_size, d_model))?;
+    let (output_weight, output_weight_i16, final_norm) = if is_last {
+        // Try output.weight first, fall back to token_embd.weight (tied embeddings).
+        let f = extract_f32(&mut reader, &content, "output.weight")
+            .or_else(|_| extract_f32(&mut reader, &content, "token_embd.weight"))?;
+        let i8w = I8Weights::quantize_f32(&f, vocab_size, d_model);
+        let i16w = I16Weights::quantize_f32(&f, vocab_size, d_model);
         let fn_ = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
         info!("Shard last: output head + final_norm loaded");
-        (ow, fn_)
+        (i8w, Some(i16w), fn_)
     } else {
-        (I8Weights::empty(), Vec::new())
+        (I8Weights::empty(), None, Vec::new())
     };
 
     // ── Layers: only [start_layer, end_layer) loaded; rest are placeholders ──
+    // We populate BOTH I8 and I16 for each held layer. The I16 weights are
+    // what forward_shard_token uses; the I8 weights are kept so other code paths
+    // (e.g. enable_q4) can fall back to them.
     let mut layers: Vec<CachedLayer> = (0..n_layers).map(|_| CachedLayer::placeholder()).collect();
+    let mut i16_layers_vec: Vec<I16Layer> = (0..n_layers).map(|_| I16Layer {
+        wq: I16Weights::empty(),
+        wk: I16Weights::empty(),
+        wv: I16Weights::empty(),
+        wo: I16Weights::empty(),
+        w_gate: I16Weights::empty(),
+        w_up: I16Weights::empty(),
+        w_down: I16Weights::empty(),
+    }).collect();
+    let mut any_i16 = false;
     for l in start_layer..end_layer {
         let p = format!("blk.{l}");
-        let wq = extract_i8(&mut reader, &content, &format!("{p}.attn_q.weight"), d_model, d_model)?;
-        let wk = extract_i8(&mut reader, &content, &format!("{p}.attn_k.weight"), d_kv, d_model)?;
-        let wv = extract_i8(&mut reader, &content, &format!("{p}.attn_v.weight"), d_kv, d_model)?;
-        let wo = extract_i8(&mut reader, &content, &format!("{p}.attn_output.weight"), d_model, d_model)?;
-        let w_gate = extract_i8(&mut reader, &content, &format!("{p}.ffn_gate.weight"), d_ff, d_model)?;
-        let w_up = extract_i8(&mut reader, &content, &format!("{p}.ffn_up.weight"), d_ff, d_model)?;
-        let w_down = extract_i8(&mut reader, &content, &format!("{p}.ffn_down.weight"), d_model, d_ff)?;
+        let (wq8, wq16) = extract_i8_i16(&mut reader, &content, &format!("{p}.attn_q.weight"), d_model, d_model)?;
+        let (wk8, wk16) = extract_i8_i16(&mut reader, &content, &format!("{p}.attn_k.weight"), d_kv, d_model)?;
+        let (wv8, wv16) = extract_i8_i16(&mut reader, &content, &format!("{p}.attn_v.weight"), d_kv, d_model)?;
+        let (wo8, wo16) = extract_i8_i16(&mut reader, &content, &format!("{p}.attn_output.weight"), d_model, d_model)?;
+        let (wg8, wg16) = extract_i8_i16(&mut reader, &content, &format!("{p}.ffn_gate.weight"), d_ff, d_model)?;
+        let (wu8, wu16) = extract_i8_i16(&mut reader, &content, &format!("{p}.ffn_up.weight"), d_ff, d_model)?;
+        let (wd8, wd16) = extract_i8_i16(&mut reader, &content, &format!("{p}.ffn_down.weight"), d_model, d_ff)?;
         layers[l] = CachedLayer {
-            wq, wk, wv, wo, w_gate, w_up, w_down,
+            wq: wq8, wk: wk8, wv: wv8, wo: wo8,
+            w_gate: wg8, w_up: wu8, w_down: wd8,
             attn_norm: extract_norm(&mut reader, &content, &format!("{p}.attn_norm.weight"), d_model),
             ffn_norm: extract_norm(&mut reader, &content, &format!("{p}.ffn_norm.weight"), d_model),
         };
+        i16_layers_vec[l] = I16Layer {
+            wq: wq16, wk: wk16, wv: wv16, wo: wo16,
+            w_gate: wg16, w_up: wu16, w_down: wd16,
+        };
+        any_i16 = true;
         if (l - start_layer) % 4 == 0 || l == end_layer - 1 {
-            info!("Shard layer {}/{} loaded ({} of {})",
+            info!("Shard layer {}/{} loaded as I8+I16 ({} of {})",
                 l + 1, n_layers, l - start_layer + 1, end_layer - start_layer);
         }
     }
@@ -2497,8 +2551,8 @@ pub fn load_cached_model_shard(
         },
         embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
-        i16_layers: None,
-        i16_output: None,
+        i16_layers: if any_i16 { Some(i16_layers_vec) } else { None },
+        i16_output: output_weight_i16,
     })
 }
 
