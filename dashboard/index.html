@@ -144,13 +144,22 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
     <div class="bg-surface-3 border border-arc-500/30 rounded-xl p-4 mb-4">
       <label class="text-[10px] uppercase tracking-wider text-arc-300 font-bold block mb-2">Type a prompt — watch the activation hop through every shard</label>
       <div class="flex gap-2">
-        <input type="text" id="shardedPrompt" placeholder="What is the meaning of life?" value="What is the meaning of life?"
+        <input type="text" id="shardedPrompt" placeholder="The largest planet is" value="The largest planet is"
                class="flex-1 px-3 py-2 bg-surface-2 border border-surface-4 rounded-lg text-white text-sm placeholder-gray-600 focus:border-arc-500 focus:outline-none mono"
                onkeypress="if(event.key==='Enter')runShardedInference()">
         <button onclick="runShardedInference()" id="shardedBtn"
                 class="px-5 py-2 rounded-lg bg-arc-500 hover:bg-arc-400 text-white font-bold text-sm whitespace-nowrap transition shadow-lg shadow-arc-500/30">
           ▶ Run Through Pipeline
         </button>
+      </div>
+      <!-- Preset prompts: one click pre-fills + auto-runs -->
+      <div class="flex flex-wrap gap-1.5 mt-2">
+        <span class="text-[9px] uppercase tracking-wider text-gray-500 font-semibold self-center mr-1">Try:</span>
+        <button onclick="presetPrompt('The largest planet is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The largest planet is</button>
+        <button onclick="presetPrompt('The capital of France is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The capital of France is</button>
+        <button onclick="presetPrompt('The sky is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The sky is</button>
+        <button onclick="presetPrompt('The fastest land animal is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The fastest land animal is</button>
+        <button onclick="presetPrompt('The speed of light in a vacuum is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The speed of light is</button>
       </div>
       <div id="shardedStatus" class="text-[10px] text-gray-500 mt-2">Sends one token through all shards. Each hop verifies the previous shard's BLAKE3 hash. Last shard runs the LM head + argmax.</div>
       <!-- Sharded result panel -->
@@ -492,6 +501,14 @@ async function refreshShardRegistry(){
   }catch(e){
     // Silent — registry not available yet
   }
+}
+
+// Click a preset prompt: pre-fill the input and auto-run.
+function presetPrompt(p){
+  const el = document.getElementById('shardedPrompt');
+  if(!el) return;
+  el.value = p;
+  runShardedInference();
 }
 
 // Run a sharded inference request through the pipeline.
