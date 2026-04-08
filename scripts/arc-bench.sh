@@ -22,18 +22,29 @@ COORDINATOR="${ARC_COORDINATOR:-http://149.28.32.76:9090}"
 MAX_TOKENS="${ARC_MAX_TOKENS:-12}"
 
 # Each entry: prompt|expected_keyword (case-insensitive substring match)
-PROMPTS=(
-    "The capital of France is|paris"
-    "The largest planet is|jupiter"
-    "The sky is|blue"
-    "The fastest land animal is|cheetah"
-    "The deepest ocean is|challenger"
-    "The tallest mountain is|everest"
-    "The currency of Japan is|yen"
-    "The longest river is|nile"
-    "The hottest planet is|venus"
-    "The speed of light in a vacuum is|299"
-)
+# Default 5 prompts. Set ARC_BENCH_FULL=1 for the 10-prompt version.
+if [ "${ARC_BENCH_FULL:-0}" = "1" ]; then
+    PROMPTS=(
+        "The capital of France is|paris"
+        "The largest planet is|jupiter"
+        "The sky is|blue"
+        "The fastest land animal is|cheetah"
+        "The deepest ocean is|challenger"
+        "The tallest mountain is|everest"
+        "The currency of Japan is|yen"
+        "The longest river is|nile"
+        "The hottest planet is|venus"
+        "The speed of light in a vacuum is|299"
+    )
+else
+    PROMPTS=(
+        "The capital of France is|paris"
+        "The largest planet is|jupiter"
+        "The fastest land animal is|cheetah"
+        "The longest river is|nile"
+        "The tallest mountain is|everest"
+    )
+fi
 
 if ! command -v curl >/dev/null || ! command -v python3 >/dev/null; then
     echo "ERROR: arc-bench.sh requires curl + python3" >&2
@@ -69,9 +80,11 @@ for entry in "${PROMPTS[@]}"; do
 
     # Pause between requests so the 7-shard pipeline has time to drain.
     # Without this the coordinator's HTTP server backs up under sequential
-    # load and the watchdog eventually restarts it.
+    # load and the watchdog eventually restarts it. 60s gives the pipeline
+    # time to fully drain (each request takes ~150s wall time through the
+    # 7-hop chain, so requests overlap if the sleep is too short).
     if [ $TOTAL -gt 1 ]; then
-        sleep 15
+        sleep 60
     fi
 
     # POST to /inference/run_sharded with a generous timeout
