@@ -731,7 +731,9 @@ async function runShardedInference(){
 
       const attestation = d.attestation || {};
       const txHash = attestation.tx_hash || '';
-      const explorerUrl = d.explorer_url || (txHash ? `/tx/${txHash}` : '');
+      // /tx/ endpoint expects 64-hex (no 0x prefix)
+      const txHashClean = txHash.replace(/^0x/, '');
+      const explorerUrl = txHashClean ? `/tx/${txHashClean}` : '';
       const txHashShort = txHash ? `${txHash.slice(0, 18)}…` : '—';
       resultEl.innerHTML = `
         <div class="bg-surface-2 border border-emerald-500/40 rounded-xl p-4">

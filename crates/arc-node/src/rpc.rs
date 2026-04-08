@@ -849,9 +849,11 @@ async fn faucet_status(
 
 /// Parse a 64-char hex string into a [u8; 32] array.
 fn parse_hash(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
-    Hash256::from_hex(hex_str)
+    // Accept both forms: with or without "0x" prefix.
+    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    Hash256::from_hex(stripped)
         .map(|h| h.0)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid hash. Must be 64 hex characters."))
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid hash. Must be 64 hex characters (0x prefix optional)."))
 }
 
 /// GET /tx/{hash} — Look up a transaction receipt by its hash.
