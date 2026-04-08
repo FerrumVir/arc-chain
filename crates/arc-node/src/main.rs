@@ -441,8 +441,20 @@ async fn main() -> Result<()> {
     // ── Initialize candle float backend FIRST (for coherent inference) ──────
     // For GGUF files, load candle FIRST (lightweight Q4), then load tokenizer-only
     // from the same GGUF. This avoids loading 7GB INT8 weights on 8GB nodes.
+    //
+    // EXCEPTION: shard holders (--shard-start / --shard-end set) do NOT load
+    // candle. Candle loads the FULL Q4 model (~4 GB on Llama-7B), and a shard
+    // holder never runs /inference/run — only /inference/forward_shard — so
+    // that 4 GB is pure waste. On 8 GB VPS this pushes the process into swap
+    // and destroys forward_shard latency (observed: 20+ seconds/token on
+    // swapping NYC). Disabling candle when the node is a shard-only role
+    // keeps the RSS under 4 GB and makes the integer path run at real speed.
+    let is_shard_holder = cli.shard_start.is_some() || cli.shard_end.is_some();
     let (candle_engine, candle_model_id): (Option<Arc<arc_inference::candle_backend::GgufEngine>>, Option<arc_crypto::Hash256>) =
-        if let Some(model_path) = &cli.model {
+        if is_shard_holder {
+            tracing::info!("Shard holder mode — candle backend SKIPPED to save ~4 GB RAM");
+            (None, None)
+        } else if let Some(model_path) = &cli.model {
             if !model_path.ends_with(".arc-int8") {
                 let engine = Arc::new(arc_inference::candle_backend::GgufEngine::new(120_000));
                 match engine.load_gguf_file(model_path) {
