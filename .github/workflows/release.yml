@@ -22,9 +22,9 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: arc-node-macos-arm64
-          - os: macos-13
-            target: x86_64-apple-darwin
-            asset: arc-node-macos-x86_64
+          # x86_64-apple-darwin disabled: macos-13 runner is no longer supported
+          # by GitHub-hosted runners. Intel Mac users can build from source or
+          # we can revisit if a working macOS Intel runner ships.
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: arc-node-linux-x86_64
