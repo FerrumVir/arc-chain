@@ -113,7 +113,22 @@ Response includes the full per-hop trace:
 
 ---
 
-## Step 6 — Join the network as a shard holder (90 seconds)
+## Step 6 — Verify a past inference (30 seconds)
+
+Anyone can independently audit any inference run on the network. Take the `tx_hash` from any prior attestation (e.g. from the dashboard's "On-chain attestation" link, or from a previous `arc-demo.sh` output) and run:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
+  | bash -s -- 0xe0c73bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833f67d
+```
+
+The verifier fetches the original attestation, re-runs the same input on the coordinator, and compares both the new `output_hash` and the new `model_hash` against the on-chain claim. Prints `✓ VERIFIED` if they match.
+
+This is the cryptographic claim turned into a tool. The model and the network are auditable by anyone, on any machine, at any time after the fact.
+
+---
+
+## Step 7 — Join the network as a shard holder (90 seconds)
 
 This is what makes it permissionless. Run **one command** on your laptop:
 

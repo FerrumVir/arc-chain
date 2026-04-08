@@ -67,6 +67,38 @@ curl -X POST http://149.28.32.76:9090/inference/run_sharded \
 
 Returns a real Llama-2-7B answer along with the full per-hop trace.
 
+## Verify any past inference run
+
+Anyone with an attestation `tx_hash` can independently confirm that the network actually produced the claimed output for the claimed input, with the claimed model:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
+  | bash -s -- 0xe0c73bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833f67d
+```
+
+The verifier:
+1. Fetches the attestation from `/inference/results` on the coordinator
+2. Reads the original input + claimed `output_hash` + `model_hash`
+3. Re-runs the SAME input on the same coordinator
+4. Compares the new hashes to the originals
+5. Prints **✓ VERIFIED** or **✗ MISMATCH**
+
+This is the cryptographic claim turned into a tool. Auto-picks `/inference/run` vs `/inference/run_sharded` based on the original attestation's sharded flag, so it works for both modes. Sample output:
+
+```
+[1/3] Fetching inference details...
+[ OK] Found attestation
+       input:        '[INST] What is 2+2? [/INST]'
+       output:       '  Sure! The answer is 2+2 = 4.</s>'
+       output_hash:  0xe0c73bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833f67d
+       model_hash:   0xabec2d582beb97a876c21d7ccc5e8e4833e8fd34aee0cb5b64e9f14f5ea57fdb
+[2/3] Re-running the same input...
+[ OK] Re-run complete
+[3/3] Comparing hashes...
+
+  ✓ VERIFIED — both output_hash and model_hash match the attestation.
+```
+
 ## Run a node in one command
 
 Anyone can join the network as a community inference node. Persistent service, daily auto-update, no compile.

@@ -36,6 +36,19 @@ This single command:
 
 ---
 
+## Verify any past run
+
+Anyone with an attestation `tx_hash` can independently audit it:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
+  | bash -s -- <tx_hash>
+```
+
+Prints `✓ VERIFIED` if the re-derivation matches the on-chain claim. The model and the network are auditable by anyone, on any machine, at any time after the fact.
+
+---
+
 ## Join the network in one command
 
 Anyone can run a node and contribute compute. Persistent service, daily auto-update, ~3 minutes from curl to running:
