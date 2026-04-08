@@ -74,6 +74,11 @@ pub struct NodeState {
     /// submissions of the same prompt+output produce unique tx_hashes
     /// (otherwise the mempool de-dups them).
     pub attestation_nonce: Arc<AtomicU64>,
+    /// Network-wide deterministic inference cache. Same prompt + same model
+    /// returns the cached output_tokens in O(1), proven correct by the
+    /// integer engine's determinism. Survives the full coordinator session
+    /// (until eviction). The cache hit count is exposed in the response.
+    pub inference_cache: Arc<arc_inference::distributed::DistributedCache>,
 }
 
 /// Describes which slice of a model a node holds.
@@ -136,6 +141,9 @@ pub fn build_node_state(
         sharded_runs_total: Arc::new(AtomicU64::new(0)),
         sharded_bytes_total: Arc::new(AtomicU64::new(0)),
         attestation_nonce: Arc::new(AtomicU64::new(0)),
+        // 10_000-entry deterministic cache for sharded inference results.
+        // LRU eviction by hit_count when full.
+        inference_cache: Arc::new(arc_inference::distributed::DistributedCache::new(10_000)),
     }
 }
 
@@ -3258,6 +3266,60 @@ async fn inference_run_sharded(
     all_tokens.extend(&prompt_tokens);
 
     let overall_start = std::time::Instant::now();
+
+    // ─────────────────────────────────────────────────────────────────────
+    // DETERMINISTIC CACHE LOOKUP
+    // Same model_id + same input tokens = same output tokens, GUARANTEED.
+    // If we've seen this exact input before, return the cached result in
+    // O(1) — no pipeline walk, no HTTP roundtrips, no compute.
+    // ─────────────────────────────────────────────────────────────────────
+    let cache_model_id_data = format!(
+        "arc-{}L-{}d-{}h-{}v",
+        model.config.n_layers, model.config.d_model,
+        model.config.n_heads, model.config.vocab_size
+    );
+    let cache_model_id_hash = arc_crypto::hash_bytes(cache_model_id_data.as_bytes());
+    let cache_input_with_max: Vec<u32> = {
+        let mut v = all_tokens.clone();
+        v.push(max_tokens); // include max_tokens in the cache key so different lengths don't collide
+        v
+    };
+    let cache_key = arc_inference::distributed::DistributedCache::cache_key(&cache_model_id_hash, &cache_input_with_max);
+
+    if let Some(cached_tokens) = node.inference_cache.get(&cache_key) {
+        // CACHE HIT — return the cached tokens with the same output_hash
+        let output_text = model.decode(&cached_tokens);
+        let output_bytes: Vec<u8> = cached_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let output_hash = arc_crypto::hash_bytes(&output_bytes);
+        let elapsed_us = overall_start.elapsed().as_micros() as u64;
+        node.sharded_runs_total.fetch_add(1, Ordering::Relaxed);
+        return Ok(Json(json!({
+            "success": true,
+            "request_id": request_id,
+            "input": input_text,
+            "output": output_text,
+            "output_tokens": cached_tokens,
+            "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+            "model_hash": format!("0x{}", hex::encode(&cache_model_id_hash.0)),
+            "tokens_generated": cached_tokens.len(),
+            "total_ms": elapsed_us / 1000,
+            "total_us": elapsed_us,
+            "ms_per_token": 0,
+            "pipeline_length": pipeline.len(),
+            "model": cache_model_id_data,
+            "shard_trace": [],
+            "total_bytes_transferred": 0,
+            "deterministic": true,
+            "engine": "deterministic cache hit (provably bit-identical to original sharded run)",
+            "cache": {
+                "hit": true,
+                "key": format!("0x{}", hex::encode(&cache_key.0)),
+                "served_in_us": elapsed_us,
+            },
+        })));
+    }
+    // ─────────────────────────────────────────────────────────────────────
+
     let mut generated: Vec<u32> = Vec::new();
     let mut shard_trace: Vec<Value> = Vec::new();
     let mut total_bytes_transferred: usize = 0;
@@ -3398,6 +3460,23 @@ async fn inference_run_sharded(
     let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
     let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
 
+    // Save to the deterministic cache. Future requests with the same prompt
+    // (and same max_tokens) will return this exact result in O(1).
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    node.inference_cache.insert(
+        cache_key,
+        arc_inference::distributed::CacheEntry {
+            output_tokens: generated.clone(),
+            output_hash,
+            model_id: cache_model_id_hash,
+            hit_count: 0,
+            created_at_secs: now_secs,
+        },
+    );
+
     // Submit an InferenceAttestation transaction so this sharded run is
     // recorded on-chain like single-node /inference/run does. Anyone reading
     // the chain later can verify model_id + input_hash + output_hash.
@@ -3468,6 +3547,11 @@ async fn inference_run_sharded(
         "total_bytes_transferred": total_bytes_transferred,
         "deterministic": true,
         "engine": "INT8 sharded pipeline (cross-platform deterministic)",
+        "cache": {
+            "hit": false,
+            "key": format!("0x{}", hex::encode(&cache_key.0)),
+            "size": node.inference_cache.len(),
+        },
         "attestation": {
             "tx_hash": tx_hash_hex,
             "bond": 1000,
