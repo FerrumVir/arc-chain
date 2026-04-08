@@ -1,0 +1,89 @@
+# Changelog
+
+All notable changes to ARC Chain are tracked here. This project follows
+[semantic versioning](https://semver.org/).
+
+## v0.4.3 — 2026-04-08
+
+**CI fix.** Dropped `x86_64-apple-darwin` from the release workflow matrix
+because GitHub-hosted `macos-13` runners were removed. Releases now ship
+`arc-node-macos-arm64` + `arc-node-linux-x86_64`. Intel Mac users can build
+from source.
+
+## v0.4.2 — 2026-04-08
+
+**Server-side sharded inference activity counters.** `NodeState` gains
+`sharded_runs_total: AtomicU64` and `sharded_bytes_total: AtomicU64`. The
+`/inference/run_sharded` handler increments both before responding. The
+`/stats` endpoint exposes them as new fields. The dashboard hero shows them
+as live "Runs Served" + "Bytes Forwarded" stats and aggregates them across
+all 8 seed nodes (resilient to single-node restarts).
+
+## v0.4.1 — 2026-04-08
+
+**Sharded inference INT16 quality fix.** The shard loader was producing
+INT8-only weights, which made the integer engine too noisy on Llama-7B —
+every prompt collapsed to the same output tokens regardless of input.
+
+Fix: each shard now loads weights as BOTH I8 (kept for fallback) AND I16,
+where I16 is quantized directly from f32 with 258× finer granularity (32,767
+levels per row vs 127). `forward_shard_token` dispatches to the I16 path
+when available. The output_weight (LM head) gets the same treatment so the
+final argmax sees better-quantized logits.
+
+After this fix the network produces coherent answers like `"The largest
+planet is Jupiter, which is more than 1,31..."` and `"The capital of France
+is Paris."`.
+
+## v0.4.0 — 2026-04-08
+
+**Pipeline-parallel sharded inference shipped.** A model is now split across
+N nodes at transformer layer boundaries. Each node holds a contiguous slice
+of layers and forwards activations to the next shard via HTTP. BLAKE3
+verifies every hidden state in transit. The first shard embeds tokens, the
+last shard runs the LM head + argmax.
+
+New endpoints:
+- `POST /inference/run_sharded` — coordinator endpoint that walks the pipeline
+- `POST /inference/forward_shard` — per-shard handler
+- `GET /shards` — local shard registry
+- `POST /shards/announce` — peers register their shards here
+
+New CLI flags: `--shard-start <usize>` `--shard-end <usize>`. Together they
+turn a node into a shard holder for the specified layer range. Without them
+the node loads the full model normally.
+
+New crate APIs:
+- `arc_inference::cached_integer_model::load_cached_model_shard(path, start, end)`
+- `arc_inference::cached_integer_model::CachedIntegerModel::forward_shard_token(input, cache, start, end, position)`
+- `arc_inference::cached_integer_model::ShardInput::{Token, Hidden}` and `ShardOutput::{Hidden, Token}`
+
+New scripts:
+- `scripts/install-community-node.sh` — one-command community node installer with launchd / systemd persistent service + daily auto-update
+- `scripts/arc-demo.sh` — end-to-end demo runner (discover pipeline → run inference → verify determinism → verify isolation)
+- `scripts/arc-watchdog.sh` — testnet watchdog that preserves shard flags on restart
+- `scripts/arc-health-check.sh` — network-wide health probe
+
+New docs:
+- `docs/HOW-SHARDING-WORKS.md` — engineer-grade deep dive
+- `docs/SERO-DEMO.md` — 5-minute demo walkthrough
+- `docs/ANNOUNCEMENT.md` — shareable summary
+
+Dashboard: new "Sharded AI" hero section with live pipeline diagram, custom
+prompt input with preset buttons, per-hop trace replay using actual wall_ms
+timings, persisted run history, server-side activity counters, model_id
+verification badge, and a copy-pasteable join command.
+
+## v0.3.1 — 2026-04-07
+
+P2P deadlock fix (try_send + broadcast write timeout), Quinn Connection
+lifetime fix, commit-scan liveness fallback, observer-mode panic fix,
+cross-device attestation reading from chain state, sero-quickstart.sh.
+
+## v0.3.0 — 2026-03-29
+
+Distributed inference parallel mode + consensus partition healing.
+
+## v0.2.x and earlier
+
+See git history.
