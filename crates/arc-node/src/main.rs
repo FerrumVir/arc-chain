@@ -813,12 +813,21 @@ async fn main() -> Result<()> {
                 Err(_) => return,
             };
             loop {
+                // Pull ONLY each seed's own self_shard, not its whole registry.
+                // Re-announcing every remote entry we see would resurrect stale
+                // entries: a seed's registry can still contain a shard for a
+                // node that restarted without --shard-start flags, and pulling
+                // + re-announcing it would defeat the 60s TTL and keep the
+                // phantom shard alive forever. Each real shard holder already
+                // broadcasts its own shard every 15s via the outbound
+                // broadcaster above, so trusting only self_shard is both
+                // sufficient and safe.
                 for addr in &seed_addrs_pull {
                     if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await {
                         if let Ok(json) = resp.json::<serde_json::Value>().await {
-                            if let Some(shards) = json.get("shards").and_then(|s| s.as_array()) {
-                                for s in shards {
-                                    let payload = serde_json::json!({"shard": s});
+                            if let Some(self_shard) = json.get("self_shard") {
+                                if !self_shard.is_null() {
+                                    let payload = serde_json::json!({"shard": self_shard});
                                     let _ = client.post(&local_announce).json(&payload).send().await;
                                 }
                             }
