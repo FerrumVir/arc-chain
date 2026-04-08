@@ -3316,8 +3316,40 @@ async fn inference_run_sharded(
     let model = node.inference_model.as_ref()
         .ok_or(api_error(StatusCode::SERVICE_UNAVAILABLE, "Coordinator needs a local model loaded for tokenization"))?;
 
-    // Build the pipeline from the local shard registry, sorted by start_layer
-    let mut pipeline: Vec<ShardInfo> = node.shard_registry.iter().map(|e| e.value().clone()).collect();
+    // Build the pipeline from the local shard registry, sorted by start_layer.
+    //
+    // Dedupe by (start_layer, end_layer, node_name): after a coordinator
+    // reboot, its own self-announcement (socket_addr=0.0.0.0:9090) and the
+    // peer-to-peer gossip copy (socket_addr=<public IP>:9090) land under
+    // different registry keys, creating two entries for the same layer
+    // range. Prefer the entry with a routable socket_addr so that
+    // forward_shard calls don't try to POST to 0.0.0.0.
+    let mut by_range: std::collections::BTreeMap<(usize, usize, String), ShardInfo> =
+        std::collections::BTreeMap::new();
+    for entry in node.shard_registry.iter() {
+        let s = entry.value().clone();
+        let key = (s.start_layer, s.end_layer, s.node_name.clone());
+        match by_range.get(&key) {
+            None => {
+                by_range.insert(key, s);
+            }
+            Some(existing) => {
+                // Prefer a routable socket_addr. 0.0.0.0 / 127.0.0.1 / empty
+                // are placeholders from self-announce before the node knew
+                // its own public IP.
+                let existing_is_stub = existing.socket_addr.starts_with("0.0.0.0")
+                    || existing.socket_addr.starts_with("127.")
+                    || existing.socket_addr.is_empty();
+                let new_is_stub = s.socket_addr.starts_with("0.0.0.0")
+                    || s.socket_addr.starts_with("127.")
+                    || s.socket_addr.is_empty();
+                if existing_is_stub && !new_is_stub {
+                    by_range.insert(key, s);
+                }
+            }
+        }
+    }
+    let mut pipeline: Vec<ShardInfo> = by_range.into_values().collect();
     pipeline.sort_by_key(|s| s.start_layer);
 
     if pipeline.is_empty() {
@@ -3330,8 +3362,8 @@ async fn inference_run_sharded(
     for shard in &pipeline {
         if shard.start_layer != covered_to {
             return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
-                "Pipeline gap: expected layer {} next, got shard [{}, {})",
-                covered_to, shard.start_layer, shard.end_layer
+                "Pipeline gap: expected layer {} next, got shard [{}, {}) (node {}, addr {})",
+                covered_to, shard.start_layer, shard.end_layer, shard.node_name, shard.socket_addr
             )));
         }
         covered_to = shard.end_layer;
@@ -3698,6 +3730,28 @@ async fn announce_shard(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<AnnounceShardRequest>,
 ) -> Json<Value> {
+    // Dedupe: if an existing entry already covers the same (layer_range,
+    // node_name) with a routable socket_addr, drop this announcement when
+    // the incoming addr is a stub (0.0.0.0 / 127.x / empty). This prevents
+    // self-announcements from clobbering gossiped entries and creating
+    // duplicate pipeline entries on coordinators after a reboot.
+    let incoming_is_stub = req.shard.socket_addr.starts_with("0.0.0.0")
+        || req.shard.socket_addr.starts_with("127.")
+        || req.shard.socket_addr.is_empty();
+    if incoming_is_stub {
+        let has_better = node.shard_registry.iter().any(|e| {
+            let s = e.value();
+            s.start_layer == req.shard.start_layer
+                && s.end_layer == req.shard.end_layer
+                && s.node_name == req.shard.node_name
+                && !s.socket_addr.starts_with("0.0.0.0")
+                && !s.socket_addr.starts_with("127.")
+                && !s.socket_addr.is_empty()
+        });
+        if has_better {
+            return Json(json!({"ok": true, "registry_size": node.shard_registry.len(), "note": "stub addr ignored — routable addr already registered"}));
+        }
+    }
     let key = req.shard.socket_addr.clone();
     node.shard_registry.insert(key, req.shard);
     Json(json!({"ok": true, "registry_size": node.shard_registry.len()}))
