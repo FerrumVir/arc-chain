@@ -2867,6 +2867,57 @@ mod tests {
             token_a, token_b);
     }
 
+    #[test]
+    fn test_forward_shard_token_multi_position() {
+        // Run 4 positions through the shard pipeline. Each position uses
+        // the same per-request KV cache, which grows as positions advance.
+        // This catches KV cache management bugs across position boundaries
+        // (e.g. wrong push offset, wrong attention-against-history shape,
+        // wrong RoPE position propagation across shards).
+        //
+        // The test compares the FULL pipeline (single shard, all layers)
+        // against a 2-shard split, position-by-position. The output token
+        // at every position must match.
+        let model = build_test_model(15, 32, 2, 64, 4); // 4 layers
+        let n_layers = model.config.n_layers;
+        let prompt: Vec<u32> = vec![1, 5, 9, 13]; // 4 positions
+        let k = 2; // shard split
+
+        // Path A: full forward through one shard, position-by-position
+        let mut cache_a = KVCache::new(n_layers);
+        let mut tokens_a = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            let res = model.forward_shard_token(
+                ShardInput::Token(tok), &mut cache_a, 0, n_layers, pos);
+            match res {
+                ShardOutput::Token { id, .. } => tokens_a.push(id),
+                _ => panic!("Expected Token at pos {}", pos),
+            }
+        }
+
+        // Path B: 2-shard split, position-by-position, sharing the same
+        // per-request KV cache (it spans all layers regardless of which
+        // shard pushed each entry)
+        let mut cache_b = KVCache::new(n_layers);
+        let mut tokens_b = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            let mid = match model.forward_shard_token(
+                ShardInput::Token(tok), &mut cache_b, 0, k, pos) {
+                ShardOutput::Hidden(h) => h,
+                _ => panic!("First shard at pos {} should produce Hidden", pos),
+            };
+            let res = model.forward_shard_token(
+                ShardInput::Hidden(mid), &mut cache_b, k, n_layers, pos);
+            match res {
+                ShardOutput::Token { id, .. } => tokens_b.push(id),
+                _ => panic!("Last shard at pos {} should produce Token", pos),
+            }
+        }
+
+        assert_eq!(tokens_a, tokens_b,
+            "Multi-position shard split diverged. A={:?} B={:?}", tokens_a, tokens_b);
+    }
+
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn test_simd_matches_scalar() {
