@@ -830,12 +830,13 @@ function renderShardedHistory(){
   // Group by hash to detect determinism — runs with the same hash get a "✓ verified" badge
   const counts = {};
   hist.forEach(r => { counts[r.hash] = (counts[r.hash] || 0) + 1; });
-  list.innerHTML = hist.map(r => {
+  list.innerHTML = hist.map((r, idx) => {
     const verified = counts[r.hash] > 1;
     const ago = Math.floor((Date.now() - r.ts) / 1000);
     const agoStr = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${Math.floor(ago/60)}m ago` : `${Math.floor(ago/3600)}h ago`;
+    const safePrompt = (r.prompt||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
     return `
-      <div class="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-2 border border-surface-4 rounded-lg text-[10px]">
+      <div class="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-2 border border-surface-4 rounded-lg text-[10px]" id="hist-row-${idx}">
         <div class="flex items-center gap-2 flex-1 min-w-0">
           ${verified ? '<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[8px] font-bold border border-emerald-500/40">✓ ×' + counts[r.hash] + '</span>' : '<span class="px-1.5 py-0.5 rounded bg-arc-500/10 text-arc-300 text-[8px] font-bold border border-arc-500/30">FRESH</span>'}
           <span class="text-gray-400 truncate" title="${(r.prompt||'').replace(/"/g,'&quot;')}">${(r.prompt||'').slice(0,40)}</span>
@@ -845,10 +846,52 @@ function renderShardedHistory(){
           <span class="text-gray-600 mono text-[9px]" title="${r.hash}">${(r.hash||'').slice(0,16)}…</span>
           <span class="text-yellow-400 mono">${r.wall_ms}ms</span>
           <span class="text-gray-500">${agoStr}</span>
+          <button onclick="verifyHistoryRun(${idx}, '${safePrompt}', '${r.hash||''}')" class="px-1.5 py-0.5 rounded bg-arc-500/10 hover:bg-arc-500/30 text-arc-300 text-[9px] font-bold border border-arc-500/30 transition" title="Re-run this prompt and verify the output_hash matches">↻ Verify</button>
         </div>
       </div>
     `;
   }).join('');
+}
+
+// Re-run a past prompt and check the new output_hash matches the saved one.
+// Updates the row inline with ✓ or ✗ status.
+async function verifyHistoryRun(idx, prompt, originalHash){
+  const row = document.getElementById(`hist-row-${idx}`);
+  if(!row) return;
+  const btn = row.querySelector('button');
+  if(!btn) return;
+  const oldText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⟳ verifying';
+  btn.classList.remove('bg-arc-500/10', 'hover:bg-arc-500/30');
+  btn.classList.add('bg-gray-600/30');
+  try {
+    const r = await fetch(RPC + '/inference/run_sharded', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({input: prompt, max_tokens: 20}),
+      signal: AbortSignal.timeout(180000)
+    });
+    const d = await r.json();
+    const newHash = d.output_hash || '';
+    btn.disabled = false;
+    btn.classList.remove('bg-gray-600/30');
+    if(newHash === originalHash){
+      btn.textContent = '✓ verified';
+      btn.classList.remove('text-arc-300', 'border-arc-500/30');
+      btn.classList.add('bg-emerald-500/20', 'text-emerald-300', 'border-emerald-500/40');
+    } else {
+      btn.textContent = '✗ mismatch';
+      btn.classList.remove('text-arc-300', 'border-arc-500/30');
+      btn.classList.add('bg-red-500/20', 'text-red-300', 'border-red-500/40');
+      btn.title = `expected ${originalHash}, got ${newHash}`;
+    }
+  } catch(e) {
+    btn.disabled = false;
+    btn.textContent = '✗ error';
+    btn.classList.remove('bg-gray-600/30');
+    btn.classList.add('bg-red-500/20', 'text-red-300');
+  }
 }
 
 // Run a custom prompt on ALL inference-enabled nodes in parallel.
