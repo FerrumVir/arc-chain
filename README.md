@@ -69,7 +69,14 @@ Returns a real Llama-2-7B answer along with the full per-hop trace.
 
 ## Verify any past inference run
 
-Anyone with an attestation `tx_hash` can independently confirm that the network actually produced the claimed output for the claimed input, with the claimed model:
+The simplest way — verify the **newest** inference run on the network with one command:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
+  | bash -s -- --latest
+```
+
+Or verify a specific past attestation by `tx_hash`:
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
