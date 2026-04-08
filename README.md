@@ -135,6 +135,27 @@ Read the paper: [On the Foundations of Trustworthy Artificial Intelligence](pape
 
 ---
 
+## Documentation
+
+| Doc | What it covers |
+|-----|----------------|
+| [`docs/STATUS.md`](docs/STATUS.md) | Overnight session snapshot — what's verified live, what's flaky, headline numbers, where to start |
+| [`docs/SERO-DEMO.md`](docs/SERO-DEMO.md) | 7-step demo walkthrough with explicit timings (designed for screen recording) |
+| [`docs/HOW-SHARDING-WORKS.md`](docs/HOW-SHARDING-WORKS.md) | Engineer-grade architecture deep dive: forward pass, wire format, KV cache, determinism |
+| [`docs/ANNOUNCEMENT.md`](docs/ANNOUNCEMENT.md) | Copy-pasteable shareable summary for X / Discord / HN |
+| [`docs/PERFORMANCE-COMPARISON.md`](docs/PERFORMANCE-COMPARISON.md) | Honest latency comparison vs centralized API + single-machine local LLM, with optimization roadmap |
+| [`docs/BENCHMARK-RESULTS.md`](docs/BENCHMARK-RESULTS.md) | Captured factual benchmark output (10 prompts) |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release notes per version |
+
+| Script | What it does |
+|--------|-------------|
+| [`scripts/install-community-node.sh`](scripts/install-community-node.sh) | One-command community node installer (launchd / systemd persistent service + auto-update) |
+| [`scripts/arc-demo.sh`](scripts/arc-demo.sh) | End-to-end demo: discover pipeline → run inference → determinism check → isolation check |
+| [`scripts/arc-verify.sh`](scripts/arc-verify.sh) | Third-party verifier (`--latest` mode auto-picks newest attestation) |
+| [`scripts/arc-bench.sh`](scripts/arc-bench.sh) | Reproducible factual benchmark with markdown report |
+| [`scripts/arc-watchdog.sh`](scripts/arc-watchdog.sh) | Testnet watchdog (preserves shard flags on restart) |
+| [`scripts/arc-health-check.sh`](scripts/arc-health-check.sh) | Network-wide health probe |
+
 ---
 
 ## Why Build on ARC
