@@ -1239,9 +1239,19 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "stake must be >= 500_000")]
-    fn test_consensus_manager_below_minimum() {
-        let addr = hash_bytes(b"too-poor");
-        ConsensusManager::new(addr, 100_000, 4, false, &[]);
+    fn test_consensus_manager_below_minimum_is_spark_observer() {
+        // After observer mode was added (so community nodes can join with
+        // stake=0), small-stake validators are no longer rejected. They get
+        // the lowest tier (Spark) and cannot produce blocks, but they can
+        // still observe consensus and serve inference. Verify that contract.
+        let addr = hash_bytes(b"observer");
+        let mgr = ConsensusManager::new(addr, 100_000, 4, false, &[]);
+        assert_eq!(mgr.tier, StakeTier::Spark, "Small stake should get Spark tier");
+        assert!(!mgr.tier.can_produce_blocks(), "Spark tier should not produce blocks");
+        // Even stake=0 should work (community observer mode)
+        let observer_addr = hash_bytes(b"zero-stake-observer");
+        let observer = ConsensusManager::new(observer_addr, 0, 4, false, &[]);
+        assert_eq!(observer.tier, StakeTier::Spark);
+        assert!(!observer.tier.can_produce_blocks());
     }
 }
