@@ -3,7 +3,22 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ARC Chain — Live Dashboard</title>
+<title>ARC Chain — Sharded AI Inference Across the Network</title>
+<meta name="description" content="Run a Llama-2-7B model split across 7 separate VPS in 7 cities. Per-row INT16 weights, BLAKE3-verified hidden states, bit-identical output on every chip. Pipeline-parallel sharded inference, cryptographically verifiable.">
+
+<!-- Open Graph -->
+<meta property="og:title" content="ARC Chain — Sharded AI Inference Across the Network">
+<meta property="og:description" content="A real Llama-7B model split across 7 separate machines. Type a prompt, watch the activation hop through every shard. BLAKE3-verified, bit-identical, deterministic.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="http://140.82.16.112:3200">
+<meta property="og:site_name" content="ARC Chain Testnet">
+
+<!-- Twitter Card -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="ARC Chain — Sharded AI Inference">
+<meta name="twitter:description" content="Run a Llama-7B model split across 7 cheap VPS. Cryptographically verifiable. Type a prompt, watch the trace.">
+
+<link rel="icon" href="data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22&gt;&lt;rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%236366f1%22/&gt;&lt;text x=%2216%22 y=%2222%22 font-family=%22Arial%22 font-size=%2218%22 font-weight=%22bold%22 fill=%22white%22 text-anchor=%22middle%22&gt;A&lt;/text&gt;&lt;/svg&gt;">
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
 tailwind.config={darkMode:'class',theme:{extend:{colors:{
@@ -989,6 +1004,36 @@ function showInferenceDetail(a){
   ]);
 }
 
+// Aggregate sharded inference counters across all 8 seed nodes.
+// Each coordinator (the node that received /inference/run_sharded) keeps
+// its own in-memory counter. By summing across all of them we get the
+// network-wide total that survives single-node restarts.
+async function aggregateShardedCounters(){
+  const shardRunsEl = document.getElementById('shardRunsTotal');
+  const shardBytesEl = document.getElementById('shardBytesTotal');
+  if(!shardRunsEl && !shardBytesEl) return;
+  let totalRuns = 0;
+  let totalBytes = 0;
+  const results = await Promise.allSettled(NODES.map(n =>
+    fetch(`http://${n.ip}:9090/stats`, {signal: AbortSignal.timeout(3000)})
+      .then(r => r.ok ? r.json() : null)
+      .catch(() => null)
+  ));
+  for(const r of results){
+    const d = r.value;
+    if(!d) continue;
+    totalRuns += d.sharded_runs_total || 0;
+    totalBytes += d.sharded_bytes_total || 0;
+  }
+  if(shardRunsEl){
+    shardRunsEl.textContent = totalRuns.toLocaleString();
+  }
+  if(shardBytesEl){
+    const mb = totalBytes / 1024 / 1024;
+    shardBytesEl.textContent = mb >= 1 ? `${mb.toFixed(1)} MB` : `${(totalBytes/1024).toFixed(1)} KB`;
+  }
+}
+
 async function refresh(){
   // Render nodes FIRST (each fetches independently, no RPC dependency)
   renderNodes();
@@ -1022,17 +1067,9 @@ async function refresh(){
     const mins=Math.floor(d.uptime_secs/60);const hrs=Math.floor(mins/60);
     document.getElementById('uptime').textContent=hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`;
     document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live — block ${d.dag_round.toLocaleString()} · ${d.dag_committed.toLocaleString()} finalized · ${d.total_transactions} txs`;
-    // Sharded inference network counters (server-side, real activity)
-    const shardRunsEl = document.getElementById('shardRunsTotal');
-    const shardBytesEl = document.getElementById('shardBytesTotal');
-    if(shardRunsEl){
-      shardRunsEl.textContent = (d.sharded_runs_total || 0).toLocaleString();
-    }
-    if(shardBytesEl){
-      const bytes = d.sharded_bytes_total || 0;
-      const mb = bytes / 1024 / 1024;
-      shardBytesEl.textContent = mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes/1024).toFixed(1)} KB`;
-    }
+    // Sharded inference network counters — aggregate across ALL nodes
+    // (resilient to single-coordinator restart resetting its in-memory counter)
+    aggregateShardedCounters();
   }catch(e){}
 
   // Nodes — fetched by renderNodes() above (runs in parallel, no blocking)
