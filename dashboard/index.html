@@ -474,7 +474,14 @@ async function refreshShardRegistry(){
       return;
     }
 
+    // Preserve badges by NOT re-rendering when content hasn't changed.
+    // Otherwise the periodic refresh wipes the per-hop animation badges.
     const totalLayersCount = currentPipeline[0]?.total_layers || totalLayers || 1;
+    const sig = currentPipeline.map(s => `${s.node_name}:${s.start_layer}-${s.end_layer}`).join('|');
+    if(diagram._lastSig === sig){
+      return; // pipeline unchanged, leave the cards (and badges) alone
+    }
+    diagram._lastSig = sig;
     let html = '';
     currentPipeline.forEach((s, i) => {
       const layerCount = s.end_layer - s.start_layer;
@@ -574,18 +581,38 @@ async function runShardedInference(){
       // Save to localStorage history
       saveShardedRun({prompt, output: d.output||'', hash: d.output_hash||'', ts: Date.now(), wall_ms: elapsed, ms_per_token: msPerTok, pipeline_length: d.pipeline_length||0});
 
-      // Update each shard card with REAL per-hop metrics
-      trace.forEach((hop, i) => {
+      // Replay the actual per-hop trace on the shard cards in real time.
+      // Each card lights up for a duration proportional to its wall_ms,
+      // scaled so the entire replay fits in ~6 seconds (max). This is an
+      // animation of the actual data flow that happened on the wire.
+      const totalWall = trace.reduce((sum, h) => sum + (h.wall_ms || 0), 0) || 1;
+      const maxReplayMs = 6000;
+      const scale = totalWall > maxReplayMs ? maxReplayMs / totalWall : 1;
+      let cumDelay = 0;
+      trace.forEach((hop) => {
         const card = document.getElementById(`shard-card-${hop.hop}`);
-        if(card){
-          const pulseDuration = 800;
-          card.classList.add('border-emerald-400');
+        if(!card) return;
+        const dur = Math.max(150, (hop.wall_ms || 0) * scale);
+        // Schedule highlight start
+        setTimeout(() => {
+          card.classList.add('ring-2', 'ring-emerald-400', 'shadow-xl', 'shadow-emerald-400/60', 'scale-105');
           card.classList.remove('border-arc-500/40');
-          setTimeout(() => {
-            card.classList.remove('border-emerald-400');
-            card.classList.add('border-arc-500/40');
-          }, pulseDuration);
-        }
+          card.classList.add('border-emerald-400');
+          // Inject a per-hop ms badge into the card so users see real numbers
+          const oldBadge = card.querySelector('.hop-badge');
+          if(oldBadge) oldBadge.remove();
+          const badge = document.createElement('div');
+          badge.className = 'hop-badge text-[9px] mt-1 mono text-emerald-300 font-bold';
+          badge.textContent = `${hop.compute_ms}ms compute · ${hop.wall_ms}ms wall`;
+          card.appendChild(badge);
+        }, cumDelay);
+        // Schedule highlight stop (leave the badge in place)
+        setTimeout(() => {
+          card.classList.remove('ring-2', 'ring-emerald-400', 'shadow-xl', 'shadow-emerald-400/60', 'scale-105');
+          card.classList.remove('border-emerald-400');
+          card.classList.add('border-arc-500/40');
+        }, cumDelay + dur);
+        cumDelay += dur;
       });
 
       resultEl.classList.remove('hidden');
