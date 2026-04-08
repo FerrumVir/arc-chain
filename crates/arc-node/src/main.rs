@@ -753,15 +753,37 @@ async fn main() -> Result<()> {
     };
     let shard_info = shard_info_for_broadcast.clone();
 
-    // Spawn a background task that announces this node's shard to all seeds.
-    // Runs once at startup + every 60s so new nodes joining later still discover us.
+    // Spawn a background task that announces this node's shard to all seeds
+    // AND pulls their shard info back. Runs immediately at startup + every 15s
+    // so the network's shard registry converges fast.
     if let Some(si) = shard_info_for_broadcast.clone() {
-        let seed_addrs: Vec<String> = peers.iter()
-            .filter_map(|p| p.split(':').next().map(|host| format!("{}:9090", host)))
-            .collect();
+        // Build the list of peer RPC URLs from the seeds file. The seeds file
+        // contains "host:p2p_port" lines; the RPC port is always p2p - 1 in
+        // our deployment, but we conservatively try both 9090 (the seed default)
+        // and (p2p_port - 1) to handle community nodes on different ports.
+        let mut seed_addrs: Vec<String> = Vec::new();
+        for p in &peers {
+            // p is a SocketAddr string like "1.2.3.4:9091"
+            if let Some(host) = p.split(':').next() {
+                seed_addrs.push(format!("{}:9090", host));
+                if let Some(port_str) = p.split(':').nth(1) {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        if port > 1 && port - 1 != 9090 {
+                            seed_addrs.push(format!("{}:{}", host, port - 1));
+                        }
+                    }
+                }
+            }
+        }
+        seed_addrs.sort();
+        seed_addrs.dedup();
+        let seed_addrs_pull = seed_addrs.clone();
+
+        // Background broadcaster: post our shard to every seed
         tokio::spawn(async move {
-            // Wait a bit for peers to come up
-            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            // Brief settle so the local /shards endpoint is up before we ask
+            // peers to fetch from us
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
                 .build() {
@@ -774,10 +796,40 @@ async fn main() -> Result<()> {
                     let url = format!("http://{}/shards/announce", addr);
                     let _ = client.post(&url).json(&payload).send().await;
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             }
         });
-        tracing::info!("Shard announcement broadcaster started");
+
+        // Background puller: fetch each seed's /shards and re-announce them locally.
+        // This converges the registry even when a peer was offline when we first
+        // announced. Anyone we reach contributes their full registry to ours.
+        let local_announce = format!("http://127.0.0.1:{}/shards/announce", rpc_addr.split(':').nth(1).unwrap_or("9090"));
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            loop {
+                for addr in &seed_addrs_pull {
+                    if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await {
+                        if let Ok(json) = resp.json::<serde_json::Value>().await {
+                            if let Some(shards) = json.get("shards").and_then(|s| s.as_array()) {
+                                for s in shards {
+                                    let payload = serde_json::json!({"shard": s});
+                                    let _ = client.post(&local_announce).json(&payload).send().await;
+                                }
+                            }
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            }
+        });
+
+        tracing::info!("Shard announcement broadcaster + puller started (15s/20s tick)");
     }
 
     rpc::serve(
