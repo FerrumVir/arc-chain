@@ -15,6 +15,16 @@ This is how a 7B model gets shared across 7 cheap VPS, and how a 70B model gets 
 > **Live demo:** http://140.82.16.112:3200
 > Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the activation reaches it. The trace table shows compute_ms, wall_ms, and payload bytes per hop, and the output_hash matches every replay.
 
+## Try it from your terminal in 5 seconds
+
+```bash
+curl -X POST http://149.28.32.76:9090/inference/run_sharded \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"The largest planet is","max_tokens":15}'
+```
+
+Returns a real Llama-2-7B answer along with the full per-hop trace showing every node that contributed compute. Run it twice — the `output_hash` is bit-identical. Run a different prompt — the hash changes. That's verifiable distributed inference.
+
 ## Run a node in one command
 
 Anyone can join the network as a community inference node. Persistent service, daily auto-update, no compile.
@@ -25,7 +35,7 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/ins
 
 The installer:
 - Detects your platform (macOS arm64/x86, Linux x86_64/aarch64)
-- Pulls the latest pre-built binary from the v0.4.0 release
+- Pulls the latest pre-built binary from the GitHub releases (currently v0.4.1)
 - Downloads Llama-2-7B-Chat Q4_K_M (~4 GB) — or TinyLlama on machines with < 6 GB RAM
 - Installs as a launchd / systemd service that auto-starts and auto-restarts
 - Schedules a daily auto-update check at 04:17 local time
@@ -33,6 +43,8 @@ The installer:
 After install your node is running, joined to the testnet, contributing inference compute, and visible at the live dashboard.
 
 Uninstall any time: `bash install-community-node.sh --uninstall`.
+
+📖 **5-minute walkthrough:** [`docs/SERO-DEMO.md`](docs/SERO-DEMO.md) — every step of the demo with explicit timings, expected outputs, and answers for skeptics.
 
 ---
 
