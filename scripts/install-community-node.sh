@@ -411,6 +411,20 @@ UTIMER_EOF
     fi
 else
     warn "--no-service: skipped persistent service install"
+    # When --no-service is used, start the node as a detached background
+    # process so the user still has a running node to test with. They can
+    # kill it manually with the printed command.
+    info "Starting node as a detached background process (no service)..."
+    nohup "$ARC_DIR/bin/arc-node" \
+        --rpc "0.0.0.0:$RPC_PORT" --p2p-port "$P2P_PORT" \
+        --seeds-file "$ARC_DIR/seeds.txt" --genesis "$ARC_DIR/genesis.toml" \
+        --validator-seed "$VALIDATOR_SEED" --stake 0 --min-stake 0 \
+        --eth-rpc-port 0 --data-dir "$ARC_DIR/data" \
+        --model "$MODEL_PATH" > "$ARC_DIR/node.log" 2>&1 &
+    NODE_PID=$!
+    echo "$NODE_PID" > "$ARC_DIR/node.pid"
+    ok "Node started in background, PID $NODE_PID (logs: $ARC_DIR/node.log)"
+    info "To stop: kill \$(cat $ARC_DIR/node.pid)"
 fi
 
 # ── Sanity check: wait for the node to come up ──────────────────────────────
