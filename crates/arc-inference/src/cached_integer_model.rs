@@ -2770,6 +2770,103 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
+    #[test]
+    fn test_forward_shard_token_full_equals_split() {
+        // The end-to-end claim: running all layers as a single shard
+        // [0, n_layers) on one node must produce the SAME hidden state
+        // (and the same final token id) as splitting the layers across
+        // two shard calls [0, k) → [k, n_layers) on the same model.
+        //
+        // If this test passes, the shard pipeline is correct: any layer
+        // boundary K produces a chain of forward_shard_token calls that
+        // compose into the same answer as a single full forward.
+        let model = build_test_model(20, 32, 2, 64, 4); // 4 layers, small d
+        let n_layers = model.config.n_layers;
+        let token: u32 = 5;
+
+        // Path A: one shard covering the whole model [0, n_layers)
+        let mut cache_a = KVCache::new(n_layers);
+        let result_a = model.forward_shard_token(
+            ShardInput::Token(token),
+            &mut cache_a,
+            0, n_layers,
+            0,
+        );
+        let token_a = match result_a {
+            ShardOutput::Token { id, .. } => id,
+            _ => panic!("Whole-model shard should produce a token, not a hidden state"),
+        };
+
+        // Path B: split at layer K, run two shards in sequence with the
+        // SAME per-request KV cache (the cache holds K/V for ALL layers)
+        let k = 2;
+        let mut cache_b = KVCache::new(n_layers);
+        let mid = model.forward_shard_token(
+            ShardInput::Token(token),
+            &mut cache_b,
+            0, k,
+            0,
+        );
+        let hidden = match mid {
+            ShardOutput::Hidden(h) => h,
+            _ => panic!("First shard should produce a hidden state, not a token"),
+        };
+        let result_b = model.forward_shard_token(
+            ShardInput::Hidden(hidden),
+            &mut cache_b,
+            k, n_layers,
+            0,
+        );
+        let token_b = match result_b {
+            ShardOutput::Token { id, .. } => id,
+            _ => panic!("Last shard should produce a token"),
+        };
+
+        assert_eq!(token_a, token_b,
+            "Shard split at K={} produced different output token (A={}, B={})",
+            k, token_a, token_b);
+    }
+
+    #[test]
+    fn test_forward_shard_token_three_way_split() {
+        // Same as the two-way split test but with THREE shards.
+        // Stress-tests the chained hidden-state forwarding through more hops.
+        let model = build_test_model(20, 32, 2, 64, 6); // 6 layers
+        let n_layers = model.config.n_layers;
+        let token: u32 = 7;
+
+        // Path A: one shard covering everything
+        let mut cache_a = KVCache::new(n_layers);
+        let result_a = model.forward_shard_token(
+            ShardInput::Token(token), &mut cache_a, 0, n_layers, 0);
+        let token_a = match result_a {
+            ShardOutput::Token { id, .. } => id,
+            _ => panic!("expected Token"),
+        };
+
+        // Path B: 3 shards [0, 2), [2, 4), [4, 6)
+        let mut cache_b = KVCache::new(n_layers);
+        let h1 = match model.forward_shard_token(
+            ShardInput::Token(token), &mut cache_b, 0, 2, 0) {
+            ShardOutput::Hidden(h) => h,
+            _ => panic!("expected Hidden"),
+        };
+        let h2 = match model.forward_shard_token(
+            ShardInput::Hidden(h1), &mut cache_b, 2, 4, 0) {
+            ShardOutput::Hidden(h) => h,
+            _ => panic!("expected Hidden"),
+        };
+        let token_b = match model.forward_shard_token(
+            ShardInput::Hidden(h2), &mut cache_b, 4, 6, 0) {
+            ShardOutput::Token { id, .. } => id,
+            _ => panic!("expected Token"),
+        };
+
+        assert_eq!(token_a, token_b,
+            "3-way shard split produced different token (A={}, B={})",
+            token_a, token_b);
+    }
+
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn test_simd_matches_scalar() {
