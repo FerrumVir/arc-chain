@@ -63,8 +63,12 @@ pub struct NodeState {
     /// release the DashMap shard lock immediately.
     pub shard_kv_caches: Arc<dashmap::DashMap<String, Arc<std::sync::Mutex<arc_inference::cached_integer_model::KVCache>>>>,
     /// Network-wide shard registry (gossiped via /shards/announce).
-    /// Maps node socket addr → ShardInfo.
-    pub shard_registry: Arc<dashmap::DashMap<String, ShardInfo>>,
+    /// Maps node socket addr → (ShardInfo, last-seen Instant). Entries older
+    /// than SHARD_REGISTRY_TTL_SECS (60s) are considered stale and dropped
+    /// at read time. This prevents stale entries from nodes that USED to
+    /// hold a shard but no longer do (e.g. after `arc-node` restarts without
+    /// --shard-start/--shard-end flags) from polluting the pipeline walker.
+    pub shard_registry: Arc<dashmap::DashMap<String, (ShardInfo, std::time::Instant)>>,
     /// Total sharded inference runs served by this node since boot.
     /// Incremented every time /inference/run_sharded completes successfully.
     pub sharded_runs_total: Arc<AtomicU64>,
@@ -102,6 +106,36 @@ pub struct ShardInfo {
     pub socket_addr: String,
     /// Friendly node name (NYC, LAX, ...).
     pub node_name: String,
+}
+
+/// Time a shard registry entry is considered fresh. Entries older than this
+/// are dropped at read time. Must be greater than the shard announcement
+/// broadcast interval (15s) with generous slack so a single lost announcement
+/// doesn't prune a live shard.
+pub const SHARD_REGISTRY_TTL_SECS: u64 = 60;
+
+/// Collect fresh shard entries, pruning stale ones that haven't been
+/// re-announced within SHARD_REGISTRY_TTL_SECS. Called by the pipeline walker
+/// and by the /shards GET endpoint so neither sees ghosts.
+fn fresh_shards(
+    registry: &dashmap::DashMap<String, (ShardInfo, std::time::Instant)>,
+) -> Vec<ShardInfo> {
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_secs(SHARD_REGISTRY_TTL_SECS);
+    let mut keep: Vec<ShardInfo> = Vec::new();
+    let mut expired_keys: Vec<String> = Vec::new();
+    for entry in registry.iter() {
+        let (info, ts) = entry.value();
+        if now.duration_since(*ts) <= ttl {
+            keep.push(info.clone());
+        } else {
+            expired_keys.push(entry.key().clone());
+        }
+    }
+    for k in expired_keys {
+        registry.remove(&k);
+    }
+    keep
 }
 
 /// Build a `NodeState` from components.
@@ -177,7 +211,7 @@ pub async fn serve(
     node.shard_info = shard_info.clone();
     // Seed the local registry with our own shard so /shards always shows us
     if let Some(si) = &shard_info {
-        node.shard_registry.insert(si.socket_addr.clone(), si.clone());
+        node.shard_registry.insert(si.socket_addr.clone(), (si.clone(), std::time::Instant::now()));
     }
 
     let app = Router::new()
@@ -3335,8 +3369,7 @@ async fn inference_run_sharded(
     // forward_shard calls don't try to POST to 0.0.0.0.
     let mut by_range: std::collections::BTreeMap<(usize, usize, String), ShardInfo> =
         std::collections::BTreeMap::new();
-    for entry in node.shard_registry.iter() {
-        let s = entry.value().clone();
+    for s in fresh_shards(&node.shard_registry) {
         let key = (s.start_layer, s.end_layer, s.node_name.clone());
         match by_range.get(&key) {
             None => {
@@ -3886,7 +3919,7 @@ async fn inference_run_sharded(
 async fn get_shards(
     AxumState(node): AxumState<NodeState>,
 ) -> Json<Value> {
-    let mut shards: Vec<ShardInfo> = node.shard_registry.iter().map(|e| e.value().clone()).collect();
+    let mut shards: Vec<ShardInfo> = fresh_shards(&node.shard_registry);
     shards.sort_by_key(|s| s.start_layer);
 
     let total_layers = shards.first().map(|s| s.total_layers).unwrap_or(0);
@@ -3940,7 +3973,7 @@ async fn announce_shard(
         || req.shard.socket_addr.is_empty();
     if incoming_is_stub {
         let has_better = node.shard_registry.iter().any(|e| {
-            let s = e.value();
+            let (s, _ts) = e.value();
             s.start_layer == req.shard.start_layer
                 && s.end_layer == req.shard.end_layer
                 && s.node_name == req.shard.node_name
@@ -3953,6 +3986,6 @@ async fn announce_shard(
         }
     }
     let key = req.shard.socket_addr.clone();
-    node.shard_registry.insert(key, req.shard);
+    node.shard_registry.insert(key, (req.shard, std::time::Instant::now()));
     Json(json!({"ok": true, "registry_size": node.shard_registry.len()}))
 }
