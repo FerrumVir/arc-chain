@@ -343,6 +343,12 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
 // Try multiple nodes — use first one that responds
 let RPC='http://140.82.16.112:9090';
 const RPC_FALLBACKS=['http://136.244.109.1:9090','http://139.84.237.49:9090','http://104.238.171.11:9090','http://149.28.32.76:9090'];
+// Sharded inference goes to a dedicated coordinator (Mac M2 Ultra, hidden
+// behind an SSH reverse tunnel on NYC:10000). Mac runs the full 27-layer
+// tail shard (layers 5..31 + LM head) plus the coordinator role, and walks
+// the pipeline through NYC [0,2) and LAX [2,5) via HTTP. Mac has the
+// DistributedCache so repeat prompts return in ~100 ms.
+const SHARDED_COORDINATOR = 'http://149.28.32.76:10000';
 async function findRPC(){
   try{const r=await fetch(RPC+'/health',{signal:AbortSignal.timeout(3000)});if(r.ok)return}catch(e){}
   for(const fb of RPC_FALLBACKS){
@@ -661,7 +667,7 @@ async function runShardedInference(){
 
   const t0 = Date.now();
   try{
-    const r = await fetch(RPC + '/inference/run_sharded', {
+    const r = await fetch(SHARDED_COORDINATOR + '/inference/run_sharded', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({input: prompt, max_tokens: 20}),
@@ -892,7 +898,7 @@ async function verifyHistoryRun(idx, prompt, originalHash){
   btn.classList.remove('bg-arc-500/10', 'hover:bg-arc-500/30');
   btn.classList.add('bg-gray-600/30');
   try {
-    const r = await fetch(RPC + '/inference/run_sharded', {
+    const r = await fetch(SHARDED_COORDINATOR + '/inference/run_sharded', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({input: prompt, max_tokens: 20}),
@@ -1381,8 +1387,8 @@ async function probePresetCache(){
   if(!buttons.length) return;
   const prompts = buttons.map(b => ({input: b.dataset.preset, max_tokens: 20}));
   try{
-    // 1) cache_stats — totals
-    const sR = await fetch(RPC + '/inference/cache_stats', {signal: AbortSignal.timeout(3000)});
+    // 1) cache_stats — totals (from the sharded coordinator, not RPC fallback)
+    const sR = await fetch(SHARDED_COORDINATOR + '/inference/cache_stats', {signal: AbortSignal.timeout(3000)});
     if(sR.ok){
       const s = await sR.json();
       const line = document.getElementById('cacheStatsLine');
@@ -1390,8 +1396,8 @@ async function probePresetCache(){
         line.textContent = `↯ cache: ${s.size}/${s.capacity} entries · ${s.total_hits} cumulative hits · O(1) lookup (~20 μs)`;
       }
     }
-    // 2) cache_check — per-preset warm status
-    const cR = await fetch(RPC + '/inference/cache_check', {
+    // 2) cache_check — per-preset warm status (same coordinator as cache_stats)
+    const cR = await fetch(SHARDED_COORDINATOR + '/inference/cache_check', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({prompts}),

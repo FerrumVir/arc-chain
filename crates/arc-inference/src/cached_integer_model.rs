@@ -1655,6 +1655,15 @@ impl CachedIntegerModel {
         let d = cfg.d_model;
         let pos = cache.seq_len;
 
+        // Shard holders that don't cover layer 0 don't load embeddings.
+        // Calling forward_one_token (single-node path) on such a node would
+        // panic reading self.embedding_q16 which is empty. Return an empty
+        // vec so the RPC handler can error gracefully instead of the whole
+        // tokio worker thread panicking and killing launchd's keepalive loop.
+        if self.embedding_q16.len() < (token as usize + 1) * d {
+            return Vec::new();
+        }
+
         // Helper macro: dispatch to Q4 matmul on x86_64 when available, else I8.
         // $q4w: Option<&Q4WeightsX86>, $i8w: &I8Weights, $inq: &QuantizedInput,
         // $raw: &[i64], $in_sz: input dim, $out: &mut [i64]

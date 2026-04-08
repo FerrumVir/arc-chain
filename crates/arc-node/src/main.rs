@@ -791,7 +791,12 @@ async fn main() -> Result<()> {
         seed_addrs.dedup();
         let seed_addrs_pull = seed_addrs.clone();
 
-        // Background broadcaster: post our shard to every seed
+        // Background broadcaster: post our shard to every seed AND to our
+        // own localhost so the self-entry in the local registry gets its
+        // timestamp refreshed every tick. Without the localhost post, the
+        // 60s TTL on the registry would prune the self entry even while
+        // the node is still live.
+        let local_announce_broadcast = format!("http://127.0.0.1:{}/shards/announce", rpc_addr.split(':').nth(1).unwrap_or("9090"));
         tokio::spawn(async move {
             // Brief settle so the local /shards endpoint is up before we ask
             // peers to fetch from us
@@ -804,6 +809,9 @@ async fn main() -> Result<()> {
             };
             loop {
                 let payload = serde_json::json!({"shard": &si});
+                // Refresh our own entry first
+                let _ = client.post(&local_announce_broadcast).json(&payload).send().await;
+                // Then announce to remote seeds
                 for addr in &seed_addrs {
                     let url = format!("http://{}/shards/announce", addr);
                     let _ = client.post(&url).json(&payload).send().await;
