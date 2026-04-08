@@ -65,6 +65,11 @@ pub struct NodeState {
     /// Network-wide shard registry (gossiped via /shards/announce).
     /// Maps node socket addr → ShardInfo.
     pub shard_registry: Arc<dashmap::DashMap<String, ShardInfo>>,
+    /// Total sharded inference runs served by this node since boot.
+    /// Incremented every time /inference/run_sharded completes successfully.
+    pub sharded_runs_total: Arc<AtomicU64>,
+    /// Total bytes of activations forwarded between shards since boot.
+    pub sharded_bytes_total: Arc<AtomicU64>,
 }
 
 /// Describes which slice of a model a node holds.
@@ -124,6 +129,8 @@ pub fn build_node_state(
         shard_info: None,
         shard_kv_caches: Arc::new(dashmap::DashMap::new()),
         shard_registry: Arc::new(dashmap::DashMap::new()),
+        sharded_runs_total: Arc::new(AtomicU64::new(0)),
+        sharded_bytes_total: Arc::new(AtomicU64::new(0)),
     }
 }
 
@@ -1141,6 +1148,8 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let peers = node.peer_count.load(Ordering::Relaxed);
     let uptime = node.boot_time.elapsed().as_secs();
     let bench_tps = if uptime > 0 { executed as u64 / uptime } else { 0 };
+    let sharded_runs = node.sharded_runs_total.load(Ordering::Relaxed);
+    let sharded_bytes = node.sharded_bytes_total.load(Ordering::Relaxed);
     Json(json!({
         "chain": "ARC Chain",
         "version": env!("CARGO_PKG_VERSION"),
@@ -1157,6 +1166,8 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "validators": validators,
         "connected_peers": peers,
         "uptime_secs": uptime,
+        "sharded_runs_total": sharded_runs,
+        "sharded_bytes_total": sharded_bytes,
     }))
 }
 
@@ -3361,6 +3372,11 @@ async fn inference_run_sharded(
     let output_text = model.decode(&generated);
     let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
     let output_hash = arc_crypto::hash_bytes(&output_bytes);
+
+    // Bump network-wide counters: how many sharded runs this coordinator has
+    // served and how many bytes of activations were forwarded between shards.
+    node.sharded_runs_total.fetch_add(1, Ordering::Relaxed);
+    node.sharded_bytes_total.fetch_add(total_bytes_transferred as u64, Ordering::Relaxed);
 
     let model_id_data = format!(
         "arc-{}L-{}d-{}h-{}v",

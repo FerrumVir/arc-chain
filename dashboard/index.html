@@ -93,7 +93,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
           Pure i64 arithmetic. <span class="text-yellow-300 font-semibold">0% quality loss</span> vs the source GGUF.
         </p>
       </div>
-      <div class="flex gap-3 text-right">
+      <div class="flex gap-3 text-right flex-wrap">
         <div class="bg-surface-3 border border-arc-500/30 rounded-lg px-3 py-2">
           <div class="text-[8px] uppercase tracking-wider text-gray-500">Model</div>
           <div class="text-sm font-bold text-white mono" id="shardModelName">—</div>
@@ -105,6 +105,14 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
         <div class="bg-surface-3 border border-arc-500/30 rounded-lg px-3 py-2">
           <div class="text-[8px] uppercase tracking-wider text-gray-500">Shards</div>
           <div class="text-sm font-bold text-emerald-300 mono" id="shardCount">—</div>
+        </div>
+        <div class="bg-surface-3 border border-emerald-500/40 rounded-lg px-3 py-2">
+          <div class="text-[8px] uppercase tracking-wider text-emerald-300">Runs Served</div>
+          <div class="text-sm font-bold text-emerald-300 mono" id="shardRunsTotal">—</div>
+        </div>
+        <div class="bg-surface-3 border border-emerald-500/40 rounded-lg px-3 py-2">
+          <div class="text-[8px] uppercase tracking-wider text-emerald-300">Bytes Forwarded</div>
+          <div class="text-sm font-bold text-emerald-300 mono" id="shardBytesTotal">—</div>
         </div>
       </div>
     </div>
@@ -1014,6 +1022,17 @@ async function refresh(){
     const mins=Math.floor(d.uptime_secs/60);const hrs=Math.floor(mins/60);
     document.getElementById('uptime').textContent=hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`;
     document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live — block ${d.dag_round.toLocaleString()} · ${d.dag_committed.toLocaleString()} finalized · ${d.total_transactions} txs`;
+    // Sharded inference network counters (server-side, real activity)
+    const shardRunsEl = document.getElementById('shardRunsTotal');
+    const shardBytesEl = document.getElementById('shardBytesTotal');
+    if(shardRunsEl){
+      shardRunsEl.textContent = (d.sharded_runs_total || 0).toLocaleString();
+    }
+    if(shardBytesEl){
+      const bytes = d.sharded_bytes_total || 0;
+      const mb = bytes / 1024 / 1024;
+      shardBytesEl.textContent = mb >= 1 ? `${mb.toFixed(1)} MB` : `${(bytes/1024).toFixed(1)} KB`;
+    }
   }catch(e){}
 
   // Nodes — fetched by renderNodes() above (runs in parallel, no blocking)
