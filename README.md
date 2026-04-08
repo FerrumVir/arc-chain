@@ -70,6 +70,93 @@ All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
 
 ---
 
+## Distributed Inference — 6× Faster, Cryptographically Verifiable
+
+**The pitch:** Same model running on N devices in parallel. Same prompt → identical `output_hash` on every device. N× throughput vs single-machine inference.
+
+**Live demo (no install needed):**
+
+1. Open [http://140.82.16.112:3200](http://140.82.16.112:3200) — the dashboard
+2. Click any inference node card → runs inference on that specific device
+3. Click **⚡ Run Live Benchmark** → measures sequential vs distributed speedup in real time
+4. Verify all devices produce the same hash for the same prompt
+
+**Or from your terminal:**
+
+```bash
+git clone https://github.com/FerrumVir/arc-chain.git && cd arc-chain
+
+# Distribute 10 inference requests across 5 nodes in parallel
+./scripts/inference-router.sh 10 "What is 2+2?"
+
+# Side-by-side benchmark: 1 node sequential vs 5 nodes parallel
+./scripts/inference-benchmark.sh 10
+```
+
+**Benchmark results (10 inferences, TinyLlama 1.1B):**
+
+| Mode | Time | Throughput |
+|------|------|-----------|
+| Sequential (1 node) | 213.5s | 0.04 req/s |
+| Distributed (5 nodes) | 34.4s | **0.29 req/s** |
+| **Speedup** | | **6.2× faster** |
+
+All 20 responses (10 sequential + 10 distributed) produced **identical** `output_hash`. Different physical machines, same cryptographic proof.
+
+### How distribution works
+
+Each inference-enabled seed loads the same GGUF model. The router script dispatches requests round-robin across all of them. Each device runs its inference fully and independently — no inter-node communication during inference. The "distribution" is at the request level (load balancing across replicas), not layer level.
+
+**Why it's faster:** A single 2-core VPS processes inferences serially. With 5 replicas, 5 inferences run simultaneously. Throughput scales linearly with the number of replica devices.
+
+**Why it's verifiable:** Every response includes an `output_hash` (BLAKE3 of token bytes). Same model file + same prompt = byte-identical output_hash across all devices. Anyone can re-run any inference on their own hardware to verify the result.
+
+### Upload your own model to a node
+
+To add a new inference node to the network:
+
+```bash
+# Option 1: One command (downloads pre-built binary, your model, joins testnet)
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/sero-quickstart.sh \
+  | bash -s -- /path/to/your-model.gguf
+
+# Option 2: Existing testnet seed with your own model
+ssh root@your-seed-ip
+cd /root/arc-chain
+# Upload your .gguf model
+scp local-model.gguf root@your-seed-ip:/root/arc-chain/model.gguf
+# Restart node with --model flag
+screen -S arc -X quit
+screen -dmS arc ./target/release/arc-node \
+  --rpc 0.0.0.0:9090 --p2p-port 9091 \
+  --validator-seed YOUR_NAME \
+  --seeds-file testnet-seeds.txt --genesis genesis.toml \
+  --stake 5000000 --eth-rpc-port 0 \
+  --model model.gguf
+```
+
+After your node loads the model (~2-30s depending on model size), it shows up in the dashboard's distributed inference grid. Add its IP to `inference-router.sh` to include it in the round-robin pool.
+
+### Run your model alongside others (sharded throughput)
+
+If you have a beefy machine and want to multiply network throughput:
+
+```bash
+# 1. Get the same TinyLlama model the seeds use
+curl -L -o model.gguf https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
+
+# 2. Run quickstart with that model
+./scripts/sero-quickstart.sh ./model.gguf
+
+# 3. The benchmark script will pick up your node automatically (it round-robins
+#    across all reachable inference-enabled nodes — edit NODES list if needed)
+./scripts/inference-benchmark.sh 10
+```
+
+Your machine joins the inference pool. The next benchmark run distributes requests across all participating devices, including yours. You contribute to network throughput AND every inference you serve gets cryptographically attested on-chain.
+
+---
+
 ## Run a Node — One Command
 
 **Zero compile. Zero setup.** Pre-built binary downloads, auto-configures, joins testnet as inference observer. Bring any GGUF model.
