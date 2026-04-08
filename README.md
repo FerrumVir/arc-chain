@@ -1,18 +1,44 @@
 ![Rust](https://img.shields.io/badge/Rust-99%2C000%2B_LOC-orange)
 ![Tests](https://img.shields.io/badge/tests-1%2C204_passing-brightgreen)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-blue)
-![Inference](https://img.shields.io/badge/inference-76ms%2Ftok_deterministic-purple)
+![Inference](https://img.shields.io/badge/inference-pipeline_parallel_sharded-purple)
 ![Testnet](https://img.shields.io/badge/testnet-live-green)
 
-# ARC Chain - Testnet
+# ARC Chain — Testnet
 
-**The blockchain for the agentic economy.**
+**Run a model that doesn't fit on any one of your machines, by splitting it across all of them.**
 
-On-chain AI inference was previously thought impossible because floating-point arithmetic produces different results on different hardware. We solved it. The ARC engine uses pure integer arithmetic to achieve bitwise identical inference outputs across every chip, every architecture, every device on earth. This means AI outputs can be cryptographically verified for the first time. Agents can trust each other. Inference can be proven. The agentic economy can be built.
+A request flows through a pipeline of nodes. Each node holds a slice of the model — a few transformer layers — and forwards the resulting hidden state to the next node via HTTP. The last node runs the LM head and returns a token. Per-row INT16 weights quantized directly from f32, pure i64 arithmetic, BLAKE3 over every wire-format hidden state. The output is bit-identical regardless of which node holds which slice, on any chip on earth.
 
-Read the paper: [On the Foundations of Trustworthy Artificial Intelligence](papers/foundations-trustworthy-ai.pdf)
+This is how a 7B model gets shared across 7 cheap VPS, and how a 70B model gets shared across 14 of them. No single node has enough RAM. The network does.
+
+> **Live demo:** http://140.82.16.112:3200
+> Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the activation reaches it. The trace table shows compute_ms, wall_ms, and payload bytes per hop, and the output_hash matches every replay.
+
+## Run a node in one command
+
+Anyone can join the network as a community inference node. Persistent service, daily auto-update, no compile.
+
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
+```
+
+The installer:
+- Detects your platform (macOS arm64/x86, Linux x86_64/aarch64)
+- Pulls the latest pre-built binary from the v0.4.0 release
+- Downloads Llama-2-7B-Chat Q4_K_M (~4 GB) — or TinyLlama on machines with < 6 GB RAM
+- Installs as a launchd / systemd service that auto-starts and auto-restarts
+- Schedules a daily auto-update check at 04:17 local time
+
+After install your node is running, joined to the testnet, contributing inference compute, and visible at the live dashboard.
+
+Uninstall any time: `bash install-community-node.sh --uninstall`.
+
+---
 
 99,000+ lines of Rust. Built from scratch.
+
+Read the paper: [On the Foundations of Trustworthy Artificial Intelligence](papers/foundations-trustworthy-ai.pdf)
 
 ---
 
