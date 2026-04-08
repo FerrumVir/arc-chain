@@ -2832,11 +2832,16 @@ async fn inference_run(
     let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
     let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
 
-    // Create InferenceAttestation transaction
+    // Create InferenceAttestation transaction.
+    // Bump the per-node attestation_nonce so repeat-prompt attestations
+    // (same model_id + input_hash + output_hash) get unique tx_hashes and
+    // aren't deduped by the mempool.
     let attester = node.validator_address;
-    let nonce = node.state.get_account(&attester)
+    let base_nonce = node.state.get_account(&attester)
         .map(|a| a.nonce)
         .unwrap_or(0);
+    let bump = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
+    let nonce = base_nonce + bump;
 
     let tx = arc_types::Transaction {
         tx_type: arc_types::TxType::InferenceAttestation,

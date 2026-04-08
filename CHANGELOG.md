@@ -3,6 +3,14 @@
 All notable changes to ARC Chain are tracked here. This project follows
 [semantic versioning](https://semver.org/).
 
+## v0.4.6 — 2026-04-08
+
+**Apply unique-nonce fix to single-node `/inference/run` too.** v0.4.5 fixed
+the duplicate-tx_hash issue for sharded inference but the same bug existed
+in the single-node handler. Both endpoints now use the shared
+`attestation_nonce: AtomicU64` so any inference call — sharded or not —
+produces a unique attestation tx_hash even on repeat prompts.
+
 ## v0.4.5 — 2026-04-08
 
 **Unique attestation tx_hash for repeat prompts.** Identical inputs to
