@@ -1,8 +1,9 @@
 # ARC Chain — Overnight Status (2026-04-08)
 
 A snapshot of everything shipped during the autonomous overnight session
-(2026-04-07 22:55 CDT → 2026-04-08 ~07:00 CDT). 28 iterations, 7 versions
-released, 30+ commits.
+(2026-04-07 22:55 CDT → 2026-04-08 ~08:15 CDT). **36 iterations, 7 versions
+released, 40+ commits, 3 unit tests for the shard pipeline, 9 user-facing
+docs, 6 ready-to-ship scripts.**
 
 ## TL;DR
 
@@ -30,16 +31,21 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/ins
 ## What works (verified live)
 
 - ✅ **7-shard pipeline** running Llama-2-7B-Chat across NYC → LAX → AMS → LHR → NRT → SGP → JNB
+- ✅ **TJ Mac upgraded to v0.4.6** as a 9th node (parallel mode, full model loaded)
 - ✅ **Coherent factual outputs**: "The largest planet is" → "Jupiter, which is more than 1,31...", "The capital of France is" → "Paris.", "The fastest land animal is" → "the cheetah", "The currency of Japan is" → "the Japanese yen (JPY)", "The longest river is" → "the Nile River"
 - ✅ **Cross-platform integer determinism**: same prompt → same output_hash on every replay
 - ✅ **Per-request KV cache isolation**: 10 concurrent prompts produced 10 unique output_hashes
+- ✅ **Multi-position determinism**: 4-position 2-way shard split produces same token sequence as full forward (unit-tested)
+- ✅ **3 unit tests for forward_shard_token**: full vs 2-way split, full vs 3-way split, multi-position. All pass in 0.02 s.
+- ✅ **Clean factual benchmark**: 3/3 pass, 3/3 unique hashes, no node restarts (`docs/BENCHMARK-RESULTS.md`)
 - ✅ **On-chain attestation** for every sharded run with `model_id`, `input_hash`, `output_hash`
-- ✅ **Cryptographic verifier**: anyone can re-derive any past inference with `arc-verify.sh --latest`
+- ✅ **Unique attestation tx_hash per submission** (atomic nonce bump fixes mempool dedupe)
+- ✅ **Cryptographic verifier**: `arc-verify.sh --latest` re-derives the newest inference and prints ✓ VERIFIED
 - ✅ **Model identity verified**: all 7 shards report identical BLAKE3 model_id (`0xabec2d58...`)
 - ✅ **Community installer** auto-detects platform, installs persistent service, schedules daily auto-update
-- ✅ **GitHub Actions release workflow** auto-builds Mac arm64 + Linux x86_64 on tag push (4 consecutive successful auto-releases)
+- ✅ **GitHub Actions release workflow** auto-builds Mac arm64 + Linux x86_64 on tag push (5+ consecutive successful auto-releases through v0.4.6)
 - ✅ **Watchdog** preserves shard flags through restarts; network self-heals from individual node failures
-- ✅ **Dashboard** shows live pipeline diagram with per-hop trace replay, model_id verify badge, server-side activity counters, persisted run history, per-run Verify button, and a copy-pasteable join command
+- ✅ **Dashboard** shows live pipeline diagram with per-hop trace replay, model_id verify badge, server-side activity counters (aggregated across all 8 nodes), persisted run history with per-run Verify button, copy-pasteable join command, and Open Graph meta tags for shareable previews
 
 ## What's flaky / known issues
 
@@ -106,14 +112,22 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 - Open Graph + Twitter Card meta tags for shareable previews
 - SVG favicon
 
-### Docs
-- `README.md` — rewrite leading with sharding + ASCII pipeline diagram
+### Docs (9 user-facing)
+- `README.md` — rewrite leading with sharding + ASCII pipeline diagram + Documentation index
 - `docs/HOW-SHARDING-WORKS.md` (184 lines) — engineer-grade architecture deep dive
 - `docs/SERO-DEMO.md` (211 lines) — 7-step walkthrough with timings
-- `docs/ANNOUNCEMENT.md` (107 lines) — copy-paste shareable summary
+- `docs/ANNOUNCEMENT.md` (107 lines) — copy-paste shareable summary for socials
+- `docs/PERFORMANCE-COMPARISON.md` (72 lines) — honest latency comparison vs centralized API + local llama.cpp
 - `docs/STATUS.md` — this file
-- `docs/BENCHMARK-RESULTS.md` — captured factual benchmark output
+- `docs/BENCHMARK-RESULTS.md` — captured factual benchmark (3/3 pass)
 - `CHANGELOG.md` — release notes for v0.3.0 → v0.4.6
+- `scripts/README.md` — index for the 25+ scripts in scripts/
+
+### Tests
+- `cached_integer_model::tests::test_forward_shard_token_full_equals_split` — 4-layer model, single shard equals 2-shard split at K=2
+- `cached_integer_model::tests::test_forward_shard_token_three_way_split` — 6-layer model, single shard equals 3-shard chain [0,2)→[2,4)→[4,6)
+- `cached_integer_model::tests::test_forward_shard_token_multi_position` — 4 sequential positions through both single shard and 2-way split, token sequences match
+- All 3 pass in 0.02 s; catches any future bug in layer-boundary stitching, RoPE positions, or KV cache pushes across shards
 
 ## Headline numbers
 
