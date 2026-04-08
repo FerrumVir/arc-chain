@@ -3383,6 +3383,53 @@ async fn inference_run_sharded(
         model.config.n_layers, model.config.d_model,
         model.config.n_heads, model.config.vocab_size
     );
+    let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
+    let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
+
+    // Submit an InferenceAttestation transaction so this sharded run is
+    // recorded on-chain like single-node /inference/run does. Anyone reading
+    // the chain later can verify model_id + input_hash + output_hash.
+    let attester = node.validator_address;
+    let nonce = node.state.get_account(&attester).map(|a| a.nonce).unwrap_or(0);
+    let tx = arc_types::Transaction {
+        tx_type: arc_types::TxType::InferenceAttestation,
+        from: attester,
+        nonce,
+        body: arc_types::TxBody::InferenceAttestation(
+            arc_types::transaction::InferenceAttestationBody {
+                model_id: model_id_hash,
+                input_hash,
+                output_hash,
+                challenge_period: 100,
+                bond: 1000,
+            },
+        ),
+        fee: 0,
+        gas_limit: 0,
+        hash: arc_crypto::Hash256::ZERO,
+        signature: arc_crypto::Signature::null(),
+        sig_verified: false,
+    };
+    let tx_hash = tx.compute_hash();
+    let _ = node.mempool.insert(tx);
+    let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
+
+    // Cache result for explorer / cross-device view (same as inference_run does)
+    node.inference_results.insert(tx_hash_hex.clone(), json!({
+        "input": input_text,
+        "output": &output_text,
+        "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+        "model": &model_id_data,
+        "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
+        "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
+        "tokens_generated": generated.len() as u64,
+        "engine": "INT8 sharded pipeline (cross-platform deterministic)",
+        "deterministic": true,
+        "sharded": true,
+        "pipeline_length": pipeline.len(),
+        "shard_trace": &shard_trace,
+        "total_bytes_transferred": total_bytes_transferred,
+    }));
 
     Ok(Json(json!({
         "success": true,
@@ -3391,6 +3438,8 @@ async fn inference_run_sharded(
         "output": output_text,
         "output_tokens": generated,
         "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+        "input_hash": format!("0x{}", hex::encode(&input_hash.0)),
+        "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
         "tokens_generated": generated.len(),
         "total_ms": total_ms,
         "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
@@ -3400,6 +3449,13 @@ async fn inference_run_sharded(
         "total_bytes_transferred": total_bytes_transferred,
         "deterministic": true,
         "engine": "INT8 sharded pipeline (cross-platform deterministic)",
+        "attestation": {
+            "tx_hash": tx_hash_hex,
+            "bond": 1000,
+            "challenge_period": 100,
+            "status": "submitted_to_mempool",
+        },
+        "explorer_url": format!("/tx/0x{}", hex::encode(&tx_hash.0)),
     })))
 }
 

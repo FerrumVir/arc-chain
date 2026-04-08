@@ -3,6 +3,16 @@
 All notable changes to ARC Chain are tracked here. This project follows
 [semantic versioning](https://semver.org/).
 
+## v0.4.4 — 2026-04-08
+
+**Sharded runs now produce on-chain attestations.** Every successful
+`/inference/run_sharded` call now submits an `InferenceAttestation`
+transaction to the mempool, just like single-node `/inference/run` does.
+The attestation includes `model_id`, `input_hash`, and `output_hash` so
+anyone reading the chain can later verify a sharded run actually happened
+and produced a specific output. Returns the attestation `tx_hash` and
+`explorer_url` in the response.
+
 ## v0.4.3 — 2026-04-08
 
 **CI fix.** Dropped `x86_64-apple-darwin` from the release workflow matrix
