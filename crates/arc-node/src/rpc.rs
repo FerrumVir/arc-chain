@@ -225,6 +225,9 @@ pub async fn serve(
         // Pipeline-parallel sharded inference
         .route("/inference/run_sharded", post(inference_run_sharded))
         .route("/inference/forward_shard", post(inference_forward_shard))
+        // Deterministic inference cache introspection
+        .route("/inference/cache_stats", get(inference_cache_stats))
+        .route("/inference/cache_check", post(inference_cache_check))
         // Shard registry — discovery + announcement
         .route("/shards", get(get_shards))
         .route("/shards/announce", post(announce_shard))
@@ -3098,6 +3101,89 @@ struct ForwardShardResponse {
     compute_ms: u64,
     /// Friendly node name.
     node_name: String,
+}
+
+/// GET /inference/cache_stats
+/// Report live stats about the deterministic inference cache: how many
+/// entries are warm, what the capacity is, and total cumulative hits.
+/// Dashboards call this to show a "N prompts cached" counter.
+async fn inference_cache_stats(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "size": node.inference_cache.len(),
+        "capacity": node.inference_cache.capacity(),
+        "total_hits": node.inference_cache.total_hits(),
+        "cache_type": "DistributedCache (BLAKE3-keyed, deterministic, LRU)",
+    }))
+}
+
+/// POST /inference/cache_check
+/// Given a list of prompts, report for each whether it is currently warm
+/// in the cache. The dashboard uses this to show a "✓ instant" badge on
+/// preset prompt buttons, so visitors can see ahead of time which clicks
+/// will return in milliseconds and which will run the full pipeline.
+#[derive(Deserialize)]
+struct CacheCheckRequest {
+    prompts: Vec<CacheCheckPrompt>,
+}
+
+#[derive(Deserialize)]
+struct CacheCheckPrompt {
+    input: String,
+    #[serde(default = "default_cache_check_max_tokens")]
+    max_tokens: u32,
+}
+
+fn default_cache_check_max_tokens() -> u32 { 20 }
+
+#[derive(Serialize)]
+struct CacheCheckResult {
+    input: String,
+    max_tokens: u32,
+    cached: bool,
+}
+
+async fn inference_cache_check(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<CacheCheckRequest>,
+) -> Result<Json<Vec<CacheCheckResult>>, (StatusCode, String)> {
+    let model = node
+        .inference_model
+        .as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no model loaded".to_string()))?;
+
+    // Replicate the cache-key derivation used by inference_run_sharded so
+    // a check here matches what a real call would look up.
+    let model_id_data = format!(
+        "arc-{}L-{}d-{}h-{}v",
+        model.config.n_layers, model.config.d_model,
+        model.config.n_heads, model.config.vocab_size
+    );
+    let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
+
+    let results: Vec<CacheCheckResult> = req
+        .prompts
+        .into_iter()
+        .map(|p| {
+            let templated = model.apply_chat_template(&p.input);
+            let prompt_tokens = model.encode(&templated);
+            let mut all_tokens: Vec<u32> = vec![model.config.bos_token];
+            all_tokens.extend(&prompt_tokens);
+            all_tokens.push(p.max_tokens);
+            let key = arc_inference::distributed::DistributedCache::cache_key(
+                &model_id_hash,
+                &all_tokens,
+            );
+            CacheCheckResult {
+                cached: node.inference_cache.contains(&key),
+                input: p.input,
+                max_tokens: p.max_tokens,
+            }
+        })
+        .collect();
+
+    Ok(Json(results))
 }
 
 /// POST /inference/forward_shard

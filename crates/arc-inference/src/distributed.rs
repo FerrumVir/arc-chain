@@ -730,9 +730,27 @@ impl DistributedCache {
         self.entries.len()
     }
 
+    /// Max entries before LRU eviction kicks in.
+    pub fn capacity(&self) -> usize {
+        self.max_entries
+    }
+
     /// Check if empty.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Check if a key is present WITHOUT bumping hit_count.
+    /// Used by /inference/cache_check so a "is this warm?" probe doesn't
+    /// distort LRU ordering.
+    pub fn contains(&self, key: &Hash256) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Total cumulative hit_count across every entry in the cache.
+    /// Reflects how many times the cache has saved a full pipeline walk.
+    pub fn total_hits(&self) -> u64 {
+        self.entries.iter().map(|e| e.value().hit_count).sum()
     }
 }
 
