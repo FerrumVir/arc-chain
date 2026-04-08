@@ -1222,14 +1222,19 @@ async function refresh(){
         const seenCount=a.seen_on.size;
         const input=(inf.input||'—').slice(0,50);
         const output=(inf.output||'—').slice(0,80);
+        const isSharded = inf.sharded === true || inf.engine?.includes('sharded');
         const crossDeviceBadge=seenCount>1
           ? `<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">✓ ${seenCount} devices</span>`
           : `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surface-4 text-gray-400">1 device</span>`;
+        const shardedBadge = isSharded
+          ? `<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-arc-500/20 text-arc-300 border border-arc-500/40" title="ran through the pipeline-parallel sharded inference">SHARDED · ${inf.pipeline_length||'?'} shards</span>`
+          : '';
         return `
         <div class="py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition" onclick='showInferenceDetail(${JSON.stringify(a)})'>
           <div class="flex items-center justify-between mb-1">
-            <div class="flex items-center gap-2">
+            <div class="flex items-center gap-2 flex-wrap">
               <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">AI</span>
+              ${shardedBadge}
               ${crossDeviceBadge}
               <span class="text-[10px] text-gray-500 mono">${inf.ms_per_token||'?'}ms/tok</span>
             </div>
