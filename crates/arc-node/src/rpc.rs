@@ -34,7 +34,8 @@ pub struct NodeState {
     pub boot_time: Instant,
     pub peer_count: Arc<AtomicU32>,
     /// Faucet rate limiter: address → last claim time.
-    pub faucet_claims: Arc<Mutex<HashMap<[u8; 32], Instant>>>,
+    /// DashMap so faucet handler never blocks the tokio runtime under load.
+    pub faucet_claims: Arc<dashmap::DashMap<[u8; 32], Instant>>,
     /// Total faucet claims since boot.
     pub faucet_claims_total: Arc<AtomicU32>,
     /// Cached INT8 inference model (if --model was provided).
@@ -77,7 +78,7 @@ pub fn build_node_state(
         tier,
         boot_time,
         peer_count,
-        faucet_claims: Arc::new(Mutex::new(HashMap::new())),
+        faucet_claims: Arc::new(dashmap::DashMap::new()),
         faucet_claims_total: Arc::new(AtomicU32::new(0)),
         inference_model,
         candle_engine,
@@ -654,11 +655,11 @@ async fn faucet_claim(
 
     // Rate limiting: check if this address claimed recently
     // Global rate limit: 5000 faucet claims/minute (testnet only — production should be 100)
+    // DashMap iter is lock-free per shard so this never blocks the runtime.
     {
         let total = node.faucet_claims_total.load(Ordering::Relaxed);
         if total > FAUCET_GLOBAL_RATE_LIMIT as u32 {
-            let claims = node.faucet_claims.lock().unwrap_or_else(|p| p.into_inner());
-            let recent = claims.values().filter(|t| t.elapsed().as_secs() < 60).count();
+            let recent = node.faucet_claims.iter().filter(|e| e.value().elapsed().as_secs() < 60).count();
             if recent > FAUCET_GLOBAL_RATE_LIMIT {
                 return Err((StatusCode::TOO_MANY_REQUESTS, Json(FaucetErrorResponse {
                     error: "Faucet busy. Too many claims globally. Try again in a minute.".to_string(),
@@ -667,20 +668,17 @@ async fn faucet_claim(
         }
     }
 
-    // Per-address rate limit: 1 claim per hour
-    {
-        let claims = node.faucet_claims.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(last_claim) = claims.get(&to.0) {
-            let elapsed = last_claim.elapsed().as_secs();
-            if elapsed < FAUCET_RATE_LIMIT_SECS {
-                let remaining = FAUCET_RATE_LIMIT_SECS - elapsed;
-                return Err((StatusCode::TOO_MANY_REQUESTS, Json(FaucetErrorResponse {
-                    error: format!(
-                        "Rate limited. Try again in {} minutes.",
-                        (remaining + 59) / 60
-                    ),
-                })));
-            }
+    // Per-address rate limit
+    if let Some(entry) = node.faucet_claims.get(&to.0) {
+        let elapsed = entry.value().elapsed().as_secs();
+        if elapsed < FAUCET_RATE_LIMIT_SECS {
+            let remaining = FAUCET_RATE_LIMIT_SECS - elapsed;
+            return Err((StatusCode::TOO_MANY_REQUESTS, Json(FaucetErrorResponse {
+                error: format!(
+                    "Rate limited. Try again in {} minutes.",
+                    (remaining + 59) / 60
+                ),
+            })));
         }
     }
 
@@ -756,13 +754,9 @@ async fn faucet_claim(
     let _ = node.mempool.insert(tx);
 
     // Record claim time + evict stale entries to prevent unbounded growth
-    {
-        let mut claims = node.faucet_claims.lock().unwrap_or_else(|p| p.into_inner());
-        claims.insert(to.0, Instant::now());
-        // Evict entries older than 2 hours (well past the 1-hour rate limit)
-        if claims.len() > 10_000 {
-            claims.retain(|_, v| v.elapsed().as_secs() < 7200);
-        }
+    node.faucet_claims.insert(to.0, Instant::now());
+    if node.faucet_claims.len() > 10_000 {
+        node.faucet_claims.retain(|_, v| v.elapsed().as_secs() < 7200);
     }
     node.faucet_claims_total.fetch_add(1, Ordering::Relaxed);
 
