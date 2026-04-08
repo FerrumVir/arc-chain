@@ -171,6 +171,20 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       </div>
     </div>
 
+    <!-- "Join the network" — the conversion event for visitors -->
+    <div class="bg-gradient-to-br from-emerald-900/40 to-arc-900/30 border-2 border-emerald-500/40 rounded-xl p-4 mb-2">
+      <div class="flex items-center gap-2 mb-2">
+        <span class="text-base">🚀</span>
+        <span class="text-sm font-bold text-white">Join the network as a shard holder in one command</span>
+      </div>
+      <div class="text-[11px] text-gray-300 mb-3">Persistent service. Daily auto-update. Auto-detects your platform. macOS arm64/x86, Linux x86_64/aarch64. ~3 minutes from curl to running node.</div>
+      <div class="bg-surface-2 border border-emerald-500/40 rounded-lg p-3 flex items-center justify-between gap-3">
+        <code class="text-[11px] text-emerald-300 mono break-all flex-1" id="installCmd">curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash</code>
+        <button onclick="copyInstallCmd(this)" class="px-3 py-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-[10px] whitespace-nowrap transition shadow-lg shadow-emerald-500/30" id="copyBtn">📋 Copy</button>
+      </div>
+      <div class="text-[9px] text-gray-500 mt-2">Or run the demo end-to-end without installing: <code class="text-arc-300 mono">curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash</code></div>
+    </div>
+
     <!-- Pure parallel demo (kept below sharded for comparison) -->
     <h3 class="text-[10px] uppercase tracking-wider text-gray-500 font-semibold mt-6 mb-2 border-t border-surface-4 pt-4">Or run the same prompt on every device in parallel (load balancing demo)</h3>
   </div>
@@ -507,6 +521,30 @@ async function refreshShardRegistry(){
     diagram.innerHTML = html;
   }catch(e){
     // Silent — registry not available yet
+  }
+}
+
+// Copy the install command to the clipboard with visual feedback.
+function copyInstallCmd(btn){
+  const cmd = document.getElementById('installCmd').textContent.trim();
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(cmd).then(() => {
+      const oldText = btn.textContent;
+      btn.textContent = '✓ Copied';
+      btn.classList.remove('bg-emerald-500', 'hover:bg-emerald-400');
+      btn.classList.add('bg-emerald-300');
+      setTimeout(() => {
+        btn.textContent = oldText;
+        btn.classList.remove('bg-emerald-300');
+        btn.classList.add('bg-emerald-500', 'hover:bg-emerald-400');
+      }, 1500);
+    }).catch(() => {
+      // Fallback: select the text
+      const range = document.createRange();
+      range.selectNode(document.getElementById('installCmd'));
+      window.getSelection().removeAllRanges();
+      window.getSelection().addRange(range);
+    });
   }
 }
 
