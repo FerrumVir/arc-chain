@@ -3,6 +3,36 @@
 All notable changes to ARC Chain are tracked here. This project follows
 [semantic versioning](https://semver.org/).
 
+## v0.5.1 — 2026-04-08
+
+**Dashboard cache warmth indicator.** The dashboard now probes the
+coordinator's `DistributedCache` on page load and tags preset prompt
+buttons that are already warm with a green `⚡ INSTANT` badge. Visitors
+know at a glance which clicks will return in ~100 ms (cache hit,
+~200 tok/s effective) vs which will run the full 7-shard pipeline.
+
+New RPC endpoints:
+- `GET /inference/cache_stats` — `{size, capacity, total_hits,
+  cache_type}`. Dashboards call this to show "N entries cached ·
+  K cumulative hits" under the preset prompt row.
+- `POST /inference/cache_check` — body: `{prompts: [{input, max_tokens},
+  ...]}`, returns `[{input, max_tokens, cached: bool}, ...]`. Tokenizes
+  server-side and re-derives the BLAKE3 cache key the exact same way
+  `inference_run_sharded` does, so a check here matches what a real
+  call would look up. Does NOT bump `hit_count` — a warmth probe
+  should not distort LRU ordering.
+
+`DistributedCache` gains `contains()`, `capacity()`, and `total_hits()`
+helpers. `contains()` is a non-mutating probe; the existing `get()`
+still bumps `hit_count` for LRU ordering.
+
+Measured tokens/sec (live testnet, 2026-04-08):
+- Cache HIT (repeat): ~200 tok/s wall (94-109 ms for 20 tokens);
+  server-side serve time is 17-37 μs, the rest is HTTP roundtrip.
+- Cache MISS (novel): ~0.04 tok/s (~22 sec/token through full
+  7-shard pipeline).
+- Speedup ratio: ~5,000× for cached results.
+
 ## v0.5.0 — 2026-04-08
 
 **Deterministic inference cache wired into sharded handler.** The

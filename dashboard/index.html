@@ -187,16 +187,20 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
           ▶ Run Through Pipeline
         </button>
       </div>
-      <!-- Preset prompts: one click pre-fills + auto-runs -->
+      <!-- Preset prompts: one click pre-fills + auto-runs.
+           data-preset buttons are auto-probed against /inference/cache_check on
+           page load and tagged with an "INSTANT" badge if already warm. Every
+           click that's a cache hit returns in ~100ms. -->
       <div class="flex flex-wrap gap-1.5 mt-2">
         <span class="text-[9px] uppercase tracking-wider text-gray-500 font-semibold self-center mr-1">Try:</span>
-        <button onclick="presetPrompt('The largest planet is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The largest planet is</button>
-        <button onclick="presetPrompt('The capital of France is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The capital of France is</button>
-        <button onclick="presetPrompt('The sky is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The sky is</button>
-        <button onclick="presetPrompt('The fastest land animal is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The fastest land animal is</button>
-        <button onclick="presetPrompt('The speed of light in a vacuum is')" class="px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The speed of light is</button>
+        <button data-preset="The largest planet is" onclick="presetPrompt('The largest planet is')" class="preset-btn px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The largest planet is</button>
+        <button data-preset="The capital of France is" onclick="presetPrompt('The capital of France is')" class="preset-btn px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The capital of France is</button>
+        <button data-preset="The sky is" onclick="presetPrompt('The sky is')" class="preset-btn px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The sky is</button>
+        <button data-preset="The fastest land animal is" onclick="presetPrompt('The fastest land animal is')" class="preset-btn px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The fastest land animal is</button>
+        <button data-preset="The speed of light in a vacuum is" onclick="presetPrompt('The speed of light in a vacuum is')" class="preset-btn px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The speed of light is</button>
       </div>
-      <div id="shardedStatus" class="text-[10px] text-gray-500 mt-2">Sends one token through all shards. Each hop verifies the previous shard's BLAKE3 hash. Last shard runs the LM head + argmax.</div>
+      <div id="cacheStatsLine" class="text-[9px] text-emerald-300/70 mt-1.5 font-mono"></div>
+      <div id="shardedStatus" class="text-[10px] text-gray-500 mt-2">Sends one token through all shards. Each hop verifies the previous shard's BLAKE3 hash. Last shard runs the LM head + argmax. <span class="text-emerald-300">Cached prompts return in ~100 ms (~200 tok/s).</span></div>
       <!-- Sharded result panel -->
       <div id="shardedResult" class="hidden mt-3"></div>
       <!-- Run history (persisted in localStorage) -->
@@ -1359,9 +1363,62 @@ async function refresh(){
 }
 
 // Await RPC discovery before first render — prevents "2 nodes" flash
-findRPC().then(()=>{refresh();setInterval(refresh,5000)});
+findRPC().then(()=>{
+  refresh();
+  setInterval(refresh,5000);
+  // Probe the cache once the RPC is known, then every 15 sec.
+  probePresetCache();
+  setInterval(probePresetCache, 15000);
+});
 // Render persisted run history immediately
 renderShardedHistory();
+
+// Ask the coordinator which of the 5 preset prompts are already warm in
+// the DistributedCache. Warm entries get an "INSTANT" pill. Also updates
+// a small cache_stats line showing N prompts cached + cumulative hits.
+async function probePresetCache(){
+  const buttons = Array.from(document.querySelectorAll('.preset-btn[data-preset]'));
+  if(!buttons.length) return;
+  const prompts = buttons.map(b => ({input: b.dataset.preset, max_tokens: 20}));
+  try{
+    // 1) cache_stats — totals
+    const sR = await fetch(RPC + '/inference/cache_stats', {signal: AbortSignal.timeout(3000)});
+    if(sR.ok){
+      const s = await sR.json();
+      const line = document.getElementById('cacheStatsLine');
+      if(line){
+        line.textContent = `↯ cache: ${s.size}/${s.capacity} entries · ${s.total_hits} cumulative hits · O(1) lookup (~20 μs)`;
+      }
+    }
+    // 2) cache_check — per-preset warm status
+    const cR = await fetch(RPC + '/inference/cache_check', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({prompts}),
+      signal: AbortSignal.timeout(4000)
+    });
+    if(!cR.ok) return;
+    const results = await cR.json();
+    results.forEach((r, i) => {
+      const btn = buttons[i];
+      if(!btn) return;
+      // Remove any old badge
+      const oldBadge = btn.querySelector('.preset-warm-badge');
+      if(oldBadge) oldBadge.remove();
+      if(r.cached){
+        btn.classList.remove('border-arc-500/20', 'text-arc-300');
+        btn.classList.add('border-emerald-400/60', 'text-emerald-200', 'bg-emerald-500/10');
+        const badge = document.createElement('span');
+        badge.className = 'preset-warm-badge ml-1 text-[8px] px-1 py-0.5 rounded bg-emerald-500/30 text-emerald-200 font-bold';
+        badge.textContent = '⚡ INSTANT';
+        btn.appendChild(badge);
+      } else {
+        btn.classList.add('border-arc-500/20', 'text-arc-300');
+        btn.classList.remove('border-emerald-400/60', 'text-emerald-200', 'bg-emerald-500/10');
+      }
+    });
+  }catch(e){/* silent — /inference/cache_check only exists on v0.5.1+ coordinators */}
+}
 </script>
 </body>
 </html>
