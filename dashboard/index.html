@@ -132,6 +132,18 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       </div>
     </div>
 
+    <!-- Model identity verification: every shard reports the same model_id hash -->
+    <div id="modelIdVerifyPanel" class="hidden mb-3 p-3 bg-surface-3 border-2 border-arc-500/40 rounded-xl">
+      <div class="flex items-center gap-2">
+        <span id="modelIdVerifyIcon" class="text-lg">🔐</span>
+        <div class="flex-1 min-w-0">
+          <div class="text-[11px] font-bold text-white" id="modelIdVerifyHeadline">Model identity verified</div>
+          <div class="text-[10px] text-gray-400 mt-0.5">All shards must report the same BLAKE3 model_id, otherwise the pipeline cannot produce trustworthy output.</div>
+          <div class="text-[10px] mono text-arc-300 truncate mt-1" id="modelIdVerifyHash">—</div>
+        </div>
+      </div>
+    </div>
+
     <!-- Memory comparison: single node vs distributed -->
     <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-5">
       <div class="bg-red-950/30 border border-red-500/30 rounded-xl p-4">
@@ -503,6 +515,34 @@ async function refreshShardRegistry(){
     document.getElementById('shardSingleMb').textContent = totalFullMb > 0 ? `${(totalFullMb/1024).toFixed(1)} GB` : '—';
     document.getElementById('shardPerNodeMb').textContent = perNodeMb > 0 ? `~${(perNodeMb/1024).toFixed(1)} GB / node` : '—';
     document.getElementById('shardLayersPerNode').textContent = layersPerNode || '—';
+
+    // Model identity verification: every shard must report the same BLAKE3 model_id
+    if(currentPipeline.length > 0){
+      const ids = new Set(currentPipeline.map(s => s.model_id).filter(x => x));
+      const panel = document.getElementById('modelIdVerifyPanel');
+      const icon = document.getElementById('modelIdVerifyIcon');
+      const headline = document.getElementById('modelIdVerifyHeadline');
+      const hashLine = document.getElementById('modelIdVerifyHash');
+      if(panel){
+        panel.classList.remove('hidden');
+        if(ids.size === 1){
+          const h = [...ids][0];
+          panel.classList.remove('border-red-500');
+          panel.classList.add('border-emerald-500/60');
+          icon.textContent = '✓';
+          icon.className = 'text-lg text-emerald-400';
+          headline.innerHTML = `<span class="text-emerald-300">Model identity verified</span> — all <span class="font-bold">${currentPipeline.length}</span> shards report the same BLAKE3 model_id`;
+          hashLine.textContent = h;
+        }else if(ids.size > 1){
+          panel.classList.remove('border-emerald-500/60');
+          panel.classList.add('border-red-500');
+          icon.textContent = '✗';
+          icon.className = 'text-lg text-red-400';
+          headline.innerHTML = `<span class="text-red-300">MODEL MISMATCH</span> — ${ids.size} different model_ids across ${currentPipeline.length} shards. Pipeline cannot produce trustworthy output.`;
+          hashLine.textContent = [...ids].join(' / ');
+        }
+      }
+    }
 
     // Render the pipeline diagram
     const diagram = document.getElementById('pipelineDiagram');
