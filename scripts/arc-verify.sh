@@ -21,6 +21,32 @@ set -uo pipefail
 COORDINATOR="${ARC_COORDINATOR:-http://149.28.32.76:9090}"
 TX_HASH="${1:-}"
 
+# --latest mode: pick the newest entry from /inference/results so users
+# don't need a prior tx_hash to try the verifier.
+if [ "$TX_HASH" = "--latest" ] || [ "$TX_HASH" = "-l" ]; then
+    LATEST_RESPONSE=$(curl -sf -m 30 "${COORDINATOR}/inference/results" 2>/dev/null || echo "")
+    if [ -z "$LATEST_RESPONSE" ]; then
+        echo "ERROR: Could not reach $COORDINATOR/inference/results" >&2
+        exit 1
+    fi
+    TX_HASH=$(ARC_RESULTS="$LATEST_RESPONSE" python3 -c '
+import json, os
+d = json.loads(os.environ["ARC_RESULTS"])
+results = d.get("results", [])
+if not results:
+    raise SystemExit(1)
+print(results[0].get("tx_hash", ""))
+' 2>/dev/null)
+    if [ -z "$TX_HASH" ]; then
+        echo "ERROR: No attestations available on the coordinator yet." >&2
+        echo "       Run an inference first:" >&2
+        echo "         curl -X POST $COORDINATOR/inference/run_sharded \\" >&2
+        echo "           -H 'Content-Type: application/json' \\" >&2
+        echo "           -d '{\"input\":\"hi\",\"max_tokens\":3}'" >&2
+        exit 1
+    fi
+fi
+
 # Colors
 if [ -t 1 ]; then
     BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'
@@ -34,14 +60,20 @@ if [ -z "$TX_HASH" ]; then
 ${BOLD}arc-verify.sh${RESET} — independently verify a past inference attestation
 
 USAGE:
-  arc-verify.sh <tx_hash>
+  arc-verify.sh <tx_hash>           # verify a specific past attestation
+  arc-verify.sh --latest            # verify the newest attestation on the coordinator
+  arc-verify.sh -l                  # short form
 
-  # Run live against the testnet coordinator (default):
+  # Live against the testnet coordinator (default):
+  curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \\
+    | bash -s -- --latest
+
+  # Or with a specific tx_hash:
   curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \\
     | bash -s -- 0x428c045cb321d061de1fefb22df0d43636b7c21e978049a28d0250ba157eb3df
 
   # Or against your own coordinator:
-  ARC_COORDINATOR=http://localhost:9944 bash arc-verify.sh <tx_hash>
+  ARC_COORDINATOR=http://localhost:9944 bash arc-verify.sh --latest
 
 WHAT IT DOES:
   1. Fetches /inference/results on the coordinator
