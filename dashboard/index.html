@@ -155,6 +155,11 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       <div id="shardedStatus" class="text-[10px] text-gray-500 mt-2">Sends one token through all shards. Each hop verifies the previous shard's BLAKE3 hash. Last shard runs the LM head + argmax.</div>
       <!-- Sharded result panel -->
       <div id="shardedResult" class="hidden mt-3"></div>
+      <!-- Run history (persisted in localStorage) -->
+      <div id="shardedHistory" class="hidden mt-3">
+        <div class="text-[10px] uppercase tracking-wider text-gray-500 font-semibold mb-1.5">Recent runs (this browser)</div>
+        <div id="shardedHistoryList" class="space-y-1"></div>
+      </div>
     </div>
 
     <!-- Pure parallel demo (kept below sharded for comparison) -->
@@ -549,6 +554,8 @@ async function runShardedInference(){
       const totalKb = (totalBytes / 1024).toFixed(1);
       const msPerTok = d.ms_per_token || 0;
       const tokensGen = d.tokens_generated || 0;
+      // Save to localStorage history
+      saveShardedRun({prompt, output: d.output||'', hash: d.output_hash||'', ts: Date.now(), wall_ms: elapsed, ms_per_token: msPerTok, pipeline_length: d.pipeline_length||0});
 
       // Update each shard card with REAL per-hop metrics
       trace.forEach((hop, i) => {
@@ -632,6 +639,61 @@ async function runShardedInference(){
     btn.classList.add('bg-arc-500', 'hover:bg-arc-400');
     btn.classList.remove('bg-gray-600', 'cursor-not-allowed');
   }
+}
+
+// Persist sharded inference runs across page refreshes so the user can
+// revisit recent prompts + verify hash equivalence on reruns. Stored as a
+// rolling FIFO of the most recent 10 runs in localStorage.
+const SHARDED_HISTORY_KEY = 'arc-sharded-history-v1';
+
+function loadShardedHistory(){
+  try{
+    return JSON.parse(localStorage.getItem(SHARDED_HISTORY_KEY) || '[]');
+  }catch(e){return [];}
+}
+
+function saveShardedRun(run){
+  try{
+    const hist = loadShardedHistory();
+    hist.unshift(run);
+    while(hist.length > 10) hist.pop();
+    localStorage.setItem(SHARDED_HISTORY_KEY, JSON.stringify(hist));
+    renderShardedHistory();
+  }catch(e){}
+}
+
+function renderShardedHistory(){
+  const wrap = document.getElementById('shardedHistory');
+  const list = document.getElementById('shardedHistoryList');
+  if(!wrap || !list) return;
+  const hist = loadShardedHistory();
+  if(hist.length === 0){
+    wrap.classList.add('hidden');
+    return;
+  }
+  wrap.classList.remove('hidden');
+  // Group by hash to detect determinism — runs with the same hash get a "✓ verified" badge
+  const counts = {};
+  hist.forEach(r => { counts[r.hash] = (counts[r.hash] || 0) + 1; });
+  list.innerHTML = hist.map(r => {
+    const verified = counts[r.hash] > 1;
+    const ago = Math.floor((Date.now() - r.ts) / 1000);
+    const agoStr = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${Math.floor(ago/60)}m ago` : `${Math.floor(ago/3600)}h ago`;
+    return `
+      <div class="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-2 border border-surface-4 rounded-lg text-[10px]">
+        <div class="flex items-center gap-2 flex-1 min-w-0">
+          ${verified ? '<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[8px] font-bold border border-emerald-500/40">✓ ×' + counts[r.hash] + '</span>' : '<span class="px-1.5 py-0.5 rounded bg-arc-500/10 text-arc-300 text-[8px] font-bold border border-arc-500/30">FRESH</span>'}
+          <span class="text-gray-400 truncate" title="${(r.prompt||'').replace(/"/g,'&quot;')}">${(r.prompt||'').slice(0,40)}</span>
+          <span class="text-white truncate" title="${(r.output||'').replace(/"/g,'&quot;')}">→ ${(r.output||'').slice(0,40)}</span>
+        </div>
+        <div class="flex items-center gap-2 flex-shrink-0">
+          <span class="text-gray-600 mono text-[9px]" title="${r.hash}">${(r.hash||'').slice(0,16)}…</span>
+          <span class="text-yellow-400 mono">${r.wall_ms}ms</span>
+          <span class="text-gray-500">${agoStr}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
 }
 
 // Run a custom prompt on ALL inference-enabled nodes in parallel.
@@ -1040,6 +1102,8 @@ async function refresh(){
 
 // Await RPC discovery before first render — prevents "2 nodes" flash
 findRPC().then(()=>{refresh();setInterval(refresh,5000)});
+// Render persisted run history immediately
+renderShardedHistory();
 </script>
 </body>
 </html>
