@@ -3311,6 +3311,15 @@ async fn inference_run_sharded(
         .and_then(|v| v.as_u64())
         .unwrap_or(20)
         .min(256) as u32;
+    // Opt-in chat template wrapping. Default OFF because the dashboard is
+    // doing autocomplete ("The capital of France is" → " Paris"), not
+    // instruction-following. Wrapping in [INST]...[/INST] inflates prompt_len
+    // by ~5x (11 tokens for a 3-token input) and since the pipeline walks
+    // all positions, that 5x directly multiplies wall time. Pass
+    // `"chat_template": true` in the body to re-enable it for chat models.
+    let chat_template_enabled = req.get("chat_template")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // We need a local model copy for tokenization
     let model = node.inference_model.as_ref()
@@ -3377,9 +3386,14 @@ async fn inference_run_sharded(
 
     let request_id = format!("0x{}", hex::encode(arc_crypto::hash_bytes(format!("{}-{}", input_text, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)).as_bytes()).0));
 
-    // Tokenize input
-    let templated = model.apply_chat_template(input_text);
-    let prompt_tokens = model.encode(&templated);
+    // Tokenize input. Only wrap in chat template when explicitly requested;
+    // the default is raw completion.
+    let tokenized_text: String = if chat_template_enabled {
+        model.apply_chat_template(input_text)
+    } else {
+        input_text.to_string()
+    };
+    let prompt_tokens = model.encode(&tokenized_text);
     let mut all_tokens: Vec<u32> = vec![model.config.bos_token];
     all_tokens.extend(&prompt_tokens);
 
@@ -3447,21 +3461,231 @@ async fn inference_run_sharded(
         .build()
         .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("HTTP client: {}", e)))?;
 
-    // Process the entire prompt through the pipeline (all positions)
-    // For position 0..prompt_len: prefill (all shards process the prompt token)
-    // Then generate up to max_tokens
+    // Pipeline execution.
+    //
+    // PREFILL (positions 0..prompt_len):
+    //   All prompt tokens are known up-front. We stream them through the
+    //   shard chain using per-shard mpsc workers, so at steady state every
+    //   shard is processing a different position simultaneously. Wall time
+    //   is ~(prompt_len + num_shards - 1) × per_shard_time instead of
+    //   prompt_len × num_shards × per_shard_time.
+    //
+    // GENERATION (positions prompt_len..prompt_len+max_tokens):
+    //   Each output token depends on the previous one's logits so we must
+    //   wait for the full pipeline walk before starting the next position.
+    //   Kept as a straight sequential loop — pipeline parallelism does not
+    //   apply to single-stream autoregressive decoding.
+    //
+    // The output from the LAST prompt position is the FIRST generated
+    // token. We capture it via the terminal flag on the pipeline's tail
+    // shard and then continue the sequential loop for the remaining
+    // (max_tokens - 1) tokens.
     let prompt_len = all_tokens.len();
-    let total_positions = prompt_len + max_tokens as usize;
 
-    for position in 0..total_positions {
-        // Determine the input token for this position
-        let input_token: u32 = if position < prompt_len {
-            all_tokens[position]
-        } else {
-            *generated.last().unwrap_or(&all_tokens[prompt_len - 1])
-        };
+    // ─── Pipelined prefill ────────────────────────────────────────────
+    {
+        use tokio::sync::mpsc;
 
-        // Walk the pipeline: first shard receives token id, others receive hidden
+        // PrefillFlow is what travels between shard worker tasks. Each
+        // worker reads a PrefillFlow, runs its forward_shard call, and
+        // sends the next PrefillFlow (carrying the new hidden state) to
+        // the next worker. The tail shard sets `terminal_token`.
+        #[derive(Debug)]
+        struct PrefillFlow {
+            position: usize,
+            token: Option<u32>,
+            hidden: Option<Vec<i64>>,
+            hidden_hash: Option<String>,
+            terminal_token: Option<u32>,
+        }
+
+        let num_shards = pipeline.len();
+        let buffer = (prompt_len + 4).max(16);
+
+        // (num_shards + 1) channels: index 0 is the coordinator→shard0
+        // input; index k (1..=num_shards) carries shard(k-1)→shard(k)
+        // outputs; index num_shards is the tail shard→coordinator output.
+        let mut txs: Vec<mpsc::Sender<PrefillFlow>> = Vec::with_capacity(num_shards + 1);
+        let mut rxs: Vec<Option<mpsc::Receiver<PrefillFlow>>> = Vec::with_capacity(num_shards + 1);
+        for _ in 0..=num_shards {
+            let (tx, rx) = mpsc::channel::<PrefillFlow>(buffer);
+            txs.push(tx);
+            rxs.push(Some(rx));
+        }
+
+        // Spawn one worker task per shard. Each loops on its input
+        // channel until the sender is dropped.
+        let mut worker_handles: Vec<tokio::task::JoinHandle<Result<(usize, Option<(u64, u64, bool, u64, String)>), String>>>
+            = Vec::with_capacity(num_shards);
+        for i in 0..num_shards {
+            let shard = pipeline[i].clone();
+            let client_c = client.clone();
+            let req_id = request_id.clone();
+            let mut rx = rxs[i].take().expect("rx slot populated");
+            let tx_out = txs[i + 1].clone();
+            let is_last_shard = i == num_shards - 1;
+
+            let handle = tokio::spawn(async move {
+                let mut bytes_this_shard: usize = 0;
+                let mut trace: Option<(u64, u64, bool, u64, String)> = None; // (compute_ms, wall_ms, is_terminal, layers, node_name) — first-seen
+                while let Some(item) = rx.recv().await {
+                    let req = ForwardShardRequest {
+                        request_id: req_id.clone(),
+                        token: item.token,
+                        hidden: item.hidden,
+                        hidden_hash: item.hidden_hash,
+                        position: item.position,
+                        start_layer: shard.start_layer,
+                        end_layer: shard.end_layer,
+                        last_token: false,
+                    };
+                    let url = format!("http://{}/inference/forward_shard", shard.socket_addr);
+                    let payload_bytes = serde_json::to_vec(&req).unwrap_or_default();
+                    bytes_this_shard += payload_bytes.len();
+
+                    let t_hop = std::time::Instant::now();
+                    let resp: ForwardShardResponse = match client_c.post(&url)
+                        .header("Content-Type", "application/json")
+                        .body(payload_bytes)
+                        .send()
+                        .await
+                    {
+                        Ok(r) => match r.json::<ForwardShardResponse>().await {
+                            Ok(j) => j,
+                            Err(e) => return Err(format!("Shard {} parse: {}", shard.node_name, e)),
+                        },
+                        Err(e) => return Err(format!("Shard {} ({}): {}", shard.node_name, shard.socket_addr, e)),
+                    };
+                    let hop_ms = t_hop.elapsed().as_millis() as u64;
+
+                    // Capture trace on the FIRST processed position only
+                    if trace.is_none() {
+                        trace = Some((
+                            resp.compute_ms,
+                            hop_ms,
+                            resp.is_terminal,
+                            resp.layers_processed as u64,
+                            shard.node_name.clone(),
+                        ));
+                    }
+
+                    let flow = PrefillFlow {
+                        position: item.position,
+                        token: None,
+                        hidden: resp.hidden,
+                        hidden_hash: resp.hidden_hash,
+                        terminal_token: if is_last_shard { resp.token_id } else { None },
+                    };
+                    if tx_out.send(flow).await.is_err() {
+                        break;
+                    }
+                }
+                Ok((bytes_this_shard, trace))
+            });
+            worker_handles.push(handle);
+        }
+
+        // Feed the entire prompt into shard 0's input channel up front.
+        // The workers will stream through in pipeline order. Drop the
+        // coordinator-held copies of all other channel senders so that
+        // workers observe EOF once their upstream drops.
+        let input_tx = txs.remove(0);
+        // txs[0..num_shards-1] are intermediate senders the workers already
+        // cloned. Drop them so workers see EOF. txs[num_shards-1] is the
+        // LAST shard's output channel that the coordinator reads from —
+        // drop our extra copy too so recv()  unblocks after all positions.
+        drop(txs);
+        for (pos, &tok) in all_tokens.iter().enumerate() {
+            let flow = PrefillFlow {
+                position: pos,
+                token: Some(tok),
+                hidden: None,
+                hidden_hash: None,
+                terminal_token: None,
+            };
+            if input_tx.send(flow).await.is_err() {
+                return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "Prefill input channel closed prematurely"));
+            }
+        }
+        drop(input_tx); // signal end-of-input to shard 0
+
+        // Collect outputs from the tail shard. Order is guaranteed by the
+        // mpsc FIFO and the in-order single-task workers, so items arrive
+        // in ascending position order. The last position's terminal token
+        // is the FIRST generated token.
+        let mut final_rx = rxs[num_shards].take().expect("tail rx slot populated");
+        let mut positions_seen = 0usize;
+        let mut first_generated_token: Option<u32> = None;
+        while let Some(flow) = final_rx.recv().await {
+            positions_seen += 1;
+            if flow.position == prompt_len - 1 {
+                first_generated_token = flow.terminal_token;
+            }
+            if positions_seen >= prompt_len {
+                break;
+            }
+        }
+
+        if positions_seen < prompt_len {
+            return Err(api_error(
+                StatusCode::BAD_GATEWAY,
+                format!("Pipelined prefill incomplete: {}/{} positions arrived at tail shard", positions_seen, prompt_len),
+            ));
+        }
+
+        // Gather per-worker stats (bytes + first-position trace).
+        let mut trace_entries: Vec<(usize, u64, u64, bool, u64, String)> = Vec::new();
+        for (hop, handle) in worker_handles.into_iter().enumerate() {
+            match handle.await {
+                Ok(Ok((bytes, trace))) => {
+                    total_bytes_transferred += bytes;
+                    if let Some((compute_ms, wall_ms, is_terminal, layers, node_name)) = trace {
+                        trace_entries.push((hop, compute_ms, wall_ms, is_terminal, layers, node_name));
+                    }
+                }
+                Ok(Err(e)) => return Err(api_error(StatusCode::BAD_GATEWAY, e)),
+                Err(e) => return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Join worker: {}", e))),
+            }
+        }
+        trace_entries.sort_by_key(|(h, _, _, _, _, _)| *h);
+        for (hop, compute_ms, wall_ms, is_terminal, layers, node_name) in trace_entries {
+            let shard = &pipeline[hop];
+            shard_trace.push(json!({
+                "hop": hop,
+                "node": node_name,
+                "node_name": shard.node_name,
+                "socket": shard.socket_addr,
+                "layers": format!("{}..{}", shard.start_layer, shard.end_layer),
+                "layers_count": layers,
+                "compute_ms": compute_ms,
+                "wall_ms": wall_ms,
+                "payload_bytes": 0, // per-shard in-flight; total is in total_bytes_transferred
+                "is_terminal": is_terminal,
+            }));
+        }
+
+        // The LAST prompt position's output at the tail shard is the FIRST
+        // generated token. Record it before starting sequential generation.
+        if let Some(tok) = first_generated_token {
+            if !model.config.eos_tokens.contains(&tok) {
+                generated.push(tok);
+            }
+        }
+    }
+    // ─── End pipelined prefill ────────────────────────────────────────
+
+    // Sequential generation for remaining tokens. Each token depends on
+    // the previous one's logits so pipeline parallelism does not apply.
+    // We skip the first output (already captured during prefill tail).
+    for gen_idx in 1..(max_tokens as usize) {
+        if let Some(last) = generated.last() {
+            if model.config.eos_tokens.contains(last) {
+                break;
+            }
+        }
+        let position = prompt_len + gen_idx - 1; // position of the NEW token we feed in
+        let input_token = *generated.last().unwrap_or(&all_tokens[prompt_len - 1]);
+
         let mut current_payload: ForwardShardRequest = ForwardShardRequest {
             request_id: request_id.clone(),
             token: Some(input_token),
@@ -3474,17 +3698,14 @@ async fn inference_run_sharded(
         };
 
         let mut next_token_id: Option<u32> = None;
-        for (idx, shard) in pipeline.iter().enumerate() {
-            // Update layer range for this shard
+        for shard in pipeline.iter() {
             current_payload.start_layer = shard.start_layer;
             current_payload.end_layer = shard.end_layer;
 
             let url = format!("http://{}/inference/forward_shard", shard.socket_addr);
             let payload_bytes = serde_json::to_vec(&current_payload).unwrap_or_default();
-            let payload_size = payload_bytes.len();
-            total_bytes_transferred += payload_size;
+            total_bytes_transferred += payload_bytes.len();
 
-            let t_hop = std::time::Instant::now();
             let resp: ForwardShardResponse = client.post(&url)
                 .header("Content-Type", "application/json")
                 .body(payload_bytes)
@@ -3494,49 +3715,28 @@ async fn inference_run_sharded(
                 .json()
                 .await
                 .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("Shard {} parse: {}", shard.node_name, e)))?;
-            let hop_ms = t_hop.elapsed().as_millis() as u64;
-
-            // Trace this hop (only on the FIRST position to avoid huge payload)
-            if position == 0 || (position == prompt_len && !generated.is_empty()) {
-                shard_trace.push(json!({
-                    "hop": idx,
-                    "node": shard.node_name,
-                    "socket": shard.socket_addr,
-                    "layers": format!("{}..{}", shard.start_layer, shard.end_layer),
-                    "layers_count": resp.layers_processed,
-                    "compute_ms": resp.compute_ms,
-                    "wall_ms": hop_ms,
-                    "payload_bytes": payload_size,
-                    "is_terminal": resp.is_terminal,
-                }));
-            }
 
             if resp.is_terminal {
                 next_token_id = resp.token_id;
                 break;
             }
-
-            // Prepare next hop's payload
             current_payload = ForwardShardRequest {
                 request_id: request_id.clone(),
                 token: None,
                 hidden: resp.hidden,
                 hidden_hash: resp.hidden_hash,
                 position,
-                start_layer: 0, // overwritten on next iter
+                start_layer: 0,
                 end_layer: 0,
                 last_token: false,
             };
         }
 
-        // After prompt prefill, start collecting generated tokens
-        if position >= prompt_len {
-            if let Some(tok) = next_token_id {
-                if model.config.eos_tokens.contains(&tok) {
-                    break;
-                }
-                generated.push(tok);
+        if let Some(tok) = next_token_id {
+            if model.config.eos_tokens.contains(&tok) {
+                break;
             }
+            generated.push(tok);
         }
     }
 
