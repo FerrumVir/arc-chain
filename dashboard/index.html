@@ -729,6 +729,10 @@ async function runShardedInference(){
         </tr>
       `).join('');
 
+      const attestation = d.attestation || {};
+      const txHash = attestation.tx_hash || '';
+      const explorerUrl = d.explorer_url || (txHash ? `/tx/${txHash}` : '');
+      const txHashShort = txHash ? `${txHash.slice(0, 18)}…` : '—';
       resultEl.innerHTML = `
         <div class="bg-surface-2 border border-emerald-500/40 rounded-xl p-4">
           <div class="flex items-center justify-between mb-2">
@@ -739,10 +743,14 @@ async function runShardedInference(){
             <div class="text-[10px] text-gray-500 mb-1">→ ${prompt}</div>
             <div class="text-sm text-white leading-snug">${(d.output || '').replace(/</g,'&lt;')}</div>
           </div>
-          <div class="grid grid-cols-3 gap-3 mb-3">
+          <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
             <div class="bg-surface-3 rounded p-2 text-center">
               <div class="text-[9px] uppercase text-gray-500">Output hash (BLAKE3)</div>
-              <div class="text-[10px] mono text-arc-400 truncate" title="${d.output_hash}">${(d.output_hash || '').slice(0, 22)}…</div>
+              <div class="text-[10px] mono text-arc-400 truncate" title="${d.output_hash}">${(d.output_hash || '').slice(0, 18)}…</div>
+            </div>
+            <div class="bg-surface-3 rounded p-2 text-center">
+              <div class="text-[9px] uppercase text-gray-500">On-chain attestation</div>
+              ${txHash ? `<a href="${RPC}${explorerUrl}" target="_blank" class="text-[10px] mono text-emerald-400 truncate hover:underline" title="${txHash}">${txHashShort} ↗</a>` : '<div class="text-[10px] text-gray-500">—</div>'}
             </div>
             <div class="bg-surface-3 rounded p-2 text-center">
               <div class="text-[9px] uppercase text-gray-500">ms / token</div>
