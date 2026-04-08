@@ -15,7 +15,20 @@ This is how a 7B model gets shared across 7 cheap VPS, and how a 70B model gets 
 > **Live demo:** http://140.82.16.112:3200
 > Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the activation reaches it. The trace table shows compute_ms, wall_ms, and payload bytes per hop, and the output_hash matches every replay.
 
-## Try it from your terminal in 5 seconds
+## Try the full demo from your terminal
+
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash
+```
+
+This single command:
+1. **Discovers the live shard pipeline** — prints every node, its layer range, and how much RAM it holds
+2. **Runs a real Llama-2-7B inference** through the 7-shard pipeline and shows the per-hop trace (compute_ms / wall_ms / payload bytes per node)
+3. **Re-runs the same prompt** and verifies the BLAKE3 hash is bit-identical (cryptographic determinism proof)
+4. **Runs a different prompt** and verifies the hash is different (per-request KV cache isolation proof)
+5. **Prints the install command** so you can join the network
+
+Or, just the inference call:
 
 ```bash
 curl -X POST http://149.28.32.76:9090/inference/run_sharded \
@@ -23,7 +36,7 @@ curl -X POST http://149.28.32.76:9090/inference/run_sharded \
   -d '{"input":"The largest planet is","max_tokens":15}'
 ```
 
-Returns a real Llama-2-7B answer along with the full per-hop trace showing every node that contributed compute. Run it twice — the `output_hash` is bit-identical. Run a different prompt — the hash changes. That's verifiable distributed inference.
+Returns a real Llama-2-7B answer along with the full per-hop trace.
 
 ## Run a node in one command
 
