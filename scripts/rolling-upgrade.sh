@@ -110,11 +110,8 @@ for idx in $(seq 0 $((TOTAL - 1))); do
         "$HOME/arc-chain/testnet-seeds.txt" "$HOME/arc-chain/genesis.toml" \
         "root@${IP}:/root/arc-chain/"
 
-    # e. Start new node in screen. Load model on LAX for inference demo.
-    MODEL_FLAG=""
-    if [ "$NODE" = "LAX" ]; then
-        MODEL_FLAG="--model model.gguf"
-    fi
+    # e. Start new node in screen. Load model on every seed (all 8 serve inference).
+    MODEL_FLAG="--model model.gguf"
     info "Starting new node${MODEL_FLAG:+ with inference}..."
     ssh $SSH_OPTS "root@${IP}" "cd /root/arc-chain && screen -dmS arc ./target/release/arc-node \
         --rpc 0.0.0.0:${RPC_PORT} \

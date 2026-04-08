@@ -122,6 +122,19 @@ struct Cli {
     /// Enables the /inference/run RPC endpoint with real deterministic inference.
     #[arg(long)]
     model: Option<String>,
+
+    /// First layer index to load (inclusive). Pipeline-parallel sharding.
+    /// Together with --shard-end, makes this node a SHARD HOLDER for a slice
+    /// of the model. Embeddings load only when --shard-start=0; output head
+    /// loads only when --shard-end=n_layers.
+    /// Example: 80-layer Llama-70B split 8 ways → node 0 uses --shard-start 0
+    /// --shard-end 10, node 1 uses --shard-start 10 --shard-end 20, etc.
+    #[arg(long)]
+    shard_start: Option<usize>,
+
+    /// Last layer index to load (exclusive). Pipeline-parallel sharding.
+    #[arg(long)]
+    shard_end: Option<usize>,
 }
 
 #[tokio::main]
@@ -472,15 +485,27 @@ async fn main() -> Result<()> {
             let load_start = Instant::now();
             let load_result = if tokenizer_path.ends_with(".arc-int8") {
                 arc_inference::cached_integer_model::load_cached_model_binary(&tokenizer_path)
+            } else if let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end) {
+                tracing::info!("SHARD MODE: loading layers [{}, {}) only", start, end);
+                arc_inference::cached_integer_model::load_cached_model_shard(&tokenizer_path, start, end)
             } else {
                 arc_inference::cached_integer_model::load_cached_model(&tokenizer_path)
             };
             match load_result {
                 Ok(model) => {
                     let elapsed = load_start.elapsed();
-                    tracing::info!("Model loaded in {:.1}s — {} MB, {} layers, vocab {}",
-                        elapsed.as_secs_f64(), model.memory_bytes() / (1024*1024),
-                        model.config.n_layers, model.config.vocab_size);
+                    let mb_held: usize = model.layers.iter()
+                        .filter(|l| l.is_loaded())
+                        .map(|l| l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
+                            + l.wo.memory_bytes() + l.w_gate.memory_bytes() + l.w_up.memory_bytes()
+                            + l.w_down.memory_bytes())
+                        .sum::<usize>() / (1024 * 1024);
+                    let layers_held = model.layers.iter().filter(|l| l.is_loaded()).count();
+                    tracing::info!(
+                        "Model loaded in {:.1}s — {} layers held / {} total, {} MB shard weights, vocab {}",
+                        elapsed.as_secs_f64(), layers_held, model.config.n_layers, mb_held,
+                        model.config.vocab_size
+                    );
                     Some(Arc::new(model))
                 }
                 Err(e) => {
@@ -688,6 +713,73 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Build shard_info if this node is a shard holder, then broadcast it
+    // to all seed peers so the network's shard registry converges.
+    let shard_info_for_broadcast = match (cli.shard_start, cli.shard_end, &inference_model) {
+        (Some(start), Some(end), Some(model)) => {
+            let total_layers = model.config.n_layers;
+            let memory_mb: usize = model.layers.iter()
+                .filter(|l| l.is_loaded())
+                .map(|l| l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
+                    + l.wo.memory_bytes() + l.w_gate.memory_bytes() + l.w_up.memory_bytes()
+                    + l.w_down.memory_bytes())
+                .sum::<usize>() / (1024 * 1024);
+            // Estimate full model size: extrapolate from this shard
+            let layers_held = end.saturating_sub(start).max(1);
+            let full_model_mb = memory_mb * total_layers / layers_held;
+            // Build a stable model id from config
+            let model_id_data = format!(
+                "arc-{}L-{}d-{}h-{}v",
+                model.config.n_layers, model.config.d_model,
+                model.config.n_heads, model.config.vocab_size
+            );
+            let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
+            // Public socket: prefer external IP if known, fall back to listening port
+            let socket_addr = std::env::var("ARC_PUBLIC_SOCKET")
+                .unwrap_or_else(|_| format!("{}:{}", rpc_addr.split(':').next().unwrap_or("127.0.0.1"), rpc_addr.split(':').nth(1).unwrap_or("9090")));
+            Some(rpc::ShardInfo {
+                start_layer: start,
+                end_layer: end,
+                total_layers,
+                model_id: format!("0x{}", hex::encode(&model_id_hash.0)),
+                model_name: model_id_data,
+                memory_mb,
+                full_model_mb,
+                socket_addr,
+                node_name: validator_seed.clone(),
+            })
+        }
+        _ => None,
+    };
+    let shard_info = shard_info_for_broadcast.clone();
+
+    // Spawn a background task that announces this node's shard to all seeds.
+    // Runs once at startup + every 60s so new nodes joining later still discover us.
+    if let Some(si) = shard_info_for_broadcast.clone() {
+        let seed_addrs: Vec<String> = peers.iter()
+            .filter_map(|p| p.split(':').next().map(|host| format!("{}:9090", host)))
+            .collect();
+        tokio::spawn(async move {
+            // Wait a bit for peers to come up
+            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            loop {
+                let payload = serde_json::json!({"shard": &si});
+                for addr in &seed_addrs {
+                    let url = format!("http://{}/shards/announce", addr);
+                    let _ = client.post(&url).json(&payload).send().await;
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+        tracing::info!("Shard announcement broadcaster started");
+    }
+
     rpc::serve(
         &rpc_addr,
         state,
@@ -702,6 +794,7 @@ async fn main() -> Result<()> {
         Some(dag_validators),
         Some(dag_round),
         Some(dag_committed),
+        shard_info,
     )
     .await?;
 

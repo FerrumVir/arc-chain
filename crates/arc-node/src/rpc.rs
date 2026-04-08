@@ -55,6 +55,39 @@ pub struct NodeState {
     pub dag_committed: Arc<AtomicU64>,
     /// Inference results indexed by attestation tx hash — for explorer display.
     pub inference_results: Arc<dashmap::DashMap<String, Value>>,
+    /// Pipeline-parallel sharding: this node's layer range, if any.
+    /// Set when the node is started with --shard-start/--shard-end flags.
+    pub shard_info: Option<ShardInfo>,
+    /// Per-request KV cache for sharded inference. Key: request_id (Hash256 hex).
+    /// Each entry is an Arc<Mutex<KVCache>> so handlers can clone the Arc and
+    /// release the DashMap shard lock immediately.
+    pub shard_kv_caches: Arc<dashmap::DashMap<String, Arc<std::sync::Mutex<arc_inference::cached_integer_model::KVCache>>>>,
+    /// Network-wide shard registry (gossiped via /shards/announce).
+    /// Maps node socket addr → ShardInfo.
+    pub shard_registry: Arc<dashmap::DashMap<String, ShardInfo>>,
+}
+
+/// Describes which slice of a model a node holds.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShardInfo {
+    /// First layer index (inclusive).
+    pub start_layer: usize,
+    /// Last layer index (exclusive).
+    pub end_layer: usize,
+    /// Total layer count of the full model (so dashboard can compute %).
+    pub total_layers: usize,
+    /// Model identifier (hex of model_id hash).
+    pub model_id: String,
+    /// Human-readable model name (from GGUF metadata).
+    pub model_name: String,
+    /// Memory used by the layers held on this node, in MB.
+    pub memory_mb: usize,
+    /// Memory the FULL model would use, in MB.
+    pub full_model_mb: usize,
+    /// Public socket of this node (for the next shard to forward to).
+    pub socket_addr: String,
+    /// Friendly node name (NYC, LAX, ...).
+    pub node_name: String,
 }
 
 /// Build a `NodeState` from components.
@@ -88,6 +121,9 @@ pub fn build_node_state(
         dag_round: Arc::new(AtomicU64::new(0)),
         dag_committed: Arc::new(AtomicU64::new(0)),
         inference_results: Arc::new(dashmap::DashMap::new()),
+        shard_info: None,
+        shard_kv_caches: Arc::new(dashmap::DashMap::new()),
+        shard_registry: Arc::new(dashmap::DashMap::new()),
     }
 }
 
@@ -106,6 +142,7 @@ pub async fn serve(
     dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
     dag_round: Option<Arc<AtomicU64>>,
     dag_committed: Option<Arc<AtomicU64>>,
+    shard_info: Option<ShardInfo>,
 ) -> anyhow::Result<()> {
     let mut node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
     if let Some(dv) = dag_validators {
@@ -116,6 +153,11 @@ pub async fn serve(
     }
     if let Some(c) = dag_committed {
         node.dag_committed = c;
+    }
+    node.shard_info = shard_info.clone();
+    // Seed the local registry with our own shard so /shards always shows us
+    if let Some(si) = &shard_info {
+        node.shard_registry.insert(si.socket_addr.clone(), si.clone());
     }
 
     let app = Router::new()
@@ -160,6 +202,12 @@ pub async fn serve(
         .route("/inference/run", post(inference_run))
         .route("/inference/attestations", get(inference_list_attestations))
         .route("/inference/results", get(inference_list_results))
+        // Pipeline-parallel sharded inference
+        .route("/inference/run_sharded", post(inference_run_sharded))
+        .route("/inference/forward_shard", post(inference_forward_shard))
+        // Shard registry — discovery + announcement
+        .route("/shards", get(get_shards))
+        .route("/shards/announce", post(announce_shard))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -2964,4 +3012,432 @@ async fn inference_list_results(
         "results": results,
         "count": results.len(),
     }))
+}
+
+// ─── Sharded Inference: Pipeline-Parallel ──────────────────────────────────
+//
+// The model is split across N nodes. A request flows:
+//   client → coordinator → shard0 (layers 0..k0)
+//                       → shard1 (layers k0..k1)
+//                       → ...
+//                       → shardN-1 (layers kN-1..n_layers + LM head)
+// Each shard holds a per-request KV cache that lives across token generation.
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ForwardShardRequest {
+    /// Unique request id (hex). The receiving shard uses this as the KV cache key.
+    request_id: String,
+    /// Either a token id (only valid on first shard) or a hidden state (i64s).
+    #[serde(default)]
+    token: Option<u32>,
+    #[serde(default)]
+    hidden: Option<Vec<i64>>,
+    /// Hash of the hidden state for integrity verification (BLAKE3 hex).
+    #[serde(default)]
+    hidden_hash: Option<String>,
+    /// Token position in the sequence (for RoPE + KV cache).
+    position: usize,
+    /// Layer range this node should process.
+    start_layer: usize,
+    end_layer: usize,
+    /// True if this is the last token of the request — used to evict KV cache.
+    #[serde(default)]
+    last_token: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ForwardShardResponse {
+    /// True if this shard ran the LM head and produced a token.
+    is_terminal: bool,
+    /// Hidden state to forward to the next shard (if not terminal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hidden: Option<Vec<i64>>,
+    /// BLAKE3 hash of the hidden state for next-shard verification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hidden_hash: Option<String>,
+    /// Token id (if terminal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_id: Option<u32>,
+    /// Hash of the logits (if terminal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logits_hash: Option<String>,
+    /// Layers this shard processed.
+    layers_processed: usize,
+    /// Compute time for this shard, in milliseconds.
+    compute_ms: u64,
+    /// Friendly node name.
+    node_name: String,
+}
+
+/// POST /inference/forward_shard
+/// Run the local shard's slice of layers on the incoming hidden state (or token).
+async fn inference_forward_shard(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<ForwardShardRequest>,
+) -> Result<Json<ForwardShardResponse>, (StatusCode, String)> {
+    let model = node.inference_model.as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "No model loaded".to_string()))?;
+    let shard = node.shard_info.as_ref()
+        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Node is not a shard holder".to_string()))?;
+
+    // Verify this node holds the requested layer range
+    if req.start_layer != shard.start_layer || req.end_layer != shard.end_layer {
+        return Err((StatusCode::BAD_REQUEST, format!(
+            "Shard mismatch: requested [{}, {}) but this node holds [{}, {})",
+            req.start_layer, req.end_layer, shard.start_layer, shard.end_layer
+        )));
+    }
+
+    // Decode input
+    use arc_inference::cached_integer_model::{ShardInput, ShardOutput, KVCache};
+
+    let input = if let Some(token) = req.token {
+        // Verify this is the first shard (only first shard accepts a raw token)
+        if shard.start_layer != 0 {
+            return Err((StatusCode::BAD_REQUEST, "Only the first shard accepts a raw token".to_string()));
+        }
+        ShardInput::Token(token)
+    } else if let Some(hidden) = req.hidden {
+        // Verify integrity hash if provided
+        if let Some(expected_hex) = &req.hidden_hash {
+            let bytes: Vec<u8> = hidden.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let actual = arc_crypto::hash_bytes(&bytes);
+            let actual_hex = format!("0x{}", hex::encode(&actual.0));
+            if &actual_hex != expected_hex {
+                return Err((StatusCode::BAD_REQUEST, format!(
+                    "Hidden state integrity check failed: expected {}, got {}", expected_hex, actual_hex
+                )));
+            }
+        }
+        ShardInput::Hidden(hidden)
+    } else {
+        return Err((StatusCode::BAD_REQUEST, "Need either 'token' or 'hidden' field".to_string()));
+    };
+
+    // Get-or-create per-request KV cache
+    let n_layers = model.config.n_layers;
+    let cache_arc = node.shard_kv_caches
+        .entry(req.request_id.clone())
+        .or_insert_with(|| Arc::new(std::sync::Mutex::new(KVCache::new(n_layers))))
+        .value()
+        .clone();
+
+    // Run the shard's forward pass (blocking — uses spawn_blocking to free runtime)
+    let model_clone = model.clone();
+    let req_id = req.request_id.clone();
+    let start_layer = shard.start_layer;
+    let end_layer = shard.end_layer;
+    let position = req.position;
+    let node_name = shard.node_name.clone();
+
+    let t0 = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || -> Result<ShardOutput, String> {
+        let cache_arc = cache_arc;
+        let mut cache = cache_arc.lock().map_err(|e| format!("KV lock: {}", e))?;
+        Ok(model_clone.forward_shard_token(input, &mut *cache, start_layer, end_layer, position))
+    }).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let compute_ms = t0.elapsed().as_millis() as u64;
+
+    // Optionally evict cache after the last token
+    if req.last_token {
+        node.shard_kv_caches.remove(&req_id);
+    }
+
+    let layers_processed = end_layer - start_layer;
+    let response = match result {
+        ShardOutput::Hidden(state) => {
+            let bytes: Vec<u8> = state.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let h = arc_crypto::hash_bytes(&bytes);
+            ForwardShardResponse {
+                is_terminal: false,
+                hidden: Some(state),
+                hidden_hash: Some(format!("0x{}", hex::encode(&h.0))),
+                token_id: None,
+                logits_hash: None,
+                layers_processed,
+                compute_ms,
+                node_name,
+            }
+        }
+        ShardOutput::Token { id, logits_hash } => {
+            ForwardShardResponse {
+                is_terminal: true,
+                hidden: None,
+                hidden_hash: None,
+                token_id: Some(id),
+                logits_hash: Some(format!("0x{}", hex::encode(&logits_hash.0))),
+                layers_processed,
+                compute_ms,
+                node_name,
+            }
+        }
+    };
+    Ok(Json(response))
+}
+
+/// POST /inference/run_sharded
+/// Coordinator endpoint: walks the pipeline of shard-holding nodes and
+/// generates `max_tokens` tokens by forwarding hidden states between shards.
+///
+/// Returns the full output, all per-shard timings, and the network bandwidth
+/// used so the dashboard can show the activation flow.
+async fn inference_run_sharded(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let input_text = req.get("input")
+        .and_then(|v| v.as_str())
+        .ok_or(api_error(StatusCode::BAD_REQUEST, "'input' field required"))?;
+    let max_tokens = req.get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .min(256) as u32;
+
+    // We need a local model copy for tokenization
+    let model = node.inference_model.as_ref()
+        .ok_or(api_error(StatusCode::SERVICE_UNAVAILABLE, "Coordinator needs a local model loaded for tokenization"))?;
+
+    // Build the pipeline from the local shard registry, sorted by start_layer
+    let mut pipeline: Vec<ShardInfo> = node.shard_registry.iter().map(|e| e.value().clone()).collect();
+    pipeline.sort_by_key(|s| s.start_layer);
+
+    if pipeline.is_empty() {
+        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "No shards announced. Need shard registry to be populated."));
+    }
+
+    // Verify the pipeline is contiguous and covers all layers
+    let n_layers = pipeline[0].total_layers;
+    let mut covered_to = 0usize;
+    for shard in &pipeline {
+        if shard.start_layer != covered_to {
+            return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
+                "Pipeline gap: expected layer {} next, got shard [{}, {})",
+                covered_to, shard.start_layer, shard.end_layer
+            )));
+        }
+        covered_to = shard.end_layer;
+    }
+    if covered_to != n_layers {
+        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
+            "Pipeline incomplete: covered layers 0..{} but model has {} layers",
+            covered_to, n_layers
+        )));
+    }
+
+    let request_id = format!("0x{}", hex::encode(arc_crypto::hash_bytes(format!("{}-{}", input_text, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)).as_bytes()).0));
+
+    // Tokenize input
+    let templated = model.apply_chat_template(input_text);
+    let prompt_tokens = model.encode(&templated);
+    let mut all_tokens: Vec<u32> = vec![model.config.bos_token];
+    all_tokens.extend(&prompt_tokens);
+
+    let overall_start = std::time::Instant::now();
+    let mut generated: Vec<u32> = Vec::new();
+    let mut shard_trace: Vec<Value> = Vec::new();
+    let mut total_bytes_transferred: usize = 0;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("HTTP client: {}", e)))?;
+
+    // Process the entire prompt through the pipeline (all positions)
+    // For position 0..prompt_len: prefill (all shards process the prompt token)
+    // Then generate up to max_tokens
+    let prompt_len = all_tokens.len();
+    let total_positions = prompt_len + max_tokens as usize;
+
+    for position in 0..total_positions {
+        // Determine the input token for this position
+        let input_token: u32 = if position < prompt_len {
+            all_tokens[position]
+        } else {
+            *generated.last().unwrap_or(&all_tokens[prompt_len - 1])
+        };
+
+        // Walk the pipeline: first shard receives token id, others receive hidden
+        let mut current_payload: ForwardShardRequest = ForwardShardRequest {
+            request_id: request_id.clone(),
+            token: Some(input_token),
+            hidden: None,
+            hidden_hash: None,
+            position,
+            start_layer: pipeline[0].start_layer,
+            end_layer: pipeline[0].end_layer,
+            last_token: false,
+        };
+
+        let mut next_token_id: Option<u32> = None;
+        for (idx, shard) in pipeline.iter().enumerate() {
+            // Update layer range for this shard
+            current_payload.start_layer = shard.start_layer;
+            current_payload.end_layer = shard.end_layer;
+
+            let url = format!("http://{}/inference/forward_shard", shard.socket_addr);
+            let payload_bytes = serde_json::to_vec(&current_payload).unwrap_or_default();
+            let payload_size = payload_bytes.len();
+            total_bytes_transferred += payload_size;
+
+            let t_hop = std::time::Instant::now();
+            let resp: ForwardShardResponse = client.post(&url)
+                .header("Content-Type", "application/json")
+                .body(payload_bytes)
+                .send()
+                .await
+                .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("Shard {} ({}): {}", shard.node_name, shard.socket_addr, e)))?
+                .json()
+                .await
+                .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("Shard {} parse: {}", shard.node_name, e)))?;
+            let hop_ms = t_hop.elapsed().as_millis() as u64;
+
+            // Trace this hop (only on the FIRST position to avoid huge payload)
+            if position == 0 || (position == prompt_len && !generated.is_empty()) {
+                shard_trace.push(json!({
+                    "hop": idx,
+                    "node": shard.node_name,
+                    "socket": shard.socket_addr,
+                    "layers": format!("{}..{}", shard.start_layer, shard.end_layer),
+                    "layers_count": resp.layers_processed,
+                    "compute_ms": resp.compute_ms,
+                    "wall_ms": hop_ms,
+                    "payload_bytes": payload_size,
+                    "is_terminal": resp.is_terminal,
+                }));
+            }
+
+            if resp.is_terminal {
+                next_token_id = resp.token_id;
+                break;
+            }
+
+            // Prepare next hop's payload
+            current_payload = ForwardShardRequest {
+                request_id: request_id.clone(),
+                token: None,
+                hidden: resp.hidden,
+                hidden_hash: resp.hidden_hash,
+                position,
+                start_layer: 0, // overwritten on next iter
+                end_layer: 0,
+                last_token: false,
+            };
+        }
+
+        // After prompt prefill, start collecting generated tokens
+        if position >= prompt_len {
+            if let Some(tok) = next_token_id {
+                if model.config.eos_tokens.contains(&tok) {
+                    break;
+                }
+                generated.push(tok);
+            }
+        }
+    }
+
+    // Cleanup: send final request with last_token=true to evict KV caches
+    for shard in &pipeline {
+        let cleanup_payload = ForwardShardRequest {
+            request_id: request_id.clone(),
+            token: None,
+            hidden: Some(vec![0i64; model.config.d_model]),
+            hidden_hash: None,
+            position: 0,
+            start_layer: shard.start_layer,
+            end_layer: shard.end_layer,
+            last_token: true,
+        };
+        let _ = node.shard_kv_caches.remove(&request_id);
+        let _ = client.post(format!("http://{}/inference/forward_shard", shard.socket_addr))
+            .json(&serde_json::json!({"request_id": request_id, "last_token": true}))
+            .send()
+            .await;
+        let _ = cleanup_payload;
+    }
+
+    let total_ms = overall_start.elapsed().as_millis() as u64;
+    let output_text = model.decode(&generated);
+    let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let output_hash = arc_crypto::hash_bytes(&output_bytes);
+
+    let model_id_data = format!(
+        "arc-{}L-{}d-{}h-{}v",
+        model.config.n_layers, model.config.d_model,
+        model.config.n_heads, model.config.vocab_size
+    );
+
+    Ok(Json(json!({
+        "success": true,
+        "request_id": request_id,
+        "input": input_text,
+        "output": output_text,
+        "output_tokens": generated,
+        "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+        "tokens_generated": generated.len(),
+        "total_ms": total_ms,
+        "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
+        "pipeline_length": pipeline.len(),
+        "model": model_id_data,
+        "shard_trace": shard_trace,
+        "total_bytes_transferred": total_bytes_transferred,
+        "deterministic": true,
+        "engine": "INT8 sharded pipeline (cross-platform deterministic)",
+    })))
+}
+
+/// GET /shards
+/// Returns the local shard registry — every node this coordinator knows about
+/// and which layer range it holds.
+async fn get_shards(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let mut shards: Vec<ShardInfo> = node.shard_registry.iter().map(|e| e.value().clone()).collect();
+    shards.sort_by_key(|s| s.start_layer);
+
+    let total_layers = shards.first().map(|s| s.total_layers).unwrap_or(0);
+    let total_full_mb = shards.first().map(|s| s.full_model_mb).unwrap_or(0);
+    let total_held_mb: usize = shards.iter().map(|s| s.memory_mb).sum();
+    let model_id = shards.first().map(|s| s.model_id.clone()).unwrap_or_default();
+    let model_name = shards.first().map(|s| s.model_name.clone()).unwrap_or_default();
+
+    let mut covered_to = 0usize;
+    let mut contiguous = true;
+    for shard in &shards {
+        if shard.start_layer != covered_to {
+            contiguous = false;
+            break;
+        }
+        covered_to = shard.end_layer;
+    }
+    let fully_covered = contiguous && covered_to == total_layers && total_layers > 0;
+
+    Json(json!({
+        "shards": shards,
+        "shard_count": shards.len(),
+        "total_layers": total_layers,
+        "fully_covered": fully_covered,
+        "model_id": model_id,
+        "model_name": model_name,
+        "full_model_mb": total_full_mb,
+        "total_distributed_mb": total_held_mb,
+        "self_shard": node.shard_info,
+    }))
+}
+
+#[derive(serde::Deserialize)]
+struct AnnounceShardRequest {
+    shard: ShardInfo,
+}
+
+/// POST /shards/announce
+/// Other nodes call this to register their shard with our local registry.
+async fn announce_shard(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<AnnounceShardRequest>,
+) -> Json<Value> {
+    let key = req.shard.socket_addr.clone();
+    node.shard_registry.insert(key, req.shard);
+    Json(json!({"ok": true, "registry_size": node.shard_registry.len()}))
 }

@@ -65,6 +65,12 @@ impl I8Weights {
     pub fn memory_bytes(&self) -> usize {
         self.data.len() + self.scales.len() * 8 + 16
     }
+
+    /// Zero-memory placeholder used by sharded loading for layers this node
+    /// does NOT hold. The forward path will skip these slots.
+    pub fn empty() -> Self {
+        Self { data: Vec::new(), scales: Vec::new(), n_rows: 0, n_cols: 0 }
+    }
 }
 
 // ─── INT16 Weight Storage (Per-Row Quantization, Feature-Gated) ──────────────
@@ -158,6 +164,30 @@ pub struct CachedLayer {
     pub w_down: I8Weights,  // [d_model × d_ff]
     pub attn_norm: Vec<i64>, // norms stay i64 (small: d_model each)
     pub ffn_norm: Vec<i64>,
+}
+
+impl CachedLayer {
+    /// Zero-memory placeholder for layer slots NOT held by this shard.
+    /// The pipeline forward pass only iterates [shard_start, shard_end), so
+    /// these slots are never read. Total cost: ~144 bytes per skipped layer.
+    pub fn placeholder() -> Self {
+        Self {
+            wq: I8Weights::empty(),
+            wk: I8Weights::empty(),
+            wv: I8Weights::empty(),
+            wo: I8Weights::empty(),
+            w_gate: I8Weights::empty(),
+            w_up: I8Weights::empty(),
+            w_down: I8Weights::empty(),
+            attn_norm: Vec::new(),
+            ffn_norm: Vec::new(),
+        }
+    }
+
+    /// True if this slot was populated by the loader (vs a placeholder).
+    pub fn is_loaded(&self) -> bool {
+        self.wq.n_rows > 0
+    }
 }
 
 /// KV cache — full i64 precision for deterministic attention.
@@ -1862,6 +1892,179 @@ impl CachedIntegerModel {
         let hash = hasher.finalize();
         Hash256(*hash.as_bytes())
     }
+
+    /// Run a single token through layers [start_layer, end_layer) of this shard.
+    ///
+    /// `input`:
+    ///   - First shard (start_layer == 0): pass `ShardInput::Token(token_id)`.
+    ///     The function looks up the embedding internally.
+    ///   - Middle/last shards: pass `ShardInput::Hidden(state)` from the previous shard.
+    ///
+    /// `position`: token position in the sequence (for RoPE + KV cache push).
+    /// `cache`: per-request KV cache (lives across tokens; size = n_layers).
+    ///
+    /// Returns:
+    ///   - Last shard (end_layer == n_layers): `ShardOutput::Token { id, logits_hash }`.
+    ///     Runs final_norm + LM head + argmax to produce the next token id.
+    ///   - First/middle shards: `ShardOutput::Hidden(state)` to forward to the next shard.
+    pub fn forward_shard_token(
+        &self,
+        input: ShardInput,
+        cache: &mut KVCache,
+        start_layer: usize,
+        end_layer: usize,
+        position: usize,
+    ) -> ShardOutput {
+        let cfg = &self.config;
+        let d = cfg.d_model;
+        let is_first = start_layer == 0;
+        let is_last = end_layer == cfg.n_layers;
+
+        // ── Input: token id (first shard) → embedding lookup ──
+        // ── Input: hidden state (middle/last) → use directly ──
+        let mut hidden: Vec<i64> = match input {
+            ShardInput::Token(token_id) => {
+                debug_assert!(is_first, "Token input is only valid on the first shard");
+                let idx = (token_id as usize).min(cfg.vocab_size - 1);
+                let emb_start = idx * d;
+                self.embedding_q16[emb_start..emb_start + d].to_vec()
+            }
+            ShardInput::Hidden(state) => {
+                debug_assert!(state.len() == d,
+                    "Shard hidden state has wrong dimension: got {}, expected {}", state.len(), d);
+                state
+            }
+        };
+
+        // Pre-allocate buffers reused across layers
+        let mut q = vec![0i64; d];
+        let mut k_buf = vec![0i64; cfg.d_kv];
+        let mut v_buf = vec![0i64; cfg.d_kv];
+        let mut attn_out = vec![0i64; d];
+        let mut projected = vec![0i64; d];
+        let mut gate = vec![0i64; cfg.d_ff];
+        let mut up = vec![0i64; cfg.d_ff];
+        let mut ff_out = vec![0i64; d];
+
+        let end = end_layer.min(self.layers.len());
+
+        for layer_idx in start_layer..end {
+            let layer = &self.layers[layer_idx];
+            debug_assert!(layer.is_loaded(),
+                "Shard does not hold layer {} (range was [{}, {}))", layer_idx, start_layer, end);
+
+            // LayerNorm
+            let normed = layernorm(&hidden, &layer.attn_norm);
+            let normed_q = QuantizedInput::from_i64(&normed);
+
+            // Q/K/V projections (I8 path — sharded loader uses I8 only)
+            matmul_fast_preq(&layer.wq, &normed_q, &normed, d, &mut q);
+            matmul_fast_preq(&layer.wk, &normed_q, &normed, d, &mut k_buf);
+            matmul_fast_preq(&layer.wv, &normed_q, &normed, d, &mut v_buf);
+
+            // RoPE on Q and K
+            for h in 0..cfg.n_heads {
+                apply_rope(
+                    &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
+                    position, cfg.d_head, &cfg.rope_cos, &cfg.rope_sin,
+                );
+            }
+            for h in 0..cfg.n_kv_heads {
+                apply_rope(
+                    &mut k_buf[h * cfg.d_head..(h + 1) * cfg.d_head],
+                    position, cfg.d_head, &cfg.rope_cos, &cfg.rope_sin,
+                );
+            }
+
+            // Push K/V into per-request cache
+            cache.push_k(layer_idx, &k_buf);
+            cache.push_v(layer_idx, &v_buf);
+
+            // Multi-head attention against the full KV cache for this layer
+            let full_seq = position + 1;
+            let head_results: Vec<Vec<i64>> = (0..cfg.n_heads).map(|h| {
+                let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
+                let dh = cfg.d_head;
+                let q_head = &q[h * dh..(h + 1) * dh];
+
+                let mut scores = Vec::with_capacity(full_seq);
+                for j in 0..full_seq {
+                    let k_off = j * cfg.d_kv + kv_h * dh;
+                    let mut dot: i64 = 0;
+                    for dd in 0..dh {
+                        dot += q_head[dd] * cache.k_data[layer_idx][k_off + dd];
+                    }
+                    scores.push((dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS);
+                }
+                let attn_weights = softmax_i64(&scores);
+
+                let mut out = vec![0i64; dh];
+                for j in 0..full_seq {
+                    let v_off = j * cfg.d_kv + kv_h * dh;
+                    let w = attn_weights[j];
+                    for dd in 0..dh {
+                        out[dd] += (w * cache.v_data[layer_idx][v_off + dd]) >> FRAC_BITS;
+                    }
+                }
+                out
+            }).collect();
+
+            for val in attn_out.iter_mut() { *val = 0; }
+            for (h, head_out) in head_results.iter().enumerate() {
+                attn_out[h * cfg.d_head..(h + 1) * cfg.d_head].copy_from_slice(head_out);
+            }
+
+            // Wo projection + residual
+            let attn_out_q = QuantizedInput::from_i64(&attn_out);
+            matmul_fast_preq(&layer.wo, &attn_out_q, &attn_out, d, &mut projected);
+            for i in 0..d { hidden[i] += projected[i]; }
+
+            // FFN: gate, up, down
+            let normed_ff = layernorm(&hidden, &layer.ffn_norm);
+            let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
+            matmul_fast_preq(&layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
+            matmul_fast_preq(&layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
+            for j in 0..cfg.d_ff {
+                gate[j] = (silu_i64(gate[j]) * up[j]) >> FRAC_BITS;
+            }
+            let gate_q = QuantizedInput::from_i64(&gate);
+            matmul_fast_preq(&layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
+            for i in 0..d { hidden[i] += ff_out[i]; }
+        }
+
+        // Last shard: run final norm + LM head + argmax
+        if is_last {
+            cache.seq_len = position + 1;
+            let normed = layernorm(&hidden, &self.final_norm);
+            let logits = matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size);
+            let token_id = argmax_i64(&logits) as u32;
+            let logits_bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let logits_hash = arc_crypto::hash_bytes(&logits_bytes);
+            ShardOutput::Token { id: token_id, logits_hash }
+        } else {
+            cache.seq_len = position + 1;
+            ShardOutput::Hidden(hidden)
+        }
+    }
+}
+
+/// Input to a shard's forward pass.
+#[derive(Debug)]
+pub enum ShardInput {
+    /// Raw token id — used by the FIRST shard, which embeds it locally.
+    Token(u32),
+    /// Hidden state from the previous shard — used by middle/last shards.
+    Hidden(Vec<i64>),
+}
+
+/// Output from a shard's forward pass.
+#[derive(Debug)]
+pub enum ShardOutput {
+    /// Hidden state to forward to the next shard.
+    Hidden(Vec<i64>),
+    /// Final token id from the LAST shard, plus the BLAKE3 hash of the logits
+    /// for cryptographic determinism verification.
+    Token { id: u32, logits_hash: Hash256 },
 }
 
 // ─── RoPE Tables ──────────────────────────────────────────────────────────────
@@ -2076,6 +2279,235 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
 
 #[cfg(not(feature = "candle"))]
 pub fn load_cached_model(_path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
+    Err(crate::InferenceError::Runtime("candle feature not enabled".into()))
+}
+
+// ─── Sharded Loading: Load Only Layers [start, end) ──────────────────────────
+//
+// A node holding shard k of N loads only its slice of the model. This is the
+// foundation for pipeline-parallel distributed inference: each node holds a
+// fraction of the layers, and a request flows through the pipeline of shards
+// via HTTP forwarding of activations.
+//
+// Memory invariant: the layers Vec is the same size as n_layers (so absolute
+// layer indexing in forward_shard_layers stays correct), but slots outside
+// [start, end) are zero-byte placeholders. A 70B model split 8 ways uses
+// ~5GB per node instead of 40GB.
+//
+// Embeddings load only on the FIRST shard (start_layer == 0).
+// Output head + final_norm load only on the LAST shard (end_layer == n_layers).
+
+#[cfg(feature = "candle")]
+pub fn load_cached_model_shard(
+    path: &str,
+    start_layer: usize,
+    end_layer: usize,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    use candle_core::Device;
+    use candle_core::quantized::gguf_file;
+    use crate::InferenceError;
+
+    let device = Device::Cpu;
+    let gguf_path = path.to_string();
+
+    // ── Read metadata ────────────────────────────────────────────────────────
+    let (n_layers, d_model, n_heads, n_kv_heads, d_ff, vocab_size, vocab,
+         rope_base, eos_tokens, bos_token, chat_template) = {
+        let mut reader = std::fs::File::open(&gguf_path)
+            .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
+        let content = gguf_file::Content::read(&mut reader)
+            .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
+
+        let arch = match content.metadata.get("general.architecture") {
+            Some(gguf_file::Value::String(s)) => s.clone(),
+            _ => "llama".to_string(),
+        };
+
+        let get_u32 = |key: &str| -> u32 {
+            match content.metadata.get(key) {
+                Some(gguf_file::Value::U32(v)) => *v,
+                Some(gguf_file::Value::U64(v)) => *v as u32,
+                Some(gguf_file::Value::I32(v)) => *v as u32,
+                _ => 0,
+            }
+        };
+
+        let nl = get_u32(&format!("{arch}.block_count")) as usize;
+        let dm = get_u32(&format!("{arch}.embedding_length")) as usize;
+        let nh = get_u32(&format!("{arch}.attention.head_count")) as usize;
+        let nkv = {
+            let v = get_u32(&format!("{arch}.attention.head_count_kv"));
+            if v > 0 { v as usize } else { nh }
+        };
+        let dff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
+        let vs = content.tensor_infos.get("token_embd.weight")
+            .map(|t| t.shape.dims()[0] as usize).unwrap_or(32000);
+
+        let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
+            Some(gguf_file::Value::F32(v)) => *v as f64,
+            Some(gguf_file::Value::F64(v)) => *v,
+            _ => 10000.0,
+        };
+
+        let eos_tokens = match content.metadata.get("tokenizer.ggml.eos_token_id") {
+            Some(gguf_file::Value::U32(v)) => vec![*v],
+            Some(gguf_file::Value::U64(v)) => vec![*v as u32],
+            Some(gguf_file::Value::Array(arr)) => {
+                arr.iter().filter_map(|v| match v {
+                    gguf_file::Value::U32(n) => Some(*n),
+                    gguf_file::Value::U64(n) => Some(*n as u32),
+                    _ => None,
+                }).collect()
+            }
+            _ => vec![2, 128001, 128009],
+        };
+
+        let bos_token = match content.metadata.get("tokenizer.ggml.bos_token_id") {
+            Some(gguf_file::Value::U32(v)) => *v,
+            Some(gguf_file::Value::U64(v)) => *v as u32,
+            _ => 1,
+        };
+
+        let chat_template = match content.metadata.get("tokenizer.chat_template") {
+            Some(gguf_file::Value::String(s)) => s.clone(),
+            _ => String::new(),
+        };
+
+        let vocab = match content.metadata.get("tokenizer.ggml.tokens") {
+            Some(gguf_file::Value::Array(arr)) => {
+                arr.iter().filter_map(|v| match v {
+                    gguf_file::Value::String(s) => Some(s.clone()),
+                    _ => None,
+                }).collect()
+            }
+            _ => Vec::new(),
+        };
+
+        (nl, dm, nh, nkv, dff, vs, vocab, rope_base, eos_tokens, bos_token, chat_template)
+    };
+
+    let d_head = d_model / n_heads;
+    let d_kv = d_head * n_kv_heads;
+
+    let end_layer = end_layer.min(n_layers);
+    if start_layer >= end_layer {
+        return Err(InferenceError::Runtime(format!(
+            "Invalid shard range: [{start_layer}, {end_layer}) is empty (n_layers={n_layers})"
+        )));
+    }
+    let is_first = start_layer == 0;
+    let is_last = end_layer == n_layers;
+
+    info!(
+        n_layers, d_model, shard_start = start_layer, shard_end = end_layer,
+        is_first, is_last, "Loading GGUF SHARD"
+    );
+
+    let mut reader = std::fs::File::open(&gguf_path)
+        .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
+    let content = gguf_file::Content::read(&mut reader)
+        .map_err(|e| InferenceError::Runtime(format!("GGUF: {e}")))?;
+
+    let extract_f32 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str| -> Result<Vec<f32>, InferenceError> {
+        let qt = content.tensor(reader, name, &device)
+            .map_err(|e| InferenceError::Runtime(format!("{name}: {e}")))?;
+        let deq = qt.dequantize(&device)
+            .map_err(|e| InferenceError::Runtime(format!("dequant {name}: {e}")))?;
+        deq.flatten_all()
+            .map_err(|e| InferenceError::Runtime(format!("flatten: {e}")))?
+            .to_vec1::<f32>()
+            .map_err(|e| InferenceError::Runtime(format!("tovec: {e}")))
+    };
+
+    let extract_i8 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, rows: usize, cols: usize| -> Result<I8Weights, InferenceError> {
+        let f = extract_f32(reader, content, name)?;
+        Ok(I8Weights::quantize_f32(&f, rows, cols))
+    };
+
+    let extract_norm = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, size: usize| -> Vec<i64> {
+        extract_f32(reader, content, name).map(|f| {
+            f.iter().map(|&x| (x * ONE as f32).round() as i64).collect()
+        }).unwrap_or_else(|_| vec![ONE; size])
+    };
+
+    // ── Embeddings: ONLY on first shard ──────────────────────────────────────
+    let (embedding_q16, embedding_i8) = if is_first {
+        let i8w = extract_i8(&mut reader, &content, "token_embd.weight", vocab_size, d_model)?;
+        let q16: Vec<i64> = {
+            let f = extract_f32(&mut reader, &content, "token_embd.weight")?;
+            f.iter().map(|&x| (x as f64 * ONE as f64).round() as i64).collect()
+        };
+        info!("Shard {}: embeddings loaded ({} MB Q16)", start_layer, q16.len() * 8 / (1024 * 1024));
+        (q16, i8w)
+    } else {
+        (Vec::new(), I8Weights::empty())
+    };
+
+    // ── Output head + final norm: ONLY on last shard ─────────────────────────
+    let (output_weight, final_norm) = if is_last {
+        let ow = extract_i8(&mut reader, &content, "output.weight", vocab_size, d_model)
+            .or_else(|_| extract_i8(&mut reader, &content, "token_embd.weight", vocab_size, d_model))?;
+        let fn_ = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
+        info!("Shard last: output head + final_norm loaded");
+        (ow, fn_)
+    } else {
+        (I8Weights::empty(), Vec::new())
+    };
+
+    // ── Layers: only [start_layer, end_layer) loaded; rest are placeholders ──
+    let mut layers: Vec<CachedLayer> = (0..n_layers).map(|_| CachedLayer::placeholder()).collect();
+    for l in start_layer..end_layer {
+        let p = format!("blk.{l}");
+        let wq = extract_i8(&mut reader, &content, &format!("{p}.attn_q.weight"), d_model, d_model)?;
+        let wk = extract_i8(&mut reader, &content, &format!("{p}.attn_k.weight"), d_kv, d_model)?;
+        let wv = extract_i8(&mut reader, &content, &format!("{p}.attn_v.weight"), d_kv, d_model)?;
+        let wo = extract_i8(&mut reader, &content, &format!("{p}.attn_output.weight"), d_model, d_model)?;
+        let w_gate = extract_i8(&mut reader, &content, &format!("{p}.ffn_gate.weight"), d_ff, d_model)?;
+        let w_up = extract_i8(&mut reader, &content, &format!("{p}.ffn_up.weight"), d_ff, d_model)?;
+        let w_down = extract_i8(&mut reader, &content, &format!("{p}.ffn_down.weight"), d_model, d_ff)?;
+        layers[l] = CachedLayer {
+            wq, wk, wv, wo, w_gate, w_up, w_down,
+            attn_norm: extract_norm(&mut reader, &content, &format!("{p}.attn_norm.weight"), d_model),
+            ffn_norm: extract_norm(&mut reader, &content, &format!("{p}.ffn_norm.weight"), d_model),
+        };
+        if (l - start_layer) % 4 == 0 || l == end_layer - 1 {
+            info!("Shard layer {}/{} loaded ({} of {})",
+                l + 1, n_layers, l - start_layer + 1, end_layer - start_layer);
+        }
+    }
+
+    let max_seq = 2048;
+    let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
+    let attn_scale = integer_isqrt((d_head as i64) * ONE);
+
+    let shard_mb: usize = layers.iter()
+        .filter(|l| l.is_loaded())
+        .map(|l| l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
+            + l.wo.memory_bytes() + l.w_gate.memory_bytes() + l.w_up.memory_bytes()
+            + l.w_down.memory_bytes())
+        .sum::<usize>() / (1024 * 1024);
+    info!("Shard loaded: layers [{}, {}) = {} MB INT8", start_layer, end_layer, shard_mb);
+
+    Ok(CachedIntegerModel {
+        config: ModelConfig {
+            n_layers, d_model, n_heads, n_kv_heads, d_ff, d_head, d_kv,
+            vocab_size, attn_scale, rope_cos, rope_sin, max_seq,
+            eos_tokens: eos_tokens.clone(),
+            bos_token, chat_template: chat_template.clone(),
+        },
+        embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
+        q4_layers: None, q4_output: None,
+        i16_layers: None,
+        i16_output: None,
+    })
+}
+
+#[cfg(not(feature = "candle"))]
+pub fn load_cached_model_shard(
+    _path: &str,
+    _start_layer: usize,
+    _end_layer: usize,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
     Err(crate::InferenceError::Runtime("candle feature not enabled".into()))
 }
 
