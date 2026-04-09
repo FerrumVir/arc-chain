@@ -561,9 +561,12 @@ unsafe fn dot_i16_i64(row: *const i16, input: *const i64, len: usize) -> i64 {
 fn matmul_i16_into(weights: &I16Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
     let data = &weights.data;
     let scales = &weights.scales;
-    // Parallel over 512-row chunks (matches INT8 path for consistency)
-    output.par_chunks_mut(512).enumerate().for_each(|(chunk_idx, chunk)| {
-        let start = chunk_idx * 512;
+    // Chunk size 256: empirical sweet spot on M2 Ultra. Going smaller
+    // (e.g. 64) increases rayon task overhead more than the extra core
+    // utilization helps. 256 keeps task count high enough for 4096+
+    // matmuls without per-task scheduling cost.
+    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start = chunk_idx * 256;
         for (local_i, out) in chunk.iter_mut().enumerate() {
             let i = start + local_i;
             let acc = unsafe {
