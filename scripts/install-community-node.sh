@@ -427,18 +427,68 @@ else
     info "To stop: kill \$(cat $ARC_DIR/node.pid)"
 fi
 
-# ── Sanity check: wait for the node to come up ──────────────────────────────
+# ── Sanity check: wait for the node to come up AND connect to peers ─────────
+# A node with status=ok but peers=0 is RUNNING but ISOLATED — it'll propose
+# its own DAG blocks forever without ever seeing the real chain. That's the
+# most common community-install failure and health-status alone doesn't catch
+# it. We explicitly wait for peers >= 1 before declaring success.
 info "Waiting for node to come up on http://localhost:$RPC_PORT ..."
 sleep 5
+NODE_UP=false
 for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
     if curl -sf -m 2 "http://localhost:$RPC_PORT/health" >/dev/null 2>&1; then
         H=$(curl -sf -m 2 "http://localhost:$RPC_PORT/health")
         ok "Node is alive: $H"
+        NODE_UP=true
         break
     fi
     sleep 5
     [ $i -eq 12 ] && warn "Node not responding yet — check $ARC_DIR/node.log"
 done
+
+if [ "$NODE_UP" = true ]; then
+    info "Waiting for peer connections (up to 60s)..."
+    PEER_COUNT=0
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        # Extract peers value from /health JSON
+        PEER_COUNT=$(curl -sf -m 3 "http://localhost:$RPC_PORT/health" 2>/dev/null \
+            | sed -n 's/.*"peers":\([0-9][0-9]*\).*/\1/p')
+        PEER_COUNT=${PEER_COUNT:-0}
+        if [ "$PEER_COUNT" -ge 1 ] 2>/dev/null; then
+            ok "Connected to $PEER_COUNT peer(s) — node is actually part of the network"
+            break
+        fi
+        printf "."
+        sleep 5
+    done
+    echo ""
+    if [ "${PEER_COUNT:-0}" -lt 1 ] 2>/dev/null; then
+        echo ""
+        printf "%s%s⚠ NODE IS RUNNING BUT HAS ZERO PEERS%s\n" "$BOLD" "$YELLOW" "$RESET"
+        echo ""
+        echo "  Your node started successfully but could not connect to any of the 8"
+        echo "  ARC testnet seed nodes. It is running in isolation and proposing its"
+        echo "  own DAG blocks that nobody else will see."
+        echo ""
+        echo "  ${BOLD}Most likely cause:${RESET} your firewall/ISP is blocking outbound UDP"
+        echo "  to port 9091. ARC uses QUIC (UDP) for P2P, not TCP."
+        echo ""
+        echo "  ${BOLD}Quick diagnosis:${RESET}"
+        echo "    nc -zu -w 3 149.28.32.76 9091   # should print 'succeeded'"
+        echo "    nc -zu -w 3 140.82.16.112 9091  # should print 'succeeded'"
+        echo ""
+        echo "  ${BOLD}If the nc tests succeed but peers stays 0:${RESET}"
+        echo "    tail -f $ARC_DIR/node.log | grep -E 'Handshake|Failed|Timeout'"
+        echo "  and paste the output in the Discord / GitHub issue."
+        echo ""
+        echo "  ${BOLD}Common fixes:${RESET}"
+        echo "    • Allow outbound UDP 9091 in your firewall"
+        echo "    • Disable VPN if it blocks UDP"
+        echo "    • If on corporate/school network, try from a residential connection"
+        echo "    • On macOS: System Settings → Privacy & Security → Firewall → allow arc-node"
+        echo ""
+    fi
+fi
 
 # ── Final banner ────────────────────────────────────────────────────────────
 echo ""
