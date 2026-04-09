@@ -135,6 +135,16 @@ struct Cli {
     /// Last layer index to load (exclusive). Pipeline-parallel sharding.
     #[arg(long)]
     shard_end: Option<usize>,
+
+    /// Enable community-mode HTTP registration. When set, the node
+    /// registers itself with all seeds via outbound HTTPS POST to
+    /// /community/register every 60s and sends a heartbeat every 15s.
+    /// This makes the node visible on the dashboard and lets it
+    /// participate in compute contributions without requiring inbound
+    /// connectivity (no port forwarding, no public IP needed).
+    /// Recommended for home / residential installs.
+    #[arg(long)]
+    community_mode: bool,
 }
 
 #[tokio::main]
@@ -859,6 +869,87 @@ async fn main() -> Result<()> {
         });
 
         tracing::info!("Shard announcement broadcaster + puller started (15s/20s tick)");
+    }
+
+    // ── Community-mode HTTP registration + heartbeat ──────────────────
+    // Spawned when --community-mode is set. Outbound-HTTPS only — works
+    // behind any NAT/residential firewall. Registers with every seed on
+    // startup + every 60s, sends a heartbeat every 15s to keep the
+    // registry entry alive. Each seed's TTL is 90s so 5 missed
+    // heartbeats before eviction.
+    if cli.community_mode {
+        let validator_seed_c = validator_seed.clone();
+        let worker_id = format!("0x{}", hex::encode(&validator_address.0));
+        let hostname = std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        let model_name = inference_model
+            .as_ref()
+            .map(|m| format!("arc-{}L-{}d-{}h-{}v",
+                m.config.n_layers, m.config.d_model, m.config.n_heads, m.config.vocab_size));
+
+        // Derive seed RPC endpoints from the peers list (P2P port - 1, usually 9090)
+        let mut seed_rpc_addrs: Vec<String> = Vec::new();
+        for p in &peers {
+            if let Some(host) = p.split(':').next() {
+                seed_rpc_addrs.push(format!("{}:9090", host));
+            }
+        }
+        seed_rpc_addrs.sort();
+        seed_rpc_addrs.dedup();
+
+        let worker_id_c = worker_id.clone();
+        let hostname_c = hostname.clone();
+        let platform_c = platform.clone();
+        let model_name_c = model_name.clone();
+        let seed_rpc_addrs_c = seed_rpc_addrs.clone();
+
+        tokio::spawn(async move {
+            // Settle before first POST
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let register_payload = serde_json::json!({
+                "worker_id": worker_id_c,
+                "name": format!("{} ({})", validator_seed_c, hostname_c),
+                "capabilities": ["inference"],
+                "model": model_name_c,
+                "platform": platform_c,
+            });
+            let heartbeat_payload = serde_json::json!({
+                "worker_id": worker_id_c,
+                "work_completed": 0,
+            });
+
+            // Register once, then heartbeat + re-register periodically
+            let mut ticks: u64 = 0;
+            loop {
+                for addr in &seed_rpc_addrs_c {
+                    // Every 4th tick (60s), do a full re-register to pick up metadata changes
+                    if ticks % 4 == 0 {
+                        let _ = client.post(format!("http://{}/community/register", addr))
+                            .json(&register_payload)
+                            .send().await;
+                    } else {
+                        let _ = client.post(format!("http://{}/community/heartbeat", addr))
+                            .json(&heartbeat_payload)
+                            .send().await;
+                    }
+                }
+                ticks += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            }
+        });
+        tracing::info!("Community-mode HTTP registration started (worker_id={})", worker_id);
     }
 
     rpc::serve(

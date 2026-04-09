@@ -83,6 +83,13 @@ pub struct NodeState {
     /// integer engine's determinism. Survives the full coordinator session
     /// (until eviction). The cache hit count is exposed in the response.
     pub inference_cache: Arc<arc_inference::distributed::DistributedCache>,
+    /// Community worker registry — nodes that volunteered HTTP-based
+    /// inference compute. Keyed by worker_id (self-chosen), value is the
+    /// registration record + last-seen Instant for TTL pruning. Workers
+    /// are pure outbound-HTTPS contributors (POST to register, POST to
+    /// heartbeat, long-poll for work). They never need inbound
+    /// connectivity so they work behind any NAT / residential firewall.
+    pub community_workers: Arc<dashmap::DashMap<String, (CommunityWorker, std::time::Instant)>>,
 }
 
 /// Describes which slice of a model a node holds.
@@ -107,6 +114,35 @@ pub struct ShardInfo {
     /// Friendly node name (NYC, LAX, ...).
     pub node_name: String,
 }
+
+/// A community worker: an arc-node running with --community-mode that
+/// registered via outbound HTTPS POST. Workers contribute compute by
+/// polling /community/claim_work and POSTing results back. They do NOT
+/// participate in consensus or hold shards — they're pure volunteer
+/// compute providers. Their entries in the registry are TTL-pruned if
+/// they stop heartbeating.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CommunityWorker {
+    /// Self-chosen worker ID (hex of validator pubkey or a uuid).
+    pub worker_id: String,
+    /// Operator-friendly name (hostname, city, whatever).
+    pub name: String,
+    /// What this worker can do. For now: just "inference".
+    pub capabilities: Vec<String>,
+    /// Model they can serve (matches coordinator's model_name exactly).
+    pub model: Option<String>,
+    /// OS + arch, for dashboard display.
+    pub platform: String,
+    /// Unix timestamp of first registration (for "joined at").
+    pub registered_at: u64,
+    /// Monotonic counter of work units completed.
+    pub work_completed: u64,
+}
+
+/// Community worker TTL. Workers that haven't heartbeated within this
+/// window are pruned. Heartbeat interval is 15s, TTL is 90s, so a
+/// worker survives 5 missed heartbeats before being evicted.
+pub const COMMUNITY_WORKER_TTL_SECS: u64 = 90;
 
 /// Time a shard registry entry is considered fresh. Entries older than this
 /// are dropped at read time. Must be greater than the shard announcement
@@ -178,6 +214,7 @@ pub fn build_node_state(
         // 10_000-entry deterministic cache for sharded inference results.
         // LRU eviction by hit_count when full.
         inference_cache: Arc::new(arc_inference::distributed::DistributedCache::new(10_000)),
+        community_workers: Arc::new(dashmap::DashMap::new()),
     }
 }
 
@@ -265,6 +302,10 @@ pub async fn serve(
         // Shard registry — discovery + announcement
         .route("/shards", get(get_shards))
         .route("/shards/announce", post(announce_shard))
+        // Community worker registration (HTTP-only, works behind NAT)
+        .route("/community/register", post(community_register))
+        .route("/community/heartbeat", post(community_heartbeat))
+        .route("/community/list", get(community_list))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -3988,4 +4029,124 @@ async fn announce_shard(
     let key = req.shard.socket_addr.clone();
     node.shard_registry.insert(key, (req.shard, std::time::Instant::now()));
     Json(json!({"ok": true, "registry_size": node.shard_registry.len()}))
+}
+
+// ─── Community worker registry ──────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct CommunityRegisterRequest {
+    worker_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    platform: String,
+}
+
+/// POST /community/register
+/// A community-mode node calls this on every seed it can reach. The seed
+/// stores the worker info in its community_workers registry. The worker
+/// is then visible to the dashboard and counted in TPS/compute stats.
+/// Workers are pure outbound-HTTPS: no inbound port, no NAT traversal,
+/// no QUIC. Works behind any residential firewall.
+async fn community_register(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<CommunityRegisterRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if req.worker_id.is_empty() || req.worker_id.len() > 128 {
+        return Err((StatusCode::BAD_REQUEST, "worker_id required (1-128 chars)".to_string()));
+    }
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let existing_registered_at = node
+        .community_workers
+        .get(&req.worker_id)
+        .map(|e| e.value().0.registered_at);
+    let worker = CommunityWorker {
+        worker_id: req.worker_id.clone(),
+        name: req.name,
+        capabilities: if req.capabilities.is_empty() {
+            vec!["inference".to_string()]
+        } else {
+            req.capabilities
+        },
+        model: req.model,
+        platform: req.platform,
+        registered_at: existing_registered_at.unwrap_or(now_secs),
+        work_completed: node
+            .community_workers
+            .get(&req.worker_id)
+            .map(|e| e.value().0.work_completed)
+            .unwrap_or(0),
+    };
+    node.community_workers
+        .insert(req.worker_id.clone(), (worker, std::time::Instant::now()));
+    Ok(Json(json!({
+        "ok": true,
+        "worker_id": req.worker_id,
+        "registry_size": node.community_workers.len(),
+        "welcome": "Your node is now visible on the ARC testnet dashboard.",
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct CommunityHeartbeatRequest {
+    worker_id: String,
+    #[serde(default)]
+    work_completed: Option<u64>,
+}
+
+/// POST /community/heartbeat
+/// Community workers call this every 15 seconds to stay alive in the
+/// registry. Without a heartbeat for COMMUNITY_WORKER_TTL_SECS (90s)
+/// the worker is pruned at read time.
+async fn community_heartbeat(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<CommunityHeartbeatRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if let Some(mut entry) = node.community_workers.get_mut(&req.worker_id) {
+        let (worker, ts) = entry.value_mut();
+        *ts = std::time::Instant::now();
+        if let Some(wc) = req.work_completed {
+            worker.work_completed = wc;
+        }
+        Ok(Json(json!({"ok": true})))
+    } else {
+        Err((StatusCode::NOT_FOUND, "worker_id not registered — call /community/register first".to_string()))
+    }
+}
+
+/// GET /community/list
+/// Returns all fresh community workers. Entries older than
+/// COMMUNITY_WORKER_TTL_SECS are pruned at read time. The dashboard
+/// polls this to show the community node count + geographic spread.
+async fn community_list(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<serde_json::Value> {
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS);
+    let mut live: Vec<CommunityWorker> = Vec::new();
+    let mut expired: Vec<String> = Vec::new();
+    for entry in node.community_workers.iter() {
+        let (w, ts) = entry.value();
+        if now.duration_since(*ts) <= ttl {
+            live.push(w.clone());
+        } else {
+            expired.push(entry.key().clone());
+        }
+    }
+    for k in expired {
+        node.community_workers.remove(&k);
+    }
+    let total_work: u64 = live.iter().map(|w| w.work_completed).sum();
+    Json(json!({
+        "workers": live,
+        "count": node.community_workers.len(),
+        "total_work_completed": total_work,
+    }))
 }

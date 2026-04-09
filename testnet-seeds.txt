@@ -1,11 +1,24 @@
 # ARC Testnet Seed Nodes
 # 8 nodes across 6 continents. Your node connects to these on startup.
+#
+# Each seed is listed TWICE: once on UDP 9091 (the native P2P port) and
+# once on UDP 443 (which is forwarded to 9091 via iptables). Dial both
+# in case your ISP / firewall / corporate network blocks the non-standard
+# 9091 but allows 443 (which it must, or HTTPS would be broken for you).
 
-149.28.32.76:9091    # NYC (US East)
-140.82.16.112:9091   # LAX (US West)
-136.244.109.1:9091   # AMS (Amsterdam)
-104.238.171.11:9091  # LHR (London)
-202.182.107.41:9091  # NRT (Tokyo)
-149.28.153.31:9091   # SGP (Singapore)
-216.238.120.27:9091  # SAO (São Paulo)
-139.84.237.49:9091   # JNB (Johannesburg)
+149.28.32.76:9091     # NYC (US East)
+149.28.32.76:443      # NYC fallback via 443
+140.82.16.112:9091    # LAX (US West)
+140.82.16.112:443     # LAX fallback via 443
+136.244.109.1:9091    # AMS (Amsterdam)
+136.244.109.1:443     # AMS fallback via 443
+104.238.171.11:9091   # LHR (London)
+104.238.171.11:443    # LHR fallback via 443
+202.182.107.41:9091   # NRT (Tokyo)
+202.182.107.41:443    # NRT fallback via 443
+149.28.153.31:9091    # SGP (Singapore)
+149.28.153.31:443     # SGP fallback via 443
+216.238.120.27:9091   # SAO (São Paulo)
+216.238.120.27:443    # SAO fallback via 443
+139.84.237.49:9091    # JNB (Johannesburg)
+139.84.237.49:443     # JNB fallback via 443

@@ -283,6 +283,7 @@ if [ "$INSTALL_SERVICE" = true ]; then
         <string>--eth-rpc-port</string><string>0</string>
         <string>--data-dir</string><string>$ARC_DIR/data</string>
         <string>--model</string><string>$MODEL_PATH</string>
+        <string>--community-mode</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -365,7 +366,8 @@ ExecStart=$ARC_DIR/bin/arc-node \\
     --stake 0 --min-stake 0 \\
     --eth-rpc-port 0 \\
     --data-dir $ARC_DIR/data \\
-    --model $MODEL_PATH
+    --model $MODEL_PATH \\
+    --community-mode
 Restart=always
 RestartSec=5
 StandardOutput=append:$ARC_DIR/node.log
