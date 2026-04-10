@@ -90,6 +90,21 @@ pub struct NodeState {
     /// heartbeat, long-poll for work). They never need inbound
     /// connectivity so they work behind any NAT / residential firewall.
     pub community_workers: Arc<dashmap::DashMap<String, (CommunityWorker, std::time::Instant)>>,
+    /// Community work dispatch: sender side. The coordinator pushes WorkItems
+    /// here when it wants community nodes to run forward_shard. This is the
+    /// "producer" half of an mpsc channel — wire it up in main.rs when
+    /// starting a coordinator.
+    pub community_work_tx: Option<Arc<tokio::sync::mpsc::Sender<WorkItem>>>,
+    /// Community work dispatch: receiver side. Wrapped in a tokio::Mutex so
+    /// multiple claim_work handlers can await concurrently (only one wins
+    /// each item). The long-poll handler calls `recv()` with a timeout.
+    pub community_work_queue: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WorkItem>>>>,
+    /// Community work results: keyed by request_id. The coordinator inserts
+    /// a oneshot::Sender before dispatching a WorkItem. When a community
+    /// worker POSTs to /community/submit_work, the handler removes the
+    /// sender and delivers the WorkResult. The coordinator awaits the
+    /// oneshot::Receiver to resume the pipeline walk.
+    pub community_work_results: Option<Arc<dashmap::DashMap<String, tokio::sync::oneshot::Sender<WorkResult>>>>,
 }
 
 /// Describes which slice of a model a node holds.
@@ -215,6 +230,9 @@ pub fn build_node_state(
         // LRU eviction by hit_count when full.
         inference_cache: Arc::new(arc_inference::distributed::DistributedCache::new(10_000)),
         community_workers: Arc::new(dashmap::DashMap::new()),
+        community_work_tx: None,
+        community_work_queue: None,
+        community_work_results: None,
     }
 }
 
@@ -306,6 +324,9 @@ pub async fn serve(
         .route("/community/register", post(community_register))
         .route("/community/heartbeat", post(community_heartbeat))
         .route("/community/list", get(community_list))
+        // Community inference work dispatch (long-poll claim + submit)
+        .route("/community/claim_work", post(community_claim_work))
+        .route("/community/submit_work", post(community_submit_work))
         // Off-chain channel relay (WebSocket-style via long-poll for simplicity)
         .route("/channel/{channel_id}/relay", post(channel_relay))
         .route("/channel/{channel_id}/state", get(channel_state))
@@ -4149,4 +4170,284 @@ async fn community_list(
         "count": node.community_workers.len(),
         "total_work_completed": total_work,
     }))
+}
+
+// ─── Community work dispatch (long-poll claim + submit) ─────────────────────
+//
+// Community nodes run with `--stake 0 --community-mode` behind NAT. They can
+// reach seed nodes via outbound HTTPS but cannot accept inbound connections.
+// The two endpoints below let the coordinator push forward_shard work to these
+// workers without requiring inbound connectivity:
+//
+//   1. Worker calls POST /community/claim_work (long-poll, up to 30s).
+//      If work arrives within the window, the coordinator writes the job
+//      payload and closes the response. If not, returns {"status":"no_work"}.
+//      The worker immediately re-polls.
+//
+//   2. Worker calls POST /community/submit_work with the computed result.
+//      The coordinator matches it to the pending oneshot and resumes the
+//      pipeline walk.
+//
+// The coordinator side pushes WorkItems into `work_queue` (mpsc) and awaits
+// WorkResults via `work_results` (DashMap<request_id, oneshot::Sender>).
+// Those fields must be added to NodeState by the caller — these handlers
+// reference them directly.
+
+/// Maximum time a claim_work long-poll will hold the connection open.
+const COMMUNITY_CLAIM_TIMEOUT_SECS: u64 = 30;
+
+/// A unit of forward_shard work dispatched to a community worker.
+/// Contains everything the worker needs to run forward_shard locally:
+/// the input (token or hidden state), the layer range, and the position.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItem {
+    /// Unique request id (hex). Matches the sharded inference request_id.
+    pub request_id: String,
+    /// Raw token id — only set when this is the first shard (layer 0).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<u32>,
+    /// Hidden state (i64 vec) — set for all shards after the first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<Vec<i64>>,
+    /// BLAKE3 hash of the hidden state for integrity verification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden_hash: Option<String>,
+    /// Token position in the sequence (for RoPE + KV cache).
+    pub position: usize,
+    /// First layer index (inclusive) the worker should process.
+    pub start_layer: usize,
+    /// Last layer index (exclusive) the worker should process.
+    pub end_layer: usize,
+    /// Model identifier so the worker can verify it has the right model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// True if this is the last token — worker should evict KV cache after.
+    #[serde(default)]
+    pub last_token: bool,
+}
+
+/// Result submitted by a community worker after completing a WorkItem.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkResult {
+    /// Must match the request_id from the WorkItem.
+    pub request_id: String,
+    /// Worker's self-chosen identifier.
+    pub worker_id: String,
+    /// True if this shard ran the LM head and produced a token.
+    pub is_terminal: bool,
+    /// Hidden state to forward to the next shard (if not terminal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<Vec<i64>>,
+    /// BLAKE3 hash of the hidden state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden_hash: Option<String>,
+    /// Token id (if terminal — this shard ran the LM head).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<u32>,
+    /// Hash of the logits (if terminal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logits_hash: Option<String>,
+    /// Number of layers processed.
+    pub layers_processed: usize,
+    /// Compute time on the worker, in milliseconds.
+    pub compute_ms: u64,
+}
+
+/// POST body for /community/claim_work.
+#[derive(Deserialize)]
+pub struct ClaimWorkRequest {
+    /// Worker's self-chosen identifier.
+    pub worker_id: String,
+    /// What the worker can do. Must include "inference" to receive work.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// Model the worker has loaded (must match coordinator's model to get work).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// POST /community/claim_work
+///
+/// Long-poll endpoint. A community worker POSTs with its worker_id and
+/// capabilities. The server holds the request open for up to 30 seconds.
+/// If a forward_shard job arrives during that window, the server writes the
+/// job payload as the response and closes the connection. If no work arrives,
+/// returns `{"status":"no_work"}`. The community node immediately re-polls.
+///
+/// The worker must be registered via /community/register before claiming work
+/// (this doubles as a heartbeat — we refresh the TTL on every poll).
+pub async fn community_claim_work(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<ClaimWorkRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // ── Validate worker_id ──────────────────────────────────────────────
+    if req.worker_id.is_empty() || req.worker_id.len() > 128 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "worker_id required (1-128 chars)".to_string(),
+        ));
+    }
+
+    // ── Worker must be registered ───────────────────────────────────────
+    if !node.community_workers.contains_key(&req.worker_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "worker_id not registered — call /community/register first".to_string(),
+        ));
+    }
+
+    // Refresh TTL (counts as heartbeat)
+    if let Some(mut entry) = node.community_workers.get_mut(&req.worker_id) {
+        entry.value_mut().1 = std::time::Instant::now();
+    }
+
+    // ── Capability check ────────────────────────────────────────────────
+    let caps = if req.capabilities.is_empty() {
+        vec!["inference".to_string()]
+    } else {
+        req.capabilities
+    };
+    if !caps.iter().any(|c| c == "inference") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "capabilities must include 'inference' to receive work".to_string(),
+        ));
+    }
+
+    // ── Long-poll: try to receive a WorkItem from the queue ─────────────
+    let work_rx = node.community_work_queue.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "work queue not initialized — coordinator not running".to_string(),
+    ))?;
+
+    let timeout = tokio::time::Duration::from_secs(COMMUNITY_CLAIM_TIMEOUT_SECS);
+    match tokio::time::timeout(timeout, work_rx.lock().await.recv()).await {
+        Ok(Some(item)) => {
+            // Optionally verify model match. If the worker specified a model
+            // and the work item has a model_id, they must agree. If the
+            // worker doesn't filter by model, accept any work.
+            if let (Some(worker_model), Some(item_model)) = (&req.model, &item.model_id) {
+                if worker_model != item_model {
+                    // Model mismatch — put the item back on the queue so
+                    // another worker can pick it up, then tell this worker
+                    // there's no matching work.
+                    if let Some(ref tx) = node.community_work_tx {
+                        let _ = tx.send(item).await;
+                    }
+                    return Ok(Json(json!({
+                        "status": "no_work",
+                        "reason": "model_mismatch",
+                    })));
+                }
+            }
+
+            Ok(Json(json!({
+                "status": "work",
+                "work": item,
+            })))
+        }
+        Ok(None) => {
+            // Channel closed — coordinator shut down
+            Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "work queue closed — coordinator shutting down".to_string(),
+            ))
+        }
+        Err(_) => {
+            // Timeout — no work within the window
+            Ok(Json(json!({
+                "status": "no_work",
+            })))
+        }
+    }
+}
+
+/// POST /community/submit_work
+///
+/// Community worker submits the completed forward_shard result. The payload
+/// must include the request_id, the shard output (hidden state or token_id),
+/// compute_ms, and the worker_id. The coordinator matches the request_id to
+/// a pending oneshot::Sender and resumes the pipeline walk.
+pub async fn community_submit_work(
+    AxumState(node): AxumState<NodeState>,
+    Json(result): Json<WorkResult>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // ── Validate required fields ────────────────────────────────────────
+    if result.request_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "request_id is required".to_string(),
+        ));
+    }
+    if result.worker_id.is_empty() || result.worker_id.len() > 128 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "worker_id required (1-128 chars)".to_string(),
+        ));
+    }
+
+    // A terminal result must have a token_id; a non-terminal must have hidden.
+    if result.is_terminal && result.token_id.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "terminal result must include token_id".to_string(),
+        ));
+    }
+    if !result.is_terminal && result.hidden.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "non-terminal result must include hidden state".to_string(),
+        ));
+    }
+
+    // ── Worker must be registered ───────────────────────────────────────
+    if !node.community_workers.contains_key(&result.worker_id) {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "worker_id not registered — call /community/register first".to_string(),
+        ));
+    }
+
+    // ── Refresh heartbeat + increment work_completed ────────────────────
+    if let Some(mut entry) = node.community_workers.get_mut(&result.worker_id) {
+        let (worker, ts) = entry.value_mut();
+        *ts = std::time::Instant::now();
+        worker.work_completed += 1;
+    }
+
+    // ── Deliver result to the coordinator via the oneshot ────────────────
+    let results_map = node.community_work_results.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "work results map not initialized — coordinator not running".to_string(),
+    ))?;
+
+    // Remove the oneshot sender for this request_id. If it's gone, the
+    // coordinator already timed out or the request was cancelled.
+    match results_map.remove(&result.request_id) {
+        Some((_, sender)) => {
+            match sender.send(result.clone()) {
+                Ok(()) => Ok(Json(json!({
+                    "ok": true,
+                    "request_id": result.request_id,
+                }))),
+                Err(_) => {
+                    // Receiver dropped — coordinator timed out
+                    Err((
+                        StatusCode::GONE,
+                        format!(
+                            "coordinator already timed out for request_id {}",
+                            result.request_id
+                        ),
+                    ))
+                }
+            }
+        }
+        None => Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no pending work for request_id {} — already completed or expired",
+                result.request_id
+            ),
+        )),
+    }
 }
