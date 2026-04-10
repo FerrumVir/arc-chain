@@ -525,57 +525,15 @@ unsafe fn dot_i16_i64_neon(row: *const i16, input: *const i64, len: usize) -> i6
     acc
 }
 
-/// AVX-512 i16×i64 dot product with exact i64 widening. x86_64 path.
-///
-/// Weights are i16, inputs are i64 truncated to i32 (same bound as the
-/// NEON path: Q16 hidden state values fit in i32). We widen both to
-/// i64 via `_mm512_cvtepi32_epi64` and use 8-lane i64 mullo+add. This
-/// is SLOWER per-element than the narrow i16×i16 VPMADDWD path but
-/// avoids the overflow that killed my first attempt — i16 × i32 can
-/// reach 2^47, which doesn't fit in i32's accumulator.
-///
-/// Falls through to the scalar unrolled path on AVX2-only boxes.
+/// x86_64 i16×i64 dot product. Falls through to the scalar 8-element
+/// unrolled path which LLVM autovectorizes adequately for the 2-3 layer
+/// shards on NYC/LAX. An explicit AVX-512 widening path was attempted
+/// (commit 8274796) but caused segfaults during consensus on Vultr
+/// Skylake Xeon VPS — reverted to scalar pending investigation.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn dot_i16_i64_avx2(row: *const i16, input: *const i64, len: usize) -> i64 {
-    use std::arch::x86_64::*;
-    if !is_x86_feature_detected!("avx512f") {
-        return dot_i16_i64_scalar(row, input, len);
-    }
-    // 8 i64 lanes per accumulator, 8 elements per iteration.
-    let mut acc = _mm512_setzero_si512();
-    let simd_len = len / 8 * 8;
-    let mut j = 0usize;
-    while j < simd_len {
-        // Load 8 i16 weights into a 128-bit register
-        let w16 = _mm_loadu_si128(row.add(j) as *const __m128i);
-        // Sign-extend 8 i16 → 8 i32 (256-bit)
-        let w32 = _mm256_cvtepi16_epi32(w16);
-        // Widen 8 i32 → 8 i64 (512-bit)
-        let w64 = _mm512_cvtepi32_epi64(w32);
-        // Load 8 i64 inputs (512-bit)
-        let i64_wide = _mm512_loadu_si512(input.add(j) as *const __m512i);
-        // Multiply 8 i64 × 8 i64 → 8 i64 via mullo
-        // Note: mullo_epi64 requires AVX-512DQ. We'll detect + fall back.
-        let prod = if is_x86_feature_detected!("avx512dq") {
-            _mm512_mullo_epi64(w64, i64_wide)
-        } else {
-            // Emulate with i32 parts: split each i64 into hi/lo 32-bit words,
-            // do four i32 mullo + shifts. Slower but works on AVX-512F alone.
-            // For simplicity here, fall back to scalar on non-DQ boxes.
-            return dot_i16_i64_scalar(row, input, len);
-        };
-        acc = _mm512_add_epi64(acc, prod);
-        j += 8;
-    }
-    // Horizontal sum the 8 i64 lanes
-    let mut sum: i64 = _mm512_reduce_add_epi64(acc);
-    // Scalar tail
-    while j < len {
-        sum += (*row.add(j) as i64) * (*input.add(j));
-        j += 1;
-    }
-    sum
+    dot_i16_i64_scalar(row, input, len)
 }
 
 /// Dispatch wrapper — picks NEON on aarch64, AVX2 on x86_64, scalar elsewhere.
