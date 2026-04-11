@@ -963,6 +963,102 @@ async fn main() -> Result<()> {
             }
         });
         tracing::info!("Community-mode HTTP registration started (worker_id={})", worker_id);
+
+        // ── Community inference worker loop ──────────────────────────────
+        // Continuously long-poll /community/claim_work on all seeds. When
+        // a job arrives, run inference locally using the loaded model, then
+        // POST the result back to /community/submit_work. This is what
+        // makes community nodes provide REAL inference compute.
+        if let Some(model) = inference_model.clone() {
+            let worker_id_w = worker_id.clone();
+            let seed_rpc_addrs_w = seed_rpc_addrs.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let client = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(35)) // 30s claim + 5s overhead
+                    .build() {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                tracing::info!("Community inference worker started — polling for jobs");
+                loop {
+                    // Try each seed's gateway for work
+                    for addr in &seed_rpc_addrs_w {
+                        let host = addr.split(':').next().unwrap_or(addr);
+                        let gateway = format!("{}:3001", host);
+                        let claim_body = serde_json::json!({
+                            "worker_id": worker_id_w,
+                            "capabilities": ["inference"],
+                        });
+                        let resp = match client
+                            .post(format!("http://{}/community/claim_work", gateway))
+                            .json(&claim_body)
+                            .send()
+                            .await
+                        {
+                            Ok(r) => r,
+                            Err(_) => continue,
+                        };
+                        let job: serde_json::Value = match resp.json().await {
+                            Ok(j) => j,
+                            Err(_) => continue,
+                        };
+                        if job.get("status").and_then(|s| s.as_str()) != Some("work") {
+                            continue; // no_work — try next seed
+                        }
+                        let job_id = job.get("job_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                        let input = job.get("input").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                        let max_tokens = job.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
+                        if input.is_empty() || job_id.is_empty() { continue; }
+
+                        tracing::info!("Claimed job {} from {}: {:?} (max_tokens={})",
+                            job_id, gateway, &input[..input.len().min(40)], max_tokens);
+
+                        // Run inference locally
+                        let start = std::time::Instant::now();
+                        let (generated, hash) = model.generate(
+                            &{
+                                let mut toks = vec![model.config.bos_token];
+                                toks.extend(model.encode(&input));
+                                toks
+                            },
+                            max_tokens,
+                            &model.config.eos_tokens,
+                        );
+                        let elapsed_ms = start.elapsed().as_millis() as u64;
+                        let output_text = model.decode(&generated);
+                        let tokens_gen = generated.len() as u64;
+                        let ms_per_tok = if tokens_gen > 0 { elapsed_ms / tokens_gen } else { 0 };
+
+                        tracing::info!("Job {} done: {} tokens in {}ms = {} ms/tok",
+                            job_id, tokens_gen, elapsed_ms, ms_per_tok);
+
+                        // Submit result
+                        let result_body = serde_json::json!({
+                            "job_id": job_id,
+                            "worker_id": worker_id_w,
+                            "success": true,
+                            "output": output_text,
+                            "output_hash": format!("0x{}", hex::encode(&hash.0)),
+                            "tokens_generated": tokens_gen,
+                            "total_ms": elapsed_ms,
+                            "ms_per_token": ms_per_tok,
+                            "engine": "INT8 integer (community worker)",
+                        });
+                        let _ = client
+                            .post(format!("http://{}/community/submit_work", gateway))
+                            .json(&result_body)
+                            .timeout(std::time::Duration::from_secs(10))
+                            .send()
+                            .await;
+                        break; // after completing a job, go back to the top and poll again
+                    }
+                    // Brief sleep between poll rounds to avoid hammering
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            });
+            tracing::info!("Community inference worker loop spawned");
+        }
     }
 
     rpc::serve(
