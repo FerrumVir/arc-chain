@@ -43,7 +43,7 @@ PORT = int(os.environ.get("ARC_GATEWAY_PORT",
     sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else 3001))
 TTL_SECS = 90
 CLAIM_TIMEOUT_SECS = 30
-LOCAL_ARC_NODE = os.environ.get("ARC_NODE_RPC", "http://localhost:9090")
+LOCAL_ARC_NODE = os.environ.get("ARC_NODE_RPC", "http://localhost:9944")
 
 # ─── Worker registry ──────────────────────────────────────────────────────────
 workers = {}       # worker_id -> {info, last_seen, work_completed}

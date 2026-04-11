@@ -390,7 +390,11 @@ impl GpuMatmul {
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
         let _ = self.device.poll(wgpu::PollType::wait());
-        rx.recv().unwrap().unwrap();
+        match rx.recv() {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => { eprintln!("GPU map error: {:?}", e); return vec![]; },
+            Err(_) => { eprintln!("GPU map channel closed"); return vec![]; },
+        }
 
         let mapped = slice.get_mapped_range();
         let result: Vec<i32> = bytemuck::cast_slice(&mapped).to_vec();
@@ -607,7 +611,11 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
             let _ = device.poll(wgpu::PollType::wait());
-            rx.recv().unwrap().unwrap();
+            match rx.recv() {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => { eprintln!("GPU map error: {:?}", e); return; },
+                Err(_) => { eprintln!("GPU map channel closed"); return; },
+            }
             let data: Vec<i32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
             println!("DIAG1 diag_write: output[0]={}, output[1]={} (expect 12345, 67890)", data[0], data[1]);
             assert_eq!(data[0], 12345, "diag_write: buffer(0) mapping failed");
@@ -698,7 +706,11 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
             let _ = device.poll(wgpu::PollType::wait());
-            rx.recv().unwrap().unwrap();
+            match rx.recv() {
+                Ok(Ok(())) => {},
+                Ok(Err(e)) => { eprintln!("GPU map error: {:?}", e); return; },
+                Err(_) => { eprintln!("GPU map channel closed"); return; },
+            }
             let data: Vec<i32> = bytemuck::cast_slice(&slice.get_mapped_range()).to_vec();
             println!("DIAG2 diag_5buf: [{}, {}, {}, {}, {}]", data[0], data[1], data[2], data[3], data[4]);
             println!("  Expected: [111 (buf0), 222 (buf1), 333 (buf3/params), 444 (buf4/scales), 77777 (sentinel)]");

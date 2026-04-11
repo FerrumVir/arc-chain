@@ -21,7 +21,7 @@ use tower_http::cors::CorsLayer;
 /// Faucet configuration.
 const FAUCET_CLAIM_AMOUNT: u64 = 10_000;
 const FAUCET_RATE_LIMIT_SECS: u64 = 60; // 1 minute per address (testnet — was 1 hour)
-const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute for testnet TPS demo
+const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute — intentionally high for testnet TPS demos; lower before mainnet
 
 /// Shared node state passed to all handlers.
 #[derive(Clone)]
@@ -3403,6 +3403,12 @@ async fn inference_run_sharded(
     let input_text = req.get("input")
         .and_then(|v| v.as_str())
         .ok_or(api_error(StatusCode::BAD_REQUEST, "'input' field required"))?;
+
+    // Validate input: enforce max length
+    if input_text.len() > 32_768 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
+    }
+
     let max_tokens = req.get("max_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(20)

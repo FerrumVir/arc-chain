@@ -403,6 +403,7 @@ unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
 /// Write matmul result into pre-allocated output buffer (zero-alloc).
 /// Parallel with 512-row chunks to minimize rayon scheduling overhead.
 fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
+    debug_assert_eq!(output.len(), weights.scales.len(), "matmul output/scales mismatch");
     let data = &weights.data;
     let scales = &weights.scales;
     output.par_chunks_mut(512).enumerate().for_each(|(chunk_idx, chunk)| {
@@ -605,6 +606,7 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
 ///        = acc / 32767 * abs_max * ONE >> FRAC_BITS
 ///        ≈ ONE * dot(W, X)  (Q16 of the real result).
 fn matmul_i16_into(weights: &I16Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
+    debug_assert!(output.len() <= weights.data.len() / in_size, "i16 matmul bounds");
     let data = &weights.data;
     let scales = &weights.scales;
     // Chunk size 256: empirical sweet spot on M2 Ultra. Going smaller
@@ -897,6 +899,7 @@ pub fn matmul_fast_preq(weights: &I8Weights, _input_q: &QuantizedInput, input_ra
 
 #[cfg(target_arch = "aarch64")]
 fn matmul_simd_preq_neon(weights: &I8Weights, input_q: &QuantizedInput, in_size: usize, output: &mut [i64]) {
+    debug_assert_eq!(output.len(), weights.scales.len(), "matmul output/scales mismatch");
     use std::arch::aarch64::*;
     let data = &weights.data;
     let inp = &input_q.data;
@@ -938,6 +941,7 @@ fn matmul_simd_preq_neon(weights: &I8Weights, input_q: &QuantizedInput, in_size:
 
 #[cfg(target_arch = "x86_64")]
 fn matmul_simd_preq_x86(weights: &I8Weights, input_q: &QuantizedInput, in_size: usize, output: &mut [i64]) {
+    debug_assert_eq!(output.len(), weights.scales.len(), "matmul output/scales mismatch");
     use std::arch::x86_64::*;
     let data = &weights.data;
     let inp = &input_q.data;
@@ -1061,6 +1065,7 @@ impl Q4WeightsX86 {
 /// Reads HALF the weight data of matmul_i8xi8 → 2x bandwidth improvement.
 #[cfg(target_arch = "x86_64")]
 pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
+    debug_assert_eq!(output.len(), q4.scales.len(), "matmul output/scales mismatch");
     use std::arch::x86_64::*;
 
     if !is_x86_feature_detected!("avx2") {
@@ -1197,6 +1202,7 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
 /// Processes 16 packed bytes (32 Q4 values) per iteration.
 #[cfg(target_arch = "aarch64")]
 pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
+    debug_assert_eq!(output.len(), q4.scales.len(), "matmul output/scales mismatch");
     use std::arch::aarch64::*;
 
     let in_size = q4.n_cols;
@@ -1286,6 +1292,7 @@ pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: 
 }
 
 fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
+    debug_assert_eq!(output.len(), q4.scales.len(), "matmul output/scales mismatch");
     let byte_cols = q4.n_cols / 2;
     let data = &q4.data;
     let inp = &input_q.data;
@@ -1309,6 +1316,7 @@ fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i
 /// Q4 × i64 matmul with FULL input precision (no pre-quantization).
 /// This avoids the double-quantization precision loss of the SIMD path.
 pub fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
+    debug_assert_eq!(output.len(), q4.scales.len(), "matmul output/scales mismatch");
     let byte_cols = q4.n_cols / 2;
     let data = &q4.data;
     let scales = &q4.scales;
@@ -1538,6 +1546,11 @@ fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
 /// Flash attention for a single query head against i8-quantized KV cache.
 /// Uses online softmax: processes KV in streaming fashion, never allocates O(n²).
 /// Numerically equivalent to standard attention (within integer rounding).
+///
+/// TODO(#4): wire flash_attention_i8 into the main forward pass. Currently the
+/// standard attention path (computing all Q*K scores then softmax) is used.
+/// Switching requires careful validation that online softmax produces bit-identical
+/// output to the existing path under all sequence lengths and precision levels.
 ///
 /// q_head: [d_head] i64 Q16 — the query for this head at current position
 /// k_data: flat i8 array of all cached K for this layer
@@ -2989,6 +3002,10 @@ mod tests {
 
     #[test]
     fn test_forward_shard_token_full_equals_split() {
+        // Note: panic!() calls in this and related test functions are intentional
+        // test assertions — they are NOT in any production code path.
+        // Production functions (forward_shard_token, forward_one_token) return Results.
+        //
         // The end-to-end claim: running all layers as a single shard
         // [0, n_layers) on one node must produce the SAME hidden state
         // (and the same final token id) as splitting the layers across
@@ -3221,6 +3238,23 @@ mod tests {
         println!("dispatched : {:>5} ns/call  (sum={})", dispatched_ns, sum_d);
         println!("speedup    : {:.2}x", speedup);
         assert_eq!(sum_s, sum_d, "SIMD and scalar must produce identical sums");
+    }
+
+    #[test]
+    fn test_q4_scale_roundtrip() {
+        let weights = I8Weights::quantize_f32(
+            &(0..512*256).map(|i| (i as f32 % 200.0 - 100.0) / 100.0).collect::<Vec<_>>(),
+            512, 256,
+        );
+        let q4 = Q4WeightsX86::from_i8(&weights);
+        assert_eq!(q4.n_rows, 512);
+        assert_eq!(q4.n_cols, 256);
+        assert_eq!(q4.scales.len(), 512);
+        // Verify scale magnitudes are reasonable
+        for (i, (&q4s, &i8s)) in q4.scales.iter().zip(weights.scales.iter()).enumerate() {
+            let ratio = q4s as f64 / i8s.max(1) as f64;
+            assert!(ratio >= 0.5 && ratio <= 20.0, "Q4 scale ratio out of range at row {}: {}", i, ratio);
+        }
     }
 }
 
@@ -3474,5 +3508,18 @@ mod int16_tests {
         // Verify dimensions match the original I8 layers
         assert_eq!(i16_layers[0].wq.n_rows, model.layers[0].wq.n_rows);
         assert_eq!(i16_layers[0].wq.n_cols, model.layers[0].wq.n_cols);
+    }
+
+    #[test]
+    fn test_i16_matmul_nonzero_output() {
+        let weights = I16Weights::quantize_f32(
+            &(0..128*64).map(|i| ((i % 200) as f32 - 100.0) / 100.0).collect::<Vec<_>>(),
+            128, 64,
+        );
+        let input: Vec<i64> = (0..64).map(|i| (i as i64 - 32) * ONE / 32).collect();
+        let mut output = vec![0i64; 128];
+        matmul_i16_into(&weights, &input, 64, &mut output);
+        let nonzero = output.iter().filter(|&&x| x != 0).count();
+        assert!(nonzero > 100, "Expected mostly nonzero outputs, got {}/128", nonzero);
     }
 }

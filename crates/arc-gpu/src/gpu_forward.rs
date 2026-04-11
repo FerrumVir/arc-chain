@@ -751,7 +751,11 @@ impl GpuForward {
         let (tx, rx) = std::sync::mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
         let _ = self.device.poll(wgpu::PollType::wait());
-        rx.recv().unwrap().unwrap();
+        match rx.recv() {
+            Ok(Ok(())) => {},
+            Ok(Err(e)) => { eprintln!("GPU map error: {:?}", e); return 0; },
+            Err(_) => { eprintln!("GPU map channel closed"); return 0; },
+        }
 
         let t_poll = t0.elapsed();
 
