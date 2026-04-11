@@ -30,8 +30,14 @@ Usage:
 
 import json, time, sys, os, uuid, hashlib
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from threading import Lock, Event, Thread
 from collections import deque
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    """Handle each request in a new thread so claim_work (30s long-poll)
+    doesn't block inference/community submissions."""
+    daemon_threads = True
 
 PORT = int(os.environ.get("ARC_GATEWAY_PORT",
     sys.argv[sys.argv.index("--port") + 1] if "--port" in sys.argv else 3001))
@@ -324,7 +330,7 @@ if __name__ == "__main__":
     print(f"  /community/list        — list live workers")
     print(f"  /community/stats       — job statistics")
 
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
