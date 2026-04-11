@@ -930,19 +930,32 @@ async fn main() -> Result<()> {
                 "work_completed": 0,
             });
 
-            // Register once, then heartbeat + re-register periodically
+            // Register once, then heartbeat + re-register periodically.
+            // Community gateway runs on port 3001 as a sidecar alongside
+            // the main arc-node on 9090. Try both 3001 (gateway) and 9090
+            // (if the seed runs the dd0 binary with built-in endpoints).
             let mut ticks: u64 = 0;
             loop {
                 for addr in &seed_rpc_addrs_c {
+                    // Derive gateway port from RPC addr: replace :9090 with :3001
+                    let host = addr.split(':').next().unwrap_or(addr);
+                    let gateway_addr = format!("{}:3001", host);
                     // Every 4th tick (60s), do a full re-register to pick up metadata changes
                     if ticks % 4 == 0 {
-                        let _ = client.post(format!("http://{}/community/register", addr))
-                            .json(&register_payload)
-                            .send().await;
+                        // Try gateway first (port 3001), then arc-node (port 9090)
+                        let r = client.post(format!("http://{}/community/register", gateway_addr))
+                            .json(&register_payload).send().await;
+                        if r.is_err() {
+                            let _ = client.post(format!("http://{}/community/register", addr))
+                                .json(&register_payload).send().await;
+                        }
                     } else {
-                        let _ = client.post(format!("http://{}/community/heartbeat", addr))
-                            .json(&heartbeat_payload)
-                            .send().await;
+                        let r = client.post(format!("http://{}/community/heartbeat", gateway_addr))
+                            .json(&heartbeat_payload).send().await;
+                        if r.is_err() {
+                            let _ = client.post(format!("http://{}/community/heartbeat", addr))
+                                .json(&heartbeat_payload).send().await;
+                        }
                     }
                 }
                 ticks += 1;
