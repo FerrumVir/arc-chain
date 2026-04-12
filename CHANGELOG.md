@@ -3,6 +3,67 @@
 All notable changes to ARC Chain are tracked here. This project follows
 [semantic versioning](https://semver.org/).
 
+## v0.5.2 — 2026-04-11
+
+**Community inference network + SIMD performance + audit hardening.**
+
+### Community Worker Infrastructure
+- **Community gateway sidecar** (`scripts/community-gateway.py`) — Python
+  HTTP server on port 3001 that runs alongside arc-node. Handles worker
+  registration, heartbeat, inference job distribution via long-poll.
+- **`POST /inference/community`** — submit inference to be computed by
+  any available community worker. Gateway queues the request, worker
+  claims via `/community/claim_work`, computes locally, submits result
+  via `/community/submit_work`. All outbound-HTTPS, works behind NAT.
+- **`--community-mode`** CLI flag — arc-node auto-registers with all
+  seed gateways (port 3001), heartbeats every 15s, polls for inference
+  jobs in background. Works with any model loaded.
+- **Standalone registration script** (`scripts/arc-community-register.sh`)
+  — bash loop that registers ANY version of arc-node with gateways.
+  No binary rebuild needed. `curl ... | bash` one-liner.
+- **UDP 443 fallback** on all 8 seeds via iptables redirect. Community
+  nodes behind ISPs that block UDP 9091 can connect via 443.
+- **`scripts/arc-diagnose.sh`** — 4-phase health check for community
+  nodes: UDP reachability, process status, peer count, chain sync.
+- Install script now checks peer count and warns if node is isolated.
+
+### Performance (NEON SIMD on Mac M2 Ultra)
+- **NEON i16 dot product** (`dot_i16_i64_neon`) — 3.7× matmul speedup.
+  Vectorized 8-lane i16×i32→i64 via vmlal_s32.
+- **NEON attention Q·K SIMD** (`dot_i64xi64_attn_neon`) — vectorized
+  attention inner loop. Heads parallelized via `into_par_iter()`.
+- **Rayon chunk-256** — empirical sweet spot for M2 Ultra core
+  saturation. Combined Mac compute: **23× faster** (14.4s → 622ms
+  per position).
+- **Q4 NEON wiring** — opt-in via `ARC_Q4_SHARD=1`. Dispatch prefers
+  Q4→I16→I8 on aarch64. Disabled by default (precision risk on 7B).
+- AVX-512 i16 widening attempted but reverted (consensus segfault on
+  Vultr Skylake Xeon). x86 stays on scalar fallback.
+
+### Stability & Correctness (11 audit fixes)
+- `debug_assert` bounds checks in all 8 matmul functions.
+- GPU `recv().unwrap()` replaced with graceful error handling.
+- 32KB prompt length limit added to `inference_run_sharded`.
+- Faucet rate limit documented as testnet-only.
+- Gateway default port fixed (9090 → 9944 to match binary).
+- New tests: `test_q4_scale_roundtrip`, `test_i16_matmul_nonzero_output`.
+- Shard registry 60s TTL + self-refresh broadcaster.
+- Puller only pulls `self_shard` from each seed (prevents stale entry
+  resurrection).
+- No-candle on shard holders saves ~4 GB RAM on 8 GB VPS.
+- `forward_one_token` panic guard for non-first shards.
+- Pipelined prefill + chat template skip (~4× faster first-token).
+
+### Infrastructure
+- Shard dedup fix: pipeline walker prefers routable socket_addr.
+- Updated `testnet-seeds.txt` with `:443` fallback entries (git only;
+  seeds themselves use `:9091` to avoid self-dial).
+- Community gateway deployed as systemd service on 6 seeds.
+
+### Tests
+- 68 tests pass (was 64 in v0.5.1). New: dot_i16 SIMD correctness,
+  Q4 scale roundtrip, I16 matmul nonzero, dot_i16 tail.
+
 ## v0.5.1 — 2026-04-08
 
 **Dashboard cache warmth indicator.** The dashboard now probes the

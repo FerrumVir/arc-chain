@@ -4,9 +4,9 @@
 
 ARC Chain is a Layer 1 blockchain for verifiable AI inference. The core innovation: a pure integer inference engine that produces bitwise identical output across ARM, x86, and GPU. This enables hash-based verification of AI computation at O(1) cost.
 
-**Version:** 0.3.0
+**Version:** 0.5.2
 **Repo:** `FerrumVir/arc-chain` (private)
-**Language:** Rust (99K+ LOC, 16 crates, 1,196 tests)
+**Language:** Rust (99K+ LOC, 16 crates, 68+ inference tests)
 
 ## Build & Test
 
@@ -17,7 +17,7 @@ cargo test -p arc-inference --lib     # 53 inference tests (includes INT16)
 make eval-perplexity                  # Run perplexity evaluation (needs GGUF model)
 ```
 
-## What Just Shipped (v0.2.1)
+## What Just Shipped (v0.5.2)
 
 1. **INT16 is now default precision.** 32,767 quantization levels per weight (258x finer than INT8, 32x finer than FP16). Same 2 bytes/param as FP16 but fully deterministic. Dispatch priority: I16 > Q4 > I8.
 

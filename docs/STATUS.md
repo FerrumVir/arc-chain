@@ -1,9 +1,8 @@
-# ARC Chain — Overnight Status (2026-04-08)
+# ARC Chain — Status (v0.5.2, 2026-04-11)
 
-A snapshot of everything shipped during the autonomous overnight session
-(2026-04-07 22:55 CDT → 2026-04-08 ~08:15 CDT). **36 iterations, 7 versions
-released, 40+ commits, 3 unit tests for the shard pipeline, 9 user-facing
-docs, 6 ready-to-ship scripts.**
+Current production state of the ARC testnet. Updated from the multi-day
+engineering sprint (2026-04-07 → 2026-04-11). **70+ commits, 68 tests,
+community inference network live.**
 
 ## TL;DR
 
