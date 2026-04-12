@@ -1,0 +1,283 @@
+# ARC Chain — Complete Architecture Reference
+
+**READ THIS FIRST IN EVERY SESSION.** This is the authoritative reference for
+all infrastructure in the codebase. Every component listed here is REAL CODE
+that EXISTS and has been audited. Do NOT build new infrastructure without
+checking if it already exists here.
+
+## Version: 0.5.2 | LOC: 94K+ | Crates: 16 | Tests: 68+
+
+---
+
+## Consensus: Sender-Sharded DAG (Mysticeti-inspired)
+
+**File:** `crates/arc-consensus/src/lib.rs` (3,600 lines)
+
+- **Two-round commit rule**: Block B committed when referenced by 2f+1
+  stake-weighted blocks two rounds later. ~200ms finality.
+- **MEV protection**: Transactions sorted lexicographically with ordering
+  commitment. EncryptedMempool for commit-reveal.
+- **Epoch transitions**: `freeze_epoch()` creates deterministic frozen
+  validator sets. All nodes freeze identically at same committed height.
+- **Slashing**: DoubleSigning, LivenessFault, InvalidBlockProposal,
+  EquivocationDAG. Rates: 10% (Spark), 20% (Arc), 30% (Core).
+
+### Beacon Chain
+**File:** `crates/arc-consensus/beacon.rs` (200 lines)
+- Hierarchical sharding coordinator
+- Each shard runs own DAG consensus
+- Beacon collects state roots per epoch
+- Global root = Merkle(shard_0_root, shard_1_root, ...)
+
+### Security Modules
+**File:** `crates/arc-consensus/security.rs` (300 lines)
+- Withholding detection (>50% score = report)
+- Long-range attack prevention (checkpoints every 1000 rounds)
+- Nothing-at-stake mitigation (double-vote detection)
+
+---
+
+## VRF Proposer Selection
+
+**Files:**
+- `crates/arc-crypto/src/vrf.rs` (150 lines) — Core VRF primitives
+- `crates/arc-node/src/vrf.rs` (300 lines) — ProposerSelector
+
+### What it does:
+- Ed25519 + BLAKE3 VRF (RFC 9381-inspired)
+- `vrf_prove(keypair, alpha)` → (proof, output)
+- `vrf_verify(pubkey, alpha, proof)` → output
+- Stake-weighted threshold: P(selected) = stake / total_stake
+- Sortition: lowest `weighted_score()` wins
+
+### STATUS: BUILT, NOT WIRED INTO CONSENSUS LOOP
+Block production is currently time-based (100ms intervals). VRF should
+replace this: only VRF-selected proposers create blocks.
+
+**To wire:** In `crates/arc-node/src/consensus.rs`, before `propose_block()`,
+call `ProposerSelector::is_proposer()` and skip if not selected.
+
+---
+
+## Inference Verification — 3 Tiers
+
+### Tier 1: All-Execute (small models <20B)
+All validators run inference independently. Majority vote determines output.
+
+### Tier 2: VRF Committee (models 20-100B)
+**File:** `crates/arc-inference/src/committee.rs` (334 lines)
+- `select_committee(vrf_seed, validators, tier, k=7)` — deterministic
+- `aggregate_votes(committee, votes)` — 5/7 agreement required
+- `corruption_probability(f=0.1, k=7, min=5)` = 0.018%
+
+### STATUS: BUILT, NOT WIRED INTO INFERENCE PIPELINE
+**To wire:** After `inference_run_sharded()` produces output, select a
+committee and broadcast for verification votes.
+
+### Tier 3: STARK-Proven (single validator + proof)
+**File:** `crates/arc-crypto/src/stwo_air.rs` (1,400 lines)
+- Real Stwo Circle STARK prover (NOT mock)
+- `prove_dense_stark()` — proves one transformer layer
+- `prove_block()` — proves full block with weights + activations + state
+- `prove_recursive()` — recursive proof composition
+- Field: M31 (2^31 - 1), Blake2s Merkle commitments
+- Feature-gated: `--features stwo-prover`
+
+### Attestation System
+**File:** `crates/arc-vm/src/inference_verify.rs` (150 lines)
+- `InferenceCommitment` — provider posts result_hash + bond
+- `VerificationChallenge` — challenger posts bond + deadline
+- Challenge types: ReExecution, SpotCheck, StatisticalAudit, ConsensusVerification
+- Resolution: winner takes loser's bond
+
+---
+
+## Distributed Inference Engine
+
+**File:** `crates/arc-inference/src/distributed.rs` (400+ lines)
+
+### ShardRegistry (MULTI-MODEL from day 1)
+```rust
+pub struct ShardRegistry {
+    models: DashMap<Hash256, Vec<ShardAssignment>>,    // per-model shards
+    node_shards: DashMap<Hash256, Vec<(Hash256, ShardAssignment)>>,
+}
+```
+- `register_shard(model_id, shard)` — per-model
+- `get_pipeline(model_id)` — ordered shard list for one model
+- `is_model_fully_covered(model_id, total_layers)` — completeness check
+- `fully_covered_models()` — which models have full pipelines
+
+### STATUS: BUILT, NOT USED AT RUNTIME
+The runtime uses a flat `DashMap<String, ShardInfo>` in `rpc.rs` instead.
+**To wire:** Replace flat registry with `ShardRegistry` from distributed.rs.
+
+### Auto-Sharding
+- `compute_shard_plan(nodes, n_layers)` — distributes layers proportional to RAM
+- GPU bonus: nodes with GPU get 1.5x weight
+- `compute_expert_shard_plan()` — MoE expert distribution
+
+### STATUS: BUILT, NEVER CALLED
+**To wire:** Call `compute_shard_plan()` when a new node joins. Send
+assignment via RPC.
+
+### DistributedCache (already multi-model)
+```rust
+pub fn cache_key(model_id: &Hash256, input_tokens: &[u32]) -> Hash256
+pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
+```
+
+---
+
+## Integer Inference Engine
+
+**File:** `crates/arc-inference/src/cached_integer_model.rs` (3,400 lines)
+
+### Precision Hierarchy
+1. **I16** (default) — 32,767 quantization levels, loaded from f32
+2. **I8** — 127 levels, fallback
+3. **Q4** — 16 levels, 2x bandwidth reduction, opt-in via ARC_Q4_SHARD=1
+
+### SIMD Acceleration (shipped v0.5.2)
+- `dot_i16_i64_neon()` — NEON i16 matmul (3.7x on M2 Ultra)
+- `dot_i64xi64_attn_neon()` — NEON attention Q*K dot product
+- `matmul_simd_preq_neon()` — NEON i8xi8 (EXISTS, not wired into shard dispatch)
+- `matmul_q4_preq_neon()` — NEON Q4 (wired, opt-in)
+- AVX-512 path reverted (consensus segfault on Vultr Xeon)
+
+### Unused Optimizations
+- `flash_attention_i8()` — online softmax, 60 lines. **EXISTS, NEVER CALLED.**
+- `quantize_for_dot()` + `dot_i8_kv_neon()` — KV cache quantization. **EXISTS, NEVER CALLED.**
+
+### Forward Paths
+- `forward_one_token()` — full model, single node
+- `forward_shard_token()` — layer range, for pipeline sharding
+- Both produce bit-identical output across ARM, x86
+
+---
+
+## GPU Engine
+
+**File:** `crates/arc-gpu/src/gpu_forward.rs` (800 lines)
+
+- `GpuForward` — wgpu-based transformer engine
+- All kernels: matmul, layernorm, RoPE, attention, SiLU, residual, argmax
+- Metal + WGSL backends
+- `forward_one_token(model, token, pos) -> u32`
+- **BROKEN:** Embedding lookup writes zeros (line 668-670)
+- **NOT WIRED** into any production inference path
+- 5 Metal shaders (attention.metal, rope.metal, silu.metal, residual.metal, argmax.metal) — UNTESTED
+
+---
+
+## Token Economics
+
+**File:** `crates/arc-types/src/economics.rs` (200 lines)
+
+| Tier | Min Stake | APY | Unbonding | Slashing |
+|------|-----------|-----|-----------|----------|
+| Lite | 50K | 5% | 1 day | — |
+| Spark | 500K | 8% | 7 days | 10% |
+| Arc | 5M | 15% | 14 days | 20% |
+| Core | 50M | 25% | 30 days | 30% |
+
+- Fixed supply: 1.03 billion ARC, 9 decimals
+- NO inflation, NO burn
+- Revenue: 40% proposers, 25% verifiers, 15% observers, 20% treasury
+- Bootstrap fund: 2-year linear vesting, 1-week cliff
+
+---
+
+## Community Worker System (v0.5.2)
+
+### Gateway Sidecar
+**File:** `scripts/community-gateway.py`
+- Port 3001, ThreadingHTTPServer
+- `/community/register` + `/community/heartbeat` + `/community/list`
+- `/community/claim_work` — long-poll (30s) for inference jobs
+- `/community/submit_work` — return computed result
+- `/inference/community` — route inference to community workers
+
+### Node Client
+**File:** `crates/arc-node/src/main.rs` (--community-mode)
+- Auto-register with all seed gateways (port 3001)
+- Auto-poll claim_work for inference jobs
+- Compute locally via model.generate()
+- Submit results back
+
+---
+
+## Transaction Types (24 total)
+
+**File:** `crates/arc-types/src/lib.rs`
+
+Key types for inference:
+- `InferenceAttestation` — on-chain record of inference result
+- `InferenceChallenge` — challenge a result with bond
+- `InferenceRegister` — register as inference provider
+- `InferenceCommitment` — commit result hash + bond
+
+---
+
+## Signature Schemes (5)
+
+**File:** `crates/arc-crypto/src/`
+- Ed25519 (primary)
+- secp256k1 (ETH compat)
+- BLS (aggregate signatures)
+- Falcon-512 (post-quantum)
+- ML-DSA (post-quantum, NIST)
+
+---
+
+## VM Runtime
+
+**File:** `crates/arc-vm/src/`
+- EVM (revm) — Solidity/ERC-20 compatible
+- WASM (wasmer) — general compute
+- Precompiles for inference operations
+
+---
+
+## Scripts
+
+| Script | Purpose |
+|--------|---------|
+| `install-community-node.sh` | One-command node install (NO model download) |
+| `community-gateway.py` | Gateway sidecar for worker registration + inference routing |
+| `arc-community-register.sh` | Standalone registration (works with ANY version) |
+| `arc-diagnose.sh` | 4-phase health check for stuck nodes |
+| `arc-demo.sh` | End-to-end sharded inference demo |
+| `arc-verify.sh` | Third-party inference verifier |
+| `arc-bench.sh` | Reproducible factual benchmark |
+| `arc-watchdog.sh` | Testnet watchdog (preserves flags on restart) |
+| `arc-health-check.sh` | Network-wide health probe |
+| `rolling-upgrade.sh` | Automated rolling deploy |
+
+---
+
+## CRITICAL RULES FOR FUTURE SESSIONS
+
+1. **NEVER build new infrastructure without checking this doc first.**
+   The VRF, committees, ShardRegistry, auto-sharding, STARK prover,
+   economics, and attestation system ALL EXIST. They need WIRING, not
+   REBUILDING.
+
+2. **NEVER restart all nodes at once.** Rolling upgrade only.
+   Exception: if all nodes are already dead.
+
+3. **NEVER download models in the install script.** Nodes join for
+   consensus + TPS immediately. Models are optional for inference.
+
+4. **The integer engine is the production path.** Candle is fallback.
+   GPU (arc-gpu) is broken (embedding bug). Don't claim GPU works.
+
+5. **The ShardRegistry in distributed.rs is multi-model.** The flat
+   registry in rpc.rs is NOT. Use the real one.
+
+6. **Test on x86 VPS before deploying.** Mac (aarch64) works but
+   Vultr x86 has different memory/timing behavior. The dd0bef8 binary
+   segfaults on x86 when receiving real consensus traffic — this is
+   likely caused by the DashMap type change in NodeState (community_workers
+   field changes memory layout, exposing a pre-existing off-by-one in
+   the consensus thread). Use the stable binary (dc662fa) for x86 seeds.
