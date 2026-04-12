@@ -175,7 +175,11 @@ curl -fsL -o "$ARC_DIR/seeds.txt" "https://raw.githubusercontent.com/${REPO}/mai
 curl -fsL -o "$ARC_DIR/genesis.toml" "https://raw.githubusercontent.com/${REPO}/main/genesis.toml"
 ok "Seeds + genesis downloaded"
 
-# ── Download model ──────────────────────────────────────────────────────────
+# ── Model download (ASYNC — node starts immediately without it) ────────────
+# The node joins the network for consensus + TPS FIRST. Model downloads
+# in the background. When it's ready, the node auto-detects it on the next
+# restart or auto-update cycle. This means the user sees their node running
+# within SECONDS, not waiting 10-30 minutes for a 4 GB download.
 if [ -n "$USER_MODEL" ]; then
     if [ ! -f "$USER_MODEL" ]; then
         fail "Model file not found: $USER_MODEL"
@@ -186,17 +190,33 @@ else
     MODEL_PATH="$ARC_DIR/$DEFAULT_MODEL_FILE"
     if [ -f "$MODEL_PATH" ]; then
         SIZE=$(stat -f%z "$MODEL_PATH" 2>/dev/null || stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)
-        if [ "$SIZE" -gt 100000000 ]; then  # >100 MB suggests a real GGUF
+        if [ "$SIZE" -gt 100000000 ]; then
             ok "Model already downloaded: $MODEL_PATH ($(du -h "$MODEL_PATH" | cut -f1))"
         else
             rm -f "$MODEL_PATH"
         fi
     fi
     if [ ! -f "$MODEL_PATH" ]; then
-        info "Downloading $DEFAULT_MODEL_FILE (~${DEFAULT_MODEL_SIZE_GB} GB) — this is one-time, takes a few minutes"
-        curl -fL --progress-bar -o "$MODEL_PATH.tmp" "$DEFAULT_MODEL_URL"
-        mv "$MODEL_PATH.tmp" "$MODEL_PATH"
-        ok "Model downloaded: $MODEL_PATH"
+        info "Model will download in background (~${DEFAULT_MODEL_SIZE_GB} GB) — your node starts NOW"
+        # Background download: when done, restart the node so it picks up the model
+        (
+            curl -fL --progress-bar -o "$MODEL_PATH.tmp" "$DEFAULT_MODEL_URL" 2>/dev/null
+            if [ -f "$MODEL_PATH.tmp" ]; then
+                mv "$MODEL_PATH.tmp" "$MODEL_PATH"
+                echo "[$(date)] Model downloaded: $MODEL_PATH" >> "$ARC_DIR/node.log"
+                # Restart service to pick up the model
+                if [ "$(uname -s)" = "Darwin" ]; then
+                    launchctl kickstart -k "gui/$(id -u)/com.arc.inference" 2>/dev/null || true
+                else
+                    sudo systemctl restart arc-node 2>/dev/null || true
+                fi
+            fi
+        ) &
+        MODEL_DOWNLOAD_PID=$!
+        ok "Model downloading in background (PID $MODEL_DOWNLOAD_PID)"
+        # Node starts WITHOUT --model flag. It joins consensus immediately.
+        # Once model download finishes, it restarts with model loaded.
+        MODEL_PATH=""
     fi
 fi
 
@@ -257,6 +277,18 @@ UPDATER_EOF
 chmod +x "$UPDATER_PATH"
 ok "Auto-updater script: $UPDATER_PATH"
 
+# Build model args (empty if model not yet downloaded — node starts without it)
+if [ -n "$MODEL_PATH" ] && [ -f "$MODEL_PATH" ]; then
+    MODEL_PLIST_ARGS="<string>--model</string><string>$MODEL_PATH</string>"
+    MODEL_SYSTEMD_ARGS="--model $MODEL_PATH"
+    MODEL_SHELL_ARGS="--model \"$MODEL_PATH\""
+else
+    MODEL_PLIST_ARGS=""
+    MODEL_SYSTEMD_ARGS=""
+    MODEL_SHELL_ARGS=""
+    info "No model yet — node joins consensus immediately. Model downloads in background."
+fi
+
 # ── Install service ─────────────────────────────────────────────────────────
 if [ "$INSTALL_SERVICE" = true ]; then
     if [ "$OS" = "Darwin" ]; then
@@ -282,7 +314,7 @@ if [ "$INSTALL_SERVICE" = true ]; then
         <string>--min-stake</string><string>0</string>
         <string>--eth-rpc-port</string><string>0</string>
         <string>--data-dir</string><string>$ARC_DIR/data</string>
-        <string>--model</string><string>$MODEL_PATH</string>
+        $MODEL_PLIST_ARGS
         <string>--community-mode</string>
     </array>
     <key>EnvironmentVariables</key>
@@ -341,7 +373,7 @@ UPLIST_EOF
                 --seeds-file "$ARC_DIR/seeds.txt" --genesis "$ARC_DIR/genesis.toml" \
                 --validator-seed "$VALIDATOR_SEED" --stake 0 --min-stake 0 \
                 --eth-rpc-port 0 --data-dir "$ARC_DIR/data" \
-                --model "$MODEL_PATH" > "$ARC_DIR/node.log" 2>&1 &
+                $MODEL_SHELL_ARGS > "$ARC_DIR/node.log" 2>&1 &
             ok "Started in background, PID $!"
         else
             SUDO=""
@@ -366,7 +398,7 @@ ExecStart=$ARC_DIR/bin/arc-node \\
     --stake 0 --min-stake 0 \\
     --eth-rpc-port 0 \\
     --data-dir $ARC_DIR/data \\
-    --model $MODEL_PATH \\
+    $MODEL_SYSTEMD_ARGS \\
     --community-mode
 Restart=always
 RestartSec=5
