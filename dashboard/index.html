@@ -210,6 +210,20 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       </div>
     </div>
 
+    <!-- Community Workers — live count from gateways -->
+    <div id="communitySection" class="bg-gradient-to-br from-violet-900/40 to-arc-900/30 border-2 border-violet-500/40 rounded-xl p-4 mb-2">
+      <div class="flex items-center justify-between mb-3">
+        <div class="flex items-center gap-2">
+          <span class="inline-block w-2.5 h-2.5 rounded-full bg-violet-400 pulse-dot shadow-lg shadow-violet-400/50"></span>
+          <span class="text-sm font-bold text-white">Community Network</span>
+          <span id="communityCount" class="text-[10px] font-bold text-violet-300 px-2 py-0.5 rounded-full bg-violet-500/10 border border-violet-500/30">0 workers</span>
+        </div>
+        <span id="communityJobs" class="text-[10px] text-violet-300 font-mono">0 jobs completed</span>
+      </div>
+      <div id="communityWorkerList" class="space-y-1 mb-3"></div>
+      <div class="text-[9px] text-gray-500">Community nodes providing inference compute. Join with one command below.</div>
+    </div>
+
     <!-- "Join the network" — the conversion event for visitors -->
     <div class="bg-gradient-to-br from-emerald-900/40 to-arc-900/30 border-2 border-emerald-500/40 rounded-xl p-4 mb-2">
       <div class="flex items-center gap-2 mb-2">
@@ -1425,6 +1439,76 @@ async function probePresetCache(){
     });
   }catch(e){/* silent — /inference/cache_check only exists on v0.5.1+ coordinators */}
 }
+
+// ── Community workers — poll gateways and display live worker list ──────
+// Try all 8 gateways, merge unique workers by worker_id, render in the
+// Community Network section. Updates every 10 seconds.
+const GATEWAY_SEEDS = [
+  '149.28.32.76','140.82.16.112','136.244.109.1','104.238.171.11',
+  '202.182.107.41','149.28.153.31','216.238.120.27','139.84.237.49'
+];
+
+async function refreshCommunityWorkers(){
+  const seen = new Map(); // worker_id -> worker
+  let totalJobs = 0;
+  // Query all gateways in parallel, merge results
+  const results = await Promise.allSettled(GATEWAY_SEEDS.map(ip =>
+    fetch(`http://${ip}:3001/community/list`, {signal: AbortSignal.timeout(3000)})
+      .then(r => r.json())
+  ));
+  for(const r of results){
+    if(r.status !== 'fulfilled') continue;
+    const d = r.value;
+    totalJobs = Math.max(totalJobs, d.total_work_completed || 0);
+    for(const w of (d.workers || [])){
+      if(!seen.has(w.worker_id)){
+        seen.set(w.worker_id, w);
+      } else {
+        // Keep the one with higher work_completed
+        const existing = seen.get(w.worker_id);
+        if((w.work_completed||0) > (existing.work_completed||0)){
+          seen.set(w.worker_id, w);
+        }
+      }
+    }
+  }
+  const workers = Array.from(seen.values());
+  // Update count badge
+  const countEl = document.getElementById('communityCount');
+  if(countEl) countEl.textContent = `${workers.length} worker${workers.length !== 1 ? 's' : ''}`;
+  // Update jobs
+  const jobsEl = document.getElementById('communityJobs');
+  if(jobsEl) jobsEl.textContent = `${totalJobs} jobs completed`;
+  // Render worker list
+  const listEl = document.getElementById('communityWorkerList');
+  if(!listEl) return;
+  if(workers.length === 0){
+    listEl.innerHTML = '<div class="text-[10px] text-gray-600 italic">No community workers online yet. Be the first — run the install command below.</div>';
+    return;
+  }
+  listEl.innerHTML = workers.map(w => {
+    const name = (w.name || w.worker_id.slice(0,12)).slice(0,25);
+    const plat = w.platform || '?';
+    const work = w.work_completed || 0;
+    const ago = w.registered_at ? Math.floor((Date.now()/1000 - w.registered_at)/60) : 0;
+    const timeStr = ago < 60 ? `${ago}m ago` : ago < 1440 ? `${Math.floor(ago/60)}h ago` : `${Math.floor(ago/1440)}d ago`;
+    return `<div class="flex items-center justify-between bg-surface-2 border border-violet-500/20 rounded-lg px-3 py-1.5">
+      <div class="flex items-center gap-2">
+        <span class="inline-block w-1.5 h-1.5 rounded-full bg-violet-400"></span>
+        <span class="text-[11px] text-white font-medium">${name}</span>
+        <span class="text-[9px] text-gray-500">${plat}</span>
+      </div>
+      <div class="flex items-center gap-3">
+        <span class="text-[9px] text-violet-300 font-mono">${work} jobs</span>
+        <span class="text-[9px] text-gray-600">joined ${timeStr}</span>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+// Start community worker polling
+refreshCommunityWorkers();
+setInterval(refreshCommunityWorkers, 10000);
 </script>
 </body>
 </html>
