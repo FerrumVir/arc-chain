@@ -43,10 +43,14 @@ INSTALL_UPDATER=true
 USER_MODEL=""
 DO_UNINSTALL=false
 
-# Default model: Llama-2-7B-Chat Q4_K_M (~4 GB) — fits 8 GB RAM, coherent output
-DEFAULT_MODEL_URL="https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf"
-DEFAULT_MODEL_FILE="llama-2-7b-chat.Q4_K_M.gguf"
-DEFAULT_MODEL_SIZE_GB=4
+# No default model download. The network is model-agnostic — nodes join and
+# provide consensus + TPS immediately. If the user has a local GGUF model,
+# they can point to it with --model and also provide inference compute.
+# The network discovers which models are available across all nodes and
+# routes inference requests accordingly. No 4GB download required to join.
+DEFAULT_MODEL_URL=""
+DEFAULT_MODEL_FILE=""
+DEFAULT_MODEL_SIZE_GB=0
 
 # ── Parse args ──────────────────────────────────────────────────────────────
 while [ $# -gt 0 ]; do
@@ -132,12 +136,6 @@ elif [ "$OS" = "Linux" ]; then
     TOTAL_RAM_GB=$(free -g 2>/dev/null | awk 'NR==2{print $2}' || echo 0)
 fi
 ok "Detected ${TOTAL_RAM_GB} GB RAM"
-if [ "$TOTAL_RAM_GB" -lt 6 ]; then
-    warn "Less than 6 GB RAM. Llama-7B Q4 needs ~5 GB. Falling back to TinyLlama 1.1B (638 MB)."
-    DEFAULT_MODEL_URL="https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
-    DEFAULT_MODEL_FILE="tinyllama-1.1b-chat.gguf"
-    DEFAULT_MODEL_SIZE_GB=1
-fi
 
 # ── Get latest version from GitHub ──────────────────────────────────────────
 info "Checking latest release..."
@@ -175,11 +173,12 @@ curl -fsL -o "$ARC_DIR/seeds.txt" "https://raw.githubusercontent.com/${REPO}/mai
 curl -fsL -o "$ARC_DIR/genesis.toml" "https://raw.githubusercontent.com/${REPO}/main/genesis.toml"
 ok "Seeds + genesis downloaded"
 
-# ── Model download (ASYNC — node starts immediately without it) ────────────
-# The node joins the network for consensus + TPS FIRST. Model downloads
-# in the background. When it's ready, the node auto-detects it on the next
-# restart or auto-update cycle. This means the user sees their node running
-# within SECONDS, not waiting 10-30 minutes for a 4 GB download.
+# ── Model detection (NO download — network is model-agnostic) ──────────────
+# Nodes join the network and contribute consensus + TPS immediately.
+# No model download required. If the user already has a local GGUF model,
+# they pass --model /path/to/model.gguf and the node also provides
+# inference compute. The network discovers available models across all
+# nodes and routes inference accordingly.
 if [ -n "$USER_MODEL" ]; then
     if [ ! -f "$USER_MODEL" ]; then
         fail "Model file not found: $USER_MODEL"
@@ -187,36 +186,22 @@ if [ -n "$USER_MODEL" ]; then
     MODEL_PATH="$USER_MODEL"
     ok "Using your model: $MODEL_PATH ($(du -h "$MODEL_PATH" | cut -f1))"
 else
-    MODEL_PATH="$ARC_DIR/$DEFAULT_MODEL_FILE"
-    if [ -f "$MODEL_PATH" ]; then
-        SIZE=$(stat -f%z "$MODEL_PATH" 2>/dev/null || stat -c%s "$MODEL_PATH" 2>/dev/null || echo 0)
-        if [ "$SIZE" -gt 100000000 ]; then
-            ok "Model already downloaded: $MODEL_PATH ($(du -h "$MODEL_PATH" | cut -f1))"
-        else
-            rm -f "$MODEL_PATH"
-        fi
-    fi
-    if [ ! -f "$MODEL_PATH" ]; then
-        info "Model will download in background (~${DEFAULT_MODEL_SIZE_GB} GB) — your node starts NOW"
-        # Background download: when done, restart the node so it picks up the model
-        (
-            curl -fL --progress-bar -o "$MODEL_PATH.tmp" "$DEFAULT_MODEL_URL" 2>/dev/null
-            if [ -f "$MODEL_PATH.tmp" ]; then
-                mv "$MODEL_PATH.tmp" "$MODEL_PATH"
-                echo "[$(date)] Model downloaded: $MODEL_PATH" >> "$ARC_DIR/node.log"
-                # Restart service to pick up the model
-                if [ "$(uname -s)" = "Darwin" ]; then
-                    launchctl kickstart -k "gui/$(id -u)/com.arc.inference" 2>/dev/null || true
-                else
-                    sudo systemctl restart arc-node 2>/dev/null || true
-                fi
+    # Check if user already has a GGUF model in the ARC directory
+    MODEL_PATH=""
+    for f in "$ARC_DIR"/*.gguf; do
+        if [ -f "$f" ]; then
+            SIZE=$(stat -f%z "$f" 2>/dev/null || stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt 100000000 ]; then
+                MODEL_PATH="$f"
+                ok "Found local model: $MODEL_PATH ($(du -h "$MODEL_PATH" | cut -f1))"
+                break
             fi
-        ) &
-        MODEL_DOWNLOAD_PID=$!
-        ok "Model downloading in background (PID $MODEL_DOWNLOAD_PID)"
-        # Node starts WITHOUT --model flag. It joins consensus immediately.
-        # Once model download finishes, it restarts with model loaded.
-        MODEL_PATH=""
+        fi
+    done
+    if [ -z "$MODEL_PATH" ]; then
+        ok "No model needed — node joins network for consensus + TPS immediately"
+        info "To also provide inference, add a model later:"
+        info "  arc-node --model /path/to/any-model.gguf"
     fi
 fi
 
