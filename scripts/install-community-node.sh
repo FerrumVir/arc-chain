@@ -246,6 +246,8 @@ fi
 echo "[$(date)] new version available: $LOCAL → $LATEST. Downloading."
 curl -fL -o "$ARC_DIR/bin/arc-node.new" "https://github.com/${REPO}/releases/download/v${LATEST}/${ASSET}"
 chmod +x "$ARC_DIR/bin/arc-node.new"
+# Keep the old binary as rollback in case the new one crashes
+cp "$ARC_DIR/bin/arc-node" "$ARC_DIR/bin/arc-node.prev" 2>/dev/null || true
 mv "$ARC_DIR/bin/arc-node.new" "$ARC_DIR/bin/arc-node"
 echo "$LATEST" > "$ARC_DIR/version.txt"
 echo "[$(date)] binary updated to v$LATEST"
@@ -256,6 +258,26 @@ if [ "$OS" = "Darwin" ]; then
 elif [ "$OS" = "Linux" ]; then
     sudo systemctl restart arc-node 2>/dev/null || systemctl --user restart arc-node 2>/dev/null || true
     echo "[$(date)] systemctl restart sent"
+fi
+# Health check: if node doesn't come up within 30s, roll back
+sleep 30
+RPC_PORT=$(grep -oP 'rpc.*0\.0\.0\.0:\K[0-9]+' "$ARC_DIR/version.txt" 2>/dev/null || echo "9944")
+if ! curl -sf -m 5 "http://localhost:${RPC_PORT}/health" >/dev/null 2>&1; then
+    if ! curl -sf -m 5 "http://localhost:9090/health" >/dev/null 2>&1; then
+        echo "[$(date)] WARNING: new binary not healthy after 30s. Rolling back to v$LOCAL"
+        if [ -f "$ARC_DIR/bin/arc-node.prev" ]; then
+            mv "$ARC_DIR/bin/arc-node.prev" "$ARC_DIR/bin/arc-node"
+            echo "$LOCAL" > "$ARC_DIR/version.txt"
+            if [ "$OS" = "Darwin" ]; then
+                launchctl kickstart -k "gui/$(id -u)/com.arc.inference" 2>/dev/null || true
+            elif [ "$OS" = "Linux" ]; then
+                sudo systemctl restart arc-node 2>/dev/null || true
+            fi
+            echo "[$(date)] ROLLED BACK to v$LOCAL"
+        else
+            echo "[$(date)] no previous binary to roll back to"
+        fi
+    fi
 fi
 echo "[$(date)] auto-update complete"
 UPDATER_EOF
