@@ -100,8 +100,33 @@ class Handler(BaseHTTPRequestHandler):
             with lock:
                 self._prune()
                 live = [v["info"] | {"work_completed": v["work_completed"]} for v in workers.values()]
+                registered_ids = {v["info"]["worker_id"] for v in workers.values()}
+
+            # Auto-discover P2P peers from the local arc-node's validator list.
+            # Any connected peer is automatically visible as a community worker —
+            # no --community-mode flag, no register script needed.
+            try:
+                import urllib.request, json as _json
+                resp = urllib.request.urlopen("http://localhost:9090/validators", timeout=2)
+                data = _json.loads(resp.read())
+                for v in data.get("validators", []):
+                    addr = v.get("address", "")
+                    hex_id = f"0x{addr}" if not addr.startswith("0x") else addr
+                    if hex_id not in registered_ids:
+                        live.append({
+                            "worker_id": hex_id,
+                            "name": f"p2p-peer (stake={v.get('stake', 0)})",
+                            "capabilities": ["consensus"],
+                            "model": None,
+                            "platform": "auto-discovered",
+                            "registered_at": int(time.time()),
+                            "work_completed": 0,
+                        })
+            except Exception:
+                pass  # arc-node RPC unreachable — just show registered workers
+
             self._json(200, {"workers": live, "count": len(live),
-                             "total_work_completed": sum(w["work_completed"] for w in workers.values())})
+                             "total_work_completed": sum(w.get("work_completed", 0) for w in live)})
 
         elif self.path == "/community/stats":
             with lock:
