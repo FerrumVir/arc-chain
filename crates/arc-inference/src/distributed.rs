@@ -480,7 +480,7 @@ use super::cached_integer_model::{
     CachedIntegerModel, CachedLayer, KVCache, I8Weights, QuantizedInput,
     layernorm, matmul_fast_preq, silu_i64, apply_rope,
 };
-use super::integer_lut::{FRAC_BITS, softmax_i64, argmax_i64};
+use super::integer_lut::{FRAC_BITS, ONE, softmax_i64, argmax_i64, integer_exp};
 
 /// Execute a subset of transformer layers on locally-held shard weights.
 /// Takes an input hidden state (from the previous shard or embedding layer)
@@ -561,7 +561,8 @@ pub fn forward_shard_layers(
         cache.push_k(layer_idx, &k_buf);
         cache.push_v(layer_idx, &v_buf);
 
-        // Multi-head attention
+        // Flash attention with online softmax (scalar path for distributed.rs).
+        // O(d_head) memory per head instead of O(full_seq) for scores array.
         let full_seq = token_position + 1;
         let head_results: Vec<Vec<i64>> = (0..cfg.n_heads)
             .into_iter()
@@ -570,25 +571,41 @@ pub fn forward_shard_layers(
                 let dh = cfg.d_head;
                 let q_head = &q[h * dh..(h + 1) * dh];
 
-                let mut scores = Vec::with_capacity(full_seq);
+                let mut running_max: i64 = i64::MIN / 2;
+                let mut running_sum: i64 = 0;
+                let mut out = vec![0i64; dh];
+
                 for j in 0..full_seq {
                     let k_off = j * cfg.d_kv + kv_h * dh;
                     let mut dot: i64 = 0;
                     for dd in 0..dh {
                         dot += q_head[dd] * cache.k_data[layer_idx][k_off + dd];
                     }
-                    scores.push((dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS);
-                }
+                    let score = (dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS;
 
-                let attn_weights = softmax_i64(&scores);
+                    if score > running_max {
+                        let diff = running_max - score;
+                        let correction = integer_exp(diff);
+                        running_sum = (running_sum * correction) >> FRAC_BITS;
+                        for dd in 0..dh {
+                            out[dd] = (out[dd] * correction) >> FRAC_BITS;
+                        }
+                        running_max = score;
+                    }
 
-                let mut out = vec![0i64; dh];
-                for j in 0..full_seq {
+                    let w = integer_exp(score - running_max);
+                    running_sum += w;
+
                     let v_off = j * cfg.d_kv + kv_h * dh;
-                    let w = attn_weights[j];
                     for dd in 0..dh {
                         out[dd] += (w * cache.v_data[layer_idx][v_off + dd])
                             >> FRAC_BITS;
+                    }
+                }
+
+                if running_sum > 0 {
+                    for dd in 0..dh {
+                        out[dd] = (out[dd] * ONE) / running_sum;
                     }
                 }
                 out

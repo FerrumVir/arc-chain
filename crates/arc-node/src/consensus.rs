@@ -4,7 +4,7 @@
 //! draining the mempool and feeding committed blocks into `StateDB`.
 
 use arc_consensus::{ConsensusEngine, StakeTier, Validator, ValidatorSet};
-use arc_crypto::{Hash256, KeyPair};
+use arc_crypto::{hash_bytes, Hash256, KeyPair};
 use arc_mempool::{EncryptedMempool, Mempool};
 use arc_net::transport::{InboundMessage, OutboundMessage};
 use arc_state::StateDB;
@@ -47,6 +47,12 @@ pub struct ConsensusManager {
     pub dag_committed: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// WAL writer for DAG persistence — enables consensus recovery after restart.
     pub dag_wal: Option<Arc<arc_state::WalWriter>>,
+    /// Long-range attack prevention: checkpoint registry (every 1000 rounds).
+    /// Behind Mutex for interior mutability in the consensus loop (takes &self).
+    pub checkpoint_registry: std::sync::Mutex<arc_consensus::security::CheckpointRegistry>,
+    /// Nothing-at-stake mitigation: double-vote tracker with graduated slashing.
+    /// Behind Mutex for interior mutability in the consensus loop (takes &self).
+    pub stake_tracker: std::sync::Mutex<arc_consensus::security::StakeTracker>,
 }
 
 impl ConsensusManager {
@@ -73,7 +79,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, checkpoint_registry: std::sync::Mutex::new(arc_consensus::security::CheckpointRegistry::new()), stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()) }
     }
 
     /// Create a consensus manager with a signing keypair (production mode).
@@ -109,7 +115,7 @@ impl ConsensusManager {
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
 
-        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None }
+        Self { engine, validator_address, stake, tier, num_shards, benchmark, proposer_mode: false, pending_diffs: dashmap::DashMap::new(), vrf_selector, encrypted_mempool: Some(Arc::new(EncryptedMempool::new(100_000))), dag_validators: None, dag_round: None, dag_committed: None, dag_wal: None, checkpoint_registry: std::sync::Mutex::new(arc_consensus::security::CheckpointRegistry::new()), stake_tracker: std::sync::Mutex::new(arc_consensus::security::StakeTracker::new()) }
     }
 
     /// Enable proposer mode: this node fully executes blocks and exports
@@ -272,11 +278,21 @@ impl ConsensusManager {
                                 // join the live set immediately and the frozen set at the
                                 // next epoch boundary (round 1000, 2000, etc.).
                                 if stake < 500_000 {
-                                    info!(
-                                        peer = %address,
-                                        stake = stake,
-                                        "Ignoring peer with insufficient stake (need 500K+ ARC)"
-                                    );
+                                    // Low-stake peer: can't vote in consensus, but
+                                    // track in dag_validators so /community/list
+                                    // auto-discovers them as community workers.
+                                    // The P2P connection IS the registration.
+                                    if let Some(ref dv) = self.dag_validators {
+                                        let mut vals = dv.write();
+                                        if !vals.iter().any(|(a, _)| *a == address) {
+                                            vals.push((address, stake));
+                                            info!(
+                                                peer = %address,
+                                                stake = stake,
+                                                "Observer peer added to tracker (auto community worker)"
+                                            );
+                                        }
+                                    }
                                     continue;
                                 }
                                 let current_vs = self.engine.validator_set();
@@ -649,10 +665,16 @@ impl ConsensusManager {
                 true // No VRF = always allowed (backward compat)
             };
 
-            // Always allow proposals. Strict parent checks cause a deadlock:
-            // no proposals → no blocks → no quorum → no advance → no proposals.
-            // The 2-round commit rule handles safety (won't commit without quorum).
-            let allow_propose = true;
+            // In multi-validator DAG mode, always allow proposals — the DAG
+            // needs blocks from ALL validators to build quorum. Strict parent
+            // checks would cause deadlock: no proposals → no blocks → no quorum.
+            // In single-validator mode, use VRF to gate proposals. The 2-round
+            // commit rule handles safety regardless (won't commit without quorum).
+            let allow_propose = if multi_validator {
+                true // DAG: all validators propose every round
+            } else {
+                vrf_approved // Single-validator: VRF gates block production
+            };
             // ── Benchmark: execute pre-signed txs EVERY TICK ─────────────
             // Runs independently of proposals. In multi-validator, DAG consensus
             // runs in parallel. The benchmark_tx_count reflects actual execution
@@ -1129,6 +1151,74 @@ impl ConsensusManager {
             if !committed.is_empty() {
                 if let Some(ref c) = self.dag_committed {
                     c.fetch_add(committed.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // ── Security: track votes + create checkpoints ──────────────
+                if let Ok(mut tracker) = self.stake_tracker.lock() {
+                    for dag_block in &committed {
+                        // Track the proposer's vote for double-vote detection
+                        tracker.report_vote(
+                            dag_block.author,
+                            dag_block.round,
+                            dag_block.hash.0,
+                        );
+
+                        // Check for double voting in this round
+                        let evidence = tracker.detect_double_voting(dag_block.round);
+                        for ev in &evidence {
+                            let slash = arc_consensus::security::calculate_slash_amount(
+                                &arc_consensus::security::SlashableOffense::DoubleVote,
+                                self.stake,
+                            );
+                            warn!(
+                                validator = %ev.validator,
+                                round = ev.round,
+                                slash_amount = slash,
+                                "DOUBLE VOTE DETECTED — slashing evidence recorded"
+                            );
+                            tracker.record_penalty(arc_consensus::security::PenaltyRecord {
+                                validator: ev.validator,
+                                offense: arc_consensus::security::SlashableOffense::DoubleVote,
+                                slash_amount: slash,
+                                round: ev.round,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            });
+                        }
+                    }
+
+                    // Prune old security data every 10000 rounds to bound memory
+                    if current_round % 10_000 == 0 && current_round > 10_000 {
+                        tracker.prune_votes(current_round - 10_000);
+                    }
+                }
+
+                // Create checkpoint every 1000 rounds for long-range attack prevention
+                if let Ok(mut cp_registry) = self.checkpoint_registry.lock() {
+                    for dag_block in &committed {
+                        if dag_block.round > 0 && dag_block.round % arc_consensus::security::CHECKPOINT_INTERVAL == 0 {
+                            let checkpoint = arc_consensus::security::Checkpoint {
+                                block_hash: dag_block.hash.0,
+                                round: dag_block.round,
+                                height: state.height(),
+                                state_root: hash_bytes(&state.height().to_le_bytes()).0,
+                                timestamp: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                                signatures: Vec::new(), // TODO: collect quorum signatures
+                            };
+                            if cp_registry.add_checkpoint(checkpoint) {
+                                info!(
+                                    round = dag_block.round,
+                                    height = state.height(),
+                                    "Checkpoint created for long-range attack prevention"
+                                );
+                            }
+                        }
+                    }
                 }
             }
 

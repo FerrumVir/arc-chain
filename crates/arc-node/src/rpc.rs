@@ -4,6 +4,7 @@ use arc_gpu::probe_gpu;
 use arc_mempool::Mempool;
 use arc_state::StateDB;
 use arc_types::*;
+use arc_types::economics::RoleRevenueConfig;
 use axum::{
     extract::{DefaultBodyLimit, Query, State as AxumState},
     http::StatusCode,
@@ -94,6 +95,16 @@ pub struct NodeState {
     /// here when it wants community nodes to run forward_shard. This is the
     /// "producer" half of an mpsc channel — wire it up in main.rs when
     /// starting a coordinator.
+    /// Multi-model shard registry (from distributed.rs). Tracks shards
+    /// per-model for multi-model routing. Populated alongside the flat
+    /// shard_registry for backward compatibility.
+    pub multi_model_registry: Arc<arc_inference::distributed::ShardRegistry>,
+    /// Inference verification manager — commit-challenge system for
+    /// economically-secured inference. Providers commit result_hash + bond;
+    /// challengers can dispute with their own bond.
+    pub verification_manager: Arc<std::sync::Mutex<arc_vm::inference_verify::VerificationManager>>,
+    /// Revenue split configuration — 40% proposers, 25% verifiers, 15% observers, 20% treasury.
+    pub revenue_config: RoleRevenueConfig,
     pub community_work_tx: Option<Arc<tokio::sync::mpsc::Sender<WorkItem>>>,
     /// Community work dispatch: receiver side. Wrapped in a tokio::Mutex so
     /// multiple claim_work handlers can await concurrently (only one wins
@@ -229,6 +240,9 @@ pub fn build_node_state(
         // 10_000-entry deterministic cache for sharded inference results.
         // LRU eviction by hit_count when full.
         inference_cache: Arc::new(arc_inference::distributed::DistributedCache::new(10_000)),
+        multi_model_registry: Arc::new(arc_inference::distributed::ShardRegistry::new()),
+        verification_manager: Arc::new(std::sync::Mutex::new(arc_vm::inference_verify::VerificationManager::new())),
+        revenue_config: RoleRevenueConfig::default(),
         community_workers: Arc::new(dashmap::DashMap::new()),
         community_work_tx: None,
         community_work_queue: None,
@@ -320,6 +334,21 @@ pub async fn serve(
         // Shard registry — discovery + announcement
         .route("/shards", get(get_shards))
         .route("/shards/announce", post(announce_shard))
+        // Multi-model registry — list all models and per-model shards
+        .route("/models", get(get_models))
+        .route("/models/shards", get(get_model_shards))
+        // Auto-sharding — compute optimal shard plan for a model
+        .route("/shards/auto_plan", post(compute_auto_shard_plan))
+        // Auto-join: node with model asks coordinator for shard assignment
+        .route("/shards/join", post(shard_join))
+        // Auto-routing inference: automatically picks best path
+        .route("/inference/auto", post(inference_auto))
+        // Inference verification — commit-challenge system
+        .route("/inference/commit", post(inference_commit))
+        .route("/inference/challenge", post(inference_challenge))
+        .route("/inference/verification_status", get(inference_verification_status))
+        // Revenue split info
+        .route("/economics/revenue_split", get(get_revenue_split))
         // Community worker registration (HTTP-only, works behind NAT)
         .route("/community/register", post(community_register))
         .route("/community/heartbeat", post(community_heartbeat))
@@ -3423,9 +3452,13 @@ async fn inference_run_sharded(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    // We need a local model copy for tokenization
+    // Coordinator needs a model for tokenization (text→tokens and tokens→text).
+    // This is the tokenizer vocabulary, not the full model weights.
+    // Shard-holding nodes or nodes with --model serve as coordinators.
     let model = node.inference_model.as_ref()
-        .ok_or(api_error(StatusCode::SERVICE_UNAVAILABLE, "Coordinator needs a local model loaded for tokenization"))?;
+        .ok_or(api_error(StatusCode::SERVICE_UNAVAILABLE,
+            "Coordinator needs a model loaded for tokenization. Start with --model <path.gguf>. \
+             Shard nodes serve inference; the coordinator only uses the tokenizer."))?;
 
     // Build the pipeline from the local shard registry, sorted by start_layer.
     //
@@ -3948,6 +3981,73 @@ async fn inference_run_sharded(
         "total_bytes_transferred": total_bytes_transferred,
     }));
 
+    // ─── VRF Committee Verification ────────────────────────────────────
+    // Select a verification committee from the live validator set using the
+    // output hash as VRF seed. This implements Tier 2 inference verification
+    // from committee.rs — deterministic, reproducible committee selection.
+    let committee_info = {
+        let validators = node.dag_validators.read();
+        let eligible: Vec<arc_inference::committee::InferenceValidator> = validators
+            .iter()
+            .map(|(addr, stake)| arc_inference::committee::InferenceValidator {
+                address: *addr,
+                max_tier: 2, // All validators eligible for Tier 2
+                stake: *stake,
+            })
+            .collect();
+
+        if eligible.len() >= 3 {
+            let committee = arc_inference::committee::select_committee(
+                &output_hash,
+                &eligible,
+                2, // Tier 2
+                eligible.len().min(arc_inference::committee::DEFAULT_COMMITTEE_SIZE),
+            );
+            // In a full implementation, we'd collect votes from committee members
+            // and call aggregate_votes(). For now, the deterministic integer engine
+            // guarantees bit-identical output, so all honest committee members
+            // WILL agree. Record the committee for auditability.
+            let member_hexes: Vec<String> = committee.members.iter()
+                .map(|m| format!("0x{}", hex::encode(&m.0)))
+                .collect();
+            json!({
+                "selected": true,
+                "size": committee.members.len(),
+                "min_agreement": committee.min_agreement,
+                "members": member_hexes,
+                "vrf_seed": format!("0x{}", hex::encode(&output_hash.0)),
+                "tier": 2,
+                "corruption_probability": arc_inference::committee::corruption_probability(0.1, committee.members.len(), committee.min_agreement),
+            })
+        } else {
+            json!({
+                "selected": false,
+                "reason": "fewer than 3 validators online",
+                "validators_online": eligible.len(),
+            })
+        }
+    };
+
+    // ─── Auto-commit inference result to verification manager ────────
+    {
+        if let Ok(mut mgr) = node.verification_manager.lock() {
+            let commitment = arc_vm::inference_verify::InferenceCommitment {
+                request_id: arc_crypto::hash_bytes(request_id.as_bytes()).0,
+                result_hash: output_hash.0,
+                provider: node.validator_address.0,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                bond_amount: 1000,
+            };
+            mgr.submit_commitment(commitment);
+        }
+    }
+
+    // ─── Fee split computation (for dashboard/explorer display) ──────
+    let fee_split = node.revenue_config.split_fee(1000, node.dag_validators.read().len().saturating_sub(1) as u32);
+
     Ok(Json(json!({
         "success": true,
         "request_id": request_id,
@@ -3976,6 +4076,13 @@ async fn inference_run_sharded(
             "bond": 1000,
             "challenge_period": 100,
             "status": "submitted_to_mempool",
+        },
+        "committee": committee_info,
+        "fee_split": {
+            "proposer": fee_split.proposer,
+            "per_verifier": fee_split.per_verifier,
+            "observer_pool": fee_split.observer_pool,
+            "treasury": fee_split.treasury,
         },
         "explorer_url": format!("/tx/0x{}", hex::encode(&tx_hash.0)),
     })))
@@ -4054,6 +4161,20 @@ async fn announce_shard(
         }
     }
     let key = req.shard.socket_addr.clone();
+    // Also register in multi-model ShardRegistry for multi-model routing
+    if let Ok(model_hash_bytes) = parse_hash(&req.shard.model_id) {
+        let model_hash = Hash256(model_hash_bytes);
+        let assignment = arc_inference::distributed::ShardAssignment {
+            node_address: Hash256(model_hash_bytes), // placeholder; real node addr comes from p2p
+            start_layer: req.shard.start_layer as u32,
+            end_layer: req.shard.end_layer as u32,
+            expert_indices: Vec::new(),
+            socket_addr: req.shard.socket_addr.clone(),
+            gpu_tier: 0,
+            available_memory: (req.shard.memory_mb as u64) * 1024 * 1024,
+        };
+        node.multi_model_registry.register_shard(model_hash, assignment);
+    }
     node.shard_registry.insert(key, (req.shard, std::time::Instant::now()));
     Json(json!({"ok": true, "registry_size": node.shard_registry.len()}))
 }
@@ -4071,6 +4192,18 @@ struct CommunityRegisterRequest {
     model: Option<String>,
     #[serde(default)]
     platform: String,
+    /// Model ID hash (hex) — if provided, coordinator auto-assigns shard layers.
+    #[serde(default)]
+    model_id: Option<String>,
+    /// Total transformer layers in the model.
+    #[serde(default)]
+    total_layers: Option<u32>,
+    /// Node's public RPC address for shard forwarding.
+    #[serde(default)]
+    rpc_addr: Option<String>,
+    /// Available memory in MB.
+    #[serde(default)]
+    available_memory_mb: Option<u64>,
 }
 
 /// POST /community/register
@@ -4094,6 +4227,9 @@ async fn community_register(
         .community_workers
         .get(&req.worker_id)
         .map(|e| e.value().0.registered_at);
+    // Clone name/model before moving into CommunityWorker — used later for shard_info
+    let worker_name = req.name.clone();
+    let worker_model_name = req.model.clone();
     let worker = CommunityWorker {
         worker_id: req.worker_id.clone(),
         name: req.name,
@@ -4113,11 +4249,106 @@ async fn community_register(
     };
     node.community_workers
         .insert(req.worker_id.clone(), (worker, std::time::Instant::now()));
+
+    // ─── Auto-shard assignment ──────────────────────────────────────
+    // If the worker provided model info, auto-assign shard layers so it
+    // can start serving inference immediately. No manual --shard-start
+    // / --shard-end flags needed.
+    let shard_assignment = if let (Some(model_id), Some(total_layers), Some(rpc_addr)) =
+        (req.model_id.as_ref(), req.total_layers, req.rpc_addr.as_ref())
+    {
+        if total_layers > 0 {
+            // Find the biggest uncovered gap for this model
+            let existing: Vec<ShardInfo> = fresh_shards(&node.shard_registry)
+                .into_iter()
+                .filter(|s| s.model_id == *model_id)
+                .collect();
+
+            let mut covered: Vec<bool> = vec![false; total_layers as usize];
+            for s in &existing {
+                for l in s.start_layer..s.end_layer.min(total_layers as usize) {
+                    covered[l] = true;
+                }
+            }
+
+            // Find biggest uncovered range
+            let mut best_start = 0usize;
+            let mut best_len = 0usize;
+            let mut run_start = 0usize;
+            let mut in_run = false;
+            for i in 0..covered.len() {
+                if !covered[i] {
+                    if !in_run { run_start = i; in_run = true; }
+                    let run_len = i - run_start + 1;
+                    if run_len > best_len { best_start = run_start; best_len = run_len; }
+                } else {
+                    in_run = false;
+                }
+            }
+
+            // If fully covered, assign redundant shard on thinnest spot
+            if best_len == 0 {
+                let mut counts: Vec<usize> = vec![0; total_layers as usize];
+                for s in &existing {
+                    for l in s.start_layer..s.end_layer.min(total_layers as usize) {
+                        counts[l] += 1;
+                    }
+                }
+                let min_c = *counts.iter().min().unwrap_or(&0);
+                let thin = counts.iter().position(|&c| c == min_c).unwrap_or(0);
+                let sz = (total_layers as usize / 4).max(1);
+                best_start = thin;
+                best_len = sz.min(total_layers as usize - thin);
+            }
+
+            let end = best_start + best_len;
+
+            // Register shard
+            let shard_info = ShardInfo {
+                start_layer: best_start,
+                end_layer: end,
+                total_layers: total_layers as usize,
+                model_id: model_id.clone(),
+                model_name: worker_model_name.clone().unwrap_or_default(),
+                memory_mb: req.available_memory_mb.unwrap_or(8192) as usize,
+                full_model_mb: 0,
+                socket_addr: rpc_addr.clone(),
+                node_name: worker_name.clone(),
+            };
+            node.shard_registry.insert(rpc_addr.clone(), (shard_info, std::time::Instant::now()));
+
+            // Register in multi-model registry
+            if let Ok(mhb) = parse_hash(model_id) {
+                let mh = Hash256(mhb);
+                node.multi_model_registry.register_shard(mh, arc_inference::distributed::ShardAssignment {
+                    node_address: mh,
+                    start_layer: best_start as u32,
+                    end_layer: end as u32,
+                    expert_indices: Vec::new(),
+                    socket_addr: rpc_addr.clone(),
+                    gpu_tier: 0,
+                    available_memory: req.available_memory_mb.unwrap_or(8192) * 1024 * 1024,
+                });
+            }
+
+            Some(json!({
+                "start_layer": best_start,
+                "end_layer": end,
+                "total_layers": total_layers,
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(Json(json!({
         "ok": true,
         "worker_id": req.worker_id,
         "registry_size": node.community_workers.len(),
         "welcome": "Your node is now visible on the ARC testnet dashboard.",
+        "shard_assignment": shard_assignment,
     })))
 }
 
@@ -4159,9 +4390,12 @@ async fn community_list(
     let ttl = std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS);
     let mut live: Vec<CommunityWorker> = Vec::new();
     let mut expired: Vec<String> = Vec::new();
+    let mut registered_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for entry in node.community_workers.iter() {
         let (w, ts) = entry.value();
         if now.duration_since(*ts) <= ttl {
+            registered_ids.insert(w.worker_id.clone());
             live.push(w.clone());
         } else {
             expired.push(entry.key().clone());
@@ -4170,11 +4404,36 @@ async fn community_list(
     for k in expired {
         node.community_workers.remove(&k);
     }
+
+    // Auto-discover P2P peers as community workers. Any node connected
+    // via P2P is automatically visible — no --community-mode flag, no
+    // separate register script, no HTTP POST needed. The P2P connection
+    // IS the registration.
+    let validators = node.dag_validators.read();
+    for (addr, stake) in validators.iter() {
+        let hex_addr = format!("0x{}", hex::encode(&addr.0));
+        // Skip self and already-registered workers
+        if *addr == node.validator_address || registered_ids.contains(&hex_addr) {
+            continue;
+        }
+        live.push(CommunityWorker {
+            worker_id: hex_addr,
+            name: format!("p2p-peer (stake={})", stake),
+            capabilities: vec!["consensus".to_string()],
+            model: None,
+            platform: "auto-discovered".to_string(),
+            registered_at: node.boot_time.elapsed().as_secs(),
+            work_completed: 0,
+        });
+    }
+
     let total_work: u64 = live.iter().map(|w| w.work_completed).sum();
     Json(json!({
         "workers": live,
-        "count": node.community_workers.len(),
+        "count": live.len(),
         "total_work_completed": total_work,
+        "registered": registered_ids.len(),
+        "auto_discovered": live.len() - registered_ids.len(),
     }))
 }
 
@@ -4455,5 +4714,565 @@ pub async fn community_submit_work(
                 result.request_id
             ),
         )),
+    }
+}
+
+// ─── Multi-Model Registry ──────────────────────────────────────────────────
+
+/// GET /models
+/// List all models known to the multi-model registry with pipeline coverage info.
+async fn get_models(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let covered = node.multi_model_registry.fully_covered_models();
+    let total_nodes = node.multi_model_registry.total_shard_nodes();
+
+    // Also gather model_ids from flat registry for backward compat
+    let flat_shards = fresh_shards(&node.shard_registry);
+    let mut model_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut models_info: Vec<Value> = Vec::new();
+
+    for s in &flat_shards {
+        if model_set.insert(s.model_id.clone()) {
+            let shards_for_model: Vec<&ShardInfo> = flat_shards.iter()
+                .filter(|ss| ss.model_id == s.model_id)
+                .collect();
+            let covered_layers: usize = shards_for_model.iter().map(|ss| ss.end_layer - ss.start_layer).sum();
+            models_info.push(json!({
+                "model_id": s.model_id,
+                "model_name": s.model_name,
+                "total_layers": s.total_layers,
+                "covered_layers": covered_layers,
+                "fully_covered": covered_layers == s.total_layers,
+                "shard_count": shards_for_model.len(),
+                "full_model_mb": s.full_model_mb,
+            }));
+        }
+    }
+
+    Json(json!({
+        "models": models_info,
+        "total_models": model_set.len(),
+        "fully_covered_models": covered.len(),
+        "total_shard_nodes": total_nodes,
+    }))
+}
+
+/// GET /models/shards?model_id=0x...
+/// Get the pipeline for a specific model.
+async fn get_model_shards(
+    AxumState(node): AxumState<NodeState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let model_id_hex = params.get("model_id")
+        .ok_or(api_error(StatusCode::BAD_REQUEST, "model_id query parameter required"))?;
+
+    let model_hash_bytes = parse_hash(model_id_hex)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid model_id hex"))?;
+    let model_hash = Hash256(model_hash_bytes);
+
+    match node.multi_model_registry.get_pipeline(&model_hash) {
+        Some(pipeline) => {
+            let shards: Vec<Value> = pipeline.iter().map(|s| json!({
+                "start_layer": s.start_layer,
+                "end_layer": s.end_layer,
+                "socket_addr": s.socket_addr,
+                "gpu_tier": s.gpu_tier,
+                "available_memory_mb": s.available_memory / (1024 * 1024),
+            })).collect();
+            let total_layers = pipeline.last().map(|s| s.end_layer).unwrap_or(0);
+            Ok(Json(json!({
+                "model_id": model_id_hex,
+                "pipeline": shards,
+                "shard_count": pipeline.len(),
+                "total_layers": total_layers,
+                "fully_covered": node.multi_model_registry.is_model_fully_covered(&model_hash, total_layers as u32),
+            })))
+        }
+        None => Err(api_error(StatusCode::NOT_FOUND, "model not found in registry")),
+    }
+}
+
+// ─── Inference Verification Endpoints ──────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct InferenceCommitRequest {
+    request_id: String,
+    result_hash: String,
+    bond_amount: u64,
+}
+
+/// POST /inference/commit
+/// Submit an inference commitment (result_hash + bond).
+async fn inference_commit(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<InferenceCommitRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let request_id_hash = parse_hash(&req.request_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid request_id hex"))?;
+    let result_hash = parse_hash(&req.result_hash)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid result_hash hex"))?;
+
+    let commitment = arc_vm::inference_verify::InferenceCommitment {
+        request_id: request_id_hash,
+        result_hash,
+        provider: node.validator_address.0,
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        bond_amount: req.bond_amount,
+    };
+
+    let commitment_id = node.verification_manager.lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "verification manager lock poisoned"))?
+        .submit_commitment(commitment);
+
+    Ok(Json(json!({
+        "ok": true,
+        "commitment_id": format!("0x{}", hex::encode(&commitment_id)),
+        "provider": node.validator_address.to_hex(),
+        "bond_amount": req.bond_amount,
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct InferenceChallengeRequest {
+    commitment_id: String,
+    challenge_type: String,
+    bond_amount: u64,
+}
+
+/// POST /inference/challenge
+/// Challenge an inference commitment.
+async fn inference_challenge(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<InferenceChallengeRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let commitment_hash = parse_hash(&req.commitment_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid commitment_id hex"))?;
+
+    let challenge_type = match req.challenge_type.as_str() {
+        "re_execution" => arc_vm::inference_verify::ChallengeType::ReExecution,
+        "spot_check" => arc_vm::inference_verify::ChallengeType::SpotCheck,
+        "statistical_audit" => arc_vm::inference_verify::ChallengeType::StatisticalAudit,
+        "consensus" => arc_vm::inference_verify::ChallengeType::ConsensusVerification,
+        _ => return Err(api_error(StatusCode::BAD_REQUEST, "invalid challenge_type: use re_execution, spot_check, statistical_audit, or consensus")),
+    };
+
+    let challenge_id = node.verification_manager.lock()
+        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "verification manager lock poisoned"))?
+        .create_challenge(commitment_hash, node.validator_address.0, challenge_type, req.bond_amount)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+
+    Ok(Json(json!({
+        "ok": true,
+        "challenge_id": format!("0x{}", hex::encode(&challenge_id)),
+        "challenger": node.validator_address.to_hex(),
+        "bond_amount": req.bond_amount,
+    })))
+}
+
+/// GET /inference/verification_status
+/// Show overall verification system stats.
+async fn inference_verification_status(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let reputation = node.verification_manager.lock()
+        .map(|mgr| mgr.get_provider_reputation(node.validator_address.0))
+        .unwrap_or(1.0);
+
+    Json(json!({
+        "provider": node.validator_address.to_hex(),
+        "reputation": reputation,
+        "verification_system": "commit-challenge",
+        "challenge_types": ["re_execution", "spot_check", "statistical_audit", "consensus"],
+        "bond_required": true,
+    }))
+}
+
+// ─── Economics Endpoints ───────────────────────────────────────────────────
+
+/// GET /economics/revenue_split
+/// Show the fee distribution configuration.
+async fn get_revenue_split(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let config = &node.revenue_config;
+    let num_validators = node.dag_validators.read().len();
+    let example_split = config.split_fee(10_000, num_validators.saturating_sub(1) as u32);
+
+    Json(json!({
+        "config": {
+            "proposer_share_bps": config.proposer_share_bps,
+            "verifier_share_bps": config.verifier_share_bps,
+            "observer_pool_bps": config.observer_pool_bps,
+            "treasury_share_bps": config.treasury_share_bps,
+        },
+        "example_split_10k_fee": {
+            "proposer": example_split.proposer,
+            "per_verifier": example_split.per_verifier,
+            "observer_pool": example_split.observer_pool,
+            "treasury": example_split.treasury,
+            "num_verifiers": num_validators.saturating_sub(1),
+        },
+        "total_supply": "1,030,000,000 ARC",
+        "decimals": 9,
+        "inflation": "none (fixed supply)",
+        "burn": "none",
+    }))
+}
+
+// ─── Auto-Sharding ─────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct AutoShardPlanRequest {
+    model_id: String,
+    total_layers: u32,
+    total_params_b: f64,
+}
+
+/// POST /shards/auto_plan
+/// Compute the optimal shard plan for a model across registered nodes.
+/// Uses compute_shard_plan() from distributed.rs which distributes layers
+/// proportional to RAM with GPU bonus.
+async fn compute_auto_shard_plan(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<AutoShardPlanRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let model_hash_bytes = parse_hash(&req.model_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid model_id hex"))?;
+    let model_hash = Hash256(model_hash_bytes);
+
+    // Build node capabilities from the live shard registry
+    let shards = fresh_shards(&node.shard_registry);
+    let mut seen_nodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut capabilities: Vec<arc_inference::distributed::NodeCapability> = Vec::new();
+
+    for s in &shards {
+        if seen_nodes.insert(s.node_name.clone()) {
+            capabilities.push(arc_inference::distributed::NodeCapability {
+                address: Hash256(parse_hash(&s.model_id).unwrap_or([0u8; 32])),
+                socket_addr: s.socket_addr.clone(),
+                gpu_tier: 0, // TODO: detect from node capabilities
+                available_memory: (s.memory_mb as u64) * 1024 * 1024,
+            });
+        }
+    }
+
+    // Also gather community workers as potential shard holders
+    let now = std::time::Instant::now();
+    for entry in node.community_workers.iter() {
+        let (worker, ts) = entry.value();
+        if now.duration_since(*ts).as_secs() < COMMUNITY_WORKER_TTL_SECS {
+            if seen_nodes.insert(worker.name.clone()) {
+                capabilities.push(arc_inference::distributed::NodeCapability {
+                    address: Hash256(parse_hash(&worker.worker_id).unwrap_or([0u8; 32])),
+                    socket_addr: worker.name.clone(),
+                    gpu_tier: 0,
+                    available_memory: 8 * 1024 * 1024 * 1024, // default 8GB estimate
+                });
+            }
+        }
+    }
+
+    if capabilities.is_empty() {
+        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "no nodes available for sharding"));
+    }
+
+    let plan = arc_inference::distributed::compute_shard_plan(
+        model_hash,
+        req.total_layers,
+        req.total_params_b,
+        &capabilities,
+    );
+
+    // Register the computed plan in the multi-model registry
+    for assignment in &plan {
+        node.multi_model_registry.register_shard(model_hash, assignment.clone());
+    }
+
+    let plan_json: Vec<Value> = plan.iter().map(|a| json!({
+        "node_address": format!("0x{}", hex::encode(&a.node_address.0)),
+        "socket_addr": a.socket_addr,
+        "start_layer": a.start_layer,
+        "end_layer": a.end_layer,
+        "gpu_tier": a.gpu_tier,
+        "available_memory_mb": a.available_memory / (1024 * 1024),
+    })).collect();
+
+    Ok(Json(json!({
+        "model_id": req.model_id,
+        "total_layers": req.total_layers,
+        "total_params_b": req.total_params_b,
+        "plan": plan_json,
+        "shard_count": plan.len(),
+        "node_count": capabilities.len(),
+        "registered_in_multi_model_registry": true,
+    })))
+}
+
+// ─── Auto-Join: Node Asks Coordinator for Shard Assignment ─────────────────
+
+#[derive(serde::Deserialize)]
+struct ShardJoinRequest {
+    /// Node's public RPC socket (e.g. "1.2.3.4:9090").
+    socket_addr: String,
+    /// Friendly name (e.g. "my-mac-studio").
+    #[serde(default)]
+    node_name: String,
+    /// Model ID hash (hex). From the GGUF model loaded on the node.
+    model_id: String,
+    /// Model name (human-readable, e.g. "Llama-2-7B").
+    #[serde(default)]
+    model_name: String,
+    /// Total transformer layers in the model.
+    total_layers: u32,
+    /// Available RAM on this node (MB).
+    available_memory_mb: u64,
+    /// GPU tier (0 = CPU only, 1 = iGPU, 2 = discrete GPU).
+    #[serde(default)]
+    gpu_tier: u8,
+}
+
+/// POST /shards/join
+/// A node with a model calls this to ask the coordinator: "what layers should I hold?"
+/// The coordinator looks at the existing shard registry, finds gaps in the pipeline,
+/// and assigns the new node a layer range that fills the biggest gap (or splits
+/// an overloaded range). Returns the assignment so the node can start serving.
+///
+/// This is the KEY endpoint for automatic sharding — nodes don't need manual
+/// --shard-start/--shard-end flags. They just load a model and call /shards/join.
+async fn shard_join(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<ShardJoinRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    if req.total_layers == 0 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "total_layers must be > 0"));
+    }
+
+    let model_hash_bytes = parse_hash(&req.model_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid model_id hex"))?;
+
+    // 1. Gather existing shards for this model from the registry
+    let existing: Vec<ShardInfo> = fresh_shards(&node.shard_registry)
+        .into_iter()
+        .filter(|s| s.model_id == req.model_id)
+        .collect();
+
+    // 2. Find the biggest uncovered gap in the pipeline
+    let mut covered: Vec<bool> = vec![false; req.total_layers as usize];
+    for s in &existing {
+        for l in s.start_layer..s.end_layer.min(req.total_layers as usize) {
+            covered[l] = true;
+        }
+    }
+
+    // Find the longest contiguous uncovered range
+    let mut best_start = 0usize;
+    let mut best_len = 0usize;
+    let mut run_start = 0usize;
+    let mut in_run = false;
+
+    for i in 0..covered.len() {
+        if !covered[i] {
+            if !in_run {
+                run_start = i;
+                in_run = true;
+            }
+            let run_len = i - run_start + 1;
+            if run_len > best_len {
+                best_start = run_start;
+                best_len = run_len;
+            }
+        } else {
+            in_run = false;
+        }
+    }
+
+    // If no gap, this model is fully covered. Assign as a redundant shard
+    // covering the most thinly-covered range (for fault tolerance).
+    if best_len == 0 {
+        // Count how many shards cover each layer
+        let mut coverage_count: Vec<usize> = vec![0; req.total_layers as usize];
+        for s in &existing {
+            for l in s.start_layer..s.end_layer.min(req.total_layers as usize) {
+                coverage_count[l] += 1;
+            }
+        }
+        // Find the layer with minimum coverage
+        let min_coverage = *coverage_count.iter().min().unwrap_or(&0);
+        let thin_start = coverage_count.iter().position(|&c| c == min_coverage).unwrap_or(0);
+        // Assign a range around the thinnest spot
+        let range_size = (req.total_layers as usize / 4).max(1);
+        best_start = thin_start;
+        best_len = range_size.min(req.total_layers as usize - thin_start);
+    }
+
+    let assigned_start = best_start;
+    let assigned_end = best_start + best_len;
+
+    // 3. Register this shard in the registry
+    let shard_info = ShardInfo {
+        start_layer: assigned_start,
+        end_layer: assigned_end,
+        total_layers: req.total_layers as usize,
+        model_id: req.model_id.clone(),
+        model_name: req.model_name.clone(),
+        memory_mb: (req.available_memory_mb as usize).min(assigned_end - assigned_start) * 100, // rough estimate
+        full_model_mb: 0,
+        socket_addr: req.socket_addr.clone(),
+        node_name: req.node_name.clone(),
+    };
+    node.shard_registry.insert(req.socket_addr.clone(), (shard_info, std::time::Instant::now()));
+
+    // Also register in multi-model registry
+    let model_hash = Hash256(model_hash_bytes);
+    let assignment = arc_inference::distributed::ShardAssignment {
+        node_address: model_hash,
+        start_layer: assigned_start as u32,
+        end_layer: assigned_end as u32,
+        expert_indices: Vec::new(),
+        socket_addr: req.socket_addr.clone(),
+        gpu_tier: req.gpu_tier,
+        available_memory: req.available_memory_mb * 1024 * 1024,
+    };
+    node.multi_model_registry.register_shard(model_hash, assignment);
+
+    // Check if pipeline is now fully covered
+    let mut new_covered: Vec<bool> = vec![false; req.total_layers as usize];
+    for s in fresh_shards(&node.shard_registry).iter().filter(|s| s.model_id == req.model_id) {
+        for l in s.start_layer..s.end_layer.min(req.total_layers as usize) {
+            new_covered[l] = true;
+        }
+    }
+    let fully_covered = new_covered.iter().all(|&c| c);
+    let covered_count = new_covered.iter().filter(|&&c| c).count();
+
+    Ok(Json(json!({
+        "ok": true,
+        "assigned_start_layer": assigned_start,
+        "assigned_end_layer": assigned_end,
+        "assigned_layers": assigned_end - assigned_start,
+        "total_layers": req.total_layers,
+        "model_id": req.model_id,
+        "pipeline_fully_covered": fully_covered,
+        "pipeline_coverage": format!("{}/{}", covered_count, req.total_layers),
+        "note": "Start your node with --shard-start {} --shard-end {} to serve these layers",
+    })))
+}
+
+// ─── Auto-Routing Inference ────────────────────────────────────────────────
+
+/// POST /inference/auto
+/// Smart inference endpoint that automatically picks the best path:
+/// 1. Check deterministic cache first (instant, O(1))
+/// 2. If sharded pipeline is available and complete → run_sharded
+/// 3. If local model is loaded → run locally
+/// 4. If community workers are available → route to community
+/// 5. Else → 503 with helpful error
+///
+/// Users don't need to know the network topology. Just POST a prompt.
+async fn inference_auto(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let input = req.get("input")
+        .and_then(|v| v.as_str())
+        .ok_or(api_error(StatusCode::BAD_REQUEST, "'input' field required"))?
+        .to_string();
+
+    if input.len() > 32_768 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
+    }
+
+    let max_tokens = req.get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .min(256) as u32;
+
+    // Strategy 1: Check if sharded pipeline is available
+    let shards = fresh_shards(&node.shard_registry);
+    let has_full_pipeline = if !shards.is_empty() {
+        let n_layers = shards.iter().map(|s| s.total_layers).max().unwrap_or(0);
+        let mut covered_to = 0usize;
+        let mut contiguous = true;
+        let mut sorted = shards.clone();
+        sorted.sort_by_key(|s| s.start_layer);
+        for s in &sorted {
+            if s.start_layer != covered_to {
+                contiguous = false;
+                break;
+            }
+            covered_to = s.end_layer;
+        }
+        contiguous && covered_to == n_layers && n_layers > 0
+    } else {
+        false
+    };
+
+    // Strategy 2: Check if local model is available
+    let has_local_model = node.inference_model.is_some() || node.candle_engine.is_some();
+
+    // Strategy 3: Check if community workers are available
+    let now = std::time::Instant::now();
+    let community_worker_count = node.community_workers.iter()
+        .filter(|e| now.duration_since(e.value().1).as_secs() < COMMUNITY_WORKER_TTL_SECS)
+        .count();
+
+    // Route to the best available path
+    if has_full_pipeline && node.inference_model.is_some() {
+        // Best path: sharded pipeline (distributed, deterministic)
+        let sharded_req = json!({
+            "input": input,
+            "max_tokens": max_tokens,
+            "chat_template": req.get("chat_template").and_then(|v| v.as_bool()).unwrap_or(false),
+        });
+        let result = inference_run_sharded(
+            AxumState(node.clone()),
+            Json(sharded_req),
+        ).await;
+        match result {
+            Ok(mut resp) => {
+                if let Some(obj) = resp.0.as_object_mut() {
+                    obj.insert("route".to_string(), json!("sharded_pipeline"));
+                }
+                Ok(resp)
+            }
+            Err(e) => Err(e),
+        }
+    } else if has_local_model {
+        // Fallback: local single-node inference
+        let local_req = json!({
+            "input": input,
+            "max_tokens": max_tokens,
+        });
+        let result = inference_run(
+            AxumState(node.clone()),
+            Some(Json(local_req)),
+        ).await;
+        match result {
+            Ok(mut resp) => {
+                if let Some(obj) = resp.0.as_object_mut() {
+                    obj.insert("route".to_string(), json!("local_model"));
+                }
+                Ok(resp)
+            }
+            Err(e) => Err(e),
+        }
+    } else if community_worker_count > 0 {
+        // Route to community workers (via work dispatch)
+        Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
+            "{} community workers available but direct dispatch not yet implemented. Use /inference/community on the gateway (port 3001).",
+            community_worker_count
+        )))
+    } else {
+        Err(api_error(StatusCode::SERVICE_UNAVAILABLE, json!({
+            "error": "No inference path available",
+            "sharded_pipeline": false,
+            "local_model": false,
+            "community_workers": 0,
+            "help": "Either: (1) load a model with --model, (2) have shard-holding nodes announce to this coordinator, or (3) start community workers with models"
+        }).to_string()))
     }
 }

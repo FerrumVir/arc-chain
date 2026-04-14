@@ -57,20 +57,29 @@ REGISTER_JSON="{\"worker_id\":\"$WORKER_ID\",\"name\":\"$HOSTNAME\",\"platform\"
 HEARTBEAT_JSON="{\"worker_id\":\"$WORKER_ID\"}"
 
 TICK=0
+REGISTERED=0
 while true; do
     for seed in $SEEDS; do
-        GW="http://${seed}:${GATEWAY_PORT}"
-        if [ $((TICK % 4)) -eq 0 ]; then
-            # Full register every 60s
-            curl -sf -m 5 -X POST "$GW/community/register" \
-                -H "Content-Type: application/json" \
-                -d "$REGISTER_JSON" >/dev/null 2>&1
-        else
-            # Heartbeat every 15s
-            curl -sf -m 5 -X POST "$GW/community/heartbeat" \
-                -H "Content-Type: application/json" \
-                -d "$HEARTBEAT_JSON" >/dev/null 2>&1
-        fi
+        # Try BOTH gateway (3001) AND arc-node RPC (9090) — some seeds
+        # only have one or the other alive.
+        for port in $GATEWAY_PORT 9090; do
+            EP="http://${seed}:${port}"
+            if [ $((TICK % 4)) -eq 0 ]; then
+                # Full register every 60s
+                if curl -sf -m 5 -X POST "$EP/community/register" \
+                    -H "Content-Type: application/json" \
+                    -d "$REGISTER_JSON" >/dev/null 2>&1; then
+                    if [ $REGISTERED -eq 0 ]; then
+                        echo "  ✓ Registered with $EP"
+                        REGISTERED=1
+                    fi
+                fi
+            else
+                curl -sf -m 5 -X POST "$EP/community/heartbeat" \
+                    -H "Content-Type: application/json" \
+                    -d "$HEARTBEAT_JSON" >/dev/null 2>&1
+            fi
+        done
     done
     TICK=$((TICK + 1))
     sleep 15

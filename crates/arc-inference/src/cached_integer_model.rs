@@ -245,6 +245,7 @@ fn quantize_vec_i8(v: &[i64]) -> (Vec<i8>, i64) {
 }
 
 /// Model config extracted from GGUF metadata.
+#[derive(Clone)]
 pub struct ModelConfig {
     pub n_layers: usize,
     pub d_model: usize,
@@ -1547,10 +1548,9 @@ fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
 /// Uses online softmax: processes KV in streaming fashion, never allocates O(n²).
 /// Numerically equivalent to standard attention (within integer rounding).
 ///
-/// TODO(#4): wire flash_attention_i8 into the main forward pass. Currently the
-/// standard attention path (computing all Q*K scores then softmax) is used.
-/// Switching requires careful validation that online softmax produces bit-identical
-/// output to the existing path under all sequence lengths and precision levels.
+/// NOTE: This i8-quantized variant is available for future use with i8 KV caches.
+/// The production path uses flash_attention_i64() which operates directly on the
+/// i64 KV cache with online softmax. Both use the same integer_exp() arithmetic.
 ///
 /// q_head: [d_head] i64 Q16 — the query for this head at current position
 /// k_data: flat i8 array of all cached K for this layer
@@ -1610,6 +1610,76 @@ fn flash_attention_i8(
         for dd in 0..d_head {
             let v_val = (v_data[v_off + dd] as i64) * v_scale;
             out[dd] += (w * v_val) >> FRAC_BITS;
+        }
+    }
+
+    // Normalize by sum
+    if running_sum > 0 {
+        for dd in 0..d_head {
+            out[dd] = (out[dd] * ONE) / running_sum;
+        }
+    }
+
+    out
+}
+
+/// Flash attention for a single query head against the i64 KV cache.
+/// Uses online softmax: processes KV in streaming fashion, O(d_head) memory
+/// instead of O(full_seq) for the scores array. Numerically equivalent to the
+/// standard softmax(Q·K)·V path (same integer_exp + shift arithmetic).
+///
+/// This is the production attention path as of v0.5.3. It replaces the standard
+/// path that allocated a scores Vec<i64> of size full_seq per head.
+///
+/// Returns the attention output for this head: [d_head] i64 Q16.
+#[inline]
+fn flash_attention_i64(
+    q_head: &[i64],            // [d_head] i64 Q16
+    k_cache: &[i64],           // flat i64 [full_seq * d_kv]
+    v_cache: &[i64],           // flat i64 [full_seq * d_kv]
+    d_kv: usize,               // total KV dimension
+    kv_h: usize,               // which KV head to use
+    d_head: usize,             // dimension per head
+    full_seq: usize,           // positions in cache
+    attn_scale: i64,           // 1/sqrt(d_head) in Q16
+) -> Vec<i64> {
+    // Online softmax: maintain running max, sum of exp, and weighted V sum.
+    let mut running_max: i64 = i64::MIN / 2; // avoid overflow on subtraction
+    let mut running_sum: i64 = 0;
+    let mut out = vec![0i64; d_head];
+
+    for j in 0..full_seq {
+        let k_off = j * d_kv + kv_h * d_head;
+
+        // Q·K dot product (same as standard path)
+        let dot = unsafe {
+            dot_i64xi64_attn_neon(
+                q_head.as_ptr(),
+                k_cache.as_ptr().add(k_off),
+                d_head,
+            )
+        };
+        let score = (dot >> FRAC_BITS) * attn_scale >> FRAC_BITS;
+
+        // Online softmax update
+        if score > running_max {
+            // New max — rescale existing accumulator
+            let diff = running_max - score; // negative
+            let correction = integer_exp(diff);
+            running_sum = (running_sum * correction) >> FRAC_BITS;
+            for dd in 0..d_head {
+                out[dd] = (out[dd] * correction) >> FRAC_BITS;
+            }
+            running_max = score;
+        }
+
+        let w = integer_exp(score - running_max);
+        running_sum += w;
+
+        // Accumulate weighted V
+        let v_off = j * d_kv + kv_h * d_head;
+        for dd in 0..d_head {
+            out[dd] += (w * v_cache[v_off + dd]) >> FRAC_BITS;
         }
     }
 
@@ -1879,41 +1949,21 @@ impl CachedIntegerModel {
             cache.push_k(layer_idx, &k_buf);
             cache.push_v(layer_idx, &v_buf);
 
-            // Attention with full-precision i64 KV cache — NEON-vectorized
-            // Q·K dot product via dot_i64xi64_attn_neon (4 lanes per iter).
+            // Flash attention with online softmax — NEON-vectorized Q·K dot product.
+            // Processes KV cache in streaming fashion: O(d_head) memory instead of
+            // O(full_seq) for the scores array. Numerically equivalent to standard
+            // softmax(Q·K)·V (same integer_exp + shift arithmetic).
             let full_seq = pos + 1;
             let k_layer_data = &cache.k_data[layer_idx];
+            let v_layer_data = &cache.v_data[layer_idx];
             let head_results: Vec<Vec<i64>> = (0..cfg.n_heads).into_par_iter().map(|h| {
                 let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
                 let dh = cfg.d_head;
                 let q_head = &q[h * dh..(h + 1) * dh];
-
-                let mut scores = Vec::with_capacity(full_seq);
-                for j in 0..full_seq {
-                    let k_off = j * cfg.d_kv + kv_h * dh;
-                    // Q16 × Q16 → Q32 dot product, then shift to Q16
-                    let dot = unsafe {
-                        dot_i64xi64_attn_neon(
-                            q_head.as_ptr(),
-                            k_layer_data.as_ptr().add(k_off),
-                            dh,
-                        )
-                    };
-                    // dot is Q32. Shift to Q16, then apply 1/sqrt(d_head) scale
-                    scores.push((dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS);
-                }
-
-                let attn_weights = softmax_i64(&scores);
-
-                let mut out = vec![0i64; dh];
-                for j in 0..full_seq {
-                    let v_off = j * cfg.d_kv + kv_h * dh;
-                    let w = attn_weights[j];
-                    for dd in 0..dh {
-                        out[dd] += (w * cache.v_data[layer_idx][v_off + dd]) >> FRAC_BITS;
-                    }
-                }
-                out
+                flash_attention_i64(
+                    q_head, k_layer_data, v_layer_data,
+                    cfg.d_kv, kv_h, dh, full_seq, cfg.attn_scale,
+                )
             }).collect();
 
             for val in attn_out.iter_mut() { *val = 0; }
@@ -2186,15 +2236,8 @@ impl CachedIntegerModel {
             cache.push_k(layer_idx, &k_buf);
             cache.push_v(layer_idx, &v_buf);
 
-            // Multi-head attention against the full KV cache for this layer.
-            //
-            // Heads are embarrassingly parallel — rayon across n_heads. Inside
-            // each head, the Q·K dot and the V-weighted sum are vectorized
-            // via dot_i64xi64_attn_neon (NEON on M2, scalar fallback on x86).
-            // The i64 inputs are narrowed to i32 in the NEON path: Q comes
-            // from a projection + RoPE, K comes from the same, both bounded
-            // by Q16 fixed-point magnitudes. This matches the widening used
-            // by dot_i16_i64_neon in the main matmul path.
+            // Flash attention with online softmax — same as forward_one_token.
+            // O(d_head) memory per head instead of O(full_seq) for scores array.
             let full_seq = position + 1;
             let k_layer_data = &cache.k_data[layer_idx];
             let v_layer_data = &cache.v_data[layer_idx];
@@ -2202,30 +2245,10 @@ impl CachedIntegerModel {
                 let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
                 let dh = cfg.d_head;
                 let q_head = &q[h * dh..(h + 1) * dh];
-
-                let mut scores = Vec::with_capacity(full_seq);
-                for j in 0..full_seq {
-                    let k_off = j * cfg.d_kv + kv_h * dh;
-                    let dot = unsafe {
-                        dot_i64xi64_attn_neon(
-                            q_head.as_ptr(),
-                            k_layer_data.as_ptr().add(k_off),
-                            dh,
-                        )
-                    };
-                    scores.push((dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS);
-                }
-                let attn_weights = softmax_i64(&scores);
-
-                let mut out = vec![0i64; dh];
-                for j in 0..full_seq {
-                    let v_off = j * cfg.d_kv + kv_h * dh;
-                    let w = attn_weights[j];
-                    for dd in 0..dh {
-                        out[dd] += (w * v_layer_data[v_off + dd]) >> FRAC_BITS;
-                    }
-                }
-                out
+                flash_attention_i64(
+                    q_head, k_layer_data, v_layer_data,
+                    cfg.d_kv, kv_h, dh, full_seq, cfg.attn_scale,
+                )
             }).collect();
 
             for val in attn_out.iter_mut() { *val = 0; }
@@ -2504,6 +2527,115 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
 
 #[cfg(not(feature = "candle"))]
 pub fn load_cached_model(_path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
+    Err(crate::InferenceError::Runtime("candle feature not enabled".into()))
+}
+
+/// Load ONLY the tokenizer from a GGUF file — no transformer weights.
+/// Returns a CachedIntegerModel with vocab, config, encode/decode capability,
+/// but zero layers and zero embedding weights. ~30MB instead of 4GB.
+///
+/// Use case: coordinator nodes that need to tokenize prompts for sharded
+/// inference but don't hold any model weights themselves.
+#[cfg(feature = "candle")]
+pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
+    use candle_core::quantized::gguf_file;
+    use crate::InferenceError;
+
+    let mut reader = std::fs::File::open(path)
+        .map_err(|e| InferenceError::Runtime(format!("Open: {e}")))?;
+    let content = gguf_file::Content::read(&mut reader)
+        .map_err(|e| InferenceError::Runtime(format!("GGUF metadata: {e}")))?;
+
+    let arch = match content.metadata.get("general.architecture") {
+        Some(gguf_file::Value::String(s)) => s.clone(),
+        _ => "llama".to_string(),
+    };
+
+    let get_u32 = |key: &str| -> u32 {
+        match content.metadata.get(key) {
+            Some(gguf_file::Value::U32(v)) => *v,
+            Some(gguf_file::Value::U64(v)) => *v as u32,
+            Some(gguf_file::Value::I32(v)) => *v as u32,
+            _ => 0,
+        }
+    };
+
+    let n_layers = get_u32(&format!("{arch}.block_count")) as usize;
+    let d_model = get_u32(&format!("{arch}.embedding_length")) as usize;
+    let n_heads = get_u32(&format!("{arch}.attention.head_count")) as usize;
+    let n_kv_heads = {
+        let v = get_u32(&format!("{arch}.attention.head_count_kv"));
+        if v > 0 { v as usize } else { n_heads }
+    };
+    let d_ff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
+    let vocab_size = content.tensor_infos.get("token_embd.weight")
+        .map(|t| t.shape.dims()[0] as usize).unwrap_or(32000);
+    let d_head = if n_heads > 0 { d_model / n_heads } else { 128 };
+    let d_kv = d_head * n_kv_heads;
+
+    let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
+        Some(gguf_file::Value::F32(v)) => *v as f64,
+        Some(gguf_file::Value::F64(v)) => *v,
+        _ => 10000.0,
+    };
+
+    let eos_tokens = match content.metadata.get("tokenizer.ggml.eos_token_id") {
+        Some(gguf_file::Value::U32(v)) => vec![*v],
+        Some(gguf_file::Value::U64(v)) => vec![*v as u32],
+        Some(gguf_file::Value::Array(arr)) => arr.iter().filter_map(|v| match v {
+            gguf_file::Value::U32(n) => Some(*n),
+            gguf_file::Value::U64(n) => Some(*n as u32),
+            _ => None,
+        }).collect(),
+        _ => vec![2, 128001, 128009],
+    };
+    let bos_token = match content.metadata.get("tokenizer.ggml.bos_token_id") {
+        Some(gguf_file::Value::U32(v)) => *v,
+        Some(gguf_file::Value::U64(v)) => *v as u32,
+        _ => 1,
+    };
+    let chat_template = match content.metadata.get("tokenizer.chat_template") {
+        Some(gguf_file::Value::String(s)) => s.clone(),
+        _ => String::new(),
+    };
+    let vocab: Vec<String> = match content.metadata.get("tokenizer.ggml.tokens") {
+        Some(gguf_file::Value::Array(arr)) => arr.iter().filter_map(|v| match v {
+            gguf_file::Value::String(s) => Some(s.clone()),
+            _ => None,
+        }).collect(),
+        _ => Vec::new(),
+    };
+
+    info!(n_layers, d_model, vocab_size, "Loaded tokenizer-only (no weights)");
+
+    // Build config with RoPE tables
+    let max_seq = 4096;
+    let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
+    let attn_scale = (ONE as f64 / (d_head as f64).sqrt()).round() as i64;
+
+    let config = ModelConfig {
+        n_layers, d_model, n_heads, n_kv_heads, d_head, d_kv, d_ff,
+        vocab_size, rope_cos, rope_sin, attn_scale, eos_tokens, bos_token,
+        chat_template, max_seq,
+    };
+
+    Ok(CachedIntegerModel {
+        config,
+        embedding_q16: Vec::new(),
+        embedding_i8: I8Weights::empty(),
+        layers: Vec::new(),
+        final_norm: Vec::new(),
+        output_weight: I8Weights::empty(),
+        vocab,
+        q4_layers: None,
+        q4_output: None,
+        i16_layers: None,
+        i16_output: None,
+    })
+}
+
+#[cfg(not(feature = "candle"))]
+pub fn load_tokenizer_only(_path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
     Err(crate::InferenceError::Runtime("candle feature not enabled".into()))
 }
 

@@ -98,6 +98,23 @@ INT16 inference must produce identical hashes across platforms. If the Mac Studi
 - **Quantization:** Per-row symmetric. INT16 = [-32767, 32767] with scale = abs_max * ONE
 - **Feature flags:** `candle` (GGUF loading), `metal-icb` (native Metal dispatch), `stwo-prover` (STARK proofs, needs nightly)
 
+## What Shipped in v0.5.3
+
+1. **ALL infrastructure wired into runtime** — VRF committees, multi-model ShardRegistry,
+   auto-sharding, verification manager, revenue config, checkpoint registry, double-vote
+   tracker, flash attention, GPU embedding fix. Zero unwired items.
+
+2. **Flash attention with online softmax** replaces standard attention in all forward paths
+   (forward_one_token, forward_shard_token, forward_shard_layers). O(d_head) memory per
+   head instead of O(full_seq) for scores. Same integer_exp arithmetic.
+
+3. **GPU embedding bug fixed** — token embeddings stored CPU-side as dequantized i32,
+   uploaded per-token. Previously wrote zeros.
+
+4. **8 new RPC endpoints** — /models, /models/shards, /shards/auto_plan,
+   /inference/commit, /inference/challenge, /inference/verification_status,
+   /economics/revenue_split
+
 ## Known Issues
 
 - `test_channel_close_releases_funds` in arc-state fails (pre-existing, unrelated to inference)

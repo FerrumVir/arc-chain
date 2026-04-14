@@ -123,6 +123,12 @@ struct Cli {
     #[arg(long)]
     model: Option<String>,
 
+    /// Load only the tokenizer from the GGUF file (no weights).
+    /// ~30MB instead of 4GB. Use for coordinator nodes that route
+    /// inference to shard-holding nodes but don't compute locally.
+    #[arg(long, default_value_t = false)]
+    tokenizer_only: bool,
+
     /// First layer index to load (inclusive). Pipeline-parallel sharding.
     /// Together with --shard-end, makes this node a SHARD HOLDER for a slice
     /// of the model. Embeddings load only when --shard-start=0; output head
@@ -505,7 +511,10 @@ async fn main() -> Result<()> {
 
             tracing::info!("Loading model from {}...", tokenizer_path);
             let load_start = Instant::now();
-            let load_result = if tokenizer_path.ends_with(".arc-int8") {
+            let load_result = if cli.tokenizer_only {
+                tracing::info!("TOKENIZER-ONLY MODE: loading vocab + config, no weights (~30MB)");
+                arc_inference::cached_integer_model::load_tokenizer_only(&tokenizer_path)
+            } else if tokenizer_path.ends_with(".arc-int8") {
                 arc_inference::cached_integer_model::load_cached_model_binary(&tokenizer_path)
             } else if let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end) {
                 tracing::info!("SHARD MODE: loading layers [{}, {}) only", start, end);
@@ -877,7 +886,19 @@ async fn main() -> Result<()> {
     // startup + every 60s, sends a heartbeat every 15s to keep the
     // registry entry alive. Each seed's TTL is 90s so 5 missed
     // heartbeats before eviction.
-    if cli.community_mode {
+    // Auto-enable community mode for observer nodes (stake=0).
+    // If you join with no stake, you're a community contributor — no flag needed.
+    let community_mode = cli.community_mode || stake == 0;
+
+    if community_mode {
+        tracing::info!("╔═══════════════════════════════════════╗");
+        tracing::info!("║  COMMUNITY MODE ACTIVE                ║");
+        tracing::info!("║  Registering with seed coordinators   ║");
+        tracing::info!("║  Your node provides TPS + inference   ║");
+        tracing::info!("╚═══════════════════════════════════════╝");
+    }
+
+    if community_mode {
         let validator_seed_c = validator_seed.clone();
         let worker_id = format!("0x{}", hex::encode(&validator_address.0));
         let hostname = std::process::Command::new("hostname")
@@ -907,6 +928,18 @@ async fn main() -> Result<()> {
         let platform_c = platform.clone();
         let model_name_c = model_name.clone();
         let seed_rpc_addrs_c = seed_rpc_addrs.clone();
+        let rpc_addr_c = rpc_addr.clone();
+        // Pre-compute model info for auto-shard registration
+        let model_id_hex = inference_model.as_ref().map(|m| {
+            let id_data = format!("arc-{}L-{}d-{}h-{}v",
+                m.config.n_layers, m.config.d_model, m.config.n_heads, m.config.vocab_size);
+            format!("0x{}", hex::encode(arc_crypto::hash_bytes(id_data.as_bytes()).0))
+        });
+        let total_layers = inference_model.as_ref().map(|m| m.config.n_layers as u32);
+        let avail_mem_mb: u64 = inference_model.as_ref()
+            .map(|m| (m.config.d_model * m.config.n_layers * 4 / 1024 / 1024) as u64 * 2)
+            .unwrap_or(8192)
+            .max(4096);
 
         tokio::spawn(async move {
             // Settle before first POST
@@ -918,12 +951,17 @@ async fn main() -> Result<()> {
                 Err(_) => return,
             };
 
+            // Model info for auto-shard assignment is pre-computed above the spawn.
             let register_payload = serde_json::json!({
                 "worker_id": worker_id_c,
                 "name": format!("{} ({})", validator_seed_c, hostname_c),
                 "capabilities": ["inference"],
                 "model": model_name_c,
                 "platform": platform_c,
+                "model_id": &model_id_hex,
+                "total_layers": &total_layers,
+                "rpc_addr": &rpc_addr_c,
+                "available_memory_mb": avail_mem_mb,
             });
             let heartbeat_payload = serde_json::json!({
                 "worker_id": worker_id_c,
@@ -945,9 +983,26 @@ async fn main() -> Result<()> {
                         // Try gateway first (port 3001), then arc-node (port 9090)
                         let r = client.post(format!("http://{}/community/register", gateway_addr))
                             .json(&register_payload).send().await;
-                        if r.is_err() {
-                            let _ = client.post(format!("http://{}/community/register", addr))
+                        let resp = if let Ok(resp) = r {
+                            resp.json::<serde_json::Value>().await.ok()
+                        } else {
+                            let r2 = client.post(format!("http://{}/community/register", addr))
                                 .json(&register_payload).send().await;
+                            if let Ok(resp) = r2 { resp.json::<serde_json::Value>().await.ok() } else { None }
+                        };
+                        // Log shard assignment from coordinator (auto-sharding)
+                        if let Some(ref resp) = resp {
+                            if let Some(sa) = resp.get("shard_assignment") {
+                                if !sa.is_null() {
+                                    tracing::info!(
+                                        start = sa.get("start_layer").and_then(|v| v.as_u64()).unwrap_or(0),
+                                        end = sa.get("end_layer").and_then(|v| v.as_u64()).unwrap_or(0),
+                                        total = sa.get("total_layers").and_then(|v| v.as_u64()).unwrap_or(0),
+                                        seed = %addr,
+                                        "Auto-shard assignment received from coordinator"
+                                    );
+                                }
+                            }
                         }
                     } else {
                         let r = client.post(format!("http://{}/community/heartbeat", gateway_addr))

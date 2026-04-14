@@ -14,6 +14,7 @@ pub mod gguf_integer;
 pub mod cached_integer_model;
 pub mod q4_engine;
 pub mod distributed;
+pub mod streaming;
 
 use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};

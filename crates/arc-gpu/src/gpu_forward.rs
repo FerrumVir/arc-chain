@@ -91,6 +91,10 @@ struct LayerBindGroups {
 
 /// All GPU buffers + pre-built bind groups for one model.
 pub struct GpuModel {
+    // Embedding table: CPU-side i32 data [vocab_size * d_model].
+    // Stored CPU-side because embedding lookup is a simple gather
+    // (one row copy) — not worth a GPU kernel for a single token.
+    embedding_i32: Vec<i32>,
     // Activation buffers
     hidden_buf: wgpu::Buffer,
     normed_buf: wgpu::Buffer,
@@ -637,7 +641,20 @@ impl GpuForward {
         info!("All bind groups pre-created ({} per layer × {} layers + 4 final = {} total)",
             19, n_layers, 19 * n_layers + 4);
 
+        // Store embedding data CPU-side as i32 for token lookup.
+        // Dequantize i8 * i64_scale → i32 for each embedding row.
+        let emb_i32: Vec<i32> = embedding_data.iter()
+            .zip(
+                (0..embedding_data.len()).map(|i| {
+                    let row = i / (d_model as usize);
+                    if row < embedding_scales.len() { embedding_scales[row] } else { 1 }
+                })
+            )
+            .map(|(&d, s)| ((d as i64 * s) >> 16) as i32)
+            .collect();
+
         GpuModel {
+            embedding_i32: emb_i32,
             hidden_buf, normed_buf, normed_packed, quant_scale,
             q_buf, k_buf, v_buf, attn_out_buf, projected_buf,
             gate_buf, up_buf, ff_out_buf, logits_buf, result_buf, staging_buf,
@@ -665,9 +682,18 @@ impl GpuForward {
 
         let t0 = std::time::Instant::now();
 
-        // Upload embedding (only CPU→GPU transfer per token)
-        let emb: Vec<i32> = vec![0i32; d as usize];
-        self.queue.write_buffer(&model.hidden_buf, 0, bytemuck::cast_slice(&emb));
+        // Upload embedding — look up the actual token row from CPU-side table.
+        // This is the ONLY CPU→GPU transfer per token.
+        let idx = (token as usize).min(model.vocab_size as usize - 1);
+        let emb_start = idx * d as usize;
+        let emb_end = emb_start + d as usize;
+        let emb: &[i32] = if emb_end <= model.embedding_i32.len() {
+            &model.embedding_i32[emb_start..emb_end]
+        } else {
+            // Fallback: zero embedding if token out of range (shouldn't happen)
+            &vec![0i32; d as usize]
+        };
+        self.queue.write_buffer(&model.hidden_buf, 0, bytemuck::cast_slice(emb));
 
         // Update shared param buffers (3 writes instead of 96)
         let rp = RopeParams { pos: seq_pos, d_head: dh, n_heads: model.n_heads, _pad: 0 };

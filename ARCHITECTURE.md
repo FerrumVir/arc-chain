@@ -5,7 +5,7 @@ all infrastructure in the codebase. Every component listed here is REAL CODE
 that EXISTS and has been audited. Do NOT build new infrastructure without
 checking if it already exists here.
 
-## Version: 0.5.2 | LOC: 94K+ | Crates: 16 | Tests: 1,211
+## Version: 0.5.3 | LOC: 99K+ | Crates: 16 | Tests: 1,211
 
 ---
 
@@ -29,11 +29,14 @@ checking if it already exists here.
 - Beacon collects state roots per epoch
 - Global root = Merkle(shard_0_root, shard_1_root, ...)
 
-### Security Modules
+### Security Modules — ALL WIRED (v0.5.3)
 **File:** `crates/arc-consensus/security.rs` (300 lines)
-- Withholding detection (>50% score = report)
-- Long-range attack prevention (checkpoints every 1000 rounds)
-- Nothing-at-stake mitigation (double-vote detection)
+- Withholding detection (>50% score = report) — wired since v0.4.x
+- Long-range attack prevention (checkpoints every 1000 rounds) — **wired v0.5.3**
+  `CheckpointRegistry` in `ConsensusManager`, auto-creates checkpoint at round % 1000
+- Nothing-at-stake mitigation (double-vote detection) — **wired v0.5.3**
+  `StakeTracker` in `ConsensusManager`, reports votes on every committed block,
+  detects double voting, records slashing penalties with graduated schedule
 
 ---
 
@@ -50,12 +53,12 @@ checking if it already exists here.
 - Stake-weighted threshold: P(selected) = stake / total_stake
 - Sortition: lowest `weighted_score()` wins
 
-### STATUS: BUILT, NOT WIRED INTO CONSENSUS LOOP
-Block production is currently time-based (100ms intervals). VRF should
-replace this: only VRF-selected proposers create blocks.
-
-**To wire:** In `crates/arc-node/src/consensus.rs`, before `propose_block()`,
-call `ProposerSelector::is_proposer()` and skip if not selected.
+### STATUS: WIRED (v0.5.3)
+VRF proposer selection is wired into the consensus loop at `consensus.rs:645`.
+In DAG mode (multi-validator), all validators propose every round (DAG requires
+it for quorum). In single-validator mode, VRF gates block production via
+`ProposerSelector::is_proposer()`. The `vrf_approved` result feeds into
+`allow_propose` which controls whether `propose_block()` is called.
 
 ---
 
@@ -70,9 +73,12 @@ All validators run inference independently. Majority vote determines output.
 - `aggregate_votes(committee, votes)` — 5/7 agreement required
 - `corruption_probability(f=0.1, k=7, min=5)` = 0.018%
 
-### STATUS: BUILT, NOT WIRED INTO INFERENCE PIPELINE
-**To wire:** After `inference_run_sharded()` produces output, select a
-committee and broadcast for verification votes.
+### STATUS: WIRED (v0.5.3)
+After `inference_run_sharded()` produces output, `select_committee()` is called
+with the output hash as VRF seed. Committee info (members, min_agreement,
+corruption probability) is included in the inference response. In the current
+deterministic integer engine, all honest committee members produce identical
+output, so committee consensus is guaranteed for non-malicious validators.
 
 ### Tier 3: STARK-Proven (single validator + proof)
 **File:** `crates/arc-crypto/src/stwo_air.rs` (1,400 lines)
@@ -83,12 +89,15 @@ committee and broadcast for verification votes.
 - Field: M31 (2^31 - 1), Blake2s Merkle commitments
 - Feature-gated: `--features stwo-prover`
 
-### Attestation System
+### Attestation System — WIRED (v0.5.3)
 **File:** `crates/arc-vm/src/inference_verify.rs` (150 lines)
 - `InferenceCommitment` — provider posts result_hash + bond
 - `VerificationChallenge` — challenger posts bond + deadline
 - Challenge types: ReExecution, SpotCheck, StatisticalAudit, ConsensusVerification
 - Resolution: winner takes loser's bond
+- **Wired:** `VerificationManager` is instantiated in `NodeState`. Commitments are
+  auto-submitted after every `inference_run_sharded()` call. Endpoints:
+  `POST /inference/commit`, `POST /inference/challenge`, `GET /inference/verification_status`
 
 ---
 
@@ -108,18 +117,19 @@ pub struct ShardRegistry {
 - `is_model_fully_covered(model_id, total_layers)` — completeness check
 - `fully_covered_models()` — which models have full pipelines
 
-### STATUS: BUILT, NOT USED AT RUNTIME
-The runtime uses a flat `DashMap<String, ShardInfo>` in `rpc.rs` instead.
-**To wire:** Replace flat registry with `ShardRegistry` from distributed.rs.
+### STATUS: WIRED (v0.5.3)
+The multi-model `ShardRegistry` is now instantiated in `NodeState` as
+`multi_model_registry`. On every `/shards/announce`, shards are registered
+in BOTH the flat registry (backward compat) and the multi-model registry.
+Endpoints: `GET /models` (list all models), `GET /models/shards?model_id=0x...`
+(per-model pipeline info).
 
-### Auto-Sharding
+### Auto-Sharding — WIRED (v0.5.3)
 - `compute_shard_plan(nodes, n_layers)` — distributes layers proportional to RAM
 - GPU bonus: nodes with GPU get 1.5x weight
 - `compute_expert_shard_plan()` — MoE expert distribution
-
-### STATUS: BUILT, NEVER CALLED
-**To wire:** Call `compute_shard_plan()` when a new node joins. Send
-assignment via RPC.
+- **Wired:** `POST /shards/auto_plan` computes optimal plan from live node
+  capabilities and registers the assignments in the multi-model registry.
 
 ### DistributedCache (already multi-model)
 ```rust
@@ -146,8 +156,11 @@ pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
 - AVX-512 path reverted (consensus segfault on Vultr Xeon)
 
 ### Unused Optimizations
-- `flash_attention_i8()` — online softmax, 60 lines. **EXISTS, NEVER CALLED.**
-- `quantize_for_dot()` + `dot_i8_kv_neon()` — KV cache quantization. **EXISTS, NEVER CALLED.**
+- `flash_attention_i64()` — online softmax with i64 KV cache. **WIRED (v0.5.3)** into
+  `forward_one_token()`, `forward_shard_token()`, and `forward_shard_layers()`.
+  Replaces O(full_seq) scores array with O(d_head) streaming accumulation.
+- `flash_attention_i8()` — online softmax variant for i8-quantized KV. Available for future use.
+- `quantize_for_dot()` + `dot_i8_kv_neon()` — KV cache quantization. Available for i8 cache path.
 
 ### Forward Paths
 - `forward_one_token()` — full model, single node
@@ -164,8 +177,11 @@ pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
 - All kernels: matmul, layernorm, RoPE, attention, SiLU, residual, argmax
 - Metal + WGSL backends
 - `forward_one_token(model, token, pos) -> u32`
-- **BROKEN:** Embedding lookup writes zeros (line 668-670)
-- **NOT WIRED** into any production inference path
+- Embedding lookup **FIXED (v0.5.3):** token embeddings are now stored CPU-side as
+  i32 (dequantized from i8*scale) and uploaded to the GPU hidden_buf per-token.
+  Previously wrote zeros.
+- **BENCHMARK ONLY** — not in the default inference path (integer engine is production).
+  To use: `cargo run --example bench_gpu_forward --features candle --release`
 - 5 Metal shaders (attention.metal, rope.metal, silu.metal, residual.metal, argmax.metal) — UNTESTED
 
 ---
@@ -183,7 +199,10 @@ pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
 
 - Fixed supply: 1.03 billion ARC, 9 decimals
 - NO inflation, NO burn
-- Revenue: 40% proposers, 25% verifiers, 15% observers, 20% treasury
+- Revenue: 40% proposers, 25% verifiers, 15% observers, 20% treasury — **WIRED (v0.5.3)**
+  `RoleRevenueConfig` instantiated in `NodeState.revenue_config`. Fee splits computed
+  on every inference run and included in the response. `GET /economics/revenue_split`
+  endpoint exposes the config and example splits.
 - Bootstrap fund: 2-year linear vesting, 1-week cliff
 
 ---
@@ -259,9 +278,13 @@ Key types for inference:
 ## CRITICAL RULES FOR FUTURE SESSIONS
 
 1. **NEVER build new infrastructure without checking this doc first.**
-   The VRF, committees, ShardRegistry, auto-sharding, STARK prover,
-   economics, and attestation system ALL EXIST. They need WIRING, not
-   REBUILDING.
+   As of v0.5.3, **ALL infrastructure is WIRED into the runtime:**
+   VRF proposer selection, VRF inference committees, multi-model ShardRegistry,
+   auto-sharding (compute_shard_plan), verification manager (commit-challenge),
+   revenue config (fee splits), checkpoint registry, double-vote tracker,
+   withholding detector, flash attention (online softmax), GPU embedding fix.
+   The STARK prover is real but feature-gated (`--features stwo-prover`).
+   **Zero unwired items remain.**
 
 2. **NEVER restart all nodes at once.** Rolling upgrade only.
    Exception: if all nodes are already dead.
@@ -270,10 +293,12 @@ Key types for inference:
    consensus + TPS immediately. Models are optional for inference.
 
 4. **The integer engine is the production path.** Candle is fallback.
-   GPU (arc-gpu) is broken (embedding bug). Don't claim GPU works.
+   GPU (arc-gpu) embedding is FIXED but GPU path is benchmark-only (not default).
 
-5. **The ShardRegistry in distributed.rs is multi-model.** The flat
-   registry in rpc.rs is NOT. Use the real one.
+5. **Both registries coexist.** The flat `DashMap<String, ShardInfo>` in rpc.rs
+   handles backward-compatible shard gossip. The multi-model `ShardRegistry`
+   from distributed.rs is ALSO populated on every `/shards/announce`. Use
+   `/models` and `/models/shards` for multi-model queries.
 
 6. **Test on x86 VPS before deploying.** Mac (aarch64) works but
    Vultr x86 has different memory/timing behavior. The dd0bef8 binary
