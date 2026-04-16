@@ -10,10 +10,14 @@
 //! - `ontology`: grid parser, diff engine, search guidance
 //!
 //! This crate is research-track: it ships combinatorial helpers + imports
-//! that unused at any given time depending on which solver variant is
-//! active. Allow dead_code and unused_imports crate-wide so CI
-//! `-D warnings` doesn't block experimentation.
-#![allow(dead_code, unused_imports, unused_variables)]
+//! that are unused at any given time depending on which solver variant is
+//! active. Allow dead_code, unused_imports, and the stylistic clippy lints
+//! crate-wide so CI doesn't block experimentation.
+//!
+//! Note `clippy::never_loop` is deny-by-default (treated as a correctness
+//! bug) — our ARC-AGI solver synthesizer has patterns that false-positive
+//! on it, so we allow it crate-wide.
+#![allow(dead_code, unused_imports, unused_variables, clippy::never_loop)]
 
 pub mod primitives;
 pub mod search;

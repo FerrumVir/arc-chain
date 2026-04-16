@@ -3,6 +3,10 @@
 //! Usage:
 //!   arc-olm eval /path/to/arc-agi/training [--max-tasks N] [--timeout-ms N]
 //!   arc-olm solve /path/to/task.json
+//!
+//! Research-track binary — same rationale as lib.rs for allowing dead_code
+//! and unused_imports (see `lib.rs`).
+#![allow(dead_code, unused_imports, unused_variables, clippy::never_loop)]
 
 use arc_olm::search::solver::{solve, SolverConfig};
 use std::path::Path;
