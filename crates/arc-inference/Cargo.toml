@@ -32,5 +32,50 @@ candle-transformers = { version = "0.8", optional = true }
 [dev-dependencies]
 rand.workspace = true
 
+# All examples load GGUF models or run inference benchmarks against candle-
+# backed tensors, which pull in candle-core/candle-nn/candle-transformers.
+# Declare required-features so `cargo test --workspace` (default features)
+# skips building them. Build any single example with:
+#     cargo run --example <name> --features candle --release
+[[example]]
+name = "bench_int8"
+required-features = ["candle"]
+[[example]]
+name = "bench_gpu_forward"
+required-features = ["candle"]
+[[example]]
+name = "bench_q4_gpu"
+required-features = ["candle"]
+[[example]]
+name = "check_weights"
+required-features = ["candle"]
+[[example]]
+name = "cross_platform_7b"
+required-features = ["candle"]
+[[example]]
+name = "debug_7b"
+required-features = ["candle"]
+[[example]]
+name = "debug_forward"
+required-features = ["candle"]
+[[example]]
+name = "debug_generation"
+required-features = ["candle"]
+[[example]]
+name = "eval_perplexity"
+required-features = ["candle"]
+[[example]]
+name = "profile_int8"
+required-features = ["candle"]
+[[example]]
+name = "test_candle"
+required-features = ["candle"]
+[[example]]
+name = "test_q4_7b"
+required-features = ["candle"]
+[[example]]
+name = "trace_layers"
+required-features = ["candle"]
+
 [lints]
 workspace = true

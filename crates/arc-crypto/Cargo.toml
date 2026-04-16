@@ -45,5 +45,17 @@ criterion.workspace = true
 name = "crypto_bench"
 harness = false
 
+# The generate_proofs example uses stwo_air, which is feature-gated behind
+# `stwo-prover` (nightly-only). Declaring it here with required-features lets
+# `cargo test --workspace` (default features) skip it instead of failing to
+# resolve the import.
+[[example]]
+name = "generate_proofs"
+required-features = ["stwo-prover"]
+
+[[example]]
+name = "prove_7b_layers"
+required-features = ["stwo-prover"]
+
 [lints]
 workspace = true

@@ -21,21 +21,33 @@ jobs:
       - run: cargo clippy --workspace
       - run: cargo test --workspace
 
+  # explorer/ has no package.json — it ships as static HTML served by the
+  # dashboard node. The old `explorer-build` job below tried to `npm ci`
+  # inside it and failed every run since the TypeScript port was reverted.
+  # Guard the job with a file-existence check so it only runs when a real
+  # node project lands. The previous hardcoded `cache-dependency-path:
+  # explorer/package-lock.json` failed the cache bootstrap before any
+  # condition could be evaluated, so we drop the cache entry and rely on
+  # setup-node's default.
   explorer-build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: explorer
     steps:
       - uses: actions/checkout@v4
+      - id: has_npm_project
+        run: |
+          if [ -f explorer/package.json ]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::explorer/ has no package.json — skipping npm build"
+          fi
       - uses: actions/setup-node@v4
+        if: steps.has_npm_project.outputs.found == 'true'
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: explorer/package-lock.json
-      - run: npm ci
-      - run: npx tsc --noEmit
-      - run: npm run build
+      - if: steps.has_npm_project.outputs.found == 'true'
+        working-directory: explorer
+        run: npm ci && npx tsc --noEmit && npm run build
 
   sdk-check:
     runs-on: ubuntu-latest
