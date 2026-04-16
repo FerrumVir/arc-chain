@@ -532,6 +532,9 @@ mod tests {
     }
 
     /// Diagnostic: test MSL buffer mapping with trivial Metal shaders.
+    /// Requires a Metal-capable adapter (Apple Silicon macOS). Skipped
+    /// elsewhere — Linux CI has no GPU so `request_adapter` unwraps None.
+    #[cfg(target_os = "macos")]
     #[test]
     fn test_msl_buffer_mapping() {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {

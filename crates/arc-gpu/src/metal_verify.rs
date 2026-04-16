@@ -2185,6 +2185,9 @@ mod tests {
         }
     }
 
+    /// Bench the GPU ed25519 dispatch path vs CPU. Requires Metal on macOS —
+    /// `dispatch_ed25519_verify_timed` panics on Linux CI runners.
+    #[cfg(target_os = "macos")]
     #[test]
     fn bench_gpu_vs_cpu_ed25519() {
         let batch_sizes = [1_000, 5_000, 10_000, 25_000];
