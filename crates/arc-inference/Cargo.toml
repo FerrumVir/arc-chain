@@ -31,3 +31,6 @@ candle-transformers = { version = "0.8", optional = true }
 
 [dev-dependencies]
 rand.workspace = true
+
+[lints]
+workspace = true

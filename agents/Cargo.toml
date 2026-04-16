@@ -25,3 +25,6 @@ path = "src/oracle_agent.rs"
 [[bin]]
 name = "router-agent"
 path = "src/router_agent.rs"
+
+[lints]
+workspace = true

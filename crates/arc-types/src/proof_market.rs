@@ -232,6 +232,7 @@ enum RequestStatus {
     Open,
     Assigned,
     Fulfilled,
+    #[allow(dead_code)] // Reserved for request-timeout sweeper (not yet wired).
     Expired,
 }
 

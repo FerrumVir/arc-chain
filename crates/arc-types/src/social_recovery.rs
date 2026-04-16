@@ -174,6 +174,7 @@ impl SocialRecoveryManager {
         self.config.guardians.iter().any(|g| g.address == *addr)
     }
 
+    #[allow(dead_code)] // Used by weighted-quorum recovery variant (planned).
     fn guardian_weight(&self, addr: &[u8; 32]) -> u32 {
         self.config
             .guardians

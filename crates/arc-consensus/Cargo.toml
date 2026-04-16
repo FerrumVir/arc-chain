@@ -19,3 +19,6 @@ tracing.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 blake3.workspace = true
+
+[lints]
+workspace = true

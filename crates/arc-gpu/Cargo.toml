@@ -33,3 +33,6 @@ objc = { version = "0.2", optional = true }
 [dev-dependencies]
 hex.workspace = true
 rand = "0.8"
+
+[lints]
+workspace = true

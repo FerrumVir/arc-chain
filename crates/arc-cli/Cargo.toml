@@ -21,3 +21,6 @@ hex.workspace = true
 anyhow.workspace = true
 ed25519-dalek.workspace = true
 k256.workspace = true
+
+[lints]
+workspace = true

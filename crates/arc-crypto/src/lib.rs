@@ -1,3 +1,8 @@
+// Clippy-lint policy is workspace-wide — see `[workspace.lints.clippy]` in
+// the root Cargo.toml. The rationale is that rewriting crypto hot-paths to
+// satisfy stylistic lints risks a one-bit divergence in on-chain attestation
+// verification between old and new nodes, which would fracture consensus.
+
 pub mod blake3_commit;
 pub mod bls;
 pub mod pedersen;

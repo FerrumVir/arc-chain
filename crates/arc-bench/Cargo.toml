@@ -98,3 +98,6 @@ clap.workspace = true
 ed25519-dalek.workspace = true
 fips204.workspace = true
 libc = "0.2"
+
+[lints]
+workspace = true

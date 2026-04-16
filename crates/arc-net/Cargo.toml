@@ -25,3 +25,6 @@ rustls = { workspace = true }
 arc-consensus = { path = "../arc-consensus" }
 arc-state = { path = "../arc-state" }
 anyhow.workspace = true
+
+[lints]
+workspace = true
