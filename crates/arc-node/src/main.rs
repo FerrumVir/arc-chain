@@ -153,6 +153,139 @@ struct Cli {
     community_mode: bool,
 }
 
+/// Rewrites a pulled peer's `self_shard.socket_addr` in place when it carries
+/// a stub (0.0.0.0 / 127.x / [::] / [::1] / empty), replacing the host with the
+/// URL we just pulled from and keeping the declared port. When no port is
+/// declared, falls back to the pulled URL's port or 9090.
+///
+/// Pure JSON mutation — no I/O, no async. Unit-testable against static fixtures.
+/// Companion to the receiver-side `rewrite_stub_shard_addr` in `rpc.rs`.
+fn rewrite_pulled_self_shard(self_shard: &mut serde_json::Value, pulled_from_addr: &str) {
+    let Some(sa) = self_shard.get("socket_addr").and_then(|v| v.as_str()) else {
+        return;
+    };
+    let is_stub = sa.starts_with("0.0.0.0")
+        || sa.starts_with("127.")
+        || sa.starts_with("[::]")
+        || sa.starts_with("[::1]")
+        || sa.is_empty();
+    if !is_stub {
+        return;
+    }
+    let declared_port = sa.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+    let fallback_port = pulled_from_addr
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(9090);
+    let port = declared_port.unwrap_or(fallback_port);
+    let host = pulled_from_addr
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(pulled_from_addr);
+    if let Some(obj) = self_shard.as_object_mut() {
+        obj.insert(
+            "socket_addr".to_string(),
+            serde_json::Value::String(format!("{}:{}", host, port)),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pulled_stub_rewritten_to_seed_host_port() {
+        // AMS announces self_shard with socket_addr=0.0.0.0:9090. We pulled
+        // from http://136.244.109.1:9090/shards, so the routable addr for AMS
+        // IS the URL we pulled from — use it.
+        let mut v = json!({
+            "start_layer": 10, "end_layer": 14, "socket_addr": "0.0.0.0:9090",
+            "node_name": "AMS"
+        });
+        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
+        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+    }
+
+    #[test]
+    fn pulled_routable_addr_is_left_alone() {
+        let mut v = json!({
+            "start_layer": 10, "end_layer": 14, "socket_addr": "136.244.109.1:9090",
+            "node_name": "AMS"
+        });
+        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
+        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+    }
+
+    #[test]
+    fn pulled_stub_uses_declared_port_over_pulled_url_port() {
+        // Peer bound to 9090 but we pulled from its port 8545 (hypothetical) —
+        // prefer the port the peer declared for its listener.
+        let mut v = json!({
+            "socket_addr": "0.0.0.0:9090", "node_name": "X"
+        });
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:8545");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_stub_falls_back_to_pulled_url_port_when_declared_is_bad() {
+        let mut v = json!({
+            "socket_addr": "0.0.0.0:junk", "node_name": "X"
+        });
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_loopback_stub_also_rewritten() {
+        // Seed set up with --rpc 127.0.0.1 on a misconfigured run would announce
+        // 127.0.0.1:9090. The pulled URL is the routable address, use it.
+        let mut v = json!({
+            "socket_addr": "127.0.0.1:9090", "node_name": "X"
+        });
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_ipv6_stub_rewritten() {
+        let mut v = json!({"socket_addr": "[::]:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+
+        let mut v = json!({"socket_addr": "[::1]:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_empty_addr_rewritten() {
+        let mut v = json!({"socket_addr": "", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn missing_socket_addr_field_is_noop() {
+        // Malformed / partial self_shard JSON should not panic.
+        let mut v = json!({"node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert!(v.get("socket_addr").is_none());
+    }
+
+    #[test]
+    fn pulled_url_with_no_port_is_tolerated() {
+        // Defensive: if seed_addrs_pull accidentally carries a host without a port,
+        // rewrite still produces a sensible string (host + default 9090).
+        let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "136.244.109.1");
+        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -876,28 +1009,7 @@ async fn main() -> Result<()> {
                         if let Ok(mut json) = resp.json::<serde_json::Value>().await {
                             if let Some(self_shard) = json.get_mut("self_shard") {
                                 if !self_shard.is_null() {
-                                    if let Some(sa) = self_shard.get("socket_addr").and_then(|v| v.as_str()) {
-                                        let is_stub = sa.starts_with("0.0.0.0")
-                                            || sa.starts_with("127.")
-                                            || sa.is_empty();
-                                        if is_stub {
-                                            // Use the port the seed declared (trust its listener port),
-                                            // falling back to the pulled URL's port if missing.
-                                            let declared_port = sa.rsplit(':').next()
-                                                .and_then(|p| p.parse::<u16>().ok());
-                                            let fallback_port = addr.rsplit(':').next()
-                                                .and_then(|p| p.parse::<u16>().ok())
-                                                .unwrap_or(9090);
-                                            let port = declared_port.unwrap_or(fallback_port);
-                                            let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr.as_str());
-                                            if let Some(obj) = self_shard.as_object_mut() {
-                                                obj.insert(
-                                                    "socket_addr".to_string(),
-                                                    serde_json::Value::String(format!("{}:{}", host, port)),
-                                                );
-                                            }
-                                        }
-                                    }
+                                    rewrite_pulled_self_shard(self_shard, addr);
                                     let payload = serde_json::json!({"shard": self_shard});
                                     let _ = client.post(&local_announce).json(&payload).send().await;
                                 }

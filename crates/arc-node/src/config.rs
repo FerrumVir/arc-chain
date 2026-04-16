@@ -271,9 +271,12 @@ mod tests {
     #[test]
     fn test_default_node_config() {
         let cfg = NodeConfig::default();
-        assert_eq!(cfg.rpc.listen, "0.0.0.0:9090");
+        // Ports moved from 9090/9091 -> 9944/9945 to avoid collisions with
+        // Prometheus (9090) and Transmission/BitTorrent (9091). These tests
+        // assert the current defaults; update both together when rebinding.
+        assert_eq!(cfg.rpc.listen, "0.0.0.0:9944");
         assert_eq!(cfg.rpc.eth_port, 8545);
-        assert_eq!(cfg.p2p.port, 9091);
+        assert_eq!(cfg.p2p.port, 9945);
         assert!(cfg.p2p.peers.is_empty());
         assert_eq!(cfg.validator.seed, "arc-validator-0");
         assert_eq!(cfg.validator.stake, 5_000_000);
@@ -291,7 +294,7 @@ mod tests {
         assert_eq!(cfg.rpc.listen, "127.0.0.1:9999");
         // All other fields should use defaults
         assert_eq!(cfg.rpc.eth_port, 8545);
-        assert_eq!(cfg.p2p.port, 9091);
+        assert_eq!(cfg.p2p.port, 9945);
         assert_eq!(cfg.validator.seed, "arc-validator-0");
     }
 
