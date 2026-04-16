@@ -152,8 +152,8 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 ## Live endpoints
 
 - Dashboard: http://140.82.16.112:3200
-- Coordinator RPC: http://149.28.32.76:9090
-- Shard registry: http://149.28.32.76:9090/shards
+- Coordinator RPC: auto-discovered via `bash scripts/arc-pick-coordinator.sh` (probes all 8 seeds, returns first healthy one)
+- Shard registry: `/shards` on whichever coordinator was picked
 - Health: `bash scripts/arc-health-check.sh`
 - GitHub: https://github.com/FerrumVir/arc-chain
 - Latest release: https://github.com/FerrumVir/arc-chain/releases/latest

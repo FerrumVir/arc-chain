@@ -12,7 +12,9 @@ Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the acti
 ## Try it from your terminal in 5 seconds
 
 ```bash
-curl -X POST http://149.28.32.76:9090/inference/run_sharded \
+# Auto-picks the first healthy coordinator from the 8 testnet seeds
+COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
+curl -X POST "$COORDINATOR/inference/run_sharded" \
   -H 'Content-Type: application/json' \
   -d '{"input":"The largest planet is","max_tokens":15}'
 ```

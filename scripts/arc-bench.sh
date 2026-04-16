@@ -18,7 +18,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-COORDINATOR="${ARC_COORDINATOR:-http://149.28.32.76:9090}"
+# ── Pick a live coordinator by probing seeds (override with ARC_COORDINATOR)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PICK="$SCRIPT_DIR/arc-pick-coordinator.sh"
+if [ ! -f "$PICK" ]; then
+    PICK=$(mktemp)
+    curl -fsSL "https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh" -o "$PICK" 2>/dev/null || true
+fi
+if [ -z "${ARC_COORDINATOR:-}" ] && [ -s "$PICK" ]; then
+    ARC_COORDINATOR=$(bash "$PICK" 2>/dev/null || echo "")
+fi
+COORDINATOR="${ARC_COORDINATOR:-http://136.244.109.1:9090}"
 MAX_TOKENS="${ARC_MAX_TOKENS:-12}"
 
 # Each entry: prompt|expected_keyword (case-insensitive substring match)

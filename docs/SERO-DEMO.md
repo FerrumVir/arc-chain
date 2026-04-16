@@ -89,7 +89,9 @@ This is what cryptographic verifiability means: anyone can re-run the same promp
 If you prefer the command line:
 
 ```bash
-curl -X POST http://149.28.32.76:9090/inference/run_sharded \
+# Pick a healthy coordinator (any seed works — this one survives outages)
+COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
+curl -X POST "$COORDINATOR/inference/run_sharded" \
   -H 'Content-Type: application/json' \
   -d '{"input":"The capital of France is","max_tokens":20}'
 ```
@@ -215,8 +217,8 @@ Either:
 ## Live links
 
 - Dashboard: http://140.82.16.112:3200
-- Coordinator RPC: http://149.28.32.76:9090/inference/run_sharded
-- Shard registry: http://149.28.32.76:9090/shards
+- Coordinator RPC: auto-selected by `scripts/arc-pick-coordinator.sh` — any of the 8 seeds works (e.g. `http://136.244.109.1:9090/inference/run_sharded`, `http://202.182.107.41:9090/inference/run_sharded`)
+- Shard registry: `/shards` on whichever coordinator was picked above
 - GitHub: https://github.com/FerrumVir/arc-chain
 - Latest release: https://github.com/FerrumVir/arc-chain/releases/latest
 - Community installer: https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh

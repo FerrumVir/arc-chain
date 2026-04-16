@@ -57,10 +57,11 @@ This single command:
 4. **Runs a different prompt** and verifies the hash is different (per-request KV cache isolation proof)
 5. **Prints the install command** so you can join the network
 
-Or, just the inference call:
+Or, just the inference call. Pick a live coordinator first — the testnet has 8 seeds and `arc-pick-coordinator.sh` returns the first one that can serve requests:
 
 ```bash
-curl -X POST http://149.28.32.76:9090/inference/run_sharded \
+COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
+curl -X POST "$COORDINATOR/inference/run_sharded" \
   -H 'Content-Type: application/json' \
   -d '{"input":"The largest planet is","max_tokens":15}'
 ```
@@ -116,8 +117,8 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/ins
 
 The installer:
 - Detects your platform (macOS arm64/x86, Linux x86_64/aarch64)
-- Pulls the latest pre-built binary from the GitHub releases (currently v0.4.1)
-- Downloads Llama-2-7B-Chat Q4_K_M (~4 GB) — or TinyLlama on machines with < 6 GB RAM
+- Pulls the latest pre-built binary from the GitHub releases (currently v0.5.2)
+- Joins consensus immediately — no 4 GB model download required. If a GGUF model is available locally or supplied via `--model`, the node also provides inference compute.
 - Installs as a launchd / systemd service that auto-starts and auto-restarts
 - Schedules a daily auto-update check at 04:17 local time
 
@@ -126,6 +127,29 @@ After install your node is running, joined to the testnet, contributing inferenc
 Uninstall any time: `bash install-community-node.sh --uninstall`.
 
 📖 **5-minute walkthrough:** [`docs/SERO-DEMO.md`](docs/SERO-DEMO.md) — every step of the demo with explicit timings, expected outputs, and answers for skeptics.
+
+---
+
+## Plug in — one command for inference, one for TPS
+
+Every entry point auto-discovers a live coordinator. No IPs to memorize, no single point of failure: if a seed is rolling-upgrading or temporarily offline, the scripts fall through to the next healthy one.
+
+```bash
+# 1. Pick the first healthy seed automatically
+COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
+echo "Using $COORDINATOR"
+
+# 2. Run a verified inference
+curl -X POST "$COORDINATOR/inference/run_sharded" \
+  -H 'Content-Type: application/json' \
+  -d '{"input":"The largest planet is","max_tokens":15}'
+
+# 3. Generate real TPS (signed transfers, gossiped + DAG-committed)
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/tps-generator.sh | bash -s -- 30 8
+# (run for 30 seconds with 8 concurrent workers across all 8 seed nodes)
+```
+
+`arc-pick-coordinator.sh` ranks seeds: **fully-covered pipeline** > **healthy with peers** > **alive but isolated**. If nothing is reachable it exits non-zero so you catch the outage explicitly instead of silently dialling a dead node. Override with `ARC_SEEDS="host1:port host2:port ..."` or `ARC_SEEDS_URL=<url>` (plaintext list, one per line).
 
 ---
 
@@ -425,7 +449,12 @@ curl -X POST http://140.82.16.112:9090/faucet/claim \
 
 ## Network Endpoints
 
-**All 8 testnet nodes** have the same API on port 9090:
+**All 8 testnet nodes** expose the same API on port 9090. Any single node may be down, under a rolling upgrade, or holding a shard with an unroutable address — **pick whichever is healthy** via `scripts/arc-pick-coordinator.sh` instead of hardcoding one IP:
+
+```bash
+COORDINATOR=$(bash scripts/arc-pick-coordinator.sh)   # e.g. http://136.244.109.1:9090
+curl "$COORDINATOR/health"
+```
 
 | Node | Location | RPC |
 |------|----------|-----|
@@ -438,15 +467,17 @@ curl -X POST http://140.82.16.112:9090/faucet/claim \
 | SAO | Sao Paulo | `http://216.238.120.27:9090` |
 | JNB | Johannesburg | `http://139.84.237.49:9090` |
 
-| Endpoint | URL |
-|----------|-----|
-| **Chain Stats** | [/stats](http://140.82.16.112:9090/stats) |
-| **Node Health** | [/health](http://140.82.16.112:9090/health) |
-| **Validators** | [/validators](http://140.82.16.112:9090/validators) |
-| **Inference Attestations** | [/inference/attestations](http://140.82.16.112:9090/inference/attestations) |
+| Endpoint | Path (use any healthy node from the table above) |
+|----------|--------------------------------------------------|
+| **Chain Stats** | `/stats` |
+| **Node Health** | `/health` |
+| **Validators** | `/validators` |
+| **Inference Attestations** | `/inference/attestations` |
 | **Account Lookup** | `/account/{address}` |
 | **Faucet** | `POST /faucet/claim` |
 | **Run Inference** | `POST /inference/run` |
+| **Sharded Inference** | `POST /inference/run_sharded` |
+| **Shards / Models** | `/shards`, `/models`, `/models/shards?model_id=0x…` |
 | **DAG Sync State** | `/sync/dag_state` |
 
 > **Your node's ports**: RPC on 9944, P2P on 9945 (both configurable). The live testnet uses 9090 (legacy).

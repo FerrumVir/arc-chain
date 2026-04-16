@@ -19,7 +19,20 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-COORDINATOR="${ARC_COORDINATOR:-http://149.28.32.76:9090}"
+# ── Pick a live coordinator by probing all seeds (override with ARC_COORDINATOR)
+# arc-pick-coordinator.sh ranks seeds by: full pipeline > healthy w/ peers > alive.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+PICK="$SCRIPT_DIR/arc-pick-coordinator.sh"
+# When the script is curl'd into bash it won't be on disk. Fall back to
+# fetching the picker from GitHub main so the curl-pipe install still works.
+if [ ! -f "$PICK" ]; then
+    PICK=$(mktemp)
+    curl -fsSL "https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh" -o "$PICK" 2>/dev/null || true
+fi
+if [ -z "${ARC_COORDINATOR:-}" ] && [ -s "$PICK" ]; then
+    ARC_COORDINATOR=$(bash "$PICK" 2>/dev/null || echo "")
+fi
+COORDINATOR="${ARC_COORDINATOR:-http://136.244.109.1:9090}"
 PROMPT_A="${ARC_PROMPT:-The largest planet is}"
 PROMPT_B="${ARC_PROMPT_B:-The capital of France is}"
 MAX_TOKENS="${ARC_MAX_TOKENS:-12}"

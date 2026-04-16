@@ -104,21 +104,34 @@ fi
 
 header "4/4 — Chain sync status"
 if [ -n "${ROUND:-}" ] && [ "$ROUND" -gt 0 ] 2>/dev/null; then
-    # Sample remote dag_round to compare
-    REMOTE_ROUND=$(curl -sf -m 5 http://149.28.32.76:9090/health 2>/dev/null \
-        | sed -n 's/.*"dag_round":\([0-9][0-9]*\).*/\1/p')
-    if [ -n "$REMOTE_ROUND" ]; then
+    # Poll each seed and take the MAX dag_round so a single outage doesn't
+    # skew the gap calculation. Seeds with 0 peers / DOWN are skipped.
+    REMOTE_ROUND=0
+    REMOTE_NAME=""
+    for entry in $SEEDS; do
+        rip="${entry%%:*}"
+        rname="${entry##*:}"
+        rr=$(curl -sf -m 4 "http://$rip:9090/health" 2>/dev/null \
+            | sed -n 's/.*"dag_round":\([0-9][0-9]*\).*/\1/p')
+        if [ -n "$rr" ] && [ "$rr" -gt "$REMOTE_ROUND" ] 2>/dev/null; then
+            REMOTE_ROUND=$rr
+            REMOTE_NAME=$rname
+        fi
+    done
+    if [ "$REMOTE_ROUND" -gt 0 ]; then
         GAP=$((REMOTE_ROUND - ROUND))
         if [ "$GAP" -lt 100 ]; then
-            ok "Local round $ROUND vs NYC $REMOTE_ROUND (gap: $GAP — synced)"
+            ok "Local round $ROUND vs $REMOTE_NAME $REMOTE_ROUND (gap: $GAP — synced)"
         elif [ "$GAP" -lt 10000 ]; then
-            warn "Local round $ROUND vs NYC $REMOTE_ROUND (gap: $GAP — catching up)"
+            warn "Local round $ROUND vs $REMOTE_NAME $REMOTE_ROUND (gap: $GAP — catching up)"
         else
-            fail "Local round $ROUND vs NYC $REMOTE_ROUND (gap: $GAP — NOT SYNCED, isolated)"
+            fail "Local round $ROUND vs $REMOTE_NAME $REMOTE_ROUND (gap: $GAP — NOT SYNCED, isolated)"
             echo "    → Your node is proposing its own DAG blocks in isolation."
             echo "    → It has never successfully synced with the real testnet chain."
             echo "    → Fix the peer connectivity issue above, then restart the node."
         fi
+    else
+        warn "Could not reach any seed's /health — skipping sync-gap check."
     fi
 else
     info "Local round not yet set — node may still be booting."

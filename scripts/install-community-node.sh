@@ -143,8 +143,8 @@ VERSION=$(curl -sf "https://api.github.com/repos/${REPO}/releases/latest" \
     | grep -m1 '"tag_name"' \
     | sed -E 's/.*"v?([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' || echo "")
 if [ -z "$VERSION" ]; then
-    warn "Could not fetch GitHub release, falling back to v0.3.1"
-    VERSION="0.3.1"
+    warn "Could not fetch GitHub release, falling back to v0.5.2"
+    VERSION="0.5.2"
 fi
 ok "Latest version: v$VERSION"
 
@@ -515,8 +515,9 @@ if [ "$NODE_UP" = true ]; then
         echo "  to port 9091. ARC uses QUIC (UDP) for P2P, not TCP."
         echo ""
         echo "  ${BOLD}Quick diagnosis:${RESET}"
-        echo "    nc -zu -w 3 149.28.32.76 9091   # should print 'succeeded'"
-        echo "    nc -zu -w 3 140.82.16.112 9091  # should print 'succeeded'"
+        echo "    nc -zu -w 3 136.244.109.1 9091  # AMS — should print 'succeeded'"
+        echo "    nc -zu -w 3 202.182.107.41 9091 # NRT — should print 'succeeded'"
+        echo "    nc -zu -w 3 139.84.237.49 9091  # JNB — should print 'succeeded'"
         echo ""
         echo "  ${BOLD}If the nc tests succeed but peers stays 0:${RESET}"
         echo "    tail -f $ARC_DIR/node.log | grep -E 'Handshake|Failed|Timeout'"
