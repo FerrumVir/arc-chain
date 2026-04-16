@@ -81,7 +81,7 @@ dashmap = "6.1"
 
 # Persistence
 crc32fast = "1.4"
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 
 # Logging / errors
 tracing = "0.1"
