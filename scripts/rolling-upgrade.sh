@@ -6,9 +6,17 @@
 # Waits for health check before proceeding to next node.
 #
 # Usage:
-#   ./scripts/rolling-upgrade.sh              # Upgrade all 8 nodes
-#   ./scripts/rolling-upgrade.sh --build-only # Just build, don't deploy
-#   ./scripts/rolling-upgrade.sh --skip-build # Deploy existing binary
+#   ./scripts/rolling-upgrade.sh                       # Upgrade all 8 nodes (halt on first fail)
+#   ./scripts/rolling-upgrade.sh --build-only          # Just build, don't deploy
+#   ./scripts/rolling-upgrade.sh --skip-build          # Deploy existing binary
+#   ./scripts/rolling-upgrade.sh --build-ip=<IP>       # Force a specific build host
+#   ./scripts/rolling-upgrade.sh --continue-on-fail    # Keep going past a bad node (default: halt)
+#   ./scripts/rolling-upgrade.sh --reset-state         # Clear dag-wal/state.wal on each node
+#   ./scripts/rolling-upgrade.sh --shard-map "NYC:0:5 LAX:5:10 AMS:10:14 ..."
+#                                                      # Override shard assignments during restart.
+#                                                      # Format: "NAME:start:end NAME:start:end ...".
+#                                                      # Any node not in the map keeps its existing
+#                                                      # --shard-start/--shard-end flags (from ps).
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -33,16 +41,58 @@ fail()  { printf "${RED}[FAIL]${RESET}  %s\n" "$*" >&2; exit 1; }
 BUILD_ONLY=false
 SKIP_BUILD=false
 RESET_STATE=false
+HALT_ON_FAIL=true
+BUILD_IP_OVERRIDE=""
+SHARD_MAP=""
 for arg in "$@"; do
     case "$arg" in
-        --build-only)  BUILD_ONLY=true ;;
-        --skip-build)  SKIP_BUILD=true ;;
-        --reset-state) RESET_STATE=true ;;
+        --build-only)       BUILD_ONLY=true ;;
+        --skip-build)       SKIP_BUILD=true ;;
+        --reset-state)      RESET_STATE=true ;;
+        --continue-on-fail) HALT_ON_FAIL=false ;;
+        --build-ip=*)       BUILD_IP_OVERRIDE="${arg#--build-ip=}" ;;
+        --shard-map=*)      SHARD_MAP="${arg#--shard-map=}" ;;
     esac
 done
 export RESET_STATE
 
-BUILD_IP="${NODE_IPS[0]}"  # NYC
+# Parser for SHARD_MAP. Given NAME, returns "--shard-start X --shard-end Y"
+# or empty string if the name is not in the map. Whitespace-separated entries.
+shard_flags_for_node() {
+    local name="$1"
+    [ -z "$SHARD_MAP" ] && return 0
+    for entry in $SHARD_MAP; do
+        local n="${entry%%:*}"
+        if [ "$n" = "$name" ]; then
+            local rest="${entry#*:}"
+            local s="${rest%%:*}"
+            local e="${rest##*:}"
+            echo "--shard-start $s --shard-end $e"
+            return 0
+        fi
+    done
+}
+
+# Auto-select a live build host. Historically BUILD_IP=NYC (index 0), but
+# NYC (or any single node) can be down during an upgrade cycle — we must not
+# assume the first node is alive. Skip any IP whose /health doesn't respond.
+# Override with --build-ip=<IP> if you want to force a specific builder.
+if [ -n "$BUILD_IP_OVERRIDE" ]; then
+    BUILD_IP="$BUILD_IP_OVERRIDE"
+    info "Using build host override: $BUILD_IP"
+else
+    BUILD_IP=""
+    for candidate in "${NODE_IPS[@]}"; do
+        if curl -sf -m 4 "http://${candidate}:${RPC_PORT}/health" >/dev/null 2>&1; then
+            BUILD_IP="$candidate"
+            info "Auto-selected live build host: $BUILD_IP"
+            break
+        fi
+    done
+    if [ -z "$BUILD_IP" ]; then
+        fail "No node responded to /health — cannot auto-select build host. Use --build-ip=<IP> or --skip-build."
+    fi
+fi
 
 # ── 1. Build on NYC ──────────────────────────────────────────────────────────
 if [ "$SKIP_BUILD" = false ]; then
@@ -90,6 +140,29 @@ for idx in $(seq 0 $((TOTAL - 1))); do
         ssh $SSH_OPTS "root@${IP}" "cp /root/arc-chain/target/release/arc-node /tmp/arc-node-new && chmod +x /tmp/arc-node-new"
     fi
 
+    # b0. Determine shard flags. Priority:
+    #   1. --shard-map override (operator explicitly assigns a range for this node)
+    #   2. Snapshot from the currently-running process (preserve existing assignment)
+    #   3. None (validator/observer only)
+    #
+    # Preserving flags matters because without them nodes come back with no
+    # --shard-start/--shard-end and the inference pipeline fragments — exactly
+    # the failure mode arc-watchdog.sh guards against.
+    SHARD_FLAGS=$(shard_flags_for_node "$NODE")
+    if [ -n "$SHARD_FLAGS" ]; then
+        ok "Using shard-map override for $NODE: $SHARD_FLAGS"
+    else
+        info "Snapshotting shard flags from running process..."
+        SHARD_FLAGS=$(ssh $SSH_OPTS "root@${IP}" \
+            "ps -ef | grep 'arc-node' | grep -v grep | head -1 | \
+             grep -oE -- '--shard-start [0-9]+[[:space:]]+--shard-end [0-9]+'" 2>/dev/null || echo "")
+        if [ -n "$SHARD_FLAGS" ]; then
+            ok "Preserving existing shard flags: $SHARD_FLAGS"
+        else
+            info "No shard flags on $NODE (validator/observer only)"
+        fi
+    fi
+
     # b. Stop old process (screen session named 'arc')
     info "Stopping old node..."
     ssh $SSH_OPTS "root@${IP}" "screen -S arc -X quit 2>/dev/null || true; sleep 1; pkill -f 'arc-node.*validator-seed' 2>/dev/null || true; sleep 1" || true
@@ -111,8 +184,10 @@ for idx in $(seq 0 $((TOTAL - 1))); do
         "root@${IP}:/root/arc-chain/"
 
     # e. Start new node in screen. Load model on every seed (all 8 serve inference).
+    # SHARD_FLAGS (from step b0) restores --shard-start/--shard-end so the
+    # pipeline doesn't fragment during upgrade.
     MODEL_FLAG="--model model.gguf"
-    info "Starting new node${MODEL_FLAG:+ with inference}..."
+    info "Starting new node${MODEL_FLAG:+ with inference}${SHARD_FLAGS:+ + shard flags}..."
     ssh $SSH_OPTS "root@${IP}" "cd /root/arc-chain && screen -dmS arc ./target/release/arc-node \
         --rpc 0.0.0.0:${RPC_PORT} \
         --p2p-port ${P2P_PORT} \
@@ -121,7 +196,8 @@ for idx in $(seq 0 $((TOTAL - 1))); do
         --genesis genesis.toml \
         --stake 5000000 \
         --eth-rpc-port 0 \
-        ${MODEL_FLAG}"
+        ${MODEL_FLAG} \
+        ${SHARD_FLAGS}"
 
     # f. Wait for health (up to 60 seconds)
     info "Waiting for health check..."
@@ -141,7 +217,30 @@ for idx in $(seq 0 $((TOTAL - 1))); do
 
     if [ "$HEALTHY" = false ]; then
         warn "$NODE failed health check after 60s — check manually: ssh root@${IP}"
-        warn "Continuing anyway (node may need more time to connect peers)..."
+        if [ "$HALT_ON_FAIL" = "true" ]; then
+            fail "Halting rollout so a bad binary doesn't propagate to the rest of the chain. \
+Re-run with --continue-on-fail to override, or investigate \`ssh root@${IP} 'tail /root/arc-chain/node.log'\` first."
+        else
+            warn "Continuing anyway (--continue-on-fail set)..."
+        fi
+    fi
+
+    # Post-restart sanity: wait 10s and verify dag_round advances. A node that
+    # comes up with status=ok but frozen round is still broken — exactly the
+    # failure mode the watchdog restarts for. Confirm *before* moving on.
+    info "Verifying round advance on $NODE..."
+    R1=$(ssh $SSH_OPTS "root@${IP}" "curl -sf http://localhost:${RPC_PORT}/health" 2>/dev/null \
+        | grep -o '"dag_round":[0-9]*' | grep -o '[0-9]*' || echo 0)
+    sleep 10
+    R2=$(ssh $SSH_OPTS "root@${IP}" "curl -sf http://localhost:${RPC_PORT}/health" 2>/dev/null \
+        | grep -o '"dag_round":[0-9]*' | grep -o '[0-9]*' || echo 0)
+    if [ "$R2" -gt "$R1" ] 2>/dev/null; then
+        ok "Round advanced $R1 -> $R2 (consensus healthy)"
+    else
+        warn "Round did not advance ($R1 -> $R2). Node may be isolated or stuck."
+        if [ "$HALT_ON_FAIL" = "true" ]; then
+            fail "Halting rollout — consensus progress check failed on $NODE."
+        fi
     fi
 done
 

@@ -6,11 +6,12 @@ use arc_state::StateDB;
 use arc_types::*;
 use arc_types::economics::RoleRevenueConfig;
 use axum::{
-    extract::{DefaultBodyLimit, Query, State as AxumState},
+    extract::{ConnectInfo, DefaultBodyLimit, Query, State as AxumState},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
+use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -374,7 +375,12 @@ pub async fn serve(
     socket.set_reuseaddr(true)?;
     socket.bind(addr.parse()?)?;
     let listener = socket.listen(1024)?;
-    axum::serve(listener, app).await?;
+    // into_make_service_with_connect_info lets handlers extract
+    // ConnectInfo<SocketAddr>. announce_shard uses this to override stub
+    // `0.0.0.0:*` socket_addrs in shard announcements with the peer's real
+    // source IP — otherwise the coordinator can't route /inference/forward_shard
+    // calls to shards held by remote nodes.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
 
@@ -4132,21 +4138,64 @@ struct AnnounceShardRequest {
     shard: ShardInfo,
 }
 
+/// Returns true iff `addr` is a stub (unroutable placeholder) that the
+/// coordinator cannot dial to forward a shard request.
+fn is_stub_socket_addr(addr: &str) -> bool {
+    addr.starts_with("0.0.0.0")
+        || addr.starts_with("127.")
+        || addr.starts_with("[::]")
+        || addr.starts_with("[::1]")
+        || addr.is_empty()
+}
+
+/// Rewrite a stub shard `socket_addr` using the peer's actual TCP source IP,
+/// keeping the port the announcer declared. Returns the corrected addr, or
+/// the original when no rewrite is needed.
+///
+/// Pure function — no I/O, no state. Cheap to unit test.
+fn rewrite_stub_shard_addr(
+    announced_addr: &str,
+    peer_addr: SocketAddr,
+) -> String {
+    if !is_stub_socket_addr(announced_addr) || peer_addr.ip().is_loopback() {
+        return announced_addr.to_string();
+    }
+    let declared_port = announced_addr
+        .rsplit(':')
+        .next()
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or_else(|| peer_addr.port());
+    // Use SocketAddr::Display so IPv6 peers get bracketed correctly
+    // ([::1]:9090, not ::1:9090).
+    SocketAddr::new(peer_addr.ip(), declared_port).to_string()
+}
+
 /// POST /shards/announce
 /// Other nodes call this to register their shard with our local registry.
+///
+/// Announcements arrive with the *announcer's* `socket_addr` in the payload.
+/// When the announcer binds 0.0.0.0 it doesn't know its own public IP, so
+/// the shipped value is "0.0.0.0:<port>" — a stub the coordinator cannot
+/// route to. We fix that here by overriding stub addrs with the peer's
+/// actual source IP (discovered from the TCP connection), keeping the port
+/// the announcer declared. Self-announces from 127.0.0.1 are left alone.
 async fn announce_shard(
     AxumState(node): AxumState<NodeState>,
-    Json(req): Json<AnnounceShardRequest>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Json(mut req): Json<AnnounceShardRequest>,
 ) -> Json<Value> {
+    // Rewrite stub addrs using the peer's source IP + announced port.
+    // Root-cause fix for "Pipeline gap" errors where every shard was
+    // announced with socket_addr=0.0.0.0:9090.
+    req.shard.socket_addr = rewrite_stub_shard_addr(&req.shard.socket_addr, peer_addr);
+
     // Dedupe: if an existing entry already covers the same (layer_range,
     // node_name) with a routable socket_addr, drop this announcement when
-    // the incoming addr is a stub (0.0.0.0 / 127.x / empty). This prevents
-    // self-announcements from clobbering gossiped entries and creating
-    // duplicate pipeline entries on coordinators after a reboot.
-    let incoming_is_stub = req.shard.socket_addr.starts_with("0.0.0.0")
-        || req.shard.socket_addr.starts_with("127.")
-        || req.shard.socket_addr.is_empty();
-    if incoming_is_stub {
+    // the incoming addr is STILL a stub (self-announce from localhost). This
+    // preserves existing behavior and prevents self-announces from clobbering
+    // gossiped entries with real public IPs.
+    let still_stub = is_stub_socket_addr(&req.shard.socket_addr);
+    if still_stub {
         let has_better = node.shard_registry.iter().any(|e| {
             let (s, _ts) = e.value();
             s.start_layer == req.shard.start_layer
@@ -5274,5 +5323,74 @@ async fn inference_auto(
             "community_workers": 0,
             "help": "Either: (1) load a model with --model, (2) have shard-holding nodes announce to this coordinator, or (3) start community workers with models"
         }).to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sa(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn stub_detector_catches_bind_all_and_loopback() {
+        assert!(is_stub_socket_addr("0.0.0.0:9090"));
+        assert!(is_stub_socket_addr("127.0.0.1:9090"));
+        assert!(is_stub_socket_addr("127.1.2.3:9090"));
+        assert!(is_stub_socket_addr("[::]:9090"));
+        assert!(is_stub_socket_addr("[::1]:9090"));
+        assert!(is_stub_socket_addr(""));
+    }
+
+    #[test]
+    fn stub_detector_leaves_public_ips_alone() {
+        assert!(!is_stub_socket_addr("149.28.32.76:9090"));
+        assert!(!is_stub_socket_addr("140.82.16.112:9944"));
+        assert!(!is_stub_socket_addr("10.0.0.1:9090")); // RFC1918 is routable on a LAN
+    }
+
+    #[test]
+    fn rewrite_overrides_stub_with_peer_ip_keeping_declared_port() {
+        // Peer behind "0.0.0.0:9090" announcement is at 149.28.32.76:51234
+        // → should record shard at 149.28.32.76:9090 (trust the declared port)
+        let got = rewrite_stub_shard_addr("0.0.0.0:9090", sa("149.28.32.76:51234"));
+        assert_eq!(got, "149.28.32.76:9090");
+    }
+
+    #[test]
+    fn rewrite_falls_back_to_peer_port_when_declared_is_unparseable() {
+        let got = rewrite_stub_shard_addr("0.0.0.0:xxxx", sa("149.28.32.76:51234"));
+        assert_eq!(got, "149.28.32.76:51234");
+    }
+
+    #[test]
+    fn rewrite_preserves_already_routable_addrs() {
+        // Well-behaved announcer already sent a real IP — don't rewrite.
+        let got = rewrite_stub_shard_addr("149.28.32.76:9090", sa("1.2.3.4:9999"));
+        assert_eq!(got, "149.28.32.76:9090");
+    }
+
+    #[test]
+    fn rewrite_ignores_loopback_peers_so_self_announces_stay_stub() {
+        // Self-announce from the local broadcaster hits 127.0.0.1/shards/announce.
+        // Rewriting would make self-entry look like 127.0.0.1:9090 (still unroutable)
+        // and defeat the dedupe logic — so we leave it alone.
+        let got = rewrite_stub_shard_addr("0.0.0.0:9090", sa("127.0.0.1:51234"));
+        assert_eq!(got, "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn rewrite_ignores_ipv6_loopback_peers() {
+        let got = rewrite_stub_shard_addr("0.0.0.0:9090", sa("[::1]:51234"));
+        assert_eq!(got, "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn rewrite_uses_ipv6_peer_ip_when_peer_is_remote() {
+        // IPv6 must be bracketed when combined with a port.
+        let got = rewrite_stub_shard_addr("0.0.0.0:9090", sa("[2001:db8::1]:51234"));
+        assert_eq!(got, "[2001:db8::1]:9090");
     }
 }

@@ -861,11 +861,43 @@ async fn main() -> Result<()> {
                 // broadcasts its own shard every 15s via the outbound
                 // broadcaster above, so trusting only self_shard is both
                 // sufficient and safe.
+                //
+                // IMPORTANT: A peer's self_shard.socket_addr is almost always
+                // "0.0.0.0:<port>" because the peer binds to all interfaces and
+                // doesn't know its own public IP. Re-announcing that stub
+                // locally would make /inference/run_sharded unable to route to
+                // the peer (dialing 0.0.0.0 fails). Rewrite the stub to the
+                // *seed's actual address* (the URL we just pulled from) before
+                // re-announcing — that IS the routable address for that shard
+                // holder, and it's what the receiver-side fix for direct
+                // /shards/announce broadcasts produces too.
                 for addr in &seed_addrs_pull {
                     if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await {
-                        if let Ok(json) = resp.json::<serde_json::Value>().await {
-                            if let Some(self_shard) = json.get("self_shard") {
+                        if let Ok(mut json) = resp.json::<serde_json::Value>().await {
+                            if let Some(self_shard) = json.get_mut("self_shard") {
                                 if !self_shard.is_null() {
+                                    if let Some(sa) = self_shard.get("socket_addr").and_then(|v| v.as_str()) {
+                                        let is_stub = sa.starts_with("0.0.0.0")
+                                            || sa.starts_with("127.")
+                                            || sa.is_empty();
+                                        if is_stub {
+                                            // Use the port the seed declared (trust its listener port),
+                                            // falling back to the pulled URL's port if missing.
+                                            let declared_port = sa.rsplit(':').next()
+                                                .and_then(|p| p.parse::<u16>().ok());
+                                            let fallback_port = addr.rsplit(':').next()
+                                                .and_then(|p| p.parse::<u16>().ok())
+                                                .unwrap_or(9090);
+                                            let port = declared_port.unwrap_or(fallback_port);
+                                            let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr.as_str());
+                                            if let Some(obj) = self_shard.as_object_mut() {
+                                                obj.insert(
+                                                    "socket_addr".to_string(),
+                                                    serde_json::Value::String(format!("{}:{}", host, port)),
+                                                );
+                                            }
+                                        }
+                                    }
                                     let payload = serde_json::json!({"shard": self_shard});
                                     let _ = client.post(&local_announce).json(&payload).send().await;
                                 }
