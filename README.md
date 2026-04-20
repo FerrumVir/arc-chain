@@ -1,20 +1,125 @@
-![Rust](https://img.shields.io/badge/Rust-99%2C000%2B_LOC-orange)
+![Rust](https://img.shields.io/badge/Rust-99%2C600%2B_LOC-orange)
 ![Tests](https://img.shields.io/badge/tests-1%2C204_passing-brightgreen)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-blue)
-![Inference](https://img.shields.io/badge/inference-pipeline_parallel_sharded-purple)
+![Inference](https://img.shields.io/badge/inference-consensus--verified-purple)
 ![Testnet](https://img.shields.io/badge/testnet-live-green)
 
-# ARC Chain — Testnet
+# ARC Chain — Trustworthy AI
 
-**Run a model that doesn't fit on any one of your machines, by splitting it across all of them.**
+**A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built so AI inference can pass network consensus — the same way transactions do.**
 
-A request flows through a pipeline of nodes. Each node holds a slice of the model — a few transformer layers — and forwards the resulting hidden state to the next node via HTTP. The last node runs the LM head and returns a token. Per-row INT16 weights quantized directly from f32, pure i64 arithmetic, BLAKE3 over every wire-format hidden state. The output is bit-identical regardless of which node holds which slice, on any chip on earth.
+**Not a fork. Not a copy. Every line is original.**
 
-This is how a 7B model gets shared across 7 cheap VPS, and how a 70B model gets shared across 14 of them. No single node has enough RAM. The network does.
+📄 Paper: *On the Foundations of Trustworthy Artificial Intelligence*
+
+---
+
+## The claim
+
+Every AI response from a cloud provider is a claim you can't check. You don't know which model ran. You don't know whether the output was truncated, cached, routed, or silently modified. You trust the logo.
+
+ARC makes inference **verifiable by a blockchain the same way transactions are verifiable**. The engine runs in pure integer arithmetic, no floating point. The output hash is bit-identical on ARM, x86, GPU — every chip on earth. Validators can re-run any inference and vote on it the same way they vote on blocks. Invalid outputs are slashed. Honest ones are attested on-chain with cryptographic proof of which model produced them.
+
+**This is AI that passes consensus.** Inference becomes a first-class on-chain primitive. An oracle you don't need to trust. A model output you can replay, verify, and settle against — at any scale, on any hardware.
+
+---
+
+## What's live right now
+
+| | |
+|---|---|
+| **8 seed validators** | NYC · LAX · AMS · LHR · NRT · SGP · SAO · JNB |
+| **Cluster round** | 1.1 M+ and advancing |
+| **DAG finality** | ~24 ms (2-round commit) |
+| **Deterministic inference** | INT16 engine, ARM Mac = x86 Linux = identical output hash, verified |
+| **Sharded inference** | 32-layer Llama-2-7B distributed across the 8 seeds, 6 continents, BLAKE3 over every hop |
+| **On-chain attestations** | Every inference produces `InferenceAttestation` (0x16) with model hash + input hash + output hash |
+| **Live dashboard** | http://140.82.16.112:3200 |
+| **Web wallet** | http://140.82.16.112:3100 |
+
+---
+
+## Test it yourself
+
+**Run a real inference on the live network, see the BLAKE3 hash, watch it verify:**
+
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash
+```
+
+Discovers the live shard pipeline, dispatches a Llama-2-7B prompt, prints the per-hop trace (compute_ms, wall_ms, payload bytes per node), re-runs the prompt, proves `output_hash` is bit-identical across both runs.
+
+**Re-verify any past on-chain attestation from scratch on your own machine:**
+
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh | bash -s -- --latest
+```
+
+Fetches the newest attestation, re-executes the same prompt against the same model, compares hashes. Prints `✓ VERIFIED` when they match.
+
+**Join the network as a node** (one command, auto-detects platform, auto-picks a layer range):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
+```
+
+Pre-built 16 MB binary. Registers as a launchd / systemd service. Auto-updates daily. Connects to all 8 seeds and starts serving inference with on-chain attestations.
+
+---
+
+## The improvements that made this real
+
+The core thesis — "inference that passes consensus" — only works if the arithmetic is perfectly reproducible. Getting there took a sequence of concrete breakthroughs, each one verified on the live network:
+
+1. **Pure-integer transformer inference.** Every matmul, softmax, layer norm, and activation in i64 fixed-point. No floating point anywhere on the hot path. Eliminates the only source of hardware drift.
+
+2. **Cross-architecture bit identity, proven.** Same prompt → same output hash on Apple M2 Ultra and x86_64 Vultr VPS. No approximations, no tolerance thresholds. Byte-for-byte equal.
+
+3. **BLAKE3 verification in O(1).** Consensus participants re-run an inference, compare one 32-byte hash. zkML proof-of-inference costs 10⁵–10⁶× the original compute; hash-match costs the same as one forward pass. At 7 B parameters we're already 700× the largest model ever verified by zkML.
+
+4. **Sharded inference with hop-level integrity.** 32-layer model split across 8 VPS. Each shard verifies the previous shard's BLAKE3 hash before computing its own layers. A single corrupted hop invalidates the whole chain — the network notices immediately.
+
+5. **Deterministic KV cache.** Integer-only means identical inputs produce identical outputs, so intermediate hidden states are content-addressable. Repeated prompts serve in microseconds. Across the whole network.
+
+6. **Heterogeneous hardware scheduler.** Every node advertises measured compute p50 + current queue depth. The coordinator races the top-K fastest workers per layer range and takes the first-finish — **determinism guarantees the output is identical whichever worker wins**. A 4090 joining today slots in automatically and outruns the CPU seeds; no manual config.
+
+7. **Content-addressed model chunks over HTTP.** `GET /chunks/get/{hash}` serves weight bytes straight from a peer. Any new node auto-picks an uncovered layer range (`--auto-shard`) and pulls the chunk from the network — no 4 GB GGUF download. A laptop with 2 GB of RAM can contribute.
+
+8. **VRF committee re-execution.** For inference gas lane transactions (tier 2 and 3), 7 validators are pseudo-randomly selected per request and must agree on the output hash. Disagreement triggers slashing. Same game-theoretic trust model as normal block finality, applied to AI.
+
+9. **Post-quantum signatures in production.** Falcon-512 and ML-DSA live alongside Ed25519, BLS12-381, secp256k1. Most chains still list this on a roadmap.
+
+10. **DashMap lock-inversion fix in `index_account_tx`** (this week). Consensus thread was holding one shard's write lock while acquiring another → classic deadlock. Found via `gdb -p` on a stuck node with a debuginfo build, fixed in a few lines. Stability debt paid; cluster holds tight round spread now.
+
+---
+
+## Measured performance
+
+All numbers on Apple M2 Ultra (24 cores, 64 GB) unless noted.
+
+| Metric | Value | Conditions |
+|---|---|---|
+| **Inference (GPU)** | **76 ms/token** | Deterministic INT16 |
+| **Inference (CPU)** | **139 ms/token** | Deterministic INT16 |
+| Standard float (Candle Q4) | 175 ms/token | Not deterministic |
+| Single-node peak TPS | 183,000 | CPU verify + sequential exec |
+| Multi-node sustained TPS | 33,230 | 2 validators, real QUIC, real DAG |
+| Peak TPS | 350,000 | 1-second burst window |
+| Commit rate | 100% | 500 K / 500 K transactions |
+| State lookups | 22.3 M/sec | DashMap baseline |
+| GPU Ed25519 verify | 379,000 / sec | Metal compute shader (13.68× CPU) |
+| Ed25519 signing | 82,800 / sec | Single-core |
+| DAG finality | ~24 ms | 2-round commit rule |
+
+The deterministic integer engine is **2.3× faster than floating-point** on GPU. Integer ops associate; floating-point ops don't; that removes a class of barriers that force the GPU to serialize.
+
+---
+
+## How the sharding works
 
 ```
                   Llama-2-7B Q4 — 32 transformer layers, ~4 GB
-                              split 7 ways across the public internet
+                          split across the public internet
 
    token id           hidden state         hidden state         token id
       ↓                    ↓                    ↓                    ↑
@@ -25,747 +130,180 @@ This is how a 7B model gets shared across 7 cheap VPS, and how a 70B model gets 
   │ ~1 GB │          │ ~1 GB │           │ ~1 GB │           │ ~1 GB │
   └───────┘          └───────┘           └───────┘           └───────┘
        │                  │                   │                   ↑
-       │                  │                   ▼                   │
-       │                  │            ┌───────┐  hidden          │
-       │                  │            │ LHR   │  +BLAKE3         │
-       │                  │            │L14–18 │  ─────►          │
-       │                  │            │ ~1 GB │                  │
+       │                  │            ┌───────┐    hidden        │
+       │                  │     ┌─────►│ LHR   │   +BLAKE3 ──►    │
+       │                  │            │L14–18 │                  │
        │                  │            └───────┘                  │
        │                  │                                       │
-       │                  │  ──── ... ────► NRT L19–22 ────►      │
-       │                  │                  SGP L23–27 ──────────┘
+       │                  │   ──── ... ────► NRT L19–22 ────►     │
+       │                  │                   SGP L23–27 ─────────┘
        │                  │
    port 9090         port 9090            port 9090           port 9090
    149.28.32.76    140.82.16.112         136.244.109.1      139.84.237.49
 ```
 
-Each → is a `POST /inference/forward_shard` to the next shard's RPC. Each shard verifies the previous shard's BLAKE3 hash before computing. The last shard runs `final_norm + LM head + argmax` and returns the next token id. The coordinator collects tokens until `max_tokens` or EOS.
+Each `→` is a `POST /inference/forward_shard` to the next shard. Each shard verifies the previous shard's BLAKE3 hash before computing. The last shard runs `final_norm + LM head + argmax` and returns the next token id. The coordinator collects tokens until `max_tokens` or EOS.
 
-> **Live demo:** http://140.82.16.112:3200
-> Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the activation reaches it. The trace table shows compute_ms, wall_ms, and payload bytes per hop, and the output_hash matches every replay.
-
-## Try the full demo from your terminal
-
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash
-```
-
-This single command:
-1. **Discovers the live shard pipeline** — prints every node, its layer range, and how much RAM it holds
-2. **Runs a real Llama-2-7B inference** through the 7-shard pipeline and shows the per-hop trace (compute_ms / wall_ms / payload bytes per node)
-3. **Re-runs the same prompt** and verifies the BLAKE3 hash is bit-identical (cryptographic determinism proof)
-4. **Runs a different prompt** and verifies the hash is different (per-request KV cache isolation proof)
-5. **Prints the install command** so you can join the network
-
-Or, just the inference call. Pick a live coordinator first — the testnet has 8 seeds and `arc-pick-coordinator.sh` returns the first one that can serve requests:
-
-```bash
-COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
-curl -X POST "$COORDINATOR/inference/run_sharded" \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"The largest planet is","max_tokens":15}'
-```
-
-Returns a real Llama-2-7B answer along with the full per-hop trace.
-
-## Verify any past inference run
-
-The simplest way — verify the **newest** inference run on the network with one command:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
-  | bash -s -- --latest
-```
-
-Or verify a specific past attestation by `tx_hash`:
-
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
-  | bash -s -- 0xe0c73bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833f67d
-```
-
-The verifier:
-1. Fetches the attestation from `/inference/results` on the coordinator
-2. Reads the original input + claimed `output_hash` + `model_hash`
-3. Re-runs the SAME input on the same coordinator
-4. Compares the new hashes to the originals
-5. Prints **✓ VERIFIED** or **✗ MISMATCH**
-
-This is the cryptographic claim turned into a tool. Auto-picks `/inference/run` vs `/inference/run_sharded` based on the original attestation's sharded flag, so it works for both modes. Sample output:
-
-```
-[1/3] Fetching inference details...
-[ OK] Found attestation
-       input:        '[INST] What is 2+2? [/INST]'
-       output:       '  Sure! The answer is 2+2 = 4.</s>'
-       output_hash:  0xe0c73bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833f67d
-       model_hash:   0xabec2d582beb97a876c21d7ccc5e8e4833e8fd34aee0cb5b64e9f14f5ea57fdb
-[2/3] Re-running the same input...
-[ OK] Re-run complete
-[3/3] Comparing hashes...
-
-  ✓ VERIFIED — both output_hash and model_hash match the attestation.
-```
-
-## Run a node in one command
-
-Anyone can join the network as a community inference node. Persistent service, daily auto-update, no compile.
-
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
-```
-
-The installer:
-- Detects your platform (macOS arm64/x86, Linux x86_64/aarch64)
-- Pulls the latest pre-built binary from the GitHub releases (currently v0.5.2)
-- Joins consensus immediately — no 4 GB model download required. If a GGUF model is available locally or supplied via `--model`, the node also provides inference compute.
-- Installs as a launchd / systemd service that auto-starts and auto-restarts
-- Schedules a daily auto-update check at 04:17 local time
-
-After install your node is running, joined to the testnet, contributing inference compute, and visible at the live dashboard.
-
-Uninstall any time: `bash install-community-node.sh --uninstall`.
-
-📖 **5-minute walkthrough:** [`docs/SERO-DEMO.md`](docs/SERO-DEMO.md) — every step of the demo with explicit timings, expected outputs, and answers for skeptics.
+Coordinators can batch the whole prompt into one round-trip per shard (`"prefill":"batch"`) or race redundant workers on the same layer range when multiple nodes cover it.
 
 ---
 
-## Plug in — one command for inference, one for TPS
-
-Every entry point auto-discovers a live coordinator. No IPs to memorize, no single point of failure: if a seed is rolling-upgrading or temporarily offline, the scripts fall through to the next healthy one.
-
-```bash
-# 1. Pick the first healthy seed automatically
-COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
-echo "Using $COORDINATOR"
-
-# 2. Run a verified inference
-curl -X POST "$COORDINATOR/inference/run_sharded" \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"The largest planet is","max_tokens":15}'
-
-# 3. Generate real TPS (signed transfers, gossiped + DAG-committed)
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/tps-generator.sh | bash -s -- 30 8
-# (run for 30 seconds with 8 concurrent workers across all 8 seed nodes)
-```
-
-`arc-pick-coordinator.sh` ranks seeds: **fully-covered pipeline** > **healthy with peers** > **alive but isolated**. If nothing is reachable it exits non-zero so you catch the outage explicitly instead of silently dialling a dead node. Override with `ARC_SEEDS="host1:port host2:port ..."` or `ARC_SEEDS_URL=<url>` (plaintext list, one per line).
-
----
-
-99,000+ lines of Rust. Built from scratch.
-
-Read the paper: [On the Foundations of Trustworthy Artificial Intelligence](papers/foundations-trustworthy-ai.pdf)
-
----
-
-## Documentation
-
-| Doc | What it covers |
-|-----|----------------|
-| [`docs/STATUS.md`](docs/STATUS.md) | Overnight session snapshot — what's verified live, what's flaky, headline numbers, where to start |
-| [`docs/SERO-DEMO.md`](docs/SERO-DEMO.md) | 7-step demo walkthrough with explicit timings (designed for screen recording) |
-| [`docs/HOW-SHARDING-WORKS.md`](docs/HOW-SHARDING-WORKS.md) | Engineer-grade architecture deep dive: forward pass, wire format, KV cache, determinism |
-| [`docs/ANNOUNCEMENT.md`](docs/ANNOUNCEMENT.md) | Copy-pasteable shareable summary for X / Discord / HN |
-| [`docs/PERFORMANCE-COMPARISON.md`](docs/PERFORMANCE-COMPARISON.md) | Honest latency comparison vs centralized API + single-machine local LLM, with optimization roadmap |
-| [`docs/BENCHMARK-RESULTS.md`](docs/BENCHMARK-RESULTS.md) | Captured factual benchmark output (10 prompts) |
-| [`CHANGELOG.md`](CHANGELOG.md) | Release notes per version |
-
-| Script | What it does |
-|--------|-------------|
-| [`scripts/install-community-node.sh`](scripts/install-community-node.sh) | One-command community node installer (launchd / systemd persistent service + auto-update) |
-| [`scripts/arc-demo.sh`](scripts/arc-demo.sh) | End-to-end demo: discover pipeline → run inference → determinism check → isolation check |
-| [`scripts/arc-verify.sh`](scripts/arc-verify.sh) | Third-party verifier (`--latest` mode auto-picks newest attestation) |
-| [`scripts/arc-bench.sh`](scripts/arc-bench.sh) | Reproducible factual benchmark with markdown report |
-| [`scripts/arc-watchdog.sh`](scripts/arc-watchdog.sh) | Testnet watchdog (preserves shard flags on restart) |
-| [`scripts/arc-health-check.sh`](scripts/arc-health-check.sh) | Network-wide health probe |
-
----
-
-## Why Build on ARC
-
-| Feature | ARC | Everyone Else |
-|---------|-----|---------------|
-| **On-chain AI inference** | 76 ms/token, deterministic, identical on every chip on earth | Does not exist. Previously thought impossible. |
-| **Verified inference** | Cryptographic proof that a specific model produced a specific output. Proven at 7B parameters, 700x larger than any prior ZK-verified model. Attested through multi-node DAG consensus. | No chain can verify AI inference. |
-| **Agent settlements** | Zero fees forever. Agents are first-class citizens with dedicated transaction types. | No chain offers zero-fee agent transactions. |
-| **Smart contracts** | Both EVM (Solidity) and WASM (Rust, C, Go) natively. Pick your stack. | One or the other, not both. |
-| **Quantum resistant** | Falcon-512 + ML-DSA implemented and shipping. Not a roadmap item. | No production chain has post-quantum signatures. |
-| **Multi-node TPS** | 33,230 measured with real DAG consensus over real QUIC networking. Throughput increases with more validators (DAG consensus scales horizontally). | Ethereum: ~15 TPS. Solana: ~4,000 non-vote TPS sustained. |
-| **Finality** | ~24ms, 2-round DAG commit (~12ms/round) | Ethereum: ~12 min. Solana: ~400ms. |
-| **MEV protection** | BLS threshold encrypted mempool. Transactions encrypted until block is committed. | Exposed or partially mitigated. |
-| **Signatures** | 5 algorithms: Ed25519, Falcon-512, BLS12-381, ML-DSA, secp256k1 | 1 or 2 options. |
-| **ZK proofs** | Circle STARKs (Stwo). No trusted setup. Post-quantum secure. Verified at 700x the scale of any prior ZK-ML system. | SNARKs requiring trusted setup, limited to small models. |
-
----
-
-## Inference Speed
-
-The ARC engine runs neural network inference in pure integer arithmetic. No floating-point operations. The output is bitwise identical on every CPU, GPU, and architecture on earth.
-
-| Backend | Speed | Deterministic | Verified |
-|---------|-------|---------------|----------|
-| ARC engine (GPU) | **76 ms/token** | Yes, all platforms | Hash + STARK |
-| ARC engine (CPU) | **139 ms/token** | Yes, all platforms | Hash + STARK |
-| Standard float (candle Q4) | 175 ms/token | No | No |
-
-The deterministic engine is **2.3x faster** than floating-point on GPU. Not slower. Faster.
-
-Every inference produces an on-chain `InferenceAttestation` with the model hash, input hash, and output hash. Anyone can independently verify by re-executing on any hardware and comparing hashes.
-
-Read the paper: [On the Foundations of Trustworthy Artificial Intelligence](papers/foundations-trustworthy-ai.pdf)
-
----
-
-## Measured Performance
-
-| Metric | Value | Conditions |
-|--------|-------|------------|
-| Single-node peak TPS | **183,000** | CPU verify + sequential exec, M2 Ultra |
-| Multi-node sustained TPS | **33,230** | 2 validators, real QUIC, real DAG consensus |
-| Peak TPS | **350,000** | 1-second burst window |
-| Commit rate | **100%** | 500K/500K transactions committed |
-| GPU Ed25519 verify | **379,000/sec** | Metal compute shader |
-| Inference (GPU) | **76 ms/token** | Deterministic INT16, M2 Ultra |
-| Inference (CPU) | **139 ms/token** | Deterministic INT16, M2 Ultra |
-| DAG finality | **~24ms** | 2-round commit rule (~12ms/round) |
-
-All numbers measured on Apple M2 Ultra (24 cores, 64 GB).
-
----
-
-## Distributed Inference — 6× Faster, Cryptographically Verifiable
-
-**The pitch:** Same model running on N devices in parallel. Same prompt → identical `output_hash` on every device. N× throughput vs single-machine inference.
-
-**Live demo (no install needed):**
-
-1. Open [http://140.82.16.112:3200](http://140.82.16.112:3200) — the dashboard
-2. Click any inference node card → runs inference on that specific device
-3. Click **⚡ Run Live Benchmark** → measures sequential vs distributed speedup in real time
-4. Verify all devices produce the same hash for the same prompt
-
-**Or from your terminal:**
-
-```bash
-git clone https://github.com/FerrumVir/arc-chain.git && cd arc-chain
-
-# Distribute 10 inference requests across 5 nodes in parallel
-./scripts/inference-router.sh 10 "What is 2+2?"
-
-# Side-by-side benchmark: 1 node sequential vs 5 nodes parallel
-./scripts/inference-benchmark.sh 10
-```
-
-**Benchmark results (10 inferences, TinyLlama 1.1B):**
-
-| Mode | Time | Throughput |
-|------|------|-----------|
-| Sequential (1 node) | 213.5s | 0.04 req/s |
-| Distributed (5 nodes) | 34.4s | **0.29 req/s** |
-| **Speedup** | | **6.2× faster** |
-
-All 20 responses (10 sequential + 10 distributed) produced **identical** `output_hash`. Different physical machines, same cryptographic proof.
-
-### How distribution works
-
-Each inference-enabled seed loads the same GGUF model. The router script dispatches requests round-robin across all of them. Each device runs its inference fully and independently — no inter-node communication during inference. The "distribution" is at the request level (load balancing across replicas), not layer level.
-
-**Why it's faster:** A single 2-core VPS processes inferences serially. With 5 replicas, 5 inferences run simultaneously. Throughput scales linearly with the number of replica devices.
-
-**Why it's verifiable:** Every response includes an `output_hash` (BLAKE3 of token bytes). Same model file + same prompt = byte-identical output_hash across all devices. Anyone can re-run any inference on their own hardware to verify the result.
-
-### Upload your own model to a node
-
-To add a new inference node to the network:
-
-```bash
-# Option 1: One command (downloads pre-built binary, your model, joins testnet)
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/sero-quickstart.sh \
-  | bash -s -- /path/to/your-model.gguf
-
-# Option 2: Existing testnet seed with your own model
-ssh root@your-seed-ip
-cd /root/arc-chain
-# Upload your .gguf model
-scp local-model.gguf root@your-seed-ip:/root/arc-chain/model.gguf
-# Restart node with --model flag
-screen -S arc -X quit
-screen -dmS arc ./target/release/arc-node \
-  --rpc 0.0.0.0:9090 --p2p-port 9091 \
-  --validator-seed YOUR_NAME \
-  --seeds-file testnet-seeds.txt --genesis genesis.toml \
-  --stake 5000000 --eth-rpc-port 0 \
-  --model model.gguf
-```
-
-After your node loads the model (~2-30s depending on model size), it shows up in the dashboard's distributed inference grid. Add its IP to `inference-router.sh` to include it in the round-robin pool.
-
-### Run your model alongside others (sharded throughput)
-
-If you have a beefy machine and want to multiply network throughput:
-
-```bash
-# 1. Get the same TinyLlama model the seeds use
-curl -L -o model.gguf https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-
-# 2. Run quickstart with that model
-./scripts/sero-quickstart.sh ./model.gguf
-
-# 3. The benchmark script will pick up your node automatically (it round-robins
-#    across all reachable inference-enabled nodes — edit NODES list if needed)
-./scripts/inference-benchmark.sh 10
-```
-
-Your machine joins the inference pool. The next benchmark run distributes requests across all participating devices, including yours. You contribute to network throughput AND every inference you serve gets cryptographically attested on-chain.
-
----
-
-## Run a Node — One Command
-
-**Zero compile. Zero setup.** Pre-built binary downloads, auto-configures, joins testnet as inference observer. Bring any GGUF model.
-
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/sero-quickstart.sh | bash -s -- /path/to/your-model.gguf
-```
-
-That's it. Your node:
-- Downloads the pre-built binary (16 MB) from GitHub releases
-- Auto-detects platform (macOS/Linux, arm64/x86_64)
-- Connects to 8 testnet seeds across 6 continents
-- Loads your GGUF model (Llama, Mistral, Phi, Gemma, Qwen — anything)
-- Starts serving inference with on-chain attestations
-
-No git clone, no Rust toolchain, no 15-minute compile.
-
-**No model? It downloads TinyLlama 1.1B for you:**
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/sero-quickstart.sh | bash
-```
-
-**Check it's working:**
-```bash
-curl http://localhost:9944/health
-# {"status":"ok","version":"0.3.1","peers":8,"dag_round":1234,"validators":9}
-```
-
-### Build From Source (optional)
-
-If you want to compile yourself:
-
-```bash
-git clone https://github.com/FerrumVir/arc-chain.git && cd arc-chain
-./scripts/join-inference.sh                                    # default TinyLlama
-./scripts/join-inference.sh --model ~/models/llama-3-8b.gguf  # bring your own
-```
-
-Your node connects to the live testnet, loads the model, and starts serving inference. That's it.
-
-**Test it works (one command):**
-```bash
-./scripts/test-inference.sh "What is 2+2?"
-```
-This runs inference, shows the output, and prints the cryptographic hashes + on-chain attestation tx hash.
-
-**Check on-chain attestations:**
-```bash
-./scripts/check-attestations.sh                       # Your local node
-./scripts/check-attestations.sh 140.82.16.112:9090 10 # Remote node, last 10
-```
-
-**Raw curl (if you prefer):**
-```bash
-# Run inference
-curl -X POST http://localhost:9944/inference/run \
-  -H 'Content-Type: application/json' \
-  -d '{"input":"[INST] What is 2+2? [/INST]","max_tokens":32}'
-
-# See all attestations on the network
-curl http://140.82.16.112:9090/inference/attestations?limit=10
-```
-
-**Response fields:**
-- `output` — the model's response
-- `output_hash` — BLAKE3 hash of the output (deterministic, verifiable)
-- `model_hash` — identifies exactly which model produced it
-- `attestation.tx_hash` — on-chain tx proving this inference happened
-- `ms_per_token` — speed
-
-**Verify determinism:** Run the same prompt on two different machines. The `output_hash` will be **bit-for-bit identical**. That's the whole point — any machine can independently verify any inference.
-
-### Already have the repo cloned?
-
-```bash
-cd arc-chain
-./scripts/join-inference.sh                           # Default model
-./scripts/join-inference.sh --model ~/my-model.gguf   # Your model
-```
-
-### What does it cost?
-
-Nothing. There is no subscription. No account. No sign-up. You run a binary on your own machine and you earn ARC for contributing compute to the network. The node software is open source.
-
-| Resource | Requirement |
-|----------|-------------|
-| **RAM** | 2 GB minimum, 4 GB+ for inference |
-| **Disk** | 2 GB for build, ~4 GB with model |
-| **CPU** | Any (x86, ARM, Apple Silicon all work) |
-| **GPU** | Optional (Metal, CUDA, or Vulkan for faster inference) |
-| **OS** | Linux or macOS |
-| **Network** | Any internet connection |
-| **Cost** | Free. Forever. |
-
----
-
-## Quick Start (no install)
-
-Don't want to run a node? You can still use the network right now:
-
-1. Open the **[Web Wallet](http://140.82.16.112:3100)** in your browser (phone or desktop)
-2. Click **"Create New Wallet"** — save your private key
-3. You now have **10,000 ARC** — send tokens, check balance, explore
-4. View the live network on the **[Dashboard](http://140.82.16.112:3200)** — 8 nodes across 6 continents
-
-**Live Dashboard:** [http://140.82.16.112:3200](http://140.82.16.112:3200)
-**Web Wallet:** [http://140.82.16.112:3100](http://140.82.16.112:3100)
-
-![Live Dashboard](docs/screenshots/dashboard.png)
-
-| Web Wallet | Private Key (copyable) |
-|:---:|:---:|
-| ![Wallet](docs/screenshots/wallet-active.png) | ![Key Modal](docs/screenshots/key-modal.png) |
-
-```bash
-# Quick test from terminal — zero install needed
-curl http://140.82.16.112:9090/stats
-
-# Claim free testnet tokens
-curl -X POST http://140.82.16.112:9090/faucet/claim \
-  -H 'Content-Type: application/json' \
-  -d '{"address":"your-64-char-hex-address-here"}'
-```
-
----
-
-## Network Endpoints
-
-**All 8 testnet nodes** expose the same API on port 9090. Any single node may be down, under a rolling upgrade, or holding a shard with an unroutable address — **pick whichever is healthy** via `scripts/arc-pick-coordinator.sh` instead of hardcoding one IP:
-
-```bash
-COORDINATOR=$(bash scripts/arc-pick-coordinator.sh)   # e.g. http://136.244.109.1:9090
-curl "$COORDINATOR/health"
-```
-
-| Node | Location | RPC |
-|------|----------|-----|
-| NYC | New York | `http://149.28.32.76:9090` |
-| LAX | Los Angeles | `http://140.82.16.112:9090` |
-| AMS | Amsterdam | `http://136.244.109.1:9090` |
-| LHR | London | `http://104.238.171.11:9090` |
-| NRT | Tokyo | `http://202.182.107.41:9090` |
-| SGP | Singapore | `http://149.28.153.31:9090` |
-| SAO | Sao Paulo | `http://216.238.120.27:9090` |
-| JNB | Johannesburg | `http://139.84.237.49:9090` |
-
-| Endpoint | Path (use any healthy node from the table above) |
-|----------|--------------------------------------------------|
-| **Chain Stats** | `/stats` |
-| **Node Health** | `/health` |
-| **Validators** | `/validators` |
-| **Inference Attestations** | `/inference/attestations` |
-| **Account Lookup** | `/account/{address}` |
-| **Faucet** | `POST /faucet/claim` |
-| **Run Inference** | `POST /inference/run` |
-| **Sharded Inference** | `POST /inference/run_sharded` |
-| **Shards / Models** | `/shards`, `/models`, `/models/shards?model_id=0x…` |
-| **DAG Sync State** | `/sync/dag_state` |
-
-> **Your node's ports**: RPC on 9944, P2P on 9945 (both configurable). The live testnet uses 9090 (legacy).
-
-### Makefile shortcuts
-
-```bash
-make join            # Join testnet (validator only)
-make inference       # Join with inference enabled
-make stats           # Check live chain stats
-make health          # Check live node health
-make test            # Run all tests
-make explorer        # Open block explorer
-```
-
-### Get testnet tokens
-
-**Easiest:** Open the [Web Wallet](http://140.82.16.112:3100) and create a wallet. You get 10,000 ARC automatically.
-
-**From terminal:**
-```bash
-curl -X POST http://localhost:9944/faucet/claim \
-  -H 'Content-Type: application/json' \
-  -d '{"address":"your-wallet-address"}'
-```
-
-### Deploy a smart contract
-
-Write Solidity (EVM via revm 19) or Rust/C/Go (WASM via Wasmer 6.0). Both VMs run natively. Choose whichever fits your stack.
-
-### Run AI agents
-
-Three agent types ship with the chain. All agent settlements are zero-fee.
-
-```bash
-cd agents && cargo run --release
-```
-
-- **Oracle agent** - submits inference attestations with economic bonds
-- **Router agent** - routes inference requests to capable nodes
-- **Sentiment agent** - on-chain sentiment analysis via deterministic inference
-
-Agents register on-chain via `RegisterAgent` (0x07) and settle via `Settle` (0x06) at zero cost. ARC is built for agents.
-
----
-
-## Dual VM: EVM + WASM
-
-Deploy in whichever runtime fits your project:
-
-| Runtime | Language | Engine | Use Case |
-|---------|----------|--------|----------|
-| **EVM** | Solidity, Vyper | revm 19 | Ethereum-compatible dApps, DeFi, existing tooling |
-| **WASM** | Rust, C, C++, Go, AssemblyScript | Wasmer 6.0 | High-performance compute, custom logic, ML models |
-
-Both VMs have access to 11 native precompiles: BLAKE3, Ed25519, VRF, Oracle, Merkle proofs, BlockInfo, Identity, Falcon-512, ZK-verify, AI-inference (0x0A), BLS-verify.
-
----
-
-## Transaction Types (24)
-
-| Type | Code | Description |
-|------|------|-------------|
-| Transfer | `0x01` | Send ARC between accounts |
-| Stake | `0x02` | Stake ARC to become a validator |
-| Unstake | `0x03` | Begin unstaking with cooldown |
-| Deploy | `0x04` | Deploy WASM or EVM smart contract |
-| Call | `0x05` | Call a deployed contract |
-| **Settle** | **`0x06`** | **Zero-fee AI agent settlement** |
-| **RegisterAgent** | **`0x07`** | **Register an AI agent on-chain** |
-| Governance | `0x08` | Submit or vote on governance proposal |
-| Bridge Lock/Unlock | `0x09-0x0B` | Cross-chain bridge operations |
-| Channel Open/Close | `0x0C-0x0E` | Payment channel lifecycle |
-| ShardProof | `0x15` | Submit STARK proof of computation |
-| **InferenceAttestation** | **`0x16`** | **Attest to inference result with bond** |
-| **InferenceChallenge** | **`0x17`** | **Challenge an attestation (dispute)** |
-| InferenceRegister | `0x18` | Register validator inference capabilities |
-| + 10 more | | Batch, social recovery, state rent, etc. |
-
-Agent transactions (bold) are unique to ARC.
-
-## Cryptographic Signatures
-
-Five signature algorithms, production ready:
-
-| Algorithm | Use | Speed |
-|-----------|-----|-------|
-| **Ed25519** | Primary signing | 118K sigs/sec |
-| **Falcon-512** | Post-quantum (NIST) | Production |
-| **BLS12-381** | Aggregate N sigs into 1 verify | Production |
-| **ML-DSA** | Post-quantum (NIST Dilithium) | Production |
-| **ECDSA secp256k1** | Ethereum compatibility | Production |
-
-Your contracts and agents can use any of these. Post-quantum ready today.
-
-## Smart Contract Standards
-
-| Standard | Description |
-|----------|-------------|
-| **ARC20** | Fungible token (ERC-20 equivalent) |
-| **ARC721** | NFT (ERC-721 equivalent) |
-| **ARC1155** | Multi-token (ERC-1155 equivalent) |
-| **UUPSProxy** | Upgradeable proxy pattern |
-| **ARCStaking** | Staking with tier system |
-| **ArcBridge** | Cross-chain bridge |
-| **ArcStateRoot** | State root commitments for rollups/L2s |
-
-## Inference Tiers
-
-Three tiers of AI inference, each with different trust/cost tradeoffs:
-
-| Tier | Execution | Verification | Use Case |
-|------|-----------|-------------|----------|
-| **Tier 1** | On-chain (precompile 0x0A) | Every validator re-executes | Small models, full trust |
-| **Tier 2** | Off-chain, optimistic | Fraud proofs + economic bonds | Large models, fast |
-| **Tier 3** | Off-chain, STARK-proven | Cryptographic proof | Maximum trust |
-
----
-
-## Distributed Inference (v0.3.0)
-
-Run models that no single device could handle. A 670B model splits across nodes that each hold a piece and compute in parallel. You go from "can't run it" to running it at full quality.
-
-**How it works:**
+## Architecture
 
 ```
-Your laptop (layers 0-10)  -->  Friend's PC (layers 11-20)  -->  ...  -->  Gaming rig (final layers)
-    embed + compute               receive activations,              run last layers,
-    forward activations           compute, forward                  produce output token
+Users / AI Agents
+       │
+       ▼
+┌─ arc-net ────────────────────────────────────────────────┐
+│  QUIC transport (quinn 0.11), TLS 1.3, shred propagation, │
+│  XOR FEC, TX gossip, peer exchange (PEX)                  │
+└──────────────────────┬───────────────────────────────────┘
+                       ▼
+┌─ arc-consensus ──────────────────────────────────────┐
+│  DAG block proposals (Mysticeti-inspired),            │
+│  stake-weighted 2-round finality, VRF proposer select │
+└──────────────────────┬───────────────────────────────┘
+                       ▼
+┌─ arc-node ───────────────────────────────────────────┐
+│  Block production, 34-endpoint RPC + ETH JSON-RPC,    │
+│  sharded inference coordinator, consensus manager     │
+└──────┬────────────────────────┬──────────────────────┘
+       ▼                        ▼
+┌─ arc-state ──────────┐ ┌─ arc-vm ──────────────────┐
+│  DashMap + JMT        │ │  Wasmer 6.0 WASM runtime   │
+│  GPU-resident cache   │ │  revm 19 EVM interpreter    │
+│  BlockSTM parallel    │ │  Gas metering, precompiles  │
+│  WAL persistence      │ └─────────────────────────────┘
+└───────────────────────┘
+       │
+┌─ arc-swarm ─────────────┐ ┌─ arc-inference ──────────────┐
+│  Content-addressed      │ │  Pure-integer INT8/INT16     │
+│  model chunks + scheduler│ │  transformer engine           │
+│  Peer-to-peer weights   │ │  VRF committee re-execution   │
+└─────────────────────────┘ └──────────────────────────────┘
+       │
+┌─ arc-gpu ──────────────────┐
+│  Metal/WGSL Ed25519 batch   │
+│  GPU state cache (wgpu)     │
+│  Unified memory             │
+└─────────────────────────────┘
 ```
-
-Every activation is i64 fixed-point, serialized as little-endian bytes with a BLAKE3 integrity hash. The output is **mathematically identical** to running on a single machine. Not similar. Identical. Bit for bit.
-
-**For MoE (Mixture of Experts) models:** Experts compute simultaneously across nodes, not sequentially. More devices = more throughput. Speed scales with participants.
-
-**Deterministic caching:** Identical inputs always produce identical outputs (integer-only arithmetic). Repeated queries are instant across the entire network. The more people join, the faster and cheaper it gets.
-
-| Feature | Detail |
-|---------|--------|
-| **Sharding** | Pipeline-parallel at transformer layer boundaries |
-| **MoE** | Expert-parallel, round-robin assignment across nodes |
-| **Activation size** | 64 KB per layer boundary per token (d_model=8192) |
-| **Network overhead** | ~30ms per token over consumer internet (6 hops) |
-| **Integrity** | BLAKE3 hash on every activation transfer |
-| **Determinism** | Bit-for-bit identical: x86, ARM, GPU, any device |
-| **Verification** | VRF committee + challenge-response fraud proofs |
-
----
-
-## ARC Token
-
-ARC exists today as an ERC-20 on Ethereum: [`0x672fdba7055bddfa8fd6bd45b1455ce5eb97f499`](https://etherscan.io/token/0x672fdba7055bddfa8fd6bd45b1455ce5eb97f499)
-
-When ARC Chain mainnet launches, ERC-20 holders will migrate to native ARC tokens via a bridge contract. Fixed supply of 1.03B ARC. No tokens are ever burned. No inflation.
-
-On testnet, use the faucet to get test tokens and start building now.
-
----
-
-## RPC API (34 endpoints)
-
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| GET | `/health` | Node health, peers, uptime |
-| GET | `/stats` | Block height, TPS, total transactions |
-| GET | `/info` | Chain info, GPU status |
-| GET | `/block/latest` | Latest block |
-| GET | `/block/{height}` | Block by height |
-| GET | `/blocks?from=&to=&limit=` | Paginated block list |
-| GET | `/account/{address}` | Account state |
-| GET | `/account/{address}/txs` | Transaction history |
-| POST | `/tx/submit` | Submit signed transaction |
-| POST | `/tx/submit_batch` | Batch submission |
-| GET | `/tx/{hash}` | Transaction with receipt |
-| GET | `/tx/{hash}/proof` | Merkle inclusion proof |
-| GET | `/validators` | Current validator set |
-| GET | `/agents` | Registered AI agents |
-| POST | `/inference/run` | Run inference (returns output + hash + ms/token) |
-| GET | `/inference/attestations` | All on-chain attestations |
-| POST | `/faucet/claim` | Claim testnet tokens |
-| GET | `/faucet/status` | Faucet status |
-| GET | `/sync/snapshot` | State sync for new nodes |
-| POST | `/contract/{address}/call` | Call a smart contract |
-| GET | `/channel/{id}/state` | Payment channel state |
-| POST | `/eth` | ETH JSON-RPC (blockNumber, getBalance, call, estimateGas, getLogs) |
 
 ---
 
 ## Codebase
 
-**99,600+ lines of Rust** across 16 crates with **1,196 tests**.
+99,600+ LOC Rust across 16 crates. 1,204 tests passing.
 
-| Crate | LOC | Tests | What It Does |
-|-------|-----|-------|-------------|
-| `arc-types` | 14,490 | 244 | 24 transaction types, blocks, accounts, governance, staking, bridge, inference |
-| `arc-state` | 13,203 | 154 | DashMap state, Jellyfish Merkle Tree, WAL, BlockSTM parallel execution, GPU cache |
-| `arc-crypto` | 11,680 | 230 | Ed25519, secp256k1, BLS, BLAKE3, Falcon-512, ML-DSA, VRF, STARK prover |
-| `arc-olm` | 9,760 | 55 | On-chain language model runtime, INT16 deterministic inference |
-| `arc-vm` | 8,439 | 145 | Wasmer WASM + revm EVM, gas metering, 11 precompiles, AI inference oracle |
-| `arc-node` | 8,424 | 61 | Block production, RPC (34 endpoints), consensus manager, STARK proofs |
-| `arc-consensus` | 7,971 | 137 | DAG consensus, 2-round finality, slashing, VRF, epoch transitions |
-| `arc-bench` | 5,336 | - | 10 benchmark binaries |
-| `arc-gpu` | 5,250 | 64 | Metal/WGSL Ed25519 batch verify (379K/sec), GPU memory, buffer pool |
-| `arc-net` | 2,355 | 26 | QUIC transport, shred propagation, FEC, gossip, peer exchange |
-| `arc-relayer` | 1,076 | - | Bridge relayer between Ethereum and ARC Chain |
-| `arc-agents` | 1,061 | - | Sentiment, oracle, and router AI agent examples |
-| `arc-mempool` | 876 | 17 | Lock-free queue, deduplication, BLS threshold encrypted mempool |
-| `arc-inference` | 620 | 53 | INT16 runtime (default), VRF committee selection, EIP-1559 inference gas lane |
-| `arc-channel` | 480 | 10 | Off-chain payment channels, BLAKE3 state commitments |
-| `arc-cli` | 660 | - | CLI: keygen, RPC, transaction submission |
+| Crate | LOC | What it does |
+|---|---|---|
+| `arc-types` | 14,490 | 24 transaction types, blocks, accounts, governance, staking, bridge, inference attestation/challenge |
+| `arc-state` | 13,203 | DashMap state DB, Jellyfish Merkle Tree, WAL, BlockSTM parallel execution, GPU-resident cache |
+| `arc-crypto` | 11,680 | Ed25519, secp256k1, BLS12-381, BLAKE3, Falcon-512, ML-DSA, VRF, Stwo STARK prover |
+| `arc-olm` | 9,760 | On-chain language model runtime, INT16 deterministic inference |
+| `arc-vm` | 8,439 | Wasmer WASM + revm EVM, gas metering, 11 precompiles, AI inference oracle |
+| `arc-node` | 8,424 | Block production, 34-endpoint RPC, sharded inference coordinator |
+| `arc-inference` | 8,343 | Pure-integer engine, committee selection, distributed dispatch |
+| `arc-consensus` | 7,971 | DAG consensus, 2-round finality, slashing, VRF, epoch transitions |
+| `arc-gpu` | 5,250 | Metal MSL + WGSL Ed25519 batch verify (379 K / sec), GPU memory |
+| `arc-net` | 2,355 | QUIC transport, shred propagation, FEC, gossip, peer exchange |
+| `arc-swarm` | 1,900 | Content-addressed model chunks, scheduler, peer-to-peer weights |
+| `arc-mempool` | 876 | Lock-free queue, deduplication, BLS threshold encrypted mempool |
+| `arc-cli`, `arc-channel`, `arc-bench`, `arc-relayer`, `arc-agents` | misc | CLI, payment channels, benchmarks, bridge, example agents |
 
-Plus: Python SDK (2,688 LOC), TypeScript SDK (2,011 LOC), Solidity contracts (1,944 LOC), block explorer.
+Plus: Python SDK (2,688 LOC), TypeScript SDK (2,011 LOC), Solidity contracts (1,944 LOC), Next.js block explorer.
 
 ---
 
-## Staking (Coming to Mainnet)
+## What's shipping on-chain
 
-Staking is implemented in the protocol but not yet active on testnet. Right now, anyone can:
-- Run a node and join the testnet
-- Deploy smart contracts (EVM or WASM)
-- Run deterministic inference
-- Test all 24 transaction types
-- Run AI agents with zero-fee settlements
-- Use the faucet for test tokens
+Every line below is live on the testnet right now:
+
+| | |
+|---|---|
+| DAG consensus, 2-round commit, ~24 ms finality | ✅ 8 nodes, 6 continents |
+| Deterministic INT16 inference, bit-identical cross-arch | ✅ ARM = x86 proof |
+| Sharded inference across 8 seeds, hop-level BLAKE3 | ✅ `/inference/run_sharded` |
+| Content-addressed model chunks (no GGUF download) | ✅ `/chunks/get/{hash}` |
+| Heterogeneous hardware scheduler, race-top-K | ✅ `/inference/plan` |
+| Auto-shard node onboarding | ✅ `--auto-shard` flag |
+| On-chain inference attestations | ✅ tx type `0x16` |
+| EVM (Solidity) + WASM (Rust / C / Go) both | ✅ revm 19, Wasmer 6.0 |
+| 5 signature algorithms incl. 2 post-quantum | ✅ Ed25519 · Falcon-512 · BLS · ML-DSA · secp256k1 |
+| Validator slashing (equivocation, liveness) | ✅ in protocol |
+| BLS threshold encrypted mempool (MEV protection) | ✅ commit-reveal |
+| Zero-fee agent settlements | ✅ `Settle` (0x06) · `RegisterAgent` (0x07) |
+| Web wallet, live dashboard, block explorer | ✅ |
 
 ---
 
-## What's Done
+## Network endpoints
 
-Everything below is implemented, deployed, and running on the live testnet:
+All 8 seeds serve the same API on port 9090. Auto-pick a healthy one:
 
-| Feature | Status | Details |
-|---------|--------|---------|
-| DAG consensus (2-round commit) | Live | 8 nodes, 6 continents, matching block hashes verified |
-| EVM (Solidity) | Live | revm 19, deploy + execute contracts, ETH JSON-RPC |
-| WASM (Rust/C/Go) | Live | Wasmer 6.0 runtime |
-| Deterministic inference | Live | INT16 + GGUF backends, 76 ms/token GPU (32,767 levels per weight, deterministic) |
-| Data availability | Live | Reed-Solomon erasure coding, DAS sampling |
-| Validator slashing | Live | Equivocation, liveness, invalid proposals |
-| State sync | Live | Chunked snapshots with BLAKE3 verification |
-| Cross-shard transactions | Live | 2-phase lock/commit protocol |
-| DAG persistence (WAL) | Live | Segmented WAL files, survives restarts |
-| Web wallet | Live | [http://140.82.16.112:3100](http://140.82.16.112:3100) |
-| 5 signature algorithms | Live | Ed25519, Falcon-512, BLS, ML-DSA, secp256k1 |
-| Encrypted mempool | Live | BLS threshold commit-reveal |
-| Block explorer | Live | `explorer/index-live.html` |
+```bash
+COORDINATOR=$(bash scripts/arc-pick-coordinator.sh)
+curl "$COORDINATOR/health"
+```
 
-## Roadmap (What's Next)
+| Node | Location | RPC |
+|---|---|---|
+| NYC | New York | http://149.28.32.76:9090 |
+| LAX | Los Angeles | http://140.82.16.112:9090 |
+| AMS | Amsterdam | http://136.244.109.1:9090 |
+| LHR | London | http://104.238.171.11:9090 |
+| NRT | Tokyo | http://202.182.107.41:9090 |
+| SGP | Singapore | http://149.28.153.31:9090 |
+| SAO | São Paulo | http://216.238.120.27:9090 |
+| JNB | Johannesburg | http://139.84.237.49:9090 |
 
-| Priority | Feature | Description |
-|----------|---------|-------------|
-| 1 | HTTPS for wallet | TLS certificate for the web wallet (currently HTTP) |
-| 2 | Mobile wallet | Native Android/iOS app or PWA |
-| 3 | DAG WAL replay | Replay persisted DAG blocks on node restart for faster recovery |
-| 4 | Load testing | Prove 30K+ TPS with real signed transfers through DAG consensus |
-| 5 | Desktop app | Electron or Tauri app for Mac/Windows/Linux |
-| 6 | SDK improvements | Python + TypeScript SDK with wallet, signing, contract deployment |
-| 7 | Mainnet preparation | Genesis ceremony, validator onboarding, bridge contract |
+Key endpoints:
+
+| Path | Purpose |
+|---|---|
+| `/health`, `/stats`, `/info` | node + chain health |
+| `/inference/run`, `/inference/run_sharded` | single-node + sharded inference |
+| `/inference/plan` | swarm scheduler preview |
+| `/inference/attestations` | all on-chain attestations |
+| `/chunks/info`, `/chunks/network`, `/chunks/get/{hash}` | content-addressed model weights |
+| `/tx/submit`, `/tx/{hash}` | transactions |
+| `/validators`, `/shards`, `/models` | network state |
+| `/faucet/claim` | free testnet tokens |
+| `/eth` | Ethereum JSON-RPC (MetaMask compatible) |
+
+Full API: 34 endpoints. See `docs/HOW-SHARDING-WORKS.md` for the wire protocol.
+
+---
+
+## ARC Token
+
+ARC exists today as ERC-20 on Ethereum: `0x672fdba7055bddfa8fd6bd45b1455ce5eb97f499`.
+
+Fixed supply: 1.03 B. No inflation. No burns.
+
+When mainnet launches, ERC-20 holders migrate to native ARC via a bridge contract. On testnet, use the faucet.
 
 ---
 
 ## Disclaimer
 
-ARC Chain is in active development. This is a testnet. Do not use real funds. The software is provided as-is with no warranty. Smart contracts deployed on testnet may not persist across upgrades. The ARC token economics described here reflect current design and may change before mainnet.
+ARC Chain is in active development. This is a testnet. Do not use real funds. Software is provided as-is, no warranty.
 
 ---
 
 ## License
 
-Open source in spirit. All source code is public. Read it, learn from it, build with it.
+BUSL-1.1. Source-available today. Becomes Apache 2.0 on 2030-03-25.
 
-**What you can do:**
+**Free forever:**
+- Any project under $10 M revenue — full production rights, no approval
+- Anything built on ARC Chain at any scale (contracts, tokens, agents, L2s, rollups)
+- Validators, inference providers, observers
+- Research, education, personal projects, forks, experiments
 
-- Use ARC for any project if your org is under $10M revenue. Full production rights. No approval needed.
-- Build anything on the ARC chain at any scale, any revenue. Contracts, tokens, agents, L2s, rollups, subnets. If it runs on ARC, it's free forever.
-- Join the ARC ecosystem. Crypto projects of any size, any market cap. If you want to build on ARC, deploy on ARC, or integrate with ARC, you are welcome. We want you here.
-- Run a validator, node, or inference provider. Always free.
-- Use it for research, education, personal projects. Always free.
-- Fork it, modify it, experiment with it.
+**Commercial license ($50 K/yr) for $10 M+ revenue orgs that want to:**
+- Fork this codebase to launch a competing L1
+- Extract consensus / inference / crypto for a competing network
+- Repackage the code as their own chain
 
-If your org is over $10M revenue and you want to use the code outside the ARC ecosystem, reach out for a commercial license (starts at $50K/year). We're friendly about it: tj@arc.ai
-
-**What you can't do:**
-
-- Fork this codebase and launch a competing L1 blockchain
-- Extract components (consensus, inference, crypto) to use in a competing network
-- Repackage or rebrand this code as your own chain
-
-I built this solo from scratch, every line. I just don't want to see it taken and passed off as someone else's work. Everything else is fair game. If you want to work together on something, I'm open to it: tj@arc.ai
-
-Becomes fully open source (Apache 2.0) on March 25, 2030. See [LICENSE](LICENSE) for details.
+Built solo from scratch, every line. I want it used. I don't want it taken. Commercial license: tj@arc.ai.
