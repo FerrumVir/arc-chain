@@ -2547,13 +2547,21 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         },
         embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
-        // REVERTED 2026-04-20: dual-quantize f32→I16 regressed WikiText-2 PPL
-        // from 107.67 (I8→I16 promotion baseline) to 782.68. Despite having 258×
-        // finer scale, the I16 matmul path produces worse numerical output —
-        // likely a scale/accumulation bug in matmul_i16_into that the promotion
-        // path masked. Keep I16 weights computed but do NOT install them until
-        // the matmul bug is found. _i16_layers_vec / _i16_output retained so
-        // future debugging can A/B the paths without re-loading from GGUF.
+        // Still disabled 2026-04-20. Spent three iterations localizing:
+        // 1. I8 scale bug (abs_max as i64 truncates) — real, independent,
+        //    does NOT cause the PPL regression (I16 dispatch preempts I8).
+        // 2. NEON dot_i16_i64 i64→i32 truncation — also not root cause,
+        //    scalar-only dispatch gives identical PPL 782.68.
+        // 3. Actual symptom (see examples/probe_i16_vs_i8.rs): I16 output
+        //    projection produces logits ~38× larger magnitude than I8
+        //    baseline; I16 layer matmuls produce logits ~1.4× larger.
+        //    Scale/acc math in matmul_i16_into appears correct on paper,
+        //    but empirically the output magnitudes are wrong. Next step
+        //    is a bottom-up repro: take a single known row of f32 weights,
+        //    quantize to I16 via quantize_f32, matmul against known Q16
+        //    input, compare to ground truth. If that passes, the bug is
+        //    higher up the stack (maybe KV cache interaction, maybe
+        //    integer_exp LUT sensitivity to magnitude).
         i16_layers: { let _ = i16_layers_vec; None },
         i16_output: { let _ = i16_output; None },
     })
