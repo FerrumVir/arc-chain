@@ -3406,6 +3406,28 @@ mod tests {
         assert_eq!(sum_s, sum_d, "SIMD and scalar must produce identical sums");
     }
 
+    /// Repro for project_i16_ppl_bug.md — I8Weights::quantize_f32 truncates
+    /// abs_max to i64 before computing the scale, destroying precision when
+    /// abs_max < ~5. Fix is to compute scale in f64:
+    ///   ((abs_max as f64 * ONE as f64) / 127.0).round().max(1.0) as i64
+    /// After applying the fix, remove #[ignore] so CI guards the invariant.
+    #[test]
+    #[ignore = "reproduces an unfixed scale-precision bug; remove #[ignore] after applying fix"]
+    fn test_i8_scale_roundtrip_small_abs_max() {
+        for &abs_max in &[0.1_f32, 0.5, 0.9, 1.2, 2.3] {
+            // Single-row matrix with exactly abs_max as the peak value.
+            let row = vec![abs_max, -abs_max, 0.0, abs_max / 2.0];
+            let w = I8Weights::quantize_f32(&row, 1, 4);
+            // Round-trip: dequantize and check peak ~= abs_max within 5%.
+            let scale = w.scales[0] as f64;
+            let peak = (w.data[0] as f64) * scale / ONE as f64;
+            let rel_err = (peak - abs_max as f64).abs() / abs_max as f64;
+            assert!(rel_err < 0.05,
+                "abs_max={} peak={} rel_err={:.3} scale={}",
+                abs_max, peak, rel_err, w.scales[0]);
+        }
+    }
+
     #[test]
     fn test_q4_scale_roundtrip() {
         let weights = I8Weights::quantize_f32(
