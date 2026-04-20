@@ -1,0 +1,24 @@
+node_modules
+dist
+dist-ssr
+*.local
+.vite
+
+# Tauri
+src-tauri/target
+src-tauri/gen
+src-tauri/WixTools
+
+# Playwright
+test-results
+playwright-report
+playwright/.cache
+
+# Editor
+.vscode
+.idea
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*

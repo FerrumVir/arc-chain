@@ -1,0 +1,163 @@
+/* ─────────────────────────────────────────────────────────────────────
+   ARC design tokens
+   ─────────────────────────────────────────────────────────────────────
+   Driven by the ARC brand guide (brandpad.io/arc):
+     - lowercase "arc" wordmark
+     - "ai for humans first" tagline
+     - arc-shape (abstract crop of circle + square) as brand device
+     - Favorit-style geometric grotesque (fallback: Inter Display)
+     - glow as secondary accent
+     - 5 core colours + 1 gradient + 11 sub colours (official hex values
+       not yet committed — drop them in where marked TODO below when
+       the signed brand pack is released)
+   ───────────────────────────────────────────────────────────────────── */
+
+:root {
+  color-scheme: dark;
+
+  /* ── Surface palette — digital greys per guide ─────────────────── */
+  --bg: #060608;
+  --bg-soft: #0c0c11;
+  --surface: #12121a;
+  --surface-elevated: #181822;
+  --surface-hover: #1e1e2b;
+  --surface-active: #262636;
+  --border: #22222e;
+  --border-bright: #2f2f40;
+  --border-focus: var(--arc);
+
+  /* ── Text palette ──────────────────────────────────────────────── */
+  --text: #f6f6f8;
+  --text-secondary: #b2b2c0;
+  --text-muted: #75758a;
+  --text-faint: #46465a;
+
+  /* ── ARC brand accents ────────────────────────────────────────────
+     Primary: arc blue. The signed brand pack at brandpad.io/arc has
+     not been dropped into the repo yet; the closest hex reference we
+     have is #4466cc (used for links in `papers/foundations-trustworthy-ai.typ`).
+     Below is a slightly brighter, more saturated variant that works on
+     dark UI. Replace when the official pack is committed. */
+  --arc: #3b63f5;             /* ARC primary (confident blue) */
+  --arc-ink: #5a7eff;         /* lighter — hover + highlights */
+  --arc-deep: #2a4ad1;        /* darker — pressed states */
+  --arc-soft: rgba(59, 99, 245, 0.12);
+  --arc-glow: rgba(59, 99, 245, 0.38);
+
+  /* Supporting — the paper's link blue, used for links + secondary accents. */
+  --arc-paper: #4466cc;
+
+  /* The gradient ("1 gradient" per the guide). Used for hero earnings,
+     active progress dots, and the hero launch logo. Runs from arc blue
+     through a cool indigo into a pale cyan. */
+  --arc-gradient: linear-gradient(135deg, #3b63f5 0%, #6b46ff 50%, #6ec1ff 100%);
+
+  /* ── Semantic ──────────────────────────────────────────────────── */
+  --success: #58d19c;
+  --success-bg: rgba(88, 209, 156, 0.10);
+  --warning: #f5b551;
+  --warning-bg: rgba(245, 181, 81, 0.10);
+  --danger: #f07373;
+  --danger-bg: rgba(240, 115, 115, 0.10);
+  --info: #5fb3e1;
+  --info-bg: rgba(95, 179, 225, 0.10);
+
+  /* Gradient aliases kept so screens using them still work. */
+  --gradient-hero: var(--arc-gradient);
+  --gradient-earnings: linear-gradient(135deg, #3b63f5 0%, #6ec1ff 100%);
+  --gradient-card: linear-gradient(180deg, rgba(59, 99, 245, 0.04) 0%, rgba(59, 99, 245, 0) 100%);
+  --gradient-border: linear-gradient(180deg, rgba(59, 99, 245, 0.45) 0%, rgba(59, 99, 245, 0.05) 100%);
+
+  /* Legacy var names for backwards-compat with earlier components. */
+  --indigo-300: #9cb6ff;
+  --indigo-400: var(--arc-ink);
+  --indigo-500: var(--arc);
+  --indigo-600: var(--arc-deep);
+  --indigo-700: #1f368c;
+  --purple: #8b7cff;
+  --earn-from: #3b63f5;
+  --earn-to: #6ec1ff;
+  --pulse: var(--success);
+
+  /* ── Typography ────────────────────────────────────────────────── */
+  /* Favorit is the ARC brand face (ABC Dinamo, commercial licence).
+     Until the licensed file is dropped in `/public/fonts/`, we fall
+     back to Inter Display → Inter → system. The tracking + feature
+     settings below approximate Favorit's geometric character. */
+  --font-sans: "Favorit", "InterDisplay", "Inter", -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "Favorit Mono", "SF Mono", "JetBrains Mono", ui-monospace, monospace;
+  --font-display: "Favorit", "InterDisplay", "Inter", sans-serif;
+
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 17px;
+  --text-xl: 20px;
+  --text-2xl: 24px;
+  --text-3xl: 32px;
+  --text-4xl: 44px;
+  --text-hero: 56px;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  --leading-tight: 1.1;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.7;
+
+  /* Favorit-feel: tighter tracking on display sizes */
+  --tracking-tighter: -0.03em;
+  --tracking-tight: -0.015em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.04em;
+  --tracking-wider: 0.08em;
+
+  /* ── Spacing scale (4px base) ──────────────────────────────────── */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-20: 80px;
+
+  /* ── Radii ─────────────────────────────────────────────────────── */
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-2xl: 28px;
+  --radius-full: 9999px;
+
+  /* ── Shadows + glow (secondary brand asset) ────────────────────── */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-lg: 0 16px 48px rgba(0, 0, 0, 0.5);
+  --shadow-glow: 0 0 28px var(--arc-glow);
+  --shadow-glow-strong: 0 0 48px var(--arc-glow), 0 0 8px rgba(255, 255, 255, 0.04) inset;
+
+  /* ── Motion ────────────────────────────────────────────────────── */
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 360ms;
+  --dur-ambient: 2400ms;
+
+  /* ── Z-index ───────────────────────────────────────────────────── */
+  --z-base: 1;
+  --z-sidebar: 10;
+  --z-overlay: 50;
+  --z-modal: 100;
+  --z-toast: 200;
+}

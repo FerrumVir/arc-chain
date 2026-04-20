@@ -1,0 +1,18 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Baseline capabilities for ARC desktop",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "shell:default",
+    "dialog:default",
+    "opener:default",
+    "updater:default",
+    {
+      "identifier": "shell:allow-open",
+      "allow": [{ "url": "https://**" }, { "url": "http://**" }]
+    }
+  ]
+}

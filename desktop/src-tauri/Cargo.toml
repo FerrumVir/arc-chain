@@ -1,0 +1,43 @@
+[package]
+name = "arc-desktop"
+version = "0.1.0"
+description = "ARC Node — desktop app"
+authors = ["FerrumVir"]
+edition = "2021"
+
+[lib]
+name = "arc_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "1"
+sysinfo = "0.32"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2", "charset"] }
+directories = "5"
+rand = "0.8"
+hex = "0.4"
+# Identity / signing — must match the arc-node derivation scheme
+# (crates/arc-node/src/main.rs:310–311). Any change here desyncs the address
+# from what the chain actually sees.
+bip39 = "2.0"
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+blake3 = "1.5"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

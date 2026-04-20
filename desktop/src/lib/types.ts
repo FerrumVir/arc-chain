@@ -1,0 +1,109 @@
+export type NodeRole = "worker" | "validator" | "verifier";
+
+export type HealthLevel = "live" | "syncing" | "offline";
+
+export interface HardwareInfo {
+  platform: string;
+  arch: string;
+  cpuModel: string;
+  cpuCores: number;
+  ramGb: number;
+  gpuName: string | null;
+  gpuVramGb: number | null;
+  recommendedModel: string;
+  recommendedRole: NodeRole;
+  estimatedDailyArc: number;
+}
+
+export interface NodeStatus {
+  running: boolean;
+  pid: number | null;
+  health: HealthLevel;
+  version: string;
+  peers: number;
+  round: number;
+  committed: number;
+  height: number;
+  uptimeSeconds: number;
+  address: string | null;
+  rpcPort: number;
+  lastError: string | null;
+}
+
+export interface Earnings {
+  totalArc: number;
+  todayArc: number;
+  pendingArc: number;
+  rank: number | null;
+  attestations: number;
+  lastPayoutAt: number | null;
+}
+
+export interface Attestation {
+  txHash: string;
+  inputPreview: string;
+  outputHash: string;
+  modelHash: string;
+  tokens: number;
+  latencyMs: number;
+  rewardArc: number;
+  timestamp: number;
+  verified: boolean;
+}
+
+export interface LogEntry {
+  id: string;
+  timestamp: number;
+  level: "info" | "warn" | "error" | "ok";
+  message: string;
+}
+
+export interface NodeConfig {
+  role: NodeRole;
+  modelPath: string | null;
+  rpcPort: number;
+  p2pPort: number;
+  autoStart: boolean;
+  autoUpdate: boolean;
+  dataDir: string;
+}
+
+export interface Identity {
+  address: string;
+  publicKey: string;
+  seedPhrase: string;
+  createdAt: number;
+}
+
+export interface NetworkStats {
+  totalNodes: number;
+  totalInferences: number;
+  avgTps: number;
+  latestBlock: number;
+}
+
+export interface AccountBalance {
+  address: string;
+  balance: number;
+  nonce: number;
+  stakedBalance: number;
+}
+
+export interface FaucetResult {
+  txHash: string;
+  amount: number;
+  message: string;
+}
+
+export interface InferenceResult {
+  input: string;
+  output: string;
+  outputHash: string;
+  modelHash: string;
+  tokensGenerated: number;
+  inferenceMs: number;
+  txHash: string;
+  deterministic: boolean;
+  engine: string;
+  explorerUrl: string;
+}

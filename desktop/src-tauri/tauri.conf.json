@@ -1,0 +1,64 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ARC Node",
+  "version": "0.1.0",
+  "identifier": "network.arc.desktop",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "ARC Node",
+        "width": 1180,
+        "height": 780,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true,
+        "decorations": true,
+        "transparent": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "backgroundColor": "#070710"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline' https://rsms.me; font-src 'self' https://rsms.me data:; connect-src 'self' http://127.0.0.1:* http://localhost:* https://api.github.com https://github.com; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "DeveloperTool",
+    "shortDescription": "Run an ARC verifiable AI inference node",
+    "longDescription": "ARC Node lets anyone run a verifiable AI inference node on their machine. Earn ARC tokens for every request your node serves. Cryptographic attestations prove your compute is honest.",
+    "createUpdaterArtifacts": true,
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": null
+    },
+    "windows": {
+      "certificateThumbprint": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": true,
+      "pubkey": "TODO — generate with `npx @tauri-apps/cli signer generate -w ~/.tauri/arc-desktop-key` and paste the public key here. Without this, auto-updates are disabled.",
+      "endpoints": [
+        "https://github.com/FerrumVir/arc-chain/releases/latest/download/latest.json"
+      ],
+      "windows": { "installMode": "passive" }
+    }
+  }
+}

@@ -336,6 +336,9 @@ impl CachedIntegerModel {
     /// For real quality improvement, the model loader should call
     /// `I16Weights::quantize_f32` from original floats instead.
     pub fn enable_i16(&mut self) {
+        // Preserve f32-quantized I16 weights installed by load_cached_model.
+        // from_i8 promotion would silently replace them with coarser I8-level precision.
+        if self.i16_layers.is_some() { return; }
         let i16_layers: Vec<I16Layer> = self.layers.iter().map(|l| I16Layer {
             wq: I16Weights::from_i8(&l.wq),
             wk: I16Weights::from_i8(&l.wk),
@@ -2456,38 +2459,58 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         Ok(I8Weights::quantize_f32(&f, rows, cols))
     };
 
+    // Extract f32 ONCE, then quantize to both I8 and I16 from the originals.
+    // I16::from_i8 would inherit I8's coarser quantization; going f32→I16 directly
+    // is what delivers the 258× finer scale INT16 is supposed to provide.
+    let extract_i8_and_i16 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, rows: usize, cols: usize| -> Result<(I8Weights, I16Weights), InferenceError> {
+        let f = extract_f32(reader, content, name)?;
+        let i8 = I8Weights::quantize_f32(&f, rows, cols);
+        let i16 = I16Weights::quantize_f32(&f, rows, cols);
+        Ok((i8, i16))
+    };
+
     let extract_norm = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, size: usize| -> Vec<i64> {
         extract_f32(reader, content, name).map(|f| {
             f.iter().map(|&x| (x * ONE as f32).round() as i64).collect()
         }).unwrap_or_else(|_| vec![ONE; size])
     };
 
-    let embedding_i8 = extract_i8(&mut reader, &content, "token_embd.weight", vocab_size, d_model)?;
-    // Also store embeddings at full Q16 precision — INT8 destroys tiny values (common in 1B models)
-    let embedding_q16: Vec<i64> = {
-        let f = extract_f32(&mut reader, &content, "token_embd.weight")?;
-        f.iter().map(|&x| (x as f64 * ONE as f64).round() as i64).collect()
-    };
+    // Embedding: single f32 extraction → I8 + full-precision Q16 vector.
+    let embedding_f32 = extract_f32(&mut reader, &content, "token_embd.weight")?;
+    let embedding_i8 = I8Weights::quantize_f32(&embedding_f32, vocab_size, d_model);
+    let embedding_q16: Vec<i64> = embedding_f32.iter()
+        .map(|&x| (x as f64 * ONE as f64).round() as i64).collect();
+    drop(embedding_f32);
     info!("Embeddings loaded: {} MB Q16 + {} MB INT8",
         embedding_q16.len() * 8 / (1024 * 1024), embedding_i8.memory_bytes() / (1024 * 1024));
 
-    let output_weight = extract_i8(&mut reader, &content, "output.weight", vocab_size, d_model)
-        .unwrap_or_else(|_| I8Weights {
-            data: embedding_i8.data.clone(), scales: embedding_i8.scales.clone(),
-            n_rows: embedding_i8.n_rows, n_cols: embedding_i8.n_cols,
-        });
+    // Output projection: f32 → I8 + I16 in one pass. Falls back to tied embeddings if absent.
+    let (output_weight, i16_output) = match extract_i8_and_i16(&mut reader, &content, "output.weight", vocab_size, d_model) {
+        Ok((i8, i16)) => (i8, Some(i16)),
+        Err(_) => (
+            I8Weights {
+                data: embedding_i8.data.clone(), scales: embedding_i8.scales.clone(),
+                n_rows: embedding_i8.n_rows, n_cols: embedding_i8.n_cols,
+            },
+            // Tied-embedding fallback: quantize embeddings directly from f32 to I16.
+            // Re-extract since we already dropped embedding_f32 above.
+            extract_f32(&mut reader, &content, "token_embd.weight").ok()
+                .map(|f| I16Weights::quantize_f32(&f, vocab_size, d_model)),
+        ),
+    };
     let final_norm = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
 
     let mut layers = Vec::with_capacity(n_layers);
+    let mut i16_layers_vec: Vec<I16Layer> = Vec::with_capacity(n_layers);
     for l in 0..n_layers {
         let p = format!("blk.{l}");
-        let wq = extract_i8(&mut reader, &content, &format!("{p}.attn_q.weight"), d_model, d_model)?;
-        let wk = extract_i8(&mut reader, &content, &format!("{p}.attn_k.weight"), d_kv, d_model)?;
-        let wv = extract_i8(&mut reader, &content, &format!("{p}.attn_v.weight"), d_kv, d_model)?;
-        let wo = extract_i8(&mut reader, &content, &format!("{p}.attn_output.weight"), d_model, d_model)?;
-        let w_gate = extract_i8(&mut reader, &content, &format!("{p}.ffn_gate.weight"), d_ff, d_model)?;
-        let w_up = extract_i8(&mut reader, &content, &format!("{p}.ffn_up.weight"), d_ff, d_model)?;
-        let w_down = extract_i8(&mut reader, &content, &format!("{p}.ffn_down.weight"), d_model, d_ff)?;
+        let (wq, wq16) = extract_i8_and_i16(&mut reader, &content, &format!("{p}.attn_q.weight"), d_model, d_model)?;
+        let (wk, wk16) = extract_i8_and_i16(&mut reader, &content, &format!("{p}.attn_k.weight"), d_kv, d_model)?;
+        let (wv, wv16) = extract_i8_and_i16(&mut reader, &content, &format!("{p}.attn_v.weight"), d_kv, d_model)?;
+        let (wo, wo16) = extract_i8_and_i16(&mut reader, &content, &format!("{p}.attn_output.weight"), d_model, d_model)?;
+        let (w_gate, w_gate16) = extract_i8_and_i16(&mut reader, &content, &format!("{p}.ffn_gate.weight"), d_ff, d_model)?;
+        let (w_up, w_up16) = extract_i8_and_i16(&mut reader, &content, &format!("{p}.ffn_up.weight"), d_ff, d_model)?;
+        let (w_down, w_down16) = extract_i8_and_i16(&mut reader, &content, &format!("{p}.ffn_down.weight"), d_model, d_ff)?;
 
         if l % 8 == 0 || l == n_layers - 1 {
             info!("Layer {}/{} loaded", l + 1, n_layers);
@@ -2497,6 +2520,10 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             wq, wk, wv, wo, w_gate, w_up, w_down,
             attn_norm: extract_norm(&mut reader, &content, &format!("{p}.attn_norm.weight"), d_model),
             ffn_norm: extract_norm(&mut reader, &content, &format!("{p}.ffn_norm.weight"), d_model),
+        });
+        i16_layers_vec.push(I16Layer {
+            wq: wq16, wk: wk16, wv: wv16, wo: wo16,
+            w_gate: w_gate16, w_up: w_up16, w_down: w_down16,
         });
     }
 
@@ -2520,8 +2547,15 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         },
         embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
-        i16_layers: None,
-        i16_output: None,
+        // REVERTED 2026-04-20: dual-quantize f32→I16 regressed WikiText-2 PPL
+        // from 107.67 (I8→I16 promotion baseline) to 782.68. Despite having 258×
+        // finer scale, the I16 matmul path produces worse numerical output —
+        // likely a scale/accumulation bug in matmul_i16_into that the promotion
+        // path masked. Keep I16 weights computed but do NOT install them until
+        // the matmul bug is found. _i16_layers_vec / _i16_output retained so
+        // future debugging can A/B the paths without re-loading from GGUF.
+        i16_layers: { let _ = i16_layers_vec; None },
+        i16_output: { let _ = i16_output; None },
     })
 }
 
