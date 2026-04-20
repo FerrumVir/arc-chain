@@ -1906,21 +1906,18 @@ impl CachedIntegerModel {
             return Vec::new();
         }
 
-        // Dispatch priority (highest quality first):
-        //   Block-I8  — 32-weight blocks with i32 Q16 scales (Q8_0-shaped)
-        //   I16       — per-row, 258× finer than I8 on paper (but known PPL
-        //               issue before the attn/LUT rescale lands, see
-        //               project_i16_ppl_bug.md). Kept as a manual override.
-        //   Q4        — x86 low-bandwidth path
-        //   I8        — original per-row fallback
+        // Helper macro: dispatch to Q4 matmul on x86_64 when available, else I8.
+        // $q4w: Option<&Q4WeightsX86>, $i8w: &I8Weights, $inq: &QuantizedInput,
+        // $raw: &[i64], $in_sz: input dim, $out: &mut [i64]
+        // Dispatch priority: I16 (best precision) > Q4 (lowest bandwidth) > I8 (default)
         macro_rules! dispatch_matmul {
-            ($blk:expr, $i16w:expr, $q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
+            ($i16w:expr, $q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
                 {
-                    if let Some(blk) = $blk {
-                        crate::block_i8::matmul_block_i8_into(blk, $raw, $out);
-                    } else if let Some(i16w) = $i16w {
+                    if let Some(i16w) = $i16w {
+                        // INT16: 258x finer quantization than INT8, deterministic
                         matmul_i16_into(i16w, $raw, $in_sz, $out);
                     } else if let Some(q4w) = $q4w {
+                        // Q4 with full i64 input precision — no double quantization
                         matmul_q4_full(q4w, $raw, $out);
                     } else {
                         matmul_fast_preq($i8w, $inq, $raw, $in_sz, $out);
@@ -1945,7 +1942,7 @@ impl CachedIntegerModel {
         let mut ff_out = vec![0i64; d];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let blk_layer = self.block_i8_layers.as_ref().map(|bl| &bl[layer_idx]);
+            // Get I16/Q4 layer refs if available (I16 preferred for precision)
             let i16_layer = self.i16_layers.as_ref().map(|il| &il[layer_idx]);
             let q4_layer = self.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
 
@@ -1955,10 +1952,10 @@ impl CachedIntegerModel {
             // Quantize normed input ONCE, reuse for Q, K, V projections
             let normed_q = QuantizedInput::from_i64(&normed);
 
-            // Q/K/V with zero-alloc + cached quantized input
-            dispatch_matmul!(blk_layer.map(|l| &l.wq), i16_layer.map(|l| &l.wq), q4_layer.map(|l| &l.wq), &layer.wq, &normed_q, &normed, d, &mut q);
-            dispatch_matmul!(blk_layer.map(|l| &l.wk), i16_layer.map(|l| &l.wk), q4_layer.map(|l| &l.wk), &layer.wk, &normed_q, &normed, d, &mut k_buf);
-            dispatch_matmul!(blk_layer.map(|l| &l.wv), i16_layer.map(|l| &l.wv), q4_layer.map(|l| &l.wv), &layer.wv, &normed_q, &normed, d, &mut v_buf);
+            // Q/K/V with zero-alloc + cached quantized input (Q4 or I8)
+            dispatch_matmul!(i16_layer.map(|l| &l.wq), q4_layer.map(|l| &l.wq), &layer.wq, &normed_q, &normed, d, &mut q);
+            dispatch_matmul!(i16_layer.map(|l| &l.wk), q4_layer.map(|l| &l.wk), &layer.wk, &normed_q, &normed, d, &mut k_buf);
+            dispatch_matmul!(i16_layer.map(|l| &l.wv), q4_layer.map(|l| &l.wv), &layer.wv, &normed_q, &normed, d, &mut v_buf);
 
             // RoPE
             for h in 0..cfg.n_heads {
@@ -1998,15 +1995,15 @@ impl CachedIntegerModel {
 
             // Wo projection + residual (zero-alloc)
             let attn_out_q = QuantizedInput::from_i64(&attn_out);
-            dispatch_matmul!(blk_layer.map(|l| &l.wo), i16_layer.map(|l| &l.wo), q4_layer.map(|l| &l.wo), &layer.wo, &attn_out_q, &attn_out, d, &mut projected);
+            dispatch_matmul!(i16_layer.map(|l| &l.wo), q4_layer.map(|l| &l.wo), &layer.wo, &attn_out_q, &attn_out, d, &mut projected);
             for i in 0..d { hidden[i] += projected[i]; }
 
             // FFN: quantize normed_ff ONCE for gate+up
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
             let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
 
-            dispatch_matmul!(blk_layer.map(|l| &l.w_gate), i16_layer.map(|l| &l.w_gate), q4_layer.map(|l| &l.w_gate), &layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
-            dispatch_matmul!(blk_layer.map(|l| &l.w_up), i16_layer.map(|l| &l.w_up), q4_layer.map(|l| &l.w_up), &layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
+            dispatch_matmul!(i16_layer.map(|l| &l.w_gate), q4_layer.map(|l| &l.w_gate), &layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
+            dispatch_matmul!(i16_layer.map(|l| &l.w_up), q4_layer.map(|l| &l.w_up), &layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
 
             // SiLU gate * up (in-place)
             for j in 0..cfg.d_ff {
@@ -2015,21 +2012,14 @@ impl CachedIntegerModel {
 
             // W_down + residual
             let gate_q = QuantizedInput::from_i64(&gate);
-            dispatch_matmul!(blk_layer.map(|l| &l.w_down), i16_layer.map(|l| &l.w_down), q4_layer.map(|l| &l.w_down), &layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
+            dispatch_matmul!(i16_layer.map(|l| &l.w_down), q4_layer.map(|l| &l.w_down), &layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
             for i in 0..d { hidden[i] += ff_out[i]; }
         }
 
         cache.seq_len = pos + 1;
         let normed = layernorm(&hidden, &self.final_norm);
 
-        // LM head dispatch: Block-I8 > I16 > Q4 > I8.
-        if let Some(blk_out) = &self.block_i8_output {
-            if blk_out.n_rows > 0 {
-                let mut logits = vec![0i64; cfg.vocab_size];
-                crate::block_i8::matmul_block_i8_into(blk_out, &normed, &mut logits);
-                return logits;
-            }
-        }
+        // LM head: I16 (best precision) > Q4 (lowest bandwidth) > I8 (default)
         if let Some(i16_out) = &self.i16_output {
             let mut logits = vec![0i64; cfg.vocab_size];
             matmul_i16_into(i16_out, &normed, d, &mut logits);
@@ -2730,8 +2720,6 @@ pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::Infe
         q4_output: None,
         i16_layers: None,
         i16_output: None,
-        block_i8_layers: None,
-        block_i8_output: None,
     })
 }
 
@@ -3016,10 +3004,6 @@ pub fn load_cached_model_shard(
         q4_output: None,
         i16_layers: if any_i16 { Some(i16_layers_vec) } else { None },
         i16_output: output_weight_i16,
-        // Shard loader does not yet emit block-i8 weights; a future pass
-        // should replicate the main loader's triple-quant pattern here.
-        block_i8_layers: None,
-        block_i8_output: None,
     })
 }
 
@@ -3119,8 +3103,6 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
         q4_layers: None, q4_output: None,
         i16_layers: None,
         i16_output: None,
-        block_i8_layers: None,
-        block_i8_output: None,
     })
 }
 
@@ -3185,8 +3167,6 @@ mod tests {
             q4_layers: None, q4_output: None,
         i16_layers: None,
         i16_output: None,
-        block_i8_layers: None,
-        block_i8_output: None,
         }
     }
 
@@ -3755,8 +3735,6 @@ mod int16_tests {
                 q4_output: None,
                 i16_layers: None,
                 i16_output: None,
-                block_i8_layers: None,
-                block_i8_output: None,
             }
         };
 

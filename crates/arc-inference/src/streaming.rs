@@ -832,6 +832,8 @@ mod tests {
             q4_output: None,
             i16_layers: None,
             i16_output: None,
+            block_i8_layers: None,
+            block_i8_output: None,
         };
 
         // Use the same model as both draft and target
@@ -871,6 +873,7 @@ mod tests {
                 output_weight: make_random_i8_weights(config.vocab_size, d, seed + 100),
                 vocab: (0..config.vocab_size).map(|i| format!("tok_{}", i)).collect(),
                 q4_layers: None, q4_output: None, i16_layers: None, i16_output: None,
+                block_i8_layers: None, block_i8_output: None,
             }
         };
 
@@ -913,6 +916,7 @@ mod tests {
                 output_weight: make_random_i8_weights(config.vocab_size, d, seed + 100),
                 vocab: (0..config.vocab_size).map(|i| format!("tok_{}", i)).collect(),
                 q4_layers: None, q4_output: None, i16_layers: None, i16_output: None,
+                block_i8_layers: None, block_i8_output: None,
             }
         };
 

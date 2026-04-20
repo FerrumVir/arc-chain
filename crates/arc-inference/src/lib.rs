@@ -14,6 +14,7 @@ pub mod gguf_integer;
 pub mod cached_integer_model;
 pub mod block_i8;
 pub mod q4_engine;
+pub mod ternary_engine;
 pub mod distributed;
 pub mod streaming;
 
