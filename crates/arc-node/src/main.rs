@@ -135,12 +135,25 @@ struct Cli {
     /// loads only when --shard-end=n_layers.
     /// Example: 80-layer Llama-70B split 8 ways → node 0 uses --shard-start 0
     /// --shard-end 10, node 1 uses --shard-start 10 --shard-end 20, etc.
+    ///
+    /// Deprecated in favor of repeated --shard-range A:B. Still accepted for
+    /// backward compatibility: when set, synthesizes a single range.
     #[arg(long)]
     shard_start: Option<usize>,
 
     /// Last layer index to load (exclusive). Pipeline-parallel sharding.
+    /// Deprecated — use --shard-range.
     #[arg(long)]
     shard_end: Option<usize>,
+
+    /// Layer range this node holds, formatted `START:END` (END exclusive).
+    /// Repeatable — every `--shard-range` adds one disjoint slice and the
+    /// node announces one ShardInfo per range, so the coordinator can treat
+    /// each as an independent replica. Example for 3× replication across
+    /// 6 seeds holding 32 Llama-2-7B layers in 6 ranges:
+    ///   --shard-range 0:6 --shard-range 11:16 --shard-range 21:26
+    #[arg(long = "shard-range", value_name = "START:END")]
+    shard_ranges: Vec<String>,
 
     /// Enable community-mode HTTP registration. When set, the node
     /// registers itself with all seeds via outbound HTTPS POST to
@@ -598,7 +611,44 @@ async fn main() -> Result<()> {
     // and destroys forward_shard latency (observed: 20+ seconds/token on
     // swapping NYC). Disabling candle when the node is a shard-only role
     // keeps the RSS under 4 GB and makes the integer path run at real speed.
-    let is_shard_holder = cli.shard_start.is_some() || cli.shard_end.is_some();
+    // Parse --shard-range entries ("START:END") into a sorted Vec<(usize, usize)>.
+    // Fall back to the deprecated single --shard-start/--shard-end pair so
+    // existing launch scripts keep working through the rolling upgrade.
+    let mut held_ranges: Vec<(usize, usize)> = Vec::new();
+    for raw in &cli.shard_ranges {
+        let (s, e) = raw.split_once(':').ok_or_else(|| anyhow::anyhow!(
+            "--shard-range must be START:END, got {raw:?}"
+        ))?;
+        let start: usize = s.trim().parse().map_err(|_| anyhow::anyhow!(
+            "--shard-range START must be a non-negative integer, got {s:?}"
+        ))?;
+        let end: usize = e.trim().parse().map_err(|_| anyhow::anyhow!(
+            "--shard-range END must be a non-negative integer, got {e:?}"
+        ))?;
+        if start >= end {
+            return Err(anyhow::anyhow!(
+                "--shard-range START ({start}) must be strictly less than END ({end})"
+            ));
+        }
+        held_ranges.push((start, end));
+    }
+    if held_ranges.is_empty() {
+        if let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end) {
+            held_ranges.push((start, end));
+        }
+    }
+    held_ranges.sort();
+    for i in 1..held_ranges.len() {
+        if held_ranges[i].0 < held_ranges[i - 1].1 {
+            return Err(anyhow::anyhow!(
+                "--shard-range entries overlap: [{}, {}) and [{}, {})",
+                held_ranges[i - 1].0, held_ranges[i - 1].1,
+                held_ranges[i].0, held_ranges[i].1
+            ));
+        }
+    }
+
+    let is_shard_holder = !held_ranges.is_empty();
     let (candle_engine, candle_model_id): (Option<Arc<arc_inference::candle_backend::GgufEngine>>, Option<arc_crypto::Hash256>) =
         if is_shard_holder {
             tracing::info!("Shard holder mode — candle backend SKIPPED to save ~4 GB RAM");
@@ -649,9 +699,12 @@ async fn main() -> Result<()> {
                 arc_inference::cached_integer_model::load_tokenizer_only(&tokenizer_path)
             } else if tokenizer_path.ends_with(".arc-int8") {
                 arc_inference::cached_integer_model::load_cached_model_binary(&tokenizer_path)
-            } else if let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end) {
-                tracing::info!("SHARD MODE: loading layers [{}, {}) only", start, end);
-                arc_inference::cached_integer_model::load_cached_model_shard(&tokenizer_path, start, end)
+            } else if !held_ranges.is_empty() {
+                let summary: Vec<String> = held_ranges.iter()
+                    .map(|(s, e)| format!("[{s}, {e})"))
+                    .collect();
+                tracing::info!("SHARD MODE: loading ranges {}", summary.join(", "));
+                arc_inference::cached_integer_model::load_cached_model_ranges(&tokenizer_path, &held_ranges)
             } else {
                 arc_inference::cached_integer_model::load_cached_model(&tokenizer_path)
             };
@@ -877,50 +930,51 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Build shard_info if this node is a shard holder, then broadcast it
-    // to all seed peers so the network's shard registry converges.
-    let shard_info_for_broadcast = match (cli.shard_start, cli.shard_end, &inference_model) {
-        (Some(start), Some(end), Some(model)) => {
+    // Build one ShardInfo per held range if this node is a shard holder, then
+    // broadcast each so the network's shard registry records every replica
+    // slot this node contributes (supports nodes that hold multiple disjoint
+    // layer ranges for 3× replication).
+    let shard_infos_for_broadcast: Vec<rpc::ShardInfo> = match (&held_ranges, &inference_model) {
+        (ranges, Some(model)) if !ranges.is_empty() => {
             let total_layers = model.config.n_layers;
-            let memory_mb: usize = model.layers.iter()
+            let layers_held_total: usize = ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+            let memory_mb_total: usize = model.layers.iter()
                 .filter(|l| l.is_loaded())
                 .map(|l| l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
                     + l.wo.memory_bytes() + l.w_gate.memory_bytes() + l.w_up.memory_bytes()
                     + l.w_down.memory_bytes())
                 .sum::<usize>() / (1024 * 1024);
-            // Estimate full model size: extrapolate from this shard
-            let layers_held = end.saturating_sub(start).max(1);
-            let full_model_mb = memory_mb * total_layers / layers_held;
-            // Build a stable model id from config
+            let per_layer_mb = memory_mb_total / layers_held_total.max(1);
+            let full_model_mb = per_layer_mb * total_layers;
             let model_id_data = format!(
                 "arc-{}L-{}d-{}h-{}v",
                 model.config.n_layers, model.config.d_model,
                 model.config.n_heads, model.config.vocab_size
             );
             let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
-            // Public socket: prefer external IP if known, fall back to listening port
             let socket_addr = std::env::var("ARC_PUBLIC_SOCKET")
                 .unwrap_or_else(|_| format!("{}:{}", rpc_addr.split(':').next().unwrap_or("127.0.0.1"), rpc_addr.split(':').nth(1).unwrap_or("9090")));
-            Some(rpc::ShardInfo {
+            ranges.iter().map(|&(start, end)| rpc::ShardInfo {
                 start_layer: start,
                 end_layer: end,
                 total_layers,
                 model_id: format!("0x{}", hex::encode(&model_id_hash.0)),
-                model_name: model_id_data,
-                memory_mb,
+                model_name: model_id_data.clone(),
+                memory_mb: per_layer_mb * (end - start),
                 full_model_mb,
-                socket_addr,
+                socket_addr: socket_addr.clone(),
                 node_name: validator_seed.clone(),
-            })
+            }).collect()
         }
-        _ => None,
+        _ => Vec::new(),
     };
-    let shard_info = shard_info_for_broadcast.clone();
+    let shard_infos = shard_infos_for_broadcast.clone();
 
-    // Spawn a background task that announces this node's shard to all seeds
-    // AND pulls their shard info back. Runs immediately at startup + every 15s
-    // so the network's shard registry converges fast.
-    if let Some(si) = shard_info_for_broadcast.clone() {
+    // Spawn a background task that announces each held range to every seed
+    // AND pulls their shards back. Runs immediately at startup + every 15s
+    // so the registry converges fast.
+    if !shard_infos_for_broadcast.is_empty() {
+        let sis = shard_infos_for_broadcast.clone();
         // Build the list of peer RPC URLs from the seeds file. The seeds file
         // contains "host:p2p_port" lines; the RPC port is always p2p - 1 in
         // our deployment, but we conservatively try both 9090 (the seed default)
@@ -960,13 +1014,15 @@ async fn main() -> Result<()> {
                 Err(_) => return,
             };
             loop {
-                let payload = serde_json::json!({"shard": &si});
-                // Refresh our own entry first
-                let _ = client.post(&local_announce_broadcast).json(&payload).send().await;
-                // Then announce to remote seeds
-                for addr in &seed_addrs {
-                    let url = format!("http://{}/shards/announce", addr);
-                    let _ = client.post(&url).json(&payload).send().await;
+                for si in &sis {
+                    let payload = serde_json::json!({"shard": si});
+                    // Refresh our own entry first
+                    let _ = client.post(&local_announce_broadcast).json(&payload).send().await;
+                    // Then announce to remote seeds
+                    for addr in &seed_addrs {
+                        let url = format!("http://{}/shards/announce", addr);
+                        let _ = client.post(&url).json(&payload).send().await;
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             }
@@ -1007,12 +1063,27 @@ async fn main() -> Result<()> {
                 for addr in &seed_addrs_pull {
                     if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await {
                         if let Ok(mut json) = resp.json::<serde_json::Value>().await {
+                            // New peers emit `self_shards: [ShardInfo, ...]`; legacy
+                            // peers still emit `self_shard: ShardInfo` — accept both
+                            // so a rolling upgrade never loses shard visibility.
+                            let mut to_announce: Vec<serde_json::Value> = Vec::new();
+                            if let Some(arr) = json.get_mut("self_shards").and_then(|v| v.as_array_mut()) {
+                                for entry in arr.iter_mut() {
+                                    if !entry.is_null() {
+                                        rewrite_pulled_self_shard(entry, addr);
+                                        to_announce.push(entry.clone());
+                                    }
+                                }
+                            }
                             if let Some(self_shard) = json.get_mut("self_shard") {
                                 if !self_shard.is_null() {
                                     rewrite_pulled_self_shard(self_shard, addr);
-                                    let payload = serde_json::json!({"shard": self_shard});
-                                    let _ = client.post(&local_announce).json(&payload).send().await;
+                                    to_announce.push(self_shard.clone());
                                 }
+                            }
+                            for shard_val in to_announce {
+                                let payload = serde_json::json!({"shard": shard_val});
+                                let _ = client.post(&local_announce).json(&payload).send().await;
                             }
                         }
                     }
@@ -1274,7 +1345,7 @@ async fn main() -> Result<()> {
         Some(dag_validators),
         Some(dag_round),
         Some(dag_committed),
-        shard_info,
+        shard_infos,
     )
     .await?;
 

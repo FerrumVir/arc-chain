@@ -57,9 +57,12 @@ pub struct NodeState {
     pub dag_committed: Arc<AtomicU64>,
     /// Inference results indexed by attestation tx hash — for explorer display.
     pub inference_results: Arc<dashmap::DashMap<String, Value>>,
-    /// Pipeline-parallel sharding: this node's layer range, if any.
-    /// Set when the node is started with --shard-start/--shard-end flags.
-    pub shard_info: Option<ShardInfo>,
+    /// Pipeline-parallel sharding: every layer range this node holds.
+    /// Set from repeated --shard-range flags (or the deprecated single
+    /// --shard-start/--shard-end pair). Empty = non-shard-holder (validator
+    /// or coordinator role only). Each entry is announced as an independent
+    /// replica so the coordinator treats multi-range nodes naturally.
+    pub shard_infos: Vec<ShardInfo>,
     /// Per-request KV cache for sharded inference. Key: request_id (Hash256 hex).
     /// Each entry is an Arc<Mutex<KVCache>> so handlers can clone the Arc and
     /// release the DashMap shard lock immediately.
@@ -232,7 +235,7 @@ pub fn build_node_state(
         dag_round: Arc::new(AtomicU64::new(0)),
         dag_committed: Arc::new(AtomicU64::new(0)),
         inference_results: Arc::new(dashmap::DashMap::new()),
-        shard_info: None,
+        shard_infos: Vec::new(),
         shard_kv_caches: Arc::new(dashmap::DashMap::new()),
         shard_registry: Arc::new(dashmap::DashMap::new()),
         sharded_runs_total: Arc::new(AtomicU64::new(0)),
@@ -266,7 +269,7 @@ pub async fn serve(
     dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
     dag_round: Option<Arc<AtomicU64>>,
     dag_committed: Option<Arc<AtomicU64>>,
-    shard_info: Option<ShardInfo>,
+    shard_infos: Vec<ShardInfo>,
 ) -> anyhow::Result<()> {
     let mut node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
     if let Some(dv) = dag_validators {
@@ -278,10 +281,14 @@ pub async fn serve(
     if let Some(c) = dag_committed {
         node.dag_committed = c;
     }
-    node.shard_info = shard_info.clone();
-    // Seed the local registry with our own shard so /shards always shows us
-    if let Some(si) = &shard_info {
-        node.shard_registry.insert(si.socket_addr.clone(), (si.clone(), std::time::Instant::now()));
+    node.shard_infos = shard_infos.clone();
+    // Seed the local registry with every range this node holds so /shards
+    // reports the full picture the moment RPC comes up. The registry is
+    // keyed by (socket_addr + range) so two entries with the same socket but
+    // different ranges coexist.
+    for si in &shard_infos {
+        let key = format!("{}#{}-{}", si.socket_addr, si.start_layer, si.end_layer);
+        node.shard_registry.insert(key, (si.clone(), std::time::Instant::now()));
     }
 
     let app = Router::new()
@@ -3325,16 +3332,19 @@ async fn inference_forward_shard(
 ) -> Result<Json<ForwardShardResponse>, (StatusCode, String)> {
     let model = node.inference_model.as_ref()
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "No model loaded".to_string()))?;
-    let shard = node.shard_info.as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "Node is not a shard holder".to_string()))?;
-
-    // Verify this node holds the requested layer range
-    if req.start_layer != shard.start_layer || req.end_layer != shard.end_layer {
-        return Err((StatusCode::BAD_REQUEST, format!(
-            "Shard mismatch: requested [{}, {}) but this node holds [{}, {})",
-            req.start_layer, req.end_layer, shard.start_layer, shard.end_layer
-        )));
+    if node.shard_infos.is_empty() {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "Node is not a shard holder".to_string()));
     }
+    // Verify this node holds the requested layer range. A node holding
+    // multiple disjoint ranges accepts requests for any of them — each range
+    // was independently announced and is an independent replica slot.
+    let shard = node.shard_infos.iter()
+        .find(|s| s.start_layer == req.start_layer && s.end_layer == req.end_layer)
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!(
+            "Shard mismatch: requested [{}, {}) but this node holds {:?}",
+            req.start_layer, req.end_layer,
+            node.shard_infos.iter().map(|s| (s.start_layer, s.end_layer)).collect::<Vec<_>>()
+        )))?;
 
     // Decode input
     use arc_inference::cached_integer_model::{ShardInput, ShardOutput, KVCache};
@@ -3474,32 +3484,48 @@ async fn inference_run_sharded(
     // different registry keys, creating two entries for the same layer
     // range. Prefer the entry with a routable socket_addr so that
     // forward_shard calls don't try to POST to 0.0.0.0.
-    let mut by_range: std::collections::BTreeMap<(usize, usize, String), ShardInfo> =
+    // Group replicas by (start, end). Every replica holding the same range
+    // is a failover candidate — if the primary stops answering mid-request,
+    // the worker falls back to the next. When multiple announcements for
+    // the same (node_name, range) exist we prefer routable socket_addrs over
+    // stubs (0.0.0.0 / 127.x / empty).
+    fn is_stub(a: &str) -> bool {
+        a.starts_with("0.0.0.0") || a.starts_with("127.") || a.is_empty()
+    }
+    let mut by_range: std::collections::BTreeMap<(usize, usize), Vec<ShardInfo>> =
         std::collections::BTreeMap::new();
     for s in fresh_shards(&node.shard_registry) {
-        let key = (s.start_layer, s.end_layer, s.node_name.clone());
-        match by_range.get(&key) {
-            None => {
-                by_range.insert(key, s);
-            }
-            Some(existing) => {
-                // Prefer a routable socket_addr. 0.0.0.0 / 127.0.0.1 / empty
-                // are placeholders from self-announce before the node knew
-                // its own public IP.
-                let existing_is_stub = existing.socket_addr.starts_with("0.0.0.0")
-                    || existing.socket_addr.starts_with("127.")
-                    || existing.socket_addr.is_empty();
-                let new_is_stub = s.socket_addr.starts_with("0.0.0.0")
-                    || s.socket_addr.starts_with("127.")
-                    || s.socket_addr.is_empty();
-                if existing_is_stub && !new_is_stub {
-                    by_range.insert(key, s);
+        let key = (s.start_layer, s.end_layer);
+        let bucket = by_range.entry(key).or_default();
+        // Dedupe per node_name within the bucket, preferring routable addrs.
+        let dup_idx = bucket.iter().position(|existing| existing.node_name == s.node_name);
+        match dup_idx {
+            None => bucket.push(s),
+            Some(i) => {
+                if is_stub(&bucket[i].socket_addr) && !is_stub(&s.socket_addr) {
+                    bucket[i] = s;
                 }
             }
         }
     }
-    let mut pipeline: Vec<ShardInfo> = by_range.into_values().collect();
-    pipeline.sort_by_key(|s| s.start_layer);
+    // Filter stubs out of the final replica list — a stub address can't be
+    // dialed so it can never satisfy a coordinator hop. Keep the entry only
+    // if it was the only announcement we have for that node.
+    for bucket in by_range.values_mut() {
+        let routable: Vec<ShardInfo> = bucket.iter().filter(|s| !is_stub(&s.socket_addr)).cloned().collect();
+        if !routable.is_empty() {
+            *bucket = routable;
+        }
+    }
+    // Pipeline becomes one entry per range with its replica list attached.
+    // The first replica in each Vec is the current primary.
+    let mut pipeline_ranges: Vec<((usize, usize), Vec<ShardInfo>)> = by_range
+        .into_iter()
+        .collect();
+    pipeline_ranges.sort_by_key(|((s, _), _)| *s);
+    let pipeline: Vec<ShardInfo> = pipeline_ranges.iter()
+        .map(|(_, replicas)| replicas[0].clone())
+        .collect();
 
     if pipeline.is_empty() {
         return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "No shards announced. Need shard registry to be populated."));
@@ -3658,7 +3684,8 @@ async fn inference_run_sharded(
         let mut worker_handles: Vec<tokio::task::JoinHandle<Result<(usize, Option<(u64, u64, bool, u64, String)>), String>>>
             = Vec::with_capacity(num_shards);
         for i in 0..num_shards {
-            let shard = pipeline[i].clone();
+            let replicas = pipeline_ranges[i].1.clone();
+            let (start_layer, end_layer) = pipeline_ranges[i].0;
             let client_c = client.clone();
             let req_id = request_id.clone();
             let mut rx = rxs[i].take().expect("rx slot populated");
@@ -3668,33 +3695,66 @@ async fn inference_run_sharded(
             let handle = tokio::spawn(async move {
                 let mut bytes_this_shard: usize = 0;
                 let mut trace: Option<(u64, u64, bool, u64, String)> = None; // (compute_ms, wall_ms, is_terminal, layers, node_name) — first-seen
+                // Ordered replica list per range. The first entry is the
+                // current primary; on HTTP/parse failure we promote the next
+                // replica and keep going. "Never breaks" guarantee: as long
+                // as any replica for this range is reachable, the request
+                // succeeds.
+                let mut replicas = replicas;
                 while let Some(item) = rx.recv().await {
                     let req = ForwardShardRequest {
                         request_id: req_id.clone(),
-                        token: item.token,
-                        hidden: item.hidden,
-                        hidden_hash: item.hidden_hash,
+                        token: item.token.clone(),
+                        hidden: item.hidden.clone(),
+                        hidden_hash: item.hidden_hash.clone(),
                         position: item.position,
-                        start_layer: shard.start_layer,
-                        end_layer: shard.end_layer,
+                        start_layer,
+                        end_layer,
                         last_token: false,
                     };
-                    let url = format!("http://{}/inference/forward_shard", shard.socket_addr);
                     let payload_bytes = serde_json::to_vec(&req).unwrap_or_default();
-                    bytes_this_shard += payload_bytes.len();
 
                     let t_hop = std::time::Instant::now();
-                    let resp: ForwardShardResponse = match client_c.post(&url)
-                        .header("Content-Type", "application/json")
-                        .body(payload_bytes)
-                        .send()
-                        .await
-                    {
-                        Ok(r) => match r.json::<ForwardShardResponse>().await {
-                            Ok(j) => j,
-                            Err(e) => return Err(format!("Shard {} parse: {}", shard.node_name, e)),
-                        },
-                        Err(e) => return Err(format!("Shard {} ({}): {}", shard.node_name, shard.socket_addr, e)),
+                    let mut resp_opt: Option<ForwardShardResponse> = None;
+                    let mut last_err: String = String::new();
+                    let mut attempted: usize = 0;
+                    let mut served_by: Option<String> = None;
+                    while attempted < replicas.len() {
+                        let shard = replicas[0].clone();
+                        let url = format!("http://{}/inference/forward_shard", shard.socket_addr);
+                        let attempt = client_c.post(&url)
+                            .header("Content-Type", "application/json")
+                            .body(payload_bytes.clone())
+                            .send()
+                            .await
+                            .and_then(|r| r.error_for_status());
+                        match attempt {
+                            Ok(r) => match r.json::<ForwardShardResponse>().await {
+                                Ok(j) => {
+                                    bytes_this_shard += payload_bytes.len();
+                                    resp_opt = Some(j);
+                                    served_by = Some(shard.node_name.clone());
+                                    break;
+                                }
+                                Err(e) => {
+                                    last_err = format!("shard [{start_layer}, {end_layer}) replica {} ({}) parse: {}",
+                                        shard.node_name, shard.socket_addr, e);
+                                    attempted += 1;
+                                    replicas.rotate_left(1);
+                                }
+                            },
+                            Err(e) => {
+                                last_err = format!("shard [{start_layer}, {end_layer}) replica {} ({}): {}",
+                                    shard.node_name, shard.socket_addr, e);
+                                attempted += 1;
+                                replicas.rotate_left(1);
+                            }
+                        }
+                    }
+                    let resp = match resp_opt {
+                        Some(r) => r,
+                        None => return Err(format!("All {} replicas failed for range [{start_layer}, {end_layer}). Last error: {}",
+                            replicas.len(), last_err)),
                     };
                     let hop_ms = t_hop.elapsed().as_millis() as u64;
 
@@ -3705,7 +3765,7 @@ async fn inference_run_sharded(
                             hop_ms,
                             resp.is_terminal,
                             resp.layers_processed as u64,
-                            shard.node_name.clone(),
+                            served_by.clone().unwrap_or_else(|| replicas[0].node_name.clone()),
                         ));
                     }
 
@@ -3838,26 +3898,45 @@ async fn inference_run_sharded(
         };
 
         let mut next_token_id: Option<u32> = None;
-        for shard in pipeline.iter() {
-            current_payload.start_layer = shard.start_layer;
-            current_payload.end_layer = shard.end_layer;
+        for (range_idx, ((s_layer, e_layer), replicas)) in pipeline_ranges.iter().enumerate() {
+            current_payload.start_layer = *s_layer;
+            current_payload.end_layer = *e_layer;
 
-            let url = format!("http://{}/inference/forward_shard", shard.socket_addr);
             let payload_bytes = serde_json::to_vec(&current_payload).unwrap_or_default();
-            total_bytes_transferred += payload_bytes.len();
 
-            let resp: ForwardShardResponse = client.post(&url)
-                .header("Content-Type", "application/json")
-                .body(payload_bytes)
-                .send()
-                .await
-                .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("Shard {} ({}): {}", shard.node_name, shard.socket_addr, e)))?
-                .json()
-                .await
-                .map_err(|e| api_error(StatusCode::BAD_GATEWAY, format!("Shard {} parse: {}", shard.node_name, e)))?;
+            // Iterate through replicas of this range until one succeeds.
+            // Each replica failure rotates the list in-place on the local
+            // copy so subsequent hops favor the working replica first.
+            let mut try_order: Vec<ShardInfo> = replicas.clone();
+            let mut resp_opt: Option<ForwardShardResponse> = None;
+            let mut last_err = String::new();
+            for replica in try_order.drain(..) {
+                let url = format!("http://{}/inference/forward_shard", replica.socket_addr);
+                let attempt = client.post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(payload_bytes.clone())
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status());
+                match attempt {
+                    Ok(r) => match r.json::<ForwardShardResponse>().await {
+                        Ok(j) => {
+                            total_bytes_transferred += payload_bytes.len();
+                            resp_opt = Some(j);
+                            break;
+                        }
+                        Err(e) => last_err = format!("replica {} ({}) parse: {}", replica.node_name, replica.socket_addr, e),
+                    },
+                    Err(e) => last_err = format!("replica {} ({}): {}", replica.node_name, replica.socket_addr, e),
+                }
+            }
+            let resp = resp_opt.ok_or_else(|| api_error(StatusCode::BAD_GATEWAY, format!(
+                "All replicas failed for range [{s_layer}, {e_layer}) at gen step {gen_idx}. Last: {last_err}"
+            )))?;
 
             if resp.is_terminal {
                 next_token_id = resp.token_id;
+                let _ = range_idx;
                 break;
             }
             current_payload = ForwardShardRequest {
@@ -3880,24 +3959,17 @@ async fn inference_run_sharded(
         }
     }
 
-    // Cleanup: send final request with last_token=true to evict KV caches
-    for shard in &pipeline {
-        let cleanup_payload = ForwardShardRequest {
-            request_id: request_id.clone(),
-            token: None,
-            hidden: Some(vec![0i64; model.config.d_model]),
-            hidden_hash: None,
-            position: 0,
-            start_layer: shard.start_layer,
-            end_layer: shard.end_layer,
-            last_token: true,
-        };
-        let _ = node.shard_kv_caches.remove(&request_id);
-        let _ = client.post(format!("http://{}/inference/forward_shard", shard.socket_addr))
-            .json(&serde_json::json!({"request_id": request_id, "last_token": true}))
-            .send()
-            .await;
-        let _ = cleanup_payload;
+    // Cleanup: fan-out last_token=true to every replica of every range so
+    // each holder drops its per-request KV cache even if generation only
+    // routed through one of them.
+    let _ = node.shard_kv_caches.remove(&request_id);
+    for (_, replicas) in pipeline_ranges.iter() {
+        for replica in replicas {
+            let _ = client.post(format!("http://{}/inference/forward_shard", replica.socket_addr))
+                .json(&serde_json::json!({"request_id": request_id, "last_token": true}))
+                .send()
+                .await;
+        }
     }
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
@@ -4120,6 +4192,10 @@ async fn get_shards(
     }
     let fully_covered = contiguous && covered_to == total_layers && total_layers > 0;
 
+    // Emit both singular (legacy, first range only) and plural (current) so
+    // peers still pulling `self_shard` keep working through the rolling
+    // upgrade while new peers consume `self_shards` and see every range.
+    let self_shard_legacy = node.shard_infos.first().cloned();
     Json(json!({
         "shards": shards,
         "shard_count": shards.len(),
@@ -4129,7 +4205,8 @@ async fn get_shards(
         "model_name": model_name,
         "full_model_mb": total_full_mb,
         "total_distributed_mb": total_held_mb,
-        "self_shard": node.shard_info,
+        "self_shard": self_shard_legacy,
+        "self_shards": node.shard_infos,
     }))
 }
 
@@ -4364,7 +4441,8 @@ async fn community_register(
                 socket_addr: rpc_addr.clone(),
                 node_name: worker_name.clone(),
             };
-            node.shard_registry.insert(rpc_addr.clone(), (shard_info, std::time::Instant::now()));
+            let reg_key = format!("{}#{}-{}", rpc_addr, best_start, end);
+            node.shard_registry.insert(reg_key, (shard_info, std::time::Instant::now()));
 
             // Register in multi-model registry
             if let Ok(mhb) = parse_hash(model_id) {
@@ -5173,7 +5251,8 @@ async fn shard_join(
         socket_addr: req.socket_addr.clone(),
         node_name: req.node_name.clone(),
     };
-    node.shard_registry.insert(req.socket_addr.clone(), (shard_info, std::time::Instant::now()));
+    let reg_key = format!("{}#{}-{}", req.socket_addr, assigned_start, assigned_end);
+    node.shard_registry.insert(reg_key, (shard_info, std::time::Instant::now()));
 
     // Also register in multi-model registry
     let model_hash = Hash256(model_hash_bytes);

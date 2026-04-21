@@ -3138,6 +3138,92 @@ pub fn load_cached_model_shard(
     Err(crate::InferenceError::Runtime("candle feature not enabled".into()))
 }
 
+/// Load the union of multiple disjoint layer ranges into a single
+/// `CachedIntegerModel`. The per-range layers vec is always full `n_layers`
+/// long; slots outside any provided range are placeholders and are never
+/// touched by `forward_shard_token`.
+///
+/// Embedding loads when 0 is in any range; output head + final_norm load
+/// when `n_layers` is at any range end. Ranges must be disjoint (overlapping
+/// ranges would double-load the same weights and waste memory).
+#[cfg(feature = "candle")]
+pub fn load_cached_model_ranges(
+    path: &str,
+    ranges: &[(usize, usize)],
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    use crate::InferenceError;
+    if ranges.is_empty() {
+        return Err(InferenceError::Runtime("load_cached_model_ranges: no ranges provided".into()));
+    }
+    let mut sorted: Vec<(usize, usize)> = ranges.to_vec();
+    sorted.sort();
+    for i in 1..sorted.len() {
+        if sorted[i].0 < sorted[i - 1].1 {
+            return Err(InferenceError::Runtime(format!(
+                "Overlapping shard ranges: [{}, {}) and [{}, {})",
+                sorted[i - 1].0, sorted[i - 1].1, sorted[i].0, sorted[i].1
+            )));
+        }
+    }
+
+    let mut aggregate = load_cached_model_shard(path, sorted[0].0, sorted[0].1)?;
+    let n_layers = aggregate.config.n_layers;
+
+    for &(start, end) in &sorted[1..] {
+        let mut other = load_cached_model_shard(path, start, end)?;
+        // Sanity: every shard load must produce the same n_layers-sized layers vec
+        if other.layers.len() != aggregate.layers.len() {
+            return Err(InferenceError::Runtime(format!(
+                "Shard loader returned inconsistent layer count: {} vs {}",
+                other.layers.len(), aggregate.layers.len()
+            )));
+        }
+        for idx in start..end.min(n_layers) {
+            if other.layers[idx].is_loaded() {
+                aggregate.layers[idx] = std::mem::replace(&mut other.layers[idx], CachedLayer::placeholder());
+            }
+        }
+        // Merge embedding if the other shard loaded it (start==0 path).
+        if start == 0 && aggregate.embedding_q16.is_empty() && !other.embedding_q16.is_empty() {
+            aggregate.embedding_q16 = std::mem::take(&mut other.embedding_q16);
+            aggregate.embedding_i8 = std::mem::replace(&mut other.embedding_i8, I8Weights::empty());
+        }
+        // Merge output head + final_norm if the other shard loaded them (end==n_layers path).
+        if end == n_layers {
+            if aggregate.output_weight.n_rows == 0 && other.output_weight.n_rows != 0 {
+                aggregate.output_weight = std::mem::replace(&mut other.output_weight, I8Weights::empty());
+            }
+            if aggregate.final_norm.is_empty() && !other.final_norm.is_empty() {
+                aggregate.final_norm = std::mem::take(&mut other.final_norm);
+            }
+        }
+    }
+    // Rebuild optional quantization paths coherently across the merged layer
+    // set. The per-range loads each produced their own i16_layers slice keyed
+    // on the subrange; discarding those and regenerating from the merged I8
+    // layers is simpler than stitching partial slices and matches what
+    // load_cached_model does at top-level after all layers are present.
+    aggregate.i16_layers = None;
+    aggregate.i16_output = None;
+    aggregate.q4_layers = None;
+    aggregate.q4_output = None;
+    aggregate.block_i8_layers = None;
+    aggregate.block_i8_output = None;
+    aggregate.ternary_layers = None;
+    aggregate.ternary_output = None;
+    aggregate.ternary_hybrid_layers = None;
+    aggregate.ternary_hybrid_output = None;
+    Ok(aggregate)
+}
+
+#[cfg(not(feature = "candle"))]
+pub fn load_cached_model_ranges(
+    _path: &str,
+    _ranges: &[(usize, usize)],
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    Err(crate::InferenceError::Runtime("candle feature not enabled".into()))
+}
+
 /// Load from binary .arc-int8 file.
 pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate::InferenceError> {
     use crate::InferenceError;

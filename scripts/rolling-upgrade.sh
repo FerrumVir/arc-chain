@@ -56,18 +56,47 @@ for arg in "$@"; do
 done
 export RESET_STATE
 
-# Parser for SHARD_MAP. Given NAME, returns "--shard-start X --shard-end Y"
-# or empty string if the name is not in the map. Whitespace-separated entries.
+# Parser for SHARD_MAP. Given NAME, returns the concatenated
+# --shard-range flags this node should run with, or empty.
+#
+# Two supported formats per entry (whitespace-separated):
+#
+#   Single range (legacy):
+#       NAME:START:END
+#
+#   Multi range (new — 3× replication):
+#       NAME=A:B,C:D,E:F
+#       Every comma-separated piece is emitted as its own --shard-range flag.
+#
+# Example multi-range input:
+#   --shard-map "NYC=0:6,21:26 LAX=0:6,6:11,26:32 AMS=6:11,11:16 ..."
+# Example legacy input:
+#   --shard-map "NYC:0:5 LAX:5:10 AMS:10:14 ..."
 shard_flags_for_node() {
     local name="$1"
     [ -z "$SHARD_MAP" ] && return 0
     for entry in $SHARD_MAP; do
+        local n_eq="${entry%%=*}"
+        if [ "$n_eq" != "$entry" ] && [ "$n_eq" = "$name" ]; then
+            # Multi-range format: NAME=A:B,C:D
+            local ranges="${entry#*=}"
+            local out=""
+            local IFS=","
+            for r in $ranges; do
+                [ -z "$r" ] && continue
+                out="$out --shard-range $r"
+            done
+            unset IFS
+            echo "$out"
+            return 0
+        fi
         local n="${entry%%:*}"
         if [ "$n" = "$name" ]; then
+            # Legacy single-range format: NAME:START:END
             local rest="${entry#*:}"
             local s="${rest%%:*}"
             local e="${rest##*:}"
-            echo "--shard-start $s --shard-end $e"
+            echo "--shard-range ${s}:${e}"
             return 0
         fi
     done
@@ -98,9 +127,25 @@ fi
 if [ "$SKIP_BUILD" = false ]; then
     info "Pushing latest code to NYC ($BUILD_IP)..."
 
-    # Sync local repo to NYC (exclude target dir)
+    # Sync local repo to the build host. IMPORTANT: excludes below protect
+    # runtime artifacts on the remote — `--delete` removes anything in the
+    # destination that isn't in the source, so any path that must survive
+    # must be listed here. Chain state (arc-data/), model weights (*.gguf),
+    # logs, and host-local generated files all live on the seed and must
+    # NEVER be wiped by a code sync.
     rsync -az --delete \
-        --exclude 'target/' --exclude '.git/' --exclude 'model.gguf' \
+        --exclude 'target/' \
+        --exclude '.git/' \
+        --exclude 'arc-data/' \
+        --exclude 'arc-data-*/' \
+        --exclude '*.gguf' \
+        --exclude '*.arc-int8' \
+        --exclude 'model.gguf' \
+        --exclude 'known_peers.json' \
+        --exclude 'node.log' \
+        --exclude '*.log' \
+        --exclude 'benchmark-*.json' \
+        --exclude 'config.toml' \
         -e "ssh $SSH_OPTS" \
         "$HOME/arc-chain/" "root@${BUILD_IP}:/root/arc-chain/"
 
@@ -141,23 +186,36 @@ for idx in $(seq 0 $((TOTAL - 1))); do
     fi
 
     # b0. Determine shard flags. Priority:
-    #   1. --shard-map override (operator explicitly assigns a range for this node)
-    #   2. Snapshot from the currently-running process (preserve existing assignment)
+    #   1. --shard-map override (operator explicitly assigns ranges — recommended)
+    #   2. Snapshot from the currently-running process (preserve existing assignment,
+    #      converting legacy --shard-start/--shard-end into a single --shard-range)
     #   3. None (validator/observer only)
     #
     # Preserving flags matters because without them nodes come back with no
-    # --shard-start/--shard-end and the inference pipeline fragments — exactly
-    # the failure mode arc-watchdog.sh guards against.
+    # shard assignment and the inference pipeline fragments — exactly the
+    # failure mode arc-watchdog.sh guards against.
     SHARD_FLAGS=$(shard_flags_for_node "$NODE")
     if [ -n "$SHARD_FLAGS" ]; then
-        ok "Using shard-map override for $NODE: $SHARD_FLAGS"
+        ok "Using shard-map override for $NODE:$SHARD_FLAGS"
     else
         info "Snapshotting shard flags from running process..."
-        SHARD_FLAGS=$(ssh $SSH_OPTS "root@${IP}" \
-            "ps -ef | grep 'arc-node' | grep -v grep | head -1 | \
-             grep -oE -- '--shard-start [0-9]+[[:space:]]+--shard-end [0-9]+'" 2>/dev/null || echo "")
+        # Try new --shard-range first (may occur multiple times), then legacy
+        # --shard-start/--shard-end pair. Either way, emit as --shard-range
+        # flags for the new binary.
+        SHARD_FLAGS=$(ssh $SSH_OPTS "root@${IP}" "bash -s" <<'REMOTE'
+PS_LINE=$(ps -eo args | grep 'arc-node' | grep -v grep | head -1)
+echo "$PS_LINE" | grep -oE -- '--shard-range [0-9]+:[0-9]+' | tr '\n' ' '
+LEGACY=$(echo "$PS_LINE" | grep -oE -- '--shard-start [0-9]+[[:space:]]+--shard-end [0-9]+')
+if [ -n "$LEGACY" ]; then
+    S=$(echo "$LEGACY" | awk '{print $2}')
+    E=$(echo "$LEGACY" | awk '{print $4}')
+    echo "--shard-range ${S}:${E}"
+fi
+REMOTE
+        )
+        SHARD_FLAGS=$(echo "$SHARD_FLAGS" | tr -s ' ' | sed 's/^ *//;s/ *$//')
         if [ -n "$SHARD_FLAGS" ]; then
-            ok "Preserving existing shard flags: $SHARD_FLAGS"
+            ok "Preserving existing shard assignment: $SHARD_FLAGS"
         else
             info "No shard flags on $NODE (validator/observer only)"
         fi
