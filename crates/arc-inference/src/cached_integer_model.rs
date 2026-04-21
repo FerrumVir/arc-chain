@@ -292,6 +292,35 @@ pub struct I16Layer {
     pub w_down: I16Weights,
 }
 
+/// Pre-loaded transformer layer in ternary (2 bits/weight).
+///
+/// Matmuls route through `matmul_ternary` — zero multiplications, pure
+/// ADD + XOR on the accumulator. See `ternary_engine.rs` for the math and
+/// `sha256_isa.rs` for the SHA-256 datapath proof.
+pub struct TernaryLayer {
+    pub wq: crate::ternary_engine::TernaryWeights,
+    pub wk: crate::ternary_engine::TernaryWeights,
+    pub wv: crate::ternary_engine::TernaryWeights,
+    pub wo: crate::ternary_engine::TernaryWeights,
+    pub w_gate: crate::ternary_engine::TernaryWeights,
+    pub w_up: crate::ternary_engine::TernaryWeights,
+    pub w_down: crate::ternary_engine::TernaryWeights,
+}
+
+/// Hybrid ternary + INT8 outliers. Ternary bulk runs on ASIC primitives;
+/// the small outlier fraction (1–5%) runs on the controller via regular
+/// INT8 multiply-accumulate. Preserves PTQ quality on models not trained
+/// ternary-aware. See `ternary_hybrid.rs`.
+pub struct TernaryHybridLayer {
+    pub wq: crate::ternary_hybrid::TernaryHybridWeights,
+    pub wk: crate::ternary_hybrid::TernaryHybridWeights,
+    pub wv: crate::ternary_hybrid::TernaryHybridWeights,
+    pub wo: crate::ternary_hybrid::TernaryHybridWeights,
+    pub w_gate: crate::ternary_hybrid::TernaryHybridWeights,
+    pub w_up: crate::ternary_hybrid::TernaryHybridWeights,
+    pub w_down: crate::ternary_hybrid::TernaryHybridWeights,
+}
+
 /// Pre-loaded transformer layer in block-wise INT8 (Q8_0-style) format.
 /// 32-weight blocks with i32 Q16 scales. Preferred storage going forward —
 /// bridges the old per-row I8 quality gap without sacrificing integer
@@ -329,6 +358,15 @@ pub struct CachedIntegerModel {
     /// per-row I8, full integer determinism, ~12% memory overhead vs I8.
     pub block_i8_layers: Option<Vec<BlockI8Layer>>,
     pub block_i8_output: Option<crate::block_i8::BlockI8Weights>,
+    /// Ternary weights — converted from I8 on enable_ternary().
+    /// 2 bits/weight, ASIC-compatible matmul (ADD + XOR only, zero multiplications).
+    /// See `ternary_engine.rs`.
+    pub ternary_layers: Option<Vec<TernaryLayer>>,
+    pub ternary_output: Option<crate::ternary_engine::TernaryWeights>,
+    /// Hybrid ternary + sparse INT8 outliers — enabled via enable_ternary_hybrid().
+    /// Takes dispatch priority over pure ternary when both are populated.
+    pub ternary_hybrid_layers: Option<Vec<TernaryHybridLayer>>,
+    pub ternary_hybrid_output: Option<crate::ternary_hybrid::TernaryHybridWeights>,
 }
 
 impl CachedIntegerModel {
@@ -346,6 +384,49 @@ impl CachedIntegerModel {
         }).collect();
         self.q4_output = Some(Q4WeightsX86::from_i8(&self.output_weight));
         self.q4_layers = Some(q4_layers);
+    }
+
+    /// Convert all weights to hybrid ternary + INT8 outliers.
+    /// `outlier_pct` = fraction of weights (by magnitude) kept as INT8 per row.
+    /// Typical values: 1.0-5.0 (lower = more ASIC-native, higher = more quality).
+    ///
+    /// The ternary bulk runs on ASIC primitives; outliers run on the controller.
+    /// This is the PTQ quality path — works on any model without retraining.
+    pub fn enable_ternary_hybrid(&mut self, outlier_pct: f32) {
+        use crate::ternary_hybrid::TernaryHybridWeights;
+        if self.ternary_hybrid_layers.is_some() { return; }
+        let hybrid_layers: Vec<TernaryHybridLayer> = self.layers.iter().map(|l| TernaryHybridLayer {
+            wq:     TernaryHybridWeights::from_i8(&l.wq, outlier_pct),
+            wk:     TernaryHybridWeights::from_i8(&l.wk, outlier_pct),
+            wv:     TernaryHybridWeights::from_i8(&l.wv, outlier_pct),
+            wo:     TernaryHybridWeights::from_i8(&l.wo, outlier_pct),
+            w_gate: TernaryHybridWeights::from_i8(&l.w_gate, outlier_pct),
+            w_up:   TernaryHybridWeights::from_i8(&l.w_up, outlier_pct),
+            w_down: TernaryHybridWeights::from_i8(&l.w_down, outlier_pct),
+        }).collect();
+        self.ternary_hybrid_output = Some(TernaryHybridWeights::from_i8(&self.output_weight, outlier_pct));
+        self.ternary_hybrid_layers = Some(hybrid_layers);
+    }
+
+    /// Convert all weights from I8 to ternary (2 bits/weight).
+    /// Call once after loading model. Original I8 weights kept for fallback.
+    ///
+    /// Ternary matmul runs on SHA-256 ASIC primitives (ADD + XOR, no multiplication),
+    /// enabling inference on Bitcoin mining hardware via the ARC distributed network.
+    pub fn enable_ternary(&mut self) {
+        use crate::ternary_engine::TernaryWeights;
+        if self.ternary_layers.is_some() { return; }
+        let ternary_layers: Vec<TernaryLayer> = self.layers.iter().map(|l| TernaryLayer {
+            wq:     TernaryWeights::from_i8(&l.wq),
+            wk:     TernaryWeights::from_i8(&l.wk),
+            wv:     TernaryWeights::from_i8(&l.wv),
+            wo:     TernaryWeights::from_i8(&l.wo),
+            w_gate: TernaryWeights::from_i8(&l.w_gate),
+            w_up:   TernaryWeights::from_i8(&l.w_up),
+            w_down: TernaryWeights::from_i8(&l.w_down),
+        }).collect();
+        self.ternary_output = Some(TernaryWeights::from_i8(&self.output_weight));
+        self.ternary_layers = Some(ternary_layers);
     }
 
     /// Convert all weights from I8 to I16 format.
@@ -1372,13 +1453,23 @@ pub fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
 pub fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
     let n = input.len() as i64;
     if n == 0 { return vec![]; }
-    // RMSNorm: compute mean of squares (NOT variance around mean)
-    let mut sq_sum: i64 = 0;
+    // RMSNorm: compute mean of squares (NOT variance around mean).
+    //
+    // Use i128 accumulator so small x² terms don't truncate. With the old
+    // `sq_sum += (x*x) >> FRAC_BITS` pattern any x with |x| < 256 Q16
+    // (≈0.0039 real) contributed 0 to the sum because x·x was below 2^16
+    // before the shift. Long-tailed distributions (most of Llama's hidden
+    // states) got systematically understated RMS → oversized normalization
+    // factor → amplified residual stream layer-to-layer — a measurable
+    // contributor to the PPL gap vs candle's Q8_0 reference.
+    let mut sq_sum: i128 = 0;
     for &x in input {
-        sq_sum += (x * x) >> FRAC_BITS;
+        sq_sum += (x as i128) * (x as i128);
     }
-    let mean_sq = sq_sum / n;
-    let inv_rms = integer_isqrt(mean_sq + 1); // 1/sqrt(mean_sq) in Q16
+    // sq_sum accumulated in full Q32. Bring back to Q16 once for isqrt.
+    let mean_sq_q32 = sq_sum / (n as i128);
+    let mean_sq = (mean_sq_q32 >> FRAC_BITS as i128) as i64;
+    let inv_rms = integer_isqrt(mean_sq + 1);
     input.iter().enumerate().map(|(i, &x)| {
         let norm = (x * inv_rms) >> FRAC_BITS;
         let g = if i < gamma.len() { gamma[i] } else { ONE };
@@ -1914,9 +2005,13 @@ impl CachedIntegerModel {
         //   Q4        — x86 low-bandwidth path
         //   I8        — original per-row fallback
         macro_rules! dispatch_matmul {
-            ($blk:expr, $i16w:expr, $q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
+            ($hyb:expr, $tern:expr, $blk:expr, $i16w:expr, $q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
                 {
-                    if let Some(blk) = $blk {
+                    if let Some(hw) = $hyb {
+                        crate::ternary_hybrid::matmul_ternary_hybrid_into(hw, $raw, $in_sz, $out);
+                    } else if let Some(tw) = $tern {
+                        crate::ternary_engine::matmul_ternary_into(tw, $raw, $in_sz, $out);
+                    } else if let Some(blk) = $blk {
                         crate::block_i8::matmul_block_i8_into(blk, $raw, $out);
                     } else if let Some(i16w) = $i16w {
                         matmul_i16_into(i16w, $raw, $in_sz, $out);
@@ -1945,9 +2040,11 @@ impl CachedIntegerModel {
         let mut ff_out = vec![0i64; d];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
-            let blk_layer = self.block_i8_layers.as_ref().map(|bl| &bl[layer_idx]);
-            let i16_layer = self.i16_layers.as_ref().map(|il| &il[layer_idx]);
-            let q4_layer = self.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
+            let hyb_layer  = self.ternary_hybrid_layers.as_ref().map(|hl| &hl[layer_idx]);
+            let tern_layer = self.ternary_layers.as_ref().map(|tl| &tl[layer_idx]);
+            let blk_layer  = self.block_i8_layers.as_ref().map(|bl| &bl[layer_idx]);
+            let i16_layer  = self.i16_layers.as_ref().map(|il| &il[layer_idx]);
+            let q4_layer   = self.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
 
             // LayerNorm once — result fits in L1 (32KB)
             let normed = layernorm(&hidden, &layer.attn_norm);
@@ -1956,9 +2053,9 @@ impl CachedIntegerModel {
             let normed_q = QuantizedInput::from_i64(&normed);
 
             // Q/K/V with zero-alloc + cached quantized input
-            dispatch_matmul!(blk_layer.map(|l| &l.wq), i16_layer.map(|l| &l.wq), q4_layer.map(|l| &l.wq), &layer.wq, &normed_q, &normed, d, &mut q);
-            dispatch_matmul!(blk_layer.map(|l| &l.wk), i16_layer.map(|l| &l.wk), q4_layer.map(|l| &l.wk), &layer.wk, &normed_q, &normed, d, &mut k_buf);
-            dispatch_matmul!(blk_layer.map(|l| &l.wv), i16_layer.map(|l| &l.wv), q4_layer.map(|l| &l.wv), &layer.wv, &normed_q, &normed, d, &mut v_buf);
+            dispatch_matmul!(hyb_layer.map(|l| &l.wq), tern_layer.map(|l| &l.wq), blk_layer.map(|l| &l.wq), i16_layer.map(|l| &l.wq), q4_layer.map(|l| &l.wq), &layer.wq, &normed_q, &normed, d, &mut q);
+            dispatch_matmul!(hyb_layer.map(|l| &l.wk), tern_layer.map(|l| &l.wk), blk_layer.map(|l| &l.wk), i16_layer.map(|l| &l.wk), q4_layer.map(|l| &l.wk), &layer.wk, &normed_q, &normed, d, &mut k_buf);
+            dispatch_matmul!(hyb_layer.map(|l| &l.wv), tern_layer.map(|l| &l.wv), blk_layer.map(|l| &l.wv), i16_layer.map(|l| &l.wv), q4_layer.map(|l| &l.wv), &layer.wv, &normed_q, &normed, d, &mut v_buf);
 
             // RoPE
             for h in 0..cfg.n_heads {
@@ -1998,15 +2095,15 @@ impl CachedIntegerModel {
 
             // Wo projection + residual (zero-alloc)
             let attn_out_q = QuantizedInput::from_i64(&attn_out);
-            dispatch_matmul!(blk_layer.map(|l| &l.wo), i16_layer.map(|l| &l.wo), q4_layer.map(|l| &l.wo), &layer.wo, &attn_out_q, &attn_out, d, &mut projected);
+            dispatch_matmul!(hyb_layer.map(|l| &l.wo), tern_layer.map(|l| &l.wo), blk_layer.map(|l| &l.wo), i16_layer.map(|l| &l.wo), q4_layer.map(|l| &l.wo), &layer.wo, &attn_out_q, &attn_out, d, &mut projected);
             for i in 0..d { hidden[i] += projected[i]; }
 
             // FFN: quantize normed_ff ONCE for gate+up
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
             let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
 
-            dispatch_matmul!(blk_layer.map(|l| &l.w_gate), i16_layer.map(|l| &l.w_gate), q4_layer.map(|l| &l.w_gate), &layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
-            dispatch_matmul!(blk_layer.map(|l| &l.w_up), i16_layer.map(|l| &l.w_up), q4_layer.map(|l| &l.w_up), &layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
+            dispatch_matmul!(hyb_layer.map(|l| &l.w_gate), tern_layer.map(|l| &l.w_gate), blk_layer.map(|l| &l.w_gate), i16_layer.map(|l| &l.w_gate), q4_layer.map(|l| &l.w_gate), &layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
+            dispatch_matmul!(hyb_layer.map(|l| &l.w_up), tern_layer.map(|l| &l.w_up), blk_layer.map(|l| &l.w_up), i16_layer.map(|l| &l.w_up), q4_layer.map(|l| &l.w_up), &layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
 
             // SiLU gate * up (in-place)
             for j in 0..cfg.d_ff {
@@ -2015,7 +2112,7 @@ impl CachedIntegerModel {
 
             // W_down + residual
             let gate_q = QuantizedInput::from_i64(&gate);
-            dispatch_matmul!(blk_layer.map(|l| &l.w_down), i16_layer.map(|l| &l.w_down), q4_layer.map(|l| &l.w_down), &layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
+            dispatch_matmul!(hyb_layer.map(|l| &l.w_down), tern_layer.map(|l| &l.w_down), blk_layer.map(|l| &l.w_down), i16_layer.map(|l| &l.w_down), q4_layer.map(|l| &l.w_down), &layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
             for i in 0..d { hidden[i] += ff_out[i]; }
         }
 
@@ -2621,7 +2718,10 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         // Forward dispatch prefers this over per-row I8 when present.
         block_i8_layers: Some(block_i8_layers_vec),
         block_i8_output,
-    })
+        ternary_layers: None,
+        ternary_output: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,    })
 }
 
 #[cfg(not(feature = "candle"))]
@@ -2732,6 +2832,9 @@ pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::Infe
         i16_output: None,
         block_i8_layers: None,
         block_i8_output: None,
+        ternary_layers: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,        ternary_output: None,
     })
 }
 
@@ -3020,6 +3123,9 @@ pub fn load_cached_model_shard(
         // should replicate the main loader's triple-quant pattern here.
         block_i8_layers: None,
         block_i8_output: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,        ternary_layers: None,
+        ternary_output: None,
     })
 }
 
@@ -3120,7 +3226,10 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
         i16_layers: None,
         i16_output: None,
         block_i8_layers: None,
-        block_i8_output: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,        block_i8_output: None,
+        ternary_layers: None,
+        ternary_output: None,
     })
 }
 
@@ -3185,8 +3294,11 @@ mod tests {
             q4_layers: None, q4_output: None,
         i16_layers: None,
         i16_output: None,
-        block_i8_layers: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,        block_i8_layers: None,
         block_i8_output: None,
+        ternary_layers: None,
+        ternary_output: None,
         }
     }
 
@@ -3239,6 +3351,61 @@ mod tests {
         let (t2, h2) = model.generate(&prompt, 8, &[99]);
         assert_eq!(t1, t2);
         assert_eq!(h1, h2);
+    }
+
+    /// End-to-end test: run forward_one_token with ternary weights enabled.
+    /// Proves the dispatch wiring works and the full transformer pipeline
+    /// (embedding → attention → FFN → output) executes correctly with
+    /// ternary weight storage.
+    #[test]
+    fn test_forward_one_token_with_ternary() {
+        // Small model: 2 layers, d_model=64, vocab=100. Uses the same
+        // dimensions as test_model_deterministic so we know it's in
+        // the test-friendly size range.
+        let mut model = build_test_model(100, 64, 2, 128, 2);
+
+        // Enable ternary — converts I8 layers to 2-bit ternary weights
+        model.enable_ternary();
+        assert!(model.ternary_layers.is_some(), "ternary layers must be populated after enable_ternary");
+
+        // Run forward_one_token — this exercises the full pipeline:
+        // embedding lookup, Q/K/V matmul, attention, output projection,
+        // FFN (gate/up/down), residuals, final norm.
+        let token: u32 = 5;
+        let mut cache = super::KVCache::new(model.config.n_layers);
+        let logits1 = model.forward_one_token(token, &mut cache);
+        assert_eq!(logits1.len(), model.config.vocab_size, "logits must have vocab_size entries");
+        assert!(logits1.iter().any(|&v| v != 0), "ternary forward must produce non-zero logits");
+
+        // Determinism: same token → same logits.
+        let mut cache2 = super::KVCache::new(model.config.n_layers);
+        let logits2 = model.forward_one_token(token, &mut cache2);
+        assert_eq!(logits1, logits2, "ternary forward_one_token must be deterministic");
+    }
+
+    #[test]
+    fn test_ternary_memory_reduction_full_model() {
+        let mut model = build_test_model(100, 64, 2, 128, 2);
+        let before_bytes: usize = model.layers.iter().map(|l| {
+            l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
+                + l.wo.memory_bytes() + l.w_gate.memory_bytes()
+                + l.w_up.memory_bytes() + l.w_down.memory_bytes()
+        }).sum();
+
+        model.enable_ternary();
+        let after_bytes: usize = model.ternary_layers.as_ref().unwrap().iter().map(|l| {
+            l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
+                + l.wo.memory_bytes() + l.w_gate.memory_bytes()
+                + l.w_up.memory_bytes() + l.w_down.memory_bytes()
+        }).sum();
+
+        // Ternary should be approximately 4x smaller than I8 on the weight data.
+        // The scale arrays are the same size, so total ratio is ~3.5-4x.
+        assert!(
+            after_bytes * 3 < before_bytes,
+            "ternary ({} B) should be at least 3x smaller than I8 ({} B)",
+            after_bytes, before_bytes,
+        );
     }
 
     #[test]
@@ -3754,9 +3921,12 @@ mod int16_tests {
                 q4_layers: None,
                 q4_output: None,
                 i16_layers: None,
-                i16_output: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,                i16_output: None,
                 block_i8_layers: None,
                 block_i8_output: None,
+                ternary_layers: None,
+                ternary_output: None,
             }
         };
 
