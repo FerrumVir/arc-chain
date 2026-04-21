@@ -507,6 +507,15 @@ unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
 /// Write matmul result into pre-allocated output buffer (zero-alloc).
 /// Parallel with 512-row chunks to minimize rayon scheduling overhead.
 fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
+    // Empty-weight guard. Shard-mode models pre-allocate every layer as an
+    // empty placeholder and only populate the range this node holds. Any
+    // code path that iterates over a non-held layer hits an empty weight
+    // struct; without this guard the SIMD dot product dereferences a
+    // dangling non-null pointer and segfaults in the consensus thread.
+    if weights.n_rows == 0 || weights.data.is_empty() {
+        for o in output.iter_mut() { *o = 0; }
+        return;
+    }
     debug_assert_eq!(output.len(), weights.scales.len(), "matmul output/scales mismatch");
     let data = &weights.data;
     let scales = &weights.scales;
@@ -525,6 +534,9 @@ fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &m
 /// Allocating matmul (for compatibility and small outputs).
 fn matmul_i8(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     let mut output = vec![0i64; out_size];
+    if weights.n_rows == 0 || weights.data.is_empty() {
+        return output;
+    }
     if out_size >= 256 {
         matmul_i8_into(weights, input, in_size, &mut output);
     } else {
@@ -710,6 +722,10 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
 ///        = acc / 32767 * abs_max * ONE >> FRAC_BITS
 ///        ≈ ONE * dot(W, X)  (Q16 of the real result).
 fn matmul_i16_into(weights: &I16Weights, input: &[i64], in_size: usize, output: &mut [i64]) {
+    if weights.n_rows == 0 || weights.data.is_empty() {
+        for o in output.iter_mut() { *o = 0; }
+        return;
+    }
     debug_assert!(output.len() <= weights.data.len() / in_size, "i16 matmul bounds");
     let data = &weights.data;
     let scales = &weights.scales;
@@ -735,6 +751,9 @@ fn matmul_i16_into(weights: &I16Weights, input: &[i64], in_size: usize, output: 
 /// Allocating i16 matmul (for compatibility and small outputs).
 fn matmul_i16(weights: &I16Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     let mut output = vec![0i64; out_size];
+    if weights.n_rows == 0 || weights.data.is_empty() {
+        return output;
+    }
     matmul_i16_into(weights, input, in_size, &mut output);
     output
 }
@@ -746,6 +765,10 @@ fn matmul_i16(weights: &I16Weights, input: &[i64], in_size: usize, out_size: usi
 #[cfg(target_arch = "aarch64")]
 fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     use std::arch::aarch64::*;
+
+    if weights.n_rows == 0 || weights.data.is_empty() {
+        return vec![0i64; out_size];
+    }
 
     let input_abs_max = input.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
     let input_scale_factor = (input_abs_max / 127).max(1);
@@ -807,6 +830,10 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
 #[cfg(target_arch = "x86_64")]
 fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     use std::arch::x86_64::*;
+
+    if weights.n_rows == 0 || weights.data.is_empty() {
+        return vec![0i64; out_size];
+    }
 
     if !is_x86_feature_detected!("avx2") {
         return matmul_i8(weights, input, in_size, out_size);
@@ -1169,6 +1196,10 @@ impl Q4WeightsX86 {
 /// Reads HALF the weight data of matmul_i8xi8 → 2x bandwidth improvement.
 #[cfg(target_arch = "x86_64")]
 pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
+    if q4.n_rows == 0 || q4.data.is_empty() {
+        for o in output.iter_mut() { *o = 0; }
+        return;
+    }
     debug_assert_eq!(output.len(), q4.scales.len(), "matmul output/scales mismatch");
     use std::arch::x86_64::*;
 
@@ -1306,6 +1337,10 @@ pub fn matmul_q4_preq_x86(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &
 /// Processes 16 packed bytes (32 Q4 values) per iteration.
 #[cfg(target_arch = "aarch64")]
 pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
+    if q4.n_rows == 0 || q4.data.is_empty() {
+        for o in output.iter_mut() { *o = 0; }
+        return;
+    }
     debug_assert_eq!(output.len(), q4.scales.len(), "matmul output/scales mismatch");
     use std::arch::aarch64::*;
 
@@ -1396,6 +1431,10 @@ pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: 
 }
 
 fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
+    if q4.n_rows == 0 || q4.data.is_empty() {
+        for o in output.iter_mut() { *o = 0; }
+        return;
+    }
     debug_assert_eq!(output.len(), q4.scales.len(), "matmul output/scales mismatch");
     let byte_cols = q4.n_cols / 2;
     let data = &q4.data;
@@ -1420,6 +1459,10 @@ fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i
 /// Q4 × i64 matmul with FULL input precision (no pre-quantization).
 /// This avoids the double-quantization precision loss of the SIMD path.
 pub fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
+    if q4.n_rows == 0 || q4.data.is_empty() {
+        for o in output.iter_mut() { *o = 0; }
+        return;
+    }
     debug_assert_eq!(output.len(), q4.scales.len(), "matmul output/scales mismatch");
     let byte_cols = q4.n_cols / 2;
     let data = &q4.data;
