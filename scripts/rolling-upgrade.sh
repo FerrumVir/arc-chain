@@ -44,6 +44,8 @@ RESET_STATE=false
 HALT_ON_FAIL=true
 BUILD_IP_OVERRIDE=""
 SHARD_MAP=""
+ONLY_NODES=""
+MODEL_FILE_OVERRIDE=""
 for arg in "$@"; do
     case "$arg" in
         --build-only)       BUILD_ONLY=true ;;
@@ -52,6 +54,8 @@ for arg in "$@"; do
         --continue-on-fail) HALT_ON_FAIL=false ;;
         --build-ip=*)       BUILD_IP_OVERRIDE="${arg#--build-ip=}" ;;
         --shard-map=*)      SHARD_MAP="${arg#--shard-map=}" ;;
+        --only=*)           ONLY_NODES="${arg#--only=}" ;;
+        --model-file=*)     MODEL_FILE_OVERRIDE="${arg#--model-file=}" ;;
     esac
 done
 export RESET_STATE
@@ -171,9 +175,32 @@ for idx in $(seq 0 $((TOTAL - 1))); do
     # or the derived address won't match the genesis validator set.
     VALIDATOR_SEED="${NODE}"
 
+    # --only=A,B,C skips every node not in the comma-separated list. Makes
+    # a rollout of a single node safe and explicit.
+    if [ -n "$ONLY_NODES" ]; then
+        case ",${ONLY_NODES}," in
+            *,"${NODE}",*) : ;;
+            *) continue ;;
+        esac
+    fi
+
     DEPLOYED=$((DEPLOYED + 1))
     echo ""
     printf "${BOLD}── [$DEPLOYED/$TOTAL] Upgrading $NODE ($IP) ──${RESET}\n"
+
+    # a0. Snapshot the live --model flag BEFORE stopping the old process.
+    # Doing this after step (b) would read from an empty ps and silently
+    # swap the node onto the default TinyLlama model. --model-file=NAME
+    # overrides the snapshot for this run.
+    if [ -n "$MODEL_FILE_OVERRIDE" ]; then
+        MODEL_FILE="$MODEL_FILE_OVERRIDE"
+        info "Model file override: $MODEL_FILE"
+    else
+        MODEL_FILE=$(ssh $SSH_OPTS "root@${IP}" \
+            "ps -eo args | grep 'arc-node' | grep -v grep | head -1 | grep -oE -- '--model [^ ]+' | awk '{print \$2}'" 2>/dev/null | head -1)
+        MODEL_FILE="${MODEL_FILE:-model.gguf}"
+        info "Snapshotted model file: $MODEL_FILE"
+    fi
 
     # a. Copy binary from build node (pipe through localhost to avoid text-file-busy)
     if [ "$IP" != "$BUILD_IP" ]; then
@@ -241,11 +268,10 @@ REMOTE
         "$HOME/arc-chain/testnet-seeds.txt" "$HOME/arc-chain/genesis.toml" \
         "root@${IP}:/root/arc-chain/"
 
-    # e. Start new node in screen. Load model on every seed (all 8 serve inference).
-    # SHARD_FLAGS (from step b0) restores --shard-start/--shard-end so the
-    # pipeline doesn't fragment during upgrade.
-    MODEL_FLAG="--model model.gguf"
-    info "Starting new node${MODEL_FLAG:+ with inference}${SHARD_FLAGS:+ + shard flags}..."
+    # e. Start new node in screen. MODEL_FILE was snapshotted in step (a0)
+    # — before the old process was killed — and must not be re-computed here.
+    MODEL_FLAG="--model ${MODEL_FILE}"
+    info "Starting new node${MODEL_FLAG:+ with inference (${MODEL_FILE})}${SHARD_FLAGS:+ + shard flags}..."
     ssh $SSH_OPTS "root@${IP}" "cd /root/arc-chain && screen -dmS arc ./target/release/arc-node \
         --rpc 0.0.0.0:${RPC_PORT} \
         --p2p-port ${P2P_PORT} \

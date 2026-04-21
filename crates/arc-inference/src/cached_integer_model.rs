@@ -3166,6 +3166,16 @@ pub fn load_cached_model_ranges(
         }
     }
 
+    // Single-range path: call load_cached_model_shard directly and return
+    // its output untouched. Any mutation here (e.g. zeroing optional
+    // quantization slices) breaks the invariants the shard loader
+    // established and has caused segfaults in production when the forward
+    // path assumed the full set was still present. For a one-range caller,
+    // this function MUST be a thin alias for load_cached_model_shard.
+    if sorted.len() == 1 {
+        return load_cached_model_shard(path, sorted[0].0, sorted[0].1);
+    }
+
     let mut aggregate = load_cached_model_shard(path, sorted[0].0, sorted[0].1)?;
     let n_layers = aggregate.config.n_layers;
 
@@ -3198,11 +3208,11 @@ pub fn load_cached_model_ranges(
             }
         }
     }
-    // Rebuild optional quantization paths coherently across the merged layer
-    // set. The per-range loads each produced their own i16_layers slice keyed
-    // on the subrange; discarding those and regenerating from the merged I8
-    // layers is simpler than stitching partial slices and matches what
-    // load_cached_model does at top-level after all layers are present.
+    // Multi-range only: rebuild optional quantization paths coherently
+    // across the merged layer set. Each sub-load's i16/q4/block_i8 slices
+    // were keyed on its own subrange; regenerating from the merged I8
+    // layers is simpler than stitching partial slices. Callers that want
+    // I16 after this should call `.enable_i16()`.
     aggregate.i16_layers = None;
     aggregate.i16_output = None;
     aggregate.q4_layers = None;
