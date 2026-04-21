@@ -4286,7 +4286,12 @@ async fn announce_shard(
             return Json(json!({"ok": true, "registry_size": node.shard_registry.len(), "note": "stub addr ignored — routable addr already registered"}));
         }
     }
-    let key = req.shard.socket_addr.clone();
+    // Key by (socket_addr, range) so one node announcing multiple held ranges
+    // produces one entry per range — otherwise the DashMap insert clobbers
+    // prior announces and only the most recent range survives. The
+    // coordinator's BTreeMap grouping already keys on (start, end) so a
+    // per-range entry is exactly what we need.
+    let key = format!("{}#{}-{}", req.shard.socket_addr, req.shard.start_layer, req.shard.end_layer);
     // Also register in multi-model ShardRegistry for multi-model routing
     if let Ok(model_hash_bytes) = parse_hash(&req.shard.model_id) {
         let model_hash = Hash256(model_hash_bytes);
