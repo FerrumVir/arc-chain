@@ -335,6 +335,7 @@ pub async fn serve(
         .route("/inference/results", get(inference_list_results))
         // Pipeline-parallel sharded inference
         .route("/inference/run_sharded", post(inference_run_sharded))
+        .route("/inference/run_consensus", post(inference_run_consensus))
         .route("/inference/forward_shard", post(inference_forward_shard))
         // Deterministic inference cache introspection
         .route("/inference/cache_stats", get(inference_cache_stats))
@@ -4163,6 +4164,358 @@ async fn inference_run_sharded(
             "treasury": fee_split.treasury,
         },
         "explorer_url": format!("/tx/0x{}", hex::encode(&tx_hash.0)),
+    })))
+}
+
+/// POST /inference/run_consensus
+/// Slice B: parallel k-of-n forward_shard per range with hash-majority
+/// verification at every shard boundary.
+///
+/// Semantics vs /inference/run_sharded:
+/// - run_sharded picks the first replica for each range; on HTTP failure it
+///   rotates to the next. Fast. Silent hash divergence is INVISIBLE.
+/// - run_consensus fires to k replicas in parallel, collects every
+///   hidden_hash, and requires >=ceil(k/2)+1 (strict majority) to agree
+///   before forwarding the majority's hidden state. Divergent replicas
+///   are logged in the response for later on-chain slashing. Slower, but
+///   an individual dishonest replica cannot produce a wrong token.
+///
+/// Request body mirrors run_sharded with an optional `k` field (default 3).
+/// Response adds a `consensus` block with per-range vote records.
+async fn inference_run_consensus(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let input_text = req.get("input")
+        .and_then(|v| v.as_str())
+        .ok_or(api_error(StatusCode::BAD_REQUEST, "'input' field required"))?;
+    if input_text.len() > 32_768 {
+        return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
+    }
+    let max_tokens = req.get("max_tokens")
+        .and_then(|v| v.as_u64()).unwrap_or(20).min(256) as u32;
+    let k_req = req.get("k").and_then(|v| v.as_u64()).unwrap_or(3).max(1) as usize;
+    let chat_template_enabled = req.get("chat_template").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let model = node.inference_model.as_ref()
+        .ok_or(api_error(StatusCode::SERVICE_UNAVAILABLE,
+            "Coordinator needs a tokenizer loaded. Start with --model <path.gguf>."))?;
+
+    // Group fresh shard announcements by (start, end). Dedupe per node_name
+    // inside each bucket preferring routable addrs over stubs.
+    fn stub(a: &str) -> bool {
+        a.starts_with("0.0.0.0") || a.starts_with("127.") || a.is_empty()
+    }
+    let mut by_range: std::collections::BTreeMap<(usize, usize), Vec<ShardInfo>> =
+        std::collections::BTreeMap::new();
+    for s in fresh_shards(&node.shard_registry) {
+        let key = (s.start_layer, s.end_layer);
+        let bucket = by_range.entry(key).or_default();
+        let dup = bucket.iter().position(|e| e.node_name == s.node_name);
+        match dup {
+            None => bucket.push(s),
+            Some(i) => {
+                if stub(&bucket[i].socket_addr) && !stub(&s.socket_addr) {
+                    bucket[i] = s;
+                }
+            }
+        }
+    }
+    for bucket in by_range.values_mut() {
+        let routable: Vec<ShardInfo> = bucket.iter().filter(|s| !stub(&s.socket_addr)).cloned().collect();
+        if !routable.is_empty() {
+            *bucket = routable;
+        }
+    }
+    let pipeline_ranges: Vec<((usize, usize), Vec<ShardInfo>)> = by_range.into_iter().collect();
+    if pipeline_ranges.is_empty() {
+        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "No shards announced."));
+    }
+    // Verify contiguous coverage.
+    let n_layers = pipeline_ranges[0].1[0].total_layers;
+    let mut covered = 0usize;
+    for ((s, e), _) in &pipeline_ranges {
+        if *s != covered {
+            return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
+                "Pipeline gap: expected layer {} next, got [{}, {})", covered, s, e
+            )));
+        }
+        covered = *e;
+    }
+    if covered != n_layers {
+        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
+            "Pipeline incomplete: 0..{} of {}", covered, n_layers
+        )));
+    }
+
+    // Tokenize
+    let tokenized_text = if chat_template_enabled { model.apply_chat_template(input_text) } else { input_text.to_string() };
+    let prompt_tokens = model.encode(&tokenized_text);
+    let mut all_tokens: Vec<u32> = vec![model.config.bos_token];
+    all_tokens.extend(&prompt_tokens);
+
+    let request_id = format!("0x{}", hex::encode(
+        arc_crypto::hash_bytes(format!("{}-{}", input_text,
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos()).unwrap_or(0)).as_bytes()).0
+    ));
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("http: {}", e)))?;
+
+    // Per-range consensus records accumulated across all token positions.
+    // Keyed by (position, range). Majority hash + full replica vote list.
+    #[derive(serde::Serialize, Clone)]
+    struct RangeVote {
+        position: usize,
+        range: (usize, usize),
+        replicas_contacted: Vec<String>,
+        replicas_returned: Vec<String>,
+        majority_hash: Option<String>,
+        divergent: Vec<(String, String)>, // (replica, their_hash)
+        agreement: String, // "unanimous" | "majority" | "split" | "no_response"
+    }
+    let mut votes: Vec<RangeVote> = Vec::new();
+
+    let overall_start = std::time::Instant::now();
+    let prompt_len = all_tokens.len();
+    let mut generated: Vec<u32> = Vec::new();
+    let mut first_gen_token: Option<u32> = None;
+
+    // Helper: fire k parallel forward_shard requests to the first k replicas
+    // in `replicas`, collect their responses. Return Result<(majority_hidden,
+    // majority_hash, vote_record), err_string>.
+    async fn consensus_hop(
+        client: &reqwest::Client,
+        replicas: &[ShardInfo],
+        k: usize,
+        req: &ForwardShardRequest,
+    ) -> Result<(Option<Vec<i64>>, Option<String>, bool, Option<u32>, Option<String>, RangeVote), String> {
+        let use_k = k.min(replicas.len()).max(1);
+        let selected: Vec<ShardInfo> = replicas.iter().take(use_k).cloned().collect();
+        let body = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+
+        let mut futs = Vec::with_capacity(use_k);
+        for r in &selected {
+            let url = format!("http://{}/inference/forward_shard", r.socket_addr);
+            let c = client.clone();
+            let b = body.clone();
+            let r_clone = r.clone();
+            futs.push(tokio::spawn(async move {
+                let send_res = c.post(&url).header("Content-Type","application/json").body(b).send().await;
+                let parsed: Result<ForwardShardResponse, String> = match send_res {
+                    Ok(r) => match r.error_for_status() {
+                        Ok(ok_resp) => ok_resp.json::<ForwardShardResponse>().await
+                            .map_err(|e| format!("parse: {}", e)),
+                        Err(e) => Err(format!("http status: {}", e)),
+                    },
+                    Err(e) => Err(format!("send: {}", e)),
+                };
+                (r_clone.node_name.clone(), parsed)
+            }));
+        }
+
+        let mut returned: Vec<(String, ForwardShardResponse)> = Vec::new();
+        for f in futs {
+            match f.await {
+                Ok((name, Ok(r))) => returned.push((name, r)),
+                Ok((name, Err(e))) => tracing::warn!("consensus replica {} failed: {}", name, e),
+                Err(e) => tracing::warn!("consensus task join failed: {}", e),
+            }
+        }
+
+        // Group by hash. For intermediate ranges: compare hidden_hash. For
+        // terminal range: compare logits_hash.
+        let is_terminal_returned = returned.iter().any(|(_, r)| r.is_terminal);
+        let hash_of = |r: &ForwardShardResponse| -> Option<String> {
+            if r.is_terminal { r.logits_hash.clone() } else { r.hidden_hash.clone() }
+        };
+        let mut hash_counts: std::collections::HashMap<String, Vec<&(String, ForwardShardResponse)>> =
+            std::collections::HashMap::new();
+        for item in &returned {
+            if let Some(h) = hash_of(&item.1) {
+                hash_counts.entry(h).or_default().push(item);
+            }
+        }
+        let (majority_hash, majority_items) = hash_counts.into_iter()
+            .max_by_key(|(_, v)| v.len())
+            .map(|(h, v)| (Some(h), v))
+            .unwrap_or((None, Vec::new()));
+
+        let needed = (use_k / 2) + 1;
+        let have = majority_items.len();
+
+        let mut vote = RangeVote {
+            position: req.position,
+            range: (req.start_layer, req.end_layer),
+            replicas_contacted: selected.iter().map(|s| s.node_name.clone()).collect(),
+            replicas_returned: returned.iter().map(|(n, _)| n.clone()).collect(),
+            majority_hash: majority_hash.clone(),
+            divergent: Vec::new(),
+            agreement: if returned.is_empty() { "no_response".into() }
+                else if have == returned.len() { "unanimous".into() }
+                else if have >= needed { "majority".into() }
+                else { "split".into() },
+        };
+        for item in &returned {
+            let h = hash_of(&item.1);
+            if h != majority_hash {
+                vote.divergent.push((item.0.clone(), h.unwrap_or_default()));
+            }
+        }
+
+        if majority_items.is_empty() {
+            return Err(format!(
+                "No replica responded for range [{}, {}) at position {}",
+                req.start_layer, req.end_layer, req.position
+            ));
+        }
+        if have < needed {
+            return Err(format!(
+                "No majority hash for range [{}, {}) at position {} — {} of {} agreed (needed {})",
+                req.start_layer, req.end_layer, req.position, have, returned.len(), needed
+            ));
+        }
+
+        let picked = &majority_items[0].1;
+        Ok((
+            picked.hidden.clone(),
+            picked.hidden_hash.clone(),
+            picked.is_terminal,
+            picked.token_id,
+            picked.logits_hash.clone(),
+            vote,
+        ))
+    }
+
+    // === Prefill: for each position, walk all ranges with k-of-n consensus.
+    // Positions run sequentially here (simpler than the pipelined prefill in
+    // run_sharded). For prompt_len up to ~128, overhead is acceptable.
+    for (pos_idx, &tok) in all_tokens.iter().enumerate() {
+        let mut cur_hidden: Option<Vec<i64>> = None;
+        let mut cur_hash: Option<String> = None;
+        let mut got_first_gen: Option<u32> = None;
+        for (range_idx, ((s_layer, e_layer), replicas)) in pipeline_ranges.iter().enumerate() {
+            let req_body = ForwardShardRequest {
+                request_id: request_id.clone(),
+                token: if range_idx == 0 { Some(tok) } else { None },
+                hidden: if range_idx == 0 { None } else { cur_hidden.clone() },
+                hidden_hash: if range_idx == 0 { None } else { cur_hash.clone() },
+                position: pos_idx,
+                start_layer: *s_layer,
+                end_layer: *e_layer,
+                last_token: false,
+            };
+            let (hid, hash, is_terminal, token_id, _logits_hash, vote) =
+                consensus_hop(&client, replicas, k_req, &req_body).await
+                    .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
+            votes.push(vote);
+            if is_terminal {
+                got_first_gen = token_id;
+                break;
+            }
+            cur_hidden = hid;
+            cur_hash = hash;
+        }
+        if pos_idx == prompt_len - 1 {
+            first_gen_token = got_first_gen;
+        }
+    }
+    if let Some(tok) = first_gen_token {
+        if !model.config.eos_tokens.contains(&tok) {
+            generated.push(tok);
+        }
+    }
+
+    // === Generation: each subsequent token feeds the previous as input.
+    for gen_idx in 1..(max_tokens as usize) {
+        if let Some(last) = generated.last() {
+            if model.config.eos_tokens.contains(last) { break; }
+        }
+        let position = prompt_len + gen_idx - 1;
+        let input_token = *generated.last().unwrap_or(&all_tokens[prompt_len - 1]);
+        let mut cur_hidden: Option<Vec<i64>> = None;
+        let mut cur_hash: Option<String> = None;
+        let mut next_tok: Option<u32> = None;
+        for (range_idx, ((s_layer, e_layer), replicas)) in pipeline_ranges.iter().enumerate() {
+            let req_body = ForwardShardRequest {
+                request_id: request_id.clone(),
+                token: if range_idx == 0 { Some(input_token) } else { None },
+                hidden: if range_idx == 0 { None } else { cur_hidden.clone() },
+                hidden_hash: if range_idx == 0 { None } else { cur_hash.clone() },
+                position,
+                start_layer: *s_layer,
+                end_layer: *e_layer,
+                last_token: false,
+            };
+            let (hid, hash, is_terminal, token_id, _logits_hash, vote) =
+                consensus_hop(&client, replicas, k_req, &req_body).await
+                    .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
+            votes.push(vote);
+            if is_terminal {
+                next_tok = token_id;
+                break;
+            }
+            cur_hidden = hid;
+            cur_hash = hash;
+        }
+        if let Some(t) = next_tok {
+            if model.config.eos_tokens.contains(&t) { break; }
+            generated.push(t);
+        }
+    }
+
+    // Cleanup — fan out last_token=true to every replica of every range.
+    for (_, replicas) in &pipeline_ranges {
+        for r in replicas {
+            let _ = client.post(format!("http://{}/inference/forward_shard", r.socket_addr))
+                .json(&serde_json::json!({"request_id": request_id, "last_token": true}))
+                .send().await;
+        }
+    }
+
+    let total_ms = overall_start.elapsed().as_millis() as u64;
+    let output_text = model.decode(&generated);
+    let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
+    let output_hash = arc_crypto::hash_bytes(&output_bytes);
+
+    // Summarize consensus: counts of unanimous/majority/split, list of
+    // divergent (replica, hash) tuples across all positions.
+    let mut unanimous = 0; let mut majority = 0; let mut split = 0;
+    let mut divergent_all: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    for v in &votes {
+        match v.agreement.as_str() {
+            "unanimous" => unanimous += 1,
+            "majority" => majority += 1,
+            "split" => split += 1,
+            _ => {}
+        }
+        for (replica, hash) in &v.divergent {
+            divergent_all.entry(replica.clone()).or_default().push(hash.clone());
+        }
+    }
+
+    Ok(Json(json!({
+        "success": true,
+        "request_id": request_id,
+        "input": input_text,
+        "output": output_text,
+        "output_tokens": generated,
+        "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+        "tokens_generated": generated.len(),
+        "total_ms": total_ms,
+        "pipeline_length": pipeline_ranges.len(),
+        "k": k_req,
+        "consensus": {
+            "k": k_req,
+            "votes_total": votes.len(),
+            "unanimous": unanimous,
+            "majority": majority,
+            "split": split,
+            "divergent_replicas": divergent_all,
+        },
     })))
 }
 
