@@ -3266,6 +3266,40 @@ pub fn load_cached_model_ranges(
     aggregate.ternary_output = None;
     aggregate.ternary_hybrid_layers = None;
     aggregate.ternary_hybrid_output = None;
+
+    // Post-load sanity: every layer that was merged in must have consistent
+    // I8Weights dimensions. data.len() MUST equal n_rows * n_cols for each
+    // of the 7 matrices per layer — a mismatch is what causes the dangling-
+    // but-non-null pointer deref in matmul_i8_into / matmul_i16_into. Panic
+    // with the exact layer + matrix + dims so the crash has a backtrace
+    // instead of SIGSEGVing the consensus thread.
+    for &(s, e) in &sorted {
+        for idx in s..e.min(n_layers) {
+            let l = &aggregate.layers[idx];
+            for (name, w) in [
+                ("wq", &l.wq), ("wk", &l.wk), ("wv", &l.wv), ("wo", &l.wo),
+                ("w_gate", &l.w_gate), ("w_up", &l.w_up), ("w_down", &l.w_down),
+            ] {
+                let expected = w.n_rows.saturating_mul(w.n_cols);
+                if w.n_rows != 0 && w.data.len() != expected {
+                    return Err(crate::InferenceError::Runtime(format!(
+                        "load_cached_model_ranges: merged layer {idx}.{name} has \
+                         n_rows={} n_cols={} but data.len()={} (expected {}). \
+                         Multi-range merge corrupted the weight vector — do not \
+                         hand this model to forward_shard_token.",
+                        w.n_rows, w.n_cols, w.data.len(), expected
+                    )));
+                }
+                if w.n_rows != 0 && w.scales.len() != w.n_rows {
+                    return Err(crate::InferenceError::Runtime(format!(
+                        "load_cached_model_ranges: merged layer {idx}.{name} has \
+                         n_rows={} but scales.len()={} (must match n_rows).",
+                        w.n_rows, w.scales.len()
+                    )));
+                }
+            }
+        }
+    }
     Ok(aggregate)
 }
 
