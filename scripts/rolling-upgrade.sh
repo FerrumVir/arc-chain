@@ -263,9 +263,16 @@ REMOTE
         ssh $SSH_OPTS "root@${IP}" "rm -rf /root/arc-chain/arc-data/dag-wal /root/arc-chain/arc-data/state.wal /root/arc-chain/arc-data/known_peers.json"
     fi
 
-    # d. Sync seeds file and genesis
+    # d. Sync seeds file only. genesis.toml is INTENTIONALLY not pushed:
+    # the local copy has SAO + JNB removed (GH #32) but the live DAG
+    # history on every seed still has the 8-validator set baked in. If
+    # a seed ever loses arc-data and bootstraps fresh, it must bootstrap
+    # against the same validator set the live chain already agreed on,
+    # not the smaller local-intent set. genesis.toml changes are a
+    # coordinated chain-restart event and should ship via a separate,
+    # explicit tool when that day comes.
     rsync -az -e "ssh $SSH_OPTS" \
-        "$HOME/arc-chain/testnet-seeds.txt" "$HOME/arc-chain/genesis.toml" \
+        "$HOME/arc-chain/testnet-seeds.txt" \
         "root@${IP}:/root/arc-chain/"
 
     # e. Start new node in screen. MODEL_FILE was snapshotted in step (a0)

@@ -4705,10 +4705,22 @@ async fn inference_run_consensus(
     })))
 }
 
-/// Placeholder bond for consensus-divergence auto-challenges opened by
-/// /inference/run_consensus (#31). Coordinator currently pays on behalf of
-/// the honest majority. The final bond amount and payer are pending TJ's
-/// decision on the open question in GH #31.
+/// Bond for consensus-divergence auto-challenges opened by
+/// /inference/run_consensus (#31).
+///
+/// Decided 2026-04-22:
+///   - Payer: coordinator that received the run_consensus request, from its
+///     own validator address. Coordinator carries reputation/revenue upside
+///     for catching divergence, so it's the right economic actor to post
+///     the witness bond.
+///   - Amount: 100_000 ARC. Sized to be ~2% of a 5M genesis-validator stake
+///     — cheap enough that a coordinator never declines to challenge, large
+///     enough to deter spurious challenges. Revisit if community-tier
+///     validators with smaller stakes become common coordinators.
+///
+/// The divergent replica's actual stake (via VerificationManager slashing)
+/// is the real deterrent; this bond is just the coordinator's skin in the
+/// game for initiating.
 const AUTO_CHALLENGE_BOND: u64 = 100_000;
 
 /// GET /shards
