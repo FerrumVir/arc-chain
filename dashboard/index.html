@@ -450,10 +450,10 @@ async function runLiveBenchmark(){
   const seqStart=Date.now();
   for(let i=1;i<=N;i++){
     try{
-      const r=await fetch(SHARDED_COORDINATOR+'/inference/run_sharded',{
+      const r=await fetch(SHARDED_COORDINATOR+'/inference/run_consensus',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({input:PROMPT,max_tokens:MAX_TOKENS}),
+        body:JSON.stringify({input:PROMPT,max_tokens:MAX_TOKENS,k:3}),
         signal:AbortSignal.timeout(120000)
       });
       const d=await r.json();
@@ -470,10 +470,10 @@ async function runLiveBenchmark(){
   document.getElementById('benchDist').textContent='running...';
   const distStart=Date.now();
   await Promise.all(Array.from({length:N},()=>
-    fetch(SHARDED_COORDINATOR+'/inference/run_sharded',{
+    fetch(SHARDED_COORDINATOR+'/inference/run_consensus',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({input:PROMPT,max_tokens:MAX_TOKENS}),
+      body:JSON.stringify({input:PROMPT,max_tokens:MAX_TOKENS,k:3}),
       signal:AbortSignal.timeout(120000)
     }).then(r=>r.json()).then(d=>distHashes.push(d.output_hash)).catch(e=>console.error(e))
   ));
@@ -683,10 +683,10 @@ async function runShardedInference(){
 
   const t0 = Date.now();
   try{
-    const r = await fetch(SHARDED_COORDINATOR + '/inference/run_sharded', {
+    const r = await fetch(SHARDED_COORDINATOR + '/inference/run_consensus', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({input: prompt, max_tokens: 20}),
+      body: JSON.stringify({input: prompt, max_tokens: 20, k: 3}),
       signal: AbortSignal.timeout(180000)
     });
     const d = await r.json();
@@ -914,10 +914,10 @@ async function verifyHistoryRun(idx, prompt, originalHash){
   btn.classList.remove('bg-arc-500/10', 'hover:bg-arc-500/30');
   btn.classList.add('bg-gray-600/30');
   try {
-    const r = await fetch(SHARDED_COORDINATOR + '/inference/run_sharded', {
+    const r = await fetch(SHARDED_COORDINATOR + '/inference/run_consensus', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({input: prompt, max_tokens: 20}),
+      body: JSON.stringify({input: prompt, max_tokens: 20, k: 3}),
       signal: AbortSignal.timeout(180000)
     });
     const d = await r.json();
@@ -990,10 +990,10 @@ async function runCustomPromptOnAll(){
   const promises=infNodes.map(async n=>{
     const t0=Date.now();
     try{
-      const r=await fetch(SHARDED_COORDINATOR+'/inference/run_sharded',{
+      const r=await fetch(SHARDED_COORDINATOR+'/inference/run_consensus',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({input:prompt,max_tokens:20}),
+        body:JSON.stringify({input:prompt,max_tokens:20,k:3}),
         signal:AbortSignal.timeout(120000)
       });
       const d=await r.json();
@@ -1084,10 +1084,10 @@ async function runInferenceOn(ip,name){
     const start=Date.now();
     // Route through the shard coordinator — single-node /inference/run
     // on a seed only has 2-5 layers and returns <unk> tokens.
-    const r=await fetch(SHARDED_COORDINATOR+'/inference/run_sharded',{
+    const r=await fetch(SHARDED_COORDINATOR+'/inference/run_consensus',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({input:'What is the largest planet?',max_tokens:15}),
+      body:JSON.stringify({input:'What is the largest planet?',max_tokens:15,k:3}),
       signal:AbortSignal.timeout(60000)
     });
     const d=await r.json();

@@ -74,6 +74,13 @@ pub struct NodeState {
     /// hold a shard but no longer do (e.g. after `arc-node` restarts without
     /// --shard-start/--shard-end flags) from polluting the pipeline walker.
     pub shard_registry: Arc<dashmap::DashMap<String, (ShardInfo, std::time::Instant)>>,
+    /// Per-replica rolling EWMA of forward_shard hop latency (ms). Keyed by
+    /// socket_addr. Populated after every successful hop; consumed by the
+    /// coordinator to sort replica lists ascending before picking primary
+    /// (run_sharded) or the top-k (run_consensus). Does not affect output
+    /// determinism — only WHICH replica answers, not WHAT it answers.
+    /// Closes #29.
+    pub latency_stats: Arc<dashmap::DashMap<String, LatencyEWMA>>,
     /// Total sharded inference runs served by this node since boot.
     /// Incremented every time /inference/run_sharded completes successfully.
     pub sharded_runs_total: Arc<AtomicU64>,
@@ -120,6 +127,17 @@ pub struct NodeState {
     /// sender and delivers the WorkResult. The coordinator awaits the
     /// oneshot::Receiver to resume the pipeline walk.
     pub community_work_results: Option<Arc<dashmap::DashMap<String, tokio::sync::oneshot::Sender<WorkResult>>>>,
+}
+
+/// Rolling EWMA of forward_shard hop latency for a single replica socket.
+/// `ms` is the smoothed latency in milliseconds; `count` is the number of
+/// samples folded in; `last_updated` is used for the /inference/latency_stats
+/// endpoint (freshness display). Created on first successful hop.
+#[derive(Debug, Clone)]
+pub struct LatencyEWMA {
+    pub ms: f64,
+    pub count: u64,
+    pub last_updated: std::time::Instant,
 }
 
 /// Describes which slice of a model a node holds.
@@ -204,6 +222,49 @@ fn fresh_shards(
     keep
 }
 
+/// Rolling EWMA weight for new samples. α = 0.2 gives recent hops meaningful
+/// pull while keeping a multi-sample memory — a single outlier won't steal
+/// primary, but a sustained shift in latency rebalances within ~5-10 hops.
+const LATENCY_ALPHA: f64 = 0.2;
+
+/// Fold a hop observation into the EWMA for `socket`.
+pub fn record_latency(
+    stats: &dashmap::DashMap<String, LatencyEWMA>,
+    socket: &str,
+    hop_ms: u64,
+) {
+    let hop = hop_ms as f64;
+    let now = std::time::Instant::now();
+    stats
+        .entry(socket.to_string())
+        .and_modify(|e| {
+            e.ms = LATENCY_ALPHA * hop + (1.0 - LATENCY_ALPHA) * e.ms;
+            e.count = e.count.saturating_add(1);
+            e.last_updated = now;
+        })
+        .or_insert_with(|| LatencyEWMA { ms: hop, count: 1, last_updated: now });
+}
+
+/// Sort a replica bucket by EWMA latency ascending. Unseen replicas (no
+/// sample yet) are placed AFTER seen ones but keep their insertion order
+/// — this keeps cold-start behavior identical to the old first-match logic
+/// and avoids starving an unseen replica of its first try.
+pub fn sort_replicas_by_latency(
+    replicas: &mut Vec<ShardInfo>,
+    stats: &dashmap::DashMap<String, LatencyEWMA>,
+) {
+    replicas.sort_by(|a, b| {
+        let a_ms = stats.get(&a.socket_addr).map(|v| v.ms);
+        let b_ms = stats.get(&b.socket_addr).map(|v| v.ms);
+        match (a_ms, b_ms) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+    });
+}
+
 /// Build a `NodeState` from components.
 pub fn build_node_state(
     state: Arc<StateDB>,
@@ -238,6 +299,7 @@ pub fn build_node_state(
         shard_infos: Vec::new(),
         shard_kv_caches: Arc::new(dashmap::DashMap::new()),
         shard_registry: Arc::new(dashmap::DashMap::new()),
+        latency_stats: Arc::new(dashmap::DashMap::new()),
         sharded_runs_total: Arc::new(AtomicU64::new(0)),
         sharded_bytes_total: Arc::new(AtomicU64::new(0)),
         attestation_nonce: Arc::new(AtomicU64::new(0)),
@@ -339,6 +401,7 @@ pub async fn serve(
         .route("/inference/forward_shard", post(inference_forward_shard))
         // Deterministic inference cache introspection
         .route("/inference/cache_stats", get(inference_cache_stats))
+        .route("/inference/latency_stats", get(inference_latency_stats))
         .route("/inference/cache_check", post(inference_cache_check))
         // Shard registry — discovery + announcement
         .route("/shards", get(get_shards))
@@ -3257,6 +3320,35 @@ async fn inference_cache_stats(
     }))
 }
 
+/// GET /inference/latency_stats
+/// Returns the rolling EWMA hop latency (ms) per replica socket, plus sample
+/// count and age. Coordinators use this map to sort per-range replica lists
+/// before picking primary (run_sharded) or top-k (run_consensus). Closes #29.
+async fn inference_latency_stats(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<serde_json::Value> {
+    let mut entries: Vec<serde_json::Value> = Vec::with_capacity(node.latency_stats.len());
+    for kv in node.latency_stats.iter() {
+        let (socket, stat) = (kv.key().clone(), kv.value().clone());
+        entries.push(json!({
+            "socket": socket,
+            "ewma_ms": (stat.ms * 100.0).round() / 100.0,
+            "samples": stat.count,
+            "age_secs": stat.last_updated.elapsed().as_secs(),
+        }));
+    }
+    entries.sort_by(|a, b| {
+        let ae = a.get("ewma_ms").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+        let be = b.get("ewma_ms").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+        ae.partial_cmp(&be).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Json(json!({
+        "alpha": LATENCY_ALPHA,
+        "count": entries.len(),
+        "replicas": entries,
+    }))
+}
+
 /// POST /inference/cache_check
 /// Given a list of prompts, report for each whether it is currently warm
 /// in the cache. The dashboard uses this to show a "✓ instant" badge on
@@ -3512,11 +3604,14 @@ async fn inference_run_sharded(
     // Filter stubs out of the final replica list — a stub address can't be
     // dialed so it can never satisfy a coordinator hop. Keep the entry only
     // if it was the only announcement we have for that node.
+    // #29: also sort each bucket by rolling EWMA latency ascending so the
+    // fastest replica for this range wins primary on the next dispatch.
     for bucket in by_range.values_mut() {
         let routable: Vec<ShardInfo> = bucket.iter().filter(|s| !is_stub(&s.socket_addr)).cloned().collect();
         if !routable.is_empty() {
             *bucket = routable;
         }
+        sort_replicas_by_latency(bucket, &node.latency_stats);
     }
     // Pipeline becomes one entry per range with its replica list attached.
     // The first replica in each Vec is the current primary.
@@ -3692,6 +3787,9 @@ async fn inference_run_sharded(
             let mut rx = rxs[i].take().expect("rx slot populated");
             let tx_out = txs[i + 1].clone();
             let is_last_shard = i == num_shards - 1;
+            // #29: hand the latency map into the spawn so successful hops fold
+            // into the EWMA used for the next dispatch's sort.
+            let lat_stats = node.latency_stats.clone();
 
             let handle = tokio::spawn(async move {
                 let mut bytes_this_shard: usize = 0;
@@ -3735,6 +3833,7 @@ async fn inference_run_sharded(
                                     bytes_this_shard += payload_bytes.len();
                                     resp_opt = Some(j);
                                     served_by = Some(shard.node_name.clone());
+                                    record_latency(&lat_stats, &shard.socket_addr, t_hop.elapsed().as_millis() as u64);
                                     break;
                                 }
                                 Err(e) => {
@@ -3913,6 +4012,7 @@ async fn inference_run_sharded(
             let mut last_err = String::new();
             for replica in try_order.drain(..) {
                 let url = format!("http://{}/inference/forward_shard", replica.socket_addr);
+                let t_hop = std::time::Instant::now();
                 let attempt = client.post(&url)
                     .header("Content-Type", "application/json")
                     .body(payload_bytes.clone())
@@ -3923,6 +4023,7 @@ async fn inference_run_sharded(
                     Ok(r) => match r.json::<ForwardShardResponse>().await {
                         Ok(j) => {
                             total_bytes_transferred += payload_bytes.len();
+                            record_latency(&node.latency_stats, &replica.socket_addr, t_hop.elapsed().as_millis() as u64);
                             resp_opt = Some(j);
                             break;
                         }
@@ -4221,11 +4322,15 @@ async fn inference_run_consensus(
             }
         }
     }
+    // #29: sort each bucket by rolling EWMA latency before taking the top-k.
+    // Does not affect determinism (hash-majority still enforces correctness);
+    // just biases us toward lower-latency replicas first.
     for bucket in by_range.values_mut() {
         let routable: Vec<ShardInfo> = bucket.iter().filter(|s| !stub(&s.socket_addr)).cloned().collect();
         if !routable.is_empty() {
             *bucket = routable;
         }
+        sort_replicas_by_latency(bucket, &node.latency_stats);
     }
     let pipeline_ranges: Vec<((usize, usize), Vec<ShardInfo>)> = by_range.into_iter().collect();
     if pipeline_ranges.is_empty() {
@@ -4292,6 +4397,7 @@ async fn inference_run_consensus(
         replicas: &[ShardInfo],
         k: usize,
         req: &ForwardShardRequest,
+        lat_stats: &Arc<dashmap::DashMap<String, LatencyEWMA>>,
     ) -> Result<(Option<Vec<i64>>, Option<String>, bool, Option<u32>, Option<String>, RangeVote), String> {
         let use_k = k.min(replicas.len()).max(1);
         let selected: Vec<ShardInfo> = replicas.iter().take(use_k).cloned().collect();
@@ -4303,7 +4409,10 @@ async fn inference_run_consensus(
             let c = client.clone();
             let b = body.clone();
             let r_clone = r.clone();
+            let stats = lat_stats.clone();
+            let socket = r.socket_addr.clone();
             futs.push(tokio::spawn(async move {
+                let t_hop = std::time::Instant::now();
                 let send_res = c.post(&url).header("Content-Type","application/json").body(b).send().await;
                 let parsed: Result<ForwardShardResponse, String> = match send_res {
                     Ok(r) => match r.error_for_status() {
@@ -4313,6 +4422,9 @@ async fn inference_run_consensus(
                     },
                     Err(e) => Err(format!("send: {}", e)),
                 };
+                if parsed.is_ok() {
+                    record_latency(&stats, &socket, t_hop.elapsed().as_millis() as u64);
+                }
                 (r_clone.node_name.clone(), parsed)
             }));
         }
@@ -4409,7 +4521,7 @@ async fn inference_run_consensus(
                 last_token: false,
             };
             let (hid, hash, is_terminal, token_id, _logits_hash, vote) =
-                consensus_hop(&client, replicas, k_req, &req_body).await
+                consensus_hop(&client, replicas, k_req, &req_body, &node.latency_stats).await
                     .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
             votes.push(vote);
             if is_terminal {
@@ -4451,7 +4563,7 @@ async fn inference_run_consensus(
                 last_token: false,
             };
             let (hid, hash, is_terminal, token_id, _logits_hash, vote) =
-                consensus_hop(&client, replicas, k_req, &req_body).await
+                consensus_hop(&client, replicas, k_req, &req_body, &node.latency_stats).await
                     .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
             votes.push(vote);
             if is_terminal {
@@ -4497,6 +4609,79 @@ async fn inference_run_consensus(
         }
     }
 
+    // #31: auto-open a verification commitment + challenge for each divergent
+    // replica. One commitment per (replica, hash) tuple representing that
+    // replica's claimed output; one challenge from this coordinator against
+    // that commitment. Slashing resolution runs on the existing
+    // VerificationManager path. Bond is a placeholder — the final value and
+    // payer (coordinator treasury vs honest-majority split) still needs TJ's
+    // call (open question from the issue body).
+    let mut auto_challenges: Vec<Value> = Vec::new();
+    if !divergent_all.is_empty() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let request_id_bytes = arc_crypto::hash_bytes(request_id.as_bytes()).0;
+        match node.verification_manager.lock() {
+            Ok(mut mgr) => {
+                for (replica_name, hashes) in &divergent_all {
+                    // Provider identity for the divergent replica. We don't
+                    // have their real validator_address from the inference
+                    // path — only their node_name + socket. Derive a stable
+                    // pseudo-address by hashing "divergent:<name>" so repeat
+                    // offenses by the same replica resolve to the same ID.
+                    // Reconciling this with the real validator address is
+                    // covered in the open-question section of the issue.
+                    let provider_id = arc_crypto::hash_bytes(
+                        format!("divergent:{replica_name}").as_bytes()
+                    ).0;
+                    // Use the first divergent hash as the offending
+                    // result_hash; additional hashes from the same replica
+                    // (multiple positions) are folded into the same provider
+                    // record but only the first is committed here.
+                    let their_hash = hashes.first().cloned().unwrap_or_default();
+                    let commit = arc_vm::inference_verify::InferenceCommitment {
+                        request_id: request_id_bytes,
+                        result_hash: arc_crypto::hash_bytes(their_hash.as_bytes()).0,
+                        provider: provider_id,
+                        timestamp,
+                        bond_amount: AUTO_CHALLENGE_BOND,
+                    };
+                    let commitment_id = mgr.submit_commitment(commit);
+                    match mgr.create_challenge(
+                        commitment_id,
+                        node.validator_address.0,
+                        arc_vm::inference_verify::ChallengeType::ConsensusVerification,
+                        AUTO_CHALLENGE_BOND,
+                    ) {
+                        Ok(challenge_id) => {
+                            auto_challenges.push(json!({
+                                "divergent_replica": replica_name,
+                                "their_hash": their_hash,
+                                "divergent_hash_count": hashes.len(),
+                                "commitment_id": format!("0x{}", hex::encode(commitment_id)),
+                                "challenge_id": format!("0x{}", hex::encode(challenge_id)),
+                                "challenger": node.validator_address.to_hex(),
+                                "bond_amount": AUTO_CHALLENGE_BOND,
+                            }));
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "auto-challenge create failed for {}: {}", replica_name, e
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "verification manager lock poisoned; skipping auto-challenges: {}", e
+                );
+            }
+        }
+    }
+
     Ok(Json(json!({
         "success": true,
         "request_id": request_id,
@@ -4515,9 +4700,16 @@ async fn inference_run_consensus(
             "majority": majority,
             "split": split,
             "divergent_replicas": divergent_all,
+            "auto_challenges": auto_challenges,
         },
     })))
 }
+
+/// Placeholder bond for consensus-divergence auto-challenges opened by
+/// /inference/run_consensus (#31). Coordinator currently pays on behalf of
+/// the honest majority. The final bond amount and payer are pending TJ's
+/// decision on the open question in GH #31.
+const AUTO_CHALLENGE_BOND: u64 = 100_000;
 
 /// GET /shards
 /// Returns the local shard registry — every node this coordinator knows about
@@ -4534,14 +4726,20 @@ async fn get_shards(
     let model_id = shards.first().map(|s| s.model_id.clone()).unwrap_or_default();
     let model_name = shards.first().map(|s| s.model_name.clone()).unwrap_or_default();
 
+    // Dedup ranges across replicas. With 3× replication each range appears
+    // three times in `shards`; walking the raw list sees the second replica's
+    // start_layer == 0 as a backward step and flips contiguous=false. BTreeSet
+    // collapses duplicates and iterates in sorted (start, end) order.
+    let unique_ranges: std::collections::BTreeSet<(usize, usize)> =
+        shards.iter().map(|s| (s.start_layer, s.end_layer)).collect();
     let mut covered_to = 0usize;
     let mut contiguous = true;
-    for shard in &shards {
-        if shard.start_layer != covered_to {
+    for (start, end) in &unique_ranges {
+        if *start != covered_to {
             contiguous = false;
             break;
         }
-        covered_to = shard.end_layer;
+        covered_to = *end;
     }
     let fully_covered = contiguous && covered_to == total_layers && total_layers > 0;
 
