@@ -25,16 +25,15 @@ A transformer model consists of:
 ARC's sharding splits the N transformer blocks across multiple nodes:
 
 ```
-                  Llama-2-7B Q4 — 32 transformer layers, ~4 GB
-                              split 7 ways across the public internet
+                  Llama-2-7B — 32 transformer layers, 6-seed pipeline
+                  with 3× replication per layer range
 
    token id           hidden state         hidden state         token id
       ↓                    ↓                    ↓                    ↑
   ┌───────┐  ─────►  ┌───────┐  ─────►   ┌───────┐  ─────►   ┌───────┐
-  │ NYC   │          │ LAX   │           │ AMS   │           │ JNB   │
-  │ L 0–4 │  hidden  │ L 5–9 │  hidden   │L10–13 │   hidden  │L28–31 │
+  │ NYC   │          │ LAX   │           │ AMS   │           │ SGP   │
+  │ [0,6) │  hidden  │[6,12) │  hidden   │[12,17)│   hidden  │[27,32)│
   │ +EMBED│  +BLAKE3 │       │  +BLAKE3  │       │  +BLAKE3  │+LM HD │
-  │ ~1 GB │          │ ~1 GB │           │ ~1 GB │           │ ~1 GB │
   └───────┘          └───────┘           └───────┘           └───────┘
 ```
 

@@ -3,6 +3,81 @@
 All notable changes to ARC Chain are tracked here. This project follows
 [semantic versioning](https://semver.org/).
 
+## Unreleased — 2026-04-22
+
+**Cluster self-heal, latency-aware routing, slashing hook-in, retirement of dead seeds.**
+
+### Self-heal daemon (GH #30)
+- **`scripts/arc-self-heal.sh`** — on-host bash daemon running as a systemd
+  unit on each seed. Polls `http://127.0.0.1:9090/health` every 30 s and
+  restarts arc-node on either (a) RPC silence ≥180 s or (b) `dag_round`
+  unchanged ≥300 s while a remote peer is ≥100 rounds ahead. Captures
+  every `--shard-range`, `--model`, and `ARC_PUBLIC_SOCKET` from
+  `/proc/PID/cmdline` + `/proc/PID/environ` so restarts reuse the live
+  argv exactly. Persists last-good snapshot to
+  `/root/arc-chain/.self-heal-last-good.sh` so the daemon can relaunch
+  arc-node from scratch if the process is already dead when the silent
+  threshold fires.
+- **`scripts/arc-self-heal.service`** — systemd unit with `KillMode=process`
+  (so `systemctl restart arc-self-heal` doesn't take arc-node down as
+  cgroup collateral) and NO `MemoryMax` (arc-node inherits the cgroup
+  via setsid and a cap on the supervisor OOM-kills the node during the
+  1 GB embedding load).
+- **`scripts/install-self-heal.sh`** — idempotent per-host installer;
+  refuses to install if `systemctl is-active arc-node` returns active
+  (would conflict with the daemon's spawn path).
+- 5 min `RESTART_DEBOUNCE` (bumped from initial 300 s proposal to 600 s)
+  so a cold-boot cycle fits inside one debounce without flapping.
+- `MIN_HEALTHY_PEERS=4` safety rail — drift-triggered restart refuses to
+  fire if fewer than 4 remote peers are healthy, preventing a cascade
+  from taking consensus below quorum.
+- Deployed to all 6 seeds; two live repairs captured in-session.
+
+### Coordinator routing (GH #29)
+- **`NodeState.latency_stats`** — `DashMap<socket_addr, LatencyEWMA>`
+  (α=0.2). Folded on every successful `forward_shard` hop in both
+  `inference_run_sharded` (prefill worker + gen loop) and
+  `inference_run_consensus` (per-replica parallel dispatch).
+- **Per-range replica lists sorted by EWMA ascending** before the
+  coordinator picks primary (`run_sharded`) or top-k (`run_consensus`).
+  Unseen replicas keep insertion order at the tail so cold-start doesn't
+  starve first-try dispatch.
+- **`GET /inference/latency_stats`** — exposes the map sorted ascending
+  for dashboard / diagnostics. Does not affect determinism — only which
+  replicas answer, not what they answer.
+
+### Divergence → on-chain slashing (GH #31)
+- When `/inference/run_consensus` records non-empty `divergent_replicas`,
+  the handler auto-submits one `InferenceCommitment` per divergent
+  replica via `arc_vm::inference_verify::VerificationManager` and one
+  `VerificationChallenge(ConsensusVerification)` from the coordinator.
+- Response JSON gains `consensus.auto_challenges[]` with
+  `commitment_id`, `challenge_id`, `divergent_replica`, `their_hash`.
+- `AUTO_CHALLENGE_BOND = 100_000` is a placeholder; final value + payer
+  (coordinator treasury vs honest-majority split) pending operator call.
+- Divergent-replica provider identity derived as
+  `hash("divergent:<node_name>")` — stable pseudo-ID until real
+  validator-address reconciliation lands.
+
+### Cosmetic (GH #33)
+- **`/shards fully_covered`** — walks `BTreeSet<(start_layer, end_layer)>`
+  to dedup the 18-replica list before the contiguity check. Returns
+  `fully_covered=true` on a healthy 3×-replicated deployment.
+
+### Dashboard (GH #34)
+- **`dashboard/index.html`** — all 6 inference fetch sites swapped from
+  `/inference/run_sharded` to `/inference/run_consensus` with `k:3`.
+  The "all passing consensus" story now shows in the UI by default.
+
+### Retirements (GH #32)
+- **SAO (216.238.120.27)** and **JNB (139.84.237.49)** retired from the
+  validator set: removed from `testnet-seeds.txt` (pushed to all 6 live
+  seeds) and from `genesis.toml` (local only — live DAG history still
+  has the 8-validator set; change takes effect on next coordinated
+  genesis event). Both had been RPC-dead for weeks with unreliable
+  datacenter connectivity; 6-seed × 3× replication already covers the
+  inference pipeline.
+
 ## v0.5.2 — 2026-04-11
 
 **Community inference network + SIMD performance + audit hardening.**

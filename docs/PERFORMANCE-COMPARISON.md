@@ -42,11 +42,11 @@ We're not pretending otherwise.
 
 ## Where the latency goes
 
-For a single token through the 7-shard pipeline (~12-15 sec):
+For a single token through the 6-shard pipeline with 3× replication per range (~10-13 sec):
 
 | Step | Time | % |
 |------|------|---|
-| HTTP roundtrip NYC → LAX → AMS → LHR → NRT → SGP → JNB | ~9-10 sec | ~70% |
+| HTTP roundtrip NYC → LAX → AMS → LHR → NRT → SGP | ~7-8 sec | ~65% |
 | Per-shard compute (5 transformer layers each, INT16 matmul on CPU) | ~1-2 sec | ~15% |
 | BLAKE3 hash verification at each hop | ~50 ms | <1% |
 | JSON encode/decode at each hop | ~100 ms | ~1% |
@@ -60,7 +60,7 @@ This is the simplest correct version. There are obvious wins waiting:
 - **Pipeline overlap** — start the next token's forward through shard 0 while the previous token is still in transit. Should give roughly N× speedup for long generations. Currently O(N · pipeline_length); could be O(N + pipeline_length) per N tokens.
 - **Smaller wire format** — hidden states are sent as i64 JSON arrays (~25 KB per hop). Switching to raw little-endian binary or msgpack would cut that to ~32 KB total per token across all hops.
 - **GPU shards** — drop the integer engine on the hot path, use Metal/CUDA where available, while still hashing the inputs and outputs for verification. Mixes GPU farms and cheap VPS in the same pipeline.
-- **Closer-together shards** — currently the 7 nodes span 6 continents. Latency is dominated by RTT. A pipeline of 7 nodes in the same datacenter would drop wall time by 5-10×.
+- **Closer-together shards** — currently the 6 seeds span 3 continents (N. America · Europe · Asia). Latency is dominated by RTT. A pipeline of 6 nodes in the same datacenter would drop wall time by 5-10×.
 - **Batched generation** — coordinator pre-encodes multiple input tokens, ships them in one HTTP body, last shard returns multiple output tokens. Cuts HTTP overhead per token.
 
 None of these change the fundamental property: the output is still bit-identical and any third party can still re-derive it. The slowness is currently a network artifact, not an algorithm artifact.

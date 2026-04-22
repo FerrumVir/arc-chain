@@ -28,11 +28,12 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 
 | | |
 |---|---|
-| **8 seed validators** | NYC · LAX · AMS · LHR · NRT · SGP · SAO · JNB |
-| **Cluster round** | 1.1 M+ and advancing |
+| **6 seed validators** | NYC · LAX · AMS · LHR · NRT · SGP |
+| **Cluster round** | 1.3 M+ and advancing |
 | **DAG finality** | ~24 ms (2-round commit) |
+| **Self-healing** | each seed runs `arc-self-heal` — drift or RPC silence auto-restarts the node with shard flags preserved |
 | **Deterministic inference** | INT16 engine, ARM Mac = x86 Linux = identical output hash, verified |
-| **Sharded inference** | 32-layer Llama-2-7B distributed across the 8 seeds, 6 continents, BLAKE3 over every hop |
+| **Sharded inference** | 32-layer Llama-2-7B distributed across 6 seeds with 3× replication per layer range, BLAKE3 over every hop |
 | **On-chain attestations** | Every inference produces `InferenceAttestation` (0x16) with model hash + input hash + output hash |
 | **Live dashboard** | http://140.82.16.112:3200 |
 | **Web wallet** | http://140.82.16.112:3100 |
@@ -63,7 +64,7 @@ Fetches the newest attestation, re-executes the same prompt against the same mod
 curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
 ```
 
-Pre-built 16 MB binary. Registers as a launchd / systemd service. Auto-updates daily. Connects to all 8 seeds and starts serving inference with on-chain attestations.
+Pre-built 16 MB binary. Registers as a launchd / systemd service. Auto-updates daily. Connects to the 6 seeds and starts serving inference with on-chain attestations.
 
 ---
 
@@ -118,28 +119,23 @@ The deterministic integer engine is **2.3× faster than floating-point** on GPU.
 ## How the sharding works
 
 ```
-                  Llama-2-7B Q4 — 32 transformer layers, ~4 GB
-                          split across the public internet
+                  Llama-2-7B — 32 transformer layers, 6 seed nodes,
+                    3× replication per layer range
 
-   token id           hidden state         hidden state         token id
-      ↓                    ↓                    ↓                    ↑
-  ┌───────┐  ─────►  ┌───────┐  ─────►   ┌───────┐  ─────►   ┌───────┐
-  │ NYC   │          │ LAX   │           │ AMS   │           │ JNB   │
-  │ L 0–4 │  hidden  │ L 5–9 │  hidden   │L10–13 │   hidden  │L28–31 │
-  │ +EMBED│  +BLAKE3 │       │  +BLAKE3  │       │  +BLAKE3  │+LM HD │
-  │ ~1 GB │          │ ~1 GB │           │ ~1 GB │           │ ~1 GB │
-  └───────┘          └───────┘           └───────┘           └───────┘
-       │                  │                   │                   ↑
-       │                  │            ┌───────┐    hidden        │
-       │                  │     ┌─────►│ LHR   │   +BLAKE3 ──►    │
-       │                  │            │L14–18 │                  │
-       │                  │            └───────┘                  │
-       │                  │                                       │
-       │                  │   ──── ... ────► NRT L19–22 ────►     │
-       │                  │                   SGP L23–27 ─────────┘
-       │                  │
-   port 9090         port 9090            port 9090           port 9090
-   149.28.32.76    140.82.16.112         136.244.109.1      139.84.237.49
+  token id  →  [0,6)  →  [6,12)  →  [12,17)  →  [17,22)  →  [22,27)  →  [27,32)  →  token id
+                EMBED                                                      LM HEAD
+
+  range           replicas (any one answers, failover to the next)
+  ─────           ────────────────────────────────────────────────
+  [0,6)           AMS · LAX · NYC
+  [6,12)          AMS · LAX · LHR
+  [12,17)         AMS · LHR · NRT
+  [17,22)         LHR · NRT · SGP
+  [22,27)         NRT · NYC · SGP
+  [27,32)         LAX · NYC · SGP
+
+  NYC 149.28.32.76   LAX 140.82.16.112   AMS 136.244.109.1
+  LHR 104.238.171.11 NRT 202.182.107.41  SGP 149.28.153.31   (port 9090)
 ```
 
 Each `→` is a `POST /inference/forward_shard` to the next shard. Each shard verifies the previous shard's BLAKE3 hash before computing. The last shard runs `final_norm + LM head + argmax` and returns the next token id. The coordinator collects tokens until `max_tokens` or EOS.
@@ -221,9 +217,11 @@ Every line below is live on the testnet right now:
 
 | | |
 |---|---|
-| DAG consensus, 2-round commit, ~24 ms finality | ✅ 8 nodes, 6 continents |
+| DAG consensus, 2-round commit, ~24 ms finality | ✅ 6 nodes, 3 continents |
+| Self-heal daemon per seed (drift or RPC-silence auto-restart) | ✅ `arc-self-heal.service` |
 | Deterministic INT16 inference, bit-identical cross-arch | ✅ ARM = x86 proof |
-| Sharded inference across 8 seeds, hop-level BLAKE3 | ✅ `/inference/run_sharded` |
+| Sharded inference across 6 seeds, 3× replication, hop-level BLAKE3 | ✅ `/inference/run_sharded` (fast path) |
+| k-of-n consensus inference with divergence detection | ✅ `/inference/run_consensus` (dashboard default) |
 | Content-addressed model chunks (no GGUF download) | ✅ `/chunks/get/{hash}` |
 | Heterogeneous hardware scheduler, race-top-K | ✅ `/inference/plan` |
 | Auto-shard node onboarding | ✅ `--auto-shard` flag |
@@ -239,7 +237,7 @@ Every line below is live on the testnet right now:
 
 ## Network endpoints
 
-All 8 seeds serve the same API on port 9090. Auto-pick a healthy one:
+All 6 seeds serve the same API on port 9090. Auto-pick a healthy one:
 
 ```bash
 COORDINATOR=$(bash scripts/arc-pick-coordinator.sh)
@@ -254,8 +252,6 @@ curl "$COORDINATOR/health"
 | LHR | London | http://104.238.171.11:9090 |
 | NRT | Tokyo | http://202.182.107.41:9090 |
 | SGP | Singapore | http://149.28.153.31:9090 |
-| SAO | São Paulo | http://216.238.120.27:9090 |
-| JNB | Johannesburg | http://139.84.237.49:9090 |
 
 Key endpoints:
 

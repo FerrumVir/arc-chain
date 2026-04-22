@@ -1,12 +1,13 @@
-# ARC Chain — Status (v0.5.2, 2026-04-11)
+# ARC Chain — Status (2026-04-22)
 
-Current production state of the ARC testnet. Updated from the multi-day
-engineering sprint (2026-04-07 → 2026-04-11). **70+ commits, 68 tests,
-community inference network live.**
+Current production state of the ARC testnet. Refreshed 2026-04-22 to reflect
+the cluster self-heal / latency-aware routing / slashing wire-up / SAO+JNB
+retirement landing this week. **The source of truth for what actually runs;
+CHANGELOG.md tracks what changed when.**
 
 ## TL;DR
 
-A real **Llama-2-7B-Chat Q4_K_M** is running across **7 separate VPS in 7 cities** (NYC, LAX, AMS, LHR, NRT, SGP, JNB), with each node holding 4–5 of the 32 transformer layers. A request flows through the pipeline via HTTP, every hidden state is BLAKE3-hashed, and the output is bit-identical regardless of which node holds which slice.
+A real **Llama-2-7B** is running across **6 separate VPS in 6 cities** (NYC, LAX, AMS, LHR, NRT, SGP) with **3× replication per layer range** — 6 contiguous ranges spanning the 32 transformer layers, each held by 3 seeds. A request flows through the pipeline via HTTP, every hidden state is BLAKE3-hashed, and the output is bit-identical regardless of which replica answers each hop. `/inference/run_consensus` fires to k=3 replicas in parallel and requires majority hash agreement; `/inference/run_sharded` picks the fastest and falls over to the next on failure.
 
 **Live demo**: http://140.82.16.112:3200 — type a prompt in the "Sharded AI" panel.
 
@@ -29,7 +30,7 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/ins
 
 ## What works (verified live)
 
-- ✅ **7-shard pipeline** running Llama-2-7B-Chat across NYC → LAX → AMS → LHR → NRT → SGP → JNB
+- ✅ **6-shard pipeline with 3× replication** running Llama-2-7B across NYC, LAX, AMS, LHR, NRT, SGP — 18 replica entries across 6 contiguous layer ranges
 - ✅ **TJ Mac upgraded to v0.4.6** as a 9th node (parallel mode, full model loaded)
 - ✅ **Coherent factual outputs**: "The largest planet is" → "Jupiter, which is more than 1,31...", "The capital of France is" → "Paris.", "The fastest land animal is" → "the cheetah", "The currency of Japan is" → "the Japanese yen (JPY)", "The longest river is" → "the Nile River"
 - ✅ **Cross-platform integer determinism**: same prompt → same output_hash on every replay
@@ -40,11 +41,11 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/ins
 - ✅ **On-chain attestation** for every sharded run with `model_id`, `input_hash`, `output_hash`
 - ✅ **Unique attestation tx_hash per submission** (atomic nonce bump fixes mempool dedupe)
 - ✅ **Cryptographic verifier**: `arc-verify.sh --latest` re-derives the newest inference and prints ✓ VERIFIED
-- ✅ **Model identity verified**: all 7 shards report identical BLAKE3 model_id (`0xabec2d58...`)
+- ✅ **Model identity verified**: all 18 replica entries (6 ranges × 3 replicas) report identical BLAKE3 model_id (`0xabec2d58...`)
 - ✅ **Community installer** auto-detects platform, installs persistent service, schedules daily auto-update
 - ✅ **GitHub Actions release workflow** auto-builds Mac arm64 + Linux x86_64 on tag push (5+ consecutive successful auto-releases through v0.4.6)
-- ✅ **Watchdog** preserves shard flags through restarts; network self-heals from individual node failures
-- ✅ **Dashboard** shows live pipeline diagram with per-hop trace replay, model_id verify badge, server-side activity counters (aggregated across all 8 nodes), persisted run history with per-run Verify button, copy-pasteable join command, and Open Graph meta tags for shareable previews
+- ✅ **Self-heal daemon (`arc-self-heal`)** on every seed — auto-restarts arc-node on RPC silence or consensus drift, preserving every `--shard-range`, `--model`, and `ARC_PUBLIC_SOCKET` via `/proc/PID/cmdline` + `environ`. Deployed to all 6 seeds 2026-04-22 (GH #30).
+- ✅ **Dashboard** defaults to `/inference/run_consensus` (GH #34) with k=3; shows live pipeline diagram with per-hop trace replay, model_id verify badge, server-side activity counters aggregated across the 6 seeds, persisted run history with per-run Verify button, copy-pasteable join command, and Open Graph meta tags for shareable previews
 
 ## What's flaky / known issues
 
@@ -96,7 +97,8 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 - `scripts/arc-demo.sh` — end-to-end demo (discover pipeline → run inference → determinism check → isolation check)
 - `scripts/arc-verify.sh` — third-party attestation verifier with `--latest` mode
 - `scripts/arc-bench.sh` — factual benchmark with markdown report
-- `scripts/arc-watchdog.sh` — testnet watchdog (preserves shard flags on restart)
+- `scripts/arc-self-heal.sh` + `.service` + `install-self-heal.sh` — per-host self-heal daemon (GH #30). Systemd unit on each seed auto-restarts arc-node on RPC silence / consensus drift, preserves shard flags via `/proc/PID/cmdline`.
+- `scripts/arc-watchdog.sh` — legacy off-cluster watchdog, superseded by `arc-self-heal`.
 - `scripts/arc-health-check.sh` — network-wide health probe
 - `.github/workflows/release.yml` — auto-build + auto-publish on tag push
 
@@ -104,7 +106,7 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 - "Sharded AI" hero section with live pipeline diagram
 - Custom prompt input with 5 preset buttons (one-click factual demos)
 - Real per-hop trace replay using actual wall_ms timings
-- Server-side counter aggregation across all 8 nodes
+- Server-side counter aggregation across the 6 seeds
 - Model_id verification badge (green ✓ when all shards match)
 - Persisted run history with per-run "↻ Verify" button
 - "Join the network" panel with 📋 Copy install command
@@ -130,12 +132,12 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 
 ## Headline numbers
 
-- **7 shards** of Llama-2-7B-Chat Q4_K_M serving sharded inference
-- **8 testnet seed nodes** in NYC, LAX, AMS, LHR, NRT, SGP, SAO, JNB (SAO has only 4 GB RAM and runs the parallel TinyLlama instead)
-- **32 transformer layers** split contiguously: NYC 0-4, LAX 5-9, AMS 10-13, LHR 14-18, NRT 19-22, SGP 23-27, JNB 28-31 + LM head
-- **~1 GB per node** of weights (the full model is ~4 GB; you'd need a single beefy node to hold it without sharding)
+- **6 layer ranges × 3 replicas** of Llama-2-7B serving sharded inference (18 replica entries total)
+- **6 testnet seed nodes** in NYC, LAX, AMS, LHR, NRT, SGP (SAO + JNB retired 2026-04-22, GH #32)
+- **32 transformer layers** split into 6 contiguous ranges: [0,6), [6,12), [12,17), [17,22), [22,27), [27,32). Each range is held by 3 seeds — any one can answer a hop, primary picked by EWMA latency.
+- **~1.1 GB per range-replica** of weights (the full model is ~4 GB; a multi-range seed like AMS holds 3 ranges = ~3.3 GB in RAM)
 - **~150 KB transferred per token** across the network (i64 hidden states + JSON envelope + BLAKE3 hash)
-- **~12-15 sec/token** wall time end-to-end (slow because of HTTP roundtrips through 7 hops)
+- **~10-13 sec/token** wall time end-to-end via `/inference/run_sharded`; `/inference/run_consensus` with k=3 is slower per-hop but catches hash divergence
 - **10/10 unique output_hashes** under 10x concurrent load
 - **9/10 factually correct** answers in the 10-prompt benchmark
 - **0% precision loss** vs the source GGUF model (per-row INT16 quantized from f32)
@@ -152,7 +154,7 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 ## Live endpoints
 
 - Dashboard: http://140.82.16.112:3200
-- Coordinator RPC: auto-discovered via `bash scripts/arc-pick-coordinator.sh` (probes all 8 seeds, returns first healthy one)
+- Coordinator RPC: auto-discovered via `bash scripts/arc-pick-coordinator.sh` (probes the 6 seeds, returns first healthy one)
 - Shard registry: `/shards` on whichever coordinator was picked
 - Health: `bash scripts/arc-health-check.sh`
 - GitHub: https://github.com/FerrumVir/arc-chain

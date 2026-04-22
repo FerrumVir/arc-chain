@@ -19,10 +19,11 @@ These are for the operator running the testnet, not for end users.
 
 | Script | What it does |
 |--------|-------------|
-| [`arc-watchdog.sh`](arc-watchdog.sh) | Polls all 8 testnet seeds every 30 s. Detects stuck (round hasn't advanced in 120 s) or isolated (0 peers after 240 s) nodes and restarts them. Critically: preserves `--shard-start`, `--shard-end`, and `--model` flags by reading the live cmdline via ps -ef. |
-| [`arc-health-check.sh`](arc-health-check.sh) | One-shot ping of all 8 seeds via SSH. Prints peer count + dag_round per node. Reports `STATUS: ALL HEALTHY` or `STATUS: SOME NODES DOWN`. |
+| [`arc-self-heal.sh`](arc-self-heal.sh) + [`arc-self-heal.service`](arc-self-heal.service) + [`install-self-heal.sh`](install-self-heal.sh) | **On-host self-heal daemon (GH #30).** Runs as a systemd unit on each seed. Polls localhost `/health`; restarts arc-node on RPC silence (≥180 s) or consensus drift (round unchanged ≥300 s while a remote peer is ≥100 rounds ahead). Reads `/proc/PID/cmdline` + `/proc/PID/environ` so every `--shard-range`, `--model`, and `ARC_PUBLIC_SOCKET` survives the restart. `KillMode=process` in the unit so `systemctl restart arc-self-heal` doesn't take arc-node down as cgroup collateral. Installed via `bash scripts/install-self-heal.sh <NODE_IP>`. |
+| [`arc-watchdog.sh`](arc-watchdog.sh) | Legacy off-cluster watchdog (run from your laptop, SSHes to each seed). Superseded by the on-host `arc-self-heal` daemon above; kept for emergencies when SSH is all you have. |
+| [`arc-health-check.sh`](arc-health-check.sh) | One-shot ping of the 6 seeds via SSH. Prints peer count + dag_round per node. Reports `STATUS: ALL HEALTHY` or `STATUS: SOME NODES DOWN`. |
 | [`rolling-upgrade.sh`](rolling-upgrade.sh) | Builds the new binary on NYC, copies it to each other seed, and rolling-restarts them with health verification. Use `--skip-build` to deploy an existing NYC binary. |
-| [`tps-generator.sh`](tps-generator.sh) | Pumps faucet transfers across all 8 seeds to drive visible TPS on the dashboard. Uses round-robin distribution and configurable worker count. |
+| [`tps-generator.sh`](tps-generator.sh) | Pumps faucet transfers across the 6 seeds to drive visible TPS on the dashboard. Uses round-robin distribution and configurable worker count. |
 
 ## Pre-existing scripts (older)
 
@@ -77,5 +78,8 @@ bash scripts/arc-bench.sh
 **I'm the operator and a node went down:**
 ```bash
 bash scripts/arc-health-check.sh           # see who's down
-nohup bash scripts/arc-watchdog.sh &       # auto-recover
+# Seeds run arc-self-heal as a systemd unit — they self-recover on drift
+# or RPC silence without intervention. If you ever need to install or
+# re-install the daemon on a seed:
+bash scripts/install-self-heal.sh <NODE_IP>
 ```

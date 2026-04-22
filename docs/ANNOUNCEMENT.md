@@ -12,7 +12,7 @@ Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the acti
 ## Try it from your terminal in 5 seconds
 
 ```bash
-# Auto-picks the first healthy coordinator from the 8 testnet seeds
+# Auto-picks the first healthy coordinator from the 6 testnet seeds
 COORDINATOR=$(curl -fsSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh | bash)
 curl -X POST "$COORDINATOR/inference/run_sharded" \
   -H 'Content-Type: application/json' \
@@ -30,7 +30,7 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc
 ```
 
 This single command:
-1. Discovers the live shard pipeline (7 nodes, 32 layers, NYC → LAX → AMS → LHR → NRT → SGP → JNB)
+1. Discovers the live shard pipeline (6 seeds × 3× replication, 32 layers, NYC · LAX · AMS · LHR · NRT · SGP)
 2. Runs a real Llama-2-7B inference and shows the per-hop trace
 3. Re-runs the same prompt and verifies the BLAKE3 hash is bit-identical (cryptographic determinism)
 4. Runs a different prompt and verifies the hash differs (per-request KV cache isolation)
@@ -80,7 +80,7 @@ After install your node is running, joined to the testnet, and visible at the li
 
 ## How it works (one paragraph)
 
-Each shard holds a contiguous range of transformer layers (e.g. NYC has layers 0-4, LAX has 5-9, ..., JNB has 28-31 + the LM head). When you POST a prompt, the coordinator tokenizes it, sends the first token id to shard 0, which embeds it and runs its layers. Shard 0's hidden state is BLAKE3-hashed and sent to shard 1 via HTTP. Shard 1 verifies the hash, runs its layers, hashes its output, sends to shard 2. This continues until the last shard runs the final layer norm + LM head + argmax and returns the next token id. The coordinator collects tokens until `max_tokens` or EOS. Per-row INT16 weights quantized directly from f32, pure i64 arithmetic in the matmul, no floating point anywhere — that's how the output is bit-identical regardless of which node holds which slice.
+Each layer range is held by 3 replicas (e.g. range [0,6) lives on AMS · LAX · NYC; range [27,32) on LAX · NYC · SGP). When you POST a prompt, the coordinator tokenizes it, picks the fastest replica of range 0 (by rolling EWMA latency), which embeds the token and runs its layers. Its hidden state is BLAKE3-hashed and sent to a replica of range 1 via HTTP. Each replica verifies the hash, runs its layers, hashes its output, forwards to the next range. The last range runs `final_norm + LM head + argmax` and returns the next token id. The coordinator collects tokens until `max_tokens` or EOS. Per-row INT16 weights quantized directly from f32, pure i64 arithmetic in the matmul, no floating point anywhere — that's how the output is bit-identical regardless of which replica answers each hop. `/inference/run_consensus` fires k=3 in parallel and requires hash-majority agreement; `/inference/run_sharded` picks the primary and falls over to the next on failure.
 
 For the deep dive: [`docs/HOW-SHARDING-WORKS.md`](HOW-SHARDING-WORKS.md)
 
@@ -92,7 +92,7 @@ For the source: https://github.com/FerrumVir/arc-chain
 
 ## Verified facts (not cherry-picked, run live)
 
-A 10-concurrent stress test (10 different prompts sent in parallel through the same 7-shard pipeline) returned:
+A 10-concurrent stress test (10 different prompts sent in parallel through the 6-range pipeline) returned:
 
 | Prompt | Answer |
 |--------|--------|
@@ -113,8 +113,8 @@ A 10-concurrent stress test (10 different prompts sent in parallel through the s
 
 ## Headline numbers
 
-- **7 shards** of Llama-2-7B-Chat Q4_K_M (4 GB total, ~1 GB per node)
-- **8 testnet seed nodes** in NYC, LAX, AMS, LHR, NRT, SGP, SAO, JNB
+- **6 layer ranges × 3 replicas** of Llama-2-7B (4 GB total, ~1.1 GB per range-replica)
+- **6 testnet seed nodes** in NYC, LAX, AMS, LHR, NRT, SGP
 - **32 transformer layers** split contiguously across the 7 shard nodes
 - **~150 KB** transferred per token across the network (i64 hidden states + JSON envelope + BLAKE3 hashes)
 - **Bit-identical output** across every replay, every machine, every CPU architecture

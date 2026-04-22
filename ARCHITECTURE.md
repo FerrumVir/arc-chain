@@ -269,7 +269,8 @@ Key types for inference:
 | `arc-demo.sh` | End-to-end sharded inference demo |
 | `arc-verify.sh` | Third-party inference verifier |
 | `arc-bench.sh` | Reproducible factual benchmark |
-| `arc-watchdog.sh` | Testnet watchdog (preserves flags on restart) |
+| `arc-self-heal.sh` + `.service` + `install-self-heal.sh` | On-host self-heal daemon (GH #30). Systemd unit on each seed; auto-restarts arc-node on RPC silence or consensus drift with shard flags preserved from `/proc/PID/cmdline`. |
+| `arc-watchdog.sh` | Legacy off-cluster watchdog — superseded by `arc-self-heal` on the hosts. |
 | `arc-health-check.sh` | Network-wide health probe |
 | `rolling-upgrade.sh` | Automated rolling deploy |
 
