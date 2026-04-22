@@ -18,7 +18,7 @@
 202.182.107.41:443    # NRT fallback via 443
 149.28.153.31:9091    # SGP (Singapore)
 149.28.153.31:443     # SGP fallback via 443
-216.238.120.27:9091   # SAO (São Paulo)
-216.238.120.27:443    # SAO fallback via 443
-139.84.237.49:9091    # JNB (Johannesburg)
-139.84.237.49:443     # JNB fallback via 443
+# SAO (São Paulo) and JNB (Johannesburg) retired 2026-04-22 — RPC dead for
+# weeks, underlying datacenter connectivity unreliable (AMS bootstrap dialed
+# both and timed out). 6-node 3× replication covers the inference pipeline.
+# Re-add as fresh community-node validators when those regions come back.

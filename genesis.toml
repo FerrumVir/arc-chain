@@ -59,10 +59,8 @@ stake = 5_000_000
 seed = "SGP"
 stake = 5_000_000
 
-[[validators]]
-seed = "SAO"
-stake = 5_000_000
-
-[[validators]]
-seed = "JNB"
-stake = 5_000_000
+# SAO + JNB retired 2026-04-22 (closes GH #32). They were RPC-dead for weeks
+# and their datacenters had unreliable peer connectivity. Removing from
+# genesis shrinks the validator set to 6; takes effect only on nodes that
+# rebuild from fresh state (live chain has the 8-validator set in its DAG
+# history and ignores this change until a coordinated restart).
