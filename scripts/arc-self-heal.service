@@ -1,0 +1,36 @@
+[Unit]
+Description=ARC Chain — local self-heal daemon (GH #30)
+Documentation=https://github.com/FerrumVir/arc-chain/issues/30
+After=network.target
+# Intentionally NOT Requires/Wants= arc-node — arc-node is launched as a bare
+# setsid+nohup process, not a systemd-managed unit. This daemon supervises it
+# out-of-band.
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/arc-chain
+Environment=ARC_DIR=/root/arc-chain
+Environment=ARC_RPC_PORT=9090
+ExecStart=/root/arc-chain/scripts/arc-self-heal.sh
+Restart=always
+RestartSec=5
+# CRITICAL: KillMode=process. The daemon uses setsid+nohup to spawn arc-node
+# out-of-session, but setsid does NOT escape the systemd cgroup. Without
+# this directive, `systemctl restart arc-self-heal` sends SIGTERM to the
+# whole cgroup and kills arc-node as collateral. With KillMode=process,
+# only the daemon's main PID (the bash loop) receives SIGTERM; the
+# detached arc-node survives in the (now orphaned) cgroup.
+KillMode=process
+# NO MemoryMax — spawned arc-node inherits the cgroup (setsid doesn't
+# escape it) and a 256M cap OOM-kills arc-node during its 1 GB embedding
+# load. The daemon itself is trivially small (bash + curl + sleep) and
+# doesn't need a cap. If we ever need containment for arc-node, the right
+# fix is to spawn it via `systemd-run --scope` into its own transient
+# unit — not to cap the supervisor's cgroup.
+# Journal gets every log line; the script also tees to self-heal.log.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
