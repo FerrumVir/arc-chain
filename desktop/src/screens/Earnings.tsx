@@ -15,23 +15,47 @@ export function Earnings() {
   });
   const { data: attestations } = useQuery({
     queryKey: ["attestations"],
-    queryFn: () => api.fetchAttestations(50),
+    queryFn: () => api.fetchAttestations(200),
     refetchInterval: 5000,
   });
 
+  // 7-day bucketed earnings derived from real attestation timestamps.
+  // Each attestation contributes its rewardArc to the UTC-day bucket it
+  // falls in. Days with no activity show as empty bars — honest about how
+  // much this node has actually earned across the week rather than the
+  // placeholder Math.random() chart.
   const weekly = useMemo(() => {
-    // synthesize 7-day series from attestations; real backend will provide history
-    const days = Array.from({ length: 7 }).map((_, i) => ({
-      label:
-        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][
-          (new Date().getDay() + 6 - (6 - i)) % 7
-        ],
-      value: Math.random() * 300 + 100,
-    }));
-    return days;
-  }, []);
+    const WEEK_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const now = new Date();
+    const todayStart = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+    ).getTime();
+    const DAY_MS = 86_400_000;
+    const buckets: Array<{ label: string; value: number; dayStart: number }> =
+      [];
+    for (let i = 6; i >= 0; i--) {
+      const start = todayStart - i * DAY_MS;
+      const date = new Date(start);
+      buckets.push({
+        label: WEEK_LABELS[date.getUTCDay()],
+        value: 0,
+        dayStart: start,
+      });
+    }
+    for (const a of attestations ?? []) {
+      const bucketIdx = buckets.findIndex(
+        (b) => a.timestamp >= b.dayStart && a.timestamp < b.dayStart + DAY_MS,
+      );
+      if (bucketIdx !== -1) {
+        buckets[bucketIdx].value += a.rewardArc;
+      }
+    }
+    return buckets;
+  }, [attestations]);
 
-  const max = Math.max(...weekly.map((d) => d.value));
+  // Floor at 1 so all-zero weeks still render visible (flat) bars instead
+  // of dividing by zero.
+  const max = Math.max(1, ...weekly.map((d) => d.value));
 
   return (
     <div className="main-inner" data-testid="earnings-screen">

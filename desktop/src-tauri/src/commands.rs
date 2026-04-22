@@ -1,6 +1,9 @@
+use crate::node_manager::{managed_binary_path, TestnetResources};
 use crate::types::*;
 use crate::{hardware, identity, rpc_client, AppState};
-use tauri::{AppHandle, State};
+use std::io::Write as _;
+use std::path::PathBuf;
+use tauri::{AppHandle, Manager, State};
 
 type CmdResult<T> = Result<T, String>;
 
@@ -69,12 +72,25 @@ pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeCon
 
 #[tauri::command]
 pub async fn start_node(
+    app: AppHandle,
     state: State<'_, AppState>,
     config: NodeConfig,
 ) -> CmdResult<()> {
+    let validator_seed = {
+        let store = state.store.lock().await;
+        store
+            .identity
+            .as_ref()
+            .map(|i| i.seed_phrase.clone())
+            .ok_or_else(|| {
+                "no identity — run onboarding so we can derive an on-chain validator address before starting arc-node".to_string()
+            })?
+    };
+    let resources = resolve_testnet_resources(&app);
     let mut node = state.node.lock().await;
-    node.start(&config).await.map_err(map_err)?;
-    Ok(())
+    node.start(&config, &validator_seed, &resources)
+        .await
+        .map_err(map_err)
 }
 
 #[tauri::command]
@@ -84,13 +100,22 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
 }
 
 #[tauri::command]
-pub async fn restart_node(state: State<'_, AppState>) -> CmdResult<()> {
-    let cfg = {
+pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    let (cfg, validator_seed) = {
         let store = state.store.lock().await;
-        store.config.clone().unwrap_or_default()
+        let cfg = store.config.clone().unwrap_or_default();
+        let seed = store
+            .identity
+            .as_ref()
+            .map(|i| i.seed_phrase.clone())
+            .ok_or_else(|| "no identity — cannot restart arc-node".to_string())?;
+        (cfg, seed)
     };
+    let resources = resolve_testnet_resources(&app);
     let mut node = state.node.lock().await;
-    node.restart(&cfg).await.map_err(map_err)
+    node.restart(&cfg, &validator_seed, &resources)
+        .await
+        .map_err(map_err)
 }
 
 #[tauri::command]
@@ -220,4 +245,114 @@ pub async fn check_for_update() -> CmdResult<UpdateCheck> {
         has_update: version != current && version != "unknown",
         version,
     })
+}
+
+/// First-launch readiness check. Confirms the bundled testnet resources are
+/// resolvable AND the arc-node binary is present; if the binary isn't
+/// installed, downloads it from the latest GitHub release for this platform.
+/// The onboarding screen calls this before transitioning to the "launch"
+/// step so the user can see download progress (or fail fast with a clear
+/// error rather than a cryptic "failed to start arc-node" later).
+#[tauri::command]
+pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
+    let target = managed_binary_path();
+    if target.exists() {
+        return Ok(BinaryStatus {
+            path: target.to_string_lossy().into_owned(),
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            already_installed: true,
+        });
+    }
+
+    let asset = platform_release_asset().ok_or_else(|| {
+        format!(
+            "no prebuilt arc-node binary for platform {}-{} — build from source or open an issue",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )
+    })?;
+    let url = format!(
+        "https://github.com/FerrumVir/arc-chain/releases/latest/download/{}",
+        asset
+    );
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(map_err)?;
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("arc-desktop/0.1")
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(map_err)?;
+
+    let resp = client.get(&url).send().await.map_err(map_err)?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "release asset {} returned HTTP {}",
+            asset,
+            resp.status()
+        ));
+    }
+    let total_bytes = resp.content_length().unwrap_or(0);
+    let tmp = target.with_extension("download");
+    {
+        let mut file = std::fs::File::create(&tmp).map_err(map_err)?;
+        let bytes = resp.bytes().await.map_err(map_err)?;
+        file.write_all(&bytes).map_err(map_err)?;
+        file.sync_all().ok();
+    }
+    std::fs::rename(&tmp, &target).map_err(map_err)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&target, perms).map_err(map_err)?;
+    }
+
+    // Best-effort: strip any macOS quarantine flag on our own download.
+    // User still needs to allow the desktop .app itself past Gatekeeper.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("xattr")
+            .args(["-d", "com.apple.quarantine"])
+            .arg(&target)
+            .output();
+    }
+
+    let _ = app; // reserved for future progress events via app.emit(...)
+
+    Ok(BinaryStatus {
+        path: target.to_string_lossy().into_owned(),
+        downloaded_bytes: total_bytes,
+        total_bytes,
+        already_installed: false,
+    })
+}
+
+fn platform_release_asset() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("arc-node-macos-arm64"),
+        ("macos", "x86_64") => Some("arc-node-macos-x86_64"),
+        ("linux", "x86_64") => Some("arc-node-linux-x86_64"),
+        _ => None,
+    }
+}
+
+fn resolve_testnet_resources(app: &AppHandle) -> TestnetResources {
+    let resolver = app.path();
+    let seeds = resolver
+        .resolve("resources/testnet-seeds.txt", tauri::path::BaseDirectory::Resource)
+        .ok()
+        .filter(|p: &PathBuf| p.exists());
+    let genesis = resolver
+        .resolve("resources/genesis.toml", tauri::path::BaseDirectory::Resource)
+        .ok()
+        .filter(|p: &PathBuf| p.exists());
+    TestnetResources {
+        seeds_file: seeds,
+        genesis_file: genesis,
+    }
 }

@@ -1,0 +1,66 @@
+# ARC Chain Genesis Configuration
+# Defines the initial chain state: prefunded accounts and validators.
+# All nodes MUST use the same genesis config for consensus to work.
+# Usage: arc-node --genesis genesis.toml
+
+[chain]
+name = "arc-testnet"
+chain_id = "0x415243"  # "ARC" in ASCII hex
+
+# ── Prefunded Genesis Accounts ──────────────────────────────────────────
+# blake3::hash(&[i]) for i in 0..10, each with 1 trillion ARC
+
+[[accounts]]
+address = "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
+balance = 1_000_000_000_000
+
+[[accounts]]
+address = "48fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b"
+balance = 1_000_000_000_000
+
+[[accounts]]
+address = "ab13bedf42e84bae0f7c62c7dd6a8ada571e8829bed6ea558217f0361b5e25d0"
+balance = 1_000_000_000_000
+
+[[accounts]]
+address = "e1e0e81d6ea39b0cf8b86ffd440921011f57400cbc3f76a8a171906a9b8d7505"
+balance = 1_000_000_000_000
+
+[[accounts]]
+address = "0c389a743e34fda435fbd575bb889dbc0d3e66b9f9d81e00be33b7188509e7eb"
+balance = 1_000_000_000_000
+
+# ── Genesis Validators (Testnet) ──────────────────────────────────────
+# These seeds MUST match the --validator-seed flag each node uses.
+# All nodes load this file → all nodes have the same validator set from
+# round 0 → deterministic leader selection → consensus.
+
+[[validators]]
+seed = "NYC"
+stake = 5_000_000
+
+[[validators]]
+seed = "LAX"
+stake = 5_000_000
+
+[[validators]]
+seed = "AMS"
+stake = 5_000_000
+
+[[validators]]
+seed = "LHR"
+stake = 5_000_000
+
+[[validators]]
+seed = "NRT"
+stake = 5_000_000
+
+[[validators]]
+seed = "SGP"
+stake = 5_000_000
+
+# SAO + JNB retired 2026-04-22 (closes GH #32). They were RPC-dead for weeks
+# and their datacenters had unreliable peer connectivity. Removing from
+# genesis shrinks the validator set to 6; takes effect only on nodes that
+# rebuild from fresh state (live chain has the 8-validator set in its DAG
+# history and ignores this change until a coordinated restart).

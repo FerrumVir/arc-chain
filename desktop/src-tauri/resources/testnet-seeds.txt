@@ -1,0 +1,24 @@
+# ARC Testnet Seed Nodes
+# 8 nodes across 6 continents. Your node connects to these on startup.
+#
+# Each seed is listed TWICE: once on UDP 9091 (the native P2P port) and
+# once on UDP 443 (which is forwarded to 9091 via iptables). Dial both
+# in case your ISP / firewall / corporate network blocks the non-standard
+# 9091 but allows 443 (which it must, or HTTPS would be broken for you).
+
+149.28.32.76:9091     # NYC (US East)
+149.28.32.76:443      # NYC fallback via 443
+140.82.16.112:9091    # LAX (US West)
+140.82.16.112:443     # LAX fallback via 443
+136.244.109.1:9091    # AMS (Amsterdam)
+136.244.109.1:443     # AMS fallback via 443
+104.238.171.11:9091   # LHR (London)
+104.238.171.11:443    # LHR fallback via 443
+202.182.107.41:9091   # NRT (Tokyo)
+202.182.107.41:443    # NRT fallback via 443
+149.28.153.31:9091    # SGP (Singapore)
+149.28.153.31:443     # SGP fallback via 443
+# SAO (São Paulo) and JNB (Johannesburg) retired 2026-04-22 — RPC dead for
+# weeks, underlying datacenter connectivity unreliable (AMS bootstrap dialed
+# both and timed out). 6-node 3× replication covers the inference pipeline.
+# Re-add as fresh community-node validators when those regions come back.

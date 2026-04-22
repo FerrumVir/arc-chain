@@ -47,7 +47,10 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        // Updater plugin disabled for the testnet release: a signing keypair
+        // needs to be generated and paid for before auto-updates can be
+        // trusted. Re-enable once tauri.conf.json > plugins.updater.pubkey
+        // is populated.
         .manage(state)
         .setup(move |app| {
             // Resolve the per-platform writable dir NOW (AppHandle available).
@@ -88,6 +91,7 @@ pub fn run() {
             commands::faucet_claim,
             commands::run_inference,
             commands::clear_crash,
+            commands::ensure_binary,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ARC desktop");

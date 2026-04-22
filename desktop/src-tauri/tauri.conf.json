@@ -39,10 +39,14 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": [
+      "resources/testnet-seeds.txt",
+      "resources/genesis.toml"
+    ],
     "category": "DeveloperTool",
     "shortDescription": "Run an ARC verifiable AI inference node",
     "longDescription": "ARC Node lets anyone run a verifiable AI inference node on their machine. Earn ARC tokens for every request your node serves. Cryptographic attestations prove your compute is honest.",
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "macOS": {
       "minimumSystemVersion": "11.0",
       "signingIdentity": null
@@ -51,14 +55,5 @@
       "certificateThumbprint": null
     }
   },
-  "plugins": {
-    "updater": {
-      "active": true,
-      "pubkey": "TODO — generate with `npx @tauri-apps/cli signer generate -w ~/.tauri/arc-desktop-key` and paste the public key here. Without this, auto-updates are disabled.",
-      "endpoints": [
-        "https://github.com/FerrumVir/arc-chain/releases/latest/download/latest.json"
-      ],
-      "windows": { "installMode": "passive" }
-    }
-  }
+  "plugins": {}
 }

@@ -1,7 +1,7 @@
 use crate::types::{LogEntry, NodeConfig};
 use std::collections::VecDeque;
 use std::net::{SocketAddr, TcpListener};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
@@ -30,6 +30,15 @@ pub struct CrashInfo {
     pub exit_code: Option<i32>,
     pub message: String,
     pub at_millis: i64,
+}
+
+/// Paths to the testnet bootstrap config bundled with the app.
+/// Callers resolve these from the Tauri resource dir via AppHandle, then
+/// hand them to `start()` so we don't carry Tauri types deep in NodeManager.
+#[derive(Clone, Debug, Default)]
+pub struct TestnetResources {
+    pub seeds_file: Option<PathBuf>,
+    pub genesis_file: Option<PathBuf>,
 }
 
 impl NodeManager {
@@ -66,7 +75,30 @@ impl NodeManager {
         self.child.is_some()
     }
 
-    pub async fn start(&mut self, config: &NodeConfig) -> anyhow::Result<()> {
+    /// Spawn arc-node with the CLI flags the chain actually accepts
+    /// (verified against crates/arc-node/src/main.rs). Pass:
+    ///   --rpc <ip>:<port>            bind the HTTP RPC server
+    ///   --p2p-port <port>            QUIC P2P listener
+    ///   --data-dir <dir>             where WAL + state live
+    ///   --validator-seed <string>    deterministic keypair seed
+    ///                                (the BIP-39 phrase from identity.rs)
+    ///   --seeds-file <path>          testnet peer bootstrap list
+    ///   --genesis <path>             testnet genesis.toml
+    ///   --eth-rpc-port 0             disable the extra EVM RPC port
+    ///   --community-mode             (worker role only) register with seed
+    ///                                gateways as a volunteer inference worker
+    ///   --model <path>               (optional) GGUF weights for local inference
+    ///
+    /// Any of these missing would leave the node either bound to wrong
+    /// ports, isolated from the testnet, identity-mismatched, or silent
+    /// as a worker. All are required for the "download → run → earn"
+    /// operator flow.
+    pub async fn start(
+        &mut self,
+        config: &NodeConfig,
+        validator_seed: &str,
+        resources: &TestnetResources,
+    ) -> anyhow::Result<()> {
         if self.is_running() {
             return Ok(());
         }
@@ -92,22 +124,84 @@ impl NodeManager {
         }
 
         let mut cmd = Command::new(&binary);
-        cmd.arg("--rpc-port")
-            .arg(rpc_port.to_string())
+        cmd.arg("--rpc")
+            .arg(format!("127.0.0.1:{}", rpc_port))
             .arg("--p2p-port")
             .arg(p2p_port.to_string())
             .arg("--data-dir")
             .arg(&data_dir)
+            .arg("--validator-seed")
+            .arg(validator_seed)
+            .arg("--eth-rpc-port")
+            .arg("0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Bundled testnet bootstrap config. Fall back to arc-node's built-in
+        // defaults if the resource wasn't found (shouldn't happen in a
+        // shipped build, but don't crash dev-mode).
+        if let Some(seeds) = &resources.seeds_file {
+            cmd.arg("--seeds-file").arg(seeds);
+        } else {
+            push_log(
+                &self.logs,
+                "warn",
+                "testnet-seeds.txt not bundled — node will start isolated".into(),
+            )
+            .await;
+        }
+        if let Some(genesis) = &resources.genesis_file {
+            cmd.arg("--genesis").arg(genesis);
+        } else {
+            push_log(
+                &self.logs,
+                "warn",
+                "genesis.toml not bundled — node validator set will be empty".into(),
+            )
+            .await;
+        }
+
+        // Worker role → register as a community inference worker with seed
+        // gateways so this machine's compute contributes to the network.
+        // Other roles (validator/verifier) skip this; they participate via
+        // consensus only.
+        if config.role == "worker" {
+            cmd.arg("--community-mode");
+        }
 
         if let Some(model) = &config.model_path {
             cmd.arg("--model").arg(model);
         }
 
+        push_log(
+            &self.logs,
+            "info",
+            format!(
+                "spawning {} --rpc 127.0.0.1:{} --p2p-port {} --validator-seed <{}…> {}{}",
+                binary.display(),
+                rpc_port,
+                p2p_port,
+                &validator_seed
+                    .chars()
+                    .take(8)
+                    .collect::<String>(),
+                if config.role == "worker" {
+                    "--community-mode "
+                } else {
+                    ""
+                },
+                config
+                    .model_path
+                    .as_deref()
+                    .map(|p| format!("--model {}", p))
+                    .unwrap_or_else(|| "(observer, no --model)".into()),
+            ),
+        )
+        .await;
+
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
-                "Failed to start arc-node at {}: {}. Run the community installer first: curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash",
+                "Failed to start arc-node at {}: {}. If this is your first launch, the binary should have been auto-downloaded. Check ~/.arc/bin/arc-node exists and is executable.",
                 binary.display(),
                 e
             )
@@ -137,39 +231,16 @@ impl NodeManager {
             });
         }
 
-        // Wait for the child in a background task. If it exits while we
-        // haven't asked it to stop(), record a CrashInfo so node_status can
-        // surface it to the UI as a red banner with "Relaunch".
-        // We extract the pid upfront since child is moved into the task.
-        let crash = self.crash_info.clone();
-        let logs = self.logs.clone();
-        let stopping = self.stopping.clone();
         self.stopping.store(false, std::sync::atomic::Ordering::SeqCst);
-        // Clear any previous crash state now that we're launching again.
         *self.crash_info.lock().await = None;
-
         self.child = Some(child);
-        // Take the child out momentarily to install the waiter. We re-insert
-        // a lightweight handle via pid() — but tokio::process::Child doesn't
-        // give us that split cleanly, so instead we install the waiter by
-        // spawning right here and sharing the exit via the crash slot.
-        // Simpler: spawn a task that holds a clone of the crash flag and
-        // waits by polling the child's .wait() lazily. Since we can't clone
-        // Child, we accept a race: if the user calls stop() cleanly, we set
-        // `stopping=true` first, and the reaper checks it.
-        // Workaround: capture the child's pid and spawn a wait_pid loop.
-        if let Some(child) = self.child.as_mut() {
-            if let Some(_pid) = child.id() {
-                // Can't move `child` into the task because it belongs to self.
-                // Instead, we detect crashes opportunistically: each node_status
-                // poll calls `try_reap_if_crashed()` below.
-            }
-        }
-        // The opportunistic reaper in try_reap_if_crashed() handles the
-        // crash detection without needing to move the child.
-        let _ = (crash, logs, stopping);
 
-        push_log(&self.logs, "info", format!("arc-node started on :{}", rpc_port)).await;
+        push_log(
+            &self.logs,
+            "info",
+            format!("arc-node started on 127.0.0.1:{}", rpc_port),
+        )
+        .await;
         Ok(())
     }
 
@@ -220,15 +291,25 @@ impl NodeManager {
         Ok(())
     }
 
-    pub async fn restart(&mut self, config: &NodeConfig) -> anyhow::Result<()> {
+    pub async fn restart(
+        &mut self,
+        config: &NodeConfig,
+        validator_seed: &str,
+        resources: &TestnetResources,
+    ) -> anyhow::Result<()> {
         self.stop().await?;
-        self.start(config).await
+        self.start(config, validator_seed, resources).await
     }
 
     pub async fn logs_snapshot(&self, limit: usize) -> Vec<LogEntry> {
         let guard = self.logs.lock().await;
         let n = guard.len().min(limit);
-        guard.iter().rev().take(n).cloned().collect::<Vec<_>>()
+        guard
+            .iter()
+            .rev()
+            .take(n)
+            .cloned()
+            .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect()
@@ -275,29 +356,37 @@ fn resolve_binary() -> anyhow::Result<PathBuf> {
         return Ok(PathBuf::from(p));
     }
 
-    // Prefer the community installer path: ~/.arc/bin/arc-node
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let installed = home.join(".arc").join("bin").join(if cfg!(windows) {
-        "arc-node.exe"
-    } else {
-        "arc-node"
-    });
-    if installed.exists() {
-        return Ok(installed);
+    // Canonical app-managed path. Auto-download (commands::ensure_binary)
+    // writes here on first launch.
+    let p = managed_binary_path();
+    if p.exists() {
+        return Ok(p);
     }
 
-    // Fall back to PATH lookup
+    // Fall back to PATH lookup for devs who built arc-node themselves
     if let Ok(p) = which_on_path("arc-node") {
         return Ok(p);
     }
 
     Err(anyhow::anyhow!(
-        "arc-node binary not found. Expected at {} or on PATH",
-        installed.display()
+        "arc-node binary not found. Expected at {} or on PATH. The app should download it on first launch — check Settings → Diagnostics.",
+        p.display()
     ))
+}
+
+/// Canonical location for the auto-downloaded arc-node binary.
+/// `~/.arc/bin/arc-node` (or `.exe` on Windows). Public so commands.rs can
+/// write to the same path during auto-download.
+pub fn managed_binary_path() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".arc").join("bin").join(if cfg!(windows) {
+        "arc-node.exe"
+    } else {
+        "arc-node"
+    })
 }
 
 fn which_on_path(name: &str) -> anyhow::Result<PathBuf> {
@@ -346,3 +435,50 @@ fn choose_port_pair(preferred_rpc: u16, preferred_p2p: u16) -> anyhow::Result<(u
         preferred_p2p
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn managed_binary_is_under_home_bin() {
+        let p = managed_binary_path();
+        let s = p.to_string_lossy();
+        assert!(s.contains(".arc"), "path should contain .arc: {s}");
+        assert!(s.ends_with("arc-node") || s.ends_with("arc-node.exe"));
+    }
+
+    #[test]
+    fn resolve_data_dir_expands_tilde() {
+        let p = resolve_data_dir("~/foo");
+        assert!(!p.starts_with("~"));
+    }
+
+    #[test]
+    fn port_pair_probes_fallback() {
+        // Hold one unprivileged port busy. The probe tries offsets +0,+10,
+        // +20,+30,+40; with only one port taken, one of those falls
+        // through to an available slot.
+        let l1 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let busy = l1.local_addr().unwrap().port();
+        // Pair the busy RPC with a separate unprivileged p2p seed so the
+        // probe has a free-port window to land in.
+        let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let p2p_seed = l2.local_addr().unwrap().port();
+        // Release l2 — we only wanted its assigned port number to feed in.
+        drop(l2);
+        let result = choose_port_pair(busy, p2p_seed);
+        assert!(result.is_ok(), "probe should find a free pair");
+        let (rpc, _p2p) = result.unwrap();
+        assert_ne!(rpc, busy, "should have picked a fallback rpc port");
+    }
+}
+
+impl Default for NodeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[allow(dead_code)]
+fn _path_sanity(_: &Path) {}

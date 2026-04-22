@@ -61,6 +61,10 @@ export function Onboarding() {
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [copied, setCopied] = useState(false);
   const [launching, setLaunching] = useState(false);
+  const [launchStage, setLaunchStage] = useState<
+    "idle" | "downloading" | "starting"
+  >("idle");
+  const [launchError, setLaunchError] = useState<string | null>(null);
   const [seedShown, setSeedShown] = useState(false);
 
   const setOnboarded = useAppStore((s) => s.setOnboarded);
@@ -87,6 +91,7 @@ export function Onboarding() {
   const finish = async () => {
     if (!identity) return;
     setLaunching(true);
+    setLaunchError(null);
     const config = {
       role,
       modelPath: null,
@@ -98,15 +103,28 @@ export function Onboarding() {
     };
     setStoreIdentity(identity);
     setStoreConfig(config);
-    await api.saveConfig(config);
     try {
+      setLaunchStage("downloading");
+      // First-launch: fetch arc-node binary from GitHub Releases if missing.
+      // Subsequent launches return `alreadyInstalled=true` instantly.
+      await api.ensureBinary();
+      await api.saveConfig(config);
+      setLaunchStage("starting");
       await api.startNode(config);
-    } catch {
-      /* show on dashboard */
+      // brief "spinning up" moment for polish
+      await new Promise((r) => setTimeout(r, 900));
+      setOnboarded(true);
+    } catch (err) {
+      setLaunchError(
+        err instanceof Error
+          ? err.message
+          : typeof err === "string"
+            ? err
+            : "Unknown error starting arc-node",
+      );
+      setLaunching(false);
+      setLaunchStage("idle");
     }
-    // brief "spinning up" moment for polish
-    await new Promise((r) => setTimeout(r, 900));
-    setOnboarded(true);
   };
 
   return (
@@ -617,12 +635,18 @@ export function Onboarding() {
                   )}
                 </div>
                 <h1 className="onboarding-title">
-                  {launching ? "starting your node" : "ready to launch"}
+                  {launching
+                    ? launchStage === "downloading"
+                      ? "downloading arc-node"
+                      : "starting your node"
+                    : "ready to launch"}
                 </h1>
                 <p className="onboarding-subtitle">
-                  {launching
-                    ? "Connecting to the ARC testnet…"
-                    : "You'll be connected as a "}
+                  {launching && launchStage === "downloading"
+                    ? "Fetching the latest arc-node binary for your platform. ~45 MB, one-time download."
+                    : launching
+                      ? "Connecting to the ARC testnet…"
+                      : "You'll be connected as a "}
                   {!launching && (
                     <strong style={{ color: "var(--text)" }}>
                       {ROLE_META[role].title}
@@ -630,6 +654,28 @@ export function Onboarding() {
                   )}
                   {!launching && ". Auto-update and persistent service will be enabled."}
                 </p>
+
+                {launchError && (
+                  <div
+                    data-testid="launch-error"
+                    style={{
+                      padding: "var(--space-4)",
+                      background: "rgba(248, 113, 113, 0.08)",
+                      border: "1px solid rgba(248, 113, 113, 0.3)",
+                      borderRadius: "var(--radius-md)",
+                      marginBottom: "var(--space-4)",
+                      color: "var(--text)",
+                      fontSize: "var(--text-sm)",
+                    }}
+                  >
+                    <div style={{ fontWeight: 600, marginBottom: 4 }}>
+                      Couldn't start arc-node
+                    </div>
+                    <div style={{ color: "var(--text-muted)", whiteSpace: "pre-wrap" }}>
+                      {launchError}
+                    </div>
+                  </div>
+                )}
 
                 {!launching && (
                   <div className="onboarding-actions">
@@ -641,7 +687,8 @@ export function Onboarding() {
                       onClick={finish}
                       data-testid="btn-launch"
                     >
-                      Launch node <Sparkles size={16} />
+                      {launchError ? "Retry" : "Launch node"}{" "}
+                      <Sparkles size={16} />
                     </button>
                   </div>
                 )}

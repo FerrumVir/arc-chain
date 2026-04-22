@@ -107,3 +107,14 @@ export interface InferenceResult {
   engine: string;
   explorerUrl: string;
 }
+
+export interface BinaryStatus {
+  /** Absolute path to the arc-node binary on disk. */
+  path: string;
+  /** Bytes downloaded on this call (0 if already installed). */
+  downloadedBytes: number;
+  /** Total announced by the server (0 if unknown). */
+  totalBytes: number;
+  /** True when the binary was already present — nothing was fetched. */
+  alreadyInstalled: boolean;
+}

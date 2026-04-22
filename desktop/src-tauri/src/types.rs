@@ -122,6 +122,19 @@ pub struct UpdateCheck {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BinaryStatus {
+    /// Absolute path to the resolved / downloaded arc-node binary.
+    pub path: String,
+    /// Bytes downloaded this call (0 if already installed).
+    pub downloaded_bytes: u64,
+    /// Total bytes announced by the server (0 if unknown).
+    pub total_bytes: u64,
+    /// True if the binary was already on disk when this was called.
+    pub already_installed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AccountBalance {
     pub address: String,
     pub balance: u64,

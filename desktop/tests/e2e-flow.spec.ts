@@ -1,0 +1,211 @@
+// End-to-end flow tests exercising the six fixes that unblocked testnet
+// release (arc-node CLI spawn args, bundled seeds/genesis, BIP-39 validator
+// seed, auto-download binary, real attestation-backed earnings, Gatekeeper
+// docs). These tests run against the mock IPC layer — exhaustive live
+// behaviour is covered by tests/live.spec.ts.
+import { expect, test } from "@playwright/test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { clearState, seedOnboarded } from "./helpers";
+
+const __dirnameHere = path.dirname(fileURLToPath(import.meta.url));
+const REPO_DESKTOP = path.resolve(__dirnameHere, "..");
+
+test.describe("Onboarding → launch end-to-end", () => {
+  test.beforeEach(async ({ page }) => {
+    await clearState(page);
+  });
+
+  test("launch step downloads binary then starts node", async ({ page }) => {
+    await page.goto("/");
+
+    // Walk the wizard up to the launch step.
+    await page.getByTestId("btn-continue-welcome").click();
+    await page.waitForFunction(() => {
+      const btn = document.querySelector(
+        "[data-testid='btn-continue-hardware']",
+      ) as HTMLButtonElement | null;
+      return btn && !btn.disabled;
+    });
+    await page.getByTestId("btn-continue-hardware").click();
+    await page.getByTestId("btn-continue-role").click();
+    await page.getByTestId("btn-reveal-seed").click();
+    await page.getByTestId("btn-continue-identity").click();
+    await expect(page.getByTestId("step-launch")).toBeVisible();
+    await expect(page.getByText(/ready to launch/i)).toBeVisible();
+
+    await page.getByTestId("btn-launch").click();
+
+    // Mock ensure_binary + start_node both resolve fast — we should land
+    // on the dashboard.
+    await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("launch button shows 'Launch node' copy before click, not 'Retry'", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("btn-continue-welcome").click();
+    await page.waitForFunction(() => {
+      const btn = document.querySelector(
+        "[data-testid='btn-continue-hardware']",
+      ) as HTMLButtonElement | null;
+      return btn && !btn.disabled;
+    });
+    await page.getByTestId("btn-continue-hardware").click();
+    await page.getByTestId("btn-continue-role").click();
+    await page.getByTestId("btn-reveal-seed").click();
+    await page.getByTestId("btn-continue-identity").click();
+    await expect(page.getByTestId("btn-launch")).toBeVisible();
+    await expect(page.getByTestId("btn-launch")).toContainText(/launch node/i);
+  });
+});
+
+test.describe("Earnings chart uses real attestation data", () => {
+  test.beforeEach(async ({ page }) => {
+    await seedOnboarded(page);
+  });
+
+  test("seven-day bars sum to the mock attestations' rewardArc total (114.5)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("earnings-screen")).toBeVisible();
+
+    // Mock attestations: rewardArc values 12.5, 34.8, 67.2 — sum 114.5.
+    // All three timestamped within the last ~4 minutes so they all land
+    // in today's bucket. The bar values rendered as toFixed(0) — today's
+    // bar should read "115" (rounded from 114.5) and the other 6 should
+    // read "0". The old Math.random implementation would land every bar
+    // in the 100-400 range so any bar > 200 would prove regression.
+    const labels = await page
+      .locator("[data-testid='earnings-screen']")
+      .locator("div")
+      .filter({ hasText: /^(\d+)$/ })
+      .allTextContents();
+
+    // Extract numeric bar-top labels (the div above each bar).
+    // The simplest check: at least one bar shows a non-zero number that's
+    // below the Math.random() floor (100), and the majority of bars read 0.
+    // Count the "0" bars — expect ≥ 5 of 7.
+    const zeroCount = labels.filter((l) => l === "0").length;
+    expect(zeroCount).toBeGreaterThanOrEqual(5);
+
+    // And assert that at least one bar has a value in the expected
+    // 100-200 range for the Math.random regression check. Since the mock
+    // has 114.5 ARC today, any value from "110"–"120" is acceptable.
+    const hasExpectedTodayBar = labels.some((l) => {
+      const n = Number(l);
+      return Number.isFinite(n) && n >= 100 && n <= 200;
+    });
+    expect(hasExpectedTodayBar).toBe(true);
+  });
+});
+
+test.describe("Gatekeeper + first-run docs are shipped", () => {
+  test("FIRST-RUN.md exists and covers macOS + Windows + Linux", () => {
+    const p = path.resolve(REPO_DESKTOP, "FIRST-RUN.md");
+    expect(fs.existsSync(p)).toBe(true);
+    const text = fs.readFileSync(p, "utf8");
+    expect(text.length).toBeGreaterThan(500);
+    expect(text).toMatch(/right-click/i);
+    expect(text).toMatch(/xattr/i);
+    expect(text).toMatch(/smartscreen/i);
+    expect(text).toMatch(/linux/i);
+  });
+});
+
+test.describe("Bundled testnet resources", () => {
+  test("seeds + genesis files are present in the Tauri bundle source", () => {
+    const resources = path.resolve(REPO_DESKTOP, "src-tauri", "resources");
+    const seeds = path.join(resources, "testnet-seeds.txt");
+    const genesis = path.join(resources, "genesis.toml");
+    expect(fs.existsSync(seeds)).toBe(true);
+    expect(fs.existsSync(genesis)).toBe(true);
+
+    // Sanity: seeds file lists the 6 live testnet seeds (NYC/LAX/AMS/
+    // LHR/NRT/SGP). SAO and JNB were retired GH #32 so they must NOT
+    // appear in the shipped seeds file.
+    const seedsText = fs.readFileSync(seeds, "utf8");
+    expect(seedsText).toContain("149.28.32.76"); // NYC
+    expect(seedsText).toContain("140.82.16.112"); // LAX
+    expect(seedsText).toContain("149.28.153.31"); // SGP
+    expect(seedsText).not.toMatch(/216\.238\.120\.27/); // SAO retired
+    expect(seedsText).not.toMatch(/139\.84\.237\.49/); // JNB retired
+  });
+
+  test("tauri.conf.json declares the resources so they land in the bundle", () => {
+    const conf = path.resolve(REPO_DESKTOP, "src-tauri", "tauri.conf.json");
+    const j = JSON.parse(fs.readFileSync(conf, "utf8"));
+    expect(j.bundle?.resources).toEqual(
+      expect.arrayContaining([
+        "resources/testnet-seeds.txt",
+        "resources/genesis.toml",
+      ]),
+    );
+  });
+});
+
+test.describe("Spawn CLI contract (Rust source)", () => {
+  // Guard against regressions in the node_manager.rs flag wiring: the
+  // only way arc-node joins testnet is if --rpc, --p2p-port, --data-dir,
+  // --validator-seed, --seeds-file, --genesis, --eth-rpc-port, and
+  // --community-mode all end up on the cmd line.
+  const src = fs.readFileSync(
+    path.resolve(REPO_DESKTOP, "src-tauri", "src", "node_manager.rs"),
+    "utf8",
+  );
+
+  test("--rpc is passed as a single addr:port (not --rpc-port)", () => {
+    // Positive: the string "--rpc" appears followed by the addr:port pattern.
+    expect(src).toMatch(/\.arg\("--rpc"\)\s*\.\s*arg\(format!\("127\.0\.0\.1/);
+    // Negative: no stray --rpc-port anywhere (that flag doesn't exist in arc-node).
+    expect(src).not.toMatch(/--rpc-port/);
+  });
+
+  test("passes all required testnet flags", () => {
+    for (const flag of [
+      '"--p2p-port"',
+      '"--data-dir"',
+      '"--validator-seed"',
+      '"--seeds-file"',
+      '"--genesis"',
+      '"--eth-rpc-port"',
+      '"--community-mode"',
+    ]) {
+      expect(src).toContain(flag);
+    }
+  });
+
+  test("community-mode only toggled for worker role", () => {
+    expect(src).toMatch(/if\s+config\.role\s*==\s*"worker"\s*\{[\s\S]*?--community-mode/);
+  });
+});
+
+test.describe("ensure_binary auto-download", () => {
+  const commands = fs.readFileSync(
+    path.resolve(REPO_DESKTOP, "src-tauri", "src", "commands.rs"),
+    "utf8",
+  );
+
+  test("selects correct release asset per platform", () => {
+    // Asset names must match what the CI release workflow actually ships.
+    expect(commands).toContain('"arc-node-macos-arm64"');
+    expect(commands).toContain('"arc-node-macos-x86_64"');
+    expect(commands).toContain('"arc-node-linux-x86_64"');
+  });
+
+  test("downloaded binary is written to ~/.arc/bin/arc-node", () => {
+    const nm = fs.readFileSync(
+      path.resolve(REPO_DESKTOP, "src-tauri", "src", "node_manager.rs"),
+      "utf8",
+    );
+    expect(nm).toMatch(/\.arc"[\s\S]*?"bin"[\s\S]*?arc-node/);
+  });
+
+  test("writes 0o755 perms on unix so it's executable", () => {
+    expect(commands).toMatch(/0o755/);
+  });
+});

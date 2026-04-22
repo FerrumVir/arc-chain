@@ -5,6 +5,7 @@
 import type {
   AccountBalance,
   Attestation,
+  BinaryStatus,
   Earnings,
   FaucetResult,
   HardwareInfo,
@@ -296,6 +297,15 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "check_for_update":
       return { hasUpdate: false, version: "0.5.2" } as T;
+    case "ensure_binary":
+      // Browser (live mode) can't install a native binary — pretend it's
+      // already installed so the UI doesn't block onboarding.
+      return {
+        path: "/browser-live-mode",
+        downloadedBytes: 0,
+        totalBytes: 0,
+        alreadyInstalled: true,
+      } as T;
     default:
       throw new Error(`Unhandled live command: ${cmd}`);
   }
@@ -510,6 +520,14 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "check_for_update":
       return { hasUpdate: false, version: "0.5.2" } as T;
+    case "ensure_binary":
+      // Mock path — no real download. Pretend it completed instantly.
+      return {
+        path: "/mock/.arc/bin/arc-node",
+        downloadedBytes: 45_000_000,
+        totalBytes: 45_000_000,
+        alreadyInstalled: false,
+      } as T;
     default:
       throw new Error(`Unmocked Tauri command: ${cmd}`);
   }
@@ -551,6 +569,7 @@ export const api = {
   openExternal: (url: string) => invoke<void>("open_external", { url }),
   checkForUpdate: () =>
     invoke<{ hasUpdate: boolean; version: string }>("check_for_update"),
+  ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
 };
 
 export const isTauri = IS_TAURI;
