@@ -283,11 +283,13 @@ REMOTE
         ${MODEL_FLAG} \
         ${SHARD_FLAGS}"
 
-    # f. Wait for health (up to 60 seconds)
+    # f. Wait for health (up to 360 seconds — multi-range loads re-open
+    # the GGUF once per range, which pushes a 3-range node to ~3 min on
+    # cold boot. 60 s was too tight and caused false failures.)
     info "Waiting for health check..."
     HEALTHY=false
-    for i in $(seq 1 12); do
-        sleep 5
+    for i in $(seq 1 36); do
+        sleep 10
         HEALTH=$(ssh $SSH_OPTS "root@${IP}" "curl -sf http://localhost:${RPC_PORT}/health 2>/dev/null" || echo "")
         if [ -n "$HEALTH" ]; then
             PEERS=$(echo "$HEALTH" | grep -o '"peers":[0-9]*' | grep -o '[0-9]*' || echo "0")
@@ -296,7 +298,7 @@ REMOTE
             HEALTHY=true
             break
         fi
-        printf "  ... attempt $i/12\n"
+        printf "  ... attempt $i/36\n"
     done
 
     if [ "$HEALTHY" = false ]; then

@@ -1,0 +1,23 @@
+{
+  "phase": "awaiting-build-414467dd",
+  "plan": [
+    "wait for build bfdcwfvs6 to finish",
+    "redeploy NRT with new binary (single range preserved) — picks up gossip fix",
+    "redeploy SGP with new binary (single range preserved) — picks up gossip fix, may also fix round lag",
+    "redeploy AMS with 3x config AMS=0:6,6:12,12:17 (test sanity assert + gossip fix both at once)",
+    "redeploy NYC with 3x config NYC=0:6,22:27,27:32",
+    "redeploy NRT with 3x config NRT=12:17,17:22,22:27",
+    "redeploy SGP with 3x config SGP=17:22,22:27,27:32",
+    "confirm all 6 seeds show 18 shard entries total (6 ranges x 3 replicas)",
+    "end-to-end: /inference/run_sharded against fixed network, verify coordinator failover by killing one replica mid-request",
+    "design + implement Slice B parallel k=3 consensus in coordinator"
+  ],
+  "invariants": [
+    "ONE node at a time — halt if quorum at risk",
+    "rolling-upgrade.sh health cap is 360s (multi-range loads are slow)",
+    "never rsync without the arc-data/ excludes",
+    "if sanity assert fires on multi-range, capture the error, revert that node to single range, investigate"
+  ],
+  "last_stage1_state": "6/6 on new binary post-session-2026-04-21",
+  "last_stage2_state": "LAX+LHR on 3x, AMS reverted, NRT+SGP+NYC still single range"
+}
