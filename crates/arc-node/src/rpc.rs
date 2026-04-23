@@ -421,6 +421,17 @@ pub async fn serve(
         .route("/inference/verification_status", get(inference_verification_status))
         // Revenue split info
         .route("/economics/revenue_split", get(get_revenue_split))
+        // Milestone C: read-only registry + demand discovery. Workers use
+        // these to discover what models exist and what ranges are open
+        // for the taking. Writes go through /tx/submit_signed like any
+        // other chain mutation — no dedicated POST endpoints needed for
+        // the MVP.
+        .route("/models/registry", get(list_model_registry))
+        .route("/models/open_requests", get(list_open_model_requests))
+        // Milestone D: capacity advertisement discovery + per-node
+        // assignment long-poll. Also read-only from the state.
+        .route("/capacity/advertisements", get(list_capacity_advertisements))
+        .route("/assignments/for_me", get(get_assignment_for_me))
         // Community worker registration (HTTP-only, works behind NAT)
         .route("/community/register", post(community_register))
         .route("/community/heartbeat", post(community_heartbeat))
@@ -4907,6 +4918,131 @@ async fn inference_run_consensus(
         });
     }
     Ok(Json(response))
+}
+
+/// Milestone C (#37): GET /models/registry
+/// Scans committed transactions for every ModelRegistration body and
+/// returns the resulting per-model metadata. For MVP this is O(N) over
+/// the full-tx DashMap; a later patch can maintain a sidecar index if
+/// the registry grows past a few thousand models.
+async fn list_model_registry(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let mut rows: Vec<Value> = Vec::new();
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if let arc_types::TxBody::ModelRegistration(body) = &tx.body {
+            rows.push(json!({
+                "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+                "metadata_hash": format!("0x{}", hex::encode(&body.metadata_hash.0)),
+                "chunk_tree_root": format!("0x{}", hex::encode(&body.chunk_tree_root.0)),
+                "n_layers": body.n_layers,
+                "d_model": body.d_model,
+                "quantization": &body.quantization,
+                "registration_fee": body.registration_fee,
+                "royalty_recipient": format!("0x{}", hex::encode(&body.royalty_recipient.0)),
+                "registered_by": format!("0x{}", hex::encode(&tx.from.0)),
+                "tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+            }));
+        }
+    }
+    Json(json!({ "models": rows, "count": rows.len() }))
+}
+
+/// Milestone C (#37): GET /models/open_requests
+/// Returns every ModelRequest tx body. Workers poll this to find open
+/// demand and decide which ranges to claim.
+async fn list_open_model_requests(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let mut rows: Vec<Value> = Vec::new();
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if let arc_types::TxBody::ModelRequest(body) = &tx.body {
+            rows.push(json!({
+                "request_id": format!("0x{}", hex::encode(&body.request_id)),
+                "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+                "target_k_replication": body.target_k_replication,
+                "bond_per_layer_epoch": body.bond_per_layer_epoch,
+                "max_wait_secs": body.max_wait_secs,
+                "requester": format!("0x{}", hex::encode(&tx.from.0)),
+                "tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+            }));
+        }
+    }
+    Json(json!({ "requests": rows, "count": rows.len() }))
+}
+
+/// Milestone D (#38): GET /capacity/advertisements
+/// Returns every CapacityAdvertisement. The planner reads this set
+/// plus open requests + current shard_registry to compute assignments.
+async fn list_capacity_advertisements(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let mut rows: Vec<Value> = Vec::new();
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if let arc_types::TxBody::CapacityAdvertisement(body) = &tx.body {
+            rows.push(json!({
+                "node_pubkey": format!("0x{}", hex::encode(&body.node_pubkey)),
+                "ram_bytes": body.ram_bytes,
+                "vram_bytes": body.vram_bytes,
+                "bandwidth_mbps": body.bandwidth_mbps,
+                "uptime_hint_mins": body.uptime_hint_mins,
+                "stake": body.stake,
+                "region": &body.region,
+                "advertised_by": format!("0x{}", hex::encode(&tx.from.0)),
+                "tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+            }));
+        }
+    }
+    Json(json!({ "advertisements": rows, "count": rows.len() }))
+}
+
+/// Milestone D (#38): GET /assignments/for_me?pubkey=0x...
+/// Returns every AssignmentEntry across every ShardAssignmentProposal
+/// whose `node_pubkey` matches the query parameter. Community workers
+/// long-poll this and auto-apply — they restart arc-node with the
+/// listed `--shard-range` flags and announce the assignment.
+async fn get_assignment_for_me(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Query(params): axum::extract::Query<
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let pk_hex = params
+        .get("pubkey")
+        .ok_or(api_error(StatusCode::BAD_REQUEST, "missing ?pubkey= param"))?;
+    let pk = decode_hash_hex(pk_hex).map_err(|e| {
+        api_error(StatusCode::BAD_REQUEST, format!("pubkey: {}", e))
+    })?;
+
+    let mut assignments: Vec<Value> = Vec::new();
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if let arc_types::TxBody::ShardAssignmentProposal(body) = &tx.body {
+            for a in &body.assignments {
+                if a.node_pubkey == pk {
+                    assignments.push(json!({
+                        "epoch_blocks": body.epoch_blocks,
+                        "input_snapshot_hash": format!(
+                            "0x{}", hex::encode(&body.input_snapshot_hash.0)
+                        ),
+                        "model_id": format!("0x{}", hex::encode(&a.model_id.0)),
+                        "ranges": a.ranges.iter()
+                            .map(|(s, e)| json!([s, e]))
+                            .collect::<Vec<_>>(),
+                        "proposal_tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+                    }));
+                }
+            }
+        }
+    }
+    Ok(Json(json!({
+        "pubkey": pk_hex,
+        "assignments": assignments,
+        "count": assignments.len(),
+    })))
 }
 
 /// Milestone B (#36): resolved payload for an escrow-gated
