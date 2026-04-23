@@ -186,7 +186,16 @@ same commit (scoped outer guard).
 
 ---
 
-## Milestone C — On-demand model provisioning
+## Milestone C — On-demand model provisioning (protocol surface shipped — PR #40)
+
+**Status 2026-04-23**: tx types `ModelRegistration` (0x1c),
+`ModelRequest` (0x1d), `ShardCoverageClaim` (0x1e) live with full
+state transitions + 4 unit tests. Registration fee floored at 1000 ARC
+flows to the treasury (Milestone E anti-spam). Discovery endpoints
+`/models/registry` and `/models/open_requests` expose the registry
+without raw tx scanning. Remaining to merge: desktop `Earn` screen
+that lists open ModelRequests sorted by bond and lets a worker
+auto-claim ranges + download chunks.
 
 **Goal**: a user says "I want to query `llama-3-70b`" and if nobody's
 serving it, the network spins up coverage — community nodes earn to
@@ -228,7 +237,17 @@ host layer ranges they didn't previously have.
 
 ---
 
-## Milestone D — Dynamic capacity + planner
+## Milestone D — Dynamic capacity + planner (protocol surface + planner shipped — PR #40)
+
+**Status 2026-04-23**: tx types `CapacityAdvertisement` (0x1f) and
+`ShardAssignmentProposal` (0x20) live with state transitions + 1 unit
+test. Deterministic MVP planner in `crates/arc-node/src/planner.rs`
+(6/6 tests: determinism under input shuffle, k-replication honoured,
+under-resourced nodes skipped, layer-range bucketing correct).
+Discovery endpoints `/capacity/advertisements` and
+`/assignments/for_me?pubkey=…` expose the state. Remaining: periodic
+proposer task that auto-runs `compute_assignment` every N blocks +
+desktop hook to advertise capacity on node start.
 
 **Goal**: users don't pick ranges. They pick "I want to earn, allocate
 me efficiently." The network assigns optimally given their hardware and
@@ -259,7 +278,16 @@ current demand.
 
 ---
 
-## Milestone E — Thousands-of-models scale
+## Milestone E — Thousands-of-models scale (LRU cache + registration fee shipped — PR #40)
+
+**Status 2026-04-23**: on-disk LRU chunk cache in
+`crates/arc-node/src/chunk_cache.rs` with JSON sidecar warm-set
+persistence + 6/6 tests (roundtrip, eviction LRU order, touch
+prevents eviction, warm-set survives restart, rejects oversized
+chunks). Registration anti-spam fee already wired into
+`TxBody::ModelRegistration` flowing to treasury. Remaining: planner
+heuristic that weights cached chunks lower cost + `cached_hashes()`
+exposed via RPC so the planner can see what each node already holds.
 
 **Goal**: the network holds 10 thousand models simultaneously, each with
 varying popularity, without any single node holding more than its
