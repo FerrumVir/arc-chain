@@ -4328,6 +4328,72 @@ async fn inference_run_consensus(
     let k_req = req.get("k").and_then(|v| v.as_u64()).unwrap_or(3).max(1) as usize;
     let chat_template_enabled = req.get("chat_template").and_then(|v| v.as_bool()).unwrap_or(false);
 
+    // Milestone B (#36): if the request carries { payer, request_id,
+    // max_fee, model_id, timeout_blocks } it's an escrow-gated call.
+    // The coordinator pre-flights that an open escrow exists with enough
+    // balance before touching any model, and on success submits an
+    // InferenceEscrowRelease that pays out the 40/25/15/20 split.
+    //
+    // Free-mode (no payer) still works: all escrow fields are optional.
+    // Dashboards + old desktop clients keep using the free path — no
+    // breaking change.
+    let escrow_payer_hex = req.get("payer").and_then(|v| v.as_str());
+    let escrow_req_id_hex = req.get("request_id").and_then(|v| v.as_str());
+    let escrow_max_fee = req.get("max_fee").and_then(|v| v.as_u64());
+    let escrow_model_id_hex = req.get("model_id").and_then(|v| v.as_str());
+    let escrow_timeout = req.get("timeout_blocks").and_then(|v| v.as_u64());
+
+    let escrow_gate: Option<EscrowGate> = match (
+        escrow_payer_hex,
+        escrow_req_id_hex,
+        escrow_max_fee,
+        escrow_model_id_hex,
+        escrow_timeout,
+    ) {
+        (Some(p), Some(r), Some(f), Some(m), Some(t)) => {
+            let payer = decode_address_hex(p).map_err(|e| {
+                api_error(StatusCode::BAD_REQUEST, format!("payer: {}", e))
+            })?;
+            let request_id = decode_hash_hex(r).map_err(|e| {
+                api_error(StatusCode::BAD_REQUEST, format!("request_id: {}", e))
+            })?;
+            let model_id = decode_hash_hex(m).map_err(|e| {
+                api_error(StatusCode::BAD_REQUEST, format!("model_id: {}", e))
+            })?;
+            let escrow_addr = arc_types::transaction::InferenceEscrowOpenBody::escrow_address(&request_id);
+            let escrow_account = node.state.get_account(&arc_crypto::Hash256(escrow_addr));
+            let locked = escrow_account.map(|a| a.balance).unwrap_or(0);
+            if locked < f {
+                return Err(api_error(
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!(
+                        "escrow not open for this request_id (locked={}, need max_fee={}); \
+                         submit an InferenceEscrowOpen tx first",
+                        locked, f
+                    ),
+                ));
+            }
+            Some(EscrowGate {
+                payer: arc_crypto::Hash256(payer),
+                request_id,
+                max_fee: f,
+                model_id: arc_crypto::Hash256(model_id),
+                max_tokens,
+                timeout_blocks: t,
+            })
+        }
+        // Partial escrow fields → reject; too easy to lose money to typos.
+        (None, None, None, None, None) => None,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "escrow-gated run_consensus requires all of { payer, \
+                 request_id, max_fee, model_id, timeout_blocks } — got a \
+                 partial set",
+            ));
+        }
+    };
+
     let model = node.inference_model.as_ref()
         .ok_or(api_error(StatusCode::SERVICE_UNAVAILABLE,
             "Coordinator needs a tokenizer loaded. Start with --model <path.gguf>."))?;
@@ -4712,7 +4778,59 @@ async fn inference_run_consensus(
         }
     }
 
-    Ok(Json(json!({
+    // Milestone B: if this was an escrow-gated request, collect the
+    // honest-replica set from the votes (the non-divergent agreeing
+    // replicas across every hop) and submit the release tx. The honest
+    // set is a union over all votes — any replica that contributed to the
+    // majority_hash at any hop earned a slice of the per-request payout.
+    let release_tx_hash = if let Some(gate) = &escrow_gate {
+        // Replica names that appeared in majority_hash agreement at
+        // any hop. Excludes divergent replicas (they're handled by
+        // auto-challenges in the slashing path, not paid).
+        let mut honest_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for v in &votes {
+            let divergent: std::collections::HashSet<&String> =
+                v.divergent.iter().map(|(n, _)| n).collect();
+            for name in &v.replicas_returned {
+                if !divergent.contains(name) {
+                    honest_names.insert(name.clone());
+                }
+            }
+        }
+        // Map replica node_name → synthetic validator address, same
+        // derivation slashing uses (hash("replica:" || name)). Keeps
+        // honest-pays and divergent-slashes symmetric; a later migration
+        // can reconcile both to real on-chain validator addresses once
+        // the shard registry carries them.
+        let replicas: Vec<arc_crypto::Hash256> = honest_names
+            .iter()
+            .map(|name| arc_crypto::hash_bytes(format!("replica:{}", name).as_bytes()))
+            .collect();
+
+        if replicas.is_empty() {
+            tracing::warn!(
+                request_id = %request_id,
+                "escrow-gated request succeeded but no honest replicas collected — \
+                 release would fail at state layer; skipping"
+            );
+            None
+        } else {
+            let tx_hash = submit_escrow_release(&node, gate, output_hash, replicas.clone());
+            tracing::info!(
+                request_id = %request_id,
+                tx = %format!("0x{}", hex::encode(&tx_hash.0)),
+                replicas = replicas.len(),
+                max_fee = gate.max_fee,
+                "InferenceEscrowRelease submitted"
+            );
+            Some(tx_hash)
+        }
+    } else {
+        None
+    };
+
+    let mut response = json!({
         "success": true,
         "request_id": request_id,
         "input": input_text,
@@ -4732,7 +4850,112 @@ async fn inference_run_consensus(
             "divergent_replicas": divergent_all,
             "auto_challenges": auto_challenges,
         },
-    })))
+    });
+    if let Some(h) = release_tx_hash {
+        response["escrow"] = json!({
+            "release_tx_hash": format!("0x{}", hex::encode(&h.0)),
+            "payer": format!("0x{}", hex::encode(&escrow_gate.as_ref().unwrap().payer.0)),
+            "max_fee": escrow_gate.as_ref().unwrap().max_fee,
+        });
+    }
+    Ok(Json(response))
+}
+
+/// Milestone B (#36): resolved payload for an escrow-gated
+/// /inference/run_consensus request. Built at the top of the handler after
+/// pre-flight passes; consumed at the success path to submit the
+/// InferenceEscrowRelease tx.
+#[derive(Clone)]
+struct EscrowGate {
+    payer: arc_crypto::Hash256,
+    request_id: [u8; 32],
+    max_fee: u64,
+    model_id: arc_crypto::Hash256,
+    max_tokens: u32,
+    timeout_blocks: u64,
+}
+
+/// Accept both `0x`-prefixed and bare hex for a 32-byte value. `[u8; 32]`
+/// so callers can directly feed into Hash256 or request_id slots.
+fn decode_hash_hex(s: &str) -> Result<[u8; 32], String> {
+    let trimmed = s.strip_prefix("0x").unwrap_or(s);
+    let raw = hex::decode(trimmed).map_err(|e| format!("hex: {}", e))?;
+    if raw.len() != 32 {
+        return Err(format!("expected 32 bytes, got {}", raw.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+/// Account addresses in ARC are `Hash256` — same 32-byte shape. Provide a
+/// named alias so callers reading the code know the intent is "an address",
+/// not "any 32-byte hash".
+fn decode_address_hex(s: &str) -> Result<[u8; 32], String> {
+    decode_hash_hex(s)
+}
+
+/// Deterministic account for the cross-node "observer pool" share of
+/// release payouts. Future work: replace with a governance-configurable
+/// address that accumulates and pays out to observer-role nodes.
+fn observer_pool_address() -> arc_crypto::Hash256 {
+    arc_crypto::hash_bytes(b"arc-observer-pool")
+}
+
+/// Deterministic treasury address. Collects the 20% treasury share plus
+/// any rounding residue from integer fee splits.
+fn treasury_address() -> arc_crypto::Hash256 {
+    arc_crypto::hash_bytes(b"arc-treasury")
+}
+
+/// Build + submit an InferenceEscrowRelease transaction. Null-signed like
+/// the existing InferenceAttestation auto-submit — the testnet's
+/// mempool accepts null sigs from internal node paths.
+fn submit_escrow_release(
+    node: &NodeState,
+    gate: &EscrowGate,
+    output_hash: arc_crypto::Hash256,
+    replicas: Vec<arc_crypto::Hash256>,
+) -> arc_crypto::Hash256 {
+    let proposer = node.validator_address;
+    // Base nonce for the coordinator's own account; bump the same way the
+    // attestation submitter does so repeat releases (different request_ids
+    // in the same block) don't collide.
+    let base_nonce = node
+        .state
+        .get_account(&proposer)
+        .map(|a| a.nonce)
+        .unwrap_or(0);
+    let bump = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
+    let nonce = base_nonce + bump;
+
+    let body = arc_types::transaction::InferenceEscrowReleaseBody {
+        request_id: gate.request_id,
+        payer: gate.payer,
+        model_id: gate.model_id,
+        max_tokens: gate.max_tokens,
+        timeout_blocks: gate.timeout_blocks,
+        output_hash,
+        proposer,
+        replicas,
+        observer_pool: observer_pool_address(),
+        treasury: treasury_address(),
+    };
+    let mut tx = arc_types::Transaction {
+        tx_type: arc_types::TxType::InferenceEscrowRelease,
+        from: proposer,
+        nonce,
+        body: arc_types::TxBody::InferenceEscrowRelease(body),
+        fee: 0,
+        gas_limit: 0,
+        hash: arc_crypto::Hash256::ZERO,
+        signature: arc_crypto::Signature::null(),
+        sig_verified: false,
+    };
+    tx.hash = tx.compute_hash();
+    let tx_hash = tx.hash;
+    let _ = node.mempool.insert(tx);
+    tx_hash
 }
 
 /// Bond for consensus-divergence auto-challenges opened by

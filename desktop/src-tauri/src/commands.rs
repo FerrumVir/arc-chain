@@ -303,6 +303,260 @@ const COORDINATOR_HOSTS: [&str; 6] = [
     "http://149.28.153.31:9090",  // SGP
 ];
 
+/// Milestone B (#36): testnet model commitment. Both ends — the
+/// InferenceEscrowOpen tx and the InferenceEscrowRelease tx the
+/// coordinator will auto-submit — must use the same value or the
+/// state-layer metadata-hash check rejects the release.
+fn testnet_model_id() -> arc_crypto::Hash256 {
+    arc_crypto::hash_bytes(b"arc-testnet-llama-2-7b-chat-q4")
+}
+
+/// Milestone B default escrow timeout (in blocks). Conservative enough
+/// that a slow 50s/token run_consensus pass can't auto-refund out from
+/// under the coordinator before it submits the release.
+const DEFAULT_ESCROW_TIMEOUT_BLOCKS: u64 = 10_000;
+
+/// Default "Pay N ARC" max_fee for the UI. Matches the PLAN.md example
+/// (Alice pays 10 ARC × 10 inferences = 100 ARC debited).
+const DEFAULT_MAX_FEE: u64 = 10_000;
+
+/// Derive the signing keypair from a BIP-39 phrase the same way
+/// `identity::derive` does. Duplicated (not factored) because
+/// `identity::derive` returns an opaque `Identity` struct meant for the
+/// UI; here we need the raw `SigningKey` so we can put the public key
+/// into the Transaction's signature slot.
+fn keypair_from_phrase(phrase: &str) -> ed25519_dalek::SigningKey {
+    const DOMAIN_TAG: &str = "ARC-chain-validator-keypair-v1";
+    let seed_bytes = blake3::derive_key(DOMAIN_TAG, phrase.trim().as_bytes());
+    ed25519_dalek::SigningKey::from_bytes(&seed_bytes)
+}
+
+/// Milestone B (#36): open an inference-escrow on a coordinator, then
+/// call `/inference/run_consensus` against it. The coordinator validates
+/// the escrow is present before running model work, and on success
+/// auto-submits the release tx that pays out 40/25/15/20 to
+/// proposer / replicas / observer pool / treasury.
+#[tauri::command]
+pub async fn run_paid_inference(
+    state: State<'_, AppState>,
+    prompt: String,
+    max_tokens: Option<u32>,
+    max_fee: Option<u64>,
+    k: Option<u32>,
+) -> CmdResult<PaidInferenceResult> {
+    use ed25519_dalek::Signer;
+
+    let phrase = {
+        let store = state.store.lock().await;
+        store
+            .identity
+            .as_ref()
+            .map(|i| i.seed_phrase.clone())
+            .ok_or_else(|| "no identity — run onboarding first".to_string())?
+    };
+    let signing_key = keypair_from_phrase(&phrase);
+    let public_key = signing_key.verifying_key().to_bytes();
+    // ARC address = BLAKE3(public_key) — matches chain derivation.
+    let payer_addr = arc_crypto::Hash256(*blake3::hash(&public_key).as_bytes());
+
+    // Pick the first reachable coordinator.
+    let probe = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(6))
+        .build()
+        .map_err(map_err)?;
+    let mut coord_url: Option<String> = None;
+    for host in COORDINATOR_HOSTS {
+        if let Ok(r) = probe.get(format!("{}/health", host)).send().await {
+            if r.status().is_success() {
+                coord_url = Some(host.to_string());
+                break;
+            }
+        }
+    }
+    let coord_url = coord_url.ok_or_else(|| {
+        "no coordinator reachable — all 6 testnet seeds timed out on /health".to_string()
+    })?;
+
+    // Pull the payer's current on-chain nonce so the open tx lands.
+    let account_url = format!(
+        "{}/account/0x{}",
+        coord_url,
+        hex::encode(&payer_addr.0)
+    );
+    let nonce: u64 = match probe.get(&account_url).send().await {
+        Ok(r) if r.status().is_success() => r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("nonce").and_then(|n| n.as_u64()))
+            .unwrap_or(0),
+        _ => 0,
+    };
+
+    let mut request_id = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut request_id);
+    let model_id = testnet_model_id();
+    let max_tokens = max_tokens.unwrap_or(32);
+    let max_fee = max_fee.unwrap_or(DEFAULT_MAX_FEE);
+    let timeout_blocks = DEFAULT_ESCROW_TIMEOUT_BLOCKS;
+
+    // Build + sign the InferenceEscrowOpen tx.
+    let body = arc_types::transaction::InferenceEscrowOpenBody {
+        request_id,
+        model_id,
+        max_fee,
+        max_tokens,
+        timeout_blocks,
+    };
+    let mut tx = arc_types::Transaction {
+        tx_type: arc_types::TxType::InferenceEscrowOpen,
+        from: payer_addr,
+        nonce,
+        body: arc_types::TxBody::InferenceEscrowOpen(body),
+        fee: 0,
+        gas_limit: 0,
+        hash: arc_crypto::Hash256::ZERO,
+        signature: arc_crypto::Signature::null(),
+        sig_verified: false,
+    };
+    tx.hash = tx.compute_hash();
+    let sig = signing_key.sign(tx.hash.as_bytes());
+    tx.signature = arc_crypto::Signature::Ed25519 {
+        public_key,
+        signature: sig.to_bytes().to_vec(),
+    };
+    let open_tx_hash = tx.hash;
+
+    let submit_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(map_err)?;
+    let open_resp = submit_client
+        .post(format!("{}/tx/submit_signed", coord_url))
+        .json(&tx)
+        .send()
+        .await
+        .map_err(map_err)?;
+    if !open_resp.status().is_success() {
+        return Err(format!(
+            "escrow open failed: {} — payer=0x{} nonce={}",
+            open_resp.status(),
+            hex::encode(&payer_addr.0),
+            nonce
+        ));
+    }
+
+    // Wait for the open tx to commit (mempool → block). ≤ 15s × 200ms.
+    let open_hash_hex = hex::encode(&open_tx_hash.0);
+    let mut committed = false;
+    for _ in 0..75 {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Ok(r) = submit_client
+            .get(format!("{}/tx/0x{}", coord_url, open_hash_hex))
+            .send()
+            .await
+        {
+            if r.status().is_success() {
+                committed = true;
+                break;
+            }
+        }
+    }
+    if !committed {
+        return Err(format!(
+            "escrow open tx did not commit within 15s (hash=0x{})",
+            open_hash_hex
+        ));
+    }
+
+    // Run inference with the escrow-gated flags.
+    let k = k.unwrap_or(3);
+    let wrapped = if prompt.contains("[INST]") {
+        prompt.clone()
+    } else {
+        format!("[INST] {} [/INST]", prompt)
+    };
+    let infer_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(map_err)?;
+    let infer_resp = infer_client
+        .post(format!("{}/inference/run_consensus", coord_url))
+        .json(&serde_json::json!({
+            "input": wrapped,
+            "max_tokens": max_tokens,
+            "k": k,
+            "payer": format!("0x{}", hex::encode(&payer_addr.0)),
+            "request_id": format!("0x{}", hex::encode(&request_id)),
+            "max_fee": max_fee,
+            "model_id": format!("0x{}", hex::encode(&model_id.0)),
+            "timeout_blocks": timeout_blocks,
+        }))
+        .send()
+        .await
+        .map_err(map_err)?;
+    if !infer_resp.status().is_success() {
+        return Err(format!(
+            "run_consensus failed: {} (escrow will refund after {} blocks)",
+            infer_resp.status(),
+            timeout_blocks
+        ));
+    }
+    let v: serde_json::Value = infer_resp.json().await.map_err(map_err)?;
+    let c = v.get("consensus").cloned().unwrap_or(serde_json::Value::Null);
+    let escrow_block = v.get("escrow").cloned().unwrap_or(serde_json::Value::Null);
+
+    Ok(PaidInferenceResult {
+        input: v
+            .get("input")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        output: v
+            .get("output")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        output_hash: v
+            .get("output_hash")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        tokens_generated: v
+            .get("tokens_generated")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+        inference_ms: v
+            .get("total_ms")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+        coordinator: coord_url,
+        consensus: InferenceConsensus {
+            k: c.get("k").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            votes_total: c
+                .get("votes_total")
+                .and_then(|x| x.as_u64())
+                .unwrap_or(0) as u32,
+            unanimous: c.get("unanimous").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            majority: c.get("majority").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            split: c.get("split").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+            divergent_replica_count: c
+                .get("divergent_replicas")
+                .and_then(|x| x.as_object())
+                .map(|m| m.len() as u32)
+                .unwrap_or(0),
+        },
+        payer_address: format!("0x{}", hex::encode(&payer_addr.0)),
+        max_fee,
+        open_tx_hash: format!("0x{}", open_hash_hex),
+        release_tx_hash: escrow_block
+            .get("release_tx_hash")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
 #[tauri::command]
 pub async fn check_for_update() -> CmdResult<UpdateCheck> {
     // Query the public GitHub releases API for the latest tag.

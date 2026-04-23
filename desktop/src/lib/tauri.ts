@@ -15,6 +15,7 @@ import type {
   NetworkStats,
   NodeConfig,
   NodeStatus,
+  PaidInferenceResult,
 } from "./types";
 
 const IS_TAURI =
@@ -357,6 +358,15 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       }
       throw new Error(`all coordinators failed; last: ${lastErr}`);
     }
+    case "run_paid_inference": {
+      // Paid-inference signs and submits an on-chain tx; the live browser
+      // mode doesn't carry the payer's private key and can't represent
+      // that flow honestly. Surface a clear error rather than synthesize
+      // fake tx hashes the user might take as real.
+      throw new Error(
+        "run_paid_inference requires the Tauri native app (signing + tx submission)",
+      );
+    }
     case "open_external":
       window.open((args as { url: string }).url, "_blank");
       return undefined as T;
@@ -612,6 +622,39 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         coordinator: "http://149.28.32.76:9090",
       } as T;
     }
+    case "run_paid_inference": {
+      const { prompt, maxFee } = args as {
+        prompt: string;
+        maxTokens?: number;
+        maxFee?: number;
+      };
+      await new Promise((r) => setTimeout(r, 1500));
+      return {
+        input: `[INST] ${prompt} [/INST]`,
+        output:
+          "  Mock paid-inference response — browser preview. In the native app, this flow: signs an InferenceEscrowOpen tx locally, POSTs it to a coordinator, waits for commit, then runs /inference/run_consensus which auto-submits the release.",
+        outputHash:
+          "0xd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+        tokensGenerated: 28,
+        inferenceMs: 22_100,
+        coordinator: "http://149.28.32.76:9090",
+        consensus: {
+          k: 3,
+          votesTotal: 48,
+          unanimous: 48,
+          majority: 0,
+          split: 0,
+          divergentReplicaCount: 0,
+        },
+        payerAddress:
+          "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+        maxFee: maxFee ?? 10_000,
+        openTxHash:
+          "0x0open111111111111111111111111111111111111111111111111111111111111",
+        releaseTxHash:
+          "0x0release1111111111111111111111111111111111111111111111111111111",
+      } as T;
+    }
     case "clear_crash":
       return undefined as T;
     case "check_for_update":
@@ -667,6 +710,18 @@ export const api = {
     invoke<InferenceResult>("run_inference_via_coordinator", {
       prompt,
       maxTokens,
+      k,
+    }),
+  runPaidInference: (
+    prompt: string,
+    maxTokens = 32,
+    maxFee = 10_000,
+    k = 3,
+  ) =>
+    invoke<PaidInferenceResult>("run_paid_inference", {
+      prompt,
+      maxTokens,
+      maxFee,
       k,
     }),
   clearCrash: () => invoke<void>("clear_crash"),
