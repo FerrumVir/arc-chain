@@ -66,6 +66,12 @@ pub mod gas_costs {
     pub const INFERENCE_ATTESTATION: u64 = 50_000;
     /// Gas for challenging an inference attestation (Tier 2).
     pub const INFERENCE_CHALLENGE: u64 = 100_000;
+    /// Gas for opening a per-request inference escrow (Milestone B).
+    pub const INFERENCE_ESCROW_OPEN: u64 = 50_000;
+    /// Gas for releasing an inference escrow to replicas + treasury + proposer.
+    pub const INFERENCE_ESCROW_RELEASE: u64 = 80_000;
+    /// Gas for refunding an unreleased escrow after timeout.
+    pub const INFERENCE_ESCROW_REFUND: u64 = 40_000;
     /// Gas for storage read.
     pub const SLOAD: u64 = 200;
     /// Gas for storage write.
@@ -203,6 +209,18 @@ pub enum TxType {
     InferenceChallenge = 0x17,
     /// Register as an inference provider (declare hardware tier + stake).
     InferenceRegister = 0x18,
+    /// Milestone B: open a per-request inference escrow — payer locks
+    /// max_fee ARC against a request_id, which can be released on a
+    /// successful attestation or refunded after timeout.
+    InferenceEscrowOpen = 0x19,
+    /// Milestone B: release an opened escrow. Splits max_fee into the
+    /// RoleRevenueConfig shares (40% proposer / 25% replicas / 15% observer
+    /// pool / 20% treasury) and zeros the escrow.
+    InferenceEscrowRelease = 0x1a,
+    /// Milestone B: payer reclaims their funds after `timeout_blocks` have
+    /// elapsed without a release. Only callable by the original payer
+    /// (identity proved via metadata-hash match on the escrow account).
+    InferenceEscrowRefund = 0x1b,
 }
 
 /// A transaction on the ARC chain.
@@ -278,6 +296,12 @@ pub enum TxBody {
     InferenceChallenge(InferenceChallengeBody),
     /// Register as an inference provider (declare hardware tier + stake).
     InferenceRegister(InferenceRegisterBody),
+    /// Open a per-request inference escrow (Milestone B).
+    InferenceEscrowOpen(InferenceEscrowOpenBody),
+    /// Release an opened escrow into replica + treasury + proposer shares.
+    InferenceEscrowRelease(InferenceEscrowReleaseBody),
+    /// Refund an unreleased escrow after timeout.
+    InferenceEscrowRefund(InferenceEscrowRefundBody),
 }
 
 /// Simple value transfer.
@@ -579,6 +603,107 @@ pub struct InferenceRegisterBody {
     pub tier: u8,
     /// Stake bond to lock (proves commitment, returned on deregister).
     pub stake_bond: u64,
+}
+
+/// Milestone B: open a per-request inference escrow.
+///
+/// The payer (tx.from) locks `max_fee` ARC against `request_id`. The chain
+/// derives a deterministic escrow account from `request_id` and stores
+/// identifying metadata (model_id, max_tokens, timeout_blocks, payer) so
+/// later release/refund tx bodies can be validated by re-hashing the
+/// same fields and matching the stored commitment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceEscrowOpenBody {
+    /// Client-chosen request identifier (must be unique per open).
+    pub request_id: [u8; 32],
+    /// Which model this payment covers — e.g. Llama-2-7B BLAKE3 ID.
+    pub model_id: Hash256,
+    /// Maximum ARC the payer is willing to pay for this request.
+    pub max_fee: u64,
+    /// Maximum tokens to generate (caps the work the network does).
+    pub max_tokens: u32,
+    /// After opened_at + timeout_blocks elapses without a release, the
+    /// original payer may reclaim the escrow via InferenceEscrowRefund.
+    pub timeout_blocks: u64,
+}
+
+/// Release an opened escrow against an attested inference result.
+///
+/// The release distributes `max_fee` according to the RoleRevenueConfig:
+/// 40% to `proposer`, 25% split evenly among `replicas`, 15% to
+/// `observer_pool`, 20% to `treasury`. Any rounding residue goes to
+/// `treasury`.
+///
+/// Authorization (MVP): any signed tx may submit a release as long as
+/// the provided metadata (payer, model_id, max_tokens, timeout_blocks)
+/// hashes to the value stored at open time. Output-hash-gated release
+/// and attestation-required release are tracked as follow-ups.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceEscrowReleaseBody {
+    pub request_id: [u8; 32],
+    /// Must match the original payer. Encoded in the escrow's stored
+    /// metadata hash.
+    pub payer: Address,
+    pub model_id: Hash256,
+    pub max_tokens: u32,
+    pub timeout_blocks: u64,
+    /// Output hash from the consensus attestation (recorded in the
+    /// release receipt for audit; not gating today).
+    pub output_hash: Hash256,
+    /// The coordinator that served the request (receives 40% share).
+    pub proposer: Address,
+    /// Replicas that answered; 25% share is split evenly.
+    pub replicas: Vec<Address>,
+    /// Account that accumulates the observer-pool share (15%). Today the
+    /// testnet uses the treasury address; decoupled for when the pool
+    /// becomes a distinct account.
+    pub observer_pool: Address,
+    /// Treasury address — receives 20% plus any rounding residue.
+    pub treasury: Address,
+}
+
+/// Refund an unreleased escrow after timeout.
+///
+/// Only the original payer can call this: `tx.from` is used as the payer
+/// in the metadata rehash, and the rehash must equal the commitment
+/// stored at open time. Current block height must be at least
+/// `opened_at + timeout_blocks`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceEscrowRefundBody {
+    pub request_id: [u8; 32],
+    pub model_id: Hash256,
+    pub max_tokens: u32,
+    pub timeout_blocks: u64,
+}
+
+/// Milestone B helpers — shared between arc-state and arc-node so both
+/// sides agree on the escrow-account derivation and metadata layout.
+impl InferenceEscrowOpenBody {
+    /// Deterministic escrow account address for this request_id.
+    pub fn escrow_address(request_id: &[u8; 32]) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(24 + 32);
+        buf.extend_from_slice(b"arc-inference-escrow");
+        buf.extend_from_slice(request_id);
+        arc_crypto::hash_bytes(&buf).0
+    }
+
+    /// Metadata commitment (32 bytes) stored in the escrow account's
+    /// storage_root slot. Allows release/refund callers to prove they
+    /// know the original (payer, model_id, max_tokens, timeout_blocks)
+    /// without the chain needing a separate DashMap of records.
+    pub fn metadata_commitment(
+        payer: &Address,
+        model_id: &Hash256,
+        max_tokens: u32,
+        timeout_blocks: u64,
+    ) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(32 + 32 + 4 + 8);
+        buf.extend_from_slice(&payer.0);
+        buf.extend_from_slice(&model_id.0);
+        buf.extend_from_slice(&max_tokens.to_le_bytes());
+        buf.extend_from_slice(&timeout_blocks.to_le_bytes());
+        arc_crypto::hash_bytes(&buf).0
+    }
 }
 
 /// EVM event log emitted during contract execution.

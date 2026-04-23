@@ -712,7 +712,10 @@ impl Pipeline {
                                 | TxBody::ShardProof(_)
                                 | TxBody::InferenceAttestation(_)
                                 | TxBody::InferenceChallenge(_)
-                                | TxBody::InferenceRegister(_) => {}
+                                | TxBody::InferenceRegister(_)
+                                | TxBody::InferenceEscrowOpen(_)
+                                | TxBody::InferenceEscrowRelease(_)
+                                | TxBody::InferenceEscrowRefund(_) => {}
                             }
                         }
 

@@ -1712,6 +1712,36 @@ async fn get_full_transaction(
             "tier": body.tier,
             "stake_bond": body.stake_bond,
         }),
+        TxBody::InferenceEscrowOpen(body) => json!({
+            "type": "InferenceEscrowOpen",
+            "request_id": format!("0x{}", hex::encode(&body.request_id)),
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "max_fee": body.max_fee,
+            "max_tokens": body.max_tokens,
+            "timeout_blocks": body.timeout_blocks,
+        }),
+        TxBody::InferenceEscrowRelease(body) => json!({
+            "type": "InferenceEscrowRelease",
+            "request_id": format!("0x{}", hex::encode(&body.request_id)),
+            "payer": format!("0x{}", hex::encode(&body.payer.0)),
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "max_tokens": body.max_tokens,
+            "timeout_blocks": body.timeout_blocks,
+            "output_hash": format!("0x{}", hex::encode(&body.output_hash.0)),
+            "proposer": format!("0x{}", hex::encode(&body.proposer.0)),
+            "replicas": body.replicas.iter()
+                .map(|r| format!("0x{}", hex::encode(&r.0)))
+                .collect::<Vec<_>>(),
+            "observer_pool": format!("0x{}", hex::encode(&body.observer_pool.0)),
+            "treasury": format!("0x{}", hex::encode(&body.treasury.0)),
+        }),
+        TxBody::InferenceEscrowRefund(body) => json!({
+            "type": "InferenceEscrowRefund",
+            "request_id": format!("0x{}", hex::encode(&body.request_id)),
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "max_tokens": body.max_tokens,
+            "timeout_blocks": body.timeout_blocks,
+        }),
     };
 
     let sig_json = match &tx.signature {

@@ -11,7 +11,7 @@ use arc_crypto::{Hash256, IncrementalMerkle, MerkleTree, hash_bytes, hash_pair};
 use arc_types::{Account, Address, Identity, IdentityLevel, Transaction, TxBody, TxType, TxReceipt, TransferBody, Block, BlockHeader, ProtocolVersion};
 use arc_types::block::{StateDiff, AccountChange};
 use arc_types::economics::StateRentConfig;
-use arc_types::transaction::{GasMeter, gas_costs};
+use arc_types::transaction::{GasMeter, gas_costs, InferenceEscrowOpenBody};
 
 use crate::jmt_store::JmtStateTree;
 use light_client::{StateProof, HeaderProof, TxInclusionProof, LightSnapshot};
@@ -2357,6 +2357,9 @@ impl StateDB {
             TxBody::InferenceAttestation(_) => gas_costs::INFERENCE_ATTESTATION,
             TxBody::InferenceChallenge(_) => gas_costs::INFERENCE_CHALLENGE,
             TxBody::InferenceRegister(_) => gas_costs::INFERENCE_ATTESTATION, // same gas as attestation
+            TxBody::InferenceEscrowOpen(_) => gas_costs::INFERENCE_ESCROW_OPEN,
+            TxBody::InferenceEscrowRelease(_) => gas_costs::INFERENCE_ESCROW_RELEASE,
+            TxBody::InferenceEscrowRefund(_) => gas_costs::INFERENCE_ESCROW_REFUND,
         }
     }
 
@@ -3923,6 +3926,234 @@ impl StateDB {
 
                 Ok(gas.consumed)
             }
+            TxBody::InferenceEscrowOpen(body) => {
+                // Milestone B: payer locks `max_fee` in a deterministic
+                // escrow account keyed by request_id. Metadata (model_id,
+                // max_tokens, timeout_blocks, payer) is committed into the
+                // account's storage_root so release/refund callers must
+                // prove they know the same fields by rehashing.
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                if sender.balance < body.max_fee {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: body.max_fee,
+                    });
+                }
+
+                let escrow_addr_bytes =
+                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = Hash256(escrow_addr_bytes);
+                let existing = self.get_or_create_account(&escrow_addr);
+                if existing.balance != 0 {
+                    return Err(StateError::ExecutionError(format!(
+                        "inference escrow open: request_id already has open \
+                         escrow (balance={})",
+                        existing.balance
+                    )));
+                }
+
+                // Debit payer.
+                sender.balance -= body.max_fee;
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                // Credit escrow + stash metadata commitment.
+                let commitment = InferenceEscrowOpenBody::metadata_commitment(
+                    &tx.from,
+                    &body.model_id,
+                    body.max_tokens,
+                    body.timeout_blocks,
+                );
+                let mut escrow = existing;
+                escrow.balance = body.max_fee;
+                // Abuse `nonce` as the opened-at block height. Refund
+                // re-reads this to enforce the timeout.
+                escrow.nonce = self.height();
+                escrow.storage_root = Hash256(commitment);
+                self.accounts.insert(escrow_addr_bytes, escrow.clone());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+
+                Ok(gas.consumed)
+            }
+            TxBody::InferenceEscrowRelease(body) => {
+                // Milestone B: distribute the locked max_fee per the
+                // RoleRevenueConfig split (40% proposer / 25% replicas /
+                // 15% observer pool / 20% treasury). Any rounding goes to
+                // treasury so total is always conserved.
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                if body.replicas.is_empty() {
+                    return Err(StateError::ExecutionError(
+                        "inference escrow release: must name at least one replica"
+                            .into(),
+                    ));
+                }
+
+                let escrow_addr_bytes =
+                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = Hash256(escrow_addr_bytes);
+                let escrow = self.get_or_create_account(&escrow_addr);
+                if escrow.balance == 0 {
+                    return Err(StateError::ExecutionError(
+                        "inference escrow release: no open escrow for this \
+                         request_id"
+                            .into(),
+                    ));
+                }
+
+                let expected = InferenceEscrowOpenBody::metadata_commitment(
+                    &body.payer,
+                    &body.model_id,
+                    body.max_tokens,
+                    body.timeout_blocks,
+                );
+                if escrow.storage_root.0 != expected {
+                    return Err(StateError::ExecutionError(
+                        "inference escrow release: metadata commitment mismatch"
+                            .into(),
+                    ));
+                }
+
+                // Advance release-submitter nonce.
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                // 40/25/15/20 split; treasury absorbs all truncation residue.
+                let total = escrow.balance;
+                let proposer_share = total * 40 / 100;
+                let replicas_pool = total * 25 / 100;
+                let observer_share = total * 15 / 100;
+                let per_replica = replicas_pool / body.replicas.len() as u64;
+                let replicas_paid = per_replica * body.replicas.len() as u64;
+                let treasury_share =
+                    total - proposer_share - replicas_paid - observer_share;
+
+                // Credit proposer.
+                let mut proposer_acc = self.get_or_create_account(&body.proposer);
+                proposer_acc.balance += proposer_share;
+                self.accounts
+                    .insert(body.proposer.0, proposer_acc.clone());
+                self.wal.append(
+                    WalOp::SetAccount(body.proposer, proposer_acc),
+                    self.height(),
+                );
+
+                // Credit each replica.
+                for r in &body.replicas {
+                    let mut rep = self.get_or_create_account(r);
+                    rep.balance += per_replica;
+                    self.accounts.insert(r.0, rep.clone());
+                    self.wal.append(WalOp::SetAccount(*r, rep), self.height());
+                }
+
+                // Credit observer pool.
+                let mut obs = self.get_or_create_account(&body.observer_pool);
+                obs.balance += observer_share;
+                self.accounts.insert(body.observer_pool.0, obs.clone());
+                self.wal.append(
+                    WalOp::SetAccount(body.observer_pool, obs),
+                    self.height(),
+                );
+
+                // Credit treasury (includes rounding residue).
+                let mut tre = self.get_or_create_account(&body.treasury);
+                tre.balance += treasury_share;
+                self.accounts.insert(body.treasury.0, tre.clone());
+                self.wal
+                    .append(WalOp::SetAccount(body.treasury, tre), self.height());
+
+                // Zero the escrow and clear the commitment so the same
+                // request_id can't be released/refunded twice.
+                let mut released = escrow;
+                released.balance = 0;
+                released.storage_root = Hash256::ZERO;
+                self.accounts.insert(escrow_addr_bytes, released.clone());
+                self.wal.append(
+                    WalOp::SetAccount(escrow_addr, released),
+                    self.height(),
+                );
+
+                Ok(gas.consumed)
+            }
+            TxBody::InferenceEscrowRefund(body) => {
+                // Milestone B: original payer reclaims funds after the
+                // `timeout_blocks` window elapses with no release. Only
+                // callable by the payer — identity proved by rehashing
+                // the same fields used at open and matching the stored
+                // commitment.
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+
+                let escrow_addr_bytes =
+                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = Hash256(escrow_addr_bytes);
+                let escrow = self.get_or_create_account(&escrow_addr);
+                if escrow.balance == 0 {
+                    return Err(StateError::ExecutionError(
+                        "inference escrow refund: no open escrow for this \
+                         request_id"
+                            .into(),
+                    ));
+                }
+                let expected = InferenceEscrowOpenBody::metadata_commitment(
+                    &tx.from,
+                    &body.model_id,
+                    body.max_tokens,
+                    body.timeout_blocks,
+                );
+                if escrow.storage_root.0 != expected {
+                    return Err(StateError::ExecutionError(
+                        "inference escrow refund: caller is not the original \
+                         payer (metadata mismatch)"
+                            .into(),
+                    ));
+                }
+                let opened_at = escrow.nonce;
+                let now = self.height();
+                if now < opened_at + body.timeout_blocks {
+                    return Err(StateError::ExecutionError(format!(
+                        "inference escrow refund: timeout not elapsed \
+                         (now={}, opened_at={}, timeout={})",
+                        now, opened_at, body.timeout_blocks
+                    )));
+                }
+
+                // Refund locked balance to payer.
+                sender.balance += escrow.balance;
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                let mut refunded = escrow;
+                refunded.balance = 0;
+                refunded.storage_root = Hash256::ZERO;
+                self.accounts.insert(escrow_addr_bytes, refunded.clone());
+                self.wal.append(
+                    WalOp::SetAccount(escrow_addr, refunded),
+                    self.height(),
+                );
+
+                Ok(gas.consumed)
+            }
         }
     }
 
@@ -4149,13 +4380,21 @@ impl StateDB {
     /// Caps per-account history at 10K entries to prevent unbounded memory growth.
     fn index_account_tx(&self, tx: &Transaction) {
         const MAX_TX_HISTORY: usize = 10_000;
-        let mut entry = self.account_txs.entry(tx.from.0).or_default();
-        if entry.len() >= MAX_TX_HISTORY {
-            // Remove oldest 10% to amortize truncation cost
-            let drain_count = MAX_TX_HISTORY / 10;
-            entry.drain(..drain_count);
+        // Index the sender first and DROP the DashMap entry guard before
+        // touching any other account. Holding a shard guard while calling
+        // `account_txs.entry(other_key)` deadlocks whenever the outer and
+        // inner keys land on the same shard — which happens for free when
+        // `other_key == tx.from.0` (e.g. an InferenceEscrowRelease whose
+        // coordinator is also the proposer).
+        {
+            let mut entry = self.account_txs.entry(tx.from.0).or_default();
+            if entry.len() >= MAX_TX_HISTORY {
+                // Remove oldest 10% to amortize truncation cost
+                let drain_count = MAX_TX_HISTORY / 10;
+                entry.drain(..drain_count);
+            }
+            entry.push(tx.hash);
         }
-        entry.push(tx.hash);
 
         match &tx.body {
             TxBody::Transfer(body) => {
@@ -4219,6 +4458,45 @@ impl StateDB {
             }
             TxBody::InferenceRegister(_) => {
                 // Registration modifies sender's staked_balance; sender is already tracked.
+            }
+            TxBody::InferenceEscrowOpen(body) => {
+                let escrow_addr =
+                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                self.account_txs
+                    .entry(escrow_addr)
+                    .or_default()
+                    .push(tx.hash);
+            }
+            TxBody::InferenceEscrowRelease(body) => {
+                let escrow_addr =
+                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                self.account_txs
+                    .entry(escrow_addr)
+                    .or_default()
+                    .push(tx.hash);
+                self.account_txs
+                    .entry(body.proposer.0)
+                    .or_default()
+                    .push(tx.hash);
+                for r in &body.replicas {
+                    self.account_txs.entry(r.0).or_default().push(tx.hash);
+                }
+                self.account_txs
+                    .entry(body.observer_pool.0)
+                    .or_default()
+                    .push(tx.hash);
+                self.account_txs
+                    .entry(body.treasury.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
+            TxBody::InferenceEscrowRefund(body) => {
+                let escrow_addr =
+                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                self.account_txs
+                    .entry(escrow_addr)
+                    .or_default()
+                    .push(tx.hash);
             }
         }
     }
@@ -4291,6 +4569,27 @@ impl StateDB {
             }
             TxBody::InferenceRegister(_) => {
                 // Sender account is already marked dirty (line above match).
+            }
+            TxBody::InferenceEscrowOpen(body) => {
+                let escrow_addr =
+                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                self.dirty_accounts.insert(escrow_addr);
+            }
+            TxBody::InferenceEscrowRelease(body) => {
+                let escrow_addr =
+                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                self.dirty_accounts.insert(escrow_addr);
+                self.dirty_accounts.insert(body.proposer.0);
+                for r in &body.replicas {
+                    self.dirty_accounts.insert(r.0);
+                }
+                self.dirty_accounts.insert(body.observer_pool.0);
+                self.dirty_accounts.insert(body.treasury.0);
+            }
+            TxBody::InferenceEscrowRefund(body) => {
+                let escrow_addr =
+                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                self.dirty_accounts.insert(escrow_addr);
             }
         }
     }
@@ -6069,5 +6368,450 @@ mod tests {
 
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(!r[0].success, "InferenceRegister with insufficient stake should fail");
+    }
+
+    // ── Milestone B: InferenceEscrow integration tests ───────────────────
+    //
+    // All tests use real balance deltas — no mocks. The acceptance criterion
+    // from PLAN.md is "payer pays N ARC; balances on serving replicas
+    // increase by their share; total conserved."
+
+    use arc_types::transaction::{
+        InferenceEscrowOpenBody, InferenceEscrowReleaseBody, InferenceEscrowRefundBody,
+    };
+
+    /// Convenience: same 32-byte request_id in every test, keyed on test name
+    /// so concurrent-cargo-test runs don't collide on the escrow DashMap.
+    fn req(tag: &[u8]) -> [u8; 32] {
+        hash_bytes(&[b"req-", tag].concat()).0
+    }
+
+    fn model_id() -> Hash256 {
+        hash_bytes(b"llama-2-7b-test-model")
+    }
+
+    #[test]
+    fn test_escrow_open_debits_payer_credits_escrow() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = req(b"open-happy");
+
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 10_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let (_, receipts) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(receipts[0].success, "InferenceEscrowOpen should succeed");
+
+        // Payer balance debited.
+        let payer = state.get_account(&addr(1)).unwrap();
+        assert_eq!(payer.balance, 990_000);
+        assert_eq!(payer.nonce, 1);
+
+        // Escrow account holds the max_fee.
+        let escrow_addr =
+            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(escrow.balance, 10_000);
+        // The escrow's storage_root commits to the payer's identity.
+        let expected = InferenceEscrowOpenBody::metadata_commitment(
+            &addr(1),
+            &model_id(),
+            32,
+            10,
+        );
+        assert_eq!(escrow.storage_root.0, expected);
+    }
+
+    #[test]
+    fn test_escrow_open_rejects_insufficient_balance() {
+        let state = StateDB::with_genesis(&[(addr(1), 100)]);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id: req(b"too-broke"),
+                model_id: model_id(),
+                max_fee: 10_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(!r[0].success, "open should reject insufficient balance");
+        // Payer balance unchanged.
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 100);
+    }
+
+    #[test]
+    fn test_escrow_open_rejects_double_open_same_request_id() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = req(b"double-open");
+        let tx1 = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 10_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let (_, r1) = state.execute_block(&[tx1], addr(99)).unwrap();
+        assert!(r1[0].success);
+
+        let tx2 = make_channel_tx(
+            addr(1),
+            1,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 10_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let (_, r2) = state.execute_block(&[tx2], addr(99)).unwrap();
+        assert!(!r2[0].success, "second open on same request_id must fail");
+    }
+
+    #[test]
+    fn test_escrow_release_distributes_40_25_15_20_and_conserves_total() {
+        // addr(1) = payer, addr(2) = proposer, addr(3..=5) = replicas,
+        // addr(10) = observer pool, addr(11) = treasury.
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = req(b"release-split");
+
+        let open = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 10_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let release = make_channel_tx(
+            addr(2), // proposer submits release
+            0,
+            TxBody::InferenceEscrowRelease(InferenceEscrowReleaseBody {
+                request_id,
+                payer: addr(1),
+                model_id: model_id(),
+                max_tokens: 32,
+                timeout_blocks: 10,
+                output_hash: hash_bytes(b"sample-output"),
+                proposer: addr(2),
+                replicas: vec![addr(3), addr(4), addr(5)],
+                observer_pool: addr(10),
+                treasury: addr(11),
+            }),
+            TxType::InferenceEscrowRelease,
+        );
+        let (_, rs) = state.execute_block(&[open, release], addr(99)).unwrap();
+        assert!(rs[0].success, "open must succeed");
+        assert!(rs[1].success, "release must succeed");
+
+        let payer = state.get_account(&addr(1)).unwrap();
+        let proposer = state.get_account(&addr(2)).unwrap();
+        let r1 = state.get_account(&addr(3)).unwrap();
+        let r2 = state.get_account(&addr(4)).unwrap();
+        let r3 = state.get_account(&addr(5)).unwrap();
+        let obs = state.get_account(&addr(10)).unwrap();
+        let tre = state.get_account(&addr(11)).unwrap();
+        let escrow_addr =
+            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow = state.get_account(&escrow_addr).unwrap();
+
+        // 40% proposer, 25% replicas (split 3 ways evenly with rounding → treasury),
+        // 15% observer, 20% treasury (+ rounding residue).
+        // 10_000 × 40 / 100 = 4_000
+        // 10_000 × 25 / 100 = 2_500 → 833 × 3 = 2_499; 1 residue to treasury
+        // 10_000 × 15 / 100 = 1_500
+        // treasury = 10_000 - 4_000 - 2_499 - 1_500 = 2_001
+        assert_eq!(proposer.balance, 4_000);
+        assert_eq!(r1.balance, 833);
+        assert_eq!(r2.balance, 833);
+        assert_eq!(r3.balance, 833);
+        assert_eq!(obs.balance, 1_500);
+        assert_eq!(tre.balance, 2_001);
+
+        // Conservation: payer is short 10_000; beneficiaries are up 10_000.
+        let credited = proposer.balance + r1.balance + r2.balance + r3.balance
+            + obs.balance + tre.balance;
+        assert_eq!(credited, 10_000);
+        assert_eq!(payer.balance, 990_000);
+
+        // Escrow zeroed + commitment cleared so it can't be replayed.
+        assert_eq!(escrow.balance, 0);
+        assert_eq!(escrow.storage_root, Hash256::ZERO);
+    }
+
+    #[test]
+    fn test_escrow_release_rejects_wrong_payer() {
+        // Open as addr(1); release names addr(42) as payer — metadata
+        // commitment won't match, release must fail.
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = req(b"wrong-payer");
+        let open = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 5_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let bad_release = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::InferenceEscrowRelease(InferenceEscrowReleaseBody {
+                request_id,
+                payer: addr(42), // LIE
+                model_id: model_id(),
+                max_tokens: 32,
+                timeout_blocks: 10,
+                output_hash: hash_bytes(b"x"),
+                proposer: addr(2),
+                replicas: vec![addr(3)],
+                observer_pool: addr(10),
+                treasury: addr(11),
+            }),
+            TxType::InferenceEscrowRelease,
+        );
+        let (_, rs) = state.execute_block(&[open, bad_release], addr(99)).unwrap();
+        assert!(rs[0].success);
+        assert!(!rs[1].success, "release with wrong payer must fail");
+        // Escrow still holds funds; nobody got paid.
+        let escrow_addr =
+            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 5_000);
+    }
+
+    #[test]
+    fn test_escrow_release_rejects_empty_replicas() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = req(b"no-replicas");
+        let open = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 5_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let bad = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::InferenceEscrowRelease(InferenceEscrowReleaseBody {
+                request_id,
+                payer: addr(1),
+                model_id: model_id(),
+                max_tokens: 32,
+                timeout_blocks: 10,
+                output_hash: hash_bytes(b"x"),
+                proposer: addr(2),
+                replicas: vec![], // empty
+                observer_pool: addr(10),
+                treasury: addr(11),
+            }),
+            TxType::InferenceEscrowRelease,
+        );
+        let (_, rs) = state.execute_block(&[open, bad], addr(99)).unwrap();
+        assert!(rs[0].success);
+        assert!(!rs[1].success, "empty replicas must be rejected");
+    }
+
+    #[test]
+    fn test_escrow_refund_after_timeout_returns_funds_to_payer() {
+        // Open with timeout_blocks=2, then advance 3 blocks, then refund
+        // succeeds and payer is whole.
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = req(b"refund-timeout");
+        let open = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 7_500,
+                max_tokens: 32,
+                timeout_blocks: 2,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let (_, r) = state.execute_block(&[open], addr(99)).unwrap();
+        assert!(r[0].success);
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 992_500);
+
+        // Advance 3 empty blocks so `now >= opened_at + timeout_blocks`.
+        let _ = state.execute_block(&[], addr(99)).unwrap();
+        let _ = state.execute_block(&[], addr(99)).unwrap();
+        let _ = state.execute_block(&[], addr(99)).unwrap();
+
+        let refund = make_channel_tx(
+            addr(1), // only payer can refund
+            1,
+            TxBody::InferenceEscrowRefund(InferenceEscrowRefundBody {
+                request_id,
+                model_id: model_id(),
+                max_tokens: 32,
+                timeout_blocks: 2,
+            }),
+            TxType::InferenceEscrowRefund,
+        );
+        let (_, rs) = state.execute_block(&[refund], addr(99)).unwrap();
+        assert!(rs[0].success, "refund after timeout should succeed");
+
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 1_000_000);
+        let escrow_addr =
+            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 0);
+    }
+
+    #[test]
+    fn test_escrow_refund_rejected_before_timeout() {
+        // Open with timeout=10; refund at block 2 must fail.
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = req(b"too-early");
+        let open = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 5_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let refund = make_channel_tx(
+            addr(1),
+            1,
+            TxBody::InferenceEscrowRefund(InferenceEscrowRefundBody {
+                request_id,
+                model_id: model_id(),
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowRefund,
+        );
+        let (_, rs) = state.execute_block(&[open, refund], addr(99)).unwrap();
+        assert!(rs[0].success);
+        assert!(!rs[1].success, "refund before timeout must fail");
+    }
+
+    #[test]
+    fn test_escrow_refund_rejects_non_payer() {
+        // addr(1) opens; addr(2) tries to refund → rejected (not original payer).
+        let state = StateDB::with_genesis(&[
+            (addr(1), 1_000_000),
+            (addr(2), 100_000),
+        ]);
+        let request_id = req(b"not-your-money");
+        let open = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 5_000,
+                max_tokens: 32,
+                timeout_blocks: 1,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let (_, r) = state.execute_block(&[open], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        // Advance timeout
+        let _ = state.execute_block(&[], addr(99)).unwrap();
+        let _ = state.execute_block(&[], addr(99)).unwrap();
+
+        let refund = make_channel_tx(
+            addr(2), // not the payer
+            0,
+            TxBody::InferenceEscrowRefund(InferenceEscrowRefundBody {
+                request_id,
+                model_id: model_id(),
+                max_tokens: 32,
+                timeout_blocks: 1,
+            }),
+            TxType::InferenceEscrowRefund,
+        );
+        let (_, rs) = state.execute_block(&[refund], addr(99)).unwrap();
+        assert!(!rs[0].success, "non-payer must not be able to refund");
+    }
+
+    #[test]
+    fn test_escrow_release_cannot_be_replayed() {
+        // After a successful release, a second release on the same
+        // request_id must fail (escrow cleared).
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = req(b"no-replay");
+        let open = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 1_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        let release_body = InferenceEscrowReleaseBody {
+            request_id,
+            payer: addr(1),
+            model_id: model_id(),
+            max_tokens: 32,
+            timeout_blocks: 10,
+            output_hash: hash_bytes(b"x"),
+            proposer: addr(2),
+            replicas: vec![addr(3)],
+            observer_pool: addr(10),
+            treasury: addr(11),
+        };
+        let release1 = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::InferenceEscrowRelease(release_body.clone()),
+            TxType::InferenceEscrowRelease,
+        );
+        let release2 = make_channel_tx(
+            addr(2),
+            1,
+            TxBody::InferenceEscrowRelease(release_body),
+            TxType::InferenceEscrowRelease,
+        );
+        let (_, rs) = state
+            .execute_block(&[open, release1, release2], addr(99))
+            .unwrap();
+        assert!(rs[0].success);
+        assert!(rs[1].success);
+        assert!(!rs[2].success, "second release must fail (escrow cleared)");
     }
 }

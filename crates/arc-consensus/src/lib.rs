@@ -1879,6 +1879,15 @@ impl ConsensusEngine {
             TxBody::InferenceAttestation(_) => false,  // Escrow is local to sender's shard
             TxBody::InferenceChallenge(_) => false,  // Resolved on attestation's shard
             TxBody::InferenceRegister(_) => false,  // Local to sender's shard
+            // Milestone B: escrow accounts are derived from request_id via
+            // a deterministic hash, so they live on the sender's shard
+            // alongside the payer account. Release touches proposer +
+            // replicas + treasury but the state transition itself is
+            // escrow-local; cross-shard crediting is handled by the
+            // per-tx execution path, not the shard router.
+            TxBody::InferenceEscrowOpen(_) => false,
+            TxBody::InferenceEscrowRelease(_) => false,
+            TxBody::InferenceEscrowRefund(_) => false,
         }
     }
 
