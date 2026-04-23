@@ -715,7 +715,12 @@ impl Pipeline {
                                 | TxBody::InferenceRegister(_)
                                 | TxBody::InferenceEscrowOpen(_)
                                 | TxBody::InferenceEscrowRelease(_)
-                                | TxBody::InferenceEscrowRefund(_) => {}
+                                | TxBody::InferenceEscrowRefund(_)
+                                | TxBody::ModelRegistration(_)
+                                | TxBody::ModelRequest(_)
+                                | TxBody::ShardCoverageClaim(_)
+                                | TxBody::CapacityAdvertisement(_)
+                                | TxBody::ShardAssignmentProposal(_) => {}
                             }
                         }
 

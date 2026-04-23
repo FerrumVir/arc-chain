@@ -72,6 +72,16 @@ pub mod gas_costs {
     pub const INFERENCE_ESCROW_RELEASE: u64 = 80_000;
     /// Gas for refunding an unreleased escrow after timeout.
     pub const INFERENCE_ESCROW_REFUND: u64 = 40_000;
+    /// Gas for registering a new model on-chain (Milestone C).
+    pub const MODEL_REGISTRATION: u64 = 60_000;
+    /// Gas for signalling model demand (Milestone C).
+    pub const MODEL_REQUEST: u64 = 50_000;
+    /// Gas for claiming shard coverage (Milestone C).
+    pub const SHARD_COVERAGE_CLAIM: u64 = 60_000;
+    /// Gas for advertising node capacity (Milestone D).
+    pub const CAPACITY_ADVERTISEMENT: u64 = 40_000;
+    /// Gas for broadcasting a planner assignment (Milestone D).
+    pub const SHARD_ASSIGNMENT_PROPOSAL: u64 = 80_000;
     /// Gas for storage read.
     pub const SLOAD: u64 = 200;
     /// Gas for storage write.
@@ -221,6 +231,27 @@ pub enum TxType {
     /// elapsed without a release. Only callable by the original payer
     /// (identity proved via metadata-hash match on the escrow account).
     InferenceEscrowRefund = 0x1b,
+    /// Milestone C: register a new model on-chain — commits to a stable
+    /// model_id (BLAKE3-derived), the layer config, quantization, and the
+    /// chunk-tree root for content-addressed weight distribution.
+    /// Registration costs a 1000 ARC fee (anti-spam, Milestone E).
+    ModelRegistration = 0x1c,
+    /// Milestone C: signal demand for a model. Pins k-replication goal,
+    /// per-layer-epoch bond offered to workers, and a max wait time.
+    /// Community workers poll for open requests and claim ranges.
+    ModelRequest = 0x1d,
+    /// Milestone C: a community worker claims coverage for a specific
+    /// layer range of a specific model for the epoch, posting a bond.
+    /// Bond slashes if the worker doesn't serve for the agreed epoch.
+    ShardCoverageClaim = 0x1e,
+    /// Milestone D: worker advertises capacity so the planner can assign
+    /// them fitting ranges. RAM / VRAM / bandwidth / uptime_hint / stake.
+    CapacityAdvertisement = 0x1f,
+    /// Milestone D: the planner's deterministic assignment output —
+    /// broadcast so any full node replaying history reaches the same
+    /// node→range mapping. Community workers long-poll for their
+    /// assignment by pubkey and auto-apply.
+    ShardAssignmentProposal = 0x20,
 }
 
 /// A transaction on the ARC chain.
@@ -302,6 +333,16 @@ pub enum TxBody {
     InferenceEscrowRelease(InferenceEscrowReleaseBody),
     /// Refund an unreleased escrow after timeout.
     InferenceEscrowRefund(InferenceEscrowRefundBody),
+    /// Register a new model on-chain (Milestone C / E anti-spam fee).
+    ModelRegistration(ModelRegistrationBody),
+    /// Signal demand for a model — recruits community workers (Milestone C).
+    ModelRequest(ModelRequestBody),
+    /// Claim coverage for a layer range of a model (Milestone C).
+    ShardCoverageClaim(ShardCoverageClaimBody),
+    /// Advertise node capacity for the planner (Milestone D).
+    CapacityAdvertisement(CapacityAdvertisementBody),
+    /// Broadcast the planner's assignment output (Milestone D).
+    ShardAssignmentProposal(ShardAssignmentProposalBody),
 }
 
 /// Simple value transfer.
@@ -675,6 +716,155 @@ pub struct InferenceEscrowRefundBody {
     pub max_tokens: u32,
     pub timeout_blocks: u64,
 }
+
+/// Milestone C: register a model. On accept, the chain stores the
+/// registration in a deterministic account keyed by the model_id (using
+/// the same "metadata-in-storage_root" trick as the inference escrow:
+/// storage_root commits to (n_layers, d_model, quantization_tag,
+/// chunk_tree_root) and nonce stores registered_at height).
+///
+/// Registration costs `registration_fee` ARC (default 1000) which goes
+/// to the treasury — anti-spam floor for the open registry.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelRegistrationBody {
+    pub model_id: Hash256,
+    pub metadata_hash: Hash256,
+    pub chunk_tree_root: Hash256,
+    pub n_layers: u32,
+    pub d_model: u32,
+    /// Short tag: "int16", "int8", "q4", "fp16", etc.
+    pub quantization: String,
+    /// Anti-spam fee. Chain floors this at
+    /// `MIN_MODEL_REGISTRATION_FEE` and transfers to treasury.
+    pub registration_fee: u64,
+    /// Address that receives future per-model fees (royalty to the
+    /// publisher). May equal `tx.from` but not required.
+    pub royalty_recipient: Address,
+}
+
+/// Milestone C: request coverage for a model. Chain records demand; a
+/// separate ShardCoverageClaim (also below) is used by workers to
+/// fulfill. The request provides an economic signal; actual routing /
+/// assignment is the planner's job (Milestone D).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ModelRequestBody {
+    pub request_id: [u8; 32],
+    pub model_id: Hash256,
+    pub target_k_replication: u32,
+    pub bond_per_layer_epoch: u64,
+    pub max_wait_secs: u32,
+}
+
+/// Milestone C: a worker claims coverage for a specific model+range
+/// for `epoch_blocks` blocks. Their `bond` locks while the claim is
+/// active; slashes if they don't serve.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShardCoverageClaimBody {
+    pub model_id: Hash256,
+    pub node_pubkey: [u8; 32],
+    pub ranges: Vec<(u32, u32)>,
+    pub bond: u64,
+    pub epoch_blocks: u64,
+}
+
+/// Milestone D: node advertises its capacity. The planner uses this plus
+/// open ModelRequests and current shard_registry state to compute a
+/// deterministic assignment.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CapacityAdvertisementBody {
+    pub node_pubkey: [u8; 32],
+    pub ram_bytes: u64,
+    pub vram_bytes: u64,
+    pub bandwidth_mbps: u32,
+    pub uptime_hint_mins: u32,
+    pub stake: u64,
+    /// Optional geographic hint so the planner can spread replicas.
+    /// Simple ISO-3166-1 alpha-2 country code or "UNK" when unknown.
+    pub region: String,
+}
+
+/// Milestone D: the planner's output. A single assignment tx contains
+/// `(node_pubkey, model_id, Vec<range>)` entries — one entry per node
+/// that gets assigned at least one range. Workers long-poll
+/// `/assignments/for_me` keyed by their pubkey.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShardAssignmentProposalBody {
+    pub epoch_blocks: u64,
+    pub assignments: Vec<AssignmentEntry>,
+    /// BLAKE3 hash of the planner's full input snapshot (registry +
+    /// requests + capacity set) so multiple nodes recompute the same
+    /// output deterministically. Stored verbatim on-chain for replay.
+    pub input_snapshot_hash: Hash256,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AssignmentEntry {
+    pub node_pubkey: [u8; 32],
+    pub model_id: Hash256,
+    pub ranges: Vec<(u32, u32)>,
+}
+
+/// Shared helpers for Milestones C–E: deterministic account addresses
+/// and metadata commitments. Same pattern as Milestone B's escrow —
+/// avoids a new DashMap by packing data into an account's storage_root.
+impl ModelRegistrationBody {
+    pub fn registry_account(model_id: &Hash256) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(19 + 32);
+        buf.extend_from_slice(b"arc-model-registry");
+        buf.extend_from_slice(&model_id.0);
+        arc_crypto::hash_bytes(&buf).0
+    }
+
+    pub fn metadata_commitment(
+        n_layers: u32,
+        d_model: u32,
+        quantization: &str,
+        chunk_tree_root: &Hash256,
+        royalty_recipient: &Address,
+    ) -> [u8; 32] {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&n_layers.to_le_bytes());
+        buf.extend_from_slice(&d_model.to_le_bytes());
+        buf.extend_from_slice(&(quantization.len() as u32).to_le_bytes());
+        buf.extend_from_slice(quantization.as_bytes());
+        buf.extend_from_slice(&chunk_tree_root.0);
+        buf.extend_from_slice(&royalty_recipient.0);
+        arc_crypto::hash_bytes(&buf).0
+    }
+}
+
+impl ModelRequestBody {
+    pub fn request_account(request_id: &[u8; 32]) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(18 + 32);
+        buf.extend_from_slice(b"arc-model-request");
+        buf.extend_from_slice(request_id);
+        arc_crypto::hash_bytes(&buf).0
+    }
+}
+
+impl ShardCoverageClaimBody {
+    pub fn claim_account(model_id: &Hash256, node_pubkey: &[u8; 32]) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(20 + 32 + 32);
+        buf.extend_from_slice(b"arc-shard-claim");
+        buf.extend_from_slice(&model_id.0);
+        buf.extend_from_slice(node_pubkey);
+        arc_crypto::hash_bytes(&buf).0
+    }
+}
+
+impl CapacityAdvertisementBody {
+    pub fn capacity_account(node_pubkey: &[u8; 32]) -> [u8; 32] {
+        let mut buf = Vec::with_capacity(20 + 32);
+        buf.extend_from_slice(b"arc-node-capacity");
+        buf.extend_from_slice(node_pubkey);
+        arc_crypto::hash_bytes(&buf).0
+    }
+}
+
+/// Minimum registration fee. Prevents a spammer from cluttering the
+/// open model registry with 10_000 fake models for free. The fee flows
+/// to the treasury (no burn — fixed total supply is a hard ARC rule).
+pub const MIN_MODEL_REGISTRATION_FEE: u64 = 1_000;
 
 /// Milestone B helpers — shared between arc-state and arc-node so both
 /// sides agree on the escrow-account derivation and metadata layout.

@@ -1888,6 +1888,15 @@ impl ConsensusEngine {
             TxBody::InferenceEscrowOpen(_) => false,
             TxBody::InferenceEscrowRelease(_) => false,
             TxBody::InferenceEscrowRefund(_) => false,
+            // Milestones C / D / E: all these new tx types are
+            // deterministic-registry writes that live on the sender's
+            // shard (registry account derived from model_id / pubkey /
+            // request_id). No cross-shard routing needed.
+            TxBody::ModelRegistration(_) => false,
+            TxBody::ModelRequest(_) => false,
+            TxBody::ShardCoverageClaim(_) => false,
+            TxBody::CapacityAdvertisement(_) => false,
+            TxBody::ShardAssignmentProposal(_) => false,
         }
     }
 

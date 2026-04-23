@@ -11,7 +11,11 @@ use arc_crypto::{Hash256, IncrementalMerkle, MerkleTree, hash_bytes, hash_pair};
 use arc_types::{Account, Address, Identity, IdentityLevel, Transaction, TxBody, TxType, TxReceipt, TransferBody, Block, BlockHeader, ProtocolVersion};
 use arc_types::block::{StateDiff, AccountChange};
 use arc_types::economics::StateRentConfig;
-use arc_types::transaction::{GasMeter, gas_costs, InferenceEscrowOpenBody};
+use arc_types::transaction::{
+    GasMeter, gas_costs, CapacityAdvertisementBody, InferenceEscrowOpenBody,
+    ModelRegistrationBody, ModelRequestBody, ShardCoverageClaimBody,
+    MIN_MODEL_REGISTRATION_FEE,
+};
 
 use crate::jmt_store::JmtStateTree;
 use light_client::{StateProof, HeaderProof, TxInclusionProof, LightSnapshot};
@@ -2360,6 +2364,11 @@ impl StateDB {
             TxBody::InferenceEscrowOpen(_) => gas_costs::INFERENCE_ESCROW_OPEN,
             TxBody::InferenceEscrowRelease(_) => gas_costs::INFERENCE_ESCROW_RELEASE,
             TxBody::InferenceEscrowRefund(_) => gas_costs::INFERENCE_ESCROW_REFUND,
+            TxBody::ModelRegistration(_) => gas_costs::MODEL_REGISTRATION,
+            TxBody::ModelRequest(_) => gas_costs::MODEL_REQUEST,
+            TxBody::ShardCoverageClaim(_) => gas_costs::SHARD_COVERAGE_CLAIM,
+            TxBody::CapacityAdvertisement(_) => gas_costs::CAPACITY_ADVERTISEMENT,
+            TxBody::ShardAssignmentProposal(_) => gas_costs::SHARD_ASSIGNMENT_PROPOSAL,
         }
     }
 
@@ -4089,6 +4098,275 @@ impl StateDB {
 
                 Ok(gas.consumed)
             }
+            TxBody::ModelRegistration(body) => {
+                // Milestone C: register a model; fee transfers to treasury.
+                // Milestone E anti-spam: fee is floored at
+                // MIN_MODEL_REGISTRATION_FEE (1000 ARC). Stored in a
+                // deterministic account keyed by model_id, with metadata
+                // committed into storage_root so later queries (or
+                // ModelRequest validation) can verify the model exists
+                // with the expected config.
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                if body.quantization.len() > 32 {
+                    return Err(StateError::ExecutionError(
+                        "model registration: quantization tag > 32 bytes".into(),
+                    ));
+                }
+                let fee = body.registration_fee.max(MIN_MODEL_REGISTRATION_FEE);
+                if sender.balance < fee {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: fee,
+                    });
+                }
+                // Reject duplicate registrations (same model_id already
+                // on-chain). Keeps the registry tamper-evident.
+                let registry_addr_bytes =
+                    ModelRegistrationBody::registry_account(&body.model_id);
+                let registry_addr = Hash256(registry_addr_bytes);
+                let existing = self.get_or_create_account(&registry_addr);
+                if existing.storage_root != Hash256::ZERO {
+                    return Err(StateError::ExecutionError(
+                        "model registration: model_id already registered".into(),
+                    ));
+                }
+
+                // Debit payer; pay fee to treasury.
+                sender.balance -= fee;
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                let treasury = Hash256(arc_crypto::hash_bytes(b"arc-treasury").0);
+                let mut tre = self.get_or_create_account(&treasury);
+                tre.balance += fee;
+                self.accounts.insert(treasury.0, tre.clone());
+                self.wal.append(WalOp::SetAccount(treasury, tre), self.height());
+
+                // Write the registry entry.
+                let commitment = ModelRegistrationBody::metadata_commitment(
+                    body.n_layers,
+                    body.d_model,
+                    &body.quantization,
+                    &body.chunk_tree_root,
+                    &body.royalty_recipient,
+                );
+                let mut reg = existing;
+                reg.nonce = self.height(); // registered_at
+                reg.storage_root = Hash256(commitment);
+                // Park the paid fee in `balance` — a future Milestone E
+                // patch can meter royalty payouts from this pool.
+                reg.balance = 0; // fees already sent to treasury; reg holds no value today
+                self.accounts.insert(registry_addr_bytes, reg.clone());
+                self.wal.append(WalOp::SetAccount(registry_addr, reg), self.height());
+
+                Ok(gas.consumed)
+            }
+            TxBody::ModelRequest(body) => {
+                // Milestone C: record demand. No fund movement today —
+                // the request sits on-chain for workers to observe and
+                // claim against. Future patch: bond_per_layer_epoch is
+                // escrowed here and released to claiming workers.
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                let req_addr_bytes =
+                    ModelRequestBody::request_account(&body.request_id);
+                let req_addr = Hash256(req_addr_bytes);
+                let mut req = self.get_or_create_account(&req_addr);
+                // Encode request state in existing account slots:
+                //   balance      = bond_per_layer_epoch (for planner weighting)
+                //   nonce        = posted_at height
+                //   storage_root = hash(model_id || target_k_replication ||
+                //                       max_wait_secs || requester)
+                req.balance = body.bond_per_layer_epoch;
+                req.nonce = self.height();
+                let mut meta = Vec::new();
+                meta.extend_from_slice(&body.model_id.0);
+                meta.extend_from_slice(&body.target_k_replication.to_le_bytes());
+                meta.extend_from_slice(&body.max_wait_secs.to_le_bytes());
+                meta.extend_from_slice(&tx.from.0);
+                req.storage_root = arc_crypto::hash_bytes(&meta);
+                self.accounts.insert(req_addr_bytes, req.clone());
+                self.wal.append(WalOp::SetAccount(req_addr, req), self.height());
+
+                Ok(gas.consumed)
+            }
+            TxBody::ShardCoverageClaim(body) => {
+                // Milestone C: worker locks a bond for the epoch.
+                // Slashing on non-serve is handled by a future verifier
+                // path (#31-style challenge + proof).
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                if body.bond == 0 {
+                    return Err(StateError::ExecutionError(
+                        "shard coverage claim: bond must be > 0".into(),
+                    ));
+                }
+                if body.ranges.is_empty() {
+                    return Err(StateError::ExecutionError(
+                        "shard coverage claim: must claim at least one range".into(),
+                    ));
+                }
+                if sender.balance < body.bond {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: body.bond,
+                    });
+                }
+
+                sender.balance -= body.bond;
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                // Lock bond in the deterministic claim account. Ranges
+                // are committed via storage_root so slashing/release can
+                // verify what was claimed without a separate DashMap.
+                let claim_addr_bytes = ShardCoverageClaimBody::claim_account(
+                    &body.model_id,
+                    &body.node_pubkey,
+                );
+                let claim_addr = Hash256(claim_addr_bytes);
+                let mut claim = self.get_or_create_account(&claim_addr);
+                if claim.balance != 0 {
+                    // Refund and reset: the worker is renewing their
+                    // claim. Return the prior bond to tx.from first.
+                    return Err(StateError::ExecutionError(
+                        "shard coverage claim: prior claim still active — \
+                         release or wait for epoch end before re-claiming"
+                            .into(),
+                    ));
+                }
+                claim.balance = body.bond;
+                claim.nonce = self.height();
+                let mut meta = Vec::new();
+                for (s, e) in &body.ranges {
+                    meta.extend_from_slice(&s.to_le_bytes());
+                    meta.extend_from_slice(&e.to_le_bytes());
+                }
+                meta.extend_from_slice(&body.epoch_blocks.to_le_bytes());
+                meta.extend_from_slice(&tx.from.0);
+                claim.storage_root = arc_crypto::hash_bytes(&meta);
+                self.accounts.insert(claim_addr_bytes, claim.clone());
+                self.wal.append(WalOp::SetAccount(claim_addr, claim), self.height());
+
+                Ok(gas.consumed)
+            }
+            TxBody::CapacityAdvertisement(body) => {
+                // Milestone D: record capacity advertisement. Pure
+                // metadata write — no funds move. Planner reads these
+                // plus open requests + current shard_registry to compute
+                // assignments.
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                if body.region.len() > 8 {
+                    return Err(StateError::ExecutionError(
+                        "capacity advertisement: region tag > 8 bytes".into(),
+                    ));
+                }
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                let cap_addr_bytes =
+                    CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
+                let cap_addr = Hash256(cap_addr_bytes);
+                let mut cap = self.get_or_create_account(&cap_addr);
+                // Encode capacity in storage_root so a replay of history
+                // reconstructs the same snapshot. A later patch can also
+                // store ram/vram/bandwidth individually in a sidecar
+                // DashMap for fast planner reads.
+                let mut meta = Vec::new();
+                meta.extend_from_slice(&body.ram_bytes.to_le_bytes());
+                meta.extend_from_slice(&body.vram_bytes.to_le_bytes());
+                meta.extend_from_slice(&body.bandwidth_mbps.to_le_bytes());
+                meta.extend_from_slice(&body.uptime_hint_mins.to_le_bytes());
+                meta.extend_from_slice(&body.stake.to_le_bytes());
+                meta.extend_from_slice(&(body.region.len() as u32).to_le_bytes());
+                meta.extend_from_slice(body.region.as_bytes());
+                cap.nonce = self.height(); // advertised_at
+                cap.storage_root = arc_crypto::hash_bytes(&meta);
+                self.accounts.insert(cap_addr_bytes, cap.clone());
+                self.wal.append(WalOp::SetAccount(cap_addr, cap), self.height());
+
+                Ok(gas.consumed)
+            }
+            TxBody::ShardAssignmentProposal(body) => {
+                // Milestone D: record planner output. The hash of the
+                // input snapshot lets any full node recompute the
+                // assignment deterministically and check the proposer
+                // got the same answer. Actual enforcement (workers
+                // follow their assignment or lose claims) happens at
+                // /assignments/for_me read time, not here.
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                if body.assignments.is_empty() {
+                    return Err(StateError::ExecutionError(
+                        "shard assignment proposal: must include at least one entry".into(),
+                    ));
+                }
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                // Derive a proposal-specific account from the input
+                // snapshot hash so replays collide and the latest
+                // proposer for a given input wins (last-write in
+                // block order).
+                let prop_addr = Hash256(arc_crypto::hash_bytes(
+                    &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()].concat(),
+                ).0);
+                let mut prop = self.get_or_create_account(&prop_addr);
+                // Serialize compact representation into storage_root so
+                // the exact assignment replayed from history matches.
+                let mut buf = Vec::new();
+                buf.extend_from_slice(&body.epoch_blocks.to_le_bytes());
+                buf.extend_from_slice(&body.input_snapshot_hash.0);
+                for a in &body.assignments {
+                    buf.extend_from_slice(&a.node_pubkey);
+                    buf.extend_from_slice(&a.model_id.0);
+                    for (s, e) in &a.ranges {
+                        buf.extend_from_slice(&s.to_le_bytes());
+                        buf.extend_from_slice(&e.to_le_bytes());
+                    }
+                }
+                prop.nonce = self.height();
+                prop.storage_root = arc_crypto::hash_bytes(&buf);
+                self.accounts.insert(prop_addr.0, prop.clone());
+                self.wal.append(WalOp::SetAccount(prop_addr, prop), self.height());
+
+                Ok(gas.consumed)
+            }
             TxBody::InferenceEscrowRefund(body) => {
                 // Milestone B: original payer reclaims funds after the
                 // `timeout_blocks` window elapses with no release. Only
@@ -4498,6 +4776,30 @@ impl StateDB {
                     .or_default()
                     .push(tx.hash);
             }
+            TxBody::ModelRegistration(body) => {
+                let reg_addr = ModelRegistrationBody::registry_account(&body.model_id);
+                self.account_txs.entry(reg_addr).or_default().push(tx.hash);
+            }
+            TxBody::ModelRequest(body) => {
+                let req_addr = ModelRequestBody::request_account(&body.request_id);
+                self.account_txs.entry(req_addr).or_default().push(tx.hash);
+            }
+            TxBody::ShardCoverageClaim(body) => {
+                let claim_addr = ShardCoverageClaimBody::claim_account(
+                    &body.model_id,
+                    &body.node_pubkey,
+                );
+                self.account_txs.entry(claim_addr).or_default().push(tx.hash);
+            }
+            TxBody::CapacityAdvertisement(body) => {
+                let cap_addr =
+                    CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
+                self.account_txs.entry(cap_addr).or_default().push(tx.hash);
+            }
+            TxBody::ShardAssignmentProposal(_) => {
+                // Assignment proposals are indexed by input-hash; sender
+                // account already tracked above.
+            }
         }
     }
 
@@ -4590,6 +4892,36 @@ impl StateDB {
                 let escrow_addr =
                     InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.dirty_accounts.insert(escrow_addr);
+            }
+            TxBody::ModelRegistration(body) => {
+                let reg_addr = ModelRegistrationBody::registry_account(&body.model_id);
+                self.dirty_accounts.insert(reg_addr);
+                let treasury = arc_crypto::hash_bytes(b"arc-treasury").0;
+                self.dirty_accounts.insert(treasury);
+            }
+            TxBody::ModelRequest(body) => {
+                let req_addr = ModelRequestBody::request_account(&body.request_id);
+                self.dirty_accounts.insert(req_addr);
+            }
+            TxBody::ShardCoverageClaim(body) => {
+                let claim_addr = ShardCoverageClaimBody::claim_account(
+                    &body.model_id,
+                    &body.node_pubkey,
+                );
+                self.dirty_accounts.insert(claim_addr);
+            }
+            TxBody::CapacityAdvertisement(body) => {
+                let cap_addr =
+                    CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
+                self.dirty_accounts.insert(cap_addr);
+            }
+            TxBody::ShardAssignmentProposal(body) => {
+                let prop_addr = arc_crypto::hash_bytes(
+                    &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()]
+                        .concat(),
+                )
+                .0;
+                self.dirty_accounts.insert(prop_addr);
             }
         }
     }
@@ -6763,6 +7095,219 @@ mod tests {
         );
         let (_, rs) = state.execute_block(&[refund], addr(99)).unwrap();
         assert!(!rs[0].success, "non-payer must not be able to refund");
+    }
+
+    // ── Milestones C+D: model registry / requests / claims / capacity ──
+    //
+    // MVP tests — exercise the happy path plus the critical reject paths
+    // (duplicate registration, insufficient balance, empty ranges).
+
+    use arc_types::transaction::{
+        CapacityAdvertisementBody, ModelRegistrationBody, ModelRequestBody,
+        ShardCoverageClaimBody, MIN_MODEL_REGISTRATION_FEE,
+    };
+
+    fn test_model_id() -> Hash256 {
+        hash_bytes(b"test-model-7b")
+    }
+
+    #[test]
+    fn test_model_registration_charges_fee_to_treasury() {
+        let state = StateDB::with_genesis(&[(addr(1), 10_000)]);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ModelRegistration(ModelRegistrationBody {
+                model_id: test_model_id(),
+                metadata_hash: hash_bytes(b"meta"),
+                chunk_tree_root: hash_bytes(b"chunks"),
+                n_layers: 32,
+                d_model: 4096,
+                quantization: "int16".into(),
+                registration_fee: MIN_MODEL_REGISTRATION_FEE,
+                royalty_recipient: addr(1),
+            }),
+            TxType::ModelRegistration,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success, "model registration should succeed");
+
+        // Payer debited by the min fee.
+        assert_eq!(
+            state.get_account(&addr(1)).unwrap().balance,
+            10_000 - MIN_MODEL_REGISTRATION_FEE
+        );
+        // Treasury credited.
+        let treasury = hash_bytes(b"arc-treasury");
+        assert_eq!(
+            state.get_account(&treasury).unwrap().balance,
+            MIN_MODEL_REGISTRATION_FEE
+        );
+
+        // Registry entry exists with a non-zero commitment.
+        let reg_addr = Hash256(ModelRegistrationBody::registry_account(&test_model_id()));
+        let reg = state.get_account(&reg_addr).unwrap();
+        assert_ne!(reg.storage_root, Hash256::ZERO);
+    }
+
+    #[test]
+    fn test_model_registration_rejects_duplicate() {
+        let state = StateDB::with_genesis(&[(addr(1), 10_000)]);
+        let body = ModelRegistrationBody {
+            model_id: test_model_id(),
+            metadata_hash: hash_bytes(b"m"),
+            chunk_tree_root: hash_bytes(b"c"),
+            n_layers: 32,
+            d_model: 4096,
+            quantization: "int16".into(),
+            registration_fee: MIN_MODEL_REGISTRATION_FEE,
+            royalty_recipient: addr(1),
+        };
+        let tx1 = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ModelRegistration(body.clone()),
+            TxType::ModelRegistration,
+        );
+        let tx2 = make_channel_tx(
+            addr(1),
+            1,
+            TxBody::ModelRegistration(body),
+            TxType::ModelRegistration,
+        );
+        let (_, r1) = state.execute_block(&[tx1], addr(99)).unwrap();
+        assert!(r1[0].success);
+        let (_, r2) = state.execute_block(&[tx2], addr(99)).unwrap();
+        assert!(!r2[0].success, "second registration for same model_id must fail");
+    }
+
+    #[test]
+    fn test_model_registration_fee_floors_at_min() {
+        // Registration fee below the min is raised to MIN. Payer pays
+        // the higher amount regardless of what they passed.
+        let state = StateDB::with_genesis(&[(addr(1), 10_000)]);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ModelRegistration(ModelRegistrationBody {
+                model_id: test_model_id(),
+                metadata_hash: hash_bytes(b"m"),
+                chunk_tree_root: hash_bytes(b"c"),
+                n_layers: 32,
+                d_model: 4096,
+                quantization: "int16".into(),
+                registration_fee: 1, // below floor
+                royalty_recipient: addr(1),
+            }),
+            TxType::ModelRegistration,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+        assert_eq!(
+            state.get_account(&addr(1)).unwrap().balance,
+            10_000 - MIN_MODEL_REGISTRATION_FEE
+        );
+    }
+
+    #[test]
+    fn test_model_request_records_demand() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = hash_bytes(b"demand-1").0;
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ModelRequest(ModelRequestBody {
+                request_id,
+                model_id: test_model_id(),
+                target_k_replication: 3,
+                bond_per_layer_epoch: 500,
+                max_wait_secs: 300,
+            }),
+            TxType::ModelRequest,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        let req_addr = Hash256(ModelRequestBody::request_account(&request_id));
+        let req = state.get_account(&req_addr).unwrap();
+        assert_eq!(req.balance, 500);
+        assert_ne!(req.storage_root, Hash256::ZERO);
+    }
+
+    #[test]
+    fn test_shard_coverage_claim_locks_bond() {
+        let state = StateDB::with_genesis(&[(addr(1), 100_000)]);
+        let node_pubkey = [7u8; 32];
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ShardCoverageClaim(ShardCoverageClaimBody {
+                model_id: test_model_id(),
+                node_pubkey,
+                ranges: vec![(0, 6), (6, 12)],
+                bond: 5_000,
+                epoch_blocks: 1_000,
+            }),
+            TxType::ShardCoverageClaim,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        // Bond debited from payer.
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 95_000);
+        // Claim account holds bond.
+        let claim_addr = Hash256(ShardCoverageClaimBody::claim_account(
+            &test_model_id(),
+            &node_pubkey,
+        ));
+        assert_eq!(state.get_account(&claim_addr).unwrap().balance, 5_000);
+    }
+
+    #[test]
+    fn test_shard_coverage_claim_rejects_empty_ranges() {
+        let state = StateDB::with_genesis(&[(addr(1), 100_000)]);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ShardCoverageClaim(ShardCoverageClaimBody {
+                model_id: test_model_id(),
+                node_pubkey: [0u8; 32],
+                ranges: vec![],
+                bond: 5_000,
+                epoch_blocks: 1_000,
+            }),
+            TxType::ShardCoverageClaim,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(!r[0].success);
+        // Payer untouched.
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 100_000);
+    }
+
+    #[test]
+    fn test_capacity_advertisement_records_metadata() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000)]);
+        let node_pubkey = [11u8; 32];
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::CapacityAdvertisement(CapacityAdvertisementBody {
+                node_pubkey,
+                ram_bytes: 16 * 1024 * 1024 * 1024,
+                vram_bytes: 8 * 1024 * 1024 * 1024,
+                bandwidth_mbps: 100,
+                uptime_hint_mins: 1440,
+                stake: 5_000_000,
+                region: "US".into(),
+            }),
+            TxType::CapacityAdvertisement,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        let cap_addr = Hash256(CapacityAdvertisementBody::capacity_account(&node_pubkey));
+        let cap = state.get_account(&cap_addr).unwrap();
+        assert_ne!(cap.storage_root, Hash256::ZERO);
     }
 
     #[test]

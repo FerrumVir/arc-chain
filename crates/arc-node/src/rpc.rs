@@ -1742,6 +1742,54 @@ async fn get_full_transaction(
             "max_tokens": body.max_tokens,
             "timeout_blocks": body.timeout_blocks,
         }),
+        TxBody::ModelRegistration(body) => json!({
+            "type": "ModelRegistration",
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "metadata_hash": format!("0x{}", hex::encode(&body.metadata_hash.0)),
+            "chunk_tree_root": format!("0x{}", hex::encode(&body.chunk_tree_root.0)),
+            "n_layers": body.n_layers,
+            "d_model": body.d_model,
+            "quantization": body.quantization,
+            "registration_fee": body.registration_fee,
+            "royalty_recipient": format!("0x{}", hex::encode(&body.royalty_recipient.0)),
+        }),
+        TxBody::ModelRequest(body) => json!({
+            "type": "ModelRequest",
+            "request_id": format!("0x{}", hex::encode(&body.request_id)),
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "target_k_replication": body.target_k_replication,
+            "bond_per_layer_epoch": body.bond_per_layer_epoch,
+            "max_wait_secs": body.max_wait_secs,
+        }),
+        TxBody::ShardCoverageClaim(body) => json!({
+            "type": "ShardCoverageClaim",
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "node_pubkey": format!("0x{}", hex::encode(&body.node_pubkey)),
+            "ranges": body.ranges.iter()
+                .map(|(s, e)| json!([s, e])).collect::<Vec<_>>(),
+            "bond": body.bond,
+            "epoch_blocks": body.epoch_blocks,
+        }),
+        TxBody::CapacityAdvertisement(body) => json!({
+            "type": "CapacityAdvertisement",
+            "node_pubkey": format!("0x{}", hex::encode(&body.node_pubkey)),
+            "ram_bytes": body.ram_bytes,
+            "vram_bytes": body.vram_bytes,
+            "bandwidth_mbps": body.bandwidth_mbps,
+            "uptime_hint_mins": body.uptime_hint_mins,
+            "stake": body.stake,
+            "region": body.region,
+        }),
+        TxBody::ShardAssignmentProposal(body) => json!({
+            "type": "ShardAssignmentProposal",
+            "epoch_blocks": body.epoch_blocks,
+            "input_snapshot_hash": format!("0x{}", hex::encode(&body.input_snapshot_hash.0)),
+            "assignments": body.assignments.iter().map(|a| json!({
+                "node_pubkey": format!("0x{}", hex::encode(&a.node_pubkey)),
+                "model_id": format!("0x{}", hex::encode(&a.model_id.0)),
+                "ranges": a.ranges.iter().map(|(s, e)| json!([s, e])).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        }),
     };
 
     let sig_json = match &tx.signature {
