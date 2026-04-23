@@ -38,11 +38,6 @@ rand.workspace = true
 # skips building them. Build any single example with:
 #     cargo run --example <name> --features candle --release
 [[example]]
-name = "bench_ternary"
-# No required-features — bench_ternary uses only the core integer path,
-# no GGUF/candle dependencies.
-
-[[example]]
 name = "bench_int8"
 required-features = ["candle"]
 [[example]]
