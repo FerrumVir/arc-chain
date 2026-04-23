@@ -143,6 +143,7 @@ pub fn run() {
             commands::fetch_balance,
             commands::faucet_claim,
             commands::run_inference,
+            commands::run_inference_via_coordinator,
             commands::clear_crash,
             commands::ensure_binary,
             commands::get_autostart,

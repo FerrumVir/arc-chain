@@ -95,6 +95,15 @@ export interface FaucetResult {
   message: string;
 }
 
+export interface InferenceConsensus {
+  k: number;
+  votesTotal: number;
+  unanimous: number;
+  majority: number;
+  split: number;
+  divergentReplicaCount: number;
+}
+
 export interface InferenceResult {
   input: string;
   output: string;
@@ -106,6 +115,10 @@ export interface InferenceResult {
   deterministic: boolean;
   engine: string;
   explorerUrl: string;
+  /** Present when the inference was served by a coordinator (seed RPC). */
+  consensus?: InferenceConsensus;
+  /** Origin URL of the coordinator that served the request; None = local. */
+  coordinator?: string;
 }
 
 export interface BinaryStatus {

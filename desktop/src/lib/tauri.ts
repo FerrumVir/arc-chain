@@ -290,6 +290,73 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         explorerUrl: v.explorer_url ?? "",
       } as T;
     }
+    case "run_inference_via_coordinator": {
+      const { prompt, maxTokens, k } = args as {
+        prompt: string;
+        maxTokens?: number;
+        k?: number;
+      };
+      const wrapped = prompt.includes("[INST]")
+        ? prompt
+        : `[INST] ${prompt} [/INST]`;
+      // Live mode iterates the same seed list the Rust side uses so the
+      // browser E2E path exercises the coordinator fallback against a
+      // real chain host.
+      const hosts = [
+        "http://149.28.32.76:9090",
+        "http://140.82.16.112:9090",
+        "http://136.244.109.1:9090",
+        "http://104.238.171.11:9090",
+        "http://202.182.107.41:9090",
+        "http://149.28.153.31:9090",
+      ];
+      let lastErr = "";
+      for (const host of hosts) {
+        try {
+          const r = await fetch(`${host}/inference/run_consensus`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              input: wrapped,
+              max_tokens: maxTokens ?? 32,
+              k: k ?? 3,
+            }),
+          });
+          if (!r.ok) {
+            lastErr = `${host} → HTTP ${r.status}`;
+            continue;
+          }
+          const v = await r.json();
+          const c = v.consensus ?? {};
+          return {
+            input: v.input ?? "",
+            output: v.output ?? "",
+            outputHash: v.output_hash ?? "",
+            modelHash: "",
+            tokensGenerated: v.tokens_generated ?? 0,
+            inferenceMs: v.total_ms ?? 0,
+            txHash: "",
+            deterministic: true,
+            engine: "consensus",
+            explorerUrl: "",
+            consensus: {
+              k: c.k ?? 0,
+              votesTotal: c.votes_total ?? 0,
+              unanimous: c.unanimous ?? 0,
+              majority: c.majority ?? 0,
+              split: c.split ?? 0,
+              divergentReplicaCount: c.divergent_replicas
+                ? Object.keys(c.divergent_replicas).length
+                : 0,
+            },
+            coordinator: host,
+          } as T;
+        } catch (e) {
+          lastErr = `${host} → ${String(e)}`;
+        }
+      }
+      throw new Error(`all coordinators failed; last: ${lastErr}`);
+    }
     case "open_external":
       window.open((args as { url: string }).url, "_blank");
       return undefined as T;
@@ -518,6 +585,33 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         explorerUrl: "/tx/0x1a2b3c4d5e6f7a8b",
       } as T;
     }
+    case "run_inference_via_coordinator": {
+      const { prompt } = args as { prompt: string };
+      await new Promise((r) => setTimeout(r, 1200));
+      return {
+        input: `[INST] ${prompt} [/INST]`,
+        output:
+          "  Mock coordinator response — browser preview. In Tauri + live testnet, this is served by one of the 6 seed nodes via /inference/run_consensus with k=3 majority verification.",
+        outputHash:
+          "0xd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
+        modelHash: "",
+        tokensGenerated: 28,
+        inferenceMs: 18_400,
+        txHash: "",
+        deterministic: true,
+        engine: "consensus",
+        explorerUrl: "",
+        consensus: {
+          k: 3,
+          votesTotal: 48,
+          unanimous: 48,
+          majority: 0,
+          split: 0,
+          divergentReplicaCount: 0,
+        },
+        coordinator: "http://149.28.32.76:9090",
+      } as T;
+    }
     case "clear_crash":
       return undefined as T;
     case "check_for_update":
@@ -569,6 +663,12 @@ export const api = {
   faucetClaim: () => invoke<FaucetResult>("faucet_claim"),
   runInference: (prompt: string, maxTokens = 32) =>
     invoke<InferenceResult>("run_inference", { prompt, maxTokens }),
+  runInferenceViaCoordinator: (prompt: string, maxTokens = 32, k = 3) =>
+    invoke<InferenceResult>("run_inference_via_coordinator", {
+      prompt,
+      maxTokens,
+      k,
+    }),
   clearCrash: () => invoke<void>("clear_crash"),
   openExternal: (url: string) => invoke<void>("open_external", { url }),
   checkForUpdate: () =>

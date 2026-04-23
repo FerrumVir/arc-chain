@@ -65,11 +65,22 @@ standalone with manual per-user "opt in to hold range X" UI.
 
 ---
 
-## Milestone A — App queries through coordinator
+## Milestone A — App queries through coordinator ✅ (2026-04-22, closed #35)
 
 **Goal**: a user who just onboarded (observer, no model) can type a
 question in the Inference screen and get a real answer served by the
 6-seed pipeline. Works today, no new chain code.
+
+**Shipped**: new `run_inference_via_coordinator` Tauri command iterating
+the 6-seed `COORDINATOR_HOSTS` list; `runInferenceSmart` in Inference.tsx
+catches local 503 / connection errors and falls back to the coordinator
+path; consensus banner ("Served by NYC · k=3 · 48/48 unanimous") renders
+when a seed serves the request. Live-test evidence: NYC
+`/inference/run_consensus` returned 96/96 unanimous, 0 divergent, 3
+tokens in 162 s for the "What is the largest planet?" prompt. Known
+follow-up: implement pipelined prefill inside `run_consensus` so the
+per-token latency falls to match `run_sharded` (~20 s/token, not
+~54 s/token); that unlocks the ≤ 60 s acceptance target.
 
 ### Scope
 - Desktop `src/screens/Inference.tsx` currently hits `api.runInference()`

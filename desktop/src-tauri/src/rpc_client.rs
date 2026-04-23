@@ -14,8 +14,8 @@
 //                                          we synthesize from attestations)
 
 use crate::types::{
-    AccountBalance, Attestation, Earnings, FaucetResult, InferenceResult,
-    NetworkStats, NodeStatus,
+    AccountBalance, Attestation, Earnings, FaucetResult, InferenceConsensus,
+    InferenceResult, NetworkStats, NodeStatus,
 };
 use serde_json::Value;
 
@@ -429,6 +429,97 @@ pub async fn run_inference(
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string(),
+        consensus: None,
+        coordinator: None,
+    })
+}
+
+/// Milestone A: fall back to a seed coordinator's `/inference/run_consensus`
+/// when the local node cannot serve inference (observer role, no model
+/// loaded). `coord_base` is a full origin like `http://149.28.32.76:9090`.
+///
+/// Caller must pass an http client with a long timeout — consensus
+/// inference on the 6-seed pipeline takes 30–60 s for a short prompt.
+pub async fn run_inference_consensus(
+    http: &reqwest::Client,
+    coord_base: &str,
+    prompt: &str,
+    max_tokens: u32,
+    k: u32,
+) -> Result<InferenceResult, String> {
+    let wrapped = if prompt.contains("[INST]") {
+        prompt.to_string()
+    } else {
+        format!("[INST] {} [/INST]", prompt)
+    };
+    let resp = http
+        .post(format!("{}/inference/run_consensus", coord_base.trim_end_matches('/')))
+        .json(&serde_json::json!({
+            "input": wrapped,
+            "max_tokens": max_tokens,
+            "k": k,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("{}: {}", coord_base, e))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} from {}", resp.status(), coord_base));
+    }
+    let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+
+    let c = v.get("consensus").cloned().unwrap_or(Value::Null);
+    let consensus = InferenceConsensus {
+        k: c.get("k").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        votes_total: c.get("votes_total").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        unanimous: c.get("unanimous").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        majority: c.get("majority").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        split: c.get("split").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        divergent_replica_count: c
+            .get("divergent_replicas")
+            .and_then(|x| x.as_object())
+            .map(|m| m.len() as u32)
+            .unwrap_or(0),
+    };
+
+    Ok(InferenceResult {
+        input: v
+            .get("input")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        output: v
+            .get("output")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        output_hash: v
+            .get("output_hash")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        // run_consensus doesn't return model_hash in its body; callers can
+        // resolve it from /shards if needed. Empty keeps the UI from
+        // showing a stale one from the prior response.
+        model_hash: String::new(),
+        tokens_generated: v
+            .get("tokens_generated")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+        // run_consensus reports `total_ms` (wall time across the whole
+        // pipeline × every token). Use it as `inference_ms` so the UI's
+        // "Xms" label still works.
+        inference_ms: v
+            .get("total_ms")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+        tx_hash: String::new(),
+        // Consensus path is deterministic by construction: majority hash
+        // required at every hop.
+        deterministic: true,
+        engine: "consensus".into(),
+        explorer_url: String::new(),
+        consensus: Some(consensus),
+        coordinator: Some(coord_base.to_string()),
     })
 }
 

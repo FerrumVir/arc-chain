@@ -3,6 +3,7 @@ import {
   ArrowUpRight,
   Copy,
   ClipboardCheck,
+  Globe,
   Loader2,
   Send,
   ShieldCheck,
@@ -23,6 +24,54 @@ const EXAMPLES = [
   "Who invented the transistor?",
 ];
 
+/// Milestone A (#35): local node may be an observer with no model loaded
+/// and return 503 / connection error. Silently fall back to a seed
+/// coordinator via /inference/run_consensus so a fresh-install user gets
+/// a real answer without configuring anything.
+async function runInferenceSmart(
+  prompt: string,
+  maxTokens: number,
+): Promise<InferenceResult> {
+  try {
+    const r = await api.runInference(prompt, maxTokens);
+    // Even a 200 from the local node can be an empty/placeholder result
+    // (some observer builds short-circuit); fall back on empty output so
+    // the user always sees *something*.
+    if (r.output.trim().length === 0 && !r.coordinator) {
+      return await api.runInferenceViaCoordinator(prompt, maxTokens);
+    }
+    return r;
+  } catch (err) {
+    const msg = String(err instanceof Error ? err.message : err);
+    // Local node returned 503 (observer / no model), or wasn't reachable,
+    // or disagreed about the request shape. Try the coordinator path.
+    if (
+      msg.includes("503") ||
+      msg.includes("SERVICE") ||
+      msg.includes("fetch") ||
+      msg.includes("error sending request") ||
+      msg.toLowerCase().includes("connection") ||
+      msg.includes("No shards")
+    ) {
+      return await api.runInferenceViaCoordinator(prompt, maxTokens);
+    }
+    throw err;
+  }
+}
+
+function coordinatorLabel(url: string): string {
+  const host = url.replace(/^https?:\/\//, "").split(":")[0];
+  const byIp: Record<string, string> = {
+    "149.28.32.76": "NYC",
+    "140.82.16.112": "LAX",
+    "136.244.109.1": "AMS",
+    "104.238.171.11": "LHR",
+    "202.182.107.41": "NRT",
+    "149.28.153.31": "SGP",
+  };
+  return byIp[host] ?? host;
+}
+
 export function Inference() {
   const [prompt, setPrompt] = useState("");
   const [maxTokens, setMaxTokens] = useState(32);
@@ -31,7 +80,7 @@ export function Inference() {
   const run = useMutation<InferenceResult, Error, void>({
     mutationFn: async () => {
       if (!prompt.trim()) throw new Error("Prompt is empty");
-      return await api.runInference(prompt.trim(), maxTokens);
+      return await runInferenceSmart(prompt.trim(), maxTokens);
     },
   });
 
@@ -225,6 +274,48 @@ export function Inference() {
             }
           />
 
+          {run.data.coordinator && run.data.consensus && (
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                alignItems: "center",
+                gap: "var(--space-3)",
+                padding: "var(--space-3) var(--space-4)",
+                marginBottom: "var(--space-4)",
+                background: "var(--success-bg, rgba(80, 200, 120, 0.08))",
+                border: "1px solid rgba(80, 200, 120, 0.25)",
+                borderRadius: "var(--radius-sm)",
+                fontSize: "var(--text-sm)",
+                color: "var(--text)",
+              }}
+              data-testid="inference-consensus"
+            >
+              <Globe size={14} style={{ color: "var(--success)" }} />
+              <span>
+                Served by{" "}
+                <strong data-testid="inference-coordinator">
+                  {coordinatorLabel(run.data.coordinator)}
+                </strong>{" "}
+                · k={run.data.consensus.k} · {run.data.consensus.unanimous}/
+                {run.data.consensus.votesTotal}{" "}
+                {run.data.consensus.split === 0 &&
+                run.data.consensus.majority === 0
+                  ? "unanimous"
+                  : `${run.data.consensus.majority} majority / ${run.data.consensus.split} split`}
+                {run.data.consensus.divergentReplicaCount > 0 && (
+                  <>
+                    {" "}
+                    ·{" "}
+                    <span style={{ color: "var(--danger)" }}>
+                      {run.data.consensus.divergentReplicaCount} divergent
+                    </span>
+                  </>
+                )}
+              </span>
+            </div>
+          )}
+
           <div
             style={{
               padding: "var(--space-4)",
@@ -250,13 +341,15 @@ export function Inference() {
               fontSize: "var(--text-sm)",
             }}
           >
-            <HashRow
-              label="Attestation tx"
-              value={run.data.txHash}
-              copied={copied === "tx"}
-              onCopy={() => copy("tx", run.data!.txHash)}
-              icon={Sparkles}
-            />
+            {run.data.txHash && (
+              <HashRow
+                label="Attestation tx"
+                value={run.data.txHash}
+                copied={copied === "tx"}
+                onCopy={() => copy("tx", run.data!.txHash)}
+                icon={Sparkles}
+              />
+            )}
             <HashRow
               label="Output hash"
               value={run.data.outputHash}
@@ -264,13 +357,15 @@ export function Inference() {
               onCopy={() => copy("out", run.data!.outputHash)}
               icon={Zap}
             />
-            <HashRow
-              label="Model hash"
-              value={run.data.modelHash}
-              copied={copied === "model"}
-              onCopy={() => copy("model", run.data!.modelHash)}
-              icon={ShieldCheck}
-            />
+            {run.data.modelHash && (
+              <HashRow
+                label="Model hash"
+                value={run.data.modelHash}
+                copied={copied === "model"}
+                onCopy={() => copy("model", run.data!.modelHash)}
+                icon={ShieldCheck}
+              />
+            )}
           </div>
 
           <div
@@ -289,17 +384,19 @@ export function Inference() {
               Engine: {run.data.engine}{" "}
               {run.data.deterministic && "· deterministic"}
             </span>
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={() =>
-                api.openExternal(
-                  `http://140.82.16.112:3200${run.data!.explorerUrl}`,
-                )
-              }
-              data-testid="btn-open-explorer-tx"
-            >
-              View on explorer <ArrowUpRight size={12} />
-            </button>
+            {run.data.explorerUrl && (
+              <button
+                className="btn btn-ghost btn-sm"
+                onClick={() =>
+                  api.openExternal(
+                    `http://140.82.16.112:3200${run.data!.explorerUrl}`,
+                  )
+                }
+                data-testid="btn-open-explorer-tx"
+              >
+                View on explorer <ArrowUpRight size={12} />
+              </button>
+            )}
           </div>
         </Card>
       )}

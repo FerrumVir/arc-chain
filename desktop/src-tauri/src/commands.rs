@@ -244,6 +244,65 @@ pub async fn run_inference(
     rpc_client::run_inference(&state.http, port, &prompt, max_tokens.unwrap_or(32)).await
 }
 
+/// Milestone A (#35): observer / no-model nodes route inference through a
+/// testnet seed coordinator's `/inference/run_consensus` endpoint.
+///
+/// Iterates the built-in `COORDINATOR_HOSTS` list until one seed responds
+/// with success. A 120s per-host timeout covers the full consensus pipeline
+/// for short prompts (NYC typical: 15–60s at k=3 through 6 ranges).
+///
+/// This command is intentionally separate from `run_inference` so the UI
+/// can try the local node first (fast path when the user is a validator
+/// with --model loaded) and fall back here on 503 / network error without
+/// the Rust side having to know about the local node's role.
+#[tauri::command]
+pub async fn run_inference_via_coordinator(
+    prompt: String,
+    max_tokens: Option<u32>,
+    k: Option<u32>,
+) -> CmdResult<InferenceResult> {
+    // 600s / 10 min per-host timeout. Observed testnet behavior: a 3-token
+    // generation through the 6-range pipeline at k=3 takes ~160s (≈54s/
+    // token × 3), and prompts with longer prefill scale linearly until
+    // run_consensus gains pipelined prefill (the followup noted in #35's
+    // close comment).
+    let long_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .map_err(map_err)?;
+    let max_tokens = max_tokens.unwrap_or(32);
+    let k = k.unwrap_or(3);
+    let mut last_err = String::new();
+    for host in COORDINATOR_HOSTS {
+        match rpc_client::run_inference_consensus(&long_client, host, &prompt, max_tokens, k)
+            .await
+        {
+            Ok(r) => return Ok(r),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(format!(
+        "all {} coordinators failed; last: {}",
+        COORDINATOR_HOSTS.len(),
+        last_err
+    ))
+}
+
+/// Origin URLs for the 6 live testnet seed coordinators. Mirrors
+/// `testnet-seeds.txt` (the P2P side) — these IPs also run RPC on port
+/// 9090. SAO + JNB retired 2026-04-22 (#32) and are intentionally
+/// omitted. Order biases toward North America first; users in other
+/// regions see the same ordered sweep, which is fine for a fallback
+/// path where any responding seed is acceptable.
+const COORDINATOR_HOSTS: [&str; 6] = [
+    "http://149.28.32.76:9090",   // NYC
+    "http://140.82.16.112:9090",  // LAX
+    "http://136.244.109.1:9090",  // AMS
+    "http://104.238.171.11:9090", // LHR
+    "http://202.182.107.41:9090", // NRT
+    "http://149.28.153.31:9090",  // SGP
+];
+
 #[tauri::command]
 pub async fn check_for_update() -> CmdResult<UpdateCheck> {
     // Query the public GitHub releases API for the latest tag.

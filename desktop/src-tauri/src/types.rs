@@ -152,6 +152,17 @@ pub struct FaucetResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct InferenceConsensus {
+    pub k: u32,
+    pub votes_total: u32,
+    pub unanimous: u32,
+    pub majority: u32,
+    pub split: u32,
+    pub divergent_replica_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InferenceResult {
     pub input: String,
     pub output: String,
@@ -163,4 +174,8 @@ pub struct InferenceResult {
     pub deterministic: bool,
     pub engine: String,
     pub explorer_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consensus: Option<InferenceConsensus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator: Option<String>,
 }
