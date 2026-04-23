@@ -1,4 +1,4 @@
-export type NodeRole = "worker" | "validator" | "verifier";
+export type NodeRole = "observer" | "worker" | "validator" | "verifier";
 
 export type HealthLevel = "live" | "syncing" | "offline";
 

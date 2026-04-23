@@ -11,49 +11,23 @@ test.describe("Screenshot gallery", () => {
     await page.screenshot({ path: "screenshots/01-onboarding-welcome.png", fullPage: false });
   });
 
-  test("onboarding — hardware", async ({ page }) => {
-    await clearState(page);
-    await page.goto("/");
-    await page.getByTestId("btn-continue-welcome").click();
-    await page.waitForFunction(() => {
-      const btn = document.querySelector(
-        "[data-testid='btn-continue-hardware']",
-      ) as HTMLButtonElement | null;
-      return btn && !btn.disabled;
-    });
-    await page.screenshot({ path: "screenshots/02-onboarding-hardware.png" });
-  });
-
-  test("onboarding — role", async ({ page }) => {
-    await clearState(page);
-    await page.goto("/");
-    await page.getByTestId("btn-continue-welcome").click();
-    await page.waitForFunction(() => {
-      const btn = document.querySelector(
-        "[data-testid='btn-continue-hardware']",
-      ) as HTMLButtonElement | null;
-      return btn && !btn.disabled;
-    });
-    await page.getByTestId("btn-continue-hardware").click();
-    await page.waitForSelector('[data-testid="step-role"]');
-    await page.screenshot({ path: "screenshots/03-onboarding-role.png" });
-  });
-
   test("onboarding — identity revealed", async ({ page }) => {
     await clearState(page);
     await page.goto("/");
     await page.getByTestId("btn-continue-welcome").click();
-    await page.waitForFunction(() => {
-      const btn = document.querySelector(
-        "[data-testid='btn-continue-hardware']",
-      ) as HTMLButtonElement | null;
-      return btn && !btn.disabled;
-    });
-    await page.getByTestId("btn-continue-hardware").click();
-    await page.getByTestId("btn-continue-role").click();
     await page.waitForSelector('[data-testid="btn-reveal-seed"]');
     await page.getByTestId("btn-reveal-seed").click();
-    await page.screenshot({ path: "screenshots/04-onboarding-identity.png" });
+    await page.screenshot({ path: "screenshots/02-onboarding-identity.png" });
+  });
+
+  test("onboarding — launch ready", async ({ page }) => {
+    await clearState(page);
+    await page.goto("/");
+    await page.getByTestId("btn-continue-welcome").click();
+    await page.getByTestId("btn-reveal-seed").click();
+    await page.getByTestId("btn-continue-identity").click();
+    await page.waitForSelector('[data-testid="step-launch"]');
+    await page.screenshot({ path: "screenshots/03-onboarding-launch.png" });
   });
 
   test("dashboard — stopped", async ({ page }) => {

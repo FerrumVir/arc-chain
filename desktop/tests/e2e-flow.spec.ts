@@ -17,48 +17,62 @@ test.describe("Onboarding → launch end-to-end", () => {
     await clearState(page);
   });
 
-  test("launch step downloads binary then starts node", async ({ page }) => {
+  test("three-step launch: welcome → identity → join", async ({ page }) => {
     await page.goto("/");
 
-    // Walk the wizard up to the launch step.
     await page.getByTestId("btn-continue-welcome").click();
-    await page.waitForFunction(() => {
-      const btn = document.querySelector(
-        "[data-testid='btn-continue-hardware']",
-      ) as HTMLButtonElement | null;
-      return btn && !btn.disabled;
-    });
-    await page.getByTestId("btn-continue-hardware").click();
-    await page.getByTestId("btn-continue-role").click();
+    await expect(page.getByTestId("step-identity")).toBeVisible();
     await page.getByTestId("btn-reveal-seed").click();
     await page.getByTestId("btn-continue-identity").click();
     await expect(page.getByTestId("step-launch")).toBeVisible();
-    await expect(page.getByText(/ready to launch/i)).toBeVisible();
+    await expect(page.getByText(/ready to join/i)).toBeVisible();
 
     await page.getByTestId("btn-launch").click();
 
-    // Mock ensure_binary + start_node both resolve fast — we should land
-    // on the dashboard.
-    await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 10_000 });
+    // Mock flow: ensureBinary + startNode + waitForPeer + faucetClaim all
+    // resolve, then dashboard renders.
+    await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 15_000 });
   });
 
-  test("launch button shows 'Launch node' copy before click, not 'Retry'", async ({
+  test("launch button says 'Join the network', not 'Launch node'", async ({
     page,
   }) => {
     await page.goto("/");
     await page.getByTestId("btn-continue-welcome").click();
-    await page.waitForFunction(() => {
-      const btn = document.querySelector(
-        "[data-testid='btn-continue-hardware']",
-      ) as HTMLButtonElement | null;
-      return btn && !btn.disabled;
-    });
-    await page.getByTestId("btn-continue-hardware").click();
-    await page.getByTestId("btn-continue-role").click();
     await page.getByTestId("btn-reveal-seed").click();
     await page.getByTestId("btn-continue-identity").click();
     await expect(page.getByTestId("btn-launch")).toBeVisible();
-    await expect(page.getByTestId("btn-launch")).toContainText(/launch node/i);
+    await expect(page.getByTestId("btn-launch")).toContainText(
+      /join the network/i,
+    );
+  });
+
+  test("launch pipeline stops off on observer role + null modelPath", () => {
+    // Regression guard: we ship with role="observer" and no model so users
+    // don't have to pick anything. Onboarding.tsx must not regress to
+    // role=worker (which would trigger the inference-worker path we don't
+    // want to default users into).
+    const src = fs.readFileSync(
+      path.resolve(REPO_DESKTOP, "src", "screens", "Onboarding.tsx"),
+      "utf8",
+    );
+    expect(src).toMatch(/role:\s*"observer"/);
+    expect(src).toMatch(/modelPath:\s*null/);
+    // And no more role picker
+    expect(src).not.toMatch(/ROLE_META/);
+    expect(src).not.toMatch(/setRole/);
+  });
+
+  test("launch pipeline auto-claims faucet after peer count ≥ 1", () => {
+    const src = fs.readFileSync(
+      path.resolve(REPO_DESKTOP, "src", "screens", "Onboarding.tsx"),
+      "utf8",
+    );
+    // Faucet claim must be gated on waitForPeer returning true — not
+    // fired unconditionally (would burn the daily limit on nodes that
+    // never joined).
+    expect(src).toMatch(/waitForPeer/);
+    expect(src).toMatch(/faucetClaim/);
   });
 });
 

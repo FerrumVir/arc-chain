@@ -40,26 +40,13 @@ test.describe("Live node (port 9090) — real data", () => {
     await page.screenshot({ path: "screenshots/live-01-welcome.png" });
 
     await page.getByTestId("btn-continue-welcome").click();
-    await page.waitForFunction(() => {
-      const btn = document.querySelector(
-        "[data-testid='btn-continue-hardware']",
-      ) as HTMLButtonElement | null;
-      return btn && !btn.disabled;
-    });
-    await page.screenshot({ path: "screenshots/live-02-hardware.png" });
-    await page.getByTestId("btn-continue-hardware").click();
-
-    await expect(page.getByTestId("step-role")).toBeVisible();
-    await page.screenshot({ path: "screenshots/live-03-role.png" });
-    await page.getByTestId("btn-continue-role").click();
-
     await expect(page.getByTestId("step-identity")).toBeVisible();
     await page.getByTestId("btn-reveal-seed").click();
-    await page.screenshot({ path: "screenshots/live-04-identity.png" });
+    await page.screenshot({ path: "screenshots/live-02-identity.png" });
     await page.getByTestId("btn-continue-identity").click();
 
     await expect(page.getByTestId("step-launch")).toBeVisible();
-    await page.screenshot({ path: "screenshots/live-05-launch.png" });
+    await page.screenshot({ path: "screenshots/live-03-launch.png" });
     await page.getByTestId("btn-launch").click();
 
     // Land on dashboard — should show real data

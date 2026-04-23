@@ -4,12 +4,8 @@ import {
   ArrowRight,
   Check,
   Copy,
-  Cpu,
-  HardDrive,
   Loader2,
-  Monitor,
   Network,
-  Server,
   ShieldCheck,
   Sparkles,
 } from "lucide-react";
@@ -17,35 +13,10 @@ import clsx from "clsx";
 import { useAppStore } from "../lib/store";
 import { api } from "../lib/tauri";
 import { LogoMark, Tagline } from "../components/Logo";
-import type { HardwareInfo, Identity, NodeRole } from "../lib/types";
+import type { Identity } from "../lib/types";
 
-const STEPS = ["welcome", "hardware", "role", "identity", "launch"] as const;
+const STEPS = ["welcome", "identity", "launch"] as const;
 type Step = (typeof STEPS)[number];
-
-const ROLE_META: Record<
-  NodeRole,
-  { title: string; description: string; icon: typeof Server; badge?: string }
-> = {
-  worker: {
-    title: "Inference Worker",
-    description:
-      "Use your GPU to serve AI inference. Earn ARC for every verified request.",
-    icon: Sparkles,
-    badge: "Recommended",
-  },
-  validator: {
-    title: "Full Validator",
-    description:
-      "Run consensus, produce blocks, attest to inference. Requires stake.",
-    icon: Server,
-  },
-  verifier: {
-    title: "Light Verifier",
-    description:
-      "Validate attestations without serving inference. Lowest resource footprint.",
-    icon: ShieldCheck,
-  },
-};
 
 const fadeSlide = {
   initial: { opacity: 0, y: 16 },
@@ -56,13 +27,11 @@ const fadeSlide = {
 
 export function Onboarding() {
   const [step, setStep] = useState<Step>("welcome");
-  const [hardware, setHardware] = useState<HardwareInfo | null>(null);
-  const [role, setRole] = useState<NodeRole>("worker");
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [copied, setCopied] = useState(false);
   const [launching, setLaunching] = useState(false);
   const [launchStage, setLaunchStage] = useState<
-    "idle" | "downloading" | "starting"
+    "idle" | "downloading" | "starting" | "connecting" | "claiming"
   >("idle");
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [seedShown, setSeedShown] = useState(false);
@@ -76,24 +45,20 @@ export function Onboarding() {
   const back = () => setStep(STEPS[Math.max(stepIndex - 1, 0)]);
 
   useEffect(() => {
-    if (step === "hardware" && !hardware) {
-      api.detectHardware().then(setHardware);
-    }
     if (step === "identity" && !identity) {
       api.generateIdentity().then(setIdentity);
     }
-  }, [step, hardware, identity]);
-
-  useEffect(() => {
-    if (hardware) setRole(hardware.recommendedRole);
-  }, [hardware]);
+  }, [step, identity]);
 
   const finish = async () => {
     if (!identity) return;
     setLaunching(true);
     setLaunchError(null);
+    // "observer" role = join consensus + validate blocks without needing a
+    // 4 GB model download. Users can flip to full inference-worker mode
+    // later via Settings → "Become an inference worker".
     const config = {
-      role,
+      role: "observer" as const,
       modelPath: null,
       rpcPort: 9090,
       p2pPort: 9091,
@@ -105,14 +70,24 @@ export function Onboarding() {
     setStoreConfig(config);
     try {
       setLaunchStage("downloading");
-      // First-launch: fetch arc-node binary from GitHub Releases if missing.
-      // Subsequent launches return `alreadyInstalled=true` instantly.
       await api.ensureBinary();
       await api.saveConfig(config);
       setLaunchStage("starting");
       await api.startNode(config);
-      // brief "spinning up" moment for polish
-      await new Promise((r) => setTimeout(r, 900));
+      // Poll /health until the node reports at least one peer — that's
+      // when it's actually on testnet, not just a running binary.
+      setLaunchStage("connecting");
+      const joined = await waitForPeer({ timeoutMs: 90_000 });
+      if (joined) {
+        // One free top-up so the wallet isn't empty when they land on
+        // the dashboard. Non-fatal if it fails (e.g. already-claimed).
+        setLaunchStage("claiming");
+        try {
+          await api.faucetClaim();
+        } catch {
+          /* faucet is a best-effort welcome gift; log-silent here */
+        }
+      }
       setOnboarded(true);
     } catch (err) {
       setLaunchError(
@@ -162,8 +137,8 @@ export function Onboarding() {
                 </div>
                 <h1 className="onboarding-title">welcome to arc</h1>
                 <p className="onboarding-subtitle">
-                  Run a verifiable AI node on your machine.
-                  Contribute compute. Earn from the network.
+                  Run a node on your machine. Help secure the network. Get
+                  testnet ARC.
                 </p>
 
                 <div
@@ -176,18 +151,18 @@ export function Onboarding() {
                   {[
                     {
                       icon: Sparkles,
-                      title: "Earn ARC continuously",
-                      desc: "Every verified inference pays you in ARC tokens.",
+                      title: "One click",
+                      desc: "Download, open, you're on testnet. No config, no downloads to pick.",
                     },
                     {
                       icon: ShieldCheck,
-                      title: "Cryptographically verifiable",
-                      desc: "Your outputs are attested on-chain. No trust required.",
+                      title: "Your identity, on-chain",
+                      desc: "A BIP-39 recovery phrase generated locally — never leaves your machine.",
                     },
                     {
                       icon: Network,
-                      title: "Join 1,283+ nodes",
-                      desc: "Part of a real network, not a centralized provider.",
+                      title: "Keeps running",
+                      desc: "Lives in the menu bar, starts on login, auto-updates. Nothing to babysit.",
                     },
                   ].map(({ icon: Icon, title, desc }) => (
                     <div
@@ -252,197 +227,12 @@ export function Onboarding() {
               </div>
             )}
 
-            {step === "hardware" && (
-              <div data-testid="step-hardware">
-                <h1 className="onboarding-title">Your machine</h1>
-                <p className="onboarding-subtitle">
-                  We checked what you have. Here's what you can run.
-                </p>
-
-                {!hardware ? (
-                  <div style={{ display: "grid", gap: "var(--space-3)" }}>
-                    {[0, 1, 2].map((i) => (
-                      <div
-                        key={i}
-                        className="shimmer"
-                        style={{ height: 78 }}
-                      />
-                    ))}
-                  </div>
-                ) : (
-                  <>
-                    <div className="hardware-summary">
-                      <div className="hw-item">
-                        <Cpu
-                          size={16}
-                          style={{
-                            color: "var(--text-muted)",
-                            margin: "0 auto var(--space-2)",
-                          }}
-                        />
-                        <div className="hw-value">{hardware.cpuCores}</div>
-                        <div className="hw-label">CPU cores</div>
-                      </div>
-                      <div className="hw-item highlight">
-                        <HardDrive
-                          size={16}
-                          style={{
-                            color: "var(--indigo-300)",
-                            margin: "0 auto var(--space-2)",
-                          }}
-                        />
-                        <div className="hw-value">{hardware.ramGb} GB</div>
-                        <div className="hw-label">RAM</div>
-                      </div>
-                      <div className="hw-item">
-                        <Monitor
-                          size={16}
-                          style={{
-                            color: "var(--text-muted)",
-                            margin: "0 auto var(--space-2)",
-                          }}
-                        />
-                        <div className="hw-value">
-                          {hardware.gpuVramGb ? `${hardware.gpuVramGb} GB` : "—"}
-                        </div>
-                        <div className="hw-label">GPU</div>
-                      </div>
-                    </div>
-
-                    <div
-                      style={{
-                        padding: "var(--space-5)",
-                        background: "var(--surface)",
-                        border: "1px solid var(--border)",
-                        borderRadius: "var(--radius-lg)",
-                        marginBottom: "var(--space-4)",
-                      }}
-                    >
-                      <div
-                        style={{
-                          fontSize: "var(--text-xs)",
-                          fontWeight: 600,
-                          letterSpacing: "var(--tracking-wider)",
-                          color: "var(--text-muted)",
-                          textTransform: "uppercase",
-                          marginBottom: "var(--space-2)",
-                        }}
-                      >
-                        Recommended model
-                      </div>
-                      <div
-                        style={{
-                          fontSize: "var(--text-lg)",
-                          fontWeight: 600,
-                          color: "var(--text)",
-                          marginBottom: "var(--space-1)",
-                        }}
-                      >
-                        {hardware.recommendedModel}
-                      </div>
-                      <div
-                        style={{
-                          fontSize: "var(--text-sm)",
-                          color: "var(--text-muted)",
-                        }}
-                      >
-                        Est. earnings:{" "}
-                        <span
-                          style={{
-                            color: "var(--success)",
-                            fontVariantNumeric: "tabular-nums",
-                            fontWeight: 600,
-                          }}
-                        >
-                          ~{hardware.estimatedDailyArc.toLocaleString()} ARC / day
-                        </span>
-                      </div>
-                    </div>
-                  </>
-                )}
-
-                <div className="onboarding-actions">
-                  <button className="btn btn-ghost" onClick={back}>
-                    Back
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    onClick={next}
-                    disabled={!hardware}
-                    data-testid="btn-continue-hardware"
-                  >
-                    Continue <ArrowRight size={16} />
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {step === "role" && (
-              <div data-testid="step-role">
-                <h1 className="onboarding-title">Pick your role</h1>
-                <p className="onboarding-subtitle">
-                  You can change this later in Settings.
-                </p>
-
-                <div className="role-grid">
-                  {(Object.keys(ROLE_META) as NodeRole[]).map((r) => {
-                    const meta = ROLE_META[r];
-                    const Icon = meta.icon;
-                    return (
-                      <button
-                        key={r}
-                        className={clsx(
-                          "role-card",
-                          role === r && "selected",
-                        )}
-                        onClick={() => setRole(r)}
-                        data-testid={`role-${r}`}
-                        aria-pressed={role === r}
-                      >
-                        <div className="role-icon">
-                          <Icon size={18} />
-                        </div>
-                        <div className="role-info">
-                          <div className="role-title">
-                            {meta.title}
-                            {meta.badge && (
-                              <span className="role-badge">{meta.badge}</span>
-                            )}
-                          </div>
-                          <div className="role-description">{meta.description}</div>
-                        </div>
-                        {role === r && (
-                          <Check
-                            size={18}
-                            style={{ color: "var(--indigo-300)", flexShrink: 0 }}
-                          />
-                        )}
-                      </button>
-                    );
-                  })}
-                </div>
-
-                <div className="onboarding-actions">
-                  <button className="btn btn-ghost" onClick={back}>
-                    Back
-                  </button>
-                  <button
-                    className="btn btn-primary"
-                    onClick={next}
-                    data-testid="btn-continue-role"
-                  >
-                    Continue <ArrowRight size={16} />
-                  </button>
-                </div>
-              </div>
-            )}
-
             {step === "identity" && (
               <div data-testid="step-identity">
                 <h1 className="onboarding-title">Your identity</h1>
                 <p className="onboarding-subtitle">
-                  This is your node's on-chain address. Keep the recovery phrase
-                  safe — it's the only way to restore this identity.
+                  This is your node's on-chain address. Save the recovery
+                  phrase — it's the only way to restore this identity.
                 </p>
 
                 {!identity ? (
@@ -635,24 +425,29 @@ export function Onboarding() {
                   )}
                 </div>
                 <h1 className="onboarding-title">
-                  {launching
-                    ? launchStage === "downloading"
+                  {!launching
+                    ? "ready to join"
+                    : launchStage === "downloading"
                       ? "downloading arc-node"
-                      : "starting your node"
-                    : "ready to launch"}
+                      : launchStage === "starting"
+                        ? "starting your node"
+                        : launchStage === "connecting"
+                          ? "joining the network"
+                          : launchStage === "claiming"
+                            ? "claiming welcome tokens"
+                            : "finishing up"}
                 </h1>
                 <p className="onboarding-subtitle">
-                  {launching && launchStage === "downloading"
-                    ? "Fetching the latest arc-node binary for your platform. ~45 MB, one-time download."
-                    : launching
-                      ? "Connecting to the ARC testnet…"
-                      : "You'll be connected as a "}
-                  {!launching && (
-                    <strong style={{ color: "var(--text)" }}>
-                      {ROLE_META[role].title}
-                    </strong>
-                  )}
-                  {!launching && ". Auto-update and persistent service will be enabled."}
+                  {!launching &&
+                    "We'll download the node binary, start it, and drop some testnet ARC into your wallet."}
+                  {launching && launchStage === "downloading" &&
+                    "Fetching the latest arc-node for your platform. ~45 MB, one-time."}
+                  {launching && launchStage === "starting" &&
+                    "Launching your local node."}
+                  {launching && launchStage === "connecting" &&
+                    "Waiting for peers — usually takes a few seconds."}
+                  {launching && launchStage === "claiming" &&
+                    "Asking the testnet faucet for your starter balance."}
                 </p>
 
                 {launchError && (
@@ -687,7 +482,7 @@ export function Onboarding() {
                       onClick={finish}
                       data-testid="btn-launch"
                     >
-                      {launchError ? "Retry" : "Launch node"}{" "}
+                      {launchError ? "Retry" : "Join the network"}{" "}
                       <Sparkles size={16} />
                     </button>
                   </div>
@@ -703,4 +498,22 @@ export function Onboarding() {
       `}</style>
     </div>
   );
+}
+
+// Poll node_status until we see peers ≥ 1 or we time out. Returns true
+// when the node has actually joined the testnet. Used in onboarding's
+// launch step to gate the faucet claim on "we're actually on the chain",
+// not just "arc-node's process is alive".
+async function waitForPeer({ timeoutMs }: { timeoutMs: number }): Promise<boolean> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const s = await api.nodeStatus();
+      if (s.running && s.peers >= 1) return true;
+    } catch {
+      /* retry */
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  return false;
 }

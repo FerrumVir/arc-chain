@@ -5,10 +5,10 @@ test.describe("Visual polish smoke tests", () => {
   test("onboarding welcome screen looks right", async ({ page }) => {
     await clearState(page);
     await page.goto("/");
-    // Hero title and three value props are rendered
-    await expect(page.getByText("Earn ARC continuously")).toBeVisible();
-    await expect(page.getByText("Cryptographically verifiable")).toBeVisible();
-    await expect(page.getByText(/join 1,283\+ nodes/i)).toBeVisible();
+    // Hero title and three value props (one-click-join copy)
+    await expect(page.getByText("One click")).toBeVisible();
+    await expect(page.getByText("Your identity, on-chain")).toBeVisible();
+    await expect(page.getByText("Keeps running")).toBeVisible();
 
     // Logo gradient uses our brand gradient
     const logo = page.getByTestId("logo-mark").first();

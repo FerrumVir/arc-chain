@@ -101,18 +101,13 @@ test.describe("Mobile layout (Pixel 7, 412×915) — seeded", () => {
 
 test.describe("Mobile layout (Pixel 7, 412×915) — onboarding", () => {
   // Intentionally NO beforeEach — this test needs a fresh, un-seeded store.
-  test("all five steps reachable at phone size", async ({ page }) => {
+  test("all three steps reachable at phone size", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByTestId("step-welcome")).toBeVisible();
     await page.getByTestId("btn-continue-welcome").click();
-    await page.waitForFunction(() => {
-      const btn = document.querySelector(
-        "[data-testid='btn-continue-hardware']",
-      ) as HTMLButtonElement | null;
-      return btn && !btn.disabled;
-    });
-    await expect(page.getByTestId("step-hardware")).toBeVisible();
-    const hwItems = page.locator(".hw-item");
-    await expect(hwItems).toHaveCount(3);
+    await expect(page.getByTestId("step-identity")).toBeVisible();
+    await page.getByTestId("btn-reveal-seed").click();
+    await page.getByTestId("btn-continue-identity").click();
+    await expect(page.getByTestId("step-launch")).toBeVisible();
   });
 });

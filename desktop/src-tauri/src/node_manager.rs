@@ -161,11 +161,13 @@ impl NodeManager {
             .await;
         }
 
-        // Worker role → register as a community inference worker with seed
-        // gateways so this machine's compute contributes to the network.
-        // Other roles (validator/verifier) skip this; they participate via
-        // consensus only.
-        if config.role == "worker" {
+        // Only register as a community inference worker if we actually
+        // have a model to serve. role="worker" without model_path is
+        // nonsense — the gateway would forward requests the node can't
+        // answer. Default role is "observer" which just joins consensus,
+        // validates blocks, and helps the network without requiring a
+        // 4 GB model download.
+        if config.role == "worker" && config.model_path.is_some() {
             cmd.arg("--community-mode");
         }
 
