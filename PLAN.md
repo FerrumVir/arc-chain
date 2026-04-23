@@ -112,11 +112,25 @@ per-token latency falls to match `run_sharded` (~20 s/token, not
 
 ---
 
-## Milestone B — Per-request fee, escrow, payout
+## Milestone B — Per-request fee, escrow, payout (in progress — PR #40)
 
 **Goal**: a user paying N ARC gets an inference; the ARC is escrowed on
 request, debited on success, split per `RoleRevenueConfig` to the
 replicas that actually answered, refunded on failure.
+
+**Status 2026-04-22**: protocol surface shipped on branch
+`milestone-b` (PR #40, commit `17a45a3d`): new tx types
+`InferenceEscrowOpen` / `InferenceEscrowRelease` / `InferenceEscrowRefund`
+(0x19 / 0x1a / 0x1b), full state transitions, 10 integration tests all
+asserting real balance deltas, 165/165 arc-state lib tests pass.
+Remaining to merge: wire `/inference/run_consensus` to require
+`{payer, max_fee}` and submit release/refund; desktop "Pay 10 ARC"
+command + UI; rolling upgrade of the 6 seeds; live balance-delta test
+(Alice 1000 ARC → 10 × 10-ARC inferences → Alice 900, seeds up by
+share, total conserved); per-replica-earnings dashboard. A latent
+DashMap-entry-guard-across-same-shard deadlock in
+`index_account_tx` surfaced by this milestone was fixed in the
+same commit (scoped outer guard).
 
 ### Scope
 - New tx type `InferenceEscrow` in `crates/arc-types/src/tx.rs`:
