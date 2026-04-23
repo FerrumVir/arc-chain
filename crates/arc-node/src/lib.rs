@@ -1,8 +1,10 @@
 pub mod benchmark;
 pub mod block_stm;
+pub mod chunk_cache;
 pub mod coalesce;
 pub mod consensus;
 pub mod pipeline;
+pub mod planner;
 pub mod producer;
 pub mod rpc;
 pub mod state_sync;
