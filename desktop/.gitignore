@@ -9,6 +9,12 @@ src-tauri/target
 src-tauri/gen
 src-tauri/WixTools
 
+# Tauri updater signing key (the public half IS committed via
+# tauri.conf.json > plugins.updater.pubkey; the private key lives in
+# GitHub Actions secrets in CI and only here for local dev — NEVER git).
+src-tauri/.tauri-keys/*.key
+src-tauri/.tauri-keys/*.key.enc
+
 # Playwright
 test-results
 playwright-report

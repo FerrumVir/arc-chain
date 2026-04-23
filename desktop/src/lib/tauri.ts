@@ -306,6 +306,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         totalBytes: 0,
         alreadyInstalled: true,
       } as T;
+    case "get_autostart":
+      return false as T;
     default:
       throw new Error(`Unhandled live command: ${cmd}`);
   }
@@ -528,6 +530,8 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         totalBytes: 45_000_000,
         alreadyInstalled: false,
       } as T;
+    case "get_autostart":
+      return true as T;
     default:
       throw new Error(`Unmocked Tauri command: ${cmd}`);
   }
@@ -570,6 +574,7 @@ export const api = {
   checkForUpdate: () =>
     invoke<{ hasUpdate: boolean; version: string }>("check_for_update"),
   ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
+  getAutostart: () => invoke<boolean>("get_autostart"),
 };
 
 export const isTauri = IS_TAURI;

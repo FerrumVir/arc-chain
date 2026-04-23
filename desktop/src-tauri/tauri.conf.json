@@ -46,7 +46,7 @@
     "category": "DeveloperTool",
     "shortDescription": "Run an ARC verifiable AI inference node",
     "longDescription": "ARC Node lets anyone run a verifiable AI inference node on their machine. Earn ARC tokens for every request your node serves. Cryptographic attestations prove your compute is honest.",
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "macOS": {
       "minimumSystemVersion": "11.0",
       "signingIdentity": null
@@ -55,5 +55,14 @@
       "certificateThumbprint": null
     }
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "active": true,
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDlBOTcwQ0FBQ0U1NjQ3M0IKUldRN1IxYk9xZ3lYbWcrbkhkWnZlc0tmWW1uTTlhcDljLzF4cUZtUUVibTRNa2V4TjBoNHJqY2EK",
+      "endpoints": [
+        "https://github.com/FerrumVir/arc-chain/releases/latest/download/latest.json"
+      ],
+      "windows": { "installMode": "passive" }
+    }
+  }
 }

@@ -209,3 +209,102 @@ test.describe("ensure_binary auto-download", () => {
     expect(commands).toMatch(/0o755/);
   });
 });
+
+test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => {
+  const lib = fs.readFileSync(
+    path.resolve(REPO_DESKTOP, "src-tauri", "src", "lib.rs"),
+    "utf8",
+  );
+  const tray = fs.readFileSync(
+    path.resolve(REPO_DESKTOP, "src-tauri", "src", "tray.rs"),
+    "utf8",
+  );
+  const cargo = fs.readFileSync(
+    path.resolve(REPO_DESKTOP, "src-tauri", "Cargo.toml"),
+    "utf8",
+  );
+  const conf = JSON.parse(
+    fs.readFileSync(
+      path.resolve(REPO_DESKTOP, "src-tauri", "tauri.conf.json"),
+      "utf8",
+    ),
+  );
+  const caps = JSON.parse(
+    fs.readFileSync(
+      path.resolve(REPO_DESKTOP, "src-tauri", "capabilities", "default.json"),
+      "utf8",
+    ),
+  );
+
+  test("auto-update: updater plugin registered + real pubkey wired", () => {
+    expect(lib).toMatch(/tauri_plugin_updater::Builder::new\(\)\.build\(\)/);
+    expect(conf.plugins?.updater?.active).toBe(true);
+    // Reject any TODO / placeholder values.
+    const pubkey = conf.plugins?.updater?.pubkey ?? "";
+    expect(pubkey.length).toBeGreaterThan(50);
+    expect(pubkey).not.toMatch(/TODO/i);
+    expect(conf.bundle?.createUpdaterArtifacts).toBe(true);
+    expect(conf.plugins?.updater?.endpoints?.[0]).toMatch(/releases\/latest/);
+  });
+
+  test("auto-start: autostart plugin registered with --minimized arg", () => {
+    expect(cargo).toMatch(/tauri-plugin-autostart\s*=\s*"2"/);
+    expect(lib).toMatch(/tauri_plugin_autostart::init\(/);
+    expect(lib).toContain('"--minimized"');
+    // Capabilities must grant autostart permissions or the plugin 500s
+    // from the frontend.
+    expect(caps.permissions).toEqual(expect.arrayContaining(["autostart:default"]));
+  });
+
+  test("tray: tray icon + open/quit menu installed, left-click opens window", () => {
+    expect(cargo).toMatch(/tauri\s*=\s*\{\s*version\s*=\s*"2"\s*,\s*features\s*=\s*\[[^\]]*"tray-icon"/);
+    expect(lib).toMatch(/mod tray;/);
+    expect(lib).toMatch(/tray::install/);
+    expect(tray).toMatch(/MenuItem::with_id\(app,\s*"open"/);
+    expect(tray).toMatch(/MenuItem::with_id\(app,\s*"quit"/);
+    // Ticker that refreshes status + round labels.
+    expect(tray).toMatch(/dag_round/);
+    expect(tray).toMatch(/interval\.tick\(\)\.await/);
+  });
+
+  test("window close hides to tray instead of exiting", () => {
+    expect(lib).toMatch(/WindowEvent::CloseRequested/);
+    expect(lib).toMatch(/window\.hide\(\)/);
+    expect(lib).toMatch(/api\.prevent_close\(\)/);
+  });
+
+  test("Quit menu stops arc-node cleanly before app.exit", () => {
+    expect(tray).toMatch(/"quit"\s*=>/);
+    expect(tray).toMatch(/node\.stop\(\)/);
+    expect(tray).toMatch(/handle\.exit\(0\)/);
+  });
+});
+
+test.describe("Release CI publishes signed update manifest", () => {
+  const wf = fs.readFileSync(
+    path.resolve(
+      REPO_DESKTOP,
+      "..",
+      ".github",
+      "workflows",
+      "release-desktop.yml",
+    ),
+    "utf8",
+  );
+
+  test("workflow signs with TAURI_SIGNING_PRIVATE_KEY secret", () => {
+    expect(wf).toContain("TAURI_SIGNING_PRIVATE_KEY");
+    expect(wf).toContain("TAURI_SIGNING_PRIVATE_KEY_PASSWORD");
+  });
+
+  test("workflow emits latest.json with per-target url + signature", () => {
+    expect(wf).toMatch(/darwin-aarch64/);
+    expect(wf).toMatch(/linux-x86_64/);
+    expect(wf).toMatch(/\.app\.tar\.gz\.sig/);
+    expect(wf).toMatch(/latest\.json/);
+  });
+
+  test("tag trigger matches v*.*.*", () => {
+    expect(wf).toMatch(/tags:\s*\n\s*-\s*'v\*\.\*\.\*'/);
+  });
+});

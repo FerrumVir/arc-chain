@@ -4,10 +4,13 @@ mod identity;
 mod node_manager;
 mod rpc_client;
 mod store;
+mod tray;
 mod types;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::{Manager, WindowEvent};
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tokio::sync::Mutex;
 
 pub struct AppState {
@@ -47,28 +50,78 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        // Updater plugin disabled for the testnet release: a signing keypair
-        // needs to be generated and paid for before auto-updates can be
-        // trusted. Re-enable once tauri.conf.json > plugins.updater.pubkey
-        // is populated.
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        // Auto-launch on OS login. LaunchAgent = macOS launchd user-scoped
+        // LoginItem, Linux XDG autostart, Windows Run key. `--minimized`
+        // tells the app to start with the window hidden to the tray so
+        // the user doesn't get a window on every reboot.
+        .plugin(
+            tauri_plugin_autostart::init(
+                MacosLauncher::LaunchAgent,
+                Some(vec!["--minimized"]),
+            ),
+        )
         .manage(state)
         .setup(move |app| {
             // Resolve the per-platform writable dir NOW (AppHandle available).
-            use tauri::Manager;
             let resolver = app.path();
             let resolved = resolver
                 .app_data_dir()
                 .unwrap_or_else(|_| std::env::temp_dir());
             tracing::info!("app data dir: {}", resolved.display());
             // Load existing store from the resolved dir, if any.
-            let loaded = store::Store::load_from(&resolved);
-            let store = store.clone();
-            let data_dir = data_dir.clone();
+            let loaded_store = store::Store::load_from(&resolved);
+            let autostart_desired = loaded_store
+                .config
+                .as_ref()
+                .map(|c| c.auto_start)
+                .unwrap_or(true);
+
+            let store_shared = store.clone();
+            let data_dir_shared = data_dir.clone();
             tauri::async_runtime::block_on(async move {
-                *store.lock().await = loaded;
-                *data_dir.lock().await = resolved;
+                *store_shared.lock().await = loaded_store;
+                *data_dir_shared.lock().await = resolved;
             });
+
+            // Sync the autostart plugin with what the user chose during
+            // onboarding (default: on). Errors are non-fatal — tray and
+            // window still work without it.
+            let autostart = app.autolaunch();
+            match (autostart_desired, autostart.is_enabled().unwrap_or(false)) {
+                (true, false) => { let _ = autostart.enable(); }
+                (false, true) => { let _ = autostart.disable(); }
+                _ => {}
+            }
+
+            // Build the system tray icon. Gives the user a way to open the
+            // window after hide-to-tray, and a real Quit so arc-node can
+            // be stopped explicitly.
+            tray::install(app.handle())?;
+
+            // If the app was launched with `--minimized` (set by the
+            // autostart plugin on login), keep the window hidden and
+            // let the tray be the only surface until the user clicks it.
+            let launched_minimized = std::env::args().any(|a| a == "--minimized");
+            if launched_minimized {
+                if let Some(win) = app.get_webview_window("main") {
+                    let _ = win.hide();
+                }
+            }
+
             Ok(())
+        })
+        // Window-close hides to tray instead of exiting. arc-node
+        // (spawned as our child) keeps running. Real exit is via the
+        // tray → Quit menu item, which calls app.exit() after stopping
+        // arc-node cleanly.
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main" {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::detect_hardware,
@@ -92,6 +145,7 @@ pub fn run() {
             commands::run_inference,
             commands::clear_crash,
             commands::ensure_binary,
+            commands::get_autostart,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ARC desktop");

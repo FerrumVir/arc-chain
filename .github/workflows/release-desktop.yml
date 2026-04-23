@@ -1,0 +1,183 @@
+name: Release desktop app
+
+# Fires on the same tags the arc-node release workflow watches. Publishes
+# signed ARC Node.app (+ .dmg on macOS, .AppImage on Linux) plus the
+# `latest.json` manifest the Tauri updater consumes.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to release (e.g. v0.5.3)'
+        required: true
+        default: 'v0.5.3'
+
+jobs:
+  bundle:
+    name: Bundle ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-14
+            rust-target: aarch64-apple-darwin
+            artifact-glob: |
+              desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+              desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
+              desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            rust-target: x86_64-unknown-linux-gnu
+            artifact-glob: |
+              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+              desktop/src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz
+              desktop/src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz.sig
+
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Install Linux webview deps
+        if: matrix.platform == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install JS deps
+        run: npm ci
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: desktop-${{ matrix.rust-target }}
+          workspaces: desktop/src-tauri -> target
+
+      - name: Build + bundle signed artifacts
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is empty — the updater won't validate. Paste the contents of src-tauri/.tauri-keys/arc-desktop.key (without a password) into GitHub repo secrets."
+            exit 1
+          fi
+          npx tauri build
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: arc-desktop-${{ matrix.platform }}
+          path: ${{ matrix.artifact-glob }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish desktop release + updater manifest
+    needs: bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: bundles
+          pattern: arc-desktop-*
+          merge-multiple: true
+
+      - name: List downloaded bundles
+        run: find bundles -type f -exec ls -lh {} \;
+
+      - name: Determine tag + version
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+
+      - name: Build latest.json for the Tauri updater
+        # The Tauri updater reads a manifest with per-target (url, signature)
+        # pairs. `url` points at the .app.tar.gz (macOS) / .AppImage.tar.gz
+        # (Linux) published on this release; `signature` is the contents of
+        # the matching .sig file. Without this file auto-update is silently
+        # disabled — so we fail hard if a .sig is missing.
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          VERSION="${{ steps.tag.outputs.version }}"
+          DATE="${{ steps.tag.outputs.date }}"
+          base="https://github.com/FerrumVir/arc-chain/releases/download/$TAG"
+
+          read_sig() {
+            local f="$1"
+            if [ ! -f "$f" ]; then
+              echo "::error::missing signature file: $f"
+              exit 1
+            fi
+            cat "$f"
+          }
+
+          mac_arm_archive=$(find bundles -name '*.app.tar.gz' -not -name '*.sig' | head -1)
+          mac_arm_sig=$(find bundles -name '*.app.tar.gz.sig' | head -1)
+          linux_x86_archive=$(find bundles -name '*.AppImage.tar.gz' -not -name '*.sig' | head -1)
+          linux_x86_sig=$(find bundles -name '*.AppImage.tar.gz.sig' | head -1)
+
+          MAC_ARM_URL="$base/$(basename "$mac_arm_archive")"
+          LINUX_URL="$base/$(basename "$linux_x86_archive")"
+          MAC_ARM_SIGNATURE=$(read_sig "$mac_arm_sig")
+          LINUX_SIGNATURE=$(read_sig "$linux_x86_sig")
+
+          cat > latest.json <<EOF
+          {
+            "version": "$VERSION",
+            "notes": "ARC Node $TAG",
+            "pub_date": "$DATE",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "$MAC_ARM_SIGNATURE",
+                "url": "$MAC_ARM_URL"
+              },
+              "linux-x86_64": {
+                "signature": "$LINUX_SIGNATURE",
+                "url": "$LINUX_URL"
+              }
+            }
+          }
+          EOF
+          cat latest.json
+
+      - name: Attach bundles + manifest to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          files: |
+            bundles/**/*
+            latest.json
+          generate_release_notes: false
+          fail_on_unmatched_files: false

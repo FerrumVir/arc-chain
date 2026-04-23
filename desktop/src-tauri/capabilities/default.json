@@ -6,10 +6,14 @@
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
+    "core:window:allow-hide",
+    "core:window:allow-show",
+    "core:window:allow-set-focus",
     "shell:default",
     "dialog:default",
     "opener:default",
     "updater:default",
+    "autostart:default",
     {
       "identifier": "shell:allow-open",
       "allow": [{ "url": "https://**" }, { "url": "http://**" }]

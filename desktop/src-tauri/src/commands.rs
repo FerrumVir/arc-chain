@@ -4,6 +4,7 @@ use crate::{hardware, identity, rpc_client, AppState};
 use std::io::Write as _;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -54,14 +55,36 @@ pub async fn load_identity(state: State<'_, AppState>) -> CmdResult<Option<Ident
 
 #[tauri::command]
 pub async fn save_config(
+    app: AppHandle,
     state: State<'_, AppState>,
     config: NodeConfig,
 ) -> CmdResult<()> {
-    let mut store = state.store.lock().await;
-    store.config = Some(config);
-    let dir = state.data_dir.lock().await.clone();
-    store.save_to(&dir).map_err(map_err)?;
+    let auto_start = config.auto_start;
+    {
+        let mut store = state.store.lock().await;
+        store.config = Some(config);
+        let dir = state.data_dir.lock().await.clone();
+        store.save_to(&dir).map_err(map_err)?;
+    }
+    // Keep the OS-level login item in sync with the user's stored
+    // preference. Errors here don't block the save — tray still works.
+    let autostart = app.autolaunch();
+    let current = autostart.is_enabled().unwrap_or(false);
+    match (auto_start, current) {
+        (true, false) => {
+            let _ = autostart.enable();
+        }
+        (false, true) => {
+            let _ = autostart.disable();
+        }
+        _ => {}
+    }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn get_autostart(app: AppHandle) -> CmdResult<bool> {
+    Ok(app.autolaunch().is_enabled().unwrap_or(false))
 }
 
 #[tauri::command]
