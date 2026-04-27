@@ -137,15 +137,36 @@ seeds via rolling upgrade. 172/172 `arc-state` lib tests + 81/81
   balance **0 → 10000**, `storage_root` = metadata commitment.
 - Conservation: −10000 payer = +10000 escrow ✓.
 
-### Remaining release-side receipt (blocker)
-The `InferenceEscrowRelease` submits HTTP 200 but isn't being included
-in any block — the testnet's DAG consensus is currently proposing empty
-blocks (seeds at divergent heights, `mempool.drain` returning 0 despite
-non-empty submits). Pre-existing chain consensus issue unrelated to
-Milestone B code. Unit tests in `arc-state/src/lib.rs::tests` prove the
-40/25/15/20 split arithmetic + escrow zeroing + commitment-clear at the
-state layer; the live release receipt closes when the consensus issue
-is fixed.
+### Live release-side receipt (2026-04-27)
+
+Root cause was `arc-inference-traffic.service` flooding the per-block
+tx slot with null-sig Transfer txs that all rejected at `execute_tx`,
+crowding out real submissions. Disabled the service on all 6 seeds
+**and** added a permanent rule to `scripts/arc-self-heal.sh` that
+stops + disables the service on every poll — survives reboots and
+manual systemctl-start. Override via `ALLOW_INFERENCE_TRAFFIC=1`.
+
+After the fix:
+
+- Release tx `0x813fde8264039c5b25c37d8837a8863d4e3eb69ab9a80b5a1e43fe771770c9f3`
+  in NYC block 2767, success=true.
+- Body: `InferenceEscrowRelease`, payer=`0x6248f5e2…`,
+  request_id=`0xf404a52a…`, replicas=[NYC,LAX,AMS,LHR,NRT,SGP synthetic
+  addrs], proposer=payer (self-release for the test), output_hash
+  recorded.
+
+Final balances on NYC:
+
+| Account | Balance | Expected | Notes |
+|---|---|---|---|
+| payer (`0x6248f5e2…`) | **4000** | 40% × 10000 = 4000 | proposer share (= self) |
+| escrow (`0x19976593…`) | **0** | 0 | drained, storage_root cleared |
+| treasury | **2004** | 2000 + 4 rounding | 20% + replica truncation residue |
+| observer pool | **1500** | 1500 | 15% |
+| replica[NYC,LAX,AMS,LHR,NRT,SGP] | **416 × 6** | (25% × 10000) / 6 = 416.67 → 416 each | 25% / 6 = 416 each, 4 ARC residue → treasury |
+| **Total credited** | **10000** | 10000 | **Δ = 0 ✓ conserved** |
+
+Conservation verified end-to-end. PR #40 is now ready to leave draft.
 
 ### Scope
 - New tx type `InferenceEscrow` in `crates/arc-types/src/tx.rs`:
