@@ -118,19 +118,34 @@ per-token latency falls to match `run_sharded` (~20 s/token, not
 request, debited on success, split per `RoleRevenueConfig` to the
 replicas that actually answered, refunded on failure.
 
-**Status 2026-04-22**: protocol surface shipped on branch
-`milestone-b` (PR #40, commit `17a45a3d`): new tx types
-`InferenceEscrowOpen` / `InferenceEscrowRelease` / `InferenceEscrowRefund`
-(0x19 / 0x1a / 0x1b), full state transitions, 10 integration tests all
-asserting real balance deltas, 165/165 arc-state lib tests pass.
-Remaining to merge: wire `/inference/run_consensus` to require
-`{payer, max_fee}` and submit release/refund; desktop "Pay 10 ARC"
-command + UI; rolling upgrade of the 6 seeds; live balance-delta test
-(Alice 1000 ARC → 10 × 10-ARC inferences → Alice 900, seeds up by
-share, total conserved); per-replica-earnings dashboard. A latent
-DashMap-entry-guard-across-same-shard deadlock in
-`index_account_tx` surfaced by this milestone was fixed in the
-same commit (scoped outer guard).
+**Status 2026-04-27**: protocol surface + state + run_consensus wiring
++ desktop UI shipped on PR #40 (head `15fe888c`, tagged
+`v0.5.3-mb1` https://github.com/FerrumVir/arc-chain/releases/tag/v0.5.3-mb1).
+Binary `240cef61cb8c9ff7cc29a787754fdf3a` deployed to all 6 testnet
+seeds via rolling upgrade. 172/172 `arc-state` lib tests + 81/81
+`arc-node` lib tests pass. Latent DashMap-entry-guard deadlock in
+`index_account_tx` fixed in-passing (scoped outer guard).
+
+### Live open-side receipt (2026-04-27)
+- tx `0x673fbef3fc9a6c173943f264488d8e8bd2b2a251def235e3aadb70a79af90e1f`
+  in NYC block 2745, `success=true`, gas 50_000.
+- Body: `InferenceEscrowOpen` `max_fee=10_000`, `max_tokens=3`,
+  `timeout_blocks=10_000`, `request_id=0xf404a52a…`,
+  `model_id=0x2c66ccd2…`.
+- Payer `0x6248f5e2…` balance: **10000 → 0**, nonce **0 → 1**.
+- Escrow account `0x19976593…` (`= blake3("arc-inference-escrow" ‖ request_id)`):
+  balance **0 → 10000**, `storage_root` = metadata commitment.
+- Conservation: −10000 payer = +10000 escrow ✓.
+
+### Remaining release-side receipt (blocker)
+The `InferenceEscrowRelease` submits HTTP 200 but isn't being included
+in any block — the testnet's DAG consensus is currently proposing empty
+blocks (seeds at divergent heights, `mempool.drain` returning 0 despite
+non-empty submits). Pre-existing chain consensus issue unrelated to
+Milestone B code. Unit tests in `arc-state/src/lib.rs::tests` prove the
+40/25/15/20 split arithmetic + escrow zeroing + commitment-clear at the
+state layer; the live release receipt closes when the consensus issue
+is fixed.
 
 ### Scope
 - New tx type `InferenceEscrow` in `crates/arc-types/src/tx.rs`:
