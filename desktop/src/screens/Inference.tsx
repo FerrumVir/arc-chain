@@ -1,6 +1,7 @@
 import { useMutation } from "@tanstack/react-query";
 import {
   ArrowUpRight,
+  Coins,
   Copy,
   ClipboardCheck,
   Globe,
@@ -15,7 +16,7 @@ import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
 import { api } from "../lib/tauri";
 import { formatHash } from "../lib/format";
-import type { InferenceResult } from "../lib/types";
+import type { InferenceResult, PaidInferenceResult } from "../lib/types";
 
 const EXAMPLES = [
   "What is the largest planet in our solar system?",
@@ -76,11 +77,22 @@ export function Inference() {
   const [prompt, setPrompt] = useState("");
   const [maxTokens, setMaxTokens] = useState(32);
   const [copied, setCopied] = useState<string | null>(null);
+  // Milestone B (#36): toggle between free run_consensus and the paid path
+  // (signs InferenceEscrowOpen locally, runs inference gated on that
+  // escrow, coordinator auto-submits the 40/25/15/20 release).
+  const [paidMode, setPaidMode] = useState(false);
+  const [maxFee, setMaxFee] = useState(10_000);
 
   const run = useMutation<InferenceResult, Error, void>({
     mutationFn: async () => {
       if (!prompt.trim()) throw new Error("Prompt is empty");
       return await runInferenceSmart(prompt.trim(), maxTokens);
+    },
+  });
+  const paidRun = useMutation<PaidInferenceResult, Error, void>({
+    mutationFn: async () => {
+      if (!prompt.trim()) throw new Error("Prompt is empty");
+      return await api.runPaidInference(prompt.trim(), maxTokens, maxFee);
     },
   });
 
@@ -210,20 +222,71 @@ export function Inference() {
               data-testid="inference-max-tokens"
             />
           </label>
+          <label
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+              flex: "0 0 140px",
+              opacity: paidMode ? 1 : 0.5,
+            }}
+          >
+            <span className="field-label">Max fee (ARC)</span>
+            <input
+              className="input input-mono"
+              type="number"
+              min={1}
+              max={1_000_000}
+              step={1}
+              value={maxFee}
+              onChange={(e) =>
+                setMaxFee(parseInt(e.target.value, 10) || 10_000)
+              }
+              disabled={!paidMode}
+              data-testid="inference-max-fee"
+            />
+          </label>
           <div style={{ flex: 1 }} />
+          <label
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 6,
+              fontSize: "var(--text-sm)",
+              color: "var(--text-muted)",
+              marginRight: "var(--space-3)",
+            }}
+            data-testid="paid-mode-toggle-label"
+          >
+            <input
+              type="checkbox"
+              checked={paidMode}
+              onChange={(e) => setPaidMode(e.target.checked)}
+              data-testid="paid-mode-toggle"
+            />
+            Pay per request
+          </label>
           <button
             className="btn btn-primary btn-lg"
-            onClick={() => run.mutate()}
-            disabled={run.isPending || !prompt.trim()}
+            onClick={() => (paidMode ? paidRun.mutate() : run.mutate())}
+            disabled={
+              run.isPending ||
+              paidRun.isPending ||
+              !prompt.trim()
+            }
             data-testid="btn-run-inference"
           >
-            {run.isPending ? (
+            {run.isPending || paidRun.isPending ? (
               <>
                 <Loader2
                   size={16}
                   style={{ animation: "spin 1s linear infinite" }}
                 />{" "}
-                Computing…
+                {paidMode ? "Paying + computing…" : "Computing…"}
+              </>
+            ) : paidMode ? (
+              <>
+                <Coins size={16} /> Pay {maxFee.toLocaleString()} ARC & run
               </>
             ) : (
               <>
@@ -233,7 +296,7 @@ export function Inference() {
           </button>
         </div>
 
-        {run.isError && (
+        {(run.isError || paidRun.isError) && (
           <div
             style={{
               marginTop: "var(--space-4)",
@@ -246,10 +309,119 @@ export function Inference() {
             }}
             data-testid="inference-error"
           >
-            {(run.error as Error).message}
+            {((run.error || paidRun.error) as Error).message}
           </div>
         )}
       </Card>
+
+      {paidRun.isSuccess && paidRun.data && (
+        <Card data-testid="paid-inference-result">
+          <CardHeader
+            title={
+              <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                Paid response
+                <Coins size={14} style={{ color: "var(--accent, #e5a84f)" }} />
+              </span>
+            }
+            action={
+              <span
+                style={{
+                  fontSize: "var(--text-xs)",
+                  color: "var(--text-muted)",
+                  fontFamily: "var(--font-mono)",
+                  fontVariantNumeric: "tabular-nums",
+                }}
+              >
+                {paidRun.data.tokensGenerated} tokens · {paidRun.data.inferenceMs}ms
+              </span>
+            }
+          />
+
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: "var(--space-3)",
+              padding: "var(--space-3) var(--space-4)",
+              marginBottom: "var(--space-4)",
+              background: "var(--success-bg, rgba(80, 200, 120, 0.08))",
+              border: "1px solid rgba(80, 200, 120, 0.25)",
+              borderRadius: "var(--radius-sm)",
+              fontSize: "var(--text-sm)",
+            }}
+            data-testid="paid-summary"
+          >
+            <Globe size={14} style={{ color: "var(--success)" }} />
+            <span>
+              Paid{" "}
+              <strong>{paidRun.data.maxFee.toLocaleString()} ARC</strong>{" "}
+              to{" "}
+              <strong>
+                {coordinatorLabel(paidRun.data.coordinator)}
+              </strong>{" "}
+              · k={paidRun.data.consensus.k} ·{" "}
+              {paidRun.data.consensus.unanimous}/
+              {paidRun.data.consensus.votesTotal}{" "}
+              {paidRun.data.consensus.split === 0 &&
+              paidRun.data.consensus.majority === 0
+                ? "unanimous"
+                : `${paidRun.data.consensus.majority} majority / ${paidRun.data.consensus.split} split`}
+            </span>
+          </div>
+
+          <div
+            style={{
+              padding: "var(--space-4)",
+              background: "var(--bg)",
+              border: "1px solid var(--border)",
+              borderRadius: "var(--radius-md)",
+              fontFamily: "var(--font-sans)",
+              fontSize: "var(--text-md)",
+              color: "var(--text)",
+              lineHeight: 1.6,
+              marginBottom: "var(--space-4)",
+              whiteSpace: "pre-wrap",
+            }}
+            data-testid="paid-inference-output"
+          >
+            {paidRun.data.output.trim() || "(empty)"}
+          </div>
+
+          <div style={{ display: "grid", gap: "var(--space-2)", fontSize: "var(--text-sm)" }}>
+            <HashRow
+              label="Escrow open"
+              value={paidRun.data.openTxHash}
+              copied={copied === "open-tx"}
+              onCopy={() => copy("open-tx", paidRun.data!.openTxHash)}
+              icon={Coins}
+            />
+            {paidRun.data.releaseTxHash && (
+              <HashRow
+                label="Release tx"
+                value={paidRun.data.releaseTxHash}
+                copied={copied === "release-tx"}
+                onCopy={() => copy("release-tx", paidRun.data!.releaseTxHash)}
+                icon={Sparkles}
+              />
+            )}
+            <HashRow
+              label="Output hash"
+              value={paidRun.data.outputHash}
+              copied={copied === "paid-out"}
+              onCopy={() => copy("paid-out", paidRun.data!.outputHash)}
+              icon={Zap}
+            />
+            <HashRow
+              label="Payer"
+              value={paidRun.data.payerAddress}
+              copied={copied === "payer"}
+              onCopy={() => copy("payer", paidRun.data!.payerAddress)}
+              icon={ShieldCheck}
+            />
+          </div>
+        </Card>
+      )}
 
       {run.isSuccess && run.data && (
         <Card data-testid="inference-result">

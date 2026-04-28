@@ -121,6 +121,22 @@ export interface InferenceResult {
   coordinator?: string;
 }
 
+/** Milestone B (#36): paid-inference receipt — includes on-chain tx
+ *  hashes for the escrow-open + escrow-release, plus payer bookkeeping. */
+export interface PaidInferenceResult {
+  input: string;
+  output: string;
+  outputHash: string;
+  tokensGenerated: number;
+  inferenceMs: number;
+  coordinator: string;
+  consensus: InferenceConsensus;
+  payerAddress: string;
+  maxFee: number;
+  openTxHash: string;
+  releaseTxHash: string;
+}
+
 export interface BinaryStatus {
   /** Absolute path to the arc-node binary on disk. */
   path: string;

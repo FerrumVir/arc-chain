@@ -74,6 +74,68 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
         TxBody::InferenceRegister(_) => {
             // Sender account is already included; inference registry is global state.
         }
+        TxBody::InferenceEscrowOpen(body) => {
+            // Escrow address is deterministic from request_id — include it
+            // so two opens on the same request_id don't run in parallel.
+            accounts.insert(
+                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(
+                    &body.request_id,
+                ),
+            );
+        }
+        TxBody::InferenceEscrowRelease(body) => {
+            accounts.insert(
+                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(
+                    &body.request_id,
+                ),
+            );
+            accounts.insert(body.proposer.0);
+            for r in &body.replicas {
+                accounts.insert(r.0);
+            }
+            accounts.insert(body.observer_pool.0);
+            accounts.insert(body.treasury.0);
+        }
+        TxBody::InferenceEscrowRefund(body) => {
+            accounts.insert(
+                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(
+                    &body.request_id,
+                ),
+            );
+        }
+        TxBody::ModelRegistration(body) => {
+            accounts.insert(
+                arc_types::transaction::ModelRegistrationBody::registry_account(
+                    &body.model_id,
+                ),
+            );
+        }
+        TxBody::ModelRequest(body) => {
+            accounts.insert(
+                arc_types::transaction::ModelRequestBody::request_account(
+                    &body.request_id,
+                ),
+            );
+        }
+        TxBody::ShardCoverageClaim(body) => {
+            accounts.insert(
+                arc_types::transaction::ShardCoverageClaimBody::claim_account(
+                    &body.model_id,
+                    &body.node_pubkey,
+                ),
+            );
+        }
+        TxBody::CapacityAdvertisement(body) => {
+            accounts.insert(
+                arc_types::transaction::CapacityAdvertisementBody::capacity_account(
+                    &body.node_pubkey,
+                ),
+            );
+        }
+        TxBody::ShardAssignmentProposal(_) => {
+            // Proposal storage key is deterministic from the input-hash —
+            // tx.from being tracked above is enough for correctness.
+        }
     }
 
     TxAccessSet { accounts }

@@ -56,6 +56,18 @@ SEEDS_FILE="${ARC_DIR}/testnet-seeds.txt"
 LOG="${ARC_DIR}/self-heal.log"
 STATE_FILE="${ARC_DIR}/.self-heal-last-good.sh"
 
+# 2026-04-27: arc-inference-traffic.service was crowding the chain's
+# block-production slot with stale benchmark Transfer txs (one tx/block,
+# 100% rejected at execute_tx because the synthetic sender has no
+# state) — drowning real submissions including Milestone B's escrow
+# release flow. Unconditionally stop + disable the service every poll
+# so a manual `systemctl start` or a future package install can't
+# silently re-enable the hog.
+#
+# Override with ALLOW_INFERENCE_TRAFFIC=1 (e.g. dedicated benchmark
+# nodes) — but the production seed config never wants this on.
+ALLOW_INFERENCE_TRAFFIC="${ALLOW_INFERENCE_TRAFFIC:-0}"
+
 mkdir -p "$ARC_DIR"
 touch "$LOG"
 
@@ -220,6 +232,19 @@ LAST_RESTART=0
 
 while true; do
     NOW=$(date +%s)
+
+    # ── PERMANENT RULE: kill stale benchmark traffic source ─────────────
+    # arc-inference-traffic submits null-sig Transfer txs that always
+    # fail at execute_tx but consume 100% of the per-block tx slot,
+    # blocking real submissions (e.g. Milestone B's escrow release).
+    # Stop + disable on every poll unless explicitly allowed.
+    if [ "$ALLOW_INFERENCE_TRAFFIC" != "1" ]; then
+        if systemctl is-active arc-inference-traffic.service 2>/dev/null | grep -qx active; then
+            log "stale benchmark traffic detected — stopping arc-inference-traffic.service"
+            systemctl stop arc-inference-traffic.service 2>/dev/null || true
+            systemctl disable arc-inference-traffic.service 2>/dev/null || true
+        fi
+    fi
 
     # Keep SELF_SOCKET fresh in case arc-node restarted.
     [ -z "$SELF_SOCKET" ] && refresh_self_socket

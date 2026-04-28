@@ -1879,6 +1879,24 @@ impl ConsensusEngine {
             TxBody::InferenceAttestation(_) => false,  // Escrow is local to sender's shard
             TxBody::InferenceChallenge(_) => false,  // Resolved on attestation's shard
             TxBody::InferenceRegister(_) => false,  // Local to sender's shard
+            // Milestone B: escrow accounts are derived from request_id via
+            // a deterministic hash, so they live on the sender's shard
+            // alongside the payer account. Release touches proposer +
+            // replicas + treasury but the state transition itself is
+            // escrow-local; cross-shard crediting is handled by the
+            // per-tx execution path, not the shard router.
+            TxBody::InferenceEscrowOpen(_) => false,
+            TxBody::InferenceEscrowRelease(_) => false,
+            TxBody::InferenceEscrowRefund(_) => false,
+            // Milestones C / D / E: all these new tx types are
+            // deterministic-registry writes that live on the sender's
+            // shard (registry account derived from model_id / pubkey /
+            // request_id). No cross-shard routing needed.
+            TxBody::ModelRegistration(_) => false,
+            TxBody::ModelRequest(_) => false,
+            TxBody::ShardCoverageClaim(_) => false,
+            TxBody::CapacityAdvertisement(_) => false,
+            TxBody::ShardAssignmentProposal(_) => false,
         }
     }
 

@@ -39,6 +39,13 @@ chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Milestone B (#36): build InferenceEscrowOpen transactions locally so the
+# desktop app can submit them to a coordinator before calling
+# /inference/run_consensus. Using path deps (not workspace deps) since
+# desktop/src-tauri is intentionally excluded from the top-level workspace.
+arc-types = { path = "../../crates/arc-types" }
+arc-crypto = { path = "../../crates/arc-crypto" }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

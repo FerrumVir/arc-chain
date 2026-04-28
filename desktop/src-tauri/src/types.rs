@@ -179,3 +179,22 @@ pub struct InferenceResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator: Option<String>,
 }
+
+/// Milestone B (#36): paid-inference response — carries the InferenceResult
+/// fields plus the on-chain receipts (open tx hash, release tx hash, the
+/// payer's address, the max_fee that was escrowed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaidInferenceResult {
+    pub input: String,
+    pub output: String,
+    pub output_hash: String,
+    pub tokens_generated: u32,
+    pub inference_ms: u32,
+    pub coordinator: String,
+    pub consensus: InferenceConsensus,
+    pub payer_address: String,
+    pub max_fee: u64,
+    pub open_tx_hash: String,
+    pub release_tx_hash: String,
+}

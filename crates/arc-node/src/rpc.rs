@@ -421,6 +421,17 @@ pub async fn serve(
         .route("/inference/verification_status", get(inference_verification_status))
         // Revenue split info
         .route("/economics/revenue_split", get(get_revenue_split))
+        // Milestone C: read-only registry + demand discovery. Workers use
+        // these to discover what models exist and what ranges are open
+        // for the taking. Writes go through /tx/submit_signed like any
+        // other chain mutation — no dedicated POST endpoints needed for
+        // the MVP.
+        .route("/models/registry", get(list_model_registry))
+        .route("/models/open_requests", get(list_open_model_requests))
+        // Milestone D: capacity advertisement discovery + per-node
+        // assignment long-poll. Also read-only from the state.
+        .route("/capacity/advertisements", get(list_capacity_advertisements))
+        .route("/assignments/for_me", get(get_assignment_for_me))
         // Community worker registration (HTTP-only, works behind NAT)
         .route("/community/register", post(community_register))
         .route("/community/heartbeat", post(community_heartbeat))
@@ -1711,6 +1722,84 @@ async fn get_full_transaction(
             "type": "InferenceRegister",
             "tier": body.tier,
             "stake_bond": body.stake_bond,
+        }),
+        TxBody::InferenceEscrowOpen(body) => json!({
+            "type": "InferenceEscrowOpen",
+            "request_id": format!("0x{}", hex::encode(&body.request_id)),
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "max_fee": body.max_fee,
+            "max_tokens": body.max_tokens,
+            "timeout_blocks": body.timeout_blocks,
+        }),
+        TxBody::InferenceEscrowRelease(body) => json!({
+            "type": "InferenceEscrowRelease",
+            "request_id": format!("0x{}", hex::encode(&body.request_id)),
+            "payer": format!("0x{}", hex::encode(&body.payer.0)),
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "max_tokens": body.max_tokens,
+            "timeout_blocks": body.timeout_blocks,
+            "output_hash": format!("0x{}", hex::encode(&body.output_hash.0)),
+            "proposer": format!("0x{}", hex::encode(&body.proposer.0)),
+            "replicas": body.replicas.iter()
+                .map(|r| format!("0x{}", hex::encode(&r.0)))
+                .collect::<Vec<_>>(),
+            "observer_pool": format!("0x{}", hex::encode(&body.observer_pool.0)),
+            "treasury": format!("0x{}", hex::encode(&body.treasury.0)),
+        }),
+        TxBody::InferenceEscrowRefund(body) => json!({
+            "type": "InferenceEscrowRefund",
+            "request_id": format!("0x{}", hex::encode(&body.request_id)),
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "max_tokens": body.max_tokens,
+            "timeout_blocks": body.timeout_blocks,
+        }),
+        TxBody::ModelRegistration(body) => json!({
+            "type": "ModelRegistration",
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "metadata_hash": format!("0x{}", hex::encode(&body.metadata_hash.0)),
+            "chunk_tree_root": format!("0x{}", hex::encode(&body.chunk_tree_root.0)),
+            "n_layers": body.n_layers,
+            "d_model": body.d_model,
+            "quantization": body.quantization,
+            "registration_fee": body.registration_fee,
+            "royalty_recipient": format!("0x{}", hex::encode(&body.royalty_recipient.0)),
+        }),
+        TxBody::ModelRequest(body) => json!({
+            "type": "ModelRequest",
+            "request_id": format!("0x{}", hex::encode(&body.request_id)),
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "target_k_replication": body.target_k_replication,
+            "bond_per_layer_epoch": body.bond_per_layer_epoch,
+            "max_wait_secs": body.max_wait_secs,
+        }),
+        TxBody::ShardCoverageClaim(body) => json!({
+            "type": "ShardCoverageClaim",
+            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "node_pubkey": format!("0x{}", hex::encode(&body.node_pubkey)),
+            "ranges": body.ranges.iter()
+                .map(|(s, e)| json!([s, e])).collect::<Vec<_>>(),
+            "bond": body.bond,
+            "epoch_blocks": body.epoch_blocks,
+        }),
+        TxBody::CapacityAdvertisement(body) => json!({
+            "type": "CapacityAdvertisement",
+            "node_pubkey": format!("0x{}", hex::encode(&body.node_pubkey)),
+            "ram_bytes": body.ram_bytes,
+            "vram_bytes": body.vram_bytes,
+            "bandwidth_mbps": body.bandwidth_mbps,
+            "uptime_hint_mins": body.uptime_hint_mins,
+            "stake": body.stake,
+            "region": body.region,
+        }),
+        TxBody::ShardAssignmentProposal(body) => json!({
+            "type": "ShardAssignmentProposal",
+            "epoch_blocks": body.epoch_blocks,
+            "input_snapshot_hash": format!("0x{}", hex::encode(&body.input_snapshot_hash.0)),
+            "assignments": body.assignments.iter().map(|a| json!({
+                "node_pubkey": format!("0x{}", hex::encode(&a.node_pubkey)),
+                "model_id": format!("0x{}", hex::encode(&a.model_id.0)),
+                "ranges": a.ranges.iter().map(|(s, e)| json!([s, e])).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
         }),
     };
 
@@ -4298,6 +4387,72 @@ async fn inference_run_consensus(
     let k_req = req.get("k").and_then(|v| v.as_u64()).unwrap_or(3).max(1) as usize;
     let chat_template_enabled = req.get("chat_template").and_then(|v| v.as_bool()).unwrap_or(false);
 
+    // Milestone B (#36): if the request carries { payer, request_id,
+    // max_fee, model_id, timeout_blocks } it's an escrow-gated call.
+    // The coordinator pre-flights that an open escrow exists with enough
+    // balance before touching any model, and on success submits an
+    // InferenceEscrowRelease that pays out the 40/25/15/20 split.
+    //
+    // Free-mode (no payer) still works: all escrow fields are optional.
+    // Dashboards + old desktop clients keep using the free path — no
+    // breaking change.
+    let escrow_payer_hex = req.get("payer").and_then(|v| v.as_str());
+    let escrow_req_id_hex = req.get("request_id").and_then(|v| v.as_str());
+    let escrow_max_fee = req.get("max_fee").and_then(|v| v.as_u64());
+    let escrow_model_id_hex = req.get("model_id").and_then(|v| v.as_str());
+    let escrow_timeout = req.get("timeout_blocks").and_then(|v| v.as_u64());
+
+    let escrow_gate: Option<EscrowGate> = match (
+        escrow_payer_hex,
+        escrow_req_id_hex,
+        escrow_max_fee,
+        escrow_model_id_hex,
+        escrow_timeout,
+    ) {
+        (Some(p), Some(r), Some(f), Some(m), Some(t)) => {
+            let payer = decode_address_hex(p).map_err(|e| {
+                api_error(StatusCode::BAD_REQUEST, format!("payer: {}", e))
+            })?;
+            let request_id = decode_hash_hex(r).map_err(|e| {
+                api_error(StatusCode::BAD_REQUEST, format!("request_id: {}", e))
+            })?;
+            let model_id = decode_hash_hex(m).map_err(|e| {
+                api_error(StatusCode::BAD_REQUEST, format!("model_id: {}", e))
+            })?;
+            let escrow_addr = arc_types::transaction::InferenceEscrowOpenBody::escrow_address(&request_id);
+            let escrow_account = node.state.get_account(&arc_crypto::Hash256(escrow_addr));
+            let locked = escrow_account.map(|a| a.balance).unwrap_or(0);
+            if locked < f {
+                return Err(api_error(
+                    StatusCode::PAYMENT_REQUIRED,
+                    format!(
+                        "escrow not open for this request_id (locked={}, need max_fee={}); \
+                         submit an InferenceEscrowOpen tx first",
+                        locked, f
+                    ),
+                ));
+            }
+            Some(EscrowGate {
+                payer: arc_crypto::Hash256(payer),
+                request_id,
+                max_fee: f,
+                model_id: arc_crypto::Hash256(model_id),
+                max_tokens,
+                timeout_blocks: t,
+            })
+        }
+        // Partial escrow fields → reject; too easy to lose money to typos.
+        (None, None, None, None, None) => None,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "escrow-gated run_consensus requires all of { payer, \
+                 request_id, max_fee, model_id, timeout_blocks } — got a \
+                 partial set",
+            ));
+        }
+    };
+
     let model = node.inference_model.as_ref()
         .ok_or(api_error(StatusCode::SERVICE_UNAVAILABLE,
             "Coordinator needs a tokenizer loaded. Start with --model <path.gguf>."))?;
@@ -4682,7 +4837,59 @@ async fn inference_run_consensus(
         }
     }
 
-    Ok(Json(json!({
+    // Milestone B: if this was an escrow-gated request, collect the
+    // honest-replica set from the votes (the non-divergent agreeing
+    // replicas across every hop) and submit the release tx. The honest
+    // set is a union over all votes — any replica that contributed to the
+    // majority_hash at any hop earned a slice of the per-request payout.
+    let release_tx_hash = if let Some(gate) = &escrow_gate {
+        // Replica names that appeared in majority_hash agreement at
+        // any hop. Excludes divergent replicas (they're handled by
+        // auto-challenges in the slashing path, not paid).
+        let mut honest_names: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for v in &votes {
+            let divergent: std::collections::HashSet<&String> =
+                v.divergent.iter().map(|(n, _)| n).collect();
+            for name in &v.replicas_returned {
+                if !divergent.contains(name) {
+                    honest_names.insert(name.clone());
+                }
+            }
+        }
+        // Map replica node_name → synthetic validator address, same
+        // derivation slashing uses (hash("replica:" || name)). Keeps
+        // honest-pays and divergent-slashes symmetric; a later migration
+        // can reconcile both to real on-chain validator addresses once
+        // the shard registry carries them.
+        let replicas: Vec<arc_crypto::Hash256> = honest_names
+            .iter()
+            .map(|name| arc_crypto::hash_bytes(format!("replica:{}", name).as_bytes()))
+            .collect();
+
+        if replicas.is_empty() {
+            tracing::warn!(
+                request_id = %request_id,
+                "escrow-gated request succeeded but no honest replicas collected — \
+                 release would fail at state layer; skipping"
+            );
+            None
+        } else {
+            let tx_hash = submit_escrow_release(&node, gate, output_hash, replicas.clone());
+            tracing::info!(
+                request_id = %request_id,
+                tx = %format!("0x{}", hex::encode(&tx_hash.0)),
+                replicas = replicas.len(),
+                max_fee = gate.max_fee,
+                "InferenceEscrowRelease submitted"
+            );
+            Some(tx_hash)
+        }
+    } else {
+        None
+    };
+
+    let mut response = json!({
         "success": true,
         "request_id": request_id,
         "input": input_text,
@@ -4702,7 +4909,237 @@ async fn inference_run_consensus(
             "divergent_replicas": divergent_all,
             "auto_challenges": auto_challenges,
         },
+    });
+    if let Some(h) = release_tx_hash {
+        response["escrow"] = json!({
+            "release_tx_hash": format!("0x{}", hex::encode(&h.0)),
+            "payer": format!("0x{}", hex::encode(&escrow_gate.as_ref().unwrap().payer.0)),
+            "max_fee": escrow_gate.as_ref().unwrap().max_fee,
+        });
+    }
+    Ok(Json(response))
+}
+
+/// Milestone C (#37): GET /models/registry
+/// Scans committed transactions for every ModelRegistration body and
+/// returns the resulting per-model metadata. For MVP this is O(N) over
+/// the full-tx DashMap; a later patch can maintain a sidecar index if
+/// the registry grows past a few thousand models.
+async fn list_model_registry(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let mut rows: Vec<Value> = Vec::new();
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if let arc_types::TxBody::ModelRegistration(body) = &tx.body {
+            rows.push(json!({
+                "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+                "metadata_hash": format!("0x{}", hex::encode(&body.metadata_hash.0)),
+                "chunk_tree_root": format!("0x{}", hex::encode(&body.chunk_tree_root.0)),
+                "n_layers": body.n_layers,
+                "d_model": body.d_model,
+                "quantization": &body.quantization,
+                "registration_fee": body.registration_fee,
+                "royalty_recipient": format!("0x{}", hex::encode(&body.royalty_recipient.0)),
+                "registered_by": format!("0x{}", hex::encode(&tx.from.0)),
+                "tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+            }));
+        }
+    }
+    Json(json!({ "models": rows, "count": rows.len() }))
+}
+
+/// Milestone C (#37): GET /models/open_requests
+/// Returns every ModelRequest tx body. Workers poll this to find open
+/// demand and decide which ranges to claim.
+async fn list_open_model_requests(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let mut rows: Vec<Value> = Vec::new();
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if let arc_types::TxBody::ModelRequest(body) = &tx.body {
+            rows.push(json!({
+                "request_id": format!("0x{}", hex::encode(&body.request_id)),
+                "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+                "target_k_replication": body.target_k_replication,
+                "bond_per_layer_epoch": body.bond_per_layer_epoch,
+                "max_wait_secs": body.max_wait_secs,
+                "requester": format!("0x{}", hex::encode(&tx.from.0)),
+                "tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+            }));
+        }
+    }
+    Json(json!({ "requests": rows, "count": rows.len() }))
+}
+
+/// Milestone D (#38): GET /capacity/advertisements
+/// Returns every CapacityAdvertisement. The planner reads this set
+/// plus open requests + current shard_registry to compute assignments.
+async fn list_capacity_advertisements(
+    AxumState(node): AxumState<NodeState>,
+) -> Json<Value> {
+    let mut rows: Vec<Value> = Vec::new();
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if let arc_types::TxBody::CapacityAdvertisement(body) = &tx.body {
+            rows.push(json!({
+                "node_pubkey": format!("0x{}", hex::encode(&body.node_pubkey)),
+                "ram_bytes": body.ram_bytes,
+                "vram_bytes": body.vram_bytes,
+                "bandwidth_mbps": body.bandwidth_mbps,
+                "uptime_hint_mins": body.uptime_hint_mins,
+                "stake": body.stake,
+                "region": &body.region,
+                "advertised_by": format!("0x{}", hex::encode(&tx.from.0)),
+                "tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+            }));
+        }
+    }
+    Json(json!({ "advertisements": rows, "count": rows.len() }))
+}
+
+/// Milestone D (#38): GET /assignments/for_me?pubkey=0x...
+/// Returns every AssignmentEntry across every ShardAssignmentProposal
+/// whose `node_pubkey` matches the query parameter. Community workers
+/// long-poll this and auto-apply — they restart arc-node with the
+/// listed `--shard-range` flags and announce the assignment.
+async fn get_assignment_for_me(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Query(params): axum::extract::Query<
+        std::collections::HashMap<String, String>,
+    >,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let pk_hex = params
+        .get("pubkey")
+        .ok_or(api_error(StatusCode::BAD_REQUEST, "missing ?pubkey= param"))?;
+    let pk = decode_hash_hex(pk_hex).map_err(|e| {
+        api_error(StatusCode::BAD_REQUEST, format!("pubkey: {}", e))
+    })?;
+
+    let mut assignments: Vec<Value> = Vec::new();
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if let arc_types::TxBody::ShardAssignmentProposal(body) = &tx.body {
+            for a in &body.assignments {
+                if a.node_pubkey == pk {
+                    assignments.push(json!({
+                        "epoch_blocks": body.epoch_blocks,
+                        "input_snapshot_hash": format!(
+                            "0x{}", hex::encode(&body.input_snapshot_hash.0)
+                        ),
+                        "model_id": format!("0x{}", hex::encode(&a.model_id.0)),
+                        "ranges": a.ranges.iter()
+                            .map(|(s, e)| json!([s, e]))
+                            .collect::<Vec<_>>(),
+                        "proposal_tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+                    }));
+                }
+            }
+        }
+    }
+    Ok(Json(json!({
+        "pubkey": pk_hex,
+        "assignments": assignments,
+        "count": assignments.len(),
     })))
+}
+
+/// Milestone B (#36): resolved payload for an escrow-gated
+/// /inference/run_consensus request. Built at the top of the handler after
+/// pre-flight passes; consumed at the success path to submit the
+/// InferenceEscrowRelease tx.
+#[derive(Clone)]
+struct EscrowGate {
+    payer: arc_crypto::Hash256,
+    request_id: [u8; 32],
+    max_fee: u64,
+    model_id: arc_crypto::Hash256,
+    max_tokens: u32,
+    timeout_blocks: u64,
+}
+
+/// Accept both `0x`-prefixed and bare hex for a 32-byte value. `[u8; 32]`
+/// so callers can directly feed into Hash256 or request_id slots.
+fn decode_hash_hex(s: &str) -> Result<[u8; 32], String> {
+    let trimmed = s.strip_prefix("0x").unwrap_or(s);
+    let raw = hex::decode(trimmed).map_err(|e| format!("hex: {}", e))?;
+    if raw.len() != 32 {
+        return Err(format!("expected 32 bytes, got {}", raw.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&raw);
+    Ok(out)
+}
+
+/// Account addresses in ARC are `Hash256` — same 32-byte shape. Provide a
+/// named alias so callers reading the code know the intent is "an address",
+/// not "any 32-byte hash".
+fn decode_address_hex(s: &str) -> Result<[u8; 32], String> {
+    decode_hash_hex(s)
+}
+
+/// Deterministic account for the cross-node "observer pool" share of
+/// release payouts. Future work: replace with a governance-configurable
+/// address that accumulates and pays out to observer-role nodes.
+fn observer_pool_address() -> arc_crypto::Hash256 {
+    arc_crypto::hash_bytes(b"arc-observer-pool")
+}
+
+/// Deterministic treasury address. Collects the 20% treasury share plus
+/// any rounding residue from integer fee splits.
+fn treasury_address() -> arc_crypto::Hash256 {
+    arc_crypto::hash_bytes(b"arc-treasury")
+}
+
+/// Build + submit an InferenceEscrowRelease transaction. Null-signed like
+/// the existing InferenceAttestation auto-submit — the testnet's
+/// mempool accepts null sigs from internal node paths.
+fn submit_escrow_release(
+    node: &NodeState,
+    gate: &EscrowGate,
+    output_hash: arc_crypto::Hash256,
+    replicas: Vec<arc_crypto::Hash256>,
+) -> arc_crypto::Hash256 {
+    let proposer = node.validator_address;
+    // Base nonce for the coordinator's own account; bump the same way the
+    // attestation submitter does so repeat releases (different request_ids
+    // in the same block) don't collide.
+    let base_nonce = node
+        .state
+        .get_account(&proposer)
+        .map(|a| a.nonce)
+        .unwrap_or(0);
+    let bump = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
+    let nonce = base_nonce + bump;
+
+    let body = arc_types::transaction::InferenceEscrowReleaseBody {
+        request_id: gate.request_id,
+        payer: gate.payer,
+        model_id: gate.model_id,
+        max_tokens: gate.max_tokens,
+        timeout_blocks: gate.timeout_blocks,
+        output_hash,
+        proposer,
+        replicas,
+        observer_pool: observer_pool_address(),
+        treasury: treasury_address(),
+    };
+    let mut tx = arc_types::Transaction {
+        tx_type: arc_types::TxType::InferenceEscrowRelease,
+        from: proposer,
+        nonce,
+        body: arc_types::TxBody::InferenceEscrowRelease(body),
+        fee: 0,
+        gas_limit: 0,
+        hash: arc_crypto::Hash256::ZERO,
+        signature: arc_crypto::Signature::null(),
+        sig_verified: false,
+    };
+    tx.hash = tx.compute_hash();
+    let tx_hash = tx.hash;
+    let _ = node.mempool.insert(tx);
+    tx_hash
 }
 
 /// Bond for consensus-divergence auto-challenges opened by

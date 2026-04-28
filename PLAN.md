@@ -112,11 +112,61 @@ per-token latency falls to match `run_sharded` (~20 s/token, not
 
 ---
 
-## Milestone B — Per-request fee, escrow, payout
+## Milestone B — Per-request fee, escrow, payout (in progress — PR #40)
 
 **Goal**: a user paying N ARC gets an inference; the ARC is escrowed on
 request, debited on success, split per `RoleRevenueConfig` to the
 replicas that actually answered, refunded on failure.
+
+**Status 2026-04-27**: protocol surface + state + run_consensus wiring
++ desktop UI shipped on PR #40 (head `15fe888c`, tagged
+`v0.5.3-mb1` https://github.com/FerrumVir/arc-chain/releases/tag/v0.5.3-mb1).
+Binary `240cef61cb8c9ff7cc29a787754fdf3a` deployed to all 6 testnet
+seeds via rolling upgrade. 172/172 `arc-state` lib tests + 81/81
+`arc-node` lib tests pass. Latent DashMap-entry-guard deadlock in
+`index_account_tx` fixed in-passing (scoped outer guard).
+
+### Live open-side receipt (2026-04-27)
+- tx `0x673fbef3fc9a6c173943f264488d8e8bd2b2a251def235e3aadb70a79af90e1f`
+  in NYC block 2745, `success=true`, gas 50_000.
+- Body: `InferenceEscrowOpen` `max_fee=10_000`, `max_tokens=3`,
+  `timeout_blocks=10_000`, `request_id=0xf404a52a…`,
+  `model_id=0x2c66ccd2…`.
+- Payer `0x6248f5e2…` balance: **10000 → 0**, nonce **0 → 1**.
+- Escrow account `0x19976593…` (`= blake3("arc-inference-escrow" ‖ request_id)`):
+  balance **0 → 10000**, `storage_root` = metadata commitment.
+- Conservation: −10000 payer = +10000 escrow ✓.
+
+### Live release-side receipt (2026-04-27)
+
+Root cause was `arc-inference-traffic.service` flooding the per-block
+tx slot with null-sig Transfer txs that all rejected at `execute_tx`,
+crowding out real submissions. Disabled the service on all 6 seeds
+**and** added a permanent rule to `scripts/arc-self-heal.sh` that
+stops + disables the service on every poll — survives reboots and
+manual systemctl-start. Override via `ALLOW_INFERENCE_TRAFFIC=1`.
+
+After the fix:
+
+- Release tx `0x813fde8264039c5b25c37d8837a8863d4e3eb69ab9a80b5a1e43fe771770c9f3`
+  in NYC block 2767, success=true.
+- Body: `InferenceEscrowRelease`, payer=`0x6248f5e2…`,
+  request_id=`0xf404a52a…`, replicas=[NYC,LAX,AMS,LHR,NRT,SGP synthetic
+  addrs], proposer=payer (self-release for the test), output_hash
+  recorded.
+
+Final balances on NYC:
+
+| Account | Balance | Expected | Notes |
+|---|---|---|---|
+| payer (`0x6248f5e2…`) | **4000** | 40% × 10000 = 4000 | proposer share (= self) |
+| escrow (`0x19976593…`) | **0** | 0 | drained, storage_root cleared |
+| treasury | **2004** | 2000 + 4 rounding | 20% + replica truncation residue |
+| observer pool | **1500** | 1500 | 15% |
+| replica[NYC,LAX,AMS,LHR,NRT,SGP] | **416 × 6** | (25% × 10000) / 6 = 416.67 → 416 each | 25% / 6 = 416 each, 4 ARC residue → treasury |
+| **Total credited** | **10000** | 10000 | **Δ = 0 ✓ conserved** |
+
+Conservation verified end-to-end. PR #40 is now ready to leave draft.
 
 ### Scope
 - New tx type `InferenceEscrow` in `crates/arc-types/src/tx.rs`:
@@ -172,7 +222,16 @@ replicas that actually answered, refunded on failure.
 
 ---
 
-## Milestone C — On-demand model provisioning
+## Milestone C — On-demand model provisioning (protocol surface shipped — PR #40)
+
+**Status 2026-04-23**: tx types `ModelRegistration` (0x1c),
+`ModelRequest` (0x1d), `ShardCoverageClaim` (0x1e) live with full
+state transitions + 4 unit tests. Registration fee floored at 1000 ARC
+flows to the treasury (Milestone E anti-spam). Discovery endpoints
+`/models/registry` and `/models/open_requests` expose the registry
+without raw tx scanning. Remaining to merge: desktop `Earn` screen
+that lists open ModelRequests sorted by bond and lets a worker
+auto-claim ranges + download chunks.
 
 **Goal**: a user says "I want to query `llama-3-70b`" and if nobody's
 serving it, the network spins up coverage — community nodes earn to
@@ -214,7 +273,17 @@ host layer ranges they didn't previously have.
 
 ---
 
-## Milestone D — Dynamic capacity + planner
+## Milestone D — Dynamic capacity + planner (protocol surface + planner shipped — PR #40)
+
+**Status 2026-04-23**: tx types `CapacityAdvertisement` (0x1f) and
+`ShardAssignmentProposal` (0x20) live with state transitions + 1 unit
+test. Deterministic MVP planner in `crates/arc-node/src/planner.rs`
+(6/6 tests: determinism under input shuffle, k-replication honoured,
+under-resourced nodes skipped, layer-range bucketing correct).
+Discovery endpoints `/capacity/advertisements` and
+`/assignments/for_me?pubkey=…` expose the state. Remaining: periodic
+proposer task that auto-runs `compute_assignment` every N blocks +
+desktop hook to advertise capacity on node start.
 
 **Goal**: users don't pick ranges. They pick "I want to earn, allocate
 me efficiently." The network assigns optimally given their hardware and
@@ -245,7 +314,16 @@ current demand.
 
 ---
 
-## Milestone E — Thousands-of-models scale
+## Milestone E — Thousands-of-models scale (LRU cache + registration fee shipped — PR #40)
+
+**Status 2026-04-23**: on-disk LRU chunk cache in
+`crates/arc-node/src/chunk_cache.rs` with JSON sidecar warm-set
+persistence + 6/6 tests (roundtrip, eviction LRU order, touch
+prevents eviction, warm-set survives restart, rejects oversized
+chunks). Registration anti-spam fee already wired into
+`TxBody::ModelRegistration` flowing to treasury. Remaining: planner
+heuristic that weights cached chunks lower cost + `cached_hashes()`
+exposed via RPC so the planner can see what each node already holds.
 
 **Goal**: the network holds 10 thousand models simultaneously, each with
 varying popularity, without any single node holding more than its
