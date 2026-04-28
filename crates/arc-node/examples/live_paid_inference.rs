@@ -92,7 +92,16 @@ async fn main() {
         .build()
         .unwrap();
 
-    let (sk, pk, payer_addr) = keypair_from_phrase("milestone-b-live-test");
+    // Use a wall-clock-derived phrase so each run gets a fresh payer
+    // address with no carry-over state from prior failed attempts.
+    let phrase = format!(
+        "milestone-b-live-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let (sk, pk, payer_addr) = keypair_from_phrase(&phrase);
     let payer_hex = hex::encode(payer_addr.0);
     println!("payer_address: 0x{}", payer_hex);
 
@@ -140,7 +149,7 @@ async fn main() {
     let mut request_id = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut request_id);
     let model_id = hash_bytes(b"arc-testnet-llama-2-7b-chat-q4");
-    let max_fee: u64 = 10_000;
+    let max_fee: u64 = 1_000;
     let max_tokens: u32 = 3; // short — saves testnet time
     let timeout_blocks: u64 = 10_000;
 
@@ -186,7 +195,7 @@ async fn main() {
     }
     println!("open submitted, waiting for commit…");
     let mut committed = false;
-    for _ in 0..60 {
+    for _ in 0..480 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if let Ok(r) = quick
             .get(format!("{}/tx/0x{}", coord, open_hash_hex))
@@ -241,7 +250,7 @@ async fn main() {
 
     // Step 7: wait for release commit.
     let release_hex = release_hash.trim_start_matches("0x");
-    for _ in 0..30 {
+    for _ in 0..480 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if let Ok(r) = quick
             .get(format!("{}/tx/0x{}", coord, release_hex))

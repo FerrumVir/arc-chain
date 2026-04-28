@@ -244,6 +244,25 @@ while true; do
             systemctl stop arc-inference-traffic.service 2>/dev/null || true
             systemctl disable arc-inference-traffic.service 2>/dev/null || true
         fi
+        # Also nuke the orphan arc-traffic.service AND any inline bash
+        # loop hammering /tx/submit (orphaned process, not a service).
+        # Found on LAX 2026-04-28: PID running `while true; do ... curl
+        # /tx/submit ...` from /opt/arc-traffic.sh, generating null-sig
+        # Transfer spam that crowded out user txs at the 1-tx/block rate.
+        if systemctl is-active arc-traffic.service 2>/dev/null | grep -qx active; then
+            log "stale arc-traffic.service detected — stopping"
+            systemctl stop arc-traffic.service 2>/dev/null || true
+            systemctl disable arc-traffic.service 2>/dev/null || true
+        fi
+        # Match cmdline-grep: any process with /tx/submit OR
+        # /opt/arc-traffic in argv. -f is full-cmdline; we kill our own
+        # script too if we ever match — guarded by checking PID isn't $$.
+        for pid in $(pgrep -f '/tx/submit\|/opt/arc-traffic' 2>/dev/null); do
+            if [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ]; then
+                log "killing orphan spam pid=$pid ($(ps -p $pid -o args= 2>/dev/null | head -c 60))"
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done
     fi
 
     # Keep SELF_SOCKET fresh in case arc-node restarted.

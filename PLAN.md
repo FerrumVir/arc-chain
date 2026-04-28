@@ -222,6 +222,46 @@ Conservation verified end-to-end. PR #40 is now ready to leave draft.
 
 ---
 
+## Session 2026-04-28: chain stabilization attempt + B-open wedge
+
+P1 — Rolling rebuild of all 6 seeds completed. Binary `0f4ca561` deployed
+to NYC, LAX, AMS, LHR (with `--reset-state`), NRT, SGP. All 6 healthy at
+peers≥3, in sync at round 2,242,000+. LHR's pre-reset h=38 fixed via
+clean state.
+
+P2 — Spam source removed: `/opt/arc-traffic.sh` orphan loop on LAX
+killed; `arc-traffic.service` and `arc-inference-traffic.service`
+disabled cluster-wide; `~/Library/LaunchAgents/com.arc.inference.plist`
+unloaded on Mac (was auto-respawning the
+`arc-worker-437c5de04317ae88` stub announcing `[0,8)` and breaking
+`/inference/run_consensus` pipeline assembly). `scripts/arc-self-heal.sh`
+gained a `pkill -f /tx/submit /opt/arc-traffic` rule + service-stop for
+both traffic services on every poll.
+
+P3 — Milestone B end-to-end NOT closed this session. Open tx
+`InferenceEscrowOpen` is being silently rejected at block-packing
+time on the rebuilt binary. `/tx/submit_signed` returns 200/pending,
+but the tx never appears in any block. Verified across multiple fresh
+keypairs with `max_fee` ranging 1000–10000. Same-shape txs of other
+types (`ModelRegistration` via `diag_model_reg`, `Transfer` via
+`quick_transfer_test` and `keepalive`) execute fine, so the regression
+is specific to `TxBody::InferenceEscrowOpen` admission/packing on the
+new binary. Existing on-chain B receipts from the previous binary
+(`0x673fbef3` open + `0x813fde82` release in NYC blocks 2745/2767) are
+preserved and remain valid evidence of the protocol working before
+this session's rebuild — so the regression is in something the rebuild
+introduced (between commit `cdb8a7c7` and current `2725ff40`), most
+likely a mempool/block-pack filter that didn't handle the new tx_type
+ordinals correctly. **Tracked as a chain-protocol bug to fix in a
+follow-up; not an operations-loop fix.** Three live driver examples
+(`live_paid_inference.rs` with longer commit-wait loops and
+per-run-unique payer keypairs, `diag_open.rs`, `keepalive.rs`) are
+committed alongside this note for the next debug session.
+
+P4–P7 — blocked on P3. Not run.
+
+---
+
 ## Milestone C — On-demand model provisioning (live ModelRegistration receipt 2026-04-28)
 
 **Status 2026-04-23**: tx types `ModelRegistration` (0x1c),
