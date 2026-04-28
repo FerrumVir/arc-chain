@@ -180,10 +180,14 @@ async fn main() {
     let open_hash_hex = hex::encode(tx.hash.0);
     println!("open_tx_hash: 0x{}", open_hash_hex);
 
-    // Step 5: submit + wait for commit.
+    // Step 5: submit + wait for commit. Use pre-serialized JSON body
+    // explicitly — `.json(&tx)` reqwest path was racing with diag_open
+    // submission and intermittently dropping the tx.
+    let json_body = serde_json::to_string(&tx).expect("serialize tx");
     let resp = quick
         .post(format!("{}/tx/submit_signed", coord))
-        .json(&tx)
+        .body(json_body)
+        .header("content-type", "application/json")
         .send()
         .await
         .expect("submit open tx");

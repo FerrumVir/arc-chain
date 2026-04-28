@@ -260,6 +260,46 @@ committed alongside this note for the next debug session.
 
 P4–P7 — blocked on P3. Not run.
 
+### Session 2026-04-22 update — root cause identified (RPC spam) + open path unblocked
+
+The B-open "regression" was not a tx-type bug — NYC's RPC port 9090
+was open to the internet and being hammered by ≥3 external IPs
+(`78.137.223.145`, `66.153.236.155`, `86.246.153.11`) that were
+spamming `Transfer`s from address `2d3adedff11b...`. The mempool
+and block-packer were saturating on those, and the legitimate
+`InferenceEscrowOpen` submissions were being drained but losing
+the next-block slot to the spam. Diagnosis:
+- `ss -tnp | grep ":9090.*ESTAB"` showed 50+ external connections.
+- After `iptables -P 9090 DROP except-{seeds,operator-IP}`, NYC
+  block production stalled (chain depended on tx flow), confirming
+  no other validator was generating txs.
+- `keepalive.rs` was relaunched to drive heartbeat Transfers; chain
+  resumed advancing.
+- `diag_open` then landed `0xce29f1dda2aa` in block 3482 in 2 s,
+  and `live_paid_inference` landed `0x005d65adaead` open at h≈3493
+  with payer balance correctly debited 10000→9000.
+
+Permanent fix needed (next session): tighten the seed firewall in
+`scripts/install-self-heal.sh` so RPC 9090 is only open to the 6
+seed IPs by default, with a `/var/lib/arc-allowed-ips` file the
+operator can edit to add their own IP. Without this, the chain
+remains DoS-able by anyone who knows a seed's IP.
+
+P3.open ✓ — `0x005d65adaead53f3e8f47664891927dbfeb0aa403e2d1b885c0fbc90631e0c1d`
+committed at NYC h=3493, debited payer 10000→9000 (1000 to escrow).
+
+P3.release ✗ — `run_consensus` returns a `release_tx_hash`
+(`0xb96615c4dfda286f2fed11e05cf70f36d1ef6376a41cb34029a97ce3e255f7d3`)
+but it never appears in any seed's chain (404 on all 6). Coordinator
+constructs the release but doesn't submit/persist it. This is a
+distinct bug from the open-path issue — needs separate fix in
+`/inference/run_consensus` post-success path.
+
+LHR is at h=36 vs NYC h=3493 — diverged again post-firewall. Needs
+another `--reset-state` rolling redeploy.
+
+P4–P7 still blocked on P3.release coordinator submit-fix.
+
 ---
 
 ## Milestone C — On-demand model provisioning (live ModelRegistration receipt 2026-04-28)
