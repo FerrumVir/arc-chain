@@ -222,16 +222,50 @@ Conservation verified end-to-end. PR #40 is now ready to leave draft.
 
 ---
 
-## Milestone C — On-demand model provisioning (protocol surface shipped — PR #40)
+## Milestone C — On-demand model provisioning (live ModelRegistration receipt 2026-04-28)
 
 **Status 2026-04-23**: tx types `ModelRegistration` (0x1c),
 `ModelRequest` (0x1d), `ShardCoverageClaim` (0x1e) live with full
 state transitions + 4 unit tests. Registration fee floored at 1000 ARC
 flows to the treasury (Milestone E anti-spam). Discovery endpoints
 `/models/registry` and `/models/open_requests` expose the registry
-without raw tx scanning. Remaining to merge: desktop `Earn` screen
-that lists open ModelRequests sorted by bond and lets a worker
-auto-claim ranges + download chunks.
+without raw tx scanning.
+
+**Status 2026-04-28**: ModelRegistration end-to-end live-proof landed
+on NYC during the milestone-cde session.
+
+### Live ModelRegistration receipt (Milestone C + Milestone E spam fee)
+
+- tx `0x53a7136c5cfc8d9552f55ae2ee68584fd28c67ff17f4cd306a7aa0d1932858b8`
+  in NYC block 3237, success=true, gas 60_000.
+- Body: `model_id=0xd6c0c62766054e80…`,
+  `metadata_hash=0xe491a617…`,
+  `chunk_tree_root=0x39fe366b…`,
+  `n_layers=32`, `d_model=4096`, `quantization=q4`,
+  `registration_fee=1000`, `royalty_recipient=publisher`.
+- Publisher `0x1ef07d5f…` balance: **10000 → 9000** (−1000 = registration fee).
+- Treasury `0x568f0881…` balance: **2004 → 3004** (+1000).
+- Conservation: −1000 publisher = +1000 treasury ✓.
+- Driver: `crates/arc-node/examples/diag_model_reg.rs`.
+
+### Acceptance gap remaining
+
+`ModelRequest`, `ShardCoverageClaim`, `CapacityAdvertisement`,
+`ShardAssignmentProposal` end-to-end live-proofs are blocked behind
+a separate chain-level wedge: NYC produces blocks at ~30 s cadence
+while the other 5 seeds have heights diverged by 800–3000 blocks
+(LHR is at h=38 with 14 k accounts from spam history). Block
+production stalls completely without arc-traffic generator activity
+on LAX, and re-enabling it competes for the 1-tx-per-block slot
+against user-submitted txs. The driver
+`crates/arc-node/examples/live_milestones_cde.rs` is committed and
+will produce all four remaining receipts once the chain's block
+producer is restored to multi-tx-per-block. Tracked separately;
+this is not a milestone-cde scope problem.
+
+Remaining for Milestone C product: desktop `Earn` screen that lists
+open ModelRequests sorted by bond and lets a worker auto-claim
+ranges + download chunks.
 
 **Goal**: a user says "I want to query `llama-3-70b`" and if nobody's
 serving it, the network spins up coverage — community nodes earn to
