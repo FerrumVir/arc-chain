@@ -527,6 +527,73 @@ The timeline for A+B+C+D+E is 4–7 weeks; each delayed milestone cascades.
 
 ---
 
+## TODO — next session (2026-04-29 pickup)
+
+Verified outstanding as of 2026-04-28 23:22 UTC. Each item has been
+checked against the live chain and is genuinely still pending.
+
+1. **B.release coordinator submit-fix** (BLOCKING Milestone B receipt
+   on the new binary). `submit_escrow_release` in
+   `crates/arc-node/src/rpc.rs:5098` calls `node.mempool.insert(tx)`
+   with a null-signed tx, but the resulting tx (e.g.
+   `0xb96615c4dfda286f2fed11e05cf70f36d1ef6376a41cb34029a97ce3e255f7d3`
+   from the most recent run) returns 404 on all 6 seeds even after
+   ~5 min. Mempool insert succeeds (returns Ok) but the tx never
+   appears in any block. Likely cause: block-pack or gossip path
+   filtering null sigs after the recent rebuild. Verify by:
+   - read `crates/arc-mempool/src/lib.rs:81 drain` — does it filter
+     null sigs?
+   - read `crates/arc-node/src/consensus.rs:738` block proposer drain
+     — does it gate on `sig_verified`?
+   - read `crates/arc-node/src/pipeline.rs:700-723` — does the
+     speculative executor accept InferenceEscrowRelease bodies?
+   - Open follow-up: gossip the release via `mempool.insert` is
+     local-only — confirm mempool also fans out to peer mempools, or
+     send to /tx/submit_signed loopback to force gossip.
+
+2. **Seed firewall hardening**. NYC's iptables whitelist (5 seed IPs +
+   operator's v4) is in-memory only. Reboot wipes it. Bake it into
+   `scripts/install-self-heal.sh`:
+   - Add an `iptables -P INPUT DROP` for tcp/9090 except seed IPs +
+     `/var/lib/arc-allowed-ips` contents.
+   - Persist via `iptables-save > /etc/iptables/rules.v4` + the
+     `iptables-persistent` package.
+   - Apply on the other 5 seeds (only NYC has the rule today).
+
+3. **LHR re-reset**. h=37 vs NYC 3497. WAL is unrecoverable. Run
+   `bash scripts/rolling-upgrade.sh --only=LHR --reset-state` and
+   verify it rejoins majority height before continuing.
+
+4. **C/D/E live receipts**. Only `ModelRegistration 0x53a7136c` exists.
+   Run `cargo run --release --example live_milestones_cde -p arc-node`
+   on the firewall-hardened chain to land:
+   - `ModelRequest`
+   - 3× `ShardCoverageClaim`
+   - 3× `CapacityAdvertisement`
+   - `ShardAssignmentProposal`
+   Document each tx hash + verify `/models/registry`,
+   `/models/open_requests`, `/capacity/advertisements`,
+   `/assignments/for_me?pubkey=…` reflect them. Close GH issues
+   #37, #38, #39 with hashes pasted as comments.
+
+5. **Desktop E2E (Milestone P5)**. Not run this session.
+   `cd ~/arc-chain/desktop && npx playwright test` (76+/4 skip/0 fail
+   target). Then SSH-tunnel NYC:9090→localhost:9090 + run
+   `tests/live.spec.ts` (4/4). Then `npx tauri build --bundles app`
+   with the signing key — verify .app + .app.tar.gz + .sig produced.
+   Open the .app, verify LaunchAgent + tray + Quit cleanup.
+
+6. **Issue #27 still open**: testnet pipeline broken — shard announces
+   carry `socket_addr=0.0.0.0:9090`. Pre-existing from 2026-04-16, not
+   addressed this session.
+
+`keepalive` bot is running locally as PID 992 (1-token Transfer to
+`arc-keepalive-recipient-v1` every 20 s) so the chain keeps producing
+blocks for further test runs. Kill with `pkill -f keepalive` when no
+longer needed.
+
+---
+
 ## The story, in one line
 
 **A user downloads a 17 MB app → clicks Join → their laptop instantly
