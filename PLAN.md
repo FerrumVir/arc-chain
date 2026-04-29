@@ -597,6 +597,62 @@ Resolution path for next session:
    ~50 blocks and triggers a `--reset-state` with the latest
    majority-snapshot, instead of letting NYC drift into a solo fork.
 
+### Session 2026-04-29: full-fleet rollout completed, chain still split
+
+`83c28aca` is now on all 6 seeds (LAX, AMS, NRT, SGP via `--skip-build`;
+LHR via `--skip-build --reset-state`; NYC was already on it). Each
+seed has peers≥4, dag_round within ±2 of each other (~2,427,800 at
+deploy completion).
+
+But local block heights remain divergent:
+| seed | h    | dag_committed (post-restart) |
+|------|------|-----------------------------|
+| NYC  | 3628 | 23,513                      |
+| LAX  | 2563 |      0                      |
+| AMS  | 2261 |      0                      |
+| LHR  |    2 |  1,187 (from genesis post-reset) |
+| NRT  | 2579 |  1,194                      |
+| SGP  | 2603 |  1,217                      |
+
+NYC continues to commit DAG blocks (round/comm both advancing) but
+its local `block_height` advances only when a tx lands; recent blocks
+3620-3628 each carry a single `Transfer` from address
+`2d3adedff11b...` (a spammer that's still injecting txs from an
+unidentified source even after firewalling 9090 + 9091 to seeds-only).
+Tx submitted via `/tx/submit_signed` to NYC accepts (200 OK), drains
+from mempool (`mempool_size` 1→0), but does not appear in any block
+on any seed (404 forever) — meanwhile the spammer's txs keep
+landing one-per-block.
+
+The remaining 5 seeds (LAX/AMS/NRT/SGP/LHR) are committing DAG blocks
+post-restart at a different rate (~1.2K commits in ~10 min) but
+their `block_height` is frozen at their pre-restart values plus a
+tiny delta — they are NOT executing the same txs NYC sees. This is
+a structural state-fork: each seed's `arc-data/state.wal` carries a
+different chain head from prior sessions, and the new binary's
+WAL replay restored that separate state on boot.
+
+The only clean fix is a coordinated `--reset-state` on ALL 6 seeds
+simultaneously (or a fresh genesis), so they all start from h=0 and
+execute the same DAG-committed txs forward. Doing this loses every
+historical receipt INCLUDING the B-fix receipt
+`0x0e8c4ef6` / `0x7176b114` from earlier this session.
+
+Recommended next-session decision: accept the reset (restart from
+genesis), then drive Milestones B + C + D + E receipts immediately
+on the fresh chain so they all share a single canonical history.
+Document the new receipts; the `0x0e8c4ef6` receipt remains valid
+evidence the protocol works but won't be reachable on the post-reset
+chain.
+
+The spammer source remains unidentified; firewalling 9090/9091 +
+killing all visible processes did not stop it. Likely candidate is
+a peer (LAX runs `community-gateway.py` on :3001 which could be
+relaying tx submissions, or a deployed inference-traffic systemd
+unit got reactivated post-restart). Investigation paused; next
+session should `pkill -9 -f community-gateway` + audit each seed's
+systemd units for hidden traffic sources before driving receipts.
+
 ---
 
 ## TODO — next session (2026-04-29 pickup)
