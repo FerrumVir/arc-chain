@@ -597,7 +597,48 @@ Resolution path for next session:
    ~50 blocks and triggers a `--reset-state` with the latest
    majority-snapshot, instead of letting NYC drift into a solo fork.
 
-### Session 2026-04-29: full-fleet rollout completed, chain still split
+### Session 2026-04-29: coordinated reset + partial receipts on fresh genesis
+
+After the full-fleet rollout still left the chain split, did a coordinated
+`--reset-state` across all 8 nodes (NYC/LAX/AMS/LHR/NRT/SGP + reactivated
+SAO/JNB) via the 8/8 sweep of `rolling-upgrade.sh --skip-build --reset-state`.
+All 8 came back at peers≥5, dag_round within ±50 of each other.
+
+Post-reset on fresh genesis:
+- P3.open ✓: `0xaff24d7520806af359505a4867cf456a75b8a3684378d8c34cf5d29a71d8f5fa`
+  committed at NYC blk 17; payer balance 10000 → 9000 (escrow debit confirmed).
+- P3.release ✗: coordinator returns
+  `0xa43c758de75eb8ca421c267c29822fe38b03947d9fd0707eae01c997c42cd0ae` but it
+  404s on NYC even after 10+ minutes. Same coordinator-internal-submit
+  pattern as before — null sig + sig_verified=true via the post-`83c28aca`
+  fix, but the tx never makes it from mempool.insert into a proposed
+  DAG block. Open from a real signed user (payer) lands fine; null-sig
+  internal submits don't.
+- P4 (ModelRegistration) ✗:
+  `0x431ab1863bd3f20425d68e1f9a41bb09e5c875fdbf3bd027a7304ceac3aa19c6`
+  also returns 200 on submit, mempool 1→0, but never lands in any block.
+  Publisher signed it correctly with ed25519; same drop pattern.
+- Plain Transfer from a fresh-faucet'd keypair also drops (test_transfer.rs)
+  while keepalive's Transfer (long-lived account) lands. Pattern: txs from
+  long-running submitters get drained AND broadcast; one-shot signed submits
+  drain but never proposed in DAG block.
+
+Latest hypothesis on the drop: NYC's consensus loop drains mempool every
+tick (`mempool.drain(500)` at consensus.rs:738), but the
+`info!("Drained {} txs ...")` line at 740 never appears in the screen
+log capture even when mempool empties between submits. Either drain
+returns 0 (and something else removes the entries from `seen`) or the
+log line gets dropped. No `Failed to propose`, `Failed to broadcast`,
+or `Block production failed` warnings appear either. The proposer
+emits `Proposed DAG block ... txs=0 ...` for every round, even when
+the mempool had non-zero entries between rounds.
+
+Resolution path for next session: ship a binary with explicit
+`eprintln!` at every step of submit_signed_tx → mempool.insert →
+consensus.rs:738 drain → propose_block, redeploy NYC, then submit
+one Open and trace which step drops the tx. Without that
+instrumentation we're black-box guessing. After identifying the drop,
+fix the underlying race / filter and re-fire the milestone drivers.
 
 `83c28aca` is now on all 6 seeds (LAX, AMS, NRT, SGP via `--skip-build`;
 LHR via `--skip-build --reset-state`; NYC was already on it). Each
