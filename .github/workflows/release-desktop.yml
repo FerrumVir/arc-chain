@@ -31,8 +31,11 @@ jobs:
               desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
               desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
               desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          # Intel Mac: cross-compiled from the macos-14 (Apple Silicon)
+          # runner instead of macos-13, since macos-13 has long queue
+          # waits in GitHub-hosted pools that block the publish step.
           - platform: macos-x86_64
-            runner: macos-13
+            runner: macos-14
             rust-target: x86_64-apple-darwin
             tauri-args: '--target x86_64-apple-darwin'
             artifact-glob: |

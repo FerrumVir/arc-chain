@@ -23,7 +23,9 @@ jobs:
             target: aarch64-apple-darwin
             asset: arc-node-macos-arm64
             binary: arc-node
-          - os: macos-13
+          # Intel Mac binary: cross-compiled from macos-14 (Apple Silicon)
+          # since macos-13 hosted pool has multi-hour queue waits.
+          - os: macos-14
             target: x86_64-apple-darwin
             asset: arc-node-macos-x86_64
             binary: arc-node
