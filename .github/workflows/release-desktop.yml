@@ -224,10 +224,18 @@ jobs:
           linux_archive=$(find bundles/arc-desktop-linux-x86_64 -name '*.AppImage' -not -name '*.sig' | head -1)
           linux_sig="${linux_archive}.sig"
 
-          mac_arm_url="$base/$(basename "$mac_arm_archive")"
-          mac_x86_url="$base/$(basename "$mac_x86_archive")"
-          win_url="$base/$(basename "$win_archive")"
-          linux_url="$base/$(basename "$linux_archive")"
+          # GitHub replaces spaces in asset filenames with dots on upload —
+          # e.g. local `ARC Node_aarch64.app.tar.gz` becomes the asset
+          # `ARC.Node_aarch64.app.tar.gz` on the release page. The
+          # auto-updater 404s if we publish the original space-bearing URL,
+          # so apply the same rename here when building the manifest URLs.
+          to_url() {
+            echo "$base/$(basename "$1" | tr ' ' '.')"
+          }
+          mac_arm_url=$(to_url "$mac_arm_archive")
+          mac_x86_url=$(to_url "$mac_x86_archive")
+          win_url=$(to_url "$win_archive")
+          linux_url=$(to_url "$linux_archive")
 
           MAC_ARM_SIG=$(read_sig "$mac_arm_sig")
           MAC_X86_SIG=$(read_sig "$mac_x86_sig")
