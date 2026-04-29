@@ -4,29 +4,6 @@
 ![Inference](https://img.shields.io/badge/inference-consensus--verified-purple)
 ![Testnet](https://img.shields.io/badge/testnet-live-green)
 
-# ⬇ Download ARC Node — pick your computer
-
-| Your computer | One-click download |
-|---|---|
-| 🍎 **Mac (Apple Silicon — M1/M2/M3/M4)** | **[Download for Apple Silicon Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_aarch64.dmg)** |
-| 🍎 **Mac (Intel)** | **[Download for Intel Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_x64.dmg)** |
-| 🪟 **Windows 10 / 11** | **[Download for Windows](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_x64-setup.exe)** |
-| 🐧 **Linux (Ubuntu / Debian)** | **[Download .deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_amd64.deb)** |
-| 🐧 **Linux (Fedora / RHEL)** | **[Download .rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node-0.5.4-1.x86_64.rpm)** |
-| 🐧 **Linux (any distro)** | **[Download .AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_amd64.AppImage)** |
-
-> **Not sure which Mac?** Apple menu → *About This Mac*. If chip says "Apple M1/M2/M3/M4" → Apple Silicon. If "Intel" → Intel.
-
-**Install in 60 seconds** (full step-by-step + Gatekeeper/SmartScreen bypass instructions live on the [release page](https://github.com/FerrumVir/arc-chain/releases/tag/v0.5.4)):
-
-- **Mac**: open the `.dmg` → drag ARC Node to Applications → first launch right-click → Open
-- **Windows**: run the `.exe` → "More info" → "Run anyway" → Next → Install → Finish
-- **Linux**: `sudo apt install ./ARC.Node_0.5.4_amd64.deb` (or `rpm -i`, or `chmod +x` the AppImage)
-
-The app onboards in 3 clicks (welcome → identity → join), runs in your tray, auto-starts on login, auto-updates when v0.5.5 ships.
-
----
-
 # ARC Chain — Trustworthy AI
 
 **A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built so AI inference can pass network consensus — the same way transactions do.**
@@ -64,6 +41,31 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 ---
 
 ## Test it yourself
+
+### ⬇ Download ARC Node — pick your computer
+
+| Your computer | One-click download |
+|---|---|
+| 🍎 **Mac (Apple Silicon — M1/M2/M3/M4)** | **[Download for Apple Silicon Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_aarch64.dmg)** |
+| 🍎 **Mac (Intel)** | **[Download for Intel Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_x64.dmg)** |
+| 🪟 **Windows 10 / 11** | **[Download for Windows](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_x64-setup.exe)** |
+| 🐧 **Linux (Ubuntu / Debian)** | **[Download .deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_amd64.deb)** |
+| 🐧 **Linux (Fedora / RHEL)** | **[Download .rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node-0.5.4-1.x86_64.rpm)** |
+| 🐧 **Linux (any distro)** | **[Download .AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_amd64.AppImage)** |
+
+> **Not sure which Mac?** Apple menu → *About This Mac*. If chip says "Apple M1/M2/M3/M4" → Apple Silicon. If "Intel" → Intel.
+
+**Install in 60 seconds** (full step-by-step + Gatekeeper/SmartScreen bypass instructions live on the [release page](https://github.com/FerrumVir/arc-chain/releases/tag/v0.5.4)):
+
+- **Mac**: open the `.dmg` → drag ARC Node to Applications → first launch right-click → Open
+- **Windows**: run the `.exe` → "More info" → "Run anyway" → Next → Install → Finish
+- **Linux**: `sudo apt install ./ARC.Node_0.5.4_amd64.deb` (or `rpm -i`, or `chmod +x` the AppImage)
+
+The app onboards in 3 clicks (welcome → identity → join), runs in your tray, auto-starts on login, auto-updates when v0.5.5 ships.
+
+---
+
+### Or run from the command line
 
 **Run a real inference on the live network, see the BLAKE3 hash, watch it verify:**
 
