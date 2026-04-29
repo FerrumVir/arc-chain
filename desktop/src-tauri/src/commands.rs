@@ -672,6 +672,7 @@ fn platform_release_asset() -> Option<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => Some("arc-node-macos-arm64"),
         ("macos", "x86_64") => Some("arc-node-macos-x86_64"),
+        ("windows", "x86_64") => Some("arc-node-windows-x86_64.exe"),
         ("linux", "x86_64") => Some("arc-node-linux-x86_64"),
         _ => None,
     }

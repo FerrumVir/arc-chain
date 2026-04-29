@@ -22,12 +22,19 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             asset: arc-node-macos-arm64
-          # x86_64-apple-darwin disabled: macos-13 runner is no longer supported
-          # by GitHub-hosted runners. Intel Mac users can build from source or
-          # we can revisit if a working macOS Intel runner ships.
+            binary: arc-node
+          - os: macos-13
+            target: x86_64-apple-darwin
+            asset: arc-node-macos-x86_64
+            binary: arc-node
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: arc-node-windows-x86_64.exe
+            binary: arc-node.exe
           - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
             asset: arc-node-linux-x86_64
+            binary: arc-node
 
     steps:
       - uses: actions/checkout@v4
@@ -44,16 +51,18 @@ jobs:
           workspaces: . -> target
 
       - name: Build arc-node release
+        shell: bash
         run: cargo build --release -p arc-node --features candle --target ${{ matrix.target }}
 
       - name: Strip binary
         if: runner.os != 'Windows'
         run: |
-          strip target/${{ matrix.target }}/release/arc-node || true
+          strip target/${{ matrix.target }}/release/${{ matrix.binary }} || true
 
       - name: Rename binary
+        shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/arc-node ${{ matrix.asset }}
+          cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

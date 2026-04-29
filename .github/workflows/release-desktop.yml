@@ -1,7 +1,8 @@
 name: Release desktop app
 
 # Fires on the same tags the arc-node release workflow watches. Publishes
-# signed ARC Node.app (+ .dmg on macOS, .AppImage on Linux) plus the
+# signed ARC Node bundles for macOS (Apple Silicon + Intel), Windows
+# (x86_64 NSIS installer), and Linux (x86_64 AppImage), plus the
 # `latest.json` manifest the Tauri updater consumes.
 on:
   push:
@@ -10,9 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release (e.g. v0.5.3)'
+        description: 'Tag to release (e.g. v0.5.4)'
         required: true
-        default: 'v0.5.3'
+        default: 'v0.5.4'
 
 jobs:
   bundle:
@@ -25,17 +26,40 @@ jobs:
           - platform: macos-arm64
             runner: macos-14
             rust-target: aarch64-apple-darwin
+            tauri-args: '--target aarch64-apple-darwin'
             artifact-glob: |
-              desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
-              desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz.sig
-              desktop/src-tauri/target/release/bundle/dmg/*.dmg
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - platform: macos-x86_64
+            runner: macos-13
+            rust-target: x86_64-apple-darwin
+            tauri-args: '--target x86_64-apple-darwin'
+            artifact-glob: |
+              desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz
+              desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+              desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          - platform: windows-x86_64
+            runner: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            tauri-args: '--target x86_64-pc-windows-msvc'
+            artifact-glob: |
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.nsis.zip
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.nsis.zip.sig
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi.sig
           - platform: linux-x86_64
             runner: ubuntu-22.04
             rust-target: x86_64-unknown-linux-gnu
+            tauri-args: '--target x86_64-unknown-linux-gnu'
             artifact-glob: |
-              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
-              desktop/src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz
-              desktop/src-tauri/target/release/bundle/appimage/*.AppImage.tar.gz.sig
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz.sig
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
 
     defaults:
       run:
@@ -53,7 +77,7 @@ jobs:
         if: matrix.platform == 'linux-x86_64'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libfuse2
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -72,15 +96,16 @@ jobs:
           workspaces: desktop/src-tauri -> target
 
       - name: Build + bundle signed artifacts
+        shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
             echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is empty — the updater won't validate. Paste the contents of src-tauri/.tauri-keys/arc-desktop.key (without a password) into GitHub repo secrets."
             exit 1
           fi
-          npx tauri build
+          npx tauri build ${{ matrix.tauri-args }}
 
       - name: Upload bundle artifacts
         uses: actions/upload-artifact@v4
@@ -122,10 +147,10 @@ jobs:
 
       - name: Build latest.json for the Tauri updater
         # The Tauri updater reads a manifest with per-target (url, signature)
-        # pairs. `url` points at the .app.tar.gz (macOS) / .AppImage.tar.gz
-        # (Linux) published on this release; `signature` is the contents of
-        # the matching .sig file. Without this file auto-update is silently
-        # disabled — so we fail hard if a .sig is missing.
+        # pairs. Without a matching entry the platform falls back to
+        # "no update available", so we list every target we shipped a bundle
+        # for. Missing signature files are a hard error — silently shipping
+        # a release without auto-update was the bug we fixed in #29.
         run: |
           set -euo pipefail
           TAG="${{ steps.tag.outputs.tag }}"
@@ -142,15 +167,37 @@ jobs:
             cat "$f"
           }
 
-          mac_arm_archive=$(find bundles -name '*.app.tar.gz' -not -name '*.sig' | head -1)
-          mac_arm_sig=$(find bundles -name '*.app.tar.gz.sig' | head -1)
-          linux_x86_archive=$(find bundles -name '*.AppImage.tar.gz' -not -name '*.sig' | head -1)
-          linux_x86_sig=$(find bundles -name '*.AppImage.tar.gz.sig' | head -1)
+          # macOS arm64
+          mac_arm_archive=$(find bundles -name '*aarch64*.app.tar.gz' -not -name '*.sig' | head -1)
+          if [ -z "$mac_arm_archive" ]; then
+            mac_arm_archive=$(find bundles -name '*.app.tar.gz' -not -name '*.sig' -path '*arm64*' | head -1)
+          fi
+          mac_arm_sig="${mac_arm_archive}.sig"
 
-          MAC_ARM_URL="$base/$(basename "$mac_arm_archive")"
-          LINUX_URL="$base/$(basename "$linux_x86_archive")"
-          MAC_ARM_SIGNATURE=$(read_sig "$mac_arm_sig")
-          LINUX_SIGNATURE=$(read_sig "$linux_x86_sig")
+          # macOS x86_64
+          mac_x86_archive=$(find bundles -name '*x64*.app.tar.gz' -not -name '*.sig' | head -1)
+          if [ -z "$mac_x86_archive" ]; then
+            mac_x86_archive=$(find bundles -name '*.app.tar.gz' -not -name '*.sig' -path '*x86_64*' | head -1)
+          fi
+          mac_x86_sig="${mac_x86_archive}.sig"
+
+          # Windows x86_64 — Tauri NSIS produces .nsis.zip + .sig for updater
+          win_archive=$(find bundles -name '*.nsis.zip' -not -name '*.sig' | head -1)
+          win_sig="${win_archive}.sig"
+
+          # Linux x86_64
+          linux_archive=$(find bundles -name '*.AppImage.tar.gz' -not -name '*.sig' | head -1)
+          linux_sig="${linux_archive}.sig"
+
+          mac_arm_url="$base/$(basename "$mac_arm_archive")"
+          mac_x86_url="$base/$(basename "$mac_x86_archive")"
+          win_url="$base/$(basename "$win_archive")"
+          linux_url="$base/$(basename "$linux_archive")"
+
+          MAC_ARM_SIG=$(read_sig "$mac_arm_sig")
+          MAC_X86_SIG=$(read_sig "$mac_x86_sig")
+          WIN_SIG=$(read_sig "$win_sig")
+          LINUX_SIG=$(read_sig "$linux_sig")
 
           cat > latest.json <<EOF
           {
@@ -159,12 +206,20 @@ jobs:
             "pub_date": "$DATE",
             "platforms": {
               "darwin-aarch64": {
-                "signature": "$MAC_ARM_SIGNATURE",
-                "url": "$MAC_ARM_URL"
+                "signature": "$MAC_ARM_SIG",
+                "url": "$mac_arm_url"
+              },
+              "darwin-x86_64": {
+                "signature": "$MAC_X86_SIG",
+                "url": "$mac_x86_url"
+              },
+              "windows-x86_64": {
+                "signature": "$WIN_SIG",
+                "url": "$win_url"
               },
               "linux-x86_64": {
-                "signature": "$LINUX_SIGNATURE",
-                "url": "$LINUX_URL"
+                "signature": "$LINUX_SIG",
+                "url": "$linux_url"
               }
             }
           }
