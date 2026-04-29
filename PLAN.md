@@ -561,21 +561,41 @@ GH issue #36 already closed from prior sessions; this run adds the
 post-fix receipt as fresh evidence the protocol works end-to-end on
 the rebuilt binary.
 
-**P4 (C/D/E) blocked on a separate ModelRegistration regression:**
-even with a brand-new model_id, the registration tx returns 200 from
-`/tx/submit_signed`, mempool size drops 1→0, but the tx never lands
-in a block (block_height stays put, `/tx/0x{h}` returns 404, publisher
-nonce does not bump). Hash 0xe6fcc961 was the latest failed attempt
-on a fresh model_id `0x0effc665...`. This is NOT the same bug the
-sig_verified=true fix addressed — the publisher's signed tx is being
-dropped at a layer between mempool insert and DAG block proposal.
-Likely culprits: (a) some block-pack filter that excludes
-ModelRegistration txs based on a stale registry-account state read,
-(b) cross-shard locking against the registry account, or
-(c) a routing decision that sends ModelRegistration to a non-existent
-encrypted-mempool slot. Investigation paused per `/loop` 2-hour rule;
-re-pick in next session with `RUST_LOG=arc_node::consensus=trace` on
-NYC + `/tx/submit_signed` adversarial fuzzing.
+**P4 (C/D/E) blocked on chain fork, not the regression I first
+hypothesized.** Cross-seed health snapshot 2026-04-29 00:30 UTC:
+
+| seed | h    | dag_round  | dag_committed |
+|------|------|------------|---------------|
+| NYC  | 3588 | 2,425,779  | **19,123**    |
+| LAX  | 2558 | 2,425,779  | 137,505       |
+| AMS  | 2256 | 2,425,781  | 138,743       |
+| LHR  |   64 | 2,425,782  | 138,398       |
+| NRT  | 2566 | 2,425,784  | 138,122       |
+| SGP  | 2589 | 2,425,786  | 136,270       |
+
+NYC's local chain (the one that received the post-`83c28aca` redeploy)
+is on its own fork. `comm=19,123` matches NYC's commit count since the
+restart-while-others-keep-running. The other 5 seeds share a chain at
+~138K commits but their local block heights are different from NYC's.
+
+Symptom this produces: `/tx/submit_signed` to NYC accepts the tx,
+mempool drains it, NYC includes it in a DAG block, but the block
+never reaches quorum (peers are committing on their own chain that
+doesn't include NYC's view). The tx vanishes between drain and
+execution. Submitting to LAX returns the same 404 dance because
+LAX doesn't know about the publisher's account at all — its state
+shows `balance=0 nonce=0` for the publisher key (which has 9000/2 on
+NYC).
+
+Resolution path for next session:
+1. Roll the new `83c28aca` binary out to the other 5 seeds (NYC
+   already has it). Use `--reset-state` on LHR.
+2. After all 6 are on the same binary AND a recent shared snapshot,
+   re-fire the live_milestones_cde driver. The published-fix-only
+   blocker disappears once the chain is no longer split.
+3. Add a self-heal rule that detects state-divergence past
+   ~50 blocks and triggers a `--reset-state` with the latest
+   majority-snapshot, instead of letting NYC drift into a solo fork.
 
 ---
 
