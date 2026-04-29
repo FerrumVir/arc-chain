@@ -147,6 +147,44 @@ jobs:
           echo "version=${TAG#v}" >> $GITHUB_OUTPUT
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
 
+      - name: Rename per-platform archives so Mac arm64 ≠ x64 collision
+        # Mac arm64 and Mac x64 both produce identically-named
+        # `ARC Node.app.tar.gz`. softprops/action-gh-release flattens
+        # all uploads into the release and the second one overwrites
+        # the first — so users on x86_64 Macs would download the arm64
+        # binary (or vice versa). Stamp the basename with the target
+        # arch so each shows up as a distinct release asset.
+        run: |
+          set -euo pipefail
+          for src in bundles/arc-desktop-macos-arm64/macos/*.app.tar.gz \
+                     bundles/arc-desktop-macos-arm64/macos/*.app.tar.gz.sig; do
+            [ -f "$src" ] || continue
+            ext="${src##*.}"
+            stem="${src%.*}"
+            if [ "$ext" = "sig" ]; then
+              # *.app.tar.gz.sig → strip .sig, rename, re-add .sig
+              base="${stem%.app.tar.gz}"
+              mv "$src" "${base}_aarch64.app.tar.gz.sig"
+            else
+              base="${src%.app.tar.gz}"
+              mv "$src" "${base}_aarch64.app.tar.gz"
+            fi
+          done
+          for src in bundles/arc-desktop-macos-x86_64/macos/*.app.tar.gz \
+                     bundles/arc-desktop-macos-x86_64/macos/*.app.tar.gz.sig; do
+            [ -f "$src" ] || continue
+            ext="${src##*.}"
+            if [ "$ext" = "sig" ]; then
+              stem="${src%.*}"
+              base="${stem%.app.tar.gz}"
+              mv "$src" "${base}_x64.app.tar.gz.sig"
+            else
+              base="${src%.app.tar.gz}"
+              mv "$src" "${base}_x64.app.tar.gz"
+            fi
+          done
+          find bundles -name '*.app.tar.gz*' | sort
+
       - name: Build latest.json for the Tauri updater
         # The Tauri updater reads a manifest with per-target (url, signature)
         # pairs. Without a matching entry the platform falls back to
@@ -174,10 +212,10 @@ jobs:
           #   macOS:   .app.tar.gz + .app.tar.gz.sig
           #   Windows: -setup.exe + -setup.exe.sig (NSIS direct, no zip)
           #   Linux:   .AppImage   + .AppImage.sig
-          mac_arm_archive=$(find bundles/arc-desktop-macos-arm64 -name '*.app.tar.gz' -not -name '*.sig' | head -1)
+          mac_arm_archive=$(find bundles/arc-desktop-macos-arm64 -name '*_aarch64.app.tar.gz' -not -name '*.sig' | head -1)
           mac_arm_sig="${mac_arm_archive}.sig"
 
-          mac_x86_archive=$(find bundles/arc-desktop-macos-x86_64 -name '*.app.tar.gz' -not -name '*.sig' | head -1)
+          mac_x86_archive=$(find bundles/arc-desktop-macos-x86_64 -name '*_x64.app.tar.gz' -not -name '*.sig' | head -1)
           mac_x86_sig="${mac_x86_archive}.sig"
 
           win_archive=$(find bundles/arc-desktop-windows-x86_64 -name '*-setup.exe' -not -name '*.sig' | head -1)
