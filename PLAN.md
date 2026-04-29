@@ -597,7 +597,62 @@ Resolution path for next session:
    ~50 blocks and triggers a `--reset-state` with the latest
    majority-snapshot, instead of letting NYC drift into a solo fork.
 
-### Session 2026-04-29: coordinated reset + partial receipts on fresh genesis
+### Session 2026-04-29 final: ALL milestones B + C + D + E ✅ on fresh testnet
+
+After identifying the root cause as the leader-only commit rule
+(`arc-consensus/src/lib.rs:1452` only commits `validators[r % n_validators]`'s
+block per round; non-leader proposals get orphaned 5/6 of the time),
+shipped two arc-node fixes:
+
+1. `consensus.rs:786` — re-enable `OutboundMessage::BroadcastTransactions`
+   gossip after drain so peers re-include drained txs in their proposals.
+   Any leader-validator can then commit them. Duplicates are dedup'd at
+   execute time via `state.receipts`.
+
+2. `rpc.rs:5121` — `submit_escrow_release` now reads sender nonce from
+   state every call. The previous in-memory `attestation_nonce.fetch_add`
+   bump counter accumulated forever even when the constructed tx failed
+   to land, leaving a nonce gap (state stays at N, in-memory counter
+   advances to N+1+...) so every subsequent release failed with
+   InvalidNonce.
+
+Live receipts from this session, all verified on the post-reset 6-seed
+testnet running binary `351a1ab4`:
+
+**Milestone B (escrow + release + 40/25/15/20 split)**
+- Open `0x51cf789ec701a3148648b05dd946d8b856778c228a8ea43d654bc74741da0422`
+- Release `0x40c8683372aa8a941bfdb0bfadd4d797233975cd0625b53c9a63c8c0f8afdafb`
+- Distribution: payer 10000→9000, treasury +204, observer +150,
+  6 replicas × +41 = +246, proposer +400. Conservation residual = 0.
+
+**Milestone C (model registry + request + worker claims)**
+- ModelRegistration `0xd2729f4597b5afd1d037803c4c5799596f9bdd503e87b70287eb387ebeccec75`
+  (publisher 9000→8000, treasury 1204→2204)
+- ModelRequest `0xda81373ba5b9231c1d3a9f0412c0899456fe438f975991d9c8650dec7bf2a149`
+- ShardCoverageClaim worker-A (0–11) `0xfeda6e0ff652e3cbaf62927d9efe39ccc43f5a9dcd0629a921ca6a1f33940fd7`
+- ShardCoverageClaim worker-B (11–22) `0xff85c8757367bb55f6081467338c0c9038698bd805242e6c65ef57809135d3f4`
+- ShardCoverageClaim worker-C (22–32) `0x305d559df706a7cc5932e8aa0875fe614414c416ff4c3f8d206749f779645e06`
+- `/models/registry` count=2, `/models/open_requests` count=1.
+
+**Milestone D (capacity advertisements + planner assignments)**
+- CapacityAdvertisement worker-A `0x23b4afdf6127766337248b6ad2147ca6de69d5c653393e066404bb01260d91e1`
+- CapacityAdvertisement worker-B `0x31922c010b3870e6e5586f8fc1b101a769ce8c2e134eae436f74b5427daa4a1b`
+- CapacityAdvertisement worker-C `0x0ecceb3fd3b64767357901907442b4ebadee16d243983c2550976de47e52b5a5`
+- ShardAssignmentProposal `0x6df304672578c8c91552ea23ab87cb509176f308614f2499417f8e61dac23644`
+- `/capacity/advertisements` count=4, `/assignments/for_me` returns 1 per worker.
+
+**Milestone E (anti-spam fee floor)**
+- ModelRegistration tx above paid the `MIN_MODEL_REGISTRATION_FEE`
+  (1000 ARC) into treasury. Floor is enforced by state handler at
+  `arc-state/src/lib.rs:4121`.
+
+GH issues #36 / #37 / #38 / #39 close with these hashes pasted as
+comments. The original `0x53a7136c` ModelRegistration receipt from
+the prior session is preserved as additional evidence on a different
+chain head — but the receipts above are the authoritative ones on
+the current canonical chain.
+
+### Session 2026-04-29 (earlier): coordinated reset + partial receipts on fresh genesis
 
 After the full-fleet rollout still left the chain split, did a coordinated
 `--reset-state` across all 8 nodes (NYC/LAX/AMS/LHR/NRT/SGP + reactivated
