@@ -49,8 +49,6 @@ jobs:
             artifact-glob: |
               desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
               desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
-              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.nsis.zip
-              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.nsis.zip.sig
               desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
               desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi.sig
           - platform: linux-x86_64
@@ -59,8 +57,7 @@ jobs:
             tauri-args: '--target x86_64-unknown-linux-gnu'
             artifact-glob: |
               desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
-              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz
-              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz.sig
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
               desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
               desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
 
@@ -172,20 +169,21 @@ jobs:
             cat "$f"
           }
 
-          # Each artifact lives in its own subdir per platform — that's
-          # why we don't use merge-multiple. Match by the subdir name so
-          # we get the right binary even when filenames collide across
-          # platforms (Mac arm64/x86_64 both produce `ARC Node.app.tar.gz`).
+          # Each artifact lives in its own subdir per platform. Tauri 2's
+          # updater consumes:
+          #   macOS:   .app.tar.gz + .app.tar.gz.sig
+          #   Windows: -setup.exe + -setup.exe.sig (NSIS direct, no zip)
+          #   Linux:   .AppImage   + .AppImage.sig
           mac_arm_archive=$(find bundles/arc-desktop-macos-arm64 -name '*.app.tar.gz' -not -name '*.sig' | head -1)
           mac_arm_sig="${mac_arm_archive}.sig"
 
           mac_x86_archive=$(find bundles/arc-desktop-macos-x86_64 -name '*.app.tar.gz' -not -name '*.sig' | head -1)
           mac_x86_sig="${mac_x86_archive}.sig"
 
-          win_archive=$(find bundles/arc-desktop-windows-x86_64 -name '*.nsis.zip' -not -name '*.sig' | head -1)
+          win_archive=$(find bundles/arc-desktop-windows-x86_64 -name '*-setup.exe' -not -name '*.sig' | head -1)
           win_sig="${win_archive}.sig"
 
-          linux_archive=$(find bundles/arc-desktop-linux-x86_64 -name '*.AppImage.tar.gz' -not -name '*.sig' | head -1)
+          linux_archive=$(find bundles/arc-desktop-linux-x86_64 -name '*.AppImage' -not -name '*.sig' | head -1)
           linux_sig="${linux_archive}.sig"
 
           mac_arm_url="$base/$(basename "$mac_arm_archive")"
