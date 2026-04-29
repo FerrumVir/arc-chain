@@ -735,9 +735,17 @@ impl ConsensusManager {
                     let drain_limit = if self.benchmark && multi_validator { 1_000 }
                         else if self.benchmark { 50_000 }
                         else { 500 };
+                    let mempool_len_pre = mempool.len();
                     let transactions = mempool.drain(drain_limit);
                     if !transactions.is_empty() {
                         info!("Drained {} txs from mempool for DAG proposal", transactions.len());
+                        for tx in &transactions {
+                            eprintln!("[DRAIN] hash=0x{} type={:?} from=0x{} nonce={}",
+                                hex::encode(&tx.hash.0[..8]), tx.tx_type,
+                                hex::encode(&tx.from.0[..6]), tx.nonce);
+                        }
+                    } else if mempool_len_pre > 0 {
+                        eprintln!("[DRAIN-MISMATCH] mempool.len()={} but drain returned 0", mempool_len_pre);
                     }
 
                     // ── Encrypted mempool: drain encrypted txs in FIFO order ──
@@ -768,13 +776,25 @@ impl ConsensusManager {
                             for tx in &transactions {
                                 pending_txs.insert(tx.hash.0, tx.clone());
                             }
-                            // NOTE: We do NOT gossip TX separately here.
-                            // The DagBlockWithTxs broadcast below carries the
-                            // full transactions, making BroadcastTransactions
-                            // redundant. Separate gossip causes peers to insert
-                            // our TX into their mempools, which they then
-                            // re-propose, causing duplicate proposals and
-                            // nonce conflicts on execution.
+                            // Re-enabled: gossip txs so peers can include them
+                            // in THEIR proposals too. The leader-only commit
+                            // rule (lib.rs:1452) means a tx in only OUR block
+                            // is orphaned 5/6 of the time. Letting peers
+                            // re-include it gives every leader a chance to
+                            // commit it. Duplicate-execution is dedup'd by
+                            // state.receipts at execute time, so cost is just
+                            // DAG bandwidth.
+                            if let Some(ref tx_chan) = outbound_tx {
+                                let serialized: Vec<Vec<u8>> = transactions
+                                    .iter()
+                                    .filter_map(|tx| bincode::serialize(tx).ok())
+                                    .collect();
+                                if !serialized.is_empty() {
+                                    let _ = tx_chan.try_send(
+                                        OutboundMessage::BroadcastTransactions(serialized)
+                                    );
+                                }
+                            }
                         }
 
                         let timestamp = SystemTime::now()

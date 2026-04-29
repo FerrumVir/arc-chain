@@ -766,15 +766,28 @@ async fn submit_signed_tx(
     Json(tx): Json<Transaction>,
 ) -> Result<Json<SubmitTxResponse>, StatusCode> {
     let hash = tx.hash.to_hex();
+    let tx_type = format!("{:?}", tx.tx_type);
+    let from_short = hex::encode(&tx.from.0[..6]);
+    let nonce = tx.nonce;
+    let sig_ok = tx.verify_signature().is_ok();
+    eprintln!(
+        "[SUBMIT] hash=0x{} type={} from={} nonce={} sig_ok={} sig_verified={}",
+        &hash[..16], tx_type, from_short, nonce, sig_ok, tx.sig_verified
+    );
 
-    node.mempool
-        .insert(tx)
-        .map_err(|_| StatusCode::CONFLICT)?;
-
-    Ok(Json(SubmitTxResponse {
-        tx_hash: hash,
-        status: "pending".to_string(),
-    }))
+    match node.mempool.insert(tx) {
+        Ok(()) => {
+            eprintln!("[SUBMIT] hash=0x{} insert=OK pool_len={}", &hash[..16], node.mempool.len());
+            Ok(Json(SubmitTxResponse {
+                tx_hash: hash,
+                status: "pending".to_string(),
+            }))
+        }
+        Err(e) => {
+            eprintln!("[SUBMIT] hash=0x{} insert=ERR {:?}", &hash[..16], e);
+            Err(StatusCode::CONFLICT)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5106,16 +5119,18 @@ fn submit_escrow_release(
     replicas: Vec<arc_crypto::Hash256>,
 ) -> arc_crypto::Hash256 {
     let proposer = node.validator_address;
-    // Base nonce for the coordinator's own account; bump the same way the
-    // attestation submitter does so repeat releases (different request_ids
-    // in the same block) don't collide.
-    let base_nonce = node
+    // Use the proposer's CURRENT state nonce. The previous in-memory bump
+    // counter (`attestation_nonce.fetch_add`) accumulated forever, even when
+    // the constructed tx failed to land — leaving a nonce gap (state stays
+    // at N, in-memory counter advances to N+1+...) that made every
+    // subsequent release fail with InvalidNonce. Reading from state every
+    // time keeps the release tx's nonce in sync with what execute_block
+    // actually expects.
+    let nonce = node
         .state
         .get_account(&proposer)
         .map(|a| a.nonce)
         .unwrap_or(0);
-    let bump = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
-    let nonce = base_nonce + bump;
 
     let body = arc_types::transaction::InferenceEscrowReleaseBody {
         request_id: gate.request_id,
