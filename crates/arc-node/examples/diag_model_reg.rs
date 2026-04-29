@@ -29,10 +29,14 @@ async fn main() {
     let bal = acc.get("balance").and_then(|n| n.as_u64()).unwrap_or(0);
     println!("from={}  nonce={}  balance={}", from_hex, nonce, bal);
 
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let body = ModelRegistrationBody {
-        model_id: hash_bytes(b"diag-model-id"),
-        metadata_hash: hash_bytes(b"diag-meta"),
-        chunk_tree_root: hash_bytes(b"diag-chunks"),
+        model_id: hash_bytes(format!("diag-model-id-{}", stamp).as_bytes()),
+        metadata_hash: hash_bytes(format!("diag-meta-{}", stamp).as_bytes()),
+        chunk_tree_root: hash_bytes(format!("diag-chunks-{}", stamp).as_bytes()),
         n_layers: 32,
         d_model: 4096,
         quantization: "q4".into(),

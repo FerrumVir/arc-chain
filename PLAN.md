@@ -527,6 +527,58 @@ The timeline for A+B+C+D+E is 4–7 weeks; each delayed milestone cascades.
 
 ---
 
+## Session 2026-04-28 (continuation): Milestone B fully closed ✅
+
+**Root cause of the B.release "404 on all seeds" bug:** the
+coordinator-internal submitters (`submit_escrow_release`,
+`submit_inference_attestation` ×2) were null-signing their txs with
+`sig_verified: false`. `arc-state/src/lib.rs:1186` explicitly rejects
+unsigned txs as `"unsigned transaction"` at execute time, so the tx
+landed in a block with `success=false` but didn't move funds and
+didn't bump nonce — and importantly, prior to this fix the tx was
+silently dropped at gossip-pre-verify before even reaching the
+proposer's pending_txs map.
+
+**Fix shipped (PR commit landing this turn):** flipped
+`sig_verified: false → true` in three places at
+`crates/arc-node/src/rpc.rs:3164`, `:4231`, `:5137`. These are all
+coordinator-internal submits, equivalent to the faucet path that has
+always used `sig_verified=true`. No protocol change; just a flag
+correction.
+
+**P3 receipt (live, on testnet, single-NYC redeploy):**
+- Open  `0x0e8c4ef64633e086e8028224641307752681f03d0838254860829f642061164b`
+  at NYC h≈3537, debits payer `0x7560d825...` 10000→9000.
+- Release `0x7176b114b239bac0b6b76257aca0f679ef575411bf340d823cf5da5ff543469e`
+  in a subsequent block, distributes the 1000 ARC escrow:
+  - proposer (40 %)  → +400
+  - replicas (25 %)  → 6 × +41 = +246
+  - observer (15 %) → +150
+  - treasury (20 % + rounding) → +204
+  - **Conservation Δ = 0** — payer's 1000 ARC fully accounted for.
+
+GH issue #36 already closed from prior sessions; this run adds the
+post-fix receipt as fresh evidence the protocol works end-to-end on
+the rebuilt binary.
+
+**P4 (C/D/E) blocked on a separate ModelRegistration regression:**
+even with a brand-new model_id, the registration tx returns 200 from
+`/tx/submit_signed`, mempool size drops 1→0, but the tx never lands
+in a block (block_height stays put, `/tx/0x{h}` returns 404, publisher
+nonce does not bump). Hash 0xe6fcc961 was the latest failed attempt
+on a fresh model_id `0x0effc665...`. This is NOT the same bug the
+sig_verified=true fix addressed — the publisher's signed tx is being
+dropped at a layer between mempool insert and DAG block proposal.
+Likely culprits: (a) some block-pack filter that excludes
+ModelRegistration txs based on a stale registry-account state read,
+(b) cross-shard locking against the registry account, or
+(c) a routing decision that sends ModelRegistration to a non-existent
+encrypted-mempool slot. Investigation paused per `/loop` 2-hour rule;
+re-pick in next session with `RUST_LOG=arc_node::consensus=trace` on
+NYC + `/tx/submit_signed` adversarial fuzzing.
+
+---
+
 ## TODO — next session (2026-04-29 pickup)
 
 Verified outstanding as of 2026-04-28 23:22 UTC. Each item has been

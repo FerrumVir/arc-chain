@@ -3162,7 +3162,9 @@ async fn inference_run(
         gas_limit: 0,
         hash: arc_crypto::Hash256::ZERO,
         signature: arc_crypto::Signature::null(),
-        sig_verified: false,
+        // Coordinator-internal submit; bypass the unsigned-tx reject
+        // at arc-state lib.rs:1186 the same way the faucet path does.
+        sig_verified: true,
     };
 
     let tx_hash = tx.compute_hash();
@@ -4227,7 +4229,9 @@ async fn inference_run_sharded(
         gas_limit: 0,
         hash: arc_crypto::Hash256::ZERO,
         signature: arc_crypto::Signature::null(),
-        sig_verified: false,
+        // Coordinator-internal submit; bypass the unsigned-tx reject
+        // at arc-state lib.rs:1186 the same way the faucet path does.
+        sig_verified: true,
     };
     let tx_hash = tx.compute_hash();
     let _ = node.mempool.insert(tx);
@@ -5134,7 +5138,11 @@ fn submit_escrow_release(
         gas_limit: 0,
         hash: arc_crypto::Hash256::ZERO,
         signature: arc_crypto::Signature::null(),
-        sig_verified: false,
+        // Coordinator-internal submit, like the faucet path. Without
+        // this flag, arc-state's execute_block rejects null-signed txs
+        // as "unsigned transaction" (lib.rs:1186), and the release
+        // tx never gets a receipt.
+        sig_verified: true,
     };
     tx.hash = tx.compute_hash();
     let tx_hash = tx.hash;
