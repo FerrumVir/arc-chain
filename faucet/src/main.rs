@@ -178,66 +178,47 @@ async fn claim(
         );
     }
 
-    // Check rate limit
-    {
-        let mut claims = state.claims.lock().await;
-        if let Some(last_claim) = claims.get(&address) {
-            let elapsed = last_claim.elapsed();
-            if elapsed < Duration::from_secs(RATE_LIMIT_SECS) {
-                let remaining = RATE_LIMIT_SECS - elapsed.as_secs();
-                return (
-                    StatusCode::TOO_MANY_REQUESTS,
-                    Json(serde_json::json!({
-                        "error": format!(
-                            "Rate limited. Try again in {} minutes.",
-                            remaining / 60 + 1
-                        )
-                    })),
-                );
-            }
-        }
-        // Record this claim
-        claims.insert(address.clone(), Instant::now());
-    }
-
-    // Get next nonce
-    let nonce = {
-        let mut n = state.nonce.lock().await;
-        let current = *n;
-        *n += 1;
-        current
-    };
-
-    // Submit transfer transaction to the node
-    let payload = serde_json::json!({
-        "from": state.faucet_address,
-        "to": address,
-        "amount": CLAIM_AMOUNT,
-        "nonce": nonce
-    });
-
-    let url = format!("{}/tx/submit", state.node_url);
+    // Proxy to the chain node's built-in /faucet/claim endpoint. The chain
+    // owns the faucet account, knows its current nonce, applies state under
+    // consensus, and rate-limits per-address. We just pass through.
+    //
+    // (Submitting a Transfer here directly fails: the faucet account has no
+    // private key, so any unsigned Transfer is rejected by /tx/submit. The
+    // chain's /faucet/claim is a privileged path that signs internally.)
+    let url = format!("{}/faucet/claim", state.node_url);
+    let payload = serde_json::json!({ "address": address });
     let result = state.http.post(&url).json(&payload).send().await;
 
     match result {
         Ok(resp) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             let tx_hash = body["tx_hash"].as_str().unwrap_or("unknown").to_string();
+            let amount = body["amount"].as_u64().unwrap_or(CLAIM_AMOUNT);
 
-            // Increment total claims
             {
                 let mut total = state.total_claims.lock().await;
                 *total += 1;
             }
+            // Mirror the chain's rate-limit decision locally for fast rejects
+            // before another network hop next time.
+            {
+                let mut claims = state.claims.lock().await;
+                claims.insert(address.clone(), Instant::now());
+            }
 
-            tracing::info!("Claimed {} ARC -> {} (tx: {})", CLAIM_AMOUNT, &address[..16], &tx_hash[..16.min(tx_hash.len())]);
+            tracing::info!(
+                "Claimed {} ARC -> {} (tx: {})",
+                amount,
+                &address[..16.min(address.len())],
+                &tx_hash[..16.min(tx_hash.len())]
+            );
 
             (
                 StatusCode::OK,
                 Json(serde_json::json!(ClaimResponse {
                     tx_hash,
-                    amount: CLAIM_AMOUNT,
-                    message: format!("{} ARC sent!", CLAIM_AMOUNT),
+                    amount,
+                    message: format!("{} ARC sent!", amount),
                 })),
             )
         }
@@ -245,33 +226,20 @@ async fn claim(
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
             tracing::error!("Node returned {}: {}", status, text);
-
-            // Roll back the nonce on failure
-            {
-                let mut n = state.nonce.lock().await;
-                if *n > 0 {
-                    *n -= 1;
-                }
-            }
-
+            // Pass the chain's status code through (e.g. 429 for rate limits).
+            let mapped = match status.as_u16() {
+                429 => StatusCode::TOO_MANY_REQUESTS,
+                400 => StatusCode::BAD_REQUEST,
+                503 => StatusCode::SERVICE_UNAVAILABLE,
+                _   => StatusCode::BAD_GATEWAY,
+            };
             (
-                StatusCode::BAD_GATEWAY,
-                Json(serde_json::json!({
-                    "error": format!("Node error: {}", text)
-                })),
+                mapped,
+                Json(serde_json::json!({ "error": text })),
             )
         }
         Err(e) => {
             tracing::error!("Failed to connect to node: {}", e);
-
-            // Roll back nonce
-            {
-                let mut n = state.nonce.lock().await;
-                if *n > 0 {
-                    *n -= 1;
-                }
-            }
-
             (
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({

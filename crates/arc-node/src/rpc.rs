@@ -1497,31 +1497,22 @@ async fn sync_manifest(
 
 /// GET /sync/chunk/:index - Returns a single snapshot chunk by index.
 /// Each chunk contains ~1000 accounts with a BLAKE3 integrity proof.
+///
+/// Serializes the canonical `StateSnapshot` struct so `state_sync::fetch_chunk`
+/// (which calls `resp.json::<StateSnapshot>()`) can decode it directly. A prior
+/// version hand-rolled a different JSON shape — accounts as
+/// `[{address, balance, nonce}]` instead of `[[hex, full_account]]` — and
+/// stripped `code_hash`/`storage_root`/`staked_balance`/`chunk_proof`, which
+/// broke every state-sync attempt with "error decoding response body" and
+/// stranded fresh-state nodes (e.g. LHR after `--reset-state`) at round 0.
 async fn sync_chunk(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(index): axum::extract::Path<u32>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<arc_state::StateSnapshot>, StatusCode> {
     let manifest = node.state.export_snapshot_manifest();
     let chunk = node.state.export_snapshot_chunk(index, manifest.chunk_size)
         .ok_or(StatusCode::NOT_FOUND)?;
-
-    let accounts: Vec<Value> = chunk.accounts.iter().map(|(addr, acct)| {
-        json!({
-            "address": format!("{}", addr),
-            "balance": acct.balance,
-            "nonce": acct.nonce,
-        })
-    }).collect();
-
-    Ok(Json(json!({
-        "version": chunk.version,
-        "state_root": format!("{}", chunk.state_root),
-        "chunk_index": chunk.chunk_index,
-        "total_chunks": chunk.total_chunks,
-        "chunk_proof": format!("{}", chunk.chunk_proof),
-        "accounts": accounts,
-        "account_count": chunk.accounts.len(),
-    })))
+    Ok(Json(chunk))
 }
 
 /// GET /sync/status - Returns whether this node can serve snapshots and
