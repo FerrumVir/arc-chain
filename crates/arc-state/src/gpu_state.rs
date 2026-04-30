@@ -1,7 +1,7 @@
 //! GPU-resident state cache for ARC Chain.
 //!
 //! Keeps hot accounts in **real GPU memory** via wgpu unified/managed buffers.
-//! On Apple Silicon (Metal), this is zero-copy unified memory — CPU and GPU
+//! On Apple Silicon (Metal), this is zero-copy unified memory - CPU and GPU
 //! share the same physical pages (~2 TB/s HBM bandwidth vs ~50 GB/s DDR5).
 //! On discrete NVIDIA/AMD GPUs, a staging buffer + device-local buffer pair
 //! handles CPU↔GPU transfers transparently.
@@ -47,9 +47,9 @@ pub enum MemoryTier {
 /// Strategy used to choose which accounts to evict from the GPU tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionPolicy {
-    /// Least Recently Used — evict the account with the oldest `last_access`.
+    /// Least Recently Used - evict the account with the oldest `last_access`.
     Lru,
-    /// Least Frequently Used — evict the account with the lowest `access_count`.
+    /// Least Frequently Used - evict the account with the lowest `access_count`.
     Lfu,
     /// Keep the top-N hottest accounts (by `access_count`), evict the rest.
     HotCold,
@@ -177,7 +177,7 @@ impl CachedAccount {
 }
 
 // ---------------------------------------------------------------------------
-// Access metadata (CPU-side only — avoids GPU writes on reads)
+// Access metadata (CPU-side only - avoids GPU writes on reads)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -227,10 +227,10 @@ pub struct CacheStats {
 
 /// Tiered account cache with real GPU-resident state.
 ///
-/// * **Hot tier** (GPU buffer) — accounts stored in GPU unified/managed memory.
+/// * **Hot tier** (GPU buffer) - accounts stored in GPU unified/managed memory.
 ///   On Metal: zero-copy access at ~2 TB/s. On discrete: staging transfers.
 ///   Bounded by `config.max_gpu_accounts`.
-/// * **Warm tier** (`DashMap`) — CPU RAM overflow for accounts evicted from GPU.
+/// * **Warm tier** (`DashMap`) - CPU RAM overflow for accounts evicted from GPU.
 ///
 /// Access metadata (hit counts, dirty flags) is tracked in a CPU-side `DashMap`
 /// to avoid GPU writes on every read operation.
@@ -240,14 +240,14 @@ pub struct GpuStateCache {
     gpu_buffer: Arc<GpuAccountBuffer>,
     /// CPU-side mirror of GPU-resident accounts for fast individual reads.
     /// On unified memory (Metal), this DashMap and the GPU buffer share the
-    /// same physical memory pages — there is no duplication overhead.
+    /// same physical memory pages - there is no duplication overhead.
     /// On discrete GPUs, this is an explicit CPU-side copy kept in sync.
     cpu_mirror: DashMap<[u8; 32], CachedAccount>,
     /// Address → slot index + access metadata (CPU-side).
     slot_map: DashMap<[u8; 32], AccessMeta>,
     /// Free slot tracking (stack of available slot indices).
     free_slots: parking_lot::Mutex<Vec<usize>>,
-    /// Warm accounts (CPU RAM tier) — overflow from GPU.
+    /// Warm accounts (CPU RAM tier) - overflow from GPU.
     warm: DashMap<[u8; 32], CachedAccount>,
     /// Cache configuration.
     config: GpuStateCacheConfig,
@@ -331,7 +331,7 @@ impl GpuStateCache {
             let meta_snap = meta.clone();
             drop(meta);
 
-            // Read from CPU-side mirror (DashMap) — NOT from GPU buffer.
+            // Read from CPU-side mirror (DashMap) - NOT from GPU buffer.
             if let Some(cached) = self.cpu_mirror.get(address) {
                 let mut result = cached.clone();
                 result.access_count = meta_snap.access_count;
@@ -368,7 +368,7 @@ impl GpuStateCache {
     /// Reads directly from CPU-side mirror, skipping slot_map write-lock
     /// for maximum throughput. Access metadata is not updated.
     pub fn get_account_fast(&self, address: &[u8; 32]) -> Option<Account> {
-        // Read directly from cpu_mirror — single DashMap lookup.
+        // Read directly from cpu_mirror - single DashMap lookup.
         if let Some(cached) = self.cpu_mirror.get(address) {
             return Some(cached.to_account());
         }
@@ -385,10 +385,10 @@ impl GpuStateCache {
     ///
     /// Writes to the CPU-side mirror (for fast individual reads) and tracks
     /// the GPU slot mapping. The actual GPU buffer is updated lazily via
-    /// `flush_to_gpu()` — called once per block before compute shader passes.
+    /// `flush_to_gpu()` - called once per block before compute shader passes.
     /// This avoids per-account wgpu overhead during transaction execution.
     pub fn put(&self, account: CachedAccount) {
-        // Fast path: already in GPU tier — update cpu_mirror only.
+        // Fast path: already in GPU tier - update cpu_mirror only.
         // Skip slot_map write-lock; metadata is updated lazily.
         if self.cpu_mirror.contains_key(&account.address) {
             self.cpu_mirror.insert(account.address, account);
@@ -403,7 +403,7 @@ impl GpuStateCache {
 
         let height = self.current_height.load(Ordering::Relaxed);
 
-        // New account — try to allocate a GPU slot.
+        // New account - try to allocate a GPU slot.
         if let Some(slot) = self.alloc_slot() {
             self.cpu_mirror.insert(account.address, account.clone());
             self.slot_map.insert(
@@ -416,7 +416,7 @@ impl GpuStateCache {
                 },
             );
         } else {
-            // GPU full — place in warm.
+            // GPU full - place in warm.
             let mut warm_acct = account;
             warm_acct.tier = MemoryTier::CpuRam;
             warm_acct.last_access = height;
@@ -458,7 +458,7 @@ impl GpuStateCache {
     pub fn drain_dirty(&self) -> Vec<CachedAccount> {
         let mut dirty = Vec::new();
 
-        // GPU tier — read from CPU mirror (fast), not GPU buffer.
+        // GPU tier - read from CPU mirror (fast), not GPU buffer.
         for mut meta in self.slot_map.iter_mut() {
             if meta.dirty {
                 meta.dirty = false;
@@ -595,7 +595,7 @@ impl GpuStateCache {
                 continue;
             }
 
-            // In warm — promote.
+            // In warm - promote.
             if self.warm.contains_key(addr) {
                 self.promote(addr);
                 if self.config.stats_enabled {
@@ -604,7 +604,7 @@ impl GpuStateCache {
                 continue;
             }
 
-            // Not cached — insert a placeholder in the hot tier.
+            // Not cached - insert a placeholder in the hot tier.
             if let Some(slot) = self.alloc_slot() {
                 let placeholder = CachedAccount {
                     address: *addr,
@@ -832,7 +832,7 @@ mod tests {
         // Access account 0 to refresh its last_access.
         cache.get(&addr(0));
 
-        // Evict 1 — should evict account 1 (oldest un-refreshed).
+        // Evict 1 - should evict account 1 (oldest un-refreshed).
         let evicted = cache.evict(1);
         assert_eq!(evicted, 1);
         assert!(cache.is_gpu_resident(&addr(0)), "account 0 should stay");

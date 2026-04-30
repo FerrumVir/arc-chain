@@ -407,7 +407,7 @@ impl ArcSubmitter {
         // Encode `stateRoot` (bytes32).
         calldata.extend_from_slice(&state_root);
 
-        // Encode `proof` (bytes32[] — dynamic type).
+        // Encode `proof` (bytes32[] - dynamic type).
         // Offset to the dynamic data (5 * 32 = 160 = 0xa0).
         let mut offset_word = [0u8; 32];
         offset_word[31] = 0xa0;

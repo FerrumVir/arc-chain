@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =========================================================================
-# ARC Chain — Testnet Monitor
+# ARC Chain - Testnet Monitor
 # =========================================================================
 # Checks health, block height, peer count, and uptime for all 4 nodes.
 #
@@ -78,7 +78,7 @@ query_node() {
         return
     fi
 
-    # Parse health response — adapt based on actual /health JSON format
+    # Parse health response - adapt based on actual /health JSON format
     BLOCK_HEIGHT=$(echo "$HEALTH" | jq -r '.block_height // .height // "N/A"' 2>/dev/null || echo "N/A")
     PEER_COUNT=$(echo "$HEALTH" | jq -r '.peer_count // .peers // "N/A"' 2>/dev/null || echo "N/A")
     UPTIME=$(echo "$HEALTH" | jq -r '.uptime // .uptime_seconds // "N/A"' 2>/dev/null || echo "N/A")
@@ -126,7 +126,7 @@ display_status() {
         echo "  \"nodes\": ["
     else
         echo ""
-        echo -e "${BOLD}ARC Chain Testnet — Node Status${NC}"
+        echo -e "${BOLD}ARC Chain Testnet - Node Status${NC}"
         echo -e "${DIM}$timestamp${NC}"
         echo "============================================"
         printf "  %-14s %-12s %-10s %-8s %s\n" "NODE" "STATUS" "HEIGHT" "PEERS" "UPTIME"
@@ -189,7 +189,7 @@ display_status() {
 load_ips
 
 if [ "$WATCH_MODE" = true ]; then
-    echo -e "${CYAN}Monitoring mode — refresh every 10s. Press Ctrl+C to stop.${NC}"
+    echo -e "${CYAN}Monitoring mode - refresh every 10s. Press Ctrl+C to stop.${NC}"
     while true; do
         clear
         display_status

@@ -4,9 +4,9 @@
 ![Inference](https://img.shields.io/badge/inference-consensus--verified-purple)
 ![Testnet](https://img.shields.io/badge/testnet-live-green)
 
-# ARC Chain — Trustworthy AI
+# ARC Chain - Trustworthy AI
 
-**A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built so AI inference can pass network consensus — the same way transactions do.**
+**A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built so AI inference can pass network consensus - the same way transactions do.**
 
 **Not a fork. Not a copy. Every line is original.**
 
@@ -18,9 +18,9 @@
 
 Every AI response from a cloud provider is a claim you can't check. You don't know which model ran. You don't know whether the output was truncated, cached, routed, or silently modified. You trust the logo.
 
-ARC makes inference **verifiable by a blockchain the same way transactions are verifiable**. The engine runs in pure integer arithmetic, no floating point. The output hash is bit-identical on ARM, x86, GPU — every chip on earth. Validators can re-run any inference and vote on it the same way they vote on blocks. Invalid outputs are slashed. Honest ones are attested on-chain with cryptographic proof of which model produced them.
+ARC makes inference **verifiable by a blockchain the same way transactions are verifiable**. The engine runs in pure integer arithmetic, no floating point. The output hash is bit-identical on ARM, x86, GPU - every chip on earth. Validators can re-run any inference and vote on it the same way they vote on blocks. Invalid outputs are slashed. Honest ones are attested on-chain with cryptographic proof of which model produced them.
 
-**This is AI that passes consensus.** Inference becomes a first-class on-chain primitive. An oracle you don't need to trust. A model output you can replay, verify, and settle against — at any scale, on any hardware.
+**This is AI that passes consensus.** Inference becomes a first-class on-chain primitive. An oracle you don't need to trust. A model output you can replay, verify, and settle against - at any scale, on any hardware.
 
 ---
 
@@ -31,7 +31,7 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 | **6 seed validators** | NYC · LAX · AMS · LHR · NRT · SGP |
 | **Cluster round** | 1.3 M+ and advancing |
 | **DAG finality** | ~24 ms (2-round commit) |
-| **Self-healing** | each seed runs `arc-self-heal` — drift or RPC silence auto-restarts the node with shard flags preserved |
+| **Self-healing** | each seed runs `arc-self-heal` - drift or RPC silence auto-restarts the node with shard flags preserved |
 | **Deterministic inference** | INT16 engine, ARM Mac = x86 Linux = identical output hash, verified |
 | **Sharded inference** | 32-layer Llama-2-7B distributed across 6 seeds with 3× replication per layer range, BLAKE3 over every hop |
 | **On-chain attestations** | Every inference produces `InferenceAttestation` (0x16) with model hash + input hash + output hash |
@@ -42,11 +42,11 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 
 ## Test it yourself
 
-### ⬇ Download ARC Node — pick your computer
+### ⬇ Download ARC Node - pick your computer
 
 | Your computer | One-click download |
 |---|---|
-| 🍎 **Mac (Apple Silicon — M1/M2/M3/M4)** | **[Download for Apple Silicon Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_aarch64.dmg)** |
+| 🍎 **Mac (Apple Silicon - M1/M2/M3/M4)** | **[Download for Apple Silicon Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_aarch64.dmg)** |
 | 🍎 **Mac (Intel)** | **[Download for Intel Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_x64.dmg)** |
 | 🪟 **Windows 10 / 11** | **[Download for Windows](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_x64-setup.exe)** |
 | 🐧 **Linux (Ubuntu / Debian)** | **[Download .deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.5.4/ARC.Node_0.5.4_amd64.deb)** |
@@ -55,13 +55,15 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 
 > **Not sure which Mac?** Apple menu → *About This Mac*. If chip says "Apple M1/M2/M3/M4" → Apple Silicon. If "Intel" → Intel.
 
-**Install in 60 seconds** (full step-by-step + Gatekeeper/SmartScreen bypass instructions live on the [release page](https://github.com/FerrumVir/arc-chain/releases/tag/v0.5.4)):
+**Install in 60 seconds:**
 
 - **Mac**: open the `.dmg` → drag ARC Node to Applications → first launch right-click → Open
 - **Windows**: run the `.exe` → "More info" → "Run anyway" → Next → Install → Finish
 - **Linux**: `sudo apt install ./ARC.Node_0.5.4_amd64.deb` (or `rpm -i`, or `chmod +x` the AppImage)
 
 The app onboards in 3 clicks (welcome → identity → join), runs in your tray, auto-starts on login, auto-updates when v0.5.5 ships.
+
+**📖 Full walkthrough:** [Getting Started with ARC Node](docs/GETTING_STARTED.md) - install, identity, first inference, faucet, earnings, and FAQ.
 
 ---
 
@@ -95,7 +97,7 @@ Pre-built 16 MB binary. Registers as a launchd / systemd service. Auto-updates d
 
 ## The improvements that made this real
 
-The core thesis — "inference that passes consensus" — only works if the arithmetic is perfectly reproducible. Getting there took a sequence of concrete breakthroughs, each one verified on the live network:
+The core thesis - "inference that passes consensus" - only works if the arithmetic is perfectly reproducible. Getting there took a sequence of concrete breakthroughs, each one verified on the live network:
 
 1. **Pure-integer transformer inference.** Every matmul, softmax, layer norm, and activation in i64 fixed-point. No floating point anywhere on the hot path. Eliminates the only source of hardware drift.
 
@@ -103,13 +105,13 @@ The core thesis — "inference that passes consensus" — only works if the arit
 
 3. **BLAKE3 verification in O(1).** Consensus participants re-run an inference, compare one 32-byte hash. zkML proof-of-inference costs 10⁵–10⁶× the original compute; hash-match costs the same as one forward pass. At 7 B parameters we're already 700× the largest model ever verified by zkML.
 
-4. **Sharded inference with hop-level integrity.** 32-layer model split across 8 VPS. Each shard verifies the previous shard's BLAKE3 hash before computing its own layers. A single corrupted hop invalidates the whole chain — the network notices immediately.
+4. **Sharded inference with hop-level integrity.** 32-layer model split across 8 VPS. Each shard verifies the previous shard's BLAKE3 hash before computing its own layers. A single corrupted hop invalidates the whole chain - the network notices immediately.
 
 5. **Deterministic KV cache.** Integer-only means identical inputs produce identical outputs, so intermediate hidden states are content-addressable. Repeated prompts serve in microseconds. Across the whole network.
 
-6. **Heterogeneous hardware scheduler.** Every node advertises measured compute p50 + current queue depth. The coordinator races the top-K fastest workers per layer range and takes the first-finish — **determinism guarantees the output is identical whichever worker wins**. A 4090 joining today slots in automatically and outruns the CPU seeds; no manual config.
+6. **Heterogeneous hardware scheduler.** Every node advertises measured compute p50 + current queue depth. The coordinator races the top-K fastest workers per layer range and takes the first-finish - **determinism guarantees the output is identical whichever worker wins**. A 4090 joining today slots in automatically and outruns the CPU seeds; no manual config.
 
-7. **Content-addressed model chunks over HTTP.** `GET /chunks/get/{hash}` serves weight bytes straight from a peer. Any new node auto-picks an uncovered layer range (`--auto-shard`) and pulls the chunk from the network — no 4 GB GGUF download. A laptop with 2 GB of RAM can contribute.
+7. **Content-addressed model chunks over HTTP.** `GET /chunks/get/{hash}` serves weight bytes straight from a peer. Any new node auto-picks an uncovered layer range (`--auto-shard`) and pulls the chunk from the network - no 4 GB GGUF download. A laptop with 2 GB of RAM can contribute.
 
 8. **VRF committee re-execution.** For inference gas lane transactions (tier 2 and 3), 7 validators are pseudo-randomly selected per request and must agree on the output hash. Disagreement triggers slashing. Same game-theoretic trust model as normal block finality, applied to AI.
 
@@ -144,7 +146,7 @@ The deterministic integer engine is **2.3× faster than floating-point** on GPU.
 ## How the sharding works
 
 ```
-                  Llama-2-7B — 32 transformer layers, 6 seed nodes,
+                  Llama-2-7B - 32 transformer layers, 6 seed nodes,
                     3× replication per layer range
 
   token id  →  [0,6)  →  [6,12)  →  [12,17)  →  [17,22)  →  [22,27)  →  [27,32)  →  token id
@@ -317,7 +319,7 @@ ARC Chain is in active development. This is a testnet. Do not use real funds. So
 BUSL-1.1. Source-available today. Becomes Apache 2.0 on 2030-03-25.
 
 **Free forever:**
-- Any project under $10 M revenue — full production rights, no approval
+- Any project under $10 M revenue - full production rights, no approval
 - Anything built on ARC Chain at any scale (contracts, tokens, agents, L2s, rollups)
 - Validators, inference providers, observers
 - Research, education, personal projects, forks, experiments

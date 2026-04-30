@@ -1,4 +1,4 @@
-//! Grid transformation primitives — the foundation of the OLM.
+//! Grid transformation primitives - the foundation of the OLM.
 //!
 //! Every function is pure: same input → same output.
 //! Every function operates on integer grids (u8 values).

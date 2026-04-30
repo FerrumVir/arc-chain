@@ -1,6 +1,6 @@
 [package]
 name = "arc-bench"
-description = "ARC Chain benchmark suite — real transaction throughput measurement"
+description = "ARC Chain benchmark suite - real transaction throughput measurement"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

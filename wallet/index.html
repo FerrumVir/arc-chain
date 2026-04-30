@@ -152,7 +152,7 @@ let wallet = null; // {privKey, address}
 })();
 
 // ── Crypto ──
-// Simple SHA-256 in JS (works on HTTP — crypto.subtle needs HTTPS)
+// Simple SHA-256 in JS (works on HTTP - crypto.subtle needs HTTPS)
 function sha256(data) {
   const K = [
     0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
@@ -228,7 +228,7 @@ function showImport() {
 function importWallet() {
   const key = document.getElementById('importKey').value.trim();
   if (key.length !== 64 || !/^[0-9a-f]+$/i.test(key)) {
-    alert('Invalid key — must be 64 hex characters');
+    alert('Invalid key - must be 64 hex characters');
     return;
   }
   const privBytes = new Uint8Array(key.match(/.{2}/g).map(b=>parseInt(b,16)));

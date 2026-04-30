@@ -1,6 +1,6 @@
 [package]
 name = "arc-crypto"
-description = "ARC Chain cryptographic primitives — Pedersen commitments, BLAKE3, Merkle trees, ZK aggregation"
+description = "ARC Chain cryptographic primitives - Pedersen commitments, BLAKE3, Merkle trees, ZK aggregation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -28,11 +28,11 @@ hex.workspace = true
 rayon.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
-# Stwo STARK prover (optional — requires nightly Rust)
+# Stwo STARK prover (optional - requires nightly Rust)
 stwo = { workspace = true, optional = true }
 stwo-constraint-framework = { workspace = true, optional = true }
 num-traits = { workspace = true, optional = true }
-# GPU acceleration (ICICLE — optional, for future GPU Backend)
+# GPU acceleration (ICICLE - optional, for future GPU Backend)
 icicle-runtime = { workspace = true, optional = true }
 icicle-core = { workspace = true, optional = true }
 icicle-m31 = { workspace = true, optional = true }

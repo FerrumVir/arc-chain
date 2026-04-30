@@ -1,17 +1,17 @@
 import { test } from "@playwright/test";
 import { clearState, seedOnboarded } from "./helpers";
 
-// Captures a gallery of the finished UI. Failing this suite does NOT fail CI —
+// Captures a gallery of the finished UI. Failing this suite does NOT fail CI -
 // it's meant for design review. Run with: npx playwright test screenshots.spec.ts
 test.describe("Screenshot gallery", () => {
-  test("onboarding — welcome", async ({ page }) => {
+  test("onboarding - welcome", async ({ page }) => {
     await clearState(page);
     await page.goto("/");
     await page.waitForSelector('[data-testid="step-welcome"]');
     await page.screenshot({ path: "screenshots/01-onboarding-welcome.png", fullPage: false });
   });
 
-  test("onboarding — identity revealed", async ({ page }) => {
+  test("onboarding - identity revealed", async ({ page }) => {
     await clearState(page);
     await page.goto("/");
     await page.getByTestId("btn-continue-welcome").click();
@@ -20,7 +20,7 @@ test.describe("Screenshot gallery", () => {
     await page.screenshot({ path: "screenshots/02-onboarding-identity.png" });
   });
 
-  test("onboarding — launch ready", async ({ page }) => {
+  test("onboarding - launch ready", async ({ page }) => {
     await clearState(page);
     await page.goto("/");
     await page.getByTestId("btn-continue-welcome").click();
@@ -30,7 +30,7 @@ test.describe("Screenshot gallery", () => {
     await page.screenshot({ path: "screenshots/03-onboarding-launch.png" });
   });
 
-  test("dashboard — stopped", async ({ page }) => {
+  test("dashboard - stopped", async ({ page }) => {
     await seedOnboarded(page);
     await page.goto("/");
     await page.waitForSelector('[data-testid="dashboard"]');
@@ -38,7 +38,7 @@ test.describe("Screenshot gallery", () => {
     await page.screenshot({ path: "screenshots/05-dashboard-stopped.png" });
   });
 
-  test("dashboard — running", async ({ page }) => {
+  test("dashboard - running", async ({ page }) => {
     await seedOnboarded(page);
     await page.goto("/");
     await page.getByTestId("btn-start").click();

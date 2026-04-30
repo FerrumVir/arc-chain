@@ -1,4 +1,4 @@
-//! Block-STM — optimistic parallel transaction execution with adaptive mode.
+//! Block-STM - optimistic parallel transaction execution with adaptive mode.
 //!
 //! Statically predicts the read/write set of each transaction from its body,
 //! partitions transactions into conflict-free batches, and executes each batch
@@ -22,7 +22,7 @@ pub struct TxAccessSet {
 
 /// Compute the access set for a single transaction.
 ///
-/// This is a *static* prediction based on the transaction body — no execution
+/// This is a *static* prediction based on the transaction body - no execution
 /// required.  It is conservative: every account that *might* be touched is
 /// included.  False positives (extra accounts) are safe; false negatives would
 /// cause silent conflicts.
@@ -75,7 +75,7 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             // Sender account is already included; inference registry is global state.
         }
         TxBody::InferenceEscrowOpen(body) => {
-            // Escrow address is deterministic from request_id — include it
+            // Escrow address is deterministic from request_id - include it
             // so two opens on the same request_id don't run in parallel.
             accounts.insert(
                 arc_types::transaction::InferenceEscrowOpenBody::escrow_address(
@@ -133,7 +133,7 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             );
         }
         TxBody::ShardAssignmentProposal(_) => {
-            // Proposal storage key is deterministic from the input-hash —
+            // Proposal storage key is deterministic from the input-hash -
             // tx.from being tracked above is enough for correctness.
         }
     }
@@ -148,7 +148,7 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
 /// runs first, then batch 1, etc.  Within each batch, execution order does not
 /// matter.
 ///
-/// Returns `Vec<Vec<usize>>` — each inner vec is a batch of tx indices.
+/// Returns `Vec<Vec<usize>>` - each inner vec is a batch of tx indices.
 ///
 /// **Nonce ordering constraint**: transactions from the same sender must execute
 /// in nonce order.  This is enforced by always placing same-sender txs in
@@ -172,7 +172,7 @@ pub fn partition_batches(transactions: &[Transaction]) -> Vec<Vec<usize>> {
             // Check if any account in this tx's access set is already in the batch
             let conflicts = access.accounts.iter().any(|a| batch_accts.contains(a));
             if !conflicts {
-                // No conflict — add to this batch
+                // No conflict - add to this batch
                 batch_accts.extend(&access.accounts);
                 batches[b].push(i);
                 placed = true;
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn test_disjoint_transfers_one_batch() {
-        // A→B and C→D are disjoint — should be in the same batch
+        // A→B and C→D are disjoint - should be in the same batch
         let txs = vec![
             make_transfer(addr(1), addr(2), 0),
             make_transfer(addr(3), addr(4), 0),
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn test_conflicting_transfers_separate_batches() {
-        // A→B and C→B conflict on B — should be in separate batches
+        // A→B and C→B conflict on B - should be in separate batches
         let txs = vec![
             make_transfer(addr(1), addr(2), 0),
             make_transfer(addr(3), addr(2), 0),
@@ -229,7 +229,7 @@ mod tests {
 
     #[test]
     fn test_same_sender_separate_batches() {
-        // A→B and A→C conflict on A (sender) — must be sequential
+        // A→B and A→C conflict on A (sender) - must be sequential
         let txs = vec![
             make_transfer(addr(1), addr(2), 0),
             make_transfer(addr(1), addr(3), 1),
@@ -283,9 +283,9 @@ mod tests {
 /// 4. Small blocks (<100 TXs) → sequential (overhead not worth it)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdaptiveMode {
-    /// Execute sequentially — lowest overhead for simple workloads.
+    /// Execute sequentially - lowest overhead for simple workloads.
     Sequential,
-    /// Execute with BlockSTM — parallel for diverse workloads.
+    /// Execute with BlockSTM - parallel for diverse workloads.
     BlockSTM,
 }
 
@@ -342,7 +342,7 @@ pub fn choose_execution_mode(transactions: &[Transaction]) -> AdaptiveMode {
 }
 
 // ===========================================================================
-// Speculative Block-STM — optimistic parallel execution with conflict detection
+// Speculative Block-STM - optimistic parallel execution with conflict detection
 // ===========================================================================
 //
 // Unlike the pessimistic `partition_batches()` above which pre-partitions
@@ -425,7 +425,7 @@ pub enum TxStatus {
     Pending,
     /// Executed speculatively, awaiting validation.
     Executed,
-    /// Validated successfully — no conflicts found.
+    /// Validated successfully - no conflicts found.
     Validated,
     /// Needs re-execution due to a read/write conflict.
     NeedsReExecution,
@@ -437,7 +437,7 @@ pub enum TxStatus {
 /// pipeline:
 ///
 /// 1. All txs execute in parallel (optimistic)
-/// 2. Validate read sets — check if any read was overwritten by a lower-index tx
+/// 2. Validate read sets - check if any read was overwritten by a lower-index tx
 /// 3. Re-execute conflicting txs (max 3 rounds)
 /// 4. Fallback to sequential for remaining conflicts
 pub struct SpeculativeScheduler {
@@ -783,7 +783,7 @@ pub fn execute_speculative(
 }
 
 // ===========================================================================
-// Tests — Speculative Block-STM
+// Tests - Speculative Block-STM
 // ===========================================================================
 
 #[cfg(test)]
@@ -845,7 +845,7 @@ mod speculative_tests {
     fn test_speculative_scheduler_no_conflicts() {
         let scheduler = SpeculativeScheduler::new(3);
 
-        // Three txs writing to different accounts — no conflicts
+        // Three txs writing to different accounts - no conflicts
         for i in 0..3 {
             let mut access_set = SpeculativeTxAccessSet::default();
             let mut a = [0u8; 32];
@@ -885,7 +885,7 @@ mod speculative_tests {
             gas_used: 21000,
         });
 
-        // TX 1 reads shared account from base (not from TX 0) — conflict
+        // TX 1 reads shared account from base (not from TX 0) - conflict
         let mut access1 = SpeculativeTxAccessSet::default();
         access1.reads.insert(shared_addr, (1000, 0, usize::MAX)); // Read stale value
         access1.writes.insert(shared_addr, (800, 1));
@@ -926,7 +926,7 @@ mod speculative_tests {
         ];
 
         let (results, unresolved) = execute_speculative(&txs, &accounts);
-        // Both senders are different, receivers are different — no conflicts
+        // Both senders are different, receivers are different - no conflicts
         assert_eq!(results.len(), 2);
         assert!(unresolved.is_empty());
         assert!(results.iter().all(|r| r.success));
@@ -955,7 +955,7 @@ mod speculative_tests {
         ];
 
         let (results, unresolved) = execute_speculative(&txs, &accounts);
-        // Shared receiver causes a conflict — after re-execution both should resolve
+        // Shared receiver causes a conflict - after re-execution both should resolve
         // or one may remain unresolved depending on validation rounds
         let total = results.len() + unresolved.len();
         assert_eq!(total, 2);

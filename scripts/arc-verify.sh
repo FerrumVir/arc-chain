@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Inference Verifier
+# ARC Chain - Inference Verifier
 #
 # Take an inference attestation tx_hash, fetch its on-chain details
 # (input, output, model_id, output_hash), re-run the SAME input through
@@ -67,7 +67,7 @@ fi
 
 if [ -z "$TX_HASH" ]; then
     cat <<USAGE
-${BOLD}arc-verify.sh${RESET} — independently verify a past inference attestation
+${BOLD}arc-verify.sh${RESET} - independently verify a past inference attestation
 
 USAGE:
   arc-verify.sh <tx_hash>           # verify a specific past attestation
@@ -107,7 +107,7 @@ TX_HASH_FULL="0x${TX_HASH_CLEAN}"
 cat <<HEADER
 ${BOLD}${CYAN}
   ╔══════════════════════════════════════════════════════════════╗
-  ║   ARC Chain — Inference Verifier                             ║
+  ║   ARC Chain - Inference Verifier                             ║
   ╚══════════════════════════════════════════════════════════════╝${RESET}
 
   Coordinator: ${COORDINATOR}
@@ -217,7 +217,7 @@ printf "${CYAN}[3/3]${RESET} Comparing hashes...\n"
 echo ""
 
 if [ "$ORIG_OUTPUT_HASH" = "$NEW_OUTPUT_HASH" ] && [ "$ORIG_MODEL_HASH" = "$NEW_MODEL_HASH" ]; then
-    printf "  ${BOLD}${GREEN}✓ VERIFIED${RESET} — both output_hash and model_hash match the attestation.\n"
+    printf "  ${BOLD}${GREEN}✓ VERIFIED${RESET} - both output_hash and model_hash match the attestation.\n"
     printf "\n"
     printf "  This is cryptographic proof that:\n"
     printf "    • The same model was used (model_hash identical)\n"

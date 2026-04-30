@@ -2,7 +2,7 @@
 name = "arc-olm"
 version = "0.1.0"
 edition = "2024"
-description = "Ontological Language Model — deterministic reasoning via typed DAG search"
+description = "Ontological Language Model - deterministic reasoning via typed DAG search"
 license = "MIT"
 
 [dependencies]

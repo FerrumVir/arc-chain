@@ -150,7 +150,7 @@ async fn main() {
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut request_id);
     let model_id = hash_bytes(b"arc-testnet-llama-2-7b-chat-q4");
     let max_fee: u64 = 1_000;
-    let max_tokens: u32 = 3; // short — saves testnet time
+    let max_tokens: u32 = 3; // short - saves testnet time
     let timeout_blocks: u64 = 10_000;
 
     let body = InferenceEscrowOpenBody {
@@ -181,7 +181,7 @@ async fn main() {
     println!("open_tx_hash: 0x{}", open_hash_hex);
 
     // Step 5: submit + wait for commit. Use pre-serialized JSON body
-    // explicitly — `.json(&tx)` reqwest path was racing with diag_open
+    // explicitly - `.json(&tx)` reqwest path was racing with diag_open
     // submission and intermittently dropping the tx.
     let json_body = serde_json::to_string(&tx).expect("serialize tx");
     let resp = quick
@@ -194,7 +194,7 @@ async fn main() {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        eprintln!("open submit failed: {} — {}", status, body);
+        eprintln!("open submit failed: {} - {}", status, body);
         std::process::exit(1);
     }
     println!("open submitted, waiting for commit…");
@@ -239,7 +239,7 @@ async fn main() {
     if !infer.status().is_success() {
         let s = infer.status();
         let b = infer.text().await.unwrap_or_default();
-        eprintln!("run_consensus failed: {} — {}", s, b);
+        eprintln!("run_consensus failed: {} - {}", s, b);
         std::process::exit(1);
     }
     let infer_body: Value = infer.json().await.expect("run_consensus parse");

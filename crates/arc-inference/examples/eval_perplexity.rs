@@ -4,7 +4,7 @@
 //! This provides the missing quality metric for the determinism paper.
 //!
 //! The inference forward pass is 100% deterministic integer arithmetic.
-//! Only the perplexity *measurement* (log-softmax) uses f64 — this is standard
+//! Only the perplexity *measurement* (log-softmax) uses f64 - this is standard
 //! practice even for floating-point models.
 //!
 //! Usage:
@@ -22,7 +22,7 @@ const ONE: f64 = 65536.0; // Q16 fixed-point scale
 /// Compute log-softmax in f64 from Q16 integer logits.
 ///
 /// The inference engine produces logits in Q16 (deterministic, integer-only).
-/// We convert to f64 for the perplexity *measurement*, which is standard —
+/// We convert to f64 for the perplexity *measurement*, which is standard -
 /// even FP16 models measure perplexity in f64.
 fn log_softmax_f64(logits_q16: &[i64]) -> Vec<f64> {
     // Convert Q16 logits to f64
@@ -116,7 +116,7 @@ fn main() {
         if next_token < log_probs.len() {
             neg_log_likelihood_sum -= log_probs[next_token];
         } else {
-            // OOV token — use worst-case
+            // OOV token - use worst-case
             neg_log_likelihood_sum -= (-(model.config.vocab_size as f64)).ln();
         }
         n_evaluated += 1;

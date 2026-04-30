@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Check On-Chain Inference Attestations
+# ARC Chain - Check On-Chain Inference Attestations
 #
 # Lists recent inference attestations from the network.
 # Proves every inference that happened is cryptographically logged on-chain.
@@ -22,7 +22,7 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-echo -e "${CYAN}${BOLD}ARC Chain — Recent Inference Attestations${NC}"
+echo -e "${CYAN}${BOLD}ARC Chain - Recent Inference Attestations${NC}"
 echo "  Node: ${NODE}"
 echo ""
 

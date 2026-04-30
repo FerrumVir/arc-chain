@@ -4,7 +4,7 @@
 //! Weights stay quantized in memory. Dequantization to i64 happens per-layer
 //! during the forward pass, so memory usage equals GGUF size + activations.
 //!
-//! Works for ANY model size — 1B, 8B, 70B — as long as the GGUF fits in RAM.
+//! Works for ANY model size - 1B, 8B, 70B - as long as the GGUF fits in RAM.
 
 #[cfg(feature = "candle")]
 use candle_core::{Device, Tensor};
@@ -71,7 +71,7 @@ fn get_meta_u32(content: &gguf_file::Content, key: &str) -> Result<u32, Inferenc
 /// on-the-fly during the forward pass, then dropped. This means:
 /// - Memory = GGUF size + one layer of i64 activations
 /// - Works for any model size (1B, 8B, 70B)
-/// - Forward pass is pure i64 — deterministic on all platforms
+/// - Forward pass is pure i64 - deterministic on all platforms
 #[cfg(feature = "candle")]
 pub fn generate_integer_from_gguf(
     path: &str,
@@ -107,7 +107,7 @@ pub fn generate_integer_from_gguf(
         .unwrap_or(32000);
 
     // Read RoPE base frequency from metadata (LLaMA-3 uses 500000, most others use 10000)
-    // Handle both F32 and F64 storage — some quantizers write F64
+    // Handle both F32 and F64 storage - some quantizers write F64
     let _rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
         Some(gguf_file::Value::F32(v)) => *v as f64,
         Some(gguf_file::Value::F64(v)) => *v,
@@ -158,7 +158,7 @@ pub fn generate_integer_from_gguf(
             hidden.extend_from_slice(&embedding[idx * d_model..(idx + 1) * d_model]);
         }
 
-        // Process each transformer layer (streaming — load, run, drop)
+        // Process each transformer layer (streaming - load, run, drop)
         for layer in 0..n_layers {
             let prefix = format!("blk.{layer}");
 
@@ -253,7 +253,7 @@ pub fn generate_integer_from_gguf(
                 let gate = matmul_i64(&w_gate, &[], &normed_ff, d_model, d_ff);
                 let up = matmul_i64(&w_up, &[], &normed_ff, d_model, d_ff);
 
-                // SiLU(x) = x * sigmoid(x) — proper integer implementation via LUT
+                // SiLU(x) = x * sigmoid(x) - proper integer implementation via LUT
                 let mut gated = Vec::with_capacity(d_ff);
                 for i in 0..d_ff {
                     gated.push((silu_i64(gate[i]) * up[i]) >> FRAC_BITS);
@@ -267,7 +267,7 @@ pub fn generate_integer_from_gguf(
             }
 
             hidden = output;
-            // Layer weights dropped here — memory freed
+            // Layer weights dropped here - memory freed
 
             if layer % 4 == 0 {
                 tracing::debug!("Layer {}/{} complete (step {})", layer + 1, n_layers, token_step);

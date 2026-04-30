@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Test Inference (dead simple verification)
+# ARC Chain - Test Inference (dead simple verification)
 #
 # Runs inference locally, shows result, fetches on-chain attestation.
 # Proves: inference works, output is hashed, attestation is on-chain.
@@ -23,7 +23,7 @@ NC='\033[0m'
 
 echo -e "${CYAN}${BOLD}"
 echo "  ╔══════════════════════════════════════════╗"
-echo "  ║     ARC Chain — Inference Test           ║"
+echo "  ║     ARC Chain - Inference Test           ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo -e "${NC}"
 

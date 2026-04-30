@@ -1,4 +1,4 @@
-//! Cached Integer Model Benchmark — Production-speed deterministic inference.
+//! Cached Integer Model Benchmark - Production-speed deterministic inference.
 //!
 //! Loads GGUF model ONCE at startup, then generates tokens using cached weights
 //! with KV cache and rayon parallelism. Pure i64, cross-platform deterministic.
@@ -42,7 +42,7 @@ fn main() {
     let eos: Vec<u32> = if is_llama3 { vec![128001, 128009] } else { vec![2] };
 
     eprintln!("═══════════════════════════════════════════════════════════");
-    eprintln!("ARC Chain — Cached Integer Model (Production Speed)");
+    eprintln!("ARC Chain - Cached Integer Model (Production Speed)");
     eprintln!("═══════════════════════════════════════════════════════════");
     eprintln!("  Platform: {} {}", std::env::consts::OS, std::env::consts::ARCH);
     eprintln!("  Model:    {}", model_path);

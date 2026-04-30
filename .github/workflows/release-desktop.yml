@@ -102,7 +102,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
-            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is empty — the updater won't validate. Paste the contents of src-tauri/.tauri-keys/arc-desktop.key (without a password) into GitHub repo secrets."
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY secret is empty - the updater won't validate. Paste the contents of src-tauri/.tauri-keys/arc-desktop.key (without a password) into GitHub repo secrets."
             exit 1
           fi
           npx tauri build ${{ matrix.tauri-args }}
@@ -151,7 +151,7 @@ jobs:
         # Mac arm64 and Mac x64 both produce identically-named
         # `ARC Node.app.tar.gz`. softprops/action-gh-release flattens
         # all uploads into the release and the second one overwrites
-        # the first — so users on x86_64 Macs would download the arm64
+        # the first - so users on x86_64 Macs would download the arm64
         # binary (or vice versa). Stamp the basename with the target
         # arch so each shows up as a distinct release asset.
         run: |
@@ -189,7 +189,7 @@ jobs:
         # The Tauri updater reads a manifest with per-target (url, signature)
         # pairs. Without a matching entry the platform falls back to
         # "no update available", so we list every target we shipped a bundle
-        # for. Missing signature files are a hard error — silently shipping
+        # for. Missing signature files are a hard error - silently shipping
         # a release without auto-update was the bug we fixed in #29.
         run: |
           set -euo pipefail
@@ -224,7 +224,7 @@ jobs:
           linux_archive=$(find bundles/arc-desktop-linux-x86_64 -name '*.AppImage' -not -name '*.sig' | head -1)
           linux_sig="${linux_archive}.sig"
 
-          # GitHub replaces spaces in asset filenames with dots on upload —
+          # GitHub replaces spaces in asset filenames with dots on upload -
           # e.g. local `ARC Node_aarch64.app.tar.gz` becomes the asset
           # `ARC.Node_aarch64.app.tar.gz` on the release page. The
           # auto-updater 404s if we publish the original space-bearing URL,

@@ -3,7 +3,7 @@ use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Block header — compact representation anchoring all transactions.
+/// Block header - compact representation anchoring all transactions.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BlockHeader {
     /// Block height (monotonically increasing).
@@ -84,7 +84,7 @@ impl Block {
 ///
 /// Contains the set of accounts that changed during block execution and the
 /// resulting state root.  Verifiers apply the diff to their local state copy
-/// and confirm the root matches — O(k) verification instead of full re-execution.
+/// and confirm the root matches - O(k) verification instead of full re-execution.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateDiff {
     /// Accounts that were created or modified.
@@ -104,7 +104,7 @@ pub struct AccountChange {
 
 // ─── Protocol Versioning & Upgrade Scheduling ────────────────────────────────
 
-/// Protocol version identifier — follows semantic versioning (major.minor.patch).
+/// Protocol version identifier - follows semantic versioning (major.minor.patch).
 ///
 /// Breaking consensus changes increment `major`; backward-compatible rule
 /// additions increment `minor`; non-consensus fixes increment `patch`.
@@ -144,7 +144,7 @@ impl ProtocolVersion {
         self.major == other.major
     }
 
-    /// Serde default helper — returns GENESIS.  Used by `#[serde(default)]` on
+    /// Serde default helper - returns GENESIS.  Used by `#[serde(default)]` on
     /// `BlockHeader::protocol_version` so that blocks serialized before this
     /// field existed deserialize without error.
     fn genesis_default() -> Self {
@@ -241,7 +241,7 @@ impl UpgradeSchedule {
         {
             if height <= last_activated_height {
                 return Err(format!(
-                    "cannot schedule upgrade at height {} — already past activated height {}",
+                    "cannot schedule upgrade at height {} - already past activated height {}",
                     height, last_activated_height
                 ));
             }
@@ -449,7 +449,7 @@ mod tests {
         // At height 999, both still pending.
         assert_eq!(schedule.pending_upgrades(999).len(), 2);
 
-        // At height 1000, V1 is no longer pending — only V2.
+        // At height 1000, V1 is no longer pending - only V2.
         let pending = schedule.pending_upgrades(1000);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].version, ProtocolVersion::new(2, 0, 0));
@@ -478,16 +478,16 @@ mod tests {
             })
             .unwrap();
 
-        // Before V1 — nothing active.
+        // Before V1 - nothing active.
         assert!(!schedule.is_feature_active(&FeatureFlag::BlockSTM, 999));
         assert!(!schedule.is_feature_active(&FeatureFlag::FalconSignatures, 999));
 
-        // At V1 — V1 features active.
+        // At V1 - V1 features active.
         assert!(schedule.is_feature_active(&FeatureFlag::BlockSTM, 1000));
         assert!(schedule.is_feature_active(&FeatureFlag::JmtState, 1000));
         assert!(!schedule.is_feature_active(&FeatureFlag::FalconSignatures, 1000));
 
-        // At V2 — all features active (V1 features carry forward).
+        // At V2 - all features active (V1 features carry forward).
         assert!(schedule.is_feature_active(&FeatureFlag::BlockSTM, 5000));
         assert!(schedule.is_feature_active(&FeatureFlag::FalconSignatures, 5000));
         assert!(schedule.is_feature_active(&FeatureFlag::EncryptedMempool, 5000));
@@ -580,7 +580,7 @@ mod tests {
         schedule.activate_upgrades(1000);
         assert_eq!(schedule.current_version, ProtocolVersion::V1);
 
-        // Between V1 and V2 — still V1.
+        // Between V1 and V2 - still V1.
         schedule.activate_upgrades(3000);
         assert_eq!(schedule.current_version, ProtocolVersion::V1);
 
@@ -588,7 +588,7 @@ mod tests {
         schedule.activate_upgrades(5000);
         assert_eq!(schedule.current_version, ProtocolVersion::new(2, 0, 0));
 
-        // Well past V2 — stays at V2.
+        // Well past V2 - stays at V2.
         schedule.activate_upgrades(99999);
         assert_eq!(schedule.current_version, ProtocolVersion::new(2, 0, 0));
     }

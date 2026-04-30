@@ -505,7 +505,7 @@ impl InferenceCache {
     /// Retrieve a cached entry by key, incrementing the hit count.
     pub fn get(&mut self, key: &[u8; 32]) -> Option<&CacheEntry> {
         if self.entries.contains_key(key) {
-            // Increment hit count — we need to use get_mut then return immutable ref
+            // Increment hit count - we need to use get_mut then return immutable ref
             if let Some(entry) = self.entries.get_mut(key) {
                 entry.hit_count += 1;
             }

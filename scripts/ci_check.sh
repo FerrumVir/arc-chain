@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# ARC Chain — Comprehensive CI Check
+# ARC Chain - Comprehensive CI Check
 # Runs: fmt check, clippy, build, test, benchmark compilation
 # Generates pass/fail summary
 
-# Don't use set -e — we handle errors manually per check
+# Don't use set -e - we handle errors manually per check
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -33,7 +33,7 @@ run_check() {
 }
 
 echo "================================================================"
-echo " ARC Chain — CI Check Suite"
+echo " ARC Chain - CI Check Suite"
 echo " $(date)"
 echo "================================================================"
 
@@ -59,7 +59,7 @@ if TEST_OUTPUT=$(cargo test --workspace 2>&1); then
     echo "  Passed:        ${TOTAL_TESTS:-0}"
     echo "  Failed:        ${TOTAL_FAILED:-0}"
 else
-    echo "  (skipped — workspace does not compile)"
+    echo "  (skipped - workspace does not compile)"
 fi
 
 # 6. Count lines of code

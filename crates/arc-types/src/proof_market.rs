@@ -249,7 +249,7 @@ struct RequestEntry {
 
 // ─── Proof marketplace ───────────────────────────────────────────────────────
 
-/// The proof marketplace — matches proof requesters with provers.
+/// The proof marketplace - matches proof requesters with provers.
 #[derive(Debug)]
 pub struct ProofMarketplace {
     requests: HashMap<[u8; 32], RequestEntry>,

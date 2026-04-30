@@ -1,4 +1,4 @@
-//! Q4 direct computation — 4-bit weights, half the memory, ~2x speed.
+//! Q4 direct computation - 4-bit weights, half the memory, ~2x speed.
 //!
 //! Symmetric per-row 4-bit quantization: each weight stored as signed nibble [-7, 7].
 //! Packed 2 values per byte (low nibble first, biased by 8 for unsigned storage).
@@ -196,7 +196,7 @@ mod tests {
     fn test_q4_matmul_basic() {
         let i8w = I8Weights::quantize_f32(
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
-        // Q4 requires even cols — pad to 4
+        // Q4 requires even cols - pad to 4
         let i8w = I8Weights::quantize_f32(
             &[1.0, 2.0, 3.0, 0.0, 4.0, 5.0, 6.0, 0.0], 2, 4);
         let q4 = Q4Weights::from_i8(&i8w);

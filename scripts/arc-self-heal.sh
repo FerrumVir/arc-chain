@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — on-host self-heal daemon (closes GH #30)
+# ARC Chain - on-host self-heal daemon (closes GH #30)
 #
 # Runs on EACH seed host as a systemd service. Polls localhost:9090/health
 # every 30 s and restarts the local arc-node process on either of:
@@ -11,7 +11,7 @@
 #
 # Replaces the manual kick-loop TJ ran during the autopilot window. The
 # restart reuses the exact argv + environment of the live process by reading
-# /proc/PID/cmdline and /proc/PID/environ — so every --shard-range and the
+# /proc/PID/cmdline and /proc/PID/environ - so every --shard-range and the
 # critical ARC_PUBLIC_SOCKET variable survive the restart.
 #
 # Safety:
@@ -34,19 +34,19 @@
 #   ARC_MIN_HEALTHY_PEERS=4
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Never use `set -e` — one transient curl failure must not kill the daemon.
+# Never use `set -e` - one transient curl failure must not kill the daemon.
 set -u
 
 ARC_DIR="${ARC_DIR:-/root/arc-chain}"
 RPC_PORT="${ARC_RPC_PORT:-9090}"
 POLL_INTERVAL="${ARC_POLL_INTERVAL:-30}"
-# 180s silent threshold — longer than the issue's initial 60s proposal. The
+# 180s silent threshold - longer than the issue's initial 60s proposal. The
 # multi-range model reload on seed hosts takes ~3 min (3× GGUF open), during
 # which /health is silent. 60s tripped during normal boot and risked flapping.
 SILENT_THRESHOLD="${ARC_SILENT_THRESHOLD:-180}"
 DRIFT_THRESHOLD="${ARC_DRIFT_THRESHOLD:-300}"
 PEER_ADVANCE_MIN="${ARC_PEER_ADVANCE_MIN:-100}"
-# 600s debounce — with a ~3 min cold-boot, 300s could re-restart a node still
+# 600s debounce - with a ~3 min cold-boot, 300s could re-restart a node still
 # loading its shards. 10 minutes gives a restarted node generous room to fully
 # rejoin before the daemon is allowed to try again.
 RESTART_DEBOUNCE="${ARC_RESTART_DEBOUNCE:-600}"
@@ -59,13 +59,13 @@ STATE_FILE="${ARC_DIR}/.self-heal-last-good.sh"
 # 2026-04-27: arc-inference-traffic.service was crowding the chain's
 # block-production slot with stale benchmark Transfer txs (one tx/block,
 # 100% rejected at execute_tx because the synthetic sender has no
-# state) — drowning real submissions including Milestone B's escrow
+# state) - drowning real submissions including Milestone B's escrow
 # release flow. Unconditionally stop + disable the service every poll
 # so a manual `systemctl start` or a future package install can't
 # silently re-enable the hog.
 #
 # Override with ALLOW_INFERENCE_TRAFFIC=1 (e.g. dedicated benchmark
-# nodes) — but the production seed config never wants this on.
+# nodes) - but the production seed config never wants this on.
 ALLOW_INFERENCE_TRAFFIC="${ALLOW_INFERENCE_TRAFFIC:-0}"
 
 mkdir -p "$ARC_DIR"
@@ -150,7 +150,7 @@ persist_last_good() {
     env_lines=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
         | grep -E '^(ARC_|PATH=|HOME=|USER=|LANG=)')
     {
-        printf '# arc-self-heal last-good snapshot — %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf '# arc-self-heal last-good snapshot - %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
         printf 'LAST_CWD=%q\n' "$cwd"
         printf 'LAST_CMDLINE=%q\n' "$cmdline"
         printf 'LAST_ENV=(\n'
@@ -194,7 +194,7 @@ restart_arc_node() {
     [ -z "${cwd:-}" ] && cwd="$ARC_DIR"
 
     # Hard kill any surviving arc-node. -9 because we've already decided it's
-    # broken — a clean shutdown would hang on the same path that hung /health.
+    # broken - a clean shutdown would hang on the same path that hung /health.
     # -x matches the exact comm="arc-node" (not argv substrings) so we can't
     # accidentally SIGKILL ourselves or any other process whose cmdline has
     # "arc-node" in it.
@@ -210,7 +210,7 @@ restart_arc_node() {
             export "$kv"
         done <<< "$env_lines"
         cd "$cwd" || exit 1
-        # setsid + nohup + disown per autopilot learnings — screen-based
+        # setsid + nohup + disown per autopilot learnings - screen-based
         # launches dropped silently from non-tty ssh.
         setsid nohup bash -c "exec $cmdline" </dev/null >>"$boot_log" 2>&1 &
         disown
@@ -240,7 +240,7 @@ while true; do
     # Stop + disable on every poll unless explicitly allowed.
     if [ "$ALLOW_INFERENCE_TRAFFIC" != "1" ]; then
         if systemctl is-active arc-inference-traffic.service 2>/dev/null | grep -qx active; then
-            log "stale benchmark traffic detected — stopping arc-inference-traffic.service"
+            log "stale benchmark traffic detected - stopping arc-inference-traffic.service"
             systemctl stop arc-inference-traffic.service 2>/dev/null || true
             systemctl disable arc-inference-traffic.service 2>/dev/null || true
         fi
@@ -250,13 +250,13 @@ while true; do
         # /tx/submit ...` from /opt/arc-traffic.sh, generating null-sig
         # Transfer spam that crowded out user txs at the 1-tx/block rate.
         if systemctl is-active arc-traffic.service 2>/dev/null | grep -qx active; then
-            log "stale arc-traffic.service detected — stopping"
+            log "stale arc-traffic.service detected - stopping"
             systemctl stop arc-traffic.service 2>/dev/null || true
             systemctl disable arc-traffic.service 2>/dev/null || true
         fi
         # Match cmdline-grep: any process with /tx/submit OR
         # /opt/arc-traffic in argv. -f is full-cmdline; we kill our own
-        # script too if we ever match — guarded by checking PID isn't $$.
+        # script too if we ever match - guarded by checking PID isn't $$.
         for pid in $(pgrep -f '/tx/submit\|/opt/arc-traffic' 2>/dev/null); do
             if [ "$pid" != "$$" ] && [ "$pid" != "$PPID" ]; then
                 log "killing orphan spam pid=$pid ($(ps -p $pid -o args= 2>/dev/null | head -c 60))"
@@ -308,7 +308,7 @@ while true; do
             DELTA=$((BEST_PEER - MY_ROUND))
             if [ "$BEST_PEER" -gt "$MY_ROUND" ] && [ "$DELTA" -ge "$PEER_ADVANCE_MIN" ]; then
                 if [ "$HEALTHY_COUNT" -lt "$MIN_HEALTHY_PEERS" ]; then
-                    log "drift detected (my=$MY_ROUND peer=$BEST_PEER Δ=$DELTA) but only $HEALTHY_COUNT healthy peers (<$MIN_HEALTHY_PEERS); refusing restart — chain already fragile"
+                    log "drift detected (my=$MY_ROUND peer=$BEST_PEER Δ=$DELTA) but only $HEALTHY_COUNT healthy peers (<$MIN_HEALTHY_PEERS); refusing restart - chain already fragile"
                 elif [ $((NOW - LAST_RESTART)) -lt "$RESTART_DEBOUNCE" ]; then
                     log "drift detected but debounce active ($((NOW - LAST_RESTART))s since last restart)"
                 else

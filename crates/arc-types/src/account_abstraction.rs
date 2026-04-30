@@ -266,7 +266,7 @@ impl SmartAccount {
                 return limit.spent_today.saturating_add(amount) <= limit.daily_limit;
             }
         }
-        // No limit configured for this token — allow.
+        // No limit configured for this token - allow.
         true
     }
 
@@ -544,7 +544,7 @@ mod tests {
         // Over limit
         assert!(!acct.check_spending_limit(&native_token, 1_000_001));
 
-        // Unknown token (no limit configured) — should be allowed
+        // Unknown token (no limit configured) - should be allowed
         assert!(acct.check_spending_limit(&test_key(42), 999_999_999));
     }
 
@@ -594,7 +594,7 @@ mod tests {
         assert!(req.add_approval(approval1));
         assert!(!req.is_approved()); // Still pending (need 2)
 
-        // Duplicate approval from same guardian — rejected
+        // Duplicate approval from same guardian - rejected
         let dup = RecoveryApproval {
             guardian: test_key(10),
             approved_at: 160,
@@ -602,7 +602,7 @@ mod tests {
         };
         assert!(!req.add_approval(dup));
 
-        // Second (different) guardian — threshold met
+        // Second (different) guardian - threshold met
         let approval2 = RecoveryApproval {
             guardian: test_key(11),
             approved_at: 200,
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].key, test_key(11));
 
-        // Revoke key 11 — now none active at 550
+        // Revoke key 11 - now none active at 550
         acct.revoke_session_key(&test_key(11));
         assert_eq!(acct.active_session_keys(550).len(), 0);
 

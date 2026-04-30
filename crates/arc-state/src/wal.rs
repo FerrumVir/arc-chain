@@ -1,7 +1,7 @@
 //! Write-Ahead Log (WAL) for ARC Chain state persistence.
 //!
 //! Every state mutation is journaled to an append-only file BEFORE acknowledging.
-//! Sequential writes only — never seeks, never reads during execution.
+//! Sequential writes only - never seeks, never reads during execution.
 //! The async writer batches entries and flushes to SSD periodically.
 
 use arc_crypto::Hash256;
@@ -48,7 +48,7 @@ pub enum WalOp {
     /// Store contract WASM bytecode.
     SetContract(Address, Vec<u8>),
     /// Checkpoint: marks a consistent state root at this point.
-    /// Used for crash recovery — replay starts from the last checkpoint.
+    /// Used for crash recovery - replay starts from the last checkpoint.
     Checkpoint(Hash256),
     /// Store a DAG consensus block (hash → serialized DagBlock).
     /// Enables consensus state recovery after restart.
@@ -212,7 +212,7 @@ impl WalWriter {
             checksum,
         };
 
-        // Best effort — if the channel is full or disconnected, we log and continue.
+        // Best effort - if the channel is full or disconnected, we log and continue.
         // In production, this should never happen (writer is faster than execution).
         if self.sender.send(WalCommand::Append(entry)).is_err() {
             tracing::error!("WAL writer channel disconnected");
@@ -535,7 +535,7 @@ pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut data = vec![0u8; len];
         if reader.read_exact(&mut data).is_err() {
-            break; // Truncated entry — stop here (crash mid-write)
+            break; // Truncated entry - stop here (crash mid-write)
         }
 
         match bincode::deserialize::<WalEntry>(&data) {
@@ -552,7 +552,7 @@ pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
                         "WAL entry {} has invalid checksum, stopping replay",
                         entries.len()
                     );
-                    break; // Corrupted entry — stop here
+                    break; // Corrupted entry - stop here
                 }
             }
             Err(_) => {

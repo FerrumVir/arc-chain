@@ -1,4 +1,4 @@
-//! LLM program-generation engine — asks Ollama to generate a COMPLETE program
+//! LLM program-generation engine - asks Ollama to generate a COMPLETE program
 //! as a sequence of operation names, then verifies and executes.
 //!
 //! Instead of step-by-step DAG navigation (which overfits to training examples),
@@ -6,7 +6,7 @@
 //! full program in one shot.  We try multiple attempts with varying temperature
 //! and also try nearby operation variants.
 //!
-//! This is Engine 5 in the solver pipeline — runs after evolution if `--llm`
+//! This is Engine 5 in the solver pipeline - runs after evolution if `--llm`
 //! is passed and time remains.
 
 use crate::Grid;

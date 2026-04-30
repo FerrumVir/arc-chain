@@ -1,4 +1,4 @@
-# ARC Chain — 4-Node Testnet Deployment
+# ARC Chain - 4-Node Testnet Deployment
 
 Deploy a production-grade ARC Chain testnet on Hetzner Cloud with 4 ARM64 validator nodes.
 

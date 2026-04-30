@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Community Node Installer (one command, persistent, auto-updating)
+# ARC Chain - Community Node Installer (one command, persistent, auto-updating)
 #
 # Installs an ARC inference node that:
 #   1. Downloads the latest pre-built binary for your OS/arch
@@ -11,7 +11,7 @@
 #        macOS: ~/Library/LaunchAgents/com.arc.inference.plist (launchd)
 #        Linux: /etc/systemd/system/arc-node.service (systemd)
 #   6. Installs a daily auto-updater that checks GitHub for new releases
-#   7. Joins the testnet as an observer (stake 0) — contributes inference compute
+#   7. Joins the testnet as an observer (stake 0) - contributes inference compute
 #
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
@@ -43,7 +43,7 @@ INSTALL_UPDATER=true
 USER_MODEL=""
 DO_UNINSTALL=false
 
-# No default model download. The network is model-agnostic — nodes join and
+# No default model download. The network is model-agnostic - nodes join and
 # provide consensus + TPS immediately. If the user has a local GGUF model,
 # they can point to it with --model and also provide inference compute.
 # The network discovers which models are available across all nodes and
@@ -76,7 +76,7 @@ fail() { printf "%s[FAIL]%s %s\n" "$RED" "$RESET" "$*" >&2; exit 1; }
 cat <<BANNER
 ${BOLD}${CYAN}
   ╔════════════════════════════════════════════════════════════╗
-  ║   ARC Chain — Community Node Installer                     ║
+  ║   ARC Chain - Community Node Installer                     ║
   ║   Verifiable AI inference. Run it. Earn from the network.  ║
   ╚════════════════════════════════════════════════════════════╝${RESET}
 BANNER
@@ -173,7 +173,7 @@ curl -fsL -o "$ARC_DIR/seeds.txt" "https://raw.githubusercontent.com/${REPO}/mai
 curl -fsL -o "$ARC_DIR/genesis.toml" "https://raw.githubusercontent.com/${REPO}/main/genesis.toml"
 ok "Seeds + genesis downloaded"
 
-# ── Model detection (NO download — network is model-agnostic) ──────────────
+# ── Model detection (NO download - network is model-agnostic) ──────────────
 # Nodes join the network and contribute consensus + TPS immediately.
 # No model download required. If the user already has a local GGUF model,
 # they pass --model /path/to/model.gguf and the node also provides
@@ -199,7 +199,7 @@ else
         fi
     done
     if [ -z "$MODEL_PATH" ]; then
-        ok "No model needed — node joins network for consensus + TPS immediately"
+        ok "No model needed - node joins network for consensus + TPS immediately"
         info "To also provide inference, add a model later:"
         info "  arc-node --model /path/to/any-model.gguf"
     fi
@@ -284,7 +284,7 @@ UPDATER_EOF
 chmod +x "$UPDATER_PATH"
 ok "Auto-updater script: $UPDATER_PATH"
 
-# Build model args (empty if model not yet downloaded — node starts without it)
+# Build model args (empty if model not yet downloaded - node starts without it)
 if [ -n "$MODEL_PATH" ] && [ -f "$MODEL_PATH" ]; then
     MODEL_PLIST_ARGS="<string>--model</string><string>$MODEL_PATH</string>"
     MODEL_SYSTEMD_ARGS="--model $MODEL_PATH"
@@ -293,7 +293,7 @@ else
     MODEL_PLIST_ARGS=""
     MODEL_SYSTEMD_ARGS=""
     MODEL_SHELL_ARGS=""
-    info "No model yet — node joins consensus immediately. Model downloads in background."
+    info "No model yet - node joins consensus immediately. Model downloads in background."
 fi
 
 # ── Install service ─────────────────────────────────────────────────────────
@@ -374,7 +374,7 @@ UPLIST_EOF
         fi
     elif [ "$OS" = "Linux" ]; then
         if [ "$EUID" -ne 0 ] && ! command -v sudo >/dev/null; then
-            warn "No root and no sudo — falling back to background process (not persistent)"
+            warn "No root and no sudo - falling back to background process (not persistent)"
             nohup "$ARC_DIR/bin/arc-node" \
                 --rpc "0.0.0.0:$RPC_PORT" --p2p-port "$P2P_PORT" \
                 --seeds-file "$ARC_DIR/seeds.txt" --genesis "$ARC_DIR/genesis.toml" \
@@ -469,7 +469,7 @@ else
 fi
 
 # ── Sanity check: wait for the node to come up AND connect to peers ─────────
-# A node with status=ok but peers=0 is RUNNING but ISOLATED — it'll propose
+# A node with status=ok but peers=0 is RUNNING but ISOLATED - it'll propose
 # its own DAG blocks forever without ever seeing the real chain. That's the
 # most common community-install failure and health-status alone doesn't catch
 # it. We explicitly wait for peers >= 1 before declaring success.
@@ -484,7 +484,7 @@ for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
         break
     fi
     sleep 5
-    [ $i -eq 12 ] && warn "Node not responding yet — check $ARC_DIR/node.log"
+    [ $i -eq 12 ] && warn "Node not responding yet - check $ARC_DIR/node.log"
 done
 
 if [ "$NODE_UP" = true ]; then
@@ -496,7 +496,7 @@ if [ "$NODE_UP" = true ]; then
             | sed -n 's/.*"peers":\([0-9][0-9]*\).*/\1/p')
         PEER_COUNT=${PEER_COUNT:-0}
         if [ "$PEER_COUNT" -ge 1 ] 2>/dev/null; then
-            ok "Connected to $PEER_COUNT peer(s) — node is actually part of the network"
+            ok "Connected to $PEER_COUNT peer(s) - node is actually part of the network"
             break
         fi
         printf "."
@@ -515,9 +515,9 @@ if [ "$NODE_UP" = true ]; then
         echo "  to port 9091. ARC uses QUIC (UDP) for P2P, not TCP."
         echo ""
         echo "  ${BOLD}Quick diagnosis:${RESET}"
-        echo "    nc -zu -w 3 136.244.109.1 9091  # AMS — should print 'succeeded'"
-        echo "    nc -zu -w 3 202.182.107.41 9091 # NRT — should print 'succeeded'"
-        echo "    nc -zu -w 3 139.84.237.49 9091  # JNB — should print 'succeeded'"
+        echo "    nc -zu -w 3 136.244.109.1 9091  # AMS - should print 'succeeded'"
+        echo "    nc -zu -w 3 202.182.107.41 9091 # NRT - should print 'succeeded'"
+        echo "    nc -zu -w 3 139.84.237.49 9091  # JNB - should print 'succeeded'"
         echo ""
         echo "  ${BOLD}If the nc tests succeed but peers stays 0:${RESET}"
         echo "    tail -f $ARC_DIR/node.log | grep -E 'Handshake|Failed|Timeout'"

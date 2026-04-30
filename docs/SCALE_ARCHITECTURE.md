@@ -1,4 +1,4 @@
-# ARC Chain Scale Architecture — True Spec
+# ARC Chain Scale Architecture - True Spec
 
 **Status:** Design doc, 2026-04-20. Supersedes ad-hoc assumptions baked into the v0.5.2 seed deployment.
 
@@ -16,9 +16,9 @@ Before the forward plan, the truth about what went wrong in the session that pre
 
 2. **Didn't compare against a reference implementation until the end of the session.** I had `candle_transformers` linked for GGUF loading the whole time. A single 30-line probe against candle's `ModelWeights::forward` would have shown on day one that our argmax matches. Instead I wrote `probe_i16_vs_i8.rs`, `probe_i16_matmul.rs`, `probe_i16_real_weights.rs`, `probe_hidden_magnitudes.rs` chasing shadows.
 
-3. **Confused "output magnitude" with "output correctness".** When block-i8 produced logits 52× larger than broken-I8, I interpreted that as a bug. It was the *fix*. Broken-I8 was 36× undersized; block-i8 produces the correct magnitude. The fact that PPL didn't improve with the "fix" was because PPL measures distribution tail, not argmax — and our single-token argmax was already correct.
+3. **Confused "output magnitude" with "output correctness".** When block-i8 produced logits 52× larger than broken-I8, I interpreted that as a bug. It was the *fix*. Broken-I8 was 36× undersized; block-i8 produces the correct magnitude. The fact that PPL didn't improve with the "fix" was because PPL measures distribution tail, not argmax - and our single-token argmax was already correct.
 
-4. **Misread the architecture.** Assumed sharding was load-bearing for 7B when it's not (7B fits on any device). The real reason sharding breaks isn't the scheme — it's that the current deployment has **1 node per shard range**, so any single node dropping kills the pipeline. Saw this happen live during the session (JNB and SAO went offline → shard dispatch returned `?`) and still didn't name the right fix until TJ pushed back.
+4. **Misread the architecture.** Assumed sharding was load-bearing for 7B when it's not (7B fits on any device). The real reason sharding breaks isn't the scheme - it's that the current deployment has **1 node per shard range**, so any single node dropping kills the pipeline. Saw this happen live during the session (JNB and SAO went offline → shard dispatch returned `?`) and still didn't name the right fix until TJ pushed back.
 
 5. **Chased academic benchmarks instead of the product claim.** WikiText-2 PPL 5.47 parity is a research benchmark. The chain's actual value prop is "N independent nodes computed the same answer, verifiable cross-platform." Argmax correctness + hash consensus is what matters, not log-likelihood tails.
 
@@ -37,7 +37,7 @@ Before the forward plan, the truth about what went wrong in the session that pre
 - **Block-i8 weight quantization is correct.** `probe_block_i8.rs` + `probe_i16_real_weights.rs` show ratio 1.000 vs f32 ground truth on real Llama-2-7B tensors (attn_q, ffn_down, output.weight).
 - **Network is alive.** 6 of 8 seeds healthy at consensus round 1.28M+, Mac syncing.
 - **Install flow works on Intel Mac** (after this session's `arc-node-macos-x86_64` upload to v0.5.3).
-- **Tunnel-backed sharded inference works** when JNB and SAO are online — produces coherent text, different prompts yield different hashes.
+- **Tunnel-backed sharded inference works** when JNB and SAO are online - produces coherent text, different prompts yield different hashes.
 
 ### 1.3 Known limitations (real, not chased-shadows)
 
@@ -49,23 +49,23 @@ Before the forward plan, the truth about what went wrong in the session that pre
 
 ---
 
-## 2. True Spec — what the chain must be
+## 2. True Spec - what the chain must be
 
 ### 2.1 Core invariants (non-negotiable)
 
 1. **Cross-platform bitwise determinism.** Same model + same prompt on ARM + x86 + GPU = same output bytes. This is the IP.
-2. **No floating-point transcendentals in the hot path.** No `exp`, `log`, `sin`, `cos`, `sqrt`, `tanh` from libm — they differ across platforms. Use integer LUTs.
+2. **No floating-point transcendentals in the hot path.** No `exp`, `log`, `sin`, `cos`, `sqrt`, `tanh` from libm - they differ across platforms. Use integer LUTs.
 3. **No FMA contracts.** The compiler must not fuse `a*b+c` into `fma(a,b,c)` because FMA produces platform-dependent rounding. Compile with LLVM's `-fno-fp-contract` equivalent.
 4. **Deterministic reduction order.** Scalar reductions, or SIMD only where bit-identical per arch.
-5. **IEEE-754 f32 basic ops (+, -, *, /, abs, copysign, sqrt) are permitted per Rust RFC 3514** — they're cross-platform bit-identical. Use this for f32 scale application; keep transcendentals integer.
+5. **IEEE-754 f32 basic ops (+, -, *, /, abs, copysign, sqrt) are permitted per Rust RFC 3514** - they're cross-platform bit-identical. Use this for f32 scale application; keep transcendentals integer.
 
 ### 2.2 Scale properties the chain must guarantee
 
 1. **Any device participates** at a tier matching its RAM/SSD/CPU budget.
 2. **Any model** (small, medium, 70B+, MoE, future architectures) is serviceable by the network given enough nodes with aggregate capacity.
-3. **Graceful degradation** — reduced redundancy still serves inference; no single node failure takes down a model; cluster survives correlated outages in one region.
-4. **Economically efficient** — operators get paid more for rarer/larger-model capacity, driving diversification naturally.
-5. **Cryptographically verifiable** — every inference is signed by a committee whose hashes agree; divergence is on-chain evidence of bad behavior and is slashable.
+3. **Graceful degradation** - reduced redundancy still serves inference; no single node failure takes down a model; cluster survives correlated outages in one region.
+4. **Economically efficient** - operators get paid more for rarer/larger-model capacity, driving diversification naturally.
+5. **Cryptographically verifiable** - every inference is signed by a committee whose hashes agree; divergence is on-chain evidence of bad behavior and is slashable.
 
 ### 2.3 Sizing examples
 
@@ -137,7 +137,7 @@ The whole "sharding" language is a red herring for small models. For a 7B model 
 
 This is massively simpler than pipelined sharding and works for every model size ≤ max-per-node capacity. Only fall back to pipelined sharding when the model legitimately doesn't fit.
 
-### 2.6 Quality vs. correctness — the honest claim
+### 2.6 Quality vs. correctness - the honest claim
 
 - **Correctness (argmax)**: our integer forward produces the same argmax as candle's reference Q8_0 on every tested position. Generation output is coherent Llama-grade text.
 - **Quality (PPL tail)**: our integer path has a ~5× PPL gap vs reference on short benchmark snippets due to cumulative integer-arithmetic noise. Doesn't affect argmax; does affect confidence calibration.
@@ -148,38 +148,38 @@ This is massively simpler than pipelined sharding and works for every model size
 
 ## 3. Implementation roadmap
 
-### Phase 1 — stop the bleeding (immediate)
+### Phase 1 - stop the bleeding (immediate)
 
 - [ ] **Rolling upgrade seeds to full-model replication for 7B.** Remove `--shard-start/--shard-end` flags. Each seed loads full 4GB Llama-2-7B. Each seed serves `/inference/run` independently. One seed at a time per the ABSOLUTE RULE.
 - [ ] **Update dashboard**: "Run on All 8" fires 8 parallel `/inference/run` requests (not sharded). Each produces output + hash. Verify all 8 match. Show wall time + speedup.
 - [ ] **Tear down the NYC:10000 tunnel + watchdog.** Not needed when every seed serves full inference.
 - [ ] **Retire single-point-of-failure shard path for 7B.** Keep code for future 70B.
 
-### Phase 2 — committee consensus (within week)
+### Phase 2 - committee consensus (within week)
 
 - [ ] Committee selection RPC: `/inference/committee` picks `k` replicas, returns node list.
 - [ ] Coordinator-less inference: user hits any node, it forms a k-of-m committee, fires parallel, hashes agree, returns.
 - [ ] Divergence handling: `/inference/dispute` accepts two attestations with different hashes, posts to chain for slashing.
 
-### Phase 3 — dynamic model registry (within 2 weeks)
+### Phase 3 - dynamic model registry (within 2 weeks)
 
 - [ ] On-chain `register_model` tx: content-addressed weights, registrants pay base fee.
 - [ ] On-chain `offer_capacity` tx: node publishes RAM/SSD, opts into models.
 - [ ] Scheduler publishes shard-plan + replica-list per model, updated on capacity changes.
 - [ ] P2P weight distribution: nodes pull model files by content hash from peers holding it.
 
-### Phase 4 — large model sharding (when demand materializes)
+### Phase 4 - large model sharding (when demand materializes)
 
 - [ ] Pipeline-parallel inference with redundant shard replicas (3× per range minimum).
 - [ ] Merkle-rooted consensus on shard boundaries.
 - [ ] Token-by-token attestation.
 
-### Phase 5 — quality parity (research track, parallel to Phase 1-4)
+### Phase 5 - quality parity (research track, parallel to Phase 1-4)
 
 - [ ] SmoothQuant-style offline activation smoothing per registered model (one-time calibration on corpus).
 - [ ] Per-channel per-block scales stored as f32 in weight file (RFC 3514 deterministic).
 - [ ] Target: <1 PPL gap vs candle Q8_0 on WikiText-2 full test set.
-- [ ] Publish results — no one has deterministic cross-platform FP-parity LLM inference at 7B yet.
+- [ ] Publish results - no one has deterministic cross-platform FP-parity LLM inference at 7B yet.
 
 ---
 
@@ -187,15 +187,15 @@ This is massively simpler than pipelined sharding and works for every model size
 
 All under `crates/arc-inference/examples/`:
 
-- `probe_i16_vs_i8.rs` — A/B of I16 vs I8 forward logit magnitudes.
-- `probe_i16_matmul.rs` — synthetic single-row matmul sanity check.
-- `probe_i16_real_weights.rs` — matmul correctness vs f32 ground truth on real Llama tensors.
-- `probe_block_i8.rs` — block-i8 quantization correctness on real tensors.
-- `probe_dispatch.rs` — confirms block-i8 is actually dispatching in forward.
-- `probe_hidden_magnitudes.rs` — per-layer hidden-state trace through the forward pass.
-- `probe_candle_vs_integer.rs` — candle Q8_0 vs our integer on BOS token.
-- `probe_candle_multi.rs` — multi-position comparison through a prompt.
-- `probe_candle_ppl.rs` — candle PPL on same tokens as eval_perplexity.
+- `probe_i16_vs_i8.rs` - A/B of I16 vs I8 forward logit magnitudes.
+- `probe_i16_matmul.rs` - synthetic single-row matmul sanity check.
+- `probe_i16_real_weights.rs` - matmul correctness vs f32 ground truth on real Llama tensors.
+- `probe_block_i8.rs` - block-i8 quantization correctness on real tensors.
+- `probe_dispatch.rs` - confirms block-i8 is actually dispatching in forward.
+- `probe_hidden_magnitudes.rs` - per-layer hidden-state trace through the forward pass.
+- `probe_candle_vs_integer.rs` - candle Q8_0 vs our integer on BOS token.
+- `probe_candle_multi.rs` - multi-position comparison through a prompt.
+- `probe_candle_ppl.rs` - candle PPL on same tokens as eval_perplexity.
 
 Anyone debugging quality should run these before making changes.
 

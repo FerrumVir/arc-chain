@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — One-Click Node Installer
+# ARC Chain - One-Click Node Installer
 # https://github.com/FerrumVir/arc-chain
 #
 # Usage:
@@ -99,7 +99,7 @@ if command -v rustc >/dev/null 2>&1; then
     RUST_VER="$(rustc --version)"
     ok "Rust already installed: $RUST_VER"
 else
-    info "Rust not found — installing via rustup..."
+    info "Rust not found - installing via rustup..."
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
     # shellcheck disable=SC1091
     source "$HOME/.cargo/env"
@@ -115,7 +115,7 @@ step "Cloning ARC Chain repository"
 mkdir -p "$ARC_HOME"
 
 if [ -d "$REPO_DIR/.git" ]; then
-    info "Repository already exists — pulling latest changes..."
+    info "Repository already exists - pulling latest changes..."
     git -C "$REPO_DIR" pull --ff-only || warn "Pull failed; continuing with existing code"
     ok "Repository updated"
 else
@@ -125,7 +125,7 @@ else
 fi
 
 # ── 5. Build in release mode ────────────────────────────────────────────────
-step "Building ARC Chain (release mode — this may take a few minutes)"
+step "Building ARC Chain (release mode - this may take a few minutes)"
 
 cd "$REPO_DIR"
 # Use nightly + stwo-prover for real STARK proofs if available, fall back to stable
@@ -134,7 +134,7 @@ if rustup run nightly cargo --version >/dev/null 2>&1; then
     ok "Build complete (nightly + Stwo STARK): $REPO_DIR/target/release/arc-node"
 else
     cargo build --release -p arc-node 2>&1 | tail -1
-    ok "Build complete (stable, mock prover — install nightly for real STARKs): $REPO_DIR/target/release/arc-node"
+    ok "Build complete (stable, mock prover - install nightly for real STARKs): $REPO_DIR/target/release/arc-node"
 fi
 
 ARC_BIN="$REPO_DIR/target/release/arc-node"
@@ -143,7 +143,7 @@ ARC_BIN="$REPO_DIR/target/release/arc-node"
 step "Creating configuration"
 
 if [ -f "$CONFIG_FILE" ]; then
-    warn "Config already exists at $CONFIG_FILE — skipping (delete it to regenerate)"
+    warn "Config already exists at $CONFIG_FILE - skipping (delete it to regenerate)"
 else
     cat > "$CONFIG_FILE" <<'TOML'
 # ARC Chain Node Configuration
@@ -172,7 +172,7 @@ fi
 step "Generating validator keypair"
 
 if [ -f "$KEY_FILE" ]; then
-    warn "Keypair already exists at $KEY_FILE — skipping (delete it to regenerate)"
+    warn "Keypair already exists at $KEY_FILE - skipping (delete it to regenerate)"
 else
     # Generate a 32-byte random seed, derive Ed25519 keypair using openssl
     SEED_HEX="$(openssl rand -hex 32)"

@@ -1,4 +1,4 @@
-//! ARC Chain — Parallel Execution Benchmark
+//! ARC Chain - Parallel Execution Benchmark
 //!
 //! Compares all three execution modes side-by-side:
 //!   1. Sequential (baseline)
@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(
     name = "arc-bench-parallel",
-    about = "ARC Chain — Sequential vs Block-STM vs Coalesced Benchmark"
+    about = "ARC Chain - Sequential vs Block-STM vs Coalesced Benchmark"
 )]
 struct Args {
     /// Total transactions to process per mode.
@@ -129,7 +129,7 @@ fn run_mode(
     while results_received < batches_submitted {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            eprintln!("  {}: TIMEOUT — got {}/{} results", mode_name, results_received, batches_submitted);
+            eprintln!("  {}: TIMEOUT - got {}/{} results", mode_name, results_received, batches_submitted);
             break;
         }
 
@@ -203,7 +203,7 @@ fn main() {
     let args = Args::parse();
 
     println!("================================================================");
-    println!(" ARC Chain — FULL PIPELINE Benchmark (CPU + GPU)");
+    println!(" ARC Chain - FULL PIPELINE Benchmark (CPU + GPU)");
     println!("================================================================");
     println!();
     println!("  Tests EVERY combination of verify + execute mode:");

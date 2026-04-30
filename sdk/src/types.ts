@@ -1,5 +1,5 @@
 // ─── ARC Chain Core Types ─────────────────────────────────────
-// Agent Runtime Chain — TypeScript SDK
+// Agent Runtime Chain - TypeScript SDK
 
 /** 32-byte hex string (0x-prefixed, 66 chars) */
 export type Hash256 = string;

@@ -61,7 +61,7 @@ export class ArcAgent {
     return new ArcAgent(client, wallet, config);
   }
 
-  /** Initialize agent — sync nonce from chain */
+  /** Initialize agent - sync nonce from chain */
   async init(): Promise<void> {
     await this.wallet.syncNonce(this.client);
     this._initialized = true;

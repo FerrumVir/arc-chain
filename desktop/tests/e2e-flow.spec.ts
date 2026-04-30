@@ -1,7 +1,7 @@
 // End-to-end flow tests exercising the six fixes that unblocked testnet
 // release (arc-node CLI spawn args, bundled seeds/genesis, BIP-39 validator
 // seed, auto-download binary, real attestation-backed earnings, Gatekeeper
-// docs). These tests run against the mock IPC layer — exhaustive live
+// docs). These tests run against the mock IPC layer - exhaustive live
 // behaviour is covered by tests/live.spec.ts.
 import { expect, test } from "@playwright/test";
 import * as fs from "node:fs";
@@ -68,7 +68,7 @@ test.describe("Onboarding → launch end-to-end", () => {
       path.resolve(REPO_DESKTOP, "src", "screens", "Onboarding.tsx"),
       "utf8",
     );
-    // Faucet claim must be gated on waitForPeer returning true — not
+    // Faucet claim must be gated on waitForPeer returning true - not
     // fired unconditionally (would burn the daily limit on nodes that
     // never joined).
     expect(src).toMatch(/waitForPeer/);
@@ -88,9 +88,9 @@ test.describe("Earnings chart uses real attestation data", () => {
     await page.getByTestId("nav-earnings").click();
     await expect(page.getByTestId("earnings-screen")).toBeVisible();
 
-    // Mock attestations: rewardArc values 12.5, 34.8, 67.2 — sum 114.5.
+    // Mock attestations: rewardArc values 12.5, 34.8, 67.2 - sum 114.5.
     // All three timestamped within the last ~4 minutes so they all land
-    // in today's bucket. The bar values rendered as toFixed(0) — today's
+    // in today's bucket. The bar values rendered as toFixed(0) - today's
     // bar should read "115" (rounded from 114.5) and the other 6 should
     // read "0". The old Math.random implementation would land every bar
     // in the 100-400 range so any bar > 200 would prove regression.
@@ -103,7 +103,7 @@ test.describe("Earnings chart uses real attestation data", () => {
     // Extract numeric bar-top labels (the div above each bar).
     // The simplest check: at least one bar shows a non-zero number that's
     // below the Math.random() floor (100), and the majority of bars read 0.
-    // Count the "0" bars — expect ≥ 5 of 7.
+    // Count the "0" bars - expect ≥ 5 of 7.
     const zeroCount = labels.filter((l) => l === "0").length;
     expect(zeroCount).toBeGreaterThanOrEqual(5);
 

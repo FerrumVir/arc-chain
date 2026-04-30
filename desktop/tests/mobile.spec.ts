@@ -7,7 +7,7 @@ import { seedOnboarded } from "./helpers";
 
 test.use({ ...devices["Pixel 7"] });
 
-test.describe("Mobile layout (Pixel 7, 412×915) — seeded", () => {
+test.describe("Mobile layout (Pixel 7, 412×915) - seeded", () => {
   test.beforeEach(async ({ page }) => {
     await seedOnboarded(page);
   });
@@ -37,7 +37,7 @@ test.describe("Mobile layout (Pixel 7, 412×915) — seeded", () => {
     }
   });
 
-  test("page header stacks vertically — title above actions", async ({
+  test("page header stacks vertically - title above actions", async ({
     page,
   }) => {
     await page.goto("/");
@@ -99,8 +99,8 @@ test.describe("Mobile layout (Pixel 7, 412×915) — seeded", () => {
   });
 });
 
-test.describe("Mobile layout (Pixel 7, 412×915) — onboarding", () => {
-  // Intentionally NO beforeEach — this test needs a fresh, un-seeded store.
+test.describe("Mobile layout (Pixel 7, 412×915) - onboarding", () => {
+  // Intentionally NO beforeEach - this test needs a fresh, un-seeded store.
   test("all three steps reachable at phone size", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByTestId("step-welcome")).toBeVisible();

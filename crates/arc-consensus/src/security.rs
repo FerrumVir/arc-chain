@@ -264,7 +264,7 @@ impl CheckpointRegistry {
             if *round >= chain_min && *round <= chain_max {
                 match round_to_hash.get(round) {
                     Some(hash) if *hash == checkpoint.block_hash => {
-                        // Consistent — continue checking.
+                        // Consistent - continue checking.
                     }
                     Some(_) => {
                         warn!(
@@ -274,7 +274,7 @@ impl CheckpointRegistry {
                         return false;
                     }
                     None => {
-                        // Chain doesn't include this round at all — suspicious but
+                        // Chain doesn't include this round at all - suspicious but
                         // may happen with sparse block refs. We treat missing as
                         // invalid since the chain should cover checkpoint rounds.
                         warn!(
@@ -296,7 +296,7 @@ impl CheckpointRegistry {
     /// that would require rewriting finalized history.
     pub fn is_valid_fork_point(&self, round: u64) -> bool {
         if self.latest_round == 0 {
-            // No checkpoints yet — any fork point is acceptable.
+            // No checkpoints yet - any fork point is acceptable.
             return true;
         }
         // Fork at or after the checkpoint round is valid. In DAG consensus,
@@ -381,7 +381,7 @@ pub struct PenaltyRecord {
 /// Calculate the slash amount for a given offense and stake.
 ///
 /// Graduated slashing schedule:
-/// - `DoubleVote`: 100% of stake (most severe — direct safety violation)
+/// - `DoubleVote`: 100% of stake (most severe - direct safety violation)
 /// - `Equivocation`: 100% of stake (equivalent severity to double vote)
 /// - `InvalidBlock`: 50% of stake (attempted protocol violation)
 /// - `WithholdingBlock`: 10% of stake (liveness degradation)
@@ -577,11 +577,11 @@ mod tests {
             }
         }
 
-        // Window of 50 covers rounds 51-100 — all present, no withholding.
+        // Window of 50 covers rounds 51-100 - all present, no withholding.
         let reports = detector.detect_withholding(50);
         assert!(reports.is_empty(), "Recent window should show no withholding");
 
-        // Window of 100 covers everything — 50 missing out of 100 = 0.5, not > 0.5.
+        // Window of 100 covers everything - 50 missing out of 100 = 0.5, not > 0.5.
         let reports_full = detector.detect_withholding(100);
         assert!(
             reports_full.is_empty(),
@@ -708,7 +708,7 @@ mod tests {
     fn checkpoint_fork_point_validity() {
         let mut registry = CheckpointRegistry::new();
 
-        // No checkpoints — any fork point is fine.
+        // No checkpoints - any fork point is fine.
         assert!(registry.is_valid_fork_point(0));
         assert!(registry.is_valid_fork_point(500));
 

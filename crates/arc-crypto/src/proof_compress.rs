@@ -542,7 +542,7 @@ mod tests {
         assert!(stats.original_bytes > 0);
         assert!(stats.compressed_bytes > 0);
         assert!(stats.ratio > 0.0);
-        assert!(stats.ratio <= 1.5); // sanity — should not be wildly worse
+        assert!(stats.ratio <= 1.5); // sanity - should not be wildly worse
     }
 
     #[test]

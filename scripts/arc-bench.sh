@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Factual Benchmark
+# ARC Chain - Factual Benchmark
 #
 # Runs 10 factual prompts through the sharded inference pipeline and
 # checks each output for an expected keyword. Captures latency, tx_hash,
@@ -63,7 +63,7 @@ fi
 
 # Markdown header
 cat <<HEADER
-# ARC Chain — Factual Benchmark Report
+# ARC Chain - Factual Benchmark Report
 
 Runs 10 factual prompts through the sharded inference pipeline and checks
 each output for the expected keyword. Reproducible: anyone with curl + python3
@@ -104,7 +104,7 @@ for entry in "${PROMPTS[@]}"; do
         -d "$BODY" 2>/dev/null || echo "")
 
     if [ -z "$RESP" ]; then
-        printf "| %d | %s | %s | (request failed) | ✗ | — | — |\n" "$TOTAL" "$PROMPT" "$EXPECTED"
+        printf "| %d | %s | %s | (request failed) | ✗ | - | - |\n" "$TOTAL" "$PROMPT" "$EXPECTED"
         FAIL=$((FAIL + 1))
         continue
     fi
@@ -141,7 +141,7 @@ cat <<FOOTER
 - **Pass rate**: $PASS / $TOTAL ($(( PASS * 100 / TOTAL ))%)
 - **Average ms/token**: $AVG_MS
 - **Pipeline length**: 7 shards (Llama-2-7B-Chat Q4_K_M, 32 layers split across 7 nodes in 7 cities)
-- **All output_hashes** are deterministic — re-running this benchmark on any node will produce the same hashes
+- **All output_hashes** are deterministic - re-running this benchmark on any node will produce the same hashes
 
 To reproduce:
 

@@ -1,4 +1,4 @@
-//! Price Oracle Agent — On-chain AI agent that attests to price data.
+//! Price Oracle Agent - On-chain AI agent that attests to price data.
 //!
 //! Demonstrates:
 //! - Fetching external price data (simulated)

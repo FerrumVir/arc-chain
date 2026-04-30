@@ -764,7 +764,7 @@ mod tests {
             )
             .unwrap();
 
-        // Only 1M ARC votes — way below 200M quorum.
+        // Only 1M ARC votes - way below 200M quorum.
         let vote = Vote {
             voter: test_address(2),
             stake_weight: 1_000_000_000_000_000, // 1M ARC
@@ -850,7 +850,7 @@ mod tests {
         // Cast enough votes to pass.
         let vote = Vote {
             voter: test_address(2),
-            stake_weight: 300_000_000_000_000_000, // 300M — above quorum
+            stake_weight: 300_000_000_000_000_000, // 300M - above quorum
             choice: VoteChoice::For,
             cast_at: 200,
             reason: None,
@@ -870,7 +870,7 @@ mod tests {
 
         let earliest_execution = voting_ends + config.execution_delay_blocks;
 
-        // Too early — cannot execute.
+        // Too early - cannot execute.
         assert!(!state.can_execute(0, earliest_execution - 1));
 
         // Exactly at the earliest allowed block.

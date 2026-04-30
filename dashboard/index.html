@@ -3,11 +3,11 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ARC Chain — Sharded AI Inference Across the Network</title>
+<title>ARC Chain - Sharded AI Inference Across the Network</title>
 <meta name="description" content="Run a Llama-2-7B model split across 7 separate VPS in 7 cities. Per-row INT16 weights, BLAKE3-verified hidden states, bit-identical output on every chip. Pipeline-parallel sharded inference, cryptographically verifiable.">
 
 <!-- Open Graph -->
-<meta property="og:title" content="ARC Chain — Sharded AI Inference Across the Network">
+<meta property="og:title" content="ARC Chain - Sharded AI Inference Across the Network">
 <meta property="og:description" content="A real Llama-7B model split across 7 separate machines. Type a prompt, watch the activation hop through every shard. BLAKE3-verified, bit-identical, deterministic.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="http://140.82.16.112:3200">
@@ -15,7 +15,7 @@
 
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary_large_image">
-<meta name="twitter:title" content="ARC Chain — Sharded AI Inference">
+<meta name="twitter:title" content="ARC Chain - Sharded AI Inference">
 <meta name="twitter:description" content="Run a Llama-7B model split across 7 cheap VPS. Cryptographically verifiable. Type a prompt, watch the trace.">
 
 <link rel="icon" href="data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22&gt;&lt;rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%236366f1%22/&gt;&lt;text x=%2216%22 y=%2222%22 font-family=%22Arial%22 font-size=%2218%22 font-weight=%22bold%22 fill=%22white%22 text-anchor=%22middle%22&gt;A&lt;/text&gt;&lt;/svg&gt;">
@@ -63,11 +63,11 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
 <main class="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
   <!-- Hero Stats -->
   <div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Block</p><p class="text-2xl font-extrabold text-arc-400 mono mt-1" id="dagRound">—</p></div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Finalized</p><p class="text-2xl font-extrabold text-white mono mt-1" id="committed">—</p></div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Validators</p><p class="text-2xl font-extrabold text-emerald-400 mono mt-1" id="validatorCount">—</p></div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Blocks/sec</p><p class="text-2xl font-extrabold text-white mono mt-1" id="rps">—</p></div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">TPS</p><p class="text-2xl font-extrabold text-yellow-400 mono mt-1" id="tps">—</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Block</p><p class="text-2xl font-extrabold text-arc-400 mono mt-1" id="dagRound">-</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Finalized</p><p class="text-2xl font-extrabold text-white mono mt-1" id="committed">-</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Validators</p><p class="text-2xl font-extrabold text-emerald-400 mono mt-1" id="validatorCount">-</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Blocks/sec</p><p class="text-2xl font-extrabold text-white mono mt-1" id="rps">-</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">TPS</p><p class="text-2xl font-extrabold text-yellow-400 mono mt-1" id="tps">-</p></div>
   </div>
 
   <!-- Chain + Nodes -->
@@ -75,30 +75,30 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
       <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Chain</h2>
       <div class="space-y-2.5 text-sm">
-        <div class="flex justify-between"><span class="text-gray-500">Total Transactions</span><span class="text-white font-medium mono" id="totalTx">—</span></div>
-        <div class="flex justify-between"><span class="text-gray-500">Accounts</span><span class="text-white font-medium mono" id="accounts">—</span></div>
-        <div class="flex justify-between"><span class="text-gray-500">Peers</span><span class="text-white font-medium mono" id="peers">—</span></div>
-        <div class="flex justify-between"><span class="text-gray-500">Uptime</span><span class="text-white font-medium mono" id="uptime">—</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Total Transactions</span><span class="text-white font-medium mono" id="totalTx">-</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Accounts</span><span class="text-white font-medium mono" id="accounts">-</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Peers</span><span class="text-white font-medium mono" id="peers">-</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Uptime</span><span class="text-white font-medium mono" id="uptime">-</span></div>
         <div class="flex justify-between border-t border-surface-4 pt-2 mt-2"><span class="text-gray-500">Codebase</span><span class="text-white font-medium text-xs">101K LOC Rust</span></div>
         <div class="flex justify-between"><span class="text-gray-500">Tests</span><span class="text-white font-medium text-xs">1,234 passing</span></div>
         <div class="flex justify-between"><span class="text-gray-500">Regions</span><span class="text-white font-medium text-xs">6 continents</span></div>
       </div>
     </div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
-      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Nodes — 6 Continents</h2>
+      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Nodes - 6 Continents</h2>
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-2" id="nodeGrid"></div>
     </div>
   </div>
 
   <!-- ════════════════════════════════════════════════════════════════════ -->
-  <!-- PIPELINE-PARALLEL SHARDED INFERENCE — the game-changing demo         -->
+  <!-- PIPELINE-PARALLEL SHARDED INFERENCE - the game-changing demo         -->
   <!-- ════════════════════════════════════════════════════════════════════ -->
   <div class="bg-gradient-to-br from-arc-950/60 via-surface-2 to-emerald-950/30 border-2 border-arc-500/50 rounded-2xl p-6 shadow-2xl shadow-arc-500/20">
     <div class="flex items-start justify-between mb-5 gap-4 flex-wrap">
       <div class="flex-1 min-w-[280px]">
         <h2 class="text-lg font-extrabold text-white flex items-center gap-2 flex-wrap">
           <span class="inline-block w-3 h-3 rounded-full bg-arc-400 pulse-dot shadow-lg shadow-arc-400/50"></span>
-          Sharded AI — One Model, Split Across the Network
+          Sharded AI - One Model, Split Across the Network
           <span class="text-[10px] font-bold text-arc-300 ml-1 px-2 py-0.5 rounded-full bg-arc-500/10 border border-arc-500/30">PIPELINE-PARALLEL</span>
         </h2>
         <p class="text-xs text-gray-300 mt-1.5 leading-relaxed">
@@ -111,23 +111,23 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       <div class="flex gap-3 text-right flex-wrap">
         <div class="bg-surface-3 border border-arc-500/30 rounded-lg px-3 py-2">
           <div class="text-[8px] uppercase tracking-wider text-gray-500">Model</div>
-          <div class="text-sm font-bold text-white mono" id="shardModelName">—</div>
+          <div class="text-sm font-bold text-white mono" id="shardModelName">-</div>
         </div>
         <div class="bg-surface-3 border border-arc-500/30 rounded-lg px-3 py-2">
           <div class="text-[8px] uppercase tracking-wider text-gray-500">Total Layers</div>
-          <div class="text-sm font-bold text-arc-300 mono" id="shardTotalLayers">—</div>
+          <div class="text-sm font-bold text-arc-300 mono" id="shardTotalLayers">-</div>
         </div>
         <div class="bg-surface-3 border border-arc-500/30 rounded-lg px-3 py-2">
           <div class="text-[8px] uppercase tracking-wider text-gray-500">Shards</div>
-          <div class="text-sm font-bold text-emerald-300 mono" id="shardCount">—</div>
+          <div class="text-sm font-bold text-emerald-300 mono" id="shardCount">-</div>
         </div>
         <div class="bg-surface-3 border border-emerald-500/40 rounded-lg px-3 py-2">
           <div class="text-[8px] uppercase tracking-wider text-emerald-300">Runs Served</div>
-          <div class="text-sm font-bold text-emerald-300 mono" id="shardRunsTotal">—</div>
+          <div class="text-sm font-bold text-emerald-300 mono" id="shardRunsTotal">-</div>
         </div>
         <div class="bg-surface-3 border border-emerald-500/40 rounded-lg px-3 py-2">
           <div class="text-[8px] uppercase tracking-wider text-emerald-300">Bytes Forwarded</div>
-          <div class="text-sm font-bold text-emerald-300 mono" id="shardBytesTotal">—</div>
+          <div class="text-sm font-bold text-emerald-300 mono" id="shardBytesTotal">-</div>
         </div>
       </div>
     </div>
@@ -139,7 +139,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
         <div class="flex-1 min-w-0">
           <div class="text-[11px] font-bold text-white" id="modelIdVerifyHeadline">Model identity verified</div>
           <div class="text-[10px] text-gray-400 mt-0.5">All shards must report the same BLAKE3 model_id, otherwise the pipeline cannot produce trustworthy output.</div>
-          <div class="text-[10px] mono text-arc-300 truncate mt-1" id="modelIdVerifyHash">—</div>
+          <div class="text-[10px] mono text-arc-300 truncate mt-1" id="modelIdVerifyHash">-</div>
         </div>
       </div>
     </div>
@@ -151,7 +151,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
           <span class="text-[10px] uppercase tracking-wider text-red-300 font-bold">If you tried this on 1 node</span>
           <span class="text-[10px] text-red-400">✗ OOM</span>
         </div>
-        <div class="text-2xl font-extrabold text-red-300 mono" id="shardSingleMb">— GB</div>
+        <div class="text-2xl font-extrabold text-red-300 mono" id="shardSingleMb">- GB</div>
         <div class="text-[10px] text-gray-500 mt-1">Full model RAM. Most consumer/cloud nodes have 8 GB max. <span class="text-red-300">Won't load.</span></div>
       </div>
       <div class="bg-emerald-950/30 border border-emerald-500/30 rounded-xl p-4">
@@ -159,8 +159,8 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
           <span class="text-[10px] uppercase tracking-wider text-emerald-300 font-bold">Sharded across the network</span>
           <span class="text-[10px] text-emerald-400">✓ FITS</span>
         </div>
-        <div class="text-2xl font-extrabold text-emerald-300 mono" id="shardPerNodeMb">— GB / node</div>
-        <div class="text-[10px] text-gray-500 mt-1">Each node holds ~<span id="shardLayersPerNode">—</span> layers. Together = full model. <span class="text-emerald-300">Loads everywhere.</span></div>
+        <div class="text-2xl font-extrabold text-emerald-300 mono" id="shardPerNodeMb">- GB / node</div>
+        <div class="text-[10px] text-gray-500 mt-1">Each node holds ~<span id="shardLayersPerNode">-</span> layers. Together = full model. <span class="text-emerald-300">Loads everywhere.</span></div>
       </div>
     </div>
 
@@ -175,9 +175,9 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       </div>
     </div>
 
-    <!-- Custom prompt input — runs through the SHARDED pipeline -->
+    <!-- Custom prompt input - runs through the SHARDED pipeline -->
     <div class="bg-surface-3 border border-arc-500/30 rounded-xl p-4 mb-4">
-      <label class="text-[10px] uppercase tracking-wider text-arc-300 font-bold block mb-2">Type a prompt — watch the activation hop through every shard</label>
+      <label class="text-[10px] uppercase tracking-wider text-arc-300 font-bold block mb-2">Type a prompt - watch the activation hop through every shard</label>
       <div class="flex gap-2">
         <input type="text" id="shardedPrompt" placeholder="The largest planet is" value="The largest planet is"
                class="flex-1 px-3 py-2 bg-surface-2 border border-surface-4 rounded-lg text-white text-sm placeholder-gray-600 focus:border-arc-500 focus:outline-none mono"
@@ -210,7 +210,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       </div>
     </div>
 
-    <!-- Community Workers — live count from gateways -->
+    <!-- Community Workers - live count from gateways -->
     <div id="communitySection" class="bg-gradient-to-br from-violet-900/40 to-arc-900/30 border-2 border-violet-500/40 rounded-xl p-4 mb-2">
       <div class="flex items-center justify-between mb-3">
         <div class="flex items-center gap-2">
@@ -224,7 +224,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       <div class="text-[9px] text-gray-500">Community nodes providing inference compute. Join with one command below.</div>
     </div>
 
-    <!-- "Join the network" — the conversion event for visitors -->
+    <!-- "Join the network" - the conversion event for visitors -->
     <div class="bg-gradient-to-br from-emerald-900/40 to-arc-900/30 border-2 border-emerald-500/40 rounded-xl p-4 mb-2">
       <div class="flex items-center gap-2 mb-2">
         <span class="text-base">🚀</span>
@@ -256,7 +256,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       <div class="grid grid-cols-3 gap-4 text-right">
         <div>
           <div class="text-[9px] uppercase tracking-wider text-gray-500">Inference Nodes</div>
-          <div class="text-2xl font-extrabold text-emerald-400 mono" id="infNodeCount">—</div>
+          <div class="text-2xl font-extrabold text-emerald-400 mono" id="infNodeCount">-</div>
         </div>
         <div>
           <div class="text-[9px] uppercase tracking-wider text-gray-500">Speedup</div>
@@ -264,14 +264,14 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
         </div>
         <div>
           <div class="text-[9px] uppercase tracking-wider text-gray-500">Total Runs</div>
-          <div class="text-2xl font-extrabold text-white mono" id="infCount">—</div>
+          <div class="text-2xl font-extrabold text-white mono" id="infCount">-</div>
         </div>
       </div>
     </div>
 
-    <!-- Custom prompt input — runs on all 8 nodes in parallel -->
+    <!-- Custom prompt input - runs on all 8 nodes in parallel -->
     <div class="mb-4 p-4 bg-surface-3 border border-emerald-500/30 rounded-xl">
-      <label class="text-[10px] uppercase tracking-wider text-emerald-400 font-bold block mb-2">Type a prompt — watch all 8 devices answer it together</label>
+      <label class="text-[10px] uppercase tracking-wider text-emerald-400 font-bold block mb-2">Type a prompt - watch all 8 devices answer it together</label>
       <div class="flex gap-2">
         <input type="text" id="customPrompt" placeholder="What is the capital of France?" value="What is the capital of France?"
                class="flex-1 px-3 py-2 bg-surface-2 border border-surface-4 rounded-lg text-white text-sm placeholder-gray-600 focus:border-emerald-500 focus:outline-none mono"
@@ -309,18 +309,18 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       <div class="grid grid-cols-3 gap-4 mb-3">
         <div>
           <div class="text-[9px] uppercase tracking-wider text-gray-500">Sequential (1 node)</div>
-          <div class="text-xl font-bold text-yellow-400 mono" id="benchSeq">—</div>
+          <div class="text-xl font-bold text-yellow-400 mono" id="benchSeq">-</div>
         </div>
         <div>
           <div class="text-[9px] uppercase tracking-wider text-gray-500">Distributed (8 nodes)</div>
-          <div class="text-xl font-bold text-emerald-400 mono" id="benchDist">—</div>
+          <div class="text-xl font-bold text-emerald-400 mono" id="benchDist">-</div>
         </div>
         <div>
           <div class="text-[9px] uppercase tracking-wider text-gray-500">Speedup</div>
-          <div class="text-xl font-bold text-white mono" id="benchSpeedup">—</div>
+          <div class="text-xl font-bold text-white mono" id="benchSpeedup">-</div>
         </div>
       </div>
-      <div class="text-[10px] text-gray-400" id="benchHashLine">—</div>
+      <div class="text-[10px] text-gray-400" id="benchHashLine">-</div>
     </div>
 
     <div id="modelBreakdown" class="hidden grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 mt-4"></div>
@@ -354,7 +354,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
 </footer>
 
 <script>
-// Try multiple nodes — use first one that responds
+// Try multiple nodes - use first one that responds
 let RPC='http://140.82.16.112:9090';
 const RPC_FALLBACKS=['http://136.244.109.1:9090','http://139.84.237.49:9090','http://104.238.171.11:9090','http://149.28.32.76:9090'];
 // Sharded inference goes to a dedicated coordinator (Mac M2 Ultra, hidden
@@ -411,7 +411,7 @@ async function renderNodes(){
     if(v.ok){
       const d=v.d,n=v.n;
       el.className='bg-surface-3 border border-surface-4 rounded-lg p-2.5 text-center hover:border-arc-500/30 transition cursor-pointer';
-      el.onclick=()=>showModal(n.name+' — '+n.loc,[['Status','🟢 Online'],['Block',d.dag_round.toLocaleString()],['Finalized',d.dag_committed.toLocaleString()],['Peers',d.peers],['Validators',d.validators],['Uptime',Math.floor(d.uptime_secs/60)+'m'],['RPC','http://'+n.ip+':9090','http://'+n.ip+':9090/health']]);
+      el.onclick=()=>showModal(n.name+' - '+n.loc,[['Status','🟢 Online'],['Block',d.dag_round.toLocaleString()],['Finalized',d.dag_committed.toLocaleString()],['Peers',d.peers],['Validators',d.validators],['Uptime',Math.floor(d.uptime_secs/60)+'m'],['RPC','http://'+n.ip+':9090','http://'+n.ip+':9090/health']]);
       el.innerHTML=`<div class="flex items-center justify-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span><span class="text-white font-semibold text-xs">${n.name}</span></div><div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div><div class="mono text-arc-400 text-[11px] mt-1">#${d.dag_round.toLocaleString()}</div>`;
     }else{
       const n=v.n;
@@ -422,7 +422,7 @@ async function renderNodes(){
   }
 }
 
-// Live benchmark — runs single-node sequential vs distributed parallel
+// Live benchmark - runs single-node sequential vs distributed parallel
 // directly from the dashboard. Shows the speedup in real time.
 async function runLiveBenchmark(){
   const btn=document.getElementById('benchBtn');
@@ -464,7 +464,7 @@ async function runLiveBenchmark(){
   const seqMs=Date.now()-seqStart;
   document.getElementById('benchSeq').textContent=`${seqMs} ms`;
 
-  // Phase 2: parallel through the same pipeline — cache should absorb most,
+  // Phase 2: parallel through the same pipeline - cache should absorb most,
   // so wall time drops dramatically. Demonstrates request-level concurrency.
   status.innerHTML=`<span class="text-emerald-400">▶</span> Phase 2: ${N} parallel requests through shard pipeline...`;
   document.getElementById('benchDist').textContent='running...';
@@ -528,7 +528,7 @@ async function refreshShardRegistry(){
     const totalLayers = d.total_layers || 0;
     const totalFullMb = d.full_model_mb || 0;
     const totalDistributedMb = d.total_distributed_mb || 0;
-    const modelName = d.model_name || '—';
+    const modelName = d.model_name || '-';
 
     const shardCount = currentPipeline.length;
     const perNodeMb = shardCount > 0 ? Math.round(totalDistributedMb / shardCount) : 0;
@@ -536,11 +536,11 @@ async function refreshShardRegistry(){
 
     // Update header stats
     document.getElementById('shardModelName').textContent = modelName.length > 22 ? modelName.slice(0,22) + '…' : modelName;
-    document.getElementById('shardTotalLayers').textContent = totalLayers || '—';
-    document.getElementById('shardCount').textContent = shardCount || '—';
-    document.getElementById('shardSingleMb').textContent = totalFullMb > 0 ? `${(totalFullMb/1024).toFixed(1)} GB` : '—';
-    document.getElementById('shardPerNodeMb').textContent = perNodeMb > 0 ? `~${(perNodeMb/1024).toFixed(1)} GB / node` : '—';
-    document.getElementById('shardLayersPerNode').textContent = layersPerNode || '—';
+    document.getElementById('shardTotalLayers').textContent = totalLayers || '-';
+    document.getElementById('shardCount').textContent = shardCount || '-';
+    document.getElementById('shardSingleMb').textContent = totalFullMb > 0 ? `${(totalFullMb/1024).toFixed(1)} GB` : '-';
+    document.getElementById('shardPerNodeMb').textContent = perNodeMb > 0 ? `~${(perNodeMb/1024).toFixed(1)} GB / node` : '-';
+    document.getElementById('shardLayersPerNode').textContent = layersPerNode || '-';
 
     // Model identity verification: every shard must report the same BLAKE3 model_id
     if(currentPipeline.length > 0){
@@ -557,14 +557,14 @@ async function refreshShardRegistry(){
           panel.classList.add('border-emerald-500/60');
           icon.textContent = '✓';
           icon.className = 'text-lg text-emerald-400';
-          headline.innerHTML = `<span class="text-emerald-300">Model identity verified</span> — all <span class="font-bold">${currentPipeline.length}</span> shards report the same BLAKE3 model_id`;
+          headline.innerHTML = `<span class="text-emerald-300">Model identity verified</span> - all <span class="font-bold">${currentPipeline.length}</span> shards report the same BLAKE3 model_id`;
           hashLine.textContent = h;
         }else if(ids.size > 1){
           panel.classList.remove('border-emerald-500/60');
           panel.classList.add('border-red-500');
           icon.textContent = '✗';
           icon.className = 'text-lg text-red-400';
-          headline.innerHTML = `<span class="text-red-300">MODEL MISMATCH</span> — ${ids.size} different model_ids across ${currentPipeline.length} shards. Pipeline cannot produce trustworthy output.`;
+          headline.innerHTML = `<span class="text-red-300">MODEL MISMATCH</span> - ${ids.size} different model_ids across ${currentPipeline.length} shards. Pipeline cannot produce trustworthy output.`;
           hashLine.textContent = [...ids].join(' / ');
         }
       }
@@ -609,7 +609,7 @@ async function refreshShardRegistry(){
     });
     diagram.innerHTML = html;
   }catch(e){
-    // Silent — registry not available yet
+    // Silent - registry not available yet
   }
 }
 
@@ -760,7 +760,7 @@ async function runShardedInference(){
       // /tx/ endpoint expects 64-hex (no 0x prefix)
       const txHashClean = txHash.replace(/^0x/, '');
       const explorerUrl = txHashClean ? `/tx/${txHashClean}` : '';
-      const txHashShort = txHash ? `${txHash.slice(0, 18)}…` : '—';
+      const txHashShort = txHash ? `${txHash.slice(0, 18)}…` : '-';
       const cache = d.cache || {};
       const cacheHit = cache.hit === true;
       const cacheBanner = cacheHit
@@ -769,7 +769,7 @@ async function runShardedInference(){
                <span class="text-2xl">✓</span>
                <div class="flex-1">
                  <div class="text-[12px] font-bold text-emerald-300 uppercase tracking-wider">Deterministic cache hit · served in ${elapsed} ms</div>
-                 <div class="text-[10px] text-gray-300 mt-0.5">Bit-identical output_hash to a prior 79-second sharded run. Same model + same input ALWAYS produces the same output — proven by the integer engine, no re-derivation needed.</div>
+                 <div class="text-[10px] text-gray-300 mt-0.5">Bit-identical output_hash to a prior 79-second sharded run. Same model + same input ALWAYS produces the same output - proven by the integer engine, no re-derivation needed.</div>
                </div>
              </div>
            </div>`
@@ -778,7 +778,7 @@ async function runShardedInference(){
                <span class="text-lg">▶</span>
                <div class="flex-1">
                  <div class="text-[11px] font-semibold text-arc-300 uppercase tracking-wider">First run · full 7-shard pipeline · ${elapsed} ms wall</div>
-                 <div class="text-[9px] text-gray-500 mt-0.5">Cached for next time. Click again — it'll come back in milliseconds.</div>
+                 <div class="text-[9px] text-gray-500 mt-0.5">Cached for next time. Click again - it'll come back in milliseconds.</div>
                </div>
              </div>
            </div>`;
@@ -800,7 +800,7 @@ async function runShardedInference(){
             </div>
             <div class="bg-surface-3 rounded p-2 text-center">
               <div class="text-[9px] uppercase text-gray-500">On-chain attestation</div>
-              ${txHash ? `<a href="${RPC}${explorerUrl}" target="_blank" class="text-[10px] mono text-emerald-400 truncate hover:underline" title="${txHash}">${txHashShort} ↗</a>` : '<div class="text-[10px] text-gray-500">—</div>'}
+              ${txHash ? `<a href="${RPC}${explorerUrl}" target="_blank" class="text-[10px] mono text-emerald-400 truncate hover:underline" title="${txHash}">${txHashShort} ↗</a>` : '<div class="text-[10px] text-gray-500">-</div>'}
             </div>
             <div class="bg-surface-3 rounded p-2 text-center">
               <div class="text-[9px] uppercase text-gray-500">ms / token</div>
@@ -829,7 +829,7 @@ async function runShardedInference(){
           </div>
         </div>
       `;
-      status.innerHTML = `<span class="text-emerald-400 font-bold">✓ Done</span> — ${currentPipeline.length} shards, ${tokensGen} tokens, ${elapsed}ms wall, identical hash on every replay.`;
+      status.innerHTML = `<span class="text-emerald-400 font-bold">✓ Done</span> - ${currentPipeline.length} shards, ${tokensGen} tokens, ${elapsed}ms wall, identical hash on every replay.`;
     } else {
       status.innerHTML = `<span class="text-red-400">✗ Failed:</span> ${d.error || JSON.stringify(d)}`;
     }
@@ -875,7 +875,7 @@ function renderShardedHistory(){
     return;
   }
   wrap.classList.remove('hidden');
-  // Group by hash to detect determinism — runs with the same hash get a "✓ verified" badge
+  // Group by hash to detect determinism - runs with the same hash get a "✓ verified" badge
   const counts = {};
   hist.forEach(r => { counts[r.hash] = (counts[r.hash] || 0) + 1; });
   list.innerHTML = hist.map((r, idx) => {
@@ -983,7 +983,7 @@ async function runCustomPromptOnAll(){
   // the 32 transformer blocks), so a single-node /inference/run on any one
   // seed returns <unk> tokens. Routing each call through the shard
   // coordinator exercises the real pipeline; Mac caches by (model, input,
-  // max_tokens) so the first request computes and the other 7 hit cache —
+  // max_tokens) so the first request computes and the other 7 hit cache -
   // the wall-time spread across the 8 cards is the real-world "first-hit
   // vs warm-hit" latency story, and the hash is identical because every
   // call sees the same deterministic integer forward.
@@ -1011,7 +1011,7 @@ async function runCustomPromptOnAll(){
             <span class="text-[9px] text-emerald-400 mono">✓ ${elapsed}ms</span>
           </div>
           <div class="text-[10px] text-gray-500 mono truncate">${inf.ms_per_token||'?'}ms/tok</div>
-          <div class="text-[10px] text-white mt-1.5 leading-tight" style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;">${(inf.output||'—').replace(/</g,'&lt;')}</div>
+          <div class="text-[10px] text-white mt-1.5 leading-tight" style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;">${(inf.output||'-').replace(/</g,'&lt;')}</div>
           <div class="text-[9px] mono text-arc-400 mt-1.5 truncate" title="${inf.output_hash||''}">${(inf.output_hash||'').slice(0,18)}…</div>
         `;
       }
@@ -1056,7 +1056,7 @@ async function runCustomPromptOnAll(){
         <div><span class="text-gray-500">Fastest device:</span> <span class="text-emerald-400 font-bold">${fastest}ms</span></div>
         <div><span class="text-gray-500">Slowest device:</span> <span class="text-yellow-400 font-bold">${slowest}ms</span></div>
       </div>
-      <div class="text-[10px] text-gray-500 mt-2">This is cryptographic proof of cross-device deterministic inference. Run it again on a different prompt — same result.</div>
+      <div class="text-[10px] text-gray-500 mt-2">This is cryptographic proof of cross-device deterministic inference. Run it again on a different prompt - same result.</div>
     `;
   }else{
     hashEl.innerHTML=`
@@ -1065,7 +1065,7 @@ async function runCustomPromptOnAll(){
     `;
   }
 
-  status.innerHTML=`<span class="text-emerald-400 font-bold">✓ Done</span> — ${okResults.length}/${infNodes.length} devices responded in ${totalMs}ms wall time.`;
+  status.innerHTML=`<span class="text-emerald-400 font-bold">✓ Done</span> - ${okResults.length}/${infNodes.length} devices responded in ${totalMs}ms wall time.`;
 
   btn.disabled=false;
   btn.textContent='▶ Run on All 8';
@@ -1082,7 +1082,7 @@ async function runInferenceOn(ip,name){
   ]);
   try{
     const start=Date.now();
-    // Route through the shard coordinator — single-node /inference/run
+    // Route through the shard coordinator - single-node /inference/run
     // on a seed only has 2-5 layers and returns <unk> tokens.
     const r=await fetch(SHARDED_COORDINATOR+'/inference/run_consensus',{
       method:'POST',
@@ -1104,7 +1104,7 @@ async function runInferenceOn(ip,name){
       ['Speed',`${inf.ms_per_token||'?'} ms/tok`],
       ['Wall time',`${elapsed} ms`],
       ['Attestation Tx',att.tx_hash||'?'],
-      ['Tip','Run on another node — the output_hash will be IDENTICAL'],
+      ['Tip','Run on another node - the output_hash will be IDENTICAL'],
     ]);
   }catch(e){
     showModal(`Inference on ${name}`,[
@@ -1134,12 +1134,12 @@ function showTxDetail(hash){
     const tx=d.transaction||d;const rc=d.receipt||{};
     showModal('Transaction Details',[
       ['Hash',hash,`${RPC}/tx/${hash}`],
-      ['From',tx.from||'—'],
-      ['To',tx.to||(tx.body?.to)||'—'],
+      ['From',tx.from||'-'],
+      ['To',tx.to||(tx.body?.to)||'-'],
       ['Amount',`${(tx.amount||tx.body?.amount||0).toLocaleString()} ARC`],
       ['Nonce',tx.nonce||0],
       ['Status',rc.success?'✅ Success':'⏳ Pending'],
-      ['Block Height',rc.block_height||'—'],
+      ['Block Height',rc.block_height||'-'],
       ['Type',tx.tx_type||tx.body_type||'Transfer'],
     ]);
   }).catch(()=>{
@@ -1151,8 +1151,8 @@ function showInferenceDetail(a){
   showModal('Inference Attestation',[
     ['TX Hash',(a.tx_hash||a.from||'').slice(0,40)+'...',a.tx_hash?`${RPC}/tx/${a.tx_hash}`:null],
     ['Amount',`${(a.amount||0).toLocaleString()} ARC`],
-    ['Block Height',a.block_height||'—'],
-    ['From',(a.from||'—').slice(0,40)+'...'],
+    ['Block Height',a.block_height||'-'],
+    ['From',(a.from||'-').slice(0,40)+'...'],
     ['Model',a.model||'TinyLlama 1.1B'],
     ['Type','InferenceAttestation'],
   ]);
@@ -1198,7 +1198,7 @@ async function refresh(){
     const r=await fetch(RPC+'/stats',{signal:AbortSignal.timeout(5000)});
     const d=await r.json();
     const now=Date.now();
-    const rps=lastRound>0?((d.dag_round-lastRound)/((now-lastTime)/1000)).toFixed(1):'—';
+    const rps=lastRound>0?((d.dag_round-lastRound)/((now-lastTime)/1000)).toFixed(1):'-';
     const txDiff=lastTxCount>0?(d.total_transactions-lastTxCount):0;
     const tps=lastTxCount>0&&(now-lastTime)>0?(txDiff/((now-lastTime)/1000)).toFixed(1):'0';
     lastRound=d.dag_round;lastTime=now;lastTxCount=d.total_transactions;
@@ -1220,13 +1220,13 @@ async function refresh(){
       : d.total_transactions.toLocaleString();
     const mins=Math.floor(d.uptime_secs/60);const hrs=Math.floor(mins/60);
     document.getElementById('uptime').textContent=hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`;
-    document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live — block ${d.dag_round.toLocaleString()} · ${d.dag_committed.toLocaleString()} finalized · ${d.total_transactions} txs`;
-    // Sharded inference network counters — aggregate across ALL nodes
+    document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live - block ${d.dag_round.toLocaleString()} · ${d.dag_committed.toLocaleString()} finalized · ${d.total_transactions} txs`;
+    // Sharded inference network counters - aggregate across ALL nodes
     // (resilient to single-coordinator restart resetting its in-memory counter)
     aggregateShardedCounters();
   }catch(e){}
 
-  // Nodes — fetched by renderNodes() above (runs in parallel, no blocking)
+  // Nodes - fetched by renderNodes() above (runs in parallel, no blocking)
 
   // Cross-device inference aggregation: fetch from ALL 8 seeds in parallel,
   // dedupe by tx_hash, group by model, and show which device(s) saw each.
@@ -1284,7 +1284,7 @@ async function refresh(){
     const infNodeCountEl=document.getElementById('infNodeCount');
     if(infNodeCountEl)infNodeCountEl.textContent=infNodes.length;
 
-    // Render inference-enabled node grid — visual cards with click-to-test
+    // Render inference-enabled node grid - visual cards with click-to-test
     const infNodeGrid=document.getElementById('inferenceNodeGrid');
     if(infNodeGrid){
       infNodeGrid.innerHTML=infNodes.map(n=>`
@@ -1324,8 +1324,8 @@ async function refresh(){
       list.innerHTML=allAttestations.slice(0,15).map(a=>{
         const inf=a.inference||{};
         const seenCount=a.seen_on.size;
-        const input=(inf.input||'—').slice(0,50);
-        const output=(inf.output||'—').slice(0,80);
+        const input=(inf.input||'-').slice(0,50);
+        const output=(inf.output||'-').slice(0,80);
         const isSharded = inf.sharded === true || inf.engine?.includes('sharded');
         const crossDeviceBadge=seenCount>1
           ? `<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">✓ ${seenCount} devices</span>`
@@ -1355,7 +1355,7 @@ async function refresh(){
     console.error('inference fetch failed',e);
   }
 
-  // Recent transactions — show live stats + recent faucet/transfer activity
+  // Recent transactions - show live stats + recent faucet/transfer activity
   try{
     const list=document.getElementById('txList');
     const statsR=await fetch(RPC+'/stats',{signal:AbortSignal.timeout(5000)});
@@ -1397,7 +1397,7 @@ async function refresh(){
   document.getElementById('lastUpdate').textContent=`Updated ${new Date().toLocaleTimeString()} · auto-refreshes every 5s`;
 }
 
-// Await RPC discovery before first render — prevents "2 nodes" flash
+// Await RPC discovery before first render - prevents "2 nodes" flash
 findRPC().then(()=>{
   refresh();
   setInterval(refresh,5000);
@@ -1416,7 +1416,7 @@ async function probePresetCache(){
   if(!buttons.length) return;
   const prompts = buttons.map(b => ({input: b.dataset.preset, max_tokens: 20}));
   try{
-    // 1) cache_stats — totals (from the sharded coordinator, not RPC fallback)
+    // 1) cache_stats - totals (from the sharded coordinator, not RPC fallback)
     const sR = await fetch(SHARDED_COORDINATOR + '/inference/cache_stats', {signal: AbortSignal.timeout(3000)});
     if(sR.ok){
       const s = await sR.json();
@@ -1425,7 +1425,7 @@ async function probePresetCache(){
         line.textContent = `↯ cache: ${s.size}/${s.capacity} entries · ${s.total_hits} cumulative hits · O(1) lookup (~20 μs)`;
       }
     }
-    // 2) cache_check — per-preset warm status (same coordinator as cache_stats)
+    // 2) cache_check - per-preset warm status (same coordinator as cache_stats)
     const cR = await fetch(SHARDED_COORDINATOR + '/inference/cache_check', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -1452,10 +1452,10 @@ async function probePresetCache(){
         btn.classList.remove('border-emerald-400/60', 'text-emerald-200', 'bg-emerald-500/10');
       }
     });
-  }catch(e){/* silent — /inference/cache_check only exists on v0.5.1+ coordinators */}
+  }catch(e){/* silent - /inference/cache_check only exists on v0.5.1+ coordinators */}
 }
 
-// ── Community workers — poll gateways and display live worker list ──────
+// ── Community workers - poll gateways and display live worker list ──────
 // Try all 8 gateways, merge unique workers by worker_id, render in the
 // Community Network section. Updates every 10 seconds.
 const GATEWAY_SEEDS = [
@@ -1498,7 +1498,7 @@ async function refreshCommunityWorkers(){
   const listEl = document.getElementById('communityWorkerList');
   if(!listEl) return;
   if(workers.length === 0){
-    listEl.innerHTML = '<div class="text-[10px] text-gray-600 italic">No community workers online yet. Be the first — run the install command below.</div>';
+    listEl.innerHTML = '<div class="text-[10px] text-gray-600 italic">No community workers online yet. Be the first - run the install command below.</div>';
     return;
   }
   listEl.innerHTML = workers.map(w => {

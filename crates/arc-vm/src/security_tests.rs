@@ -123,7 +123,7 @@ impl SecurityReport {
 
 impl fmt::Display for SecurityReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Security Report — Score: {:.1}/100", self.score)?;
+        writeln!(f, "Security Report - Score: {:.1}/100", self.score)?;
         writeln!(
             f,
             "  {} checks | {} critical | {} high | {} medium | {} low",
@@ -132,7 +132,7 @@ impl fmt::Display for SecurityReport {
         for finding in &self.findings {
             writeln!(
                 f,
-                "  [{}] {} @ {} — {}",
+                "  [{}] {} @ {} - {}",
                 finding.severity, finding.check, finding.location, finding.description
             )?;
         }
@@ -225,10 +225,10 @@ impl SecurityScanner {
     ///
     /// This is a mock/heuristic scanner that demonstrates the framework.
     /// It looks for byte patterns that loosely correspond to known issues:
-    /// - `0xF1` (CALL opcode) repeated — potential reentrancy
-    /// - `0x01`/`0x02` (ADD/MUL) without `0x11` (GT) guard — overflow
-    /// - `0x42` (TIMESTAMP) — timestamp dependence
-    /// - `0xFF` (SELFDESTRUCT) — unprotected self-destruct
+    /// - `0xF1` (CALL opcode) repeated - potential reentrancy
+    /// - `0x01`/`0x02` (ADD/MUL) without `0x11` (GT) guard - overflow
+    /// - `0x42` (TIMESTAMP) - timestamp dependence
+    /// - `0xFF` (SELFDESTRUCT) - unprotected self-destruct
     pub fn scan_contract(&mut self, bytecode: &[u8]) -> SecurityReport {
         self.results.clear();
         let total_checks = self.checks.len();
@@ -286,7 +286,7 @@ impl SecurityScanner {
     fn run_check(&self, check: &SecurityCheck, bytecode: &[u8]) -> Option<SecurityFinding> {
         match check {
             SecurityCheck::Reentrancy => {
-                // Look for multiple CALL opcodes (0xF1) — naive reentrancy pattern.
+                // Look for multiple CALL opcodes (0xF1) - naive reentrancy pattern.
                 let call_count = bytecode.iter().filter(|&&b| b == 0xF1).count();
                 if call_count >= 2 {
                     Some(SecurityFinding {
@@ -326,7 +326,7 @@ impl SecurityScanner {
                         check: SecurityCheck::TimestampDependence,
                         severity: Severity::Low,
                         location: "bytecode".to_string(),
-                        description: "TIMESTAMP opcode used — block timestamp can be manipulated by miners.".to_string(),
+                        description: "TIMESTAMP opcode used - block timestamp can be manipulated by miners.".to_string(),
                         recommendation: "Avoid using block.timestamp for critical logic; use block.number or an oracle.".to_string(),
                     })
                 } else {
@@ -339,7 +339,7 @@ impl SecurityScanner {
                         check: SecurityCheck::UnprotectedSelfDestruct,
                         severity: Severity::Critical,
                         location: "bytecode".to_string(),
-                        description: "SELFDESTRUCT opcode found — may be callable by non-owners.".to_string(),
+                        description: "SELFDESTRUCT opcode found - may be callable by non-owners.".to_string(),
                         recommendation: "Add access control to self-destruct functionality.".to_string(),
                     })
                 } else {
@@ -353,7 +353,7 @@ impl SecurityScanner {
                         check: SecurityCheck::UnauthorizedAccess,
                         severity: Severity::High,
                         location: "bytecode".to_string(),
-                        description: "No CALLER checks found — functions may lack access control.".to_string(),
+                        description: "No CALLER checks found - functions may lack access control.".to_string(),
                         recommendation: "Add onlyOwner or role-based access control modifiers.".to_string(),
                     })
                 } else {
@@ -369,7 +369,7 @@ impl SecurityScanner {
                         check: SecurityCheck::DenialOfService,
                         severity: Severity::Medium,
                         location: "bytecode".to_string(),
-                        description: "Multiple jump targets detected — possible unbounded loop.".to_string(),
+                        description: "Multiple jump targets detected - possible unbounded loop.".to_string(),
                         recommendation: "Bound loop iterations and use pull-over-push patterns.".to_string(),
                     })
                 } else {
@@ -383,7 +383,7 @@ impl SecurityScanner {
                         check: SecurityCheck::FrontRunning,
                         severity: Severity::Medium,
                         location: "bytecode".to_string(),
-                        description: "GASPRICE and ORIGIN used — transaction ordering dependency.".to_string(),
+                        description: "GASPRICE and ORIGIN used - transaction ordering dependency.".to_string(),
                         recommendation: "Use commit-reveal schemes or transaction ordering protection.".to_string(),
                     })
                 } else {
@@ -397,7 +397,7 @@ impl SecurityScanner {
                         check: SecurityCheck::OracleManipulation,
                         severity: Severity::High,
                         location: "bytecode".to_string(),
-                        description: "External call result stored directly — possible oracle manipulation.".to_string(),
+                        description: "External call result stored directly - possible oracle manipulation.".to_string(),
                         recommendation: "Use TWAP oracles or multiple oracle sources with median.".to_string(),
                     })
                 } else {
@@ -411,7 +411,7 @@ impl SecurityScanner {
                         check: SecurityCheck::FlashLoan,
                         severity: Severity::Medium,
                         location: "bytecode".to_string(),
-                        description: "Value-dependent external calls detected — flash loan attack surface.".to_string(),
+                        description: "Value-dependent external calls detected - flash loan attack surface.".to_string(),
                         recommendation: "Add flash-loan guards or require multi-block settlement.".to_string(),
                     })
                 } else {
@@ -425,7 +425,7 @@ impl SecurityScanner {
                         check: SecurityCheck::PrivilegeEscalation,
                         severity: Severity::Critical,
                         location: "bytecode".to_string(),
-                        description: "DELEGATECALL found — attacker may hijack storage context.".to_string(),
+                        description: "DELEGATECALL found - attacker may hijack storage context.".to_string(),
                         recommendation: "Validate delegate targets and use proxy patterns carefully.".to_string(),
                     })
                 } else {
@@ -476,7 +476,7 @@ mod tests {
     fn test_scan_clean_bytecode() {
         let mut scanner = SecurityScanner::new();
         scanner.add_all_checks();
-        // Completely benign bytecode — no suspicious opcodes.
+        // Completely benign bytecode - no suspicious opcodes.
         let bytecode = vec![0x60, 0x00, 0x60, 0x00, 0x33, 0x11, 0x00];
         let report = scanner.scan_contract(&bytecode);
         assert_eq!(report.critical, 0);

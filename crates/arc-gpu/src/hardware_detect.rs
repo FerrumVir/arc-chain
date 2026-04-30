@@ -151,7 +151,7 @@ fn detect_avx512() -> bool {
 /// effectively a target_arch check.
 #[cfg(target_arch = "aarch64")]
 fn detect_neon() -> bool {
-    // NEON is mandatory on aarch64 — always available.
+    // NEON is mandatory on aarch64 - always available.
     true
 }
 

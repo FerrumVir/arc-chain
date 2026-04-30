@@ -3,7 +3,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// A BLAKE3-based transaction commitment.
-/// This is the fast-path commitment used for throughput — each transaction
+/// This is the fast-path commitment used for throughput - each transaction
 /// is hashed into a 256-bit commitment that can be independently verified.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TransactionCommitment {
@@ -37,7 +37,7 @@ pub fn commit_transaction(domain: u8, data: &[u8]) -> TransactionCommitment {
 }
 
 /// Batch-commit many transactions in parallel using Rayon.
-/// This is the core throughput function — splits work across all CPU cores.
+/// This is the core throughput function - splits work across all CPU cores.
 pub fn batch_commit_parallel(transactions: &[(u8, &[u8])]) -> Vec<TransactionCommitment> {
     transactions
         .par_iter()

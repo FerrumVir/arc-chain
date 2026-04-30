@@ -128,7 +128,7 @@ fn commits_equivalent(a: &[DagBlock], b: &[DagBlock]) -> bool {
     if a.len() != b.len() {
         return false;
     }
-    // Compare as sorted sets — same blocks committed regardless of DashMap iteration order.
+    // Compare as sorted sets - same blocks committed regardless of DashMap iteration order.
     // Within a DAG round, blocks are independent, so ordering within a round is not a
     // safety concern. Cross-round ordering is preserved by the commit rule.
     let mut a_hashes: Vec<Hash256> = a.iter().map(|b| b.hash).collect();

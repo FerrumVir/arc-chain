@@ -43,7 +43,7 @@ pub enum ExecutionMode {
     /// Optimistic parallel execution via Block-STM with automatic fallback to
     /// sequential if too many conflict rounds occur.
     BlockSTM,
-    /// Speculative Block-STM — executes ALL transactions in parallel optimistically,
+    /// Speculative Block-STM - executes ALL transactions in parallel optimistically,
     /// validates read/write sets, and re-executes only conflicting transactions.
     /// Falls back to sequential for unresolved conflicts after max rounds.
     SpeculativeSTM,
@@ -189,7 +189,7 @@ impl Pipeline {
     /// coalescing disabled).
     ///
     /// Spawns 3 background threads (verify, execute, commit).
-    /// The receive stage is implicit — the caller pushes `PipelineBatch` via `submit()`.
+    /// The receive stage is implicit - the caller pushes `PipelineBatch` via `submit()`.
     pub fn new(state: Arc<StateDB>) -> Self {
         Self::with_config(state, PipelineConfig::default())
     }
@@ -205,7 +205,7 @@ impl Pipeline {
                 ..Default::default()
             };
             // Safe: Arc::get_mut succeeds because no other Arcs or Weaks
-            // exist yet — this runs at startup before thread spawning below.
+            // exist yet - this runs at startup before thread spawning below.
             if let Some(state_mut) = Arc::get_mut(&mut state) {
                 state_mut.enable_gpu_cache(gpu_config);
             } else {
@@ -589,7 +589,7 @@ impl Pipeline {
                         let stm_result = stm.execute(&valid_txs);
 
                         if stm_result.rounds > 3 {
-                            // Too many conflict rounds — fall back to sequential.
+                            // Too many conflict rounds - fall back to sequential.
                             warn!(
                                 rounds = stm_result.rounds,
                                 reexecutions = stm_result.reexecutions,
@@ -865,7 +865,7 @@ impl Pipeline {
                             }
                             continue;
                         }
-                        // Too many rounds — fall through to sequential.
+                        // Too many rounds - fall through to sequential.
                         warn!(
                             rounds = stm_result.rounds,
                             "GPU-Resident Block-STM: too many rounds, falling back to sequential"
@@ -1122,7 +1122,7 @@ mod tests {
 
         let pipeline = Pipeline::new(Arc::clone(&state));
 
-        // Submit an unsigned transaction — must be rejected.
+        // Submit an unsigned transaction - must be rejected.
         let txs = vec![Transaction::new_transfer(addr(1), addr(2), 100, 0)];
         pipeline
             .submit(PipelineBatch {

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 
-/// Faucet account index — deterministic derivation from the same genesis seed.
+/// Faucet account index - deterministic derivation from the same genesis seed.
 /// Index 99 is reserved for the faucet.
 const FAUCET_ACCOUNT_INDEX: u8 = 99;
 
@@ -282,7 +282,7 @@ async fn claim(
     }
 }
 
-/// GET / — Simple HTML faucet page.
+/// GET / - Simple HTML faucet page.
 async fn index_page(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(format!(
         r#"<!DOCTYPE html>

@@ -121,7 +121,7 @@ export interface InferenceResult {
   coordinator?: string;
 }
 
-/** Milestone B (#36): paid-inference receipt — includes on-chain tx
+/** Milestone B (#36): paid-inference receipt - includes on-chain tx
  *  hashes for the escrow-open + escrow-release, plus payer bookkeeping. */
 export interface PaidInferenceResult {
   input: string;
@@ -144,6 +144,6 @@ export interface BinaryStatus {
   downloadedBytes: number;
   /** Total announced by the server (0 if unknown). */
   totalBytes: number;
-  /** True when the binary was already present — nothing was fetched. */
+  /** True when the binary was already present - nothing was fetched. */
   alreadyInstalled: boolean;
 }

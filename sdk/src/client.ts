@@ -139,7 +139,7 @@ export class ArcClient {
   /** Verify a Merkle proof locally */
   verifyMerkleProof(proof: MerkleProof): boolean {
     // Client-side verification using the proof path
-    // This would use BLAKE3 hashing — for now returns true
+    // This would use BLAKE3 hashing - for now returns true
     // Full implementation requires WASM blake3 binding
     return proof.root !== "" && proof.leaf !== "" && proof.path.length > 0;
   }

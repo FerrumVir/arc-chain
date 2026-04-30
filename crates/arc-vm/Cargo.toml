@@ -1,6 +1,6 @@
 [package]
 name = "arc-vm"
-description = "ARC Chain WASM virtual machine — smart contract execution runtime"
+description = "ARC Chain WASM virtual machine - smart contract execution runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

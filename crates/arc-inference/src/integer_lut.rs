@@ -1,6 +1,6 @@
 //! Precomputed lookup tables for integer-only inference.
 //!
-//! All tables are const arrays computed at build time — zero runtime float dependency.
+//! All tables are const arrays computed at build time - zero runtime float dependency.
 //! Used by integer_engine.rs for exp and GeLU approximations.
 
 /// Fixed-point fractional bits. Value x represents x / 2^FRAC_BITS.
@@ -12,7 +12,7 @@ pub const ONE: i64 = 1 << FRAC_BITS; // 65536
 /// 4097 entries covering x in [-16*ONE, 0] with 16× finer resolution
 /// than the original 257-entry table. Step size: ONE/256 = 256 Q16 units
 /// (≈0.0039 real), which reduces the linear-interp error on exp() from
-/// ~0.5% per call down to ~0.002% — critical for attention softmax where
+/// ~0.5% per call down to ~0.002% - critical for attention softmax where
 /// small per-position errors compound into distribution noise that
 /// inflates PPL without affecting argmax.
 ///
@@ -77,7 +77,7 @@ pub fn softmax_i64(input: &[i64]) -> Vec<i64> {
     // Sum of exps
     let sum: i64 = exps.iter().sum();
     if sum == 0 {
-        // All values are negligible — return uniform
+        // All values are negligible - return uniform
         let n = input.len() as i64;
         return vec![ONE / n; input.len()];
     }

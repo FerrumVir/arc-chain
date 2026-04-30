@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ARC Chain — Soak Test
+# ARC Chain - Soak Test
 # Runs N validator nodes on this machine for a sustained period
 # Monitors TPS, errors, memory, and state root consistency
 #
@@ -29,7 +29,7 @@ HOURS=$((DURATION / 3600))
 MINS=$(( (DURATION % 3600) / 60 ))
 
 echo "================================================================"
-echo " ARC Chain — Soak Test"
+echo " ARC Chain - Soak Test"
 echo "================================================================"
 echo ""
 echo "  Nodes:          $NODES"

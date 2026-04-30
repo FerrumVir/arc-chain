@@ -8,14 +8,14 @@
      - Favorit-style geometric grotesque (fallback: Inter Display)
      - glow as secondary accent
      - 5 core colours + 1 gradient + 11 sub colours (official hex values
-       not yet committed — drop them in where marked TODO below when
+       not yet committed - drop them in where marked TODO below when
        the signed brand pack is released)
    ───────────────────────────────────────────────────────────────────── */
 
 :root {
   color-scheme: dark;
 
-  /* ── Surface palette — digital greys per guide ─────────────────── */
+  /* ── Surface palette - digital greys per guide ─────────────────── */
   --bg: #060608;
   --bg-soft: #0c0c11;
   --surface: #12121a;
@@ -39,12 +39,12 @@
      Below is a slightly brighter, more saturated variant that works on
      dark UI. Replace when the official pack is committed. */
   --arc: #3b63f5;             /* ARC primary (confident blue) */
-  --arc-ink: #5a7eff;         /* lighter — hover + highlights */
-  --arc-deep: #2a4ad1;        /* darker — pressed states */
+  --arc-ink: #5a7eff;         /* lighter - hover + highlights */
+  --arc-deep: #2a4ad1;        /* darker - pressed states */
   --arc-soft: rgba(59, 99, 245, 0.12);
   --arc-glow: rgba(59, 99, 245, 0.38);
 
-  /* Supporting — the paper's link blue, used for links + secondary accents. */
+  /* Supporting - the paper's link blue, used for links + secondary accents. */
   --arc-paper: #4466cc;
 
   /* The gradient ("1 gradient" per the guide). Used for hero earnings,

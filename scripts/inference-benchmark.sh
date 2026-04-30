@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Single vs Distributed Inference Benchmark
+# ARC Chain - Single vs Distributed Inference Benchmark
 #
 # Runs the same N prompts in two modes:
 #   1. SEQUENTIAL on a single node (the "old" way)
@@ -67,7 +67,7 @@ BOLD=$'\033[1m' GREEN=$'\033[32m' CYAN=$'\033[36m' YELLOW=$'\033[33m' RED=$'\033
 now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
 printf "%s%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$BOLD" "$RESET"
-printf "%s║   ARC Chain — Single vs Distributed Benchmark                ║%s\n" "$CYAN$BOLD" "$RESET"
+printf "%s║   ARC Chain - Single vs Distributed Benchmark                ║%s\n" "$CYAN$BOLD" "$RESET"
 printf "%s╚══════════════════════════════════════════════════════════════╝%s\n" "$CYAN$BOLD" "$RESET"
 echo ""
 printf "  Running %s%s%s identical inference requests in two modes\n" "$BOLD" "$N" "$RESET"
@@ -160,7 +160,7 @@ if [ "$SEQ_UNIQUE" = "1" ] && [ "$DIST_UNIQUE" = "1" ] && [ "$SEQ_HASH" = "$DIST
     printf "  Hash: %s\n" "$SEQ_HASH"
     printf "  %sCryptographic proof of cross-device deterministic inference%s\n" "$BOLD" "$RESET"
 else
-    printf "  %s⚠ Hashes diverge — investigate%s\n" "$YELLOW" "$RESET"
+    printf "  %s⚠ Hashes diverge - investigate%s\n" "$YELLOW" "$RESET"
 fi
 
 rm -f "$SEQ_HASH_FILE" "$DIST_HASH_FILE"

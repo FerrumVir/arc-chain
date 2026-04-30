@@ -1,4 +1,4 @@
-//! EVM execution runtime — runs Solidity/EVM bytecode via `revm`.
+//! EVM execution runtime - runs Solidity/EVM bytecode via `revm`.
 //!
 //! This enables full Ethereum compatibility: developers can deploy
 //! Solidity contracts unchanged, and existing EVM tooling (Hardhat,
@@ -133,7 +133,7 @@ impl Database for ArcStateDb {
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
         match self.state.get_block(number) {
             Some(block) => {
-                // ARC block hashes are 32-byte BLAKE3 hashes — map directly to B256.
+                // ARC block hashes are 32-byte BLAKE3 hashes - map directly to B256.
                 Ok(B256::from(block.hash.0))
             }
             None => Ok(B256::ZERO),

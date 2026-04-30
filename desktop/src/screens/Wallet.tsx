@@ -76,7 +76,7 @@ export function Wallet() {
             <span
               className="status-pill info"
               data-testid="wallet-nonce"
-              title="Transaction counter — increments with every tx you send"
+              title="Transaction counter - increments with every tx you send"
             >
               Nonce {formatInt(balance?.nonce ?? 0)}
             </span>
@@ -193,7 +193,7 @@ export function Wallet() {
             }}
             data-testid="receive-address"
           >
-            {identity?.address ?? "—"}
+            {identity?.address ?? "-"}
           </div>
           <button
             className="btn btn-secondary"
@@ -240,7 +240,7 @@ export function Wallet() {
               marginBottom: "var(--space-4)",
             }}
           >
-            Coming in v0.2 — secure ed25519 signing is a prerequisite and
+            Coming in v0.2 - secure ed25519 signing is a prerequisite and
             lands with keychain integration.
           </div>
           <div
@@ -287,7 +287,7 @@ export function Wallet() {
             style={{ color: "var(--warning)", flexShrink: 0, marginTop: 2 }}
           />
           <div>
-            These tokens are testnet ARC — no monetary value. Mainnet uses a
+            These tokens are testnet ARC - no monetary value. Mainnet uses a
             separate address space: <code>0x672fdBA7055bddFa8fD6bD45B1455cE5eB97f499</code> (ETH L1, ERC-20).
             Your testnet identity will not port to mainnet.
           </div>

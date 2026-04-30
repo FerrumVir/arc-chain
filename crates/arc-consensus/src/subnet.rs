@@ -697,7 +697,7 @@ mod tests {
             SubnetStatus::Pending,
         );
 
-        // First validator — still pending.
+        // First validator - still pending.
         reg.join_subnet(&id, make_validator(addr(0x10), id, 5_000))
             .unwrap();
         assert_eq!(
@@ -705,7 +705,7 @@ mod tests {
             SubnetStatus::Pending,
         );
 
-        // Second validator — should now be Active.
+        // Second validator - should now be Active.
         reg.join_subnet(&id, make_validator(addr(0x11), id, 5_000))
             .unwrap();
         assert_eq!(
@@ -724,7 +724,7 @@ mod tests {
         config.status = SubnetStatus::Active;
         reg.register_subnet(config).unwrap();
 
-        // No anchor yet — not live.
+        // No anchor yet - not live.
         assert!(!reg.check_liveness(&id, 60));
 
         // Submit a fresh anchor.

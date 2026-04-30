@@ -1,4 +1,4 @@
-//! ARC Chain — Mixed Workload Benchmark (ETH-weighted TPS)
+//! ARC Chain - Mixed Workload Benchmark (ETH-weighted TPS)
 //!
 //! Simulates real Ethereum mainnet transaction distribution through the
 //! production pipeline.  Every transaction is a real signed transfer that
@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(
     name = "arc-bench-mixed",
-    about = "ARC Chain — Mixed Workload Benchmark (ETH-weighted TPS)"
+    about = "ARC Chain - Mixed Workload Benchmark (ETH-weighted TPS)"
 )]
 struct Args {
     /// Total transactions to process.
@@ -520,7 +520,7 @@ fn main() {
 
     println!();
     println!("================================================================");
-    println!(" ARC Chain — MIXED WORKLOAD Benchmark (ETH-weighted TPS)");
+    println!(" ARC Chain - MIXED WORKLOAD Benchmark (ETH-weighted TPS)");
     println!("================================================================");
     println!();
     println!("  WHAT THIS MEASURES:");

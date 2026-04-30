@@ -43,7 +43,7 @@ const MAX_TX_SIZE: usize = 65_536;
 const MIN_TX_BODY: usize = 116;
 
 // ---------------------------------------------------------------------------
-// ParsedTx — zero-copy where possible
+// ParsedTx - zero-copy where possible
 // ---------------------------------------------------------------------------
 
 /// A parsed transaction.  All fixed-size fields are copied; the signature is
@@ -136,7 +136,7 @@ impl SimdParser {
 
             if tx_len > MAX_TX_SIZE {
                 error_count += 1;
-                // Skip is impossible if we don't know the real length — bail.
+                // Skip is impossible if we don't know the real length - bail.
                 break;
             }
 
@@ -215,7 +215,7 @@ impl SimdParser {
         let receiver: [u8; 32] = data[pos..pos + 32].try_into().unwrap();
         pos += 32;
 
-        // amount: 8 bytes LE — use wide u64 read
+        // amount: 8 bytes LE - use wide u64 read
         let amount = read_u64_le(data, pos);
         pos += 8;
 
@@ -324,7 +324,7 @@ fn read_u64_le(buf: &[u8], offset: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-/// Read a little-endian `u128` from `buf` at `offset` — useful for comparing
+/// Read a little-endian `u128` from `buf` at `offset` - useful for comparing
 /// two 16-byte address halves in one operation.
 #[inline(always)]
 #[allow(dead_code)]
@@ -347,7 +347,7 @@ fn prefetch_read(buf: &[u8], offset: usize) {
     let _ptr = buf.as_ptr().wrapping_add(offset);
 
     // On x86_64 we can use _mm_prefetch; on aarch64 we have __prefetch.
-    // For now this is a compiler hint via the pointer read — a real SIMD
+    // For now this is a compiler hint via the pointer read - a real SIMD
     // backend would use std::arch intrinsics gated behind cfg.
     #[cfg(target_arch = "x86_64")]
     {
@@ -377,7 +377,7 @@ fn prefetch_read(buf: &[u8], offset: usize) {
 // ---------------------------------------------------------------------------
 
 /// Compare two 32-byte addresses using two `u128` reads instead of
-/// byte-by-byte — 2x fewer comparisons on 64-bit architectures.
+/// byte-by-byte - 2x fewer comparisons on 64-bit architectures.
 #[inline]
 pub fn addresses_equal(a: &[u8; 32], b: &[u8; 32]) -> bool {
     let a_lo = u128::from_le_bytes(a[0..16].try_into().unwrap());

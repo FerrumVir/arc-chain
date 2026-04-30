@@ -1,8 +1,8 @@
-//! Cached Integer Model — Production-speed deterministic inference.
+//! Cached Integer Model - Production-speed deterministic inference.
 //!
 //! Default mode: **INT16** weights (2 bytes per parameter) with per-row Q16 scale factors.
-//! INT16 gives 32,767 quantization levels per row — 258x finer than INT8's 127 levels,
-//! and 32x finer than FP16's 1,024 mantissa levels — while remaining fully deterministic.
+//! INT16 gives 32,767 quantization levels per row - 258x finer than INT8's 127 levels,
+//! and 32x finer than FP16's 1,024 mantissa levels - while remaining fully deterministic.
 //!
 //! Also supports INT8 (1 byte, lower precision) and Q4 (0.5 byte, lowest bandwidth).
 //! Forward pass: integer weight × i64 activation → accumulate in i64 → per-row scale → Q16.
@@ -51,7 +51,7 @@ impl I8Weights {
                 data.push((x * inv_abs_max).round().clamp(-127.0, 127.0) as i8);
             }
 
-            // Per-row scale = abs_max / 127 in Q16 (pure integer — no f64 rounding)
+            // Per-row scale = abs_max / 127 in Q16 (pure integer - no f64 rounding)
             // scale = ceil(abs_max * ONE / 127) to avoid underflow
             let abs_max_i64 = abs_max as i64;
             let scale = ((abs_max_i64 * ONE) + 126) / 127;
@@ -131,7 +131,7 @@ impl I16Weights {
 
     /// Convert from existing I8Weights (cast i8 -> i16, adjust scales).
     ///
-    /// This does NOT improve precision — the i8 quantization loss is already baked in.
+    /// This does NOT improve precision - the i8 quantization loss is already baked in.
     /// Use this to validate the I16 code path. For real quality improvement,
     /// use `quantize_f32` with the original float weights.
     ///
@@ -195,7 +195,7 @@ impl CachedLayer {
     }
 }
 
-/// KV cache — full i64 precision for deterministic attention.
+/// KV cache - full i64 precision for deterministic attention.
 /// i8 quantization loses too much precision for attention dot products,
 /// causing the model to attend to wrong positions after a few tokens.
 /// Memory: 7B at 2048 context: ~4 GB. Fits on Mac Studio, tight on 8GB Vultr.
@@ -266,7 +266,7 @@ pub struct ModelConfig {
     /// Chat template (Jinja2) from GGUF metadata. Used to wrap user prompts
     /// in the correct format for the model (e.g., [INST]...[/INST] for LLaMA-2,
     /// <|start_header_id|>user<|end_header_id|> for LLaMA-3, etc.).
-    /// Empty string means no template — use raw input.
+    /// Empty string means no template - use raw input.
     pub chat_template: String,
 }
 
@@ -292,8 +292,37 @@ pub struct I16Layer {
     pub w_down: I16Weights,
 }
 
+/// Pre-loaded transformer layer in ternary (2 bits/weight).
+///
+/// Matmuls route through `matmul_ternary` - zero multiplications, pure
+/// ADD + XOR on the accumulator. See `ternary_engine.rs` for the math and
+/// `sha256_isa.rs` for the SHA-256 datapath proof.
+pub struct TernaryLayer {
+    pub wq: crate::ternary_engine::TernaryWeights,
+    pub wk: crate::ternary_engine::TernaryWeights,
+    pub wv: crate::ternary_engine::TernaryWeights,
+    pub wo: crate::ternary_engine::TernaryWeights,
+    pub w_gate: crate::ternary_engine::TernaryWeights,
+    pub w_up: crate::ternary_engine::TernaryWeights,
+    pub w_down: crate::ternary_engine::TernaryWeights,
+}
+
+/// Hybrid ternary + INT8 outliers. Ternary bulk runs on ASIC primitives;
+/// the small outlier fraction (1–5%) runs on the controller via regular
+/// INT8 multiply-accumulate. Preserves PTQ quality on models not trained
+/// ternary-aware. See `ternary_hybrid.rs`.
+pub struct TernaryHybridLayer {
+    pub wq: crate::ternary_hybrid::TernaryHybridWeights,
+    pub wk: crate::ternary_hybrid::TernaryHybridWeights,
+    pub wv: crate::ternary_hybrid::TernaryHybridWeights,
+    pub wo: crate::ternary_hybrid::TernaryHybridWeights,
+    pub w_gate: crate::ternary_hybrid::TernaryHybridWeights,
+    pub w_up: crate::ternary_hybrid::TernaryHybridWeights,
+    pub w_down: crate::ternary_hybrid::TernaryHybridWeights,
+}
+
 /// Pre-loaded transformer layer in block-wise INT8 (Q8_0-style) format.
-/// 32-weight blocks with i32 Q16 scales. Preferred storage going forward —
+/// 32-weight blocks with i32 Q16 scales. Preferred storage going forward -
 /// bridges the old per-row I8 quality gap without sacrificing integer
 /// determinism.
 pub struct BlockI8Layer {
@@ -311,17 +340,17 @@ pub struct CachedIntegerModel {
     pub config: ModelConfig,
     /// Embeddings stored at full Q16 precision (not INT8).
     /// Embedding values can be extremely small (1e-6) and INT8 destroys them.
-    /// This is just a lookup table, not a matmul — no performance impact.
+    /// This is just a lookup table, not a matmul - no performance impact.
     pub embedding_q16: Vec<i64>,  // [vocab × d_model] in Q16
     pub embedding_i8: I8Weights,  // kept for weight_hash and save_weights
     pub layers: Vec<CachedLayer>,
     pub final_norm: Vec<i64>,
     pub output_weight: I8Weights, // [vocab × d_model]
     pub vocab: Vec<String>,
-    /// Q4 weights — converted from I8 on enable_q4(). Halves bandwidth.
+    /// Q4 weights - converted from I8 on enable_q4(). Halves bandwidth.
     pub q4_layers: Option<Vec<Q4Layer>>,
     pub q4_output: Option<Q4WeightsX86>,
-    /// I16 weights — converted from I8 on enable_i16(). Finer quantization.
+    /// I16 weights - converted from I8 on enable_i16(). Finer quantization.
         pub i16_layers: Option<Vec<I16Layer>>,
         pub i16_output: Option<I16Weights>,
     /// Block-wise INT8 (32-weight blocks with i32 Q16 scales). When present,
@@ -329,6 +358,15 @@ pub struct CachedIntegerModel {
     /// per-row I8, full integer determinism, ~12% memory overhead vs I8.
     pub block_i8_layers: Option<Vec<BlockI8Layer>>,
     pub block_i8_output: Option<crate::block_i8::BlockI8Weights>,
+    /// Ternary weights - converted from I8 on enable_ternary().
+    /// 2 bits/weight, ASIC-compatible matmul (ADD + XOR only, zero multiplications).
+    /// See `ternary_engine.rs`.
+    pub ternary_layers: Option<Vec<TernaryLayer>>,
+    pub ternary_output: Option<crate::ternary_engine::TernaryWeights>,
+    /// Hybrid ternary + sparse INT8 outliers - enabled via enable_ternary_hybrid().
+    /// Takes dispatch priority over pure ternary when both are populated.
+    pub ternary_hybrid_layers: Option<Vec<TernaryHybridLayer>>,
+    pub ternary_hybrid_output: Option<crate::ternary_hybrid::TernaryHybridWeights>,
 }
 
 impl CachedIntegerModel {
@@ -346,6 +384,49 @@ impl CachedIntegerModel {
         }).collect();
         self.q4_output = Some(Q4WeightsX86::from_i8(&self.output_weight));
         self.q4_layers = Some(q4_layers);
+    }
+
+    /// Convert all weights to hybrid ternary + INT8 outliers.
+    /// `outlier_pct` = fraction of weights (by magnitude) kept as INT8 per row.
+    /// Typical values: 1.0-5.0 (lower = more ASIC-native, higher = more quality).
+    ///
+    /// The ternary bulk runs on ASIC primitives; outliers run on the controller.
+    /// This is the PTQ quality path - works on any model without retraining.
+    pub fn enable_ternary_hybrid(&mut self, outlier_pct: f32) {
+        use crate::ternary_hybrid::TernaryHybridWeights;
+        if self.ternary_hybrid_layers.is_some() { return; }
+        let hybrid_layers: Vec<TernaryHybridLayer> = self.layers.iter().map(|l| TernaryHybridLayer {
+            wq:     TernaryHybridWeights::from_i8(&l.wq, outlier_pct),
+            wk:     TernaryHybridWeights::from_i8(&l.wk, outlier_pct),
+            wv:     TernaryHybridWeights::from_i8(&l.wv, outlier_pct),
+            wo:     TernaryHybridWeights::from_i8(&l.wo, outlier_pct),
+            w_gate: TernaryHybridWeights::from_i8(&l.w_gate, outlier_pct),
+            w_up:   TernaryHybridWeights::from_i8(&l.w_up, outlier_pct),
+            w_down: TernaryHybridWeights::from_i8(&l.w_down, outlier_pct),
+        }).collect();
+        self.ternary_hybrid_output = Some(TernaryHybridWeights::from_i8(&self.output_weight, outlier_pct));
+        self.ternary_hybrid_layers = Some(hybrid_layers);
+    }
+
+    /// Convert all weights from I8 to ternary (2 bits/weight).
+    /// Call once after loading model. Original I8 weights kept for fallback.
+    ///
+    /// Ternary matmul runs on SHA-256 ASIC primitives (ADD + XOR, no multiplication),
+    /// enabling inference on Bitcoin mining hardware via the ARC distributed network.
+    pub fn enable_ternary(&mut self) {
+        use crate::ternary_engine::TernaryWeights;
+        if self.ternary_layers.is_some() { return; }
+        let ternary_layers: Vec<TernaryLayer> = self.layers.iter().map(|l| TernaryLayer {
+            wq:     TernaryWeights::from_i8(&l.wq),
+            wk:     TernaryWeights::from_i8(&l.wk),
+            wv:     TernaryWeights::from_i8(&l.wv),
+            wo:     TernaryWeights::from_i8(&l.wo),
+            w_gate: TernaryWeights::from_i8(&l.w_gate),
+            w_up:   TernaryWeights::from_i8(&l.w_up),
+            w_down: TernaryWeights::from_i8(&l.w_down),
+        }).collect();
+        self.ternary_output = Some(TernaryWeights::from_i8(&self.output_weight));
+        self.ternary_layers = Some(ternary_layers);
     }
 
     /// Convert all weights from I8 to I16 format.
@@ -374,7 +455,7 @@ impl CachedIntegerModel {
 
 // ─── Cached Input Quantization ────────────────────────────────────────────────
 
-/// Pre-quantized i8 input — computed once, reused for multiple matmuls.
+/// Pre-quantized i8 input - computed once, reused for multiple matmuls.
 pub struct QuantizedInput {
     pub data: Vec<i8>,
     pub scale_factor: i64,
@@ -565,14 +646,14 @@ unsafe fn dot_i16_i64_neon(row: *const i16, input: *const i64, len: usize) -> i6
 /// unrolled path which LLVM autovectorizes adequately for the 2-3 layer
 /// shards on NYC/LAX. An explicit AVX-512 widening path was attempted
 /// (commit 8274796) but caused segfaults during consensus on Vultr
-/// Skylake Xeon VPS — reverted to scalar pending investigation.
+/// Skylake Xeon VPS - reverted to scalar pending investigation.
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn dot_i16_i64_avx2(row: *const i16, input: *const i64, len: usize) -> i64 {
     dot_i16_i64_scalar(row, input, len)
 }
 
-/// Dispatch wrapper — picks NEON on aarch64, AVX2 on x86_64, scalar elsewhere.
+/// Dispatch wrapper - picks NEON on aarch64, AVX2 on x86_64, scalar elsewhere.
 #[inline(always)]
 unsafe fn dot_i16_i64(row: *const i16, input: *const i64, len: usize) -> i64 {
     #[cfg(target_arch = "aarch64")]
@@ -607,7 +688,7 @@ unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64
         let a1 = vld1q_s64(a.add(j + 2));  // a[j+2..j+4]
         let b0 = vld1q_s64(b.add(j));
         let b1 = vld1q_s64(b.add(j + 2));
-        // Narrow to i32 (truncate — values are bounded by Q16)
+        // Narrow to i32 (truncate - values are bounded by Q16)
         let a32 = vcombine_s32(vmovn_s64(a0), vmovn_s64(a1));
         let b32 = vcombine_s32(vmovn_s64(b0), vmovn_s64(b1));
         // Multiply i32×i32 → i64 via vmull
@@ -743,7 +824,7 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
     output
 }
 
-/// x86 SIMD matmul — llama.cpp sign trick for AVX2, AVX-512.
+/// x86 SIMD matmul - llama.cpp sign trick for AVX2, AVX-512.
 /// sign trick: abs(w) × sign_corrected(input) → safe maddubs (no i16 saturation)
 /// Processes 32 bytes at once (AVX2) or 64 (AVX-512), no sign extension needed.
 #[cfg(target_arch = "x86_64")]
@@ -760,7 +841,7 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
 
     let use_avx512 = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
 
-    // Quantize input once — reused across all output rows
+    // Quantize input once - reused across all output rows
     let input_abs_max = input.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
     let input_scale_factor = (input_abs_max / 127).max(1);
     // Align to 64 bytes for AVX-512 loads (pad with zeros)
@@ -935,12 +1016,12 @@ fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_siz
 /// NOTE: SIMD path quantizes input to i8 which causes double-quantization precision loss.
 /// For models with small weight distributions, use scalar path (i8×i64, full input precision).
 pub fn matmul_fast(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
-    // Use scalar i8×i64 path for full precision — SIMD i8×i8 loses too much
+    // Use scalar i8×i64 path for full precision - SIMD i8×i8 loses too much
     // precision for small models like TinyLlama where weights are near-zero.
     matmul_i8(weights, input, in_size, out_size)
 }
 
-/// Zero-alloc matmul — uses scalar i8×i64 for full precision.
+/// Zero-alloc matmul - uses scalar i8×i64 for full precision.
 pub fn matmul_fast_preq(weights: &I8Weights, _input_q: &QuantizedInput, input_raw: &[i64], in_size: usize, output: &mut [i64]) {
     // Use scalar i8×i64 path for full input precision.
     // The SIMD i8×i8 path loses too much via double quantization.
@@ -1409,7 +1490,7 @@ pub fn matmul_q4_full(q4: &Q4WeightsX86, input: &[i64], output: &mut [i64]) {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// RMSNorm (what Llama uses — no mean subtraction, just root-mean-square).
+/// RMSNorm (what Llama uses - no mean subtraction, just root-mean-square).
 /// output[i] = (input[i] / rms) * gamma[i]
 /// where rms = sqrt(mean(x²))
 pub fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
@@ -1422,7 +1503,7 @@ pub fn layernorm(input: &[i64], gamma: &[i64]) -> Vec<i64> {
     // (≈0.0039 real) contributed 0 to the sum because x·x was below 2^16
     // before the shift. Long-tailed distributions (most of Llama's hidden
     // states) got systematically understated RMS → oversized normalization
-    // factor → amplified residual stream layer-to-layer — a measurable
+    // factor → amplified residual stream layer-to-layer - a measurable
     // contributor to the PPL gap vs candle's Q8_0 reference.
     let mut sq_sum: i128 = 0;
     for &x in input {
@@ -1627,7 +1708,7 @@ fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
 /// The production path uses flash_attention_i64() which operates directly on the
 /// i64 KV cache with online softmax. Both use the same integer_exp() arithmetic.
 ///
-/// q_head: [d_head] i64 Q16 — the query for this head at current position
+/// q_head: [d_head] i64 Q16 - the query for this head at current position
 /// k_data: flat i8 array of all cached K for this layer
 /// k_scales: per-position scales for K
 /// v_data: flat i8 array of all cached V
@@ -1645,7 +1726,7 @@ fn flash_attention_i8(
     full_seq: usize, attn_scale: i64,
 ) -> Vec<i64> {
     // Online softmax: maintain running max, sum of exp, and weighted V sum.
-    // Process one position at a time — O(1) extra memory (no scores array).
+    // Process one position at a time - O(1) extra memory (no scores array).
     let mut running_max: i64 = -8 * ONE; // start very negative
     let mut running_sum: i64 = 0;        // sum of exp(score - max)
     let mut out = vec![0i64; d_head];     // weighted V accumulator
@@ -1664,7 +1745,7 @@ fn flash_attention_i8(
 
         // Online softmax update
         if score > running_max {
-            // New max — rescale existing accumulator
+            // New max - rescale existing accumulator
             let diff = running_max - score; // negative
             let correction = integer_exp(diff); // exp(old_max - new_max) < 1
             // Scale down existing sum and output
@@ -1738,7 +1819,7 @@ fn flash_attention_i64(
 
         // Online softmax update
         if score > running_max {
-            // New max — rescale existing accumulator
+            // New max - rescale existing accumulator
             let diff = running_max - score; // negative
             let correction = integer_exp(diff);
             running_sum = (running_sum * correction) >> FRAC_BITS;
@@ -1935,12 +2016,12 @@ impl CachedIntegerModel {
                 user_input
             )
         } else {
-            // Unknown template — use raw input
+            // Unknown template - use raw input
             user_input.to_string()
         }
     }
 
-    /// Forward pass — zero-alloc matmuls with cached input quantization.
+    /// Forward pass - zero-alloc matmuls with cached input quantization.
     /// Quantize input ONCE, reuse for Q/K/V (3 matmuls) and gate/up (2 matmuls).
     /// Saves 4 input quantizations per layer × 32 layers = 128 saved quantizations.
     /// Uses pre-allocated buffers (q/k/v/attn_out/gate/up/gated/ff_out).
@@ -1960,16 +2041,20 @@ impl CachedIntegerModel {
         }
 
         // Dispatch priority (highest quality first):
-        //   Block-I8  — 32-weight blocks with i32 Q16 scales (Q8_0-shaped)
-        //   I16       — per-row, 258× finer than I8 on paper (but known PPL
+        //   Block-I8  - 32-weight blocks with i32 Q16 scales (Q8_0-shaped)
+        //   I16       - per-row, 258× finer than I8 on paper (but known PPL
         //               issue before the attn/LUT rescale lands, see
         //               project_i16_ppl_bug.md). Kept as a manual override.
-        //   Q4        — x86 low-bandwidth path
-        //   I8        — original per-row fallback
+        //   Q4        - x86 low-bandwidth path
+        //   I8        - original per-row fallback
         macro_rules! dispatch_matmul {
-            ($blk:expr, $i16w:expr, $q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
+            ($hyb:expr, $tern:expr, $blk:expr, $i16w:expr, $q4w:expr, $i8w:expr, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
                 {
-                    if let Some(blk) = $blk {
+                    if let Some(hw) = $hyb {
+                        crate::ternary_hybrid::matmul_ternary_hybrid_into(hw, $raw, $in_sz, $out);
+                    } else if let Some(tw) = $tern {
+                        crate::ternary_engine::matmul_ternary_into(tw, $raw, $in_sz, $out);
+                    } else if let Some(blk) = $blk {
                         crate::block_i8::matmul_block_i8_into(blk, $raw, $out);
                     } else if let Some(i16w) = $i16w {
                         matmul_i16_into(i16w, $raw, $in_sz, $out);
@@ -1982,7 +2067,7 @@ impl CachedIntegerModel {
             };
         }
 
-        // Embed — use full Q16 precision (INT8 destroys tiny embedding values)
+        // Embed - use full Q16 precision (INT8 destroys tiny embedding values)
         let idx = (token as usize).min(cfg.vocab_size - 1);
         let emb_start = idx * d;
         let mut hidden: Vec<i64> = self.embedding_q16[emb_start..emb_start + d].to_vec();
@@ -1998,20 +2083,22 @@ impl CachedIntegerModel {
         let mut ff_out = vec![0i64; d];
 
         for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let hyb_layer  = self.ternary_hybrid_layers.as_ref().map(|hl| &hl[layer_idx]);
+            let tern_layer = self.ternary_layers.as_ref().map(|tl| &tl[layer_idx]);
             let blk_layer  = self.block_i8_layers.as_ref().map(|bl| &bl[layer_idx]);
             let i16_layer  = self.i16_layers.as_ref().map(|il| &il[layer_idx]);
             let q4_layer   = self.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
 
-            // LayerNorm once — result fits in L1 (32KB)
+            // LayerNorm once - result fits in L1 (32KB)
             let normed = layernorm(&hidden, &layer.attn_norm);
 
             // Quantize normed input ONCE, reuse for Q, K, V projections
             let normed_q = QuantizedInput::from_i64(&normed);
 
             // Q/K/V with zero-alloc + cached quantized input
-            dispatch_matmul!(blk_layer.map(|l| &l.wq), i16_layer.map(|l| &l.wq), q4_layer.map(|l| &l.wq), &layer.wq, &normed_q, &normed, d, &mut q);
-            dispatch_matmul!(blk_layer.map(|l| &l.wk), i16_layer.map(|l| &l.wk), q4_layer.map(|l| &l.wk), &layer.wk, &normed_q, &normed, d, &mut k_buf);
-            dispatch_matmul!(blk_layer.map(|l| &l.wv), i16_layer.map(|l| &l.wv), q4_layer.map(|l| &l.wv), &layer.wv, &normed_q, &normed, d, &mut v_buf);
+            dispatch_matmul!(hyb_layer.map(|l| &l.wq), tern_layer.map(|l| &l.wq), blk_layer.map(|l| &l.wq), i16_layer.map(|l| &l.wq), q4_layer.map(|l| &l.wq), &layer.wq, &normed_q, &normed, d, &mut q);
+            dispatch_matmul!(hyb_layer.map(|l| &l.wk), tern_layer.map(|l| &l.wk), blk_layer.map(|l| &l.wk), i16_layer.map(|l| &l.wk), q4_layer.map(|l| &l.wk), &layer.wk, &normed_q, &normed, d, &mut k_buf);
+            dispatch_matmul!(hyb_layer.map(|l| &l.wv), tern_layer.map(|l| &l.wv), blk_layer.map(|l| &l.wv), i16_layer.map(|l| &l.wv), q4_layer.map(|l| &l.wv), &layer.wv, &normed_q, &normed, d, &mut v_buf);
 
             // RoPE
             for h in 0..cfg.n_heads {
@@ -2027,7 +2114,7 @@ impl CachedIntegerModel {
             cache.push_k(layer_idx, &k_buf);
             cache.push_v(layer_idx, &v_buf);
 
-            // Flash attention with online softmax — NEON-vectorized Q·K dot product.
+            // Flash attention with online softmax - NEON-vectorized Q·K dot product.
             // Processes KV cache in streaming fashion: O(d_head) memory instead of
             // O(full_seq) for the scores array. Numerically equivalent to standard
             // softmax(Q·K)·V (same integer_exp + shift arithmetic).
@@ -2051,15 +2138,15 @@ impl CachedIntegerModel {
 
             // Wo projection + residual (zero-alloc)
             let attn_out_q = QuantizedInput::from_i64(&attn_out);
-            dispatch_matmul!(blk_layer.map(|l| &l.wo), i16_layer.map(|l| &l.wo), q4_layer.map(|l| &l.wo), &layer.wo, &attn_out_q, &attn_out, d, &mut projected);
+            dispatch_matmul!(hyb_layer.map(|l| &l.wo), tern_layer.map(|l| &l.wo), blk_layer.map(|l| &l.wo), i16_layer.map(|l| &l.wo), q4_layer.map(|l| &l.wo), &layer.wo, &attn_out_q, &attn_out, d, &mut projected);
             for i in 0..d { hidden[i] += projected[i]; }
 
             // FFN: quantize normed_ff ONCE for gate+up
             let normed_ff = layernorm(&hidden, &layer.ffn_norm);
             let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
 
-            dispatch_matmul!(blk_layer.map(|l| &l.w_gate), i16_layer.map(|l| &l.w_gate), q4_layer.map(|l| &l.w_gate), &layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
-            dispatch_matmul!(blk_layer.map(|l| &l.w_up), i16_layer.map(|l| &l.w_up), q4_layer.map(|l| &l.w_up), &layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
+            dispatch_matmul!(hyb_layer.map(|l| &l.w_gate), tern_layer.map(|l| &l.w_gate), blk_layer.map(|l| &l.w_gate), i16_layer.map(|l| &l.w_gate), q4_layer.map(|l| &l.w_gate), &layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
+            dispatch_matmul!(hyb_layer.map(|l| &l.w_up), tern_layer.map(|l| &l.w_up), blk_layer.map(|l| &l.w_up), i16_layer.map(|l| &l.w_up), q4_layer.map(|l| &l.w_up), &layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
 
             // SiLU gate * up (in-place)
             for j in 0..cfg.d_ff {
@@ -2068,7 +2155,7 @@ impl CachedIntegerModel {
 
             // W_down + residual
             let gate_q = QuantizedInput::from_i64(&gate);
-            dispatch_matmul!(blk_layer.map(|l| &l.w_down), i16_layer.map(|l| &l.w_down), q4_layer.map(|l| &l.w_down), &layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
+            dispatch_matmul!(hyb_layer.map(|l| &l.w_down), tern_layer.map(|l| &l.w_down), blk_layer.map(|l| &l.w_down), i16_layer.map(|l| &l.w_down), q4_layer.map(|l| &l.w_down), &layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
             for i in 0..d { hidden[i] += ff_out[i]; }
         }
 
@@ -2100,7 +2187,7 @@ impl CachedIntegerModel {
         let mut cache = KVCache::new(self.config.n_layers);
         let mut generated = Vec::new();
 
-        // Prepend BOS token (1) — Llama requires it
+        // Prepend BOS token (1) - Llama requires it
         let _ = self.forward_one_token(1, &mut cache);
 
         for &tok in prompt {
@@ -2257,7 +2344,7 @@ impl CachedIntegerModel {
             debug_assert!(layer.is_loaded(),
                 "Shard does not hold layer {} (range was [{}, {}))", layer_idx, start_layer, end);
 
-            // I16 layer ref (preferred — quantized from f32 with 258x finer
+            // I16 layer ref (preferred - quantized from f32 with 258x finer
             // granularity than I8, which is what makes output coherent on
             // smaller models like Llama-7B). Q4 layer ref used on aarch64
             // where matmul_q4_preq_neon delivers ~2× extra bandwidth.
@@ -2298,7 +2385,7 @@ impl CachedIntegerModel {
             let normed = layernorm(&hidden, &layer.attn_norm);
             let normed_q = QuantizedInput::from_i64(&normed);
 
-            // Q/K/V projections — I16 if loaded, else I8
+            // Q/K/V projections - I16 if loaded, else I8
             dispatch!(wq, wq, &normed_q, &normed, d, &mut q);
             dispatch!(wk, wk, &normed_q, &normed, d, &mut k_buf);
             dispatch!(wv, wv, &normed_q, &normed, d, &mut v_buf);
@@ -2321,7 +2408,7 @@ impl CachedIntegerModel {
             cache.push_k(layer_idx, &k_buf);
             cache.push_v(layer_idx, &v_buf);
 
-            // Flash attention with online softmax — same as forward_one_token.
+            // Flash attention with online softmax - same as forward_one_token.
             // O(d_head) memory per head instead of O(full_seq) for scores array.
             let full_seq = position + 1;
             let k_layer_data = &cache.k_data[layer_idx];
@@ -2384,9 +2471,9 @@ impl CachedIntegerModel {
 /// Input to a shard's forward pass.
 #[derive(Debug)]
 pub enum ShardInput {
-    /// Raw token id — used by the FIRST shard, which embeds it locally.
+    /// Raw token id - used by the FIRST shard, which embeds it locally.
     Token(u32),
-    /// Hidden state from the previous shard — used by middle/last shards.
+    /// Hidden state from the previous shard - used by middle/last shards.
     Hidden(Vec<i64>),
 }
 
@@ -2462,7 +2549,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             .map(|t| t.shape.dims()[0] as usize).unwrap_or(32000);
 
         // Read RoPE base frequency from metadata (LLaMA-3 uses 500000, most others use 10000)
-        // Handle both F32 and F64 storage — some quantizers write F64
+        // Handle both F32 and F64 storage - some quantizers write F64
         let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
             Some(gguf_file::Value::F32(v)) => *v as f64,
             Some(gguf_file::Value::F64(v)) => *v,
@@ -2634,7 +2721,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
 
     let max_seq = 2048;
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
-    // 1/sqrt(d_head) in Q16 — integer_isqrt already returns ONE/sqrt(x/ONE)
+    // 1/sqrt(d_head) in Q16 - integer_isqrt already returns ONE/sqrt(x/ONE)
     let attn_scale = integer_isqrt((d_head as i64) * ONE);
 
     info!("Model loaded: ~{} MB per-row INT8", layers.iter()
@@ -2653,9 +2740,9 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
         // Still disabled 2026-04-20. Spent three iterations localizing:
-        // 1. I8 scale bug (abs_max as i64 truncates) — real, independent,
+        // 1. I8 scale bug (abs_max as i64 truncates) - real, independent,
         //    does NOT cause the PPL regression (I16 dispatch preempts I8).
-        // 2. NEON dot_i16_i64 i64→i32 truncation — also not root cause,
+        // 2. NEON dot_i16_i64 i64→i32 truncation - also not root cause,
         //    scalar-only dispatch gives identical PPL 782.68.
         // 3. Actual symptom (see examples/probe_i16_vs_i8.rs): I16 output
         //    projection produces logits ~38× larger magnitude than I8
@@ -2669,12 +2756,15 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         //    integer_exp LUT sensitivity to magnitude).
         i16_layers: { let _ = i16_layers_vec; None },
         i16_output: { let _ = i16_output; None },
-        // Block-wise INT8 installed by default — 32-weight blocks with i32
+        // Block-wise INT8 installed by default - 32-weight blocks with i32
         // Q16 scales, pure integer math, quality on par with llama.cpp Q8_0.
         // Forward dispatch prefers this over per-row I8 when present.
         block_i8_layers: Some(block_i8_layers_vec),
         block_i8_output,
-        })
+        ternary_layers: None,
+        ternary_output: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,    })
 }
 
 #[cfg(not(feature = "candle"))]
@@ -2682,7 +2772,7 @@ pub fn load_cached_model(_path: &str) -> Result<CachedIntegerModel, crate::Infer
     Err(crate::InferenceError::Runtime("candle feature not enabled".into()))
 }
 
-/// Load ONLY the tokenizer from a GGUF file — no transformer weights.
+/// Load ONLY the tokenizer from a GGUF file - no transformer weights.
 /// Returns a CachedIntegerModel with vocab, config, encode/decode capability,
 /// but zero layers and zero embedding weights. ~30MB instead of 4GB.
 ///
@@ -2785,7 +2875,10 @@ pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::Infe
         i16_output: None,
         block_i8_layers: None,
         block_i8_output: None,
-        })
+        ternary_layers: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,        ternary_output: None,
+    })
 }
 
 #[cfg(not(feature = "candle"))]
@@ -2932,7 +3025,7 @@ pub fn load_cached_model_shard(
 
     // Extract f32 once and produce BOTH I8 (kept for compat / placeholder math)
     // AND I16 (used by forward_shard_token for ~258x finer quantization).
-    // I16 directly from f32 is the only way to get real quality improvement —
+    // I16 directly from f32 is the only way to get real quality improvement -
     // I16Weights::from_i8() preserves I8-level precision, I16Weights::quantize_f32
     // doesn't.
     let extract_i8_i16 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, rows: usize, cols: usize| -> Result<(I8Weights, I16Weights), InferenceError> {
@@ -3073,7 +3166,10 @@ pub fn load_cached_model_shard(
         // should replicate the main loader's triple-quant pattern here.
         block_i8_layers: None,
         block_i8_output: None,
-        })
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,        ternary_layers: None,
+        ternary_output: None,
+    })
 }
 
 #[cfg(not(feature = "candle"))]
@@ -3166,9 +3262,14 @@ pub fn load_cached_model_ranges(
     aggregate.q4_output = None;
     aggregate.block_i8_layers = None;
     aggregate.block_i8_output = None;
+    aggregate.ternary_layers = None;
+    aggregate.ternary_output = None;
+    aggregate.ternary_hybrid_layers = None;
+    aggregate.ternary_hybrid_output = None;
+
     // Post-load sanity: every layer that was merged in must have consistent
     // I8Weights dimensions. data.len() MUST equal n_rows * n_cols for each
-    // of the 7 matrices per layer — a mismatch is what causes the dangling-
+    // of the 7 matrices per layer - a mismatch is what causes the dangling-
     // but-non-null pointer deref in matmul_i8_into / matmul_i16_into. Panic
     // with the exact layer + matrix + dims so the crash has a backtrace
     // instead of SIGSEGVing the consensus thread.
@@ -3184,7 +3285,7 @@ pub fn load_cached_model_ranges(
                     return Err(crate::InferenceError::Runtime(format!(
                         "load_cached_model_ranges: merged layer {idx}.{name} has \
                          n_rows={} n_cols={} but data.len()={} (expected {}). \
-                         Multi-range merge corrupted the weight vector — do not \
+                         Multi-range merge corrupted the weight vector - do not \
                          hand this model to forward_shard_token.",
                         w.n_rows, w.n_cols, w.data.len(), expected
                     )));
@@ -3298,7 +3399,10 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
         i16_layers: None,
         i16_output: None,
         block_i8_layers: None,
-        block_i8_output: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,        block_i8_output: None,
+        ternary_layers: None,
+        ternary_output: None,
     })
 }
 
@@ -3363,8 +3467,11 @@ mod tests {
             q4_layers: None, q4_output: None,
         i16_layers: None,
         i16_output: None,
-        block_i8_layers: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,        block_i8_layers: None,
         block_i8_output: None,
+        ternary_layers: None,
+        ternary_output: None,
         }
     }
 
@@ -3378,7 +3485,7 @@ mod tests {
         // Row 0: abs_max=0.01, scale=0.01/127. Values should be 127 (full range)
         assert_eq!(q.data[0], 127, "Row 0 should use full range");
         // Row 1: abs_max=10.0, scale=10/127. 0.01 → round(0.01/10*127) = 0
-        // This is expected — but only affects row 1, not row 0
+        // This is expected - but only affects row 1, not row 0
         assert_eq!(q.data[8], 127, "Row 1 outlier should be 127");
         // Per-row means row 0 is NOT affected by row 1's outlier
         assert!(q.scales[0] < q.scales[1], "Row 0 should have smaller scale");
@@ -3419,10 +3526,65 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
+    /// End-to-end test: run forward_one_token with ternary weights enabled.
+    /// Proves the dispatch wiring works and the full transformer pipeline
+    /// (embedding → attention → FFN → output) executes correctly with
+    /// ternary weight storage.
+    #[test]
+    fn test_forward_one_token_with_ternary() {
+        // Small model: 2 layers, d_model=64, vocab=100. Uses the same
+        // dimensions as test_model_deterministic so we know it's in
+        // the test-friendly size range.
+        let mut model = build_test_model(100, 64, 2, 128, 2);
+
+        // Enable ternary - converts I8 layers to 2-bit ternary weights
+        model.enable_ternary();
+        assert!(model.ternary_layers.is_some(), "ternary layers must be populated after enable_ternary");
+
+        // Run forward_one_token - this exercises the full pipeline:
+        // embedding lookup, Q/K/V matmul, attention, output projection,
+        // FFN (gate/up/down), residuals, final norm.
+        let token: u32 = 5;
+        let mut cache = super::KVCache::new(model.config.n_layers);
+        let logits1 = model.forward_one_token(token, &mut cache);
+        assert_eq!(logits1.len(), model.config.vocab_size, "logits must have vocab_size entries");
+        assert!(logits1.iter().any(|&v| v != 0), "ternary forward must produce non-zero logits");
+
+        // Determinism: same token → same logits.
+        let mut cache2 = super::KVCache::new(model.config.n_layers);
+        let logits2 = model.forward_one_token(token, &mut cache2);
+        assert_eq!(logits1, logits2, "ternary forward_one_token must be deterministic");
+    }
+
+    #[test]
+    fn test_ternary_memory_reduction_full_model() {
+        let mut model = build_test_model(100, 64, 2, 128, 2);
+        let before_bytes: usize = model.layers.iter().map(|l| {
+            l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
+                + l.wo.memory_bytes() + l.w_gate.memory_bytes()
+                + l.w_up.memory_bytes() + l.w_down.memory_bytes()
+        }).sum();
+
+        model.enable_ternary();
+        let after_bytes: usize = model.ternary_layers.as_ref().unwrap().iter().map(|l| {
+            l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
+                + l.wo.memory_bytes() + l.w_gate.memory_bytes()
+                + l.w_up.memory_bytes() + l.w_down.memory_bytes()
+        }).sum();
+
+        // Ternary should be approximately 4x smaller than I8 on the weight data.
+        // The scale arrays are the same size, so total ratio is ~3.5-4x.
+        assert!(
+            after_bytes * 3 < before_bytes,
+            "ternary ({} B) should be at least 3x smaller than I8 ({} B)",
+            after_bytes, before_bytes,
+        );
+    }
+
     #[test]
     fn test_forward_shard_token_full_equals_split() {
         // Note: panic!() calls in this and related test functions are intentional
-        // test assertions — they are NOT in any production code path.
+        // test assertions - they are NOT in any production code path.
         // Production functions (forward_shard_token, forward_one_token) return Results.
         //
         // The end-to-end claim: running all layers as a single shard
@@ -3659,7 +3821,7 @@ mod tests {
         assert_eq!(sum_s, sum_d, "SIMD and scalar must produce identical sums");
     }
 
-    /// Repro for project_i16_ppl_bug.md — I8Weights::quantize_f32 truncates
+    /// Repro for project_i16_ppl_bug.md - I8Weights::quantize_f32 truncates
     /// abs_max to i64 before computing the scale, destroying precision when
     /// abs_max < ~5. Fix is to compute scale in f64:
     ///   ((abs_max as f64 * ONE as f64) / 127.0).round().max(1.0) as i64
@@ -3830,7 +3992,7 @@ mod int16_tests {
             let tolerance = (i8_out[i].abs() / 100).max(2);
             assert!(
                 diff <= tolerance,
-                "Row {i}: i8={}, i16={}, diff={} > tolerance={} — from_i8 should produce close results",
+                "Row {i}: i8={}, i16={}, diff={} > tolerance={} - from_i8 should produce close results",
                 i8_out[i], i16_out[i], diff, tolerance
             );
         }
@@ -3932,9 +4094,12 @@ mod int16_tests {
                 q4_layers: None,
                 q4_output: None,
                 i16_layers: None,
-        i16_output: None,
+        ternary_hybrid_layers: None,
+        ternary_hybrid_output: None,                i16_output: None,
                 block_i8_layers: None,
                 block_i8_output: None,
+                ternary_layers: None,
+                ternary_output: None,
             }
         };
 

@@ -21,7 +21,7 @@ export function Earnings() {
 
   // 7-day bucketed earnings derived from real attestation timestamps.
   // Each attestation contributes its rewardArc to the UTC-day bucket it
-  // falls in. Days with no activity show as empty bars — honest about how
+  // falls in. Days with no activity show as empty bars - honest about how
   // much this node has actually earned across the week rather than the
   // placeholder Math.random() chart.
   const weekly = useMemo(() => {

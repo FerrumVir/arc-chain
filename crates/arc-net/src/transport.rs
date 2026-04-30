@@ -1,4 +1,4 @@
-//! QUIC transport — real peer-to-peer networking for ARC Chain.
+//! QUIC transport - real peer-to-peer networking for ARC Chain.
 //!
 //! Provides a QUIC server (listener) and client (dialer) unified behind
 //! `run_transport()`. Communicates with the consensus layer via tokio mpsc
@@ -20,7 +20,7 @@ use tracing::{debug, error, info, warn};
 
 /// Maximum number of simultaneous peer connections.
 /// At scale (millions of nodes), each node only needs O(sqrt(N)) peers
-/// for full reachability — gossip propagation handles the rest.
+/// for full reachability - gossip propagation handles the rest.
 /// 256 peers gives 2-hop reachability for networks up to ~65K nodes,
 /// and 3-hop for networks up to ~16M nodes.
 const MAX_PEERS: u32 = 256;
@@ -58,27 +58,27 @@ pub enum InboundMessage {
         diff: arc_types::StateDiff,
         block_height: u64,
     },
-    /// State Sync — a peer is requesting our snapshot manifest.
+    /// State Sync - a peer is requesting our snapshot manifest.
     SnapshotManifestRequest {
         source: Hash256,
     },
-    /// State Sync — a peer is requesting a specific snapshot chunk.
+    /// State Sync - a peer is requesting a specific snapshot chunk.
     SnapshotChunkRequest {
         source: Hash256,
         manifest_hash: Hash256,
         chunk_index: u32,
     },
-    /// State Sync — received a snapshot manifest from a peer.
+    /// State Sync - received a snapshot manifest from a peer.
     SnapshotManifestResponse {
         source: Hash256,
         manifest: arc_state::SnapshotManifest,
     },
-    /// State Sync — received a snapshot chunk from a peer.
+    /// State Sync - received a snapshot chunk from a peer.
     SnapshotChunkResponse {
         source: Hash256,
         chunk: arc_state::StateSnapshot,
     },
-    /// Inference request from another node — run model and respond.
+    /// Inference request from another node - run model and respond.
     InferenceRequest {
         request_id: Hash256,
         input: String,
@@ -133,7 +133,7 @@ pub enum InboundMessage {
         their_round: u64,
         their_committed: u64,
     },
-    /// Round sync response — peer's current consensus state.
+    /// Round sync response - peer's current consensus state.
     RoundSyncResponse {
         current_round: u64,
         last_committed_round: u64,
@@ -240,7 +240,7 @@ fn make_server_config() -> quinn::ServerConfig {
 /// which accepts all server certificates. Peer identity is instead verified via
 /// application-layer challenge-response (see module docs on [`TestnetCertVerifier`]).
 ///
-/// With `strict-tls` enabled, this panics at startup — certificate pinning is
+/// With `strict-tls` enabled, this panics at startup - certificate pinning is
 /// not yet implemented. This feature flag exists to prevent accidental production
 /// deployment without TLS-layer peer verification.
 fn make_client_config() -> quinn::ClientConfig {
@@ -273,7 +273,7 @@ fn make_client_config() -> quinn::ClientConfig {
     #[cfg(not(feature = "strict-tls"))]
     {
         warn!(
-            "TLS certificate verification is DISABLED — using TestnetCertVerifier. \
+            "TLS certificate verification is DISABLED - using TestnetCertVerifier. \
              Peer identity is verified via application-layer challenge-response only. \
              Do NOT use this configuration in production without enabling the `strict-tls` feature."
         );
@@ -312,13 +312,13 @@ fn make_client_config() -> quinn::ClientConfig {
 /// In ARC Chain's permissioned validator network, peer identity is NOT verified
 /// at the TLS layer. Instead, the security model is:
 ///
-/// 1. **TLS provides encryption only** — all QUIC traffic is encrypted in transit,
+/// 1. **TLS provides encryption only** - all QUIC traffic is encrypted in transit,
 ///    preventing passive eavesdropping.
 /// 2. **Peer identity is verified at the application layer** via challenge-response
 ///    authentication (see [`verify_handshake`]). Each peer must prove ownership of
 ///    their validator private key by signing a random challenge. The public key is
 ///    then verified to derive to the claimed validator address.
-/// 3. **Genesis hash binding** — peers must share the same genesis hash, preventing
+/// 3. **Genesis hash binding** - peers must share the same genesis hash, preventing
 ///    cross-network connections.
 ///
 /// This means TLS cert verification is intentionally skipped: validators use
@@ -331,7 +331,7 @@ fn make_client_config() -> quinn::ClientConfig {
 ///
 /// For production, consider implementing certificate pinning via a validator
 /// cert registry so that TLS itself authenticates peers (defense in depth).
-/// Enable the `strict-tls` feature flag to enforce this — it will panic at
+/// Enable the `strict-tls` feature flag to enforce this - it will panic at
 /// startup until cert pinning is implemented, preventing accidental deployment
 /// without TLS verification.
 #[derive(Debug)]
@@ -539,7 +539,7 @@ impl PeerConnections {
     }
 
     async fn broadcast(&self, msg_type: MessageType, payload: &[u8]) {
-        // Snapshot peer keys first — do NOT hold DashMap shard locks during
+        // Snapshot peer keys first - do NOT hold DashMap shard locks during
         // network I/O. The old code held iter_mut() locks for the entire
         // broadcast, which blocked peer insert/remove operations for seconds.
         let peer_keys: Vec<[u8; 32]> = self.peers.iter().map(|e| *e.key()).collect();
@@ -612,7 +612,7 @@ pub async fn run_transport(
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // ── Bind QUIC endpoint ──────────────────────────────────────────────
-    // Retry binding up to 5 times with 2s delay — the old process may
+    // Retry binding up to 5 times with 2s delay - the old process may
     // not have fully released the UDP port yet after killall -9.
     let server_config = make_server_config();
     let mut endpoint = {
@@ -622,7 +622,7 @@ pub async fn run_transport(
             match quinn::Endpoint::server(server_config.clone(), listen_addr) {
                 Ok(ep) => { ep_opt = Some(ep); break; }
                 Err(e) => {
-                    warn!("QUIC bind attempt {} failed: {} — retrying in 2s", attempt + 1, e);
+                    warn!("QUIC bind attempt {} failed: {} - retrying in 2s", attempt + 1, e);
                     last_err = Some(e);
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
@@ -652,7 +652,7 @@ pub async fn run_transport(
     {
         let mut dial_handles = Vec::new();
         for peer_addr in &bootstrap_peers {
-            // Skip self — check loopback, listen_addr, AND local interfaces
+            // Skip self - check loopback, listen_addr, AND local interfaces
             // (our public IP is in the seeds file but listen_addr is 0.0.0.0)
             if peer_addr.ip().is_loopback() || peer_addr == &listen_addr {
                 continue;
@@ -687,7 +687,7 @@ pub async fn run_transport(
                         }
                         Ok(Err(e)) => {
                             if attempt < 3 {
-                                warn!("Failed to connect to {} (attempt {}): {} — retrying", addr, attempt, e);
+                                warn!("Failed to connect to {} (attempt {}): {} - retrying", addr, attempt, e);
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             } else {
                                 warn!("Failed to connect to {} after 3 attempts: {}", addr, e);
@@ -695,7 +695,7 @@ pub async fn run_transport(
                         }
                         Err(_) => {
                             if attempt < 3 {
-                                warn!("Timeout connecting to {} ({}s, attempt {}) — retrying", addr, timeout_secs, attempt);
+                                warn!("Timeout connecting to {} ({}s, attempt {}) - retrying", addr, timeout_secs, attempt);
                             } else {
                                 warn!("Timeout connecting to {} after 3 attempts ({}s each)", addr, timeout_secs);
                             }
@@ -869,7 +869,7 @@ pub async fn run_transport(
             let mut pex_tick = tokio::time::interval(std::time::Duration::from_secs(60));
             pex_tick.tick().await;
             // Reconnect every 30s. Tried 10s but that caused excessive dial
-            // churn — every restart triggered a flood of duplicate-accept
+            // churn - every restart triggered a flood of duplicate-accept
             // events from the restarting node's peers, which then deadlocked
             // accept_peer with consensus on shared DashMap shards.
             let mut recon_tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -1009,7 +1009,7 @@ pub async fn run_transport(
                 let rate_limiter_clone = rate_limiter.clone();
 
                 tokio::spawn(async move {
-                    // 10-second handshake timeout — prevents attackers from
+                    // 10-second handshake timeout - prevents attackers from
                     // holding connection slots with incomplete handshakes.
                     let handshake_msg = make_signed_handshake(
                         local_address, local_stake, listen_addr.port(), genesis_hash, &keypair_clone,
@@ -1127,7 +1127,7 @@ async fn dial_peer(
         return Ok(());
     }
 
-    // Skip if already connected — prevents the dual-dial race where both
+    // Skip if already connected - prevents the dual-dial race where both
     // nodes dial each other and the second insert overwrites the first's
     // SendStream. The old recv handler's cleanup then removes the new entry.
     if connections.is_connected(&remote.validator_address.0) {
@@ -1516,7 +1516,7 @@ async fn handle_peer_recv(
             }
             MessageType::Heartbeat => {
                 // Heartbeat now carries round info for partition detection.
-                // Old heartbeats (empty payload) are still valid — just skip parse.
+                // Old heartbeats (empty payload) are still valid - just skip parse.
                 if !data.is_empty() {
                     if let Ok(hb) = bincode::deserialize::<crate::protocol::HeartbeatMessage>(&data) {
                         let _ = inbound_tx.send(InboundMessage::HeartbeatWithRound {

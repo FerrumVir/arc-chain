@@ -5,7 +5,7 @@ use thiserror::Error;
 
 // ─── Intent ─────────────────────────────────────────────────────────────────
 
-/// User intent — a declarative transaction request.
+/// User intent - a declarative transaction request.
 ///
 /// Users declare WHAT they want (e.g. "swap 100 USDC for at least 99 DAI"),
 /// not HOW it happens. Solvers compete to fulfill intents optimally.
@@ -129,7 +129,7 @@ pub enum IntentStatus {
 
 /// A solver's proposed execution plan for fulfilling an intent.
 ///
-/// Solvers stake tokens as collateral — if the solution fails or violates
+/// Solvers stake tokens as collateral - if the solution fails or violates
 /// constraints, the stake is slashed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Solution {

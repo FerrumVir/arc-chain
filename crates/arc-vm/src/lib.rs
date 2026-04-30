@@ -123,7 +123,7 @@ pub fn compute_contract_address(deployer: &Address, nonce: u64) -> Address {
 }
 
 // ---------------------------------------------------------------------------
-// Host environment — shared state accessible by all host functions
+// Host environment - shared state accessible by all host functions
 // ---------------------------------------------------------------------------
 
 /// Environment data shared across all WASM host imports for a single execution.
@@ -229,11 +229,11 @@ impl VmHostEnv {
 // Host function implementations
 // ---------------------------------------------------------------------------
 
-/// `use_gas(amount: i64)` — metered gas accounting; traps on overflow.
+/// `use_gas(amount: i64)` - metered gas accounting; traps on overflow.
 fn host_use_gas(mut env: FunctionEnvMut<'_, VmHostEnv>, amount: i64) {
     let data = env.data_mut();
     if amount < 0 {
-        // Negative gas amounts are invalid — treat as protocol violation
+        // Negative gas amounts are invalid - treat as protocol violation
         *data.out_of_gas.lock().unwrap() = true;
         return;
     }
@@ -249,7 +249,7 @@ fn host_use_gas(mut env: FunctionEnvMut<'_, VmHostEnv>, amount: i64) {
 /// Maximum allocation size for WASM host calls (10 MB).
 const MAX_HOST_ALLOC: usize = 10 * 1024 * 1024;
 
-/// `log(ptr: i32, len: i32)` — read a UTF-8 string from WASM memory and push to logs.
+/// `log(ptr: i32, len: i32)` - read a UTF-8 string from WASM memory and push to logs.
 fn host_log(mut env: FunctionEnvMut<'_, VmHostEnv>, ptr: i32, len: i32) {
     let (data, store) = env.data_and_store_mut();
     const MAX_LOGS_PER_EXECUTION: usize = 1024;
@@ -311,7 +311,7 @@ fn host_storage_get(mut env: FunctionEnvMut<'_, VmHostEnv>, key_ptr: i32, val_pt
         return val.len() as i32;
     }
 
-    // Not in cache — try loading from StateDB
+    // Not in cache - try loading from StateDB
     if let Some(ref state_db) = data.state_db {
         let addr = Hash256(data.contract_address);
         let key_hash = Hash256(key);
@@ -389,7 +389,7 @@ fn host_storage_set(
     data.storage_writes.lock().unwrap().push((key, val));
 }
 
-/// `balance_of(addr_ptr: i32) -> i64` — read 32-byte address, return its balance.
+/// `balance_of(addr_ptr: i32) -> i64` - read 32-byte address, return its balance.
 fn host_balance_of(mut env: FunctionEnvMut<'_, VmHostEnv>, addr_ptr: i32) -> i64 {
     let (data, store) = env.data_and_store_mut();
     let memory = match data.memory {
@@ -407,12 +407,12 @@ fn host_balance_of(mut env: FunctionEnvMut<'_, VmHostEnv>, addr_ptr: i32) -> i64
     balances.get(&addr).copied().unwrap_or(0) as i64
 }
 
-/// `self_balance() -> i64` — return balance of the executing contract.
+/// `self_balance() -> i64` - return balance of the executing contract.
 fn host_self_balance(env: FunctionEnvMut<'_, VmHostEnv>) -> i64 {
     env.data().self_balance as i64
 }
 
-/// `caller(ptr: i32)` — write caller address (32 bytes) to WASM memory.
+/// `caller(ptr: i32)` - write caller address (32 bytes) to WASM memory.
 fn host_caller(mut env: FunctionEnvMut<'_, VmHostEnv>, ptr: i32) {
     let (data, store) = env.data_and_store_mut();
     if let Some(ref memory) = data.memory {
@@ -421,7 +421,7 @@ fn host_caller(mut env: FunctionEnvMut<'_, VmHostEnv>, ptr: i32) {
     }
 }
 
-/// `self_address(ptr: i32)` — write contract address (32 bytes) to WASM memory.
+/// `self_address(ptr: i32)` - write contract address (32 bytes) to WASM memory.
 fn host_self_address(mut env: FunctionEnvMut<'_, VmHostEnv>, ptr: i32) {
     let (data, store) = env.data_and_store_mut();
     if let Some(ref memory) = data.memory {
@@ -440,7 +440,7 @@ fn host_block_timestamp(env: FunctionEnvMut<'_, VmHostEnv>) -> i64 {
     env.data().block_timestamp as i64
 }
 
-/// `tx_value() -> i64` — return value (ARC tokens) sent with this call.
+/// `tx_value() -> i64` - return value (ARC tokens) sent with this call.
 fn host_tx_value(env: FunctionEnvMut<'_, VmHostEnv>) -> i64 {
     env.data().call_value as i64
 }
@@ -500,7 +500,7 @@ fn host_emit_event(
 ///
 /// Currently returns a deterministic mock response (BLAKE3 hash of input).
 /// The real inference engine is in `arc-inference` (`integer_engine.rs`,
-/// `cached_integer_model.rs`) — not yet wired into this WASM host import.
+/// `cached_integer_model.rs`) - not yet wired into this WASM host import.
 fn host_ai_inference(
     mut env: FunctionEnvMut<'_, VmHostEnv>,
     model_ptr: i32,
@@ -532,7 +532,7 @@ fn host_ai_inference(
     let input_hash = arc_crypto::hash_bytes(&input);
 
     // Generate deterministic mock output for testnet:
-    // output = BLAKE3(model_id || input) — 32 bytes
+    // output = BLAKE3(model_id || input) - 32 bytes
     let mut inference_preimage = Vec::with_capacity(model_id.len() + input.len());
     inference_preimage.extend_from_slice(&model_id);
     inference_preimage.extend_from_slice(&input);
@@ -570,7 +570,7 @@ fn host_ai_inference(
     output.len() as i32
 }
 // ---------------------------------------------------------------------------
-// ArcVM — the virtual machine
+// ArcVM - the virtual machine
 // ---------------------------------------------------------------------------
 
 /// ARC WASM Virtual Machine.
@@ -594,7 +594,7 @@ impl ArcVM {
             .map_err(|e| VmError::CompilationError(e.to_string()))
     }
 
-    /// Execute a function with full state access — the main execution path
+    /// Execute a function with full state access - the main execution path
     /// for smart contracts.
     ///
     /// Storage writes are buffered during execution and flushed to the
@@ -766,7 +766,7 @@ impl ArcVM {
         }
     }
 
-    /// Simple execute without state — backward compatible for basic WASM modules
+    /// Simple execute without state - backward compatible for basic WASM modules
     /// that only need gas metering and logging.
     pub fn execute(
         &mut self,
@@ -903,7 +903,7 @@ mod tests {
     use arc_crypto::hash_bytes;
 
     // -----------------------------------------------------------------------
-    // WAT helpers — each generates a valid WAT string that imports the host
+    // WAT helpers - each generates a valid WAT string that imports the host
     // functions it needs from the "env" namespace.
     // -----------------------------------------------------------------------
 
@@ -1259,7 +1259,7 @@ mod tests {
         let ctx = test_context();
         // Fund the contract account
         let _account = state.get_or_create_account(&ctx.self_address);
-        // We need to set balance — get_or_create gives 0 balance.
+        // We need to set balance - get_or_create gives 0 balance.
         // StateDB doesn't have a set_balance, but we can use the account:
         // Actually, looking at StateDB, accounts are created with 0 balance.
         // The VmHostEnv reads balance from get_account. So self_balance = 0.

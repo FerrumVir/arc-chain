@@ -312,7 +312,7 @@ impl GeneratedCode {
 
 // ─── SDK generator ───────────────────────────────────────────────────────────
 
-/// SDK code generator — produces client bindings from contract ABIs.
+/// SDK code generator - produces client bindings from contract ABIs.
 #[derive(Debug)]
 pub struct SdkGenerator {
     config: SdkConfig,
@@ -443,7 +443,7 @@ impl SdkGenerator {
         for method in &binding.methods {
             let marker = if method.is_view { "view" } else { "send" };
             lines.push(format!(
-                "// [{}] {} — gas estimate: {}",
+                "// [{}] {} - gas estimate: {}",
                 marker, method.name, method.gas_estimate,
             ));
         }
@@ -454,7 +454,7 @@ impl SdkGenerator {
     fn render_index(&self) -> String {
         let mut lines = Vec::new();
         lines.push(format!(
-            "// {} SDK — {} v{}",
+            "// {} SDK - {} v{}",
             self.config.package_name,
             self.config.language.display_name(),
             self.config.version,
@@ -520,7 +520,7 @@ mod tests {
         assert_eq!(SdkLanguage::Kotlin.extension(), "kt");
     }
 
-    // 2. ContractBinding from ABI — methods extracted correctly.
+    // 2. ContractBinding from ABI - methods extracted correctly.
     #[test]
     fn test_contract_binding_from_abi() {
         let abi = sample_abi();

@@ -30,7 +30,7 @@ NC='\033[0m'
 
 echo -e "${CYAN}"
 echo "  ╔══════════════════════════════════════════╗"
-echo "  ║     ARC Chain — Inference Node           ║"
+echo "  ║     ARC Chain - Inference Node           ║"
 echo "  ║     Earn ARC by running AI inference     ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -96,7 +96,7 @@ echo ""
 
 # ─── Start ─────────────────────────────────────────────────────────────────
 echo -e "${YELLOW}[5/5] Starting inference node...${NC}"
-echo -e "${CYAN}Your IP is private — it will not be shared with other nodes.${NC}"
+echo -e "${CYAN}Your IP is private - it will not be shared with other nodes.${NC}"
 echo "Press Ctrl+C to stop."
 echo ""
 

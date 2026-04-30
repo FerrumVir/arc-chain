@@ -1,4 +1,4 @@
-# ARC Chain — Session Guide
+# ARC Chain - Session Guide
 
 ## What This Is
 
@@ -48,7 +48,7 @@ cargo run --example eval_perplexity --features candle --release -- \
   ~/.arc-models/llama-2-7b.Q8_0.gguf ~/.arc-models/wikitext-2-raw/wiki.test.raw 512
 ```
 
-**What to look for:** PPL (perplexity) number. Published FP16 baseline for Llama-2-7B base is 5.47. If INT16 is close (say <10), that proves INT16 is production-quality. The paper currently shows INT8 at PPL 144 on a Chat model — that comparison is confounded. We need base-model INT16 vs base-model FP16.
+**What to look for:** PPL (perplexity) number. Published FP16 baseline for Llama-2-7B base is 5.47. If INT16 is close (say <10), that proves INT16 is production-quality. The paper currently shows INT8 at PPL 144 on a Chat model - that comparison is confounded. We need base-model INT16 vs base-model FP16.
 
 **IMPORTANT:** The eval currently runs the INT16 path by default (dispatch_matmul prefers I16). To also test INT8 for comparison, temporarily comment out `enable_i16()` or the I16 dispatch path.
 
@@ -92,15 +92,15 @@ INT16 inference must produce identical hashes across platforms. If the Mac Studi
 
 ## Architecture Notes
 
-- **Inference crate:** `crates/arc-inference/src/cached_integer_model.rs` — INT16 weights, matmul, forward pass
-- **GPU crate:** `crates/arc-gpu/src/` — WGSL shaders (`transformer.wgsl`), Metal shaders (`.metal`), forward orchestration (`gpu_forward.rs`), Metal ICB (`metal_icb.rs`)
+- **Inference crate:** `crates/arc-inference/src/cached_integer_model.rs` - INT16 weights, matmul, forward pass
+- **GPU crate:** `crates/arc-gpu/src/` - WGSL shaders (`transformer.wgsl`), Metal shaders (`.metal`), forward orchestration (`gpu_forward.rs`), Metal ICB (`metal_icb.rs`)
 - **Fixed-point:** Q16 format (i64 with 16 fractional bits, ONE = 65536)
 - **Quantization:** Per-row symmetric. INT16 = [-32767, 32767] with scale = abs_max * ONE
 - **Feature flags:** `candle` (GGUF loading), `metal-icb` (native Metal dispatch), `stwo-prover` (STARK proofs, needs nightly)
 
 ## What Shipped in v0.5.3
 
-1. **ALL infrastructure wired into runtime** — VRF committees, multi-model ShardRegistry,
+1. **ALL infrastructure wired into runtime** - VRF committees, multi-model ShardRegistry,
    auto-sharding, verification manager, revenue config, checkpoint registry, double-vote
    tracker, flash attention, GPU embedding fix. Zero unwired items.
 
@@ -108,17 +108,17 @@ INT16 inference must produce identical hashes across platforms. If the Mac Studi
    (forward_one_token, forward_shard_token, forward_shard_layers). O(d_head) memory per
    head instead of O(full_seq) for scores. Same integer_exp arithmetic.
 
-3. **GPU embedding bug fixed** — token embeddings stored CPU-side as dequantized i32,
+3. **GPU embedding bug fixed** - token embeddings stored CPU-side as dequantized i32,
    uploaded per-token. Previously wrote zeros.
 
-4. **8 new RPC endpoints** — /models, /models/shards, /shards/auto_plan,
+4. **8 new RPC endpoints** - /models, /models/shards, /shards/auto_plan,
    /inference/commit, /inference/challenge, /inference/verification_status,
    /economics/revenue_split
 
 ## Known Issues
 
 - `test_channel_close_releases_funds` in arc-state fails (pre-existing, unrelated to inference)
-- Metal shaders are UNTESTED — marked with comments, need hardware validation
+- Metal shaders are UNTESTED - marked with comments, need hardware validation
 - `eval_perplexity.rs` needs model files to run (not checked into repo)
 - Q4 scale factor `* 18` approximation in `Q4WeightsX86::from_i8` may produce wrong magnitudes on x86 (never validated on actual x86 hardware)
 

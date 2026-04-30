@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Continuous TPS Generator
+# ARC Chain - Continuous TPS Generator
 #
 # Pumps real signed transfer transactions across all 8 seed nodes via the
 # faucet endpoint. Each request creates an on-chain transfer that is gossip
 # propagated, included in a DAG block, and committed via the two-round rule.
 #
 # This is what populates the dashboard's "Total Transactions" counter and
-# proves the chain is processing real, ordered, finalized transactions —
+# proves the chain is processing real, ordered, finalized transactions -
 # not just inference attestations.
 #
 # Usage:
@@ -36,7 +36,7 @@ NUM_NODES=${#NODES[@]}
 
 BOLD=$'\033[1m' GREEN=$'\033[32m' CYAN=$'\033[36m' YELLOW=$'\033[33m' RED=$'\033[31m' RESET=$'\033[0m'
 
-printf "%s%sARC Chain — TPS Generator%s\n" "$CYAN" "$BOLD" "$RESET"
+printf "%s%sARC Chain - TPS Generator%s\n" "$CYAN" "$BOLD" "$RESET"
 printf "  Pumping signed faucet transfers across %s%d%s nodes with %s%d%s workers\n" "$BOLD" "$NUM_NODES" "$RESET" "$BOLD" "$WORKERS" "$RESET"
 printf "  Duration: %s%s%s\n\n" "$BOLD" "$DURATION" "$RESET"
 
@@ -48,7 +48,7 @@ trap "rm -rf $TMPDIR" EXIT
 
 # Worker function: continuously fires requests, round-robin across all nodes.
 # Each successful tx appends a single character to the count file (atomic O_APPEND).
-# We count file size at report time — this avoids read/modify/write races.
+# We count file size at report time - this avoids read/modify/write races.
 worker() {
     local id=$1
     local count_file="$TMPDIR/worker-$id.count"
@@ -75,7 +75,7 @@ worker() {
     done
 }
 
-# Status reporter — uses file size as the counter (atomic, no races)
+# Status reporter - uses file size as the counter (atomic, no races)
 report() {
     local total=0
     local fail=0

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// Both ARC Chain and external EVM chains use this format for cross-chain transfers.
 pub type EvmAddress = [u8; 20];
 
-/// Zero EVM address — indicates native token (ETH, ARC, etc.).
+/// Zero EVM address - indicates native token (ETH, ARC, etc.).
 pub const ZERO_EVM_ADDRESS: EvmAddress = [0u8; 20];
 
 // ─── Chain Identifiers ──────────────────────────────────────────────────────
@@ -30,7 +30,7 @@ impl ChainId {
     /// Return the EVM-standard numeric chain ID.
     pub fn evm_chain_id(&self) -> u64 {
         match self {
-            ChainId::ArcMainnet => 0xA4C, // 2636 — ARC custom chain ID
+            ChainId::ArcMainnet => 0xA4C, // 2636 - ARC custom chain ID
             ChainId::Ethereum => 1,
             ChainId::Base => 8453,
             ChainId::Arbitrum => 42161,
@@ -81,11 +81,11 @@ pub enum BridgeStatus {
     Proving,
     /// Wrapped assets minted on destination chain.
     DestMinted,
-    /// Confirmed on both chains — terminal success state.
+    /// Confirmed on both chains - terminal success state.
     Completed,
-    /// Transaction reverted — terminal failure state.
+    /// Transaction reverted - terminal failure state.
     Failed,
-    /// Timeout reached without completion — terminal failure state.
+    /// Timeout reached without completion - terminal failure state.
     Expired,
 }
 
@@ -289,7 +289,7 @@ impl BridgeConfig {
         Self {
             source_chain: ChainId::Ethereum,
             dest_chain: ChainId::ArcMainnet,
-            bridge_contract: [0u8; 20], // Placeholder — set after deployment
+            bridge_contract: [0u8; 20], // Placeholder - set after deployment
             min_confirmations: 12,
             max_transfer_amount: 1_000_000_000_000_000_000_000, // 1000 ETH in wei
             min_transfer_amount: 10_000_000_000_000_000,        // 0.01 ETH in wei
@@ -304,7 +304,7 @@ impl BridgeConfig {
         Self {
             source_chain: ChainId::ArcMainnet,
             dest_chain: ChainId::Ethereum,
-            bridge_contract: [0u8; 20], // Placeholder — set after deployment
+            bridge_contract: [0u8; 20], // Placeholder - set after deployment
             min_confirmations: 1,
             max_transfer_amount: 1_000_000_000_000_000_000_000,
             min_transfer_amount: 10_000_000_000_000_000,
@@ -757,31 +757,31 @@ mod tests {
             0,
         );
 
-        // Pending — not finalized
+        // Pending - not finalized
         assert_eq!(transfer.status, BridgeStatus::Pending);
         assert!(!transfer.is_finalized());
 
-        // SourceLocked — not finalized
+        // SourceLocked - not finalized
         transfer.status = BridgeStatus::SourceLocked;
         assert!(!transfer.is_finalized());
 
-        // Proving — not finalized
+        // Proving - not finalized
         transfer.status = BridgeStatus::Proving;
         assert!(!transfer.is_finalized());
 
-        // DestMinted — not finalized
+        // DestMinted - not finalized
         transfer.status = BridgeStatus::DestMinted;
         assert!(!transfer.is_finalized());
 
-        // Completed — finalized
+        // Completed - finalized
         transfer.status = BridgeStatus::Completed;
         assert!(transfer.is_finalized());
 
-        // Failed — finalized
+        // Failed - finalized
         transfer.status = BridgeStatus::Failed;
         assert!(transfer.is_finalized());
 
-        // Expired — finalized
+        // Expired - finalized
         transfer.status = BridgeStatus::Expired;
         assert!(transfer.is_finalized());
     }

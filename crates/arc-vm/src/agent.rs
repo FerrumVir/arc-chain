@@ -179,7 +179,7 @@ impl AgentMemory {
     pub fn write(&mut self, key: String, value: Vec<u8>, timestamp: u64) -> Result<(), AgentError> {
         let new_size = key.len() + value.len();
 
-        // Check if key already exists — reclaim old size first.
+        // Check if key already exists - reclaim old size first.
         if let Some(pos) = self.entries.iter().position(|e| e.key == key) {
             let old = &self.entries[pos];
             let old_size = old.key.len() + old.value.len();
@@ -298,7 +298,7 @@ impl AgentRegistry {
     /// - Paused -> Active | Terminated
     /// - Suspended -> Active | Terminated
     /// - OutOfFunds -> Active (after funding) | Terminated
-    /// - Terminated -> (none — terminal)
+    /// - Terminated -> (none - terminal)
     pub fn update_state(&mut self, id: &AgentId, state: AgentState) -> Result<(), AgentError> {
         let agent = self.agents.get_mut(id).ok_or(AgentError::NotFound)?;
         if agent.state == AgentState::Terminated {
@@ -373,7 +373,7 @@ impl AgentRegistry {
             return Ok(ActionResult::Unauthorized);
         }
 
-        // Execute — deduct gas, record action.
+        // Execute - deduct gas, record action.
         let agent_mut = self.agents.get_mut(id).unwrap();
         agent_mut.balance = agent_mut.balance.saturating_sub(action.gas_used);
         agent_mut.total_actions += 1;
@@ -637,10 +637,10 @@ mod tests {
         reg.register(agent).unwrap();
         let id = make_id(1);
 
-        // "key1" (4 bytes) + value (4 bytes) = 8 bytes — fits
+        // "key1" (4 bytes) + value (4 bytes) = 8 bytes - fits
         reg.write_memory(&id, "key1".to_string(), vec![0; 4]).unwrap();
 
-        // "key2" (4 bytes) + value (4 bytes) = 8 more bytes — exceeds limit of 10
+        // "key2" (4 bytes) + value (4 bytes) = 8 more bytes - exceeds limit of 10
         let err = reg.write_memory(&id, "key2".to_string(), vec![0; 4]).unwrap_err();
         assert_eq!(err, AgentError::MemoryFull);
     }
@@ -726,7 +726,7 @@ mod tests {
 
         // "abc" (3) + value (5) = 8
         reg.write_memory(&id, "abc".to_string(), vec![0; 5]).unwrap();
-        // Overwrite with smaller value — should free space.
+        // Overwrite with smaller value - should free space.
         reg.write_memory(&id, "abc".to_string(), vec![0; 2]).unwrap();
         let val = reg.read_memory(&id, "abc").unwrap();
         assert_eq!(val.len(), 2);

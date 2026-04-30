@@ -1,16 +1,16 @@
-//! Multi-engine solver — orchestrates synthesizer, diff-synth, exhaustive, beam search, augmentation, evolution, and LLM.
+//! Multi-engine solver - orchestrates synthesizer, diff-synth, exhaustive, beam search, augmentation, evolution, and LLM.
 //!
 //! Runs each engine in sequence with a time budget.  Returns as soon as any
 //! engine finds a program that maps every training input to its expected output.
 //!
 //! Engine priority (with default time budgets):
-//! 1.   **Synthesizer** (~10%) — exhaustive DFS up to depth 5, fast for simple tasks
-//! 1.5  **Diff-synth** (~20%) — diff-guided synthesis: analyze how output differs from input
-//! 1.8  **Exhaustive** (~15%) — deterministic DFS over ALL type-valid programs, no pruning
-//! 2.   **Beam search** (~10%) — fitness-guided parallel search
-//! 3.   **Augmented beam search** (~30%) — D4 + PoE voting over beam search
-//! 4.   **Evolution** (~30%) — genetic refinement of partial solutions
-//! 5.   **LLM-guided** (remaining time) — Ollama LLM picks operations step by step
+//! 1.   **Synthesizer** (~10%) - exhaustive DFS up to depth 5, fast for simple tasks
+//! 1.5  **Diff-synth** (~20%) - diff-guided synthesis: analyze how output differs from input
+//! 1.8  **Exhaustive** (~15%) - deterministic DFS over ALL type-valid programs, no pruning
+//! 2.   **Beam search** (~10%) - fitness-guided parallel search
+//! 3.   **Augmented beam search** (~30%) - D4 + PoE voting over beam search
+//! 4.   **Evolution** (~30%) - genetic refinement of partial solutions
+//! 5.   **LLM-guided** (remaining time) - Ollama LLM picks operations step by step
 
 use crate::Grid;
 use crate::search::beam::{beam_search, beam_search_steered, exhaustive_search, BeamConfig};
@@ -199,7 +199,7 @@ pub fn solve(
     // ----------------------------------------------------------
     // Engine 1.8: Exhaustive deterministic search (~15%)
     // ----------------------------------------------------------
-    let exhaust_budget = config.timeout_ms * 5 / 100; // only 5% — fast depth-3 search
+    let exhaust_budget = config.timeout_ms * 5 / 100; // only 5% - fast depth-3 search
     if config.verbose {
         eprintln!("[solver] engine 1.8: exhaustive search (budget={}ms, depth=3)", exhaust_budget);
     }

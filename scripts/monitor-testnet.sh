@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════════════════════
-# ARC Chain — Live Testnet Monitor
+# ARC Chain - Live Testnet Monitor
 # Shows all 8 nodes, TPS, block height, consensus status.
 # Usage: ./scripts/monitor-testnet.sh
 # ══════════════════════════════════════════════════════════════════════════════
@@ -38,7 +38,7 @@ while true; do
 
     echo -e "${BOLD}${CYAN}"
     echo "  ╔══════════════════════════════════════════╗"
-    echo "  ║       ARC Chain — Testnet Monitor        ║"
+    echo "  ║       ARC Chain - Testnet Monitor        ║"
     echo "  ╚══════════════════════════════════════════╝"
     echo -e "${NC}"
 
@@ -57,7 +57,7 @@ while true; do
         health=$(curl -sf --connect-timeout 2 --max-time 3 "http://${ip}:9090/health" 2>/dev/null || echo "")
 
         if [ -z "$health" ]; then
-            printf "  ${RED}%-6s %-16s %8s %10s %6s %6s${NC}\n" "$name" "$ip" "—" "—" "—" "DOWN"
+            printf "  ${RED}%-6s %-16s %8s %10s %6s %6s${NC}\n" "$name" "$ip" "-" "-" "-" "DOWN"
             continue
         fi
 

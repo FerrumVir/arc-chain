@@ -1,6 +1,6 @@
 [package]
 name = "arc-inference"
-description = "ARC Chain on-chain inference — INT4 runtime, VRF committee selection, EIP-1559 inference gas lane"
+description = "ARC Chain on-chain inference - INT4 runtime, VRF committee selection, EIP-1559 inference gas lane"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -38,6 +38,31 @@ rand.workspace = true
 # skips building them. Build any single example with:
 #     cargo run --example <name> --features candle --release
 [[example]]
+name = "bench_ternary"
+# No required-features - bench_ternary uses only the core integer path,
+# no GGUF/candle dependencies.
+
+[[example]]
+name = "asic_inference_network"
+# End-to-end ASIC-fleet demo. No GGUF/candle - pure integer path.
+
+[[example]]
+name = "economics_report"
+# Honest economics analysis. No GGUF/candle.
+
+[[example]]
+name = "comprehensive_audit"
+# Every miner × every model × pricing tiers. No GGUF/candle.
+
+[[example]]
+name = "trump_presentation"
+# Fleet-scale dollars, depreciation, undercut table. No GGUF/candle.
+
+[[example]]
+name = "market_rate_presentation"
+# Market-rate pricing on real models (DeepSeek R1, Llama-70B). No GGUF/candle.
+
+[[example]]
 name = "bench_int8"
 required-features = ["candle"]
 [[example]]
@@ -63,6 +88,9 @@ name = "debug_generation"
 required-features = ["candle"]
 [[example]]
 name = "eval_perplexity"
+required-features = ["candle"]
+[[example]]
+name = "eval_perplexity_ternary"
 required-features = ["candle"]
 [[example]]
 name = "profile_int8"

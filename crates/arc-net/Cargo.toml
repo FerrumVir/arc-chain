@@ -1,6 +1,6 @@
 [package]
 name = "arc-net"
-description = "ARC Chain networking — QUIC transport, shred propagation, tx gossip"
+description = "ARC Chain networking - QUIC transport, shred propagation, tx gossip"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

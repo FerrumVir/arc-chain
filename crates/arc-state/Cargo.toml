@@ -1,6 +1,6 @@
 [package]
 name = "arc-state"
-description = "ARC Chain state management — accounts, balances, WAL persistence, snapshots"
+description = "ARC Chain state management - accounts, balances, WAL persistence, snapshots"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

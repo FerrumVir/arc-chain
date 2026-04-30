@@ -20,7 +20,7 @@ fn main() {
         .unwrap_or(100);
 
     eprintln!("═══════════════════════════════════════════════════════════");
-    eprintln!("ARC Chain — Integer Engine Cross-Platform Benchmark");
+    eprintln!("ARC Chain - Integer Engine Cross-Platform Benchmark");
     eprintln!("═══════════════════════════════════════════════════════════");
     eprintln!("  Platform: {} {}", std::env::consts::OS, std::env::consts::ARCH);
     eprintln!("  Runs:     {}", runs);

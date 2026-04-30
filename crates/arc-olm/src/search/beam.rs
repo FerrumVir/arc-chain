@@ -1,4 +1,4 @@
-//! Fitness beam search — parallel, deterministic, with Merkle dedup.
+//! Fitness beam search - parallel, deterministic, with Merkle dedup.
 //!
 //! At each depth:
 //! 1. Take the top-K partial programs (by fitness toward target)
@@ -349,7 +349,7 @@ use std::time::Instant;
 /// Global iteration counter for amortized timeout checking.
 static EXHAUST_ITER_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Exhaustive deterministic search — try ALL type-valid programs up to max_depth.
+/// Exhaustive deterministic search - try ALL type-valid programs up to max_depth.
 /// No pruning, no beam width. Uses hash dedup and iterative deepening.
 pub fn exhaustive_search(
     train_pairs: &[(Grid, Grid)],

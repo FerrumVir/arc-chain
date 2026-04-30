@@ -313,11 +313,11 @@ impl Default for Signature {
 /// Key pair for signing ARC chain transactions.
 #[derive(Clone)]
 pub enum KeyPair {
-    /// Ed25519 key pair — fast, native operations.
+    /// Ed25519 key pair - fast, native operations.
     Ed25519(ed25519_dalek::SigningKey),
-    /// Secp256k1 key pair — ETH-compatible operations.
+    /// Secp256k1 key pair - ETH-compatible operations.
     Secp256k1(k256::ecdsa::SigningKey),
-    /// ML-DSA-65 key pair — quantum-resistant operations (NIST FIPS 204).
+    /// ML-DSA-65 key pair - quantum-resistant operations (NIST FIPS 204).
     /// Stored as serialized bytes because fips204 types don't implement Debug/Serialize.
     MlDsa65 {
         /// 4032-byte serialized private key.
@@ -325,7 +325,7 @@ pub enum KeyPair {
         /// 1952-byte serialized public key.
         pk_bytes: Vec<u8>,
     },
-    /// Falcon-512 key pair — post-quantum NTRU lattice signatures.
+    /// Falcon-512 key pair - post-quantum NTRU lattice signatures.
     /// Stored as serialized bytes (pqcrypto types don't implement Debug/Serialize by default).
     Falcon512 {
         /// 1281-byte serialized secret key.

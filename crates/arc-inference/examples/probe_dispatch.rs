@@ -38,7 +38,7 @@ fn main() {
     let identical = logits_with == logits_without;
     eprintln!("Identical: {}", identical);
     if identical {
-        eprintln!("⚠ block-i8 is NOT dispatching — forward is using I8 fallback.");
+        eprintln!("⚠ block-i8 is NOT dispatching - forward is using I8 fallback.");
     } else {
         let max_abs_diff = logits_with.iter().zip(logits_without.iter())
             .map(|(a, b)| (a - b).abs()).max().unwrap();

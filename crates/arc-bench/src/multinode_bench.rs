@@ -1,4 +1,4 @@
-//! ARC Chain — Real Multi-Node TPS Benchmark
+//! ARC Chain - Real Multi-Node TPS Benchmark
 //!
 //! This benchmark starts 2+ real arc-node instances in-process, connected via
 //! QUIC transport with DAG consensus, and measures actual committed TPS through
@@ -39,7 +39,7 @@ use tokio::sync::mpsc;
 #[derive(Parser, Debug, Clone)]
 #[command(
     name = "arc-bench-multinode",
-    about = "ARC Chain — Real Multi-Node TPS Benchmark"
+    about = "ARC Chain - Real Multi-Node TPS Benchmark"
 )]
 struct Args {
     /// Total transactions to process across all nodes.
@@ -253,13 +253,13 @@ impl BenchNode {
             format!("/tmp/arc-bench-node-{}", port),
         ));
 
-        // Start DAG consensus — no pre-populated peers (dynamic discovery via transport)
+        // Start DAG consensus - no pre-populated peers (dynamic discovery via transport)
         let consensus = ConsensusManager::new_with_keypair(
             address,
             stake,
             4,     // num_shards
-            false, // not benchmark mode — we inject into mempool directly
-            &[],   // no pre-populated peers — discovered via QUIC handshake
+            false, // not benchmark mode - we inject into mempool directly
+            &[],   // no pre-populated peers - discovered via QUIC handshake
             keypair,
         );
         let state_clone = state.clone();
@@ -271,7 +271,7 @@ impl BenchNode {
                     mempool_clone,
                     Some(inbound_rx),
                     Some(outbound_tx),
-                    None, // no benchmark pool — direct mempool injection
+                    None, // no benchmark pool - direct mempool injection
                 )
                 .await;
         });
@@ -369,7 +369,7 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     };
 
     let txs_per_node = args.txs / args.nodes;
-    let stake = 5_000_000u64; // Arc tier — can produce blocks
+    let stake = 5_000_000u64; // Arc tier - can produce blocks
 
     println!();
     println!("============================================================");
@@ -581,7 +581,7 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
             tokio::time::sleep(Duration::from_secs(2)).await;
             let h_after = nodes[0].state.height();
             if h_after == h_before {
-                // Heights stable, all mempools drained — done
+                // Heights stable, all mempools drained - done
                 break;
             }
         }

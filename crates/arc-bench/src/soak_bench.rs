@@ -1,4 +1,4 @@
-//! ARC Chain — Soak / Stress Test Benchmark
+//! ARC Chain - Soak / Stress Test Benchmark
 //!
 //! Runs a sustained stress test for a configurable duration, continuously
 //! submitting batches through the full pipeline and reporting live metrics
@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(
     name = "arc-bench-soak",
-    about = "ARC Chain — Sustained soak / stress test"
+    about = "ARC Chain - Sustained soak / stress test"
 )]
 struct Args {
     /// Total duration of the soak test in seconds.

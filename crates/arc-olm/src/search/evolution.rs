@@ -1,4 +1,4 @@
-//! Evolutionary refinement — mutate and crossover partial solutions.
+//! Evolutionary refinement - mutate and crossover partial solutions.
 //!
 //! Takes candidates found by the synthesizer and beam search, then applies
 //! genetic operators (swap, extend, truncate, crossover) to evolve better

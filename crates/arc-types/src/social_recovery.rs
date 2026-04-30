@@ -330,7 +330,7 @@ impl SocialRecoveryManager {
 
         let process = self.find_process_mut(&recovery_id)?;
 
-        // Check executed before cooldown — "already executed" is specific to this
+        // Check executed before cooldown - "already executed" is specific to this
         // recovery and takes precedence over the global cooldown check.
         if process.status == RecoveryStatus::Executed {
             return Err(RecoveryError::AlreadyExecuted);

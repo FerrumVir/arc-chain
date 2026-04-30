@@ -26,7 +26,7 @@ if [[ ! -f "$BINARY" ]]; then
 fi
 
 echo "╔═══════════════════════════════════════════╗"
-echo "║  ARC Chain — 5-Node Consensus Benchmark   ║"
+echo "║  ARC Chain - 5-Node Consensus Benchmark   ║"
 echo "╚═══════════════════════════════════════════╝"
 echo ""
 

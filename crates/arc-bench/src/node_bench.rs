@@ -1,10 +1,10 @@
-/// ARC Chain — Multi-Node Live Benchmark
+/// ARC Chain - Multi-Node Live Benchmark
 ///
 /// Modes:
-///   live     — Live dashboard + WebSocket coordinator
-///   worker   — Benchmark worker (standalone HTTP or reporting to coordinator)
-///   coord    — One-shot aggregation of worker nodes
-///   local    — Run benchmark locally, output JSON
+///   live     - Live dashboard + WebSocket coordinator
+///   worker   - Benchmark worker (standalone HTTP or reporting to coordinator)
+///   coord    - One-shot aggregation of worker nodes
+///   local    - Run benchmark locally, output JSON
 ///
 /// Usage:
 ///   arc-bench-node live [--port 8080]
@@ -336,7 +336,7 @@ async fn live_join_sh(headers: HeaderMap) -> impl IntoResponse {
         r#"#!/bin/sh
 set -e
 echo ""
-echo "  ARC Chain Benchmark — Joining the Swarm"
+echo "  ARC Chain Benchmark - Joining the Swarm"
 echo "  ========================================="
 echo ""
 
@@ -373,7 +373,7 @@ echo ""
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Live mode — coordinator + dashboard + self-benchmark
+//  Live mode - coordinator + dashboard + self-benchmark
 // ─────────────────────────────────────────────────────────────────
 
 async fn run_live(port: u16) {
@@ -421,7 +421,7 @@ async fn run_live(port: u16) {
     let addr = format!("0.0.0.0:{port}");
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  ARC Chain — Live Benchmark Coordinator                    ║");
+    println!("║  ARC Chain - Live Benchmark Coordinator                    ║");
     println!(
         "║  Dashboard:   http://{:<40}║",
         format!("localhost:{port}")
@@ -449,7 +449,7 @@ async fn run_live(port: u16) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Worker mode — standalone HTTP or reporting to coordinator
+//  Worker mode - standalone HTTP or reporting to coordinator
 // ─────────────────────────────────────────────────────────────────
 
 async fn run_worker(port: u16, coord_url: Option<String>) {
@@ -466,7 +466,7 @@ async fn run_worker(port: u16, coord_url: Option<String>) {
 
     let addr = format!("0.0.0.0:{port}");
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  ARC Chain — Benchmark Worker Node                         ║");
+    println!("║  ARC Chain - Benchmark Worker Node                         ║");
     println!(
         "║  Listening on {:<46}║",
         &addr
@@ -484,7 +484,7 @@ async fn run_worker_reporting(coord_url: &str) {
     let n = 500_000usize;
 
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  ARC Chain — Benchmark Worker (Reporting Mode)             ║");
+    println!("║  ARC Chain - Benchmark Worker (Reporting Mode)             ║");
     println!(
         "║  Coordinator: {:<46}║",
         coord_url
@@ -503,7 +503,7 @@ async fn run_worker_reporting(coord_url: &str) {
             .unwrap();
 
         println!(
-            "    Pipeline: {:.0} TPS — reporting to coordinator...",
+            "    Pipeline: {:.0} TPS - reporting to coordinator...",
             result.compact_pipeline_tps
         );
 
@@ -531,12 +531,12 @@ async fn run_worker_reporting(coord_url: &str) {
 }
 
 // ─────────────────────────────────────────────────────────────────
-//  Coordinator mode — one-shot aggregation (existing)
+//  Coordinator mode - one-shot aggregation (existing)
 // ─────────────────────────────────────────────────────────────────
 
 async fn run_coordinator(node_urls: Vec<String>, n: usize) {
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  ARC Chain — Multi-Node Benchmark Coordinator              ║");
+    println!("║  ARC Chain - Multi-Node Benchmark Coordinator              ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("  Nodes: {}", node_urls.join(", "));
@@ -549,13 +549,13 @@ async fn run_coordinator(node_urls: Vec<String>, n: usize) {
     println!("  Checking node health...");
     for url in &node_urls {
         match client.get(format!("{url}/health")).send().await {
-            Ok(resp) if resp.status().is_success() => println!("    {} — OK", url),
+            Ok(resp) if resp.status().is_success() => println!("    {} - OK", url),
             Ok(resp) => {
-                eprintln!("    {} — ERROR: status {}", url, resp.status());
+                eprintln!("    {} - ERROR: status {}", url, resp.status());
                 return;
             }
             Err(e) => {
-                eprintln!("    {} — ERROR: {}", url, e);
+                eprintln!("    {} - ERROR: {}", url, e);
                 return;
             }
         }
@@ -731,7 +731,7 @@ async fn main() {
             println!("\n{}", serde_json::to_string_pretty(&result).unwrap());
         }
         _ => {
-            eprintln!("ARC Chain — Multi-Node Benchmark");
+            eprintln!("ARC Chain - Multi-Node Benchmark");
             eprintln!();
             eprintln!("Usage:");
             eprintln!("  arc-bench-node live     [--port 8080]                             Live dashboard coordinator");

@@ -21,7 +21,7 @@ test.describe("Dashboard", () => {
     await page.goto("/");
     const earnings = page.getByTestId("earnings-total");
     await expect(earnings).toBeVisible();
-    // Wait for the ticker to animate in — at least a non-zero value shows up.
+    // Wait for the ticker to animate in - at least a non-zero value shows up.
     await expect(earnings).not.toHaveText(/^0\.00/);
   });
 

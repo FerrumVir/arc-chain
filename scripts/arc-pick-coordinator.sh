@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Coordinator Auto-Discovery
+# ARC Chain - Coordinator Auto-Discovery
 #
 # Probes the testnet seed list and prints the URL of the first coordinator
 # that is actually able to serve inference requests right now. Used by
@@ -31,7 +31,7 @@
 
 # Default seed list. Can be overridden with ARC_SEEDS="ip1:port1 ip2:port2 ..."
 # or with ARC_SEEDS_URL pointing to a plaintext list (one "host:port" per line).
-# We keep NYC + LAX in the list — they come back from time to time, and the
+# We keep NYC + LAX in the list - they come back from time to time, and the
 # scripts should prefer them when healthy because they've historically held
 # layers 0-9 of the production pipeline.
 _ARC_DEFAULT_SEEDS="149.28.32.76:9090 140.82.16.112:9090 136.244.109.1:9090 104.238.171.11:9090 202.182.107.41:9090 149.28.153.31:9090 216.238.120.27:9090 139.84.237.49:9090"
@@ -57,7 +57,7 @@ arc_pick_coordinator() {
         seed="${seed%%/*}"
         local url="http://${seed}"
 
-        # Probe /health first — fastest signal
+        # Probe /health first - fastest signal
         local health_json
         health_json=$(curl -sf -m "$timeout" "${url}/health" 2>/dev/null || echo "")
         if [ -z "$health_json" ]; then
@@ -68,7 +68,7 @@ arc_pick_coordinator() {
         peers=$(echo "$health_json" | sed -n 's/.*"peers":\([0-9][0-9]*\).*/\1/p')
         peers=${peers:-0}
 
-        # Probe /shards — required for inference routing
+        # Probe /shards - required for inference routing
         local shards_json
         shards_json=$(curl -sf -m "$timeout" "${url}/shards" 2>/dev/null || echo "")
         local shards_ok=0
@@ -78,7 +78,7 @@ arc_pick_coordinator() {
             echo "$shards_json" | grep -q '"fully_covered":true' && fully_covered=1
         fi
 
-        # Tier 4: perfect — full pipeline ready
+        # Tier 4: perfect - full pipeline ready
         if [ "$fully_covered" = "1" ]; then
             [ "$verbose" = "1" ] && echo "  [tier4 full-pipeline] $url" >&2
             echo "$url"

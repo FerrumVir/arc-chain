@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 echo "╔═══════════════════════════════════════╗"
-echo "║   ARC Chain — Node Setup              ║"
+echo "║   ARC Chain - Node Setup              ║"
 echo "╚═══════════════════════════════════════╝"
 echo ""
 

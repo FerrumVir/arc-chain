@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Distributed Inference Router
+# ARC Chain - Distributed Inference Router
 #
 # Sends N inference requests across all available inference-enabled nodes.
 # Demonstrates that the network distributes load and is faster than
@@ -39,7 +39,7 @@ for entry in "${ALL_NODES[@]}"; do
     name="${entry%%:*}"
     host="${entry#*:}"
     if curl -sf -m 3 "http://${host}/health" >/dev/null 2>&1; then
-        # Probe inference endpoint — give 30s since busy nodes may queue
+        # Probe inference endpoint - give 30s since busy nodes may queue
         if curl -sf -m 30 -X POST "http://${host}/inference/run" \
             -H 'Content-Type: application/json' \
             -d '{"input":"hi","max_tokens":1}' 2>/dev/null | grep -q '"output_hash"'; then
@@ -67,7 +67,7 @@ BOLD=$'\033[1m' GREEN=$'\033[32m' CYAN=$'\033[36m' YELLOW=$'\033[33m' RESET=$'\0
 now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 
 printf "%s%s╔══════════════════════════════════════════════════════════════╗%s\n" "$CYAN" "$BOLD" "$RESET"
-printf "%s║       ARC Chain — Distributed Inference Router               ║%s\n" "$CYAN$BOLD" "$RESET"
+printf "%s║       ARC Chain - Distributed Inference Router               ║%s\n" "$CYAN$BOLD" "$RESET"
 printf "%s╚══════════════════════════════════════════════════════════════╝%s\n" "$CYAN$BOLD" "$RESET"
 echo ""
 printf "  Sending %s%s%s inference requests across %s%s%s devices in parallel\n" "$BOLD" "$N" "$RESET" "$BOLD" "$NUM_NODES" "$RESET"
@@ -98,10 +98,10 @@ for i in $(seq 1 $N); do
         if [ -n "$RESPONSE" ]; then
             HASH=$(echo "$RESPONSE" | grep -o '"output_hash":"[^"]*"' | cut -d'"' -f4)
             SPEED=$(echo "$RESPONSE" | grep -o '"ms_per_token":[0-9]*' | grep -o '[0-9]*')
-            printf "  [%2d] %s✓%s %-4s — %5dms wall, %4sms/tok, hash=%s...\n" "$i" "$GREEN" "$RESET" "$NODE_NAME" "$REQ_MS" "$SPEED" "${HASH:0:18}"
+            printf "  [%2d] %s✓%s %-4s - %5dms wall, %4sms/tok, hash=%s...\n" "$i" "$GREEN" "$RESET" "$NODE_NAME" "$REQ_MS" "$SPEED" "${HASH:0:18}"
             echo "$NODE_NAME $HASH $REQ_MS" >> "$RESULTS_FILE"
         else
-            printf "  [%2d] %s✗%s %-4s — failed\n" "$i" "$YELLOW" "$RESET" "$NODE_NAME"
+            printf "  [%2d] %s✗%s %-4s - failed\n" "$i" "$YELLOW" "$RESET" "$NODE_NAME"
         fi
     ) &
     PIDS+=($!)
@@ -120,7 +120,7 @@ printf "${BOLD}${GREEN}Total wall time: ${TOTAL_MS}ms${RESET}\n"
 printf "${BOLD}Throughput:      $(echo "scale=2; $N * 1000 / $TOTAL_MS" | bc) req/sec${RESET}\n"
 echo ""
 
-# Determinism check — all nodes using same model should produce same hash for same prompt
+# Determinism check - all nodes using same model should produce same hash for same prompt
 UNIQUE_HASHES=$(awk '{print $2}' "$RESULTS_FILE" | sort -u | wc -l | tr -d ' ')
 TOTAL_REQS=$(wc -l < "$RESULTS_FILE" | tr -d ' ')
 

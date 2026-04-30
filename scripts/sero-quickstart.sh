@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Sero One-Command Quickstart
+# ARC Chain - Sero One-Command Quickstart
 #
 # Downloads pre-built binary + config files, starts node as observer.
 # Zero compile, zero configuration. Just bring a GGUF model.
@@ -42,8 +42,8 @@ EXAMPLES:
 
 OUTPUT:
   Node listens on:
-    http://localhost:9944        — RPC + inference endpoint
-    http://localhost:9944/health — health status
+    http://localhost:9944        - RPC + inference endpoint
+    http://localhost:9944/health - health status
 
   Test inference:
     curl -X POST http://localhost:9944/inference/run \\
@@ -68,7 +68,7 @@ fail()  { printf "${RED}[FAIL]${RESET}  %s\n" "$*" >&2; exit 1; }
 
 cat <<'BANNER'
   ╔══════════════════════════════════════════╗
-  ║     ARC Chain — Sero Quickstart          ║
+  ║     ARC Chain - Sero Quickstart          ║
   ║     Verifiable AI inference on chain     ║
   ╚══════════════════════════════════════════╝
 BANNER

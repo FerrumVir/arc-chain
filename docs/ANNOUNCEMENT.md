@@ -1,11 +1,11 @@
-# ARC Chain — Sharded AI Inference Across the Network
+# ARC Chain - Sharded AI Inference Across the Network
 
 A real Llama-2-7B model running across **7 separate VPS in 7 cities**. Each holds ~1 GB of weights. No single one of them has the full model. Together they answer prompts in real time, with **bit-identical output on every chip on earth**.
 
 **Live demo (open in any browser):**
 http://140.82.16.112:3200
 
-Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the activation reaches it. The trace table shows compute_ms, wall_ms, and payload bytes per node. Run the same prompt twice — the BLAKE3 hash is bit-identical. Run a different prompt — the hash changes.
+Type a prompt in the "Sharded AI" panel. Watch each shard card pulse as the activation reaches it. The trace table shows compute_ms, wall_ms, and payload bytes per node. Run the same prompt twice - the BLAKE3 hash is bit-identical. Run a different prompt - the hash changes.
 
 ---
 
@@ -80,7 +80,7 @@ After install your node is running, joined to the testnet, and visible at the li
 
 ## How it works (one paragraph)
 
-Each layer range is held by 3 replicas (e.g. range [0,6) lives on AMS · LAX · NYC; range [27,32) on LAX · NYC · SGP). When you POST a prompt, the coordinator tokenizes it, picks the fastest replica of range 0 (by rolling EWMA latency), which embeds the token and runs its layers. Its hidden state is BLAKE3-hashed and sent to a replica of range 1 via HTTP. Each replica verifies the hash, runs its layers, hashes its output, forwards to the next range. The last range runs `final_norm + LM head + argmax` and returns the next token id. The coordinator collects tokens until `max_tokens` or EOS. Per-row INT16 weights quantized directly from f32, pure i64 arithmetic in the matmul, no floating point anywhere — that's how the output is bit-identical regardless of which replica answers each hop. `/inference/run_consensus` fires k=3 in parallel and requires hash-majority agreement; `/inference/run_sharded` picks the primary and falls over to the next on failure.
+Each layer range is held by 3 replicas (e.g. range [0,6) lives on AMS · LAX · NYC; range [27,32) on LAX · NYC · SGP). When you POST a prompt, the coordinator tokenizes it, picks the fastest replica of range 0 (by rolling EWMA latency), which embeds the token and runs its layers. Its hidden state is BLAKE3-hashed and sent to a replica of range 1 via HTTP. Each replica verifies the hash, runs its layers, hashes its output, forwards to the next range. The last range runs `final_norm + LM head + argmax` and returns the next token id. The coordinator collects tokens until `max_tokens` or EOS. Per-row INT16 weights quantized directly from f32, pure i64 arithmetic in the matmul, no floating point anywhere - that's how the output is bit-identical regardless of which replica answers each hop. `/inference/run_consensus` fires k=3 in parallel and requires hash-majority agreement; `/inference/run_sharded` picks the primary and falls over to the next on failure.
 
 For the deep dive: [`docs/HOW-SHARDING-WORKS.md`](HOW-SHARDING-WORKS.md)
 

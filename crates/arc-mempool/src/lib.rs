@@ -126,7 +126,7 @@ impl Default for Mempool {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Encrypted Mempool — MEV Protection via BLS Threshold Encryption
+// Encrypted Mempool - MEV Protection via BLS Threshold Encryption
 // ──────────────────────────────────────────────────────────────────────────────
 //
 // Transactions enter the mempool encrypted. The proposer MUST include them in
@@ -165,9 +165,9 @@ pub struct EncryptedTx {
     /// Per-tx symmetric key encrypted under the committee slot key.
     /// Format: ThresholdEncryption AEAD(slot_key, per_tx_key).
     pub encrypted_key: Vec<u8>,
-    /// Submission timestamp — used for FIFO ordering.
+    /// Submission timestamp - used for FIFO ordering.
     pub submitted_at: std::time::Instant,
-    /// BLAKE3(sender_address || slot || random_salt) — commit without revealing sender.
+    /// BLAKE3(sender_address || slot || random_salt) - commit without revealing sender.
     pub sender_commitment: Hash256,
 }
 
@@ -578,7 +578,7 @@ mod tests {
 
         assert_eq!(pool.pending_count(), 5);
 
-        // Drain all — must come back in FIFO submission order
+        // Drain all - must come back in FIFO submission order
         let batch = pool.drain_fifo(10);
         assert_eq!(batch.len(), 5);
         assert_eq!(pool.pending_count(), 0);
@@ -653,7 +653,7 @@ mod tests {
         // Correct order should pass
         assert!(EncryptedMempool::verify_fifo_ordering(&batch));
 
-        // Swap two elements to break FIFO — should fail
+        // Swap two elements to break FIFO - should fail
         let last_idx = batch.len() - 1;
         if last_idx > 0 {
             batch.swap(0, last_idx);
@@ -846,7 +846,7 @@ mod tests {
         for (kp, sig) in committee.keypairs.iter().zip(sigs.iter()) {
             assert!(
                 bls_verify(&kp.public, &msg, sig),
-                "BLS signature must verify — this is real blst crypto"
+                "BLS signature must verify - this is real blst crypto"
             );
         }
     }

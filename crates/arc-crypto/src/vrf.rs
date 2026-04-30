@@ -79,7 +79,7 @@ pub fn vrf_prove(
         Hash256(*h.finalize().as_bytes())
     };
 
-    // Step 2: Sign the gamma input — this binds gamma to the secret key.
+    // Step 2: Sign the gamma input - this binds gamma to the secret key.
     // Ed25519 signatures are deterministic (RFC 8032), so the same
     // (keypair, alpha) always produces the same gamma.
     let gamma_sig = keypair.sign(&gamma_input)?;
@@ -123,7 +123,7 @@ pub fn vrf_prove(
         Hash256(*h.finalize().as_bytes())
     };
 
-    // Step 4: Create the proof — sign(gamma || H(alpha)).
+    // Step 4: Create the proof - sign(gamma || H(alpha)).
     let alpha_hash = hash_bytes(alpha);
     let proof_msg = {
         let mut h = blake3::Hasher::new_derive_key("ARC-vrf-proof-v1");
@@ -169,7 +169,7 @@ pub fn vrf_verify(
         Hash256(*h.finalize().as_bytes())
     };
 
-    // Verify the Ed25519 signature — this proves the prover knew the
+    // Verify the Ed25519 signature - this proves the prover knew the
     // secret key corresponding to `public_key_address`.
     proof.signature.verify(&proof_msg, public_key_address)?;
 
@@ -256,7 +256,7 @@ mod tests {
 
         let (mut proof, _) = vrf_prove(&kp, alpha).expect("prove ok");
 
-        // Tamper with gamma — flip a byte.
+        // Tamper with gamma - flip a byte.
         proof.gamma.0[0] ^= 0xff;
 
         let result = vrf_verify(&address, alpha, &proof);

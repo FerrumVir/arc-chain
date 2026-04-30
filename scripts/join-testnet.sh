@@ -28,7 +28,7 @@ NC='\033[0m'
 
 echo -e "${CYAN}"
 echo "  ╔══════════════════════════════════════════╗"
-echo "  ║         ARC Chain — Join Testnet         ║"
+echo "  ║         ARC Chain - Join Testnet         ║"
 echo "  ╚══════════════════════════════════════════╝"
 echo -e "${NC}"
 

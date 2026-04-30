@@ -28,7 +28,7 @@ use arc_submitter::ArcSubmitter;
 use config::RelayerConfig;
 use eth_watcher::EthWatcher;
 
-/// ARC Chain Bridge Relayer — connects Ethereum and ARC Chain.
+/// ARC Chain Bridge Relayer - connects Ethereum and ARC Chain.
 #[derive(Parser, Debug)]
 #[command(name = "arc-relayer", about = "Bridge relayer for ARC Chain")]
 struct Cli {

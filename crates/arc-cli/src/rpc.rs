@@ -19,7 +19,7 @@ impl RpcClient {
         }
     }
 
-    /// `GET /info` — chain metadata (version, height, account count, mempool size).
+    /// `GET /info` - chain metadata (version, height, account count, mempool size).
     pub async fn get_info(&self) -> Result<Value> {
         let url = format!("{}/info", self.base_url);
         let resp = self.client.get(&url).send().await
@@ -27,7 +27,7 @@ impl RpcClient {
         self.handle_response(resp).await
     }
 
-    /// `GET /account/{addr}` — account balance and nonce.
+    /// `GET /account/{addr}` - account balance and nonce.
     pub async fn get_account(&self, addr: &str) -> Result<Value> {
         let url = format!("{}/account/{}", self.base_url, addr);
         let resp = self.client.get(&url).send().await
@@ -35,7 +35,7 @@ impl RpcClient {
         self.handle_response(resp).await
     }
 
-    /// `GET /block/{height}` — block header and transaction list.
+    /// `GET /block/{height}` - block header and transaction list.
     pub async fn get_block(&self, height: u64) -> Result<Value> {
         let url = format!("{}/block/{}", self.base_url, height);
         let resp = self.client.get(&url).send().await
@@ -43,7 +43,7 @@ impl RpcClient {
         self.handle_response(resp).await
     }
 
-    /// `GET /tx/{hash}/full` — full transaction with receipt.
+    /// `GET /tx/{hash}/full` - full transaction with receipt.
     pub async fn get_tx(&self, hash: &str) -> Result<Value> {
         let url = format!("{}/tx/{}/full", self.base_url, hash);
         let resp = self.client.get(&url).send().await
@@ -51,7 +51,7 @@ impl RpcClient {
         self.handle_response(resp).await
     }
 
-    /// `POST /tx/submit` — submit a transaction (JSON body).
+    /// `POST /tx/submit` - submit a transaction (JSON body).
     pub async fn submit_tx(&self, tx_json: Value) -> Result<Value> {
         let url = format!("{}/tx/submit", self.base_url);
         let resp = self.client.post(&url).json(&tx_json).send().await
@@ -59,7 +59,7 @@ impl RpcClient {
         self.handle_response(resp).await
     }
 
-    /// `POST {faucet_url}/claim` — request testnet tokens from the faucet.
+    /// `POST {faucet_url}/claim` - request testnet tokens from the faucet.
     pub async fn claim_faucet(&self, faucet_url: &str, addr: &str) -> Result<Value> {
         let url = format!("{}/claim", faucet_url.trim_end_matches('/'));
         let body = serde_json::json!({ "address": addr });

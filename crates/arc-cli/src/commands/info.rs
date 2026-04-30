@@ -1,4 +1,4 @@
-//! `arc info` — display chain metadata.
+//! `arc info` - display chain metadata.
 
 use anyhow::Result;
 use crate::rpc::RpcClient;

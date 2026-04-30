@@ -1,5 +1,5 @@
 <stdin>:15: DeprecationWarning: datetime.datetime.utcnow() is deprecated and scheduled for removal in a future version. Use timezone-aware objects to represent datetimes in UTC: datetime.datetime.now(datetime.UTC).
-# ARC Chain — Factual Benchmark Report
+# ARC Chain - Factual Benchmark Report
 
 > **Topology note (2026-04-22):** this run was captured against the 7-shard
 > 1×-replica topology in April. The live cluster now runs 6 layer ranges

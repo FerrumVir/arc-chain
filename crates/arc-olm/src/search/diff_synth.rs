@@ -42,7 +42,7 @@ pub fn diff_synthesize(
     }
     if elapsed() > timeout_ms { return None; }
 
-    // Strategy 2: Positional diff — cells that change share a spatial pattern
+    // Strategy 2: Positional diff - cells that change share a spatial pattern
     if same_size {
         if let Some(r) = strategy_positional_diff(train_pairs, test_inputs) {
             return Some(r);
@@ -50,7 +50,7 @@ pub fn diff_synthesize(
     }
     if elapsed() > timeout_ms { return None; }
 
-    // Strategy 3: Object diff — detect what happened to objects
+    // Strategy 3: Object diff - detect what happened to objects
     if let Some(r) = strategy_object_diff(train_pairs, test_inputs) {
         return Some(r);
     }
@@ -396,7 +396,7 @@ fn strategy_positional_diff(
     None
 }
 
-/// 2f: Relaxed adjacency fill — changed cells of ANY source color adjacent to trigger
+/// 2f: Relaxed adjacency fill - changed cells of ANY source color adjacent to trigger
 fn positional_adjacent_fill_any(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -759,7 +759,7 @@ fn find_enclosed_bg(grid: &Grid, bg: Color) -> BTreeSet<(usize, usize)> {
     enclosed
 }
 
-/// 2j: Enclosed recolor — replace cells of color X with Y only when inside enclosed regions.
+/// 2j: Enclosed recolor - replace cells of color X with Y only when inside enclosed regions.
 fn positional_enclosed_recolor(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -882,7 +882,7 @@ fn positional_enclosed_recolor(
     None
 }
 
-/// 2k: Diagonal neighbors fill — like adjacency fill but 8-connected.
+/// 2k: Diagonal neighbors fill - like adjacency fill but 8-connected.
 fn positional_diagonal_fill(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -970,7 +970,7 @@ fn adjacent_8_to_color(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     result
 }
 
-/// 2a: Changed cells are ALL adjacent to a specific color — fill with a target color.
+/// 2a: Changed cells are ALL adjacent to a specific color - fill with a target color.
 fn positional_adjacent_fill(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -1164,7 +1164,7 @@ fn positional_line_fill(
     None
 }
 
-/// 2d: Noise removal — isolated cells replaced by background.
+/// 2d: Noise removal - isolated cells replaced by background.
 fn positional_noise_removal(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -1218,7 +1218,7 @@ fn positional_noise_removal(
     })
 }
 
-/// 2e: Gap fill — fill between two same-color cells.
+/// 2e: Gap fill - fill between two same-color cells.
 fn positional_gap_fill(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],

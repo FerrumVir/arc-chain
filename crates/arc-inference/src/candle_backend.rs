@@ -124,7 +124,7 @@ impl GgufEngine {
     #[cfg(not(feature = "candle"))]
     pub fn load_gguf_file(&self, _path: &str) -> Result<Hash256, InferenceError> {
         Err(InferenceError::Runtime(
-            "candle feature not enabled — build with: cargo build --features candle".into(),
+            "candle feature not enabled - build with: cargo build --features candle".into(),
         ))
     }
 
@@ -200,8 +200,8 @@ impl GgufEngine {
             generated_tokens.push(next_token);
             all_tokens.push(next_token);
 
-            // Stop on EOS — token 2 (LLaMA-2), 128001/128009 (LLaMA-3)
-            // Token 0 is PAD, not EOS — do not stop on it
+            // Stop on EOS - token 2 (LLaMA-2), 128001/128009 (LLaMA-3)
+            // Token 0 is PAD, not EOS - do not stop on it
             if matches!(next_token, 2 | 128001 | 128009) {
                 break;
             }
@@ -238,7 +238,7 @@ impl GgufEngine {
         _max_tokens: u32,
     ) -> Result<InferenceResult, InferenceError> {
         Err(InferenceError::Runtime(
-            "candle feature not enabled — build with: cargo build --features candle".into(),
+            "candle feature not enabled - build with: cargo build --features candle".into(),
         ))
     }
 

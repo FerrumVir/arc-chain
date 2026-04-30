@@ -1,4 +1,4 @@
-# ARC Chain Genesis Configuration — 4-Node Testnet
+# ARC Chain Genesis Configuration - 4-Node Testnet
 # -----------------------------------------------------------------
 # Deployed to /etc/arc/genesis.toml on each validator.
 # All nodes MUST use an identical copy of this file.

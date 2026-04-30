@@ -29,17 +29,17 @@ impl BenchmarkPool {
     /// nonce conflicts.
     ///
     /// # Arguments
-    /// * `sender_start` — first sender index (0-based)
-    /// * `sender_count` — number of senders this node owns
-    /// * `num_threads` — signing threads (default 4)
-    /// * `batch_size` — txs per batch sent through channel
+    /// * `sender_start` - first sender index (0-based)
+    /// * `sender_count` - number of senders this node owns
+    /// * `num_threads` - signing threads (default 4)
+    /// * `batch_size` - txs per batch sent through channel
     pub fn start(
         sender_start: u8,
         sender_count: u8,
         num_threads: usize,
         batch_size: usize,
     ) -> Self {
-        // Bounded channel — prevents OOM if execution can't keep up
+        // Bounded channel - prevents OOM if execution can't keep up
         let (tx, rx) = channel::bounded::<Vec<Transaction>>(64);
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -137,7 +137,7 @@ impl BenchmarkPool {
     }
 
     /// Drain up to `max` signed transactions from the pool.
-    /// Non-blocking — returns whatever is available.
+    /// Non-blocking - returns whatever is available.
     pub fn drain(&self, max: usize) -> Vec<Transaction> {
         let mut result = Vec::with_capacity(max);
         while result.len() < max {

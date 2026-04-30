@@ -9,14 +9,14 @@
 //! keeps only N layers in a hot cache (RAM). When a layer is needed that's
 //! not cached, it's loaded from the memory-mapped GGUF file on-demand.
 //! Cold layers are evicted LRU. This means a 400B model can run on a
-//! machine with 16GB RAM — only ~2 layers in memory at a time.
+//! machine with 16GB RAM - only ~2 layers in memory at a time.
 //!
 //! ## Speculative Decoding
 //!
 //! A small draft model (e.g. TinyLlama 1.1B) predicts N candidate tokens.
 //! The large target model verifies the batch in a single forward pass.
 //! Because integer inference is deterministic, verification is just hash
-//! comparison — if draft output == target output, all N tokens are accepted.
+//! comparison - if draft output == target output, all N tokens are accepted.
 //! Typical acceptance rate: 60-80% → 2-3x effective throughput.
 //!
 //! ## Memory-Tier Execution
@@ -184,11 +184,11 @@ impl MemoryTierConfig {
 /// Which memory tier a layer's weights are stored in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryTier {
-    /// GPU VRAM — fastest access, limited capacity.
+    /// GPU VRAM - fastest access, limited capacity.
     Vram,
-    /// System RAM — fast, moderate capacity.
+    /// System RAM - fast, moderate capacity.
     Ram,
-    /// SSD via mmap — slow but unlimited capacity.
+    /// SSD via mmap - slow but unlimited capacity.
     Ssd,
 }
 
@@ -246,7 +246,7 @@ impl StreamingLayerCache {
             return Ok(self.cache.get(&layer_idx).unwrap());
         }
 
-        // Not cached — load from disk
+        // Not cached - load from disk
         self.load_layer_from_disk(layer_idx)?;
         Ok(self.cache.get(&layer_idx).unwrap())
     }
@@ -399,7 +399,7 @@ pub fn speculative_decode(
     let mut target_cache = KVCache::new(target.config.n_layers);
 
     // Prefill: run prompt through both models.
-    // forward_one_token increments cache.seq_len internally — do NOT set it manually.
+    // forward_one_token increments cache.seq_len internally - do NOT set it manually.
     for &tok in prompt_tokens {
         draft.forward_one_token(tok, &mut draft_cache);
         target.forward_one_token(tok, &mut target_cache);
@@ -443,7 +443,7 @@ pub fn speculative_decode(
             let target_tok = crate::integer_lut::argmax_i64(&target_logits) as u32;
 
             if target_tok == draft_tok {
-                // Draft was correct — accept
+                // Draft was correct - accept
                 accepted_tokens.push(target_tok);
                 all_tokens.push(target_tok);
                 accepted_this_round += 1;
@@ -451,7 +451,7 @@ pub fn speculative_decode(
                 if target.config.eos_tokens.contains(&target_tok) { break; }
                 if accepted_tokens.len() >= max_tokens as usize { break; }
             } else {
-                // Draft diverged — accept target's token (it's correct),
+                // Draft diverged - accept target's token (it's correct),
                 // discard remaining draft tokens
                 accepted_tokens.push(target_tok);
                 all_tokens.push(target_tok);
@@ -475,7 +475,7 @@ pub fn speculative_decode(
         // by (draft_tokens.len() - accepted_this_round) positions. Rollback
         // the excess positions.
         if !rejected && accepted_this_round < draft_tokens.len() {
-            // Draft cache advanced too far — rebuild
+            // Draft cache advanced too far - rebuild
             draft_cache = KVCache::new(draft.config.n_layers);
             for &t in &all_tokens {
                 draft.forward_one_token(t, &mut draft_cache);
@@ -678,7 +678,7 @@ mod tests {
         let d_ff = config.d_ff;
         let mut cache = StreamingLayerCache::new(config, "/dev/null".to_string(), 3);
 
-        // Insert 3 layers — should all fit
+        // Insert 3 layers - should all fit
         cache.insert_layer(0, make_random_layer(d, d_ff, 100));
         cache.insert_layer(1, make_random_layer(d, d_ff, 200));
         cache.insert_layer(2, make_random_layer(d, d_ff, 300));
@@ -688,7 +688,7 @@ mod tests {
         assert!(cache.is_cached(2));
         assert_eq!(cache.evictions, 0);
 
-        // Insert 4th — should evict layer 0 (LRU)
+        // Insert 4th - should evict layer 0 (LRU)
         cache.insert_layer(3, make_random_layer(d, d_ff, 400));
         assert_eq!(cache.cached_count(), 3);
         assert!(!cache.is_cached(0), "layer 0 should be evicted");
@@ -834,6 +834,10 @@ mod tests {
             i16_output: None,
             block_i8_layers: None,
             block_i8_output: None,
+            ternary_layers: None,
+            ternary_output: None,
+            ternary_hybrid_layers: None,
+            ternary_hybrid_output: None,
         };
 
         // Use the same model as both draft and target
@@ -874,6 +878,8 @@ mod tests {
                 vocab: (0..config.vocab_size).map(|i| format!("tok_{}", i)).collect(),
                 q4_layers: None, q4_output: None, i16_layers: None, i16_output: None,
                 block_i8_layers: None, block_i8_output: None,
+                ternary_layers: None, ternary_output: None,
+                ternary_hybrid_layers: None, ternary_hybrid_output: None,
             }
         };
 
@@ -917,6 +923,8 @@ mod tests {
                 vocab: (0..config.vocab_size).map(|i| format!("tok_{}", i)).collect(),
                 q4_layers: None, q4_output: None, i16_layers: None, i16_output: None,
                 block_i8_layers: None, block_i8_output: None,
+                ternary_layers: None, ternary_output: None,
+                ternary_hybrid_layers: None, ternary_hybrid_output: None,
             }
         };
 

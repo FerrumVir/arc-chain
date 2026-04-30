@@ -1,4 +1,4 @@
-//! `arc block <height>` — display block details.
+//! `arc block <height>` - display block details.
 
 use anyhow::Result;
 use crate::rpc::RpcClient;

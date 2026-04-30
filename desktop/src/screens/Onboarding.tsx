@@ -74,7 +74,7 @@ export function Onboarding() {
       await api.saveConfig(config);
       setLaunchStage("starting");
       await api.startNode(config);
-      // Poll /health until the node reports at least one peer — that's
+      // Poll /health until the node reports at least one peer - that's
       // when it's actually on testnet, not just a running binary.
       setLaunchStage("connecting");
       const joined = await waitForPeer({ timeoutMs: 90_000 });
@@ -157,7 +157,7 @@ export function Onboarding() {
                     {
                       icon: ShieldCheck,
                       title: "Your identity, on-chain",
-                      desc: "A BIP-39 recovery phrase generated locally — never leaves your machine.",
+                      desc: "A BIP-39 recovery phrase generated locally - never leaves your machine.",
                     },
                     {
                       icon: Network,
@@ -232,7 +232,7 @@ export function Onboarding() {
                 <h1 className="onboarding-title">Your identity</h1>
                 <p className="onboarding-subtitle">
                   This is your node's on-chain address. Save the recovery
-                  phrase — it's the only way to restore this identity.
+                  phrase - it's the only way to restore this identity.
                 </p>
 
                 {!identity ? (
@@ -445,7 +445,7 @@ export function Onboarding() {
                   {launching && launchStage === "starting" &&
                     "Launching your local node."}
                   {launching && launchStage === "connecting" &&
-                    "Waiting for peers — usually takes a few seconds."}
+                    "Waiting for peers - usually takes a few seconds."}
                   {launching && launchStage === "claiming" &&
                     "Asking the testnet faucet for your starter balance."}
                 </p>

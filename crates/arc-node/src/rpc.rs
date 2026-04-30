@@ -22,8 +22,8 @@ use tower_http::cors::CorsLayer;
 
 /// Faucet configuration.
 const FAUCET_CLAIM_AMOUNT: u64 = 10_000;
-const FAUCET_RATE_LIMIT_SECS: u64 = 60; // 1 minute per address (testnet — was 1 hour)
-const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute — intentionally high for testnet TPS demos; lower before mainnet
+const FAUCET_RATE_LIMIT_SECS: u64 = 60; // 1 minute per address (testnet - was 1 hour)
+const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute - intentionally high for testnet TPS demos; lower before mainnet
 
 /// Shared node state passed to all handlers.
 #[derive(Clone)]
@@ -55,7 +55,7 @@ pub struct NodeState {
     pub dag_round: Arc<AtomicU64>,
     /// DAG committed block count (updated by consensus loop).
     pub dag_committed: Arc<AtomicU64>,
-    /// Inference results indexed by attestation tx hash — for explorer display.
+    /// Inference results indexed by attestation tx hash - for explorer display.
     pub inference_results: Arc<dashmap::DashMap<String, Value>>,
     /// Pipeline-parallel sharding: every layer range this node holds.
     /// Set from repeated --shard-range flags (or the deprecated single
@@ -78,7 +78,7 @@ pub struct NodeState {
     /// socket_addr. Populated after every successful hop; consumed by the
     /// coordinator to sort replica lists ascending before picking primary
     /// (run_sharded) or the top-k (run_consensus). Does not affect output
-    /// determinism — only WHICH replica answers, not WHAT it answers.
+    /// determinism - only WHICH replica answers, not WHAT it answers.
     /// Closes #29.
     pub latency_stats: Arc<dashmap::DashMap<String, LatencyEWMA>>,
     /// Total sharded inference runs served by this node since boot.
@@ -95,7 +95,7 @@ pub struct NodeState {
     /// integer engine's determinism. Survives the full coordinator session
     /// (until eviction). The cache hit count is exposed in the response.
     pub inference_cache: Arc<arc_inference::distributed::DistributedCache>,
-    /// Community worker registry — nodes that volunteered HTTP-based
+    /// Community worker registry - nodes that volunteered HTTP-based
     /// inference compute. Keyed by worker_id (self-chosen), value is the
     /// registration record + last-seen Instant for TTL pruning. Workers
     /// are pure outbound-HTTPS contributors (POST to register, POST to
@@ -104,17 +104,17 @@ pub struct NodeState {
     pub community_workers: Arc<dashmap::DashMap<String, (CommunityWorker, std::time::Instant)>>,
     /// Community work dispatch: sender side. The coordinator pushes WorkItems
     /// here when it wants community nodes to run forward_shard. This is the
-    /// "producer" half of an mpsc channel — wire it up in main.rs when
+    /// "producer" half of an mpsc channel - wire it up in main.rs when
     /// starting a coordinator.
     /// Multi-model shard registry (from distributed.rs). Tracks shards
     /// per-model for multi-model routing. Populated alongside the flat
     /// shard_registry for backward compatibility.
     pub multi_model_registry: Arc<arc_inference::distributed::ShardRegistry>,
-    /// Inference verification manager — commit-challenge system for
+    /// Inference verification manager - commit-challenge system for
     /// economically-secured inference. Providers commit result_hash + bond;
     /// challengers can dispute with their own bond.
     pub verification_manager: Arc<std::sync::Mutex<arc_vm::inference_verify::VerificationManager>>,
-    /// Revenue split configuration — 40% proposers, 25% verifiers, 15% observers, 20% treasury.
+    /// Revenue split configuration - 40% proposers, 25% verifiers, 15% observers, 20% treasury.
     pub revenue_config: RoleRevenueConfig,
     pub community_work_tx: Option<Arc<tokio::sync::mpsc::Sender<WorkItem>>>,
     /// Community work dispatch: receiver side. Wrapped in a tokio::Mutex so
@@ -166,7 +166,7 @@ pub struct ShardInfo {
 /// A community worker: an arc-node running with --community-mode that
 /// registered via outbound HTTPS POST. Workers contribute compute by
 /// polling /community/claim_work and POSTing results back. They do NOT
-/// participate in consensus or hold shards — they're pure volunteer
+/// participate in consensus or hold shards - they're pure volunteer
 /// compute providers. Their entries in the registry are TTL-pruned if
 /// they stop heartbeating.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -223,7 +223,7 @@ fn fresh_shards(
 }
 
 /// Rolling EWMA weight for new samples. α = 0.2 gives recent hops meaningful
-/// pull while keeping a multi-sample memory — a single outlier won't steal
+/// pull while keeping a multi-sample memory - a single outlier won't steal
 /// primary, but a sustained shift in latency rebalances within ~5-10 hops.
 const LATENCY_ALPHA: f64 = 0.2;
 
@@ -247,7 +247,7 @@ pub fn record_latency(
 
 /// Sort a replica bucket by EWMA latency ascending. Unseen replicas (no
 /// sample yet) are placed AFTER seen ones but keep their insertion order
-/// — this keeps cold-start behavior identical to the old first-match logic
+/// - this keeps cold-start behavior identical to the old first-match logic
 /// and avoids starving an unseen replica of its first try.
 pub fn sort_replicas_by_latency(
     replicas: &mut Vec<ShardInfo>,
@@ -382,16 +382,16 @@ pub async fn serve(
         .route("/faucet/status", get(faucet_status))
         // Light Client Finality Proofs (A8)
         .route("/light/snapshot", get(light_snapshot))
-        // State Sync Protocol (A5) — snapshot bootstrap for new nodes
+        // State Sync Protocol (A5) - snapshot bootstrap for new nodes
         .route("/sync/snapshot", get(sync_snapshot))
         .route("/sync/snapshot/info", get(sync_snapshot_info))
-        // Chunked State Sync — parallel chunk download for fast catch-up
+        // Chunked State Sync - parallel chunk download for fast catch-up
         .route("/sync/manifest", get(sync_manifest))
         .route("/sync/chunk/{index}", get(sync_chunk))
         .route("/sync/status", get(sync_status))
-        // DAG round sync — allows new nodes to start at the right round
+        // DAG round sync - allows new nodes to start at the right round
         .route("/sync/dag_state", get(sync_dag_state))
-        // Inference — run model and record attestation on-chain
+        // Inference - run model and record attestation on-chain
         .route("/inference/run", post(inference_run))
         .route("/inference/attestations", get(inference_list_attestations))
         .route("/inference/results", get(inference_list_results))
@@ -403,19 +403,19 @@ pub async fn serve(
         .route("/inference/cache_stats", get(inference_cache_stats))
         .route("/inference/latency_stats", get(inference_latency_stats))
         .route("/inference/cache_check", post(inference_cache_check))
-        // Shard registry — discovery + announcement
+        // Shard registry - discovery + announcement
         .route("/shards", get(get_shards))
         .route("/shards/announce", post(announce_shard))
-        // Multi-model registry — list all models and per-model shards
+        // Multi-model registry - list all models and per-model shards
         .route("/models", get(get_models))
         .route("/models/shards", get(get_model_shards))
-        // Auto-sharding — compute optimal shard plan for a model
+        // Auto-sharding - compute optimal shard plan for a model
         .route("/shards/auto_plan", post(compute_auto_shard_plan))
         // Auto-join: node with model asks coordinator for shard assignment
         .route("/shards/join", post(shard_join))
         // Auto-routing inference: automatically picks best path
         .route("/inference/auto", post(inference_auto))
-        // Inference verification — commit-challenge system
+        // Inference verification - commit-challenge system
         .route("/inference/commit", post(inference_commit))
         .route("/inference/challenge", post(inference_challenge))
         .route("/inference/verification_status", get(inference_verification_status))
@@ -424,7 +424,7 @@ pub async fn serve(
         // Milestone C: read-only registry + demand discovery. Workers use
         // these to discover what models exist and what ranges are open
         // for the taking. Writes go through /tx/submit_signed like any
-        // other chain mutation — no dedicated POST endpoints needed for
+        // other chain mutation - no dedicated POST endpoints needed for
         // the MVP.
         .route("/models/registry", get(list_model_registry))
         .route("/models/open_requests", get(list_open_model_requests))
@@ -460,7 +460,7 @@ pub async fn serve(
     // into_make_service_with_connect_info lets handlers extract
     // ConnectInfo<SocketAddr>. announce_shard uses this to override stub
     // `0.0.0.0:*` socket_addrs in shard announcements with the peer's real
-    // source IP — otherwise the coordinator can't route /inference/forward_shard
+    // source IP - otherwise the coordinator can't route /inference/forward_shard
     // calls to shards held by remote nodes.
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
@@ -488,7 +488,7 @@ pub async fn serve_eth(addr: &str, node: NodeState) -> anyhow::Result<()> {
 }
 
 async fn index() -> &'static str {
-    concat!("ARC Chain — Agent Runtime Chain — Testnet v", env!("CARGO_PKG_VERSION"))
+    concat!("ARC Chain - Agent Runtime Chain - Testnet v", env!("CARGO_PKG_VERSION"))
 }
 
 /// JSON error response body returned by endpoints that fail with 4xx/5xx.
@@ -701,7 +701,7 @@ async fn submit_tx(
         }
     }
 
-    // No signature provided — reject. Unsigned transfers are a security hole
+    // No signature provided - reject. Unsigned transfers are a security hole
     // (anyone could drain any account). Require a signature for all transfers.
     Err((StatusCode::BAD_REQUEST, "Signature required. Provide 'signature' and 'public_key' fields. Use the wallet at http://140.82.16.112:3100 to send tokens.".to_string()))
 }
@@ -951,7 +951,7 @@ async fn faucet_claim(
     })?;
 
     // Rate limiting: check if this address claimed recently
-    // Global rate limit: 5000 faucet claims/minute (testnet only — production should be 100)
+    // Global rate limit: 5000 faucet claims/minute (testnet only - production should be 100)
     // DashMap iter is lock-free per shard so this never blocks the runtime.
     {
         let total = node.faucet_claims_total.load(Ordering::Relaxed);
@@ -1013,7 +1013,7 @@ async fn faucet_claim(
     tx.sig_verified = true; // Faucet is a trusted internal operation
     let hash = tx.hash.to_hex();
 
-    // Write receipt FIRST — the consensus thread uses receipts.contains_key()
+    // Write receipt FIRST - the consensus thread uses receipts.contains_key()
     // to dedup. If we write state before receipt, there's a race window where
     // the DAG commit thread could execute the same tx again (double credit).
     let receipt = TxReceipt {
@@ -1098,7 +1098,7 @@ fn parse_hash(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid hash. Must be 64 hex characters (0x prefix optional)."))
 }
 
-/// GET /tx/{hash} — Look up a transaction receipt by its hash.
+/// GET /tx/{hash} - Look up a transaction receipt by its hash.
 /// Falls back to on-demand reconstruction for benchmark transactions.
 async fn get_transaction(
     AxumState(node): AxumState<NodeState>,
@@ -1116,7 +1116,7 @@ async fn get_transaction(
         .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Transaction {} not found", hash)))
 }
 
-/// GET /tx/{hash}/proof — Return a full verification bundle for a transaction.
+/// GET /tx/{hash}/proof - Return a full verification bundle for a transaction.
 /// For benchmark transactions, reconstructs the Merkle tree on-demand (~130ms).
 async fn get_tx_proof(
     AxumState(node): AxumState<NodeState>,
@@ -1198,7 +1198,7 @@ async fn get_tx_proof(
     })))
 }
 
-/// GET /block/{height}/proofs — Return all Merkle proofs for transactions in a block.
+/// GET /block/{height}/proofs - Return all Merkle proofs for transactions in a block.
 async fn get_block_proofs(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
@@ -1250,7 +1250,7 @@ struct BlocksQuery {
     limit: Option<usize>,
 }
 
-/// GET /blocks?from=0&to=100&limit=20 — Paginated block listing.
+/// GET /blocks?from=0&to=100&limit=20 - Paginated block listing.
 async fn get_blocks(
     AxumState(node): AxumState<NodeState>,
     Query(params): Query<BlocksQuery>,
@@ -1286,7 +1286,7 @@ async fn get_blocks(
     }))
 }
 
-/// GET /block/{height}/txs?offset=0&limit=100 — Paginated transaction listing for a block.
+/// GET /block/{height}/txs?offset=0&limit=100 - Paginated transaction listing for a block.
 /// Reconstructs benchmark transactions on-demand from deterministic parameters.
 #[derive(Deserialize)]
 struct BlockTxsQuery {
@@ -1364,7 +1364,7 @@ async fn get_block_txs(
     })))
 }
 
-/// GET /account/{address}/txs — Return transaction hashes involving an account.
+/// GET /account/{address}/txs - Return transaction hashes involving an account.
 async fn get_account_txs(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address): axum::extract::Path<String>,
@@ -1381,7 +1381,7 @@ async fn get_account_txs(
     })))
 }
 
-/// GET /stats — Basic chain statistics.
+/// GET /stats - Basic chain statistics.
 async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let indexed_receipts = node.state.receipts.len();
     let indexed_hashes = node.state.tx_index.len();
@@ -1416,7 +1416,7 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// State Sync Protocol (A5) — snapshot bootstrap for new nodes
+// State Sync Protocol (A5) - snapshot bootstrap for new nodes
 // ---------------------------------------------------------------------------
 
 /// Returns metadata about the latest snapshot available for sync.
@@ -1460,7 +1460,7 @@ async fn sync_snapshot(
 // Light Client Proofs (A8)
 // ---------------------------------------------------------------------------
 
-/// GET /light/snapshot — Returns a lightweight snapshot for light client bootstrapping:
+/// GET /light/snapshot - Returns a lightweight snapshot for light client bootstrapping:
 /// current height, state root, account count, total supply, latest block hash.
 async fn light_snapshot(
     AxumState(node): AxumState<NodeState>,
@@ -1476,10 +1476,10 @@ async fn light_snapshot(
 }
 
 // ---------------------------------------------------------------------------
-// Chunked State Sync — parallel chunk download for fast catch-up
+// Chunked State Sync - parallel chunk download for fast catch-up
 // ---------------------------------------------------------------------------
 
-/// GET /sync/manifest — Returns the snapshot manifest (height, chunk count,
+/// GET /sync/manifest - Returns the snapshot manifest (height, chunk count,
 /// state root, accounts) so a syncing node can plan parallel chunk downloads.
 async fn sync_manifest(
     AxumState(node): AxumState<NodeState>,
@@ -1495,7 +1495,7 @@ async fn sync_manifest(
     }))
 }
 
-/// GET /sync/chunk/:index — Returns a single snapshot chunk by index.
+/// GET /sync/chunk/:index - Returns a single snapshot chunk by index.
 /// Each chunk contains ~1000 accounts with a BLAKE3 integrity proof.
 async fn sync_chunk(
     AxumState(node): AxumState<NodeState>,
@@ -1524,7 +1524,7 @@ async fn sync_chunk(
     })))
 }
 
-/// GET /sync/status — Returns whether this node can serve snapshots and
+/// GET /sync/status - Returns whether this node can serve snapshots and
 /// information about the latest available snapshot.
 async fn sync_status(
     AxumState(node): AxumState<NodeState>,
@@ -1542,7 +1542,7 @@ async fn sync_status(
     }))
 }
 
-/// GET /sync/dag_state — Returns the current DAG consensus round state.
+/// GET /sync/dag_state - Returns the current DAG consensus round state.
 /// Used by new nodes to start at the right round instead of round 0.
 /// This prevents permanent partition from genesis round mismatch.
 async fn sync_dag_state(
@@ -1564,7 +1564,7 @@ async fn sync_dag_state(
 // Full transaction & contract endpoints
 // ---------------------------------------------------------------------------
 
-/// GET /tx/{hash}/full — Return the full transaction body with type-specific fields.
+/// GET /tx/{hash}/full - Return the full transaction body with type-specific fields.
 /// Falls back to on-demand reconstruction for benchmark transactions.
 async fn get_full_transaction(
     AxumState(node): AxumState<NodeState>,
@@ -1859,7 +1859,7 @@ async fn get_full_transaction(
     Ok(Json(result))
 }
 
-/// GET /contract/{address} — Return contract info.
+/// GET /contract/{address} - Return contract info.
 async fn get_contract_info(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address): axum::extract::Path<String>,
@@ -1882,7 +1882,7 @@ async fn get_contract_info(
     })))
 }
 
-/// POST /contract/{address}/call — Read-only contract call.
+/// POST /contract/{address}/call - Read-only contract call.
 #[derive(Deserialize)]
 struct ContractCallRequest {
     function: String,
@@ -2336,7 +2336,7 @@ fn eth_get_tx_receipt(node: &NodeState, params: &Value, id: &Value) -> Json<Valu
     }
 }
 
-/// eth_getLogs — returns event logs matching a filter.
+/// eth_getLogs - returns event logs matching a filter.
 fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
     let filter = match params.get(0) {
         Some(f) => f,
@@ -2477,13 +2477,13 @@ fn eth_call(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// eth_sendRawTransaction — accept RLP-encoded Ethereum transactions
+// eth_sendRawTransaction - accept RLP-encoded Ethereum transactions
 // ---------------------------------------------------------------------------
 // Decodes signed Ethereum transactions (legacy format), recovers the sender
 // via secp256k1 ecrecover, converts to an ARC Transaction, and inserts into
 // the mempool. Returns the Keccak-256 transaction hash (Ethereum-style).
 
-/// Minimal RLP decoder — just enough to parse Ethereum legacy transactions.
+/// Minimal RLP decoder - just enough to parse Ethereum legacy transactions.
 ///
 /// RLP encoding rules:
 ///   - Single byte in [0x00, 0x7f]: the byte itself is its RLP encoding
@@ -2881,7 +2881,7 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
     let secp_sig = arc_crypto::Signature::Secp256k1 { signature: sig_65 };
 
     let arc_tx = if is_contract_creation {
-        // Contract deployment — run EVM deploy immediately and persist
+        // Contract deployment - run EVM deploy immediately and persist
         let result = arc_vm::evm::evm_deploy(
             &node.state,
             sender_address,
@@ -2916,7 +2916,7 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         tx.hash = tx.compute_hash();
         tx
     } else {
-        // Contract call — map to WasmCall with raw calldata
+        // Contract call - map to WasmCall with raw calldata
         let mut tx = Transaction::new_wasm_call(
             sender_address,
             to_address,
@@ -3046,7 +3046,7 @@ async fn channel_state(
 /// Body: { "input": "What is 2+2?", "max_tokens": 64, "bond": 1000 }
 ///
 /// If --model was provided at startup, runs real deterministic inference through
-/// the cached INT8 integer engine. Pure i64 arithmetic — identical output hash
+/// the cached INT8 integer engine. Pure i64 arithmetic - identical output hash
 /// on ARM, x86, RISC-V, any platform.
 ///
 /// Returns the query, response text, output hash, ms/token, and attestation TX.
@@ -3109,15 +3109,15 @@ async fn inference_run(
         })));
     }
 
-    // Both engines need BOS prepended — the model expects token 1 (<s>) at start.
+    // Both engines need BOS prepended - the model expects token 1 (<s>) at start.
     // Without BOS, the integer engine produces incoherent output because the
     // prompt starts in an undefined state.
     let mut tokens_with_bos = vec![model.config.bos_token];
     tokens_with_bos.extend(&prompt_tokens);
 
-    // Run inference — use candle float backend if available, else integer engine
+    // Run inference - use candle float backend if available, else integer engine
     let (generated_tokens, output_hash, engine_name) = if let (Some(engine), Some(mid)) = (&node.candle_engine, &node.candle_model_id) {
-        // Candle Q4 float backend — coherent output, deterministic on same arch
+        // Candle Q4 float backend - coherent output, deterministic on same arch
         let result = engine.generate(mid, &tokens_with_bos, max_tokens)
             .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Inference failed: {}", e)))?;
         let gen_tokens: Vec<u32> = result.output.chunks(4)
@@ -3126,7 +3126,7 @@ async fn inference_run(
             .collect();
         (gen_tokens, result.output_hash, "candle Q4 (float, deterministic per-arch)")
     } else {
-        // Integer engine fallback — bit-identical across architectures
+        // Integer engine fallback - bit-identical across architectures
         let (generated, hash) = model.generate(&tokens_with_bos, max_tokens, &model.config.eos_tokens);
         (generated, hash, "INT8 integer (cross-platform deterministic)")
     };
@@ -3242,7 +3242,7 @@ async fn inference_list_attestations(
     let height = node.state.height();
     let mut attestations = Vec::new();
 
-    // First: add inference results (highest priority — these are what users want to see)
+    // First: add inference results (highest priority - these are what users want to see)
     for entry in node.inference_results.iter() {
         let tx_hex = entry.key().clone();
         let inf = entry.value().clone();
@@ -3280,7 +3280,7 @@ async fn inference_list_attestations(
         // Skip if already added from local inference_results cache
         if node.inference_results.contains_key(&tx_hex) { continue; }
 
-        // Inference attestations from other devices — include with hashes
+        // Inference attestations from other devices - include with hashes
         if let TxBody::InferenceAttestation(body) = &tx.body {
             let att = json!({
                 "tx_hash": tx_hex,
@@ -3337,7 +3337,7 @@ async fn inference_list_attestations(
     })))
 }
 
-/// GET /inference/results — list stored inference results (input, output, hash, model).
+/// GET /inference/results - list stored inference results (input, output, hash, model).
 async fn inference_list_results(
     AxumState(node): AxumState<NodeState>,
 ) -> Json<Value> {
@@ -3380,7 +3380,7 @@ struct ForwardShardRequest {
     /// Layer range this node should process.
     start_layer: usize,
     end_layer: usize,
-    /// True if this is the last token of the request — used to evict KV cache.
+    /// True if this is the last token of the request - used to evict KV cache.
     #[serde(default)]
     last_token: bool,
 }
@@ -3533,7 +3533,7 @@ async fn inference_forward_shard(
         return Err((StatusCode::SERVICE_UNAVAILABLE, "Node is not a shard holder".to_string()));
     }
     // Verify this node holds the requested layer range. A node holding
-    // multiple disjoint ranges accepts requests for any of them — each range
+    // multiple disjoint ranges accepts requests for any of them - each range
     // was independently announced and is an independent replica slot.
     let shard = node.shard_infos.iter()
         .find(|s| s.start_layer == req.start_layer && s.end_layer == req.end_layer)
@@ -3577,7 +3577,7 @@ async fn inference_forward_shard(
         .value()
         .clone();
 
-    // Run the shard's forward pass (blocking — uses spawn_blocking to free runtime)
+    // Run the shard's forward pass (blocking - uses spawn_blocking to free runtime)
     let model_clone = model.clone();
     let req_id = req.request_id.clone();
     let start_layer = shard.start_layer;
@@ -3682,7 +3682,7 @@ async fn inference_run_sharded(
     // range. Prefer the entry with a routable socket_addr so that
     // forward_shard calls don't try to POST to 0.0.0.0.
     // Group replicas by (start, end). Every replica holding the same range
-    // is a failover candidate — if the primary stops answering mid-request,
+    // is a failover candidate - if the primary stops answering mid-request,
     // the worker falls back to the next. When multiple announcements for
     // the same (node_name, range) exist we prefer routable socket_addrs over
     // stubs (0.0.0.0 / 127.x / empty).
@@ -3705,7 +3705,7 @@ async fn inference_run_sharded(
             }
         }
     }
-    // Filter stubs out of the final replica list — a stub address can't be
+    // Filter stubs out of the final replica list - a stub address can't be
     // dialed so it can never satisfy a coordinator hop. Keep the entry only
     // if it was the only announcement we have for that node.
     // #29: also sort each bucket by rolling EWMA latency ascending so the
@@ -3769,7 +3769,7 @@ async fn inference_run_sharded(
     // DETERMINISTIC CACHE LOOKUP
     // Same model_id + same input tokens = same output tokens, GUARANTEED.
     // If we've seen this exact input before, return the cached result in
-    // O(1) — no pipeline walk, no HTTP roundtrips, no compute.
+    // O(1) - no pipeline walk, no HTTP roundtrips, no compute.
     // ─────────────────────────────────────────────────────────────────────
     let cache_model_id_data = format!(
         "arc-{}L-{}d-{}h-{}v",
@@ -3785,7 +3785,7 @@ async fn inference_run_sharded(
     let cache_key = arc_inference::distributed::DistributedCache::cache_key(&cache_model_id_hash, &cache_input_with_max);
 
     if let Some(cached_tokens) = node.inference_cache.get(&cache_key) {
-        // CACHE HIT — return the cached tokens with the same output_hash
+        // CACHE HIT - return the cached tokens with the same output_hash
         let output_text = model.decode(&cached_tokens);
         let output_bytes: Vec<u8> = cached_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         let output_hash = arc_crypto::hash_bytes(&output_bytes);
@@ -3839,7 +3839,7 @@ async fn inference_run_sharded(
     // GENERATION (positions prompt_len..prompt_len+max_tokens):
     //   Each output token depends on the previous one's logits so we must
     //   wait for the full pipeline walk before starting the next position.
-    //   Kept as a straight sequential loop — pipeline parallelism does not
+    //   Kept as a straight sequential loop - pipeline parallelism does not
     //   apply to single-stream autoregressive decoding.
     //
     // The output from the LAST prompt position is the FIRST generated
@@ -3897,7 +3897,7 @@ async fn inference_run_sharded(
 
             let handle = tokio::spawn(async move {
                 let mut bytes_this_shard: usize = 0;
-                let mut trace: Option<(u64, u64, bool, u64, String)> = None; // (compute_ms, wall_ms, is_terminal, layers, node_name) — first-seen
+                let mut trace: Option<(u64, u64, bool, u64, String)> = None; // (compute_ms, wall_ms, is_terminal, layers, node_name) - first-seen
                 // Ordered replica list per range. The first entry is the
                 // current primary; on HTTP/parse failure we promote the next
                 // replica and keep going. "Never breaks" guarantee: as long
@@ -3996,7 +3996,7 @@ async fn inference_run_sharded(
         let input_tx = txs.remove(0);
         // txs[0..num_shards-1] are intermediate senders the workers already
         // cloned. Drop them so workers see EOF. txs[num_shards-1] is the
-        // LAST shard's output channel that the coordinator reads from —
+        // LAST shard's output channel that the coordinator reads from -
         // drop our extra copy too so recv()  unblocks after all positions.
         drop(txs);
         for (pos, &tok) in all_tokens.iter().enumerate() {
@@ -4270,7 +4270,7 @@ async fn inference_run_sharded(
     // ─── VRF Committee Verification ────────────────────────────────────
     // Select a verification committee from the live validator set using the
     // output hash as VRF seed. This implements Tier 2 inference verification
-    // from committee.rs — deterministic, reproducible committee selection.
+    // from committee.rs - deterministic, reproducible committee selection.
     let committee_info = {
         let validators = node.dag_validators.read();
         let eligible: Vec<arc_inference::committee::InferenceValidator> = validators
@@ -4411,7 +4411,7 @@ async fn inference_run_consensus(
     // InferenceEscrowRelease that pays out the 40/25/15/20 split.
     //
     // Free-mode (no payer) still works: all escrow fields are optional.
-    // Dashboards + old desktop clients keep using the free path — no
+    // Dashboards + old desktop clients keep using the free path - no
     // breaking change.
     let escrow_payer_hex = req.get("payer").and_then(|v| v.as_str());
     let escrow_req_id_hex = req.get("request_id").and_then(|v| v.as_str());
@@ -4464,7 +4464,7 @@ async fn inference_run_consensus(
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "escrow-gated run_consensus requires all of { payer, \
-                 request_id, max_fee, model_id, timeout_blocks } — got a \
+                 request_id, max_fee, model_id, timeout_blocks } - got a \
                  partial set",
             ));
         }
@@ -4658,7 +4658,7 @@ async fn inference_run_consensus(
         }
         if have < needed {
             return Err(format!(
-                "No majority hash for range [{}, {}) at position {} — {} of {} agreed (needed {})",
+                "No majority hash for range [{}, {}) at position {} - {} of {} agreed (needed {})",
                 req.start_layer, req.end_layer, req.position, have, returned.len(), needed
             ));
         }
@@ -4751,7 +4751,7 @@ async fn inference_run_consensus(
         }
     }
 
-    // Cleanup — fan out last_token=true to every replica of every range.
+    // Cleanup - fan out last_token=true to every replica of every range.
     for (_, replicas) in &pipeline_ranges {
         for r in replicas {
             let _ = client.post(format!("http://{}/inference/forward_shard", r.socket_addr))
@@ -4785,7 +4785,7 @@ async fn inference_run_consensus(
     // replica. One commitment per (replica, hash) tuple representing that
     // replica's claimed output; one challenge from this coordinator against
     // that commitment. Slashing resolution runs on the existing
-    // VerificationManager path. Bond is a placeholder — the final value and
+    // VerificationManager path. Bond is a placeholder - the final value and
     // payer (coordinator treasury vs honest-majority split) still needs TJ's
     // call (open question from the issue body).
     let mut auto_challenges: Vec<Value> = Vec::new();
@@ -4800,7 +4800,7 @@ async fn inference_run_consensus(
                 for (replica_name, hashes) in &divergent_all {
                     // Provider identity for the divergent replica. We don't
                     // have their real validator_address from the inference
-                    // path — only their node_name + socket. Derive a stable
+                    // path - only their node_name + socket. Derive a stable
                     // pseudo-address by hashing "divergent:<name>" so repeat
                     // offenses by the same replica resolve to the same ID.
                     // Reconciling this with the real validator address is
@@ -4857,7 +4857,7 @@ async fn inference_run_consensus(
     // Milestone B: if this was an escrow-gated request, collect the
     // honest-replica set from the votes (the non-divergent agreeing
     // replicas across every hop) and submit the release tx. The honest
-    // set is a union over all votes — any replica that contributed to the
+    // set is a union over all votes - any replica that contributed to the
     // majority_hash at any hop earned a slice of the per-request payout.
     let release_tx_hash = if let Some(gate) = &escrow_gate {
         // Replica names that appeared in majority_hash agreement at
@@ -4887,7 +4887,7 @@ async fn inference_run_consensus(
         if replicas.is_empty() {
             tracing::warn!(
                 request_id = %request_id,
-                "escrow-gated request succeeded but no honest replicas collected — \
+                "escrow-gated request succeeded but no honest replicas collected - \
                  release would fail at state layer; skipping"
             );
             None
@@ -5019,7 +5019,7 @@ async fn list_capacity_advertisements(
 /// Milestone D (#38): GET /assignments/for_me?pubkey=0x...
 /// Returns every AssignmentEntry across every ShardAssignmentProposal
 /// whose `node_pubkey` matches the query parameter. Community workers
-/// long-poll this and auto-apply — they restart arc-node with the
+/// long-poll this and auto-apply - they restart arc-node with the
 /// listed `--shard-range` flags and announce the assignment.
 async fn get_assignment_for_me(
     AxumState(node): AxumState<NodeState>,
@@ -5089,7 +5089,7 @@ fn decode_hash_hex(s: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-/// Account addresses in ARC are `Hash256` — same 32-byte shape. Provide a
+/// Account addresses in ARC are `Hash256` - same 32-byte shape. Provide a
 /// named alias so callers reading the code know the intent is "an address",
 /// not "any 32-byte hash".
 fn decode_address_hex(s: &str) -> Result<[u8; 32], String> {
@@ -5110,7 +5110,7 @@ fn treasury_address() -> arc_crypto::Hash256 {
 }
 
 /// Build + submit an InferenceEscrowRelease transaction. Null-signed like
-/// the existing InferenceAttestation auto-submit — the testnet's
+/// the existing InferenceAttestation auto-submit - the testnet's
 /// mempool accepts null sigs from internal node paths.
 fn submit_escrow_release(
     node: &NodeState,
@@ -5121,7 +5121,7 @@ fn submit_escrow_release(
     let proposer = node.validator_address;
     // Use the proposer's CURRENT state nonce. The previous in-memory bump
     // counter (`attestation_nonce.fetch_add`) accumulated forever, even when
-    // the constructed tx failed to land — leaving a nonce gap (state stays
+    // the constructed tx failed to land - leaving a nonce gap (state stays
     // at N, in-memory counter advances to N+1+...) that made every
     // subsequent release fail with InvalidNonce. Reading from state every
     // time keeps the release tx's nonce in sync with what execute_block
@@ -5174,7 +5174,7 @@ fn submit_escrow_release(
 ///     for catching divergence, so it's the right economic actor to post
 ///     the witness bond.
 ///   - Amount: 100_000 ARC. Sized to be ~2% of a 5M genesis-validator stake
-///     — cheap enough that a coordinator never declines to challenge, large
+///     - cheap enough that a coordinator never declines to challenge, large
 ///     enough to deter spurious challenges. Revisit if community-tier
 ///     validators with smaller stakes become common coordinators.
 ///
@@ -5184,7 +5184,7 @@ fn submit_escrow_release(
 const AUTO_CHALLENGE_BOND: u64 = 100_000;
 
 /// GET /shards
-/// Returns the local shard registry — every node this coordinator knows about
+/// Returns the local shard registry - every node this coordinator knows about
 /// and which layer range it holds.
 async fn get_shards(
     AxumState(node): AxumState<NodeState>,
@@ -5252,7 +5252,7 @@ fn is_stub_socket_addr(addr: &str) -> bool {
 /// keeping the port the announcer declared. Returns the corrected addr, or
 /// the original when no rewrite is needed.
 ///
-/// Pure function — no I/O, no state. Cheap to unit test.
+/// Pure function - no I/O, no state. Cheap to unit test.
 fn rewrite_stub_shard_addr(
     announced_addr: &str,
     peer_addr: SocketAddr,
@@ -5275,7 +5275,7 @@ fn rewrite_stub_shard_addr(
 ///
 /// Announcements arrive with the *announcer's* `socket_addr` in the payload.
 /// When the announcer binds 0.0.0.0 it doesn't know its own public IP, so
-/// the shipped value is "0.0.0.0:<port>" — a stub the coordinator cannot
+/// the shipped value is "0.0.0.0:<port>" - a stub the coordinator cannot
 /// route to. We fix that here by overriding stub addrs with the peer's
 /// actual source IP (discovered from the TCP connection), keeping the port
 /// the announcer declared. Self-announces from 127.0.0.1 are left alone.
@@ -5306,11 +5306,11 @@ async fn announce_shard(
                 && !s.socket_addr.is_empty()
         });
         if has_better {
-            return Json(json!({"ok": true, "registry_size": node.shard_registry.len(), "note": "stub addr ignored — routable addr already registered"}));
+            return Json(json!({"ok": true, "registry_size": node.shard_registry.len(), "note": "stub addr ignored - routable addr already registered"}));
         }
     }
     // Key by (socket_addr, range) so one node announcing multiple held ranges
-    // produces one entry per range — otherwise the DashMap insert clobbers
+    // produces one entry per range - otherwise the DashMap insert clobbers
     // prior announces and only the most recent range survives. The
     // coordinator's BTreeMap grouping already keys on (start, end) so a
     // per-range entry is exactly what we need.
@@ -5346,7 +5346,7 @@ struct CommunityRegisterRequest {
     model: Option<String>,
     #[serde(default)]
     platform: String,
-    /// Model ID hash (hex) — if provided, coordinator auto-assigns shard layers.
+    /// Model ID hash (hex) - if provided, coordinator auto-assigns shard layers.
     #[serde(default)]
     model_id: Option<String>,
     /// Total transformer layers in the model.
@@ -5381,7 +5381,7 @@ async fn community_register(
         .community_workers
         .get(&req.worker_id)
         .map(|e| e.value().0.registered_at);
-    // Clone name/model before moving into CommunityWorker — used later for shard_info
+    // Clone name/model before moving into CommunityWorker - used later for shard_info
     let worker_name = req.name.clone();
     let worker_model_name = req.model.clone();
     let worker = CommunityWorker {
@@ -5530,7 +5530,7 @@ async fn community_heartbeat(
         }
         Ok(Json(json!({"ok": true})))
     } else {
-        Err((StatusCode::NOT_FOUND, "worker_id not registered — call /community/register first".to_string()))
+        Err((StatusCode::NOT_FOUND, "worker_id not registered - call /community/register first".to_string()))
     }
 }
 
@@ -5561,7 +5561,7 @@ async fn community_list(
     }
 
     // Auto-discover P2P peers as community workers. Any node connected
-    // via P2P is automatically visible — no --community-mode flag, no
+    // via P2P is automatically visible - no --community-mode flag, no
     // separate register script, no HTTP POST needed. The P2P connection
     // IS the registration.
     let validators = node.dag_validators.read();
@@ -5610,7 +5610,7 @@ async fn community_list(
 //
 // The coordinator side pushes WorkItems into `work_queue` (mpsc) and awaits
 // WorkResults via `work_results` (DashMap<request_id, oneshot::Sender>).
-// Those fields must be added to NodeState by the caller — these handlers
+// Those fields must be added to NodeState by the caller - these handlers
 // reference them directly.
 
 /// Maximum time a claim_work long-poll will hold the connection open.
@@ -5623,10 +5623,10 @@ const COMMUNITY_CLAIM_TIMEOUT_SECS: u64 = 30;
 pub struct WorkItem {
     /// Unique request id (hex). Matches the sharded inference request_id.
     pub request_id: String,
-    /// Raw token id — only set when this is the first shard (layer 0).
+    /// Raw token id - only set when this is the first shard (layer 0).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<u32>,
-    /// Hidden state (i64 vec) — set for all shards after the first.
+    /// Hidden state (i64 vec) - set for all shards after the first.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden: Option<Vec<i64>>,
     /// BLAKE3 hash of the hidden state for integrity verification.
@@ -5641,7 +5641,7 @@ pub struct WorkItem {
     /// Model identifier so the worker can verify it has the right model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
-    /// True if this is the last token — worker should evict KV cache after.
+    /// True if this is the last token - worker should evict KV cache after.
     #[serde(default)]
     pub last_token: bool,
 }
@@ -5661,7 +5661,7 @@ pub struct WorkResult {
     /// BLAKE3 hash of the hidden state.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hidden_hash: Option<String>,
-    /// Token id (if terminal — this shard ran the LM head).
+    /// Token id (if terminal - this shard ran the LM head).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_id: Option<u32>,
     /// Hash of the logits (if terminal).
@@ -5695,7 +5695,7 @@ pub struct ClaimWorkRequest {
 /// returns `{"status":"no_work"}`. The community node immediately re-polls.
 ///
 /// The worker must be registered via /community/register before claiming work
-/// (this doubles as a heartbeat — we refresh the TTL on every poll).
+/// (this doubles as a heartbeat - we refresh the TTL on every poll).
 pub async fn community_claim_work(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<ClaimWorkRequest>,
@@ -5712,7 +5712,7 @@ pub async fn community_claim_work(
     if !node.community_workers.contains_key(&req.worker_id) {
         return Err((
             StatusCode::NOT_FOUND,
-            "worker_id not registered — call /community/register first".to_string(),
+            "worker_id not registered - call /community/register first".to_string(),
         ));
     }
 
@@ -5737,7 +5737,7 @@ pub async fn community_claim_work(
     // ── Long-poll: try to receive a WorkItem from the queue ─────────────
     let work_rx = node.community_work_queue.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
-        "work queue not initialized — coordinator not running".to_string(),
+        "work queue not initialized - coordinator not running".to_string(),
     ))?;
 
     let timeout = tokio::time::Duration::from_secs(COMMUNITY_CLAIM_TIMEOUT_SECS);
@@ -5748,7 +5748,7 @@ pub async fn community_claim_work(
             // worker doesn't filter by model, accept any work.
             if let (Some(worker_model), Some(item_model)) = (&req.model, &item.model_id) {
                 if worker_model != item_model {
-                    // Model mismatch — put the item back on the queue so
+                    // Model mismatch - put the item back on the queue so
                     // another worker can pick it up, then tell this worker
                     // there's no matching work.
                     if let Some(ref tx) = node.community_work_tx {
@@ -5767,14 +5767,14 @@ pub async fn community_claim_work(
             })))
         }
         Ok(None) => {
-            // Channel closed — coordinator shut down
+            // Channel closed - coordinator shut down
             Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                "work queue closed — coordinator shutting down".to_string(),
+                "work queue closed - coordinator shutting down".to_string(),
             ))
         }
         Err(_) => {
-            // Timeout — no work within the window
+            // Timeout - no work within the window
             Ok(Json(json!({
                 "status": "no_work",
             })))
@@ -5824,7 +5824,7 @@ pub async fn community_submit_work(
     if !node.community_workers.contains_key(&result.worker_id) {
         return Err((
             StatusCode::NOT_FOUND,
-            "worker_id not registered — call /community/register first".to_string(),
+            "worker_id not registered - call /community/register first".to_string(),
         ));
     }
 
@@ -5838,7 +5838,7 @@ pub async fn community_submit_work(
     // ── Deliver result to the coordinator via the oneshot ────────────────
     let results_map = node.community_work_results.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
-        "work results map not initialized — coordinator not running".to_string(),
+        "work results map not initialized - coordinator not running".to_string(),
     ))?;
 
     // Remove the oneshot sender for this request_id. If it's gone, the
@@ -5851,7 +5851,7 @@ pub async fn community_submit_work(
                     "request_id": result.request_id,
                 }))),
                 Err(_) => {
-                    // Receiver dropped — coordinator timed out
+                    // Receiver dropped - coordinator timed out
                     Err((
                         StatusCode::GONE,
                         format!(
@@ -5865,7 +5865,7 @@ pub async fn community_submit_work(
         None => Err((
             StatusCode::NOT_FOUND,
             format!(
-                "no pending work for request_id {} — already completed or expired",
+                "no pending work for request_id {} - already completed or expired",
                 result.request_id
             ),
         )),
@@ -6196,7 +6196,7 @@ struct ShardJoinRequest {
 /// and assigns the new node a layer range that fills the biggest gap (or splits
 /// an overloaded range). Returns the assignment so the node can start serving.
 ///
-/// This is the KEY endpoint for automatic sharding — nodes don't need manual
+/// This is the KEY endpoint for automatic sharding - nodes don't need manual
 /// --shard-start/--shard-end flags. They just load a model and call /shards/join.
 async fn shard_join(
     AxumState(node): AxumState<NodeState>,
@@ -6474,7 +6474,7 @@ mod tests {
 
     #[test]
     fn rewrite_preserves_already_routable_addrs() {
-        // Well-behaved announcer already sent a real IP — don't rewrite.
+        // Well-behaved announcer already sent a real IP - don't rewrite.
         let got = rewrite_stub_shard_addr("149.28.32.76:9090", sa("1.2.3.4:9999"));
         assert_eq!(got, "149.28.32.76:9090");
     }
@@ -6483,7 +6483,7 @@ mod tests {
     fn rewrite_ignores_loopback_peers_so_self_announces_stay_stub() {
         // Self-announce from the local broadcaster hits 127.0.0.1/shards/announce.
         // Rewriting would make self-entry look like 127.0.0.1:9090 (still unroutable)
-        // and defeat the dedupe logic — so we leave it alone.
+        // and defeat the dedupe logic - so we leave it alone.
         let got = rewrite_stub_shard_addr("0.0.0.0:9090", sa("127.0.0.1:51234"));
         assert_eq!(got, "0.0.0.0:9090");
     }

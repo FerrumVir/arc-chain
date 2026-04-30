@@ -1,4 +1,4 @@
-//! Metal direct dispatch — bypass wgpu for native Metal compute.
+//! Metal direct dispatch - bypass wgpu for native Metal compute.
 //!
 //! Two-phase approach to eliminating the ~18ms per-token encode overhead:
 //!
@@ -20,7 +20,7 @@ pub mod direct {
     use metal::*;
     use tracing::info;
 
-    /// Direct Metal dispatch engine — compiles shaders natively, dispatches
+    /// Direct Metal dispatch engine - compiles shaders natively, dispatches
     /// all kernels in a single command buffer with minimal CPU overhead.
     pub struct MetalDirectForward {
         device: Device,
@@ -29,7 +29,7 @@ pub mod direct {
         matmul_pso: ComputePipelineState,
         matmul_q4_pso: ComputePipelineState,
         fused_lnq_pso: ComputePipelineState,
-        // UNTESTED — new PSOs for complete forward pass
+        // UNTESTED - new PSOs for complete forward pass
         rope_pso: ComputePipelineState,
         attention_pso: ComputePipelineState,
         silu_pso: ComputePipelineState,
@@ -127,7 +127,7 @@ pub mod direct {
                 include_str!("fused_kernels.metal"), &compile_opts)
                 .map_err(|e| format!("fused_kernels.metal: {e}"))?;
 
-            // UNTESTED — new shader libraries for complete forward pass
+            // UNTESTED - new shader libraries for complete forward pass
             let rope_lib = device.new_library_with_source(
                 include_str!("rope.metal"), &compile_opts)
                 .map_err(|e| format!("rope.metal: {e}"))?;
@@ -189,7 +189,7 @@ pub mod direct {
         }
 
         /// Dispatch a single matmul: weights × input → output.
-        /// All buffers are pre-uploaded Metal shared memory — zero copy on Apple Silicon.
+        /// All buffers are pre-uploaded Metal shared memory - zero copy on Apple Silicon.
         /// Single encoder, no bind groups, no wgpu overhead.
         pub fn dispatch_matmul(
             &self,
@@ -236,7 +236,7 @@ pub mod direct {
             encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(256, 1, 1));
         }
 
-        // UNTESTED — the following 5 dispatch methods require hardware validation
+        // UNTESTED - the following 5 dispatch methods require hardware validation
 
         /// Dispatch RoPE rotation on Q or K vectors.
         /// threads = n_heads * (d_head / 2), workgroup_size = 256
@@ -338,9 +338,9 @@ pub mod direct {
         }
 
         /// Execute full forward pass in a single command buffer.
-        /// UNTESTED — all 5 new kernel dispatches require hardware validation.
+        /// UNTESTED - all 5 new kernel dispatches require hardware validation.
         ///
-        /// All dispatches use direct Metal API — no wgpu overhead.
+        /// All dispatches use direct Metal API - no wgpu overhead.
         /// Per layer: fused_lnq, Q/K/V matmul, rope Q, rope K, attention,
         ///            fused_lnq (attn_out), Wo matmul, residual,
         ///            fused_lnq (ffn), gate/up matmul, silu,
@@ -371,7 +371,7 @@ pub mod direct {
             let d_head = self.d_head as u32;
             let kv_dim = (self.n_kv_heads * self.d_head) as u32;
 
-            // Update RoPE params for Q (n_heads) — written to shared buffer
+            // Update RoPE params for Q (n_heads) - written to shared buffer
             let rope_q_data: [u32; 4] = [pos, d_head, n_heads, 0];
             unsafe {
                 let ptr = model.rope_q_params.contents() as *mut u32;
@@ -429,7 +429,7 @@ pub mod direct {
                 // K and V are read from per-layer KV cache buffers.
                 // (Caller is responsible for writing current K/V into the cache
                 //  at position `pos` before this dispatch, or using a separate
-                //  KV cache update kernel — not included in this pass.)
+                //  KV cache update kernel - not included in this pass.)
                 self.dispatch_attention(
                     encoder,
                     &model.q_buf,

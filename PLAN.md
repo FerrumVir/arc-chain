@@ -1,4 +1,4 @@
-# ARC Chain — "any model, any node, any time" execution plan
+# ARC Chain - "any model, any node, any time" execution plan
 
 The testnet is live (6 seeds, 3× replication, self-healing, signed desktop
 app auto-updating with auto-start + tray). The desktop app onboards a
@@ -12,7 +12,7 @@ hand-assigned shard map."**
 
 Read this top-to-bottom before starting. Every milestone lists exact
 files to touch, new tx types to add, acceptance criteria, test matrix,
-and the rollout plan. No step is "bolt on a placeholder" — each
+and the rollout plan. No step is "bolt on a placeholder" - each
 milestone is a real protocol extension that a rolling upgrade across
 the 6 seeds has to absorb safely.
 
@@ -49,23 +49,23 @@ around any model**. The testnet just uses the static slice.
 ## Execution order + dependencies
 
 ```
-A — App queries through coordinator  (no deps)
+A - App queries through coordinator  (no deps)
     ↓
-B — Per-request fee + escrow + payout  (depends on A for happy-path exercise)
+B - Per-request fee + escrow + payout  (depends on A for happy-path exercise)
     ↓
-C — On-demand model provisioning       (depends on B for economic pull)
+C - On-demand model provisioning       (depends on B for economic pull)
     ↓
-D — Dynamic capacity + planner         (depends on C for assignment framework)
+D - Dynamic capacity + planner         (depends on C for assignment framework)
     ↓
-E — Thousands-of-models scale (LRU + model registry as tx type)  (depends on D)
+E - Thousands-of-models scale (LRU + model registry as tx type)  (depends on D)
 ```
 
-Each milestone is shippable in isolation — if D gets delayed, C works
+Each milestone is shippable in isolation - if D gets delayed, C works
 standalone with manual per-user "opt in to hold range X" UI.
 
 ---
 
-## Milestone A — App queries through coordinator ✅ (2026-04-22, closed #35)
+## Milestone A - App queries through coordinator ✅ (2026-04-22, closed #35)
 
 **Goal**: a user who just onboarded (observer, no model) can type a
 question in the Inference screen and get a real answer served by the
@@ -94,10 +94,10 @@ per-token latency falls to match `run_sharded` (~20 s/token, not
   counts, divergent replicas if any.
 
 ### Files
-- `desktop/src-tauri/src/commands.rs` — new command `run_inference_via_coordinator(prompt, max_tokens)` that iterates a built-in list of coordinator IPs until one responds.
-- `desktop/src-tauri/src/rpc_client.rs` — add `run_inference_consensus(http, coord_url, prompt, max_tokens, k)` that hits `/inference/run_consensus`.
-- `desktop/src/screens/Inference.tsx` — try local first, fall back to coordinator; render consensus breakdown.
-- `desktop/src/lib/tauri.ts` — mock + live handlers.
+- `desktop/src-tauri/src/commands.rs` - new command `run_inference_via_coordinator(prompt, max_tokens)` that iterates a built-in list of coordinator IPs until one responds.
+- `desktop/src-tauri/src/rpc_client.rs` - add `run_inference_consensus(http, coord_url, prompt, max_tokens, k)` that hits `/inference/run_consensus`.
+- `desktop/src/screens/Inference.tsx` - try local first, fall back to coordinator; render consensus breakdown.
+- `desktop/src/lib/tauri.ts` - mock + live handlers.
 
 ### Acceptance criteria
 - Fresh onboarding → Inference screen → "What's the largest planet?" returns an answer in ≤ 60 s, even though the local node has no model.
@@ -112,7 +112,7 @@ per-token latency falls to match `run_sharded` (~20 s/token, not
 
 ---
 
-## Milestone B — Per-request fee, escrow, payout (in progress — PR #40)
+## Milestone B - Per-request fee, escrow, payout (in progress - PR #40)
 
 **Goal**: a user paying N ARC gets an inference; the ARC is escrowed on
 request, debited on success, split per `RoleRevenueConfig` to the
@@ -143,7 +143,7 @@ Root cause was `arc-inference-traffic.service` flooding the per-block
 tx slot with null-sig Transfer txs that all rejected at `execute_tx`,
 crowding out real submissions. Disabled the service on all 6 seeds
 **and** added a permanent rule to `scripts/arc-self-heal.sh` that
-stops + disables the service on every poll — survives reboots and
+stops + disables the service on every poll - survives reboots and
 manual systemctl-start. Override via `ALLOW_INFERENCE_TRAFFIC=1`.
 
 After the fix:
@@ -182,9 +182,9 @@ Conservation verified end-to-end. PR #40 is now ready to leave draft.
   }
   ```
 - State transition in `arc-vm`:
-  - `escrow_open(request_id, payer, amount)` — reserves balance, inserts `(request_id, payer, amount, opened_at)` into a new `inference_escrow: DashMap<[u8;32], Escrow>` state table.
-  - `escrow_release(request_id, attestation)` — debits payer, credits replicas per their contribution weight in `RoleRevenueConfig`, credits treasury pool.
-  - `escrow_refund(request_id)` — returns full amount to payer (on timeout or divergence without majority).
+  - `escrow_open(request_id, payer, amount)` - reserves balance, inserts `(request_id, payer, amount, opened_at)` into a new `inference_escrow: DashMap<[u8;32], Escrow>` state table.
+  - `escrow_release(request_id, attestation)` - debits payer, credits replicas per their contribution weight in `RoleRevenueConfig`, credits treasury pool.
+  - `escrow_refund(request_id)` - returns full amount to payer (on timeout or divergence without majority).
 - `/inference/run_consensus` gains `{ payer, max_fee }` fields in the request body. Pre-flight verifies an `InferenceEscrow` tx for this `request_id` has committed; aborts with 402 `PAYMENT_REQUIRED` if not. On success, submits a follow-up `escrow_release` tx with the attestation as proof.
 - Client flow (desktop):
   - Before inference: sign + submit `InferenceEscrowTx` with `max_fee=10_ARC`, wait for mempool confirm (~100 ms).
@@ -200,17 +200,17 @@ Conservation verified end-to-end. PR #40 is now ready to leave draft.
 - Sum matches `max_fee` exactly; rounding goes to treasury.
 
 ### Files
-- New: `crates/arc-vm/src/escrow.rs` — state transitions + tests.
-- Modify: `crates/arc-types/src/tx.rs` — `InferenceEscrowTx`, `EscrowRelease`, `EscrowRefund`.
-- Modify: `crates/arc-mempool/src/lib.rs` — validate escrow txs pre-commit.
-- Modify: `crates/arc-node/src/rpc.rs` — wire `max_fee` + `payer` in `inference_run_consensus`, submit release on success, refund on timeout.
-- Modify: `desktop/src-tauri/src/commands.rs` — `run_paid_inference` command that does the escrow dance.
-- Modify: `desktop/src/screens/Inference.tsx` — show "Pay 10 ARC" button; after answer, show the real on-chain tx + explorer link.
+- New: `crates/arc-vm/src/escrow.rs` - state transitions + tests.
+- Modify: `crates/arc-types/src/tx.rs` - `InferenceEscrowTx`, `EscrowRelease`, `EscrowRefund`.
+- Modify: `crates/arc-mempool/src/lib.rs` - validate escrow txs pre-commit.
+- Modify: `crates/arc-node/src/rpc.rs` - wire `max_fee` + `payer` in `inference_run_consensus`, submit release on success, refund on timeout.
+- Modify: `desktop/src-tauri/src/commands.rs` - `run_paid_inference` command that does the escrow dance.
+- Modify: `desktop/src/screens/Inference.tsx` - show "Pay 10 ARC" button; after answer, show the real on-chain tx + explorer link.
 
 ### Acceptance criteria
 - Unit tests (`arc-vm/src/escrow.rs::tests`): open + release, open + refund on timeout, open + refund on split consensus, double-open same request_id rejected, payer balance insufficient rejected.
 - Integration test on the live testnet: user address A with 1000 ARC runs 10 inferences at 10 ARC each → A's balance is 900 − 10 fees, the 6 seeds' balances have each gone up by their share.
-- **No inference happens without a committed escrow tx** — verified by attempting to call `/inference/run_consensus` without one, expecting 402.
+- **No inference happens without a committed escrow tx** - verified by attempting to call `/inference/run_consensus` without one, expecting 402.
 - Desktop Inference screen shows the fee + resulting tx hash + balance delta.
 
 ### Rollout
@@ -224,12 +224,12 @@ Conservation verified end-to-end. PR #40 is now ready to leave draft.
 
 ## Session 2026-04-28: chain stabilization attempt + B-open wedge
 
-P1 — Rolling rebuild of all 6 seeds completed. Binary `0f4ca561` deployed
+P1 - Rolling rebuild of all 6 seeds completed. Binary `0f4ca561` deployed
 to NYC, LAX, AMS, LHR (with `--reset-state`), NRT, SGP. All 6 healthy at
 peers≥3, in sync at round 2,242,000+. LHR's pre-reset h=38 fixed via
 clean state.
 
-P2 — Spam source removed: `/opt/arc-traffic.sh` orphan loop on LAX
+P2 - Spam source removed: `/opt/arc-traffic.sh` orphan loop on LAX
 killed; `arc-traffic.service` and `arc-inference-traffic.service`
 disabled cluster-wide; `~/Library/LaunchAgents/com.arc.inference.plist`
 unloaded on Mac (was auto-respawning the
@@ -238,7 +238,7 @@ unloaded on Mac (was auto-respawning the
 gained a `pkill -f /tx/submit /opt/arc-traffic` rule + service-stop for
 both traffic services on every poll.
 
-P3 — Milestone B end-to-end NOT closed this session. Open tx
+P3 - Milestone B end-to-end NOT closed this session. Open tx
 `InferenceEscrowOpen` is being silently rejected at block-packing
 time on the rebuilt binary. `/tx/submit_signed` returns 200/pending,
 but the tx never appears in any block. Verified across multiple fresh
@@ -249,7 +249,7 @@ is specific to `TxBody::InferenceEscrowOpen` admission/packing on the
 new binary. Existing on-chain B receipts from the previous binary
 (`0x673fbef3` open + `0x813fde82` release in NYC blocks 2745/2767) are
 preserved and remain valid evidence of the protocol working before
-this session's rebuild — so the regression is in something the rebuild
+this session's rebuild - so the regression is in something the rebuild
 introduced (between commit `cdb8a7c7` and current `2725ff40`), most
 likely a mempool/block-pack filter that didn't handle the new tx_type
 ordinals correctly. **Tracked as a chain-protocol bug to fix in a
@@ -258,11 +258,11 @@ follow-up; not an operations-loop fix.** Three live driver examples
 per-run-unique payer keypairs, `diag_open.rs`, `keepalive.rs`) are
 committed alongside this note for the next debug session.
 
-P4–P7 — blocked on P3. Not run.
+P4–P7 - blocked on P3. Not run.
 
-### Session 2026-04-22 update — root cause identified (RPC spam) + open path unblocked
+### Session 2026-04-22 update - root cause identified (RPC spam) + open path unblocked
 
-The B-open "regression" was not a tx-type bug — NYC's RPC port 9090
+The B-open "regression" was not a tx-type bug - NYC's RPC port 9090
 was open to the internet and being hammered by ≥3 external IPs
 (`78.137.223.145`, `66.153.236.155`, `86.246.153.11`) that were
 spamming `Transfer`s from address `2d3adedff11b...`. The mempool
@@ -285,24 +285,24 @@ seed IPs by default, with a `/var/lib/arc-allowed-ips` file the
 operator can edit to add their own IP. Without this, the chain
 remains DoS-able by anyone who knows a seed's IP.
 
-P3.open ✓ — `0x005d65adaead53f3e8f47664891927dbfeb0aa403e2d1b885c0fbc90631e0c1d`
+P3.open ✓ - `0x005d65adaead53f3e8f47664891927dbfeb0aa403e2d1b885c0fbc90631e0c1d`
 committed at NYC h=3493, debited payer 10000→9000 (1000 to escrow).
 
-P3.release ✗ — `run_consensus` returns a `release_tx_hash`
+P3.release ✗ - `run_consensus` returns a `release_tx_hash`
 (`0xb96615c4dfda286f2fed11e05cf70f36d1ef6376a41cb34029a97ce3e255f7d3`)
 but it never appears in any seed's chain (404 on all 6). Coordinator
 constructs the release but doesn't submit/persist it. This is a
-distinct bug from the open-path issue — needs separate fix in
+distinct bug from the open-path issue - needs separate fix in
 `/inference/run_consensus` post-success path.
 
-LHR is at h=36 vs NYC h=3493 — diverged again post-firewall. Needs
+LHR is at h=36 vs NYC h=3493 - diverged again post-firewall. Needs
 another `--reset-state` rolling redeploy.
 
 P4–P7 still blocked on P3.release coordinator submit-fix.
 
 ---
 
-## Milestone C — On-demand model provisioning (live ModelRegistration receipt 2026-04-28)
+## Milestone C - On-demand model provisioning (live ModelRegistration receipt 2026-04-28)
 
 **Status 2026-04-23**: tx types `ModelRegistration` (0x1c),
 `ModelRequest` (0x1d), `ShardCoverageClaim` (0x1e) live with full
@@ -348,7 +348,7 @@ open ModelRequests sorted by bond and lets a worker auto-claim
 ranges + download chunks.
 
 **Goal**: a user says "I want to query `llama-3-70b`" and if nobody's
-serving it, the network spins up coverage — community nodes earn to
+serving it, the network spins up coverage - community nodes earn to
 host layer ranges they didn't previously have.
 
 ### Scope
@@ -357,12 +357,12 @@ host layer ranges they didn't previously have.
   - `ModelRequestTx { model_id, requester, target_k_replication, bond_per_layer_epoch, max_wait_secs }`. Signals demand.
   - `ShardCoverageClaimTx { model_id, node_pubkey, ranges: Vec<(usize,usize)>, bond }`. A community node claims to cover specific ranges for `epoch_duration` in exchange for per-hop fees.
 - Coordinator logic:
-  - `POST /inference/run_consensus { model_id, ... }` — look up the model in `multi_model_registry`. If fully_covered, route as today. If not, submit a `ModelRequestTx` and return 503 with a `model_request_id`.
-  - Client polls `GET /model_requests/{id}/status` — returns `pending|ready|timeout` with ETA.
+  - `POST /inference/run_consensus { model_id, ... }` - look up the model in `multi_model_registry`. If fully_covered, route as today. If not, submit a `ModelRequestTx` and return 503 with a `model_request_id`.
+  - Client polls `GET /model_requests/{id}/status` - returns `pending|ready|timeout` with ETA.
   - When coverage reaches target k for all ranges, status flips to `ready`; client re-issues inference.
 - Community-worker behavior:
   - Desktop app's Settings → "Earn by hosting models" opens a screen listing open `ModelRequest`s sorted by `bond_per_layer_epoch` descending.
-  - User picks a model (or clicks "Auto — highest earning fit for my RAM"), app fetches the specific chunks needed via `/chunks/get`, spawns arc-node with the right `--shard-range` flags, announces via `/shards/announce`.
+  - User picks a model (or clicks "Auto - highest earning fit for my RAM"), app fetches the specific chunks needed via `/chunks/get`, spawns arc-node with the right `--shard-range` flags, announces via `/shards/announce`.
   - Earnings accrue per inference served (leveraging Milestone B's payout split).
 
 ### Chunked model distribution (already exists)
@@ -371,11 +371,11 @@ host layer ranges they didn't previously have.
 - A 40 GB Llama-3-70B split into 1024 chunks = ~40 MB per chunk. A worker assigned layers [12, 16) fetches only the chunks for those layers (~600 MB), not 40 GB.
 
 ### Files
-- New: `crates/arc-vm/src/model_registry.rs` — state for registered models, open requests, coverage claims, reward escrow.
-- Modify: `crates/arc-types/src/tx.rs` — 3 new tx variants above.
-- Modify: `crates/arc-node/src/rpc.rs` — `run_consensus` branches on coverage; new `/models/register`, `/models/request`, `/models/claim`, `/models/open_requests` endpoints.
-- Modify: `desktop/src-tauri/src/commands.rs` — `list_earning_opportunities`, `claim_range_for_model`, `download_chunks_and_restart`.
-- New desktop screen `src/screens/Earn.tsx` — earning opportunities, "Auto-assign me" button.
+- New: `crates/arc-vm/src/model_registry.rs` - state for registered models, open requests, coverage claims, reward escrow.
+- Modify: `crates/arc-types/src/tx.rs` - 3 new tx variants above.
+- Modify: `crates/arc-node/src/rpc.rs` - `run_consensus` branches on coverage; new `/models/register`, `/models/request`, `/models/claim`, `/models/open_requests` endpoints.
+- Modify: `desktop/src-tauri/src/commands.rs` - `list_earning_opportunities`, `claim_range_for_model`, `download_chunks_and_restart`.
+- New desktop screen `src/screens/Earn.tsx` - earning opportunities, "Auto-assign me" button.
 
 ### Acceptance criteria
 - Fresh testnet scenario: testnet has Llama-2-7B coverage. User requests `mistral-7b` (never seen). A `ModelRequestTx` lands on-chain. Three community nodes (simulated by three desktop-app instances on the same machine with different ports) see the recruitment, claim ranges. Within 5 min, coverage reaches k=3 for all layers. Inference runs.
@@ -387,7 +387,7 @@ host layer ranges they didn't previously have.
 
 ---
 
-## Milestone D — Dynamic capacity + planner (protocol surface + planner shipped — PR #40)
+## Milestone D - Dynamic capacity + planner (protocol surface + planner shipped - PR #40)
 
 **Status 2026-04-23**: tx types `CapacityAdvertisement` (0x1f) and
 `ShardAssignmentProposal` (0x20) live with state transitions + 1 unit
@@ -404,7 +404,7 @@ me efficiently." The network assigns optimally given their hardware and
 current demand.
 
 ### Scope
-- `CapacityAdvertisementTx { node_pubkey, ram_bytes, vram_bytes, bandwidth_mbps, uptime_hint_mins, stake }` — community nodes advertise capacity.
+- `CapacityAdvertisementTx { node_pubkey, ram_bytes, vram_bytes, bandwidth_mbps, uptime_hint_mins, stake }` - community nodes advertise capacity.
 - Coordinator-elected planner (any full node can compute it; determinism given registry state):
   - Input: open `ModelRequestTx`s, known `CapacityAdvertisementTx`s, current `shard_registry` state, `latency_stats` from all known coordinators (gossiped).
   - Output: a proposed assignment `Map<node_pubkey, Vec<(model_id, range)>>`.
@@ -413,10 +413,10 @@ current demand.
 - Re-planning triggers: new `ModelRequestTx`, node TTL expiration, `CapacityAdvertisementTx` update, coverage drops below target k.
 
 ### Files
-- New: `crates/arc-vm/src/planner.rs` — deterministic assignment function + tests for specific scenarios.
-- Modify: `crates/arc-types/src/tx.rs` — `CapacityAdvertisementTx`, `ShardAssignmentProposalTx`.
-- Modify: `crates/arc-node/src/rpc.rs` — `/capacity/advertise`, `/assignments/for_me` long-poll.
-- Modify: `desktop/src-tauri/src/commands.rs` — advertise capacity on node start, poll for assignments, apply automatically.
+- New: `crates/arc-vm/src/planner.rs` - deterministic assignment function + tests for specific scenarios.
+- Modify: `crates/arc-types/src/tx.rs` - `CapacityAdvertisementTx`, `ShardAssignmentProposalTx`.
+- Modify: `crates/arc-node/src/rpc.rs` - `/capacity/advertise`, `/assignments/for_me` long-poll.
+- Modify: `desktop/src-tauri/src/commands.rs` - advertise capacity on node start, poll for assignments, apply automatically.
 
 ### Acceptance criteria
 - Same scenario as C but user clicks "Auto" and does nothing else. Network assigns them a fitting range.
@@ -428,7 +428,7 @@ current demand.
 
 ---
 
-## Milestone E — Thousands-of-models scale (LRU cache + registration fee shipped — PR #40)
+## Milestone E - Thousands-of-models scale (LRU cache + registration fee shipped - PR #40)
 
 **Status 2026-04-23**: on-disk LRU chunk cache in
 `crates/arc-node/src/chunk_cache.rs` with JSON sidecar warm-set
@@ -465,8 +465,8 @@ Write these into tests, not just docs:
 
 ### Speed
 - **Per-hop cost ≤ 200 ms** (today's NYC → LAX hop is ~177 ms per #29 EWMA numbers).
-- **Latency-aware routing (`#29`) stays on** — sort replicas by EWMA before primary pick.
-- **Token generation for 70B through 80-hop pipeline ≤ 16 sec for first token, ≤ 300 ms per subsequent token** — achievable with pipelined prefill (already implemented in `run_sharded`).
+- **Latency-aware routing (`#29`) stays on** - sort replicas by EWMA before primary pick.
+- **Token generation for 70B through 80-hop pipeline ≤ 16 sec for first token, ≤ 300 ms per subsequent token** - achievable with pipelined prefill (already implemented in `run_sharded`).
 
 ### Cost (economic story)
 - A consumer laptop with 8 GB usable RAM holding ~8 × 500 MB ranges earns `8 ranges × (10 ARC / 80 hops) × N requests/day`. For N=1000 requests/day, that's 100 ARC/day. With ARC=$0.10, operator earns $10/day passively. Sanity-check in Milestone B's live test.
@@ -478,7 +478,7 @@ Write these into tests, not just docs:
 ### Security
 - Every inference still produces an attestation with `output_hash`.
 - Divergence triggers slashing per `#31`. Run the "forced-bad replica" test on every milestone to confirm divergence detection didn't regress.
-- Fee escrow means a malicious coordinator can't pocket fees — payouts flow from on-chain txs only.
+- Fee escrow means a malicious coordinator can't pocket fees - payouts flow from on-chain txs only.
 
 ---
 
@@ -500,7 +500,7 @@ Write these into tests, not just docs:
    flag-day consensus changes.
 7. **Self-heal / auto-start / auto-update must continue to function
    after every rolling upgrade.** Tests asserting tray exists,
-   LaunchAgent registered, updater pubkey matches — all must still
+   LaunchAgent registered, updater pubkey matches - all must still
    pass.
 8. **Only commit when the user asks.** Leave uncommitted work visible.
 
@@ -535,7 +535,7 @@ coordinator-internal submitters (`submit_escrow_release`,
 `sig_verified: false`. `arc-state/src/lib.rs:1186` explicitly rejects
 unsigned txs as `"unsigned transaction"` at execute time, so the tx
 landed in a block with `success=false` but didn't move funds and
-didn't bump nonce — and importantly, prior to this fix the tx was
+didn't bump nonce - and importantly, prior to this fix the tx was
 silently dropped at gossip-pre-verify before even reaching the
 proposer's pending_txs map.
 
@@ -555,7 +555,7 @@ correction.
   - replicas (25 %)  → 6 × +41 = +246
   - observer (15 %) → +150
   - treasury (20 % + rounding) → +204
-  - **Conservation Δ = 0** — payer's 1000 ARC fully accounted for.
+  - **Conservation Δ = 0** - payer's 1000 ARC fully accounted for.
 
 GH issue #36 already closed from prior sessions; this run adds the
 post-fix receipt as fresh evidence the protocol works end-to-end on
@@ -583,7 +583,7 @@ mempool drains it, NYC includes it in a DAG block, but the block
 never reaches quorum (peers are committing on their own chain that
 doesn't include NYC's view). The tx vanishes between drain and
 execution. Submitting to LAX returns the same 404 dance because
-LAX doesn't know about the publisher's account at all — its state
+LAX doesn't know about the publisher's account at all - its state
 shows `balance=0 nonce=0` for the publisher key (which has 9000/2 on
 NYC).
 
@@ -604,12 +604,12 @@ After identifying the root cause as the leader-only commit rule
 block per round; non-leader proposals get orphaned 5/6 of the time),
 shipped two arc-node fixes:
 
-1. `consensus.rs:786` — re-enable `OutboundMessage::BroadcastTransactions`
+1. `consensus.rs:786` - re-enable `OutboundMessage::BroadcastTransactions`
    gossip after drain so peers re-include drained txs in their proposals.
    Any leader-validator can then commit them. Duplicates are dedup'd at
    execute time via `state.receipts`.
 
-2. `rpc.rs:5121` — `submit_escrow_release` now reads sender nonce from
+2. `rpc.rs:5121` - `submit_escrow_release` now reads sender nonce from
    state every call. The previous in-memory `attestation_nonce.fetch_add`
    bump counter accumulated forever even when the constructed tx failed
    to land, leaving a nonce gap (state stays at N, in-memory counter
@@ -649,7 +649,7 @@ testnet running binary `351a1ab4`:
 GH issues #36 / #37 / #38 / #39 close with these hashes pasted as
 comments. The original `0x53a7136c` ModelRegistration receipt from
 the prior session is preserved as additional evidence on a different
-chain head — but the receipts above are the authoritative ones on
+chain head - but the receipts above are the authoritative ones on
 the current canonical chain.
 
 ### Session 2026-04-29 (earlier): coordinated reset + partial receipts on fresh genesis
@@ -665,7 +665,7 @@ Post-reset on fresh genesis:
 - P3.release ✗: coordinator returns
   `0xa43c758de75eb8ca421c267c29822fe38b03947d9fd0707eae01c997c42cd0ae` but it
   404s on NYC even after 10+ minutes. Same coordinator-internal-submit
-  pattern as before — null sig + sig_verified=true via the post-`83c28aca`
+  pattern as before - null sig + sig_verified=true via the post-`83c28aca`
   fix, but the tx never makes it from mempool.insert into a proposed
   DAG block. Open from a real signed user (payer) lands fine; null-sig
   internal submits don't.
@@ -717,13 +717,13 @@ its local `block_height` advances only when a tx lands; recent blocks
 unidentified source even after firewalling 9090 + 9091 to seeds-only).
 Tx submitted via `/tx/submit_signed` to NYC accepts (200 OK), drains
 from mempool (`mempool_size` 1→0), but does not appear in any block
-on any seed (404 forever) — meanwhile the spammer's txs keep
+on any seed (404 forever) - meanwhile the spammer's txs keep
 landing one-per-block.
 
 The remaining 5 seeds (LAX/AMS/NRT/SGP/LHR) are committing DAG blocks
 post-restart at a different rate (~1.2K commits in ~10 min) but
 their `block_height` is frozen at their pre-restart values plus a
-tiny delta — they are NOT executing the same txs NYC sees. This is
+tiny delta - they are NOT executing the same txs NYC sees. This is
 a structural state-fork: each seed's `arc-data/state.wal` carries a
 different chain head from prior sessions, and the new binary's
 WAL replay restored that separate state on boot.
@@ -751,7 +751,7 @@ systemd units for hidden traffic sources before driving receipts.
 
 ---
 
-## TODO — next session (2026-04-29 pickup)
+## TODO - next session (2026-04-29 pickup)
 
 Verified outstanding as of 2026-04-28 23:22 UTC. Each item has been
 checked against the live chain and is genuinely still pending.
@@ -765,14 +765,14 @@ checked against the live chain and is genuinely still pending.
    ~5 min. Mempool insert succeeds (returns Ok) but the tx never
    appears in any block. Likely cause: block-pack or gossip path
    filtering null sigs after the recent rebuild. Verify by:
-   - read `crates/arc-mempool/src/lib.rs:81 drain` — does it filter
+   - read `crates/arc-mempool/src/lib.rs:81 drain` - does it filter
      null sigs?
    - read `crates/arc-node/src/consensus.rs:738` block proposer drain
-     — does it gate on `sig_verified`?
-   - read `crates/arc-node/src/pipeline.rs:700-723` — does the
+     - does it gate on `sig_verified`?
+   - read `crates/arc-node/src/pipeline.rs:700-723` - does the
      speculative executor accept InferenceEscrowRelease bodies?
    - Open follow-up: gossip the release via `mempool.insert` is
-     local-only — confirm mempool also fans out to peer mempools, or
+     local-only - confirm mempool also fans out to peer mempools, or
      send to /tx/submit_signed loopback to force gossip.
 
 2. **Seed firewall hardening**. NYC's iptables whitelist (5 seed IPs +
@@ -804,10 +804,10 @@ checked against the live chain and is genuinely still pending.
    `cd ~/arc-chain/desktop && npx playwright test` (76+/4 skip/0 fail
    target). Then SSH-tunnel NYC:9090→localhost:9090 + run
    `tests/live.spec.ts` (4/4). Then `npx tauri build --bundles app`
-   with the signing key — verify .app + .app.tar.gz + .sig produced.
+   with the signing key - verify .app + .app.tar.gz + .sig produced.
    Open the .app, verify LaunchAgent + tray + Quit cleanup.
 
-6. **Issue #27 still open**: testnet pipeline broken — shard announces
+6. **Issue #27 still open**: testnet pipeline broken - shard announces
    carry `socket_addr=0.0.0.0:9090`. Pre-existing from 2026-04-16, not
    addressed this session.
 

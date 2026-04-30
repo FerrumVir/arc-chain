@@ -54,7 +54,7 @@ fn main() {
     assert!(!merged.embedding_q16.is_empty(), "embedding should be loaded when 0 is in ranges");
     eprintln!("  embedding loaded (len={})", merged.embedding_q16.len());
 
-    // Output head must be present iff n is in any range end — range (24,28) does NOT include n_layers=32,
+    // Output head must be present iff n is in any range end - range (24,28) does NOT include n_layers=32,
     // so output head must be EMPTY in merged.
     let covers_tail = ranges.iter().any(|&(_, e)| e == n);
     if covers_tail {
@@ -85,5 +85,5 @@ fn main() {
         eprintln!("  range [{s},{e}) matches single-shard load");
     }
 
-    eprintln!("\nALL CHECKS PASSED — multi-range loader is equivalent to concatenated single loads.");
+    eprintln!("\nALL CHECKS PASSED - multi-range loader is equivalent to concatenated single loads.");
 }

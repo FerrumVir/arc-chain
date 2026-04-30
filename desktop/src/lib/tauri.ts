@@ -23,13 +23,13 @@ const IS_TAURI =
 
 // Set by vite.config.ts: true only inside the production Tauri bundle. A
 // production build served off a web host has this true but no Tauri
-// internals — in that case mockInvoke() refuses to run to prevent a user
+// internals - in that case mockInvoke() refuses to run to prevent a user
 // from opening DevTools and fabricating node state.
 declare const __ARC_PROD_TAURI__: boolean;
 const IS_PROD_TAURI_BUNDLE =
   typeof __ARC_PROD_TAURI__ !== "undefined" && __ARC_PROD_TAURI__;
 
-// Live mode — used by E2E tests against a real running arc-node (typically on
+// Live mode - used by E2E tests against a real running arc-node (typically on
 // 127.0.0.1:9090 from the community installer). When `window.__ARC_LIVE__` is
 // truthy, the browser bypasses the mock layer and calls the node's HTTP RPC
 // directly, adapting the shapes the same way src-tauri/src/rpc_client.rs does.
@@ -375,7 +375,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "check_for_update":
       return { hasUpdate: false, version: "0.5.2" } as T;
     case "ensure_binary":
-      // Browser (live mode) can't install a native binary — pretend it's
+      // Browser (live mode) can't install a native binary - pretend it's
       // already installed so the UI doesn't block onboarding.
       return {
         path: "/browser-live-mode",
@@ -390,7 +390,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   }
 }
 
-// Mock state — only used in browser preview. Tauri env always hits the real backend.
+// Mock state - only used in browser preview. Tauri env always hits the real backend.
 let mockStartedAt: number | null = null;
 const mockLogs: LogEntry[] = [];
 let mockEarnings: Earnings = {
@@ -601,7 +601,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return {
         input: `[INST] ${prompt} [/INST]`,
         output:
-          "  Mock coordinator response — browser preview. In Tauri + live testnet, this is served by one of the 6 seed nodes via /inference/run_consensus with k=3 majority verification.",
+          "  Mock coordinator response - browser preview. In Tauri + live testnet, this is served by one of the 6 seed nodes via /inference/run_consensus with k=3 majority verification.",
         outputHash:
           "0xd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
         modelHash: "",
@@ -632,7 +632,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return {
         input: `[INST] ${prompt} [/INST]`,
         output:
-          "  Mock paid-inference response — browser preview. In the native app, this flow: signs an InferenceEscrowOpen tx locally, POSTs it to a coordinator, waits for commit, then runs /inference/run_consensus which auto-submits the release.",
+          "  Mock paid-inference response - browser preview. In the native app, this flow: signs an InferenceEscrowOpen tx locally, POSTs it to a coordinator, waits for commit, then runs /inference/run_consensus which auto-submits the release.",
         outputHash:
           "0xd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
         tokensGenerated: 28,
@@ -660,7 +660,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "check_for_update":
       return { hasUpdate: false, version: "0.5.2" } as T;
     case "ensure_binary":
-      // Mock path — no real download. Pretend it completed instantly.
+      // Mock path - no real download. Pretend it completed instantly.
       return {
         path: "/mock/.arc/bin/arc-node",
         downloadedBytes: 45_000_000,
@@ -685,7 +685,7 @@ export async function invoke<T>(cmd: string, args?: unknown): Promise<T> {
   return mockInvoke<T>(cmd, args);
 }
 
-// Typed wrappers — call these, not invoke() directly.
+// Typed wrappers - call these, not invoke() directly.
 
 export const api = {
   detectHardware: () => invoke<HardwareInfo>("detect_hardware"),

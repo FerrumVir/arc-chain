@@ -93,10 +93,10 @@ impl TestNode {
     /// dynamically adds them to the validator set and transitions to multi-
     /// validator DAG consensus mode. This mirrors the production wiring.
     ///
-    /// * `seed` — deterministic validator seed (e.g. "test-validator-0").
-    /// * `stake` — ARC stake amount (must be >= 5M for block production).
-    /// * `port` — port to listen on (use `find_free_port()` to get one).
-    /// * `bootstrap_peers` — addresses of peers to connect to on startup.
+    /// * `seed` - deterministic validator seed (e.g. "test-validator-0").
+    /// * `stake` - ARC stake amount (must be >= 5M for block production).
+    /// * `port` - port to listen on (use `find_free_port()` to get one).
+    /// * `bootstrap_peers` - addresses of peers to connect to on startup.
     async fn start(
         seed: &str,
         stake: u64,
@@ -136,14 +136,14 @@ impl TestNode {
             String::new(), // data_dir: empty for tests (no peer persistence)
         ));
 
-        // Start consensus — no pre-populated peers (matches main.rs behavior).
+        // Start consensus - no pre-populated peers (matches main.rs behavior).
         // Peers are discovered dynamically via PeerConnected from transport.
         let consensus = ConsensusManager::new_with_keypair(
             address,
             stake,
             4,     // num_shards
             false, // not benchmark mode
-            &[],   // no pre-populated peers — dynamic discovery
+            &[],   // no pre-populated peers - dynamic discovery
             keypair,
         );
         let state_clone = state.clone();
@@ -238,7 +238,7 @@ async fn test_two_nodes_connect() {
 
     let addr_a: SocketAddr = format!("127.0.0.1:{}", port_a).parse().unwrap();
 
-    // Node A: standalone transport (no consensus — pure connect test).
+    // Node A: standalone transport (no consensus - pure connect test).
     let (inbound_tx_a, mut inbound_rx_a) = mpsc::channel::<InboundMessage>(100);
     let (_outbound_tx_a, outbound_rx_a) = mpsc::channel::<OutboundMessage>(100);
     let peer_count_a = Arc::new(AtomicU32::new(0));
@@ -249,7 +249,7 @@ async fn test_two_nodes_connect() {
     let kp_a = keypair_a.clone();
     let handle_a = tokio::spawn(run_transport(
         listen_a,
-        vec![], // seed node — no bootstrap
+        vec![], // seed node - no bootstrap
         address_a,
         stake,
         genesis_hash,
@@ -357,7 +357,7 @@ async fn test_block_propagation() {
 
     let seed_a = "test-validator-0";
     let seed_b = "test-validator-1";
-    let stake = 5_000_000u64; // Arc tier — can produce blocks
+    let stake = 5_000_000u64; // Arc tier - can produce blocks
 
     let addr_a: SocketAddr = format!("127.0.0.1:{}", port_a).parse().unwrap();
 
@@ -473,7 +473,7 @@ async fn test_three_node_consensus() {
     // Brief delay for Node 0 to bind its QUIC listener.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // Start Nodes 1 and 2 nearly simultaneously — both bootstrap to Node 0.
+    // Start Nodes 1 and 2 nearly simultaneously - both bootstrap to Node 0.
     // Node 1 also serves as a bootstrap target for Node 2.
     let node_1 = TestNode::start(seeds[1], stake, port_1, vec![addr_0]).await;
     // Tiny delay for Node 1 to bind.
@@ -638,7 +638,7 @@ async fn test_genesis_mismatch_rejected() {
 
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Node B: DIFFERENT genesis hash — should be rejected by Node A.
+    // Node B: DIFFERENT genesis hash - should be rejected by Node A.
     let (inbound_tx_b, _inbound_rx_b) = mpsc::channel::<InboundMessage>(100);
     let (_outbound_tx_b, outbound_rx_b) = mpsc::channel::<OutboundMessage>(100);
     let peer_count_b = Arc::new(AtomicU32::new(0));
@@ -650,7 +650,7 @@ async fn test_genesis_mismatch_rejected() {
         vec![addr_a], // attempt to connect to Node A
         address_b,
         stake,
-        genesis_hash_b, // MISMATCH — handshake should fail
+        genesis_hash_b, // MISMATCH - handshake should fail
         outbound_rx_b,
         inbound_tx_b,
         pc_b,

@@ -16,7 +16,7 @@ fn main() {
     // 60 proofs at varying dimensions (representing different model scales)
     let configs: Vec<(usize, usize, &str)> = vec![
         // (out_size, in_size, label)
-        // Small models (1B scale) — fast proofs
+        // Small models (1B scale) - fast proofs
         (32, 64, "1b-attn-q"),
         (32, 64, "1b-attn-k"),
         (32, 64, "1b-attn-v"),
@@ -159,5 +159,5 @@ fn main() {
     println!("Total time: {:.1}s", total_elapsed.as_secs_f64());
     println!("Total proof size: {} bytes", manifest.iter().map(|e| e["proof_size"].as_u64().unwrap()).sum::<u64>());
     println!("Manifest: {}", manifest_path);
-    println!("All proofs are REAL Circle STARK (Stwo) — cryptographically verifiable");
+    println!("All proofs are REAL Circle STARK (Stwo) - cryptographically verifiable");
 }

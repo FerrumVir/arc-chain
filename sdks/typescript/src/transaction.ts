@@ -1,5 +1,5 @@
 /**
- * ARC Chain SDK — Transaction builder.
+ * ARC Chain SDK - Transaction builder.
  *
  * Constructs unsigned transaction objects matching the ARC Chain RPC format,
  * then signs them with Ed25519 and computes the BLAKE3 transaction hash.

@@ -1,4 +1,4 @@
-//! Consensus manager — wires arc-consensus into the node.
+//! Consensus manager - wires arc-consensus into the node.
 //!
 //! Wraps the DAG `ConsensusEngine` and drives the propose → commit loop,
 //! draining the mempool and feeding committed blocks into `StateDB`.
@@ -39,13 +39,13 @@ pub struct ConsensusManager {
     /// Encrypted mempool for MEV-protected commit-reveal transactions.
     /// Runs alongside the regular mempool when `Some`.
     encrypted_mempool: Option<Arc<EncryptedMempool>>,
-    /// Shared validator list for RPC — updated on PeerConnected/Disconnected.
+    /// Shared validator list for RPC - updated on PeerConnected/Disconnected.
     pub dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
     /// Shared DAG round counter for health endpoint.
     pub dag_round: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Shared DAG committed block counter for health endpoint.
     pub dag_committed: Option<Arc<std::sync::atomic::AtomicU64>>,
-    /// WAL writer for DAG persistence — enables consensus recovery after restart.
+    /// WAL writer for DAG persistence - enables consensus recovery after restart.
     pub dag_wal: Option<Arc<arc_state::WalWriter>>,
     /// Long-range attack prevention: checkpoint registry (every 1000 rounds).
     /// Behind Mutex for interior mutability in the consensus loop (takes &self).
@@ -59,9 +59,9 @@ impl ConsensusManager {
     /// Create a new consensus manager.
     ///
     /// # Arguments
-    /// * `validator_address` — 256-bit address derived from the validator key.
-    /// * `stake` — amount of ARC staked (must be >= STAKE_SPARK).
-    /// * `num_shards` — number of sender-shards for the DAG.
+    /// * `validator_address` - 256-bit address derived from the validator key.
+    /// * `stake` - amount of ARC staked (must be >= STAKE_SPARK).
+    /// * `num_shards` - number of sender-shards for the DAG.
     ///
     /// # Panics
     /// Panics if `stake` is below the minimum Spark threshold (500 000 ARC).
@@ -136,7 +136,7 @@ impl ConsensusManager {
         // for display, so we default to Spark (lowest) for observers.
         let tier = StakeTier::from_stake(stake).unwrap_or(StakeTier::Spark);
 
-        // Build validator set from peers only — observer isn't added.
+        // Build validator set from peers only - observer isn't added.
         // This keeps observers out of the quorum calculation so they
         // don't break consensus when they go offline.
         let mut validators = Vec::new();
@@ -211,7 +211,7 @@ impl ConsensusManager {
 
         let can_produce = self.tier.can_produce_blocks();
         if !can_produce {
-            info!("Validator is Spark tier — observing only (cannot produce blocks)");
+            info!("Validator is Spark tier - observing only (cannot produce blocks)");
         }
 
         // Pending transaction index: tx_hash → Transaction
@@ -233,7 +233,7 @@ impl ConsensusManager {
             // Multi-validator: 50ms to give peer blocks time to arrive
             // before re-checking quorum parents. This amortizes the
             // cross-continent latency (~100-300ms) without sacrificing
-            // throughput — rounds advance when peers are ready, not on
+            // throughput - rounds advance when peers are ready, not on
             // a fixed timer.
             // Multi-validator: 200ms normal, 50ms benchmark (fast but peers can keep up).
             // Single-validator: 1ms for max local TPS.
@@ -261,14 +261,14 @@ impl ConsensusManager {
                     match msg {
                         InboundMessage::PeerConnected { address, stake } => {
                             // Check if this peer is already in our validator set.
-                            // If so, this is a reconnect — do NOT reset the DAG,
+                            // If so, this is a reconnect - do NOT reset the DAG,
                             // which would destroy all round progress and cause
                             // perpetual 0 TPS in soak tests with network jitter.
                             let already_known = self.engine.validator_set().is_validator(&address);
                             if already_known {
                                 info!(
                                     peer = %address,
-                                    "Peer reconnected — already in validator set, keeping DAG state"
+                                    "Peer reconnected - already in validator set, keeping DAG state"
                                 );
                             } else {
                                 // New peer: only add if it's a known genesis
@@ -312,7 +312,7 @@ impl ConsensusManager {
                                 self.engine.update_validator_set(new_set);
 
                                 // On first peer connection, reset DAG but DON'T freeze
-                                // the epoch yet — more peers will connect in the next
+                                // the epoch yet - more peers will connect in the next
                                 // 30-60s. The periodic freeze (every 100 rounds) will
                                 // capture the full validator set once peers stabilize.
                                 if was_single {
@@ -324,7 +324,7 @@ impl ConsensusManager {
                                     peer = %address,
                                     validators = self.engine.validator_set().len(),
                                     was_single = was_single,
-                                    "Peer connected — ValidatorSet updated"
+                                    "Peer connected - ValidatorSet updated"
                                 );
 
                                 // Update shared validator list for RPC
@@ -352,7 +352,7 @@ impl ConsensusManager {
                             if is_genesis {
                                 info!(
                                     peer = %address,
-                                    "Peer transport disconnected (genesis validator — keeping in set)"
+                                    "Peer transport disconnected (genesis validator - keeping in set)"
                                 );
                                 continue;
                             }
@@ -387,7 +387,7 @@ impl ConsensusManager {
                             info!(
                                 peer = %address,
                                 now_single = now_single,
-                                "Peer disconnected — non-genesis validator removed"
+                                "Peer disconnected - non-genesis validator removed"
                             );
                         }
                         InboundMessage::DagBlockWithTxs {
@@ -396,7 +396,7 @@ impl ConsensusManager {
                         } => {
                             // Insert the full transactions into pending_txs
                             // so we can resolve them when this block commits.
-                            // Mark as sig_verified — the proposing node validated
+                            // Mark as sig_verified - the proposing node validated
                             // them at the RPC layer, and sig_verified doesn't
                             // survive serde roundtrip (defaults to false).
                             for tx in &transactions {
@@ -525,7 +525,7 @@ impl ConsensusManager {
                                 );
                             }
                         }
-                        // ── Round sync request — respond with our state ───
+                        // ── Round sync request - respond with our state ───
                         InboundMessage::RoundSyncRequest { peer, their_round, their_committed } => {
                             let my_round = self.engine.current_round();
                             let my_committed = self.engine.last_committed_round();
@@ -549,12 +549,12 @@ impl ConsensusManager {
                                 self.engine.set_initial_round(their_round.saturating_sub(10), their_committed);
                             }
                         }
-                        // ── Round sync response — update our round if behind ───
+                        // ── Round sync response - update our round if behind ───
                         InboundMessage::RoundSyncResponse { current_round, last_committed_round } => {
                             let my_round = self.engine.current_round();
                             if current_round > my_round + 1000 {
                                 info!(
-                                    "Round sync: peer at round {}, we are at {} — catching up",
+                                    "Round sync: peer at round {}, we are at {} - catching up",
                                     current_round, my_round
                                 );
                                 self.engine.set_initial_round(
@@ -568,7 +568,7 @@ impl ConsensusManager {
                             info!(
                                 request_id = %request_id,
                                 layer = next_layer,
-                                "Received shard forward — processing layers"
+                                "Received shard forward - processing layers"
                             );
                             // Shard processing handled by inference coordinator (Phase 2)
                         }
@@ -647,7 +647,7 @@ impl ConsensusManager {
             };
 
             // ── VRF proposer eligibility check ──────────────────────────
-            // In DAG consensus, ALL validators propose every round — that's
+            // In DAG consensus, ALL validators propose every round - that's
             // what builds the DAG. The leader is selected at commit time, not
             // at proposal time. VRF selection (EXPECTED_PROPOSERS_PER_SLOT=1)
             // would filter out 7/8 validators per round, preventing quorum.
@@ -665,7 +665,7 @@ impl ConsensusManager {
                 true // No VRF = always allowed (backward compat)
             };
 
-            // In multi-validator DAG mode, always allow proposals — the DAG
+            // In multi-validator DAG mode, always allow proposals - the DAG
             // needs blocks from ALL validators to build quorum. Strict parent
             // checks would cause deadlock: no proposals → no blocks → no quorum.
             // In single-validator mode, use VRF to gate proposals. The 2-round
@@ -836,7 +836,7 @@ impl ConsensusManager {
                                         Err(e) => warn!("Failed to broadcast DAG block: {} (channel full or closed)", e),
                                     }
                                 } else {
-                                    warn!("No outbound channel — cannot broadcast DAG block");
+                                    warn!("No outbound channel - cannot broadcast DAG block");
                                 }
                             }
                             Err(e) => {
@@ -893,7 +893,7 @@ impl ConsensusManager {
                                 });
                             }
 
-                            // Clean up pending index — pipeline owns them now
+                            // Clean up pending index - pipeline owns them now
                             for tx in &transactions {
                                 pending_txs.remove(&tx.hash.0);
                             }
@@ -994,7 +994,7 @@ impl ConsensusManager {
                             // If the spawned task hangs (runtime starvation), fall
                             // back to unverified txs after 5 seconds.
                             // All validators must execute the same tx set to agree on
-                            // state root. NEVER truncate — different validators could
+                            // state root. NEVER truncate - different validators could
                             // truncate at different points, causing a consensus fork.
                             committed_txs = match tokio::time::timeout(
                                 tokio::time::Duration::from_secs(5),
@@ -1002,11 +1002,11 @@ impl ConsensusManager {
                             ).await {
                                 Ok(Ok(verified_txs)) => verified_txs,
                                 Ok(Err(e)) => {
-                                    warn!("Pre-verify error: {e} — proceeding with unverified txs");
+                                    warn!("Pre-verify error: {e} - proceeding with unverified txs");
                                     committed_txs
                                 }
                                 Err(_) => {
-                                    warn!("Pre-verify timeout — proceeding with unverified txs");
+                                    warn!("Pre-verify timeout - proceeding with unverified txs");
                                     committed_txs
                                 }
                             };
@@ -1145,7 +1145,7 @@ impl ConsensusManager {
                                 } else {
                                     // FRAUD DETECTED: proposer's state diff doesn't match
                                     // our independent verification. Do NOT update finality
-                                    // proof — this block should not be considered verified.
+                                    // proof - this block should not be considered verified.
                                     // State was already mutated by apply_state_diff; the
                                     // computed root is our ground truth (not the proposer's).
                                     warn!(
@@ -1153,7 +1153,7 @@ impl ConsensusManager {
                                         expected = %diff.new_root,
                                         computed = %verified_root,
                                         proposer = %dag_block.author,
-                                        "FRAUD: state diff root mismatch — block NOT finalized"
+                                        "FRAUD: state diff root mismatch - block NOT finalized"
                                     );
                                     // TODO: submit on-chain fraud proof for economic slashing
                                     // TODO: re-execute from committed_txs to recover correct state
@@ -1194,7 +1194,7 @@ impl ConsensusManager {
                                 validator = %ev.validator,
                                 round = ev.round,
                                 slash_amount = slash,
-                                "DOUBLE VOTE DETECTED — slashing evidence recorded"
+                                "DOUBLE VOTE DETECTED - slashing evidence recorded"
                             );
                             tracker.record_penalty(arc_consensus::security::PenaltyRecord {
                                 validator: ev.validator,
@@ -1251,7 +1251,7 @@ impl ConsensusManager {
             if multi_validator && self.engine.needs_view_change() {
                 warn!(
                     round = current_round,
-                    "Round stalled — forcing view-change (advancing round)"
+                    "Round stalled - forcing view-change (advancing round)"
                 );
                 self.engine.force_advance_round();
                 last_proposed_round = None;
@@ -1281,7 +1281,7 @@ impl ConsensusManager {
             // Epoch management: the genesis set is frozen at construction
             // (epoch 1). Re-freeze only at round 1000, 2000, etc. to
             // absorb new validators that joined via staking.
-            // CRITICAL: do NOT freeze at round 0 — that would overwrite the
+            // CRITICAL: do NOT freeze at round 0 - that would overwrite the
             // genesis freeze with whatever PeerConnected events arrived.
             if multi_validator && current_round >= 1000 && current_round % 1000 == 0 {
                 self.engine.freeze_epoch();

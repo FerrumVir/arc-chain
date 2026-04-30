@@ -1,4 +1,4 @@
-//! ARC Chain — Production Pipeline Benchmark (HONEST)
+//! ARC Chain - Production Pipeline Benchmark (HONEST)
 //!
 //! This benchmark measures REAL production throughput through the actual
 //! 4-stage pipeline: Receive → Verify → Execute → Commit.
@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(
     name = "arc-bench-production",
-    about = "ARC Chain — Honest Production Pipeline Benchmark"
+    about = "ARC Chain - Honest Production Pipeline Benchmark"
 )]
 struct Args {
     /// Total transactions per proposer to process.
@@ -181,7 +181,7 @@ fn run_single_proposer(
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             eprintln!(
-                "  Proposer {}: TIMEOUT — got {}/{} results",
+                "  Proposer {}: TIMEOUT - got {}/{} results",
                 proposer_id, results_received, batches_submitted
             );
             break;
@@ -217,7 +217,7 @@ fn main() {
 
     println!();
     println!("================================================================");
-    println!(" ARC Chain — PRODUCTION Pipeline Benchmark (HONEST)");
+    println!(" ARC Chain - PRODUCTION Pipeline Benchmark (HONEST)");
     println!("================================================================");
     println!();
     println!("  WHAT THIS MEASURES:");

@@ -1,4 +1,4 @@
-//! ARC Chain — Propose-Verify Multi-Proposer Benchmark
+//! ARC Chain - Propose-Verify Multi-Proposer Benchmark
 //!
 //! Demonstrates the core scaling mechanism: multiple proposers execute
 //! non-overlapping transaction sets in parallel, then each proposer's
@@ -14,7 +14,7 @@
 
 use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_crypto::Hash256;
-// Pipeline not used — we call execute_block() directly to avoid channel overhead
+// Pipeline not used - we call execute_block() directly to avoid channel overhead
 use arc_state::StateDB;
 use arc_types::Transaction;
 use clap::Parser;
@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(
     name = "arc-bench-propose-verify",
-    about = "ARC Chain — Multi-Proposer Propose-Verify Benchmark"
+    about = "ARC Chain - Multi-Proposer Propose-Verify Benchmark"
 )]
 struct Args {
     /// Number of parallel proposers.
@@ -81,7 +81,7 @@ fn build_proposer_genesis(
         genesis.push((addr, u64::MAX / 4));
     }
 
-    // Receivers (shared pool is fine — propose-verify doesn't require
+    // Receivers (shared pool is fine - propose-verify doesn't require
     // non-overlapping receivers, only that each proposer's diff is
     // independently verifiable)
     for r in 200u8..=255 {
@@ -195,7 +195,7 @@ fn run_proposer(
 
     let exec_elapsed = start.elapsed();
 
-    // Export state diff — pass the addresses we know were touched
+    // Export state diff - pass the addresses we know were touched
     let dirty_addrs: Vec<Hash256> = touched.into_iter().collect();
     let diff = state.export_state_diff(&dirty_addrs);
 
@@ -206,7 +206,7 @@ fn main() {
     let args = Args::parse();
 
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║  ARC Chain — Propose-Verify Multi-Proposer Benchmark       ║");
+    println!("║  ARC Chain - Propose-Verify Multi-Proposer Benchmark       ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
     println!("  Proposers:          {}", args.proposers);
@@ -260,7 +260,7 @@ fn main() {
     println!("    Transactions:   {}/{}", single_success, total_txs);
     println!("    Time:           {}", format_duration(single_elapsed));
     println!("    Throughput:     {} TPS", format_tps(single_tps));
-    println!("    (This is what EVERY chain does today — 1 node re-executes everything)");
+    println!("    (This is what EVERY chain does today - 1 node re-executes everything)");
     println!();
 
     // ── Phase 3: Multi-proposer parallel execution ──────────────────────

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Network Health Check
+# ARC Chain - Network Health Check
 #
 # Pings the /health endpoint of all 8 testnet seed nodes via SSH and prints
 # peer count + dag_round for each. Reports STATUS: ALL HEALTHY or DOWN.

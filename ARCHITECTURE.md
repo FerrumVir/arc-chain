@@ -1,4 +1,4 @@
-# ARC Chain — Complete Architecture Reference
+# ARC Chain - Complete Architecture Reference
 
 **READ THIS FIRST IN EVERY SESSION.** This is the authoritative reference for
 all infrastructure in the codebase. Every component listed here is REAL CODE
@@ -29,12 +29,12 @@ checking if it already exists here.
 - Beacon collects state roots per epoch
 - Global root = Merkle(shard_0_root, shard_1_root, ...)
 
-### Security Modules — ALL WIRED (v0.5.3)
+### Security Modules - ALL WIRED (v0.5.3)
 **File:** `crates/arc-consensus/security.rs` (300 lines)
-- Withholding detection (>50% score = report) — wired since v0.4.x
-- Long-range attack prevention (checkpoints every 1000 rounds) — **wired v0.5.3**
+- Withholding detection (>50% score = report) - wired since v0.4.x
+- Long-range attack prevention (checkpoints every 1000 rounds) - **wired v0.5.3**
   `CheckpointRegistry` in `ConsensusManager`, auto-creates checkpoint at round % 1000
-- Nothing-at-stake mitigation (double-vote detection) — **wired v0.5.3**
+- Nothing-at-stake mitigation (double-vote detection) - **wired v0.5.3**
   `StakeTracker` in `ConsensusManager`, reports votes on every committed block,
   detects double voting, records slashing penalties with graduated schedule
 
@@ -43,8 +43,8 @@ checking if it already exists here.
 ## VRF Proposer Selection
 
 **Files:**
-- `crates/arc-crypto/src/vrf.rs` (150 lines) — Core VRF primitives
-- `crates/arc-node/src/vrf.rs` (300 lines) — ProposerSelector
+- `crates/arc-crypto/src/vrf.rs` (150 lines) - Core VRF primitives
+- `crates/arc-node/src/vrf.rs` (300 lines) - ProposerSelector
 
 ### What it does:
 - Ed25519 + BLAKE3 VRF (RFC 9381-inspired)
@@ -62,15 +62,15 @@ it for quorum). In single-validator mode, VRF gates block production via
 
 ---
 
-## Inference Verification — 3 Tiers
+## Inference Verification - 3 Tiers
 
 ### Tier 1: All-Execute (small models <20B)
 All validators run inference independently. Majority vote determines output.
 
 ### Tier 2: VRF Committee (models 20-100B)
 **File:** `crates/arc-inference/src/committee.rs` (334 lines)
-- `select_committee(vrf_seed, validators, tier, k=7)` — deterministic
-- `aggregate_votes(committee, votes)` — 5/7 agreement required
+- `select_committee(vrf_seed, validators, tier, k=7)` - deterministic
+- `aggregate_votes(committee, votes)` - 5/7 agreement required
 - `corruption_probability(f=0.1, k=7, min=5)` = 0.018%
 
 ### STATUS: WIRED (v0.5.3)
@@ -83,16 +83,16 @@ output, so committee consensus is guaranteed for non-malicious validators.
 ### Tier 3: STARK-Proven (single validator + proof)
 **File:** `crates/arc-crypto/src/stwo_air.rs` (1,400 lines)
 - Real Stwo Circle STARK prover (NOT mock)
-- `prove_dense_stark()` — proves one transformer layer
-- `prove_block()` — proves full block with weights + activations + state
-- `prove_recursive()` — recursive proof composition
+- `prove_dense_stark()` - proves one transformer layer
+- `prove_block()` - proves full block with weights + activations + state
+- `prove_recursive()` - recursive proof composition
 - Field: M31 (2^31 - 1), Blake2s Merkle commitments
 - Feature-gated: `--features stwo-prover`
 
-### Attestation System — WIRED (v0.5.3)
+### Attestation System - WIRED (v0.5.3)
 **File:** `crates/arc-vm/src/inference_verify.rs` (150 lines)
-- `InferenceCommitment` — provider posts result_hash + bond
-- `VerificationChallenge` — challenger posts bond + deadline
+- `InferenceCommitment` - provider posts result_hash + bond
+- `VerificationChallenge` - challenger posts bond + deadline
 - Challenge types: ReExecution, SpotCheck, StatisticalAudit, ConsensusVerification
 - Resolution: winner takes loser's bond
 - **Wired:** `VerificationManager` is instantiated in `NodeState`. Commitments are
@@ -112,10 +112,10 @@ pub struct ShardRegistry {
     node_shards: DashMap<Hash256, Vec<(Hash256, ShardAssignment)>>,
 }
 ```
-- `register_shard(model_id, shard)` — per-model
-- `get_pipeline(model_id)` — ordered shard list for one model
-- `is_model_fully_covered(model_id, total_layers)` — completeness check
-- `fully_covered_models()` — which models have full pipelines
+- `register_shard(model_id, shard)` - per-model
+- `get_pipeline(model_id)` - ordered shard list for one model
+- `is_model_fully_covered(model_id, total_layers)` - completeness check
+- `fully_covered_models()` - which models have full pipelines
 
 ### STATUS: WIRED (v0.5.3)
 The multi-model `ShardRegistry` is now instantiated in `NodeState` as
@@ -124,10 +124,10 @@ in BOTH the flat registry (backward compat) and the multi-model registry.
 Endpoints: `GET /models` (list all models), `GET /models/shards?model_id=0x...`
 (per-model pipeline info).
 
-### Auto-Sharding — WIRED (v0.5.3)
-- `compute_shard_plan(nodes, n_layers)` — distributes layers proportional to RAM
+### Auto-Sharding - WIRED (v0.5.3)
+- `compute_shard_plan(nodes, n_layers)` - distributes layers proportional to RAM
 - GPU bonus: nodes with GPU get 1.5x weight
-- `compute_expert_shard_plan()` — MoE expert distribution
+- `compute_expert_shard_plan()` - MoE expert distribution
 - **Wired:** `POST /shards/auto_plan` computes optimal plan from live node
   capabilities and registers the assignments in the multi-model registry.
 
@@ -144,27 +144,27 @@ pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
 **File:** `crates/arc-inference/src/cached_integer_model.rs` (3,400 lines)
 
 ### Precision Hierarchy
-1. **I16** (default) — 32,767 quantization levels, loaded from f32
-2. **I8** — 127 levels, fallback
-3. **Q4** — 16 levels, 2x bandwidth reduction, opt-in via ARC_Q4_SHARD=1
+1. **I16** (default) - 32,767 quantization levels, loaded from f32
+2. **I8** - 127 levels, fallback
+3. **Q4** - 16 levels, 2x bandwidth reduction, opt-in via ARC_Q4_SHARD=1
 
 ### SIMD Acceleration (shipped v0.5.2)
-- `dot_i16_i64_neon()` — NEON i16 matmul (3.7x on M2 Ultra)
-- `dot_i64xi64_attn_neon()` — NEON attention Q*K dot product
-- `matmul_simd_preq_neon()` — NEON i8xi8 (EXISTS, not wired into shard dispatch)
-- `matmul_q4_preq_neon()` — NEON Q4 (wired, opt-in)
+- `dot_i16_i64_neon()` - NEON i16 matmul (3.7x on M2 Ultra)
+- `dot_i64xi64_attn_neon()` - NEON attention Q*K dot product
+- `matmul_simd_preq_neon()` - NEON i8xi8 (EXISTS, not wired into shard dispatch)
+- `matmul_q4_preq_neon()` - NEON Q4 (wired, opt-in)
 - AVX-512 path reverted (consensus segfault on Vultr Xeon)
 
 ### Unused Optimizations
-- `flash_attention_i64()` — online softmax with i64 KV cache. **WIRED (v0.5.3)** into
+- `flash_attention_i64()` - online softmax with i64 KV cache. **WIRED (v0.5.3)** into
   `forward_one_token()`, `forward_shard_token()`, and `forward_shard_layers()`.
   Replaces O(full_seq) scores array with O(d_head) streaming accumulation.
-- `flash_attention_i8()` — online softmax variant for i8-quantized KV. Available for future use.
-- `quantize_for_dot()` + `dot_i8_kv_neon()` — KV cache quantization. Available for i8 cache path.
+- `flash_attention_i8()` - online softmax variant for i8-quantized KV. Available for future use.
+- `quantize_for_dot()` + `dot_i8_kv_neon()` - KV cache quantization. Available for i8 cache path.
 
 ### Forward Paths
-- `forward_one_token()` — full model, single node
-- `forward_shard_token()` — layer range, for pipeline sharding
+- `forward_one_token()` - full model, single node
+- `forward_shard_token()` - layer range, for pipeline sharding
 - Both produce bit-identical output across ARM, x86
 
 ---
@@ -173,16 +173,16 @@ pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
 
 **File:** `crates/arc-gpu/src/gpu_forward.rs` (800 lines)
 
-- `GpuForward` — wgpu-based transformer engine
+- `GpuForward` - wgpu-based transformer engine
 - All kernels: matmul, layernorm, RoPE, attention, SiLU, residual, argmax
 - Metal + WGSL backends
 - `forward_one_token(model, token, pos) -> u32`
 - Embedding lookup **FIXED (v0.5.3):** token embeddings are now stored CPU-side as
   i32 (dequantized from i8*scale) and uploaded to the GPU hidden_buf per-token.
   Previously wrote zeros.
-- **BENCHMARK ONLY** — not in the default inference path (integer engine is production).
+- **BENCHMARK ONLY** - not in the default inference path (integer engine is production).
   To use: `cargo run --example bench_gpu_forward --features candle --release`
-- 5 Metal shaders (attention.metal, rope.metal, silu.metal, residual.metal, argmax.metal) — UNTESTED
+- 5 Metal shaders (attention.metal, rope.metal, silu.metal, residual.metal, argmax.metal) - UNTESTED
 
 ---
 
@@ -192,14 +192,14 @@ pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
 
 | Tier | Min Stake | APY | Unbonding | Slashing |
 |------|-----------|-----|-----------|----------|
-| Lite | 50K | 5% | 1 day | — |
+| Lite | 50K | 5% | 1 day | - |
 | Spark | 500K | 8% | 7 days | 10% |
 | Arc | 5M | 15% | 14 days | 20% |
 | Core | 50M | 25% | 30 days | 30% |
 
 - Fixed supply: 1.03 billion ARC, 9 decimals
 - NO inflation, NO burn
-- Revenue: 40% proposers, 25% verifiers, 15% observers, 20% treasury — **WIRED (v0.5.3)**
+- Revenue: 40% proposers, 25% verifiers, 15% observers, 20% treasury - **WIRED (v0.5.3)**
   `RoleRevenueConfig` instantiated in `NodeState.revenue_config`. Fee splits computed
   on every inference run and included in the response. `GET /economics/revenue_split`
   endpoint exposes the config and example splits.
@@ -213,9 +213,9 @@ pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
 **File:** `scripts/community-gateway.py`
 - Port 3001, ThreadingHTTPServer
 - `/community/register` + `/community/heartbeat` + `/community/list`
-- `/community/claim_work` — long-poll (30s) for inference jobs
-- `/community/submit_work` — return computed result
-- `/inference/community` — route inference to community workers
+- `/community/claim_work` - long-poll (30s) for inference jobs
+- `/community/submit_work` - return computed result
+- `/inference/community` - route inference to community workers
 
 ### Node Client
 **File:** `crates/arc-node/src/main.rs` (--community-mode)
@@ -231,10 +231,10 @@ pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
 **File:** `crates/arc-types/src/lib.rs`
 
 Key types for inference:
-- `InferenceAttestation` — on-chain record of inference result
-- `InferenceChallenge` — challenge a result with bond
-- `InferenceRegister` — register as inference provider
-- `InferenceCommitment` — commit result hash + bond
+- `InferenceAttestation` - on-chain record of inference result
+- `InferenceChallenge` - challenge a result with bond
+- `InferenceRegister` - register as inference provider
+- `InferenceCommitment` - commit result hash + bond
 
 ---
 
@@ -252,8 +252,8 @@ Key types for inference:
 ## VM Runtime
 
 **File:** `crates/arc-vm/src/`
-- EVM (revm) — Solidity/ERC-20 compatible
-- WASM (wasmer) — general compute
+- EVM (revm) - Solidity/ERC-20 compatible
+- WASM (wasmer) - general compute
 - Precompiles for inference operations
 
 ---
@@ -270,7 +270,7 @@ Key types for inference:
 | `arc-verify.sh` | Third-party inference verifier |
 | `arc-bench.sh` | Reproducible factual benchmark |
 | `arc-self-heal.sh` + `.service` + `install-self-heal.sh` | On-host self-heal daemon (GH #30). Systemd unit on each seed; auto-restarts arc-node on RPC silence or consensus drift with shard flags preserved from `/proc/PID/cmdline`. |
-| `arc-watchdog.sh` | Legacy off-cluster watchdog — superseded by `arc-self-heal` on the hosts. |
+| `arc-watchdog.sh` | Legacy off-cluster watchdog - superseded by `arc-self-heal` on the hosts. |
 | `arc-health-check.sh` | Network-wide health probe |
 | `rolling-upgrade.sh` | Automated rolling deploy |
 
@@ -303,7 +303,7 @@ Key types for inference:
 
 6. **Test on x86 VPS before deploying.** Mac (aarch64) works but
    Vultr x86 has different memory/timing behavior. The dd0bef8 binary
-   segfaults on x86 when receiving real consensus traffic — this is
+   segfaults on x86 when receiving real consensus traffic - this is
    likely caused by the DashMap type change in NodeState (community_workers
    field changes memory layout, exposing a pre-existing off-by-one in
    the consensus thread). Use the stable binary (dc662fa) for x86 seeds.

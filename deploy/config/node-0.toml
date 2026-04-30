@@ -1,4 +1,4 @@
-# ARC Chain Node Configuration — Validator 0 (Boot Node)
+# ARC Chain Node Configuration - Validator 0 (Boot Node)
 # -----------------------------------------------------------------
 # Deployed to /etc/arc/config.toml on arc-node-0.
 # Peer addresses are populated by setup-testnet.sh after provisioning.
@@ -9,7 +9,7 @@ eth_port = 8545
 
 [p2p]
 port = 9945
-# Peers injected by setup-testnet.sh — node-0 is the boot node
+# Peers injected by setup-testnet.sh - node-0 is the boot node
 peers = ["__NODE_1_IP__:9945", "__NODE_2_IP__:9945", "__NODE_3_IP__:9945"]
 
 [validator]

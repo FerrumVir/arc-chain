@@ -35,7 +35,7 @@ fn main() {
     let mut candle_model = ModelWeights::from_gguf(content, &mut file, &device).expect("from_gguf");
     eprintln!("Loaded candle model.");
 
-    // BOS token (1) forward — batch=1, seq=1
+    // BOS token (1) forward - batch=1, seq=1
     let bos = Tensor::new(&[1u32], &device).unwrap().unsqueeze(0).unwrap();
     let candle_logits = candle_model.forward(&bos, 0).expect("candle forward");
     let candle_logits = candle_logits.squeeze(0).unwrap();

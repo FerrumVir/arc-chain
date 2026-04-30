@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Testnet Watchdog
+# ARC Chain - Testnet Watchdog
 #
 # Polls each of the 8 testnet seed nodes every 30 seconds. Detects two
 # failure modes and auto-restarts the affected node:
@@ -13,7 +13,7 @@
 # for sharded inference: a restart that drops the shard flags would break
 # the pipeline.
 #
-# Bash 3.2 compatible (no associative arrays — uses parallel arrays).
+# Bash 3.2 compatible (no associative arrays - uses parallel arrays).
 #
 # Usage:
 #   # Run in background:
@@ -62,7 +62,7 @@ restart_node() {
     # Step 1: kill old (separate ssh, longer timeout)
     ssh -o ConnectTimeout=15 -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o BatchMode=yes "root@${ip}" "screen -S arc -X quit 2>/dev/null || true; pkill -9 -f arc-node 2>/dev/null || true; sleep 2; ps aux | grep arc-node | grep -v grep | wc -l" >/dev/null 2>&1 || true
     sleep 3
-    # Step 2: start new node — preserve any shard flags we discovered
+    # Step 2: start new node - preserve any shard flags we discovered
     ssh -o ConnectTimeout=15 -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o BatchMode=yes "root@${ip}" "cd /root/arc-chain && ARC_PUBLIC_SOCKET=${ip}:9090 screen -dmS arc -L -Logfile screenlog.0 ./target/release/arc-node --rpc 0.0.0.0:9090 --p2p-port 9091 --validator-seed ${node} --seeds-file testnet-seeds.txt --genesis genesis.toml --stake 5000000 --eth-rpc-port 0 ${model_flag} ${shard_flag}" >/dev/null 2>&1 || true
     sleep 5
     # Step 3: verify new process is running
@@ -83,10 +83,10 @@ while true; do
         IP="${IPS[$i]}"
         HEALTH=$(ssh $SSH_OPTS "root@${IP}" "curl -sf http://localhost:9090/health 2>/dev/null" 2>/dev/null || echo "")
         if [ -z "$HEALTH" ]; then
-            # Node is unreachable — check if process is running at all
+            # Node is unreachable - check if process is running at all
             PROC_COUNT=$(ssh $SSH_OPTS "root@${IP}" "ps aux | grep arc-node | grep -v grep | wc -l" 2>/dev/null || echo "?")
             if [ "$PROC_COUNT" = "0" ]; then
-                log "$NODE has 0 processes — restarting"
+                log "$NODE has 0 processes - restarting"
                 restart_node $i
                 sleep 5
             fi
@@ -96,10 +96,10 @@ while true; do
         PEERS=$(echo "$HEALTH" | grep -o '"peers":[0-9]*' | grep -o '[0-9]*' || echo "0")
         UPTIME=$(echo "$HEALTH" | grep -o '"uptime_secs":[0-9]*' | grep -o '[0-9]*' || echo "0")
 
-        # Detect isolated nodes (0 peers) — allow 240s grace period after startup
+        # Detect isolated nodes (0 peers) - allow 240s grace period after startup
         # for cross-continent peer dial + handshake to complete.
         if [ "$PEERS" = "0" ] && [ "$UPTIME" -gt "240" ]; then
-            log "$NODE isolated (0 peers, uptime ${UPTIME}s, round $ROUND) — restarting"
+            log "$NODE isolated (0 peers, uptime ${UPTIME}s, round $ROUND) - restarting"
             restart_node $i
             LAST_ROUND[$i]=0
             STUCK_SINCE[$i]=0
@@ -116,7 +116,7 @@ while true; do
             fi
             STUCK_DUR=$((NOW - STUCK_START))
             if [ $STUCK_DUR -gt 120 ]; then
-                log "$NODE STUCK at round $ROUND for ${STUCK_DUR}s — restarting"
+                log "$NODE STUCK at round $ROUND for ${STUCK_DUR}s - restarting"
                 restart_node $i
                 STUCK_SINCE[$i]=0
                 LAST_ROUND[$i]=0

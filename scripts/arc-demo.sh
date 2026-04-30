@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Sharded Inference Demo (one command)
+# ARC Chain - Sharded Inference Demo (one command)
 #
 # This is what to run after watching the dashboard. It hits the live
 # coordinator, walks through the demo, and prints colored output proving
@@ -34,7 +34,7 @@ if [ -z "${ARC_COORDINATOR:-}" ] && [ -s "$PICK" ]; then
 fi
 COORDINATOR="${ARC_COORDINATOR:-http://136.244.109.1:9090}"
 # 2026-04-27: the prior B prompt "The capital of France is" reliably
-# triggered a model-side collision with PROMPT_A on the testnet build —
+# triggered a model-side collision with PROMPT_A on the testnet build -
 # both prompts produced identical output tokens for medium-length
 # 5-word inputs. A user-reported issue ("Hashes collided or B failed").
 # Switched to a structurally-distinct B prompt so the isolation check
@@ -60,7 +60,7 @@ section() { printf "\n%s%s%s%s\n" "$BOLD" "$CYAN" "$1" "$RESET"; hr; }
 cat <<BANNER
 ${BOLD}${MAGENTA}
   ╔════════════════════════════════════════════════════════════╗
-  ║   ARC Chain — Sharded Inference Demo                       ║
+  ║   ARC Chain - Sharded Inference Demo                       ║
   ║   A real LLM running across 7 nodes in 7 cities            ║
   ║   Cryptographically verifiable. Pure integer arithmetic.   ║
   ╚════════════════════════════════════════════════════════════╝${RESET}
@@ -168,7 +168,7 @@ PYEOF
 
 # ── 3. Determinism check ────────────────────────────────────────────────────
 section "3. Determinism check"
-printf "  Re-running the SAME prompt — hash should be %sIDENTICAL%s\n\n" "$BOLD" "$RESET"
+printf "  Re-running the SAME prompt - hash should be %sIDENTICAL%s\n\n" "$BOLD" "$RESET"
 
 RESP_A2=$(curl -sf -m "$TIMEOUT" -X POST "${COORDINATOR}/inference/run_sharded" \
     -H 'Content-Type: application/json' \
@@ -178,7 +178,7 @@ HASH_A2=$(echo "$RESP_A2" | python3 -c "import json,sys;print(json.load(sys.stdi
 printf "  Run 1 hash: %s%s%s\n" "$BLUE" "$HASH_A" "$RESET"
 printf "  Run 2 hash: %s%s%s\n" "$BLUE" "$HASH_A2" "$RESET"
 if [ "$HASH_A" = "$HASH_A2" ] && [ -n "$HASH_A" ]; then
-    printf "\n  %s%s✓ DETERMINISTIC%s — bit-identical hash on rerun.\n" "$BOLD" "$GREEN" "$RESET"
+    printf "\n  %s%s✓ DETERMINISTIC%s - bit-identical hash on rerun.\n" "$BOLD" "$GREEN" "$RESET"
     printf "  %sThis means the model output can be cryptographically verified.%s\n" "$DIM" "$RESET"
 else
     printf "\n  %s✗ Hashes diverged.%s\n" "$RED" "$RESET"
@@ -186,7 +186,7 @@ fi
 
 # ── 4. Isolation check ──────────────────────────────────────────────────────
 section "4. Isolation check"
-printf "  Running a DIFFERENT prompt — hash should be %sDIFFERENT%s\n\n" "$BOLD" "$RESET"
+printf "  Running a DIFFERENT prompt - hash should be %sDIFFERENT%s\n\n" "$BOLD" "$RESET"
 
 RESP_B=$(curl -sf -m "$TIMEOUT" -X POST "${COORDINATOR}/inference/run_sharded" \
     -H 'Content-Type: application/json' \
@@ -202,16 +202,16 @@ printf "  Hash B:   %s\n" "$HASH_B"
 printf "  Output B: %s\n" "$OUT_B"
 
 if [ "$HASH_A" != "$HASH_B" ] && [ -n "$HASH_B" ]; then
-    printf "\n  %s%s✓ ISOLATED%s — different prompts → different hashes.\n" "$BOLD" "$GREEN" "$RESET"
+    printf "\n  %s%s✓ ISOLATED%s - different prompts → different hashes.\n" "$BOLD" "$GREEN" "$RESET"
     printf "  %sPer-request KV cache isolation works under concurrent load.%s\n" "$DIM" "$RESET"
 elif [ -z "$HASH_B" ]; then
-    printf "\n  %s⚠ B request failed%s — coordinator returned empty. Retry or use a different coordinator.\n" "$YELLOW" "$RESET"
+    printf "\n  %s⚠ B request failed%s - coordinator returned empty. Retry or use a different coordinator.\n" "$YELLOW" "$RESET"
     printf "  %sCheck %s/health and try again.%s\n" "$DIM" "$COORDINATOR" "$RESET"
 else
     printf "\n  %s⚠ Both prompts produced the same output hash.%s\n" "$YELLOW" "$RESET"
     printf "  %sThis is a known model-side determinism issue on the testnet INT8 forward path:\n" "$DIM"
     printf "  certain medium-length prompts collide on the same generated tokens. The CHAIN's\n"
-    printf "  per-request isolation (KV cache, request_id) is intact — the model output is\n"
+    printf "  per-request isolation (KV cache, request_id) is intact - the model output is\n"
     printf "  deterministic but not yet input-sensitive enough on the live testnet build.\n"
     printf "  Re-run with structurally different prompts via ARC_PROMPT and ARC_PROMPT_B.%s\n" "$RESET"
 fi
@@ -225,7 +225,7 @@ cat <<SUMMARY
   No single one of them has the full model in memory.
 
   Every hop was BLAKE3-verified. The output is bit-identical regardless
-  of which node ran which slice. Pure i64 arithmetic — no floating point.
+  of which node ran which slice. Pure i64 arithmetic - no floating point.
 
   ${BOLD}Try it yourself:${RESET}
     curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash

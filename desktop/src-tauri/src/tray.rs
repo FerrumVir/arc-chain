@@ -1,6 +1,6 @@
 // System tray for ARC Node.
 //
-// The desktop app is designed to run continuously on a user's machine —
+// The desktop app is designed to run continuously on a user's machine -
 // closing the window hides to the tray; the only way to actually stop
 // arc-node is the "Quit" menu item here. Pattern matches Tailscale,
 // Docker Desktop, Ollama.
@@ -29,7 +29,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
     let open_i = MenuItem::with_id(app, "open", "Open ARC Node", true, None::<&str>)?;
     let sep1 = PredefinedMenuItem::separator(app)?;
     let status_i = MenuItem::with_id(app, "status", "Status: starting…", false, None::<&str>)?;
-    let round_i = MenuItem::with_id(app, "round", "Round: —", false, None::<&str>)?;
+    let round_i = MenuItem::with_id(app, "round", "Round: -", false, None::<&str>)?;
     let sep2 = PredefinedMenuItem::separator(app)?;
     let quit_i = MenuItem::with_id(app, "quit", "Quit ARC Node", true, None::<&str>)?;
 
@@ -139,7 +139,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 }
                 _ => (
                     "Status: offline".to_string(),
-                    "Round: —".to_string(),
+                    "Round: -".to_string(),
                 ),
             };
             let _ = status_item.set_text(status_text);

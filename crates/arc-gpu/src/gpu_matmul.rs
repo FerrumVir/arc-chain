@@ -1,8 +1,8 @@
-//! GPU-accelerated integer matmul — native Metal + WGSL fallback.
+//! GPU-accelerated integer matmul - native Metal + WGSL fallback.
 //!
 //! Pre-allocates buffer pools at model load time. Per-matmul dispatch
 //! reuses existing buffers (zero allocation). Native Metal shader uses
-//! char (i8) types directly — no packed u32 extraction overhead.
+//! char (i8) types directly - no packed u32 extraction overhead.
 //!
 //! Apple Silicon: unified memory, weight buffer shared with CPU.
 //! Discrete GPU: weights copied once at load, input/output per dispatch.
@@ -149,7 +149,7 @@ impl GpuMatmul {
             cache: None,
         });
 
-        // MSL passthrough — native Metal char4 types, no u32 packing overhead
+        // MSL passthrough - native Metal char4 types, no u32 packing overhead
         // 4 simdgroups × 32 threads = 128 threads per threadgroup
         let msl_pipeline = if has_msl && !force_wgsl {
             let msl_source = include_str!("matmul.metal");
@@ -533,7 +533,7 @@ mod tests {
 
     /// Diagnostic: test MSL buffer mapping with trivial Metal shaders.
     /// Requires a Metal-capable adapter (Apple Silicon macOS). Skipped
-    /// elsewhere — Linux CI has no GPU so `request_adapter` unwraps None.
+    /// elsewhere - Linux CI has no GPU so `request_adapter` unwraps None.
     #[cfg(target_os = "macos")]
     #[test]
     fn test_msl_buffer_mapping() {
@@ -564,7 +564,7 @@ mod tests {
 
         let diag_src = include_str!("matmul_diag.metal");
 
-        // ─── Test 1: diag_write — 1 buffer, write constant ───
+        // ─── Test 1: diag_write - 1 buffer, write constant ───
         {
             let shader = unsafe {
                 device.create_shader_module_passthrough(
@@ -625,7 +625,7 @@ mod tests {
             assert_eq!(data[1], 67890, "diag_write: buffer(0) mapping failed");
         }
 
-        // ─── Test 2: diag_5buf — 5 buffers matching matmul layout ───
+        // ─── Test 2: diag_5buf - 5 buffers matching matmul layout ───
         {
             let shader = unsafe {
                 device.create_shader_module_passthrough(
@@ -718,7 +718,7 @@ mod tests {
             println!("DIAG2 diag_5buf: [{}, {}, {}, {}, {}]", data[0], data[1], data[2], data[3], data[4]);
             println!("  Expected: [111 (buf0), 222 (buf1), 333 (buf3/params), 444 (buf4/scales), 77777 (sentinel)]");
 
-            // Don't assert yet — just print to discover the actual mapping
+            // Don't assert yet - just print to discover the actual mapping
             if data[4] != 77777 {
                 println!("  SENTINEL MISMATCH: output buffer(2) may not map to binding(2)!");
                 // Try to find the actual data
@@ -838,7 +838,7 @@ mod tests {
                 let result = gpu.matmul(&gw, &input);
                 let nonzero = result.iter().filter(|&&x| x != 0).count();
                 println!("  Non-zero outputs: {}/{}", nonzero, result.len());
-                assert!(nonzero > 0, "All outputs zero — shader not computing");
+                assert!(nonzero > 0, "All outputs zero - shader not computing");
 
                 // Also measure WGSL for comparison
                 println!("\n  Forcing WGSL for comparison...");

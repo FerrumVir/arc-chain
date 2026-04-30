@@ -27,7 +27,7 @@ fn main() {
         .unwrap_or(16);
 
     eprintln!("═══════════════════════════════════════════════════════════");
-    eprintln!("ARC Chain — GGUF Model Inference Benchmark");
+    eprintln!("ARC Chain - GGUF Model Inference Benchmark");
     eprintln!("═══════════════════════════════════════════════════════════");
     eprintln!("  Model:      {}", model_path);
     eprintln!("  Runs:       {}", runs);

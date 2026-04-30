@@ -10,7 +10,7 @@ test.describe("InfoPopover (in-context explainers)", () => {
   test("attestation explainer opens, shows content, closes on Esc", async ({
     page,
   }) => {
-    // There are multiple info-btn on the dashboard — the attestation one
+    // There are multiple info-btn on the dashboard - the attestation one
     // is inside "Recent attestations" card header.
     const infoButtons = page.getByTestId("info-btn");
     await expect(infoButtons.first()).toBeVisible();

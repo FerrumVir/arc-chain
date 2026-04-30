@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Deploy 8-Node Global Testnet on Vultr
+# ARC Chain - Deploy 8-Node Global Testnet on Vultr
 #
 # Prerequisites:
 #   brew install vultr/vultr-cli/vultr-cli
@@ -26,14 +26,14 @@ SSH_KEY="$HOME/.ssh/id_ed25519"
 # ── 8 Vultr regions across 6 continents ──────────────────────────────────────
 # Vultr region slugs: https://api.vultr.com/v2/regions
 REGIONS=(
-    "ewr"    # New York / Newark     — North America
-    "lax"    # Los Angeles           — North America
-    "ams"    # Amsterdam             — Europe
-    "lhr"    # London                — Europe
-    "nrt"    # Tokyo                 — Asia
-    "sgp"    # Singapore             — Asia
-    "sao"    # São Paulo             — South America
-    "jnb"    # Johannesburg          — Africa
+    "ewr"    # New York / Newark     - North America
+    "lax"    # Los Angeles           - North America
+    "ams"    # Amsterdam             - Europe
+    "lhr"    # London                - Europe
+    "nrt"    # Tokyo                 - Asia
+    "sgp"    # Singapore             - Asia
+    "sao"    # São Paulo             - South America
+    "jnb"    # Johannesburg          - Africa
 )
 LABELS=(
     "arc-node-nyc"
@@ -136,7 +136,7 @@ wait_for_ips() {
 generate_seeds() {
     info "Generating seeds file..."
     > "$SEEDS_FILE"
-    echo "# ARC Chain Testnet — Auto-generated $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SEEDS_FILE"
+    echo "# ARC Chain Testnet - Auto-generated $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$SEEDS_FILE"
     echo "# 8 nodes across 6 continents" >> "$SEEDS_FILE"
 
     while IFS=' ' read -r label ip; do
@@ -328,7 +328,7 @@ case "${1:-deploy}" in
         # Generate seeds file from IPs
         generate_seeds
 
-        # Deploy to all 8 nodes (sequential — each takes ~5 min to build)
+        # Deploy to all 8 nodes (sequential - each takes ~5 min to build)
         for idx in "${!REGIONS[@]}"; do
             deploy_node "$idx"
         done

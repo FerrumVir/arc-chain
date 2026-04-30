@@ -1,6 +1,6 @@
 # ARC Chain Node Configuration
 # ─────────────────────────────────────────────────────────────────────────
-# All values shown are defaults — uncomment and modify as needed.
+# All values shown are defaults - uncomment and modify as needed.
 # CLI arguments take precedence over values in this file.
 #
 # Usage: arc-node --config config.toml

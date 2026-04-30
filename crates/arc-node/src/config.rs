@@ -25,7 +25,7 @@ pub struct ChainInfo {
 /// A prefunded account in the genesis state.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct GenesisAccount {
-    /// 64-character hex string (32 bytes) — the account address.
+    /// 64-character hex string (32 bytes) - the account address.
     pub address: String,
     /// Initial balance in ARC (smallest unit).
     pub balance: u64,

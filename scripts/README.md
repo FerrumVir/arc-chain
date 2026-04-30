@@ -1,4 +1,4 @@
-# scripts/ — runtime tooling for the ARC Chain testnet
+# scripts/ - runtime tooling for the ARC Chain testnet
 
 A guide to the scripts shipped with ARC Chain. Most of these can be run as `bash scripts/<name>.sh` from the repo root, or piped via `curl … | bash` from a fresh machine.
 
@@ -78,7 +78,7 @@ bash scripts/arc-bench.sh
 **I'm the operator and a node went down:**
 ```bash
 bash scripts/arc-health-check.sh           # see who's down
-# Seeds run arc-self-heal as a systemd unit — they self-recover on drift
+# Seeds run arc-self-heal as a systemd unit - they self-recover on drift
 # or RPC silence without intervention. If you ever need to install or
 # re-install the daemon on a seed:
 bash scripts/install-self-heal.sh <NODE_IP>

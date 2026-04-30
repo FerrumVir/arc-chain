@@ -1,9 +1,9 @@
-# ARC Node — Canonical Desktop App
+# ARC Node - Canonical Desktop App
 
 **Version:** 0.1.0 · **Stack:** Tauri 2 + React 18 + Vite 5 · **Status:** Working
 
 This is *the* desktop app TJ built and approved on 2026-04-19. Fully committed to
-the repo — if the source ever disappears from the working tree again, check
+the repo - if the source ever disappears from the working tree again, check
 `desktop/src/` at any commit after this one.
 
 ## Running
@@ -23,4 +23,4 @@ npm run tauri:build   # release .dmg → src-tauri/target/release/bundle/dmg/
 ## Draggable window
 - `src/styles/app.css` sets `.titlebar { -webkit-app-region: drag }`
 - `src/components/Titlebar.tsx` includes `data-tauri-drag-region` attribute
-- `tauri.conf.json` uses `titleBarStyle: "Overlay"` + `decorations: true` — native drag + traffic lights on macOS
+- `tauri.conf.json` uses `titleBarStyle: "Overlay"` + `decorations: true` - native drag + traffic lights on macOS

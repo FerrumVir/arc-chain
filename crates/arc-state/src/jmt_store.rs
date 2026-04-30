@@ -2,7 +2,7 @@
 
 //! Jellyfish Merkle Tree (JMT) backing store for ARC Chain.
 //!
-//! Provides incremental state root computation — only accounts modified in a
+//! Provides incremental state root computation - only accounts modified in a
 //! block ("dirty set") have their trie paths recomputed, giving O(k log n) per
 //! block instead of the O(n) full-rebuild the current `StateDB::compute_state_root`
 //! performs.
@@ -54,7 +54,7 @@ pub enum JmtError {
 }
 
 // ---------------------------------------------------------------------------
-// NibblePath — compact representation of a hex-nibble sequence
+// NibblePath - compact representation of a hex-nibble sequence
 // ---------------------------------------------------------------------------
 
 /// A path through the trie expressed as a sequence of 4-bit nibbles.
@@ -63,7 +63,7 @@ pub enum JmtError {
 /// logical length so an odd-length suffix is representable.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NibblePath {
-    /// Packed nibbles — high nibble first in each byte.
+    /// Packed nibbles - high nibble first in each byte.
     bytes: Vec<u8>,
     /// Logical number of nibbles (may be odd, in which case the low nibble of
     /// the last byte is padding).
@@ -193,7 +193,7 @@ impl NibblePath {
 }
 
 // ---------------------------------------------------------------------------
-// NodeKey — uniquely identifies a node across versions
+// NodeKey - uniquely identifies a node across versions
 // ---------------------------------------------------------------------------
 
 /// Identifies a node in the versioned trie.
@@ -206,7 +206,7 @@ pub struct NodeKey {
 }
 
 // ---------------------------------------------------------------------------
-// Node — trie node variants
+// Node - trie node variants
 // ---------------------------------------------------------------------------
 
 /// A node in the Jellyfish Merkle Tree.
@@ -290,7 +290,7 @@ impl LeafNode {
 }
 
 // ---------------------------------------------------------------------------
-// MerkleProof — for light-client state verification
+// MerkleProof - for light-client state verification
 // ---------------------------------------------------------------------------
 
 /// Proof of inclusion (or non-inclusion) of an account in the JMT.
@@ -304,7 +304,7 @@ pub struct MerkleProof {
 }
 
 // ---------------------------------------------------------------------------
-// JmtStore — main structure
+// JmtStore - main structure
 // ---------------------------------------------------------------------------
 
 /// Jellyfish Merkle Tree store with versioned nodes and dirty tracking.
@@ -319,7 +319,7 @@ pub struct JmtStore {
     version_roots: DashMap<u64, Hash256>,
     /// Pending dirty accounts that have not yet been committed.
     dirty: RwLock<HashMap<Address, Hash256>>,
-    /// Root NodeKey path (always empty) — stored per version.
+    /// Root NodeKey path (always empty) - stored per version.
     /// Maps version → root node key for traversal.
     root_keys: DashMap<u64, NodeKey>,
 }
@@ -386,7 +386,7 @@ impl JmtStore {
         };
 
         if dirty.is_empty() {
-            // Nothing changed — carry forward the current root.
+            // Nothing changed - carry forward the current root.
             self.version.store(new_version, Ordering::SeqCst);
             let root = *self.root_hash.read();
             self.version_roots.insert(new_version, root);
@@ -412,7 +412,7 @@ impl JmtStore {
     /// Efficient batch update: stage all accounts then commit in one shot.
     pub fn batch_update(&mut self, dirty: &[(Address, Account)]) -> Hash256 {
         for (addr, account) in dirty {
-            // Unwrap is safe — serialization of Account should always succeed.
+            // Unwrap is safe - serialization of Account should always succeed.
             self.put_account(*addr, account)
                 .expect("account serialization should not fail");
         }
@@ -450,9 +450,9 @@ impl JmtStore {
     ///
     /// Supports both inclusion proofs (leaf address matches queried address)
     /// and non-membership proofs:
-    ///   - Empty slot: `proof.leaf` is `None` — the path leads to an empty
+    ///   - Empty slot: `proof.leaf` is `None` - the path leads to an empty
     ///     position. We walk up from an empty hash using the siblings.
-    ///   - Different key: `proof.leaf` is `Some((other_addr, _))` — a different
+    ///   - Different key: `proof.leaf` is `Some((other_addr, _))` - a different
     ///     key occupies the only possible slot, proving absence of the queried key.
     pub fn verify_proof(root: &Hash256, addr: &Address, proof: &MerkleProof) -> bool {
         // Determine the leaf hash and the path to walk up from.
@@ -467,7 +467,7 @@ impl JmtStore {
 
                 if leaf_addr != addr {
                     // Non-membership proof: a different key occupies this position.
-                    // Verify the proof is valid for THAT key — if the sibling hashes
+                    // Verify the proof is valid for THAT key - if the sibling hashes
                     // reconstruct to the root, it proves the queried key is absent
                     // because only one key can occupy any given trie path.
                     // Walk using the OTHER key's path (the one actually in the trie).
@@ -480,7 +480,7 @@ impl JmtStore {
             None => {
                 // Non-membership proof: empty slot at this position.
                 if proof.siblings.is_empty() {
-                    // Empty trie — root must be ZERO.
+                    // Empty trie - root must be ZERO.
                     return *root == Hash256::ZERO;
                 }
                 // Walk up from an empty leaf hash (ZERO) using the queried
@@ -627,7 +627,7 @@ impl JmtStore {
     ) -> Node {
         match node {
             None | Some(Node::Null) => {
-                // Empty slot — place leaf here with remaining suffix.
+                // Empty slot - place leaf here with remaining suffix.
                 Node::Leaf(LeafNode {
                     address: new_leaf.address,
                     suffix: path.suffix(depth),
@@ -900,7 +900,7 @@ fn hash_pair_with_domain(domain: &[u8], left: &Hash256, right: &Hash256) -> Hash
 }
 
 // ===========================================================================
-// JmtStateTree — simplified incremental Merkle tree for StateDB integration
+// JmtStateTree - simplified incremental Merkle tree for StateDB integration
 // ===========================================================================
 
 /// A simplified Jellyfish Merkle Tree for incremental state root computation.
@@ -1013,7 +1013,7 @@ impl JmtStateTree {
                     hasher.update(chunk[1].as_ref());
                     next_level.push(Hash256(*hasher.finalize().as_bytes()));
                 } else {
-                    // Odd number of nodes — promote without hashing.
+                    // Odd number of nodes - promote without hashing.
                     next_level.push(chunk[0]);
                 }
             }
@@ -1033,7 +1033,7 @@ impl JmtStateTree {
         // the prune watermark in `version` so that future extensions can
         // use it.
         if version > self.version {
-            // Cannot prune past the current version — clamp silently.
+            // Cannot prune past the current version - clamp silently.
             return;
         }
         // In the full VersionedJmtStore this would drop old nodes.
@@ -1104,7 +1104,7 @@ impl JmtStateTree {
             if sibling_idx < current_level.len() {
                 siblings.push(current_level[sibling_idx]);
             } else {
-                // Odd number of nodes — no sibling.
+                // Odd number of nodes - no sibling.
                 siblings.push(Hash256::ZERO);
             }
 
@@ -1242,7 +1242,7 @@ mod tests {
         // Batch roots must be identical regardless of order.
         assert_eq!(root2, root3, "batch must be order-independent");
         // Sequential inserts across two commits vs. single batch may differ
-        // (different trie structure due to versioning) — but a single batch
+        // (different trie structure due to versioning) - but a single batch
         // with the same final state must be deterministic.
     }
 

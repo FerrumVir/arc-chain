@@ -1,4 +1,4 @@
-//! ARC Chain — Signed Transaction Benchmark Suite
+//! ARC Chain - Signed Transaction Benchmark Suite
 //!
 //! Measures real TPS with signature verification: Ed25519 (classical) vs ML-DSA-65 (quantum-proof).
 //!
@@ -6,11 +6,11 @@
 //!   arc-bench-signed [--txs N] [--mode unsigned|signed|batch-verified|ml-dsa|all] [--threads N]
 //!
 //! Modes:
-//!   unsigned       — No signature checks (baseline)
-//!   signed         — Generate real Ed25519-signed txs, verify each individually
-//!   batch-verified — Generate signed txs, batch_verify_ed25519() then execute
-//!   ml-dsa         — Generate ML-DSA-65 (post-quantum) signed txs + batch verify
-//!   all            — Run all modes including quantum comparison (default)
+//!   unsigned       - No signature checks (baseline)
+//!   signed         - Generate real Ed25519-signed txs, verify each individually
+//!   batch-verified - Generate signed txs, batch_verify_ed25519() then execute
+//!   ml-dsa         - Generate ML-DSA-65 (post-quantum) signed txs + batch verify
+//!   all            - Run all modes including quantum comparison (default)
 
 use arc_crypto::{hash_bytes, batch_verify_ed25519, batch_verify_ml_dsa, Hash256, KeyPair};
 use arc_crypto::signature::{ML_DSA_PK_LEN, ML_DSA_SIG_LEN};
@@ -27,7 +27,7 @@ use std::time::Instant;
 #[derive(Parser, Debug)]
 #[command(
     name = "arc-bench-signed",
-    about = "ARC Chain — Signature Benchmark (Ed25519 + ML-DSA-65 Quantum-Proof)"
+    about = "ARC Chain - Signature Benchmark (Ed25519 + ML-DSA-65 Quantum-Proof)"
 )]
 struct Args {
     /// Number of transactions to benchmark.
@@ -105,7 +105,7 @@ fn generate_signed_transactions(
 fn generate_ml_dsa_transactions(
     count: usize,
 ) -> (Vec<Transaction>, Vec<KeyPair>, std::time::Duration, std::time::Duration) {
-    // Step 1: Generate ML-DSA keypairs (parallel — heavier than Ed25519)
+    // Step 1: Generate ML-DSA keypairs (parallel - heavier than Ed25519)
     let keygen_start = Instant::now();
     let keypairs: Vec<KeyPair> = (0..count)
         .into_par_iter()
@@ -465,7 +465,7 @@ fn print_results(results: &BenchResults) {
 
     println!();
     println!("{}", line);
-    println!(" ARC Chain Benchmark — Classical vs Quantum-Proof Signatures");
+    println!(" ARC Chain Benchmark - Classical vs Quantum-Proof Signatures");
     println!("{}", line);
     println!(
         " Transactions     : {}",
@@ -493,7 +493,7 @@ fn print_results(results: &BenchResults) {
         results.batch_speedup
     );
     println!("{}", dash);
-    println!(" ML-DSA-65 (QUANTUM-PROOF — NIST FIPS 204)");
+    println!(" ML-DSA-65 (QUANTUM-PROOF - NIST FIPS 204)");
     println!("{}", dash);
     println!(
         " Key Generation   : {:>12} keys/sec",
@@ -595,7 +595,7 @@ fn main() {
 
     println!();
     println!("================================================================");
-    println!(" ARC Chain — Signature Benchmark (Classical + Quantum-Proof)");
+    println!(" ARC Chain - Signature Benchmark (Classical + Quantum-Proof)");
     println!(" {} transactions, {} threads", format_number(n), num_threads);
     println!("================================================================");
     println!();

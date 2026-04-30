@@ -54,10 +54,10 @@ pub fn derive(phrase: &str) -> Result<Identity, String> {
         created_at: chrono::Utc::now().timestamp_millis(),
     })
     .map(|id| {
-        // Tag logging only — identity still returned unchanged.
+        // Tag logging only - identity still returned unchanged.
         if !is_bip39 {
             tracing::warn!(
-                "imported identity is not a BIP-39 phrase — derivation still deterministic but no checksum protection"
+                "imported identity is not a BIP-39 phrase - derivation still deterministic but no checksum protection"
             );
         }
         id

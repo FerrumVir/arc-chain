@@ -260,7 +260,7 @@ impl RollupVerifier {
         }
 
         // Mock verification: BLAKE3 of proof_data must have leading zero
-        // nibble. This is NOT a ZK proof — it's a trivial PoW check for
+        // nibble. This is NOT a ZK proof - it's a trivial PoW check for
         // pipeline testing. Real STARK verification is in `stwo_air.rs`.
         let h = blake3::hash(&proof.proof_data);
         h.as_bytes()[0] < 0x10
@@ -397,17 +397,17 @@ pub fn resolve_dispute(
     match clone.apply_batch(&batch.transactions) {
         Ok(actual_root) => {
             if actual_root != batch.post_state_root {
-                // The batch's claimed post-root is wrong — fraud confirmed.
+                // The batch's claimed post-root is wrong - fraud confirmed.
                 DisputeResolution::ProverSlashed
             } else if fraud.expected_root != actual_root {
-                // Challenger's expected root is wrong — no fraud.
+                // Challenger's expected root is wrong - no fraud.
                 DisputeResolution::NoFraud
             } else {
                 DisputeResolution::NoFraud
             }
         }
         Err(_) => {
-            // Batch contains an invalid transaction — fraud confirmed.
+            // Batch contains an invalid transaction - fraud confirmed.
             DisputeResolution::ProverSlashed
         }
     }

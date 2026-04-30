@@ -1,6 +1,6 @@
 [package]
 name = "arc-cli"
-description = "ARC Chain CLI — key management, queries, transactions"
+description = "ARC Chain CLI - key management, queries, transactions"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

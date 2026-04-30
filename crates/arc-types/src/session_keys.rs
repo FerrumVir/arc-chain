@@ -249,7 +249,7 @@ impl SessionKeyManager {
     /// This checks: status, expiration, contract whitelist, function whitelist,
     /// per-tx value limit, total value budget, gas limit, and rate limit.
     ///
-    /// Does NOT record usage — call `record_usage` after successful execution.
+    /// Does NOT record usage - call `record_usage` after successful execution.
     pub fn validate_transaction(
         &self,
         key_id: [u8; 32],
@@ -576,7 +576,7 @@ mod tests {
         for i in 0..5u64 {
             mgr.record_usage(kid, 100, 21_000, i).unwrap();
         }
-        // Move to next hour — should pass validation.
+        // Move to next hour - should pass validation.
         mgr.validate_transaction(kid, addr(50), selector(0xAA), 100, 21_000, 3700)
             .unwrap();
     }

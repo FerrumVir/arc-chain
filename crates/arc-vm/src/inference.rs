@@ -2,9 +2,9 @@
 //! Manages model lifecycle and executes inference requests within the ARC VM.
 //!
 //! Supports two modes:
-//! 1. **Real compute** — loads serialized `NeuralNet` weights and runs actual
+//! 1. **Real compute** - loads serialized `NeuralNet` weights and runs actual
 //!    matrix-multiply forward passes (Dense, ReLU, Softmax, LayerNorm, Embedding).
-//! 2. **Mock fallback** — when no model weights are provided, uses the legacy
+//! 2. **Mock fallback** - when no model weights are provided, uses the legacy
 //!    mock behaviour (reversed text, normalized embeddings, etc.).
 //!
 //! All floating-point arithmetic is designed for deterministic, platform-identical
@@ -25,9 +25,9 @@ pub enum Layer {
         weights: Vec<Vec<f32>>,
         bias: Vec<f32>,
     },
-    /// Rectified Linear Unit — `max(0, x)`.
+    /// Rectified Linear Unit - `max(0, x)`.
     ReLU,
-    /// Softmax — `exp(x_i) / sum_j(exp(x_j))`.
+    /// Softmax - `exp(x_i) / sum_j(exp(x_j))`.
     Softmax,
     /// Layer normalization with learnable affine parameters.
     LayerNorm {
@@ -103,7 +103,7 @@ fn write_f32(buf: &mut Vec<u8>, val: f32) {
 
 impl NeuralNet {
     // ------------------------------------------------------------------
-    // Serialization — simple binary format
+    // Serialization - simple binary format
     // ------------------------------------------------------------------
     //
     //  [4 bytes] num_layers  (u32 LE)
@@ -331,7 +331,7 @@ impl NeuralNet {
         let exps: Vec<f32> = input.iter().map(|&x| (x - max_val).exp()).collect();
         let sum: f32 = exps.iter().sum();
         if sum == 0.0 {
-            // Degenerate case — return uniform.
+            // Degenerate case - return uniform.
             let n = input.len() as f32;
             return vec![1.0 / n; input.len()];
         }
@@ -372,7 +372,7 @@ impl NeuralNet {
             if idx < table.len() {
                 output.extend_from_slice(&table[idx]);
             } else {
-                // Out-of-vocabulary — emit zeros matching embed_dim.
+                // Out-of-vocabulary - emit zeros matching embed_dim.
                 let dim = if table.is_empty() { 0 } else { table[0].len() };
                 output.extend(std::iter::repeat(0.0f32).take(dim));
             }
@@ -399,11 +399,11 @@ impl NeuralNet {
                     return Ok(table.len());
                 }
                 Layer::LayerNorm { gamma, .. } => return Ok(gamma.len()),
-                // ReLU / Softmax are element-wise — skip to find a sized layer.
+                // ReLU / Softmax are element-wise - skip to find a sized layer.
                 _ => continue,
             }
         }
-        // No sized layer found — accept any size.
+        // No sized layer found - accept any size.
         Ok(0)
     }
 
@@ -854,7 +854,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Original tests (must still pass — backward compat)
+    // Original tests (must still pass - backward compat)
     // -----------------------------------------------------------------------
 
     #[test]

@@ -1,4 +1,4 @@
-//! Wire protocol — message framing for QUIC streams.
+//! Wire protocol - message framing for QUIC streams.
 //!
 //! Every message on a QUIC stream is framed as:
 //!   [1 byte type][4 bytes payload length (u32 BE)][N bytes bincode payload]
@@ -22,32 +22,32 @@ pub enum MessageType {
     TxGossip = 0x04,
     /// State diff from a proposer node (Propose-Verify protocol).
     StateDiff = 0x05,
-    /// Peer Exchange — share known peer list for dynamic discovery.
+    /// Peer Exchange - share known peer list for dynamic discovery.
     PeerExchange = 0x06,
-    /// State Sync — request the snapshot manifest from a peer.
+    /// State Sync - request the snapshot manifest from a peer.
     SnapshotManifestRequest = 0x07,
-    /// State Sync — response with snapshot manifest.
+    /// State Sync - response with snapshot manifest.
     SnapshotManifestResponse = 0x08,
-    /// State Sync — request a single snapshot chunk by index.
+    /// State Sync - request a single snapshot chunk by index.
     SnapshotChunkRequest = 0x09,
-    /// State Sync — response with a snapshot chunk.
+    /// State Sync - response with a snapshot chunk.
     SnapshotChunkResponse = 0x0A,
-    /// Inference request — routed to peers with GPU/model capability.
+    /// Inference request - routed to peers with GPU/model capability.
     InferenceRequest = 0x0B,
-    /// Inference response — result from a community GPU node.
+    /// Inference response - result from a community GPU node.
     InferenceResponse = 0x0C,
-    /// Heartbeat — lightweight liveness probe with round info.
+    /// Heartbeat - lightweight liveness probe with round info.
     /// Sent during reconnect to detect dead QUIC streams and partitions.
     Heartbeat = 0x0D,
-    /// Shard activation forward — send layer activations to next shard holder.
+    /// Shard activation forward - send layer activations to next shard holder.
     ShardForward = 0x0E,
-    /// Shard result — final logits/token from last shard back to coordinator.
+    /// Shard result - final logits/token from last shard back to coordinator.
     ShardResult = 0x0F,
-    /// Shard registration — announce which model layers this node holds.
+    /// Shard registration - announce which model layers this node holds.
     ShardAnnounce = 0x10,
-    /// DAG round sync request — ask peer for their current round state.
+    /// DAG round sync request - ask peer for their current round state.
     RoundSyncRequest = 0x11,
-    /// DAG round sync response — reply with current round and committed round.
+    /// DAG round sync response - reply with current round and committed round.
     RoundSyncResponse = 0x12,
 }
 
@@ -137,27 +137,27 @@ pub struct StateDiffMessage {
     pub block_height: u64,
 }
 
-/// Peer Exchange message — shares a list of known peers for dynamic discovery.
+/// Peer Exchange message - shares a list of known peers for dynamic discovery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerExchangeMessage {
     pub peers: Vec<PexPeerInfo>,
 }
 
-/// State Sync — request snapshot manifest from a peer.
+/// State Sync - request snapshot manifest from a peer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifestRequestMessage {
     /// Optionally request a snapshot at a specific height (0 = latest).
     pub prefer_height: u64,
 }
 
-/// State Sync — response with snapshot manifest.
+/// State Sync - response with snapshot manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotManifestResponseMessage {
     /// The manifest describing the chunked snapshot.
     pub manifest: arc_state::SnapshotManifest,
 }
 
-/// State Sync — request a single snapshot chunk by index.
+/// State Sync - request a single snapshot chunk by index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotChunkRequestMessage {
     /// BLAKE3 hash of the manifest (to identify which snapshot).
@@ -166,14 +166,14 @@ pub struct SnapshotChunkRequestMessage {
     pub chunk_index: u32,
 }
 
-/// State Sync — response with a snapshot chunk.
+/// State Sync - response with a snapshot chunk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotChunkResponseMessage {
     /// The snapshot chunk data (includes BLAKE3 proof for verification).
     pub chunk: arc_state::StateSnapshot,
 }
 
-/// Inference request — broadcast to peers with model capability.
+/// Inference request - broadcast to peers with model capability.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceRequestMessage {
     /// Unique request ID (BLAKE3 hash of input + timestamp).
@@ -186,14 +186,14 @@ pub struct InferenceRequestMessage {
     pub requester: Hash256,
 }
 
-/// Inference response — result from a community GPU node.
+/// Inference response - result from a community GPU node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceResponseMessage {
     /// Matches the request_id from InferenceRequestMessage.
     pub request_id: Hash256,
     /// Generated output text.
     pub output: String,
-    /// BLAKE3 hash of the output (deterministic — identical on all hardware).
+    /// BLAKE3 hash of the output (deterministic - identical on all hardware).
     pub output_hash: Hash256,
     /// Model hash (identifies which model produced this output).
     pub model_hash: Hash256,
@@ -287,7 +287,7 @@ pub struct RoundSyncResponseMessage {
     pub total_stake: u64,
 }
 
-/// Heartbeat payload — now includes round info for partition detection.
+/// Heartbeat payload - now includes round info for partition detection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeartbeatMessage {
     /// Sender's current DAG round.
@@ -301,7 +301,7 @@ pub struct HeartbeatMessage {
 
 // ─── Framing ────────────────────────────────────────────────────────────────
 
-/// Maximum message payload size (16 MiB — generous for large blocks).
+/// Maximum message payload size (16 MiB - generous for large blocks).
 const MAX_PAYLOAD_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Write a framed message to a QUIC send stream.
@@ -349,7 +349,7 @@ pub async fn read_message<R: AsyncRead + Unpin>(
                 let mut discard = vec![0u8; len as usize];
                 reader.read_exact(&mut discard).await?;
                 tracing::debug!(
-                    "Skipped unknown message type 0x{:02x} ({} bytes) — peer may be newer version",
+                    "Skipped unknown message type 0x{:02x} ({} bytes) - peer may be newer version",
                     type_byte, len
                 );
             }

@@ -1,4 +1,4 @@
-# ARC Chain — Status (2026-04-22)
+# ARC Chain - Status (2026-04-22)
 
 Current production state of the ARC testnet. Refreshed 2026-04-22 to reflect
 the cluster self-heal / latency-aware routing / slashing wire-up / SAO+JNB
@@ -7,9 +7,9 @@ CHANGELOG.md tracks what changed when.**
 
 ## TL;DR
 
-A real **Llama-2-7B** is running across **6 separate VPS in 6 cities** (NYC, LAX, AMS, LHR, NRT, SGP) with **3× replication per layer range** — 6 contiguous ranges spanning the 32 transformer layers, each held by 3 seeds. A request flows through the pipeline via HTTP, every hidden state is BLAKE3-hashed, and the output is bit-identical regardless of which replica answers each hop. `/inference/run_consensus` fires to k=3 replicas in parallel and requires majority hash agreement; `/inference/run_sharded` picks the fastest and falls over to the next on failure.
+A real **Llama-2-7B** is running across **6 separate VPS in 6 cities** (NYC, LAX, AMS, LHR, NRT, SGP) with **3× replication per layer range** - 6 contiguous ranges spanning the 32 transformer layers, each held by 3 seeds. A request flows through the pipeline via HTTP, every hidden state is BLAKE3-hashed, and the output is bit-identical regardless of which replica answers each hop. `/inference/run_consensus` fires to k=3 replicas in parallel and requires majority hash agreement; `/inference/run_sharded` picks the fastest and falls over to the next on failure.
 
-**Live demo**: http://140.82.16.112:3200 — type a prompt in the "Sharded AI" panel.
+**Live demo**: http://140.82.16.112:3200 - type a prompt in the "Sharded AI" panel.
 
 **One-command end-to-end demo**:
 ```bash
@@ -30,7 +30,7 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/ins
 
 ## What works (verified live)
 
-- ✅ **6-shard pipeline with 3× replication** running Llama-2-7B across NYC, LAX, AMS, LHR, NRT, SGP — 18 replica entries across 6 contiguous layer ranges
+- ✅ **6-shard pipeline with 3× replication** running Llama-2-7B across NYC, LAX, AMS, LHR, NRT, SGP - 18 replica entries across 6 contiguous layer ranges
 - ✅ **TJ Mac upgraded to v0.4.6** as a 9th node (parallel mode, full model loaded)
 - ✅ **Coherent factual outputs**: "The largest planet is" → "Jupiter, which is more than 1,31...", "The capital of France is" → "Paris.", "The fastest land animal is" → "the cheetah", "The currency of Japan is" → "the Japanese yen (JPY)", "The longest river is" → "the Nile River"
 - ✅ **Cross-platform integer determinism**: same prompt → same output_hash on every replay
@@ -44,7 +44,7 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/ins
 - ✅ **Model identity verified**: all 18 replica entries (6 ranges × 3 replicas) report identical BLAKE3 model_id (`0xabec2d58...`)
 - ✅ **Community installer** auto-detects platform, installs persistent service, schedules daily auto-update
 - ✅ **GitHub Actions release workflow** auto-builds Mac arm64 + Linux x86_64 on tag push (5+ consecutive successful auto-releases through v0.4.6)
-- ✅ **Self-heal daemon (`arc-self-heal`)** on every seed — auto-restarts arc-node on RPC silence or consensus drift, preserving every `--shard-range`, `--model`, and `ARC_PUBLIC_SOCKET` via `/proc/PID/cmdline` + `environ`. Deployed to all 6 seeds 2026-04-22 (GH #30).
+- ✅ **Self-heal daemon (`arc-self-heal`)** on every seed - auto-restarts arc-node on RPC silence or consensus drift, preserving every `--shard-range`, `--model`, and `ARC_PUBLIC_SOCKET` via `/proc/PID/cmdline` + `environ`. Deployed to all 6 seeds 2026-04-22 (GH #30).
 - ✅ **Dashboard** defaults to `/inference/run_consensus` (GH #34) with k=3; shows live pipeline diagram with per-hop trace replay, model_id verify badge, server-side activity counters aggregated across the 6 seeds, persisted run history with per-run Verify button, copy-pasteable join command, and Open Graph meta tags for shareable previews
 
 ## What's flaky / known issues
@@ -59,7 +59,7 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/ins
 | Version | Date | Highlight |
 |---------|------|-----------|
 | v0.4.0 | 2026-04-08 | Pipeline-parallel sharded inference shipped |
-| v0.4.1 | 2026-04-08 | INT16 quality fix — output now coherent on Llama-7B |
+| v0.4.1 | 2026-04-08 | INT16 quality fix - output now coherent on Llama-7B |
 | v0.4.2 | 2026-04-08 | Server-side sharded inference activity counters |
 | v0.4.3 | 2026-04-08 | CI fix: dropped macos-13 runner (was breaking releases) |
 | v0.4.4 | 2026-04-08 | Sharded runs now submit on-chain InferenceAttestation TX |
@@ -73,8 +73,8 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 ### Rust (arc-node + arc-inference)
 - `crates/arc-inference/src/cached_integer_model.rs`:
   - `I8Weights::empty()`, `I16Weights::empty()`, `CachedLayer::placeholder()` (zero-byte placeholders for sharded loading)
-  - `load_cached_model_shard(path, start_layer, end_layer)` — loads only the held layers, populates both I8 and I16 from f32
-  - `CachedIntegerModel::forward_shard_token(input, cache, start_layer, end_layer, position)` — runs the shard's slice on a token id (first shard) or hidden state (middle/last shards)
+  - `load_cached_model_shard(path, start_layer, end_layer)` - loads only the held layers, populates both I8 and I16 from f32
+  - `CachedIntegerModel::forward_shard_token(input, cache, start_layer, end_layer, position)` - runs the shard's slice on a token id (first shard) or hidden state (middle/last shards)
   - `ShardInput::{Token, Hidden}` and `ShardOutput::{Hidden, Token}` enums
 - `crates/arc-node/src/main.rs`:
   - `--shard-start` / `--shard-end` CLI flags
@@ -84,23 +84,23 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 - `crates/arc-node/src/rpc.rs`:
   - `NodeState` gains `shard_info`, `shard_kv_caches`, `shard_registry`, `sharded_runs_total`, `sharded_bytes_total`, `attestation_nonce`
   - `ShardInfo` struct with model_id, layer range, memory, socket, friendly node name
-  - `POST /inference/forward_shard` — per-shard handler with BLAKE3 hash verification
-  - `POST /inference/run_sharded` — coordinator endpoint, walks the pipeline, submits on-chain attestation, returns full per-hop trace
-  - `GET /shards` and `POST /shards/announce` — registry discovery
+  - `POST /inference/forward_shard` - per-shard handler with BLAKE3 hash verification
+  - `POST /inference/run_sharded` - coordinator endpoint, walks the pipeline, submits on-chain attestation, returns full per-hop trace
+  - `GET /shards` and `POST /shards/announce` - registry discovery
   - `parse_hash` accepts both `0x`-prefixed and bare hex
   - Attestation nonce: `base_nonce + atomic_bump` (unique per submission)
   - `/stats` exposes `sharded_runs_total` + `sharded_bytes_total`
   - Faucet uses lock-free `DashMap` (was holding sync Mutex across awaits)
 
 ### Scripts
-- `scripts/install-community-node.sh` — one-command installer (platform detect, binary download, model download, launchd/systemd service, daily auto-update)
-- `scripts/arc-demo.sh` — end-to-end demo (discover pipeline → run inference → determinism check → isolation check)
-- `scripts/arc-verify.sh` — third-party attestation verifier with `--latest` mode
-- `scripts/arc-bench.sh` — factual benchmark with markdown report
-- `scripts/arc-self-heal.sh` + `.service` + `install-self-heal.sh` — per-host self-heal daemon (GH #30). Systemd unit on each seed auto-restarts arc-node on RPC silence / consensus drift, preserves shard flags via `/proc/PID/cmdline`.
-- `scripts/arc-watchdog.sh` — legacy off-cluster watchdog, superseded by `arc-self-heal`.
-- `scripts/arc-health-check.sh` — network-wide health probe
-- `.github/workflows/release.yml` — auto-build + auto-publish on tag push
+- `scripts/install-community-node.sh` - one-command installer (platform detect, binary download, model download, launchd/systemd service, daily auto-update)
+- `scripts/arc-demo.sh` - end-to-end demo (discover pipeline → run inference → determinism check → isolation check)
+- `scripts/arc-verify.sh` - third-party attestation verifier with `--latest` mode
+- `scripts/arc-bench.sh` - factual benchmark with markdown report
+- `scripts/arc-self-heal.sh` + `.service` + `install-self-heal.sh` - per-host self-heal daemon (GH #30). Systemd unit on each seed auto-restarts arc-node on RPC silence / consensus drift, preserves shard flags via `/proc/PID/cmdline`.
+- `scripts/arc-watchdog.sh` - legacy off-cluster watchdog, superseded by `arc-self-heal`.
+- `scripts/arc-health-check.sh` - network-wide health probe
+- `.github/workflows/release.yml` - auto-build + auto-publish on tag push
 
 ### Dashboard
 - "Sharded AI" hero section with live pipeline diagram
@@ -114,27 +114,27 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 - SVG favicon
 
 ### Docs (9 user-facing)
-- `README.md` — rewrite leading with sharding + ASCII pipeline diagram + Documentation index
-- `docs/HOW-SHARDING-WORKS.md` (184 lines) — engineer-grade architecture deep dive
-- `docs/SERO-DEMO.md` (211 lines) — 7-step walkthrough with timings
-- `docs/ANNOUNCEMENT.md` (107 lines) — copy-paste shareable summary for socials
-- `docs/PERFORMANCE-COMPARISON.md` (72 lines) — honest latency comparison vs centralized API + local llama.cpp
-- `docs/STATUS.md` — this file
-- `docs/BENCHMARK-RESULTS.md` — captured factual benchmark (3/3 pass)
-- `CHANGELOG.md` — release notes for v0.3.0 → v0.4.6
-- `scripts/README.md` — index for the 25+ scripts in scripts/
+- `README.md` - rewrite leading with sharding + ASCII pipeline diagram + Documentation index
+- `docs/HOW-SHARDING-WORKS.md` (184 lines) - engineer-grade architecture deep dive
+- `docs/SERO-DEMO.md` (211 lines) - 7-step walkthrough with timings
+- `docs/ANNOUNCEMENT.md` (107 lines) - copy-paste shareable summary for socials
+- `docs/PERFORMANCE-COMPARISON.md` (72 lines) - honest latency comparison vs centralized API + local llama.cpp
+- `docs/STATUS.md` - this file
+- `docs/BENCHMARK-RESULTS.md` - captured factual benchmark (3/3 pass)
+- `CHANGELOG.md` - release notes for v0.3.0 → v0.4.6
+- `scripts/README.md` - index for the 25+ scripts in scripts/
 
 ### Tests
-- `cached_integer_model::tests::test_forward_shard_token_full_equals_split` — 4-layer model, single shard equals 2-shard split at K=2
-- `cached_integer_model::tests::test_forward_shard_token_three_way_split` — 6-layer model, single shard equals 3-shard chain [0,2)→[2,4)→[4,6)
-- `cached_integer_model::tests::test_forward_shard_token_multi_position` — 4 sequential positions through both single shard and 2-way split, token sequences match
+- `cached_integer_model::tests::test_forward_shard_token_full_equals_split` - 4-layer model, single shard equals 2-shard split at K=2
+- `cached_integer_model::tests::test_forward_shard_token_three_way_split` - 6-layer model, single shard equals 3-shard chain [0,2)→[2,4)→[4,6)
+- `cached_integer_model::tests::test_forward_shard_token_multi_position` - 4 sequential positions through both single shard and 2-way split, token sequences match
 - All 3 pass in 0.02 s; catches any future bug in layer-boundary stitching, RoPE positions, or KV cache pushes across shards
 
 ## Headline numbers
 
 - **6 layer ranges × 3 replicas** of Llama-2-7B serving sharded inference (18 replica entries total)
 - **6 testnet seed nodes** in NYC, LAX, AMS, LHR, NRT, SGP (SAO + JNB retired 2026-04-22, GH #32)
-- **32 transformer layers** split into 6 contiguous ranges: [0,6), [6,12), [12,17), [17,22), [22,27), [27,32). Each range is held by 3 seeds — any one can answer a hop, primary picked by EWMA latency.
+- **32 transformer layers** split into 6 contiguous ranges: [0,6), [6,12), [12,17), [17,22), [22,27), [27,32). Each range is held by 3 seeds - any one can answer a hop, primary picked by EWMA latency.
 - **~1.1 GB per range-replica** of weights (the full model is ~4 GB; a multi-range seed like AMS holds 3 ranges = ~3.3 GB in RAM)
 - **~150 KB transferred per token** across the network (i64 hidden states + JSON envelope + BLAKE3 hash)
 - **~10-13 sec/token** wall time end-to-end via `/inference/run_sharded`; `/inference/run_consensus` with k=3 is slower per-hop but catches hash divergence
@@ -144,10 +144,10 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 
 ## What TJ should look at first when he wakes up
 
-1. **Open the dashboard**: http://140.82.16.112:3200 — see the live pipeline, click "Run Through Pipeline" with the default prompt, watch the cards animate, see the trace
+1. **Open the dashboard**: http://140.82.16.112:3200 - see the live pipeline, click "Run Through Pipeline" with the default prompt, watch the cards animate, see the trace
 2. **Read** `docs/SERO-DEMO.md` for the screen-recording flow
 3. **Read** `docs/ANNOUNCEMENT.md` for the social-post version
-4. **Try the verifier**: `bash scripts/arc-verify.sh --latest` — see the cryptographic proof
+4. **Try the verifier**: `bash scripts/arc-verify.sh --latest` - see the cryptographic proof
 5. **Check the autoloop log**: `/tmp/arc-autoloop-state.md` for iter-by-iter progress
 6. **Ship the install link to Sero**: `curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash`
 

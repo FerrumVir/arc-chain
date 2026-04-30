@@ -1,4 +1,4 @@
-//! Block-STM — optimistic parallel transaction execution with conflict detection.
+//! Block-STM - optimistic parallel transaction execution with conflict detection.
 //!
 //! Implements the Block-STM algorithm from Aptos/Diem:
 //!
@@ -372,7 +372,7 @@ impl BlockSTM {
                     nonce: wv.nonce,
                 }
             } else {
-                // No predecessor write — use base state.
+                // No predecessor write - use base state.
                 let snap = self.read_account_from_state(&Hash256(key));
                 ReadValue {
                     balance: snap.balance,
@@ -405,7 +405,7 @@ impl BlockSTM {
             let exec = &executions[i];
 
             if exec.write_set.is_empty() && !exec.success {
-                // Non-transfer tx type or failed validation — try sequential execution.
+                // Non-transfer tx type or failed validation - try sequential execution.
                 // Only attempt if this is a supported tx type that we skipped in STM.
                 match &transactions[i].body {
                     TxBody::Transfer(_) | TxBody::Settle(_) => {
@@ -496,7 +496,7 @@ mod tests {
 
     #[test]
     fn test_disjoint_transfers_parallel() {
-        // A->B and C->D are fully disjoint — no conflicts expected.
+        // A->B and C->D are fully disjoint - no conflicts expected.
         let state = Arc::new(StateDB::with_genesis(&[
             (addr(1), 1_000_000),
             (addr(2), 0),
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_conflicting_transfers_same_receiver() {
-        // A->C and B->C both write to C — conflict on receiver.
+        // A->C and B->C both write to C - conflict on receiver.
         // Block-STM should detect and re-execute to get correct final balance.
         let state = Arc::new(StateDB::with_genesis(&[
             (addr(1), 1_000_000),
@@ -547,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_same_sender_sequential_nonces() {
-        // A->B (nonce 0) and A->C (nonce 1) — must execute in order.
+        // A->B (nonce 0) and A->C (nonce 1) - must execute in order.
         // First tx sets nonce to 1, second needs to read nonce=1.
         let state = Arc::new(StateDB::with_genesis(&[
             (addr(1), 1_000_000),

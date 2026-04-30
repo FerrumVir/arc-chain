@@ -90,7 +90,7 @@ fn main() {
     let context = b"ARC-chain-tx-v1";
 
     // Phase 1: Derive key from context string
-    // Context is 15 bytes — fits in one block (64 bytes)
+    // Context is 15 bytes - fits in one block (64 bytes)
     let context_block = bytes_to_block(context);
     let flags = CHUNK_START | CHUNK_END | ROOT | DERIVE_KEY_CONTEXT;
     let context_result = compress(&IV, &context_block, 0, context.len() as u32, flags);

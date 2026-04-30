@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# arc-compile — Compile Solidity contracts for ARC Chain deployment
+# arc-compile - Compile Solidity contracts for ARC Chain deployment
 set -euo pipefail
 
 VERSION="0.1.0"
@@ -21,7 +21,7 @@ err()   { echo -e "${RED}[arc-compile]${NC} $*" >&2; }
 # ── Usage ───────────────────────────────────────────────────────────────────
 usage() {
   cat <<EOF
-${BOLD}arc-compile v${VERSION}${NC} — Compile Solidity contracts for ARC Chain
+${BOLD}arc-compile v${VERSION}${NC} - Compile Solidity contracts for ARC Chain
 
 ${BOLD}Usage:${NC}
   arc-compile <file.sol> [options]
@@ -61,7 +61,7 @@ check_solc() {
     echo "  Linux (snap):"
     echo "    sudo snap install solc"
     echo ""
-    echo "  Any platform (solc-select — recommended for version management):"
+    echo "  Any platform (solc-select - recommended for version management):"
     echo "    pip install solc-select"
     echo "    solc-select install 0.8.24"
     echo "    solc-select use 0.8.24"

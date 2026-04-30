@@ -154,7 +154,7 @@ impl MetalVerifier {
         }
 
         if self.gpu_available && tasks.len() >= self.min_batch_for_gpu {
-            // GPU path — unwrap is safe because we checked gpu_available
+            // GPU path - unwrap is safe because we checked gpu_available
             self.batch_verify_gpu(tasks)
                 .unwrap_or_else(|_| self.batch_verify_cpu(tasks))
         } else {
@@ -340,7 +340,7 @@ impl MetalVerifier {
     ///
     /// Metal is available on macOS with Apple Silicon (aarch64).
     /// Intel Macs also have Metal but with significantly less compute
-    /// throughput — we target Apple Silicon only for now.
+    /// throughput - we target Apple Silicon only for now.
     fn detect_metal_gpu() -> bool {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
@@ -364,7 +364,7 @@ impl Default for MetalVerifier {
 /// Verify a single Ed25519 signature using `ed25519_dalek::verify_strict`.
 ///
 /// Returns `true` if the signature is valid, `false` otherwise.
-/// This never panics — invalid keys or signatures simply return `false`.
+/// This never panics - invalid keys or signatures simply return `false`.
 fn verify_single(task: &VerifyTask) -> bool {
     let vk = match VerifyingKey::from_bytes(&task.public_key) {
         Ok(vk) => vk,
@@ -466,7 +466,7 @@ struct GpuContext {
     msl_pipeline: Option<wgpu::ComputePipeline>,
     bind_group_layout: wgpu::BindGroupLayout,
     base_table_buffer: wgpu::Buffer,
-    /// Pre-allocated buffer pool — eliminates per-dispatch Metal allocations.
+    /// Pre-allocated buffer pool - eliminates per-dispatch Metal allocations.
     pool: Mutex<BufferPool>,
 }
 
@@ -542,7 +542,7 @@ fn base_point_table_data() -> [u32; 480] {
     ]
 }
 
-/// Global cached GPU context — avoids recreating Instance/Adapter/Device/Pipeline per call.
+/// Global cached GPU context - avoids recreating Instance/Adapter/Device/Pipeline per call.
 static GPU_CONTEXT: OnceLock<Option<GpuContext>> = OnceLock::new();
 
 fn get_or_init_gpu() -> Option<&'static GpuContext> {
@@ -651,7 +651,7 @@ fn get_or_init_gpu() -> Option<&'static GpuContext> {
             cache: None,
         });
 
-        // Native MSL pipeline (Metal only — uses hardware u64 arithmetic)
+        // Native MSL pipeline (Metal only - uses hardware u64 arithmetic)
         let msl_pipeline = if has_msl {
             let msl_source = include_str!("ed25519_verify.metal");
             let msl_shader = unsafe {
@@ -756,7 +756,7 @@ fn dispatch_ed25519_verify_timed(
     let input_bytes: &[u8] = bytemuck::cast_slice(&input_u32s);
     let output_size = (n * 4) as u64;
 
-    // Lock buffer pool (held through dispatch — GPU serializes anyway)
+    // Lock buffer pool (held through dispatch - GPU serializes anyway)
     let mut pool = ctx.pool.lock();
 
     // Grow pool if batch exceeds capacity
@@ -837,7 +837,7 @@ fn dispatch_ed25519_verify_timed(
 /// A future representing in-flight GPU signature verification.
 ///
 /// Created by `MetalVerifier::batch_verify_gpu_async()`. The GPU compute
-/// runs concurrently — call `wait()` to block until results are ready.
+/// runs concurrently - call `wait()` to block until results are ready.
 /// This frees CPU cores for execution while the GPU verifies signatures.
 pub struct GpuVerifyFuture {
     staging_buffer: wgpu::Buffer,
@@ -957,7 +957,7 @@ fn dispatch_ed25519_verify_async(packed: &[[u8; 128]]) -> Result<GpuVerifyFuture
         encoder.copy_buffer_to_buffer(&pool.output_buffer, 0, &staging_buffer, 0, output_size);
         ctx.queue.submit(Some(encoder.finish()));
 
-        // Pool unlocked here — GPU has captured all commands
+        // Pool unlocked here - GPU has captured all commands
     }
 
     Ok(GpuVerifyFuture { staging_buffer, count: n, start })
@@ -1362,7 +1362,7 @@ mod tests {
     fn test_async_gpu_verify() {
         let verifier = MetalVerifier::new();
         if !verifier.is_gpu_available() {
-            println!("Skipping async test — no GPU");
+            println!("Skipping async test - no GPU");
             return;
         }
 
@@ -1473,7 +1473,7 @@ mod tests {
         let cache = SigVerifyCache::new();
         let verifier = MetalVerifier::new();
         if !verifier.is_gpu_available() {
-            println!("Skipping cache async test — no GPU");
+            println!("Skipping cache async test - no GPU");
             return;
         }
 
@@ -1521,11 +1521,11 @@ mod tests {
     #[test]
     fn test_gpu_diagnostic_codes() {
         // Diagnostic test: GPU arithmetic tests
-        // idx 0: fe_sq(1) limb 0 — expect 1
-        // idx 1: fe_sq([0,1,0,...]) limb 2 — expect 2 (odd-odd doubling test)
-        // idx 2: ge_frombytes identity check — 0=identity, 99=not identity
+        // idx 0: fe_sq(1) limb 0 - expect 1
+        // idx 1: fe_sq([0,1,0,...]) limb 2 - expect 2 (odd-odd doubling test)
+        // idx 2: ge_frombytes identity check - 0=identity, 99=not identity
         // idx 3: y^2 limb 0 from R decompression
-        // idx 4: vx2 check result — 100=first pass, 200=sqrt(-1) pass, 300=both fail
+        // idx 4: vx2 check result - 100=first pass, 200=sqrt(-1) pass, 300=both fail
         let tasks = generate_valid_tasks(12);
 
         // CPU-side: compute decompression intermediates for first R
@@ -1718,7 +1718,7 @@ mod tests {
             }
         }
 
-        // Final carry wraps with factor 19 — MUST stay in u64 to avoid truncation
+        // Final carry wraps with factor 19 - MUST stay in u64 to avoid truncation
         r64[0] += carry * 19;
 
         // One more carry propagation round (still u64 to handle overflow)
@@ -2185,7 +2185,7 @@ mod tests {
         }
     }
 
-    /// Bench the GPU ed25519 dispatch path vs CPU. Requires Metal on macOS —
+    /// Bench the GPU ed25519 dispatch path vs CPU. Requires Metal on macOS -
     /// `dispatch_ed25519_verify_timed` panics on Linux CI runners.
     #[cfg(target_os = "macos")]
     #[test]
@@ -2215,7 +2215,7 @@ mod tests {
                 }
             }
 
-            // CPU sequential (skip for large batches — too slow)
+            // CPU sequential (skip for large batches - too slow)
             let (cpu_vps, cpu_results) = if n <= 10_000 {
                 let cpu_start = Instant::now();
                 let results: Vec<bool> = tasks.iter().map(|t| verify_single(t)).collect();
@@ -2276,8 +2276,8 @@ mod tests {
                     gpu_elapsed.as_secs_f64() * 1000.0);
             } else {
                 println!("{:>7}  {:>14}  {:>10.0} v/s  {:>10.0} v/s  {:>10}  {:>9.2}x  {:>8.1}ms",
-                    n, "—", par_vps, gpu_vps,
-                    "—", gpu_vps / par_vps,
+                    n, "-", par_vps, gpu_vps,
+                    "-", gpu_vps / par_vps,
                     gpu_elapsed.as_secs_f64() * 1000.0);
             }
             println!("         precompute={:.1}ms  write={:.1}ms  compute={:.1}ms  readback={:.1}ms",

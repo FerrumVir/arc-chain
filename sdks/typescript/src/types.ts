@@ -1,5 +1,5 @@
 /**
- * ARC Chain SDK — TypeScript type definitions.
+ * ARC Chain SDK - TypeScript type definitions.
  *
  * Interfaces matching the ARC Chain RPC response shapes.
  */

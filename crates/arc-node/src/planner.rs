@@ -5,14 +5,14 @@
 //! range for the next epoch. The output is the body of a
 //! `ShardAssignmentProposal` tx that any full node can replay.
 //!
-//! **Determinism** is the whole point — given the exact same inputs, two
+//! **Determinism** is the whole point - given the exact same inputs, two
 //! nodes running this function on different machines must produce
 //! byte-identical output, or the proposal broadcast loses consensus
 //! immediately. That means:
 //!
 //! - All inputs are sorted by stable keys (model_id, node_pubkey) before
 //!   iteration.
-//! - No `HashMap` iteration in the algorithm — `BTreeMap` only.
+//! - No `HashMap` iteration in the algorithm - `BTreeMap` only.
 //! - No randomness. No floating-point. No wall clocks.
 //!
 //! # MVP algorithm
@@ -40,11 +40,11 @@ use arc_types::transaction::{
 use std::collections::BTreeMap;
 
 /// Per-model layer count snapshot. The planner doesn't itself know how
-/// many layers a model has — callers fetch it from the registry and
+/// many layers a model has - callers fetch it from the registry and
 /// feed the `(model_id, n_layers)` pairs in.
 /// Model layer count snapshot keyed by raw bytes of the model_id. Uses
 /// `[u8; 32]` instead of `Hash256` because `Hash256` doesn't implement
-/// `Ord` — the raw array does.
+/// `Ord` - the raw array does.
 pub type LayerCounts = BTreeMap<[u8; 32], u32>;
 
 /// Fixed layer-range bucket size. A 32-layer 7B fits in 6 ranges of 5-6
@@ -58,7 +58,7 @@ pub const DEFAULT_BUCKET_LAYERS: u32 = 5;
 /// pure output.
 ///
 /// Returns `None` if there are no open requests or no advertised
-/// capacity — nothing meaningful to propose.
+/// capacity - nothing meaningful to propose.
 pub fn compute_assignment(
     open_requests: &[ModelRequestBody],
     capacity_ads: &[CapacityAdvertisementBody],
@@ -97,7 +97,7 @@ pub fn compute_assignment(
 
     // Rough per-range memory bid: assume a layer costs ~100 MB at INT16
     // for a 7B model; bucket cost = layers_in_bucket × 100 MB. This is
-    // a coarse heuristic — the real chain would pull per-model costs
+    // a coarse heuristic - the real chain would pull per-model costs
     // from the registry, but it's good enough to prevent over-assigning
     // a 1 GB-RAM laptop to 8 ranges of a 70B model.
     const BYTES_PER_LAYER_HEURISTIC: u64 = 100 * 1024 * 1024;
@@ -113,7 +113,7 @@ pub fn compute_assignment(
                 BYTES_PER_LAYER_HEURISTIC * (end - start) as u64;
 
             // Candidate list: every node that has enough remaining RAM.
-            // Sort by (remaining_ram DESC, node_pubkey ASC) — deterministic
+            // Sort by (remaining_ram DESC, node_pubkey ASC) - deterministic
             // and biases toward high-capacity nodes so planner finishes
             // faster when supply is abundant.
             let mut candidates: Vec<([u8; 32], u64)> = remaining
@@ -330,7 +330,7 @@ mod tests {
         // distributed across distinct (node, model) entries.
         let total_ranges: usize = p.assignments.iter().map(|a| a.ranges.len()).sum();
         assert_eq!(total_ranges, 6);
-        // Exactly 3 distinct node_pubkeys per range — check first range.
+        // Exactly 3 distinct node_pubkeys per range - check first range.
         let servers_of_0_5: Vec<[u8; 32]> = p
             .assignments
             .iter()
@@ -347,7 +347,7 @@ mod tests {
         // bucket it should be skipped.
         let m = b"m7b";
         let reqs = vec![req(m, b"r1", 1)];
-        // Only 1 node with 1 GB — enough for 2 ranges. A 3rd-range
+        // Only 1 node with 1 GB - enough for 2 ranges. A 3rd-range
         // request would need another node (none available) so the
         // proposal just omits it.
         let ads = vec![ad(1, 1, "US")];

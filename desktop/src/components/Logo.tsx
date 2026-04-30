@@ -12,7 +12,7 @@
 import type { CSSProperties } from "react";
 
 // Vite's ?url import resolves to the asset URL if the file exists, and
-// throws at build time if it doesn't — so the catch + undefined pattern
+// throws at build time if it doesn't - so the catch + undefined pattern
 // below gives a safe default. (Using { eager: false } import.meta.glob
 // keeps it tree-shakable.)
 const assetModules = import.meta.glob<{ default: string }>(
@@ -126,7 +126,7 @@ export function Wordmark({
 }
 
 // The ARC-shape device. An abstract crop of a circle within a square.
-// Used sparingly — as a secondary accent inside empty states, section
+// Used sparingly - as a secondary accent inside empty states, section
 // dividers, and marketing hero areas.
 export function ArcDevice({
   size = 24,

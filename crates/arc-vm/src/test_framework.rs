@@ -402,7 +402,7 @@ impl TestRunner {
                 // In a real implementation this would deploy to a test VM.
             }
             TestSetupStep::AdvanceBlock { .. } => {
-                // Symbolic — advance the simulated block height.
+                // Symbolic - advance the simulated block height.
             }
             TestSetupStep::CallContract { .. } => {
                 // Symbolic call.

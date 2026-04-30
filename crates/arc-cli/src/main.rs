@@ -1,4 +1,4 @@
-//! ARC Chain CLI — key management, queries, and transactions.
+//! ARC Chain CLI - key management, queries, and transactions.
 //!
 //! Usage:
 //!   arc keygen --scheme ed25519 --output my-key.json

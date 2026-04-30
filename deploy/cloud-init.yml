@@ -1,5 +1,5 @@
 #cloud-config
-# ARC Chain Node — Hetzner Cloud-Init
+# ARC Chain Node - Hetzner Cloud-Init
 # This file bootstraps a fresh VM into a ready-to-run ARC Chain validator.
 
 package_update: true
@@ -24,7 +24,7 @@ users:
 
 # Create directories and download binary
 runcmd:
-  # Firewall — allow SSH, RPC, P2P only
+  # Firewall - allow SSH, RPC, P2P only
   - ufw default deny incoming
   - ufw default allow outgoing
   - ufw allow 22/tcp comment 'SSH'
@@ -93,7 +93,7 @@ write_files:
     owner: arc:arc
     permissions: '0644'
     content: |
-      # Placeholder — overwritten by setup-testnet.sh
+      # Placeholder - overwritten by setup-testnet.sh
       [chain]
       name = "arc-testnet"
 
@@ -101,7 +101,7 @@ write_files:
     owner: arc:arc
     permissions: '0644'
     content: |
-      # Placeholder — overwritten by setup-testnet.sh
+      # Placeholder - overwritten by setup-testnet.sh
       [rpc]
       listen = "0.0.0.0:9090"
 

@@ -1,6 +1,6 @@
 [package]
 name = "arc-consensus"
-description = "ARC Chain DAG-based consensus — Mysticeti-inspired, sender-sharded"
+description = "ARC Chain DAG-based consensus - Mysticeti-inspired, sender-sharded"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -344,7 +344,7 @@ impl ValidatorSet {
                 warn!(
                     address = %offender,
                     remaining_stake = validator.stake,
-                    "Validator stake below minimum after slashing — removing from validator set"
+                    "Validator stake below minimum after slashing - removing from validator set"
                 );
                 removed = true;
             } else {
@@ -415,7 +415,7 @@ impl DagBlock {
     /// Compute the ordering commitment for a list of transaction hashes.
     /// This is BLAKE3 over the concatenated tx hashes in **canonical lexicographic
     /// order**. Validators recompute this commitment by sorting the block's
-    /// transactions lexicographically and comparing — any deviation proves the
+    /// transactions lexicographically and comparing - any deviation proves the
     /// proposer reordered transactions (MEV extraction attempt).
     ///
     /// The input `transactions` slice MUST already be sorted lexicographically
@@ -493,7 +493,7 @@ pub struct CrossShardProof {
     pub lock_hash: Hash256,
     pub inclusion_proof: Vec<u8>,
     /// Timestamp when the lock was acquired (unix millis).
-    /// Used for deadlock prevention — locks older than CROSS_SHARD_LOCK_TIMEOUT_MS
+    /// Used for deadlock prevention - locks older than CROSS_SHARD_LOCK_TIMEOUT_MS
     /// are automatically expired to prevent indefinite lock-holding.
     pub locked_at_ms: u64,
     /// Consensus round when the lock was acquired.
@@ -505,7 +505,7 @@ pub struct CrossShardProof {
 // ── Finality Proof (A8: Light Client Finality Proofs) ────────────────────────
 
 /// Proof that a block has been finalized by a quorum of validators.
-/// Light clients can verify this without replaying the DAG — they just
+/// Light clients can verify this without replaying the DAG - they just
 /// check that >= 2/3 stake signed the block hash.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalityProof {
@@ -575,7 +575,7 @@ pub struct ConsensusEngine {
     last_committed_round: AtomicU64,
     /// Current DAG round.
     current_round: AtomicU64,
-    /// Active validator set (updated live by PeerConnected — used for
+    /// Active validator set (updated live by PeerConnected - used for
     /// block acceptance and round advancement only).
     validator_set: RwLock<ValidatorSet>,
     /// Frozen validator set for leader selection and commit decisions.
@@ -587,7 +587,7 @@ pub struct ConsensusEngine {
     /// This node's validator address.
     local_address: Address,
     /// This node's signing keypair for block proposals.
-    /// None only in legacy test mode — production always has a keypair.
+    /// None only in legacy test mode - production always has a keypair.
     local_keypair: Option<KeyPair>,
     /// Testnet mode: relax validator registration, parent quorum, and slashing
     /// checks to handle peer join races and node restarts. Production mode
@@ -793,7 +793,7 @@ impl ConsensusEngine {
         // Locks released here
 
         // Merge without holding any locks.
-        // Normalize all stakes to the maximum observed — different nodes may
+        // Normalize all stakes to the maximum observed - different nodes may
         // see slightly different stake values due to PeerConnected race.
         // This ensures all nodes freeze byte-identical validator sets.
         let mut all = validators;
@@ -1033,7 +1033,7 @@ impl ConsensusEngine {
         drop(vs);
 
         // MEV Protection: enforce canonical lexicographic ordering of tx hashes.
-        // This removes proposer discretion — transactions MUST be ordered by hash,
+        // This removes proposer discretion - transactions MUST be ordered by hash,
         // not by the proposer's chosen (potentially MEV-extracting) sequence.
         let mut transactions = transactions;
         transactions.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1145,7 +1145,7 @@ impl ConsensusEngine {
             ));
         }
 
-        // 3c. Verify block signature — author must have signed the block hash
+        // 3c. Verify block signature - author must have signed the block hash
         if !block.signature.is_empty() {
             let sig: CryptoSignature = bincode::deserialize(&block.signature)
                 .map_err(|_| ConsensusError::InvalidSignature)?;
@@ -1175,7 +1175,7 @@ impl ConsensusEngine {
             // Production mode: reject unsigned blocks
             return Err(ConsensusError::InvalidSignature);
         }
-        // else: legacy/test mode — accept unsigned blocks
+        // else: legacy/test mode - accept unsigned blocks
 
         // 4. Round check: if block is ahead, fast-forward to catch up (testnet round sync).
         let current = self.current_round.load(Ordering::SeqCst);
@@ -1191,7 +1191,7 @@ impl ConsensusEngine {
         if block.round > current + 1 {
             let gap = block.round - current;
             if gap > PRUNE_DEPTH * 2 {
-                // Large gap (>200 rounds) — likely a network partition healed.
+                // Large gap (>200 rounds) - likely a network partition healed.
                 // Fast-forwarding would skip thousands of empty rounds that
                 // try_commit scans. Update last_committed_round to avoid
                 // scanning the gap, which would waste CPU and never commit.
@@ -1201,7 +1201,7 @@ impl ConsensusEngine {
                     self.last_committed_round.store(new_committed, Ordering::SeqCst);
                 }
                 tracing::warn!(
-                    "Large round gap ({} rounds) — partition healed? Fast-forwarding and skipping empty gap.",
+                    "Large round gap ({} rounds) - partition healed? Fast-forwarding and skipping empty gap.",
                     gap
                 );
             }
@@ -1225,7 +1225,7 @@ impl ConsensusEngine {
             // All parents must exist in our DAG and be from round - 1.
             // Exception: if we recently fast-forwarded (round catch-up), we
             // won't have the parent blocks in our DAG. Accept the block
-            // anyway — the signature and round are already verified.
+            // anyway - the signature and round are already verified.
             let expected_parent_round = block.round - 1;
             let mut parent_stake = 0u64;
             let mut missing_parents = 0usize;
@@ -1234,7 +1234,7 @@ impl ConsensusEngine {
                 match self.dag.get(parent_hash) {
                     Some(parent_block) => {
                         if parent_block.round != expected_parent_round {
-                            // Parent round mismatch — skip this parent but don't reject
+                            // Parent round mismatch - skip this parent but don't reject
                             missing_parents += 1;
                             continue;
                         }
@@ -1243,7 +1243,7 @@ impl ConsensusEngine {
                         }
                     }
                     None => {
-                        // Parent not in our DAG — we may have missed it.
+                        // Parent not in our DAG - we may have missed it.
                         // Count as missing but don't reject the block.
                         missing_parents += 1;
                     }
@@ -1287,7 +1287,7 @@ impl ConsensusEngine {
                 round = block.round,
                 first_block = %equivocation.block1_hash,
                 equivocating_block = %equivocation.block2_hash,
-                "EQUIVOCATION DETECTED — validator produced two blocks in the same round"
+                "EQUIVOCATION DETECTED - validator produced two blocks in the same round"
             );
             let mut vs = self.validator_set.write();
             if let Ok(record) = vs.report_offense(
@@ -1363,7 +1363,7 @@ impl ConsensusEngine {
                         tracing::warn!(
                             validator = %dv.validator,
                             round = dv.round,
-                            "Double vote detected — slashing validator"
+                            "Double vote detected - slashing validator"
                         );
                     }
                 }
@@ -1391,7 +1391,7 @@ impl ConsensusEngine {
     /// # Returns
     /// Newly committed blocks in causal order.
     pub fn try_commit(&self) -> Vec<DagBlock> {
-        // Before first epoch freeze (epoch=0), DON'T commit — wait for
+        // Before first epoch freeze (epoch=0), DON'T commit - wait for
         // the validator set to stabilize. This prevents nodes from
         // committing their own blocks with a 1-validator frozen set.
         let vs = self.frozen_validator_set.read();
@@ -1417,7 +1417,7 @@ impl ConsensusEngine {
         // (eventually), so they compute the same set of authors per round.
 
         // Cache frozen validator addresses ONCE (same for all rounds).
-        // Old code re-read + re-sorted on every round iteration — O(n*k log k).
+        // Old code re-read + re-sorted on every round iteration - O(n*k log k).
         let frozen_vals = {
             let fvs = self.frozen_validator_set.read();
             let mut addrs: Vec<Address> = fvs.validators.iter().map(|v| v.address).collect();
@@ -1431,7 +1431,7 @@ impl ConsensusEngine {
         for r in scan_start..=(current.saturating_sub(2)) {
             let round_r_blocks = self.blocks_in_round(r);
             if round_r_blocks.is_empty() {
-                // No blocks in this round at all — advance scan past it.
+                // No blocks in this round at all - advance scan past it.
                 // Empty rounds can't produce commits, no point rescanning.
                 self.last_committed_round.store(r + 1, Ordering::SeqCst);
                 continue;
@@ -1455,7 +1455,7 @@ impl ConsensusEngine {
                 if let Some(leader_addr) = leader {
                     if let Some(block_b) = self.dag.get(block_b_hash) {
                         if block_b.author != leader_addr {
-                            continue; // Not the leader — skip
+                            continue; // Not the leader - skip
                         }
                     }
                 }
@@ -1527,13 +1527,13 @@ impl ConsensusEngine {
             // Advance past this round if EITHER:
             // (a) The leader's block was committed (normal path), OR
             // (b) The leader has no block AND the round has quorum from
-            //     other validators (leader was offline — skip round), OR
-            // (c) We're lagging >50 rounds behind current (liveness fallback —
+            //     other validators (leader was offline - skip round), OR
+            // (c) We're lagging >50 rounds behind current (liveness fallback -
             //     the 2-round rule's parent reference chain broke due to
             //     cross-continent latency; skip and move on).
             let leader_block_committed = newly_committed.iter().any(|b| b.round == r);
             if leader_block_committed {
-                // Leader's block committed — advance scan past this round
+                // Leader's block committed - advance scan past this round
                 self.last_committed_round.store(r + 1, Ordering::SeqCst);
             } else {
                 let leader_block_exists = round_r_blocks.iter().any(|h| {
@@ -1562,14 +1562,14 @@ impl ConsensusEngine {
                         }
                     }
                     if stake >= vs.quorum {
-                        // Quorum without leader — skip this round
+                        // Quorum without leader - skip this round
                         self.last_committed_round.store(r + 1, Ordering::SeqCst);
                     } else {
-                        // Not enough info yet — stop scanning, retry later
+                        // Not enough info yet - stop scanning, retry later
                         break;
                     }
                 }
-                // Leader block exists, not lagging far — retry on next call.
+                // Leader block exists, not lagging far - retry on next call.
             }
         }
 
@@ -1612,7 +1612,7 @@ impl ConsensusEngine {
                     warn!(
                         validator = %report.validator,
                         score = report.withholding_score,
-                        "Withholding detected — scheduling slash"
+                        "Withholding detected - scheduling slash"
                     );
                     let evidence_hash = arc_crypto::hash_bytes(&report.validator.0);
                     let mut vs_w = self.validator_set.write();
@@ -1972,7 +1972,7 @@ impl ConsensusEngine {
     /// block within the last N rounds).
     ///
     /// The caller can use this to alert if online stake drops near the 2/3
-    /// quorum threshold — a warning that the network is close to stalling.
+    /// quorum threshold - a warning that the network is close to stalling.
     pub fn online_stake_fraction(&self, lookback_rounds: u64) -> f64 {
         let current = self.current_round.load(Ordering::SeqCst);
         let vs = self.validator_set.read();
@@ -2174,7 +2174,7 @@ impl ConsensusEngine {
                 warn!(
                     tx = %tx_hash,
                     age_ms = now_ms.saturating_sub(proof.locked_at_ms),
-                    "Cross-shard lock expired — aborting to prevent deadlock"
+                    "Cross-shard lock expired - aborting to prevent deadlock"
                 );
                 self.completed_cross_shard.insert(tx_hash, proof);
             }
@@ -2312,7 +2312,7 @@ impl ConsensusEngine {
         pruned_count
     }
 
-    // ── A3: Slashing Enforcement — Equivocation Detection ────────────────────
+    // ── A3: Slashing Enforcement - Equivocation Detection ────────────────────
 
     /// Check if the given block constitutes equivocation (same author already
     /// proposed a different block in the same round).
@@ -2414,7 +2414,7 @@ impl ConsensusEngine {
                     tx = %tx_hash,
                     age_ms = now_ms.saturating_sub(proof.locked_at_ms),
                     timeout_secs = timeout_secs,
-                    "Cross-shard lock expired (parameterized) — aborting to prevent deadlock"
+                    "Cross-shard lock expired (parameterized) - aborting to prevent deadlock"
                 );
                 self.completed_cross_shard.insert(tx_hash, proof);
             }
@@ -2835,7 +2835,7 @@ mod tests {
     fn test_receive_block_future_round_catchup() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
-        // Current round is 0, block in round 5 — should fast-forward and accept
+        // Current round is 0, block in round 5 - should fast-forward and accept
         let block = make_block(test_addr(1), 5, vec![], vec![], 1000);
         let result = engine.receive_block(&block);
         // Block is accepted (round catch-up), though it may fail parent validation
@@ -3511,7 +3511,7 @@ mod tests {
         assert_eq!(engine.cross_shard_stats(), (1, 1));
     }
 
-    // ── 13. MEV Protection — Fair Ordering (A7) ─────────────────────────────
+    // ── 13. MEV Protection - Fair Ordering (A7) ─────────────────────────────
 
     #[test]
     fn test_ordering_commitment_deterministic() {
@@ -3652,7 +3652,7 @@ mod tests {
         let tx = hash_bytes(b"fresh_lock");
         engine.lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0).unwrap();
 
-        // Just locked — should not be expired
+        // Just locked - should not be expired
         let expired = engine.expire_stale_locks();
         assert_eq!(expired, 0, "fresh lock should not be expired");
         assert_eq!(engine.cross_shard_stats(), (1, 0));
@@ -3790,7 +3790,7 @@ mod tests {
         let initial_dag_size = engine.dag_size();
         assert!(initial_dag_size > 0);
 
-        // Prune with committed_round = 110 — should remove rounds < 110 - 100 = 10
+        // Prune with committed_round = 110 - should remove rounds < 110 - 100 = 10
         let pruned = engine.prune_below_round(110);
         assert!(pruned > 0, "should have pruned some blocks");
 
@@ -3858,7 +3858,7 @@ mod tests {
         let block1 = make_block(test_addr(1), 0, vec![], vec![hash_bytes(b"tx_a")], 1000);
         engine.receive_block(&block1).unwrap();
 
-        // Second (different) block from validator 1 in round 0 — equivocation!
+        // Second (different) block from validator 1 in round 0 - equivocation!
         let block2 = make_block(test_addr(1), 0, vec![], vec![hash_bytes(b"tx_b")], 1001);
 
         // detect_equivocation should find it
@@ -3881,7 +3881,7 @@ mod tests {
         let block1 = make_block(test_addr(1), 0, vec![], vec![hash_bytes(b"tx_a")], 1000);
         engine.receive_block(&block1).unwrap();
 
-        // Block from validator 1 in round 1 — different round, NOT equivocation
+        // Block from validator 1 in round 1 - different round, NOT equivocation
         // Need to set up parent references properly
         let block2 = make_block(test_addr(1), 1, vec![block1.hash], vec![hash_bytes(b"tx_b")], 1001);
 
@@ -3900,7 +3900,7 @@ mod tests {
         let initial_stake = engine.validator_set().get_validator(&target).unwrap().stake;
         assert_eq!(initial_stake, STAKE_ARC); // 5,000,000
 
-        // Slash 1,000,000 ARC — should reduce stake but not remove
+        // Slash 1,000,000 ARC - should reduce stake but not remove
         let removed = engine.enforce_slash(&target, 1_000_000);
         assert!(!removed, "validator should not be removed with 4M remaining");
 
@@ -3916,7 +3916,7 @@ mod tests {
         let target = test_addr(1);
         assert!(engine.validator_set().is_validator(&target));
 
-        // Slash the entire stake — should remove the validator
+        // Slash the entire stake - should remove the validator
         let removed = engine.enforce_slash(&target, STAKE_ARC);
         assert!(removed, "validator should be removed when stake falls below STAKE_SPARK");
 
@@ -3969,7 +3969,7 @@ mod tests {
         let tx = hash_bytes(b"fresh_lock_test");
         engine.lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0).unwrap();
 
-        // Lock was just created — should NOT be expired even with a short timeout
+        // Lock was just created - should NOT be expired even with a short timeout
         let expired = engine.expire_stale_locks_with_timeout(30);
         assert_eq!(expired, 0, "fresh lock should not be expired");
         assert_eq!(engine.cross_shard_stats(), (1, 0));

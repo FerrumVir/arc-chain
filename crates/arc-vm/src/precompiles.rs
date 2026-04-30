@@ -133,7 +133,7 @@ impl PrecompileRegistry {
     /// `current_proposer`, and `current_state_root` supply the block context
     /// for the block-info precompile (0x06).
     pub fn new() -> Self {
-        // Shared oracle with mock data — real integration wires in the actual
+        // Shared oracle with mock data - real integration wires in the actual
         // registries later.
         let oracle = Arc::new(RwLock::new(OracleRegistry::new()));
 
@@ -812,7 +812,7 @@ mod tests {
         assert_eq!(&result.output[..], expected.as_bytes());
     }
 
-    // ── 3. Ed25519 verify — valid signature ────────────────────────────
+    // ── 3. Ed25519 verify - valid signature ────────────────────────────
 
     #[test]
     fn test_ed25519_verify_precompile() {
@@ -840,7 +840,7 @@ mod tests {
         assert!(result.error.is_none());
     }
 
-    // ── 4. Ed25519 verify — invalid signature ──────────────────────────
+    // ── 4. Ed25519 verify - invalid signature ──────────────────────────
 
     #[test]
     fn test_ed25519_verify_invalid() {
@@ -928,7 +928,7 @@ mod tests {
         assert_eq!(list[10].0[31], 0x0B);
     }
 
-    // ── 8. Oracle registry — update and read price ─────────────────────
+    // ── 8. Oracle registry - update and read price ─────────────────────
 
     #[test]
     fn test_oracle_registry_update() {

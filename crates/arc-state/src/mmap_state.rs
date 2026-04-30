@@ -130,7 +130,7 @@ pub trait MmapBackend: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// VecBackend — in-process simulation
+// VecBackend - in-process simulation
 // ---------------------------------------------------------------------------
 
 /// A `Vec<u8>` that implements [`MmapBackend`].
@@ -175,7 +175,7 @@ impl MmapBackend for VecBackend {
     }
 
     fn flush(&self) -> MmapResult<()> {
-        // Vec is already in memory — nothing to flush.
+        // Vec is already in memory - nothing to flush.
         Ok(())
     }
 
@@ -385,7 +385,7 @@ impl<B: MmapBackend> MmapStateStore<B> {
     }
 
     /// Remove a page from the store (marks the slot as freed but does not
-    /// compact — compaction is a future optimisation).
+    /// compact - compaction is a future optimisation).
     pub fn remove_page(&self, page_id: u64) -> MmapResult<()> {
         self.index
             .remove(&page_id)

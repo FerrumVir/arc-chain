@@ -1,6 +1,6 @@
 //! GPU-resident transformer forward pass.
 //!
-//! Entire forward pass runs on GPU — no CPU round-trips between layers.
+//! Entire forward pass runs on GPU - no CPU round-trips between layers.
 //! All kernels dispatched in a single command buffer per token.
 //! Only reads back the final argmax token ID.
 //!
@@ -64,7 +64,7 @@ pub struct GpuForward {
     argmax_bgl: wgpu::BindGroupLayout,
 }
 
-/// Pre-built bind groups for one layer — created once, reused every token.
+/// Pre-built bind groups for one layer - created once, reused every token.
 struct LayerBindGroups {
     fused_lnq_attn: wgpu::BindGroup,
     fused_lnq_ffn: wgpu::BindGroup,
@@ -93,7 +93,7 @@ struct LayerBindGroups {
 pub struct GpuModel {
     // Embedding table: CPU-side i32 data [vocab_size * d_model].
     // Stored CPU-side because embedding lookup is a simple gather
-    // (one row copy) — not worth a GPU kernel for a single token.
+    // (one row copy) - not worth a GPU kernel for a single token.
     embedding_i32: Vec<i32>,
     // Activation buffers
     hidden_buf: wgpu::Buffer,
@@ -123,7 +123,7 @@ pub struct GpuModel {
     final_quantize_bg: wgpu::BindGroup,
     lm_head_bg: wgpu::BindGroup,
     argmax_bg: wgpu::BindGroup,
-    // Shared param buffers (all layers use the same — updated once per token)
+    // Shared param buffers (all layers use the same - updated once per token)
     rope_q_params: wgpu::Buffer,
     rope_k_params: wgpu::Buffer,
     attn_params_bufs: wgpu::Buffer,
@@ -156,7 +156,7 @@ impl GpuModel {
     pub fn normed_buf_ref(&self) -> &wgpu::Buffer { &self.normed_buf }
 }
 
-// Accessors removed — use gpu_matmul directly
+// Accessors removed - use gpu_matmul directly
 
 struct LayerWeightBuffers {
     wq: wgpu::Buffer,
@@ -594,7 +594,7 @@ impl GpuForward {
         };
         let be = bg_entry; // shorthand
 
-        // Shared param buffers (all layers use the same — updated once per token)
+        // Shared param buffers (all layers use the same - updated once per token)
         let shared_rqp = self.buf("shared_rqp", bytemuck::bytes_of(&RopeParams { pos: 0, d_head, n_heads, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
         let shared_rkp = self.buf("shared_rkp", bytemuck::bytes_of(&RopeParams { pos: 0, d_head, n_heads: n_kv_heads, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
         let shared_atp = self.buf("shared_atp", bytemuck::bytes_of(&AttnParams {
@@ -682,7 +682,7 @@ impl GpuForward {
 
         let t0 = std::time::Instant::now();
 
-        // Upload embedding — look up the actual token row from CPU-side table.
+        // Upload embedding - look up the actual token row from CPU-side table.
         // This is the ONLY CPU→GPU transfer per token.
         let idx = (token as usize).min(model.vocab_size as usize - 1);
         let emb_start = idx * d as usize;
@@ -709,7 +709,7 @@ impl GpuForward {
 
         let t_params = t0.elapsed();
 
-        // Encode ALL dispatches — just pipeline+bindgroup+dispatch, zero allocation
+        // Encode ALL dispatches - just pipeline+bindgroup+dispatch, zero allocation
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
         let rt = (model.n_heads * (dh / 2) + 255) / 256; // RoPE Q workgroups

@@ -1,4 +1,4 @@
-//! Block-wise INT8 quantization — llama.cpp Q8_0 structure with integer scales.
+//! Block-wise INT8 quantization - llama.cpp Q8_0 structure with integer scales.
 //!
 //! Each `BLOCK_SIZE`-weight chunk shares one scale. Scale is stored as i32
 //! Q16 fixed-point (the real scale value × ONE) so matmul stays pure-integer
@@ -11,7 +11,7 @@
 //! bit pattern on ARM/x86/AVX-512/NEON/phone.
 //!
 //! See `project_i16_ppl_bug.md` for why the previous per-row scheme topped
-//! out at PPL 107 — per-row scales couldn't capture the dynamic-range
+//! out at PPL 107 - per-row scales couldn't capture the dynamic-range
 //! structure of Llama's output/ffn_down tensors. Per-32-weight blocks solve
 //! that without giving up integer determinism.
 
@@ -51,7 +51,7 @@ impl BlockI8Weights {
             for block_idx in 0..blocks_per_row {
                 let block = &row[block_idx * BLOCK_SIZE..(block_idx + 1) * BLOCK_SIZE];
 
-                // abs_max per block — in f64 to preserve precision for
+                // abs_max per block - in f64 to preserve precision for
                 // sub-integer values (the trap that broke the old per-row
                 // scheme). Floor at 1e-10 so a pure-zero block still
                 // produces a valid i16 scale.
@@ -65,7 +65,7 @@ impl BlockI8Weights {
 
                 // Block scale: (abs_max / 127) * ONE in f64, clamped to i32
                 // range so it fits alongside the data without bloating
-                // memory. At abs_max=100, scale ≈ 51_600 — comfortably
+                // memory. At abs_max=100, scale ≈ 51_600 - comfortably
                 // inside i32 max (2.1e9).
                 let scale = ((abs_max as f64 / 127.0) * ONE as f64).round();
                 let scale = scale.clamp(1.0, i32::MAX as f64) as i32;
@@ -86,7 +86,7 @@ impl BlockI8Weights {
         self.data.len() + self.scales.len() * 4 + 32
     }
 
-    /// Dequantize a single weight back to f64 — for reference / testing only.
+    /// Dequantize a single weight back to f64 - for reference / testing only.
     /// Production math never dequantizes; the matmul consumes blocks directly.
     pub fn dequant(&self, row: usize, col: usize) -> f64 {
         debug_assert!(row < self.n_rows && col < self.n_cols);
@@ -106,7 +106,7 @@ impl BlockI8Weights {
 /// The scale is i32 Q16, so `block_dot × scale` fits in i128 (block_dot peaks
 /// at 127 × 2^28 × 32 = 2^39, × i32 scale = 2^71, inside i128's 2^127 budget).
 ///
-/// Integer-only — no f32 anywhere. Produces bit-identical output on any
+/// Integer-only - no f32 anywhere. Produces bit-identical output on any
 /// platform where i128 arithmetic is supported (all modern CPUs, GPUs via
 /// emulation, and phones).
 pub fn matmul_block_i8_into(

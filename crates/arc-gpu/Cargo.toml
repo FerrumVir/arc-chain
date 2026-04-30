@@ -1,6 +1,6 @@
 [package]
 name = "arc-gpu"
-description = "ARC Chain GPU acceleration — parallel transaction commits via compute shaders"
+description = "ARC Chain GPU acceleration - parallel transaction commits via compute shaders"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

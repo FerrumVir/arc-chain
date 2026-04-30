@@ -90,7 +90,7 @@ export class ErrorBoundary extends Component<Props, State> {
               lineHeight: 1.55,
             }}
           >
-            The app hit an unexpected error. Your node keeps running — this is
+            The app hit an unexpected error. Your node keeps running - this is
             a UI glitch. Restart the view to recover.
           </p>
 

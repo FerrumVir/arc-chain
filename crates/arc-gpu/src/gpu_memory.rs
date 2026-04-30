@@ -1,7 +1,7 @@
 //! GPU-resident account buffer using wgpu unified/managed memory.
 //!
 //! On Apple Silicon (Metal), wgpu buffers with `MAP_READ | MAP_WRITE | STORAGE`
-//! are backed by unified memory — CPU and GPU share the same physical pages.
+//! are backed by unified memory - CPU and GPU share the same physical pages.
 //! Zero copy, zero sync overhead.
 //!
 //! On discrete GPUs (Vulkan/DX12), a staging buffer handles CPU↔GPU transfers.
@@ -17,13 +17,13 @@ use tracing::{info, warn};
 /// How GPU memory is managed on this system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoryModel {
-    /// Apple Silicon — `MAP_READ | MAP_WRITE | STORAGE` on a single buffer.
+    /// Apple Silicon - `MAP_READ | MAP_WRITE | STORAGE` on a single buffer.
     /// CPU pointer and GPU pointer are the same physical memory. Zero copy.
     UnifiedMetal,
-    /// Discrete GPU — separate host-visible staging buffer + device-local storage buffer.
+    /// Discrete GPU - separate host-visible staging buffer + device-local storage buffer.
     /// Requires explicit `sync_to_gpu()` / `sync_from_gpu()` calls.
     ManagedDiscrete,
-    /// No GPU available — backed by a CPU-side `Vec<u8>`.
+    /// No GPU available - backed by a CPU-side `Vec<u8>`.
     CpuOnly,
 }
 
@@ -145,7 +145,7 @@ impl GpuAccountBuffer {
             },
         ))
         .or_else(|_| {
-            // Retry without MAPPABLE_PRIMARY_BUFFERS — discrete GPUs may not support it.
+            // Retry without MAPPABLE_PRIMARY_BUFFERS - discrete GPUs may not support it.
             pollster::block_on(adapter.request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("ARC GPU State"),
@@ -559,7 +559,7 @@ impl GpuAccountBuffer {
         }
 
         info!("GPU state buffer securely zeroed and released");
-        // Drop order: buffers, then device, then queue — wgpu handles cleanup.
+        // Drop order: buffers, then device, then queue - wgpu handles cleanup.
     }
 }
 
@@ -671,6 +671,6 @@ mod tests {
         };
         buf.write_account(0, &acct);
         buf.secure_shutdown();
-        // Buffer is consumed — no way to read after shutdown.
+        // Buffer is consumed - no way to read after shutdown.
     }
 }

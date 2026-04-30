@@ -1,4 +1,4 @@
-//! `arc faucet <address>` — request testnet tokens from the faucet.
+//! `arc faucet <address>` - request testnet tokens from the faucet.
 
 use anyhow::Result;
 use crate::rpc::RpcClient;

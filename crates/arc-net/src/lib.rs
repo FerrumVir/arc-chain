@@ -1,4 +1,4 @@
-//! ARC Chain networking — QUIC transport, shred propagation, tx gossip.
+//! ARC Chain networking - QUIC transport, shred propagation, tx gossip.
 //!
 //! This crate provides the networking primitives for ARC Chain:
 //! - **Shred encoding/decoding**: Blocks are split into 1280-byte shreds for
@@ -33,7 +33,7 @@ use tracing::{debug, info, warn};
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Maximum payload per shred — sized to fit in a single QUIC packet.
+/// Maximum payload per shred - sized to fit in a single QUIC packet.
 pub const SHRED_DATA_SIZE: usize = 1280;
 
 /// Maximum number of transactions in a single gossip message.
@@ -71,7 +71,7 @@ pub enum NetError {
 // Shred messages
 // ---------------------------------------------------------------------------
 
-/// A single shred — one chunk of a block destined for network propagation.
+/// A single shred - one chunk of a block destined for network propagation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShredMessage {
     /// Block hash this shred belongs to.
@@ -111,7 +111,7 @@ impl ShredEncoder {
         block_height: u64,
         shard_id: u16,
     ) -> Vec<ShredMessage> {
-        // Handle empty block — produce exactly one shred with empty data.
+        // Handle empty block - produce exactly one shred with empty data.
         if block_data.is_empty() {
             return vec![ShredMessage {
                 block_hash,
@@ -161,7 +161,7 @@ impl ShredEncoder {
                 }
                 xor
             } else {
-                // Unpaired — parity is just a copy of the lone shred.
+                // Unpaired - parity is just a copy of the lone shred.
                 a_data.clone()
             };
 
@@ -231,14 +231,14 @@ impl ShredEncoder {
             }
 
             if b_idx >= total_shreds as usize {
-                // Unpaired shred — parity is a copy, use it if data is missing.
+                // Unpaired shred - parity is a copy, use it if data is missing.
                 if !a_present && parity_present {
                     data_slots[a_idx] = parity_slots[pair_idx].clone();
                 }
                 continue;
             }
 
-            // One data shred missing — recover via XOR with parity.
+            // One data shred missing - recover via XOR with parity.
             if !a_present && b_present && parity_present {
                 let b_data = data_slots[b_idx].as_ref().unwrap();
                 let parity = parity_slots[pair_idx].as_ref().unwrap();
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn test_shred_decode_insufficient_shreds() {
-        // 3 data shreds needed, only supply index 0 and no parity — should fail.
+        // 3 data shreds needed, only supply index 0 and no parity - should fail.
         let hash = test_hash(1);
         let shreds = vec![ShredMessage {
             block_hash: hash,
@@ -910,14 +910,14 @@ mod tests {
         let tx2 = b"transfer 200 ARC".to_vec();
         let tx3 = b"transfer 100 ARC".to_vec(); // duplicate of tx1
 
-        // First broadcast — all novel.
+        // First broadcast - all novel.
         let r1 = node.broadcast_transactions(vec![tx1.clone(), tx2.clone()]);
         assert_eq!(r1.deduped, 0);
         assert_eq!(r1.messages.len(), 1);
         assert_eq!(r1.messages[0].transactions.len(), 2);
         assert_eq!(r1.targets.len(), 2);
 
-        // Second broadcast — tx1 and tx3 are duplicates; only tx2 is also a dup now.
+        // Second broadcast - tx1 and tx3 are duplicates; only tx2 is also a dup now.
         let r2 = node.broadcast_transactions(vec![tx1.clone(), tx3, b"brand new tx".to_vec()]);
         assert_eq!(r2.deduped, 2); // tx1 and tx3 (same content) both deduped
         assert_eq!(r2.messages[0].transactions.len(), 1);
@@ -948,7 +948,7 @@ mod tests {
     #[test]
     fn test_tx_gossip_message_batching() {
         let sender = test_hash(0);
-        // Create 250 transactions — should produce 3 messages (100 + 100 + 50).
+        // Create 250 transactions - should produce 3 messages (100 + 100 + 50).
         let txs: Vec<Vec<u8>> = (0..250u16).map(|i| i.to_le_bytes().to_vec()).collect();
         let messages = TxGossipMessage::new(txs, sender);
 
@@ -1094,7 +1094,7 @@ mod tests {
 
     #[test]
     fn test_fec_fails_when_both_missing() {
-        // 2 data shreds + 1 parity. Drop both data shreds — cannot recover.
+        // 2 data shreds + 1 parity. Drop both data shreds - cannot recover.
         let data = vec![0xEFu8; SHRED_DATA_SIZE * 2];
         let hash = hash_bytes(&data);
         let shreds = ShredEncoder::encode(&data, hash, 3, 0);

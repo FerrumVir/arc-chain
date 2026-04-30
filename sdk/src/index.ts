@@ -4,13 +4,13 @@
 // Usage:
 //   import { ArcAgent, ArcClient, ArcWallet, TxType } from "@arc-chain/sdk";
 //
-//   // Quick start — create agent with new wallet
+//   // Quick start - create agent with new wallet
 //   const agent = ArcAgent.create("http://localhost:8545");
 //   await agent.init();
 //
 //   // Send tokens
 //   const receipt = await agent.transfer("0x...", 1000n);
-//   console.log(`TX ${receipt.tx_hash} — ${receipt.success ? "OK" : "FAIL"}`);
+//   console.log(`TX ${receipt.tx_hash} - ${receipt.success ? "OK" : "FAIL"}`);
 //
 //   // Listen for blocks
 //   agent.onBlock((block) => console.log(`Block #${block.height}`));

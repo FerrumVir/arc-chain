@@ -49,7 +49,7 @@ impl PoseidonConfig {
 // ---------------------------------------------------------------------------
 
 /// A 64-bit modular prime used to keep intermediate values within a single
-/// u64 word.  This is NOT the BN254 scalar field — it is a convenience prime
+/// u64 word.  This is NOT the BN254 scalar field - it is a convenience prime
 /// for the reference implementation that avoids big-integer arithmetic while
 /// still exercising the correct Poseidon structure.
 const MODULUS: u64 = (1u64 << 61) - 1; // Mersenne prime 2^61 - 1

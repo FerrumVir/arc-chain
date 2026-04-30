@@ -61,7 +61,7 @@ pub enum StateError {
 
 
 // ---------------------------------------------------------------------------
-// Chunked State Snapshot Protocol — types for fast state sync
+// Chunked State Snapshot Protocol - types for fast state sync
 // ---------------------------------------------------------------------------
 
 /// A single chunk of a state snapshot for streaming sync.
@@ -134,7 +134,7 @@ const WASM_MAGIC: &[u8; 4] = b"\0asm";
 
 /// Derive a deterministic contract address from the deployer address and nonce.
 ///
-/// Mirrors the logic in `arc_vm::compute_contract_address` — duplicated here to
+/// Mirrors the logic in `arc_vm::compute_contract_address` - duplicated here to
 /// avoid a circular dependency (arc-vm already depends on arc-state).
 fn compute_contract_address(deployer: &Address, nonce: u64) -> Address {
     let mut preimage = Vec::with_capacity(32 + 32 + 8);
@@ -185,7 +185,7 @@ pub struct StateDB {
     snapshot_counter: AtomicU64,
     /// Total benchmark transactions executed (atomic counter for /stats).
     pub benchmark_tx_count: AtomicU64,
-    /// Async indexer channel — sends batches to background threads.
+    /// Async indexer channel - sends batches to background threads.
     indexer_tx: Option<crossbeam::channel::Sender<IndexerBatch>>,
     /// Benchmark block nonce bases: height → nonce_base for deterministic tx reconstruction.
     benchmark_nonces: DashMap<u64, u64>,
@@ -221,13 +221,13 @@ pub struct StateDB {
     /// Optional GPU-resident state cache for hot accounts.
     /// When enabled, `get_account()` checks GPU memory first.
     gpu_cache: Option<Arc<gpu_state::GpuStateCache>>,
-    /// Archive mode — when true, skips all pruning (keeps full history).
+    /// Archive mode - when true, skips all pruning (keeps full history).
     /// Used by block explorers and analytics nodes.
     pub archive_mode: bool,
 }
 
 impl StateDB {
-    /// Create a new empty state (no persistence — benchmark mode).
+    /// Create a new empty state (no persistence - benchmark mode).
     pub fn new() -> Self {
         Self {
             accounts: DashMap::new(),
@@ -359,7 +359,7 @@ impl StateDB {
         let wal_path = wal_dir.join("state.wal");
 
         if wal_path.exists() {
-            // WAL exists — replay to recover state
+            // WAL exists - replay to recover state
             let state = Self::with_persistence(&wal_path)?;
 
             let entries = wal::read_wal(&wal_path);
@@ -382,7 +382,7 @@ impl StateDB {
 
             Ok(state)
         } else {
-            // No WAL — fresh start with genesis accounts and persistence enabled
+            // No WAL - fresh start with genesis accounts and persistence enabled
             let state = Self::with_persistence(&wal_path)?;
 
             for (addr, balance) in prefunded {
@@ -471,13 +471,13 @@ impl StateDB {
                 self.receipts.insert(hash.0, receipt.clone());
             }
             WalOp::SetAgent(_addr, _name, _endpoint, _caps) => {
-                // Agent registry — stored in account metadata (future)
+                // Agent registry - stored in account metadata (future)
             }
             WalOp::SetContract(addr, bytecode) => {
                 self.contracts.insert(addr.0, bytecode.clone());
             }
             WalOp::Checkpoint(_) => {
-                // Checkpoints are informational — no state change
+                // Checkpoints are informational - no state change
             }
             WalOp::SetDagBlock(_, _) | WalOp::SetDagRound(_) | WalOp::CommitDagBlock(_) => {
                 // DAG operations are replayed by the consensus engine, not StateDB.
@@ -524,7 +524,7 @@ impl StateDB {
                     "Snapshot height changed ({} → {}), retrying for consistency",
                     height_before, height_after
                 );
-                continue; // Retry — a block was applied during iteration
+                continue; // Retry - a block was applied during iteration
             }
 
             return Snapshot {
@@ -632,7 +632,7 @@ impl StateDB {
     pub fn update_account(&self, addr: &Address, account: Account) {
         self.accounts.insert(addr.0, account.clone());
         self.dirty_accounts.insert(addr.0);
-        // Write-through to GPU cache (fast path — single DashMap insert).
+        // Write-through to GPU cache (fast path - single DashMap insert).
         if let Some(ref cache) = self.gpu_cache {
             cache.update_account_fast(&account);
         }
@@ -767,7 +767,7 @@ impl StateDB {
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
-        // Execute transactions — use Block-STM parallel batches when beneficial
+        // Execute transactions - use Block-STM parallel batches when beneficial
         if transactions.len() >= 16 {
             // Block-STM: partition into conflict-free batches for parallel execution
             let batches = block_stm::partition_batches(transactions);
@@ -805,7 +805,7 @@ impl StateDB {
                     self.mark_tx_accounts_dirty(&transactions[idx]);
                 }
 
-                // Each batch contains txs that touch disjoint accounts — safe to parallelize
+                // Each batch contains txs that touch disjoint accounts - safe to parallelize
                 let results: Vec<(usize, bool, u64)> = batch_indices
                     .par_iter()
                     .map(|&idx| {
@@ -921,7 +921,7 @@ impl StateDB {
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
         if count > 0 && count % 10_000 == 0 {
             tracing::info!("Snapshot trigger at block {}", height);
-            // Snapshot is taken asynchronously in production — here we just log
+            // Snapshot is taken asynchronously in production - here we just log
         }
 
         Ok((block, receipts))
@@ -1004,7 +1004,7 @@ impl StateDB {
                     let tx = &transactions[orig_idx];
                     self.mark_tx_accounts_dirty(tx);
                     let result = if tx.sig_verified {
-                        self.execute_tx(tx) // Pre-verified (faucet/RPC) — skip sig check
+                        self.execute_tx(tx) // Pre-verified (faucet/RPC) - skip sig check
                     } else if tx.is_unsigned() {
                         Err(StateError::ExecutionError("unsigned transaction".into()))
                     } else if tx.verify_signature().is_err() {
@@ -1165,7 +1165,7 @@ impl StateDB {
                         }
                     }
                     Err(_) => {
-                        // Batch failed — fall back to individual verification to find bad ones
+                        // Batch failed - fall back to individual verification to find bad ones
                         for &idx in &ed_indices {
                             let valid = transactions[idx].verify_signature().is_ok();
                             batch_sig_valid[idx] = Some(valid);
@@ -1181,7 +1181,7 @@ impl StateDB {
         for (i, tx) in transactions.iter().enumerate() {
             self.mark_tx_accounts_dirty(tx);
             let result = if tx.sig_verified {
-                // Pre-verified (faucet/RPC) — skip sig check
+                // Pre-verified (faucet/RPC) - skip sig check
                 self.execute_tx(tx)
             } else if tx.is_unsigned() {
                 Err(StateError::ExecutionError("unsigned transaction".into()))
@@ -1277,7 +1277,7 @@ impl StateDB {
     /// Execute a block with GPU-accelerated batch signature verification.
     ///
     /// Combines MetalVerifier batch Ed25519 verification with Block-STM
-    /// parallel execution. This is the production path — signatures are
+    /// parallel execution. This is the production path - signatures are
     /// verified in a single GPU dispatch, then only valid transactions
     /// are executed.
     pub fn execute_block_gpu_verified(
@@ -1601,7 +1601,7 @@ impl StateDB {
         Ok((block, receipts))
     }
 
-    /// Block-STM parallel execution — partitions transactions into conflict-free
+    /// Block-STM parallel execution - partitions transactions into conflict-free
     /// batches based on static access-set analysis, then executes each batch
     /// in parallel with rayon.
     ///
@@ -1726,7 +1726,7 @@ impl StateDB {
         Ok((block, receipts))
     }
 
-    /// Optimistic parallel execution — pre-sorted by sender nonce for maximum throughput.
+    /// Optimistic parallel execution - pre-sorted by sender nonce for maximum throughput.
     pub fn execute_optimistic(
         &self,
         transactions: &[Transaction],
@@ -1762,7 +1762,7 @@ impl StateDB {
     pub fn start_benchmark_indexer(self: &Arc<Self>) {
         let (tx, rx) = crossbeam::channel::unbounded::<IndexerBatch>();
 
-        // Spawn 4 indexer threads — each computes hashes and inserts hash→(height, index)
+        // Spawn 4 indexer threads - each computes hashes and inserts hash→(height, index)
         for thread_id in 0..4u32 {
             let rx = rx.clone();
             let state = Arc::clone(self);
@@ -1805,7 +1805,7 @@ impl StateDB {
                 .expect("spawn indexer thread");
         }
 
-        // Store the sender — we need unsafe to set the field on Arc<Self>
+        // Store the sender - we need unsafe to set the field on Arc<Self>
         // since start_benchmark_indexer is called once at startup.
         // Safety: called exactly once before any concurrent access to indexer_tx.
         #[allow(invalid_reference_casting)]
@@ -1878,7 +1878,7 @@ impl StateDB {
 
         // ── Generate real tx hashes in parallel (rayon-sharded) ─────────
         // Each shard precomputes body_bytes + base blake3 hasher.
-        // Only the nonce varies per tx — huge optimization.
+        // Only the nonce varies per tx - huge optimization.
         let shard_data: Vec<(Hash256, Hash256, u64)> = senders
             .iter()
             .zip(receivers.iter())
@@ -1932,7 +1932,7 @@ impl StateDB {
             state_diff: None,
         };
 
-        // Empty tx_hashes vec — 10M hashes would be 320MB per block.
+        // Empty tx_hashes vec - 10M hashes would be 320MB per block.
         // txs are reconstructable on-demand from nonce_base + deterministic params.
         let block = Block::new(header, vec![]);
         self.blocks.insert(height, block.clone());
@@ -1971,7 +1971,7 @@ impl StateDB {
     /// 4. Real state_root from all account states
     /// 5. Async index for hash→(height, idx) mapping
     ///
-    /// This is the "honest" benchmark path — every tx is signed, verified,
+    /// This is the "honest" benchmark path - every tx is signed, verified,
     /// individually executed with nonce/balance checks, and queryable.
     pub fn execute_block_signed_benchmark(
         &self,
@@ -2033,11 +2033,11 @@ impl StateDB {
                         // All valid in this chunk
                         vec![true; chunk.len()]
                     } else {
-                        // Batch failed — fall back to individual verification
+                        // Batch failed - fall back to individual verification
                         chunk.iter().map(|tx| tx.verify_signature().is_ok()).collect()
                     }
                 } else {
-                    // Non-Ed25519 or parse error — verify individually
+                    // Non-Ed25519 or parse error - verify individually
                     chunk.iter().map(|tx| tx.verify_signature().is_ok()).collect()
                 }
             })
@@ -2213,7 +2213,7 @@ impl StateDB {
     }
 
     /// Reconstruct a Merkle inclusion proof for a benchmark transaction.
-    /// This is expensive (~130ms for 10M txs) — only called on-demand for /tx/{hash}/proof.
+    /// This is expensive (~130ms for 10M txs) - only called on-demand for /tx/{hash}/proof.
     pub fn reconstruct_benchmark_proof(
         &self,
         height: u64,
@@ -2645,7 +2645,7 @@ impl StateDB {
                             need: body.value,
                         });
                     }
-                    // Nonce increment — revm will see the updated state.
+                    // Nonce increment - revm will see the updated state.
                     sender.nonce += 1;
                     self.accounts.insert(tx.from.0, sender.clone());
                     self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
@@ -2653,7 +2653,7 @@ impl StateDB {
                     tracing::debug!(
                         contract = ?body.contract,
                         calldata_len = body.calldata.len(),
-                        "EVM contract call — nonce incremented, execution delegated"
+                        "EVM contract call - nonce incremented, execution delegated"
                     );
                 } else {
                     // --- WASM contract ---
@@ -2792,7 +2792,7 @@ impl StateDB {
                             },
                         );
 
-                        // Host: caller(ptr: i32) — write caller address to WASM memory
+                        // Host: caller(ptr: i32) - write caller address to WASM memory
                         let h_caller = Function::new_typed_with_env(
                             &mut store, &func_env,
                             |mut env: FunctionEnvMut<'_, WasmHostState>, ptr: i32| {
@@ -3188,7 +3188,7 @@ impl StateDB {
                                 );
                             }
                             Err(e) => {
-                                // Constructor failed — remove the deployed contract
+                                // Constructor failed - remove the deployed contract
                                 self.contracts.remove(&contract_addr.0);
                                 self.accounts.remove(&contract_addr.0);
                                 return Err(StateError::ExecutionError(
@@ -3623,12 +3623,12 @@ impl StateDB {
                 self.accounts.insert(escrow_addr.0, escrow_mut.clone());
                 self.wal.append(WalOp::SetAccount(escrow_addr, escrow_mut), self.height());
 
-                // Credit opener — ADD back their channel share to existing balance
+                // Credit opener - ADD back their channel share to existing balance
                 sender.balance += body.opener_balance;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // Credit counterparty — address was stored in escrow.storage_root
+                // Credit counterparty - address was stored in escrow.storage_root
                 // during ChannelOpen (see above). This is the definitive on-chain
                 // record of who the counterparty is.
                 let counterparty_addr = escrow.storage_root;
@@ -3686,7 +3686,7 @@ impl StateDB {
                 }
 
                 // If a previous dispute exists and its challenge period has expired,
-                // the state is already finalized — no further disputes allowed.
+                // the state is already finalized - no further disputes allowed.
                 if escrow.staked_balance > 0 && self.height() >= escrow.staked_balance {
                     return Err(StateError::ExecutionError(
                         "channel dispute: challenge period has expired, state is finalized".to_string(),
@@ -3772,7 +3772,7 @@ impl StateDB {
                     }
                 }
 
-                // Record verified shard proof — store proof hash in a deterministic
+                // Record verified shard proof - store proof hash in a deterministic
                 // address derived from shard_id + block_height.
                 // This creates an on-chain receipt that shard X's block Y was proven.
                 let mut proof_input = Vec::new();
@@ -4160,7 +4160,7 @@ impl StateDB {
                 let mut reg = existing;
                 reg.nonce = self.height(); // registered_at
                 reg.storage_root = Hash256(commitment);
-                // Park the paid fee in `balance` — a future Milestone E
+                // Park the paid fee in `balance` - a future Milestone E
                 // patch can meter royalty payouts from this pool.
                 reg.balance = 0; // fees already sent to treasury; reg holds no value today
                 self.accounts.insert(registry_addr_bytes, reg.clone());
@@ -4169,7 +4169,7 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::ModelRequest(body) => {
-                // Milestone C: record demand. No fund movement today —
+                // Milestone C: record demand. No fund movement today -
                 // the request sits on-chain for workers to observe and
                 // claim against. Future patch: bond_per_layer_epoch is
                 // escrowed here and released to claiming workers.
@@ -4252,7 +4252,7 @@ impl StateDB {
                     // Refund and reset: the worker is renewing their
                     // claim. Return the prior bond to tx.from first.
                     return Err(StateError::ExecutionError(
-                        "shard coverage claim: prior claim still active — \
+                        "shard coverage claim: prior claim still active - \
                          release or wait for epoch end before re-claiming"
                             .into(),
                     ));
@@ -4274,7 +4274,7 @@ impl StateDB {
             }
             TxBody::CapacityAdvertisement(body) => {
                 // Milestone D: record capacity advertisement. Pure
-                // metadata write — no funds move. Planner reads these
+                // metadata write - no funds move. Planner reads these
                 // plus open requests + current shard_registry to compute
                 // assignments.
                 let mut sender = self.get_or_create_account(&tx.from);
@@ -4370,7 +4370,7 @@ impl StateDB {
             TxBody::InferenceEscrowRefund(body) => {
                 // Milestone B: original payer reclaims funds after the
                 // `timeout_blocks` window elapses with no release. Only
-                // callable by the payer — identity proved by rehashing
+                // callable by the payer - identity proved by rehashing
                 // the same fields used at open and matching the stored
                 // commitment.
                 let mut sender = self.get_or_create_account(&tx.from);
@@ -4439,7 +4439,7 @@ impl StateDB {
     // Public wrappers for the 4-stage pipeline (B3), which executes on
     // separate threads and needs direct access to individual operations.
 
-    /// Public wrapper around the private `execute_tx()` — used by the pipeline
+    /// Public wrapper around the private `execute_tx()` - used by the pipeline
     /// execute stage which runs on a dedicated thread.
     /// Returns gas consumed on success.
     pub fn execute_tx_pub(&self, tx: &Transaction) -> Result<u64, StateError> {
@@ -4661,7 +4661,7 @@ impl StateDB {
         // Index the sender first and DROP the DashMap entry guard before
         // touching any other account. Holding a shard guard while calling
         // `account_txs.entry(other_key)` deadlocks whenever the outer and
-        // inner keys land on the same shard — which happens for free when
+        // inner keys land on the same shard - which happens for free when
         // `other_key == tx.from.0` (e.g. an InferenceEscrowRelease whose
         // coordinator is also the proposer).
         {
@@ -4814,7 +4814,7 @@ impl StateDB {
             TxBody::WasmCall(body) => { self.dirty_accounts.insert(body.contract.0); }
             TxBody::Escrow(body) => { self.dirty_accounts.insert(body.beneficiary.0); }
             TxBody::DeployContract(_) => {
-                // The contract address is deterministic — mark it dirty
+                // The contract address is deterministic - mark it dirty
                 let contract_addr = compute_contract_address(&tx.from, tx.nonce);
                 self.dirty_accounts.insert(contract_addr.0);
             }
@@ -4841,7 +4841,7 @@ impl StateDB {
             TxBody::ChannelClose(body) => {
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
-                // Also mark the counterparty as dirty — their balance is modified during close.
+                // Also mark the counterparty as dirty - their balance is modified during close.
                 // The counterparty address is stored in the escrow account's storage_root.
                 if let Some(escrow) = self.accounts.get(&escrow_addr.0) {
                     if escrow.storage_root != Hash256::ZERO {
@@ -5244,7 +5244,7 @@ impl StateDB {
     ///
     /// Called by verifier nodes.  Applies the account changes, marks them dirty,
     /// and recomputes the state root.  The caller compares the returned root
-    /// against `diff.new_root` — a mismatch indicates a fraudulent proposal.
+    /// against `diff.new_root` - a mismatch indicates a fraudulent proposal.
     pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Hash256 {
         for change in &diff.changes {
             self.accounts.insert(change.address.0, change.account.clone());
@@ -5628,7 +5628,7 @@ impl StateDB {
     /// Default number of accounts per chunk when serving snapshots to peers.
     const DEFAULT_CHUNK_SIZE: usize = 1000;
 
-    /// Export just the manifest metadata (lightweight — no account data).
+    /// Export just the manifest metadata (lightweight - no account data).
     ///
     /// Peers request the manifest first to learn the chunk count, then
     /// download individual chunks in parallel via `export_snapshot_chunk`.
@@ -5732,7 +5732,7 @@ impl Default for StateDB {
 /// Compute the blake3 hash for a benchmark transfer transaction.
 /// Uses the exact same algorithm as Transaction::compute_hash() but with
 /// a precomputed base hasher (tx_type + from already hashed) and body_bytes.
-/// Only the nonce varies per call — enables massive parallelism.
+/// Only the nonce varies per call - enables massive parallelism.
 #[inline]
 fn compute_benchmark_tx_hash(
     base_hasher: &blake3::Hasher,
@@ -6593,7 +6593,7 @@ mod tests {
         let (_, r) = state.execute_block(&[d1], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Second dispute with lower nonce (5) — should fail
+        // Second dispute with lower nonce (5) - should fail
         let d2 = make_channel_tx(addr(1), 1, TxBody::ChannelDispute(ChannelDisputeBody {
             channel_id,
             opener_balance: 80_000,
@@ -6632,7 +6632,7 @@ mod tests {
         let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Try to close — should fail (active dispute)
+        // Try to close - should fail (active dispute)
         let close_tx = make_channel_tx(addr(1), 1, TxBody::ChannelClose(ChannelCloseBody {
             channel_id,
             opener_balance: 100_000,
@@ -6658,7 +6658,7 @@ mod tests {
         }), TxType::ChannelOpen);
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
-        // Dispute claiming more than deposited — should fail
+        // Dispute claiming more than deposited - should fail
         let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
             channel_id,
             opener_balance: 80_000,
@@ -6704,7 +6704,7 @@ mod tests {
 
     // ── Milestone B: InferenceEscrow integration tests ───────────────────
     //
-    // All tests use real balance deltas — no mocks. The acceptance criterion
+    // All tests use real balance deltas - no mocks. The acceptance criterion
     // from PLAN.md is "payer pays N ARC; balances on serving replicas
     // increase by their share; total conserved."
 
@@ -6895,7 +6895,7 @@ mod tests {
 
     #[test]
     fn test_escrow_release_rejects_wrong_payer() {
-        // Open as addr(1); release names addr(42) as payer — metadata
+        // Open as addr(1); release names addr(42) as payer - metadata
         // commitment won't match, release must fail.
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
         let request_id = req(b"wrong-payer");
@@ -7099,7 +7099,7 @@ mod tests {
 
     // ── Milestones C+D: model registry / requests / claims / capacity ──
     //
-    // MVP tests — exercise the happy path plus the critical reject paths
+    // MVP tests - exercise the happy path plus the critical reject paths
     // (duplicate registration, insufficient balance, empty ranges).
 
     use arc_types::transaction::{

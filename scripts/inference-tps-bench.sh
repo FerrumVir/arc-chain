@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — inference TPS + minimum-throughput benchmark
+# ARC Chain - inference TPS + minimum-throughput benchmark
 #
 # Fires N inference requests against the testnet and reports:
 #   - successful inferences
@@ -9,7 +9,7 @@
 #   - per-request latency (min/median/max)
 #   - per-token latency
 #
-# Use this to prove the chain meets a minimum TPS / N-inferences target —
+# Use this to prove the chain meets a minimum TPS / N-inferences target -
 # e.g. "we run 50 inferences in under 5 minutes" → 1 inference per 6 s
 # average, which is well within today's 6-seed pipeline.
 #
@@ -73,7 +73,7 @@ OUT_DIR="$(mktemp -d -t arc-tps-bench.XXXXXX)"
 trap 'rm -rf "$OUT_DIR"' EXIT
 
 echo "════════════════════════════════════════════════════════════════════════"
-echo " ARC Chain — inference TPS benchmark"
+echo " ARC Chain - inference TPS benchmark"
 echo "════════════════════════════════════════════════════════════════════════"
 echo " coordinator: $COORDINATOR"
 echo " endpoint:    /inference/$ENDPOINT"
@@ -168,7 +168,7 @@ print(f"  wall time:       {wall_ms / 1000:.2f} s")
 print(f"  requests/sec:    {(ok / (wall_ms / 1000)) if wall_ms > 0 else 0:.3f}  (end-to-end through this script)")
 if total_tokens > 0 and chain_total_ms > 0:
     chain_tps = total_tokens / (chain_total_ms / 1000)
-    print(f"  chain tokens/s:  {chain_tps:.2f}  (sum_tokens / sum_chain_total_ms — model compute only)")
+    print(f"  chain tokens/s:  {chain_tps:.2f}  (sum_tokens / sum_chain_total_ms - model compute only)")
     print(f"  ms / token:      {chain_total_ms / total_tokens:.0f} ms")
 if latencies:
     latencies.sort()
@@ -178,7 +178,7 @@ if latencies:
 
 if hashes:
     unique = len(set(hashes))
-    print(f"  unique hashes:   {unique}/{ok}  ({'PROMPT ISOLATION ✓' if unique == ok else 'COLLISIONS DETECTED ✗ — see known model issue'})")
+    print(f"  unique hashes:   {unique}/{ok}  ({'PROMPT ISOLATION ✓' if unique == ok else 'COLLISIONS DETECTED ✗ - see known model issue'})")
 
 print()
 print("─" * 72)

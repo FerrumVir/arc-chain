@@ -1,4 +1,4 @@
-# Integer Inference on ARC Chain — Determinism & Quality
+# Integer Inference on ARC Chain - Determinism & Quality
 
 **Version:** v0.5.2 (shipped)
 **Last verified:** 2026-04-20
@@ -32,8 +32,8 @@ Root cause (diagnosed 2026-04-20, see `project_i16_ppl_bug.md` memory
 and `crates/arc-inference/examples/probe_i16_real_weights.rs`):
 `I8Weights::quantize_f32` truncates the f32 per-row `abs_max` with
 `abs_max as i64` before computing the scale. For 100% of Llama-2-7B's
-`output.weight` rows and 100% of `ffn_down` rows — which have
-`abs_max ∈ [0.034, 0.523]` — this collapses the scale to 1, making
+`output.weight` rows and 100% of `ffn_down` rows - which have
+`abs_max ∈ [0.034, 0.523]` - this collapses the scale to 1, making
 matmul output 36× smaller than f32 ground truth.
 
 **Why the quality loss is not fixable with a one-line edit:** every
@@ -46,7 +46,7 @@ mathematically correct magnitudes).
 **Path forward (not done):**
 1. Coordinated rescale of `attn_scale`, `integer_exp` LUT, KV cache
    scales to match the corrected matmul magnitudes. Changes every
-   chain attestation hash — requires rolling upgrade of all seeds.
+   chain attestation hash - requires rolling upgrade of all seeds.
 2. Or swap to proper block-wise quantization (Q8_0 / Q4_K style) with
    per-block scales. Larger rewrite but matches llama.cpp quality.
 
@@ -54,10 +54,10 @@ mathematically correct magnitudes).
 
 Committed probes for whoever picks this up:
 
-- `crates/arc-inference/examples/probe_i16_vs_i8.rs` — forward-pass A/B
-- `crates/arc-inference/examples/probe_i16_matmul.rs` — single-row
+- `crates/arc-inference/examples/probe_i16_vs_i8.rs` - forward-pass A/B
+- `crates/arc-inference/examples/probe_i16_matmul.rs` - single-row
   synthetic matmul vs ground truth
-- `crates/arc-inference/examples/probe_i16_real_weights.rs` — real
+- `crates/arc-inference/examples/probe_i16_real_weights.rs` - real
   Llama-2-7B tensors vs ground truth (the definitive probe)
 
 ## What's unblocked on top of the current v0.5.2 baseline
@@ -65,5 +65,5 @@ Committed probes for whoever picks this up:
 The PPL-107 baseline is coherent enough that the chain-level features
 work: shard pipeline agrees on output hashes, attestations verify,
 cross-arch determinism holds. The inference quality limitation does
-not block consensus, economics, or demo use cases — it blocks a
+not block consensus, economics, or demo use cases - it blocks a
 head-to-head comparison with FP16 Llama on natural-language benchmarks.

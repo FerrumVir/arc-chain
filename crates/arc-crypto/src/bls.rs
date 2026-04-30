@@ -2,7 +2,7 @@
 //!
 //! Uses the `blst` crate (supranational/blst) for production BLS12-381
 //! cryptography. Public keys are compressed G1 points (48 bytes), signatures
-//! are compressed G2 points (96 bytes) — the "min_pk" variant.
+//! are compressed G2 points (96 bytes) - the "min_pk" variant.
 //!
 //! Used for consensus finality proofs where N validators produce a single
 //! aggregated signature verifiable against an aggregated public key.

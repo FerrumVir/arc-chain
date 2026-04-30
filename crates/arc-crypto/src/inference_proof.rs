@@ -34,11 +34,11 @@
 //!
 //! ## Constraints (all degree ≤ 2)
 //!
-//! 1. `active * (active - 1) = 0` — boolean
-//! 2. `is_last_col * (is_last_col - 1) = 0` — boolean
-//! 3. `active * (product - weight * input) = 0` — multiplication correctness
-//! 4. `active * (acc_next - acc_prev - product) = 0` — accumulation
-//! 5. `active * is_last_col * (output - acc_next - bias) = 0` — final output
+//! 1. `active * (active - 1) = 0` - boolean
+//! 2. `is_last_col * (is_last_col - 1) = 0` - boolean
+//! 3. `active * (product - weight * input) = 0` - multiplication correctness
+//! 4. `active * (acc_next - acc_prev - product) = 0` - accumulation
+//! 5. `active * is_last_col * (output - acc_next - bias) = 0` - final output
 
 use crate::{hash_bytes, Hash256};
 use serde::{Deserialize, Serialize};
@@ -186,7 +186,7 @@ pub fn generate_dense_trace(layer: &DenseLayerInput) -> Vec<Vec<i64>> {
 
 /// Verify a Dense layer trace against constraints (CPU verification, no STARK).
 ///
-/// This is the reference verifier — checks all constraints row by row.
+/// This is the reference verifier - checks all constraints row by row.
 /// Used for testing and as a fallback when the stwo-prover feature is disabled.
 pub fn verify_dense_trace(trace: &[Vec<i64>]) -> Result<(), String> {
     if trace.len() != DENSE_TRACE_COLS {

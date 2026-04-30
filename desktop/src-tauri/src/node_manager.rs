@@ -19,7 +19,7 @@ pub struct NodeManager {
     /// Set by the reaper when the child exits unexpectedly (we didn't call stop()).
     /// Surfaced through node_status.last_error so the UI can show a crash banner.
     pub crash_info: Arc<Mutex<Option<CrashInfo>>>,
-    /// Intentional-stop flag — `stop()` sets this before killing, so the reaper
+    /// Intentional-stop flag - `stop()` sets this before killing, so the reaper
     /// doesn't misreport a clean shutdown as a crash.
     stopping: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -71,7 +71,7 @@ impl NodeManager {
 
     pub fn is_running(&mut self) -> bool {
         // tokio::process::Child::try_wait doesn't exist on async Child;
-        // checking id() is enough — if we haven't called wait() it's still alive.
+        // checking id() is enough - if we haven't called wait() it's still alive.
         self.child.is_some()
     }
 
@@ -116,7 +116,7 @@ impl NodeManager {
                 &self.logs,
                 "warn",
                 format!(
-                    "port {} busy — using {} instead (p2p {} → {})",
+                    "port {} busy - using {} instead (p2p {} → {})",
                     config.rpc_port, rpc_port, config.p2p_port, p2p_port
                 ),
             )
@@ -146,7 +146,7 @@ impl NodeManager {
             push_log(
                 &self.logs,
                 "warn",
-                "testnet-seeds.txt not bundled — node will start isolated".into(),
+                "testnet-seeds.txt not bundled - node will start isolated".into(),
             )
             .await;
         }
@@ -156,14 +156,14 @@ impl NodeManager {
             push_log(
                 &self.logs,
                 "warn",
-                "genesis.toml not bundled — node validator set will be empty".into(),
+                "genesis.toml not bundled - node validator set will be empty".into(),
             )
             .await;
         }
 
         // Only register as a community inference worker if we actually
         // have a model to serve. role="worker" without model_path is
-        // nonsense — the gateway would forward requests the node can't
+        // nonsense - the gateway would forward requests the node can't
         // answer. Default role is "observer" which just joins consensus,
         // validates blocks, and helps the network without requiring a
         // 4 GB model download.
@@ -371,7 +371,7 @@ fn resolve_binary() -> anyhow::Result<PathBuf> {
     }
 
     Err(anyhow::anyhow!(
-        "arc-node binary not found. Expected at {} or on PATH. The app should download it on first launch — check Settings → Diagnostics.",
+        "arc-node binary not found. Expected at {} or on PATH. The app should download it on first launch - check Settings → Diagnostics.",
         p.display()
     ))
 }
@@ -467,7 +467,7 @@ mod tests {
         // probe has a free-port window to land in.
         let l2 = TcpListener::bind("127.0.0.1:0").unwrap();
         let p2p_seed = l2.local_addr().unwrap().port();
-        // Release l2 — we only wanted its assigned port number to feed in.
+        // Release l2 - we only wanted its assigned port number to feed in.
         drop(l2);
         let result = choose_port_pair(busy, p2p_seed);
         assert!(result.is_ok(), "probe should find a free pair");

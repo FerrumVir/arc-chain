@@ -19,7 +19,7 @@ test.describe("Onboarding wizard", () => {
     ).toBeVisible();
     await page.getByTestId("btn-continue-welcome").click();
 
-    // Identity (no role / hardware step anymore — one-click join)
+    // Identity (no role / hardware step anymore - one-click join)
     await expect(page.getByTestId("step-identity")).toBeVisible();
     await expect(page.getByTestId("identity-address")).toContainText("arc1q");
     await expect(page.getByTestId("btn-continue-identity")).toBeDisabled();
@@ -39,7 +39,7 @@ test.describe("Onboarding wizard", () => {
 
   test("progress dots update per step (3 dots, not 5)", async ({ page }) => {
     await page.goto("/");
-    // 3 dots total — dot 3 should NOT exist.
+    // 3 dots total - dot 3 should NOT exist.
     await expect(page.getByTestId("step-dot-0")).toHaveClass(/active/);
     await expect(page.getByTestId("step-dot-2")).toBeVisible();
     await expect(page.getByTestId("step-dot-3")).toHaveCount(0);

@@ -38,7 +38,7 @@ pub struct NodeConfig {
 
 impl Default for NodeConfig {
     fn default() -> Self {
-        // Default to port 9090 — matches the community installer script
+        // Default to port 9090 - matches the community installer script
         // (`arc-node --rpc 0.0.0.0:9090`) so the app auto-detects an
         // already-running community node on first launch.
         Self {
@@ -180,7 +180,7 @@ pub struct InferenceResult {
     pub coordinator: Option<String>,
 }
 
-/// Milestone B (#36): paid-inference response — carries the InferenceResult
+/// Milestone B (#36): paid-inference response - carries the InferenceResult
 /// fields plus the on-chain receipts (open tx hash, release tx hash, the
 /// payer's address, the max_fee that was escrowed).
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -103,7 +103,7 @@ async fn faucet_and_wait(c: &Client, coord: &str, addr_hex: &str, target: u64) {
         }
     }
     eprintln!(
-        "  WARN: {} did not reach {} ARC after faucet — current {}",
+        "  WARN: {} did not reach {} ARC after faucet - current {}",
         addr_hex,
         target,
         balance(c, coord, addr_hex).await
@@ -147,14 +147,14 @@ async fn submit_signed(
     if !resp.status().is_success() {
         let s = resp.status();
         let b = resp.text().await.unwrap_or_default();
-        panic!("submit failed: {} — {}", s, b);
+        panic!("submit failed: {} - {}", s, b);
     }
     hash_hex
 }
 
 async fn wait_committed(c: &Client, coord: &str, hash_hex: &str) -> bool {
     // Loaded testnet produces ~1 block / 30 s. Allow up to 240 s (8 blocks)
-    // before giving up — generous but well below the operator's patience.
+    // before giving up - generous but well below the operator's patience.
     for _ in 0..480 {
         tokio::time::sleep(Duration::from_millis(500)).await;
         if let Ok(r) = c
@@ -194,7 +194,7 @@ async fn main() {
 
     println!("=== Live driver for Milestones C + D + E on {} ===", coord);
 
-    // Stable phrases so reruns produce monotonic nonces — every step
+    // Stable phrases so reruns produce monotonic nonces - every step
     // uses the right next nonce read fresh from /account/.
     let (pub_sk, pub_pk, pub_addr) = keypair("milestone-c-publisher");
     let (qry_sk, qry_pk, qry_addr) = keypair("milestone-c-querier");
@@ -241,7 +241,7 @@ async fn main() {
 
     // Step 2: ModelRegistration with floor fee. Body hashes incorporate
     // the publisher's current nonce so reruns produce fresh tx_hashes
-    // — avoids being wedged by prior-attempt hashes still cached in
+    // - avoids being wedged by prior-attempt hashes still cached in
     // mempool's seen-set.
     println!();
     println!("--- step 2: ModelRegistration (Milestone C + E spam fee) ---");
@@ -273,7 +273,7 @@ async fn main() {
     .await;
     println!("ModelRegistration tx: 0x{}", reg_tx_hash);
     if !wait_committed(&c, &coord, &reg_tx_hash).await {
-        eprintln!("ModelRegistration did not commit — abort");
+        eprintln!("ModelRegistration did not commit - abort");
         std::process::exit(1);
     }
     let pub_bal_post = balance(&c, &coord, &pub_hex).await;
@@ -488,5 +488,5 @@ async fn main() {
         std::process::exit(1);
     }
     println!();
-    println!("ALL CHECKS PASS — Milestones C + D + E are live on the testnet.");
+    println!("ALL CHECKS PASS - Milestones C + D + E are live on the testnet.");
 }

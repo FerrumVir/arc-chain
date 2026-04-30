@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =========================================================================
-# ARC Chain — 4-Node Testnet Provisioning Script
+# ARC Chain - 4-Node Testnet Provisioning Script
 # =========================================================================
 # Provisions 4 Hetzner Cloud CAX41 (ARM64) servers with cloud-init,
 # deploys node configs with correct peer addresses, and starts the network.
@@ -39,7 +39,7 @@ NC='\033[0m'
 
 # -- Preflight Checks ----------------------------------------------------
 
-echo -e "${BOLD}ARC Chain Testnet — Provisioning 4 Nodes${NC}"
+echo -e "${BOLD}ARC Chain Testnet - Provisioning 4 Nodes${NC}"
 echo "============================================"
 echo ""
 
@@ -199,7 +199,7 @@ echo ""
 # -- Summary ---------------------------------------------------------------
 
 echo "============================================"
-echo -e "${BOLD}ARC Chain Testnet — Deployment Summary${NC}"
+echo -e "${BOLD}ARC Chain Testnet - Deployment Summary${NC}"
 echo "============================================"
 echo ""
 

@@ -1,6 +1,6 @@
 // Tests for the stability primitives added in the alpha-hardening pass:
 // ErrorBoundary, CrashBanner, mock-strip guard. These cover render-error
-// recovery and node-crash UX — the two paths most likely to break first-time
+// recovery and node-crash UX - the two paths most likely to break first-time
 // users when something goes wrong.
 
 import { expect, test } from "@playwright/test";
@@ -31,7 +31,7 @@ test.describe("Error boundary", () => {
       window.dispatchEvent(throwEvent);
     });
 
-    // The test above is best-effort — the actual ErrorBoundary UI is exercised
+    // The test above is best-effort - the actual ErrorBoundary UI is exercised
     // manually. We verify it's *present in the bundle* by confirming the
     // exported test-id renders when triggered, but absent otherwise.
     const boundary = page.getByTestId("error-boundary");
@@ -70,7 +70,7 @@ test.describe("Crash banner", () => {
       (window as unknown as { __ARC_MOCK_CRASH__: boolean }).__ARC_MOCK_CRASH__ =
         true;
     });
-    // Inject status fake before the app boots — we patch fetch for
+    // Inject status fake before the app boots - we patch fetch for
     // `/` not available, so instead we wait for dashboard then check the
     // banner is absent (no crash in normal mock mode).
     await page.goto("/");
@@ -84,7 +84,7 @@ test.describe("Crash banner", () => {
   }) => {
     await seedOnboarded(page);
     // Force the banner by mounting a test harness that injects a crash state
-    // directly into zustand — easier said than done without test hooks. As a
+    // directly into zustand - easier said than done without test hooks. As a
     // placeholder, this test confirms the CrashBanner's test ids will exist
     // once the Rust side emits a crash.
     await page.goto("/");

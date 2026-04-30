@@ -1,4 +1,4 @@
-# ARC Chain Node Configuration — Validator 1
+# ARC Chain Node Configuration - Validator 1
 # -----------------------------------------------------------------
 # Deployed to /etc/arc/config.toml on arc-node-1.
 # Peer addresses are populated by setup-testnet.sh after provisioning.

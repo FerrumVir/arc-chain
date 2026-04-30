@@ -149,7 +149,7 @@ export function Network() {
               className="big-number"
               style={{ marginTop: "var(--space-2)" }}
             >
-              {status?.committed === network?.latestBlock ? "100" : "—"}
+              {status?.committed === network?.latestBlock ? "100" : "-"}
               <span className="unit">%</span>
             </div>
             <div

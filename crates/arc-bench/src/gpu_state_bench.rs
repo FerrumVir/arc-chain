@@ -26,7 +26,7 @@ fn benchmark_address_u16(seed: u16) -> Address {
 pub fn run_gpu_state_benchmark() {
     println!();
     println!("╔══════════════════════════════════════════════════════════════════╗");
-    println!("║           ARC Chain — GPU-Resident State Benchmark              ║");
+    println!("║           ARC Chain - GPU-Resident State Benchmark              ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -41,7 +41,7 @@ pub fn run_gpu_state_benchmark() {
         .map(|i| (benchmark_address_u16(i), 1_000_000))
         .collect();
 
-    // ── Phase 2: Baseline — DashMap only ────────────────────────────────────
+    // ── Phase 2: Baseline - DashMap only ────────────────────────────────────
     println!("\n━━━ Phase 2: Baseline (DashMap only) ━━━");
 
     let state_baseline = Arc::new(StateDB::with_genesis(&genesis));

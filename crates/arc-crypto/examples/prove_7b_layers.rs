@@ -6,8 +6,8 @@
 //! Llama-2-7B dimensions:
 //!   d_model=4096, n_heads=32, d_head=128, d_ff=11008
 //!   Attention Q/K/V/O: 4096×4096 (16M MACs)
-//!   FFN gate/up:       4096×11008 (45M MACs) — requires sharding
-//!   FFN down:          11008×4096 (45M MACs) — requires sharding
+//!   FFN gate/up:       4096×11008 (45M MACs) - requires sharding
+//!   FFN down:          11008×4096 (45M MACs) - requires sharding
 //!
 //! Usage: cargo run --example prove_7b_layers --features stwo-icicle --release
 
@@ -144,7 +144,7 @@ fn main() {
                     root_hashes.push(out_hash);
                 }
                 Err(e) => {
-                    println!("   Run {}: FAILED — {}", rep + 1, e);
+                    println!("   Run {}: FAILED - {}", rep + 1, e);
                     root_hashes.push(String::new());
                 }
             }

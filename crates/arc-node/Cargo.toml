@@ -1,6 +1,6 @@
 [package]
 name = "arc-node"
-description = "ARC Chain node — block production, RPC server, DAG consensus"
+description = "ARC Chain node - block production, RPC server, DAG consensus"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ name = "arc-node"
 path = "src/main.rs"
 
 # Real Stwo Circle-STARK proofs enabled automatically in production (nightly).
-# Dev builds on stable use mock BLAKE3 verifier — proofs are structurally identical.
+# Dev builds on stable use mock BLAKE3 verifier - proofs are structurally identical.
 [features]
 default = []
 candle = ["arc-inference/candle"]

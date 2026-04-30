@@ -1,4 +1,4 @@
-//! ARC Chain — Inference Benchmark for Paper Evidence
+//! ARC Chain - Inference Benchmark for Paper Evidence
 //!
 //! Loads real neural network models, executes inference through the
 //! InferenceEngine, and measures:
@@ -30,7 +30,7 @@ fn main() {
     let model_path = args.iter().position(|a| a == "--model").map(|i| args[i + 1].clone());
 
     eprintln!("═══════════════════════════════════════════════════════════");
-    eprintln!("ARC Chain — Inference Benchmark");
+    eprintln!("ARC Chain - Inference Benchmark");
     eprintln!("═══════════════════════════════════════════════════════════");
 
     let mut results = serde_json::json!({

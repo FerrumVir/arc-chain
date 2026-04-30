@@ -268,7 +268,7 @@ impl LiquidityPool {
         }
 
         let shares = if self.total_lp_shares == 0 {
-            // Initial deposit — geometric mean sets the share base.
+            // Initial deposit - geometric mean sets the share base.
             isqrt(amount_a * amount_b)
         } else {
             // Mint proportional to the smaller ratio to prevent manipulation.
@@ -695,7 +695,7 @@ mod tests {
         addr
     }
 
-    // 1. Pool creation — new pool is empty
+    // 1. Pool creation - new pool is empty
     #[test]
     fn test_pool_creation() {
         let pool = LiquidityPool::new(token(1), token(2), DEFAULT_SWAP_FEE_BPS);
@@ -751,7 +751,7 @@ mod tests {
         // With zero fee: out = 1M * 100K / (1M + 100K) = 100_000_000_000 / 1_100_000 ≈ 90909
         assert_eq!(result.amount_out, 90909);
 
-        // Verify k is maintained (approximately — integer rounding).
+        // Verify k is maintained (approximately - integer rounding).
         let k_before: u128 = 1_000_000 * 1_000_000;
         let k_after: u128 = result.new_reserve_a * result.new_reserve_b;
         // k_after should be >= k_before (fees make k grow; with 0 fee it stays equal or rounds up)
@@ -893,7 +893,7 @@ mod tests {
         let price = 2 * PRICE_PRECISION; // $2 per token
 
         // Collateral value = $2000, at 150% ratio max debt = ~$1333
-        // Try to mint $1400 — should fail
+        // Try to mint $1400 - should fail
         let result = vault.mint_stablecoin(1_400 * PRICE_PRECISION, price);
         assert!(result.is_err(), "Minting beyond ratio should fail");
     }

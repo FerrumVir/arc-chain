@@ -27,7 +27,7 @@ jobs:
       - run: cargo clippy --workspace --lib --tests
       - run: cargo test --workspace --lib
 
-  # explorer/ has no package.json — it ships as static HTML served by the
+  # explorer/ has no package.json - it ships as static HTML served by the
   # dashboard node. The old `explorer-build` job below tried to `npm ci`
   # inside it and failed every run since the TypeScript port was reverted.
   # Guard the job with a file-existence check so it only runs when a real
@@ -45,7 +45,7 @@ jobs:
             echo "found=true" >> "$GITHUB_OUTPUT"
           else
             echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::explorer/ has no package.json — skipping npm build"
+            echo "::notice::explorer/ has no package.json - skipping npm build"
           fi
       - uses: actions/setup-node@v4
         if: steps.has_npm_project.outputs.found == 'true'

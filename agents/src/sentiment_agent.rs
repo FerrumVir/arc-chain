@@ -1,4 +1,4 @@
-//! Sentiment Agent — On-chain AI agent for binary text sentiment classification.
+//! Sentiment Agent - On-chain AI agent for binary text sentiment classification.
 //!
 //! Demonstrates:
 //! - Building a small 3-layer neural net (Dense 128->64->2 with ReLU + Softmax)
@@ -201,7 +201,7 @@ impl std::fmt::Display for SentimentResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{} (confidence: {:.2}%) — positive: {:.4}, negative: {:.4}",
+            "{} (confidence: {:.2}%) - positive: {:.4}, negative: {:.4}",
             self.label,
             self.confidence * 100.0,
             self.scores[0],

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Community Worker Registration (works with ANY arc-node version)
+# ARC Chain - Community Worker Registration (works with ANY arc-node version)
 #
 # Registers this node as a community inference worker with all 8 testnet
-# seed gateways. Runs as a sidecar alongside arc-node — no binary changes
+# seed gateways. Runs as a sidecar alongside arc-node - no binary changes
 # needed. Works with v0.3.0, v0.4.x, v0.5.x, or any future version.
 #
 # What it does:
@@ -60,7 +60,7 @@ TICK=0
 REGISTERED=0
 while true; do
     for seed in $SEEDS; do
-        # Try BOTH gateway (3001) AND arc-node RPC (9090) — some seeds
+        # Try BOTH gateway (3001) AND arc-node RPC (9090) - some seeds
         # only have one or the other alive.
         for port in $GATEWAY_PORT 9090; do
             EP="http://${seed}:${port}"

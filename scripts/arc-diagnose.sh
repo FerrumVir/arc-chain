@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Community Node Diagnostic
+# ARC Chain - Community Node Diagnostic
 #
 # Run this if your node is "running" but not syncing. It checks the 4 things
 # that break community installs most often:
@@ -41,7 +41,7 @@ header(){ printf "\n%s%s═══ %s ═══%s\n" "$BOLD" "$GREEN" "$1" "$RESE
 
 SEEDS="149.28.32.76:NYC 140.82.16.112:LAX 136.244.109.1:AMS 104.238.171.11:LHR 202.182.107.41:NRT 149.28.153.31:SGP 216.238.120.27:SAO 139.84.237.49:JNB"
 
-header "1/4 — Seed node UDP reachability (QUIC on port 9091)"
+header "1/4 - Seed node UDP reachability (QUIC on port 9091)"
 REACHABLE=0
 UNREACHABLE=0
 for entry in $SEEDS; do
@@ -49,14 +49,14 @@ for entry in $SEEDS; do
     name="${entry#*:}"
     if command -v nc >/dev/null 2>&1; then
         if nc -zu -w 3 "$ip" 9091 >/dev/null 2>&1; then
-            ok "$name ($ip:9091) — UDP reachable"
+            ok "$name ($ip:9091) - UDP reachable"
             REACHABLE=$((REACHABLE + 1))
         else
-            fail "$name ($ip:9091) — UDP unreachable (firewall/ISP?)"
+            fail "$name ($ip:9091) - UDP unreachable (firewall/ISP?)"
             UNREACHABLE=$((UNREACHABLE + 1))
         fi
     else
-        warn "nc not installed — skipping UDP reachability check"
+        warn "nc not installed - skipping UDP reachability check"
         break
     fi
 done
@@ -66,7 +66,7 @@ if [ "$UNREACHABLE" -gt 0 ]; then
     echo "    → Common fixes: allow UDP 9091 outbound, disable VPN, try residential net."
 fi
 
-header "2/4 — Local arc-node process"
+header "2/4 - Local arc-node process"
 if pgrep -f "arc-node --rpc" >/dev/null 2>&1; then
     PID=$(pgrep -f "arc-node --rpc" | head -1)
     ok "arc-node running (PID $PID)"
@@ -78,7 +78,7 @@ else
     echo "    → Or check logs: tail -50 ~/.arc/node.log"
 fi
 
-header "3/4 — Local RPC + peer count"
+header "3/4 - Local RPC + peer count"
 HEALTH=$(curl -sf -m 3 "http://localhost:$RPC_PORT/health" 2>/dev/null || echo "")
 if [ -z "$HEALTH" ]; then
     fail "http://localhost:$RPC_PORT/health not responding"
@@ -92,7 +92,7 @@ else
     info "uptime: ${UPTIME:-?} s"
     info "dag_round: ${ROUND:-?}"
     if [ -z "$PEERS" ] || [ "$PEERS" -eq 0 ] 2>/dev/null; then
-        fail "peers: 0 — NODE IS ISOLATED"
+        fail "peers: 0 - NODE IS ISOLATED"
         echo "    → This is the core bug. The node is running but can't reach any seed."
         echo "    → If UDP test above failed: fix firewall and restart the node."
         echo "    → If UDP test passed: look for Handshake errors in node.log:"
@@ -102,7 +102,7 @@ else
     fi
 fi
 
-header "4/4 — Chain sync status"
+header "4/4 - Chain sync status"
 if [ -n "${ROUND:-}" ] && [ "$ROUND" -gt 0 ] 2>/dev/null; then
     # Poll each seed and take the MAX dag_round so a single outage doesn't
     # skew the gap calculation. Seeds with 0 peers / DOWN are skipped.
@@ -121,20 +121,20 @@ if [ -n "${ROUND:-}" ] && [ "$ROUND" -gt 0 ] 2>/dev/null; then
     if [ "$REMOTE_ROUND" -gt 0 ]; then
         GAP=$((REMOTE_ROUND - ROUND))
         if [ "$GAP" -lt 100 ]; then
-            ok "Local round $ROUND vs $REMOTE_NAME $REMOTE_ROUND (gap: $GAP — synced)"
+            ok "Local round $ROUND vs $REMOTE_NAME $REMOTE_ROUND (gap: $GAP - synced)"
         elif [ "$GAP" -lt 10000 ]; then
-            warn "Local round $ROUND vs $REMOTE_NAME $REMOTE_ROUND (gap: $GAP — catching up)"
+            warn "Local round $ROUND vs $REMOTE_NAME $REMOTE_ROUND (gap: $GAP - catching up)"
         else
-            fail "Local round $ROUND vs $REMOTE_NAME $REMOTE_ROUND (gap: $GAP — NOT SYNCED, isolated)"
+            fail "Local round $ROUND vs $REMOTE_NAME $REMOTE_ROUND (gap: $GAP - NOT SYNCED, isolated)"
             echo "    → Your node is proposing its own DAG blocks in isolation."
             echo "    → It has never successfully synced with the real testnet chain."
             echo "    → Fix the peer connectivity issue above, then restart the node."
         fi
     else
-        warn "Could not reach any seed's /health — skipping sync-gap check."
+        warn "Could not reach any seed's /health - skipping sync-gap check."
     fi
 else
-    info "Local round not yet set — node may still be booting."
+    info "Local round not yet set - node may still be booting."
 fi
 
 echo ""

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ARC Chain — Live TPS</title>
+    <title>ARC Chain - Live TPS</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         :root {
@@ -209,7 +209,7 @@ function upd(d) {
         const e = 0.88, a = d.avg_node_tps;
         $('prs').innerHTML = [10,50,100,250,500,1000].map(n => {
             const t = a*n*e, hi = t >= 1e9;
-            return `<div class="pr${hi?' hi':''}"><span class="lb">${n} nodes</span><span>${fmt(t)} TPS${hi?' — 1B+':''}</span></div>`;
+            return `<div class="pr${hi?' hi':''}"><span class="lb">${n} nodes</span><span>${fmt(t)} TPS${hi?' - 1B+':''}</span></div>`;
         }).join('');
     }
 }

@@ -34,7 +34,7 @@ beforeEach(() => {
 });
 
 // ---------------------------------------------------------------------------
-// Client — getBlock
+// Client - getBlock
 // ---------------------------------------------------------------------------
 
 describe("ArcClient.getBlock", () => {
@@ -82,7 +82,7 @@ describe("ArcClient.getBlock", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Client — getAccount
+// Client - getAccount
 // ---------------------------------------------------------------------------
 
 describe("ArcClient.getAccount", () => {
@@ -104,7 +104,7 @@ describe("ArcClient.getAccount", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Client — submitTransaction
+// Client - submitTransaction
 // ---------------------------------------------------------------------------
 
 describe("ArcClient.submitTransaction", () => {
@@ -163,7 +163,7 @@ describe("ArcClient.submitTransaction", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Client — submitBatch
+// Client - submitBatch
 // ---------------------------------------------------------------------------
 
 describe("ArcClient.submitBatch", () => {
@@ -186,7 +186,7 @@ describe("ArcClient.submitBatch", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Client — getChainInfo / getStats
+// Client - getChainInfo / getStats
 // ---------------------------------------------------------------------------
 
 describe("ArcClient.getChainInfo", () => {
@@ -230,7 +230,7 @@ describe("ArcClient.getStats", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Client — ethCall
+// Client - ethCall
 // ---------------------------------------------------------------------------
 
 describe("ArcClient.ethCall", () => {

@@ -18,7 +18,7 @@ NC='\033[0m'
 
 echo -e "${CYAN}"
 echo "  ╔══════════════════════════════════════╗"
-echo "  ║      ARC Chain — Load Test           ║"
+echo "  ║      ARC Chain - Load Test           ║"
 echo "  ╚══════════════════════════════════════╝"
 echo -e "${NC}"
 

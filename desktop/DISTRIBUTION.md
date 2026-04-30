@@ -1,4 +1,4 @@
-# ARC — pre-distribution checklist
+# ARC - pre-distribution checklist
 
 **Target: 10,000 users. Zero silent failures.**
 
@@ -24,9 +24,9 @@ Read every line. Ship only when every **❌** becomes a **✅**.
   12-word BIP-39 phrase.
 - Store path fixed for Android. Was using `directories::ProjectDirs` which
   returns a read-only path on Android (`Read-only file system (os error 30)`).
-  Now uses Tauri's `PathResolver::app_data_dir()` — resolves to
+  Now uses Tauri's `PathResolver::app_data_dir()` - resolves to
   `/data/user/0/network.arc.desktop/files` on Android.
-- `reqwest` switched to `rustls-tls` — native-tls/openssl-sys can't
+- `reqwest` switched to `rustls-tls` - native-tls/openssl-sys can't
   cross-compile to Android without a pre-built OpenSSL.
 - Responsive CSS: sidebar → bottom tab bar below 768px, 46px tap targets,
   info popovers become centered modals, `env(safe-area-inset-*)` respected.
@@ -42,7 +42,7 @@ Read every line. Ship only when every **❌** becomes a **✅**.
 ### 1. The app on mobile has no node to talk to
 
 The desktop app assumes `arc-node` is running at `127.0.0.1:9090`. On a
-phone, there's no local node and can't reasonably be one — iOS kills
+phone, there's no local node and can't reasonably be one - iOS kills
 background CPU after a few minutes, Android thermal-throttles a GPU
 inference process, and neither OS lets you bind a port durably.
 
@@ -60,7 +60,7 @@ Attestations show up, balance + faucet work.
 **(c) Pretend it's desktop and watch users hit "Start node" → error.**
 Don't do this. This is how you generate 10,000 1-star reviews.
 
-I'd pick (b) for v0.1 mobile — lets you claim "10k verifier nodes" in
+I'd pick (b) for v0.1 mobile - lets you claim "10k verifier nodes" in
 marketing, no infrastructure ask of the user. Point the RPC at a CDN-
 fronted public gateway.
 
@@ -110,10 +110,10 @@ internal testing track → review (~1–3 days) → production rollout.
 
 Required before upload:
 
-- App name: "ARC" (check trademark conflict — there's an "Arc" browser)
+- App name: "ARC" (check trademark conflict - there's an "Arc" browser)
 - Short description (80 chars)
 - Full description (4000 chars)
-- 2 screenshots (min), ideally 8 — one per screen
+- 2 screenshots (min), ideally 8 - one per screen
 - Feature graphic (1024×500)
 - App icon 512×512 (regenerate from your real logo, not the bitmap
   wordmark currently in `src-tauri/icons/`)
@@ -143,7 +143,7 @@ straight to dashboard.
 ### 7. No Android UI tests
 
 Playwright tests cover the *same* React code the APK ships, but they
-run in chromium at a mobile viewport — not in Android WebView. Subtle
+run in chromium at a mobile viewport - not in Android WebView. Subtle
 differences (scroll behavior, font rendering, keyboard handling, WebView
 version differences across OEMs) aren't caught.
 
@@ -179,7 +179,7 @@ Use that.
 ## If you want the minimum path to 10k this week
 
 Ship **desktop-only** to 10k (Mac first since that's where the APK-less
-setup cost is zero — everything is ready except Apple Dev ID signing).
+setup cost is zero - everything is ready except Apple Dev ID signing).
 Keep Android in closed testing until scope decisions above are made.
 
 Desktop blockers remaining: `Apple Developer Program enrolment ($99, ~24h)`

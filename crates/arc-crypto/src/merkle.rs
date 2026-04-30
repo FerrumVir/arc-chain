@@ -125,7 +125,7 @@ impl MerkleTree {
     }
 }
 
-/// Persistent incremental Merkle tree — O(k log n) updates.
+/// Persistent incremental Merkle tree - O(k log n) updates.
 ///
 /// Maintains a sorted set of (key, leaf_hash) pairs and caches all tree
 /// levels between calls.  When only existing leaves change, only the
@@ -133,7 +133,7 @@ impl MerkleTree {
 /// (inserts / deletes) trigger a full O(n) rebuild.
 ///
 /// Produces the **exact same root** as `MerkleTree::from_leaves` for the
-/// same sorted sequence of leaf hashes — the padding rules are identical.
+/// same sorted sequence of leaf hashes - the padding rules are identical.
 pub struct IncrementalMerkle {
     /// Sorted keys (e.g. account addresses).
     keys: Vec<[u8; 32]>,
@@ -173,7 +173,7 @@ impl IncrementalMerkle {
             let idx = self.keys.binary_search(&key).unwrap_or_else(|i| i);
             self.keys.insert(idx, key);
             self.leaves.insert(idx, hash);
-            // Rebuild the index — indices after `idx` shifted by 1.
+            // Rebuild the index - indices after `idx` shifted by 1.
             self.key_index.clear();
             for (i, k) in self.keys.iter().enumerate() {
                 self.key_index.insert(*k, i);
@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn test_incremental_odd_leaf_count() {
-        // Odd number of leaves — tests padding edge case.
+        // Odd number of leaves - tests padding edge case.
         let mut im = IncrementalMerkle::new();
         let n = 7u32;
         let keys: Vec<[u8; 32]> = (0..n)

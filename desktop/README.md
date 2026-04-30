@@ -1,4 +1,4 @@
-# ARC Node — Desktop App
+# ARC Node - Desktop App
 
 A Tauri 2 desktop app that wraps the `arc-node` binary so anyone can run an ARC node by double-clicking a `.dmg`, `.msi`, or `.AppImage`. No terminal, no curl-pipe-bash.
 
@@ -71,7 +71,7 @@ Outputs to `src-tauri/target/release/bundle/`:
 - **Windows**: `.msi`, `.exe` (Authenticode-signed when cert is configured)
 - **Linux**: `.AppImage`, `.deb`, `.rpm`
 
-### Code signing — the single biggest UX investment
+### Code signing - the single biggest UX investment
 
 Without signing, Gatekeeper (macOS) and SmartScreen (Windows) block the installer
 by default. This is the reason most "run from source" apps see <10% conversion.
@@ -110,16 +110,16 @@ npm run test:ui         # Playwright UI mode (time-travel debugger)
 
 **Coverage**: 26 tests across 6 suites:
 
-- `onboarding.spec.ts` — 4 tests: five-step flow, progress dots, back button, seed-reveal gate
-- `dashboard.spec.ts` — 6 tests: shell, earnings ticker, start/stop toggle, stat grid, attestation feed, clipboard
-- `navigation.spec.ts` — 6 tests: each of 5 routes + aria-current
-- `settings.spec.ts` — 3 tests: save, reset, update check
-- `accessibility.spec.ts` — 3 tests: heading structure, keyboard focus, preview badge
-- `visual.spec.ts` — 4 tests: gradient logo, gradient earnings text, live pulse animation, active-nav glow
+- `onboarding.spec.ts` - 4 tests: five-step flow, progress dots, back button, seed-reveal gate
+- `dashboard.spec.ts` - 6 tests: shell, earnings ticker, start/stop toggle, stat grid, attestation feed, clipboard
+- `navigation.spec.ts` - 6 tests: each of 5 routes + aria-current
+- `settings.spec.ts` - 3 tests: save, reset, update check
+- `accessibility.spec.ts` - 3 tests: heading structure, keyboard focus, preview badge
+- `visual.spec.ts` - 4 tests: gradient logo, gradient earnings text, live pulse animation, active-nav glow
 
 There's also a `screenshots.spec.ts` that captures a 10-screen design gallery into `screenshots/`.
 
-The tests run against the Vite preview server (`npm run build && npm run preview`) using the same frontend the native app ships — just with mock Tauri IPC. Native integration (child-process spawning, file I/O) is covered by Rust unit tests.
+The tests run against the Vite preview server (`npm run build && npm run preview`) using the same frontend the native app ships - just with mock Tauri IPC. Native integration (child-process spawning, file I/O) is covered by Rust unit tests.
 
 ## Architecture
 
@@ -156,7 +156,7 @@ every Playwright test).
 - **zustand** + `localStorage` for UI-only state (route, onboarded flag)
 - **Rust `store.rs`** writes identity + config to the OS app-data dir
   (e.g. `~/Library/Application Support/ARC Node/store.json` on macOS)
-- Recovery phrase is **never** stored on disk — user is forced to reveal and save it during onboarding
+- Recovery phrase is **never** stored on disk - user is forced to reveal and save it during onboarding
 
 ### Design tokens
 
@@ -178,7 +178,7 @@ properties in `src/styles/tokens.css`. No hardcoded hex in components.
 
 ## Next steps (not in this PR)
 
-- **Auto-update** via `tauri-plugin-updater` — wire to the same GitHub release feed the CLI installer uses
+- **Auto-update** via `tauri-plugin-updater` - wire to the same GitHub release feed the CLI installer uses
 - **Tray icon** for quiet background mode (macOS `NSStatusItem`, Windows tray)
 - **Model management** screen: list available GGUF models, download progress, per-model earnings
 - **Hardware wallet signing** via Tauri's WebUSB bridge (Ledger Nano)

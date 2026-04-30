@@ -1,4 +1,4 @@
-//! `arc transfer` — send ARC tokens to another address.
+//! `arc transfer` - send ARC tokens to another address.
 
 use anyhow::{Result, Context};
 use crate::keygen;

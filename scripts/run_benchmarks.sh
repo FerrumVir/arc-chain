@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# ARC Chain — Full Benchmark Suite
+# ARC Chain - Full Benchmark Suite
 # Runs production, mixed workload, and signed benchmarks
 # Generates a summary report
 
 set -euo pipefail
 
 echo "================================================================"
-echo " ARC Chain — Full Benchmark Suite"
+echo " ARC Chain - Full Benchmark Suite"
 echo " $(date)"
 echo "================================================================"
 echo ""
@@ -28,9 +28,9 @@ cargo run --release --bin arc-bench-mixed 2>&1
 # Run signed benchmark (if exists)
 echo ""
 echo "[4/4] Running signed transaction benchmark..."
-cargo run --release --bin arc-bench-signed 2>&1 || echo "  (skipped — signed bench not available)"
+cargo run --release --bin arc-bench-signed 2>&1 || echo "  (skipped - signed bench not available)"
 
 echo ""
 echo "================================================================"
-echo " Benchmark suite complete — $(date)"
+echo " Benchmark suite complete - $(date)"
 echo "================================================================"

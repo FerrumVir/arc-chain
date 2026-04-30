@@ -1,9 +1,9 @@
 //! Integer-only transformer inference engine.
 //!
 //! All computation is i64 fixed-point arithmetic. No f32, no f64,
-//! no exp(), no sqrt() — only integer multiply, add, shift, and
+//! no exp(), no sqrt() - only integer multiply, add, shift, and
 //! lookup tables. Produces bitwise identical output on ARM, x86,
-//! RISC-V, GPU — any platform with 64-bit integer arithmetic.
+//! RISC-V, GPU - any platform with 64-bit integer arithmetic.
 //!
 //! This is ARC Chain's production inference path for consensus.
 

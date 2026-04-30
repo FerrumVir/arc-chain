@@ -1,4 +1,4 @@
-//! `arc balance <address>` — query an account's balance and nonce.
+//! `arc balance <address>` - query an account's balance and nonce.
 
 use anyhow::Result;
 use crate::rpc::RpcClient;
@@ -10,7 +10,7 @@ pub async fn run(rpc: &RpcClient, address: &str) -> Result<()> {
     let data = match rpc.get_account(address).await {
         Ok(d) => d,
         Err(e) => {
-            // 404 means account doesn't exist yet — show zero balance
+            // 404 means account doesn't exist yet - show zero balance
             let msg = format!("{:#}", e);
             if msg.contains("404") {
                 let short_addr = if address.len() > 16 {

@@ -1,4 +1,4 @@
-//! `arc tx <hash>` — display transaction details.
+//! `arc tx <hash>` - display transaction details.
 
 use anyhow::Result;
 use crate::rpc::RpcClient;
@@ -36,7 +36,7 @@ pub async fn run(rpc: &RpcClient, hash: &str) -> Result<()> {
         print_body(tx_type, body);
     }
 
-    // Print status — may be at top level or nested under "receipt"
+    // Print status - may be at top level or nested under "receipt"
     let (success, gas_used) = if let Some(receipt) = data.get("receipt") {
         (
             receipt.get("success").and_then(|v| v.as_bool()),

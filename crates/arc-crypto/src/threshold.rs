@@ -438,7 +438,7 @@ impl ThresholdSigner {
 
     /// Verify a combined threshold signature against a message and public key.
     ///
-    /// The public key is BLAKE3(secret) — the commitment to the original secret.
+    /// The public key is BLAKE3(secret) - the commitment to the original secret.
     pub fn verify_combined(
         message: &[u8],
         combined_sig: &[u8; 32],
@@ -454,7 +454,7 @@ impl ThresholdSigner {
 
         // The signature is valid if the tag's first byte has high bit set.
         // Mock verification: accepts any non-zero combined signature.
-        // This is NOT cryptographically secure — it's a structural check
+        // This is NOT cryptographically secure - it's a structural check
         // for pipeline testing. Real threshold signatures would require
         // a discrete-log-based scheme (e.g., FROST).
         let _ = tag;

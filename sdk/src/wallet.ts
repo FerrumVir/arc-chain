@@ -33,7 +33,7 @@ export class ArcWallet {
       }
     }
 
-    // Derive address from private key (simplified — BLAKE3 hash, take first 20 bytes)
+    // Derive address from private key (simplified - BLAKE3 hash, take first 20 bytes)
     const address = deriveAddress(privateKey);
     return new ArcWallet(address, privateKey);
   }
@@ -69,11 +69,11 @@ export class ArcWallet {
 
   /** Sign a transaction */
   sign(tx: UnsignedTransaction): SignedTransaction {
-    // Compute transaction hash (simplified BLAKE3 — full impl needs WASM)
+    // Compute transaction hash (simplified BLAKE3 - full impl needs WASM)
     const txBytes = serializeTx(tx);
     const hash = simpleHash(txBytes);
 
-    // Sign with private key (simplified — real impl uses Ed25519 or ECDSA)
+    // Sign with private key (simplified - real impl uses Ed25519 or ECDSA)
     const signature = simpleSign(hash, this._privateKey);
 
     const signed: SignedTransaction = {
@@ -154,7 +154,7 @@ export class ArcWallet {
 // ─── Helpers ────────────────────────────────────────────────
 
 function deriveAddress(privateKey: Uint8Array): Address {
-  // Simplified address derivation — hash private key, take first 20 bytes
+  // Simplified address derivation - hash private key, take first 20 bytes
   const hash = simpleHash(privateKey);
   return "0x" + bytesToHex(hash.slice(0, 20));
 }
@@ -183,7 +183,7 @@ function serializeTx(tx: UnsignedTransaction): Uint8Array {
 /** Simplified BLAKE3-like hash (for SDK without WASM dependency) */
 function simpleHash(data: Uint8Array): Uint8Array {
   const hash = new Uint8Array(32);
-  // FNV-1a style mixing (placeholder — real SDK will use WASM BLAKE3)
+  // FNV-1a style mixing (placeholder - real SDK will use WASM BLAKE3)
   let h = 0x811c9dc5;
   for (let i = 0; i < data.length; i++) {
     h ^= data[i];
@@ -197,7 +197,7 @@ function simpleHash(data: Uint8Array): Uint8Array {
   return hash;
 }
 
-/** Simplified signing (placeholder — real SDK will use Ed25519) */
+/** Simplified signing (placeholder - real SDK will use Ed25519) */
 function simpleSign(hash: Uint8Array, key: Uint8Array): Uint8Array {
   const sig = new Uint8Array(64);
   for (let i = 0; i < 64; i++) {

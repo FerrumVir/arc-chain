@@ -12,13 +12,13 @@
 //! and a deterministic input derived from `(slot_number, previous_block_hash)`.
 //! The VRF output is a pseudorandom 32-byte value that:
 //!
-//! 1. **Unpredictable** — nobody knows who the proposer is until they reveal
+//! 1. **Unpredictable** - nobody knows who the proposer is until they reveal
 //!    their VRF proof, because the output depends on the validator's secret key.
-//! 2. **Ungameable** — the VRF input includes `prev_block_hash` which is already
+//! 2. **Ungameable** - the VRF input includes `prev_block_hash` which is already
 //!    committed on-chain; the current proposer cannot manipulate it.
-//! 3. **Verifiable** — any node can check the VRF proof to confirm the proposer
+//! 3. **Verifiable** - any node can check the VRF proof to confirm the proposer
 //!    was legitimately selected without knowing their secret key.
-//! 4. **Stake-weighted** — validators with higher stake have a proportionally
+//! 4. **Stake-weighted** - validators with higher stake have a proportionally
 //!    higher probability of being selected as proposer.
 //!
 //! # Proposer selection
@@ -70,7 +70,7 @@ const EXPECTED_PROPOSERS_PER_SLOT: u64 = 1;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-/// VRF output — the pseudorandom value derived from the proof.
+/// VRF output - the pseudorandom value derived from the proof.
 ///
 /// This wraps the `arc_crypto::VrfOutput` with a convenience interface
 /// for proposer selection arithmetic.
@@ -146,7 +146,7 @@ impl VrfOutput {
     }
 }
 
-/// VRF proof — proves the output was correctly computed by the secret key holder.
+/// VRF proof - proves the output was correctly computed by the secret key holder.
 ///
 /// Wraps the `arc_crypto::VrfProof` which contains the intermediate gamma value
 /// and an Ed25519 signature binding gamma to the VRF input.
@@ -185,7 +185,7 @@ impl ProposerSelector {
     /// Create a new proposer selector with the given validator set.
     ///
     /// # Arguments
-    /// * `validators` — The active validator set for the current epoch.
+    /// * `validators` - The active validator set for the current epoch.
     ///
     /// # Panics
     /// Panics if `validators` is empty (there must be at least one validator).
@@ -238,12 +238,12 @@ impl ProposerSelector {
     /// VRF output that determines their proposer eligibility for this slot.
     ///
     /// # Arguments
-    /// * `keypair` — The validator's Ed25519 keypair.
-    /// * `slot` — The slot number to compute the VRF for.
-    /// * `prev_hash` — Hash of the previous block (anchors randomness).
+    /// * `keypair` - The validator's Ed25519 keypair.
+    /// * `slot` - The slot number to compute the VRF for.
+    /// * `prev_hash` - Hash of the previous block (anchors randomness).
     ///
     /// # Returns
-    /// `(VrfOutput, VrfProof)` — The pseudorandom output and its proof.
+    /// `(VrfOutput, VrfProof)` - The pseudorandom output and its proof.
     pub fn compute_vrf(
         keypair: &KeyPair,
         slot: u64,
@@ -267,11 +267,11 @@ impl ProposerSelector {
     /// and that the claimed output matches the proof.
     ///
     /// # Arguments
-    /// * `validator_address` — The ARC address of the validator who produced the proof.
-    /// * `slot` — The slot number the proof claims to be for.
-    /// * `prev_hash` — The previous block hash used as VRF input.
-    /// * `output` — The claimed VRF output to verify.
-    /// * `proof` — The VRF proof to verify.
+    /// * `validator_address` - The ARC address of the validator who produced the proof.
+    /// * `slot` - The slot number the proof claims to be for.
+    /// * `prev_hash` - The previous block hash used as VRF input.
+    /// * `output` - The claimed VRF output to verify.
+    /// * `proof` - The VRF proof to verify.
     ///
     /// # Returns
     /// `true` if the proof is valid and the output matches, `false` otherwise.
@@ -302,8 +302,8 @@ impl ProposerSelector {
     /// across the entire validator set.
     ///
     /// # Arguments
-    /// * `validator_stake` — The stake of the validator to check.
-    /// * `vrf_output` — The validator's VRF output for this slot.
+    /// * `validator_stake` - The stake of the validator to check.
+    /// * `vrf_output` - The validator's VRF output for this slot.
     ///
     /// # Returns
     /// `true` if the validator's VRF output falls below the stake-weighted
@@ -320,7 +320,7 @@ impl ProposerSelector {
     /// validators pass the threshold check.
     ///
     /// # Arguments
-    /// * `candidates` — Tuples of (address, vrf_output, vrf_proof) for each
+    /// * `candidates` - Tuples of (address, vrf_output, vrf_proof) for each
     ///   candidate who passed the threshold check and has a valid proof.
     ///
     /// # Returns
@@ -359,9 +359,9 @@ impl ProposerSelector {
     /// filter to eligible proposers, and select the winner.
     ///
     /// # Arguments
-    /// * `slot` — The slot number.
-    /// * `prev_hash` — The previous block hash.
-    /// * `candidates` — Tuples of (address, vrf_output, vrf_proof).
+    /// * `slot` - The slot number.
+    /// * `prev_hash` - The previous block hash.
+    /// * `candidates` - Tuples of (address, vrf_output, vrf_proof).
     ///
     /// # Returns
     /// The address of the winning proposer, or `None` if no valid candidates.
@@ -564,7 +564,7 @@ mod tests {
 
         let prev_hash = hash_bytes(b"anchor").0;
 
-        // Test across many slots — a sole validator should always be eligible.
+        // Test across many slots - a sole validator should always be eligible.
         let mut eligible_count = 0;
         for slot in 0..100 {
             let (output, _) = ProposerSelector::compute_vrf(&kp, slot, &prev_hash).expect("ok");
@@ -716,7 +716,7 @@ mod tests {
             ProposerSelector::compute_vrf(&kp_invalid, slot, &prev_hash).expect("ok");
 
         // Candidate 0: valid proof for v_valid
-        // Candidate 1: invalid — proof from kp_invalid but address of v_valid
+        // Candidate 1: invalid - proof from kp_invalid but address of v_valid
         let candidates = vec![
             (v_valid.address, out_valid, proof_valid),
             (v_valid.address, out_fake, proof_fake), // address mismatch

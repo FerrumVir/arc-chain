@@ -147,7 +147,7 @@ pub struct AbiEventParam {
 pub struct AbiEvent {
     pub name: String,
     pub inputs: Vec<AbiEventParam>,
-    /// BLAKE3(event signature) — used as topic[0].
+    /// BLAKE3(event signature) - used as topic[0].
     pub topic0: [u8; 32],
 }
 
@@ -205,7 +205,7 @@ impl Default for ContractAbi {
 
 // ─── Contract manifest ───────────────────────────────────────────────────────
 
-/// Smart contract deployment manifest — everything needed to deploy a contract.
+/// Smart contract deployment manifest - everything needed to deploy a contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContractManifest {
     pub name: String,
@@ -423,7 +423,7 @@ mod tests {
         h
     }
 
-    // 1. Contract manifest creation — correct fields.
+    // 1. Contract manifest creation - correct fields.
     #[test]
     fn test_contract_manifest_creation() {
         let hash = test_hash(0xAB);
@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(manifest.deploy_gas, 0);
     }
 
-    // 2. ABI add function — add and retrieve by name.
+    // 2. ABI add function - add and retrieve by name.
     #[test]
     fn test_abi_add_function() {
         let mut abi = ContractAbi::new();
@@ -476,7 +476,7 @@ mod tests {
         assert!(abi.get_function("approve").is_none());
     }
 
-    // 3. ABI selector — correct 4-byte selector from BLAKE3.
+    // 3. ABI selector - correct 4-byte selector from BLAKE3.
     #[test]
     fn test_abi_selector() {
         let sig = "transfer(address,uint256)";
@@ -488,7 +488,7 @@ mod tests {
         assert_eq!(&selector, expected);
     }
 
-    // 4. ABI get by selector — retrieve function by its selector.
+    // 4. ABI get by selector - retrieve function by its selector.
     #[test]
     fn test_abi_get_by_selector() {
         let mut abi = ContractAbi::new();
@@ -526,7 +526,7 @@ mod tests {
         assert!(abi.get_function_by_selector(&bad_selector).is_none());
     }
 
-    // 5. Function signature — canonical format "transfer(address,uint256)".
+    // 5. Function signature - canonical format "transfer(address,uint256)".
     #[test]
     fn test_function_signature() {
         let func = AbiFunction::new(
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(complex.signature(), "batchTransfer(address[],(uint256,bool))");
     }
 
-    // 6. Test case creation — create with actions and assertions.
+    // 6. Test case creation - create with actions and assertions.
     #[test]
     fn test_test_case_creation() {
         let mut tc = TestCase::new("token_transfer");
@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(tc.is_passed(), Some(true));
     }
 
-    // 7. Gas profile recursive — total includes sub-calls.
+    // 7. Gas profile recursive - total includes sub-calls.
     #[test]
     fn test_gas_profile_recursive() {
         let mut root = GasProfile::new("swap", 100);
@@ -618,7 +618,7 @@ mod tests {
         assert_eq!(root.sub_calls[0].sub_calls[0].total_with_subcalls(), 30);
     }
 
-    // 8. ABI types complete — all ABI types serialize/deserialize.
+    // 8. ABI types complete - all ABI types serialize/deserialize.
     #[test]
     fn test_abi_types_complete() {
         let types = vec![
@@ -655,7 +655,7 @@ mod tests {
         }
     }
 
-    // 9. VM target variants — both Wasm and Evm.
+    // 9. VM target variants - both Wasm and Evm.
     #[test]
     fn test_vm_target_variants() {
         let wasm = VmTarget::Wasm;
@@ -676,7 +676,7 @@ mod tests {
         assert_eq!(evm_back, VmTarget::Evm);
     }
 
-    // 10. Network stats defaults — reasonable values.
+    // 10. Network stats defaults - reasonable values.
     #[test]
     fn test_network_stats_defaults() {
         let stats = NetworkStats::default_stats();

@@ -430,7 +430,7 @@ mod tests {
         let s0 = state.advance_epoch();
         assert_eq!(s0.epoch, 0);
 
-        // Epoch 1 — attestations must use epoch 1 now.
+        // Epoch 1 - attestations must use epoch 1 now.
         state
             .submit_attestation(make_attestation(0, 1, 200))
             .unwrap();

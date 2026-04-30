@@ -14,6 +14,16 @@ pub mod gguf_integer;
 pub mod cached_integer_model;
 pub mod block_i8;
 pub mod q4_engine;
+pub mod ternary_engine;
+pub mod ternary_hybrid;
+pub mod int8_asic;
+pub mod int16_asic;
+pub mod sha256_isa;
+pub mod asic_families;
+pub mod asic_parallel;
+pub mod asic_batched;
+pub mod mining_asic_node;
+pub mod economics;
 pub mod distributed;
 pub mod streaming;
 
@@ -353,7 +363,7 @@ mod tests {
             max_tokens: 50,
         };
 
-        // Run twice — must produce identical output
+        // Run twice - must produce identical output
         let r1 = runtime.execute(&request).unwrap();
         let r2 = runtime.execute(&request).unwrap();
         assert_eq!(r1.output, r2.output);

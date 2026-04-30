@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# ARC Chain Quick Test — build, start, submit tx, verify block, check receipt
+# ARC Chain Quick Test - build, start, submit tx, verify block, check receipt
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 RPC="http://127.0.0.1:9944"
@@ -46,7 +46,7 @@ HEALTH=$(curl -sf "$RPC/health" 2>/dev/null || echo "FAIL")
 if echo "$HEALTH" | grep -q '"status":"ok"'; then
     echo "  OK: Node is healthy"
 else
-    echo "FAIL: Health check failed — $HEALTH"
+    echo "FAIL: Health check failed - $HEALTH"
     exit 1
 fi
 
@@ -56,7 +56,7 @@ echo "  Initial height: $INITIAL_HEIGHT"
 
 # 5. Submit a test transfer
 echo "[5/7] Submitting test transfer..."
-# Genesis account 0 = hash of [0x00] — prefunded with 1T
+# Genesis account 0 = hash of [0x00] - prefunded with 1T
 FROM="af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 TO="2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
 
@@ -66,9 +66,9 @@ TX_RESULT=$(curl -sf -X POST "$RPC/tx/submit" \
 
 if echo "$TX_RESULT" | grep -q '"status":"pending"'; then
     TX_HASH=$(echo "$TX_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['tx_hash'])" 2>/dev/null)
-    echo "  OK: TX submitted — $TX_HASH"
+    echo "  OK: TX submitted - $TX_HASH"
 else
-    echo "FAIL: TX submission failed — $TX_RESULT"
+    echo "FAIL: TX submission failed - $TX_RESULT"
     exit 1
 fi
 
@@ -92,11 +92,11 @@ RECEIPT=$(curl -sf "$RPC/tx/$TX_HASH" 2>/dev/null || echo "FAIL")
 if echo "$RECEIPT" | grep -q '"success":true'; then
     echo "  OK: Transaction confirmed and successful"
 else
-    echo "FAIL: Receipt check failed — $RECEIPT"
+    echo "FAIL: Receipt check failed - $RECEIPT"
     exit 1
 fi
 
 echo ""
 echo "==============================="
-echo "  PASS — All checks passed"
+echo "  PASS - All checks passed"
 echo "==============================="

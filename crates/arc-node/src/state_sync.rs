@@ -1,4 +1,4 @@
-//! State Sync — chunked snapshot download for fast node catch-up.
+//! State Sync - chunked snapshot download for fast node catch-up.
 //!
 //! New nodes that are behind the network can download a recent state snapshot
 //! from peers instead of replaying every block from genesis. The protocol:
@@ -228,7 +228,7 @@ impl StateSyncManager {
             chunk_index = batch_end;
         }
 
-        // 4. Finalize — verify state root
+        // 4. Finalize - verify state root
         state.finalize_sync(&progress)?;
 
         info!(

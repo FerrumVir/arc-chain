@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — Auto-Update Daemon
+# ARC Chain - Auto-Update Daemon
 #
 # Checks GitHub releases every 10 minutes. When a new version is available,
 # downloads the pre-built binary and gracefully restarts the node.
@@ -11,7 +11,7 @@
 #   nohup ./scripts/auto-update.sh &            # Background daemon
 #
 # The daemon only restarts the node if you originally started it via
-# join-inference.sh or install-node.sh — otherwise it just logs the
+# join-inference.sh or install-node.sh - otherwise it just logs the
 # available update and lets you restart manually.
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
@@ -71,7 +71,7 @@ get_installed_version() {
 }
 
 get_latest_version() {
-    # GitHub releases API — no auth needed for public repos
+    # GitHub releases API - no auth needed for public repos
     curl -sf "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
         | grep -m1 '"tag_name"' \
         | sed -E 's/.*"v?([0-9]+\.[0-9]+\.[0-9]+)".*/\1/'
@@ -110,7 +110,7 @@ restart_node() {
     local pid
     pid="$(find_running_node_pid)"
     if [ -z "$pid" ]; then
-        log "  No running arc-node process found — skipping restart"
+        log "  No running arc-node process found - skipping restart"
         return 1
     fi
 
@@ -123,7 +123,7 @@ restart_node() {
     fi
 
     if [ -z "$cmdline" ]; then
-        log "  Couldn't read cmdline for pid $pid — skipping restart"
+        log "  Couldn't read cmdline for pid $pid - skipping restart"
         return 1
     fi
 
@@ -178,7 +178,7 @@ check_and_update() {
 
     if [ "$current" != "none" ] && [ "$current" != "unknown" ]; then
         if ! version_gt "$latest" "$current"; then
-            log "Installed version is newer or equal — skipping"
+            log "Installed version is newer or equal - skipping"
             return 0
         fi
     fi

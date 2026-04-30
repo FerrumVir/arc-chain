@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARC Chain — Deploy Node + Explorer on VPS
+# ARC Chain - Deploy Node + Explorer on VPS
 #
 # Sets up a persistent ARC Chain node with seeded transactions and a public
 # block explorer. After running this, you have a URL you can share.
@@ -37,9 +37,9 @@ NODE_PORT=9944
 EXPLORER_PORT=3100
 
 echo "═══════════════════════════════════════════════════════════"
-echo "ARC Chain — Deploy Node + Explorer"
+echo "ARC Chain - Deploy Node + Explorer"
 echo "═══════════════════════════════════════════════════════════"
-echo "Domain: ${DOMAIN:-'(none — using IP:$EXPLORER_PORT)'}"
+echo "Domain: ${DOMAIN:-'(none - using IP:$EXPLORER_PORT)'}"
 
 # ── Step 1: System dependencies ──────────────────────────────────────────────
 
@@ -194,7 +194,7 @@ EOF
     echo "    RPC API:  https://api.$DOMAIN"
 else
     echo ""
-    echo "[8/8] No domain set — explorer available at http://$(hostname -I | awk '{print $1}'):$EXPLORER_PORT"
+    echo "[8/8] No domain set - explorer available at http://$(hostname -I | awk '{print $1}'):$EXPLORER_PORT"
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────

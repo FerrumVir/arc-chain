@@ -1,4 +1,4 @@
-//! Router Agent — On-chain AI agent that routes inference requests.
+//! Router Agent - On-chain AI agent that routes inference requests.
 //!
 //! Demonstrates:
 //! - Receiving inference requests and routing to available agents

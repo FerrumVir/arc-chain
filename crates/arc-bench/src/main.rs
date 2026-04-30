@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use std::time::Instant;
 
 // ─────────────────────────────────────────────────────────────────────
-//  ARC Chain Benchmark Suite — Path to 1 Billion TPS
+//  ARC Chain Benchmark Suite - Path to 1 Billion TPS
 //
 //  Phase 1: Single-core baseline
 //  Phase 2: Multi-core (Rayon parallel sharded execution)
@@ -22,7 +22,7 @@ fn main() {
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║         ARC Chain — Scaling Benchmark Suite                 ║");
+    println!("║         ARC Chain - Scaling Benchmark Suite                 ║");
     println!("║         Path to 1 Billion TPS                              ║");
     println!("║         Agent Runtime Chain v0.1.0                          ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
@@ -182,7 +182,7 @@ fn main() {
         );
     }
 
-    // 2c: Full pipeline — hash + execute + merkle
+    // 2c: Full pipeline - hash + execute + merkle
     let n_full = 5_000_000usize;
     let mut phase2_full_tps = 0.0f64;
     {
@@ -325,7 +325,7 @@ fn main() {
     // ═══════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 4: Multi-Node Cluster Simulation");
-    println!("  (Sender-address sharding is embarrassingly parallel —");
+    println!("  (Sender-address sharding is embarrassingly parallel -");
     println!("   N nodes processing N shards = Nx throughput)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
@@ -350,7 +350,7 @@ fn main() {
     for (nodes, label) in &node_configs {
         let effective_tps = single_node_tps * (*nodes as f64) * network_efficiency;
         println!(
-            "    {:>3} nodes — {:<22} {:>14.0} TPS  ({:.1}x)",
+            "    {:>3} nodes - {:<22} {:>14.0} TPS  ({:.1}x)",
             nodes,
             label,
             effective_tps,
@@ -368,7 +368,7 @@ fn main() {
     // ═══════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 5: GPU-Accelerated Hashing (MEASURED)");
-    println!("  (Metal/Vulkan compute shaders — real BLAKE3 on GPU)");
+    println!("  (Metal/Vulkan compute shaders - real BLAKE3 on GPU)");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let gpu_profile = estimate_gpu_throughput(compact_hash_tps);
@@ -471,7 +471,7 @@ fn main() {
         let effective = gpu_single_node_tps * (*nodes as f64) * network_efficiency;
         let marker = if effective >= 1_000_000_000.0 { " <-- 1B+ TPS" } else { "" };
         println!(
-            "    {:>3} nodes — {:<24} {:>14.0} TPS{} ",
+            "    {:>3} nodes - {:<24} {:>14.0} TPS{} ",
             nodes,
             label,
             effective,
@@ -511,10 +511,10 @@ fn main() {
 
     // Milestones
     let milestones = vec![
-        (1_000_000.0, "1M TPS — 1000x Solana"),
-        (10_000_000.0, "10M TPS — Real-time AI settlement"),
-        (100_000_000.0, "100M TPS — Global agent economy"),
-        (1_000_000_000.0, "1B TPS — Planetary scale"),
+        (1_000_000.0, "1M TPS - 1000x Solana"),
+        (10_000_000.0, "10M TPS - Real-time AI settlement"),
+        (100_000_000.0, "100M TPS - Global agent economy"),
+        (1_000_000_000.0, "1B TPS - Planetary scale"),
     ];
     println!("║  Milestones:                                               ║");
     for (threshold, label) in &milestones {

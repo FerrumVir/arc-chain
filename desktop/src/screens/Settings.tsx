@@ -216,7 +216,7 @@ export function Settings() {
             ) {
               // Full reset: clear identity + config + onboarded flag so the
               // wizard actually runs again. (The Rust store would still hold
-              // the keys on disk — a full wipe requires `Uninstall` which
+              // the keys on disk - a full wipe requires `Uninstall` which
               // removes the app-data dir.)
               setIdentity(null);
               setConfig(null);

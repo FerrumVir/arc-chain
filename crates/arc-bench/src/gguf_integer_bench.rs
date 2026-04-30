@@ -1,7 +1,7 @@
 //! GGUF Integer Engine Benchmark
 //!
 //! Loads a REAL GGUF model and runs it through the integer-only engine.
-//! Cross-platform deterministic — proves the same model produces the
+//! Cross-platform deterministic - proves the same model produces the
 //! same output on ARM, x86, GPU, or any hardware.
 //!
 //! Usage:
@@ -50,7 +50,7 @@ fn main() {
     };
 
     eprintln!("═══════════════════════════════════════════════════════════");
-    eprintln!("ARC Chain — GGUF Integer Engine (Cross-Platform Deterministic)");
+    eprintln!("ARC Chain - GGUF Integer Engine (Cross-Platform Deterministic)");
     eprintln!("═══════════════════════════════════════════════════════════");
     eprintln!("  Model:      {}", model_path);
     eprintln!("  Tokens:     {}", max_tokens);

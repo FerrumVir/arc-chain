@@ -45,7 +45,7 @@ pub struct BlockProof {
     pub verifier_hash: [u8; 32],
 }
 
-/// Recursive proof — attests to N block proofs (or N child recursive proofs).
+/// Recursive proof - attests to N block proofs (or N child recursive proofs).
 ///
 /// The recursive structure allows logarithmic compression: instead of verifying
 /// 1 000 block proofs, a verifier checks a single recursive proof whose depth
@@ -96,7 +96,7 @@ pub enum ProofType {
     StateTransition,
 }
 
-/// Prover configuration — controls security parameters and performance knobs.
+/// Prover configuration - controls security parameters and performance knobs.
 #[derive(Debug, Clone)]
 pub struct ProverConfig {
     pub max_constraints: u64,
@@ -113,15 +113,15 @@ pub struct ProverConfig {
 /// Hash function used inside the proof circuit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProofHashType {
-    /// Poseidon — fast in-circuit, algebraic hash.
+    /// Poseidon - fast in-circuit, algebraic hash.
     Poseidon,
-    /// BLAKE3 — fast out-circuit, used for commitment hashing.
+    /// BLAKE3 - fast out-circuit, used for commitment hashing.
     Blake3,
-    /// Keccak-256 — EVM-compatible, used for L1 bridge verification.
+    /// Keccak-256 - EVM-compatible, used for L1 bridge verification.
     Keccak256,
 }
 
-/// Proving pipeline — batches blocks into proofs and recursively aggregates.
+/// Proving pipeline - batches blocks into proofs and recursively aggregates.
 pub struct ProvingPipeline {
     config: ProverConfig,
     pending_blocks: Vec<BlockProofInput>,
@@ -164,12 +164,12 @@ pub struct BlockProofInput {
     pub tx_hashes: Vec<[u8; 32]>,
     /// State diffs: (address, old_hash, new_hash).
     pub state_diffs: Vec<([u8; 32], [u8; 32], [u8; 32])>,
-    /// Transfer witness data — one per transaction in the block.
+    /// Transfer witness data - one per transaction in the block.
     /// When empty, the AIR only enforces hash-based state diff constraints.
     pub transfers: Vec<TransferWitness>,
 }
 
-/// Proving statistics — tracked by the pipeline.
+/// Proving statistics - tracked by the pipeline.
 #[derive(Debug, Clone, Default)]
 pub struct ProvingStats {
     pub blocks_proven: u64,
@@ -645,7 +645,7 @@ impl RecursiveProof {
     /// 1. Structural invariant checks (heights, counts, non-empty data)
     /// 2. Merkle root reconstruction from `child_proofs` hashes and comparison
     ///    against the Merkle root committed in `proof_data`
-    /// 3. State commitment check — verifies the BLAKE3(start || end) state hash
+    /// 3. State commitment check - verifies the BLAKE3(start || end) state hash
     ///    in `proof_data` matches the proof's state roots
     pub fn verify(&self) -> VerificationResult {
         let start = Instant::now();
@@ -881,7 +881,7 @@ impl RecursiveProof {
 // ---------------------------------------------------------------------------
 
 impl ProverConfig {
-    /// Default configuration — balanced security and performance.
+    /// Default configuration - balanced security and performance.
     ///
     /// With `stwo-prover` or `stwo-icicle`: uses M31 field (31 bits), producing real STARK proofs.
     /// Without: uses Goldilocks field (64 bits) as a placeholder.
@@ -902,7 +902,7 @@ impl ProverConfig {
         }
     }
 
-    /// Fast configuration — lower security, faster proving (testnets).
+    /// Fast configuration - lower security, faster proving (testnets).
     pub fn fast_config() -> Self {
         Self {
             max_constraints: 1 << 16, // ~64K constraints
@@ -914,7 +914,7 @@ impl ProverConfig {
         }
     }
 
-    /// Production configuration — full security, larger proofs.
+    /// Production configuration - full security, larger proofs.
     pub fn production_config() -> Self {
         Self {
             max_constraints: 1 << 22, // ~4M constraints
@@ -1232,7 +1232,7 @@ mod tests {
         };
         let mut pipeline = ProvingPipeline::new(config);
 
-        // Submit and prove 3 blocks — not enough for recursion
+        // Submit and prove 3 blocks - not enough for recursion
         for h in 0..3 {
             pipeline.submit_block(make_input(h));
         }
@@ -1240,7 +1240,7 @@ mod tests {
         assert!(pipeline.try_recursive().is_none());
         assert_eq!(pipeline.blocks_behind(), 3);
 
-        // Submit and prove 1 more — now we have 4, meeting threshold
+        // Submit and prove 1 more - now we have 4, meeting threshold
         pipeline.submit_block(make_input(3));
         pipeline.prove_pending();
         assert_eq!(pipeline.blocks_behind(), 4);
@@ -1425,7 +1425,7 @@ mod tests {
             result.error
         );
 
-        // Tamper with a child proof hash — should also cause Merkle root mismatch
+        // Tamper with a child proof hash - should also cause Merkle root mismatch
         let mut tampered2 = recursive.clone();
         tampered2.child_proofs[3][0] ^= 0x01;
         let result2 = tampered2.verify();
@@ -1436,7 +1436,7 @@ mod tests {
             result2.error
         );
 
-        // Tamper with state root — should cause state hash mismatch
+        // Tamper with state root - should cause state hash mismatch
         let mut tampered3 = recursive.clone();
         tampered3.start_state_root[0] ^= 0x01;
         let result3 = tampered3.verify();
@@ -1501,7 +1501,7 @@ mod tests {
         let tree = MerkleTree::from_leaves(leaves);
         assert_eq!(*tree.root().as_bytes(), committed_root);
 
-        // Layer 4: even deeper — aggregate of aggregates
+        // Layer 4: even deeper - aggregate of aggregates
         let group_d: Vec<BlockProof> = (12..16)
             .map(|h| BlockProof::mock_prove(&make_input(h)))
             .collect();
@@ -1576,7 +1576,7 @@ mod tests {
             .map(|h| BlockProof::mock_prove(&make_input(h)))
             .collect();
 
-        // Tamper with the proof_data of child 1 — this invalidates its verifier_hash
+        // Tamper with the proof_data of child 1 - this invalidates its verifier_hash
         proofs[1].proof_data[0] ^= 0xFF;
 
         // The tampered proof should fail individual verification
@@ -1611,7 +1611,7 @@ mod tests {
         let rec_a = RecursiveProof::from_block_proofs(&valid_a).unwrap();
         let mut rec_b = RecursiveProof::from_block_proofs(&valid_b).unwrap();
 
-        // Tamper with rec_b's merkle_root field — makes verify() fail
+        // Tamper with rec_b's merkle_root field - makes verify() fail
         rec_b.merkle_root[0] ^= 0xFF;
         assert!(
             !rec_b.verify().is_valid,
@@ -1713,7 +1713,7 @@ mod tests {
         assert_eq!(agg_cd.end_height, 71);
         assert_eq!(agg_cd.block_count, 6);
 
-        // Layer 4: final aggregate (depth 3) — covers all 12 blocks
+        // Layer 4: final aggregate (depth 3) - covers all 12 blocks
         let final_proof = RecursiveProof::from_recursive_proofs(&[agg_ab, agg_cd]).unwrap();
 
         assert_eq!(final_proof.depth, 3);

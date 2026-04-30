@@ -67,7 +67,7 @@ pub async fn save_config(
         store.save_to(&dir).map_err(map_err)?;
     }
     // Keep the OS-level login item in sync with the user's stored
-    // preference. Errors here don't block the save — tray still works.
+    // preference. Errors here don't block the save - tray still works.
     let autostart = app.autolaunch();
     let current = autostart.is_enabled().unwrap_or(false);
     match (auto_start, current) {
@@ -106,7 +106,7 @@ pub async fn start_node(
             .as_ref()
             .map(|i| i.seed_phrase.clone())
             .ok_or_else(|| {
-                "no identity — run onboarding so we can derive an on-chain validator address before starting arc-node".to_string()
+                "no identity - run onboarding so we can derive an on-chain validator address before starting arc-node".to_string()
             })?
     };
     let resources = resolve_testnet_resources(&app);
@@ -131,7 +131,7 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
             .identity
             .as_ref()
             .map(|i| i.seed_phrase.clone())
-            .ok_or_else(|| "no identity — cannot restart arc-node".to_string())?;
+            .ok_or_else(|| "no identity - cannot restart arc-node".to_string())?;
         (cfg, seed)
     };
     let resources = resolve_testnet_resources(&app);
@@ -145,7 +145,7 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
 pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     let (port, pid, address, crash) = {
         let mut node = state.node.lock().await;
-        // Opportunistic crash detection — checks if our child process exited
+        // Opportunistic crash detection - checks if our child process exited
         // unexpectedly since the last poll.
         node.try_reap_if_crashed().await;
         let pid = if node.is_running() { node.pid() } else { None };
@@ -289,7 +289,7 @@ pub async fn run_inference_via_coordinator(
 }
 
 /// Origin URLs for the 6 live testnet seed coordinators. Mirrors
-/// `testnet-seeds.txt` (the P2P side) — these IPs also run RPC on port
+/// `testnet-seeds.txt` (the P2P side) - these IPs also run RPC on port
 /// 9090. SAO + JNB retired 2026-04-22 (#32) and are intentionally
 /// omitted. Order biases toward North America first; users in other
 /// regions see the same ordered sweep, which is fine for a fallback
@@ -303,9 +303,9 @@ const COORDINATOR_HOSTS: [&str; 6] = [
     "http://149.28.153.31:9090",  // SGP
 ];
 
-/// Milestone B (#36): testnet model commitment. Both ends — the
+/// Milestone B (#36): testnet model commitment. Both ends - the
 /// InferenceEscrowOpen tx and the InferenceEscrowRelease tx the
-/// coordinator will auto-submit — must use the same value or the
+/// coordinator will auto-submit - must use the same value or the
 /// state-layer metadata-hash check rejects the release.
 fn testnet_model_id() -> arc_crypto::Hash256 {
     arc_crypto::hash_bytes(b"arc-testnet-llama-2-7b-chat-q4")
@@ -352,11 +352,11 @@ pub async fn run_paid_inference(
             .identity
             .as_ref()
             .map(|i| i.seed_phrase.clone())
-            .ok_or_else(|| "no identity — run onboarding first".to_string())?
+            .ok_or_else(|| "no identity - run onboarding first".to_string())?
     };
     let signing_key = keypair_from_phrase(&phrase);
     let public_key = signing_key.verifying_key().to_bytes();
-    // ARC address = BLAKE3(public_key) — matches chain derivation.
+    // ARC address = BLAKE3(public_key) - matches chain derivation.
     let payer_addr = arc_crypto::Hash256(*blake3::hash(&public_key).as_bytes());
 
     // Pick the first reachable coordinator.
@@ -374,7 +374,7 @@ pub async fn run_paid_inference(
         }
     }
     let coord_url = coord_url.ok_or_else(|| {
-        "no coordinator reachable — all 6 testnet seeds timed out on /health".to_string()
+        "no coordinator reachable - all 6 testnet seeds timed out on /health".to_string()
     })?;
 
     // Pull the payer's current on-chain nonce so the open tx lands.
@@ -439,7 +439,7 @@ pub async fn run_paid_inference(
         .map_err(map_err)?;
     if !open_resp.status().is_success() {
         return Err(format!(
-            "escrow open failed: {} — payer=0x{} nonce={}",
+            "escrow open failed: {} - payer=0x{} nonce={}",
             open_resp.status(),
             hex::encode(&payer_addr.0),
             nonce
@@ -603,7 +603,7 @@ pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
 
     let asset = platform_release_asset().ok_or_else(|| {
         format!(
-            "no prebuilt arc-node binary for platform {}-{} — build from source or open an issue",
+            "no prebuilt arc-node binary for platform {}-{} - build from source or open an issue",
             std::env::consts::OS,
             std::env::consts::ARCH
         )

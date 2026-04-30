@@ -18,7 +18,7 @@ async function injectLive(page: import("@playwright/test").Page) {
   }, LIVE_PORT);
 }
 
-test.describe("Live node (port 9090) — real data", () => {
+test.describe("Live node (port 9090) - real data", () => {
   test.beforeEach(async () => {
     // Only run if the node is actually reachable
     try {
@@ -49,7 +49,7 @@ test.describe("Live node (port 9090) — real data", () => {
     await page.screenshot({ path: "screenshots/live-03-launch.png" });
     await page.getByTestId("btn-launch").click();
 
-    // Land on dashboard — should show real data
+    // Land on dashboard - should show real data
     await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 10_000 });
     await page.waitForTimeout(2_000); // let queries populate
     await page.screenshot({
@@ -101,7 +101,7 @@ test.describe("Live node (port 9090) — real data", () => {
     await page.getByTestId("nav-earnings").click();
     await page.waitForTimeout(2_000);
 
-    // Lifetime total should be (attestations * 2.5 ARC) — non-zero
+    // Lifetime total should be (attestations * 2.5 ARC) - non-zero
     const lifetime = page.locator(".big-number.gradient").first();
     await expect(lifetime).toBeVisible();
     const lifetimeText = await lifetime.textContent();
@@ -123,7 +123,7 @@ test.describe("Live node (port 9090) — real data", () => {
     await page.getByTestId("nav-network").click();
     await page.waitForTimeout(1_500);
 
-    // Latest block ≈ dag_committed — > 1000 on this node
+    // Latest block ≈ dag_committed - > 1000 on this node
     const latestBlock = page
       .locator('[data-testid="network-screen"] .stat-value')
       .last();

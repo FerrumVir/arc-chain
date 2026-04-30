@@ -1,4 +1,4 @@
-//! Distributed Inference — Model Sharding and Pipeline-Parallel Execution
+//! Distributed Inference - Model Sharding and Pipeline-Parallel Execution
 //!
 //! Splits a model across N nodes at transformer layer boundaries.
 //! Each node holds a contiguous range of layers and forwards activations
@@ -63,7 +63,7 @@ impl ShardRegistry {
         }
     }
 
-    /// Register a shard assignment. Idempotent — updates if already exists.
+    /// Register a shard assignment. Idempotent - updates if already exists.
     pub fn register_shard(&self, model_id: Hash256, shard: ShardAssignment) {
         // Add to model registry
         let mut model_shards = self.models.entry(model_id).or_default();
@@ -207,7 +207,7 @@ pub fn compute_shard_plan(
             node_address: node.address,
             start_layer: current_layer,
             end_layer,
-            expert_indices: Vec::new(), // Dense model — no expert assignment
+            expert_indices: Vec::new(), // Dense model - no expert assignment
             socket_addr: node.socket_addr.clone(),
             gpu_tier: node.gpu_tier,
             available_memory: node.available_memory,
@@ -421,7 +421,7 @@ impl PipelineCoordinator {
             return PipelineAction::Complete { tokens };
         }
 
-        // Need another token — restart pipeline from shard 0
+        // Need another token - restart pipeline from shard 0
         state.current_shard_idx = 0;
         let model_id = state.model_id;
         drop(state);

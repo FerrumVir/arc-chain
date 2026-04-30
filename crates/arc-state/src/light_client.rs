@@ -1,12 +1,12 @@
-//! Light client proofs — allow verification of state without downloading the full chain.
+//! Light client proofs - allow verification of state without downloading the full chain.
 //!
 //! Provides:
-//! - `StateProof` — prove an account's state against a Merkle state root
-//! - `HeaderProof` — verify a chain of block headers by parent-hash linkage
-//! - `TxInclusionProof` — prove a transaction was included in a specific block
-//! - `LightSnapshot` — compact aggregate view for light client bootstrapping
-//! - `FinalityProof` — prove a block was finalized by a consensus quorum
-//! - `LightClientBundle` — complete verification bundle (finality + state + header)
+//! - `StateProof` - prove an account's state against a Merkle state root
+//! - `HeaderProof` - verify a chain of block headers by parent-hash linkage
+//! - `TxInclusionProof` - prove a transaction was included in a specific block
+//! - `LightSnapshot` - compact aggregate view for light client bootstrapping
+//! - `FinalityProof` - prove a block was finalized by a consensus quorum
+//! - `LightClientBundle` - complete verification bundle (finality + state + header)
 //!
 //! All verification functions are pure (no StateDB required), so light clients
 //! can run them with only the proof data and a trusted state root.
@@ -40,12 +40,12 @@ pub struct StateProof {
 }
 
 /// A block header annotated with optional validator signature and explicit
-/// parent hash — used by light clients to verify header-chain continuity.
+/// parent hash - used by light clients to verify header-chain continuity.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HeaderProof {
     /// The block header.
     pub header: BlockHeader,
-    /// Validator signature over the header (placeholder — not yet enforced).
+    /// Validator signature over the header (placeholder - not yet enforced).
     pub validator_signature: Option<Vec<u8>>,
     /// Hash of the parent block header (convenience duplicate of `header.parent_hash`).
     pub parent_hash: Hash256,
@@ -65,7 +65,7 @@ pub struct TxInclusionProof {
 }
 
 /// Verify finality by checking that signing stake >= 2/3 of total stake.
-/// This is a pure function — light clients can call it with raw values
+/// This is a pure function - light clients can call it with raw values
 /// obtained from a FinalityProof (defined in arc-consensus).
 pub fn verify_finality_stake(signing_stake: u64, total_stake: u64) -> bool {
     let quorum = (2 * total_stake + 2) / 3;
@@ -97,7 +97,7 @@ pub struct LightSnapshot {
 /// Verify that a `StateProof`'s Merkle path resolves to the embedded state root.
 ///
 /// This confirms the account leaf is a member of the state tree that produced
-/// `proof.state_root`. It does NOT verify that `state_root` itself is trusted —
+/// `proof.state_root`. It does NOT verify that `state_root` itself is trusted -
 /// that responsibility falls on the light client (e.g. via header chain).
 pub fn verify_state_proof(proof: &StateProof) -> bool {
     // The proof's root must match the declared state root.
@@ -121,7 +121,7 @@ pub fn verify_account_balance(proof: &StateProof, expected_balance: u64) -> bool
     proof.account.balance == expected_balance
 }
 
-/// Verify a state proof — returns `true` if the Merkle proof is valid, which
+/// Verify a state proof - returns `true` if the Merkle proof is valid, which
 /// inherently proves the account exists in the state tree.
 pub fn verify_account_exists(proof: &StateProof) -> bool {
     verify_state_proof(proof)
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_finality_proof_quorum_sufficient() {
-        // 70% of stake signed — should be valid (threshold is ~68 for total=100).
+        // 70% of stake signed - should be valid (threshold is ~68 for total=100).
         let attestations = make_attestations(&[30, 20, 20]);
         let proof = FinalityProof::new(
             hash_bytes(b"block"),
@@ -516,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_finality_proof_quorum_insufficient() {
-        // 60% of stake signed — should be invalid (threshold is 68 for total=100).
+        // 60% of stake signed - should be invalid (threshold is 68 for total=100).
         let attestations = make_attestations(&[30, 30]);
         let proof = FinalityProof::new(
             hash_bytes(b"block"),

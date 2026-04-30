@@ -37,7 +37,7 @@ const COORD_PAYLOAD = {
   },
 };
 
-test.describe("Inference — coordinator fallback (Milestone A, #35)", () => {
+test.describe("Inference - coordinator fallback (Milestone A, #35)", () => {
   test("observer node (local 503) falls back to coordinator and renders consensus panel", async ({
     page,
   }) => {
@@ -110,11 +110,11 @@ test.describe("Inference — coordinator fallback (Milestone A, #35)", () => {
       "Jupiter",
     );
 
-    // Only one coordinator was hit (NYC succeeded first — no retry).
+    // Only one coordinator was hit (NYC succeeded first - no retry).
     expect(coordHitCount).toBe(1);
   });
 
-  test("local node healthy (returns real output) — no coordinator fallback", async ({
+  test("local node healthy (returns real output) - no coordinator fallback", async ({
     page,
   }) => {
     await seedOnboarded(page);
@@ -144,7 +144,7 @@ test.describe("Inference — coordinator fallback (Milestone A, #35)", () => {
       }),
     );
 
-    // If any fetch hits run_consensus, we fail — local should have served it.
+    // If any fetch hits run_consensus, we fail - local should have served it.
     let hitConsensus = false;
     await page.route("**/inference/run_consensus", (route) => {
       hitConsensus = true;
@@ -176,7 +176,7 @@ test.describe("Inference — coordinator fallback (Milestone A, #35)", () => {
       timeout: 10_000,
     });
 
-    // Consensus banner must NOT be shown — local served directly.
+    // Consensus banner must NOT be shown - local served directly.
     await expect(page.getByTestId("inference-consensus")).toHaveCount(0);
     expect(hitConsensus).toBe(false);
   });

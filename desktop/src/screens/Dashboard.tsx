@@ -102,7 +102,7 @@ export function Dashboard() {
           <p className="page-subtitle">
             {running
               ? isExternal
-                ? "Your node is live — managed by the system (launchd / systemd)."
+                ? "Your node is live - managed by the system (launchd / systemd)."
                 : "Your node is live. Earnings update every few seconds."
               : "Your node is stopped. Start it to begin earning."}
           </p>
@@ -221,7 +221,7 @@ export function Dashboard() {
               <dd>
                 {earnings?.lastPayoutAt
                   ? formatRelativeTime(earnings.lastPayoutAt)
-                  : "—"}
+                  : "-"}
               </dd>
               <dt>Address</dt>
               <dd>
@@ -241,7 +241,7 @@ export function Dashboard() {
                       <ClipboardCheck size={11} /> Copied
                     </>
                   ) : (
-                    <>{identity ? formatAddress(identity.address) : "—"}</>
+                    <>{identity ? formatAddress(identity.address) : "-"}</>
                   )}
                 </button>
               </dd>
@@ -299,7 +299,7 @@ export function Dashboard() {
                   in parallel and reach agreement in ~1&thinsp;s.
                 </p>
                 <p>
-                  This number is the current round being voted on — it
+                  This number is the current round being voted on - it
                   ticks up continuously as long as the network is live.
                 </p>
               </>
@@ -312,7 +312,7 @@ export function Dashboard() {
           value={
             status?.running
               ? formatUptime(status.uptimeSeconds)
-              : "—"
+              : "-"
           }
           info={{
             title: "Uptime",
@@ -336,7 +336,7 @@ export function Dashboard() {
                 <InfoPopover title="How verifiable inference works">
                   <p>
                     When someone sends a prompt to arc, the network <strong>executes
-                    the model end-to-end</strong> — sharded across nodes,
+                    the model end-to-end</strong> - sharded across nodes,
                     each holding a range of transformer layers. Your
                     node runs its slice and passes the hidden state on.
                   </p>
@@ -344,7 +344,7 @@ export function Dashboard() {
                     The final output is hashed (BLAKE3) with the model
                     weights. A <strong>bonded attestation</strong> carrying{" "}
                     <code>(input_hash, output_hash, model_hash)</code> is
-                    posted to the chain — this is what shows up here.
+                    posted to the chain - this is what shows up here.
                   </p>
                   <p>
                     A VRF-selected committee of 7 validators re-runs the
@@ -436,15 +436,15 @@ export function Dashboard() {
               <StatusPill level={status?.health ?? "offline"} />
             </dd>
             <dt>Version</dt>
-            <dd>v{status?.version ?? "—"}</dd>
+            <dd>v{status?.version ?? "-"}</dd>
             <dt>Block height</dt>
             <dd>{formatInt(status?.committed ?? 0)}</dd>
             <dt>Round</dt>
             <dd>{formatInt(status?.round ?? 0)}</dd>
             <dt>RPC port</dt>
-            <dd className="mono">:{status?.rpcPort ?? "—"}</dd>
+            <dd className="mono">:{status?.rpcPort ?? "-"}</dd>
             <dt>PID</dt>
-            <dd>{status?.pid ?? "—"}</dd>
+            <dd>{status?.pid ?? "-"}</dd>
           </div>
           {status?.lastError && (
             <div

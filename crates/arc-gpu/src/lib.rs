@@ -66,7 +66,7 @@ pub fn probe_gpu() -> GpuInfo {
 }
 
 /// CPU-parallel BLAKE3 batch commit (fallback when GPU unavailable or for comparison).
-/// This is already extremely fast — BLAKE3 + Rayon across all cores.
+/// This is already extremely fast - BLAKE3 + Rayon across all cores.
 pub fn cpu_batch_commit(data: &[&[u8]]) -> Vec<Hash256> {
     data.par_iter()
         .map(|item| {
@@ -153,7 +153,7 @@ pub fn estimate_gpu_throughput(cpu_tps: f64) -> GpuProfile {
     } else if name_lower.contains("h100") {
         (14592, 3350.0, 10_000_000_000.0)
     } else {
-        // Unknown GPU — conservative 5x over CPU
+        // Unknown GPU - conservative 5x over CPU
         (1024, 200.0, cpu_tps * 5.0)
     };
 
@@ -175,7 +175,7 @@ pub fn estimate_gpu_throughput(cpu_tps: f64) -> GpuProfile {
 /// Minimum batch size for GPU dispatch (below this, CPU is faster due to dispatch overhead).
 const GPU_MIN_BATCH: usize = 4096;
 
-/// Padded payload size in bytes — all inputs padded to this for uniform GPU dispatch.
+/// Padded payload size in bytes - all inputs padded to this for uniform GPU dispatch.
 const PAYLOAD_PAD: usize = 256;
 
 /// GPU-accelerated batch commit using wgpu BLAKE3 compute shaders.
@@ -518,7 +518,7 @@ mod tests {
     #[test]
     fn test_gpu_probe() {
         let info = probe_gpu();
-        // Just check it doesn't crash — GPU may or may not be available in CI
+        // Just check it doesn't crash - GPU may or may not be available in CI
         println!("GPU probe: {:?}", info);
     }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =========================================================================
-# ARC Chain — Testnet Teardown
+# ARC Chain - Testnet Teardown
 # =========================================================================
 # Deletes all 4 Hetzner Cloud testnet servers.
 # Requires confirmation before proceeding.
@@ -36,7 +36,7 @@ fi
 
 # -- List servers to delete ------------------------------------------------
 
-echo -e "${BOLD}ARC Chain Testnet — Teardown${NC}"
+echo -e "${BOLD}ARC Chain Testnet - Teardown${NC}"
 echo "============================================"
 echo ""
 

@@ -1,4 +1,4 @@
-//! EIP-1559 inference gas lane — separate fee market for inference transactions.
+//! EIP-1559 inference gas lane - separate fee market for inference transactions.
 //!
 //! Prevents inference DoS by maintaining a dedicated base fee that adjusts
 //! per block based on inference transaction density:

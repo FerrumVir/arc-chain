@@ -390,7 +390,7 @@ fn default_circulating_supply() -> u128 { TOTAL_SUPPLY }
 fn default_target_burn_bps() -> u16 { 0 }
 
 /// Breakdown of fees for a single transaction.
-/// No tokens are burned — 100% distributed to validators + treasury.
+/// No tokens are burned - 100% distributed to validators + treasury.
 #[derive(Debug, Clone)]
 pub struct FeeBreakdown {
     /// Base fee component.
@@ -413,7 +413,7 @@ pub struct FeeBreakdown {
 
 impl FeeConfig {
     /// Sensible default configuration for ARC Chain mainnet.
-    /// No burn — 100% of fees distributed to validators + treasury.
+    /// No burn - 100% of fees distributed to validators + treasury.
     pub fn default_config() -> Self {
         Self {
             base_fee: 1_000,
@@ -458,7 +458,7 @@ impl FeeConfig {
         let priority_component = priority_fee.saturating_mul(gas_used);
         let total = base_component.saturating_add(priority_component);
 
-        // No burn — 100% of fees distributed by role.
+        // No burn - 100% of fees distributed by role.
         let to_proposer =
             (total as u128 * self.role_revenue.proposer_share_bps as u128 / 10_000) as u64;
         let to_verifiers =
@@ -579,7 +579,7 @@ impl FeeConfig {
 
 // ─── State rent ─────────────────────────────────────────────────────────────
 
-/// Configuration for state rent — charges accounts for on-chain storage to
+/// Configuration for state rent - charges accounts for on-chain storage to
 /// prevent unbounded state growth at high TPS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateRentConfig {
@@ -666,7 +666,7 @@ pub struct BlockReward {
 
 // ─── Supply tracker ────────────────────────────────────────────────────────
 
-/// Tracks the ARC token supply. Fixed supply — no burn, no inflation.
+/// Tracks the ARC token supply. Fixed supply - no burn, no inflation.
 /// Staking rewards and validator payments come from fees + tax revenue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SupplyTracker {
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn test_stake_tier_from_amount() {
         assert_eq!(StakeTier::from_amount(0), StakeTier::None);
-        assert_eq!(StakeTier::from_amount(10_000_000_000_000), StakeTier::None); // 10K — below Lite
+        assert_eq!(StakeTier::from_amount(10_000_000_000_000), StakeTier::None); // 10K - below Lite
         assert_eq!(StakeTier::from_amount(MIN_STAKE_LITE), StakeTier::Lite);
         assert_eq!(StakeTier::from_amount(MIN_STAKE_SPARK), StakeTier::Spark);
         assert_eq!(StakeTier::from_amount(MIN_STAKE_ARC), StakeTier::Arc);
@@ -911,7 +911,7 @@ mod tests {
         assert!(pos.can_withdraw(1_000 + UNBONDING_ARC + 1_000));
     }
 
-    // 7. Normal transaction fee split — no burn, 100% to validators + treasury
+    // 7. Normal transaction fee split - no burn, 100% to validators + treasury
     #[test]
     fn test_fee_calculation_normal_tx() {
         let config = FeeConfig::default_config();
@@ -925,7 +925,7 @@ mod tests {
         assert_eq!(fee.priority_fee, priority_fee * gas_used);
         assert_eq!(fee.total_fee, fee.base_fee + fee.priority_fee);
 
-        // No burn — all fees distributed
+        // No burn - all fees distributed
         let total_distributed = fee.to_proposer + fee.to_verifiers + fee.to_observer_pool + fee.to_treasury;
         // Allow ±4 for integer rounding across 4 splits
         assert!(
@@ -986,7 +986,7 @@ mod tests {
         );
     }
 
-    // 11. Supply tracker — staking reduces circulating supply
+    // 11. Supply tracker - staking reduces circulating supply
     #[test]
     fn test_supply_tracker_staking() {
         let mut tracker = SupplyTracker::new();

@@ -53,7 +53,7 @@ struct Cli {
     #[arg(long, default_value = "arc-validator-0")]
     validator_seed: String,
 
-    /// Archive mode — disable all pruning, keep full transaction history.
+    /// Archive mode - disable all pruning, keep full transaction history.
     /// Use for block explorers and analytics. Requires more disk space.
     /// Regular validators should NOT use this flag.
     #[arg(long, default_value_t = false)]
@@ -142,12 +142,12 @@ struct Cli {
     shard_start: Option<usize>,
 
     /// Last layer index to load (exclusive). Pipeline-parallel sharding.
-    /// Deprecated — use --shard-range.
+    /// Deprecated - use --shard-range.
     #[arg(long)]
     shard_end: Option<usize>,
 
     /// Layer range this node holds, formatted `START:END` (END exclusive).
-    /// Repeatable — every `--shard-range` adds one disjoint slice and the
+    /// Repeatable - every `--shard-range` adds one disjoint slice and the
     /// node announces one ShardInfo per range, so the coordinator can treat
     /// each as an independent replica. Example for 3× replication across
     /// 6 seeds holding 32 Llama-2-7B layers in 6 ranges:
@@ -171,7 +171,7 @@ struct Cli {
 /// URL we just pulled from and keeping the declared port. When no port is
 /// declared, falls back to the pulled URL's port or 9090.
 ///
-/// Pure JSON mutation — no I/O, no async. Unit-testable against static fixtures.
+/// Pure JSON mutation - no I/O, no async. Unit-testable against static fixtures.
 /// Companion to the receiver-side `rewrite_stub_shard_addr` in `rpc.rs`.
 fn rewrite_pulled_self_shard(self_shard: &mut serde_json::Value, pulled_from_addr: &str) {
     let Some(sa) = self_shard.get("socket_addr").and_then(|v| v.as_str()) else {
@@ -213,7 +213,7 @@ mod tests {
     fn pulled_stub_rewritten_to_seed_host_port() {
         // AMS announces self_shard with socket_addr=0.0.0.0:9090. We pulled
         // from http://136.244.109.1:9090/shards, so the routable addr for AMS
-        // IS the URL we pulled from — use it.
+        // IS the URL we pulled from - use it.
         let mut v = json!({
             "start_layer": 10, "end_layer": 14, "socket_addr": "0.0.0.0:9090",
             "node_name": "AMS"
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn pulled_stub_uses_declared_port_over_pulled_url_port() {
-        // Peer bound to 9090 but we pulled from its port 8545 (hypothetical) —
+        // Peer bound to 9090 but we pulled from its port 8545 (hypothetical) -
         // prefer the port the peer declared for its listener.
         let mut v = json!({
             "socket_addr": "0.0.0.0:9090", "node_name": "X"
@@ -464,7 +464,7 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "Below minimum".to_string());
 
     tracing::info!("╔═══════════════════════════════════════╗");
-    tracing::info!("║   ARC Chain — Agent Runtime Chain     ║");
+    tracing::info!("║   ARC Chain - Agent Runtime Chain     ║");
     tracing::info!("║   Testnet Node v0.3.0                 ║");
     tracing::info!("╚═══════════════════════════════════════╝");
     tracing::info!("Validator  : {}", validator_address);
@@ -483,7 +483,7 @@ async fn main() -> Result<()> {
         tracing::info!("Peers      : {:?}", peers);
     }
 
-    // ── Genesis accounts — prefunded for testing ────────────────────────
+    // ── Genesis accounts - prefunded for testing ────────────────────────
     // Priority: --genesis file > hardcoded defaults.
     // In benchmark mode (without --genesis), use deterministic ed25519
     // keypair-derived addresses so signatures can be verified.
@@ -549,12 +549,12 @@ async fn main() -> Result<()> {
             .expect("Failed to initialize state with WAL persistence");
         if cli.archive {
             db.archive_mode = true;
-            tracing::info!("Archive mode ENABLED — no pruning, full transaction history retained");
+            tracing::info!("Archive mode ENABLED - no pruning, full transaction history retained");
         }
         db
     });
 
-    // ── State Sync Protocol (A5) — bootstrap from peer snapshot ─────
+    // ── State Sync Protocol (A5) - bootstrap from peer snapshot ─────
     // Auto-sync: if this node has peers configured and state is fresh (height 0),
     // automatically sync state from the first reachable peer. This allows new
     // nodes to join an existing network without manual --sync-from.
@@ -562,7 +562,7 @@ async fn main() -> Result<()> {
         cli.sync_from.clone()
     } else if state.height() == 0 && !peers.is_empty() {
         // Try each peer until one responds
-        // Quick check — try first 3 peers with 1s timeout each.
+        // Quick check - try first 3 peers with 1s timeout each.
         // Don't block startup for unreachable peers.
         let mut found = None;
         for peer_addr in peers.iter().take(3) {
@@ -592,7 +592,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 tracing::warn!("Sync from peer failed ({}), continuing from genesis state", e);
-                // Don't crash — the node will start from genesis and catch
+                // Don't crash - the node will start from genesis and catch
                 // up via DAG consensus. This is fine for testnet.
             }
         }
@@ -606,7 +606,7 @@ async fn main() -> Result<()> {
     //
     // EXCEPTION: shard holders (--shard-start / --shard-end set) do NOT load
     // candle. Candle loads the FULL Q4 model (~4 GB on Llama-7B), and a shard
-    // holder never runs /inference/run — only /inference/forward_shard — so
+    // holder never runs /inference/run - only /inference/forward_shard - so
     // that 4 GB is pure waste. On 8 GB VPS this pushes the process into swap
     // and destroys forward_shard latency (observed: 20+ seconds/token on
     // swapping NYC). Disabling candle when the node is a shard-only role
@@ -651,7 +651,7 @@ async fn main() -> Result<()> {
     let is_shard_holder = !held_ranges.is_empty();
     let (candle_engine, candle_model_id): (Option<Arc<arc_inference::candle_backend::GgufEngine>>, Option<arc_crypto::Hash256>) =
         if is_shard_holder {
-            tracing::info!("Shard holder mode — candle backend SKIPPED to save ~4 GB RAM");
+            tracing::info!("Shard holder mode - candle backend SKIPPED to save ~4 GB RAM");
             (None, None)
         } else if let Some(model_path) = &cli.model {
             if !model_path.ends_with(".arc-int8") {
@@ -662,7 +662,7 @@ async fn main() -> Result<()> {
                         (Some(engine), Some(mid))
                     }
                     Err(e) => {
-                        tracing::warn!("Candle backend failed: {} — falling back to INT8", e);
+                        tracing::warn!("Candle backend failed: {} - falling back to INT8", e);
                         (None, None)
                     }
                 }
@@ -719,7 +719,7 @@ async fn main() -> Result<()> {
                         .sum::<usize>() / (1024 * 1024);
                     let layers_held = model.layers.iter().filter(|l| l.is_loaded()).count();
                     tracing::info!(
-                        "Model loaded in {:.1}s — {} layers held / {} total, {} MB shard weights, vocab {}",
+                        "Model loaded in {:.1}s - {} layers held / {} total, {} MB shard weights, vocab {}",
                         elapsed.as_secs_f64(), layers_held, model.config.n_layers, mb_held,
                         model.config.vocab_size
                     );
@@ -779,7 +779,7 @@ async fn main() -> Result<()> {
             10_000, // txs per batch
         );
         tracing::info!(
-            "Benchmark mode ACTIVE — ed25519 signed txs, senders {}-{}, async indexing",
+            "Benchmark mode ACTIVE - ed25519 signed txs, senders {}-{}, async indexing",
             bench_sender_start,
             bench_sender_start + bench_sender_count - 1
         );
@@ -790,12 +790,12 @@ async fn main() -> Result<()> {
 
     // ── Start DAG consensus in background ─────────────────────────────
     // Initialize with ALL known validators from seeds file. This ensures
-    // all nodes have the same validator set from boot — critical for
+    // all nodes have the same validator set from boot - critical for
     // deterministic leader selection. Without this, nodes that connect
     // peers at different speeds have different validator counts, causing
     // different leader selection for the same round.
     // If genesis validators are provided, use them. This ensures ALL nodes
-    // have the SAME validator set from round 0 — the key to consensus.
+    // have the SAME validator set from round 0 - the key to consensus.
     // Without this, nodes discover peers at different times → different
     // validator counts → different epoch freezes → different leaders.
     let peer_vals: Vec<(Hash256, u64)> = genesis_validators.iter()
@@ -815,7 +815,7 @@ async fn main() -> Result<()> {
     consensus.dag_validators = Some(dag_validators.clone());
     consensus.dag_round = Some(dag_round.clone());
     consensus.dag_committed = Some(dag_committed.clone());
-    // DAG persistence WAL — survives restarts
+    // DAG persistence WAL - survives restarts
     let dag_wal_path = format!("{}/dag-wal", data_dir);
     std::fs::create_dir_all(&dag_wal_path).ok();
     if let Ok(dag_wal) = arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
@@ -829,7 +829,7 @@ async fn main() -> Result<()> {
     // Run consensus on a dedicated thread with its own tokio runtime.
     // This prevents broadcast/transport/RPC tasks from starving the
     // consensus loop (the root cause of random freezes at ~4000 rounds).
-    // If the consensus thread panics, log the error and exit the process —
+    // If the consensus thread panics, log the error and exit the process -
     // a node without consensus is useless and should restart via systemd.
     std::thread::Builder::new()
         .name("consensus".into())
@@ -853,13 +853,13 @@ async fn main() -> Result<()> {
             }));
             match result {
                 Ok(()) => {
-                    tracing::error!("Consensus loop exited unexpectedly — shutting down");
+                    tracing::error!("Consensus loop exited unexpectedly - shutting down");
                 }
                 Err(panic_info) => {
                     tracing::error!("CONSENSUS THREAD PANICKED: {:?}", panic_info);
                 }
             }
-            // Exit the process — a node without consensus must restart
+            // Exit the process - a node without consensus must restart
             std::process::exit(1);
         })
         .expect("spawn consensus thread");
@@ -902,7 +902,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         match tokio::signal::ctrl_c().await {
             Ok(()) => {
-                tracing::info!("SIGINT received — initiating graceful shutdown...");
+                tracing::info!("SIGINT received - initiating graceful shutdown...");
             }
             Err(e) => {
                 tracing::warn!("Failed to install SIGINT handler: {}", e);
@@ -923,7 +923,7 @@ async fn main() -> Result<()> {
             let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .expect("SIGTERM handler");
             sigterm.recv().await;
-            tracing::info!("SIGTERM received — initiating graceful shutdown...");
+            tracing::info!("SIGTERM received - initiating graceful shutdown...");
             shutdown_state.sync_wal();
             tracing::info!("Graceful shutdown complete. Exiting.");
             std::process::exit(0);
@@ -1057,14 +1057,14 @@ async fn main() -> Result<()> {
                 // locally would make /inference/run_sharded unable to route to
                 // the peer (dialing 0.0.0.0 fails). Rewrite the stub to the
                 // *seed's actual address* (the URL we just pulled from) before
-                // re-announcing — that IS the routable address for that shard
+                // re-announcing - that IS the routable address for that shard
                 // holder, and it's what the receiver-side fix for direct
                 // /shards/announce broadcasts produces too.
                 for addr in &seed_addrs_pull {
                     if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await {
                         if let Ok(mut json) = resp.json::<serde_json::Value>().await {
                             // New peers emit `self_shards: [ShardInfo, ...]`; legacy
-                            // peers still emit `self_shard: ShardInfo` — accept both
+                            // peers still emit `self_shard: ShardInfo` - accept both
                             // so a rolling upgrade never loses shard visibility.
                             let mut to_announce: Vec<serde_json::Value> = Vec::new();
                             if let Some(arr) = json.get_mut("self_shards").and_then(|v| v.as_array_mut()) {
@@ -1096,13 +1096,13 @@ async fn main() -> Result<()> {
     }
 
     // ── Community-mode HTTP registration + heartbeat ──────────────────
-    // Spawned when --community-mode is set. Outbound-HTTPS only — works
+    // Spawned when --community-mode is set. Outbound-HTTPS only - works
     // behind any NAT/residential firewall. Registers with every seed on
     // startup + every 60s, sends a heartbeat every 15s to keep the
     // registry entry alive. Each seed's TTL is 90s so 5 missed
     // heartbeats before eviction.
     // Auto-enable community mode for observer nodes (stake=0).
-    // If you join with no stake, you're a community contributor — no flag needed.
+    // If you join with no stake, you're a community contributor - no flag needed.
     let community_mode = cli.community_mode || stake == 0;
 
     if community_mode {
@@ -1250,7 +1250,7 @@ async fn main() -> Result<()> {
                     Ok(c) => c,
                     Err(_) => return,
                 };
-                tracing::info!("Community inference worker started — polling for jobs");
+                tracing::info!("Community inference worker started - polling for jobs");
                 loop {
                     // Try each seed's gateway for work
                     for addr in &seed_rpc_addrs_w {
@@ -1274,7 +1274,7 @@ async fn main() -> Result<()> {
                             Err(_) => continue,
                         };
                         if job.get("status").and_then(|s| s.as_str()) != Some("work") {
-                            continue; // no_work — try next seed
+                            continue; // no_work - try next seed
                         }
                         let job_id = job.get("job_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
                         let input = job.get("input").and_then(|s| s.as_str()).unwrap_or("").to_string();

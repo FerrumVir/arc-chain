@@ -1,13 +1,13 @@
 // Add to lib.rs: pub mod coalesce;
 
-//! State coalescing — batch multiple transactions touching the same account
+//! State coalescing - batch multiple transactions touching the same account
 //! into fewer state reads and writes.
 //!
 //! # Motivation
 //!
 //! In a typical block with 10K transactions, many touch the same hot accounts
 //! (e.g. a DEX contract, a popular sender). Without coalescing, each transaction
-//! independently reads and writes those accounts — leading to redundant I/O.
+//! independently reads and writes those accounts - leading to redundant I/O.
 //!
 //! State coalescing groups transactions by sender, sorts by nonce, and applies
 //! them sequentially against a single cached balance read. Similarly, receiver
@@ -69,7 +69,7 @@ fn transfer_target(body: &TxBody) -> Option<(Address, u64)> {
 }
 
 /// Returns true if a transaction type can be coalesced.
-/// Only simple value-transfer types qualify — anything with complex
+/// Only simple value-transfer types qualify - anything with complex
 /// side effects (WASM, swaps, escrow) must go through normal execution.
 fn is_coalesceable(tx: &Transaction) -> bool {
     matches!(tx.tx_type, TxType::Transfer | TxType::Settle)
@@ -154,7 +154,7 @@ impl CoalescedBatch {
                 let (receiver_addr, amount) = match transfer_target(&tx.body) {
                     Some(pair) => pair,
                     None => {
-                        // Should not happen — we only group coalesceable txs.
+                        // Should not happen - we only group coalesceable txs.
                         failed_txs += 1;
                         continue;
                     }
@@ -207,7 +207,7 @@ impl CoalescedBatch {
         let reads_saved = coalesced_tx_count
             .saturating_sub(unique_senders)
             + coalesced_tx_count.saturating_sub(unique_receivers);
-        let writes_saved = reads_saved; // symmetric — same number of reads and writes saved
+        let writes_saved = reads_saved; // symmetric - same number of reads and writes saved
 
         Ok(CoalesceStats {
             total_txs,
@@ -407,7 +407,7 @@ mod tests {
         let txs = vec![
             Transaction::new_transfer(addr(1), addr(2), 300, 0), // OK: 500 -> 200
             Transaction::new_transfer(addr(1), addr(2), 300, 1), // FAIL: 200 < 300
-            Transaction::new_transfer(addr(1), addr(2), 100, 2), // skipped — nonce gap from failed tx
+            Transaction::new_transfer(addr(1), addr(2), 100, 2), // skipped - nonce gap from failed tx
         ];
         let batch = CoalescedBatch::from_transactions(txs);
         let stats = batch.execute(&state).unwrap();
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_is_worthwhile_no_overlap() {
-        // Each tx has a unique sender and receiver — no overlap.
+        // Each tx has a unique sender and receiver - no overlap.
         let txs = vec![
             Transaction::new_transfer(addr(1), addr(4), 100, 0),
             Transaction::new_transfer(addr(2), addr(5), 100, 0),
@@ -503,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_sender_also_receives() {
-        // addr(1) sends to addr(2), addr(2) sends to addr(1) — circular.
+        // addr(1) sends to addr(2), addr(2) sends to addr(1) - circular.
         let state = test_state(&[(addr(1), 5000), (addr(2), 3000)]);
 
         let txs = vec![
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn test_receiver_auto_created() {
-        // Receiver does not exist in state — should be auto-created.
+        // Receiver does not exist in state - should be auto-created.
         let state = test_state(&[(addr(1), 1000)]);
 
         let txs = vec![Transaction::new_transfer(addr(1), addr(99), 500, 0)];

@@ -138,7 +138,7 @@ export function Inference() {
                 </p>
                 <p>
                   4. Returns the output and the attestation's{" "}
-                  <code>tx_hash</code> — which you can see below.
+                  <code>tx_hash</code> - which you can see below.
                 </p>
               </InfoPopover>
             </span>

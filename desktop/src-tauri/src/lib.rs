@@ -85,7 +85,7 @@ pub fn run() {
             });
 
             // Sync the autostart plugin with what the user chose during
-            // onboarding (default: on). Errors are non-fatal — tray and
+            // onboarding (default: on). Errors are non-fatal - tray and
             // window still work without it.
             let autostart = app.autolaunch();
             match (autostart_desired, autostart.is_enabled().unwrap_or(false)) {

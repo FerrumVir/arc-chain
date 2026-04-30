@@ -52,7 +52,7 @@ pub mod gas_costs {
     pub const BATCH_SETTLE_PER_ENTRY: u64 = 500;
     /// Maximum entries allowed in a single BatchSettle transaction.
     pub const BATCH_SETTLE_MAX_ENTRIES: usize = 10_000;
-    /// Legacy flat gas constant (deprecated — use BATCH_SETTLE_BASE + PER_ENTRY).
+    /// Legacy flat gas constant (deprecated - use BATCH_SETTLE_BASE + PER_ENTRY).
     pub const BATCH_SETTLE: u64 = 30_000;
     /// Gas for opening a state channel.
     pub const CHANNEL_OPEN: u64 = 40_000;
@@ -203,7 +203,7 @@ pub enum TxType {
     BridgeLock = 0x0f,
     /// Mint bridged tokens from another chain.
     BridgeMint = 0x10,
-    /// Batch settlement — nets bilateral balances from multiple settlements.
+    /// Batch settlement - nets bilateral balances from multiple settlements.
     BatchSettle = 0x11,
     /// Open a bilateral state channel (lock funds).
     ChannelOpen = 0x12,
@@ -213,13 +213,13 @@ pub enum TxType {
     ChannelDispute = 0x14,
     /// Submit a STARK proof for a shard block.
     ShardProof = 0x15,
-    /// Optimistic inference attestation (Tier 2 — off-chain with fraud proofs).
+    /// Optimistic inference attestation (Tier 2 - off-chain with fraud proofs).
     InferenceAttestation = 0x16,
     /// Challenge an inference attestation (Tier 2 fraud proof).
     InferenceChallenge = 0x17,
     /// Register as an inference provider (declare hardware tier + stake).
     InferenceRegister = 0x18,
-    /// Milestone B: open a per-request inference escrow — payer locks
+    /// Milestone B: open a per-request inference escrow - payer locks
     /// max_fee ARC against a request_id, which can be released on a
     /// successful attestation or refunded after timeout.
     InferenceEscrowOpen = 0x19,
@@ -231,7 +231,7 @@ pub enum TxType {
     /// elapsed without a release. Only callable by the original payer
     /// (identity proved via metadata-hash match on the escrow account).
     InferenceEscrowRefund = 0x1b,
-    /// Milestone C: register a new model on-chain — commits to a stable
+    /// Milestone C: register a new model on-chain - commits to a stable
     /// model_id (BLAKE3-derived), the layer config, quantization, and the
     /// chunk-tree root for content-addressed weight distribution.
     /// Registration costs a 1000 ARC fee (anti-spam, Milestone E).
@@ -247,7 +247,7 @@ pub enum TxType {
     /// Milestone D: worker advertises capacity so the planner can assign
     /// them fitting ranges. RAM / VRAM / bandwidth / uptime_hint / stake.
     CapacityAdvertisement = 0x1f,
-    /// Milestone D: the planner's deterministic assignment output —
+    /// Milestone D: the planner's deterministic assignment output -
     /// broadcast so any full node replaying history reaches the same
     /// node→range mapping. Community workers long-poll for their
     /// assignment by pubkey and auto-apply.
@@ -277,7 +277,7 @@ pub struct Transaction {
     pub gas_limit: u64,
     /// BLAKE3 hash of the signable content (computed on creation).
     pub hash: Hash256,
-    /// Cryptographic signature. Must be valid — null signatures are rejected.
+    /// Cryptographic signature. Must be valid - null signatures are rejected.
     pub signature: Signature,
     /// Whether the signature has already been verified (e.g. at mempool insertion).
     /// When true, block execution can skip re-verification for a ~2x speedup.
@@ -311,7 +311,7 @@ pub enum TxBody {
     BridgeLock(BridgeLockBody),
     /// Mint bridged tokens from another chain.
     BridgeMint(BridgeMintBody),
-    /// Batch settlement — multiple settlements netted into one TX.
+    /// Batch settlement - multiple settlements netted into one TX.
     BatchSettle(BatchSettleBody),
     /// Open a bilateral state channel.
     ChannelOpen(ChannelOpenBody),
@@ -335,7 +335,7 @@ pub enum TxBody {
     InferenceEscrowRefund(InferenceEscrowRefundBody),
     /// Register a new model on-chain (Milestone C / E anti-spam fee).
     ModelRegistration(ModelRegistrationBody),
-    /// Signal demand for a model — recruits community workers (Milestone C).
+    /// Signal demand for a model - recruits community workers (Milestone C).
     ModelRequest(ModelRequestBody),
     /// Claim coverage for a layer range of a model (Milestone C).
     ShardCoverageClaim(ShardCoverageClaimBody),
@@ -453,7 +453,7 @@ pub struct UpdateStakeBody {
     pub new_stake: u64,
 }
 
-/// Governance transaction payload — records on-chain execution of a passed proposal.
+/// Governance transaction payload - records on-chain execution of a passed proposal.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GovernanceBody {
     /// The proposal ID being executed.
@@ -495,7 +495,7 @@ pub struct BridgeMintBody {
     pub merkle_proof: Vec<u8>,
 }
 
-/// Batch settlement — nets bilateral balances for efficiency.
+/// Batch settlement - nets bilateral balances for efficiency.
 ///
 /// Instead of N individual Settle transactions (N state reads + N writes),
 /// a BatchSettle computes the net balance change per account and applies
@@ -530,7 +530,7 @@ pub struct ChannelOpenBody {
     pub counterparty: Address,
     /// Amount to lock in the channel.
     pub deposit: u64,
-    /// Timeout in blocks — if counterparty doesn't open, funds unlock.
+    /// Timeout in blocks - if counterparty doesn't open, funds unlock.
     pub timeout_blocks: u64,
 }
 
@@ -657,7 +657,7 @@ pub struct InferenceRegisterBody {
 pub struct InferenceEscrowOpenBody {
     /// Client-chosen request identifier (must be unique per open).
     pub request_id: [u8; 32],
-    /// Which model this payment covers — e.g. Llama-2-7B BLAKE3 ID.
+    /// Which model this payment covers - e.g. Llama-2-7B BLAKE3 ID.
     pub model_id: Hash256,
     /// Maximum ARC the payer is willing to pay for this request.
     pub max_fee: u64,
@@ -699,7 +699,7 @@ pub struct InferenceEscrowReleaseBody {
     /// testnet uses the treasury address; decoupled for when the pool
     /// becomes a distinct account.
     pub observer_pool: Address,
-    /// Treasury address — receives 20% plus any rounding residue.
+    /// Treasury address - receives 20% plus any rounding residue.
     pub treasury: Address,
 }
 
@@ -724,7 +724,7 @@ pub struct InferenceEscrowRefundBody {
 /// chunk_tree_root) and nonce stores registered_at height).
 ///
 /// Registration costs `registration_fee` ARC (default 1000) which goes
-/// to the treasury — anti-spam floor for the open registry.
+/// to the treasury - anti-spam floor for the open registry.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelRegistrationBody {
     pub model_id: Hash256,
@@ -784,7 +784,7 @@ pub struct CapacityAdvertisementBody {
 }
 
 /// Milestone D: the planner's output. A single assignment tx contains
-/// `(node_pubkey, model_id, Vec<range>)` entries — one entry per node
+/// `(node_pubkey, model_id, Vec<range>)` entries - one entry per node
 /// that gets assigned at least one range. Workers long-poll
 /// `/assignments/for_me` keyed by their pubkey.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -805,7 +805,7 @@ pub struct AssignmentEntry {
 }
 
 /// Shared helpers for Milestones C–E: deterministic account addresses
-/// and metadata commitments. Same pattern as Milestone B's escrow —
+/// and metadata commitments. Same pattern as Milestone B's escrow -
 /// avoids a new DashMap by packing data into an account's storage_root.
 impl ModelRegistrationBody {
     pub fn registry_account(model_id: &Hash256) -> [u8; 32] {
@@ -863,10 +863,10 @@ impl CapacityAdvertisementBody {
 
 /// Minimum registration fee. Prevents a spammer from cluttering the
 /// open model registry with 10_000 fake models for free. The fee flows
-/// to the treasury (no burn — fixed total supply is a hard ARC rule).
+/// to the treasury (no burn - fixed total supply is a hard ARC rule).
 pub const MIN_MODEL_REGISTRATION_FEE: u64 = 1_000;
 
-/// Milestone B helpers — shared between arc-state and arc-node so both
+/// Milestone B helpers - shared between arc-state and arc-node so both
 /// sides agree on the escrow-account derivation and metadata layout.
 impl InferenceEscrowOpenBody {
     /// Deterministic escrow account address for this request_id.
@@ -930,7 +930,7 @@ pub struct TxReceipt {
     pub logs: Vec<EventLog>,
 }
 
-/// Compact transfer transaction — optimized for throughput benchmarks.
+/// Compact transfer transaction - optimized for throughput benchmarks.
 /// Fixed-size 250-byte layout: less memory bandwidth = more TPS.
 ///
 /// Layout:
@@ -1004,7 +1004,7 @@ impl Transaction {
         tx
     }
 
-    /// Create a new settlement transaction (unsigned, zero fee — settlements are always free).
+    /// Create a new settlement transaction (unsigned, zero fee - settlements are always free).
     pub fn new_settle(
         from: Address,
         agent_id: Address,

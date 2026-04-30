@@ -79,7 +79,7 @@ impl IoBackend for StdBackend {
 
 /// Direct I/O backend that bypasses the kernel page cache.
 /// On macOS: uses F_NOCACHE via fcntl.
-/// On Linux: uses O_DIRECT (would need aligned buffers — simplified here).
+/// On Linux: uses O_DIRECT (would need aligned buffers - simplified here).
 /// Falls back to StdBackend + F_NOCACHE hint on macOS.
 pub struct DirectBackend {
     writer: BufWriter<File>,
@@ -97,7 +97,7 @@ impl DirectBackend {
         #[cfg(target_os = "macos")]
         {
             use std::os::unix::io::AsRawFd;
-            // F_NOCACHE = 48 on macOS — tells the kernel not to cache this file's data
+            // F_NOCACHE = 48 on macOS - tells the kernel not to cache this file's data
             unsafe {
                 libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
             }
@@ -329,7 +329,7 @@ impl IoBackend for PreallocBackend {
 
         // Truncate the file back to logical size so readers don't see zero-fill.
         // (Only needed if preallocated_size > file_size, which is the common case.)
-        // NOTE: We intentionally do NOT truncate here — the zeros beyond file_size
+        // NOTE: We intentionally do NOT truncate here - the zeros beyond file_size
         // are only visible if something reads past the logical data. The WAL reader
         // already handles short reads / zero-length entries gracefully.
         self.syncs += 1;
@@ -667,15 +667,15 @@ impl IoBackend for DevNullBackend {
 /// Selects which I/O backend to instantiate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendType {
-    /// DevNullBackend — discards data, tracks counts.
+    /// DevNullBackend - discards data, tracks counts.
     Null,
-    /// StdBackend — BufWriter<File> (256 KB buffer).
+    /// StdBackend - BufWriter<File> (256 KB buffer).
     Standard,
-    /// DirectBackend — cache-bypass hints + BufWriter (512 KB buffer).
+    /// DirectBackend - cache-bypass hints + BufWriter (512 KB buffer).
     Direct,
-    /// PreallocBackend — 64 MB pre-allocation + 4 MB write buffer.
+    /// PreallocBackend - 64 MB pre-allocation + 4 MB write buffer.
     Prealloc,
-    /// BatchWriter wrapping StdBackend — coalesces small writes.
+    /// BatchWriter wrapping StdBackend - coalesces small writes.
     Batched,
 }
 
@@ -872,11 +872,11 @@ mod tests {
         // 256 byte capacity, 128 byte threshold.
         let mut batch = BatchWriter::with_capacity(inner, 256, 128);
 
-        // Write 64 bytes — under threshold, should stay in batch.
+        // Write 64 bytes - under threshold, should stay in batch.
         batch.write_all(&[b'A'; 64]).unwrap();
         assert_eq!(batch.flush_count(), 0);
 
-        // Write another 128 bytes — total 192, over 128 threshold => auto-flush.
+        // Write another 128 bytes - total 192, over 128 threshold => auto-flush.
         batch.write_all(&[b'B'; 128]).unwrap();
         assert_eq!(batch.flush_count(), 1);
 
@@ -931,7 +931,7 @@ mod tests {
         let path = tmp_path("factory_typed.bin");
         let _ = fs::remove_file(&path);
 
-        // Null backend — no file needed.
+        // Null backend - no file needed.
         {
             let mut be = create_backend_typed(BackendType::Null, &path).unwrap();
             be.write_all(b"gone").unwrap();
@@ -993,6 +993,6 @@ mod tests {
         assert_eq!(be.flush_calls(), 1);
         assert_eq!(be.sync_calls(), 1);
 
-        // But there is no file to read — all data was discarded.
+        // But there is no file to read - all data was discarded.
     }
 }

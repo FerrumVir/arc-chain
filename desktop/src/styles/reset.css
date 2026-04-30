@@ -80,7 +80,7 @@ h6 {
   line-height: var(--leading-tight);
 }
 
-/* Custom scrollbar — thin, subtle, matches theme */
+/* Custom scrollbar - thin, subtle, matches theme */
 ::-webkit-scrollbar {
   width: 10px;
   height: 10px;
@@ -103,7 +103,7 @@ h6 {
   color: var(--text);
 }
 
-/* Focus ring — accessible, brand-consistent */
+/* Focus ring - accessible, brand-consistent */
 :focus-visible {
   outline: 2px solid var(--border-focus);
   outline-offset: 2px;

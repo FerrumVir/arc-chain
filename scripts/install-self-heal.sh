@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain — install arc-self-heal on ONE seed host (GH #30)
+# ARC Chain - install arc-self-heal on ONE seed host (GH #30)
 #
 # Deploys scripts/arc-self-heal.sh + arc-self-heal.service to the target,
 # enables the systemd unit, and prints status. Safe to re-run.
 #
-# The daemon is supervisory only — installing/starting it does NOT touch the
+# The daemon is supervisory only - installing/starting it does NOT touch the
 # running arc-node process. The daemon will only restart arc-node if it
 # detects a silent or drifted state per the issue acceptance criteria.
 #
@@ -14,7 +14,7 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
-IP="${1:?usage: $0 <ip> — e.g. 136.244.109.1 (AMS)}"
+IP="${1:?usage: $0 <ip> - e.g. 136.244.109.1 (AMS)}"
 SSH_KEY="$HOME/.ssh/id_ed25519"
 SSH_OPTS="-i $SSH_KEY -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o BatchMode=yes"
 
@@ -26,12 +26,12 @@ ok()    { printf "${GREEN}[  OK]${RESET}  %s\n" "$*"; }
 warn()  { printf "${YELLOW}[WARN]${RESET}  %s\n" "$*"; }
 fail()  { printf "${RED}[FAIL]${RESET}  %s\n" "$*" >&2; exit 1; }
 
-# Refuse to install if arc-node is managed by systemd on this host — we'd
+# Refuse to install if arc-node is managed by systemd on this host - we'd
 # conflict on restart. (Currently seeds run arc-node bare via setsid+nohup.)
 info "Preflight: checking $IP..."
 ARC_UNIT_STATE=$(ssh $SSH_OPTS "root@${IP}" "systemctl is-active arc-node 2>/dev/null || true")
 if [ "$ARC_UNIT_STATE" = "active" ]; then
-    fail "arc-node.service is active on $IP — self-heal would conflict. Disable the systemd unit first."
+    fail "arc-node.service is active on $IP - self-heal would conflict. Disable the systemd unit first."
 fi
 
 # Confirm arc-node is running as a bare process (gives us a live cmdline to snapshot).

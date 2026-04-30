@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARC Chain — VPS Setup & Paper Benchmark Runner
+# ARC Chain - VPS Setup & Paper Benchmark Runner
 #
 # Run this on a fresh VPS (Ubuntu 22.04/24.04) to:
 #   1. Install dependencies (Rust, Python, etc.)
@@ -27,7 +27,7 @@ set -euo pipefail
 # ══════════════════════════════════════════════════════════════════════════════
 
 echo "═══════════════════════════════════════════════════════════"
-echo "ARC Chain — VPS Setup & Paper Benchmark Runner"
+echo "ARC Chain - VPS Setup & Paper Benchmark Runner"
 echo "═══════════════════════════════════════════════════════════"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,7 +44,7 @@ if [[ "$OSTYPE" == "linux-gnu"* ]]; then
         sudo apt-get install -y -qq build-essential pkg-config libssl-dev python3 python3-pip git curl
     fi
 elif [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS — assume Xcode CLI tools installed
+    # macOS - assume Xcode CLI tools installed
     echo "  macOS detected, skipping apt-get."
 fi
 
@@ -148,10 +148,10 @@ echo "BENCHMARK COMPLETE"
 echo "═══════════════════════════════════════════════════════════"
 echo ""
 echo "Evidence files:"
-echo "  /tmp/arc-paper-benchmarks.json  — raw benchmark data"
-echo "  /tmp/arc-paper-benchmarks.md    — paper-ready tables"
-echo "  /tmp/arc-multinode-results.txt  — multi-node TPS data"
-echo "  /tmp/arc-models/               — ARC-format model files"
+echo "  /tmp/arc-paper-benchmarks.json  - raw benchmark data"
+echo "  /tmp/arc-paper-benchmarks.md    - paper-ready tables"
+echo "  /tmp/arc-multinode-results.txt  - multi-node TPS data"
+echo "  /tmp/arc-models/               - ARC-format model files"
 echo ""
 echo "Test results:"
 cargo test --workspace --release 2>&1 | grep "^test result:" | awk '{s+=$4; f+=$6} END {printf "  %d tests passed, %d failed\n", s, f}'

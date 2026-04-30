@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ARC Chain — Testnet Launcher
+# ARC Chain - Testnet Launcher
 # Spin up a local multi-node testnet for development and benchmarking
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -14,7 +14,7 @@ BASE_RPC_PORT=9944
 BASE_P2P_PORT=9190
 STAKE=5000000
 
-# Genesis account 0 — prefunded with 1T ARC
+# Genesis account 0 - prefunded with 1T ARC
 GENESIS_FROM="af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
 GENESIS_TO="2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213"
 
@@ -132,7 +132,7 @@ cmd_start() {
 
         mkdir -p "$datadir"
 
-        # Build peer list — connect to all previously started nodes
+        # Build peer list - connect to all previously started nodes
         local peers=""
         if [ "$i" -gt 0 ]; then
             for p in $(seq 0 $((i - 1))); do

@@ -1,5 +1,5 @@
 /**
- * ARC Chain SDK — RPC client.
+ * ARC Chain SDK - RPC client.
  *
  * Typed HTTP client for all ARC Chain RPC endpoints.
  * Uses the native `fetch` API (Node 18+, Deno, Bun, browsers).

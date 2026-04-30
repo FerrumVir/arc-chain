@@ -10,7 +10,7 @@
 //   GET  /inference/results?limit=N      { results: [{input, output, output_hash,
 //                                          ms_per_token, tokens_generated,
 //                                          tx_hash}], count }
-//   GET  /worker/earnings                (not implemented on this node — empty body;
+//   GET  /worker/earnings                (not implemented on this node - empty body;
 //                                          we synthesize from attestations)
 
 use crate::types::{
@@ -36,7 +36,7 @@ pub async fn fetch_status(
         _ => None,
     };
 
-    // Running if /health responds — whether or not we spawned it. This lets the
+    // Running if /health responds - whether or not we spawned it. This lets the
     // app recognize externally-managed nodes (e.g. a community installer launchd
     // daemon).
     let running = parsed.is_some();
@@ -199,7 +199,7 @@ pub async fn fetch_attestations(
 }
 
 pub async fn fetch_network_stats(http: &reqwest::Client, port: u16) -> NetworkStats {
-    // No dedicated /network/stats endpoint — synthesize:
+    // No dedicated /network/stats endpoint - synthesize:
     //   total_nodes  ← /health.validators (rough: treat each validator as a node)
     //   total_inferences ← /inference/results.count
     //   avg_tps      ← /health.dag_round / uptime_secs * factor
@@ -438,7 +438,7 @@ pub async fn run_inference(
 /// when the local node cannot serve inference (observer role, no model
 /// loaded). `coord_base` is a full origin like `http://149.28.32.76:9090`.
 ///
-/// Caller must pass an http client with a long timeout — consensus
+/// Caller must pass an http client with a long timeout - consensus
 /// inference on the 6-seed pipeline takes 30–60 s for a short prompt.
 pub async fn run_inference_consensus(
     http: &reqwest::Client,

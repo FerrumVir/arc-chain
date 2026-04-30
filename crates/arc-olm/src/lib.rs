@@ -1,7 +1,7 @@
-//! # arc-olm — Ontological Language Model
+//! # arc-olm - Ontological Language Model
 //!
 //! Deterministic reasoning through typed DAG search.
-//! The model doesn't predict tokens — it navigates a computation graph.
+//! The model doesn't predict tokens - it navigates a computation graph.
 //! Every step is typed, verified, and deterministic.
 //!
 //! ## Architecture
@@ -15,7 +15,7 @@
 //! crate-wide so CI doesn't block experimentation.
 //!
 //! Note `clippy::never_loop` is deny-by-default (treated as a correctness
-//! bug) — our ARC-AGI solver synthesizer has patterns that false-positive
+//! bug) - our ARC-AGI solver synthesizer has patterns that false-positive
 //! on it, so we allow it crate-wide.
 #![allow(dead_code, unused_imports, unused_variables, clippy::never_loop)]
 

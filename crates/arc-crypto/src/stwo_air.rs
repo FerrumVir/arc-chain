@@ -25,7 +25,7 @@
 //! ```
 
 // ---------------------------------------------------------------------------
-// Imports — upstream Stwo (used for both stwo-prover and stwo-icicle features)
+// Imports - upstream Stwo (used for both stwo-prover and stwo-icicle features)
 // ---------------------------------------------------------------------------
 //
 // `stwo-icicle` extends `stwo-prover` (adds ICICLE GPU crates for future
@@ -61,7 +61,7 @@ use crate::stark::BlockProofInput;
 /// Ensures the ICICLE runtime is initialized (GPU path only).
 /// Uses `Once` to guarantee single initialization across all prove calls.
 ///
-/// Currently a no-op beyond device selection — the proving pipeline still
+/// Currently a no-op beyond device selection - the proving pipeline still
 /// uses `SimdBackend` (CPU). When upstream stwo adds an `IcicleBackend`,
 /// this initializer will be called before GPU-accelerated proving.
 #[cfg(feature = "stwo-icicle")]
@@ -157,7 +157,7 @@ pub fn m31_limbs_to_u64(lo: M31, hi: M31) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// AIR definition — ArcBlockWitnessEval
+// AIR definition - ArcBlockWitnessEval
 // ---------------------------------------------------------------------------
 //
 /// AIR for ARC Chain block state transition proof.
@@ -279,12 +279,12 @@ impl FrameworkEval for ArcBlockWitnessEval {
         let amount = amt_lo.clone() + amt_hi.clone() * base;
 
         // ---------------------------------------------------------------
-        // Constraint 1: active is boolean — active² - active = 0
+        // Constraint 1: active is boolean - active² - active = 0
         // ---------------------------------------------------------------
         eval.add_constraint(active.clone() * active.clone() - active.clone());
 
         // ---------------------------------------------------------------
-        // Constraint 2: has_transfer is boolean — has_transfer² - has_transfer = 0
+        // Constraint 2: has_transfer is boolean - has_transfer² - has_transfer = 0
         // ---------------------------------------------------------------
         eval.add_constraint(
             has_transfer.clone() * has_transfer.clone() - has_transfer.clone(),
@@ -833,7 +833,7 @@ impl StwoproofReceipt {
 ///
 /// Returns `(proof_data, proof_size_bytes, proving_time_ms)`.
 ///
-/// The proof_data contains a serialized `StwoproofReceipt` — the Merkle
+/// The proof_data contains a serialized `StwoproofReceipt` - the Merkle
 /// commitment roots and config parameters. The full STARK proof is verified
 /// inline during proving to ensure correctness.
 ///
@@ -910,7 +910,7 @@ pub fn prove_block(input: &BlockProofInput) -> (Vec<u8>, usize, u64) {
         .commitments
         .iter()
         .map(|c| {
-            // Blake2s hash is 32 bytes — extract via Debug format and hash
+            // Blake2s hash is 32 bytes - extract via Debug format and hash
             let repr = format!("{:?}", c);
             *blake3::hash(repr.as_bytes()).as_bytes()
         })
@@ -970,7 +970,7 @@ pub fn verify_block_proof(input: &BlockProofInput, proof_data: &[u8]) -> bool {
 
 
 // ---------------------------------------------------------------------------
-// Recursive Verifier AIR — inner-circuit STARK recursion
+// Recursive Verifier AIR - inner-circuit STARK recursion
 // ---------------------------------------------------------------------------
 //
 // The RecursiveVerifierAIR proves, inside a STARK circuit, that child proof
@@ -989,13 +989,13 @@ pub fn verify_block_proof(input: &BlockProofInput, proof_data: &[u8]) -> bool {
 /// Number of trace columns for the recursive verifier AIR.
 ///
 /// Layout:
-///   active              (1 col)  — boolean, 1 for real child proof rows
-///   child_hash_limbs   (16 cols) — M31 decomposition of child proof hash
-///   child_start_state  (16 cols) — M31 decomposition of child's start_state_root
-///   child_end_state    (16 cols) — M31 decomposition of child's end_state_root
-///   merkle_sibling     (16 cols) — M31 limbs of Merkle sibling at this depth
-///   merkle_computed    (16 cols) — M31 limbs of computed Merkle node
-///   chain_valid         (1 col)  — boolean, 1 if child_i.end == child_{i+1}.start
+///   active              (1 col)  - boolean, 1 for real child proof rows
+///   child_hash_limbs   (16 cols) - M31 decomposition of child proof hash
+///   child_start_state  (16 cols) - M31 decomposition of child's start_state_root
+///   child_end_state    (16 cols) - M31 decomposition of child's end_state_root
+///   merkle_sibling     (16 cols) - M31 limbs of Merkle sibling at this depth
+///   merkle_computed    (16 cols) - M31 limbs of computed Merkle node
+///   chain_valid         (1 col)  - boolean, 1 if child_i.end == child_{i+1}.start
 ///   Total: 82 columns
 pub const RECURSIVE_VERIFIER_COLS: usize = 82;
 
@@ -1020,7 +1020,7 @@ pub struct RecursiveVerifierInput {
 }
 
 // ---------------------------------------------------------------------------
-// AIR definition — ArcRecursiveVerifierEval
+// AIR definition - ArcRecursiveVerifierEval
 // ---------------------------------------------------------------------------
 
 /// AIR for recursive proof verification.
@@ -1110,12 +1110,12 @@ impl FrameworkEval for ArcRecursiveVerifierEval {
         let chain_valid = eval.next_trace_mask();
 
         // ---------------------------------------------------------------
-        // Constraint 1: active is boolean — active^2 - active = 0
+        // Constraint 1: active is boolean - active^2 - active = 0
         // ---------------------------------------------------------------
         eval.add_constraint(active.clone() * active.clone() - active.clone());
 
         // ---------------------------------------------------------------
-        // Constraint 2: chain_valid is boolean — chain_valid^2 - chain_valid = 0
+        // Constraint 2: chain_valid is boolean - chain_valid^2 - chain_valid = 0
         // ---------------------------------------------------------------
         eval.add_constraint(
             chain_valid.clone() * chain_valid.clone() - chain_valid.clone(),
@@ -1130,7 +1130,7 @@ impl FrameworkEval for ArcRecursiveVerifierEval {
         );
 
         // ---------------------------------------------------------------
-        // Constraint 4 (x64): padding — all limb columns zero when active=0
+        // Constraint 4 (x64): padding - all limb columns zero when active=0
         //   limb * (1 - active) = limb - active * limb = 0
         // ---------------------------------------------------------------
         for limb in &child_hash_limbs {
@@ -1169,7 +1169,7 @@ impl FrameworkEval for ArcRecursiveVerifierEval {
         }
 
         // ---------------------------------------------------------------
-        // Constraint 6: chain_valid padding — chain_valid column zero when active=0
+        // Constraint 6: chain_valid padding - chain_valid column zero when active=0
         //   chain_valid * (1 - active) = 0  (already covered by constraint 3)
         //   But we also constrain: chain_valid is 0 on padding rows.
         //   This is already implied by constraint 3 above.
@@ -1341,7 +1341,7 @@ pub fn generate_recursive_verifier_trace(
 }
 
 // ---------------------------------------------------------------------------
-// Prove / Verify — Recursive Verifier
+// Prove / Verify - Recursive Verifier
 // ---------------------------------------------------------------------------
 
 /// Binding domain for recursive proof receipts (distinct from block proofs).
@@ -1351,7 +1351,7 @@ const RECURSIVE_BINDING_DOMAIN: &str = "ARC-stwo-recursive-binding-v1";
 ///
 /// The proof attests that the prover correctly verified all child proofs
 /// and that their state roots form a valid chain. This is the inner-circuit
-/// recursive verification — the STARK proof itself proves the verification.
+/// recursive verification - the STARK proof itself proves the verification.
 ///
 /// Returns `(proof_data, proof_size_bytes, proving_time_ms)` where
 /// `proof_data` is a serialized `StwoproofReceipt` with the recursive
@@ -1711,11 +1711,11 @@ mod tests {
 
         eprintln!("\nMock = BLAKE3 hash (no cryptographic proof of computation)");
         eprintln!("Stwo = Real Circle STARK: FRI commitment + Merkle tree + AIR constraints");
-        eprintln!("Stwo proves REAL zero-knowledge — mock proves nothing.\n");
+        eprintln!("Stwo proves REAL zero-knowledge - mock proves nothing.\n");
     }
 
     /// Test that proving works with stwo-icicle feature enabled.
-    /// (stwo-icicle extends stwo-prover — same proving path, ICICLE crates available)
+    /// (stwo-icicle extends stwo-prover - same proving path, ICICLE crates available)
     #[test]
     fn test_dense_layer_real_stark() {
         use crate::inference_proof::dense_forward_i64;

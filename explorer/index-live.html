@@ -87,9 +87,9 @@ const NODES=[
   {n:'SAO',ip:'216.238.120.27',r:'S. America'},
   {n:'JNB',ip:'139.84.237.49',r:'Africa'},
 ];
-const RPC_STATS='http://'+NODES[1].ip+':9090';   // LAX — live node stats
-const RPC_BENCH='http://'+NODES[1].ip+':3100';   // LAX — benchmark results
-const RPC_INF='http://'+NODES[3].ip+':9090';     // LHR — inference + receipts
+const RPC_STATS='http://'+NODES[1].ip+':9090';   // LAX - live node stats
+const RPC_BENCH='http://'+NODES[1].ip+':3100';   // LAX - benchmark results
+const RPC_INF='http://'+NODES[3].ip+':9090';     // LHR - inference + receipts
 
 function f(u,ms=3000){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms);return fetch(u,{signal:c.signal}).then(r=>{clearTimeout(t);return r.json()}).catch(()=>{clearTimeout(t);return null})}
 function sh(h){return h?(h.length>16?h.slice(0,8)+'...'+h.slice(-6):h):'?'}
@@ -171,17 +171,17 @@ async function showTx(hash){
   }
 
   const s=tx.success?'<span class="tag ok">SUCCESS</span>':'<span class="tag fail">FAILED</span>';
-  const to=tx.body&&tx.body.to?tx.body.to:'—';
-  const amt=tx.body&&tx.body.amount?fmt(tx.body.amount)+' ARC':'—';
+  const to=tx.body&&tx.body.to?tx.body.to:'-';
+  const amt=tx.body&&tx.body.amount?fmt(tx.body.amount)+' ARC':'-';
   let rows=
     '<tr><td>Hash</td><td>'+tx.tx_hash+'</td></tr>'+
     '<tr><td>Status</td><td>'+s+'</td></tr>'+
     '<tr><td>Type</td><td>'+txType(cached||tx)+'</td></tr>'+
-    '<tr><td>From</td><td>'+(tx.from||'—')+'</td></tr>'+
+    '<tr><td>From</td><td>'+(tx.from||'-')+'</td></tr>'+
     '<tr><td>To</td><td>'+to+'</td></tr>'+
     '<tr><td>Amount</td><td style="color:#34d399">'+amt+'</td></tr>'+
     '<tr><td>Gas</td><td>'+fmt(tx.gas_used)+'</td></tr>'+
-    '<tr><td>Block</td><td>'+(tx.block_height||'—')+'</td></tr>';
+    '<tr><td>Block</td><td>'+(tx.block_height||'-')+'</td></tr>';
 
   // Show inference details from cached attestation or /inference/results
   let inf=cached&&cached.inference?cached.inference:null;
@@ -198,7 +198,7 @@ async function showTx(hash){
       '<tr><td>Model Hash</td><td>'+(inf.model_hash||'')+'</td></tr>'+
       '<tr><td>Speed</td><td>'+inf.ms_per_token+' ms/tok ('+inf.tokens_generated+' tokens)</td></tr>'+
       '<tr><td>Engine</td><td>'+inf.engine+'</td></tr>'+
-      '<tr><td>Deterministic</td><td><span class="tag ok">YES — identical output on every chip on earth</span></td></tr>';
+      '<tr><td>Deterministic</td><td><span class="tag ok">YES - identical output on every chip on earth</span></td></tr>';
   }
   b.innerHTML=rows;
 }
@@ -216,9 +216,9 @@ async function updateTxs(){
   el.innerHTML=sorted.slice(0,20).map(a=>{
     const h=(a.tx_hash||'').replace('0x','');
     const s=a.success?'<span class="tag ok">OK</span>':'<span class="tag fail">FAIL</span>';
-    const to=a.to?sa(a.to):(a.inference?'AI Model':'—');
-    const amt=a.amount?fmt(a.amount)+' ARC':(a.inference?a.inference.ms_per_token+' ms/tok':'—');
-    const from=a.from?sa(a.from):(a.inference?'Validator':'—');
+    const to=a.to?sa(a.to):(a.inference?'AI Model':'-');
+    const amt=a.amount?fmt(a.amount)+' ARC':(a.inference?a.inference.ms_per_token+' ms/tok':'-');
+    const from=a.from?sa(a.from):(a.inference?'Validator':'-');
     return '<tr class="cl" onclick="showTx(\''+h+'\')"><td class="hash">'+sh(h)+'</td><td>'+txType(a)+'</td><td class="hash">'+from+'</td><td class="hash">'+to+'</td><td>'+amt+'</td><td>'+s+'</td></tr>';
   }).join('');
 }
@@ -238,11 +238,11 @@ async function updateInference(){
   el.innerHTML=results.slice(0,10).map(r=>{
     const h=(r.tx_hash||'').replace('0x','');
     return '<div class="inf-card" style="cursor:pointer" onclick="showTx(\''+h+'\')">'+
-      '<div class="inf-q">Q: '+(r.input||'—')+'</div>'+
-      '<div class="inf-a">A: '+(r.output||'—')+'</div>'+
+      '<div class="inf-q">Q: '+(r.input||'-')+'</div>'+
+      '<div class="inf-a">A: '+(r.output||'-')+'</div>'+
       '<div class="inf-meta">'+
         '<span>Hash: '+sh(r.output_hash||'')+'</span>'+
-        '<span>Model: '+(r.model||'—')+'</span>'+
+        '<span>Model: '+(r.model||'-')+'</span>'+
         '<span>'+r.ms_per_token+' ms/tok</span>'+
         '<span>'+r.tokens_generated+' tokens</span>'+
         '<span>'+(r.deterministic?'DETERMINISTIC':'')+'</span>'+

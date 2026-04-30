@@ -11,14 +11,14 @@
 //! - One file per chunk under `cache_dir/<hex-hash>`.
 //! - A separate JSON sidecar `cache_dir/_index.json` records
 //!   `{hash: last_served_unix_millis}` so last-served timestamps
-//!   survive restarts (warm-set persistence — a restarted node prefers
+//!   survive restarts (warm-set persistence - a restarted node prefers
 //!   re-taking ranges it already has cached over downloading fresh).
 //! - Eviction runs whenever `put` would push total size over `cap_bytes`;
 //!   it evicts in ascending last_served order until under cap.
 //!
 //! # Non-goals
 //!
-//! This module is intentionally simple — no background GC thread, no
+//! This module is intentionally simple - no background GC thread, no
 //! async tokio file I/O, no compaction. Calls are synchronous; the
 //! expected call frequency is tens of chunks per minute, not per second.
 //! A future tighter implementation can layer those on without changing
@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Stored as JSON alongside the chunk files so a restart doesn't
-/// forget which chunks are the hottest (warm-set persistence —
+/// forget which chunks are the hottest (warm-set persistence -
 /// planner prefers re-assigning ranges the node already has cached).
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 struct IndexFile {
@@ -51,7 +51,7 @@ pub struct ChunkCache {
     last_served: BTreeMap<String, u64>,
 }
 
-/// Default cap — 50 GB. Same as the value called out in PLAN.md's
+/// Default cap - 50 GB. Same as the value called out in PLAN.md's
 /// Milestone E acceptance.
 pub const DEFAULT_CAP_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 
@@ -71,7 +71,7 @@ impl ChunkCache {
         fs::create_dir_all(&cache_dir)?;
 
         // Load the index sidecar if present; a missing or corrupt sidecar
-        // is recoverable — we scan the directory and fabricate "now" for
+        // is recoverable - we scan the directory and fabricate "now" for
         // every chunk so the next put sorts on real usage.
         let index_path = cache_dir.join("_index.json");
         let mut last_served = if index_path.exists() {
@@ -82,7 +82,7 @@ impl ChunkCache {
             BTreeMap::new()
         };
 
-        // Reconcile with the actual on-disk set — purge index rows for
+        // Reconcile with the actual on-disk set - purge index rows for
         // chunks that got deleted out-of-band, and add rows for chunks
         // present on disk but missing from the index.
         let mut seen: BTreeMap<String, ()> = BTreeMap::new();
@@ -108,7 +108,7 @@ impl ChunkCache {
     }
 
     /// Record a "serve" event on an existing chunk. Updates the in-memory
-    /// index but does NOT flush the sidecar — callers batch flushes via
+    /// index but does NOT flush the sidecar - callers batch flushes via
     /// `save_index()` to avoid thrashing the JSON file per serve.
     pub fn touch(&mut self, hash_hex: &str) {
         if self.last_served.contains_key(hash_hex) {
@@ -148,7 +148,7 @@ impl ChunkCache {
     }
 
     /// Compute total bytes of all cached chunks on disk. Fresh each
-    /// time — avoids stale in-memory accounting drifting from reality
+    /// time - avoids stale in-memory accounting drifting from reality
     /// if a user manually deletes cache files.
     pub fn total_bytes(&self) -> io::Result<u64> {
         let mut total = 0u64;
@@ -185,7 +185,7 @@ impl ChunkCache {
     }
 
     /// Evict until total_bytes <= cap. Public variant of the loop used
-    /// inside `put` — callers can invoke it manually after a series of
+    /// inside `put` - callers can invoke it manually after a series of
     /// touches that didn't themselves grow the cache.
     pub fn purge_to_cap(&mut self) -> io::Result<()> {
         while self.total_bytes()? > self.cap_bytes {
