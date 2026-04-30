@@ -20,6 +20,14 @@ This guide walks you from a fresh install through your first earned ARC token. R
    - Click **Open** in the dialog that appears.
    - You only do this once. After the first launch, double-clicking works normally.
 
+> **Got *"ARC Node is damaged and can't be opened. You should move it to the Trash"* instead?**
+> That's the same Gatekeeper rejection in disguise — it isn't actually damaged. macOS just refuses to verify a signature that doesn't exist on early builds. Two fixes:
+>
+> - **Easy:** open Terminal and run `xattr -cr "/Applications/ARC Node.app"`, then double-click ARC Node again. The command strips the quarantine flag macOS adds to anything downloaded from a browser.
+> - **Or:** delete the .app, re-download the .dmg, and use the right-click → Open flow above *before* double-clicking.
+>
+> Permanent fix is on the roadmap — once the project is signed + notarized with an Apple Developer ID, this dialog goes away for everyone.
+
 > **Apple Silicon vs Intel?** Apple menu → *About This Mac*. If you see "Apple M1/M2/M3/M4" → use the Apple Silicon `.dmg`. If "Intel" → use the Intel `.dmg`.
 
 ### Windows 10 / 11
