@@ -115,6 +115,13 @@ pub struct SyncProgress {
     pub verified_chunks: u32,
     /// Running total of accounts imported so far.
     pub total_accounts_imported: u64,
+    /// Latest state_root reported by an imported chunk. Chunks are
+    /// generated live on the server, so when the source chain is producing
+    /// blocks, the manifest's `state_root` (taken at manifest-fetch time)
+    /// will differ from the chunk's (taken at chunk-fetch time). The chunk's
+    /// `state_root` describes the accounts we actually imported, so we use
+    /// it as the authority for `finalize_sync`'s integrity check.
+    pub latest_chunk_state_root: Option<Hash256>,
 }
 
 /// Compact state summary for monitoring / health-check endpoints.
@@ -5562,12 +5569,28 @@ impl StateDB {
     ///
     /// Verifies the chunk's BLAKE3 proof before inserting accounts.
     /// Returns the number of accounts imported from this chunk.
+    ///
+    /// On the first chunk (`chunk_index == 0`) of a fresh-state sync
+    /// (height == 0), wipes any pre-import accounts/contracts/storage so the
+    /// recomputed merkle root matches the source. Without this, fresh nodes
+    /// keep their genesis-init validator account, which the source snapshot
+    /// doesn't contain, and `finalize_sync` rejects the imported state with
+    /// "state root mismatch" — the exact failure mode that stranded LHR at
+    /// round 0 after every `--reset-state`.
     pub fn import_snapshot_chunk(&self, chunk: &StateSnapshot) -> Result<u32, StateError> {
         // Verify chunk proof: re-hash the chunk's account data and compare.
         let chunk_data = bincode::serialize(&chunk.accounts).expect("serializable");
         let computed_proof = hash_bytes(&chunk_data);
         if computed_proof != chunk.chunk_proof {
             return Err(StateError::ChunkVerificationFailed);
+        }
+
+        if chunk.chunk_index == 0 && self.height() == 0 {
+            self.accounts.clear();
+            self.contracts.clear();
+            self.storage.clear();
+            *self.incremental_merkle.lock() = IncrementalMerkle::new();
+            self.dirty_accounts.clear();
         }
 
         let count = chunk.accounts.len() as u32;
@@ -5596,6 +5619,7 @@ impl StateDB {
             received_chunks: vec![false; total],
             verified_chunks: 0,
             total_accounts_imported: 0,
+            latest_chunk_state_root: None,
         }
     }
 
@@ -5622,6 +5646,7 @@ impl StateDB {
         progress.received_chunks[idx] = true;
         progress.verified_chunks += 1;
         progress.total_accounts_imported += accounts_imported as u64;
+        progress.latest_chunk_state_root = Some(chunk.state_root);
         Ok(())
     }
 
@@ -5672,10 +5697,18 @@ impl StateDB {
             });
         }
 
+        // Verify against the most recent chunk's state_root (which describes
+        // the actual accounts we imported), not the manifest's state_root
+        // (which was captured earlier and is stale by the time chunks were
+        // generated on a chain that's producing blocks live). Falls back to
+        // manifest's state_root if no chunks were received.
+        let expected = progress
+            .latest_chunk_state_root
+            .unwrap_or(progress.manifest.state_root);
         let computed_root = self.compute_state_root();
-        if computed_root != progress.manifest.state_root {
+        if computed_root != expected {
             return Err(StateError::StateRootMismatch {
-                expected: progress.manifest.state_root,
+                expected,
                 computed: computed_root,
             });
         }
