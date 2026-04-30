@@ -110,7 +110,16 @@ button.secondary:hover{border-color:#6366f1;color:#fff}
 </div>
 </div>
 
-<script>
+<script type="module">
+// Real Ed25519 + BLAKE3 keyed hashing matching arc-chain server-side verification:
+//   address  = BLAKE3(ed25519_pubkey)
+//   tx_hash  = BLAKE3-derive-key("ARC-chain-tx-v1", [tx_type, from, nonce_le, body, fee_le, gas_le])
+//   sig      = Ed25519.sign(privKey, tx_hash)
+import * as ed     from 'https://esm.sh/@noble/ed25519@2.1.0';
+import { sha512 }  from 'https://esm.sh/@noble/hashes@1.4.0/sha512';
+import { blake3 }  from 'https://esm.sh/@noble/hashes@1.4.0/blake3';
+ed.etc.sha512Sync = (...m) => sha512(ed.etc.concatBytes(...m));
+
 // ── Config ──
 const NODES = [
   {name:'LAX', ip:'140.82.16.112'},
@@ -119,15 +128,12 @@ const NODES = [
   {name:'NYC', ip:'149.28.32.76'},
   {name:'LHR', ip:'104.238.171.11'},
   {name:'SGP', ip:'149.28.153.31'},
-  {name:'SAO', ip:'216.238.120.27'},
-  {name:'JNB', ip:'139.84.237.49'},
 ];
 let RPC = '';
-let wallet = null; // {privKey, address}
+let wallet = null; // {version, privKey, pubKey, address}
 
 // ── Startup ──
 (async function init() {
-  // Find a live node
   for (const n of NODES) {
     try {
       const r = await fetch(`http://${n.ip}:9090/health`, {signal: AbortSignal.timeout(3000)});
@@ -143,62 +149,67 @@ let wallet = null; // {privKey, address}
     document.getElementById('netDot').className = 'dot off';
     document.getElementById('netStatus').textContent = 'Testnet unreachable';
   }
-  // Check saved wallet
   const saved = localStorage.getItem('arc_wallet');
   if (saved) {
-    wallet = JSON.parse(saved);
-    showApp();
+    const w = JSON.parse(saved);
+    if (w.version === 2 && w.pubKey) {
+      wallet = w;
+      showApp();
+    } else {
+      // Legacy wallet (random-bytes "key", sha256 address) couldn't sign. Drop it
+      // and start fresh with a real Ed25519 keypair.
+      localStorage.removeItem('arc_wallet');
+      localStorage.removeItem('arc_txs');
+    }
   }
 })();
 
-// ── Crypto ──
-// Simple SHA-256 in JS (works on HTTP - crypto.subtle needs HTTPS)
-function sha256(data) {
-  const K = [
-    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-  ];
-  const rr=(v,n)=>(v>>>n)|(v<<(32-n));
-  let h0=0x6a09e667,h1=0xbb67ae85,h2=0x3c6ef372,h3=0xa54ff53a,h4=0x510e527f,h5=0x9b05688c,h6=0x1f83d9ab,h7=0x5be0cd19;
-  const msg=new Uint8Array(data);const bl=msg.length*8;
-  const pad=new Uint8Array(((msg.length+9+63)&~63));
-  pad.set(msg);pad[msg.length]=0x80;
-  const dv=new DataView(pad.buffer);dv.setUint32(pad.length-4,bl);
-  for(let o=0;o<pad.length;o+=64){
-    const w=new Int32Array(64);
-    for(let i=0;i<16;i++)w[i]=dv.getInt32(o+i*4);
-    for(let i=16;i<64;i++){const s0=rr(w[i-15],7)^rr(w[i-15],18)^(w[i-15]>>>3);const s1=rr(w[i-2],17)^rr(w[i-2],19)^(w[i-2]>>>10);w[i]=(w[i-16]+s0+w[i-7]+s1)|0;}
-    let a=h0,b=h1,c=h2,d=h3,e=h4,f=h5,g=h6,h=h7;
-    for(let i=0;i<64;i++){const S1=rr(e,6)^rr(e,11)^rr(e,25);const ch=(e&f)^(~e&g);const t1=(h+S1+ch+K[i]+w[i])|0;const S0=rr(a,2)^rr(a,13)^rr(a,22);const mj=(a&b)^(a&c)^(b&c);const t2=(S0+mj)|0;h=g;g=f;f=e;e=(d+t1)|0;d=c;c=b;b=a;a=(t1+t2)|0;}
-    h0=(h0+a)|0;h1=(h1+b)|0;h2=(h2+c)|0;h3=(h3+d)|0;h4=(h4+e)|0;h5=(h5+f)|0;h6=(h6+g)|0;h7=(h7+h)|0;
-  }
-  const out=new Uint8Array(32);const ov=new DataView(out.buffer);
-  ov.setUint32(0,h0);ov.setUint32(4,h1);ov.setUint32(8,h2);ov.setUint32(12,h3);
-  ov.setUint32(16,h4);ov.setUint32(20,h5);ov.setUint32(24,h6);ov.setUint32(28,h7);
-  return out;
-}
+// ── Hex helpers ──
 function toHex(bytes){return Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join('')}
+function fromHex(s){const out=new Uint8Array(s.length/2);for(let i=0;i<out.length;i++)out[i]=parseInt(s.substr(i*2,2),16);return out}
+function u64le(n){const b=new Uint8Array(8);new DataView(b.buffer).setBigUint64(0,BigInt(n),true);return b}
+function concat(...arrs){let n=0;for(const a of arrs)n+=a.length;const o=new Uint8Array(n);let i=0;for(const a of arrs){o.set(a,i);i+=a.length}return o}
+
+// ── Tx hash (matches arc-types::Transaction::compute_hash) ──
+// Transfer body bincode encoding (1.3 default cfg, fixint, varint disabled for primitives):
+//   variant_idx (u32 LE = 0)         4 B
+//   to (Address = [u8;32])           32 B
+//   amount (u64 LE)                  8 B
+//   amount_commitment (Option=None)  1 B
+function transferBodyBytes(toBytes, amount){
+  const buf=new Uint8Array(45);
+  // 0..4 = variant index 0 (Transfer)
+  buf.set(toBytes,4);
+  new DataView(buf.buffer).setBigUint64(36,BigInt(amount),true);
+  // 44 = Option None tag (0)
+  return buf;
+}
+function txTransferHash(fromBytes, toBytes, amount, nonce){
+  const body = transferBodyBytes(toBytes, amount);
+  // BLAKE3 keyed-derive with context "ARC-chain-tx-v1"
+  const data = concat(
+    new Uint8Array([0x01]),  // TxType::Transfer = 0x01
+    fromBytes,                // 32 B
+    u64le(nonce),             // 8 B
+    body,                     // 45 B
+    u64le(0),                 // fee = 0
+    u64le(0),                 // gas_limit = 0
+  );
+  return blake3(data, {context: 'ARC-chain-tx-v1', dkLen: 32});
+}
 
 function generateKeypair() {
-  const privBytes = crypto.getRandomValues(new Uint8Array(32));
-  const privKey = toHex(privBytes);
-  const address = toHex(sha256(privBytes));
-  return {privKey, address};
+  const privBytes = ed.utils.randomPrivateKey();
+  const pubBytes  = ed.getPublicKey(privBytes);
+  const addrBytes = blake3(pubBytes, {dkLen: 32});
+  return {version:2, privKey:toHex(privBytes), pubKey:toHex(pubBytes), address:toHex(addrBytes)};
 }
 
 function createWallet() {
   wallet = generateKeypair();
   localStorage.setItem('arc_wallet', JSON.stringify(wallet));
-  // Show private key in a copyable modal instead of alert()
   showKeyModal(wallet.privKey, wallet.address);
   showApp();
-  // Auto-claim faucet, then refresh balance after it succeeds
   claimFaucet().then(() => { setTimeout(refreshBalance, 1000); });
 }
 
@@ -231,9 +242,10 @@ function importWallet() {
     alert('Invalid key - must be 64 hex characters');
     return;
   }
-  const privBytes = new Uint8Array(key.match(/.{2}/g).map(b=>parseInt(b,16)));
-  const address = toHex(sha256(privBytes));
-  wallet = {privKey: key, address};
+  const privBytes = fromHex(key);
+  const pubBytes  = ed.getPublicKey(privBytes);
+  const address   = toHex(blake3(pubBytes, {dkLen: 32}));
+  wallet = {version:2, privKey: key, pubKey: toHex(pubBytes), address};
   localStorage.setItem('arc_wallet', JSON.stringify(wallet));
   showApp();
 }
@@ -272,26 +284,47 @@ async function refreshBalance() {
 }
 setInterval(refreshBalance, 5000);
 
-// ── Send ──
+// ── Send (Ed25519-signed) ──
 async function sendTx() {
-  const to = document.getElementById('sendTo').value.trim();
+  const to  = document.getElementById('sendTo').value.trim();
   const amt = parseInt(document.getElementById('sendAmt').value);
-  const el = document.getElementById('sendStatus');
-  if (!to || to.length!==64) { el.innerHTML='<div class="status err">Invalid address</div>'; return; }
+  const el  = document.getElementById('sendStatus');
+  if (!to || to.length!==64 || !/^[0-9a-f]+$/i.test(to)) {
+    el.innerHTML='<div class="status err">Invalid address (need 64 hex chars)</div>'; return;
+  }
   if (!amt || amt<=0) { el.innerHTML='<div class="status err">Invalid amount</div>'; return; }
-  el.innerHTML='<div class="status info">Sending...</div>';
+  el.innerHTML='<div class="status info">Signing & submitting...</div>';
   try {
+    // Fetch fresh nonce
+    const acct = await (await fetch(`${RPC}/account/${wallet.address}`)).json();
+    const nonce = acct.nonce || 0;
+
+    const fromBytes = fromHex(wallet.address);
+    const toBytes   = fromHex(to);
+    const privBytes = fromHex(wallet.privKey);
+    const pubBytes  = fromHex(wallet.pubKey);
+
+    const txHash = txTransferHash(fromBytes, toBytes, amt, nonce);
+    const sig    = ed.sign(txHash, privBytes);
+
     const r = await fetch(`${RPC}/tx/submit`, {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({from:wallet.address, to, amount:amt, nonce:0})
+      body: JSON.stringify({
+        from: wallet.address,
+        to,
+        amount: amt,
+        nonce,
+        signature:  toHex(sig),
+        public_key: toHex(pubBytes),
+      })
     });
     const d = await r.json();
-    if (r.ok) {
-      el.innerHTML=`<div class="status ok">Sent! TX: ${d.tx_hash?.slice(0,16)}...</div>`;
+    if (r.ok && d.tx_hash) {
+      el.innerHTML=`<div class="status ok">Sent! TX: ${d.tx_hash.slice(0,16)}...</div>`;
       addTxToHistory({hash:d.tx_hash, to, amount:-amt});
       document.getElementById('sendTo').value='';
       document.getElementById('sendAmt').value='';
-      refreshBalance();
+      setTimeout(refreshBalance, 2000);
     } else {
       el.innerHTML=`<div class="status err">${d.error||d.message||JSON.stringify(d)}</div>`;
     }
@@ -351,6 +384,12 @@ function loadHistory() {
     </div>`;
   }).join('');
 }
+
+// Expose handlers for inline onclick="..." attributes (module scope is local).
+Object.assign(window, {
+  createWallet, importWallet, showImport, sendTx, claimFaucet,
+  switchTab, copyAddr, logout, loadHistory,
+});
 </script>
 </body>
 </html>

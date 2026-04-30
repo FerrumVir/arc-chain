@@ -8,7 +8,7 @@
  * ```ts
  * import { ArcClient, KeyPair, TransactionBuilder } from "@arc-chain/sdk";
  *
- * const client = new ArcClient("http://localhost:9000");
+ * const client = new ArcClient("http://localhost:9090");
  * const kp = await KeyPair.generate();
  *
  * const tx = TransactionBuilder.transfer(kp.address(), "0".repeat(64), 1000);

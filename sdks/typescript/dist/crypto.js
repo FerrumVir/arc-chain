@@ -1,6 +1,6 @@
 "use strict";
 /**
- * ARC Chain SDK — Cryptographic primitives.
+ * ARC Chain SDK - Cryptographic primitives.
  *
  * Ed25519 key pair generation, signing, verification, and BLAKE3 address
  * derivation using @noble/ed25519 and @noble/hashes.

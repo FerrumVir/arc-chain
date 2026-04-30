@@ -1,8 +1,12 @@
 /**
- * ARC Chain SDK — TypeScript type definitions.
+ * ARC Chain SDK - TypeScript type definitions.
  *
  * Interfaces matching the ARC Chain RPC response shapes.
  */
+/** 32-byte hex-encoded hash (BLAKE3 digest, no `0x` prefix). */
+export type Hash256 = string;
+/** 32-byte hex-encoded account address (BLAKE3 of pubkey). */
+export type Address = string;
 /** Transaction type discriminant matching the Rust TxType enum. */
 export type TxType = "Transfer" | "Settle" | "Swap" | "Escrow" | "Stake" | "WasmCall" | "MultiSig" | "DeployContract" | "RegisterAgent" | "JoinValidator" | "LeaveValidator" | "ClaimRewards" | "UpdateStake";
 /** Transfer body. */
@@ -44,8 +48,37 @@ export interface SettleBody {
     usage_units: number;
     amount_commitment?: string | null;
 }
+/** Channel open body. */
+export interface ChannelOpenBody {
+    type: "ChannelOpen";
+    channel_id: Hash256;
+    counterparty: Address;
+    deposit: number;
+    timeout_blocks: number;
+}
+/** Channel close body. */
+export interface ChannelCloseBody {
+    type: "ChannelClose";
+    channel_id: Hash256;
+    opener_balance: number;
+    counterparty_balance: number;
+    counterparty_sig: number[];
+    state_nonce: number;
+}
+/** Channel dispute body. */
+export interface ChannelDisputeBody {
+    type: "ChannelDispute";
+    channel_id: Hash256;
+    opener_balance: number;
+    counterparty_balance: number;
+    other_party_sig: number[];
+    state_nonce: number;
+    challenge_period: number;
+}
 /** Union of all transaction body types. */
-export type TxBody = TransferBody | DeployContractBody | WasmCallBody | StakeBody | SettleBody;
+export type TxBody = TransferBody | DeployContractBody | WasmCallBody | StakeBody | SettleBody | ChannelOpenBody | ChannelCloseBody | ChannelDisputeBody;
+/** Alias for TxBody used by older code. */
+export type TransactionBody = TxBody;
 /** Ed25519 signature payload. */
 export interface Ed25519Signature {
     Ed25519: {
