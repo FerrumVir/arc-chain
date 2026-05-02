@@ -500,16 +500,19 @@ export function Onboarding() {
   );
 }
 
-// Poll node_status until we see peers ≥ 1 or we time out. Returns true
-// when the node has actually joined the testnet. Used in onboarding's
-// launch step to gate the faucet claim on "we're actually on the chain",
-// not just "arc-node's process is alive".
+// Poll node_status until we're "online" — either the local node has joined
+// P2P (peers ≥ 1) or a public seed coordinator's /health is reachable. The
+// coordinator path matters because most consumer ISPs silently drop outbound
+// UDP on non-standard ports, killing our QUIC handshake to seed UDP 9091; we
+// don't want those users stranded at "offline" when they can fully use the
+// chain over HTTPS RPC. Returns true on either success path.
 async function waitForPeer({ timeoutMs }: { timeoutMs: number }): Promise<boolean> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     try {
       const s = await api.nodeStatus();
       if (s.running && s.peers >= 1) return true;
+      if (s.coordinatorUrl) return true;
     } catch {
       /* retry */
     }

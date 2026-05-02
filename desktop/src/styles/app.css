@@ -578,6 +578,9 @@
 .pulse-dot.live {
   background: var(--success);
 }
+.pulse-dot.lite {
+  background: var(--info);
+}
 .pulse-dot.syncing {
   background: var(--warning);
 }
@@ -617,6 +620,10 @@
   background: var(--success-bg);
   color: var(--success);
 }
+.status-pill.lite {
+  background: var(--info-bg);
+  color: var(--info);
+}
 .status-pill.syncing {
   background: var(--warning-bg);
   color: var(--warning);
@@ -628,6 +635,21 @@
 .status-pill.info {
   background: var(--info-bg);
   color: var(--info);
+}
+
+.lite-banner {
+  background: var(--info-bg);
+  color: var(--info);
+  border: 1px solid color-mix(in srgb, var(--info) 35%, transparent);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-6);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.lite-banner strong {
+  color: var(--info);
+  margin-right: var(--space-2);
 }
 
 /* - Big number - */

@@ -4,6 +4,7 @@ import type { HealthLevel } from "../lib/types";
 
 const labels: Record<HealthLevel | "info", string> = {
   live: "Live",
+  lite: "Lite",
   syncing: "Syncing",
   offline: "Offline",
   info: "Info",

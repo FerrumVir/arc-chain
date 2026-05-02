@@ -1,6 +1,6 @@
 export type NodeRole = "observer" | "worker" | "validator" | "verifier";
 
-export type HealthLevel = "live" | "syncing" | "offline";
+export type HealthLevel = "live" | "lite" | "syncing" | "offline";
 
 export interface HardwareInfo {
   platform: string;
@@ -28,6 +28,14 @@ export interface NodeStatus {
   address: string | null;
   rpcPort: number;
   lastError: string | null;
+  /**
+   * If the local node has no peers but a public seed coordinator's `/health`
+   * responded, this is its origin (e.g. `http://140.82.16.112:9090`). The UI
+   * shows "Lite mode (via NYC)" and the onboarding gate lets the user through
+   * even when residential UDP P2P is blocked. All actions already have a
+   * coordinator-fallback path, so the user is fully usable in lite mode.
+   */
+  coordinatorUrl?: string | null;
 }
 
 export interface Earnings {

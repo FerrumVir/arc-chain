@@ -58,6 +58,10 @@ impl Default for NodeConfig {
 pub struct NodeStatus {
     pub running: bool,
     pub pid: Option<u32>,
+    /// `live` (local peers ≥ 1), `lite` (local has no peers but a public
+    /// coordinator's /health responded — the user is fully usable via
+    /// HTTPS RPC even if their network blocks UDP P2P), `syncing` (local
+    /// is up but no peers and no coordinator yet), `offline` (neither).
     pub health: String,
     pub version: String,
     pub peers: u32,
@@ -68,6 +72,14 @@ pub struct NodeStatus {
     pub address: Option<String>,
     pub rpc_port: u16,
     pub last_error: Option<String>,
+    /// HTTPS RPC origin of a reachable public seed coordinator (e.g.
+    /// `http://140.82.16.112:9090`). Set whenever any `COORDINATOR_HOSTS`
+    /// entry returned 200 on `/health` during the last poll. Lets the UI
+    /// show "Lite mode (via NYC)" instead of a hard "offline" when local
+    /// P2P fails — common on residential ISPs that drop outbound UDP on
+    /// non-standard ports.
+    #[serde(default)]
+    pub coordinator_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -108,6 +108,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           address: null,
           rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
           lastError: null,
+          coordinatorUrl: null,
         } as T;
       } catch {
         return {
@@ -123,6 +124,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           address: null,
           rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
           lastError: "No response",
+          coordinatorUrl: null,
         } as T;
       }
     }
@@ -527,6 +529,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
         rpcPort: 9944,
         lastError: null,
+        coordinatorUrl: null,
       } as T;
     }
     case "start_node":

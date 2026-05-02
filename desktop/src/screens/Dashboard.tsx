@@ -30,6 +30,22 @@ import {
 } from "../lib/format";
 import { useAppStore } from "../lib/store";
 
+const COORDINATOR_LABELS: Record<string, string> = {
+  "149.28.32.76": "NYC",
+  "140.82.16.112": "LAX",
+  "136.244.109.1": "AMS",
+  "104.238.171.11": "LHR",
+  "202.182.107.41": "NRT",
+  "149.28.153.31": "SGP",
+};
+
+function coordinatorLabel(url: string): string {
+  for (const [ip, label] of Object.entries(COORDINATOR_LABELS)) {
+    if (url.includes(ip)) return label;
+  }
+  return url;
+}
+
 export function Dashboard() {
   const queryClient = useQueryClient();
   const identity = useAppStore((s) => s.identity);
@@ -153,6 +169,22 @@ export function Dashboard() {
 
       {isCrashed && status?.lastError && (
         <CrashBanner message={status.lastError} />
+      )}
+
+      {status?.health === "lite" && status?.coordinatorUrl && (
+        <div
+          className="lite-banner"
+          data-testid="lite-mode-banner"
+          role="status"
+        >
+          <strong>Lite mode</strong> — your network is blocking the
+          peer-to-peer port (UDP&nbsp;9091), so this app is talking to the
+          chain through a public coordinator
+          ({coordinatorLabel(status.coordinatorUrl)}). Faucet, send, and
+          inference all work normally; only your local node isn&rsquo;t
+          earning peer rewards yet. Try a different network or VPN to join
+          P2P directly.
+        </div>
       )}
 
       <Card featured style={{ marginBottom: "var(--space-6)" }}>

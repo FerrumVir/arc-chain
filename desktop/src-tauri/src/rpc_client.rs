@@ -21,6 +21,43 @@ use serde_json::Value;
 
 const REWARD_PER_ATTESTATION: f64 = 2.5; // ARC; matches testnet flat rate
 
+/// Public seed coordinators that mirror `commands.rs::COORDINATOR_HOSTS`.
+/// Probed when local P2P can't get peers, so the UI can flip to "lite mode"
+/// (HTTPS RPC fallback) instead of showing a hard "offline" — most consumer
+/// ISPs silently drop outbound UDP on non-standard ports, which kills our
+/// QUIC handshake to seed UDP 9091. Order biases North America first.
+const STATUS_COORDINATORS: [&str; 6] = [
+    "http://149.28.32.76:9090",   // NYC
+    "http://140.82.16.112:9090",  // LAX
+    "http://136.244.109.1:9090",  // AMS
+    "http://104.238.171.11:9090", // LHR
+    "http://202.182.107.41:9090", // NRT
+    "http://149.28.153.31:9090",  // SGP
+];
+
+/// Probe each coordinator in order; return the first to answer 200 on
+/// `/health` within 2s. None means every public seed is unreachable (genuine
+/// offline — total network failure or full ISP captive portal). Sequential
+/// instead of parallel to avoid pulling in a futures dep; the typical hit is
+/// the first host and returns sub-200ms, so the worst-case 12s only applies
+/// when the user has *no* working internet.
+pub async fn probe_coordinator(http: &reqwest::Client) -> Option<String> {
+    for origin in STATUS_COORDINATORS.iter() {
+        let url = format!("{}/health", origin);
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            http.get(&url).send(),
+        )
+        .await;
+        if let Ok(Ok(resp)) = r {
+            if resp.status().is_success() {
+                return Some(origin.to_string());
+            }
+        }
+    }
+    None
+}
+
 pub async fn fetch_status(
     http: &reqwest::Client,
     port: u16,
@@ -57,12 +94,23 @@ pub async fn fetch_status(
         None => (0, 0, 0, 0, 0, "unknown".into(), 0),
     };
 
-    let health_level = if !running {
-        "offline"
-    } else if peers == 0 || uptime < 8 {
+    // Always probe coordinators in parallel with the local check. The result
+    // gates the "lite" health level + the Onboarding "online" check, so
+    // residential ISPs that block UDP 9091 don't strand the user at "offline".
+    let coordinator_url = if !running || peers == 0 {
+        probe_coordinator(http).await
+    } else {
+        None
+    };
+
+    let health_level = if running && peers >= 1 && uptime >= 8 {
+        "live"
+    } else if coordinator_url.is_some() {
+        "lite"
+    } else if running {
         "syncing"
     } else {
-        "live"
+        "offline"
     };
 
     NodeStatus {
@@ -80,10 +128,16 @@ pub async fn fetch_status(
         last_error: crash_message.or_else(|| {
             if running {
                 None
+            } else if coordinator_url.is_some() {
+                None
             } else {
-                Some(format!("No response from 127.0.0.1:{}", port))
+                Some(format!(
+                    "No response from 127.0.0.1:{} and every public seed is unreachable. Check internet/firewall.",
+                    port
+                ))
             }
         }),
+        coordinator_url,
     }
     .with_validators_hint(validators)
 }
