@@ -612,34 +612,87 @@ pub async fn run_transport(
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // ── Bind QUIC endpoint ──────────────────────────────────────────────
-    // Retry binding up to 5 times with 2s delay - the old process may
-    // not have fully released the UDP port yet after killall -9.
+    // Try the configured port first (5× with 2 s spacing) so seeds and
+    // anyone with the port actually free keeps the stable inbound port.
+    // If that fails, fall back to an OS-assigned ephemeral UDP port so
+    // consumer/outbound nodes still join the network — they don't need
+    // a stable inbound port, and some local environments make the
+    // configured port un-bindable in ways no firewall/port-forward rule
+    // touches:
+    //
+    //   • Windows Hyper-V dynamic UDP exclusions
+    //     (`netsh int ipv4 show excludedportrange protocol=udp`) often
+    //     swallow ranges around 9000-9100 when WSL2 / Docker Desktop
+    //     is installed — 9091 becomes un-bindable for any user-mode
+    //     process even with Administrator + firewall exception +
+    //     forwarded UDP.
+    //   • Another P2P app holding the port (Transmission/qBittorrent
+    //     historically defaulted to 9091).
+    //   • Antivirus / EDR port reservations on locked-down Windows.
+    //
+    // Trade-off: a fallback-bound node cannot serve as a public seed
+    // (peers can't dial it on a known port). That is fine for the
+    // residential consumers this fallback exists for — they're behind
+    // NAT and never accept unsolicited inbound anyway.
     let server_config = make_server_config();
+    let configured_addr = listen_addr;
     let mut endpoint = {
-        let mut last_err = None;
-        let mut ep_opt = None;
+        let mut bound: Option<quinn::Endpoint> = None;
         for attempt in 0..5 {
-            match quinn::Endpoint::server(server_config.clone(), listen_addr) {
-                Ok(ep) => { ep_opt = Some(ep); break; }
+            match quinn::Endpoint::server(server_config.clone(), configured_addr) {
+                Ok(ep) => { bound = Some(ep); break; }
                 Err(e) => {
-                    warn!("QUIC bind attempt {} failed: {} - retrying in 2s", attempt + 1, e);
-                    last_err = Some(e);
+                    warn!(
+                        "QUIC bind on {} attempt {} failed: {} - retrying in 2s",
+                        configured_addr, attempt + 1, e
+                    );
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
             }
         }
-        match ep_opt {
-            Some(ep) => ep,
-            None => {
-                error!("Failed to bind QUIC endpoint on {} after 5 attempts: {:?}", listen_addr, last_err);
-                return;
+        if bound.is_none() {
+            let fallback = SocketAddr::new(configured_addr.ip(), 0);
+            match quinn::Endpoint::server(server_config.clone(), fallback) {
+                Ok(ep) => {
+                    warn!(
+                        "Configured UDP port {} unavailable after 5 attempts - \
+                         bound to an OS-assigned ephemeral port instead. This node \
+                         will participate normally as a consumer/observer but cannot \
+                         accept inbound dials as a public seed. Common cause on \
+                         Windows: Hyper-V's dynamic UDP exclusion range covers {}.",
+                        configured_addr.port(), configured_addr.port()
+                    );
+                    bound = Some(ep);
+                }
+                Err(e) => {
+                    error!(
+                        "QUIC bind failed on configured {} AND on ephemeral fallback: \
+                         {}. The OS likely does not permit this process to bind UDP \
+                         at all - check firewall/EDR policy.",
+                        configured_addr, e
+                    );
+                    return;
+                }
             }
         }
+        bound.unwrap()
     };
     // Set client config for outgoing connections on the same endpoint
     endpoint.set_default_client_config(make_client_config());
 
-    info!("P2P transport listening on {}", listen_addr);
+    // Shadow the parameter with the actual bound address. If we fell
+    // back to ephemeral, every downstream handshake/self-skip uses the
+    // real port - peers see the truth in our handshake, and PEX gossip
+    // to other nodes carries the real address.
+    let listen_addr = endpoint.local_addr().unwrap_or(configured_addr);
+    if listen_addr.port() != configured_addr.port() {
+        info!(
+            "P2P transport listening on {} (configured was {})",
+            listen_addr, configured_addr
+        );
+    } else {
+        info!("P2P transport listening on {}", listen_addr);
+    }
 
     let connections = Arc::new(PeerConnections::new());
     let rate_limiter = Arc::new(PeerRateLimiter::new());

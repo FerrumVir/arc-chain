@@ -99,6 +99,15 @@ pub async fn start_node(
     state: State<'_, AppState>,
     config: NodeConfig,
 ) -> CmdResult<()> {
+    // Version-check (and upgrade if needed) the arc-node binary on every
+    // start. Cheap if it's current - one --version call - and ensures
+    // existing users picked up by the desktop auto-updater don't keep
+    // running a stale arc-node from a previous release. Without this,
+    // chain-side bug fixes (e.g. the v0.5.7 ephemeral-UDP fallback that
+    // unblocks Windows users whose Hyper-V port range covers 9091) never
+    // reach anyone past their first launch.
+    ensure_binary(app.clone()).await?;
+
     let validator_seed = {
         let store = state.store.lock().await;
         store
@@ -124,6 +133,11 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
+    // Same version-check as start_node - a restart is a great moment to
+    // pick up a newer arc-node, since the user is already incurring the
+    // restart cost.
+    ensure_binary(app.clone()).await?;
+
     let (cfg, validator_seed) = {
         let store = state.store.lock().await;
         let cfg = store.config.clone().unwrap_or_default();
@@ -583,22 +597,53 @@ pub async fn check_for_update() -> CmdResult<UpdateCheck> {
     })
 }
 
+/// Desktop and arc-node ship as a matched pair - the desktop's CARGO_PKG_VERSION
+/// is the same string arc-node prints from `--version` (both inherit from the
+/// release tag's workspace version). Mismatch → we have a stale arc-node from
+/// a previous release sitting in ~/.arc/bin and must redownload, otherwise
+/// chain bug fixes never reach existing users on auto-update.
+const EXPECTED_NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// First-launch readiness check. Confirms the bundled testnet resources are
-/// resolvable AND the arc-node binary is present; if the binary isn't
-/// installed, downloads it from the latest GitHub release for this platform.
-/// The onboarding screen calls this before transitioning to the "launch"
-/// step so the user can see download progress (or fail fast with a clear
-/// error rather than a cryptic "failed to start arc-node" later).
+/// resolvable AND the arc-node binary is present at the version this desktop
+/// was built against. If the binary is missing OR its `--version` doesn't
+/// match this desktop's `CARGO_PKG_VERSION`, downloads the matching arc-node
+/// binary from the latest GitHub release for this platform. The onboarding
+/// screen calls this before launching the node, and `start_node` also calls
+/// it on every start so existing users picked up by the desktop auto-updater
+/// always get the matching arc-node binary instead of running a stale one.
 #[tauri::command]
 pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
     let target = managed_binary_path();
     if target.exists() {
-        return Ok(BinaryStatus {
-            path: target.to_string_lossy().into_owned(),
-            downloaded_bytes: 0,
-            total_bytes: 0,
-            already_installed: true,
-        });
+        match read_arc_node_version(&target) {
+            Some(ref v) if v == EXPECTED_NODE_VERSION => {
+                return Ok(BinaryStatus {
+                    path: target.to_string_lossy().into_owned(),
+                    downloaded_bytes: 0,
+                    total_bytes: 0,
+                    already_installed: true,
+                });
+            }
+            Some(v) => {
+                tracing::info!(
+                    "arc-node {} at {} is older than desktop's expected {} - upgrading",
+                    v,
+                    target.display(),
+                    EXPECTED_NODE_VERSION
+                );
+            }
+            None => {
+                tracing::warn!(
+                    "arc-node binary at {} is unreadable or missing --version - replacing",
+                    target.display()
+                );
+            }
+        }
+        // Fall through to download. We don't pre-remove the target; the
+        // download writes to a `.download` sidecar then atomically renames
+        // over the existing binary, so a failed download leaves the working
+        // copy in place.
     }
 
     let asset = platform_release_asset().ok_or_else(|| {
@@ -666,6 +711,23 @@ pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
         total_bytes,
         already_installed: false,
     })
+}
+
+/// Run `arc-node --version` and return the version token (e.g. "0.5.7").
+/// Returns None if the binary fails to launch (corrupt, wrong arch, missing
+/// shared lib) or prints something we can't parse - in either case the caller
+/// should redownload to recover.
+fn read_arc_node_version(binary: &std::path::Path) -> Option<String> {
+    let out = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Expected format: "arc-node 0.5.7"
+    stdout.split_whitespace().nth(1).map(|s| s.to_string())
 }
 
 fn platform_release_asset() -> Option<&'static str> {
