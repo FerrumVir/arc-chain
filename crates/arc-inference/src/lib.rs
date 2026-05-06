@@ -16,14 +16,6 @@ pub mod block_i8;
 pub mod q4_engine;
 pub mod ternary_engine;
 pub mod ternary_hybrid;
-pub mod int8_asic;
-pub mod int16_asic;
-pub mod sha256_isa;
-pub mod asic_families;
-pub mod asic_parallel;
-pub mod asic_batched;
-pub mod mining_asic_node;
-pub mod economics;
 pub mod distributed;
 pub mod streaming;
 

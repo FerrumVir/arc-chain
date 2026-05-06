@@ -49,7 +49,7 @@
     "createUpdaterArtifacts": true,
     "macOS": {
       "minimumSystemVersion": "11.0",
-      "signingIdentity": "-"
+      "signingIdentity": "Apple Distribution: ARC Solutions inc. (XJ427A77T7)"
     },
     "windows": {
       "certificateThumbprint": null
