@@ -32,36 +32,16 @@ candle-transformers = { version = "0.8", optional = true }
 [dev-dependencies]
 rand.workspace = true
 
-# All examples load GGUF models or run inference benchmarks against candle-
-# backed tensors, which pull in candle-core/candle-nn/candle-transformers.
-# Declare required-features so `cargo test --workspace` (default features)
-# skips building them. Build any single example with:
+# Examples that load GGUF models or run inference benchmarks against candle-
+# backed tensors pull in candle-core/candle-nn/candle-transformers. Declare
+# required-features so `cargo test --workspace` (default features) skips
+# building them. Build any single example with:
 #     cargo run --example <name> --features candle --release
-[[example]]
-name = "bench_ternary"
-# No required-features - bench_ternary uses only the core integer path,
-# no GGUF/candle dependencies.
-
-[[example]]
-name = "asic_inference_network"
-# End-to-end ASIC-fleet demo. No GGUF/candle - pure integer path.
-
-[[example]]
-name = "economics_report"
-# Honest economics analysis. No GGUF/candle.
-
-[[example]]
-name = "comprehensive_audit"
-# Every miner × every model × pricing tiers. No GGUF/candle.
-
-[[example]]
-name = "trump_presentation"
-# Fleet-scale dollars, depreciation, undercut table. No GGUF/candle.
-
-[[example]]
-name = "market_rate_presentation"
-# Market-rate pricing on real models (DeepSeek R1, Llama-70B). No GGUF/candle.
-
+#
+# Only examples whose source files are actually checked in are listed here -
+# adding a [[example]] line for an uncommitted file fails manifest parse on
+# CI runners and breaks the release workflow (last seen v0.5.5 / v0.5.6,
+# where arc-node-*.exe binaries never made it onto the GitHub release).
 [[example]]
 name = "bench_int8"
 required-features = ["candle"]
@@ -88,9 +68,6 @@ name = "debug_generation"
 required-features = ["candle"]
 [[example]]
 name = "eval_perplexity"
-required-features = ["candle"]
-[[example]]
-name = "eval_perplexity_ternary"
 required-features = ["candle"]
 [[example]]
 name = "profile_int8"
