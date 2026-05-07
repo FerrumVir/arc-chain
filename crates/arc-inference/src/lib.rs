@@ -14,18 +14,103 @@ pub mod gguf_integer;
 pub mod cached_integer_model;
 pub mod block_i8;
 pub mod q4_engine;
-pub mod ternary_engine;
-pub mod ternary_hybrid;
-pub mod int8_asic;
-pub mod int16_asic;
-pub mod sha256_isa;
-pub mod asic_families;
-pub mod asic_parallel;
-pub mod asic_batched;
-pub mod mining_asic_node;
-pub mod economics;
 pub mod distributed;
 pub mod streaming;
+
+// Patent-pending integer/ASIC inference paths. The implementation files for
+// these modules (ternary_engine.rs, ternary_hybrid.rs, int8_asic.rs,
+// int16_asic.rs, sha256_isa.rs, asic_families.rs, asic_parallel.rs,
+// asic_batched.rs, mining_asic_node.rs, economics.rs) live in a private
+// branch and the author's working tree only - they are intentionally NOT in
+// the public repo until patents are filed.
+//
+// To keep the rest of the crate (and the chain release build) compiling
+// without those files, the public default exposes empty stub types under
+// `crate::ternary_engine` and `crate::ternary_hybrid` that satisfy the
+// signatures referenced from `cached_integer_model.rs`. The full code path
+// is only reachable when the `experimental-ip` feature is on, which requires
+// the real implementation files to be present at the canonical paths.
+#[cfg(feature = "experimental-ip")]
+pub mod ternary_engine;
+#[cfg(feature = "experimental-ip")]
+pub mod ternary_hybrid;
+#[cfg(feature = "experimental-ip")]
+pub mod int8_asic;
+#[cfg(feature = "experimental-ip")]
+pub mod int16_asic;
+#[cfg(feature = "experimental-ip")]
+pub mod sha256_isa;
+#[cfg(feature = "experimental-ip")]
+pub mod asic_families;
+#[cfg(feature = "experimental-ip")]
+pub mod asic_parallel;
+#[cfg(feature = "experimental-ip")]
+pub mod asic_batched;
+#[cfg(feature = "experimental-ip")]
+pub mod mining_asic_node;
+#[cfg(feature = "experimental-ip")]
+pub mod economics;
+
+#[cfg(not(feature = "experimental-ip"))]
+pub mod ternary_engine {
+    //! Stub: real implementation lives outside the public repo until patents
+    //! file. Public types exposed here only to satisfy struct-field references
+    //! in `cached_integer_model.rs`. Functions panic if reached - the
+    //! corresponding `enable_ternary*` paths in `CachedIntegerModel` are
+    //! gated behind the `experimental-ip` feature, so they cannot be called
+    //! in this build.
+    use crate::cached_integer_model::I8Weights;
+
+    pub struct TernaryWeights;
+    impl TernaryWeights {
+        pub fn from_i8(_: &I8Weights) -> Self {
+            unreachable!(
+                "TernaryWeights::from_i8 called without the experimental-ip \
+                 feature - this path is unreachable in default builds"
+            )
+        }
+    }
+
+    pub fn matmul_ternary_into(
+        _: &TernaryWeights,
+        _: &[i64],
+        _: usize,
+        _: &mut [i64],
+    ) {
+        unreachable!(
+            "matmul_ternary_into called without the experimental-ip feature"
+        )
+    }
+}
+
+#[cfg(not(feature = "experimental-ip"))]
+pub mod ternary_hybrid {
+    //! Stub mirror of `ternary_engine` for the hybrid (ternary + sparse INT8
+    //! outliers) path. See the `ternary_engine` stub for full rationale.
+    use crate::cached_integer_model::I8Weights;
+
+    pub struct TernaryHybridWeights;
+    impl TernaryHybridWeights {
+        pub fn from_i8(_: &I8Weights, _: f32) -> Self {
+            unreachable!(
+                "TernaryHybridWeights::from_i8 called without the \
+                 experimental-ip feature"
+            )
+        }
+    }
+
+    pub fn matmul_ternary_hybrid_into(
+        _: &TernaryHybridWeights,
+        _: &[i64],
+        _: usize,
+        _: &mut [i64],
+    ) {
+        unreachable!(
+            "matmul_ternary_hybrid_into called without the experimental-ip \
+             feature"
+        )
+    }
+}
 
 use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};

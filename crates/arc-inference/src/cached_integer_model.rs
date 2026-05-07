@@ -392,6 +392,11 @@ impl CachedIntegerModel {
     ///
     /// The ternary bulk runs on ASIC primitives; outliers run on the controller.
     /// This is the PTQ quality path - works on any model without retraining.
+    ///
+    /// Gated behind the `experimental-ip` feature - the actual ternary
+    /// implementation lives in a private branch until patents are filed
+    /// (see lib.rs ternary_engine/ternary_hybrid stub modules for context).
+    #[cfg(feature = "experimental-ip")]
     pub fn enable_ternary_hybrid(&mut self, outlier_pct: f32) {
         use crate::ternary_hybrid::TernaryHybridWeights;
         if self.ternary_hybrid_layers.is_some() { return; }
@@ -413,6 +418,10 @@ impl CachedIntegerModel {
     ///
     /// Ternary matmul runs on SHA-256 ASIC primitives (ADD + XOR, no multiplication),
     /// enabling inference on Bitcoin mining hardware via the ARC distributed network.
+    ///
+    /// Gated behind `experimental-ip` for the same reason as
+    /// `enable_ternary_hybrid` - real implementation isn't in the public repo.
+    #[cfg(feature = "experimental-ip")]
     pub fn enable_ternary(&mut self) {
         use crate::ternary_engine::TernaryWeights;
         if self.ternary_layers.is_some() { return; }
@@ -3530,6 +3539,7 @@ mod tests {
     /// Proves the dispatch wiring works and the full transformer pipeline
     /// (embedding → attention → FFN → output) executes correctly with
     /// ternary weight storage.
+    #[cfg(feature = "experimental-ip")]
     #[test]
     fn test_forward_one_token_with_ternary() {
         // Small model: 2 layers, d_model=64, vocab=100. Uses the same
@@ -3556,6 +3566,7 @@ mod tests {
         assert_eq!(logits1, logits2, "ternary forward_one_token must be deterministic");
     }
 
+    #[cfg(feature = "experimental-ip")]
     #[test]
     fn test_ternary_memory_reduction_full_model() {
         let mut model = build_test_model(100, 64, 2, 128, 2);

@@ -9,6 +9,14 @@ license.workspace = true
 default = []
 int16 = []
 candle = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers"]
+# Patent-pending integer/ASIC inference paths (ternary, INT8/INT16-ASIC, mining
+# datapath, etc). Source files for these modules are intentionally NOT in the
+# public repo until patents are filed; they live in a private branch and on
+# the author's local working tree. The default build (and CI release builds)
+# stub out the type signatures so the rest of the crate compiles. Enabling
+# `experimental-ip` requires the actual implementation files at
+# crates/arc-inference/src/ternary_engine.rs and ternary_hybrid.rs.
+experimental-ip = []
 
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
