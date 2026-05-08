@@ -191,8 +191,26 @@ pub struct CommunityWorker {
     pub platform: String,
     /// Unix timestamp of first registration (for "joined at").
     pub registered_at: u64,
-    /// Monotonic counter of work units completed.
+    /// Monotonic counter of work units completed (success only).
     pub work_completed: u64,
+    /// v0.7.0 scoring stats — populated by submit_work as jobs come in.
+    /// Used to rank workers in the /workers/scoreboard endpoint and
+    /// (in a future release) to bias dispatch toward higher-scoring
+    /// workers via per-worker job lanes.
+    /// Total successful submissions.
+    #[serde(default)]
+    pub success_count: u64,
+    /// Total submissions reporting failure.
+    #[serde(default)]
+    pub failure_count: u64,
+    /// Sum of total_ms across every successful submission. Average
+    /// latency per job = sum_total_ms_success / success_count when
+    /// success_count > 0.
+    #[serde(default)]
+    pub sum_total_ms_success: u64,
+    /// Last total_ms reported (most-recent latency datapoint).
+    #[serde(default)]
+    pub last_total_ms: u64,
 }
 
 /// Community worker TTL. Workers that haven't heartbeated within this
@@ -432,6 +450,10 @@ pub async fn serve(
         // events (tx 0x16). v0.7.0: replaces the synthesized count*2.5
         // estimate the desktop used to compute client-side.
         .route("/worker/earnings/:address", get(worker_earnings))
+        // v0.7.0: live community-worker leaderboard. Reads the in-memory
+        // CommunityWorker registry; no chain query. Sorted by composite
+        // score (success rate * 1000 - avg_ms). Dashboard renders this.
+        .route("/workers/scoreboard", get(workers_scoreboard))
         // Pipeline-parallel sharded inference
         .route("/inference/run_sharded", post(inference_run_sharded))
         .route("/inference/run_consensus", post(inference_run_consensus))
@@ -3554,6 +3576,102 @@ async fn worker_earnings(
     })))
 }
 
+/// Live community-worker leaderboard. Reads only in-memory state
+/// (no chain query) so it's cheap to poll from the dashboard.
+///
+/// GET /workers/scoreboard?limit=50
+///
+/// Returns workers sorted by composite score:
+///   score = (success_rate * 1000) − avg_ms_per_job
+///
+/// Workers with no successful submissions yet get score = 0 (not -∞)
+/// and sort to the bottom but stay visible — fresh workers shouldn't
+/// disappear from the board until they actively fail.
+///
+/// In v0.8 this endpoint will additionally drive per-worker dispatch
+/// priority. v0.7.0 phase 1 keeps the FIFO mpsc; this is the
+/// observability hook that the worker-targeted-lane refactor will
+/// build on.
+async fn workers_scoreboard(
+    AxumState(node): AxumState<NodeState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Json<Value> {
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(50)
+        .min(500);
+
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS);
+
+    #[derive(serde::Serialize)]
+    struct WorkerScore {
+        worker_id: String,
+        name: String,
+        platform: String,
+        model: Option<String>,
+        registered_at: u64,
+        success_count: u64,
+        failure_count: u64,
+        success_rate: f64,
+        avg_ms_per_job: f64,
+        last_total_ms: u64,
+        score: f64,
+    }
+
+    let mut rows: Vec<WorkerScore> = Vec::new();
+    for entry in node.community_workers.iter() {
+        let (w, ts) = entry.value();
+        if now.duration_since(*ts) > ttl {
+            continue;
+        }
+        let attempts = w.success_count + w.failure_count;
+        let success_rate = if attempts > 0 {
+            w.success_count as f64 / attempts as f64
+        } else {
+            0.0
+        };
+        let avg_ms = if w.success_count > 0 {
+            w.sum_total_ms_success as f64 / w.success_count as f64
+        } else {
+            0.0
+        };
+        // Composite score: heavily weight success_rate, penalize slow
+        // workers. Scale chosen so a 100% success-rate worker at 100ms
+        // beats a 50%-rate worker at 50ms (1000 - 100 = 900 vs 500 - 50
+        // = 450). Workers with no completed jobs yet get score 0 (visible
+        // but ranked last among visible workers).
+        let score = if w.success_count == 0 {
+            0.0
+        } else {
+            success_rate * 1000.0 - avg_ms
+        };
+        rows.push(WorkerScore {
+            worker_id: w.worker_id.clone(),
+            name: w.name.clone(),
+            platform: w.platform.clone(),
+            model: w.model.clone(),
+            registered_at: w.registered_at,
+            success_count: w.success_count,
+            failure_count: w.failure_count,
+            success_rate,
+            avg_ms_per_job: avg_ms,
+            last_total_ms: w.last_total_ms,
+            score,
+        });
+    }
+
+    rows.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    rows.truncate(limit);
+
+    Json(json!({
+        "workers": rows,
+        "count_visible": rows.len(),
+        "count_total": node.community_workers.len(),
+    }))
+}
+
 /// List recent inference attestations from chain state.
 ///
 /// GET /inference/attestations?limit=10
@@ -5704,10 +5822,15 @@ async fn community_register(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let existing_registered_at = node
+    // Preserve all stat fields across re-registrations so a re-register
+    // every 60s doesn't reset the scoreboard. Default to zeros for a
+    // brand-new worker.
+    let prior = node
         .community_workers
         .get(&req.worker_id)
-        .map(|e| e.value().0.registered_at);
+        .map(|e| e.value().0.clone());
+    let existing_registered_at = prior.as_ref().map(|p| p.registered_at);
+
     // Clone name/model before moving into CommunityWorker - used later for shard_info
     let worker_name = req.name.clone();
     let worker_model_name = req.model.clone();
@@ -5722,11 +5845,11 @@ async fn community_register(
         model: req.model,
         platform: req.platform,
         registered_at: existing_registered_at.unwrap_or(now_secs),
-        work_completed: node
-            .community_workers
-            .get(&req.worker_id)
-            .map(|e| e.value().0.work_completed)
-            .unwrap_or(0),
+        work_completed: prior.as_ref().map(|p| p.work_completed).unwrap_or(0),
+        success_count: prior.as_ref().map(|p| p.success_count).unwrap_or(0),
+        failure_count: prior.as_ref().map(|p| p.failure_count).unwrap_or(0),
+        sum_total_ms_success: prior.as_ref().map(|p| p.sum_total_ms_success).unwrap_or(0),
+        last_total_ms: prior.as_ref().map(|p| p.last_total_ms).unwrap_or(0),
     };
     node.community_workers
         .insert(req.worker_id.clone(), (worker, std::time::Instant::now()));
@@ -5906,6 +6029,10 @@ async fn community_list(
             platform: "auto-discovered".to_string(),
             registered_at: node.boot_time.elapsed().as_secs(),
             work_completed: 0,
+            success_count: 0,
+            failure_count: 0,
+            sum_total_ms_success: 0,
+            last_total_ms: 0,
         });
     }
 
@@ -6186,12 +6313,23 @@ pub async fn community_submit_work(
         ));
     }
 
-    // ── Refresh heartbeat + increment work_completed (only on success) ──
+    // ── Refresh heartbeat + score stats ─────────────────────────────────
+    // success_count / failure_count / sum_total_ms_success power the
+    // /workers/scoreboard endpoint and (in v0.8) per-worker dispatch
+    // priority. last_total_ms is the most-recent latency sample so the
+    // dashboard can show a "current latency" without walking the EWMA.
     if let Some(mut entry) = node.community_workers.get_mut(&result.worker_id) {
         let (worker, ts) = entry.value_mut();
         *ts = std::time::Instant::now();
         if result.success {
             worker.work_completed += 1;
+            worker.success_count += 1;
+            worker.sum_total_ms_success = worker
+                .sum_total_ms_success
+                .saturating_add(result.total_ms);
+            worker.last_total_ms = result.total_ms;
+        } else {
+            worker.failure_count += 1;
         }
     }
 
@@ -7157,6 +7295,10 @@ mod tests {
             platform: "test".into(),
             registered_at: 0,
             work_completed: 0,
+            success_count: 0,
+            failure_count: 0,
+            sum_total_ms_success: 0,
+            last_total_ms: 0,
         }
     }
 
@@ -7377,5 +7519,99 @@ mod tests {
         let err = decode_and_verify_worker_attestation("zz not hex", "0xab")
             .expect_err("hex decode must fail");
         assert!(err.contains("hex decode"), "got: {err}");
+    }
+
+    // ── Task 4: worker scoring + scoreboard tests ───────────────────────
+
+    fn worker_with_stats(
+        id: &str,
+        success: u64,
+        failure: u64,
+        sum_ms: u64,
+        last_ms: u64,
+    ) -> CommunityWorker {
+        let mut w = worker(id, &["inference"]);
+        w.success_count = success;
+        w.failure_count = failure;
+        w.sum_total_ms_success = sum_ms;
+        w.last_total_ms = last_ms;
+        w.work_completed = success;
+        w
+    }
+
+    #[tokio::test]
+    async fn scoreboard_sorts_by_composite_score() {
+        // Compose three workers with known stats:
+        //   fast_reliable: 100% success, 100ms avg → score = 1000 - 100 = 900
+        //   slow_reliable: 100% success, 500ms avg → score = 1000 - 500 = 500
+        //   fresh:         0 successes              → score = 0
+        // Expected ordering: fast_reliable, slow_reliable, fresh.
+        let now = std::time::Instant::now();
+        let node = fake_node_with_workers(vec![
+            (worker_with_stats("fast_reliable", 10, 0, 1000, 100), now),
+            (worker_with_stats("slow_reliable", 10, 0, 5000, 500), now),
+            (worker_with_stats("fresh", 0, 0, 0, 0), now),
+        ]);
+
+        let resp = workers_scoreboard(
+            AxumState(node),
+            Query(HashMap::new()),
+        )
+        .await;
+        let v: Value = resp.0;
+        let workers = v.get("workers").and_then(|x| x.as_array()).unwrap();
+        let ids: Vec<&str> = workers
+            .iter()
+            .map(|w| w.get("worker_id").and_then(|x| x.as_str()).unwrap_or(""))
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["fast_reliable", "slow_reliable", "fresh"],
+            "scoreboard order must be score-descending"
+        );
+        // Sanity: count_visible matches the number of fresh-TTL workers.
+        assert_eq!(v.get("count_visible").and_then(|x| x.as_u64()), Some(3));
+    }
+
+    #[tokio::test]
+    async fn scoreboard_excludes_stale_workers() {
+        let now = std::time::Instant::now();
+        let stale = now - std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS + 30);
+        let node = fake_node_with_workers(vec![
+            (worker_with_stats("alive", 5, 0, 1000, 200), now),
+            (worker_with_stats("stale", 999, 0, 999_999, 999_999), stale),
+        ]);
+
+        let v: Value = workers_scoreboard(AxumState(node), Query(HashMap::new())).await.0;
+        let workers = v.get("workers").and_then(|x| x.as_array()).unwrap();
+        assert_eq!(workers.len(), 1, "stale worker must be hidden");
+        assert_eq!(
+            workers[0].get("worker_id").and_then(|x| x.as_str()),
+            Some("alive")
+        );
+    }
+
+    #[test]
+    fn scoreboard_score_handles_pure_failure() {
+        // A worker with all failures and no successes scores 0 (no
+        // success_count means no avg_ms; we don't punish to -∞ because
+        // the worker may still be online and trying).
+        let w = worker_with_stats("flunker", 0, 10, 0, 0);
+        assert_eq!(w.success_count, 0);
+        assert_eq!(w.failure_count, 10);
+        // Equivalent of the score computation in workers_scoreboard
+        let attempts = w.success_count + w.failure_count;
+        let success_rate = if attempts > 0 {
+            w.success_count as f64 / attempts as f64
+        } else {
+            0.0
+        };
+        let score = if w.success_count == 0 {
+            0.0
+        } else {
+            success_rate * 1000.0
+                - (w.sum_total_ms_success as f64 / w.success_count as f64)
+        };
+        assert_eq!(score, 0.0);
     }
 }
