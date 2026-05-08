@@ -91,12 +91,47 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "load_config":
       return null as T;
     case "node_status": {
+      // Mirror desktop/src-tauri/src/rpc_client.rs::fetch_status:
+      // if local /health is missing peers, probe the public seed
+      // coordinators in order. First 200 → set coordinatorUrl + flip
+      // health to "lite". This is what unlocks the v0.7.0 Client-mode
+      // banner in the dashboard. Pre-v0.7 the JS mock hardcoded
+      // coordinatorUrl: null so the banner was untestable in live mode.
+      const COORDINATOR_HOSTS = [
+        "http://149.28.32.76:9090",
+        "http://140.82.16.112:9090",
+        "http://136.244.109.1:9090",
+        "http://104.238.171.11:9090",
+        "http://202.182.107.41:9090",
+        "http://149.28.153.31:9090",
+      ];
+      const probeCoordinator = async (): Promise<string | null> => {
+        for (const origin of COORDINATOR_HOSTS) {
+          try {
+            const r = await fetch(`${origin}/health`, {
+              method: "GET",
+              signal: AbortSignal.timeout(2000),
+            });
+            if (r.ok) return origin;
+          } catch {
+            // try next
+          }
+        }
+        return null;
+      };
+
       try {
         const h = await fetchJson("/health");
         const peers = h.peers ?? 0;
         const uptime = h.uptime_secs ?? 0;
+        const coordinatorUrl =
+          peers === 0 ? await probeCoordinator() : null;
         const health =
-          peers === 0 || uptime < 8 ? "syncing" : "live";
+          peers >= 1 && uptime >= 8
+            ? "live"
+            : coordinatorUrl
+              ? "lite"
+              : "syncing";
         return {
           running: true,
           pid: null,
@@ -110,13 +145,14 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           address: null,
           rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
           lastError: null,
-          coordinatorUrl: null,
+          coordinatorUrl,
         } as T;
       } catch {
+        const coordinatorUrl = await probeCoordinator();
         return {
           running: false,
           pid: null,
-          health: "offline",
+          health: coordinatorUrl ? "lite" : "offline",
           version: "unknown",
           peers: 0,
           round: 0,
@@ -125,8 +161,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           uptimeSeconds: 0,
           address: null,
           rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
-          lastError: "No response",
-          coordinatorUrl: null,
+          lastError: coordinatorUrl ? null : "No response",
+          coordinatorUrl,
         } as T;
       }
     }
