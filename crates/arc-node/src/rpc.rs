@@ -310,11 +310,21 @@ pub fn build_node_state(
         verification_manager: Arc::new(std::sync::Mutex::new(arc_vm::inference_verify::VerificationManager::new())),
         revenue_config: RoleRevenueConfig::default(),
         community_workers: Arc::new(dashmap::DashMap::new()),
+        // Community work dispatch — bounded mpsc with 256-slot buffer. New
+        // jobs that arrive when 256 are already queued get backpressure
+        // (the dispatcher in /inference/run awaits .send().await). Workers
+        // long-poll the receiver in claim_work; multiple handlers race for
+        // each item via the tokio Mutex.
         community_work_tx: None,
         community_work_queue: None,
         community_work_results: None,
     }
 }
+
+/// Capacity of the community work mpsc. Each slot is a single whole-prompt
+/// job; under heavy load the dispatcher's `.send().await` provides natural
+/// backpressure without unbounded memory growth.
+const COMMUNITY_WORK_QUEUE_CAP: usize = 256;
 
 /// Start the RPC server.
 pub async fn serve(
@@ -343,6 +353,21 @@ pub async fn serve(
     if let Some(c) = dag_committed {
         node.dag_committed = c;
     }
+
+    // ── Community work dispatch wiring ──────────────────────────────────
+    // Every node's RPC server now exposes a real mpsc-backed work queue.
+    // Producers (the smart router in /inference/run, task 2 of v0.7.0)
+    // push WorkItems via `community_work_tx`; consumers
+    // (/community/claim_work long-pollers) drain via `community_work_queue`.
+    // Results land back via the `community_work_results` oneshot map
+    // keyed by job_id. Pre-v0.7.0 these were `None` so claim_work always
+    // returned 503 — that's why every community worker reported 0
+    // attestations forever.
+    let (work_tx, work_rx) = tokio::sync::mpsc::channel::<WorkItem>(COMMUNITY_WORK_QUEUE_CAP);
+    node.community_work_tx = Some(Arc::new(work_tx));
+    node.community_work_queue = Some(Arc::new(tokio::sync::Mutex::new(work_rx)));
+    node.community_work_results = Some(Arc::new(dashmap::DashMap::new()));
+
     node.shard_infos = shard_infos.clone();
     // Seed the local registry with every range this node holds so /shards
     // reports the full picture the moment RPC comes up. The registry is
@@ -5607,62 +5632,67 @@ async fn community_list(
 /// Maximum time a claim_work long-poll will hold the connection open.
 const COMMUNITY_CLAIM_TIMEOUT_SECS: u64 = 30;
 
-/// A unit of forward_shard work dispatched to a community worker.
-/// Contains everything the worker needs to run forward_shard locally:
-/// the input (token or hidden state), the layer range, and the position.
+/// A whole-prompt inference job dispatched to a community worker.
+///
+/// v0.7.0: layer-shard work is no longer dispatched to community workers — it
+/// remains a seed-to-seed primitive only (see `inference_run_sharded`). The
+/// community-worker channel now carries entire prompts, which any device with
+/// a loaded model can serve end-to-end. This is the unit that makes "every
+/// device is a node" honest: a phone running a 1B model handles a whole job;
+/// a workstation running 13B handles a whole job; both earn per attestation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
-    /// Unique request id (hex). Matches the sharded inference request_id.
-    pub request_id: String,
-    /// Raw token id - only set when this is the first shard (layer 0).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token: Option<u32>,
-    /// Hidden state (i64 vec) - set for all shards after the first.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hidden: Option<Vec<i64>>,
-    /// BLAKE3 hash of the hidden state for integrity verification.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hidden_hash: Option<String>,
-    /// Token position in the sequence (for RoPE + KV cache).
-    pub position: usize,
-    /// First layer index (inclusive) the worker should process.
-    pub start_layer: usize,
-    /// Last layer index (exclusive) the worker should process.
-    pub end_layer: usize,
-    /// Model identifier so the worker can verify it has the right model.
+    /// Unique job id (hex of blake3(input || nonce)). Used to match
+    /// submit_work back to the awaiting oneshot.
+    pub job_id: String,
+    /// Prompt text (already chat-templated by the dispatcher if needed).
+    pub input: String,
+    /// Maximum tokens the worker should generate.
+    pub max_tokens: u32,
+    /// Optional model identifier (hex of model_id hash). When set, only
+    /// workers serving the same model will accept the job.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
-    /// True if this is the last token - worker should evict KV cache after.
-    #[serde(default)]
-    pub last_token: bool,
+    /// Unix timestamp (ms) when the dispatcher queued the job. Workers
+    /// echo this back so the dispatcher can compute end-to-end latency.
+    pub submitted_at_unix_ms: i64,
 }
 
 /// Result submitted by a community worker after completing a WorkItem.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkResult {
-    /// Must match the request_id from the WorkItem.
-    pub request_id: String,
-    /// Worker's self-chosen identifier.
+    /// Must match the WorkItem.job_id.
+    pub job_id: String,
+    /// Worker's self-chosen identifier (hex of validator pubkey).
     pub worker_id: String,
-    /// True if this shard ran the LM head and produced a token.
-    pub is_terminal: bool,
-    /// Hidden state to forward to the next shard (if not terminal).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hidden: Option<Vec<i64>>,
-    /// BLAKE3 hash of the hidden state.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hidden_hash: Option<String>,
-    /// Token id (if terminal - this shard ran the LM head).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub token_id: Option<u32>,
-    /// Hash of the logits (if terminal).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub logits_hash: Option<String>,
-    /// Number of layers processed.
-    pub layers_processed: usize,
-    /// Compute time on the worker, in milliseconds.
-    pub compute_ms: u64,
+    /// True if the worker produced output; false on inference error.
+    #[serde(default = "default_true")]
+    pub success: bool,
+    /// Generated text (decoded from the worker's tokens).
+    #[serde(default)]
+    pub output: String,
+    /// BLAKE3 of the output token sequence (hex, 0x-prefixed). The chain
+    /// uses this for cross-worker hash-majority verification.
+    #[serde(default)]
+    pub output_hash: String,
+    /// Number of tokens generated.
+    #[serde(default)]
+    pub tokens_generated: u64,
+    /// Total wall time on the worker, in milliseconds (encode + generate + decode).
+    #[serde(default)]
+    pub total_ms: u64,
+    /// Average ms per generated token.
+    #[serde(default)]
+    pub ms_per_token: u64,
+    /// Engine identifier ("INT8 integer (community worker)", etc.) for analytics.
+    #[serde(default)]
+    pub engine: String,
+    /// Optional error message when success=false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
+
+fn default_true() -> bool { true }
 
 /// POST body for /community/claim_work.
 #[derive(Deserialize)]
@@ -5752,10 +5782,20 @@ pub async fn community_claim_work(
                 }
             }
 
-            Ok(Json(json!({
+            // Flat response shape — the worker (arc-node main.rs) reads
+            // `job_id`, `input`, `max_tokens` directly off the top-level
+            // JSON. Don't nest under "work".
+            let mut body = json!({
                 "status": "work",
-                "work": item,
-            })))
+                "job_id": item.job_id,
+                "input": item.input,
+                "max_tokens": item.max_tokens,
+                "submitted_at_unix_ms": item.submitted_at_unix_ms,
+            });
+            if let Some(mid) = item.model_id {
+                body["model_id"] = Value::String(mid);
+            }
+            Ok(Json(body))
         }
         Ok(None) => {
             // Channel closed - coordinator shut down
@@ -5775,19 +5815,23 @@ pub async fn community_claim_work(
 
 /// POST /community/submit_work
 ///
-/// Community worker submits the completed forward_shard result. The payload
-/// must include the request_id, the shard output (hidden state or token_id),
-/// compute_ms, and the worker_id. The coordinator matches the request_id to
-/// a pending oneshot::Sender and resumes the pipeline walk.
+/// Community worker submits a completed whole-prompt inference result. The
+/// payload must include `job_id`, `worker_id`, and the generated output. The
+/// coordinator matches `job_id` to a pending oneshot::Sender and unblocks the
+/// dispatcher in `/inference/run`.
+///
+/// On success the worker's `work_completed` counter increments and (in
+/// task 3 of v0.7.0) an `InferenceAttestation` tx is posted on-chain so the
+/// reward is real ARC, not a synthesized count.
 pub async fn community_submit_work(
     AxumState(node): AxumState<NodeState>,
     Json(result): Json<WorkResult>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // ── Validate required fields ────────────────────────────────────────
-    if result.request_id.is_empty() {
+    if result.job_id.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
-            "request_id is required".to_string(),
+            "job_id is required".to_string(),
         ));
     }
     if result.worker_id.is_empty() || result.worker_id.len() > 128 {
@@ -5796,19 +5840,22 @@ pub async fn community_submit_work(
             "worker_id required (1-128 chars)".to_string(),
         ));
     }
-
-    // A terminal result must have a token_id; a non-terminal must have hidden.
-    if result.is_terminal && result.token_id.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "terminal result must include token_id".to_string(),
-        ));
-    }
-    if !result.is_terminal && result.hidden.is_none() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "non-terminal result must include hidden state".to_string(),
-        ));
+    // A successful submit must have an output and an output_hash. Failure
+    // submits are accepted (the dispatcher needs to know the worker tried)
+    // but they don't earn rewards.
+    if result.success {
+        if result.output_hash.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "output_hash required on success=true".to_string(),
+            ));
+        }
+        if result.tokens_generated == 0 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "tokens_generated must be > 0 on success=true".to_string(),
+            ));
+        }
     }
 
     // ── Worker must be registered ───────────────────────────────────────
@@ -5819,11 +5866,13 @@ pub async fn community_submit_work(
         ));
     }
 
-    // ── Refresh heartbeat + increment work_completed ────────────────────
+    // ── Refresh heartbeat + increment work_completed (only on success) ──
     if let Some(mut entry) = node.community_workers.get_mut(&result.worker_id) {
         let (worker, ts) = entry.value_mut();
         *ts = std::time::Instant::now();
-        worker.work_completed += 1;
+        if result.success {
+            worker.work_completed += 1;
+        }
     }
 
     // ── Deliver result to the coordinator via the oneshot ────────────────
@@ -5832,22 +5881,23 @@ pub async fn community_submit_work(
         "work results map not initialized - coordinator not running".to_string(),
     ))?;
 
-    // Remove the oneshot sender for this request_id. If it's gone, the
-    // coordinator already timed out or the request was cancelled.
-    match results_map.remove(&result.request_id) {
+    // Remove the oneshot sender for this job_id. If it's gone, the
+    // dispatcher already timed out or the request was cancelled.
+    match results_map.remove(&result.job_id) {
         Some((_, sender)) => {
-            match sender.send(result.clone()) {
+            let job_id = result.job_id.clone();
+            match sender.send(result) {
                 Ok(()) => Ok(Json(json!({
                     "ok": true,
-                    "request_id": result.request_id,
+                    "job_id": job_id,
                 }))),
                 Err(_) => {
-                    // Receiver dropped - coordinator timed out
+                    // Receiver dropped - dispatcher timed out
                     Err((
                         StatusCode::GONE,
                         format!(
-                            "coordinator already timed out for request_id {}",
-                            result.request_id
+                            "dispatcher already timed out for job_id {}",
+                            job_id
                         ),
                     ))
                 }
@@ -5856,8 +5906,8 @@ pub async fn community_submit_work(
         None => Err((
             StatusCode::NOT_FOUND,
             format!(
-                "no pending work for request_id {} - already completed or expired",
-                result.request_id
+                "no pending work for job_id {} - already completed or expired",
+                result.job_id
             ),
         )),
     }
@@ -6490,5 +6540,115 @@ mod tests {
         // IPv6 must be bracketed when combined with a port.
         let got = rewrite_stub_shard_addr("0.0.0.0:9090", sa("[2001:db8::1]:51234"));
         assert_eq!(got, "[2001:db8::1]:9090");
+    }
+
+    // ── v0.7.0 community work queue / schema tests ─────────────────────
+
+    #[test]
+    fn workitem_serializes_in_shape_worker_reads() {
+        // The desktop community-worker loop in main.rs reads job_id, input,
+        // max_tokens, and (optionally) model_id directly off the top-level
+        // claim_work response. Pin the serialization shape so a future
+        // refactor can't silently drift the wire format.
+        let item = WorkItem {
+            job_id: "a1b2c3".to_string(),
+            input: "What is 2+2?".to_string(),
+            max_tokens: 64,
+            model_id: Some("0xdeadbeef".to_string()),
+            submitted_at_unix_ms: 1_700_000_000_000,
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert_eq!(v["job_id"], "a1b2c3");
+        assert_eq!(v["input"], "What is 2+2?");
+        assert_eq!(v["max_tokens"], 64);
+        assert_eq!(v["model_id"], "0xdeadbeef");
+        assert_eq!(v["submitted_at_unix_ms"], 1_700_000_000_000i64);
+        // Old layer-shard fields must NOT appear — they belong to the
+        // seed-to-seed forward_shard path now.
+        assert!(v.get("request_id").is_none(), "request_id is the v0.6 layer-shard field, must not leak into community jobs");
+        assert!(v.get("hidden").is_none());
+        assert!(v.get("start_layer").is_none());
+        assert!(v.get("end_layer").is_none());
+    }
+
+    #[test]
+    fn workitem_omits_model_id_when_none() {
+        // model_id is optional; when None, it must be absent from JSON
+        // (workers skip the model-match check when the field isn't present).
+        let item = WorkItem {
+            job_id: "x".into(),
+            input: "hi".into(),
+            max_tokens: 8,
+            model_id: None,
+            submitted_at_unix_ms: 0,
+        };
+        let v = serde_json::to_value(&item).unwrap();
+        assert!(v.get("model_id").is_none());
+    }
+
+    #[test]
+    fn workresult_deserializes_from_worker_payload() {
+        // Pin compatibility with the exact JSON the worker loop in
+        // crates/arc-node/src/main.rs sends to /community/submit_work.
+        let body = serde_json::json!({
+            "job_id": "abc",
+            "worker_id": "0x12ab",
+            "success": true,
+            "output": "4",
+            "output_hash": "0xfeed",
+            "tokens_generated": 1u64,
+            "total_ms": 250u64,
+            "ms_per_token": 250u64,
+            "engine": "INT8 integer (community worker)",
+        });
+        let r: WorkResult = serde_json::from_value(body).expect("worker payload should deserialize");
+        assert_eq!(r.job_id, "abc");
+        assert_eq!(r.worker_id, "0x12ab");
+        assert!(r.success);
+        assert_eq!(r.output, "4");
+        assert_eq!(r.output_hash, "0xfeed");
+        assert_eq!(r.tokens_generated, 1);
+        assert_eq!(r.ms_per_token, 250);
+    }
+
+    #[test]
+    fn workresult_defaults_for_failure_submit() {
+        // When a worker fails it can submit just job_id + worker_id +
+        // success=false + error. All other fields default to empty/0.
+        let body = serde_json::json!({
+            "job_id": "abc",
+            "worker_id": "0x12ab",
+            "success": false,
+            "error": "model not loaded",
+        });
+        let r: WorkResult = serde_json::from_value(body).unwrap();
+        assert!(!r.success);
+        assert_eq!(r.tokens_generated, 0);
+        assert_eq!(r.output, "");
+        assert_eq!(r.error.as_deref(), Some("model not loaded"));
+    }
+
+    #[tokio::test]
+    async fn work_queue_round_trip_after_serve_wiring() {
+        // Smoke test: build_node_state alone leaves the queue None
+        // (callers must use serve() to wire it). After we manually wire
+        // the channel (mirroring serve()), tx.send → rx.recv works.
+        let (tx, rx) = tokio::sync::mpsc::channel::<WorkItem>(8);
+        let tx = Arc::new(tx);
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
+
+        // Push one job
+        tx.send(WorkItem {
+            job_id: "j1".into(),
+            input: "ping".into(),
+            max_tokens: 4,
+            model_id: None,
+            submitted_at_unix_ms: 1,
+        }).await.unwrap();
+
+        // Drain
+        let got = rx.lock().await.recv().await.expect("a job");
+        assert_eq!(got.job_id, "j1");
+        assert_eq!(got.input, "ping");
     }
 }
