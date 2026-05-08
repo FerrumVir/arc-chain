@@ -3056,16 +3056,138 @@ async fn channel_state(
 
 // ─── Inference Endpoints ─────────────────────────────────────────────────────
 
-/// Run inference through the cached INT8 integer model and record attestation on-chain.
+/// How long /inference/run waits for a community worker to return a
+/// completed job before giving up and falling through to the local
+/// model. 60s covers the worst-case for a 13B model on a slow laptop
+/// generating 64 tokens at ~700ms/token, with headroom for the 30s
+/// claim-poll cycle.
+const COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 60;
+
+/// Count community workers that haven't expired their TTL and advertise
+/// the "inference" capability. Used by the smart router to decide
+/// whether to dispatch externally or run locally.
+fn live_inference_worker_count(node: &NodeState) -> usize {
+    let now = std::time::Instant::now();
+    let ttl = std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS);
+    node.community_workers
+        .iter()
+        .filter(|e| {
+            let (w, ts) = e.value();
+            now.duration_since(*ts) <= ttl
+                && w.capabilities.iter().any(|c| c == "inference")
+        })
+        .count()
+}
+
+/// Push a whole-prompt job onto the community work queue and await the
+/// result via oneshot. Returns Err when there's no queue, no worker
+/// claims the job in time, the worker reports failure, or the result
+/// channel breaks.
+///
+/// On success the returned WorkResult carries `output`, `output_hash`,
+/// `tokens_generated`, and `total_ms` — enough to satisfy the same
+/// response shape the local-inference path produces.
+async fn dispatch_to_community_worker(
+    node: &NodeState,
+    input: String,
+    max_tokens: u32,
+    model_id_hint: Option<String>,
+) -> Result<WorkResult, String> {
+    let tx = node
+        .community_work_tx
+        .as_ref()
+        .ok_or_else(|| "community work queue not wired".to_string())?
+        .clone();
+    let results = node
+        .community_work_results
+        .as_ref()
+        .ok_or_else(|| "community work results map not wired".to_string())?
+        .clone();
+
+    // job_id = blake3(input || max_tokens || nonce). The per-node
+    // attestation_nonce already exists for de-duping repeat prompts;
+    // reuse it here so identical concurrent prompts get distinct ids.
+    let nonce = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(input.as_bytes());
+    hasher.update(&max_tokens.to_le_bytes());
+    hasher.update(&nonce.to_le_bytes());
+    let job_id = hex::encode(hasher.finalize().as_bytes());
+
+    let (osh_tx, osh_rx) = tokio::sync::oneshot::channel::<WorkResult>();
+    results.insert(job_id.clone(), osh_tx);
+
+    let submitted_at = chrono::Utc::now().timestamp_millis();
+    let item = WorkItem {
+        job_id: job_id.clone(),
+        input,
+        max_tokens,
+        model_id: model_id_hint,
+        submitted_at_unix_ms: submitted_at,
+    };
+
+    if let Err(e) = tx.send(item).await {
+        // Channel closed — drop our orphan oneshot from the map and
+        // surface the error so the caller can fall back to local.
+        results.remove(&job_id);
+        return Err(format!("queue closed: {}", e));
+    }
+
+    let timeout = tokio::time::Duration::from_secs(COMMUNITY_DISPATCH_TIMEOUT_SECS);
+    match tokio::time::timeout(timeout, osh_rx).await {
+        Ok(Ok(result)) => {
+            if !result.success {
+                let err = result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "worker reported failure".to_string());
+                return Err(err);
+            }
+            // Record dispatch latency in EWMA so future routing favors
+            // workers that consistently beat the deadline. Keyed by
+            // worker_id so it's distinguishable from the seed-to-seed
+            // forward_shard latency table.
+            record_latency(
+                &node.latency_stats,
+                &format!("worker:{}", result.worker_id),
+                result.total_ms,
+            );
+            Ok(result)
+        }
+        Ok(Err(_)) => {
+            // oneshot sender dropped without sending — the worker
+            // disconnected mid-job or the queue purged us.
+            results.remove(&job_id);
+            Err("worker disconnected before completing job".into())
+        }
+        Err(_) => {
+            // Timeout — orphan our entry so submit_work doesn't crash
+            // when the late result arrives.
+            results.remove(&job_id);
+            Err(format!(
+                "no worker completed within {}s",
+                COMMUNITY_DISPATCH_TIMEOUT_SECS
+            ))
+        }
+    }
+}
+
+/// Run inference through a community worker (preferred when any are
+/// online) or the local model (fallback). Records attestation on-chain
+/// either way — task 3 of v0.7.0 will sign the worker's output with the
+/// originating seed's key so community-served jobs land on-chain too.
 ///
 /// POST /inference/run
-/// Body: { "input": "What is 2+2?", "max_tokens": 64, "bond": 1000 }
+/// Body: { "input": "What is 2+2?", "max_tokens": 64, "bond": 1000,
+///         "force_local": false }
 ///
-/// If --model was provided at startup, runs real deterministic inference through
-/// the cached INT8 integer engine. Pure i64 arithmetic - identical output hash
-/// on ARM, x86, RISC-V, any platform.
+/// `force_local: true` skips the community dispatch and runs the
+/// request on the local model only. Used by benchmarks and by the
+/// rolling-upgrade verifier to confirm the seed's own engine still
+/// serves correctly without depending on network state.
 ///
-/// Returns the query, response text, output hash, ms/token, and attestation TX.
+/// Returns the query, response text, output hash, ms/token, attestation
+/// TX, and a `routed_via` field ("community:<worker_id>" | "local").
 async fn inference_run(
     AxumState(node): AxumState<NodeState>,
     body: Option<Json<Value>>,
@@ -3097,6 +3219,100 @@ async fn inference_run(
     let challenge_period = req.get("challenge_period")
         .and_then(|v| v.as_u64())
         .unwrap_or(100);
+    let force_local = req.get("force_local")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // ── Smart router: prefer community workers when any are online ──────
+    //
+    // The chain's design promise is "every device is a node, traffic
+    // auto-routes to the most efficient worker." Concretely: when a
+    // community worker has the model loaded and is idle, the seed
+    // dispatches to them; the seed's own model is the fallback when no
+    // worker can serve the job.
+    //
+    // Routing order:
+    //   1. force_local=true  → skip dispatch, run on this seed.
+    //   2. ≥1 live worker    → push WorkItem, wait up to 60s. If any
+    //                          worker completes, return their result.
+    //   3. Community fail    → fall through to local model.
+    //   4. No local model    → return a 200 with success=false explaining
+    //                          why (workers all timed out, no model loaded).
+    //
+    // On-chain attestation for the community path lands in task 3 of
+    // v0.7.0 (worker signs the result with their validator key, seed
+    // verifies + inserts to mempool). For now community-routed jobs
+    // record into inference_results for explorer visibility but skip
+    // the on-chain tx — that's intentional and explicit; without a
+    // worker signature the seed crediting itself would be wrong.
+    let live_workers = live_inference_worker_count(&node);
+    if !force_local && live_workers > 0 && node.community_work_tx.is_some() {
+        let dispatched_at = std::time::Instant::now();
+        match dispatch_to_community_worker(
+            &node,
+            input_text.to_string(),
+            max_tokens,
+            None, // model_id pinning lands in task 4 (worker scoring)
+        )
+        .await
+        {
+            Ok(result) => {
+                let total_ms = dispatched_at.elapsed().as_millis() as u64;
+                let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
+                node.inference_results.insert(
+                    result.job_id.clone(),
+                    json!({
+                        "input": input_text,
+                        "output": &result.output,
+                        "output_hash": &result.output_hash,
+                        "model": format!("community:{}", result.engine),
+                        "model_hash": "",
+                        "ms_per_token": result.ms_per_token,
+                        "tokens_generated": result.tokens_generated,
+                        "engine": &result.engine,
+                        "deterministic": result.engine.contains("integer"),
+                        "worker_id": &result.worker_id,
+                    }),
+                );
+                return Ok(Json(json!({
+                    "success": true,
+                    "routed_via": format!("community:{}", result.worker_id),
+                    "inference": {
+                        "model": "community-served",
+                        "model_hash": "",
+                        "input": input_text,
+                        "input_hash": format!("0x{}", hex::encode(&input_hash.0)),
+                        "output": result.output,
+                        "output_hash": result.output_hash,
+                        "tokens_generated": result.tokens_generated,
+                        "inference_ms": result.total_ms,
+                        "ms_per_token": result.ms_per_token,
+                        "encode_ms": 0,
+                        "deterministic": result.engine.contains("integer"),
+                        "engine": result.engine,
+                        "dispatch_ms": total_ms,
+                    },
+                    "attestation": {
+                        "tx_hash": "",
+                        "bond": bond,
+                        "challenge_period": challenge_period,
+                        "status": "deferred_to_worker_signed_attestation",
+                    },
+                    "worker": {
+                        "worker_id": result.worker_id,
+                        "live_workers_at_dispatch": live_workers,
+                    },
+                })));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    workers = live_workers,
+                    "community dispatch failed, falling back to local: {}",
+                    e
+                );
+            }
+        }
+    }
 
     // Check if we have a loaded model (prefer candle float backend for quality)
     let model = match &node.inference_model {
@@ -3104,7 +3320,13 @@ async fn inference_run(
         None => {
             return Ok(Json(json!({
                 "success": false,
-                "error": "No model loaded. Start node with --model /path/to/model.gguf",
+                "routed_via": "none",
+                "error": format!(
+                    "No model loaded on this node and {} live community workers (community dispatch \
+                     either timed out or none accepted). Start node with --model /path/to/model.gguf, \
+                     or wait for a worker to register.",
+                    live_workers
+                ),
             })));
         }
     };
@@ -3217,6 +3439,7 @@ async fn inference_run(
 
     Ok(Json(json!({
         "success": true,
+        "routed_via": "local",
         "inference": {
             "model": model_id_data,
             "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
@@ -6650,5 +6873,193 @@ mod tests {
         let got = rx.lock().await.recv().await.expect("a job");
         assert_eq!(got.job_id, "j1");
         assert_eq!(got.input, "ping");
+    }
+
+    // ── Smart router (task 2) tests ─────────────────────────────────────
+    //
+    // These exercise live_inference_worker_count and
+    // dispatch_to_community_worker against a node state we wire up by
+    // hand — a full serve() boot would pull in axum + listen sockets,
+    // which is out of scope for a unit test. We construct just enough of
+    // NodeState to drive the router paths.
+
+    use std::sync::atomic::AtomicU32;
+    use std::time::Instant;
+
+    fn fake_node_with_workers(workers: Vec<(CommunityWorker, std::time::Instant)>) -> NodeState {
+        // Build a minimal NodeState by hand. We can't call build_node_state
+        // because it requires real Arc<StateDB> and Arc<Mempool>; we only
+        // touch fields the router reads.
+        let workers_map: dashmap::DashMap<String, (CommunityWorker, std::time::Instant)> =
+            dashmap::DashMap::new();
+        for (w, ts) in workers {
+            workers_map.insert(w.worker_id.clone(), (w, ts));
+        }
+        let (tx, rx) = tokio::sync::mpsc::channel::<WorkItem>(16);
+        NodeState {
+            // Fields the router actually reads ↓
+            community_workers: Arc::new(workers_map),
+            community_work_tx: Some(Arc::new(tx)),
+            community_work_queue: Some(Arc::new(tokio::sync::Mutex::new(rx))),
+            community_work_results: Some(Arc::new(dashmap::DashMap::new())),
+            attestation_nonce: Arc::new(AtomicU64::new(0)),
+            latency_stats: Arc::new(dashmap::DashMap::new()),
+
+            // Filler ↓ — never read by the router but required by the struct
+            state: Arc::new(arc_state::StateDB::new()),
+            mempool: Arc::new(arc_mempool::Mempool::new(1_000)),
+            validator_address: Hash256::ZERO,
+            stake: 0,
+            tier: StakeTier::Spark,
+            boot_time: Instant::now(),
+            peer_count: Arc::new(AtomicU32::new(0)),
+            faucet_claims: Arc::new(dashmap::DashMap::new()),
+            faucet_claims_total: Arc::new(AtomicU32::new(0)),
+            inference_model: None,
+            candle_engine: None,
+            candle_model_id: None,
+            dag_validators: Arc::new(parking_lot::RwLock::new(Vec::new())),
+            tx_rate_limit: Arc::new(dashmap::DashMap::new()),
+            dag_round: Arc::new(AtomicU64::new(0)),
+            dag_committed: Arc::new(AtomicU64::new(0)),
+            inference_results: Arc::new(dashmap::DashMap::new()),
+            shard_infos: Vec::new(),
+            shard_kv_caches: Arc::new(dashmap::DashMap::new()),
+            shard_registry: Arc::new(dashmap::DashMap::new()),
+            sharded_runs_total: Arc::new(AtomicU64::new(0)),
+            sharded_bytes_total: Arc::new(AtomicU64::new(0)),
+            inference_cache: Arc::new(arc_inference::distributed::DistributedCache::new(16)),
+            multi_model_registry: Arc::new(arc_inference::distributed::ShardRegistry::new()),
+            verification_manager: Arc::new(std::sync::Mutex::new(arc_vm::inference_verify::VerificationManager::new())),
+            revenue_config: RoleRevenueConfig::default(),
+        }
+    }
+
+    fn worker(id: &str, caps: &[&str]) -> CommunityWorker {
+        CommunityWorker {
+            worker_id: id.into(),
+            name: format!("test-{}", id),
+            capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            model: Some("Llama-2-7B".into()),
+            platform: "test".into(),
+            registered_at: 0,
+            work_completed: 0,
+        }
+    }
+
+    #[test]
+    fn live_worker_count_filters_by_capability_and_ttl() {
+        let now = std::time::Instant::now();
+        let stale = now - std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS + 5);
+
+        let node = fake_node_with_workers(vec![
+            (worker("alive-inference", &["inference"]), now),
+            (worker("alive-other-cap", &["consensus"]), now),
+            (worker("stale-inference", &["inference"]), stale),
+        ]);
+
+        // Only "alive-inference" should count: alive AND has the
+        // inference capability.
+        assert_eq!(live_inference_worker_count(&node), 1);
+    }
+
+    #[test]
+    fn live_worker_count_zero_when_no_workers_registered() {
+        let node = fake_node_with_workers(vec![]);
+        assert_eq!(live_inference_worker_count(&node), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_to_community_worker_returns_result_when_worker_submits() {
+        // Wire a worker: we manually drain the queue and post a result
+        // through the same channels submit_work uses, then assert the
+        // dispatcher returns the right WorkResult.
+        let now = std::time::Instant::now();
+        let node = fake_node_with_workers(vec![(
+            worker("w1", &["inference"]),
+            now,
+        )]);
+
+        let queue = node.community_work_queue.as_ref().unwrap().clone();
+        let results = node.community_work_results.as_ref().unwrap().clone();
+
+        // Spawn a fake worker that drains the queue and posts a result.
+        tokio::spawn(async move {
+            let item = queue.lock().await.recv().await.expect("a job");
+            // submit a successful result
+            if let Some((_, sender)) = results.remove(&item.job_id) {
+                let _ = sender.send(WorkResult {
+                    job_id: item.job_id,
+                    worker_id: "w1".into(),
+                    success: true,
+                    output: "4".into(),
+                    output_hash: "0xdeadbeef".into(),
+                    tokens_generated: 1,
+                    total_ms: 50,
+                    ms_per_token: 50,
+                    engine: "INT8 integer (community worker)".into(),
+                    error: None,
+                });
+            }
+        });
+
+        let result = dispatch_to_community_worker(&node, "What is 2+2?".into(), 4, None)
+            .await
+            .expect("worker returned a result");
+
+        assert_eq!(result.worker_id, "w1");
+        assert_eq!(result.output, "4");
+        assert_eq!(result.tokens_generated, 1);
+        // EWMA was recorded for this worker
+        assert!(node.latency_stats.contains_key("worker:w1"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_propagates_worker_failure() {
+        let now = std::time::Instant::now();
+        let node = fake_node_with_workers(vec![(worker("w1", &["inference"]), now)]);
+        let queue = node.community_work_queue.as_ref().unwrap().clone();
+        let results = node.community_work_results.as_ref().unwrap().clone();
+
+        tokio::spawn(async move {
+            let item = queue.lock().await.recv().await.expect("a job");
+            if let Some((_, sender)) = results.remove(&item.job_id) {
+                let _ = sender.send(WorkResult {
+                    job_id: item.job_id,
+                    worker_id: "w1".into(),
+                    success: false,
+                    output: String::new(),
+                    output_hash: String::new(),
+                    tokens_generated: 0,
+                    total_ms: 0,
+                    ms_per_token: 0,
+                    engine: String::new(),
+                    error: Some("model not loaded on worker".into()),
+                });
+            }
+        });
+
+        let err = dispatch_to_community_worker(&node, "x".into(), 4, None)
+            .await
+            .expect_err("failure must propagate");
+        assert!(err.contains("model not loaded on worker"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_errors_when_queue_unwired() {
+        // Build a minimal NodeState with no community_work_tx, simulating
+        // an old binary or a misconfigured server.
+        let mut node = fake_node_with_workers(vec![(worker("w1", &["inference"]), Instant::now())]);
+        node.community_work_tx = None;
+        node.community_work_queue = None;
+        node.community_work_results = None;
+
+        let err = dispatch_to_community_worker(&node, "x".into(), 4, None)
+            .await
+            .expect_err("must error when not wired");
+        assert!(
+            err.contains("not wired"),
+            "expected 'not wired' error, got: {err}"
+        );
     }
 }
