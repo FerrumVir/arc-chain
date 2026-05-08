@@ -192,6 +192,33 @@ pub struct InferenceResult {
     pub coordinator: Option<String>,
 }
 
+/// One entry in the desktop's model-tier picker. The frontend renders this
+/// in onboarding (and the Settings → "Switch model" flow) so the user can
+/// pick what to download. `size_bytes` is the canonical HF-reported size, used
+/// both for the human-readable size label ("~4.1 GB") and for the
+/// already-downloaded check (`existing_model_for_tier`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelTierInfo {
+    pub id: String,
+    pub display_name: String,
+    pub size_bytes: u64,
+    pub url: String,
+}
+
+/// Streamed progress event for an in-flight model download. Frontend listens
+/// on the `model-download-progress` Tauri channel and renders a progress bar
+/// from `downloaded_bytes / total_bytes`. `done = true` is the terminal event
+/// (file fully written + atomically renamed into place).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelDownloadProgress {
+    pub tier: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: u64,
+    pub done: bool,
+}
+
 /// Milestone B (#36): paid-inference response - carries the InferenceResult
 /// fields plus the on-chain receipts (open tx hash, release tx hash, the
 /// payer's address, the max_fee that was escrowed).

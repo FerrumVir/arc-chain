@@ -2,9 +2,10 @@ use crate::node_manager::{managed_binary_path, TestnetResources};
 use crate::types::*;
 use crate::{hardware, identity, rpc_client, AppState};
 use std::io::Write as _;
-use std::path::PathBuf;
-use tauri::{AppHandle, Manager, State};
+use std::path::{Path, PathBuf};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
+use tokio::io::AsyncWriteExt;
 
 type CmdResult<T> = Result<T, String>;
 
@@ -755,3 +756,279 @@ fn resolve_testnet_resources(app: &AppHandle) -> TestnetResources {
         genesis_file: genesis,
     }
 }
+
+// ─── Model download (community inference worker setup) ─────────────────────
+//
+// The desktop's #1 user complaint with v0.5.x: "I joined, I have peers, but
+// I have 0 attestations and 0 earnings." Root cause: onboarding defaulted to
+// `role: "observer"` with `model_path: None`, so node_manager never passed
+// `--community-mode` to arc-node, so the coordinator never dispatched
+// inference to the user. They were a passive validator forever.
+//
+// v0.6.0 fixes that: onboarding picks a hardware-appropriate model, downloads
+// the GGUF from a stable HF mirror, configures the node as a worker. The
+// runtime distinction (worker vs observer) becomes a consequence of "did
+// the user download a model?" instead of a UI choice they make blindly.
+//
+// All three tiers are llama-architecture (the only family arc-inference's
+// candle backend supports today - see `quantized_llama::ModelWeights` in
+// crates/arc-inference/src/candle_backend.rs). Sizes are Q4_K_M quantization
+// from TheBloke's GGUF mirrors:
+//   tiny     ~669 MB   TinyLlama-1.1B-Chat   - laptops without GPU, mobile-class
+//   standard ~4.08 GB  Llama-2-7B-Chat       - 16GB+ RAM, the network's primary tier
+//   big      ~7.87 GB  Llama-2-13B-Chat      - workstations w/ GPU, top earner
+//
+// Llama-2-70B (~39 GB) intentionally not in the auto-download set: too large
+// to push through a one-click onboarding without scaring users. Operators
+// who want it can `huggingface-cli download` manually + Settings → "use
+// existing model".
+struct ModelTierSpec {
+    id: &'static str,
+    display_name: &'static str,
+    url: &'static str,
+    size_bytes: u64,
+}
+
+const MODEL_TIERS: &[ModelTierSpec] = &[
+    ModelTierSpec {
+        id: "tiny",
+        display_name: "TinyLlama 1.1B (Q4_K_M)",
+        url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        size_bytes: 669_262_336,
+    },
+    ModelTierSpec {
+        id: "standard",
+        display_name: "Llama-2 7B Chat (Q4_K_M)",
+        url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
+        size_bytes: 4_081_004_544,
+    },
+    ModelTierSpec {
+        id: "big",
+        display_name: "Llama-2 13B Chat (Q4_K_M)",
+        url: "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_K_M.gguf",
+        size_bytes: 7_866_070_016,
+    },
+];
+
+fn tier_spec(id: &str) -> Option<&'static ModelTierSpec> {
+    MODEL_TIERS.iter().find(|t| t.id == id)
+}
+
+fn models_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".arc").join("models")
+}
+
+fn model_path_for(tier: &str) -> PathBuf {
+    models_dir().join(format!("{}.gguf", tier))
+}
+
+/// List the tiers the desktop knows how to auto-download. Frontend uses this
+/// to render the picker.
+#[tauri::command]
+pub async fn list_model_tiers() -> CmdResult<Vec<ModelTierInfo>> {
+    Ok(MODEL_TIERS
+        .iter()
+        .map(|t| ModelTierInfo {
+            id: t.id.into(),
+            display_name: t.display_name.into(),
+            size_bytes: t.size_bytes,
+            url: t.url.into(),
+        })
+        .collect())
+}
+
+/// Map detected hardware → recommended tier id. Mirrors the existing
+/// `hardware::recommend()` mapping but returns just the tier id (not the
+/// human-readable model name) so the frontend has something stable to
+/// pre-select in the picker.
+///
+/// Returns "none" when the machine isn't strong enough to run any tier
+/// usefully — frontend should offer "verifier-only" mode instead.
+#[tauri::command]
+pub async fn recommended_tier() -> CmdResult<String> {
+    let hw = hardware::detect();
+    let vram = hw.gpu_vram_gb.unwrap_or(0);
+    let tier = if hw.ram_gb >= 32 && vram >= 16 {
+        "big"
+    } else if hw.ram_gb >= 16 {
+        "standard"
+    } else if hw.ram_gb >= 8 {
+        "tiny"
+    } else {
+        "none"
+    };
+    Ok(tier.into())
+}
+
+/// Returns `Some(path)` if the matching tier's GGUF is already on disk and
+/// looks at least mostly downloaded (size within 1% of expected). Frontend
+/// uses this to skip the download step on a re-install or after the upgrade
+/// flow ran successfully.
+#[tauri::command]
+pub async fn existing_model_for_tier(tier: String) -> CmdResult<Option<String>> {
+    let Some(spec) = tier_spec(&tier) else { return Ok(None) };
+    let p = model_path_for(&tier);
+    if !p.exists() {
+        return Ok(None);
+    }
+    let metadata = match std::fs::metadata(&p) {
+        Ok(m) => m,
+        Err(_) => return Ok(None),
+    };
+    let actual = metadata.len();
+    let expected = spec.size_bytes;
+    // Within 1% tolerance — accommodates HF re-uploads with tiny size deltas
+    // without false-positiving on a half-downloaded file.
+    let tolerance = expected / 100;
+    if actual + tolerance < expected || actual > expected + tolerance {
+        return Ok(None);
+    }
+    Ok(Some(p.to_string_lossy().into_owned()))
+}
+
+/// Download the GGUF for `tier` to ~/.arc/models/<tier>.gguf, streaming
+/// progress events on the `model-download-progress` channel so the UI can
+/// render a real progress bar.
+///
+/// Idempotent — if the target file already exists at the expected size,
+/// returns immediately without re-downloading. Atomically renames into place
+/// from a `.download` sidecar so a crashed mid-download leaves the previous
+/// good copy intact.
+#[tauri::command]
+pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
+    let spec = tier_spec(&tier)
+        .ok_or_else(|| format!("unknown model tier: {}", tier))?;
+    let target = model_path_for(&tier);
+
+    // Already downloaded at expected size → done.
+    if let Ok(meta) = std::fs::metadata(&target) {
+        let actual = meta.len();
+        let tolerance = spec.size_bytes / 100;
+        if actual + tolerance >= spec.size_bytes && actual <= spec.size_bytes + tolerance {
+            // Emit a final 100% progress so the UI doesn't hang on a stale
+            // "downloading" state when the model was already there.
+            let _ = app.emit(
+                "model-download-progress",
+                ModelDownloadProgress {
+                    tier: tier.clone(),
+                    downloaded_bytes: actual,
+                    total_bytes: spec.size_bytes,
+                    done: true,
+                },
+            );
+            return Ok(target.to_string_lossy().into_owned());
+        }
+    }
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(map_err)?;
+    }
+
+    // Long timeout for the slowest tier on a residential connection: 13B
+    // chat is ~7.9 GB, on a 5 Mbps link that's ~3.5 hours. 4 hours.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(4 * 60 * 60))
+        .build()
+        .map_err(map_err)?;
+
+    let resp = client
+        .get(spec.url)
+        .send()
+        .await
+        .map_err(|e| format!("HF fetch failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "GGUF mirror returned HTTP {} for tier {}",
+            resp.status(),
+            tier
+        ));
+    }
+    let total_bytes = resp.content_length().unwrap_or(spec.size_bytes);
+
+    let tmp = target.with_extension("download");
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .map_err(|e| format!("create temp file: {}", e))?;
+
+    let mut stream = resp;
+    let mut downloaded: u64 = 0;
+    let mut last_emit = std::time::Instant::now();
+    // Emit progress at most every 250ms. HF chunks tend to land in 8-64 KB
+    // units; emitting on every chunk would flood the IPC channel and pin
+    // the UI thread re-rendering progress.
+    let emit_every = std::time::Duration::from_millis(250);
+
+    loop {
+        let chunk = match stream.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => return Err(format!("chunk read failed at {} bytes: {}", downloaded, e)),
+        };
+        downloaded += chunk.len() as u64;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("write to temp file: {}", e))?;
+
+        if last_emit.elapsed() >= emit_every {
+            let _ = app.emit(
+                "model-download-progress",
+                ModelDownloadProgress {
+                    tier: tier.clone(),
+                    downloaded_bytes: downloaded,
+                    total_bytes,
+                    done: false,
+                },
+            );
+            last_emit = std::time::Instant::now();
+        }
+    }
+
+    file.flush().await.map_err(map_err)?;
+    drop(file);
+
+    // Atomic rename over any existing target. std::fs::rename uses
+    // MoveFileEx(REPLACE_EXISTING) on Windows since Rust 1.62, so this
+    // works cross-platform.
+    std::fs::rename(&tmp, &target).map_err(|e| {
+        // Best-effort cleanup of the temp on failure — caller should be able
+        // to retry without a stale ".download" sidecar accumulating.
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename to {}: {}", target.display(), e)
+    })?;
+
+    let _ = app.emit(
+        "model-download-progress",
+        ModelDownloadProgress {
+            tier: tier.clone(),
+            downloaded_bytes: downloaded,
+            total_bytes,
+            done: true,
+        },
+    );
+
+    Ok(target.to_string_lossy().into_owned())
+}
+
+/// Delete a previously-downloaded model. Frontend uses this when the user
+/// switches tiers (e.g., from `tiny` → `standard`) so we don't leave 600 MB
+/// of dead weight on a laptop with limited disk.
+#[tauri::command]
+pub async fn remove_model(tier: String) -> CmdResult<()> {
+    let p = model_path_for(&tier);
+    if p.exists() {
+        std::fs::remove_file(&p).map_err(map_err)?;
+    }
+    // Also clean any stale .download sidecar from a crashed download.
+    let tmp = p.with_extension("download");
+    if tmp.exists() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn _path_helper(_: &Path) {} // keep `Path` import used if `model_path_for` returns inline

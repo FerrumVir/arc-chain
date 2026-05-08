@@ -148,6 +148,11 @@ pub fn run() {
             commands::clear_crash,
             commands::ensure_binary,
             commands::get_autostart,
+            commands::list_model_tiers,
+            commands::recommended_tier,
+            commands::existing_model_for_tier,
+            commands::download_model,
+            commands::remove_model,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ARC desktop");

@@ -12,6 +12,7 @@ import type {
   Identity,
   InferenceResult,
   LogEntry,
+  ModelTierInfo,
   NetworkStats,
   NodeConfig,
   NodeStatus,
@@ -387,6 +388,35 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     case "get_autostart":
       return false as T;
+    case "list_model_tiers":
+      return [
+        {
+          id: "tiny",
+          displayName: "TinyLlama 1.1B (Q4_K_M)",
+          sizeBytes: 669_262_336,
+          url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        },
+        {
+          id: "standard",
+          displayName: "Llama-2 7B Chat (Q4_K_M)",
+          sizeBytes: 4_081_004_544,
+          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
+        },
+        {
+          id: "big",
+          displayName: "Llama-2 13B Chat (Q4_K_M)",
+          sizeBytes: 7_866_070_016,
+          url: "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_K_M.gguf",
+        },
+      ] as T;
+    case "recommended_tier":
+      return "standard" as T;
+    case "existing_model_for_tier":
+      return null as T;
+    case "download_model":
+      return "/browser-live-mode/.arc/models/standard.gguf" as T;
+    case "remove_model":
+      return undefined as T;
     default:
       throw new Error(`Unhandled live command: ${cmd}`);
   }
@@ -672,6 +702,37 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     case "get_autostart":
       return true as T;
+    case "list_model_tiers":
+      return [
+        {
+          id: "tiny",
+          displayName: "TinyLlama 1.1B (Q4_K_M)",
+          sizeBytes: 669_262_336,
+          url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        },
+        {
+          id: "standard",
+          displayName: "Llama-2 7B Chat (Q4_K_M)",
+          sizeBytes: 4_081_004_544,
+          url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
+        },
+        {
+          id: "big",
+          displayName: "Llama-2 13B Chat (Q4_K_M)",
+          sizeBytes: 7_866_070_016,
+          url: "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_K_M.gguf",
+        },
+      ] as T;
+    case "recommended_tier":
+      return "standard" as T;
+    case "existing_model_for_tier":
+      return null as T;
+    case "download_model":
+      // In mock mode pretend the download finishes instantly. The real
+      // backend streams progress events; the mock skips that for speed.
+      return "/mock/.arc/models/standard.gguf" as T;
+    case "remove_model":
+      return undefined as T;
     default:
       throw new Error(`Unmocked Tauri command: ${cmd}`);
   }
@@ -733,6 +794,12 @@ export const api = {
     invoke<{ hasUpdate: boolean; version: string }>("check_for_update"),
   ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
   getAutostart: () => invoke<boolean>("get_autostart"),
+  listModelTiers: () => invoke<ModelTierInfo[]>("list_model_tiers"),
+  recommendedTier: () => invoke<string>("recommended_tier"),
+  existingModelForTier: (tier: string) =>
+    invoke<string | null>("existing_model_for_tier", { tier }),
+  downloadModel: (tier: string) => invoke<string>("download_model", { tier }),
+  removeModel: (tier: string) => invoke<void>("remove_model", { tier }),
 };
 
 export const isTauri = IS_TAURI;

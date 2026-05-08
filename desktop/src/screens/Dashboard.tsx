@@ -19,6 +19,7 @@ import { CrashBanner } from "../components/CrashBanner";
 import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
 import { NumberTicker } from "../components/NumberTicker";
+import { ObserverUpgradeBanner } from "../components/ObserverUpgradeBanner";
 import { StatusPill } from "../components/StatusPill";
 import { api } from "../lib/tauri";
 import {
@@ -177,15 +178,19 @@ export function Dashboard() {
           data-testid="lite-mode-banner"
           role="status"
         >
-          <strong>Lite mode</strong> — your network is blocking the
-          peer-to-peer port (UDP&nbsp;9091), so this app is talking to the
-          chain through a public coordinator
-          ({coordinatorLabel(status.coordinatorUrl)}). Faucet, send, and
-          inference all work normally; only your local node isn&rsquo;t
-          earning peer rewards yet. Try a different network or VPN to join
-          P2P directly.
+          <strong>Lite mode</strong> — your local arc-node couldn&rsquo;t bind
+          UDP&nbsp;9091 (often Windows&rsquo; Hyper-V port reservations) or
+          can&rsquo;t reach P2P seeds. v0.6.0+ falls back to an OS-assigned
+          UDP port automatically; if you&rsquo;re still seeing this banner
+          after restarting, the app is talking to the chain through a public
+          coordinator ({coordinatorLabel(status.coordinatorUrl)}). Faucet,
+          send, and inference still work; only your local node isn&rsquo;t
+          earning peer rewards yet.
         </div>
       )}
+
+      <ObserverUpgradeBanner />
+
 
       <Card featured style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader

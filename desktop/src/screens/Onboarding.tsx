@@ -4,6 +4,8 @@ import {
   ArrowRight,
   Check,
   Copy,
+  Cpu,
+  HardDrive,
   Loader2,
   Network,
   ShieldCheck,
@@ -11,11 +13,15 @@ import {
 } from "lucide-react";
 import clsx from "clsx";
 import { useAppStore } from "../lib/store";
-import { api } from "../lib/tauri";
+import { api, isTauri } from "../lib/tauri";
 import { LogoMark, Tagline } from "../components/Logo";
-import type { Identity } from "../lib/types";
+import type {
+  Identity,
+  ModelDownloadProgress,
+  ModelTierInfo,
+} from "../lib/types";
 
-const STEPS = ["welcome", "identity", "launch"] as const;
+const STEPS = ["welcome", "identity", "model", "launch"] as const;
 type Step = (typeof STEPS)[number];
 
 const fadeSlide = {
@@ -25,16 +31,31 @@ const fadeSlide = {
   transition: { duration: 0.32, ease: [0.22, 1, 0.36, 1] as const },
 };
 
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(0)} MB`;
+  return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+}
+
 export function Onboarding() {
   const [step, setStep] = useState<Step>("welcome");
   const [identity, setIdentity] = useState<Identity | null>(null);
   const [copied, setCopied] = useState(false);
+  const [seedShown, setSeedShown] = useState(false);
+
+  // Model picker state — populated when entering the "model" step.
+  const [tiers, setTiers] = useState<ModelTierInfo[]>([]);
+  const [recommendedTier, setRecommendedTier] = useState<string>("standard");
+  const [selectedTier, setSelectedTier] = useState<string | null>(null);
+
   const [launching, setLaunching] = useState(false);
   const [launchStage, setLaunchStage] = useState<
-    "idle" | "downloading" | "starting" | "connecting" | "claiming"
+    "idle" | "model" | "downloading" | "starting" | "connecting" | "claiming"
   >("idle");
+  const [modelProgress, setModelProgress] =
+    useState<ModelDownloadProgress | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
-  const [seedShown, setSeedShown] = useState(false);
 
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const setStoreIdentity = useAppStore((s) => s.setIdentity);
@@ -50,42 +71,108 @@ export function Onboarding() {
     }
   }, [step, identity]);
 
+  // Load model tiers + the recommended-for-this-machine tier when we land
+  // on the model step. Pre-select the recommended one so the typical user
+  // can keep clicking through without thinking.
+  useEffect(() => {
+    if (step !== "model" || tiers.length > 0) return;
+    let cancelled = false;
+    Promise.all([api.listModelTiers(), api.recommendedTier()]).then(
+      ([loadedTiers, rec]) => {
+        if (cancelled) return;
+        setTiers(loadedTiers);
+        // "none" comes back when the machine isn't strong enough — pre-select
+        // tiny so the user has a sensible default to override or skip.
+        const safeRec = rec === "none" ? "tiny" : rec;
+        setRecommendedTier(safeRec);
+        setSelectedTier(safeRec);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [step, tiers.length]);
+
+  // Subscribe to model-download-progress events from the Rust side. Outside
+  // a Tauri shell (dev / browser preview) the mock just resolves the
+  // download() call instantly without progress events, so the listener is a
+  // no-op and the UI shows the "starting" stage straight after.
+  useEffect(() => {
+    if (!isTauri) return;
+    let unlisten: (() => void) | undefined;
+    (async () => {
+      const { listen } = await import("@tauri-apps/api/event");
+      const handle = await listen<ModelDownloadProgress>(
+        "model-download-progress",
+        (event) => {
+          setModelProgress(event.payload);
+        },
+      );
+      unlisten = handle;
+    })();
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
   const finish = async () => {
     if (!identity) return;
     setLaunching(true);
     setLaunchError(null);
-    // "observer" role = join consensus + validate blocks without needing a
-    // 4 GB model download. Users can flip to full inference-worker mode
-    // later via Settings → "Become an inference worker".
-    const config = {
-      role: "observer" as const,
-      modelPath: null,
-      rpcPort: 9090,
-      p2pPort: 9091,
-      autoStart: true,
-      autoUpdate: true,
-      dataDir: "~/.arc",
-    };
     setStoreIdentity(identity);
-    setStoreConfig(config);
+
+    const tier = selectedTier ?? recommendedTier;
+    const wantsModel = tier !== "skip";
+
     try {
+      // 1. Download the model first if the user picked one. Big tier is
+      //    ~7.9 GB; we surface progress via the modelProgress event.
+      let modelPath: string | null = null;
+      if (wantsModel) {
+        setLaunchStage("model");
+        // If the user previously downloaded this tier (re-running onboarding,
+        // re-install on same disk), skip straight to the path.
+        const existing = await api.existingModelForTier(tier);
+        if (existing) {
+          modelPath = existing;
+        } else {
+          modelPath = await api.downloadModel(tier);
+        }
+      }
+
+      // 2. Build the config now that we know whether we have a model. Worker
+      //    role + modelPath set ⇒ node_manager passes --community-mode and the
+      //    coordinator dispatches inference jobs. No model = observer
+      //    (validates consensus, doesn't earn — only path for users who
+      //    explicitly opt out).
+      const config = {
+        role: modelPath ? ("worker" as const) : ("observer" as const),
+        modelPath,
+        rpcPort: 9090,
+        p2pPort: 9091,
+        autoStart: true,
+        autoUpdate: true,
+        dataDir: "~/.arc",
+      };
+      setStoreConfig(config);
+
+      // 3. Download the arc-node binary if it isn't already there.
       setLaunchStage("downloading");
       await api.ensureBinary();
       await api.saveConfig(config);
+
+      // 4. Start the node + wait for either real peers OR a coordinator
+      //    fallback (Lite mode survives residential UDP blocks).
       setLaunchStage("starting");
       await api.startNode(config);
-      // Poll /health until the node reports at least one peer - that's
-      // when it's actually on testnet, not just a running binary.
       setLaunchStage("connecting");
       const joined = await waitForPeer({ timeoutMs: 90_000 });
       if (joined) {
-        // One free top-up so the wallet isn't empty when they land on
-        // the dashboard. Non-fatal if it fails (e.g. already-claimed).
         setLaunchStage("claiming");
         try {
           await api.faucetClaim();
         } catch {
-          /* faucet is a best-effort welcome gift; log-silent here */
+          /* faucet is a best-effort welcome gift; non-fatal */
         }
       }
       setOnboarded(true);
@@ -95,7 +182,7 @@ export function Onboarding() {
           ? err.message
           : typeof err === "string"
             ? err
-            : "Unknown error starting arc-node",
+            : "Unknown error during onboarding",
       );
       setLaunching(false);
       setLaunchStage("idle");
@@ -137,8 +224,7 @@ export function Onboarding() {
                 </div>
                 <h1 className="onboarding-title">welcome to arc</h1>
                 <p className="onboarding-subtitle">
-                  Run a node on your machine. Help secure the network. Get
-                  testnet ARC.
+                  Run a node on your machine. Serve inference. Earn ARC.
                 </p>
 
                 <div
@@ -151,8 +237,8 @@ export function Onboarding() {
                   {[
                     {
                       icon: Sparkles,
-                      title: "One click",
-                      desc: "Download, open, you're on testnet. No config, no downloads to pick.",
+                      title: "One click setup",
+                      desc: "Pick the model tier matching your hardware. We download it, configure your node, you start earning.",
                     },
                     {
                       icon: ShieldCheck,
@@ -161,8 +247,8 @@ export function Onboarding() {
                     },
                     {
                       icon: Network,
-                      title: "Keeps running",
-                      desc: "Lives in the menu bar, starts on login, auto-updates. Nothing to babysit.",
+                      title: "Always on",
+                      desc: "Lives in the menu bar, starts on login, auto-updates. Inference jobs land while you sleep.",
                     },
                   ].map(({ icon: Icon, title, desc }) => (
                     <div
@@ -349,7 +435,10 @@ export function Onboarding() {
                             }}
                           >
                             <span
-                              style={{ color: "var(--text-faint)", minWidth: 14 }}
+                              style={{
+                                color: "var(--text-faint)",
+                                minWidth: 14,
+                              }}
                             >
                               {i + 1}
                             </span>
@@ -393,6 +482,165 @@ export function Onboarding() {
               </div>
             )}
 
+            {step === "model" && (
+              <div data-testid="step-model">
+                <h1 className="onboarding-title">Pick your model</h1>
+                <p className="onboarding-subtitle">
+                  Your node serves inference for the network and earns ARC per
+                  attestation. We pre-selected the tier that fits your machine.
+                  Bigger model = more demand = more earnings.
+                </p>
+
+                <div
+                  style={{
+                    display: "grid",
+                    gap: "var(--space-3)",
+                    margin: "var(--space-6) 0",
+                  }}
+                >
+                  {tiers.length === 0 && (
+                    <div className="shimmer" style={{ height: 220 }} />
+                  )}
+                  {tiers.map((tier) => {
+                    const isSelected = selectedTier === tier.id;
+                    const isRecommended = recommendedTier === tier.id;
+                    return (
+                      <button
+                        key={tier.id}
+                        type="button"
+                        onClick={() => setSelectedTier(tier.id)}
+                        data-testid={`tier-${tier.id}`}
+                        style={{
+                          textAlign: "left",
+                          padding: "var(--space-4)",
+                          background: isSelected
+                            ? "rgba(99, 102, 241, 0.10)"
+                            : "var(--surface)",
+                          border: `1px solid ${isSelected ? "var(--indigo-400)" : "var(--border)"}`,
+                          borderRadius: "var(--radius-md)",
+                          cursor: "pointer",
+                          color: "var(--text)",
+                          display: "flex",
+                          gap: "var(--space-3)",
+                          alignItems: "flex-start",
+                          transition: "border-color 0.15s, background 0.15s",
+                        }}
+                      >
+                        <div
+                          style={{
+                            width: 32,
+                            height: 32,
+                            borderRadius: "var(--radius-sm)",
+                            background: "rgba(99, 102, 241, 0.12)",
+                            color: "var(--indigo-300)",
+                            display: "grid",
+                            placeItems: "center",
+                            flexShrink: 0,
+                          }}
+                        >
+                          {tier.id === "tiny" ? (
+                            <Cpu size={16} />
+                          ) : tier.id === "big" ? (
+                            <Sparkles size={16} />
+                          ) : (
+                            <HardDrive size={16} />
+                          )}
+                        </div>
+                        <div style={{ flex: 1 }}>
+                          <div
+                            style={{
+                              display: "flex",
+                              gap: "var(--space-2)",
+                              alignItems: "center",
+                              marginBottom: 2,
+                            }}
+                          >
+                            <span style={{ fontWeight: 500 }}>
+                              {tier.displayName}
+                            </span>
+                            {isRecommended && (
+                              <span
+                                style={{
+                                  fontSize: "var(--text-xs)",
+                                  color: "var(--indigo-300)",
+                                  fontWeight: 600,
+                                  letterSpacing:
+                                    "var(--tracking-wider)",
+                                  textTransform: "uppercase",
+                                }}
+                              >
+                                Recommended
+                              </span>
+                            )}
+                          </div>
+                          <div
+                            style={{
+                              fontSize: "var(--text-sm)",
+                              color: "var(--text-muted)",
+                              lineHeight: 1.5,
+                            }}
+                          >
+                            {formatBytes(tier.sizeBytes)} download · one-time
+                          </div>
+                        </div>
+                        <div
+                          style={{
+                            width: 18,
+                            height: 18,
+                            borderRadius: "50%",
+                            border: `2px solid ${isSelected ? "var(--indigo-400)" : "var(--border)"}`,
+                            background: isSelected
+                              ? "var(--indigo-400)"
+                              : "transparent",
+                            display: "grid",
+                            placeItems: "center",
+                            flexShrink: 0,
+                          }}
+                        >
+                          {isSelected && <Check size={10} color="white" />}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setSelectedTier("skip")}
+                  data-testid="tier-skip"
+                  style={{
+                    background: "none",
+                    border: "none",
+                    color:
+                      selectedTier === "skip"
+                        ? "var(--indigo-300)"
+                        : "var(--text-muted)",
+                    fontSize: "var(--text-sm)",
+                    cursor: "pointer",
+                    padding: "var(--space-2) 0",
+                    textDecoration:
+                      selectedTier === "skip" ? "underline" : "none",
+                  }}
+                >
+                  Skip — run as a verifier only (no inference earnings)
+                </button>
+
+                <div className="onboarding-actions">
+                  <button className="btn btn-ghost" onClick={back}>
+                    Back
+                  </button>
+                  <button
+                    className="btn btn-primary"
+                    onClick={next}
+                    disabled={!selectedTier}
+                    data-testid="btn-continue-model"
+                  >
+                    Continue <ArrowRight size={16} />
+                  </button>
+                </div>
+              </div>
+            )}
+
             {step === "launch" && (
               <div data-testid="step-launch" style={{ textAlign: "center" }}>
                 <div
@@ -426,29 +674,79 @@ export function Onboarding() {
                 </div>
                 <h1 className="onboarding-title">
                   {!launching
-                    ? "ready to join"
-                    : launchStage === "downloading"
-                      ? "downloading arc-node"
-                      : launchStage === "starting"
-                        ? "starting your node"
-                        : launchStage === "connecting"
-                          ? "joining the network"
-                          : launchStage === "claiming"
-                            ? "claiming welcome tokens"
-                            : "finishing up"}
+                    ? "Ready to join"
+                    : launchStage === "model"
+                      ? "Downloading model"
+                      : launchStage === "downloading"
+                        ? "Downloading arc-node"
+                        : launchStage === "starting"
+                          ? "Starting your node"
+                          : launchStage === "connecting"
+                            ? "Joining the network"
+                            : launchStage === "claiming"
+                              ? "Claiming welcome tokens"
+                              : "Finishing up"}
                 </h1>
                 <p className="onboarding-subtitle">
                   {!launching &&
-                    "We'll download the node binary, start it, and drop some testnet ARC into your wallet."}
-                  {launching && launchStage === "downloading" &&
-                    "Fetching the latest arc-node for your platform. ~45 MB, one-time."}
-                  {launching && launchStage === "starting" &&
+                    "We'll fetch the model, download the node binary, start it, and drop testnet ARC into your wallet."}
+                  {launching && launchStage === "model" && modelProgress && (
+                    <>
+                      {formatBytes(modelProgress.downloadedBytes)} of{" "}
+                      {formatBytes(modelProgress.totalBytes)} (
+                      {modelProgress.totalBytes > 0
+                        ? Math.floor(
+                            (modelProgress.downloadedBytes /
+                              modelProgress.totalBytes) *
+                              100,
+                          )
+                        : 0}
+                      %) — Hugging Face is fast, this is the bulk of the wait.
+                    </>
+                  )}
+                  {launching &&
+                    launchStage === "model" &&
+                    !modelProgress &&
+                    "Connecting to Hugging Face mirror..."}
+                  {launching &&
+                    launchStage === "downloading" &&
+                    "Fetching the latest arc-node for your platform. ~45 MB."}
+                  {launching &&
+                    launchStage === "starting" &&
                     "Launching your local node."}
-                  {launching && launchStage === "connecting" &&
+                  {launching &&
+                    launchStage === "connecting" &&
                     "Waiting for peers - usually takes a few seconds."}
-                  {launching && launchStage === "claiming" &&
+                  {launching &&
+                    launchStage === "claiming" &&
                     "Asking the testnet faucet for your starter balance."}
                 </p>
+
+                {launching && launchStage === "model" && modelProgress && (
+                  <div
+                    style={{
+                      width: "100%",
+                      height: 8,
+                      borderRadius: 4,
+                      background: "var(--surface)",
+                      border: "1px solid var(--border)",
+                      overflow: "hidden",
+                      margin: "var(--space-4) 0",
+                    }}
+                  >
+                    <div
+                      style={{
+                        width:
+                          modelProgress.totalBytes > 0
+                            ? `${Math.min(100, (modelProgress.downloadedBytes / modelProgress.totalBytes) * 100)}%`
+                            : "0%",
+                        height: "100%",
+                        background: "var(--arc-gradient)",
+                        transition: "width 0.25s linear",
+                      }}
+                    />
+                  </div>
+                )}
 
                 {launchError && (
                   <div
@@ -466,7 +764,12 @@ export function Onboarding() {
                     <div style={{ fontWeight: 600, marginBottom: 4 }}>
                       Couldn't start arc-node
                     </div>
-                    <div style={{ color: "var(--text-muted)", whiteSpace: "pre-wrap" }}>
+                    <div
+                      style={{
+                        color: "var(--text-muted)",
+                        whiteSpace: "pre-wrap",
+                      }}
+                    >
                       {launchError}
                     </div>
                   </div>
@@ -501,12 +804,12 @@ export function Onboarding() {
 }
 
 // Poll node_status until we're "online" — either the local node has joined
-// P2P (peers ≥ 1) or a public seed coordinator's /health is reachable. The
-// coordinator path matters because most consumer ISPs silently drop outbound
-// UDP on non-standard ports, killing our QUIC handshake to seed UDP 9091; we
-// don't want those users stranded at "offline" when they can fully use the
-// chain over HTTPS RPC. Returns true on either success path.
-async function waitForPeer({ timeoutMs }: { timeoutMs: number }): Promise<boolean> {
+// P2P (peers ≥ 1) or a public seed coordinator's /health is reachable.
+async function waitForPeer({
+  timeoutMs,
+}: {
+  timeoutMs: number;
+}): Promise<boolean> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     try {

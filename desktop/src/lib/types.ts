@@ -155,3 +155,24 @@ export interface BinaryStatus {
   /** True when the binary was already present - nothing was fetched. */
   alreadyInstalled: boolean;
 }
+
+/** A model tier the desktop will auto-download from a stable HF mirror. */
+export interface ModelTierInfo {
+  /** Stable id used everywhere (`tiny` | `standard` | `big`). */
+  id: string;
+  /** Human label e.g. "Llama-2 7B Chat (Q4_K_M)". */
+  displayName: string;
+  /** Size on disk after download. */
+  sizeBytes: number;
+  /** HF resolve URL the desktop streams from. */
+  url: string;
+}
+
+/** Streamed event emitted on the `model-download-progress` channel during
+ *  an active model download. `done = true` is the terminal event. */
+export interface ModelDownloadProgress {
+  tier: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  done: boolean;
+}
