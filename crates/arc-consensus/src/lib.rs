@@ -1182,8 +1182,14 @@ impl ConsensusEngine {
         // Cap round jumps to prevent a malicious peer from sending round=u64::MAX
         // which would stall the node (huge prune computation, stuck at max round).
         // 1M allows ~46 hours of partition healing at 6 rounds/sec.
+        //
+        // Exception: when current == 0 we're a brand-new node booting against
+        // a long-running network. The max-jump check would reject every
+        // catch-up block from peers at round N>1M, leaving the new node
+        // permanently isolated. v0.7.0: trust the first peer's round when
+        // current == 0; subsequent blocks are bounded normally.
         const MAX_ROUND_JUMP: u64 = 1_000_000;
-        if block.round > current + MAX_ROUND_JUMP {
+        if current > 0 && block.round > current + MAX_ROUND_JUMP {
             return Err(ConsensusError::InvalidBlock(
                 format!("round {} is too far ahead (current={}, max jump={})", block.round, current, MAX_ROUND_JUMP)
             ));
@@ -4027,6 +4033,106 @@ mod tests {
 
         engine.set_node_role(NodeRole::Full);
         assert_eq!(engine.node_role(), NodeRole::Full);
+    }
+
+    // ── v0.7.0: fresh-boot catch-up tests ──────────────────────────────
+    //
+    // Pre-v0.7 a fresh node booting against a long-running network was
+    // permanently isolated by the max-jump cap (any block at round >1M
+    // got rejected when current_round=0). v0.7.0 lifts the cap when
+    // current==0 so the node can fast-forward; tests pin both halves
+    // of the contract.
+
+    #[test]
+    fn fresh_boot_accepts_far_ahead_block_when_current_is_zero() {
+        // Engine at round 0, peer offers block at round 5_000_000 (>1M).
+        // Pre-v0.7: rejected with "too far ahead". v0.7.0: accepted, engine
+        // fast-forwards.
+        let validators = vec![
+            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
+            Validator::new(test_addr(2), STAKE_ARC, 1).unwrap(),
+        ];
+        let vs = ValidatorSet::new(validators, 1);
+        // testnet mode relaxes the parent-quorum check so an empty-parents
+        // catch-up block from a peer doesn't trip InsufficientParents.
+        // Production seeds run with this enabled (cli.testnet_mode=true);
+        // tests need it for the same reason.
+        let engine = ConsensusEngine::new_testnet(vs, test_addr(1));
+
+        let block = make_block(
+            test_addr(2),
+            5_000_000,
+            vec![],
+            vec![],
+            1_700_000_000_000,
+        );
+        let result = engine.receive_block(&block);
+        assert!(
+            result.is_ok(),
+            "fresh-boot node must accept far-ahead block; got {:?}",
+            result
+        );
+        // Engine fast-forwards to block.round - 1 (so the just-received
+        // block lands at "current+1 = block.round"). Check we got close.
+        let after = engine.current_round();
+        assert!(
+            after >= 4_999_999 && after <= 5_000_000,
+            "engine should be at the peer's round (~5_000_000); got {after}"
+        );
+    }
+
+    #[test]
+    fn established_node_rejects_block_beyond_max_jump() {
+        // Same scenario but engine already has current_round > 0. The
+        // protective max-jump cap stays in effect: a malicious peer
+        // can't lie about round=u64::MAX and pin us there.
+        let validators = vec![
+            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
+            Validator::new(test_addr(2), STAKE_ARC, 1).unwrap(),
+        ];
+        let vs = ValidatorSet::new(validators, 1);
+        let engine = ConsensusEngine::new(vs, test_addr(1));
+        engine.set_initial_round(100, 0); // established, current=100
+
+        let block = make_block(
+            test_addr(2),
+            10_000_000, // jump = 9_999_900 > 1M cap
+            vec![],
+            vec![],
+            1_700_000_000_000,
+        );
+        let result = engine.receive_block(&block);
+        assert!(
+            result.is_err(),
+            "established node must reject too-far-ahead block; got {:?}",
+            result
+        );
+        match result {
+            Err(ConsensusError::InvalidBlock(msg)) => {
+                assert!(
+                    msg.contains("too far ahead"),
+                    "expected 'too far ahead' error, got: {msg}"
+                );
+            }
+            _ => panic!("expected InvalidBlock"),
+        }
+    }
+
+    #[test]
+    fn set_initial_round_idempotent_when_lower() {
+        // set_initial_round(N) when current >= N is a no-op. Prevents a
+        // stale dag-wal segment from clobbering an in-memory advance.
+        let validators = vec![
+            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
+        ];
+        let vs = ValidatorSet::new(validators, 1);
+        let engine = ConsensusEngine::new(vs, test_addr(1));
+        engine.set_initial_round(500, 400);
+        assert_eq!(engine.current_round(), 500);
+
+        // Try to "rewind" to 100 — should be ignored.
+        engine.set_initial_round(100, 50);
+        assert_eq!(engine.current_round(), 500, "set_initial_round must not rewind");
     }
 
     #[test]

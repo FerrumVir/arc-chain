@@ -574,6 +574,54 @@ pub fn read_wal_dir(dir: impl AsRef<Path>) -> Vec<WalEntry> {
     all_entries
 }
 
+/// Find the highest `block_height` recorded in any WAL segment under `dir`.
+///
+/// Reads only the most recent segment (segments are append-only, sorted by
+/// segment number, and rotation only happens when the previous segment is
+/// full — so the highest block_height is always in the last one). This is
+/// the dag-wal recovery primitive: at boot, find where we left off, hand
+/// that round number to consensus.set_initial_round, resume mid-stream.
+///
+/// Returns 0 if `dir` is empty, missing, or contains no parseable entries.
+/// Bounded memory: reads at most one segment (default 64 MB).
+pub fn latest_block_height_in_wal_dir(dir: impl AsRef<Path>) -> u64 {
+    // Inline the same segment listing logic as WalWriter::list_segments —
+    // we can't call the private helper from this free function.
+    let mut segments: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir.as_ref()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if name.starts_with("wal-") && name.ends_with(".bin") {
+                    segments.push(path);
+                }
+            }
+        }
+    }
+    segments.sort();
+
+    // Walk segments newest-to-oldest and return the first non-zero max we
+    // find. Rotation creates a new empty segment after the previous one
+    // fills, so the very last segment can legitimately be empty — without
+    // this fallback we'd return 0 and miss the recovery.
+    //
+    // Bound the scan to the last 3 segments (≤192 MB at default 64 MB
+    // segment size) so we never read the full multi-GB history just to
+    // find a round number.
+    const MAX_SEGMENTS_TO_SCAN: usize = 3;
+    let scan_count = segments.len().min(MAX_SEGMENTS_TO_SCAN);
+    for seg in segments.iter().rev().take(scan_count) {
+        let max = read_wal(seg)
+            .into_iter()
+            .map(|e| e.block_height)
+            .max();
+        if let Some(h) = max {
+            return h;
+        }
+    }
+    0
+}
+
 /// Read WAL entries starting from a given sequence number (for replay after snapshot).
 pub fn read_wal_from(path: impl AsRef<Path>, from_sequence: u64) -> Vec<WalEntry> {
     read_wal(path)
@@ -1118,6 +1166,77 @@ mod tests {
             );
         }
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ── v0.7.0 dag-wal recovery helper tests ───────────────────────────
+
+    #[test]
+    fn latest_block_height_returns_zero_for_missing_dir() {
+        let dir = std::env::temp_dir().join("arc-wal-tests-missing-xyz");
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(latest_block_height_in_wal_dir(&dir), 0);
+    }
+
+    #[test]
+    fn latest_block_height_returns_zero_for_empty_dir() {
+        let dir = tmp_dir("latest_empty");
+        assert_eq!(latest_block_height_in_wal_dir(&dir), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_block_height_returns_max_in_latest_segment() {
+        let dir = tmp_dir("latest_height");
+        // Force tiny segments so we span multiple files. Append entries with
+        // increasing block_height and ensure latest_block_height_in_wal_dir
+        // returns the max.
+        {
+            let writer = WalWriter::with_segments(&dir, 1024).expect("create");
+            for h in 0u64..200 {
+                writer.append(
+                    WalOp::Checkpoint(Hash256::ZERO),
+                    h,
+                );
+            }
+            writer.sync();
+            // Drop the writer so the bg thread flushes before we read.
+            drop(writer);
+        }
+        // Latest segment has the largest block_height. With tiny segments
+        // and rotation-on-overflow, the auto-rotated final segment may be
+        // empty (rotation happens AFTER the final write that filled the
+        // segment lands in the previous one). So we read the latest
+        // NON-EMPTY segment by walking backward — which the helper does
+        // by virtue of taking max() over read_wal of the latest file (or
+        // returning 0 and falling back is acceptable too). Either way the
+        // helper should produce the actual max we wrote.
+        //
+        // For this test we relax the assertion: the helper must return
+        // SOME value > 0 (proving it read something), and that value must
+        // be ≤ 199 (the max we ever wrote). Detecting "exactly 199" relies
+        // on rotation timing which is implementation-defined.
+        let latest = latest_block_height_in_wal_dir(&dir);
+        assert_eq!(
+            latest, 199,
+            "helper must find max round even when newest segment is the empty post-rotation file"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn latest_block_height_handles_unsorted_entries_within_segment() {
+        // Write entries in non-monotonic order; helper still finds the max.
+        let dir = tmp_dir("latest_unsorted");
+        {
+            let writer = WalWriter::with_segments(&dir, 64 * 1024 * 1024).expect("create");
+            writer.append(WalOp::Checkpoint(Hash256::ZERO), 100);
+            writer.append(WalOp::Checkpoint(Hash256::ZERO), 50);
+            writer.append(WalOp::Checkpoint(Hash256::ZERO), 999);
+            writer.append(WalOp::Checkpoint(Hash256::ZERO), 12);
+            writer.sync();
+        }
+        assert_eq!(latest_block_height_in_wal_dir(&dir), 999);
         let _ = fs::remove_dir_all(&dir);
     }
 }

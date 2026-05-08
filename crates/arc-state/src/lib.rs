@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
-pub use wal::{WalWriter, WalOp, WalEntry, Snapshot, PersistenceConfig, read_wal, read_wal_dir, find_last_checkpoint};
+pub use wal::{WalWriter, WalOp, WalEntry, Snapshot, PersistenceConfig, read_wal, read_wal_dir, find_last_checkpoint, latest_block_height_in_wal_dir};
 
 #[derive(Error, Debug)]
 pub enum StateError {

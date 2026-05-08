@@ -818,6 +818,45 @@ async fn main() -> Result<()> {
     // DAG persistence WAL - survives restarts
     let dag_wal_path = format!("{}/dag-wal", data_dir);
     std::fs::create_dir_all(&dag_wal_path).ok();
+
+    // ── v0.7.0: DAG WAL recovery on boot ────────────────────────────────
+    //
+    // Pre-v0.7 the dag-wal was write-only: every block.proposed and every
+    // block.received called wal.append, but nothing ever read those
+    // segments back at startup. The seed boots, sees `current_round = 0`,
+    // and any block from a peer at round=N gets rejected as "too far
+    // ahead" once N > 1M. NYC hit this on the v0.7.0 upgrade attempt:
+    // 76 segments of accumulated DAG history sat on disk, ignored.
+    //
+    // The fix: scan dag-wal/ for the highest block_height we've ever
+    // persisted. That's the round we WERE at the moment we crashed/
+    // shutdown. Hand it to consensus.set_initial_round so the engine
+    // resumes from there instead of fighting peers about it.
+    //
+    // We don't replay block contents — peers will re-deliver any DAG
+    // blocks we still need on the normal consensus path. We only need
+    // the round number to skip the max-jump rejection.
+    // Bounded read: scans only the latest segment (≤64 MB), not every
+    // segment. NYC's dag-wal is 5 GB+ and growing; reading the whole
+    // history at boot would balloon memory and slow startup minutes.
+    let recovered_round = arc_state::latest_block_height_in_wal_dir(&dag_wal_path);
+    if recovered_round > 0 {
+        // committed lags round by PRUNE_DEPTH (100) under the consensus
+        // engine's normal pruning rule; saturating_sub keeps it sane on
+        // tiny round numbers.
+        let recovered_committed = recovered_round.saturating_sub(100);
+        consensus
+            .engine
+            .set_initial_round(recovered_round, recovered_committed);
+        tracing::info!(
+            recovered_round,
+            recovered_committed,
+            "DAG WAL recovered from disk - resuming consensus mid-stream"
+        );
+    } else {
+        tracing::info!("DAG WAL is empty - starting fresh from round 0");
+    }
+
     if let Ok(dag_wal) = arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
         consensus.dag_wal = Some(Arc::new(dag_wal));
         tracing::info!("DAG persistence WAL enabled: {}", dag_wal_path);
