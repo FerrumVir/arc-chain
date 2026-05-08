@@ -103,6 +103,12 @@ export interface FaucetResult {
   message: string;
 }
 
+export interface ResetPeerStateResult {
+  removedPath: string;
+  wasPresent: boolean;
+  message: string;
+}
+
 export interface InferenceConsensus {
   k: number;
   votesTotal: number;

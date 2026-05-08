@@ -17,6 +17,7 @@ import type {
   NodeConfig,
   NodeStatus,
   PaidInferenceResult,
+  ResetPeerStateResult,
 } from "./types";
 
 const IS_TAURI =
@@ -216,6 +217,12 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "stop_node":
     case "restart_node":
       return undefined as T;
+    case "reset_peer_state":
+      return {
+        removedPath: "/mock/.arc/data/known_peers.json",
+        wasPresent: true,
+        message: "Cleared cached peer list. Rebootstrapping from testnet seeds.",
+      } as T;
     case "fetch_balance": {
       // Identity address is stored in localStorage zustand under `arc-desktop-state-v1`.
       const stored = localStorage.getItem("arc-desktop-state-v1");
@@ -571,6 +578,13 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "restart_node":
       mockStartedAt = Date.now();
       return undefined as T;
+    case "reset_peer_state":
+      mockStartedAt = Date.now();
+      return {
+        removedPath: "/mock/.arc/data/known_peers.json",
+        wasPresent: true,
+        message: "Cleared cached peer list. Rebootstrapping from testnet seeds.",
+      } as T;
     case "fetch_earnings": {
       if (mockStartedAt) {
         const elapsed = (Date.now() - mockStartedAt) / 1000;
@@ -760,6 +774,7 @@ export const api = {
   startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
   stopNode: () => invoke<void>("stop_node"),
   restartNode: () => invoke<void>("restart_node"),
+  resetPeerState: () => invoke<ResetPeerStateResult>("reset_peer_state"),
   nodeStatus: () => invoke<NodeStatus>("node_status"),
   fetchEarnings: () => invoke<Earnings>("fetch_earnings"),
   fetchAttestations: (limit = 20) =>

@@ -105,6 +105,17 @@ export function Dashboard() {
     },
   });
 
+  // Wipes <data_dir>/known_peers.json and restarts the node. Most common
+  // cause of "I had peers, then I restarted, now I'm stuck" is a stale
+  // peer cache pinning to dead seeds. After wiping, the node falls back
+  // to the bundled testnet seeds and re-bootstraps cleanly.
+  const resetPeersMutation = useMutation({
+    mutationFn: () => api.resetPeerState(),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["status"] });
+    },
+  });
+
   const running = !!status?.running;
   const isExternal = running && status?.pid == null;
   const isCrashed =
@@ -178,14 +189,55 @@ export function Dashboard() {
           data-testid="lite-mode-banner"
           role="status"
         >
-          <strong>Lite mode</strong> — your local arc-node couldn&rsquo;t bind
-          UDP&nbsp;9091 (often Windows&rsquo; Hyper-V port reservations) or
-          can&rsquo;t reach P2P seeds. v0.6.0+ falls back to an OS-assigned
-          UDP port automatically; if you&rsquo;re still seeing this banner
-          after restarting, the app is talking to the chain through a public
-          coordinator ({coordinatorLabel(status.coordinatorUrl)}). Faucet,
-          send, and inference still work; only your local node isn&rsquo;t
-          earning peer rewards yet.
+          <strong>Client mode</strong> — your node has 0 peers, so the app is
+          using the public network through{" "}
+          {coordinatorLabel(status.coordinatorUrl)}. You can faucet, send, and
+          run inference, but{" "}
+          <strong>you won&rsquo;t earn ARC until you have at least one peer</strong>.
+          The most common cause is a stale peer cache from a prior session
+          pinning to seeds that have rotated.
+          <div
+            style={{
+              marginTop: "var(--space-3)",
+              display: "flex",
+              gap: "var(--space-3)",
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
+            <button
+              type="button"
+              className="btn-secondary"
+              data-testid="reset-peer-state-btn"
+              onClick={() => resetPeersMutation.mutate()}
+              disabled={resetPeersMutation.isPending}
+            >
+              {resetPeersMutation.isPending
+                ? "Resetting…"
+                : "Reset peer state & rebootstrap"}
+            </button>
+            {resetPeersMutation.data && (
+              <span
+                style={{
+                  color: "var(--text-muted)",
+                  fontSize: "var(--text-sm)",
+                }}
+                data-testid="reset-peer-state-result"
+              >
+                {resetPeersMutation.data.message}
+              </span>
+            )}
+            {resetPeersMutation.error && (
+              <span
+                style={{
+                  color: "var(--danger)",
+                  fontSize: "var(--text-sm)",
+                }}
+              >
+                {String(resetPeersMutation.error)}
+              </span>
+            )}
+          </div>
         </div>
       )}
 

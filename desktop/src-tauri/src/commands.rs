@@ -156,6 +156,60 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
         .map_err(map_err)
 }
 
+/// Stops the node, wipes the cached peer dial list (`known_peers.json` in
+/// the data directory), and restarts. This is the recovery button for
+/// "I had peers, then I restarted, now I'm stuck at 0 peers / Lite
+/// mode" — the most common cause is a stale peer cache pinning to dead
+/// or unreachable seeds. After wiping, the node falls back to the
+/// bundled testnet-seeds.txt and re-bootstraps.
+///
+/// All other state (WAL, blocks, identity, config) is preserved. Only
+/// the peer dial cache is removed.
+#[tauri::command]
+pub async fn reset_peer_state(app: AppHandle, state: State<'_, AppState>) -> CmdResult<ResetPeerStateResult> {
+    use std::path::PathBuf;
+
+    // Resolve the data dir the same way node_manager does
+    let cfg = {
+        let store = state.store.lock().await;
+        store.config.clone().unwrap_or_default()
+    };
+    let data_dir: PathBuf = if let Some(rest) = cfg.data_dir.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        home.join(rest)
+    } else {
+        PathBuf::from(&cfg.data_dir)
+    };
+    let peers_path = data_dir.join("known_peers.json");
+
+    // Stop first so the node isn't holding the file open or racing on writes.
+    {
+        let mut node = state.node.lock().await;
+        let _ = node.stop().await;
+    }
+
+    let removed = match std::fs::remove_file(&peers_path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(format!("failed to remove {}: {}", peers_path.display(), e)),
+    };
+
+    // Restart. Reuses restart_node's plumbing.
+    restart_node(app, state).await?;
+
+    Ok(ResetPeerStateResult {
+        removed_path: peers_path.display().to_string(),
+        was_present: removed,
+        message: if removed {
+            "Cleared cached peer list. Rebootstrapping from testnet seeds.".into()
+        } else {
+            "No cached peer file existed. Restarted with the bundled seeds.".into()
+        },
+    })
+}
+
 #[tauri::command]
 pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     let (port, pid, address, crash) = {

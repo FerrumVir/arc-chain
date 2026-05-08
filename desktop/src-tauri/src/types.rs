@@ -219,6 +219,19 @@ pub struct ModelDownloadProgress {
     pub done: bool,
 }
 
+/// Result of `reset_peer_state` — wipes `<data_dir>/known_peers.json`
+/// and restarts the node so it bootstraps from the bundled testnet
+/// seed list. The dashboard surfaces `message` as a toast and
+/// `was_present` to distinguish "we cleaned up stale state" from "the
+/// problem wasn't a stale peer cache."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResetPeerStateResult {
+    pub removed_path: String,
+    pub was_present: bool,
+    pub message: String,
+}
+
 /// Milestone B (#36): paid-inference response - carries the InferenceResult
 /// fields plus the on-chain receipts (open tx hash, release tx hash, the
 /// payer's address, the max_fee that was escrowed).

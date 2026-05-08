@@ -133,6 +133,7 @@ pub fn run() {
             commands::start_node,
             commands::stop_node,
             commands::restart_node,
+            commands::reset_peer_state,
             commands::node_status,
             commands::fetch_earnings,
             commands::fetch_attestations,
