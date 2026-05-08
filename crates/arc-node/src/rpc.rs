@@ -5913,6 +5913,15 @@ pub struct WorkResult {
     /// Optional error message when success=false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Hex-encoded `bincode(arc_types::Transaction)` of the worker-signed
+    /// InferenceAttestation (tx 0x16) for this completion. Lets the seed
+    /// post the attestation on-chain with `from = worker_address`, so
+    /// rewards accrue to the worker who actually did the work — not the
+    /// seed that routed the request. Optional during the v0.7.0
+    /// transition; pre-v0.7 workers don't send it, and the seed accepts
+    /// the submit anyway (just no on-chain record).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_attestation_hex: Option<String>,
 }
 
 fn default_true() -> bool { true }
@@ -6098,6 +6107,76 @@ pub async fn community_submit_work(
         }
     }
 
+    // ── Post the worker-signed InferenceAttestation on-chain ────────────
+    //
+    // The worker built and signed an `arc_types::Transaction` with
+    // `tx_type = InferenceAttestation`, `from = worker_address`, and
+    // bond + model_id + input/output hashes. We deserialize, verify the
+    // signature, and insert into our local mempool. From there the
+    // chain's normal consensus + state-execute pipeline applies it,
+    // crediting the worker on-chain.
+    //
+    // This is the missing piece that turns "0 attestations forever"
+    // into real ARC. Pre-v0.7 workers won't send this field; we accept
+    // their submit anyway (just no on-chain record) so the rolling
+    // upgrade doesn't strand them.
+    let mut attestation_outcome: Option<serde_json::Value> = None;
+    if result.success {
+        if let Some(hex_bytes) = result.signed_attestation_hex.as_ref() {
+            match decode_and_verify_worker_attestation(hex_bytes, &result.worker_id) {
+                Ok(tx) => {
+                    let tx_hash_hex = format!("0x{}", hex::encode(&tx.hash.0));
+                    let tx_from_hex = format!("0x{}", hex::encode(&tx.from.0));
+                    match node.mempool.insert(tx) {
+                        Ok(_) => {
+                            tracing::info!(
+                                tx_hash = %tx_hash_hex,
+                                worker = %tx_from_hex,
+                                "worker-signed attestation accepted into mempool"
+                            );
+                            attestation_outcome = Some(json!({
+                                "status": "submitted_to_mempool",
+                                "tx_hash": tx_hash_hex,
+                                "from": tx_from_hex,
+                            }));
+                        }
+                        Err(e) => {
+                            // Don't fail the submit — the worker did their
+                            // job. Just record that the chain rejected the
+                            // attestation tx (e.g. duplicate nonce, low
+                            // balance for bond) so the worker can react.
+                            tracing::warn!(
+                                worker = %result.worker_id,
+                                error = ?e,
+                                "worker attestation rejected by mempool"
+                            );
+                            attestation_outcome = Some(json!({
+                                "status": "rejected",
+                                "error": format!("{:?}", e),
+                            }));
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        worker = %result.worker_id,
+                        error = %e,
+                        "worker attestation signature/decode failed"
+                    );
+                    attestation_outcome = Some(json!({
+                        "status": "invalid",
+                        "error": e,
+                    }));
+                }
+            }
+        } else {
+            attestation_outcome = Some(json!({
+                "status": "missing",
+                "reason": "worker did not include signed_attestation_hex",
+            }));
+        }
+    }
+
     // ── Deliver result to the coordinator via the oneshot ────────────────
     let results_map = node.community_work_results.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -6113,6 +6192,7 @@ pub async fn community_submit_work(
                 Ok(()) => Ok(Json(json!({
                     "ok": true,
                     "job_id": job_id,
+                    "attestation": attestation_outcome,
                 }))),
                 Err(_) => {
                     // Receiver dropped - dispatcher timed out
@@ -6134,6 +6214,51 @@ pub async fn community_submit_work(
             ),
         )),
     }
+}
+
+/// Decode the worker-signed `InferenceAttestation` Transaction submitted
+/// alongside a WorkResult, verify its signature, and check that
+/// `tx.from` matches the claimed `worker_id`. Returns the verified tx
+/// ready for `mempool.insert`.
+///
+/// Errors as a string so submit_work can surface the diagnostic to the
+/// worker without picking a single error type.
+fn decode_and_verify_worker_attestation(
+    hex_bytes: &str,
+    expected_worker_id: &str,
+) -> Result<arc_types::Transaction, String> {
+    // Strip optional "0x" prefix so workers can encode either way.
+    let trimmed = hex_bytes.trim_start_matches("0x");
+    let raw = hex::decode(trimmed)
+        .map_err(|e| format!("hex decode failed: {}", e))?;
+    let tx: arc_types::Transaction = bincode::deserialize(&raw)
+        .map_err(|e| format!("bincode deserialize failed: {}", e))?;
+
+    if tx.tx_type != arc_types::TxType::InferenceAttestation {
+        return Err(format!(
+            "expected InferenceAttestation tx, got {:?}",
+            tx.tx_type
+        ));
+    }
+
+    // The worker signs as `from = their validator_address`. The claim
+    // submission's worker_id is the hex of that address. Reject mismatches
+    // outright so a worker can't submit on someone else's behalf.
+    let claim_address = expected_worker_id
+        .trim_start_matches("0x")
+        .to_string();
+    let tx_from_hex = hex::encode(&tx.from.0);
+    if claim_address != tx_from_hex {
+        return Err(format!(
+            "tx.from ({}) does not match worker_id ({})",
+            tx_from_hex, claim_address
+        ));
+    }
+
+    tx.verify_signature()
+        .map_err(|e| format!("signature verify failed: {:?}", e))?;
+
+    Ok(tx)
 }
 
 // ─── Multi-Model Registry ──────────────────────────────────────────────────
@@ -6999,6 +7124,7 @@ mod tests {
                     ms_per_token: 50,
                     engine: "INT8 integer (community worker)".into(),
                     error: None,
+                    signed_attestation_hex: None,
                 });
             }
         });
@@ -7035,6 +7161,7 @@ mod tests {
                     ms_per_token: 0,
                     engine: String::new(),
                     error: Some("model not loaded on worker".into()),
+                    signed_attestation_hex: None,
                 });
             }
         });
@@ -7061,5 +7188,106 @@ mod tests {
             err.contains("not wired"),
             "expected 'not wired' error, got: {err}"
         );
+    }
+
+    // ── Task 3: worker-signed attestation tests ─────────────────────────
+
+    use arc_crypto::KeyPair;
+    use arc_types::{Transaction, TxBody, TxType, transaction::InferenceAttestationBody};
+
+    fn sign_attestation_for(keypair: &KeyPair, nonce: u64, bond: u64) -> (Transaction, String) {
+        let mut tx = Transaction {
+            tx_type: TxType::InferenceAttestation,
+            from: keypair.address(),
+            nonce,
+            body: TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id: arc_crypto::hash_bytes(b"arc-test-model"),
+                input_hash: arc_crypto::hash_bytes(b"hello"),
+                output_hash: arc_crypto::hash_bytes(b"world"),
+                challenge_period: 100,
+                bond,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: arc_crypto::Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        tx.sign(keypair).expect("sign ok");
+        let bytes = bincode::serialize(&tx).expect("serialize ok");
+        let hex_s = format!("0x{}", hex::encode(bytes));
+        (tx, hex_s)
+    }
+
+    #[test]
+    fn decode_and_verify_accepts_worker_signed_attestation() {
+        let kp = KeyPair::generate_ed25519();
+        let (orig, hex_s) = sign_attestation_for(&kp, 0, 0);
+        let worker_id = format!("0x{}", hex::encode(&kp.address().0));
+        let got = decode_and_verify_worker_attestation(&hex_s, &worker_id)
+            .expect("verify ok");
+        assert_eq!(got.hash, orig.hash, "hash should round-trip exactly");
+        assert_eq!(got.tx_type, TxType::InferenceAttestation);
+    }
+
+    #[test]
+    fn decode_strips_optional_0x_prefix() {
+        let kp = KeyPair::generate_ed25519();
+        let (_, hex_with_0x) = sign_attestation_for(&kp, 0, 0);
+        let bare = hex_with_0x.trim_start_matches("0x").to_string();
+        let worker_id = hex::encode(&kp.address().0); // no 0x
+        decode_and_verify_worker_attestation(&bare, &worker_id)
+            .expect("bare hex + bare worker_id should work");
+    }
+
+    #[test]
+    fn decode_rejects_worker_id_mismatch() {
+        let kp_a = KeyPair::generate_ed25519();
+        let kp_b = KeyPair::generate_ed25519();
+        let (_, hex_s) = sign_attestation_for(&kp_a, 0, 0);
+        // Submit kp_a's signed tx but claim to be kp_b
+        let worker_id_b = format!("0x{}", hex::encode(&kp_b.address().0));
+        let err = decode_and_verify_worker_attestation(&hex_s, &worker_id_b)
+            .expect_err("must reject worker_id mismatch");
+        assert!(err.contains("does not match worker_id"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_rejects_wrong_tx_type() {
+        // Build a Transfer tx (not an InferenceAttestation) and try to
+        // submit it as an attestation.
+        let kp = KeyPair::generate_ed25519();
+        let mut tx = Transaction::new_transfer(kp.address(), kp.address(), 1, 0);
+        tx.sign(&kp).unwrap();
+        let bytes = bincode::serialize(&tx).unwrap();
+        let hex_s = format!("0x{}", hex::encode(bytes));
+        let worker_id = format!("0x{}", hex::encode(&kp.address().0));
+        let err = decode_and_verify_worker_attestation(&hex_s, &worker_id)
+            .expect_err("must reject non-attestation tx");
+        assert!(err.contains("expected InferenceAttestation"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_rejects_tampered_signature() {
+        let kp = KeyPair::generate_ed25519();
+        let (mut tx, _) = sign_attestation_for(&kp, 0, 0);
+
+        // Mutate the body without re-signing — the hash + sig now mismatch.
+        if let TxBody::InferenceAttestation(ref mut body) = tx.body {
+            body.bond = 999;
+        }
+        let bytes = bincode::serialize(&tx).unwrap();
+        let hex_s = format!("0x{}", hex::encode(bytes));
+        let worker_id = format!("0x{}", hex::encode(&kp.address().0));
+        let err = decode_and_verify_worker_attestation(&hex_s, &worker_id)
+            .expect_err("tampered tx must fail signature verification");
+        assert!(err.contains("signature verify failed"), "got: {err}");
+    }
+
+    #[test]
+    fn decode_rejects_garbage_hex() {
+        let err = decode_and_verify_worker_attestation("zz not hex", "0xab")
+            .expect_err("hex decode must fail");
+        assert!(err.contains("hex decode"), "got: {err}");
     }
 }

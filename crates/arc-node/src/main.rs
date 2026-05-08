@@ -811,7 +811,7 @@ async fn main() -> Result<()> {
     let dag_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let mut consensus =
-        ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &peer_vals, validator_keypair);
+        ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &peer_vals, validator_keypair.clone());
     consensus.dag_validators = Some(dag_validators.clone());
     consensus.dag_round = Some(dag_round.clone());
     consensus.dag_committed = Some(dag_committed.clone());
@@ -1242,6 +1242,22 @@ async fn main() -> Result<()> {
         if let Some(model) = inference_model.clone() {
             let worker_id_w = worker_id.clone();
             let seed_rpc_addrs_w = seed_rpc_addrs.clone();
+            // Worker keypair + address for signing InferenceAttestation txs
+            // (v0.7.0). On every successful submit we build a signed
+            // tx with `from = worker_address` so on-chain rewards accrue
+            // to the worker who actually did the work.
+            let worker_keypair = validator_keypair.clone();
+            let worker_address = validator_address;
+            // Per-process attestation nonce. Initialized on first submit
+            // by querying the chain for the worker's current account
+            // nonce (see init-from-chain block inside the loop), then
+            // incremented locally per attestation. If a future submit
+            // is rejected with InvalidNonce we re-query and reset.
+            let attestation_nonce =
+                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let attestation_nonce_initialized =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 let client = match reqwest::Client::builder()
@@ -1250,39 +1266,55 @@ async fn main() -> Result<()> {
                     Ok(c) => c,
                     Err(_) => return,
                 };
-                tracing::info!("Community inference worker started - polling for jobs");
+                tracing::info!(
+                    address = %format!("0x{}", hex::encode(&worker_address.0)),
+                    "Community inference worker started - polling for jobs"
+                );
                 loop {
-                    // Try each seed's gateway for work
+                    // Try each seed: prefer the v0.7.0+ arc-node queue on
+                    // port 9090; fall back to the legacy Python gateway on
+                    // port 3001 for seeds that haven't upgraded yet.
                     for addr in &seed_rpc_addrs_w {
                         let host = addr.split(':').next().unwrap_or(addr);
-                        let gateway = format!("{}:3001", host);
+                        let primary = addr.clone(); // host:9090 (new arc-node)
+                        let legacy = format!("{}:3001", host); // python gateway
                         let claim_body = serde_json::json!({
                             "worker_id": worker_id_w,
                             "capabilities": ["inference"],
                         });
-                        let resp = match client
-                            .post(format!("http://{}/community/claim_work", gateway))
-                            .json(&claim_body)
-                            .send()
-                            .await
-                        {
-                            Ok(r) => r,
-                            Err(_) => continue,
+
+                        let try_post = |target: String| {
+                            let client = client.clone();
+                            let body = claim_body.clone();
+                            async move {
+                                let resp = client
+                                    .post(format!("http://{}/community/claim_work", target))
+                                    .json(&body)
+                                    .send()
+                                    .await
+                                    .ok()?;
+                                let job: serde_json::Value = resp.json().await.ok()?;
+                                if job.get("status").and_then(|s| s.as_str()) == Some("work") {
+                                    Some((target, job))
+                                } else {
+                                    None
+                                }
+                            }
                         };
-                        let job: serde_json::Value = match resp.json().await {
-                            Ok(j) => j,
-                            Err(_) => continue,
+
+                        let claimed = match try_post(primary.clone()).await {
+                            Some(p) => Some(p),
+                            None => try_post(legacy.clone()).await,
                         };
-                        if job.get("status").and_then(|s| s.as_str()) != Some("work") {
-                            continue; // no_work - try next seed
-                        }
+                        let Some((winner, job)) = claimed else { continue };
+
                         let job_id = job.get("job_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
                         let input = job.get("input").and_then(|s| s.as_str()).unwrap_or("").to_string();
                         let max_tokens = job.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
                         if input.is_empty() || job_id.is_empty() { continue; }
 
                         tracing::info!("Claimed job {} from {}: {:?} (max_tokens={})",
-                            job_id, gateway, &input[..input.len().min(40)], max_tokens);
+                            job_id, winner, &input[..input.len().min(40)], max_tokens);
 
                         // Run inference locally
                         let start = std::time::Instant::now();
@@ -1303,10 +1335,74 @@ async fn main() -> Result<()> {
                         tracing::info!("Job {} done: {} tokens in {}ms = {} ms/tok",
                             job_id, tokens_gen, elapsed_ms, ms_per_tok);
 
-                        // Submit result
-                        let result_body = serde_json::json!({
+                        // ── Build + sign the InferenceAttestation tx ──
+                        // First time only: query the chain for the worker's
+                        // current nonce and seed our local counter from
+                        // there. Subsequent attestations increment locally.
+                        if !attestation_nonce_initialized.load(std::sync::atomic::Ordering::Relaxed) {
+                            let q_url = format!("http://{}/account/0x{}",
+                                winner, hex::encode(&worker_address.0));
+                            if let Ok(resp) = client.get(&q_url).send().await {
+                                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                    let n = v.get("nonce").and_then(|x| x.as_u64()).unwrap_or(0);
+                                    attestation_nonce.store(n, std::sync::atomic::Ordering::Relaxed);
+                                    tracing::info!(starting_nonce = n, "worker attestation nonce initialized from chain");
+                                }
+                            }
+                            attestation_nonce_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+
+                        // Build the InferenceAttestation body. Mirrors what
+                        // /inference/run does on the local-served path.
+                        let model_id_data = format!(
+                            "arc-{}L-{}d-{}h-{}v",
+                            model.config.n_layers, model.config.d_model,
+                            model.config.n_heads, model.config.vocab_size
+                        );
+                        let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
+                        let input_hash = arc_crypto::hash_bytes(input.as_bytes());
+
+                        let nonce = attestation_nonce
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut tx = arc_types::Transaction {
+                            tx_type: arc_types::TxType::InferenceAttestation,
+                            from: worker_address,
+                            nonce,
+                            body: arc_types::TxBody::InferenceAttestation(
+                                arc_types::transaction::InferenceAttestationBody {
+                                    model_id: model_id_hash,
+                                    input_hash,
+                                    output_hash: hash,
+                                    challenge_period: 100,
+                                    // Bond = 0 for testnet community attestations.
+                                    // Production tokenomics will require a non-zero
+                                    // bond — that lands with the inference-pool
+                                    // reward distribution in a later release.
+                                    bond: 0,
+                                },
+                            ),
+                            fee: 0,
+                            gas_limit: 0,
+                            hash: arc_crypto::Hash256::ZERO,
+                            signature: arc_crypto::Signature::null(),
+                            sig_verified: false,
+                        };
+
+                        let signed_attestation_hex = match tx.sign(&worker_keypair) {
+                            Ok(()) => {
+                                bincode::serialize(&tx)
+                                    .ok()
+                                    .map(|b| format!("0x{}", hex::encode(b)))
+                            }
+                            Err(e) => {
+                                tracing::warn!("attestation sign failed: {:?}", e);
+                                None
+                            }
+                        };
+
+                        let mut result_body = serde_json::json!({
                             "job_id": job_id,
-                            "worker_id": worker_id_w,
+                            "worker_id": format!("0x{}", hex::encode(&worker_address.0)),
                             "success": true,
                             "output": output_text,
                             "output_hash": format!("0x{}", hex::encode(&hash.0)),
@@ -1315,12 +1411,34 @@ async fn main() -> Result<()> {
                             "ms_per_token": ms_per_tok,
                             "engine": "INT8 integer (community worker)",
                         });
-                        let _ = client
-                            .post(format!("http://{}/community/submit_work", gateway))
+                        if let Some(hex_str) = signed_attestation_hex {
+                            result_body["signed_attestation_hex"] = serde_json::Value::String(hex_str);
+                        }
+
+                        let submit_resp = client
+                            .post(format!("http://{}/community/submit_work", winner))
                             .json(&result_body)
                             .timeout(std::time::Duration::from_secs(10))
                             .send()
                             .await;
+
+                        // If submit reports invalid_nonce, force a re-query
+                        // of the chain on the next loop iteration.
+                        if let Ok(resp) = submit_resp {
+                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                                let attestation = body.get("attestation");
+                                if let Some(a) = attestation {
+                                    let status = a.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                                    let err = a.get("error").and_then(|s| s.as_str()).unwrap_or("");
+                                    if status == "rejected" && err.contains("InvalidNonce") {
+                                        tracing::warn!("attestation nonce drifted; will re-query chain on next submit");
+                                        attestation_nonce_initialized
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                        }
+
                         break; // after completing a job, go back to the top and poll again
                     }
                     // Brief sleep between poll rounds to avoid hammering
