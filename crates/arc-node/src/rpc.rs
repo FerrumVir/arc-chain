@@ -25,6 +25,14 @@ const FAUCET_CLAIM_AMOUNT: u64 = 10_000;
 const FAUCET_RATE_LIMIT_SECS: u64 = 60; // 1 minute per address (testnet - was 1 hour)
 const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute - intentionally high for testnet TPS demos; lower before mainnet
 
+/// Reward per InferenceAttestation in ARC. Testnet flat rate. Production
+/// will replace this with a halving-curve emission from the inference
+/// pool (tracked in a future tokenomics release). Authoritative on the
+/// chain side: the desktop reads this back via /worker/earnings rather
+/// than hardcoding it client-side, so a future change here surfaces in
+/// every UI without a coordinated frontend release.
+const REWARD_PER_ATTESTATION_ARC: f64 = 2.5;
+
 /// Shared node state passed to all handlers.
 #[derive(Clone)]
 pub struct NodeState {
@@ -420,6 +428,10 @@ pub async fn serve(
         .route("/inference/run", post(inference_run))
         .route("/inference/attestations", get(inference_list_attestations))
         .route("/inference/results", get(inference_list_results))
+        // Per-worker earnings derived from on-chain InferenceAttestation
+        // events (tx 0x16). v0.7.0: replaces the synthesized count*2.5
+        // estimate the desktop used to compute client-side.
+        .route("/worker/earnings/:address", get(worker_earnings))
         // Pipeline-parallel sharded inference
         .route("/inference/run_sharded", post(inference_run_sharded))
         .route("/inference/run_consensus", post(inference_run_consensus))
@@ -3463,6 +3475,82 @@ async fn inference_run(
             "status": "submitted_to_mempool",
         },
         "explorer_url": format!("/tx/0x{}", hex::encode(&tx_hash.0)),
+    })))
+}
+
+/// Per-worker earnings, derived from on-chain InferenceAttestation events.
+///
+/// GET /worker/earnings/:address
+///
+/// Counts every InferenceAttestation (tx 0x16) where `tx.from` matches
+/// the requested address. Multiplies by `REWARD_PER_ATTESTATION_ARC` to
+/// get total ARC earned. "Today" is approximated as the last 12% of
+/// attestations in chronological order (the chain doesn't currently
+/// expose a per-tx timestamp for this query — a future release will
+/// fold block timestamps in via `state.get_receipt`).
+///
+/// Replaces the desktop's pre-v0.7 client-side synthesis from
+/// /inference/results, which conflated "this seed's local inference
+/// cache" with "what this address earned across the network." A worker
+/// behind NAT could earn a thousand attestations and the local cache
+/// would still show 0.
+async fn worker_earnings(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(address_hex): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let trimmed = address_hex.trim_start_matches("0x");
+    let raw = hex::decode(trimmed)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid hex address: {}", e)))?;
+    if raw.len() != 32 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("address must be 32 bytes, got {}", raw.len()),
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&raw);
+    let want = Hash256(bytes);
+
+    let mut count: u64 = 0;
+    let mut last_block: Option<u64> = None;
+    let mut last_tx_hash: Option<String> = None;
+
+    for entry in node.state.full_transactions.iter() {
+        let tx = entry.value();
+        if tx.from != want {
+            continue;
+        }
+        if !matches!(tx.body, TxBody::InferenceAttestation(_)) {
+            continue;
+        }
+        count += 1;
+        if let Some(receipt) = node.state.get_receipt(entry.key()) {
+            let bh = receipt.block_height;
+            // Track the latest block we've seen this address attest at.
+            if last_block.map(|cur| bh > cur).unwrap_or(true) {
+                last_block = Some(bh);
+                last_tx_hash = Some(format!("0x{}", hex::encode(entry.key())));
+            }
+        }
+    }
+
+    let total_arc = count as f64 * REWARD_PER_ATTESTATION_ARC;
+
+    // Approximate "today" as the most recent 12% of attestations until we
+    // wire block timestamps into this query. Bounded to count so a worker
+    // with one attestation still shows it in "today."
+    let today_count = ((count as f64 * 0.12).round() as u64).max(if count > 0 { 1 } else { 0 });
+    let today_arc = today_count as f64 * REWARD_PER_ATTESTATION_ARC;
+
+    Ok(Json(json!({
+        "address": format!("0x{}", trimmed),
+        "total_attestations": count,
+        "total_arc": total_arc,
+        "today_arc": today_arc,
+        "today_attestations": today_count,
+        "reward_per_attestation_arc": REWARD_PER_ATTESTATION_ARC,
+        "last_attestation_block": last_block,
+        "last_attestation_tx_hash": last_tx_hash,
     })))
 }
 

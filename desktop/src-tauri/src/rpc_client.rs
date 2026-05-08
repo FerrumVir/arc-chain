@@ -142,11 +142,71 @@ pub async fn fetch_status(
     .with_validators_hint(validators)
 }
 
-pub async fn fetch_earnings(http: &reqwest::Client, port: u16) -> Earnings {
-    // The node doesn't expose /worker/earnings yet. Synthesize from /inference/results
-    // (count × flat testnet rate). Today = attestations in last 24h via timestamp
-    // proxy (we use index since results aren't timestamped).
+/// Fetch this worker's earnings. v0.7.0+: hits the chain-side
+/// `/worker/earnings/:address` endpoint, which counts on-chain
+/// InferenceAttestation events (tx 0x16) attributed to this address.
+/// Falls back to the pre-v0.7 `/inference/results` synthesis when:
+///   - we don't have an address yet (onboarding not finished), or
+///   - the node hasn't been upgraded to v0.7.0 (returns 404 on the
+///     new route).
+///
+/// `address` is the user's hex address (with or without `0x` prefix).
+pub async fn fetch_earnings(
+    http: &reqwest::Client,
+    port: u16,
+    address: Option<&str>,
+) -> Earnings {
     let base = format!("http://127.0.0.1:{}", port);
+
+    if let Some(addr) = address {
+        let url = format!("{}/worker/earnings/{}", base, addr.trim_start_matches("0x"));
+        if let Ok(resp) = http.get(&url).send().await {
+            if resp.status().is_success() {
+                if let Ok(v) = resp.json::<Value>().await {
+                    let total_arc = v
+                        .get("total_arc")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0);
+                    let today_arc = v
+                        .get("today_arc")
+                        .and_then(|x| x.as_f64())
+                        .unwrap_or(0.0);
+                    let attestations = v
+                        .get("total_attestations")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0);
+                    let last_block = v
+                        .get("last_attestation_block")
+                        .and_then(|x| x.as_u64());
+                    return Earnings {
+                        total_arc,
+                        today_arc,
+                        // Pending = an attestation submitted but not yet
+                        // unchallenged-released. The chain doesn't expose
+                        // this distinction yet — when it does, fold it in
+                        // here. For now report 0 so the UI doesn't show
+                        // imaginary pending rewards.
+                        pending_arc: 0.0,
+                        rank: None,
+                        attestations,
+                        // Prefer block height (cleanly chain-derived) when
+                        // available; else now-1m so the UI doesn't show
+                        // a Unix epoch zero.
+                        last_payout_at: last_block
+                            .map(|h| h as i64)
+                            .or_else(|| Some(chrono::Utc::now().timestamp_millis() - 60_000)),
+                    };
+                }
+            }
+            // 404 from v0.6.x seeds → fall through to synthesis
+        }
+    }
+
+    // Pre-v0.7 fallback: synthesize from /inference/results (the local
+    // node's ring buffer of recent inferences). Misleading for workers
+    // behind NAT (they earn on remote seeds, but their local cache
+    // doesn't see those attestations) — keeping it only as a safety net
+    // for old binaries.
     let resp = http
         .get(format!("{}/inference/results?limit=10000", base))
         .send()
@@ -162,15 +222,14 @@ pub async fn fetch_earnings(http: &reqwest::Client, port: u16) -> Earnings {
         .cloned()
         .unwrap_or_default();
 
-    // Approximation: "today" is the tail ~12% of attestations by order (they're
-    // returned most-recent-first from the node's ring buffer).
+    // Approximation: "today" is the tail ~12% of attestations by order.
     let today = (total as f64 * 0.12).round() as u64;
 
     Earnings {
         total_arc: total as f64 * REWARD_PER_ATTESTATION,
         today_arc: today as f64 * REWARD_PER_ATTESTATION,
         pending_arc: (results.len().min(5) as f64) * REWARD_PER_ATTESTATION / 2.0,
-        rank: None, // node doesn't expose leaderboard
+        rank: None,
         attestations: total,
         last_payout_at: Some(chrono::Utc::now().timestamp_millis() - 60_000),
     }

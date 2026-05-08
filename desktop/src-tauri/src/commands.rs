@@ -244,7 +244,11 @@ pub async fn clear_crash(state: State<'_, AppState>) -> CmdResult<()> {
 #[tauri::command]
 pub async fn fetch_earnings(state: State<'_, AppState>) -> CmdResult<Earnings> {
     let port = state.node.lock().await.rpc_port;
-    Ok(rpc_client::fetch_earnings(&state.http, port).await)
+    let address = {
+        let store = state.store.lock().await;
+        store.identity.as_ref().map(|i| i.address.clone())
+    };
+    Ok(rpc_client::fetch_earnings(&state.http, port, address.as_deref()).await)
 }
 
 #[tauri::command]
