@@ -449,7 +449,7 @@ pub async fn serve(
         // Per-worker earnings derived from on-chain InferenceAttestation
         // events (tx 0x16). v0.7.0: replaces the synthesized count*2.5
         // estimate the desktop used to compute client-side.
-        .route("/worker/earnings/:address", get(worker_earnings))
+        .route("/worker/earnings/{address}", get(worker_earnings))
         // v0.7.0: live community-worker leaderboard. Reads the in-memory
         // CommunityWorker registry; no chain query. Sorted by composite
         // score (success rate * 1000 - avg_ms). Dashboard renders this.
