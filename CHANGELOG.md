@@ -3,6 +3,53 @@
 All notable changes to ARC Chain are tracked here. This project follows
 [semantic versioning](https://semver.org/).
 
+## v0.7.0 - "Just be a node, and earn for real"
+
+The community-worker system actually works for the first time. Pre-v0.7
+the seed coordinators advertised a work queue that was never wired up:
+NodeState's `community_work_tx`, `_queue`, and `_results` were
+declared but always set to `None`, so every `/community/claim_work`
+poll returned 503 "work queue not initialized." Workers polled,
+heartbeated, and ran the literal definition of doing nothing — which
+matches every "12 peers connected, 0 attestations, 0 earnings forever"
+report from v0.6 users.
+
+### Architecture
+- `rpc::serve()` now wires a real bounded mpsc (256 slots) for
+  community work. `claim_work` long-poll, `submit_work` round-trip,
+  and the seed-side dispatcher all share that channel.
+- `WorkItem` and `WorkResult` redesigned around whole-prompt routing
+  (`job_id`, `input`, `max_tokens` → `output`, `output_hash`,
+  `tokens_generated`). The half-built layer-shard community-work
+  shape is gone; layer-shard remains a seed-to-seed primitive
+  (`forward_shard`).
+- `/inference/run` is now a smart router: prefers a community worker
+  when any are online, falls back to the seed's local model otherwise.
+  EWMA latency is recorded per worker for future scoring (task 4).
+- Workers sign `InferenceAttestation` (tx 0x16) with their validator
+  key and submit alongside results; the seed verifies and inserts
+  to mempool. Earnings are now actual on-chain credits.
+- `GET /worker/earnings/:address` reads chain state directly. The
+  desktop's pre-v0.7 client-side synthesis from
+  `/inference/results` (which conflated "this seed's local cache"
+  with "this address's network earnings") is gone.
+
+### Desktop
+- Lite-mode banner rewritten as honest "Client mode": tells users
+  they're connected as a client, will not earn ARC until peers > 0,
+  and offers a "Reset peer state & rebootstrap" button that wipes
+  `<data_dir>/known_peers.json` and restarts. The most common cause
+  of "I had peers, then I restarted, now stuck" is a stale dial cache,
+  and this fixes it in one click.
+- New Tauri command: `reset_peer_state`.
+
+### Removed
+- **`scripts/community-gateway.py`** — Python sidecar from v0.5.2
+  on port 3001. All functionality is now in arc-node on port 9090.
+  The legacy port 3001 fallback in the worker loop and registration
+  script is kept temporarily for the rolling-upgrade window; remove
+  in v0.7.x once all seeds run v0.7.0+.
+
 ## Unreleased - 2026-04-22
 
 **Cluster self-heal, latency-aware routing, slashing hook-in, retirement of dead seeds.**
@@ -83,7 +130,7 @@ All notable changes to ARC Chain are tracked here. This project follows
 **Community inference network + SIMD performance + audit hardening.**
 
 ### Community Worker Infrastructure
-- **Community gateway sidecar** (`scripts/community-gateway.py`) - Python
+- **Community gateway sidecar (REMOVED IN v0.7.0)** (`scripts/community-gateway.py`) - Python
   HTTP server on port 3001 that runs alongside arc-node. Handles worker
   registration, heartbeat, inference job distribution via long-poll.
 - **`POST /inference/community`** - submit inference to be computed by

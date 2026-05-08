@@ -207,22 +207,30 @@ pub struct CacheEntry { model_id: Hash256, output_tokens: Vec<u32>, ... }
 
 ---
 
-## Community Worker System (v0.5.2)
+## Community Worker System (v0.7.0+)
 
-### Gateway Sidecar
-**File:** `scripts/community-gateway.py`
-- Port 3001, ThreadingHTTPServer
+The Python gateway sidecar from v0.5.2–v0.6.x is gone. Worker
+registration, work dispatch, and result collection are all built
+into arc-node itself on port 9090.
+
+### Coordinator (built into arc-node)
+**File:** `crates/arc-node/src/rpc.rs`
 - `/community/register` + `/community/heartbeat` + `/community/list`
-- `/community/claim_work` - long-poll (30s) for inference jobs
-- `/community/submit_work` - return computed result
-- `/inference/community` - route inference to community workers
+- `/community/claim_work` — long-poll (30s) for whole-prompt inference jobs
+- `/community/submit_work` — accept result + worker-signed
+  `InferenceAttestation` tx, post on-chain
+- `/inference/run` — smart router: prefers a community worker when
+  one is online, falls back to the seed's local model
+- `/worker/earnings/:address` — chain-derived earnings (tx 0x16 events)
 
-### Node Client
-**File:** `crates/arc-node/src/main.rs` (--community-mode)
-- Auto-register with all seed gateways (port 3001)
-- Auto-poll claim_work for inference jobs
-- Compute locally via model.generate()
-- Submit results back
+### Node Client (--community-mode)
+**File:** `crates/arc-node/src/main.rs`
+- Auto-register with every seed it peers with
+- Long-poll `/community/claim_work` (port 9090, with port 3001
+  fallback for the rolling-upgrade window)
+- Compute locally via `model.generate()`
+- Sign + submit each result; the chain credits the worker's address
+  on `InferenceAttestation` finalization
 
 ---
 
@@ -263,8 +271,7 @@ Key types for inference:
 | Script | Purpose |
 |--------|---------|
 | `install-community-node.sh` | One-command node install (NO model download) |
-| `community-gateway.py` | Gateway sidecar for worker registration + inference routing |
-| `arc-community-register.sh` | Standalone registration (works with ANY version) |
+| `arc-community-register.sh` | Legacy registration shim — only useful for v0.6.x and older nodes; v0.7.0+ self-registers |
 | `arc-diagnose.sh` | 4-phase health check for stuck nodes |
 | `arc-demo.sh` | End-to-end sharded inference demo |
 | `arc-verify.sh` | Third-party inference verifier |

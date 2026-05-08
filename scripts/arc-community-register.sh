@@ -1,29 +1,33 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# ARC Chain - Community Worker Registration (works with ANY arc-node version)
+# ARC Chain - Community Worker Registration (legacy compat)
 #
-# Registers this node as a community inference worker with all 8 testnet
-# seed gateways. Runs as a sidecar alongside arc-node - no binary changes
-# needed. Works with v0.3.0, v0.4.x, v0.5.x, or any future version.
+# v0.7.0 NOTE: this script is no longer required. arc-node v0.7.0+
+# auto-registers as a community worker on every seed it peers with —
+# the inference worker loop runs in-process. Keep this script only
+# for older arc-node binaries (v0.3 → v0.6) that don't have native
+# auto-registration. Once your install is on v0.7.0+, you can stop
+# this script and uninstall it from any system service unit.
 #
-# What it does:
+# What it does (for legacy binaries):
 #   1. Detects your arc-node's validator address and platform
-#   2. POSTs /community/register to each seed gateway (port 3001) every 60s
+#   2. POSTs /community/register to each seed every 60s. Tries port
+#      9090 first (v0.7.0+ native handler), falls back to 3001 only
+#      for the rapidly-shrinking set of seeds still running the old
+#      Python sidecar.
 #   3. POSTs /community/heartbeat every 15s to stay alive (TTL 90s)
-#   4. Optionally polls /community/claim_work to compute inference jobs
 #
 # Usage:
-#   # Start alongside your arc-node:
 #   nohup bash scripts/arc-community-register.sh &
-#
-#   # Or install as a service (the main installer does this automatically):
-#   curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-community-register.sh | bash
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -u
 
 ARC_RPC="${ARC_RPC:-http://localhost:9944}"
-GATEWAY_PORT=3001
+# Legacy port for the v0.6.x Python gateway sidecar — kept for
+# transitional compat only. v0.7.0+ folds the gateway into arc-node
+# itself on port 9090.
+LEGACY_GATEWAY_PORT=3001
 
 # Detect worker identity from local arc-node
 WORKER_ID=""
@@ -46,11 +50,12 @@ HOSTNAME=$(hostname 2>/dev/null || echo "unknown")
 # Seed gateway addresses
 SEEDS="149.28.32.76 140.82.16.112 136.244.109.1 104.238.171.11 202.182.107.41 149.28.153.31 216.238.120.27 139.84.237.49"
 
-echo "ARC Community Worker Registration"
+echo "ARC Community Worker Registration (legacy script)"
 echo "  worker_id: $WORKER_ID"
 echo "  platform:  $PLATFORM"
 echo "  arc-node:  $ARC_RPC"
-echo "  gateways:  8 seeds on port $GATEWAY_PORT"
+echo "  seeds:     8 (will try arc-node :9090 first, legacy gateway :$LEGACY_GATEWAY_PORT as fallback)"
+echo "  note:      arc-node v0.7.0+ auto-registers natively — this script is unnecessary on new installs"
 echo ""
 
 REGISTER_JSON="{\"worker_id\":\"$WORKER_ID\",\"name\":\"$HOSTNAME\",\"platform\":\"$PLATFORM\",\"capabilities\":[\"inference\"]}"
@@ -60,9 +65,9 @@ TICK=0
 REGISTERED=0
 while true; do
     for seed in $SEEDS; do
-        # Try BOTH gateway (3001) AND arc-node RPC (9090) - some seeds
-        # only have one or the other alive.
-        for port in $GATEWAY_PORT 9090; do
+        # Prefer arc-node native (9090); fall back to legacy gateway (3001)
+        # only for seeds that haven't upgraded to v0.7.0+ yet.
+        for port in 9090 $LEGACY_GATEWAY_PORT; do
             EP="http://${seed}:${port}"
             if [ $((TICK % 4)) -eq 0 ]; then
                 # Full register every 60s
