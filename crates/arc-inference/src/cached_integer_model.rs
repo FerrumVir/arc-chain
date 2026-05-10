@@ -51,11 +51,20 @@ impl I8Weights {
                 data.push((x * inv_abs_max).round().clamp(-127.0, 127.0) as i8);
             }
 
-            // Per-row scale = abs_max / 127 in Q16 (pure integer - no f64 rounding)
-            // scale = ceil(abs_max * ONE / 127) to avoid underflow
-            let abs_max_i64 = abs_max as i64;
-            let scale = ((abs_max_i64 * ONE) + 126) / 127;
-            scales.push(scale.max(1));
+            // Per-row scale = abs_max / 127 in Q16. Compute in f64 to keep
+            // sub-1.0 abs_max values (every output.weight and ffn_down row
+            // in real Llama-2-7B per probe_i16_real_weights.rs) from
+            // collapsing to scale=1. Pre-fix this used `abs_max as i64`,
+            // which truncated abs_max < 1 to 0 — leaving every row of those
+            // tensors quantized at ~36-258× the wrong magnitude. Block-wise
+            // INT8 (the default forward path on v0.5.3+) was unaffected
+            // because it does its own per-block scale; this fix matters for
+            // any path still routing through I8Weights (sharded loaders
+            // and the I16 dual-quantize bring-up).
+            let scale = ((abs_max as f64 * ONE as f64) / 127.0)
+                .round()
+                .max(1.0) as i64;
+            scales.push(scale);
         }
 
         Self { data, scales, n_rows, n_cols }

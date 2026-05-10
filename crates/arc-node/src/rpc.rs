@@ -39,6 +39,10 @@ pub struct NodeState {
     pub state: Arc<StateDB>,
     pub mempool: Arc<Mempool>,
     pub validator_address: Hash256,
+    /// Validator keypair for signing coordinator-internal txs
+    /// (InferenceEscrowRelease, auto InferenceAttestation). Optional only
+    /// for test fixtures; production paths always have it.
+    pub validator_keypair: Option<Arc<arc_crypto::KeyPair>>,
     pub stake: u64,
     pub tier: StakeTier,
     pub boot_time: Instant,
@@ -296,6 +300,7 @@ pub fn build_node_state(
     state: Arc<StateDB>,
     mempool: Arc<Mempool>,
     validator_address: Hash256,
+    validator_keypair: Option<Arc<arc_crypto::KeyPair>>,
     stake: u64,
     boot_time: Instant,
     peer_count: Arc<AtomicU32>,
@@ -308,6 +313,7 @@ pub fn build_node_state(
         state,
         mempool,
         validator_address,
+        validator_keypair,
         stake,
         tier,
         boot_time,
@@ -358,6 +364,7 @@ pub async fn serve(
     state: Arc<StateDB>,
     mempool: Arc<Mempool>,
     validator_address: Hash256,
+    validator_keypair: Option<Arc<arc_crypto::KeyPair>>,
     stake: u64,
     boot_time: Instant,
     peer_count: Arc<AtomicU32>,
@@ -369,7 +376,7 @@ pub async fn serve(
     dag_committed: Option<Arc<AtomicU64>>,
     shard_infos: Vec<ShardInfo>,
 ) -> anyhow::Result<()> {
-    let mut node = build_node_state(state, mempool, validator_address, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
+    let mut node = build_node_state(state, mempool, validator_address, validator_keypair, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
     }
@@ -3430,7 +3437,7 @@ async fn inference_run(
     let bump = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
     let nonce = base_nonce + bump;
 
-    let tx = arc_types::Transaction {
+    let mut tx = arc_types::Transaction {
         tx_type: arc_types::TxType::InferenceAttestation,
         from: attester,
         nonce,
@@ -3447,15 +3454,34 @@ async fn inference_run(
         gas_limit: 0,
         hash: arc_crypto::Hash256::ZERO,
         signature: arc_crypto::Signature::null(),
-        // Coordinator-internal submit; bypass the unsigned-tx reject
-        // at arc-state lib.rs:1186 the same way the faucet path does.
-        sig_verified: true,
+        sig_verified: false,
     };
-
-    let tx_hash = tx.compute_hash();
-
-    // Submit to mempool
-    let _submit_result = node.mempool.insert(tx);
+    // Sign with the validator keypair so this tx survives `pipeline.rs`'s
+    // verify stage on every peer. Setting `sig_verified=true` alone is not
+    // enough — pipeline.rs only inspects the signature bytes; null sigs
+    // always fail verification regardless of the flag.
+    let tx_hash = if let Some(kp) = node.validator_keypair.as_ref() {
+        match tx.sign(kp) {
+            Ok(()) => {
+                tx.sig_verified = true;
+                let h = tx.hash;
+                let _ = node.mempool.insert(tx);
+                h
+            }
+            Err(e) => {
+                tracing::warn!("inference attestation sign failed: {:?}", e);
+                tx.compute_hash()
+            }
+        }
+    } else {
+        // Test fixture path: keep the legacy null-sig + sig_verified=true
+        // shape so unit tests that don't wire a keypair still execute.
+        tx.sig_verified = true;
+        let h = tx.compute_hash();
+        tx.hash = h;
+        let _ = node.mempool.insert(tx);
+        h
+    };
 
     // Store inference result for explorer display
     let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
@@ -5337,15 +5363,26 @@ async fn inference_run_consensus(
             );
             None
         } else {
-            let tx_hash = submit_escrow_release(&node, gate, output_hash, replicas.clone());
-            tracing::info!(
-                request_id = %request_id,
-                tx = %format!("0x{}", hex::encode(&tx_hash.0)),
-                replicas = replicas.len(),
-                max_fee = gate.max_fee,
-                "InferenceEscrowRelease submitted"
-            );
-            Some(tx_hash)
+            match submit_escrow_release(&node, gate, output_hash, replicas.clone()) {
+                Some(tx_hash) => {
+                    tracing::info!(
+                        request_id = %request_id,
+                        tx = %format!("0x{}", hex::encode(&tx_hash.0)),
+                        replicas = replicas.len(),
+                        max_fee = gate.max_fee,
+                        "InferenceEscrowRelease submitted"
+                    );
+                    Some(tx_hash)
+                }
+                None => {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        "InferenceEscrowRelease skipped: validator keypair unavailable on \
+                         this coordinator (test fixture or misconfig)"
+                    );
+                    None
+                }
+            }
         }
     } else {
         None
@@ -5554,15 +5591,28 @@ fn treasury_address() -> arc_crypto::Hash256 {
     arc_crypto::hash_bytes(b"arc-treasury")
 }
 
-/// Build + submit an InferenceEscrowRelease transaction. Null-signed like
-/// the existing InferenceAttestation auto-submit - the testnet's
-/// mempool accepts null sigs from internal node paths.
+/// Build + submit an InferenceEscrowRelease transaction signed by the
+/// proposer's validator keypair.
+///
+/// History note: an earlier version null-signed this tx and relied on
+/// `sig_verified=true` to bypass execute_block's signature check. That
+/// works locally (proposer side), but `pipeline.rs`'s verify stage only
+/// inspects the actual signature bytes — it ignores `sig_verified`. So
+/// the tx failed verification on every peer, never landed in any block,
+/// and 1000 ARC per paid call sat stuck in escrow accounts. Documented
+/// at length in `project_arc_session_handoff_20260428.md`. Signing with
+/// the validator keypair routes the tx through the same path real txs
+/// take, end of story.
+///
+/// Returns `None` if no validator keypair is wired into NodeState (test
+/// fixtures); production paths always provide one.
 fn submit_escrow_release(
     node: &NodeState,
     gate: &EscrowGate,
     output_hash: arc_crypto::Hash256,
     replicas: Vec<arc_crypto::Hash256>,
-) -> arc_crypto::Hash256 {
+) -> Option<arc_crypto::Hash256> {
+    let keypair = node.validator_keypair.as_ref()?;
     let proposer = node.validator_address;
     // Use the proposer's CURRENT state nonce. The previous in-memory bump
     // counter (`attestation_nonce.fetch_add`) accumulated forever, even when
@@ -5598,16 +5648,16 @@ fn submit_escrow_release(
         gas_limit: 0,
         hash: arc_crypto::Hash256::ZERO,
         signature: arc_crypto::Signature::null(),
-        // Coordinator-internal submit, like the faucet path. Without
-        // this flag, arc-state's execute_block rejects null-signed txs
-        // as "unsigned transaction" (lib.rs:1186), and the release
-        // tx never gets a receipt.
-        sig_verified: true,
+        sig_verified: false,
     };
-    tx.hash = tx.compute_hash();
+    if let Err(e) = tx.sign(keypair) {
+        tracing::warn!("escrow release sign failed: {:?}", e);
+        return None;
+    }
+    tx.sig_verified = true; // proposer just signed it; safe local fast-path
     let tx_hash = tx.hash;
     let _ = node.mempool.insert(tx);
-    tx_hash
+    Some(tx_hash)
 }
 
 /// Bond for consensus-divergence auto-challenges opened by
@@ -7260,6 +7310,7 @@ mod tests {
             state: Arc::new(arc_state::StateDB::new()),
             mempool: Arc::new(arc_mempool::Mempool::new(1_000)),
             validator_address: Hash256::ZERO,
+            validator_keypair: None,
             stake: 0,
             tier: StakeTier::Spark,
             boot_time: Instant::now(),
