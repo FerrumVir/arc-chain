@@ -137,6 +137,41 @@ impl NodeManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
+        // Windows: detach from the GUI parent's console.
+        //
+        // arc-node is a console executable. When a Tauri GUI app spawns
+        // it without these flags, Windows allocates a fresh console
+        // window for the child and ties it to the parent's console
+        // group. Two failure modes follow:
+        //
+        //   1. The black console pops up alongside the desktop window.
+        //      Users (reasonably) close it. Closing a console sends
+        //      CTRL_CLOSE_EVENT to every process attached to it; the
+        //      C runtime's default handler exits with NTSTATUS
+        //      0xC000013A (STATUS_CONTROL_C_EXIT, decimal -1073741510).
+        //      That is exactly the exit code we see in field crash
+        //      reports.
+        //   2. Any Ctrl+C delivered to the parent console is also
+        //      delivered to the child via the shared process group,
+        //      same -1073741510 exit.
+        //
+        // CREATE_NO_WINDOW (0x08000000) tells Windows not to allocate
+        // a console for the child. CREATE_NEW_PROCESS_GROUP (0x00000200)
+        // additionally isolates it from any console signals the parent
+        // does receive. Together they make the child immune to the
+        // console-event class of crashes. Stdio::piped() above still
+        // gives us the child's stdout/stderr, so log capture is
+        // unaffected.
+        #[cfg(windows)]
+        {
+            // `tokio::process::Command::creation_flags` is a Windows-only
+            // inherent method (it forwards to CreateProcessW). No std
+            // trait import needed.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        }
+
         // Bundled testnet bootstrap config. Fall back to arc-node's built-in
         // defaults if the resource wasn't found (shouldn't happen in a
         // shipped build, but don't crash dev-mode).

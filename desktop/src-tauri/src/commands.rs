@@ -777,10 +777,20 @@ pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
 /// shared lib) or prints something we can't parse - in either case the caller
 /// should redownload to recover.
 fn read_arc_node_version(binary: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new(binary)
-        .arg("--version")
-        .output()
-        .ok()?;
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("--version");
+    // Windows: suppress the console flash that would otherwise appear
+    // for ~50 ms on every Start/Restart click. Same CREATE_NO_WINDOW
+    // flag as in node_manager::start; see the comment there for the
+    // full rationale (this probe is short-lived so the crash risk is
+    // smaller, but the flicker is user-visible).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok()?;
     if !out.status.success() {
         return None;
     }
