@@ -2376,6 +2376,7 @@ impl StateDB {
             TxBody::ShardCoverageClaim(_) => gas_costs::SHARD_COVERAGE_CLAIM,
             TxBody::CapacityAdvertisement(_) => gas_costs::CAPACITY_ADVERTISEMENT,
             TxBody::ShardAssignmentProposal(_) => gas_costs::SHARD_ASSIGNMENT_PROPOSAL,
+            TxBody::FaucetClaim(_) => gas_costs::FAUCET_CLAIM,
         }
     }
 
@@ -4439,6 +4440,103 @@ impl StateDB {
 
                 Ok(gas.consumed)
             }
+            TxBody::FaucetClaim(body) => {
+                // Validator-authorized faucet drain. The signer (tx.from)
+                // must be in the active validator set — that authorization
+                // is what lets us debit a shared pool the signer doesn't
+                // own. Validator-set membership is deterministic across
+                // every seed (loaded from genesis.toml + on-chain
+                // JoinValidator txs), so this check produces the same
+                // accept/reject decision everywhere.
+                if !self.is_validator(&tx.from) {
+                    return Err(StateError::ExecutionError(format!(
+                        "faucet claim: signer {} is not an active validator",
+                        tx.from.to_hex()
+                    )));
+                }
+                if body.amount == 0 || body.amount > arc_types::transaction::FAUCET_CLAIM_MAX {
+                    return Err(StateError::ExecutionError(format!(
+                        "faucet claim: amount {} outside [1, {}]",
+                        body.amount,
+                        arc_types::transaction::FAUCET_CLAIM_MAX
+                    )));
+                }
+
+                // Bump signer's nonce. The validator's own balance is NOT
+                // debited — we just need their nonce to advance so replays
+                // get rejected and the tx hash stays unique.
+                {
+                    let mut signer = self
+                        .accounts
+                        .entry(tx.from.0)
+                        .or_insert_with(|| Account::new(tx.from, 0));
+                    if signer.nonce != tx.nonce {
+                        return Err(StateError::InvalidNonce {
+                            expected: signer.nonce,
+                            got: tx.nonce,
+                        });
+                    }
+                    signer.nonce += 1;
+                    if self.use_jmt {
+                        let h = hash_bytes(&bincode::serialize(signer.value()).unwrap_or_default());
+                        self.jmt.lock().update_leaf(tx.from.0, h);
+                    }
+                    if self.wal.is_active() {
+                        let snap = signer.clone();
+                        drop(signer);
+                        self.wal.append(WalOp::SetAccount(tx.from, snap), self.height());
+                    }
+                }
+
+                // Debit the system faucet pool. Account exists on every
+                // seed because it's prefunded in genesis.toml as the first
+                // [[accounts]] entry (blake3(&[0u8])).
+                let pool_addr = arc_types::transaction::faucet_pool_address();
+                {
+                    let mut pool = self
+                        .accounts
+                        .get_mut(&pool_addr.0)
+                        .ok_or_else(|| StateError::ExecutionError(
+                            "faucet claim: system faucet pool account is not prefunded".into(),
+                        ))?;
+                    if pool.balance < body.amount {
+                        return Err(StateError::InsufficientBalance {
+                            have: pool.balance,
+                            need: body.amount,
+                        });
+                    }
+                    pool.balance -= body.amount;
+                    if self.use_jmt {
+                        let h = hash_bytes(&bincode::serialize(pool.value()).unwrap_or_default());
+                        self.jmt.lock().update_leaf(pool_addr.0, h);
+                    }
+                    if self.wal.is_active() {
+                        let snap = pool.clone();
+                        drop(pool);
+                        self.wal.append(WalOp::SetAccount(pool_addr, snap), self.height());
+                    }
+                }
+
+                // Credit recipient.
+                {
+                    let mut recipient = self
+                        .accounts
+                        .entry(body.recipient.0)
+                        .or_insert_with(|| Account::new(body.recipient, 0));
+                    recipient.balance = recipient.balance.saturating_add(body.amount);
+                    if self.use_jmt {
+                        let h = hash_bytes(&bincode::serialize(recipient.value()).unwrap_or_default());
+                        self.jmt.lock().update_leaf(body.recipient.0, h);
+                    }
+                    if self.wal.is_active() {
+                        let snap = recipient.clone();
+                        drop(recipient);
+                        self.wal.append(WalOp::SetAccount(body.recipient, snap), self.height());
+                    }
+                }
+
+                Ok(gas.consumed)
+            }
         }
     }
 
@@ -4807,6 +4905,17 @@ impl StateDB {
                 // Assignment proposals are indexed by input-hash; sender
                 // account already tracked above.
             }
+            TxBody::FaucetClaim(body) => {
+                self.account_txs
+                    .entry(body.recipient.0)
+                    .or_default()
+                    .push(tx.hash);
+                let pool_addr = arc_types::transaction::faucet_pool_address();
+                self.account_txs
+                    .entry(pool_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
         }
     }
 
@@ -4929,6 +5038,11 @@ impl StateDB {
                 )
                 .0;
                 self.dirty_accounts.insert(prop_addr);
+            }
+            TxBody::FaucetClaim(body) => {
+                self.dirty_accounts.insert(body.recipient.0);
+                let pool_addr = arc_types::transaction::faucet_pool_address();
+                self.dirty_accounts.insert(pool_addr.0);
             }
         }
     }
@@ -7391,5 +7505,199 @@ mod tests {
         assert!(rs[0].success);
         assert!(rs[1].success);
         assert!(!rs[2].success, "second release must fail (escrow cleared)");
+    }
+
+    // ── FaucetClaim: validator-authorized faucet drain (P0 fix) ──────────
+    //
+    // Lives at the bottom of the test module so the helpers above (`addr`,
+    // `make_channel_tx`) are in scope.
+
+    use arc_types::transaction::{FaucetClaimBody, FAUCET_CLAIM_MAX};
+
+    /// Convenience: seed a validator at `signer` with stake = MIN_VALIDATOR_STAKE
+    /// so `is_validator(&signer)` returns true without paying the
+    /// JoinValidator-debit / nonce-bump path.
+    fn seed_validator(state: &StateDB, signer: Address) {
+        state.validators.insert(signer.0, StateDB::MIN_VALIDATOR_STAKE);
+    }
+
+    #[test]
+    fn test_faucet_claim_validator_authorized_credits_recipient() {
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let validator = addr(7);
+        let recipient = addr(42);
+        let state = StateDB::with_genesis(&[
+            (pool_addr, 1_000_000_000),
+            (validator, 0), // validator doesn't need balance — pool is debited
+        ]);
+        seed_validator(&state, validator);
+
+        let tx = make_channel_tx(
+            validator,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient,
+                amount: 10_000,
+            }),
+            TxType::FaucetClaim,
+        );
+
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success, "FaucetClaim from validator should succeed");
+
+        let recv = state.get_account(&recipient).expect("recipient created");
+        assert_eq!(recv.balance, 10_000, "recipient credited 10_000");
+        let pool = state.get_account(&pool_addr).expect("pool exists");
+        assert_eq!(pool.balance, 999_990_000, "pool debited 10_000");
+        let signer = state.get_account(&validator).expect("signer exists");
+        assert_eq!(signer.nonce, 1, "signer nonce bumped");
+        assert_eq!(signer.balance, 0, "signer balance untouched");
+    }
+
+    #[test]
+    fn test_faucet_claim_rejects_non_validator_signer() {
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let not_a_validator = addr(8);
+        let state = StateDB::with_genesis(&[
+            (pool_addr, 1_000_000),
+            (not_a_validator, 0),
+        ]);
+        // Deliberately do NOT seed_validator.
+
+        let tx = make_channel_tx(
+            not_a_validator,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: addr(43),
+                amount: 1_000,
+            }),
+            TxType::FaucetClaim,
+        );
+
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(
+            !r[0].success,
+            "FaucetClaim signed by non-validator must be rejected"
+        );
+
+        // Pool untouched, recipient never created.
+        let pool = state.get_account(&pool_addr).unwrap();
+        assert_eq!(pool.balance, 1_000_000);
+        assert!(state.get_account(&addr(43)).is_none() || state.get_account(&addr(43)).unwrap().balance == 0);
+    }
+
+    #[test]
+    fn test_faucet_claim_rejects_amount_over_max() {
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let validator = addr(9);
+        let state = StateDB::with_genesis(&[
+            (pool_addr, 1_000_000_000),
+        ]);
+        seed_validator(&state, validator);
+
+        let tx = make_channel_tx(
+            validator,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: addr(44),
+                amount: FAUCET_CLAIM_MAX + 1,
+            }),
+            TxType::FaucetClaim,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(!r[0].success, "amount above FAUCET_CLAIM_MAX must reject");
+    }
+
+    #[test]
+    fn test_faucet_claim_rejects_zero_amount() {
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let validator = addr(10);
+        let state = StateDB::with_genesis(&[
+            (pool_addr, 1_000_000),
+        ]);
+        seed_validator(&state, validator);
+
+        let tx = make_channel_tx(
+            validator,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: addr(45),
+                amount: 0,
+            }),
+            TxType::FaucetClaim,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(!r[0].success, "zero-amount FaucetClaim must reject");
+    }
+
+    #[test]
+    fn test_faucet_claim_rejects_insufficient_pool_balance() {
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let validator = addr(11);
+        let state = StateDB::with_genesis(&[
+            (pool_addr, 500), // not enough for a 1_000 claim
+        ]);
+        seed_validator(&state, validator);
+
+        let tx = make_channel_tx(
+            validator,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: addr(46),
+                amount: 1_000,
+            }),
+            TxType::FaucetClaim,
+        );
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(!r[0].success, "underfunded pool must reject the claim");
+        // Pool balance unchanged.
+        assert_eq!(state.get_account(&pool_addr).unwrap().balance, 500);
+    }
+
+    #[test]
+    fn test_faucet_claim_propagates_via_serialize_roundtrip() {
+        // Mirrors the real peer-propagation path: build + sign on one
+        // state, serialize, deserialize on a SEPARATE state, run through
+        // execute_block. Catches the bug the P0 fix exists to fix —
+        // before the fix, a null-signed faucet tx serialized over the
+        // wire would deserialize with sig_verified=false on the peer,
+        // get its signature checked, fail, and never apply.
+        use arc_crypto::KeyPair;
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+
+        // Seed an Ed25519 validator on the proposer side.
+        let kp = KeyPair::generate_ed25519();
+        let validator = kp.address();
+
+        let proposer_state = StateDB::with_genesis(&[
+            (pool_addr, 100_000_000),
+        ]);
+        seed_validator(&proposer_state, validator);
+
+        let mut tx = Transaction::new_faucet_claim(validator, addr(50), 10_000, 0);
+        tx.sign(&kp).expect("sign ok");
+        let wire = bincode::serialize(&tx).expect("serialize tx");
+
+        let peer_state = StateDB::with_genesis(&[
+            (pool_addr, 100_000_000),
+        ]);
+        seed_validator(&peer_state, validator);
+
+        // sig_verified is `#[serde(default)]` so the peer deserializes
+        // with the flag cleared — same as a real network hop.
+        let peer_tx: Transaction = bincode::deserialize(&wire).expect("deserialize tx");
+        assert!(!peer_tx.sig_verified, "wire-format tx must arrive with sig_verified=false");
+        assert!(!peer_tx.is_unsigned(), "wire-format tx must still carry the validator sig");
+
+        let (_, r) = peer_state.execute_block(&[peer_tx], addr(99)).unwrap();
+        assert!(
+            r[0].success,
+            "peer must accept the validator-signed FaucetClaim and apply it"
+        );
+
+        let recv = peer_state.get_account(&addr(50)).unwrap();
+        assert_eq!(recv.balance, 10_000, "peer credits recipient with 10_000");
+        let pool = peer_state.get_account(&pool_addr).unwrap();
+        assert_eq!(pool.balance, 99_990_000, "peer debits pool by 10_000");
     }
 }

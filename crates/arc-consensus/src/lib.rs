@@ -1903,6 +1903,11 @@ impl ConsensusEngine {
             TxBody::ShardCoverageClaim(_) => false,
             TxBody::CapacityAdvertisement(_) => false,
             TxBody::ShardAssignmentProposal(_) => false,
+            // Faucet drains touch the shared pool account; signer is the
+            // local validator. Pool lives on a deterministic shard but the
+            // recipient is arbitrary — treat as same-shard since the pool
+            // is the dominant access (recipient is just credited).
+            TxBody::FaucetClaim(_) => false,
         }
     }
 

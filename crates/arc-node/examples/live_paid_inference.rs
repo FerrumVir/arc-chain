@@ -105,27 +105,46 @@ async fn main() {
     let payer_hex = hex::encode(payer_addr.0);
     println!("payer_address: 0x{}", payer_hex);
 
-    // Step 2: faucet top-up if low.
-    let bal = balance(&quick, &coord, &payer_hex).await;
-    println!("payer_balance_initial: {} ARC", bal);
-    if bal < 10_000 {
-        println!("  faucet claim…");
-        let r = quick
-            .post(format!("{}/faucet/claim", coord))
-            .json(&json!({ "address": &payer_hex }))
-            .send()
-            .await
-            .expect("faucet claim request");
-        println!("  faucet response: {}", r.status());
-        for _ in 0..30 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            if balance(&quick, &coord, &payer_hex).await >= 10_000 {
-                break;
-            }
+    // Step 2: faucet via the coordinator. The validator-signed FaucetClaim
+    // (TxType 0x21, shipped 2026-05-11) propagates cleanly through DAG
+    // consensus so the funded balance appears on every seed within ~1
+    // block. We then wait for the tx to commit before reading balances.
+    println!("faucet on coordinator…");
+    let url = format!("{}/faucet/claim", coord);
+    let faucet_resp = quick
+        .post(&url)
+        .json(&json!({ "address": &payer_hex }))
+        .send()
+        .await;
+    match faucet_resp {
+        Ok(r) => println!("  coord: {}", r.status()),
+        Err(e) => println!("  coord: ERR {}", e),
+    }
+    // Poll the payer balance on the coordinator until it lands on the
+    // chain (faucet handler pre-applies locally but the receipt may
+    // take a few hundred ms to surface).
+    let mut bal_pre = 0u64;
+    for _ in 0..40 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        bal_pre = balance(&quick, &coord, &payer_hex).await;
+        if bal_pre > 0 {
+            break;
         }
     }
-    let bal_pre = balance(&quick, &coord, &payer_hex).await;
-    println!("payer_balance_pre_inference: {} ARC", bal_pre);
+    println!("payer_balance_pre_inference: {} ARC (on coord)", bal_pre);
+    // Sanity: confirm the balance also propagated to the other seeds.
+    // Allow up to 10s of slack — the DAG round at 4.2M Hz commits ~1s/block
+    // but cross-region propagation can take a few rounds.
+    for (name, ip) in SEEDS {
+        let url = format!("http://{}:9090", ip);
+        let mut b = 0u64;
+        for _ in 0..40 {
+            b = balance(&quick, &url, &payer_hex).await;
+            if b > 0 { break; }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        println!("  payer_balance[{}]: {} ARC", name, b);
+    }
 
     // Step 3: snapshot everyone's balance we care about.
     let treasury = hex::encode(hash_bytes(b"arc-treasury").0);

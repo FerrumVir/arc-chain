@@ -38,6 +38,10 @@ pub mod gas_costs {
     pub const LEAVE_VALIDATOR: u64 = 25_000;
     /// Gas for claiming rewards.
     pub const CLAIM_REWARDS: u64 = 25_000;
+    /// Gas for a validator-signed faucet claim (slightly higher than a
+    /// plain transfer because the executor performs a validator-set
+    /// lookup and writes three account snapshots — signer, pool, recipient).
+    pub const FAUCET_CLAIM: u64 = 25_000;
     /// Gas for updating validator stake.
     pub const UPDATE_STAKE: u64 = 25_000;
     /// Gas for governance proposal execution.
@@ -252,6 +256,12 @@ pub enum TxType {
     /// node→range mapping. Community workers long-poll for their
     /// assignment by pubkey and auto-apply.
     ShardAssignmentProposal = 0x20,
+    /// Validator-signed faucet claim. Authorizes a debit from the system
+    /// faucet pool (`faucet_pool_address()`) to a recipient. Replaces the
+    /// previous null-signed Transfer pattern, which `pipeline.rs` rejected
+    /// on every non-originating seed — see `arc-state` executor for the
+    /// authorization rule (signer must be an active validator).
+    FaucetClaim = 0x21,
 }
 
 /// A transaction on the ARC chain.
@@ -343,6 +353,8 @@ pub enum TxBody {
     CapacityAdvertisement(CapacityAdvertisementBody),
     /// Broadcast the planner's assignment output (Milestone D).
     ShardAssignmentProposal(ShardAssignmentProposalBody),
+    /// Validator-authorized faucet claim — debits the system faucet pool.
+    FaucetClaim(FaucetClaimBody),
 }
 
 /// Simple value transfer.
@@ -866,6 +878,30 @@ impl CapacityAdvertisementBody {
 /// to the treasury (no burn - fixed total supply is a hard ARC rule).
 pub const MIN_MODEL_REGISTRATION_FEE: u64 = 1_000;
 
+/// Validator-authorized faucet claim. Validator signs the tx; executor
+/// requires `tx.from` to be an active validator (deterministic on every
+/// seed) and debits the system faucet pool instead of the signer's own
+/// balance. This is the cross-seed-propagation-safe replacement for the
+/// previous null-signed Transfer pattern.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FaucetClaimBody {
+    /// Address to credit.
+    pub recipient: Address,
+    /// Amount in ARC. Chain enforces `<= FAUCET_CLAIM_MAX`.
+    pub amount: u64,
+}
+
+/// Per-claim cap enforced by the executor (anti-drain). Matches the
+/// RPC-layer `FAUCET_CLAIM_AMOUNT` default so a routine /faucet/claim
+/// hits the cap exactly; raising one without the other will reject txs.
+pub const FAUCET_CLAIM_MAX: u64 = 10_000;
+
+/// System faucet pool address. Same on every seed because it's derived
+/// from `blake3::hash(&[0u8])` and prefunded in genesis.toml.
+pub fn faucet_pool_address() -> Address {
+    arc_crypto::hash_bytes(&[0u8])
+}
+
 /// Milestone B helpers - shared between arc-state and arc-node so both
 /// sides agree on the escrow-account derivation and metadata layout.
 impl InferenceEscrowOpenBody {
@@ -982,6 +1018,27 @@ impl CompactTransfer {
 }
 
 impl Transaction {
+    /// Construct a validator-authorized faucet claim (unsigned — caller
+    /// must `tx.sign(&validator_keypair)` before submitting). The executor
+    /// will reject the tx unless `validator` is an active validator at
+    /// commit time.
+    pub fn new_faucet_claim(validator: Address, recipient: Address, amount: u64, nonce: u64) -> Self {
+        let body = TxBody::FaucetClaim(FaucetClaimBody { recipient, amount });
+        let mut tx = Self {
+            tx_type: TxType::FaucetClaim,
+            from: validator,
+            nonce,
+            body,
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: false,
+        };
+        tx.hash = tx.compute_hash();
+        tx
+    }
+
     /// Create a new transfer transaction (unsigned, zero fee).
     pub fn new_transfer(from: Address, to: Address, amount: u64, nonce: u64) -> Self {
         let body = TxBody::Transfer(TransferBody {

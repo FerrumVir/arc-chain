@@ -136,6 +136,13 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             // Proposal storage key is deterministic from the input-hash -
             // tx.from being tracked above is enough for correctness.
         }
+        TxBody::FaucetClaim(body) => {
+            // Validator-signed faucet drain touches the recipient and the
+            // shared system pool; flag both so a concurrent FaucetClaim
+            // doesn't race on the pool's balance.
+            accounts.insert(body.recipient.0);
+            accounts.insert(arc_types::transaction::faucet_pool_address().0);
+        }
     }
 
     TxAccessSet { accounts }

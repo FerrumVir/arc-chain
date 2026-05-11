@@ -702,6 +702,15 @@ impl Pipeline {
                                         }
                                     }
                                 }
+                                TxBody::FaucetClaim(body) => {
+                                    let pool_addr = arc_types::transaction::faucet_pool_address();
+                                    if let Some(acct) = exec_state.get_account(&pool_addr) {
+                                        account_snapshot.insert(pool_addr.0, acct);
+                                    }
+                                    if let Some(acct) = exec_state.get_account(&body.recipient) {
+                                        account_snapshot.insert(body.recipient.0, acct);
+                                    }
+                                }
                                 TxBody::DeployContract(_) | TxBody::RegisterAgent(_)
                                 | TxBody::MultiSig(_) | TxBody::JoinValidator(_)
                                 | TxBody::LeaveValidator | TxBody::ClaimRewards

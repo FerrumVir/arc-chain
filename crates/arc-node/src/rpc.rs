@@ -1045,76 +1045,172 @@ async fn faucet_claim(
         }
     }
 
-    // Use genesis account 0 (blake3::hash(&[0])) as the faucet source.
-    // This account exists on ALL nodes with the same address and balance,
-    // so faucet transactions propagated via DAG consensus will execute
-    // correctly on every node.
-    let faucet_addr = arc_crypto::hash_bytes(&[0u8]);
-    let faucet_account = node.state
-        .get_account(&faucet_addr)
-        .ok_or_else(|| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
-                error: "Faucet account not funded. Node misconfiguration.".to_string(),
+    // Hard-fork rollout gate. v0.7.1 adds TxType::FaucetClaim (0x21),
+    // which v0.7.0 peers can't deserialize. While we roll v0.7.1 across
+    // the fleet, every v0.7.1 node defaults to the legacy null-sig
+    // Transfer path (wire-compatible with v0.7.0). Once every seed is
+    // on v0.7.1 we flip FAUCET_V2_ENABLED=true on each (env is read
+    // per-call, no restart) and the new propagating path activates.
+    // v0.7.2 removes this gate and the legacy branch.
+    let v2_enabled = std::env::var("FAUCET_V2_ENABLED")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(false);
+
+    let hash = if v2_enabled {
+        // v0.7.1+ validator-signed FaucetClaim path. Validator signs a
+        // FaucetClaim tx that arc-state's executor accepts as
+        // authorization to debit the shared system pool
+        // (`arc-types::transaction::faucet_pool_address()`). Replaces
+        // the legacy null-sig Transfer, which peers rejected at
+        // `pipeline.rs`'s verify stage (signature bytes, not the
+        // `sig_verified` flag) so the funded balance only existed on
+        // the seed that received the /faucet/claim call.
+        let keypair = node.validator_keypair.as_ref().ok_or_else(|| {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(FaucetErrorResponse {
+                error: "Validator keypair not configured on this node.".to_string(),
             }))
         })?;
+        let validator_addr = node.validator_address;
 
-    if faucet_account.balance < FAUCET_CLAIM_AMOUNT {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, Json(FaucetErrorResponse {
-            error: "Faucet balance too low. Please try another node.".to_string(),
-        })));
-    }
+        let pool_addr = arc_types::transaction::faucet_pool_address();
+        let pool_account = node.state
+            .get_account(&pool_addr)
+            .ok_or_else(|| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
+                    error: "Faucet pool account not funded. Node misconfiguration.".to_string(),
+                }))
+            })?;
+        if pool_account.balance < FAUCET_CLAIM_AMOUNT {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(FaucetErrorResponse {
+                error: "Faucet balance too low. Please try another node.".to_string(),
+            })));
+        }
 
-    // Use atomic nonce to prevent TOCTOU: two concurrent claims reading
-    // the same nonce from state would create duplicate-nonce transactions.
-    // fetch_add ensures each claim gets a unique nonce.
-    static FAUCET_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = FAUCET_NONCE.fetch_add(1, Ordering::SeqCst);
-    // Sync atomic with state nonce on first use
-    if nonce == 0 {
-        FAUCET_NONCE.store(faucet_account.nonce + 1, Ordering::SeqCst);
-    }
-    let actual_nonce = if nonce == 0 { faucet_account.nonce } else { nonce };
+        // Read validator's current state nonce per-call. An in-memory
+        // atomic counter would drift past state when txs fail to land,
+        // leaving a permanent nonce gap. Concurrent calls in the same
+        // block window race; the loser gets a 409 on commit and retries.
+        let validator_account = node.state.get_or_create_account(&validator_addr);
+        let nonce = validator_account.nonce;
 
-    let mut tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, actual_nonce);
-    tx.sig_verified = true; // Faucet is a trusted internal operation
-    let hash = tx.hash.to_hex();
+        let mut tx = Transaction::new_faucet_claim(
+            validator_addr,
+            to,
+            FAUCET_CLAIM_AMOUNT,
+            nonce,
+        );
+        tx.sign(keypair).map_err(|e| {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
+                error: format!("Faucet sign failed: {:?}", e),
+            }))
+        })?;
+        tx.sig_verified = true;
+        let hash = tx.hash.to_hex();
 
-    // Write receipt FIRST - the consensus thread uses receipts.contains_key()
-    // to dedup. If we write state before receipt, there's a race window where
-    // the DAG commit thread could execute the same tx again (double credit).
-    let receipt = TxReceipt {
-        tx_hash: tx.hash,
-        block_height: node.state.height(),
-        block_hash: node.state.get_block(node.state.height())
-            .map(|b| b.hash)
-            .unwrap_or(Hash256::ZERO),
-        index: 0,
-        success: true,
-        gas_used: 21_000,
-        value_commitment: None,
-        inclusion_proof: None,
-        logs: vec![],
+        // Receipt first — the consensus thread dedups via
+        // `receipts.contains_key()`. Peers don't have the receipt and
+        // run the FaucetClaim arm through `execute_block` normally.
+        let receipt = TxReceipt {
+            tx_hash: tx.hash,
+            block_height: node.state.height(),
+            block_hash: node.state.get_block(node.state.height())
+                .map(|b| b.hash)
+                .unwrap_or(Hash256::ZERO),
+            index: 0,
+            success: true,
+            gas_used: arc_types::gas_costs::FAUCET_CLAIM,
+            value_commitment: None,
+            inclusion_proof: None,
+            logs: vec![],
+        };
+        node.state.receipts.insert(tx.hash.0, receipt);
+
+        // Pre-apply locally so /account/X reflects funded balance
+        // immediately. Mirrors the executor arm exactly.
+        {
+            let mut signer = validator_account.clone();
+            signer.nonce += 1;
+            node.state.update_account(&validator_addr, signer);
+
+            let mut pool = pool_account.clone();
+            pool.balance -= FAUCET_CLAIM_AMOUNT;
+            node.state.update_account(&pool_addr, pool);
+
+            let mut recipient = node.state.get_or_create_account(&to);
+            recipient.balance = recipient.balance.saturating_add(FAUCET_CLAIM_AMOUNT);
+            node.state.update_account(&to, recipient);
+        }
+        node.state.full_transactions.insert(tx.hash.0, tx.clone());
+        node.state.account_txs.entry(validator_addr.0).or_default().push(tx.hash);
+        node.state.account_txs.entry(pool_addr.0).or_default().push(tx.hash);
+        node.state.account_txs.entry(to.0).or_default().push(tx.hash);
+
+        let _ = node.mempool.insert(tx);
+        hash
+    } else {
+        // Legacy v0.7.0 null-sig Transfer path. Funded balance is
+        // observable only on the seed that handled the call (the
+        // known propagation bug). Acceptable during the rollout window
+        // because no FaucetClaim variant is emitted that v0.7.0 peers
+        // can't deserialize.
+        let faucet_addr = arc_crypto::hash_bytes(&[0u8]);
+        let faucet_account = node.state
+            .get_account(&faucet_addr)
+            .ok_or_else(|| {
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
+                    error: "Faucet account not funded. Node misconfiguration.".to_string(),
+                }))
+            })?;
+
+        if faucet_account.balance < FAUCET_CLAIM_AMOUNT {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(FaucetErrorResponse {
+                error: "Faucet balance too low. Please try another node.".to_string(),
+            })));
+        }
+
+        static FAUCET_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let nonce = FAUCET_NONCE.fetch_add(1, Ordering::SeqCst);
+        if nonce == 0 {
+            FAUCET_NONCE.store(faucet_account.nonce + 1, Ordering::SeqCst);
+        }
+        let actual_nonce = if nonce == 0 { faucet_account.nonce } else { nonce };
+
+        let mut tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, actual_nonce);
+        tx.sig_verified = true;
+        let hash = tx.hash.to_hex();
+
+        let receipt = TxReceipt {
+            tx_hash: tx.hash,
+            block_height: node.state.height(),
+            block_hash: node.state.get_block(node.state.height())
+                .map(|b| b.hash)
+                .unwrap_or(Hash256::ZERO),
+            index: 0,
+            success: true,
+            gas_used: 21_000,
+            value_commitment: None,
+            inclusion_proof: None,
+            logs: vec![],
+        };
+        node.state.receipts.insert(tx.hash.0, receipt);
+
+        {
+            let mut sender = faucet_account.clone();
+            sender.balance -= FAUCET_CLAIM_AMOUNT;
+            sender.nonce += 1;
+            node.state.update_account(&faucet_addr, sender);
+
+            let mut recipient = node.state.get_or_create_account(&to);
+            recipient.balance = recipient.balance.saturating_add(FAUCET_CLAIM_AMOUNT);
+            node.state.update_account(&to, recipient);
+        }
+        node.state.full_transactions.insert(tx.hash.0, tx.clone());
+        node.state.account_txs.entry(faucet_addr.0).or_default().push(tx.hash);
+        node.state.account_txs.entry(to.0).or_default().push(tx.hash);
+
+        let _ = node.mempool.insert(tx);
+        hash
     };
-    node.state.receipts.insert(tx.hash.0, receipt);
-
-    // Now apply the transfer to state (receipt already marks it as done)
-    {
-        let mut sender = faucet_account.clone();
-        sender.balance -= FAUCET_CLAIM_AMOUNT;
-        sender.nonce += 1;
-        node.state.update_account(&faucet_addr, sender);
-
-        let mut recipient = node.state.get_or_create_account(&to);
-        recipient.balance = recipient.balance.saturating_add(FAUCET_CLAIM_AMOUNT);
-        node.state.update_account(&to, recipient);
-    }
-    node.state.full_transactions.insert(tx.hash.0, tx.clone());
-    // Index for account tx history
-    node.state.account_txs.entry(faucet_addr.0).or_default().push(tx.hash);
-    node.state.account_txs.entry(to.0).or_default().push(tx.hash);
-
-    // Also insert into mempool for DAG consensus propagation to other nodes
-    let _ = node.mempool.insert(tx);
 
     // Record claim time + evict stale entries to prevent unbounded growth
     node.faucet_claims.insert(to.0, Instant::now());
@@ -1870,6 +1966,11 @@ async fn get_full_transaction(
                 "model_id": format!("0x{}", hex::encode(&a.model_id.0)),
                 "ranges": a.ranges.iter().map(|(s, e)| json!([s, e])).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
+        }),
+        TxBody::FaucetClaim(b) => json!({
+            "type": "FaucetClaim",
+            "recipient": b.recipient.to_hex(),
+            "amount": b.amount,
         }),
     };
 
