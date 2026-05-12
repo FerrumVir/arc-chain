@@ -551,6 +551,19 @@ async fn main() -> Result<()> {
             db.archive_mode = true;
             tracing::info!("Archive mode ENABLED - no pruning, full transaction history retained");
         }
+        // Pre-populate StateDB.validators with the genesis validator set so
+        // `is_validator()` returns true for the 8 genesis validators on
+        // every node, regardless of how far behind the local commit log
+        // is. Required for TxBody::FaucetClaim (and any future
+        // validator-authorized body) to apply on peers that haven't synced
+        // chain history.
+        if !genesis_validators.is_empty() {
+            db.seed_genesis_validators(&genesis_validators);
+            tracing::info!(
+                "Seeded {} genesis validators into StateDB.validators",
+                genesis_validators.len()
+            );
+        }
         db
     });
 

@@ -684,6 +684,26 @@ impl StateDB {
             .unwrap_or(false)
     }
 
+    /// Pre-populate the validator set from genesis.toml at startup.
+    ///
+    /// `StateDB.validators` is otherwise only populated by on-chain
+    /// JoinValidator/Stake/UpdateStake txs. On nodes that haven't fully
+    /// synced the chain history (a common state on this testnet — commit
+    /// logs drift between peers under load), the genesis validators are
+    /// missing from `self.validators`, which makes `is_validator()` return
+    /// false for them and breaks any tx body that authorizes by validator
+    /// membership (notably TxBody::FaucetClaim).
+    ///
+    /// Seeding from genesis at startup is safe because the genesis
+    /// validator set is deterministic across every node (loaded from the
+    /// same genesis.toml). Subsequent JoinValidator/LeaveValidator txs
+    /// still update this map normally.
+    pub fn seed_genesis_validators(&self, genesis_validators: &[(Address, u64)]) {
+        for (addr, stake) in genesis_validators {
+            self.validators.insert(addr.0, *stake);
+        }
+    }
+
     /// Get all active validators and their stakes.
     pub fn active_validators(&self) -> Vec<(Address, u64)> {
         self.validators
