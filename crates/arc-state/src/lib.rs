@@ -684,21 +684,27 @@ impl StateDB {
             .unwrap_or(false)
     }
 
-    /// Pre-populate the validator set from genesis.toml at startup.
+    /// Reset the validator set to exactly the genesis validators at startup.
     ///
-    /// `StateDB.validators` is otherwise only populated by on-chain
-    /// JoinValidator/Stake/UpdateStake txs. On nodes that haven't fully
-    /// synced the chain history (a common state on this testnet — commit
-    /// logs drift between peers under load), the genesis validators are
-    /// missing from `self.validators`, which makes `is_validator()` return
-    /// false for them and breaks any tx body that authorizes by validator
-    /// membership (notably TxBody::FaucetClaim).
+    /// Two problems this solves:
     ///
-    /// Seeding from genesis at startup is safe because the genesis
-    /// validator set is deterministic across every node (loaded from the
-    /// same genesis.toml). Subsequent JoinValidator/LeaveValidator txs
-    /// still update this map normally.
+    /// 1. `StateDB.validators` is otherwise only populated by on-chain
+    ///    JoinValidator/Stake/UpdateStake txs. On nodes that haven't fully
+    ///    synced the chain history, the genesis validators are missing,
+    ///    which makes `is_validator()` return false for them and breaks
+    ///    any tx body that authorizes by validator membership (notably
+    ///    TxBody::FaucetClaim).
+    /// 2. Dynamic validators added during a prior process lifetime survive
+    ///    state.wal replay but DIVERGE between peers (different commit-log
+    ///    heights → different replayed JoinValidator txs). The result is
+    ///    that each seed disagrees on the validator-set size, so they
+    ///    disagree on the 2/3 quorum threshold, and BFT consensus stalls.
+    ///
+    /// Clearing first + reseeding from genesis gives every node the same
+    /// 8-validator set at boot. Subsequent JoinValidator txs still update
+    /// this map normally, but the agreed baseline is consistent.
     pub fn seed_genesis_validators(&self, genesis_validators: &[(Address, u64)]) {
+        self.validators.clear();
         for (addr, stake) in genesis_validators {
             self.validators.insert(addr.0, *stake);
         }
