@@ -1045,16 +1045,14 @@ async fn faucet_claim(
         }
     }
 
-    // Hard-fork rollout gate. v0.7.1 adds TxType::FaucetClaim (0x21),
-    // which v0.7.0 peers can't deserialize. While we roll v0.7.1 across
-    // the fleet, every v0.7.1 node defaults to the legacy null-sig
-    // Transfer path (wire-compatible with v0.7.0). Once every seed is
-    // on v0.7.1 we flip FAUCET_V2_ENABLED=true on each (env is read
-    // per-call, no restart) and the new propagating path activates.
-    // v0.7.2 removes this gate and the legacy branch.
+    // FaucetClaim path (default). Legacy null-sig Transfer path is
+    // retained for emergency rollback via FAUCET_V2_ENABLED=false, but
+    // every active v0.7.1 seed should use the new path so the funded
+    // balance actually propagates cross-seed. v0.7.2 will drop the gate
+    // and the legacy branch entirely.
     let v2_enabled = std::env::var("FAUCET_V2_ENABLED")
-        .map(|v| v == "true" || v == "1")
-        .unwrap_or(false);
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
 
     let hash = if v2_enabled {
         // v0.7.1+ validator-signed FaucetClaim path. Validator signs a
