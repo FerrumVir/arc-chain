@@ -4462,31 +4462,22 @@ impl StateDB {
                     )));
                 }
 
-                // Bump signer's nonce. The validator's own balance is NOT
-                // debited — we just need their nonce to advance so replays
-                // get rejected and the tx hash stays unique.
-                {
-                    let mut signer = self
-                        .accounts
-                        .entry(tx.from.0)
-                        .or_insert_with(|| Account::new(tx.from, 0));
-                    if signer.nonce != tx.nonce {
-                        return Err(StateError::InvalidNonce {
-                            expected: signer.nonce,
-                            got: tx.nonce,
-                        });
-                    }
-                    signer.nonce += 1;
-                    if self.use_jmt {
-                        let h = hash_bytes(&bincode::serialize(signer.value()).unwrap_or_default());
-                        self.jmt.lock().update_leaf(tx.from.0, h);
-                    }
-                    if self.wal.is_active() {
-                        let snap = signer.clone();
-                        drop(signer);
-                        self.wal.append(WalOp::SetAccount(tx.from, snap), self.height());
-                    }
-                }
+                // No signer-nonce check or bump. A validator-signed
+                // FaucetClaim is authorized by the Ed25519 signature plus
+                // is_validator(tx.from) — both deterministic across peers.
+                // Replay protection comes from the tx_hash receipt dedup
+                // in consensus.rs:966-973 plus the per-address rate limit
+                // in the /faucet/claim handler.
+                //
+                // We INTENTIONALLY do NOT enforce signer.nonce == tx.nonce
+                // here. Peers' committed-state nonce for a validator
+                // diverges from the validator's local nonce when commit-log
+                // heights drift (a common condition on this testnet — see
+                // memory/project_arc_session_handoff_20260510.md). A strict
+                // check causes spurious InvalidNonce rejections that block
+                // cross-seed propagation of the funded balance — exactly
+                // the bug v0.7.1 was meant to fix. Signer balance is also
+                // not touched: the pool is the shared source.
 
                 // Debit the system faucet pool. Account exists on every
                 // seed because it's prefunded in genesis.toml as the first
@@ -7549,9 +7540,12 @@ mod tests {
         assert_eq!(recv.balance, 10_000, "recipient credited 10_000");
         let pool = state.get_account(&pool_addr).expect("pool exists");
         assert_eq!(pool.balance, 999_990_000, "pool debited 10_000");
-        let signer = state.get_account(&validator).expect("signer exists");
-        assert_eq!(signer.nonce, 1, "signer nonce bumped");
-        assert_eq!(signer.balance, 0, "signer balance untouched");
+        // Signer nonce is INTENTIONALLY not bumped — see executor arm.
+        // Validators are read from state on signing-side anyway, so a
+        // missing-account here is also acceptable.
+        if let Some(signer) = state.get_account(&validator) {
+            assert_eq!(signer.balance, 0, "signer balance untouched");
+        }
     }
 
     #[test]
