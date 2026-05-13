@@ -4301,10 +4301,15 @@ async fn inference_run_sharded(
         return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "No shards announced. Need shard registry to be populated."));
     }
 
-    // Verify the pipeline is contiguous and covers all layers
+    // Verify the pipeline is contiguous and covers all layers.
+    // Stop early once coverage is complete — stale extra shards in the
+    // registry beyond n_layers must not cause a false gap error.
     let n_layers = pipeline[0].total_layers;
     let mut covered_to = 0usize;
     for shard in &pipeline {
+        if covered_to >= n_layers {
+            break;
+        }
         if shard.start_layer != covered_to {
             return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
                 "Pipeline gap: expected layer {} next, got shard [{}, {}) (node {}, addr {})",
@@ -5078,10 +5083,14 @@ async fn inference_run_consensus(
     if pipeline_ranges.is_empty() {
         return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "No shards announced."));
     }
-    // Verify contiguous coverage.
+    // Verify contiguous coverage. Stop early once coverage is complete —
+    // stale extra shards beyond n_layers must not cause a false gap error.
     let n_layers = pipeline_ranges[0].1[0].total_layers;
     let mut covered = 0usize;
     for ((s, e), _) in &pipeline_ranges {
+        if covered >= n_layers {
+            break;
+        }
         if *s != covered {
             return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
                 "Pipeline gap: expected layer {} next, got [{}, {})", covered, s, e
