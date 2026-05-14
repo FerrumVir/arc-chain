@@ -651,6 +651,19 @@
   color: var(--info);
   margin-right: var(--space-2);
 }
+.syncing-banner {
+  background: var(--warning-bg);
+  color: var(--warning);
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-6);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+}
+.syncing-banner strong {
+  color: var(--warning);
+}
 
 /* - Big number - */
 .big-number {
@@ -1251,3 +1264,6 @@
   font-size: var(--text-lg);
   font-weight: var(--weight-semibold);
 }
+
+@keyframes spin { to { transform: rotate(360deg); } }
+.spin { animation: spin 1s linear infinite; }
