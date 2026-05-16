@@ -127,6 +127,23 @@ export function Settings() {
       </Card>
 
       <Card style={{ marginBottom: "var(--space-6)" }}>
+        <CardHeader title="Inference" />
+        <p
+          style={{
+            fontSize: "var(--text-sm)",
+            color: "var(--text-muted)",
+            marginBottom: "var(--space-3)",
+          }}
+        >
+          Selects how the network executes your inference requests. On-chain
+          mode replaces the coordinator with a VRF-selected committee of
+          validators voting on the output hash. See{" "}
+          <code>TIER1_ONCHAIN_INFERENCE_PLAN.md</code> in the docs repo.
+        </p>
+        <InferenceModeToggle />
+      </Card>
+
+      <Card style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader
           title="Updates"
           action={update ? <StatusPill level="info" label={`v${update.version}`} /> : null}
@@ -230,6 +247,65 @@ export function Settings() {
       </Card>
 
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
+function InferenceModeToggle() {
+  const mode = useAppStore((s) => s.inferenceMode);
+  const setMode = useAppStore((s) => s.setInferenceMode);
+  return (
+    <div style={{ display: "grid", gap: "var(--space-2)" }}>
+      <label
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "var(--space-3)",
+          cursor: "pointer",
+        }}
+      >
+        <input
+          type="radio"
+          name="inferenceMode"
+          checked={mode === "coordinator"}
+          onChange={() => setMode("coordinator")}
+          data-testid="inference-mode-coordinator"
+        />
+        <div>
+          <div style={{ fontWeight: 500 }}>Coordinator (legacy)</div>
+          <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
+            Uses the hardcoded seed coordinator list. Lower latency on
+            healthy testnets; subject to the pipeline-gap and INT8
+            output-quality issues described in INFERENCE_FLOW.md.
+          </div>
+        </div>
+      </label>
+      <label
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "var(--space-3)",
+          cursor: "pointer",
+        }}
+      >
+        <input
+          type="radio"
+          name="inferenceMode"
+          checked={mode === "onchain"}
+          onChange={() => setMode("onchain")}
+          data-testid="inference-mode-onchain"
+        />
+        <div>
+          <div style={{ fontWeight: 500 }}>On-chain (Tier 1)</div>
+          <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
+            Submits an <code>InferenceRequest</code> tx. A VRF committee of
+            validators each run candle Q4 locally and vote on the
+            <code>output_hash</code>. Coherent output, fully verifiable.
+            Requires Phase B model upload across coordinators for committee
+            ≥ 3 in production.
+          </div>
+        </div>
+      </label>
     </div>
   );
 }

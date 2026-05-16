@@ -13,7 +13,7 @@ import {
   WifiOff,
   Zap,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { CrashBanner } from "../components/CrashBanner";
 import { EmptyState } from "../components/EmptyState";
@@ -89,6 +89,9 @@ export function Dashboard() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["status"] });
     },
+    onError: (err) => {
+      console.error("start_node failed:", err);
+    },
   });
 
   const stopMutation = useMutation({
@@ -96,12 +99,18 @@ export function Dashboard() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["status"] });
     },
+    onError: (err) => {
+      console.error("stop_node failed:", err);
+    },
   });
 
   const restartMutation = useMutation({
     mutationFn: () => api.restartNode(),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["status"] });
+    },
+    onError: (err) => {
+      console.error("restart_node failed:", err);
     },
   });
 
@@ -120,6 +129,30 @@ export function Dashboard() {
   const isExternal = running && status?.pid == null;
   const isCrashed =
     !!status?.lastError && status.lastError.includes("exited unexpectedly");
+  // Spawned but RPC not yet bound. arc-node spends most of its startup time
+  // loading the GGUF model into memory (especially in debug builds), during
+  // which /health doesn't respond, so status.running stays false even though
+  // the child process is alive and working. Without surfacing this, the
+  // Start button appears unresponsive for minutes.
+  const isStarting =
+    (!running && status?.pid != null) || startMutation.isPending;
+
+  const [startedAt, setStartedAt] = useState<number | null>(null);
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (isStarting && startedAt == null) setStartedAt(Date.now());
+    if (running) setStartedAt(null);
+  }, [isStarting, running, startedAt]);
+  useEffect(() => {
+    if (!isStarting) return;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [isStarting]);
+  const startingElapsedSec = startedAt
+    ? Math.floor((Date.now() - startedAt) / 1000)
+    : 0;
+  void tick;
+
   const [addressCopied, setAddressCopied] = useState(false);
 
   return (
@@ -132,40 +165,54 @@ export function Dashboard() {
               ? isExternal
                 ? "Your node is live - managed by the system (launchd / systemd)."
                 : "Your node is live. Earnings update every few seconds."
-              : "Your node is stopped. Start it to begin earning."}
+              : isStarting
+                ? "Starting node — loading model and binding RPC. This can take a few minutes on first run."
+                : "Your node is stopped. Start it to begin earning."}
           </p>
         </div>
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
           {running ? (
-            isExternal ? (
-              <span
-                title="This node is managed by the system. Use `launchctl` (macOS) or `systemctl` (Linux) to stop it."
-                className="status-pill info"
-                style={{ padding: "8px 14px" }}
-                data-testid="external-pill"
+            <>
+              {isExternal && (
+                <span
+                  title="Desktop lost track of the child handle (likely a Tauri rebuild while arc-node kept running). Restart will respawn from this Tauri process."
+                  className="status-pill info"
+                  style={{ padding: "8px 14px" }}
+                  data-testid="external-pill"
+                >
+                  Detached
+                </span>
+              )}
+              <button
+                className="btn btn-secondary"
+                onClick={() => restartMutation.mutate()}
+                disabled={restartMutation.isPending}
+                data-testid="btn-restart"
               >
-                External · read-only
-              </span>
-            ) : (
-              <>
-                <button
-                  className="btn btn-secondary"
-                  onClick={() => restartMutation.mutate()}
-                  disabled={restartMutation.isPending}
-                  data-testid="btn-restart"
-                >
-                  <RotateCw size={14} /> Restart
-                </button>
-                <button
-                  className="btn btn-danger"
-                  onClick={() => stopMutation.mutate()}
-                  disabled={stopMutation.isPending}
-                  data-testid="btn-stop"
-                >
-                  <CircleStop size={14} /> Stop
-                </button>
-              </>
-            )
+                <RotateCw size={14} /> Restart
+              </button>
+              <button
+                className="btn btn-danger"
+                onClick={() => stopMutation.mutate()}
+                disabled={stopMutation.isPending}
+                data-testid="btn-stop"
+              >
+                <CircleStop size={14} /> Stop
+              </button>
+            </>
+          ) : isStarting ? (
+            <button
+              className="btn btn-primary"
+              disabled
+              data-testid="btn-starting"
+              style={{ opacity: 0.85 }}
+            >
+              <RotateCw
+                size={14}
+                style={{ animation: "spin 1s linear infinite" }}
+              /> Starting
+              {startedAt ? `… ${startingElapsedSec}s` : "…"}
+            </button>
           ) : (
             <button
               className="btn btn-primary"
@@ -179,8 +226,63 @@ export function Dashboard() {
         </div>
       </div>
 
+      {isStarting && (
+        <div
+          role="status"
+          data-testid="starting-banner"
+          style={{
+            margin: "var(--space-3) 0",
+            padding: "12px 16px",
+            border: "1px solid rgba(99, 102, 241, 0.4)",
+            background: "rgba(99, 102, 241, 0.08)",
+            color: "#c7d2fe",
+            borderRadius: 8,
+            fontSize: 13,
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+          }}
+        >
+          <RotateCw
+            size={16}
+            style={{ animation: "spin 1s linear infinite" }}
+          />
+          <div>
+            <strong>Node is starting</strong>
+            {startedAt ? ` (${startingElapsedSec}s elapsed)` : ""} — arc-node is
+            loading the GGUF model into memory before binding RPC. Debug builds
+            can take 2-5 minutes; release builds are 10-30 seconds. Switch to
+            Logs tab for live progress.
+          </div>
+        </div>
+      )}
+
       {isCrashed && status?.lastError && (
         <CrashBanner message={status.lastError} />
+      )}
+
+      {(startMutation.error || stopMutation.error || restartMutation.error) && (
+        <div
+          role="alert"
+          data-testid="mutation-error"
+          style={{
+            margin: "var(--space-3) 0",
+            padding: "12px 16px",
+            border: "1px solid #ef4444",
+            background: "rgba(239, 68, 68, 0.08)",
+            color: "#fca5a5",
+            borderRadius: 8,
+            fontFamily: "ui-monospace, monospace",
+            fontSize: 13,
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          {String(
+            startMutation.error ??
+              stopMutation.error ??
+              restartMutation.error,
+          )}
+        </div>
       )}
 
       {status?.health === "lite" && status?.coordinatorUrl && (
@@ -582,6 +684,8 @@ export function Dashboard() {
           </button>
         </Card>
       </div>
+
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
 }

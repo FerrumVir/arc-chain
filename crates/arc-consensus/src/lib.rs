@@ -1908,6 +1908,12 @@ impl ConsensusEngine {
             // recipient is arbitrary — treat as same-shard since the pool
             // is the dominant access (recipient is just credited).
             TxBody::FaucetClaim(_) => false,
+            // Tier 1 inference txs all reference a deterministic escrow
+            // address derived from request_id — that escrow lives on a
+            // single shard, so treat as same-shard for routing.
+            TxBody::InferenceRequest(_) => false,
+            TxBody::InferenceVote(_) => false,
+            TxBody::InferenceFinalize(_) => false,
         }
     }
 

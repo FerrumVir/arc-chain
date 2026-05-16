@@ -139,6 +139,30 @@ pub struct StateSummary {
 /// WASM module magic bytes: `\0asm`.
 const WASM_MAGIC: &[u8; 4] = b"\0asm";
 
+// ── Tier 1 on-chain inference status bytes ────────────────────────────────
+// Stored in the first byte of the request escrow's `code_hash` field. See
+// `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md` for the lifecycle.
+pub const TIER1_STATUS_OPEN: u8 = 0;
+pub const TIER1_STATUS_VOTING: u8 = 1;
+pub const TIER1_STATUS_FINALIZED: u8 = 2;
+pub const TIER1_STATUS_REFUNDED: u8 = 3;
+
+/// Read-only snapshot of a Tier 1 inference request — returned by
+/// `StateDB::tier1_request_snapshot()` so the validator inference task can
+/// pick its next action without holding state locks.
+#[derive(Clone, Debug)]
+pub struct Tier1RequestSnapshot {
+    pub request_id: [u8; 32],
+    pub escrow_addr: Address,
+    pub status: u8,
+    pub deadline_blocks: u64,
+    pub committee_size: u8,
+    pub anchor_height: u64,
+    pub input_blob: Vec<u8>,
+    pub votes: Vec<(Address, Hash256)>,
+    pub max_reward: u64,
+}
+
 /// Derive a deterministic contract address from the deployer address and nonce.
 ///
 /// Mirrors the logic in `arc_vm::compute_contract_address` - duplicated here to
@@ -231,6 +255,11 @@ pub struct StateDB {
     /// Archive mode - when true, skips all pruning (keeps full history).
     /// Used by block explorers and analytics nodes.
     pub archive_mode: bool,
+    /// Index of open Tier 1 inference requests (request_id → anchor_height).
+    /// Populated by `apply_inference_request`, cleared by
+    /// `apply_inference_finalize`. The `inference_validator` background task
+    /// polls this to discover requests where its address is in the committee.
+    pub tier1_pending: DashMap<[u8; 32], u64>,
 }
 
 impl StateDB {
@@ -265,6 +294,7 @@ impl StateDB {
             use_jmt: false,
             gpu_cache: None,
             archive_mode: false,
+            tier1_pending: DashMap::new(),
         }
     }
 
@@ -301,6 +331,7 @@ impl StateDB {
             use_jmt: false,
             gpu_cache: None,
             archive_mode: false,
+            tier1_pending: DashMap::new(),
         })
     }
 
@@ -570,6 +601,92 @@ impl StateDB {
             }
         }
         None
+    }
+
+    // ── Tier 1 on-chain inference helpers ────────────────────────────────
+
+    /// Snapshot of open Tier 1 inference requests for the validator task.
+    /// Returns `(request_id, anchor_height)` pairs. Order is unspecified.
+    pub fn tier1_pending_requests(&self) -> Vec<([u8; 32], u64)> {
+        self.tier1_pending
+            .iter()
+            .map(|kv| (*kv.key(), *kv.value()))
+            .collect()
+    }
+
+    /// Read a Tier 1 request's escrow state + storage. Returns `None` if no
+    /// such escrow exists. Used by the validator task to check status,
+    /// gather votes, and decide whether to vote/finalize.
+    pub fn tier1_request_snapshot(&self, request_id: &[u8; 32]) -> Option<Tier1RequestSnapshot> {
+        let escrow_addr = arc_crypto::hash_bytes(
+            &[b"arc-infreq", request_id.as_ref()].concat(),
+        );
+        let escrow = self.get_account(&escrow_addr)?;
+        if escrow.balance == 0 && escrow.code_hash == Hash256::ZERO {
+            return None;
+        }
+        let status = escrow.code_hash.0[0];
+        let deadline_blocks =
+            u64::from_le_bytes(escrow.code_hash.0[1..9].try_into().unwrap_or([0u8; 8]));
+        let committee_size = escrow.code_hash.0[9];
+        let anchor_height = escrow.nonce;
+        let input_blob = self
+            .get_storage(&escrow_addr, &arc_crypto::hash_bytes(b"tier1.input_blob"))
+            .unwrap_or_default();
+        let votes_bytes = self
+            .get_storage(&escrow_addr, &arc_crypto::hash_bytes(b"tier1.votes"))
+            .unwrap_or_default();
+        let votes: Vec<(Address, Hash256)> =
+            bincode::deserialize(&votes_bytes).unwrap_or_default();
+        Some(Tier1RequestSnapshot {
+            request_id: *request_id,
+            escrow_addr,
+            status,
+            deadline_blocks,
+            committee_size,
+            anchor_height,
+            input_blob,
+            votes,
+            max_reward: escrow.balance,
+        })
+    }
+
+    /// Derive the committee for a given request. Mirrors the apply-time
+    /// derivation in `apply_inference_vote`. Used by the validator task
+    /// to check whether it should vote.
+    pub fn tier1_committee_for(
+        &self,
+        request_id: &[u8; 32],
+        anchor_height: u64,
+        committee_size: u8,
+    ) -> Vec<Address> {
+        let mut seed_input: Vec<u8> = Vec::with_capacity(64);
+        seed_input.extend_from_slice(b"tier1-seed");
+        seed_input.extend_from_slice(request_id);
+        seed_input.extend_from_slice(&anchor_height.to_le_bytes());
+        let seed = arc_crypto::hash_bytes(&seed_input);
+
+        let mut eligible: Vec<Address> = self
+            .validators
+            .iter()
+            .map(|kv| Hash256(*kv.key()))
+            .collect();
+        eligible.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut scored: Vec<(Address, Hash256)> = eligible
+            .into_iter()
+            .map(|a| {
+                let mut input = Vec::with_capacity(64);
+                input.extend_from_slice(&seed.0);
+                input.extend_from_slice(&a.0);
+                (a, arc_crypto::hash_bytes(&input))
+            })
+            .collect();
+        scored.sort_by(|a, b| a.1 .0.cmp(&b.1 .0));
+        scored
+            .into_iter()
+            .take(committee_size as usize)
+            .map(|(a, _)| a)
+            .collect()
     }
 
     /// Set a storage value for a contract.
@@ -2403,6 +2520,9 @@ impl StateDB {
             TxBody::CapacityAdvertisement(_) => gas_costs::CAPACITY_ADVERTISEMENT,
             TxBody::ShardAssignmentProposal(_) => gas_costs::SHARD_ASSIGNMENT_PROPOSAL,
             TxBody::FaucetClaim(_) => gas_costs::FAUCET_CLAIM,
+            TxBody::InferenceRequest(_) => gas_costs::TIER1_INFERENCE_REQUEST,
+            TxBody::InferenceVote(_) => gas_costs::TIER1_INFERENCE_VOTE,
+            TxBody::InferenceFinalize(_) => gas_costs::TIER1_INFERENCE_FINALIZE,
         }
     }
 
@@ -4466,6 +4586,474 @@ impl StateDB {
 
                 Ok(gas.consumed)
             }
+            TxBody::InferenceRequest(body) => {
+                // Tier 1 on-chain inference request. Locks `max_reward` in
+                // a deterministic escrow and records request metadata that
+                // every full node can reconstruct on replay.
+                //
+                // The committee is NOT derived here — it's derived at
+                // InferenceVote apply time using the commit block hash of
+                // *this* tx as the VRF seed. We record the anchor height
+                // in the escrow nonce so vote-apply knows which seed
+                // (block_hash_at_anchor_height) to use.
+                use arc_types::transaction as ttx;
+
+                // ── 1. Bounds checks (chain-enforced invariants) ──
+                if body.input_blob.len() > ttx::TIER1_INPUT_BLOB_MAX {
+                    return Err(StateError::ExecutionError(format!(
+                        "tier1 request: input_blob {} > max {}",
+                        body.input_blob.len(),
+                        ttx::TIER1_INPUT_BLOB_MAX
+                    )));
+                }
+                if body.max_tokens == 0 || body.max_tokens > ttx::TIER1_MAX_TOKENS {
+                    return Err(StateError::ExecutionError(format!(
+                        "tier1 request: max_tokens {} outside [1, {}]",
+                        body.max_tokens,
+                        ttx::TIER1_MAX_TOKENS
+                    )));
+                }
+                if body.deadline_blocks < ttx::TIER1_MIN_DEADLINE_BLOCKS
+                    || body.deadline_blocks > ttx::TIER1_MAX_DEADLINE_BLOCKS
+                {
+                    return Err(StateError::ExecutionError(format!(
+                        "tier1 request: deadline_blocks {} outside [{}, {}]",
+                        body.deadline_blocks,
+                        ttx::TIER1_MIN_DEADLINE_BLOCKS,
+                        ttx::TIER1_MAX_DEADLINE_BLOCKS
+                    )));
+                }
+                if body.committee_size == 0 || body.committee_size > 32 {
+                    return Err(StateError::ExecutionError(format!(
+                        "tier1 request: committee_size {} outside [1, 32]",
+                        body.committee_size
+                    )));
+                }
+                if body.tier != 1 {
+                    return Err(StateError::ExecutionError(format!(
+                        "tier1 request: only tier=1 supported in this phase, got {}",
+                        body.tier
+                    )));
+                }
+                // Verify input_hash matches blob (chain-side check; the
+                // client may have computed it lazily).
+                let computed = hash_bytes(&body.input_blob);
+                if computed != body.input_hash {
+                    return Err(StateError::ExecutionError(
+                        "tier1 request: input_hash does not match blob".into(),
+                    ));
+                }
+
+                // ── 2. Verify sender nonce + balance ──
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                if sender.balance < body.max_reward {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: body.max_reward,
+                    });
+                }
+
+                // ── 3. Debit max_reward, bump nonce ──
+                sender.balance -= body.max_reward;
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                // ── 4. Create request escrow ──
+                let escrow_addr = hash_bytes(
+                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
+                );
+                let mut escrow = self.get_or_create_account(&escrow_addr);
+                if escrow.balance != 0 || escrow.code_hash != Hash256::ZERO {
+                    return Err(StateError::ExecutionError(
+                        "tier1 request: request_id collides with existing escrow".into(),
+                    ));
+                }
+                escrow.balance = body.max_reward;
+                // Anchor height in nonce for vote-apply to read.
+                escrow.nonce = self.height();
+                // Status byte 0 = Open. First byte of code_hash holds status.
+                let mut status_bytes = [0u8; 32];
+                status_bytes[0] = TIER1_STATUS_OPEN;
+                // Bytes [1..9] hold deadline_blocks (relative) for easy lookup.
+                status_bytes[1..9].copy_from_slice(&body.deadline_blocks.to_le_bytes());
+                // Byte 9 holds committee_size.
+                status_bytes[9] = body.committee_size;
+                escrow.code_hash = Hash256(status_bytes);
+                // Metadata commitment in storage_root.
+                let mut meta = Vec::new();
+                meta.extend_from_slice(&body.model_id.0);
+                meta.extend_from_slice(&body.input_hash.0);
+                meta.extend_from_slice(&body.tier.to_le_bytes());
+                meta.extend_from_slice(&body.max_tokens.to_le_bytes());
+                meta.extend_from_slice(&body.committee_size.to_le_bytes());
+                meta.extend_from_slice(&body.deadline_blocks.to_le_bytes());
+                meta.extend_from_slice(&body.max_reward.to_le_bytes());
+                meta.extend_from_slice(&self.height().to_le_bytes());
+                escrow.storage_root = hash_bytes(&meta);
+                self.accounts.insert(escrow_addr.0, escrow.clone());
+                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+
+                // Store the requester address so finalize knows whom to refund.
+                self.set_storage(
+                    &escrow_addr,
+                    hash_bytes(b"tier1.requester"),
+                    tx.from.0.to_vec(),
+                );
+                // Store the prompt blob so committee members can fetch it
+                // from chain state if they missed the original tx.
+                self.set_storage(
+                    &escrow_addr,
+                    hash_bytes(b"tier1.input_blob"),
+                    body.input_blob.clone(),
+                );
+                // Initialize empty vote list.
+                self.set_storage(
+                    &escrow_addr,
+                    hash_bytes(b"tier1.votes"),
+                    bincode::serialize(&Vec::<(Address, Hash256)>::new())
+                        .unwrap_or_default(),
+                );
+
+                // Index the open request for the validator inference task
+                // to poll. The anchor height equals the escrow's nonce,
+                // also used for committee seed derivation.
+                self.tier1_pending.insert(body.request_id, self.height());
+
+                Ok(gas.consumed)
+            }
+            TxBody::InferenceVote(body) => {
+                // Tier 1 committee member vote. Re-derive the committee
+                // deterministically and reject votes from non-members.
+                use arc_types::transaction as ttx;
+
+                // ── 1. Bounds checks ──
+                if let Some(blob) = &body.output_blob {
+                    if blob.len() > ttx::TIER1_OUTPUT_BLOB_MAX {
+                        return Err(StateError::ExecutionError(format!(
+                            "tier1 vote: output_blob {} > max {}",
+                            blob.len(),
+                            ttx::TIER1_OUTPUT_BLOB_MAX
+                        )));
+                    }
+                    // Verify hash matches blob if blob attached.
+                    let computed = hash_bytes(blob);
+                    if computed != body.output_hash {
+                        return Err(StateError::ExecutionError(
+                            "tier1 vote: output_hash does not match attached blob".into(),
+                        ));
+                    }
+                }
+
+                // ── 2. Verify sender nonce ──
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+
+                // ── 3. Look up request escrow ──
+                let escrow_addr = hash_bytes(
+                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
+                );
+                let escrow = self.get_or_create_account(&escrow_addr);
+                if escrow.balance == 0 {
+                    return Err(StateError::ExecutionError(
+                        "tier1 vote: request not found or already settled".into(),
+                    ));
+                }
+                let status = escrow.code_hash.0[0];
+                if status != TIER1_STATUS_OPEN && status != TIER1_STATUS_VOTING {
+                    return Err(StateError::ExecutionError(format!(
+                        "tier1 vote: request status {} disallows voting",
+                        status
+                    )));
+                }
+                let committee_size = escrow.code_hash.0[9] as usize;
+
+                // ── 4. Derive committee deterministically ──
+                // The committee seed is recomputed from state-controlled
+                // fields, NOT from `body.committee_seed`. A voter-supplied
+                // seed would let a malicious member grind their address
+                // into the committee. The published `body.committee_seed`
+                // is advisory only — the security gate is this re-derive.
+                //
+                // Seed = BLAKE3("tier1-seed" || request_id || anchor_height_LE).
+                // anchor_height is `escrow.nonce`, set at apply_inference_request
+                // time from `self.height()`. The validator inference task uses
+                // the same derivation to learn which requests select it.
+                let mut seed_input: Vec<u8> = Vec::with_capacity(64);
+                seed_input.extend_from_slice(b"tier1-seed");
+                seed_input.extend_from_slice(&body.request_id);
+                seed_input.extend_from_slice(&escrow.nonce.to_le_bytes());
+                let canonical_seed = hash_bytes(&seed_input);
+
+                let mut eligible: Vec<Address> = self
+                    .validators
+                    .iter()
+                    .map(|kv| Hash256(*kv.key()))
+                    .collect();
+                // Deterministic ordering before scoring (HashMap iteration is not).
+                eligible.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut scored: Vec<(Address, Hash256)> = eligible
+                    .into_iter()
+                    .map(|a| {
+                        let mut input = Vec::with_capacity(64);
+                        input.extend_from_slice(&canonical_seed.0);
+                        input.extend_from_slice(&a.0);
+                        (a, hash_bytes(&input))
+                    })
+                    .collect();
+                scored.sort_by(|a, b| a.1.0.cmp(&b.1.0));
+                let members: Vec<Address> = scored
+                    .into_iter()
+                    .take(committee_size)
+                    .map(|(a, _)| a)
+                    .collect();
+                if !members.iter().any(|m| m.0 == tx.from.0) {
+                    return Err(StateError::ExecutionError(format!(
+                        "tier1 vote: signer {} not in committee",
+                        tx.from.to_hex()
+                    )));
+                }
+
+                // ── 5. Load existing votes, reject duplicates, append ──
+                let key = hash_bytes(b"tier1.votes");
+                let existing = self
+                    .get_storage(&escrow_addr, &key)
+                    .unwrap_or_default();
+                let mut votes: Vec<(Address, Hash256)> =
+                    bincode::deserialize(&existing).unwrap_or_default();
+                if votes.iter().any(|(v, _)| v.0 == tx.from.0) {
+                    return Err(StateError::ExecutionError(
+                        "tier1 vote: duplicate vote from this validator".into(),
+                    ));
+                }
+                votes.push((tx.from, body.output_hash));
+                let encoded =
+                    bincode::serialize(&votes).map_err(|e| StateError::ExecutionError(
+                        format!("tier1 vote: serialize votes: {}", e),
+                    ))?;
+                self.set_storage(&escrow_addr, key, encoded);
+
+                // ── 6. If voter attached blob, store it for the requester ──
+                if let Some(blob) = &body.output_blob {
+                    // Only the first attached blob is kept (saves space).
+                    let blob_key = hash_bytes(b"tier1.output_blob");
+                    if self.get_storage(&escrow_addr, &blob_key).is_none() {
+                        self.set_storage(&escrow_addr, blob_key, blob.clone());
+                    }
+                }
+
+                // ── 7. Bump signer nonce ──
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                // ── 8. Flip status to Voting (if still Open) ──
+                if status == TIER1_STATUS_OPEN {
+                    let mut updated = escrow.clone();
+                    updated.code_hash.0[0] = TIER1_STATUS_VOTING;
+                    self.accounts.insert(escrow_addr.0, updated.clone());
+                    self.wal
+                        .append(WalOp::SetAccount(escrow_addr, updated), self.height());
+                }
+
+                Ok(gas.consumed)
+            }
+            TxBody::InferenceFinalize(body) => {
+                // Tier 1 finalize. Deterministic — first submitter wins,
+                // subsequent submissions reject because status flips to
+                // Finalized/Refunded after the first apply.
+                use arc_types::transaction as ttx;
+
+                // ── 1. Verify sender nonce (any signer can submit; only nonce check) ──
+                let mut sender = self.get_or_create_account(&tx.from);
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                sender.nonce += 1;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                // ── 2. Look up request escrow ──
+                let escrow_addr = hash_bytes(
+                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
+                );
+                let escrow = self.get_or_create_account(&escrow_addr);
+                if escrow.balance == 0 {
+                    return Err(StateError::ExecutionError(
+                        "tier1 finalize: request not found or already settled".into(),
+                    ));
+                }
+                let status = escrow.code_hash.0[0];
+                if status != TIER1_STATUS_OPEN && status != TIER1_STATUS_VOTING {
+                    return Err(StateError::ExecutionError(format!(
+                        "tier1 finalize: request status {} already terminal",
+                        status
+                    )));
+                }
+                let deadline_blocks =
+                    u64::from_le_bytes(escrow.code_hash.0[1..9].try_into().unwrap_or([0u8; 8]));
+                let committee_size = escrow.code_hash.0[9] as usize;
+                let anchor_height = escrow.nonce;
+                let now = self.height();
+
+                // ── 3. Load votes ──
+                let key = hash_bytes(b"tier1.votes");
+                let votes_bytes = self.get_storage(&escrow_addr, &key).unwrap_or_default();
+                let votes: Vec<(Address, Hash256)> =
+                    bincode::deserialize(&votes_bytes).unwrap_or_default();
+                let vote_count = votes.len();
+
+                // ── 4. Determine if finalization is eligible ──
+                let timeout_reached =
+                    now >= anchor_height.saturating_add(deadline_blocks);
+                let all_voted = vote_count >= committee_size;
+                if !timeout_reached && !all_voted {
+                    return Err(StateError::ExecutionError(format!(
+                        "tier1 finalize: not yet eligible (votes {}/{}, height {} < deadline {})",
+                        vote_count,
+                        committee_size,
+                        now,
+                        anchor_height.saturating_add(deadline_blocks)
+                    )));
+                }
+
+                // ── 5. Aggregate votes ──
+                let min_agreement: usize = (committee_size / 2 + 1).max(1);
+                let mut tally: std::collections::HashMap<[u8; 32], usize> =
+                    std::collections::HashMap::new();
+                for (_, oh) in &votes {
+                    *tally.entry(oh.0).or_insert(0) += 1;
+                }
+                let majority = tally
+                    .iter()
+                    .max_by_key(|(_, c)| **c)
+                    .map(|(h, c)| (Hash256(*h), *c))
+                    .unwrap_or((Hash256::ZERO, 0));
+
+                // ── 6. Look up requester ──
+                let requester_bytes = self
+                    .get_storage(&escrow_addr, &hash_bytes(b"tier1.requester"))
+                    .unwrap_or_default();
+                let requester: Address = if requester_bytes.len() == 32 {
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&requester_bytes);
+                    Hash256(a)
+                } else {
+                    return Err(StateError::ExecutionError(
+                        "tier1 finalize: requester not recorded in escrow storage".into(),
+                    ));
+                };
+
+                let max_reward = escrow.balance;
+                let new_status: u8;
+                if majority.1 >= min_agreement {
+                    // Consensus reached: pay agreeing voters, rebate requester, treasury cut.
+                    let voters_pool =
+                        max_reward * ttx::TIER1_REWARD_SHARE_VOTERS_BPS / 10_000;
+                    let refund =
+                        max_reward * ttx::TIER1_REWARD_SHARE_REFUND_BPS / 10_000;
+                    let treasury =
+                        max_reward * ttx::TIER1_REWARD_SHARE_TREASURY_BPS / 10_000;
+                    // Anti-rounding remainder goes to treasury.
+                    let remainder = max_reward
+                        .saturating_sub(voters_pool + refund + treasury);
+
+                    let agreeing: Vec<Address> = votes
+                        .iter()
+                        .filter(|(_, oh)| oh.0 == majority.0.0)
+                        .map(|(v, _)| *v)
+                        .collect();
+                    let per_voter = if agreeing.is_empty() {
+                        0
+                    } else {
+                        voters_pool / agreeing.len() as u64
+                    };
+                    let voter_rem =
+                        voters_pool.saturating_sub(per_voter * agreeing.len() as u64);
+
+                    // Credit each agreeing voter.
+                    for v in &agreeing {
+                        let mut acct = self.get_or_create_account(v);
+                        acct.balance = acct.balance.saturating_add(per_voter);
+                        self.accounts.insert(v.0, acct.clone());
+                        self.wal.append(WalOp::SetAccount(*v, acct), self.height());
+                    }
+                    // Rebate to requester.
+                    {
+                        let mut acct = self.get_or_create_account(&requester);
+                        acct.balance = acct.balance.saturating_add(refund);
+                        self.accounts.insert(requester.0, acct.clone());
+                        self.wal
+                            .append(WalOp::SetAccount(requester, acct), self.height());
+                    }
+                    // Treasury (faucet_pool_address doubles as treasury sink for testnet).
+                    let treasury_addr = arc_types::transaction::faucet_pool_address();
+                    {
+                        let mut acct = self.get_or_create_account(&treasury_addr);
+                        acct.balance = acct
+                            .balance
+                            .saturating_add(treasury + remainder + voter_rem);
+                        self.accounts.insert(treasury_addr.0, acct.clone());
+                        self.wal
+                            .append(WalOp::SetAccount(treasury_addr, acct), self.height());
+                    }
+                    new_status = TIER1_STATUS_FINALIZED;
+                    // Record final output hash in escrow's storage_root for reads.
+                    self.set_storage(
+                        &escrow_addr,
+                        hash_bytes(b"tier1.final_output_hash"),
+                        majority.0.0.to_vec(),
+                    );
+                } else {
+                    // Disagreement or timeout: refund payer minus anti-spam fee.
+                    let fee = ttx::TIER1_ANTI_SPAM_FEE.min(max_reward);
+                    let refund = max_reward - fee;
+                    {
+                        let mut acct = self.get_or_create_account(&requester);
+                        acct.balance = acct.balance.saturating_add(refund);
+                        self.accounts.insert(requester.0, acct.clone());
+                        self.wal
+                            .append(WalOp::SetAccount(requester, acct), self.height());
+                    }
+                    if fee > 0 {
+                        let treasury_addr = arc_types::transaction::faucet_pool_address();
+                        let mut acct = self.get_or_create_account(&treasury_addr);
+                        acct.balance = acct.balance.saturating_add(fee);
+                        self.accounts.insert(treasury_addr.0, acct.clone());
+                        self.wal
+                            .append(WalOp::SetAccount(treasury_addr, acct), self.height());
+                    }
+                    new_status = TIER1_STATUS_REFUNDED;
+                }
+
+                // ── 7. Zero escrow + flip status ──
+                let mut closed = escrow.clone();
+                closed.balance = 0;
+                closed.code_hash.0[0] = new_status;
+                self.accounts.insert(escrow_addr.0, closed.clone());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, closed), self.height());
+
+                // Drop from the pending index so the inference task stops
+                // polling this request.
+                self.tier1_pending.remove(&body.request_id);
+
+                Ok(gas.consumed)
+            }
             TxBody::FaucetClaim(body) => {
                 // Validator-authorized faucet drain. The signer (tx.from)
                 // must be in the active validator set — that authorization
@@ -4933,6 +5521,36 @@ impl StateDB {
                     .or_default()
                     .push(tx.hash);
             }
+            TxBody::InferenceRequest(body) => {
+                // Index against the request escrow address so a polling
+                // client (`GET /inference/onchain/result/:id`) can find
+                // the create tx by request_id.
+                let escrow_addr = hash_bytes(
+                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
+                );
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
+            TxBody::InferenceVote(body) => {
+                let escrow_addr = hash_bytes(
+                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
+                );
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
+            TxBody::InferenceFinalize(body) => {
+                let escrow_addr = hash_bytes(
+                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
+                );
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
+            }
         }
     }
 
@@ -5060,6 +5678,30 @@ impl StateDB {
                 self.dirty_accounts.insert(body.recipient.0);
                 let pool_addr = arc_types::transaction::faucet_pool_address();
                 self.dirty_accounts.insert(pool_addr.0);
+            }
+            TxBody::InferenceRequest(body) => {
+                // Request: signer balance debited + escrow created.
+                let escrow_addr = hash_bytes(
+                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
+                );
+                self.dirty_accounts.insert(escrow_addr.0);
+            }
+            TxBody::InferenceVote(_body) => {
+                // Vote: only signer nonce + escrow.code_hash flip — both already covered
+                // (signer via the top-of-function insert; escrow not balance-affected).
+            }
+            TxBody::InferenceFinalize(body) => {
+                // Finalize: escrow zeroed, agreeing voters + requester + treasury credited.
+                // Exact voter set depends on stored vote bucket which we can't read here
+                // (this runs before/parallel-to execute_tx in some paths). Mark the escrow
+                // and the treasury; agreeing voters are marked by execute_tx via direct
+                // accounts.insert (which the dirty tracker also picks up).
+                let escrow_addr = hash_bytes(
+                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
+                );
+                self.dirty_accounts.insert(escrow_addr.0);
+                let treasury_addr = arc_types::transaction::faucet_pool_address();
+                self.dirty_accounts.insert(treasury_addr.0);
             }
         }
     }
@@ -7719,5 +8361,272 @@ mod tests {
         assert_eq!(recv.balance, 10_000, "peer credits recipient with 10_000");
         let pool = peer_state.get_account(&pool_addr).unwrap();
         assert_eq!(pool.balance, 99_990_000, "peer debits pool by 10_000");
+    }
+
+    // ── Tier 1 on-chain inference state transitions ──
+
+    /// Build an unsigned tier1 InferenceRequest tx for tests.
+    fn build_tier1_request(
+        from: Address,
+        nonce: u64,
+        request_id: [u8; 32],
+        max_reward: u64,
+        committee_size: u8,
+        deadline_blocks: u64,
+    ) -> arc_types::transaction::Transaction {
+        use arc_types::transaction::{InferenceRequestBody, Transaction, TxBody, TxType};
+        use arc_crypto::Signature;
+        let input_blob = b"[INST] hi [/INST]".to_vec();
+        let input_hash = hash_bytes(&input_blob);
+        let body = TxBody::InferenceRequest(InferenceRequestBody {
+            request_id,
+            model_id: hash_bytes(b"arc-32L-test"),
+            input_hash,
+            input_blob,
+            max_tokens: 32,
+            tier: 1,
+            max_reward,
+            deadline_blocks,
+            committee_size,
+        });
+        let mut tx = Transaction {
+            tx_type: TxType::InferenceRequest,
+            from,
+            nonce,
+            body,
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: true,
+        };
+        tx.hash = tx.compute_hash();
+        tx
+    }
+
+    fn build_tier1_vote(
+        from: Address,
+        nonce: u64,
+        request_id: [u8; 32],
+        committee_seed: Hash256,
+        output_hash: Hash256,
+    ) -> arc_types::transaction::Transaction {
+        use arc_types::transaction::{InferenceVoteBody, Transaction, TxBody, TxType};
+        use arc_crypto::Signature;
+        let body = TxBody::InferenceVote(InferenceVoteBody {
+            request_id,
+            output_hash,
+            output_blob: None,
+            vrf_proof: vec![0u8; 80],
+            committee_seed,
+        });
+        let mut tx = Transaction {
+            tx_type: TxType::InferenceVote,
+            from,
+            nonce,
+            body,
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: true,
+        };
+        tx.hash = tx.compute_hash();
+        tx
+    }
+
+    fn build_tier1_finalize(
+        from: Address,
+        nonce: u64,
+        request_id: [u8; 32],
+    ) -> arc_types::transaction::Transaction {
+        use arc_types::transaction::{InferenceFinalizeBody, Transaction, TxBody, TxType};
+        use arc_crypto::Signature;
+        let body = TxBody::InferenceFinalize(InferenceFinalizeBody { request_id });
+        let mut tx = Transaction {
+            tx_type: TxType::InferenceFinalize,
+            from,
+            nonce,
+            body,
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: true,
+        };
+        tx.hash = tx.compute_hash();
+        tx
+    }
+
+    #[test]
+    fn tier1_request_locks_escrow_and_records_metadata() {
+        let requester = addr(1);
+        let state = StateDB::with_genesis(&[(requester, 100)]);
+        // Register a validator so block production has a proposer.
+        state.validators.insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
+
+        let req_id = [42u8; 32];
+        let tx = build_tier1_request(requester, 0, req_id, 10, 1, 20);
+        let (_, receipts) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(receipts[0].success, "request must succeed");
+
+        // Requester balance debited.
+        let r = state.get_account(&requester).unwrap();
+        assert_eq!(r.balance, 90);
+        assert_eq!(r.nonce, 1);
+
+        // Escrow holds the locked reward.
+        let escrow_addr = hash_bytes(&[b"arc-infreq", req_id.as_ref()].concat());
+        let escrow = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(escrow.balance, 10);
+        assert_eq!(escrow.code_hash.0[0], TIER1_STATUS_OPEN);
+        assert_eq!(escrow.code_hash.0[9], 1, "committee_size byte");
+    }
+
+    #[test]
+    fn tier1_request_rejects_oversized_input() {
+        let requester = addr(1);
+        let state = StateDB::with_genesis(&[(requester, 1_000_000)]);
+        state.validators.insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
+
+        // Construct an oversized prompt directly.
+        use arc_types::transaction::{
+            InferenceRequestBody, Transaction, TxBody, TxType, TIER1_INPUT_BLOB_MAX,
+        };
+        use arc_crypto::Signature;
+        let oversized = vec![0u8; TIER1_INPUT_BLOB_MAX + 1];
+        let body = TxBody::InferenceRequest(InferenceRequestBody {
+            request_id: [1u8; 32],
+            model_id: hash_bytes(b"m"),
+            input_hash: hash_bytes(&oversized),
+            input_blob: oversized,
+            max_tokens: 8,
+            tier: 1,
+            max_reward: 10,
+            deadline_blocks: 20,
+            committee_size: 1,
+        });
+        let mut tx = Transaction {
+            tx_type: TxType::InferenceRequest,
+            from: requester,
+            nonce: 0,
+            body,
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: true,
+        };
+        tx.hash = tx.compute_hash();
+
+        let (_, receipts) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(
+            !receipts[0].success,
+            "oversized prompt must be rejected by state validator"
+        );
+    }
+
+    #[test]
+    fn tier1_full_consensus_payout() {
+        // Single-validator committee. Validator votes for its own
+        // request, finalize pays out (after escrow rebate + treasury).
+        let validator = addr(10);
+        let state = StateDB::with_genesis(&[(validator, 1_000_000)]);
+        state
+            .validators
+            .insert(validator.0, StateDB::MIN_VALIDATOR_STAKE);
+
+        let req_id = [7u8; 32];
+        // Tx 1: request (nonce 0)
+        let tx1 = build_tier1_request(validator, 0, req_id, 100, 1, 20);
+        let (block1, r1) = state.execute_block(&[tx1], validator).unwrap();
+        assert!(r1[0].success);
+
+        // Committee seed = block hash of tx1's commit block.
+        let committee_seed = block1.hash;
+
+        // Tx 2: vote (nonce 1)
+        let output_hash = hash_bytes(b"the answer");
+        let tx2 = build_tier1_vote(validator, 1, req_id, committee_seed, output_hash);
+        let (_, r2) = state.execute_block(&[tx2], validator).unwrap();
+        assert!(r2[0].success, "vote must succeed");
+
+        // Tx 3: finalize (nonce 2). vote_count = 1 = committee_size → eligible.
+        let tx3 = build_tier1_finalize(validator, 2, req_id);
+        let (_, r3) = state.execute_block(&[tx3], validator).unwrap();
+        assert!(r3[0].success, "finalize must succeed");
+
+        // Escrow zeroed + status Finalized.
+        let escrow_addr = hash_bytes(&[b"arc-infreq", req_id.as_ref()].concat());
+        let escrow = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(escrow.balance, 0);
+        assert_eq!(escrow.code_hash.0[0], TIER1_STATUS_FINALIZED);
+
+        // Validator received 70% of 100 = 70 (voters share) + 20 (refund) = 90 back.
+        // Treasury got 10.
+        let final_validator = state.get_account(&validator).unwrap();
+        // started 1_000_000, locked 100 in tx1, then earned voters+refund=90,
+        // so balance = 999_900 + 90 = 999_990
+        assert_eq!(final_validator.balance, 999_990);
+
+        let treasury = state
+            .get_account(&arc_types::transaction::faucet_pool_address())
+            .unwrap();
+        // Treasury starts at 0 in this genesis, gets +10.
+        assert_eq!(treasury.balance, 10);
+    }
+
+    #[test]
+    fn tier1_timeout_refunds_minus_anti_spam_fee() {
+        let requester = addr(20);
+        let state = StateDB::with_genesis(&[(requester, 1000)]);
+        state
+            .validators
+            .insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
+
+        let req_id = [99u8; 32];
+        let max_reward = 50u64;
+        let tx1 = build_tier1_request(requester, 0, req_id, max_reward, 1, 5);
+        let (_, r1) = state.execute_block(&[tx1], addr(99)).unwrap();
+        assert!(r1[0].success);
+
+        // Advance past deadline (5 blocks).
+        for _ in 0..6 {
+            state.execute_block(&[], addr(99)).unwrap();
+        }
+
+        // Finalize with no votes → timeout refund.
+        let tx2 = build_tier1_finalize(addr(99), 0, req_id);
+        let (_, r2) = state.execute_block(&[tx2], addr(99)).unwrap();
+        assert!(r2[0].success, "finalize on timeout must succeed");
+
+        let after = state.get_account(&requester).unwrap();
+        // requester started 1000, locked 50, gets back 49 (50 - 1 anti-spam) → 999.
+        assert_eq!(after.balance, 1000 - max_reward + (max_reward - 1));
+    }
+
+    #[test]
+    fn tier1_vote_from_non_committee_rejected() {
+        let alice = addr(30);
+        let bob = addr(31); // Not a validator → not in committee.
+        let state = StateDB::with_genesis(&[(alice, 1000), (bob, 1000)]);
+        // Only alice is a validator.
+        state
+            .validators
+            .insert(alice.0, StateDB::MIN_VALIDATOR_STAKE);
+
+        let req_id = [55u8; 32];
+        let tx1 = build_tier1_request(alice, 0, req_id, 10, 1, 20);
+        let (block1, r1) = state.execute_block(&[tx1], alice).unwrap();
+        assert!(r1[0].success);
+        let committee_seed = block1.hash;
+
+        // bob tries to vote → must fail.
+        let tx2 = build_tier1_vote(bob, 0, req_id, committee_seed, hash_bytes(b"x"));
+        let (_, r2) = state.execute_block(&[tx2], alice).unwrap();
+        assert!(
+            !r2[0].success,
+            "vote from non-committee member must be rejected"
+        );
     }
 }

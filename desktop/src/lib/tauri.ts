@@ -18,6 +18,9 @@ import type {
   NodeStatus,
   PaidInferenceResult,
   ResetPeerStateResult,
+  Tier1Result,
+  Tier1Submitted,
+  Tier1Vote,
 } from "./types";
 
 const IS_TAURI =
@@ -404,6 +407,60 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       }
       throw new Error(`all coordinators failed; last: ${lastErr}`);
     }
+    case "run_inference_via_coordinator_direct": {
+      const { prompt, maxTokens } = args as {
+        prompt: string;
+        maxTokens?: number;
+      };
+      const wrapped = prompt.includes("[INST]")
+        ? prompt
+        : `[INST] ${prompt} [/INST]`;
+      const hosts = [
+        "http://149.28.32.76:9090",
+        "http://140.82.16.112:9090",
+        "http://136.244.109.1:9090",
+        "http://104.238.171.11:9090",
+        "http://202.182.107.41:9090",
+        "http://149.28.153.31:9090",
+      ];
+      let lastErr = "";
+      for (const host of hosts) {
+        try {
+          const r = await fetch(`${host}/inference/run`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              input: wrapped,
+              max_tokens: maxTokens ?? 32,
+            }),
+          });
+          if (!r.ok) {
+            lastErr = `${host} → HTTP ${r.status}`;
+            continue;
+          }
+          const v = await r.json();
+          const inf = v.inference ?? {};
+          const att = v.attestation ?? {};
+          return {
+            input: inf.input ?? "",
+            output: inf.output ?? "",
+            outputHash: inf.output_hash ?? "",
+            modelHash: inf.model_hash ?? "",
+            tokensGenerated: inf.tokens_generated ?? 0,
+            inferenceMs: inf.inference_ms ?? 0,
+            txHash: att.tx_hash ?? "",
+            deterministic: inf.deterministic ?? false,
+            engine: inf.engine ?? "",
+            explorerUrl: v.explorer_url ?? "",
+            consensus: undefined,
+            coordinator: host,
+          } as T;
+        } catch (e) {
+          lastErr = `${host} → ${String(e)}`;
+        }
+      }
+      throw new Error(`all coordinators failed (direct path); last: ${lastErr}`);
+    }
     case "run_paid_inference": {
       // Paid-inference signs and submits an on-chain tx; the live browser
       // mode doesn't carry the payer's private key and can't represent
@@ -412,6 +469,60 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       throw new Error(
         "run_paid_inference requires the Tauri native app (signing + tx submission)",
       );
+    }
+    case "tier1_submit": {
+      const { prompt, maxTokens, maxReward, deadlineBlocks, committeeSize } =
+        args as {
+          prompt: string;
+          maxTokens?: number;
+          maxReward?: number;
+          deadlineBlocks?: number;
+          committeeSize?: number;
+        };
+      const r = await fetch(`${base}/inference/onchain/submit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          input: prompt,
+          max_tokens: maxTokens ?? 32,
+          max_reward: maxReward ?? 10,
+          deadline_blocks: deadlineBlocks ?? 20,
+          committee_size: committeeSize ?? 5,
+        }),
+      });
+      if (!r.ok) throw new Error(`tier1_submit → HTTP ${r.status}`);
+      const v = await r.json();
+      return {
+        requestId: v.request_id,
+        txHash: v.tx_hash,
+        anchorHeight: v.anchor_height,
+        committeeSize: v.committee_size,
+        deadlineBlocks: v.deadline_blocks,
+        maxReward: v.max_reward,
+      } as T;
+    }
+    case "tier1_result": {
+      const { requestId } = args as { requestId: string };
+      const r = await fetch(
+        `${base}/inference/onchain/result/${encodeURIComponent(requestId)}`,
+      );
+      if (!r.ok) throw new Error(`tier1_result → HTTP ${r.status}`);
+      const v = await r.json();
+      return {
+        requestId: v.request_id,
+        status: v.status,
+        voteCount: v.vote_count,
+        committeeSize: v.committee_size,
+        anchorHeight: v.anchor_height,
+        deadlineBlocks: v.deadline_blocks,
+        votes: (v.votes ?? []).map((x: { voter: string; output_hash: string }) => ({
+          voter: x.voter,
+          outputHash: x.output_hash,
+        })),
+        outputHash: v.output_hash ?? null,
+        outputBlob: v.output_blob ?? null,
+        maxReward: v.max_reward,
+      } as T;
     }
     case "open_external":
       window.open((args as { url: string }).url, "_blank");
@@ -705,6 +816,82 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         coordinator: "http://149.28.32.76:9090",
       } as T;
     }
+    case "run_inference_via_coordinator_direct": {
+      const { prompt } = args as { prompt: string };
+      await new Promise((r) => setTimeout(r, 800));
+      return {
+        input: `[INST] ${prompt} [/INST]`,
+        output:
+          "  Mock direct-coordinator response - browser preview. In Tauri + live testnet, this hits a single coordinator's /inference/run as a fallback when the sharded /inference/run_consensus path is degraded.",
+        outputHash:
+          "0xe5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
+        modelHash:
+          "0xabec2d582beb97a876c21d7ccc5e8e4833e8fd34aee0cb5b64e9f14f5ea57fdb",
+        tokensGenerated: 28,
+        inferenceMs: 7_800,
+        txHash: "0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
+        deterministic: true,
+        engine: "INT8 integer (cross-platform deterministic)",
+        explorerUrl: "/tx/0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
+        consensus: undefined,
+        coordinator: "http://140.82.16.112:9090",
+      } as T;
+    }
+    case "tier1_submit": {
+      await new Promise((r) => setTimeout(r, 300));
+      const requestId =
+        "0x" +
+        [...crypto.getRandomValues(new Uint8Array(32))]
+          .map((b) => b.toString(16).padStart(2, "0"))
+          .join("");
+      return {
+        requestId,
+        txHash:
+          "0x" +
+          [...crypto.getRandomValues(new Uint8Array(32))]
+            .map((b) => b.toString(16).padStart(2, "0"))
+            .join(""),
+        anchorHeight: 12345,
+        committeeSize: 5,
+        deadlineBlocks: 20,
+        maxReward: 10,
+      } as T;
+    }
+    case "tier1_result": {
+      const { requestId } = args as { requestId: string };
+      // Walk through Open → Voting → Finalized over ~6 polls so the UI
+      // exercises every state. mockInvoke is stateless; we derive the
+      // "step" from a counter on globalThis to make it look animated.
+      const w = globalThis as unknown as { __arcTier1Tick?: Record<string, number> };
+      if (!w.__arcTier1Tick) w.__arcTier1Tick = {};
+      const counter = (w.__arcTier1Tick[requestId] ?? 0) + 1;
+      w.__arcTier1Tick[requestId] = counter;
+      const voteCount = Math.min(5, Math.max(0, counter - 1));
+      const status =
+        counter === 1 ? "Open" : counter < 5 ? "Voting" : "Finalized";
+      const votes: Tier1Vote[] = Array.from({ length: voteCount }, (_, i) => ({
+        voter:
+          "0xv" +
+          (i + 1).toString().padStart(63, "0"),
+        outputHash:
+          "0xe598" + "0".repeat(60),
+      }));
+      return {
+        requestId,
+        status,
+        voteCount,
+        committeeSize: 5,
+        anchorHeight: 12345,
+        deadlineBlocks: 20,
+        votes,
+        outputHash: status === "Finalized" ? "0xe598" + "0".repeat(60) : null,
+        outputBlob:
+          status === "Finalized"
+            ? "A zero-knowledge proof lets one party prove they know a secret without revealing the secret itself."
+            : null,
+        maxReward: 10,
+      } as T;
+    }
     case "run_paid_inference": {
       const { prompt, maxFee } = args as {
         prompt: string;
@@ -827,6 +1014,28 @@ export const api = {
       maxTokens,
       k,
     }),
+  runInferenceViaCoordinatorDirect: (prompt: string, maxTokens = 32) =>
+    invoke<InferenceResult>("run_inference_via_coordinator_direct", {
+      prompt,
+      maxTokens,
+    }),
+  // ── Tier 1 on-chain inference ────────────────────────────────────────────
+  tier1Submit: (
+    prompt: string,
+    maxTokens = 32,
+    maxReward = 10,
+    deadlineBlocks = 20,
+    committeeSize = 5,
+  ) =>
+    invoke<Tier1Submitted>("tier1_submit", {
+      prompt,
+      maxTokens,
+      maxReward,
+      deadlineBlocks,
+      committeeSize,
+    }),
+  tier1Result: (requestId: string) =>
+    invoke<Tier1Result>("tier1_result", { requestId }),
   runPaidInference: (
     prompt: string,
     maxTokens = 32,

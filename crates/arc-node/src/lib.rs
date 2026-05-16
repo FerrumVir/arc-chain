@@ -3,6 +3,7 @@ pub mod block_stm;
 pub mod chunk_cache;
 pub mod coalesce;
 pub mod consensus;
+pub mod inference_validator;
 pub mod pipeline;
 pub mod planner;
 pub mod producer;

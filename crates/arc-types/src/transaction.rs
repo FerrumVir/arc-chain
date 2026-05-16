@@ -86,6 +86,17 @@ pub mod gas_costs {
     pub const CAPACITY_ADVERTISEMENT: u64 = 40_000;
     /// Gas for broadcasting a planner assignment (Milestone D).
     pub const SHARD_ASSIGNMENT_PROPOSAL: u64 = 80_000;
+    /// Gas for opening a Tier 1 on-chain inference request. Slightly
+    /// above an attestation because state writes a request escrow + a
+    /// (lazy) vote bucket account.
+    pub const TIER1_INFERENCE_REQUEST: u64 = 80_000;
+    /// Gas for a single committee vote. Lower than a request because
+    /// it only appends to the vote bucket + bumps signer nonce.
+    pub const TIER1_INFERENCE_VOTE: u64 = 30_000;
+    /// Gas for the finalize tx. Reads the vote bucket, aggregates,
+    /// emits payouts; the actual cost scales with committee size but
+    /// at K≤7 the work is bounded.
+    pub const TIER1_INFERENCE_FINALIZE: u64 = 60_000;
     /// Gas for storage read.
     pub const SLOAD: u64 = 200;
     /// Gas for storage write.
@@ -262,6 +273,20 @@ pub enum TxType {
     /// on every non-originating seed — see `arc-state` executor for the
     /// authorization rule (signer must be an active validator).
     FaucetClaim = 0x21,
+    /// Tier 1 on-chain inference request. Submitted by the user; locks
+    /// `max_reward` ARC in escrow and triggers VRF committee selection.
+    /// Each selected validator runs the model locally and submits an
+    /// `InferenceVote`. See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
+    InferenceRequest = 0x22,
+    /// Tier 1 vote from a committee member: their computed `output_hash`
+    /// plus a VRF proof of committee membership. Multiple votes per
+    /// request; aggregation runs once `min_agreement` votes match.
+    InferenceVote = 0x23,
+    /// Tier 1 system-deterministic finalize tx. Any full node injects this
+    /// when either `committee_size` votes received or `deadline_blocks`
+    /// elapsed. Distributes payout (or refunds), zeroes the escrow, and
+    /// commits the final `output_hash` to the receipt log.
+    InferenceFinalize = 0x24,
 }
 
 /// A transaction on the ARC chain.
@@ -355,6 +380,12 @@ pub enum TxBody {
     ShardAssignmentProposal(ShardAssignmentProposalBody),
     /// Validator-authorized faucet claim — debits the system faucet pool.
     FaucetClaim(FaucetClaimBody),
+    /// Tier 1 on-chain inference request (locks max_reward, triggers VRF committee).
+    InferenceRequest(InferenceRequestBody),
+    /// Tier 1 committee member vote (output_hash + VRF proof of membership).
+    InferenceVote(InferenceVoteBody),
+    /// Tier 1 system-deterministic finalize (payout or refund, zeroes escrow).
+    InferenceFinalize(InferenceFinalizeBody),
 }
 
 /// Simple value transfer.
@@ -728,6 +759,128 @@ pub struct InferenceEscrowRefundBody {
     pub max_tokens: u32,
     pub timeout_blocks: u64,
 }
+
+// ---------------------------------------------------------------------------
+// Tier 1 on-chain inference (VRF committee voting)
+//
+// See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md` for the full design.
+// In short: requester submits InferenceRequest → committee selected via VRF
+// using BLAKE3(commit_block_hash || request_id) → each committee member
+// runs the model locally and submits InferenceVote → any node deterministically
+// injects InferenceFinalize once min_agreement votes match or deadline expires.
+// ---------------------------------------------------------------------------
+
+/// Tier 1 inference request body. Locks `max_reward` ARC in escrow at
+/// `BLAKE3("arc-infreq" || request_id)`. Committee selection happens at apply
+/// time using the commit block hash as the VRF seed.
+///
+/// Prompts longer than 32 KB should use a future content-addressed variant
+/// (model_id-style hash + off-chain blob fetch). For Phase A we inline the
+/// prompt to keep the desktop client simple.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceRequestBody {
+    /// Caller-chosen request identifier, must be unique per requester.
+    /// Convention: `BLAKE3(requester || nonce || input_hash)`.
+    pub request_id: [u8; 32],
+    /// Model the requester wants run (must be registered via ModelRegistration).
+    pub model_id: Hash256,
+    /// BLAKE3 of the input bytes — committee members verify against the blob.
+    pub input_hash: Hash256,
+    /// The actual prompt bytes. Capped at 32 KB by the state validator.
+    pub input_blob: Vec<u8>,
+    /// Maximum tokens to generate.
+    pub max_tokens: u32,
+    /// Hardware tier required (1 = commodity CPU, 2 = GPU, 3+ = sharded).
+    /// Phase A only supports tier=1.
+    pub tier: u8,
+    /// Maximum ARC the requester is willing to pay for this request.
+    /// Locked in escrow; distributed on Finalize (70/20/10 by default).
+    pub max_reward: u64,
+    /// Relative deadline in blocks. Auto-refund triggers if Finalize hasn't
+    /// committed by `anchor_height + deadline_blocks`.
+    pub deadline_blocks: u64,
+    /// Target committee size K (e.g. 5 for testnet, 7 for default).
+    /// Actual size may be smaller if eligible validator set is smaller.
+    pub committee_size: u8,
+}
+
+/// Tier 1 inference vote body. One per (committee_member, request).
+/// Voter must be in the committee derived from the request's commit block
+/// hash — state apply rejects votes from non-members.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceVoteBody {
+    /// The request this vote is for.
+    pub request_id: [u8; 32],
+    /// Voter's computed BLAKE3 over the generated output tokens.
+    pub output_hash: Hash256,
+    /// Optional plaintext output. Only the first voter attaches to save
+    /// block space; subsequent voters set None. State apply verifies
+    /// `BLAKE3(blob) == output_hash` when blob is present.
+    pub output_blob: Option<Vec<u8>>,
+    /// ECVRF proof that the voter belongs to the committee derived from
+    /// (`committee_seed`, voter address). Defense-in-depth on top of the
+    /// state-side committee re-derivation.
+    pub vrf_proof: Vec<u8>,
+    /// Block hash of the block that committed this request. The committee
+    /// was derived from `BLAKE3(committee_seed || request_id)`.
+    pub committee_seed: Hash256,
+}
+
+/// Tier 1 finalize body. Deterministic — any full node can submit, only
+/// the first one to commit succeeds (subsequent submissions reject in
+/// `apply` because status != Voting/ReadyToFinalize). State apply runs
+/// `committee::aggregate_votes` and distributes the escrow.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InferenceFinalizeBody {
+    /// The request being finalized.
+    pub request_id: [u8; 32],
+}
+
+/// Maximum size (in bytes) of an inline prompt in `InferenceRequestBody`.
+/// Enforced by state validation. Longer prompts must wait for the future
+/// content-addressed variant. 32 KB ≈ 8000 tokens of UTF-8 input which
+/// comfortably exceeds Llama-2-7B's 4096-token context window.
+pub const TIER1_INPUT_BLOB_MAX: usize = 32 * 1024;
+
+/// Maximum size of the optional `output_blob` in `InferenceVoteBody`.
+/// Sized for the largest realistic `max_tokens` (2048) at a worst-case
+/// ~8 bytes per token UTF-8 (multi-byte CJK etc.) plus a small framing
+/// margin. Voters whose output exceeds this must omit the blob (set
+/// `None`) and rely on hash-only voting; the first-attached blob
+/// requirement is best-effort.
+pub const TIER1_OUTPUT_BLOB_MAX: usize = 16 * 1024;
+
+/// Anti-spam fee charged from the requester even on timeout/disagreement
+/// refund. Prevents free DoS of validator inference capacity.
+pub const TIER1_ANTI_SPAM_FEE: u64 = 1;
+
+/// Maximum tokens a single InferenceRequest may ask for. Bounds validator
+/// work per request; without this a u32::MAX value could pin a validator
+/// for hours. 2048 is roughly half a Llama-2 context window — plenty for
+/// chat, summarization, and short essay generation.
+pub const TIER1_MAX_TOKENS: u32 = 2048;
+
+/// Lower bound on `deadline_blocks`. Below this a request would refund
+/// before validators realistically can run inference + submit votes
+/// (CPU inference of even 32 tokens takes 20-40 sec, and chain block
+/// time is ~1-3 sec). 5 blocks ≈ 5-15 sec wall-clock buffer for committee
+/// observability before any vote can possibly land.
+pub const TIER1_MIN_DEADLINE_BLOCKS: u64 = 5;
+
+/// Upper bound on `deadline_blocks`. Caps how long a requester's
+/// `max_reward` can sit locked in escrow. 1000 blocks ≈ 16-50 minutes
+/// at the current block tempo — long enough for slow GPU-less validators,
+/// short enough that an abandoned request returns funds within an hour.
+pub const TIER1_MAX_DEADLINE_BLOCKS: u64 = 1000;
+
+/// Default reward split applied by `apply_inference_finalize` on a
+/// successful consensus outcome. Mirrors the Milestone B
+/// `RoleRevenueConfig` shape: most goes to the producers, a rebate
+/// returns to the requester (encouraging tight max_reward), a slice to
+/// treasury.
+pub const TIER1_REWARD_SHARE_VOTERS_BPS: u64 = 7000; // 70.00%
+pub const TIER1_REWARD_SHARE_REFUND_BPS: u64 = 2000; // 20.00%
+pub const TIER1_REWARD_SHARE_TREASURY_BPS: u64 = 1000; // 10.00%
 
 /// Milestone C: register a model. On accept, the chain stores the
 /// registration in a deterministic account keyed by the model_id (using
@@ -1442,5 +1595,119 @@ mod tests {
         assert_eq!(gas_costs::TX_BASE, 21_000);
         assert!(gas_costs::DEPLOY_CONTRACT > gas_costs::TRANSFER);
         assert!(gas_costs::BLOCK_GAS_LIMIT >= 30_000_000);
+    }
+
+    // ── Tier 1 on-chain inference tx round-trip ──
+
+    fn tier1_request() -> InferenceRequestBody {
+        InferenceRequestBody {
+            request_id: [7u8; 32],
+            model_id: hash_bytes(b"arc-32L-4096d-32h-32000v"),
+            input_hash: hash_bytes(b"[INST] hello [/INST]"),
+            input_blob: b"[INST] hello [/INST]".to_vec(),
+            max_tokens: 32,
+            tier: 1,
+            max_reward: 10,
+            deadline_blocks: 20,
+            committee_size: 5,
+        }
+    }
+
+    #[test]
+    fn tier1_inference_request_roundtrip() {
+        let body = TxBody::InferenceRequest(tier1_request());
+        let bytes = bincode::serialize(&body).expect("serialize InferenceRequest");
+        let back: TxBody = bincode::deserialize(&bytes).expect("deserialize InferenceRequest");
+        match back {
+            TxBody::InferenceRequest(b) => {
+                assert_eq!(b.request_id, [7u8; 32]);
+                assert_eq!(b.committee_size, 5);
+                assert_eq!(b.max_tokens, 32);
+                assert_eq!(b.max_reward, 10);
+                assert_eq!(b.tier, 1);
+                assert_eq!(b.input_blob.len(), b"[INST] hello [/INST]".len());
+            }
+            other => panic!("wrong variant after roundtrip: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tier1_inference_vote_roundtrip() {
+        let body = TxBody::InferenceVote(InferenceVoteBody {
+            request_id: [7u8; 32],
+            output_hash: hash_bytes(b"hello world output"),
+            output_blob: Some(b"hello world".to_vec()),
+            vrf_proof: vec![0u8; 80],
+            committee_seed: hash_bytes(b"block-hash-1234"),
+        });
+        let bytes = bincode::serialize(&body).expect("serialize InferenceVote");
+        let back: TxBody = bincode::deserialize(&bytes).expect("deserialize InferenceVote");
+        match back {
+            TxBody::InferenceVote(b) => {
+                assert_eq!(b.request_id, [7u8; 32]);
+                assert_eq!(b.output_hash, hash_bytes(b"hello world output"));
+                assert_eq!(b.output_blob.as_deref(), Some(&b"hello world"[..]));
+                assert_eq!(b.vrf_proof.len(), 80);
+            }
+            other => panic!("wrong variant after roundtrip: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tier1_inference_finalize_roundtrip() {
+        let body = TxBody::InferenceFinalize(InferenceFinalizeBody {
+            request_id: [7u8; 32],
+        });
+        let bytes = bincode::serialize(&body).expect("serialize InferenceFinalize");
+        let back: TxBody = bincode::deserialize(&bytes).expect("deserialize InferenceFinalize");
+        match back {
+            TxBody::InferenceFinalize(b) => assert_eq!(b.request_id, [7u8; 32]),
+            other => panic!("wrong variant after roundtrip: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn tier1_tx_type_discriminants_match_plan() {
+        // The plan (TIER1_ONCHAIN_INFERENCE_PLAN.md) reserves 0x22-0x24.
+        // Lock these down: a future renumber would change the wire format
+        // and silently break older clients.
+        assert_eq!(TxType::InferenceRequest as u8, 0x22);
+        assert_eq!(TxType::InferenceVote as u8, 0x23);
+        assert_eq!(TxType::InferenceFinalize as u8, 0x24);
+    }
+
+    #[test]
+    fn tier1_constants_sane() {
+        assert!(TIER1_INPUT_BLOB_MAX > 0 && TIER1_INPUT_BLOB_MAX <= 1024 * 1024);
+        assert!(TIER1_OUTPUT_BLOB_MAX > 0);
+        // Output blob ceiling should comfortably hold the max-token output:
+        // TIER1_MAX_TOKENS × ~8 bytes/token UTF-8 worst case = 16 KB.
+        assert!(TIER1_OUTPUT_BLOB_MAX as u32 >= TIER1_MAX_TOKENS * 8);
+        // Three shares must sum to 100%.
+        assert_eq!(
+            TIER1_REWARD_SHARE_VOTERS_BPS
+                + TIER1_REWARD_SHARE_REFUND_BPS
+                + TIER1_REWARD_SHARE_TREASURY_BPS,
+            10_000
+        );
+    }
+
+    #[test]
+    fn tier1_deadline_bounds_sane() {
+        // Must be a real range, and min must leave validators time to
+        // observe + run inference + submit a vote tx (single block is
+        // not enough even on the fastest hardware).
+        assert!(TIER1_MIN_DEADLINE_BLOCKS >= 5);
+        assert!(TIER1_MAX_DEADLINE_BLOCKS > TIER1_MIN_DEADLINE_BLOCKS);
+        assert!(TIER1_MAX_DEADLINE_BLOCKS <= 100_000);
+    }
+
+    #[test]
+    fn tier1_max_tokens_bounded() {
+        // A single request must not be allowed to consume hours of
+        // validator compute. 2048 caps each request at ~5-15 minutes
+        // of CPU inference, manageable as a worst case.
+        assert!(TIER1_MAX_TOKENS > 0);
+        assert!(TIER1_MAX_TOKENS <= 8192);
     }
 }
