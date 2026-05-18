@@ -3572,6 +3572,20 @@ async fn inference_onchain_result(
             &arc_crypto::hash_bytes(b"tier1.output_blob"),
         );
 
+    // Decode token-id bytes (little-endian u32) back to text via the
+    // local tokenizer. The blob is the same bytes the candle backend
+    // hashed (see candle_backend.rs: `generated_tokens.iter().flat_map(|t| t.to_le_bytes())`).
+    let output_text = output_blob.as_ref().and_then(|bytes| {
+        if bytes.is_empty() || bytes.len() % 4 != 0 {
+            return None;
+        }
+        let tokens: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        node.inference_model.as_ref().map(|m| m.decode(&tokens))
+    });
+
     let votes_json: Vec<Value> = snap
         .votes
         .iter()
@@ -3593,6 +3607,7 @@ async fn inference_onchain_result(
         "votes": votes_json,
         "output_hash": final_output_hash.map(|h| h.to_hex()),
         "output_blob": output_blob.as_ref().map(|b| String::from_utf8_lossy(b).to_string()),
+        "output_text": output_text,
         "max_reward": snap.max_reward,
     })))
 }

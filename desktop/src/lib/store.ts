@@ -41,7 +41,7 @@ function loadInitial(): Pick<
       onboarded: false,
       identity: null,
       config: null,
-      inferenceMode: "coordinator",
+      inferenceMode: "onchain",
     };
   }
   try {
@@ -51,7 +51,7 @@ function loadInitial(): Pick<
         onboarded: false,
         identity: null,
         config: null,
-        inferenceMode: "coordinator",
+        inferenceMode: "onchain",
       };
     const parsed = JSON.parse(raw);
     return {
@@ -59,14 +59,14 @@ function loadInitial(): Pick<
       identity: parsed.identity ?? null,
       config: parsed.config ?? null,
       inferenceMode:
-        parsed.inferenceMode === "onchain" ? "onchain" : "coordinator",
+        parsed.inferenceMode === "coordinator" ? "coordinator" : "onchain",
     };
   } catch {
     return {
       onboarded: false,
       identity: null,
       config: null,
-      inferenceMode: "coordinator",
+      inferenceMode: "onchain",
     };
   }
 }

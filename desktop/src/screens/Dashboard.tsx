@@ -186,7 +186,8 @@ export function Dashboard() {
               <button
                 className="btn btn-secondary"
                 onClick={() => restartMutation.mutate()}
-                disabled={restartMutation.isPending}
+                disabled={restartMutation.isPending || isExternal}
+                title={isExternal ? "Node is managed externally — stop it first before restarting via desktop" : undefined}
                 data-testid="btn-restart"
               >
                 <RotateCw size={14} /> Restart

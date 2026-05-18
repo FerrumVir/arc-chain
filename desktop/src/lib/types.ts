@@ -170,6 +170,9 @@ export interface Tier1Result {
   outputHash: string | null;
   /** UTF-8 decode of the first voter's attached output, when present. */
   outputBlob: string | null;
+  /** Tokenizer-decoded text of the output blob, when the node has the
+   *  tokenizer loaded. Preferred over outputBlob for display. */
+  outputText: string | null;
   maxReward: number;
 }
 

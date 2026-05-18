@@ -119,6 +119,10 @@ export function Inference() {
   const inferenceMode = useAppStore((s) => s.inferenceMode);
   const [tier1RequestId, setTier1RequestId] = useState<string | null>(null);
   const [tier1Result, setTier1Result] = useState<Tier1Result | null>(null);
+  // Tier 1 user-tunable params. Defaults match the production target
+  // (committee=5, reward=10). On a solo dev chain set committee=1.
+  const [tier1CommitteeSize, setTier1CommitteeSize] = useState(1);
+  const [tier1MaxReward, setTier1MaxReward] = useState(10);
 
   const run = useMutation<InferenceResult, Error, void>({
     mutationFn: async () => {
@@ -135,7 +139,13 @@ export function Inference() {
   const tier1Run = useMutation<{ requestId: string }, Error, void>({
     mutationFn: async () => {
       if (!prompt.trim()) throw new Error("Prompt is empty");
-      const sub = await api.tier1Submit(prompt.trim(), maxTokens);
+      const sub = await api.tier1Submit(
+        prompt.trim(),
+        maxTokens,
+        tier1MaxReward,
+        20, // deadline_blocks (keep default)
+        tier1CommitteeSize,
+      );
       setTier1RequestId(sub.requestId);
       setTier1Result(null);
       return { requestId: sub.requestId };
@@ -318,6 +328,52 @@ export function Inference() {
               data-testid="inference-max-fee"
             />
           </label>
+          {inferenceMode === "onchain" && (
+            <>
+              <label
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
+                  flex: "0 0 140px",
+                }}
+              >
+                <span className="field-label">Committee size</span>
+                <input
+                  className="input input-mono"
+                  type="number"
+                  min={1}
+                  max={15}
+                  value={tier1CommitteeSize}
+                  onChange={(e) =>
+                    setTier1CommitteeSize(parseInt(e.target.value, 10) || 1)
+                  }
+                  data-testid="tier1-committee-size"
+                />
+              </label>
+              <label
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
+                  flex: "0 0 140px",
+                }}
+              >
+                <span className="field-label">Max reward (ARC)</span>
+                <input
+                  className="input input-mono"
+                  type="number"
+                  min={1}
+                  max={1_000_000}
+                  value={tier1MaxReward}
+                  onChange={(e) =>
+                    setTier1MaxReward(parseInt(e.target.value, 10) || 10)
+                  }
+                  data-testid="tier1-max-reward"
+                />
+              </label>
+            </>
+          )}
           <div style={{ flex: 1 }} />
           <label
             style={{
@@ -487,27 +543,30 @@ export function Inference() {
                 {tier1Result.committeeSize - tier1Result.voteCount} more vote(s)…
               </div>
             )}
-            {tier1Result.status === "Finalized" && tier1Result.outputBlob && (
-              <div
-                style={{
-                  marginTop: "var(--space-2)",
-                  padding: "var(--space-3)",
-                  background: "var(--surface-2)",
-                  borderRadius: "var(--radius-sm)",
-                  whiteSpace: "pre-wrap",
-                }}
-              >
-                <strong style={{ color: "var(--success)" }}>
-                  ✓ Verified on-chain consensus
-                </strong>
-                <div style={{ marginTop: 8 }}>{tier1Result.outputBlob}</div>
-                {tier1Result.outputHash && (
-                  <div style={{ marginTop: 8, color: "var(--text-muted)", fontSize: 12 }}>
-                    hash: <code>{formatHash(tier1Result.outputHash)}</code>
+            {tier1Result.status === "Finalized" &&
+              (tier1Result.outputText || tier1Result.outputBlob) && (
+                <div
+                  style={{
+                    marginTop: "var(--space-2)",
+                    padding: "var(--space-3)",
+                    background: "var(--surface-2)",
+                    borderRadius: "var(--radius-sm)",
+                    whiteSpace: "pre-wrap",
+                  }}
+                >
+                  <strong style={{ color: "var(--success)" }}>
+                    ✓ Verified on-chain consensus
+                  </strong>
+                  <div style={{ marginTop: 8 }}>
+                    {tier1Result.outputText ?? tier1Result.outputBlob}
                   </div>
-                )}
-              </div>
-            )}
+                  {tier1Result.outputHash && (
+                    <div style={{ marginTop: 8, color: "var(--text-muted)", fontSize: 12 }}>
+                      hash: <code>{formatHash(tier1Result.outputHash)}</code>
+                    </div>
+                  )}
+                </div>
+              )}
             {tier1Result.status === "Refunded" && (
               <div style={{ color: "var(--warning)" }}>
                 ⚠ Request refunded (timeout or disagreement). Locked ARC

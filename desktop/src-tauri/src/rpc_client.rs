@@ -733,6 +733,20 @@ impl NodeStatus {
 // ── Tier 1 on-chain inference (VRF committee voting) ───────────────────────
 // See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
 
+/// Resolve the tier1 RPC base URL. Defaults to the deployed alpha VPS
+/// (`http://34.133.106.125:9090`, GCP us-central1-a) which runs the
+/// tier1-capable arc-node binary. Override via env var `ARC_TIER1_RPC`
+/// to target a different host (e.g. local dev: `http://127.0.0.1:9090`).
+///
+/// The hardcoded default exists because the existing testnet seeds
+/// (STATUS_COORDINATORS) run v0.7.1 without tier1 — they accept the
+/// request but never finalize. After Phase B (testnet upgrade), switch
+/// this default back to a random pick from STATUS_COORDINATORS.
+fn tier1_base_url(_port: u16) -> String {
+    std::env::var("ARC_TIER1_RPC")
+        .unwrap_or_else(|_| "http://34.133.106.125:9090".to_string())
+}
+
 /// Submit an `InferenceRequest` tx via the local arc-node's convenience
 /// endpoint (`/inference/onchain/submit`). The node signs with its
 /// validator keypair on the user's behalf. Returns the request_id which
@@ -746,8 +760,9 @@ pub async fn tier1_submit(
     deadline_blocks: u64,
     committee_size: u8,
 ) -> Result<Tier1Submitted, String> {
+    let base = tier1_base_url(port);
     let resp = http
-        .post(format!("http://127.0.0.1:{}/inference/onchain/submit", port))
+        .post(format!("{}/inference/onchain/submit", base))
         .json(&serde_json::json!({
             "input": prompt,
             "max_tokens": max_tokens,
@@ -791,10 +806,11 @@ pub async fn tier1_result(
     port: u16,
     request_id: &str,
 ) -> Result<Tier1Result, String> {
+    let base = tier1_base_url(port);
     let resp = http
         .get(format!(
-            "http://127.0.0.1:{}/inference/onchain/result/{}",
-            port, request_id
+            "{}/inference/onchain/result/{}",
+            base, request_id
         ))
         .send()
         .await
@@ -821,6 +837,7 @@ pub async fn tier1_result(
         votes,
         output_hash: v.get("output_hash").and_then(|x| x.as_str()).map(String::from),
         output_blob: v.get("output_blob").and_then(|x| x.as_str()).map(String::from),
+        output_text: v.get("output_text").and_then(|x| x.as_str()).map(String::from),
         max_reward: v.get("max_reward").and_then(|x| x.as_u64()).unwrap_or(0),
     })
 }
@@ -855,5 +872,6 @@ pub struct Tier1Result {
     pub votes: Vec<Tier1Vote>,
     pub output_hash: Option<String>,
     pub output_blob: Option<String>,
+    pub output_text: Option<String>,
     pub max_reward: u64,
 }

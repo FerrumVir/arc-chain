@@ -521,6 +521,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         })),
         outputHash: v.output_hash ?? null,
         outputBlob: v.output_blob ?? null,
+        outputText: v.output_text ?? null,
         maxReward: v.max_reward,
       } as T;
     }
@@ -1025,7 +1026,7 @@ export const api = {
     maxTokens = 32,
     maxReward = 10,
     deadlineBlocks = 20,
-    committeeSize = 5,
+    committeeSize = 1, // TEMP: solo-chain testing; production should be 3-5
   ) =>
     invoke<Tier1Submitted>("tier1_submit", {
       prompt,
