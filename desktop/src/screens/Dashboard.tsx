@@ -4,6 +4,7 @@ import {
   CircleStop,
   ClipboardCheck,
   FileSignature,
+  Loader2,
   Play,
   RotateCw,
   Sparkles,
@@ -13,7 +14,7 @@ import {
   WifiOff,
   Zap,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { CrashBanner } from "../components/CrashBanner";
 import { EmptyState } from "../components/EmptyState";
@@ -155,6 +156,28 @@ export function Dashboard() {
 
   const [addressCopied, setAddressCopied] = useState(false);
 
+  const [syncElapsed, setSyncElapsed] = useState(0);
+  const syncTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    const isSyncing = !!(status?.running && status?.health === "syncing");
+    if (isSyncing && !syncTimerRef.current) {
+      setSyncElapsed(0);
+      syncTimerRef.current = setInterval(() => setSyncElapsed((s) => s + 1), 1000);
+    } else if (!isSyncing && syncTimerRef.current) {
+      clearInterval(syncTimerRef.current);
+      syncTimerRef.current = null;
+      setSyncElapsed(0);
+    }
+  }, [status?.running, status?.health]);
+
+  useEffect(
+    () => () => {
+      if (syncTimerRef.current) clearInterval(syncTimerRef.current);
+    },
+    [],
+  );
+
   return (
     <div className="main-inner" data-testid="dashboard">
       <div className="page-header">
@@ -283,6 +306,42 @@ export function Dashboard() {
               stopMutation.error ??
               restartMutation.error,
           )}
+        </div>
+      )}
+
+      {status?.running && status?.health === "syncing" && (
+        <div
+          className="syncing-banner"
+          role="status"
+          data-testid="syncing-banner"
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "var(--space-2)",
+              marginBottom: "var(--space-1)",
+            }}
+          >
+            <Loader2 size={13} className="spin" />
+            <strong>Connecting to network</strong>
+            <span
+              style={{
+                fontFamily: "var(--font-mono)",
+                fontSize: "var(--text-xs)",
+                opacity: 0.7,
+              }}
+            >
+              {syncElapsed}s
+            </span>
+          </div>
+          {syncElapsed < 10
+            ? "Handshaking with seed nodes…"
+            : syncElapsed < 25
+              ? "Waiting for QUIC peers to respond…"
+              : syncElapsed < 45
+                ? "Still connecting — trying all 6 data centers…"
+                : "Taking longer than usual. If this persists, try resetting peer state below."}
         </div>
       )}
 

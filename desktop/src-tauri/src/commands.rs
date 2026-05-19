@@ -314,7 +314,14 @@ pub async fn run_inference(
     max_tokens: Option<u32>,
 ) -> CmdResult<InferenceResult> {
     let port = state.node.lock().await.rpc_port;
-    rpc_client::run_inference(&state.http, port, &prompt, max_tokens.unwrap_or(32)).await
+    // Local inference can take 3-30s depending on token count and hardware.
+    // The shared state.http has a 3s timeout (fine for health polls) which
+    // is too short here — build a dedicated client with a generous limit.
+    let long_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .map_err(map_err)?;
+    rpc_client::run_inference(&long_client, port, &prompt, max_tokens.unwrap_or(32)).await
 }
 
 /// Milestone A (#35): observer / no-model nodes route inference through a
@@ -761,10 +768,12 @@ pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
                 });
             }
             Some(v) => {
+                let relation = if semver_gt(&v, EXPECTED_NODE_VERSION) { "newer" } else { "older" };
                 tracing::info!(
-                    "arc-node {} at {} is older than desktop's expected {} - upgrading",
+                    "arc-node {} at {} is {} than desktop's expected {} - replacing with matched version",
                     v,
                     target.display(),
+                    relation,
                     EXPECTED_NODE_VERSION
                 );
             }
@@ -850,6 +859,22 @@ pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
 
 /// Run `arc-node --version` and return the version token (e.g. "0.5.7").
 /// Returns None if the binary fails to launch (corrupt, wrong arch, missing
+/// Returns true if semver string `a` is strictly greater than `b`.
+/// Compares major.minor.patch numerically. Falls back to false on parse error.
+fn semver_gt(a: &str, b: &str) -> bool {
+    let parse = |s: &str| -> Option<(u64, u64, u64)> {
+        let mut parts = s.trim().splitn(3, '.');
+        let maj = parts.next()?.parse().ok()?;
+        let min = parts.next()?.parse().ok()?;
+        let pat = parts.next().and_then(|p| p.split('-').next()).and_then(|p| p.parse().ok()).unwrap_or(0);
+        Some((maj, min, pat))
+    };
+    match (parse(a), parse(b)) {
+        (Some(av), Some(bv)) => av > bv,
+        _ => false,
+    }
+}
+
 /// shared lib) or prints something we can't parse - in either case the caller
 /// should redownload to recover.
 fn read_arc_node_version(binary: &std::path::Path) -> Option<String> {

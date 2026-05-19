@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowRight,
   Check,
+  CheckCircle2,
   Copy,
   Cpu,
   HardDrive,
@@ -56,6 +57,11 @@ export function Onboarding() {
   const [modelProgress, setModelProgress] =
     useState<ModelDownloadProgress | null>(null);
   const [launchError, setLaunchError] = useState<string | null>(null);
+
+  // Connecting stage: elapsed time + which seed was reached
+  const [connectElapsed, setConnectElapsed] = useState(0);
+  const [connectedVia, setConnectedVia] = useState<string | null>(null);
+  const connectTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const setStoreIdentity = useAppStore((s) => s.setIdentity);
@@ -166,8 +172,21 @@ export function Onboarding() {
       setLaunchStage("starting");
       await api.startNode(config);
       setLaunchStage("connecting");
-      const joined = await waitForPeer({ timeoutMs: 90_000 });
-      if (joined) {
+      setConnectElapsed(0);
+      setConnectedVia(null);
+      connectTimerRef.current = setInterval(
+        () => setConnectElapsed((s) => s + 1),
+        1000,
+      );
+      const joinResult = await waitForPeer({ timeoutMs: 90_000 });
+      if (connectTimerRef.current) {
+        clearInterval(connectTimerRef.current);
+        connectTimerRef.current = null;
+      }
+      if (joinResult) {
+        setConnectedVia(joinResult.via ?? null);
+      }
+      if (joinResult) {
         setLaunchStage("claiming");
         try {
           await api.faucetClaim();
@@ -177,6 +196,10 @@ export function Onboarding() {
       }
       setOnboarded(true);
     } catch (err) {
+      if (connectTimerRef.current) {
+        clearInterval(connectTimerRef.current);
+        connectTimerRef.current = null;
+      }
       setLaunchError(
         err instanceof Error
           ? err.message
@@ -663,10 +686,7 @@ export function Onboarding() {
                         boxShadow: "var(--shadow-glow-strong)",
                       }}
                     >
-                      <Loader2
-                        size={26}
-                        style={{ animation: "spin 1s linear infinite" }}
-                      />
+                      <Loader2 size={26} className="spin" />
                     </div>
                   ) : (
                     <LogoMark size={64} radius={18} variant="gradient" />
@@ -714,9 +734,12 @@ export function Onboarding() {
                   {launching &&
                     launchStage === "starting" &&
                     "Launching your local node."}
-                  {launching &&
-                    launchStage === "connecting" &&
-                    "Waiting for peers - usually takes a few seconds."}
+                  {launching && launchStage === "connecting" && (
+                    <ConnectingStatus
+                      elapsed={connectElapsed}
+                      connectedVia={connectedVia}
+                    />
+                  )}
                   {launching &&
                     launchStage === "claiming" &&
                     "Asking the testnet faucet for your starter balance."}
@@ -796,10 +819,103 @@ export function Onboarding() {
         </AnimatePresence>
       </div>
 
-      <style>{`
-        @keyframes spin { to { transform: rotate(360deg); } }
-      `}</style>
     </div>
+  );
+}
+
+const SEEDS = [
+  { label: "NYC", ip: "149.28.32.76" },
+  { label: "LAX", ip: "140.82.16.112" },
+  { label: "AMS", ip: "136.244.109.1" },
+  { label: "LHR", ip: "104.238.171.11" },
+  { label: "NRT", ip: "202.182.107.41" },
+  { label: "SGP", ip: "149.28.153.31" },
+];
+
+function connectingPhaseMessage(elapsed: number): string {
+  if (elapsed < 10) return "Handshaking with seed nodes…";
+  if (elapsed < 25) return "Waiting for QUIC peers to respond…";
+  if (elapsed < 45) return "Still connecting — trying all 6 data centers…";
+  return "Taking longer than usual. Falling back to coordinator mode…";
+}
+
+function ConnectingStatus({
+  elapsed,
+  connectedVia,
+}: {
+  elapsed: number;
+  connectedVia: string | null;
+}) {
+  const activeSeedIdx = Math.floor(elapsed / 3) % SEEDS.length;
+
+  if (connectedVia) {
+    const label =
+      SEEDS.find((s) => connectedVia.includes(s.ip))?.label ?? connectedVia;
+    return (
+      <span style={{ color: "var(--success)" }}>
+        Connected via {label} coordinator ✓
+      </span>
+    );
+  }
+
+  return (
+    <span>
+      <span style={{ display: "block", marginBottom: "var(--space-3)" }}>
+        {connectingPhaseMessage(elapsed)}
+        <span
+          style={{
+            marginLeft: "var(--space-2)",
+            fontFamily: "var(--font-mono)",
+            color: "var(--text-muted)",
+          }}
+        >
+          {elapsed}s
+        </span>
+      </span>
+
+      {/* Seed node status row */}
+      <span
+        style={{
+          display: "flex",
+          gap: "var(--space-2)",
+          justifyContent: "center",
+          flexWrap: "wrap",
+        }}
+      >
+        {SEEDS.map((seed, i) => {
+          const isActive = i === activeSeedIdx && elapsed > 0;
+          const isPast = elapsed > (i + 1) * 3;
+          return (
+            <span
+              key={seed.label}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 4,
+                padding: "2px 8px",
+                borderRadius: 999,
+                fontSize: "var(--text-xs)",
+                fontFamily: "var(--font-mono)",
+                border: `1px solid ${isActive ? "var(--indigo-400)" : "var(--border)"}`,
+                background: isActive
+                  ? "rgba(99,102,241,0.12)"
+                  : "var(--surface)",
+                color: isActive
+                  ? "var(--indigo-300)"
+                  : isPast
+                    ? "var(--text-muted)"
+                    : "var(--text-faint)",
+                transition: "all 0.3s ease",
+              }}
+            >
+              {isActive && <Loader2 size={9} className="spin" />}
+              {isPast && !isActive && <CheckCircle2 size={9} />}
+              {seed.label}
+            </span>
+          );
+        })}
+      </span>
+    </span>
   );
 }
 
@@ -809,17 +925,17 @@ async function waitForPeer({
   timeoutMs,
 }: {
   timeoutMs: number;
-}): Promise<boolean> {
+}): Promise<{ via?: string } | null> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     try {
       const s = await api.nodeStatus();
-      if (s.running && s.peers >= 1) return true;
-      if (s.coordinatorUrl) return true;
+      if (s.running && s.peers >= 1) return { via: "p2p" };
+      if (s.coordinatorUrl) return { via: s.coordinatorUrl };
     } catch {
       /* retry */
     }
     await new Promise((r) => setTimeout(r, 2000));
   }
-  return false;
+  return null;
 }

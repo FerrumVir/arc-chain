@@ -18,6 +18,7 @@ use crate::types::{
     InferenceResult, NetworkStats, NodeStatus,
 };
 use serde_json::Value;
+use tracing::{debug, info, warn};
 
 const REWARD_PER_ATTESTATION: f64 = 2.5; // ARC; matches testnet flat rate
 
@@ -482,16 +483,24 @@ pub async fn run_inference(
     } else {
         format!("[INST] {} [/INST]", prompt)
     };
+    info!("[inference/run] → POST {}/inference/run  prompt={:?}  max_tokens={}", base, &wrapped[..wrapped.len().min(80)], max_tokens);
     let resp = http
         .post(format!("{}/inference/run", base))
         .json(&serde_json::json!({ "input": wrapped, "max_tokens": max_tokens }))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+        .map_err(|e| {
+            warn!("[inference/run] ✗ request failed: {}", e);
+            e.to_string()
+        })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        warn!("[inference/run] ✗ HTTP {} — body: {}", status, body);
+        return Err(format!("HTTP {}: {}", status, body));
     }
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    debug!("[inference/run] ✓ response: {}", serde_json::to_string(&v).unwrap_or_default());
     let inf = v.get("inference").cloned().unwrap_or(Value::Null);
     let att = v.get("attestation").cloned().unwrap_or(Value::Null);
     Ok(InferenceResult {
@@ -565,6 +574,8 @@ pub async fn run_inference_consensus(
     } else {
         format!("[INST] {} [/INST]", prompt)
     };
+    info!("[inference/consensus] → POST {}/inference/run_consensus  k={}  max_tokens={}  prompt={:?}",
+        coord_base, k, max_tokens, &wrapped[..wrapped.len().min(80)]);
     let resp = http
         .post(format!("{}/inference/run_consensus", coord_base.trim_end_matches('/')))
         .json(&serde_json::json!({
@@ -574,11 +585,19 @@ pub async fn run_inference_consensus(
         }))
         .send()
         .await
-        .map_err(|e| format!("{}: {}", coord_base, e))?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} from {}", resp.status(), coord_base));
+        .map_err(|e| {
+            warn!("[inference/consensus] ✗ coordinator {} unreachable: {}", coord_base, e);
+            format!("{}: {}", coord_base, e)
+        })?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        warn!("[inference/consensus] ✗ HTTP {} from {} — body: {}", status, coord_base, body);
+        return Err(format!("HTTP {} from {}: {}", status, coord_base, body));
     }
+    info!("[inference/consensus] ✓ got response from {}", coord_base);
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    debug!("[inference/consensus] full response: {}", serde_json::to_string(&v).unwrap_or_default());
 
     let c = v.get("consensus").cloned().unwrap_or(Value::Null);
     let consensus = InferenceConsensus {
