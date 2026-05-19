@@ -280,8 +280,10 @@ export function Inference() {
         <div
           style={{
             display: "flex",
-            alignItems: "center",
-            gap: "var(--space-3)",
+            flexWrap: "wrap",
+            alignItems: "flex-end",
+            columnGap: "var(--space-3)",
+            rowGap: "var(--space-3)",
             marginTop: "var(--space-5)",
           }}
         >
@@ -304,31 +306,7 @@ export function Inference() {
               data-testid="inference-max-tokens"
             />
           </label>
-          <label
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              gap: 4,
-              flex: "0 0 140px",
-              opacity: paidMode ? 1 : 0.5,
-            }}
-          >
-            <span className="field-label">Max fee (ARC)</span>
-            <input
-              className="input input-mono"
-              type="number"
-              min={1}
-              max={1_000_000}
-              step={1}
-              value={maxFee}
-              onChange={(e) =>
-                setMaxFee(parseInt(e.target.value, 10) || 10_000)
-              }
-              disabled={!paidMode}
-              data-testid="inference-max-fee"
-            />
-          </label>
-          {inferenceMode === "onchain" && (
+          {inferenceMode === "onchain" ? (
             <>
               <label
                 style={{
@@ -373,27 +351,55 @@ export function Inference() {
                 />
               </label>
             </>
+          ) : (
+            <>
+              <label
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 4,
+                  flex: "0 0 140px",
+                  opacity: paidMode ? 1 : 0.5,
+                }}
+              >
+                <span className="field-label">Max fee (ARC)</span>
+                <input
+                  className="input input-mono"
+                  type="number"
+                  min={1}
+                  max={1_000_000}
+                  step={1}
+                  value={maxFee}
+                  onChange={(e) =>
+                    setMaxFee(parseInt(e.target.value, 10) || 10_000)
+                  }
+                  disabled={!paidMode}
+                  data-testid="inference-max-fee"
+                />
+              </label>
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: "var(--text-sm)",
+                  color: "var(--text-muted)",
+                  whiteSpace: "nowrap",
+                  paddingBottom: 10,
+                }}
+                data-testid="paid-mode-toggle-label"
+              >
+                <input
+                  type="checkbox"
+                  checked={paidMode}
+                  onChange={(e) => setPaidMode(e.target.checked)}
+                  data-testid="paid-mode-toggle"
+                />
+                Pay per request
+              </label>
+            </>
           )}
-          <div style={{ flex: 1 }} />
-          <label
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: 6,
-              fontSize: "var(--text-sm)",
-              color: "var(--text-muted)",
-              marginRight: "var(--space-3)",
-            }}
-            data-testid="paid-mode-toggle-label"
-          >
-            <input
-              type="checkbox"
-              checked={paidMode}
-              onChange={(e) => setPaidMode(e.target.checked)}
-              data-testid="paid-mode-toggle"
-            />
-            Pay per request
-          </label>
+          <div style={{ flex: 1, minWidth: "var(--space-3)" }} />
           <button
             className="btn btn-primary btn-lg"
             onClick={() => {

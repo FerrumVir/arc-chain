@@ -137,8 +137,7 @@ export function Settings() {
         >
           Selects how the network executes your inference requests. On-chain
           mode replaces the coordinator with a VRF-selected committee of
-          validators voting on the output hash. See{" "}
-          <code>TIER1_ONCHAIN_INFERENCE_PLAN.md</code> in the docs repo.
+          validators voting on the output hash.
         </p>
         <InferenceModeToggle />
       </Card>
@@ -275,8 +274,8 @@ function InferenceModeToggle() {
           <div style={{ fontWeight: 500 }}>Coordinator (legacy)</div>
           <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
             Uses the hardcoded seed coordinator list. Lower latency on
-            healthy testnets; subject to the pipeline-gap and INT8
-            output-quality issues described in INFERENCE_FLOW.md.
+            healthy testnets; subject to pipeline-gap stalls and INT8
+            output-quality drift.
           </div>
         </div>
       </label>
