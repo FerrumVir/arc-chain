@@ -324,6 +324,23 @@ impl NodeManager {
             self.started_at = None;
             *self.crash_info.lock().await = None;
             push_log(&self.logs, "info", "arc-node stopped".into()).await;
+            return Ok(());
+        }
+        // No managed child handle. This happens when the Tauri process
+        // restarted (e.g. cargo rebuild in dev) while arc-node — spawned
+        // with CREATE_NEW_PROCESS_GROUP — kept running detached. Locate
+        // it by the managed binary path and kill it so the UI's Stop
+        // button is not a no-op.
+        let killed = kill_detached_arc_node();
+        if killed > 0 {
+            self.started_at = None;
+            *self.crash_info.lock().await = None;
+            push_log(
+                &self.logs,
+                "info",
+                format!("arc-node stopped (detached, {} pid)", killed),
+            )
+            .await;
         }
         Ok(())
     }
@@ -414,6 +431,27 @@ fn resolve_binary() -> anyhow::Result<PathBuf> {
 /// Canonical location for the auto-downloaded arc-node binary.
 /// `~/.arc/bin/arc-node` (or `.exe` on Windows). Public so commands.rs can
 /// write to the same path during auto-download.
+/// Find and kill any arc-node process whose executable matches the managed
+/// binary path. Returns the count killed. Used by `stop()` when the in-memory
+/// child handle is gone (typically after a Tauri-side dev rebuild).
+fn kill_detached_arc_node() -> usize {
+    let managed = managed_binary_path();
+    let managed_canon = managed.canonicalize().unwrap_or(managed.clone());
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut killed = 0;
+    for (_pid, proc_) in sys.processes() {
+        let Some(exe) = proc_.exe() else { continue };
+        let exe_canon = exe.canonicalize().unwrap_or(exe.to_path_buf());
+        if exe_canon == managed_canon {
+            if proc_.kill() {
+                killed += 1;
+            }
+        }
+    }
+    killed
+}
+
 pub fn managed_binary_path() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)

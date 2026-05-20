@@ -135,6 +135,47 @@ export interface InferenceResult {
   coordinator?: string;
 }
 
+// ── Tier 1 on-chain inference (VRF committee voting) ───────────────────────
+// See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
+export interface Tier1Submitted {
+  requestId: string; // 0x-prefixed 32-byte hex
+  txHash: string;
+  anchorHeight: number;
+  committeeSize: number;
+  deadlineBlocks: number;
+  maxReward: number;
+}
+
+export interface Tier1Vote {
+  voter: string;
+  outputHash: string;
+}
+
+export type Tier1Status =
+  | "Open"
+  | "Voting"
+  | "Finalized"
+  | "Refunded"
+  | "Unknown";
+
+export interface Tier1Result {
+  requestId: string;
+  status: Tier1Status;
+  voteCount: number;
+  committeeSize: number;
+  anchorHeight: number;
+  deadlineBlocks: number;
+  votes: Tier1Vote[];
+  /** Set once consensus is reached. */
+  outputHash: string | null;
+  /** UTF-8 decode of the first voter's attached output, when present. */
+  outputBlob: string | null;
+  /** Tokenizer-decoded text of the output blob, when the node has the
+   *  tokenizer loaded. Preferred over outputBlob for display. */
+  outputText: string | null;
+  maxReward: number;
+}
+
 /** Milestone B (#36): paid-inference receipt - includes on-chain tx
  *  hashes for the escrow-open + escrow-release, plus payer bookkeeping. */
 export interface PaidInferenceResult {

@@ -947,6 +947,35 @@ async fn main() -> Result<()> {
     }
     tracing::info!("RPC server listening on {}", rpc_addr);
 
+    // ── Spawn Tier 1 on-chain inference validator task ──────────────────
+    // The task polls StateDB for open InferenceRequest escrows, checks
+    // committee membership (deterministic VRF over the validator set),
+    // runs candle inference locally for requests selecting it, and
+    // submits InferenceVote / InferenceFinalize txs. See
+    // `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
+    //
+    // Safe to spawn even without a model loaded — the task uses a
+    // deterministic stub output in that case (single-validator dev mode).
+    // In multi-validator production, stub voters disagree with real-model
+    // voters, so they effectively abstain from consensus.
+    {
+        let validator_task = arc_node::inference_validator::InferenceValidatorTask::new(
+            state.clone(),
+            mempool.clone(),
+            validator_address,
+            validator_keypair.clone(),
+            candle_engine.clone(),
+            inference_model.clone(),
+            candle_model_id,
+        );
+        tokio::spawn(async move { validator_task.run().await });
+        tracing::info!(
+            "Tier 1 validator task spawned (candle={}, tokenizer={})",
+            candle_engine.is_some(),
+            inference_model.is_some()
+        );
+    }
+
     // ── Graceful shutdown handler ───────────────────────────────────────
     // On SIGTERM (from systemd stop / rolling upgrade), drain pending state
     // and close connections before exiting. This prevents lost transactions

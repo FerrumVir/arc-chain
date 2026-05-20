@@ -368,6 +368,82 @@ pub async fn run_inference_via_coordinator(
     ))
 }
 
+/// Direct single-node inference fallback. Used by the desktop UI when
+/// `/inference/run_consensus` fails on every coordinator (the current
+/// failure mode: retired-but-still-registered SAO+JNB shards cause every
+/// coordinator's pipeline planner to return `Pipeline gap: expected
+/// layer 32 next, got [28, 30)` before any token is generated). Hitting
+/// `/inference/run` directly skips the sharded pipeline entirely — the
+/// coordinator serves the model from its local shards and still emits
+/// an on-chain attestation. We lose the k-of-n cross-replica consensus
+/// (no `consensus` field in the result), but the user gets a real
+/// answer instead of an error.
+#[tauri::command]
+pub async fn run_inference_via_coordinator_direct(
+    prompt: String,
+    max_tokens: Option<u32>,
+) -> CmdResult<InferenceResult> {
+    let long_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(map_err)?;
+    let max_tokens = max_tokens.unwrap_or(32);
+    let mut last_err = String::new();
+    for host in COORDINATOR_HOSTS {
+        match rpc_client::run_inference_remote(&long_client, host, &prompt, max_tokens).await
+        {
+            Ok(r) => return Ok(r),
+            Err(e) => last_err = e,
+        }
+    }
+    Err(format!(
+        "all {} coordinators failed (direct path); last: {}",
+        COORDINATOR_HOSTS.len(),
+        last_err
+    ))
+}
+
+/// Tier 1 on-chain inference: submit an InferenceRequest via the local
+/// arc-node's `/inference/onchain/submit` convenience endpoint. The local
+/// node signs with its validator keypair and forwards to its mempool.
+///
+/// Returns the request_id (32 bytes, hex-encoded) which the UI then polls
+/// via `tier1_result` until status is "Finalized" or "Refunded". See
+/// `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
+#[tauri::command]
+pub async fn tier1_submit(
+    state: State<'_, AppState>,
+    prompt: String,
+    max_tokens: Option<u32>,
+    max_reward: Option<u64>,
+    deadline_blocks: Option<u64>,
+    committee_size: Option<u8>,
+) -> CmdResult<rpc_client::Tier1Submitted> {
+    let port = state.node.lock().await.rpc_port;
+    rpc_client::tier1_submit(
+        &state.http,
+        port,
+        &prompt,
+        max_tokens.unwrap_or(32),
+        max_reward.unwrap_or(10),
+        deadline_blocks.unwrap_or(20),
+        committee_size.unwrap_or(5),
+    )
+    .await
+}
+
+/// Poll the chain for the on-chain state of a Tier 1 request. Called
+/// every 500 ms from the desktop UI until status transitions to a
+/// terminal value.
+#[tauri::command]
+pub async fn tier1_result(
+    state: State<'_, AppState>,
+    request_id: String,
+) -> CmdResult<rpc_client::Tier1Result> {
+    let port = state.node.lock().await.rpc_port;
+    rpc_client::tier1_result(&state.http, port, &request_id).await
+}
+
 /// Origin URLs for the 6 live testnet seed coordinators. Mirrors
 /// `testnet-seeds.txt` (the P2P side) - these IPs also run RPC on port
 /// 9090. SAO + JNB retired 2026-04-22 (#32) and are intentionally

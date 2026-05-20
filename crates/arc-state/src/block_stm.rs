@@ -143,6 +143,29 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             accounts.insert(body.recipient.0);
             accounts.insert(arc_types::transaction::faucet_pool_address().0);
         }
+        TxBody::InferenceRequest(body) => {
+            // Touches the request escrow account derived from request_id.
+            let escrow_addr = arc_crypto::hash_bytes(
+                &[b"arc-infreq", body.request_id.as_ref()].concat(),
+            );
+            accounts.insert(escrow_addr.0);
+        }
+        TxBody::InferenceVote(body) => {
+            let escrow_addr = arc_crypto::hash_bytes(
+                &[b"arc-infreq", body.request_id.as_ref()].concat(),
+            );
+            accounts.insert(escrow_addr.0);
+        }
+        TxBody::InferenceFinalize(body) => {
+            // Finalize touches escrow + treasury + (committee voters, which
+            // we cannot enumerate statically without reading state — leave to
+            // the executor to detect conflicts).
+            let escrow_addr = arc_crypto::hash_bytes(
+                &[b"arc-infreq", body.request_id.as_ref()].concat(),
+            );
+            accounts.insert(escrow_addr.0);
+            accounts.insert(arc_types::transaction::faucet_pool_address().0);
+        }
     }
 
     TxAccessSet { accounts }

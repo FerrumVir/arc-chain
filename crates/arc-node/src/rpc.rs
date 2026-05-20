@@ -465,6 +465,13 @@ pub async fn serve(
         .route("/inference/run_sharded", post(inference_run_sharded))
         .route("/inference/run_consensus", post(inference_run_consensus))
         .route("/inference/forward_shard", post(inference_forward_shard))
+        // Tier 1 fully-on-chain inference. Submitter sends a prompt and a
+        // max_reward; the chain selects a VRF committee, each member runs
+        // candle locally, votes are aggregated by `apply_inference_finalize`
+        // and the result is committed on-chain. See
+        // `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
+        .route("/inference/onchain/submit", post(inference_onchain_submit))
+        .route("/inference/onchain/result/{request_id}", get(inference_onchain_result))
         // Deterministic inference cache introspection
         .route("/inference/cache_stats", get(inference_cache_stats))
         .route("/inference/latency_stats", get(inference_latency_stats))
@@ -1970,6 +1977,27 @@ async fn get_full_transaction(
             "recipient": b.recipient.to_hex(),
             "amount": b.amount,
         }),
+        TxBody::InferenceRequest(b) => json!({
+            "type": "InferenceRequest",
+            "request_id": format!("0x{}", hex::encode(b.request_id)),
+            "model_id": b.model_id.to_hex(),
+            "input_hash": b.input_hash.to_hex(),
+            "max_tokens": b.max_tokens,
+            "tier": b.tier,
+            "max_reward": b.max_reward,
+            "deadline_blocks": b.deadline_blocks,
+            "committee_size": b.committee_size,
+        }),
+        TxBody::InferenceVote(b) => json!({
+            "type": "InferenceVote",
+            "request_id": format!("0x{}", hex::encode(b.request_id)),
+            "output_hash": b.output_hash.to_hex(),
+            "output_blob_attached": b.output_blob.is_some(),
+        }),
+        TxBody::InferenceFinalize(b) => json!({
+            "type": "InferenceFinalize",
+            "request_id": format!("0x{}", hex::encode(b.request_id)),
+        }),
     };
 
     let sig_json = match &tx.signature {
@@ -3310,6 +3338,278 @@ async fn dispatch_to_community_worker(
             ))
         }
     }
+}
+
+/// Tier 1 on-chain inference: submit a request that triggers VRF
+/// committee voting on-chain.
+///
+/// POST /inference/onchain/submit
+/// Body: {
+///   "input": "What is zero-knowledge?",
+///   "max_tokens": 32,
+///   "max_reward": 10,           // ARC to lock in escrow
+///   "deadline_blocks": 20,      // relative deadline
+///   "committee_size": 5,        // K
+///   "model_id": "0xabc..."      // optional; defaults to BLAKE3("arc-32L-test")
+/// }
+///
+/// Returns: { "request_id": "0x...", "tx_hash": "0x...", "anchor_height": 123 }
+///
+/// Convenience endpoint: signs the InferenceRequest tx with the local
+/// validator's key. Desktop clients with their own identity can build the
+/// tx locally and POST to `/tx/submit_signed` instead — the state apply
+/// path is identical.
+async fn inference_onchain_submit(
+    AxumState(node): AxumState<NodeState>,
+    body: Option<Json<Value>>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    use arc_types::transaction::{
+        InferenceRequestBody, Transaction, TxBody, TxType, TIER1_INPUT_BLOB_MAX,
+        TIER1_MAX_TOKENS, TIER1_MIN_DEADLINE_BLOCKS, TIER1_MAX_DEADLINE_BLOCKS,
+    };
+
+    let req = match body {
+        Some(Json(v)) => v,
+        None => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "Request body required (input, max_tokens, max_reward, ...)",
+            ))
+        }
+    };
+
+    let input_text = req
+        .get("input")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "input must be a string"))?;
+    if input_text.len() > TIER1_INPUT_BLOB_MAX {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            format!("input exceeds {} bytes", TIER1_INPUT_BLOB_MAX),
+        ));
+    }
+    let max_tokens = req
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(32)
+        .min(TIER1_MAX_TOKENS as u64) as u32;
+    let max_reward = req.get("max_reward").and_then(|v| v.as_u64()).unwrap_or(10);
+    let deadline_blocks = req
+        .get("deadline_blocks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .clamp(TIER1_MIN_DEADLINE_BLOCKS, TIER1_MAX_DEADLINE_BLOCKS);
+    let committee_size = req
+        .get("committee_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5)
+        .clamp(1, 32) as u8;
+    let model_id = match req.get("model_id").and_then(|v| v.as_str()) {
+        Some(hex_str) => {
+            let stripped = hex_str.trim_start_matches("0x");
+            let bytes = hex::decode(stripped).map_err(|e| {
+                api_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("invalid model_id hex: {}", e),
+                )
+            })?;
+            if bytes.len() != 32 {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "model_id must be 32 bytes",
+                ));
+            }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&bytes);
+            arc_crypto::Hash256(h)
+        }
+        None => arc_crypto::hash_bytes(b"arc-32L-test"),
+    };
+
+    let input_blob = input_text.as_bytes().to_vec();
+    let input_hash = arc_crypto::hash_bytes(&input_blob);
+
+    // Deterministic request_id from (sender || input_hash || height).
+    let sender_addr = node.validator_address;
+    let mut id_input = Vec::with_capacity(72);
+    id_input.extend_from_slice(&sender_addr.0);
+    id_input.extend_from_slice(&input_hash.0);
+    id_input.extend_from_slice(&node.state.height().to_le_bytes());
+    let request_id_hash = arc_crypto::hash_bytes(&id_input);
+    let request_id = request_id_hash.0;
+
+    let nonce = node
+        .state
+        .get_account(&sender_addr)
+        .map(|a| a.nonce)
+        .unwrap_or(0);
+
+    let body = TxBody::InferenceRequest(InferenceRequestBody {
+        request_id,
+        model_id,
+        input_hash,
+        input_blob,
+        max_tokens,
+        tier: 1,
+        max_reward,
+        deadline_blocks,
+        committee_size,
+    });
+
+    let mut tx = Transaction {
+        tx_type: TxType::InferenceRequest,
+        from: sender_addr,
+        nonce,
+        body,
+        fee: 0,
+        gas_limit: 0,
+        hash: arc_crypto::Hash256::ZERO,
+        signature: arc_crypto::Signature::null(),
+        sig_verified: false,
+    };
+    tx.hash = tx.compute_hash();
+    if let Some(kp) = &node.validator_keypair {
+        if let Ok(sig) = kp.sign(&tx.hash) {
+            tx.signature = sig;
+            tx.sig_verified = true;
+        }
+    } else {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "validator keypair not loaded — cannot sign InferenceRequest",
+        ));
+    }
+
+    let tx_hash = tx.hash;
+    node.mempool.insert(tx).map_err(|e| {
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("mempool insert failed: {:?}", e),
+        )
+    })?;
+
+    Ok(Json(json!({
+        "request_id": format!("0x{}", hex::encode(request_id)),
+        "tx_hash": tx_hash.to_hex(),
+        "anchor_height": node.state.height(),
+        "committee_size": committee_size,
+        "deadline_blocks": deadline_blocks,
+        "max_reward": max_reward,
+    })))
+}
+
+/// Poll the on-chain status of a Tier 1 inference request.
+///
+/// GET /inference/onchain/result/:request_id
+///
+/// Returns: {
+///   "request_id": "0x...",
+///   "status": "Open" | "Voting" | "Finalized" | "Refunded",
+///   "vote_count": 3,
+///   "committee_size": 5,
+///   "anchor_height": 123,
+///   "deadline_blocks": 20,
+///   "votes": [{"voter": "0x...", "output_hash": "0x..."}],
+///   "output_hash": "0x..." | null,      // final, when Finalized
+///   "output_blob": "..." | null,        // utf-8 if first voter attached
+///   "max_reward": 10
+/// }
+async fn inference_onchain_result(
+    AxumState(node): AxumState<NodeState>,
+    axum::extract::Path(request_id_str): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let stripped = request_id_str.trim_start_matches("0x");
+    let bytes = hex::decode(stripped).map_err(|e| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid request_id hex: {}", e),
+        )
+    })?;
+    if bytes.len() != 32 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "request_id must be 32 bytes",
+        ));
+    }
+    let mut request_id = [0u8; 32];
+    request_id.copy_from_slice(&bytes);
+
+    let snap = node.state.tier1_request_snapshot(&request_id).ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("no such request: {}", request_id_str),
+        )
+    })?;
+
+    let status_str = match snap.status {
+        arc_state::TIER1_STATUS_OPEN => "Open",
+        arc_state::TIER1_STATUS_VOTING => "Voting",
+        arc_state::TIER1_STATUS_FINALIZED => "Finalized",
+        arc_state::TIER1_STATUS_REFUNDED => "Refunded",
+        _ => "Unknown",
+    };
+
+    // The final output_hash is stored after Finalize succeeds.
+    let final_output_hash = node
+        .state
+        .get_storage(
+            &snap.escrow_addr,
+            &arc_crypto::hash_bytes(b"tier1.final_output_hash"),
+        )
+        .and_then(|bytes| {
+            if bytes.len() == 32 {
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&bytes);
+                Some(arc_crypto::Hash256(h))
+            } else {
+                None
+            }
+        });
+    let output_blob = node
+        .state
+        .get_storage(
+            &snap.escrow_addr,
+            &arc_crypto::hash_bytes(b"tier1.output_blob"),
+        );
+
+    // Decode token-id bytes (little-endian u32) back to text via the
+    // local tokenizer. The blob is the same bytes the candle backend
+    // hashed (see candle_backend.rs: `generated_tokens.iter().flat_map(|t| t.to_le_bytes())`).
+    let output_text = output_blob.as_ref().and_then(|bytes| {
+        if bytes.is_empty() || bytes.len() % 4 != 0 {
+            return None;
+        }
+        let tokens: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        node.inference_model.as_ref().map(|m| m.decode(&tokens))
+    });
+
+    let votes_json: Vec<Value> = snap
+        .votes
+        .iter()
+        .map(|(voter, oh)| {
+            json!({
+                "voter": voter.to_hex(),
+                "output_hash": oh.to_hex(),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "request_id": format!("0x{}", hex::encode(request_id)),
+        "status": status_str,
+        "vote_count": snap.votes.len(),
+        "committee_size": snap.committee_size,
+        "anchor_height": snap.anchor_height,
+        "deadline_blocks": snap.deadline_blocks,
+        "votes": votes_json,
+        "output_hash": final_output_hash.map(|h| h.to_hex()),
+        "output_blob": output_blob.as_ref().map(|b| String::from_utf8_lossy(b).to_string()),
+        "output_text": output_text,
+        "max_reward": snap.max_reward,
+    })))
 }
 
 /// Run inference through a community worker (preferred when any are

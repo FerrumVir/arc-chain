@@ -729,7 +729,10 @@ impl Pipeline {
                                 | TxBody::ModelRequest(_)
                                 | TxBody::ShardCoverageClaim(_)
                                 | TxBody::CapacityAdvertisement(_)
-                                | TxBody::ShardAssignmentProposal(_) => {}
+                                | TxBody::ShardAssignmentProposal(_)
+                                | TxBody::InferenceRequest(_)
+                                | TxBody::InferenceVote(_)
+                                | TxBody::InferenceFinalize(_) => {}
                             }
                         }
 

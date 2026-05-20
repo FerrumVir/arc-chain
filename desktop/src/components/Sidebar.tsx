@@ -72,14 +72,31 @@ export function Sidebar() {
 
       <div className="sidebar-footer">
         <div className="node-status-chip" data-testid="sidebar-status">
-          <PulseDot level={level} />
+          <PulseDot
+            level={
+              status?.running
+                ? level
+                : status?.pid != null
+                  ? "syncing"
+                  : level
+            }
+          />
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ fontSize: 13, fontWeight: 500, color: "var(--text)" }}>
-              {status?.running ? "Running" : "Stopped"}
+              {status?.running
+                ? "Running"
+                : status?.pid != null
+                  ? "Starting"
+                  : "Stopped"}
             </div>
             {status?.running && (
               <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
                 {formatUptime(status.uptimeSeconds)} · {status.peers} peers
+              </div>
+            )}
+            {!status?.running && status?.pid != null && (
+              <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                loading model…
               </div>
             )}
           </div>

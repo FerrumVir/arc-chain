@@ -704,14 +704,25 @@ pub async fn run_transport(
     // ── Dial bootstrap peers (concurrent with 5s timeout each) ──────────
     {
         let mut dial_handles = Vec::new();
+        let allow_loopback_peers = std::env::var("ARC_ALLOW_LOOPBACK_PEERS").is_ok();
         for peer_addr in &bootstrap_peers {
             // Skip self - check loopback, listen_addr, AND local interfaces
-            // (our public IP is in the seeds file but listen_addr is 0.0.0.0)
-            if peer_addr.ip().is_loopback() || peer_addr == &listen_addr {
+            // (our public IP is in the seeds file but listen_addr is 0.0.0.0).
+            // ARC_ALLOW_LOOPBACK_PEERS=1 relaxes the loopback/local-iface checks
+            // so multiple arc-node processes on a single host can peer over
+            // 127.0.0.1 — used by scripts/arc-multi-start.sh for tier1 testing.
+            if peer_addr == &listen_addr {
                 continue;
             }
-            if std::net::UdpSocket::bind(SocketAddr::new(peer_addr.ip(), 0)).is_ok() {
-                info!("Skipping self-dial to {} (local interface)", peer_addr);
+            if !allow_loopback_peers {
+                if peer_addr.ip().is_loopback() {
+                    continue;
+                }
+                if std::net::UdpSocket::bind(SocketAddr::new(peer_addr.ip(), 0)).is_ok() {
+                    info!("Skipping self-dial to {} (local interface)", peer_addr);
+                    continue;
+                }
+            } else if peer_addr.port() == listen_addr.port() {
                 continue;
             }
             info!("Dialing bootstrap peer {}", peer_addr);
@@ -983,9 +994,13 @@ pub async fn run_transport(
                             .filter(|e| conn_bg.peers.contains_key(e.key()))
                             .map(|e| e.value().dial_addr)
                             .collect();
+                        let allow_lo = std::env::var("ARC_ALLOW_LOOPBACK_PEERS").is_ok();
                         let disconnected: Vec<SocketAddr> = candidates.into_iter()
                             .filter(|a| !connected_addrs.contains(a))
                             .filter(|a| {
+                                if allow_lo {
+                                    return a.port() != listen_addr.port();
+                                }
                                 if a.ip().is_loopback() { return false; }
                                 let test_addr = SocketAddr::new(a.ip(), 0);
                                 if std::net::UdpSocket::bind(test_addr).is_ok() { return false; }

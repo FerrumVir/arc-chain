@@ -655,6 +655,91 @@ pub async fn run_inference_consensus(
     })
 }
 
+/// Single-node inference on a remote coordinator. Same `/inference/run` route
+/// as the local node but at an arbitrary base URL. Used as a fallback when
+/// `/inference/run_consensus` fails with `Pipeline gap` because the shard
+/// registry still references retired or overlapping shards. Loses k-of-n
+/// consensus, but still produces a deterministic output and an on-chain
+/// attestation from the coordinator that served it.
+pub async fn run_inference_remote(
+    http: &reqwest::Client,
+    coord_base: &str,
+    prompt: &str,
+    max_tokens: u32,
+) -> Result<InferenceResult, String> {
+    let wrapped = if prompt.contains("[INST]") {
+        prompt.to_string()
+    } else {
+        format!("[INST] {} [/INST]", prompt)
+    };
+    let resp = http
+        .post(format!(
+            "{}/inference/run",
+            coord_base.trim_end_matches('/')
+        ))
+        .json(&serde_json::json!({ "input": wrapped, "max_tokens": max_tokens }))
+        .send()
+        .await
+        .map_err(|e| format!("{}: {}", coord_base, e))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} from {}", resp.status(), coord_base));
+    }
+    let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let inf = v.get("inference").cloned().unwrap_or(Value::Null);
+    let att = v.get("attestation").cloned().unwrap_or(Value::Null);
+    Ok(InferenceResult {
+        input: inf
+            .get("input")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        output: inf
+            .get("output")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        output_hash: inf
+            .get("output_hash")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        model_hash: inf
+            .get("model_hash")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        tokens_generated: inf
+            .get("tokens_generated")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+        inference_ms: inf
+            .get("inference_ms")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+        tx_hash: att
+            .get("tx_hash")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        deterministic: inf
+            .get("deterministic")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false),
+        engine: inf
+            .get("engine")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        explorer_url: v
+            .get("explorer_url")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        consensus: None,
+        coordinator: Some(coord_base.to_string()),
+    })
+}
+
 // NodeStatus doesn't expose `validators` directly, but we can stash it in
 // `last_error` when the node is live, to avoid a schema change. Kept as a
 // no-op for now (hook here later if we expose validator count in the UI).
@@ -662,4 +747,150 @@ impl NodeStatus {
     fn with_validators_hint(self, _validators: u64) -> Self {
         self
     }
+}
+
+// ── Tier 1 on-chain inference (VRF committee voting) ───────────────────────
+// See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
+
+/// Resolve the tier1 RPC base URL. Defaults to the deployed alpha VPS
+/// (`http://34.133.106.125:9090`, GCP us-central1-a) which runs the
+/// tier1-capable arc-node binary. Override via env var `ARC_TIER1_RPC`
+/// to target a different host (e.g. local dev: `http://127.0.0.1:9090`).
+///
+/// The hardcoded default exists because the existing testnet seeds
+/// (STATUS_COORDINATORS) run v0.7.1 without tier1 — they accept the
+/// request but never finalize. After Phase B (testnet upgrade), switch
+/// this default back to a random pick from STATUS_COORDINATORS.
+fn tier1_base_url(_port: u16) -> String {
+    std::env::var("ARC_TIER1_RPC")
+        .unwrap_or_else(|_| "http://34.133.106.125:9090".to_string())
+}
+
+/// Submit an `InferenceRequest` tx via the local arc-node's convenience
+/// endpoint (`/inference/onchain/submit`). The node signs with its
+/// validator keypair on the user's behalf. Returns the request_id which
+/// the UI then polls via `tier1_result`.
+pub async fn tier1_submit(
+    http: &reqwest::Client,
+    port: u16,
+    prompt: &str,
+    max_tokens: u32,
+    max_reward: u64,
+    deadline_blocks: u64,
+    committee_size: u8,
+) -> Result<Tier1Submitted, String> {
+    let base = tier1_base_url(port);
+    let resp = http
+        .post(format!("{}/inference/onchain/submit", base))
+        .json(&serde_json::json!({
+            "input": prompt,
+            "max_tokens": max_tokens,
+            "max_reward": max_reward,
+            "deadline_blocks": deadline_blocks,
+            "committee_size": committee_size,
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} from /inference/onchain/submit", resp.status()));
+    }
+    let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    Ok(Tier1Submitted {
+        request_id: v
+            .get("request_id")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        tx_hash: v
+            .get("tx_hash")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        anchor_height: v.get("anchor_height").and_then(|x| x.as_u64()).unwrap_or(0),
+        committee_size: v
+            .get("committee_size")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u8,
+        deadline_blocks: v.get("deadline_blocks").and_then(|x| x.as_u64()).unwrap_or(0),
+        max_reward: v.get("max_reward").and_then(|x| x.as_u64()).unwrap_or(0),
+    })
+}
+
+/// Poll the on-chain state of a Tier 1 request. Returns the current
+/// status, the votes seen so far, and (once finalized) the agreed
+/// `output_hash` + `output_blob`.
+pub async fn tier1_result(
+    http: &reqwest::Client,
+    port: u16,
+    request_id: &str,
+) -> Result<Tier1Result, String> {
+    let base = tier1_base_url(port);
+    let resp = http
+        .get(format!(
+            "{}/inference/onchain/result/{}",
+            base, request_id
+        ))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} from /inference/onchain/result", resp.status()));
+    }
+    let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let votes_json = v.get("votes").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+    let votes: Vec<Tier1Vote> = votes_json
+        .into_iter()
+        .map(|vj| Tier1Vote {
+            voter: vj.get("voter").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            output_hash: vj.get("output_hash").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        })
+        .collect();
+    Ok(Tier1Result {
+        request_id: v.get("request_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        status: v.get("status").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        vote_count: v.get("vote_count").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+        committee_size: v.get("committee_size").and_then(|x| x.as_u64()).unwrap_or(0) as u8,
+        anchor_height: v.get("anchor_height").and_then(|x| x.as_u64()).unwrap_or(0),
+        deadline_blocks: v.get("deadline_blocks").and_then(|x| x.as_u64()).unwrap_or(0),
+        votes,
+        output_hash: v.get("output_hash").and_then(|x| x.as_str()).map(String::from),
+        output_blob: v.get("output_blob").and_then(|x| x.as_str()).map(String::from),
+        output_text: v.get("output_text").and_then(|x| x.as_str()).map(String::from),
+        max_reward: v.get("max_reward").and_then(|x| x.as_u64()).unwrap_or(0),
+    })
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tier1Submitted {
+    pub request_id: String,
+    pub tx_hash: String,
+    pub anchor_height: u64,
+    pub committee_size: u8,
+    pub deadline_blocks: u64,
+    pub max_reward: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tier1Vote {
+    pub voter: String,
+    pub output_hash: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tier1Result {
+    pub request_id: String,
+    pub status: String,
+    pub vote_count: u32,
+    pub committee_size: u8,
+    pub anchor_height: u64,
+    pub deadline_blocks: u64,
+    pub votes: Vec<Tier1Vote>,
+    pub output_hash: Option<String>,
+    pub output_blob: Option<String>,
+    pub output_text: Option<String>,
+    pub max_reward: u64,
 }
