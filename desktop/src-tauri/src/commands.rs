@@ -403,12 +403,18 @@ pub async fn run_inference_via_coordinator_direct(
     ))
 }
 
-/// Tier 1 on-chain inference: submit an InferenceRequest via the local
-/// arc-node's `/inference/onchain/submit` convenience endpoint. The local
-/// node signs with its validator keypair and forwards to its mempool.
+/// Tier 1 on-chain inference: submit an InferenceRequest to one of the live
+/// testnet seed VPSes via its `/inference/onchain/submit` convenience endpoint.
+/// The seed signs with its validator keypair and forwards to its mempool.
 ///
-/// Returns the request_id (32 bytes, hex-encoded) which the UI then polls
-/// via `tier1_result` until status is "Finalized" or "Refunded". See
+/// Picks a random host from `TIER1_HOSTS` (shuffled, then tried in order) so
+/// load spreads across the 6 seeds. The picked host is pinned to the returned
+/// request_id in `state.tier1_routes`, because each seed runs its own chain
+/// with a different `anchor_height` — polling a different seed for the result
+/// would 404.
+///
+/// `ARC_TIER1_RPC` env var, if set, overrides the host list (used for local
+/// dev: `ARC_TIER1_RPC=http://127.0.0.1:9090`). See
 /// `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
 #[tauri::command]
 pub async fn tier1_submit(
@@ -419,39 +425,97 @@ pub async fn tier1_submit(
     deadline_blocks: Option<u64>,
     committee_size: Option<u8>,
 ) -> CmdResult<rpc_client::Tier1Submitted> {
-    let port = state.node.lock().await.rpc_port;
-    rpc_client::tier1_submit(
-        &state.http,
-        port,
-        &prompt,
-        max_tokens.unwrap_or(32),
-        max_reward.unwrap_or(10),
-        deadline_blocks.unwrap_or(20),
-        committee_size.unwrap_or(5),
-    )
-    .await
+    let candidates = tier1_candidate_hosts();
+    let mut last_err = String::from("no tier1 hosts configured");
+    for host in &candidates {
+        match rpc_client::tier1_submit(
+            &state.http,
+            host,
+            &prompt,
+            max_tokens.unwrap_or(32),
+            max_reward.unwrap_or(10),
+            deadline_blocks.unwrap_or(20),
+            committee_size.unwrap_or(5),
+        )
+        .await
+        {
+            Ok(sub) => {
+                state
+                    .tier1_routes
+                    .lock()
+                    .await
+                    .insert(sub.request_id.clone(), host.clone());
+                return Ok(sub);
+            }
+            Err(e) => {
+                last_err = format!("{}: {}", host, e);
+                tracing::warn!("tier1_submit fallback: {}", last_err);
+            }
+        }
+    }
+    Err(format!(
+        "all {} tier1 hosts failed; last: {}",
+        candidates.len(),
+        last_err
+    ))
 }
 
-/// Poll the chain for the on-chain state of a Tier 1 request. Called
-/// every 500 ms from the desktop UI until status transitions to a
-/// terminal value.
+/// Poll the chain for the on-chain state of a Tier 1 request. Called every
+/// 500 ms from the desktop UI until status transitions to a terminal value.
+/// Looks up the host that accepted the original submit from
+/// `state.tier1_routes`; if missing (e.g. app restart between submit and
+/// poll), falls back to scanning every host.
 #[tauri::command]
 pub async fn tier1_result(
     state: State<'_, AppState>,
     request_id: String,
 ) -> CmdResult<rpc_client::Tier1Result> {
-    let port = state.node.lock().await.rpc_port;
-    rpc_client::tier1_result(&state.http, port, &request_id).await
+    let pinned = state.tier1_routes.lock().await.get(&request_id).cloned();
+    if let Some(host) = pinned {
+        return rpc_client::tier1_result(&state.http, &host, &request_id).await;
+    }
+    let mut last_err = String::from("no tier1 hosts configured");
+    for host in tier1_candidate_hosts() {
+        match rpc_client::tier1_result(&state.http, &host, &request_id).await {
+            Ok(r) => {
+                state
+                    .tier1_routes
+                    .lock()
+                    .await
+                    .insert(request_id.clone(), host);
+                return Ok(r);
+            }
+            Err(e) => last_err = format!("{}: {}", host, e),
+        }
+    }
+    Err(format!("tier1_result not found on any host; last: {}", last_err))
 }
 
-/// Origin URLs for the 6 live testnet seed coordinators. Mirrors
+/// Tier 1 RPC host candidates in the order to try them. Honors
+/// `ARC_TIER1_RPC` (single host, for local dev). Otherwise shuffles
+/// `COORDINATOR_HOSTS` so load spreads across the 6 testnet seeds and a
+/// dead host (e.g. NYC = 149.28.32.76 was unreachable as of 2026-05-22)
+/// just causes one extra hop instead of a permanent failure.
+fn tier1_candidate_hosts() -> Vec<String> {
+    if let Ok(env) = std::env::var("ARC_TIER1_RPC") {
+        let trimmed = env.trim();
+        if !trimmed.is_empty() {
+            return vec![trimmed.to_string()];
+        }
+    }
+    use rand::seq::SliceRandom;
+    let mut hosts: Vec<String> =
+        COORDINATOR_HOSTS.iter().map(|s| s.to_string()).collect();
+    hosts.shuffle(&mut rand::thread_rng());
+    hosts
+}
+
+/// Origin URLs for the live testnet seed coordinators. Mirrors
 /// `testnet-seeds.txt` (the P2P side) - these IPs also run RPC on port
-/// 9090. SAO + JNB retired 2026-04-22 (#32) and are intentionally
-/// omitted. Order biases toward North America first; users in other
-/// regions see the same ordered sweep, which is fine for a fallback
-/// path where any responding seed is acceptable.
-const COORDINATOR_HOSTS: [&str; 6] = [
-    "http://149.28.32.76:9090",   // NYC
+/// 9090. SAO + JNB retired 2026-04-22 (#32); NYC dropped 2026-05-22
+/// (offline, not coming back). All five remaining seeds also run RPC
+/// on port 9090.
+const COORDINATOR_HOSTS: [&str; 5] = [
     "http://140.82.16.112:9090",  // LAX
     "http://136.244.109.1:9090",  // AMS
     "http://104.238.171.11:9090", // LHR
