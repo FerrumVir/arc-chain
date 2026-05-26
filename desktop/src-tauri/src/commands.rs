@@ -510,17 +510,16 @@ fn tier1_candidate_hosts() -> Vec<String> {
     hosts
 }
 
-/// Origin URLs for the live testnet seed coordinators. Mirrors
-/// `testnet-seeds.txt` (the P2P side) - these IPs also run RPC on port
-/// 9090. SAO + JNB retired 2026-04-22 (#32); NYC dropped 2026-05-22
-/// (offline, not coming back). All five remaining seeds also run RPC
-/// on port 9090.
-const COORDINATOR_HOSTS: [&str; 5] = [
-    "http://140.82.16.112:9090",  // LAX
-    "http://136.244.109.1:9090",  // AMS
-    "http://104.238.171.11:9090", // LHR
-    "http://202.182.107.41:9090", // NRT
-    "http://149.28.153.31:9090",  // SGP
+/// Origin URLs for the live tier1 host(s). The 5 testnet seeds
+/// (LAX/AMS/LHR/NRT/SGP) all run v0.7.2 but tier1 InferenceRequest
+/// txs fail to land on-chain on multi-validator chains (BlockSTM /
+/// consensus path bug, hypothesised; reproducible end-to-end). Solo
+/// chain at 34.133.106.125 (us-central1-a) was upgraded to v0.7.2 on
+/// 2026-05-22 and tier1 still finalizes there. Until the
+/// multi-validator regression is patched, route all tier1 traffic to
+/// the solo host.
+const COORDINATOR_HOSTS: [&str; 1] = [
+    "http://34.133.106.125:9090", // GCP us-central1-a, solo v0.7.2
 ];
 
 /// Milestone B (#36): testnet model commitment. Both ends - the
