@@ -510,14 +510,10 @@ fn tier1_candidate_hosts() -> Vec<String> {
     hosts
 }
 
-/// Origin URLs for the live tier1 host(s). The 5 testnet seeds
-/// (LAX/AMS/LHR/NRT/SGP) all run v0.7.2 but tier1 InferenceRequest
-/// txs fail to land on-chain on multi-validator chains (BlockSTM /
-/// consensus path bug, hypothesised; reproducible end-to-end). Solo
-/// chain at 34.133.106.125 (us-central1-a) was upgraded to v0.7.2 on
-/// 2026-05-22 and tier1 still finalizes there. Until the
-/// multi-validator regression is patched, route all tier1 traffic to
-/// the solo host.
+/// Origin URLs for the live tier1 host(s). Route all tier1 traffic to
+/// the GCP solo host at 34.133.106.125 (us-central1-a), running v0.7.2
+/// and verified finalizing requests end-to-end (Open → Voting →
+/// Finalized).
 const COORDINATOR_HOSTS: [&str; 1] = [
     "http://34.133.106.125:9090", // GCP us-central1-a, solo v0.7.2
 ];
