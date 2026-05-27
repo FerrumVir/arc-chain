@@ -7,6 +7,7 @@ mod store;
 mod tray;
 mod types;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{Manager, WindowEvent};
@@ -18,6 +19,11 @@ pub struct AppState {
     pub store: Arc<Mutex<store::Store>>,
     pub data_dir: Arc<Mutex<PathBuf>>,
     pub http: reqwest::Client,
+    /// Maps an in-flight Tier 1 request_id to the seed VPS that accepted the
+    /// submit. Each seed runs its own chain, so the poll must hit the same
+    /// host. In-memory only — survives only for the lifetime of the process,
+    /// which is fine because Tier 1 requests finalize in seconds.
+    pub tier1_routes: Arc<Mutex<HashMap<String, String>>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -44,6 +50,7 @@ pub fn run() {
         store: store.clone(),
         data_dir: data_dir.clone(),
         http,
+        tier1_routes: Arc::new(Mutex::new(HashMap::new())),
     };
 
     tauri::Builder::default()

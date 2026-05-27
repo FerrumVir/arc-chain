@@ -46,12 +46,12 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 
 | Your computer | One-click download |
 |---|---|
-| 🍎 **Mac (Apple Silicon - M1/M2/M3/M4)** | **[Download for Apple Silicon Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.6.0/ARC.Node_0.6.0_aarch64.dmg)** |
-| 🍎 **Mac (Intel)** | **[Download for Intel Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.6.0/ARC.Node_0.6.0_x64.dmg)** |
-| 🪟 **Windows 10 / 11** | **[Download for Windows](https://github.com/FerrumVir/arc-chain/releases/download/v0.6.0/ARC.Node_0.6.0_x64-setup.exe)** |
-| 🐧 **Linux (Ubuntu / Debian)** | **[Download .deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.6.0/ARC.Node_0.6.0_amd64.deb)** |
-| 🐧 **Linux (Fedora / RHEL)** | **[Download .rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.6.0/ARC.Node-0.6.0-1.x86_64.rpm)** |
-| 🐧 **Linux (any distro)** | **[Download .AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.6.0/ARC.Node_0.6.0_amd64.AppImage)** |
+| 🍎 **Mac (Apple Silicon - M1/M2/M3/M4)** | **[Download for Apple Silicon Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.3/ARC.Node_0.7.3_aarch64.dmg)** |
+| 🍎 **Mac (Intel)** | **[Download for Intel Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.3/ARC.Node_0.7.3_x64.dmg)** |
+| 🪟 **Windows 10 / 11** | **[Download for Windows](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.3/ARC.Node_0.7.3_x64-setup.exe)** |
+| 🐧 **Linux (Ubuntu / Debian)** | **[Download .deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.3/ARC.Node_0.7.3_amd64.deb)** |
+| 🐧 **Linux (Fedora / RHEL)** | **[Download .rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.3/ARC.Node-0.7.3-1.x86_64.rpm)** |
+| 🐧 **Linux (any distro)** | **[Download .AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.3/ARC.Node_0.7.3_amd64.AppImage)** |
 
 > **Not sure which Mac?** Apple menu → *About This Mac*. If chip says "Apple M1/M2/M3/M4" → Apple Silicon. If "Intel" → Intel.
 
@@ -59,9 +59,9 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 
 - **Mac**: open the `.dmg` → drag ARC Node to Applications → first launch right-click → Open
 - **Windows**: run the `.exe` → "More info" → "Run anyway" → Next → Install → Finish
-- **Linux**: `sudo apt install ./ARC.Node_0.6.0_amd64.deb` (or `rpm -i`, or `chmod +x` the AppImage)
+- **Linux**: `sudo apt install ./ARC.Node_0.7.3_amd64.deb` (or `rpm -i`, or `chmod +x` the AppImage)
 
-The app onboards in 3 clicks (welcome → identity → join), runs in your tray, auto-starts on login, auto-updates when v0.6.0 ships.
+The app onboards in 3 clicks (welcome → identity → join), runs in your tray, auto-starts on login, auto-updates when v0.7.3+ ships.
 
 **📖 Full walkthrough:** [Getting Started with ARC Node](docs/GETTING_STARTED.md) - install, identity, first inference, faucet, earnings, and FAQ.
 

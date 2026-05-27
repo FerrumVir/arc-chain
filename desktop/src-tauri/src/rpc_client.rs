@@ -27,8 +27,7 @@ const REWARD_PER_ATTESTATION: f64 = 2.5; // ARC; matches testnet flat rate
 /// (HTTPS RPC fallback) instead of showing a hard "offline" — most consumer
 /// ISPs silently drop outbound UDP on non-standard ports, which kills our
 /// QUIC handshake to seed UDP 9091. Order biases North America first.
-const STATUS_COORDINATORS: [&str; 6] = [
-    "http://149.28.32.76:9090",   // NYC
+const STATUS_COORDINATORS: [&str; 5] = [
     "http://140.82.16.112:9090",  // LAX
     "http://136.244.109.1:9090",  // AMS
     "http://104.238.171.11:9090", // LHR
@@ -751,37 +750,28 @@ impl NodeStatus {
 
 // ── Tier 1 on-chain inference (VRF committee voting) ───────────────────────
 // See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
+//
+// The caller picks which seed VPS to talk to (see commands.rs::pick_tier1_host).
+// Each seed runs its own chain instance with a different anchor_height, so the
+// submit/result pair MUST stick to the same host or the poll will 404. The
+// command layer stores request_id → host in `AppState::tier1_routes` to enforce
+// this.
 
-/// Resolve the tier1 RPC base URL. Defaults to the deployed alpha VPS
-/// (`http://34.133.106.125:9090`, GCP us-central1-a) which runs the
-/// tier1-capable arc-node binary. Override via env var `ARC_TIER1_RPC`
-/// to target a different host (e.g. local dev: `http://127.0.0.1:9090`).
-///
-/// The hardcoded default exists because the existing testnet seeds
-/// (STATUS_COORDINATORS) run v0.7.1 without tier1 — they accept the
-/// request but never finalize. After Phase B (testnet upgrade), switch
-/// this default back to a random pick from STATUS_COORDINATORS.
-fn tier1_base_url(_port: u16) -> String {
-    std::env::var("ARC_TIER1_RPC")
-        .unwrap_or_else(|_| "http://34.133.106.125:9090".to_string())
-}
-
-/// Submit an `InferenceRequest` tx via the local arc-node's convenience
-/// endpoint (`/inference/onchain/submit`). The node signs with its
-/// validator keypair on the user's behalf. Returns the request_id which
-/// the UI then polls via `tier1_result`.
+/// Submit an `InferenceRequest` tx via the chosen seed's convenience endpoint
+/// (`/inference/onchain/submit`). The seed signs with its validator keypair on
+/// the user's behalf. Returns the request_id which the UI then polls via
+/// `tier1_result` against the SAME `base_url`.
 pub async fn tier1_submit(
     http: &reqwest::Client,
-    port: u16,
+    base_url: &str,
     prompt: &str,
     max_tokens: u32,
     max_reward: u64,
     deadline_blocks: u64,
     committee_size: u8,
 ) -> Result<Tier1Submitted, String> {
-    let base = tier1_base_url(port);
     let resp = http
-        .post(format!("{}/inference/onchain/submit", base))
+        .post(format!("{}/inference/onchain/submit", base_url))
         .json(&serde_json::json!({
             "input": prompt,
             "max_tokens": max_tokens,
@@ -822,14 +812,13 @@ pub async fn tier1_submit(
 /// `output_hash` + `output_blob`.
 pub async fn tier1_result(
     http: &reqwest::Client,
-    port: u16,
+    base_url: &str,
     request_id: &str,
 ) -> Result<Tier1Result, String> {
-    let base = tier1_base_url(port);
     let resp = http
         .get(format!(
             "{}/inference/onchain/result/{}",
-            base, request_id
+            base_url, request_id
         ))
         .send()
         .await
