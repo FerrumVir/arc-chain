@@ -305,12 +305,14 @@ pub async fn faucet_claim(state: State<'_, AppState>) -> CmdResult<FaucetResult>
     rpc_client::faucet_claim(&state.http, &host, &addr).await
 }
 
-/// Where the wallet — balance, faucet, earnings — reads from. Pinned to
-/// the same alpha host the tier1 inference flow uses so the user's
-/// on-chain state is read from a single source of truth. The local
-/// arc-node may run a different chain (community testnet) where the
-/// user's address is unfunded, which is why an explicit constant beats
-/// `127.0.0.1`. Override via `ARC_TIER1_RPC` env var for local dev.
+/// Where the wallet — balance, faucet, earnings — reads from. Targets
+/// the public testnet seeds (not alpha) because that's where existing
+/// users' state already lives — funds, faucet history, identity. If
+/// the wallet read from alpha instead, every existing user would see
+/// their balance reset to 0 on update. Tier 1 max_reward is paid by
+/// alpha's validator (not the requester), so reading wallet from one
+/// chain and submitting tier1 to another causes no double-spend.
+/// Override via `ARC_TIER1_RPC` env var for local dev.
 fn wallet_host() -> String {
     if let Ok(env) = std::env::var("ARC_TIER1_RPC") {
         let trimmed = env.trim();
@@ -318,7 +320,11 @@ fn wallet_host() -> String {
             return trimmed.to_string();
         }
     }
-    COORDINATOR_HOSTS[0].to_string()
+    use rand::seq::SliceRandom;
+    WALLET_HOSTS
+        .choose(&mut rand::thread_rng())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| WALLET_HOSTS[0].to_string())
 }
 
 #[tauri::command]
@@ -524,12 +530,27 @@ fn tier1_candidate_hosts() -> Vec<String> {
     hosts
 }
 
-/// Origin URLs for the live tier1 host(s). Route all tier1 traffic to
-/// the GCP solo host at 34.133.106.125 (us-central1-a), running v0.7.2
-/// and verified finalizing requests end-to-end (Open → Voting →
-/// Finalized).
+/// Tier 1 inference is pinned to the GCP solo host (us-central1-a,
+/// v0.7.2). Multi-validator chains hit a BlockSTM regression on the
+/// InferenceRequest apply path that makes tier1 hang on "no such
+/// request"; the solo host avoids that codepath.
 const COORDINATOR_HOSTS: [&str; 1] = [
     "http://34.133.106.125:9090", // GCP us-central1-a, solo v0.7.2
+];
+
+/// Wallet reads (balance / faucet / earnings) target the public
+/// testnet seeds — the chain where every user's identity has already
+/// been seen, funded, and earned on. Reading from alpha instead would
+/// reset existing users to a 0-balance state on update, even though
+/// their funds still exist on the seeds. Tier 1 max_reward is paid by
+/// the alpha validator (not the requester), so this split causes no
+/// double-spend or balance mismatch. NYC dropped 2026-05-22.
+const WALLET_HOSTS: [&str; 5] = [
+    "http://140.82.16.112:9090",  // LAX
+    "http://136.244.109.1:9090",  // AMS
+    "http://104.238.171.11:9090", // LHR
+    "http://202.182.107.41:9090", // NRT
+    "http://149.28.153.31:9090",  // SGP
 ];
 
 /// Milestone B (#36): testnet model commitment. Both ends - the
