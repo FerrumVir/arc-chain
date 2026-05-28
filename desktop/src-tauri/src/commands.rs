@@ -307,11 +307,13 @@ pub async fn faucet_claim(state: State<'_, AppState>) -> CmdResult<FaucetResult>
 }
 
 /// Where the wallet RPCs (balance / faucet / earnings / status /
-/// attestations / network) go. Targets the 5 public testnet seeds —
-/// the real multi-validator chain. Tier 1 inference uses a different
-/// host (alpha) because the seeds hit a BlockSTM regression on the
-/// InferenceRequest apply path. `ARC_TIER1_RPC` env var overrides for
-/// local dev.
+/// attestations / network) go. Pinned to `WALLET_HOSTS[0]` (LAX) so
+/// every wallet read hits the same chain — the 5 seeds turned out to
+/// be independent solo chains, not a shared consensus, so balance
+/// state isn't cross-replicated and random picks make the balance
+/// appear to flip back to 0 between refreshes.
+///
+/// `ARC_TIER1_RPC` env var overrides for local dev.
 fn wallet_host() -> String {
     if let Ok(env) = std::env::var("ARC_TIER1_RPC") {
         let trimmed = env.trim();
@@ -319,11 +321,7 @@ fn wallet_host() -> String {
             return trimmed.to_string();
         }
     }
-    use rand::seq::SliceRandom;
-    WALLET_HOSTS
-        .choose(&mut rand::thread_rng())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| WALLET_HOSTS[0].to_string())
+    WALLET_HOSTS[0].to_string()
 }
 
 #[tauri::command]
