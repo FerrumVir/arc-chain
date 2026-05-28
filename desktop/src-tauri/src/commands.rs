@@ -243,12 +243,12 @@ pub async fn clear_crash(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn fetch_earnings(state: State<'_, AppState>) -> CmdResult<Earnings> {
-    let port = state.node.lock().await.rpc_port;
     let address = {
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
     };
-    Ok(rpc_client::fetch_earnings(&state.http, port, address.as_deref()).await)
+    let host = wallet_host();
+    Ok(rpc_client::fetch_earnings(&state.http, &host, address.as_deref()).await)
 }
 
 #[tauri::command]
@@ -285,26 +285,40 @@ pub async fn open_external(app: AppHandle, url: String) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn fetch_balance(state: State<'_, AppState>) -> CmdResult<AccountBalance> {
-    let (port, addr) = {
-        let node = state.node.lock().await;
+    let addr = {
         let store = state.store.lock().await;
-        let addr = store.identity.as_ref().map(|i| i.address.clone());
-        (node.rpc_port, addr)
-    };
-    let addr = addr.ok_or_else(|| "no identity".to_string())?;
-    rpc_client::fetch_balance(&state.http, port, &addr).await
+        store.identity.as_ref().map(|i| i.address.clone())
+    }
+    .ok_or_else(|| "no identity".to_string())?;
+    let host = wallet_host();
+    rpc_client::fetch_balance(&state.http, &host, &addr).await
 }
 
 #[tauri::command]
 pub async fn faucet_claim(state: State<'_, AppState>) -> CmdResult<FaucetResult> {
-    let (port, addr) = {
-        let node = state.node.lock().await;
+    let addr = {
         let store = state.store.lock().await;
-        let addr = store.identity.as_ref().map(|i| i.address.clone());
-        (node.rpc_port, addr)
-    };
-    let addr = addr.ok_or_else(|| "no identity".to_string())?;
-    rpc_client::faucet_claim(&state.http, port, &addr).await
+        store.identity.as_ref().map(|i| i.address.clone())
+    }
+    .ok_or_else(|| "no identity".to_string())?;
+    let host = wallet_host();
+    rpc_client::faucet_claim(&state.http, &host, &addr).await
+}
+
+/// Where the wallet — balance, faucet, earnings — reads from. Pinned to
+/// the same alpha host the tier1 inference flow uses so the user's
+/// on-chain state is read from a single source of truth. The local
+/// arc-node may run a different chain (community testnet) where the
+/// user's address is unfunded, which is why an explicit constant beats
+/// `127.0.0.1`. Override via `ARC_TIER1_RPC` env var for local dev.
+fn wallet_host() -> String {
+    if let Ok(env) = std::env::var("ARC_TIER1_RPC") {
+        let trimmed = env.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    COORDINATOR_HOSTS[0].to_string()
 }
 
 #[tauri::command]

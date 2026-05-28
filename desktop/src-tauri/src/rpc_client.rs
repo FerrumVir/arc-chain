@@ -153,13 +153,11 @@ pub async fn fetch_status(
 /// `address` is the user's hex address (with or without `0x` prefix).
 pub async fn fetch_earnings(
     http: &reqwest::Client,
-    port: u16,
+    base_url: &str,
     address: Option<&str>,
 ) -> Earnings {
-    let base = format!("http://127.0.0.1:{}", port);
-
     if let Some(addr) = address {
-        let url = format!("{}/worker/earnings/{}", base, addr.trim_start_matches("0x"));
+        let url = format!("{}/worker/earnings/{}", base_url, addr.trim_start_matches("0x"));
         if let Ok(resp) = http.get(&url).send().await {
             if resp.status().is_success() {
                 if let Ok(v) = resp.json::<Value>().await {
@@ -202,13 +200,13 @@ pub async fn fetch_earnings(
         }
     }
 
-    // Pre-v0.7 fallback: synthesize from /inference/results (the local
-    // node's ring buffer of recent inferences). Misleading for workers
-    // behind NAT (they earn on remote seeds, but their local cache
-    // doesn't see those attestations) — keeping it only as a safety net
-    // for old binaries.
+    // Pre-v0.7 fallback: synthesize from /inference/results (the host's
+    // ring buffer of recent inferences). Misleading for workers behind
+    // NAT (they earn on remote seeds, but their local cache doesn't see
+    // those attestations) — keeping it only as a safety net for old
+    // binaries.
     let resp = http
-        .get(format!("{}/inference/results?limit=10000", base))
+        .get(format!("{}/inference/results?limit=10000", base_url))
         .send()
         .await;
     let v: Value = match resp {
@@ -396,12 +394,11 @@ fn empty_earnings() -> Earnings {
 
 pub async fn fetch_balance(
     http: &reqwest::Client,
-    port: u16,
+    base_url: &str,
     address_hex: &str,
 ) -> Result<AccountBalance, String> {
-    let base = format!("http://127.0.0.1:{}", port);
     let resp = http
-        .get(format!("{}/account/{}", base, address_hex))
+        .get(format!("{}/account/{}", base_url, address_hex))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -435,12 +432,11 @@ pub async fn fetch_balance(
 
 pub async fn faucet_claim(
     http: &reqwest::Client,
-    port: u16,
+    base_url: &str,
     address_hex: &str,
 ) -> Result<FaucetResult, String> {
-    let base = format!("http://127.0.0.1:{}", port);
     let resp = http
-        .post(format!("{}/faucet/claim", base))
+        .post(format!("{}/faucet/claim", base_url))
         .json(&serde_json::json!({ "address": address_hex }))
         .send()
         .await
