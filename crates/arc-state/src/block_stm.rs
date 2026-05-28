@@ -593,7 +593,27 @@ impl SpeculativeScheduler {
             match status {
                 TxStatus::Validated => {
                     if let Some(result) = self.results[idx].lock().clone() {
-                        validated.push(result);
+                        if result.success {
+                            validated.push(result);
+                        } else {
+                            // `success: false` here means the speculative
+                            // executor either couldn't handle this tx type
+                            // (anything other than Transfer/Settle hits the
+                            // `_` catch-all in `speculative_execute_tx` and
+                            // returns success=false) OR a Transfer/Settle
+                            // failed its precondition (balance/nonce). In
+                            // both cases the right thing is to fall through
+                            // to the sequential apply path, which knows
+                            // every TxType and produces the canonical
+                            // success/failure result. Without this routing,
+                            // multi-validator chains silently drop every
+                            // InferenceRequest / InferenceVote /
+                            // InferenceAttestation / FaucetClaim / etc.
+                            // (the tier 1 "no such request" bug).
+                            unresolved.push(idx);
+                        }
+                    } else {
+                        unresolved.push(idx);
                     }
                 }
                 _ => {
@@ -1010,6 +1030,58 @@ mod speculative_tests {
         if !results.is_empty() {
             assert!(!results[0].success);
         }
+    }
+
+    /// Regression: BlockSTM used to silently mark every non-Transfer/Settle
+    /// tx as `validated with success=false`, dropping it without running
+    /// the sequential apply fallback. That made every tier 1
+    /// InferenceRequest hang at "no such request" on multi-validator
+    /// chains. After the fix, unsupported tx types must land in
+    /// `unresolved` so the caller's sequential path can run them.
+    #[test]
+    fn test_speculative_routes_unsupported_tx_to_unresolved() {
+        use arc_types::transaction::{InferenceRequestBody, TxBody, TxType};
+
+        let accounts: DashMap<[u8; 32], Account> = DashMap::new();
+        let sender = addr(1);
+        accounts.insert(sender.0, Account::new(sender, 1_000_000));
+
+        let mut tx = Transaction {
+            tx_type: TxType::InferenceRequest,
+            from: sender,
+            nonce: 0,
+            body: TxBody::InferenceRequest(InferenceRequestBody {
+                request_id: [7u8; 32],
+                model_id: hash_bytes(b"arc-32L-test"),
+                input_hash: hash_bytes(b"hello"),
+                input_blob: b"hello".to_vec(),
+                max_tokens: 4,
+                tier: 1,
+                max_reward: 10,
+                deadline_blocks: 20,
+                committee_size: 1,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: arc_crypto::Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        tx.hash = tx.compute_hash();
+
+        let (validated, unresolved) = execute_speculative(&[tx], &accounts);
+        assert!(
+            validated.is_empty(),
+            "InferenceRequest must NOT be returned as a validated speculative \
+             result — it would silently fail the receipt instead of falling \
+             through to sequential apply (the tier 1 'no such request' bug)"
+        );
+        assert_eq!(
+            unresolved,
+            vec![0],
+            "InferenceRequest must be routed to `unresolved` so the caller's \
+             sequential fallback can actually apply it"
+        );
     }
 
     #[test]
