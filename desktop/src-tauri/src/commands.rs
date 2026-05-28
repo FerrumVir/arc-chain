@@ -312,16 +312,22 @@ pub async fn faucet_claim(state: State<'_, AppState>) -> CmdResult<FaucetResult>
 }
 
 /// Where the wallet RPCs (balance / faucet / earnings / status /
-/// attestations / network / legacy run_inference) go. Pinned to the
-/// locally-spawned arc-node on `127.0.0.1:<port>` — same as v0.7.0
-/// through v0.7.4. The local node's bundled genesis pre-funds the
-/// user's identity (= local validator) with 1T ARC and accumulates
-/// attestations as the user runs legacy inference, so the wallet
-/// shows real per-user state out of the box. Tier 1 inference is
-/// the only flow that goes to a different host (alpha) because the
-/// alpha solo chain is what actually finalizes tier 1 requests.
-fn wallet_host(port: u16) -> String {
-    format!("http://127.0.0.1:{}", port)
+/// attestations / network / legacy run_inference) go. Pinned to
+/// `WALLET_HOSTS[0]` (LAX) — the public testnet seeds form a real
+/// multi-validator consensus network (27 validators, shared DAG
+/// round), so reading from any one of them returns consistent state.
+/// LAX is the canonical pin so every wallet RPC hits the same chain
+/// view within a session. Tier 1 still goes elsewhere (alpha) until
+/// the BlockSTM regression on InferenceRequest apply is fixed; once
+/// that lands, tier 1 will route here too.
+fn wallet_host(_port: u16) -> String {
+    if let Ok(env) = std::env::var("ARC_TIER1_RPC") {
+        let trimmed = env.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    WALLET_HOSTS[0].to_string()
 }
 
 #[tauri::command]
@@ -469,13 +475,22 @@ pub async fn tier1_submit(
     let max_tokens = max_tokens.unwrap_or(32);
     let max_reward = max_reward.unwrap_or(10);
     let deadline_blocks = deadline_blocks.unwrap_or(20);
-    let committee_size = committee_size.unwrap_or(5);
+    // Alpha is a solo chain with 1 validator — committee_size > 1 stalls
+    // forever waiting for votes that will never come. Default to 1 so
+    // requests finalize on alpha. Users can still override via the
+    // Inference UI's committee_size input when targeting multi-validator
+    // chains in the future.
+    let committee_size = committee_size.unwrap_or(1);
 
     for host in &candidates {
         // Fetch the user's current nonce and the chain's current height
         // (used in the deterministic request_id derivation).
+        // No `0x` prefix — the /account handler requires bare 64-hex.
+        // With the prefix it returns 400 "Invalid address", fallback in
+        // the match below uses nonce=0 and every submit after the first
+        // gets rejected at apply with InvalidNonce.
         let account_url = format!(
-            "{}/account/0x{}",
+            "{}/account/{}",
             host,
             hex::encode(&payer_addr.0)
         );
@@ -634,12 +649,29 @@ fn tier1_candidate_hosts() -> Vec<String> {
     hosts
 }
 
-/// Tier 1 inference is pinned to the GCP solo host (us-central1-a,
-/// v0.7.2). Multi-validator chains hit a BlockSTM regression on the
-/// InferenceRequest apply path that makes tier1 hang on "no such
-/// request"; the solo host avoids that codepath.
+/// Tier 1 inference is temporarily pinned to the GCP solo host
+/// (us-central1-a, v0.7.5). The 5 testnet seeds form a real
+/// multi-validator consensus network but hit a BlockSTM regression on
+/// the InferenceRequest apply path that makes tier1 hang on "no such
+/// request". The solo host avoids that codepath. **This pin is a
+/// stopgap** — once the BlockSTM bug is patched and rolled out to all
+/// 27 validators, tier 1 collapses back onto `WALLET_HOSTS` and alpha
+/// is retired.
 const COORDINATOR_HOSTS: [&str; 1] = [
-    "http://34.133.106.125:9090", // GCP us-central1-a, solo v0.7.2
+    "http://34.133.106.125:9090", // GCP us-central1-a, solo v0.7.5
+];
+
+/// The public testnet — 5 seed VPSes running a real 27-validator
+/// consensus network with shared DAG round. Every wallet RPC pins to
+/// `WALLET_HOSTS[0]` (LAX) so per-session reads are consistent (the
+/// seeds DO replicate state via consensus, but anchoring to one host
+/// avoids confusion if a node lags briefly).
+const WALLET_HOSTS: [&str; 5] = [
+    "http://140.82.16.112:9090",  // LAX
+    "http://136.244.109.1:9090",  // AMS
+    "http://104.238.171.11:9090", // LHR
+    "http://202.182.107.41:9090", // NRT
+    "http://149.28.153.31:9090",  // SGP
 ];
 
 /// Milestone B (#36): testnet model commitment. Both ends - the
