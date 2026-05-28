@@ -649,16 +649,18 @@ fn tier1_candidate_hosts() -> Vec<String> {
     hosts
 }
 
-/// Tier 1 inference is temporarily pinned to the GCP solo host
-/// (us-central1-a, v0.7.5). The 5 testnet seeds form a real
-/// multi-validator consensus network but hit a BlockSTM regression on
-/// the InferenceRequest apply path that makes tier1 hang on "no such
-/// request". The solo host avoids that codepath. **This pin is a
-/// stopgap** — once the BlockSTM bug is patched and rolled out to all
-/// 27 validators, tier 1 collapses back onto `WALLET_HOSTS` and alpha
-/// is retired.
-const COORDINATOR_HOSTS: [&str; 1] = [
-    "http://34.133.106.125:9090", // GCP us-central1-a, solo v0.7.5
+/// Tier 1 inference hosts — same 5 testnet seeds the wallet reads
+/// from. Requires the v0.7.6 BlockSTM fix to be deployed on the seeds
+/// for InferenceRequest tx to actually land. Before v0.7.6 the
+/// speculative executor silently dropped the tx; the alpha solo host
+/// was the temporary stopgap. With v0.7.6 rolled out, alpha retires
+/// and tier 1 lives on the public testnet alongside everything else.
+const COORDINATOR_HOSTS: [&str; 5] = [
+    "http://140.82.16.112:9090",  // LAX
+    "http://136.244.109.1:9090",  // AMS
+    "http://104.238.171.11:9090", // LHR
+    "http://202.182.107.41:9090", // NRT
+    "http://149.28.153.31:9090",  // SGP
 ];
 
 /// The public testnet — 5 seed VPSes running a real 27-validator
