@@ -243,12 +243,9 @@ pub async fn clear_crash(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn fetch_earnings(state: State<'_, AppState>) -> CmdResult<Earnings> {
-    let address = {
-        let store = state.store.lock().await;
-        store.identity.as_ref().map(|i| i.address.clone())
-    };
+    let address = wallet_display_address();
     let host = wallet_host();
-    Ok(rpc_client::fetch_earnings(&state.http, &host, address.as_deref()).await)
+    Ok(rpc_client::fetch_earnings(&state.http, &host, Some(&address)).await)
 }
 
 #[tauri::command]
@@ -285,34 +282,38 @@ pub async fn open_external(app: AppHandle, url: String) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn fetch_balance(state: State<'_, AppState>) -> CmdResult<AccountBalance> {
-    let addr = {
-        let store = state.store.lock().await;
-        store.identity.as_ref().map(|i| i.address.clone())
-    }
-    .ok_or_else(|| "no identity".to_string())?;
+    let addr = wallet_display_address();
     let host = wallet_host();
     rpc_client::fetch_balance(&state.http, &host, &addr).await
 }
 
 #[tauri::command]
 pub async fn faucet_claim(state: State<'_, AppState>) -> CmdResult<FaucetResult> {
-    let addr = {
-        let store = state.store.lock().await;
-        store.identity.as_ref().map(|i| i.address.clone())
-    }
-    .ok_or_else(|| "no identity".to_string())?;
+    let addr = wallet_display_address();
     let host = wallet_host();
     rpc_client::faucet_claim(&state.http, &host, &addr).await
 }
 
-/// Where the wallet — balance, faucet, earnings — reads from. Targets
-/// the public testnet seeds (not alpha) because that's where existing
-/// users' state already lives — funds, faucet history, identity. If
-/// the wallet read from alpha instead, every existing user would see
-/// their balance reset to 0 on update. Tier 1 max_reward is paid by
-/// alpha's validator (not the requester), so reading wallet from one
-/// chain and submitting tier1 to another causes no double-spend.
-/// Override via `ARC_TIER1_RPC` env var for local dev.
+/// Demo wallet aggregation address (alpha's validator). Wallet reads
+/// (balance / faucet / earnings) all target this single shared address
+/// instead of the user's per-identity address, so the UI shows the
+/// real on-chain state of the tier 1 demo node — including the +2.5
+/// ARC attestation each tier 1 vote produces. Tradeoff: balance and
+/// earnings are shared across every user that connects, since they
+/// all see the same alpha account. Sufficient for a single-user demo
+/// where the user owns the seed phrase ("VPS1") underlying this
+/// address; misleading for multi-user testnet. Track [[option-c]] for
+/// the proper per-user beneficiary architecture.
+fn wallet_display_address() -> String {
+    // sha256/blake3-derived from the "VPS1" seed using arc-node's
+    // ARC-chain-validator-keypair-v1 domain tag. Hardcoded because it
+    // never changes — same string in alpha's systemd service file.
+    "e59f2fa173e8063c48a84a17cdbb66c76c2c6a02902bae1569fffced81d23062".to_string()
+}
+
+/// Where the wallet RPCs go. Same alpha host as tier 1 so balance,
+/// faucet, and earnings reflect the same chain where tier 1 votes
+/// post attestations.
 fn wallet_host() -> String {
     if let Ok(env) = std::env::var("ARC_TIER1_RPC") {
         let trimmed = env.trim();
@@ -320,11 +321,7 @@ fn wallet_host() -> String {
             return trimmed.to_string();
         }
     }
-    use rand::seq::SliceRandom;
-    WALLET_HOSTS
-        .choose(&mut rand::thread_rng())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| WALLET_HOSTS[0].to_string())
+    COORDINATOR_HOSTS[0].to_string()
 }
 
 #[tauri::command]
@@ -536,21 +533,6 @@ fn tier1_candidate_hosts() -> Vec<String> {
 /// request"; the solo host avoids that codepath.
 const COORDINATOR_HOSTS: [&str; 1] = [
     "http://34.133.106.125:9090", // GCP us-central1-a, solo v0.7.2
-];
-
-/// Wallet reads (balance / faucet / earnings) target the public
-/// testnet seeds — the chain where every user's identity has already
-/// been seen, funded, and earned on. Reading from alpha instead would
-/// reset existing users to a 0-balance state on update, even though
-/// their funds still exist on the seeds. Tier 1 max_reward is paid by
-/// the alpha validator (not the requester), so this split causes no
-/// double-spend or balance mismatch. NYC dropped 2026-05-22.
-const WALLET_HOSTS: [&str; 5] = [
-    "http://140.82.16.112:9090",  // LAX
-    "http://136.244.109.1:9090",  // AMS
-    "http://104.238.171.11:9090", // LHR
-    "http://202.182.107.41:9090", // NRT
-    "http://149.28.153.31:9090",  // SGP
 ];
 
 /// Milestone B (#36): testnet model commitment. Both ends - the
