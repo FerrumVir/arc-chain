@@ -232,7 +232,8 @@ pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
         };
         (port, pid, address, crash)
     };
-    Ok(rpc_client::fetch_status(&state.http, port, pid, address, crash).await)
+    let host = wallet_host();
+    Ok(rpc_client::fetch_status(&state.http, &host, port, pid, address, crash).await)
 }
 
 #[tauri::command]
@@ -253,8 +254,8 @@ pub async fn fetch_attestations(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> CmdResult<Vec<Attestation>> {
-    let port = state.node.lock().await.rpc_port;
-    Ok(rpc_client::fetch_attestations(&state.http, port, limit.unwrap_or(20)).await)
+    let host = wallet_host();
+    Ok(rpc_client::fetch_attestations(&state.http, &host, limit.unwrap_or(20)).await)
 }
 
 #[tauri::command]
@@ -270,8 +271,8 @@ pub async fn fetch_logs(
 
 #[tauri::command]
 pub async fn fetch_network_stats(state: State<'_, AppState>) -> CmdResult<NetworkStats> {
-    let port = state.node.lock().await.rpc_port;
-    Ok(rpc_client::fetch_network_stats(&state.http, port).await)
+    let host = wallet_host();
+    Ok(rpc_client::fetch_network_stats(&state.http, &host).await)
 }
 
 #[tauri::command]
@@ -330,15 +331,16 @@ pub async fn run_inference(
     prompt: String,
     max_tokens: Option<u32>,
 ) -> CmdResult<InferenceResult> {
-    let port = state.node.lock().await.rpc_port;
-    // Local inference can take 3-30s depending on token count and hardware.
+    let host = wallet_host();
+    // Inference can take 3-30s depending on token count and hardware.
     // The shared state.http has a 3s timeout (fine for health polls) which
     // is too short here — build a dedicated client with a generous limit.
     let long_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(map_err)?;
-    rpc_client::run_inference(&long_client, port, &prompt, max_tokens.unwrap_or(32)).await
+    let _ = state; // keep arg for tauri command signature
+    rpc_client::run_inference(&long_client, &host, &prompt, max_tokens.unwrap_or(32)).await
 }
 
 /// Milestone A (#35): observer / no-model nodes route inference through a

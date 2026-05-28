@@ -60,12 +60,13 @@ pub async fn probe_coordinator(http: &reqwest::Client) -> Option<String> {
 
 pub async fn fetch_status(
     http: &reqwest::Client,
+    base_url: &str,
     port: u16,
     owned_pid: Option<u32>,
     address: Option<String>,
     crash_message: Option<String>,
 ) -> NodeStatus {
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = base_url.to_string();
 
     let resp = http.get(format!("{}/health", base)).send().await;
     let parsed: Option<Value> = match resp {
@@ -131,9 +132,10 @@ pub async fn fetch_status(
             } else if coordinator_url.is_some() {
                 None
             } else {
+                let _ = port;
                 Some(format!(
-                    "No response from 127.0.0.1:{} and every public seed is unreachable. Check internet/firewall.",
-                    port
+                    "No response from {} and every public seed is unreachable. Check internet/firewall.",
+                    base
                 ))
             }
         }),
@@ -235,11 +237,10 @@ pub async fn fetch_earnings(
 
 pub async fn fetch_attestations(
     http: &reqwest::Client,
-    port: u16,
+    base_url: &str,
     limit: u32,
 ) -> Vec<Attestation> {
-    let base = format!("http://127.0.0.1:{}", port);
-    let url = format!("{}/inference/attestations?limit={}", base, limit);
+    let url = format!("{}/inference/attestations?limit={}", base_url, limit);
     let resp = match http.get(url).send().await {
         Ok(r) => r,
         Err(_) => return Vec::new(),
@@ -309,13 +310,13 @@ pub async fn fetch_attestations(
         .collect()
 }
 
-pub async fn fetch_network_stats(http: &reqwest::Client, port: u16) -> NetworkStats {
+pub async fn fetch_network_stats(http: &reqwest::Client, base_url: &str) -> NetworkStats {
     // No dedicated /network/stats endpoint - synthesize:
     //   total_nodes  ← /health.validators (rough: treat each validator as a node)
     //   total_inferences ← /inference/results.count
     //   avg_tps      ← /health.dag_round / uptime_secs * factor
     //   latest_block ← /health.dag_committed
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = base_url.to_string();
     let (health_val, results_val) = tokio::join!(
         async {
             http.get(format!("{}/health", base))
@@ -468,11 +469,11 @@ pub async fn faucet_claim(
 
 pub async fn run_inference(
     http: &reqwest::Client,
-    port: u16,
+    base_url: &str,
     prompt: &str,
     max_tokens: u32,
 ) -> Result<InferenceResult, String> {
-    let base = format!("http://127.0.0.1:{}", port);
+    let base = base_url.to_string();
     let wrapped = if prompt.contains("[INST]") {
         prompt.to_string()
     } else {
