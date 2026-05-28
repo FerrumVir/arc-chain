@@ -58,6 +58,11 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // Needed so the frontend can call `relaunch()` from
+        // `@tauri-apps/plugin-process` after `update.downloadAndInstall()`
+        // finishes. Without this, the new installer runs but the app stays
+        // dead until the user manually relaunches.
+        .plugin(tauri_plugin_process::init())
         // Auto-launch on OS login. LaunchAgent = macOS launchd user-scoped
         // LoginItem, Linux XDG autostart, Windows Run key. `--minimized`
         // tells the app to start with the window hidden to the tray so
