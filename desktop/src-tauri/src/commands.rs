@@ -232,7 +232,7 @@ pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
         };
         (port, pid, address, crash)
     };
-    let host = wallet_host();
+    let host = wallet_host(port);
     Ok(rpc_client::fetch_status(&state.http, &host, port, pid, address, crash).await)
 }
 
@@ -244,11 +244,12 @@ pub async fn clear_crash(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn fetch_earnings(state: State<'_, AppState>) -> CmdResult<Earnings> {
+    let port = state.node.lock().await.rpc_port;
     let address = {
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
     };
-    let host = wallet_host();
+    let host = wallet_host(port);
     Ok(rpc_client::fetch_earnings(&state.http, &host, address.as_deref()).await)
 }
 
@@ -257,7 +258,8 @@ pub async fn fetch_attestations(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> CmdResult<Vec<Attestation>> {
-    let host = wallet_host();
+    let port = state.node.lock().await.rpc_port;
+    let host = wallet_host(port);
     Ok(rpc_client::fetch_attestations(&state.http, &host, limit.unwrap_or(20)).await)
 }
 
@@ -274,7 +276,8 @@ pub async fn fetch_logs(
 
 #[tauri::command]
 pub async fn fetch_network_stats(state: State<'_, AppState>) -> CmdResult<NetworkStats> {
-    let host = wallet_host();
+    let port = state.node.lock().await.rpc_port;
+    let host = wallet_host(port);
     Ok(rpc_client::fetch_network_stats(&state.http, &host).await)
 }
 
@@ -286,42 +289,39 @@ pub async fn open_external(app: AppHandle, url: String) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn fetch_balance(state: State<'_, AppState>) -> CmdResult<AccountBalance> {
+    let port = state.node.lock().await.rpc_port;
     let addr = {
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
     }
     .ok_or_else(|| "no identity".to_string())?;
-    let host = wallet_host();
+    let host = wallet_host(port);
     rpc_client::fetch_balance(&state.http, &host, &addr).await
 }
 
 #[tauri::command]
 pub async fn faucet_claim(state: State<'_, AppState>) -> CmdResult<FaucetResult> {
+    let port = state.node.lock().await.rpc_port;
     let addr = {
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
     }
     .ok_or_else(|| "no identity".to_string())?;
-    let host = wallet_host();
+    let host = wallet_host(port);
     rpc_client::faucet_claim(&state.http, &host, &addr).await
 }
 
 /// Where the wallet RPCs (balance / faucet / earnings / status /
-/// attestations / network) go. Pinned to `WALLET_HOSTS[0]` (LAX) so
-/// every wallet read hits the same chain — the 5 seeds turned out to
-/// be independent solo chains, not a shared consensus, so balance
-/// state isn't cross-replicated and random picks make the balance
-/// appear to flip back to 0 between refreshes.
-///
-/// `ARC_TIER1_RPC` env var overrides for local dev.
-fn wallet_host() -> String {
-    if let Ok(env) = std::env::var("ARC_TIER1_RPC") {
-        let trimmed = env.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
-        }
-    }
-    WALLET_HOSTS[0].to_string()
+/// attestations / network / legacy run_inference) go. Pinned to the
+/// locally-spawned arc-node on `127.0.0.1:<port>` — same as v0.7.0
+/// through v0.7.4. The local node's bundled genesis pre-funds the
+/// user's identity (= local validator) with 1T ARC and accumulates
+/// attestations as the user runs legacy inference, so the wallet
+/// shows real per-user state out of the box. Tier 1 inference is
+/// the only flow that goes to a different host (alpha) because the
+/// alpha solo chain is what actually finalizes tier 1 requests.
+fn wallet_host(port: u16) -> String {
+    format!("http://127.0.0.1:{}", port)
 }
 
 #[tauri::command]
@@ -330,7 +330,8 @@ pub async fn run_inference(
     prompt: String,
     max_tokens: Option<u32>,
 ) -> CmdResult<InferenceResult> {
-    let host = wallet_host();
+    let port = state.node.lock().await.rpc_port;
+    let host = wallet_host(port);
     // Inference can take 3-30s depending on token count and hardware.
     // The shared state.http has a 3s timeout (fine for health polls) which
     // is too short here — build a dedicated client with a generous limit.
@@ -338,7 +339,6 @@ pub async fn run_inference(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .map_err(map_err)?;
-    let _ = state; // keep arg for tauri command signature
     rpc_client::run_inference(&long_client, &host, &prompt, max_tokens.unwrap_or(32)).await
 }
 
@@ -534,18 +534,6 @@ fn tier1_candidate_hosts() -> Vec<String> {
 /// request"; the solo host avoids that codepath.
 const COORDINATOR_HOSTS: [&str; 1] = [
     "http://34.133.106.125:9090", // GCP us-central1-a, solo v0.7.2
-];
-
-/// Public testnet seed coordinators (LAX/AMS/LHR/NRT/SGP). Used for
-/// every wallet RPC and for non-tier1 inference. Tier 1 specifically
-/// goes elsewhere (COORDINATOR_HOSTS) because these hit a BlockSTM
-/// regression on InferenceRequest apply.
-const WALLET_HOSTS: [&str; 5] = [
-    "http://140.82.16.112:9090",  // LAX
-    "http://136.244.109.1:9090",  // AMS
-    "http://104.238.171.11:9090", // LHR
-    "http://202.182.107.41:9090", // NRT
-    "http://149.28.153.31:9090",  // SGP
 ];
 
 /// Milestone B (#36): testnet model commitment. Both ends - the
