@@ -30,7 +30,8 @@ use arc_state::{
     TIER1_STATUS_OPEN, TIER1_STATUS_REFUNDED, TIER1_STATUS_FINALIZED, TIER1_STATUS_VOTING,
 };
 use arc_types::transaction::{
-    InferenceFinalizeBody, InferenceVoteBody, Transaction, TxBody, TxType,
+    InferenceAttestationBody, InferenceFinalizeBody, InferenceVoteBody, Transaction, TxBody,
+    TxType,
 };
 use arc_types::Address;
 use dashmap::DashMap;
@@ -266,6 +267,50 @@ impl InferenceValidatorTask {
             request_id = %hex::encode(request_id),
             "Tier 1 vote submitted"
         );
+
+        // Also post an InferenceAttestation tx for the same work. Tier 1
+        // votes are real inference jobs the validator just executed, so
+        // they deserve the same earnings accounting (/worker/earnings)
+        // that community-mode worker attestations get. Without this, the
+        // alpha solo validator never accrues earnings even though it does
+        // real inference on every tier1 request. Best-effort: a failure
+        // here logs but doesn't block the vote.
+        let model_id = arc_crypto::hash_bytes(b"arc-32L-test");
+        let input_hash = arc_crypto::hash_bytes(&snap.input_blob);
+        let mut att_tx = Transaction {
+            tx_type: TxType::InferenceAttestation,
+            from: self.validator_address,
+            nonce: nonce + 1,
+            body: TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id,
+                input_hash,
+                output_hash,
+                challenge_period: 100,
+                bond: 0,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        att_tx.hash = att_tx.compute_hash();
+        if let Ok(sig) = self.validator_keypair.sign(&att_tx.hash) {
+            att_tx.signature = sig;
+            att_tx.sig_verified = true;
+        }
+        if let Err(e) = self.mempool.insert(att_tx) {
+            warn!(
+                request_id = %hex::encode(request_id),
+                "Tier 1 attestation mempool insert failed: {:?}", e
+            );
+        } else {
+            info!(
+                request_id = %hex::encode(request_id),
+                "Tier 1 attestation submitted (earnings +{} ARC)",
+                2.5
+            );
+        }
         Ok(())
     }
 
