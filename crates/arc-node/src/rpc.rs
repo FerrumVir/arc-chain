@@ -3847,6 +3847,7 @@ async fn inference_run(
                 output_hash,
                 challenge_period,
                 bond,
+                beneficiary: None,
             },
         ),
         fee: 0,
@@ -3964,10 +3965,16 @@ async fn worker_earnings(
 
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
-        if tx.from != want {
-            continue;
-        }
-        if !matches!(tx.body, TxBody::InferenceAttestation(_)) {
+        let body = match &tx.body {
+            TxBody::InferenceAttestation(b) => b,
+            _ => continue,
+        };
+        // Option C: prefer the explicit `beneficiary` field if the
+        // attestation was posted with one (e.g. the tier 1 voting path
+        // credits the original requester, not itself). Legacy
+        // attestations without `beneficiary` fall back to `tx.from`.
+        let credited = body.beneficiary.unwrap_or(tx.from);
+        if credited != want {
             continue;
         }
         count += 1;
@@ -5111,6 +5118,7 @@ async fn inference_run_sharded(
                 output_hash,
                 challenge_period: 100,
                 bond: 1000,
+                beneficiary: None,
             },
         ),
         fee: 0,
@@ -7895,6 +7903,7 @@ mod tests {
                 output_hash: arc_crypto::hash_bytes(b"world"),
                 challenge_period: 100,
                 bond,
+                beneficiary: None,
             }),
             fee: 0,
             gas_limit: 0,

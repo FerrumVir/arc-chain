@@ -94,6 +94,7 @@ fn build_attestation_tx(
         output_hash: hash_bytes(output_data),
         challenge_period: 100, // 100 blocks
         bond: 1000,            // 1000 ARC bond
+        beneficiary: None,
     });
 
     let hash = hash_bytes(&serde_json::to_vec(&body).unwrap_or_default());

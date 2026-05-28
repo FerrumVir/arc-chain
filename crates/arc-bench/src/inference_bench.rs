@@ -216,6 +216,7 @@ fn main() {
                     output_hash,
                     challenge_period: 100,
                     bond: 100,
+                    beneficiary: None,
                 }),
                 fee: 0,
                 gas_limit: 0,

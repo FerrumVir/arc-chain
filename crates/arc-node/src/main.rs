@@ -1461,6 +1461,7 @@ async fn main() -> Result<()> {
                                     // bond — that lands with the inference-pool
                                     // reward distribution in a later release.
                                     bond: 0,
+                                    beneficiary: None,
                                 },
                             ),
                             fee: 0,

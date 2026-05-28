@@ -443,27 +443,133 @@ pub async fn tier1_submit(
     deadline_blocks: Option<u64>,
     committee_size: Option<u8>,
 ) -> CmdResult<rpc_client::Tier1Submitted> {
+    use ed25519_dalek::Signer;
+
+    // Pull the user's keypair so the InferenceRequest tx is signed by
+    // the user — not the seed validator's convenience endpoint. The
+    // resulting tx.from = user, which arc-state's apply path stores as
+    // `tier1.requester`. When the seed votes, it reads that back and
+    // sets it as the `beneficiary` on the InferenceAttestation, so
+    // /worker/earnings credits the user (Option C).
+    let phrase = {
+        let store = state.store.lock().await;
+        store
+            .identity
+            .as_ref()
+            .map(|i| i.seed_phrase.clone())
+            .ok_or_else(|| "no identity - run onboarding first".to_string())?
+    };
+    let signing_key = keypair_from_phrase(&phrase);
+    let public_key = signing_key.verifying_key().to_bytes();
+    let payer_addr = arc_crypto::Hash256(*blake3::hash(&public_key).as_bytes());
+
     let candidates = tier1_candidate_hosts();
     let mut last_err = String::from("no tier1 hosts configured");
+
+    let max_tokens = max_tokens.unwrap_or(32);
+    let max_reward = max_reward.unwrap_or(10);
+    let deadline_blocks = deadline_blocks.unwrap_or(20);
+    let committee_size = committee_size.unwrap_or(5);
+
     for host in &candidates {
-        match rpc_client::tier1_submit(
-            &state.http,
+        // Fetch the user's current nonce and the chain's current height
+        // (used in the deterministic request_id derivation).
+        let account_url = format!(
+            "{}/account/0x{}",
             host,
-            &prompt,
-            max_tokens.unwrap_or(32),
-            max_reward.unwrap_or(10),
-            deadline_blocks.unwrap_or(20),
-            committee_size.unwrap_or(5),
-        )
-        .await
-        {
-            Ok(sub) => {
+            hex::encode(&payer_addr.0)
+        );
+        let nonce: u64 = match state.http.get(&account_url).send().await {
+            Ok(r) if r.status().is_success() => r
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("nonce").and_then(|n| n.as_u64()))
+                .unwrap_or(0),
+            _ => 0,
+        };
+        let height_url = format!("{}/health", host);
+        let height: u64 = match state.http.get(&height_url).send().await {
+            Ok(r) if r.status().is_success() => r
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|v| v.get("height").and_then(|n| n.as_u64()))
+                .unwrap_or(0),
+            _ => 0,
+        };
+
+        // request_id mirrors the chain's derivation in
+        // arc-node/src/rpc.rs:inference_onchain_submit, so the
+        // generated id is the same one apply uses to key the escrow.
+        let input_blob = prompt.as_bytes().to_vec();
+        let input_hash = arc_crypto::hash_bytes(&input_blob);
+        let mut id_input = Vec::with_capacity(72);
+        id_input.extend_from_slice(&payer_addr.0);
+        id_input.extend_from_slice(&input_hash.0);
+        id_input.extend_from_slice(&height.to_le_bytes());
+        let request_id_hash = arc_crypto::hash_bytes(&id_input);
+        let request_id = request_id_hash.0;
+
+        let model_id = arc_crypto::hash_bytes(b"arc-32L-test");
+        let body = arc_types::transaction::InferenceRequestBody {
+            request_id,
+            model_id,
+            input_hash,
+            input_blob,
+            max_tokens,
+            tier: 1,
+            max_reward,
+            deadline_blocks,
+            committee_size,
+        };
+        let mut tx = arc_types::Transaction {
+            tx_type: arc_types::TxType::InferenceRequest,
+            from: payer_addr,
+            nonce,
+            body: arc_types::TxBody::InferenceRequest(body),
+            fee: 0,
+            gas_limit: 0,
+            hash: arc_crypto::Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        tx.hash = tx.compute_hash();
+        let sig = signing_key.sign(tx.hash.as_bytes());
+        tx.signature = arc_crypto::Signature::Ed25519 {
+            public_key,
+            signature: sig.to_bytes().to_vec(),
+        };
+        let tx_hash = tx.hash;
+
+        let resp = state
+            .http
+            .post(format!("{}/tx/submit_signed", host))
+            .json(&tx)
+            .send()
+            .await;
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let request_id_hex = format!("0x{}", hex::encode(&request_id));
                 state
                     .tier1_routes
                     .lock()
                     .await
-                    .insert(sub.request_id.clone(), host.clone());
-                return Ok(sub);
+                    .insert(request_id_hex.clone(), host.clone());
+                return Ok(rpc_client::Tier1Submitted {
+                    request_id: request_id_hex,
+                    tx_hash: tx_hash.to_hex(),
+                    anchor_height: height,
+                    committee_size,
+                    deadline_blocks,
+                    max_reward,
+                });
+            }
+            Ok(r) => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                last_err = format!("{}: HTTP {} - {}", host, status, body);
+                tracing::warn!("tier1_submit fallback: {}", last_err);
             }
             Err(e) => {
                 last_err = format!("{}: {}", host, e);

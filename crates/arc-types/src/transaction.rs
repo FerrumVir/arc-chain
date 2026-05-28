@@ -657,6 +657,14 @@ pub struct InferenceAttestationBody {
     pub challenge_period: u64,
     /// Bond amount locked as collateral (slashed if fraud proven).
     pub bond: u64,
+    /// Address that receives the worker-earnings credit for this
+    /// attestation. None means credit falls back to `tx.from` (the
+    /// signer), matching pre-Option-C behavior. Set by the tier 1
+    /// voting code to the original InferenceRequest sender so the
+    /// user who paid for the inference gets the on-chain credit
+    /// even though the validator did the work.
+    #[serde(default)]
+    pub beneficiary: Option<Address>,
 }
 
 /// Challenge an inference attestation (Tier 2 fraud proof).

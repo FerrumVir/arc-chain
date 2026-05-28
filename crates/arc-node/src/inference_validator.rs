@@ -277,6 +277,15 @@ impl InferenceValidatorTask {
         // here logs but doesn't block the vote.
         let model_id = arc_crypto::hash_bytes(b"arc-32L-test");
         let input_hash = arc_crypto::hash_bytes(&snap.input_blob);
+        // Option C: credit the requester (user) for the work, not the
+        // signing validator. If the requester address equals the escrow
+        // address (legacy snapshot fallback) skip the beneficiary so the
+        // attestation behaves like pre-Option-C and credits the signer.
+        let beneficiary = if snap.requester == snap.escrow_addr {
+            None
+        } else {
+            Some(snap.requester)
+        };
         let mut att_tx = Transaction {
             tx_type: TxType::InferenceAttestation,
             from: self.validator_address,
@@ -287,6 +296,7 @@ impl InferenceValidatorTask {
                 output_hash,
                 challenge_period: 100,
                 bond: 0,
+                beneficiary,
             }),
             fee: 0,
             gas_limit: 0,

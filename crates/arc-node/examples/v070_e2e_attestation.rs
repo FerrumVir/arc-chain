@@ -161,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
             output_hash,
             challenge_period: 100,
             bond: 0,
+            beneficiary: None,
         }),
         fee: 0,
         gas_limit: 0,

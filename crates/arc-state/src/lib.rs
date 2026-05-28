@@ -161,6 +161,11 @@ pub struct Tier1RequestSnapshot {
     pub input_blob: Vec<u8>,
     pub votes: Vec<(Address, Hash256)>,
     pub max_reward: u64,
+    /// Address that originally submitted the InferenceRequest. Used by the
+    /// voting validator to credit the user (not itself) on the subsequent
+    /// InferenceAttestation it posts. Defaults to escrow_addr for legacy
+    /// snapshots that pre-date Option C.
+    pub requester: Address,
 }
 
 /// Derive a deterministic contract address from the deployer address and nonce.
@@ -638,6 +643,18 @@ impl StateDB {
             .unwrap_or_default();
         let votes: Vec<(Address, Hash256)> =
             bincode::deserialize(&votes_bytes).unwrap_or_default();
+        let requester_bytes = self
+            .get_storage(&escrow_addr, &arc_crypto::hash_bytes(b"tier1.requester"))
+            .unwrap_or_default();
+        let requester = if requester_bytes.len() == 32 {
+            let mut addr = [0u8; 32];
+            addr.copy_from_slice(&requester_bytes);
+            Hash256(addr)
+        } else {
+            // Legacy snapshots without a stored requester fall back to the
+            // escrow address itself so callers always get a usable Address.
+            escrow_addr
+        };
         Some(Tier1RequestSnapshot {
             request_id: *request_id,
             escrow_addr,
@@ -648,6 +665,7 @@ impl StateDB {
             input_blob,
             votes,
             max_reward: escrow.balance,
+            requester,
         })
     }
 
