@@ -1,6 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Check, RefreshCw, Trash2 } from "lucide-react";
 import { useState } from "react";
+import { check as tauriCheckUpdate } from "@tauri-apps/plugin-updater";
+import { relaunch as tauriRelaunch } from "@tauri-apps/plugin-process";
 import { Card, CardHeader } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
 import { api } from "../lib/tauri";
@@ -22,6 +24,32 @@ export function Settings() {
     queryFn: api.checkForUpdate,
     enabled: false,
   });
+  const [installing, setInstalling] = useState(false);
+  const [installError, setInstallError] = useState<string | null>(null);
+
+  // Tauri auto-update: download the new bundle then relaunch the app.
+  // Without the relaunch() call the installer overwrites the .app/.exe but
+  // the existing process exits without reopening — user sees "auto-update
+  // ran but the window never came back". The Rust-side updater plugin is
+  // already registered in lib.rs; this is the missing JS-side trigger.
+  const installUpdate = async () => {
+    setInstalling(true);
+    setInstallError(null);
+    try {
+      const u = await tauriCheckUpdate();
+      if (!u) {
+        setInstallError("No update available.");
+        setInstalling(false);
+        return;
+      }
+      await u.downloadAndInstall();
+      await tauriRelaunch();
+      // relaunch() never returns — process is replaced.
+    } catch (e) {
+      setInstallError(e instanceof Error ? e.message : String(e));
+      setInstalling(false);
+    }
+  };
 
   const save = async () => {
     if (!config) return;
@@ -155,21 +183,45 @@ export function Settings() {
           }}
         >
           {update?.hasUpdate
-            ? `A new version is available. Your node will upgrade on next restart.`
+            ? `Version ${update.version} is available. Click below to download, install, and relaunch.`
             : "You're running the latest version."}
         </p>
-        <button
-          className="btn btn-secondary"
-          onClick={() => checkUpdate()}
-          disabled={isFetching}
-          data-testid="btn-check-update"
-        >
-          <RefreshCw
-            size={14}
-            style={isFetching ? { animation: "spin 1s linear infinite" } : {}}
-          />{" "}
-          Check for updates
-        </button>
+        {installError && (
+          <p
+            style={{
+              fontSize: "var(--text-sm)",
+              color: "var(--danger)",
+              marginBottom: "var(--space-3)",
+            }}
+            data-testid="update-error"
+          >
+            Update failed: {installError}
+          </p>
+        )}
+        <div style={{ display: "flex", gap: "var(--space-2)" }}>
+          <button
+            className="btn btn-secondary"
+            onClick={() => checkUpdate()}
+            disabled={isFetching || installing}
+            data-testid="btn-check-update"
+          >
+            <RefreshCw
+              size={14}
+              style={isFetching ? { animation: "spin 1s linear infinite" } : {}}
+            />{" "}
+            Check for updates
+          </button>
+          {update?.hasUpdate && (
+            <button
+              className="btn btn-primary"
+              onClick={installUpdate}
+              disabled={installing}
+              data-testid="btn-install-update"
+            >
+              {installing ? "Installing…" : `Install v${update.version} & relaunch`}
+            </button>
+          )}
+        </div>
       </Card>
 
       <Card>
