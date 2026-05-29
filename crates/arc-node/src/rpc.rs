@@ -3963,17 +3963,34 @@ async fn worker_earnings(
     let mut last_block: Option<u64> = None;
     let mut last_tx_hash: Option<String> = None;
 
+    // Option C (credit the original requester, not the working validator)
+    // WITHOUT a wire field: map each request's input_hash -> the requester
+    // (the sender of the InferenceRequest tx). The matching attestation
+    // carries the same input_hash, so the original payer is recoverable
+    // from on-chain history. This replaces the v0.7.6 `beneficiary` wire
+    // field, which was a bincode-incompatible change that partitioned the
+    // chain (see InferenceAttestationBody::beneficiary).
+    let mut requester_by_input: HashMap<Hash256, Hash256> = HashMap::new();
+    for entry in node.state.full_transactions.iter() {
+        if let TxBody::InferenceRequest(req) = &entry.value().body {
+            requester_by_input
+                .entry(req.input_hash)
+                .or_insert_with(|| entry.value().from);
+        }
+    }
+
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
         let body = match &tx.body {
             TxBody::InferenceAttestation(b) => b,
             _ => continue,
         };
-        // Option C: prefer the explicit `beneficiary` field if the
-        // attestation was posted with one (e.g. the tier 1 voting path
-        // credits the original requester, not itself). Legacy
-        // attestations without `beneficiary` fall back to `tx.from`.
-        let credited = body.beneficiary.unwrap_or(tx.from);
+        // Credit the original requester (looked up by input_hash) when
+        // known; otherwise fall back to the attestation signer (`tx.from`).
+        let credited = requester_by_input
+            .get(&body.input_hash)
+            .copied()
+            .unwrap_or(tx.from);
         if credited != want {
             continue;
         }

@@ -657,13 +657,22 @@ pub struct InferenceAttestationBody {
     pub challenge_period: u64,
     /// Bond amount locked as collateral (slashed if fraud proven).
     pub bond: u64,
-    /// Address that receives the worker-earnings credit for this
-    /// attestation. None means credit falls back to `tx.from` (the
-    /// signer), matching pre-Option-C behavior. Set by the tier 1
-    /// voting code to the original InferenceRequest sender so the
-    /// user who paid for the inference gets the on-chain credit
-    /// even though the validator did the work.
-    #[serde(default)]
+    /// Local-only credit hint — NEVER serialized on the wire.
+    ///
+    /// IMPORTANT: this field is `#[serde(skip)]` on purpose. It shipped as
+    /// `#[serde(default)]` in v0.7.6, but transactions are serialized with
+    /// bincode, which is NOT self-describing: adding a struct field shifts
+    /// the byte layout of every DAG block carrying an attestation, so v0.7.6
+    /// nodes could not deserialize v0.7.2 blocks (and vice-versa). That
+    /// partitioned the validator set during a rolling upgrade on 2026-05-29.
+    /// Marking the field `skip` makes the serialized form (and the tx hash)
+    /// byte-identical to v0.7.2, restoring rolling-upgrade compatibility.
+    ///
+    /// The "credit the original requester, not the working validator"
+    /// behavior (Option C) is reconstructed at query time in
+    /// `worker_earnings` by matching this attestation's `input_hash` to the
+    /// sender of the original InferenceRequest — no wire field required.
+    #[serde(skip)]
     pub beneficiary: Option<Address>,
 }
 
