@@ -428,6 +428,104 @@ fn auto_download_model() -> Option<String> {
     Some(target)
 }
 
+/// Best-effort detection of total system RAM in MB. Reads /proc/meminfo on
+/// Linux; falls back to 8192 (8 GB) on macOS / non-Linux or on parse failure.
+/// Used by validator auto-shard to advertise capacity to the seed.
+fn detect_ram_mb() -> u64 {
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if line.starts_with("MemTotal:") {
+                if let Some(kb) = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    return kb / 1024;
+                }
+            }
+        }
+    }
+    8192
+}
+
+/// Derive a seed RPC URL ("host:9090") from --peers or --seeds-file.
+/// Convention: seeds expose RPC on port 9090 regardless of the P2P port
+/// they advertise in seeds files. Returns the first usable host.
+fn pick_seed_rpc(cli: &Cli) -> Option<String> {
+    for p in &cli.peers {
+        if let Some(host) = p.split(':').next() {
+            if !host.is_empty() {
+                return Some(format!("{}:9090", host));
+            }
+        }
+    }
+    if let Some(path) = &cli.seeds_file {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for raw in content.lines() {
+                let line = raw.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some(host) = line.split(':').next() {
+                    if !host.is_empty() {
+                        return Some(format!("{}:9090", host));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Ask a seed for our shard assignment by POSTing /shards/join. Used by
+/// validators that didn't pass an explicit --shard-range; the seed finds
+/// the biggest uncovered layer gap in the pipeline and returns a range
+/// for this node to hold. Returns `Some((start, end))` on success.
+///
+/// Uses the canonical testnet model_id from inference_validator so the
+/// assignment registers in the same pipeline that tier-1 voting reads.
+async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
+    let seed = pick_seed_rpc(cli)?;
+    let url = format!("http://{}/shards/join", seed);
+    let model_id_hex = hex::encode(arc_node::inference_validator::canonical_testnet_model_id().0);
+
+    let body = serde_json::json!({
+        "socket_addr": cli.rpc,
+        "node_name": cli.validator_seed,
+        "model_id": model_id_hex,
+        "model_name": "Llama-2-7B",
+        "total_layers": 32u32,
+        "available_memory_mb": detect_ram_mb(),
+        "gpu_tier": 0u8,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("auto-shard: POST {} failed: {}", url, e);
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!("auto-shard: {} returned HTTP {}", url, resp.status());
+        return None;
+    }
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("auto-shard: response parse failed: {}", e);
+            return None;
+        }
+    };
+    let start = v.get("assigned_start_layer")?.as_u64()? as usize;
+    let end = v.get("assigned_end_layer")?.as_u64()? as usize;
+    Some((start, end))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -470,6 +568,37 @@ async fn main() -> Result<()> {
                 tracing::warn!("  Manual download: huggingface-cli download TheBloke/Llama-2-7B-GGUF llama-2-7b.Q4_K_M.gguf --local-dir $HOME/.arc-models");
                 tracing::warn!("  Then: mv $HOME/.arc-models/llama-2-7b.Q4_K_M.gguf $HOME/.arc-models/llama2-7b.gguf");
                 tracing::warn!("  Continuing in community routing mode (registered with seeds, no local inference).");
+            }
+        }
+    }
+
+    // ── Validator auto-shard: ask a seed which layers to hold ──────────
+    // Fires for staked nodes (stake>0) with a model loaded and no explicit
+    // --shard-range / --shard-start / --shard-end. POSTs /shards/join on a
+    // seed, which returns the biggest uncovered layer range in the current
+    // pipeline. Setting shard_ranges here means the later sharded model
+    // load picks up only that slice instead of holding the full model.
+    // Community workers (stake=0) skip this — they hold the full model by
+    // design and auto-register via /community/register.
+    if cli.stake > 0
+        && cli.model.is_some()
+        && cli.shard_ranges.is_empty()
+        && cli.shard_start.is_none()
+        && cli.shard_end.is_none()
+    {
+        match auto_shard_join(&cli).await {
+            Some((start, end)) => {
+                tracing::info!(
+                    "auto-shard: seed assigned this validator layers [{}, {}) — loading shard",
+                    start, end
+                );
+                cli.shard_ranges.push(format!("{}:{}", start, end));
+            }
+            None => {
+                tracing::info!(
+                    "auto-shard: no assignment received; loading FULL model. \
+                     Pass --shard-range a:b to override, or check seed connectivity."
+                );
             }
         }
     }

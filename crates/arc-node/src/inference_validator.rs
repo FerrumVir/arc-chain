@@ -38,6 +38,22 @@ use dashmap::DashMap;
 use tokio::time;
 use tracing::{debug, info, warn};
 
+/// Canonical model_id for the v0.7.x testnet Llama-2-7B model.
+///
+/// Returns `BLAKE3("arc-32L-test")` (32 bytes). Every caller that talks
+/// about "the testnet Llama-2-7B" — tier-1 voting attestations
+/// (`InferenceAttestationBody`), validator auto-shard join requests
+/// (`POST /shards/join`), shard-registry entries — MUST use this exact
+/// identifier or it won't link with existing on-chain attestations or
+/// the registered shard pipeline.
+///
+/// TODO(v0.8): migrate to content-addressed model_id (BLAKE3 of the GGUF
+/// file) so different quantizations / fine-tunes can coexist on one
+/// chain. That's a coordinated state-format change, not a drop-in.
+pub fn canonical_testnet_model_id() -> Hash256 {
+    hash_bytes(b"arc-32L-test")
+}
+
 /// How often the task scans for new work. 500 ms balances reactivity against
 /// state-lock contention. The chain's block tempo (~1-3 s) is the natural
 /// upper bound — finer polling than that wastes cycles.
@@ -275,7 +291,7 @@ impl InferenceValidatorTask {
         // alpha solo validator never accrues earnings even though it does
         // real inference on every tier1 request. Best-effort: a failure
         // here logs but doesn't block the vote.
-        let model_id = arc_crypto::hash_bytes(b"arc-32L-test");
+        let model_id = canonical_testnet_model_id();
         let input_hash = arc_crypto::hash_bytes(&snap.input_blob);
         // Option C: credit the requester (user) for the work, not the
         // signing validator. If the requester address equals the escrow
