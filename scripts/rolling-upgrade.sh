@@ -38,6 +38,35 @@ ok()    { printf "${GREEN}[  OK]${RESET}  %s\n" "$*"; }
 warn()  { printf "${YELLOW}[WARN]${RESET}  %s\n" "$*"; }
 fail()  { printf "${RED}[FAIL]${RESET}  %s\n" "$*" >&2; exit 1; }
 
+# ── Self-heal watchdog control ──────────────────────────────────────────────
+# arc-self-heal.service runs on every seed and restarts arc-node if /health
+# is silent for ≥180s. The new node's 3-shard cold model load takes ~165s
+# during which /health IS silent, so without intervention the watchdog
+# restarts our brand-new binary mid-load — racing this script and producing
+# the false-negative health-timeout incident of 2026-05-29 (see memory
+# project_arc_v076_wire_incompat.md). We pause the service on each seed
+# before restarting and resume it after the round-advance check passes.
+#
+# Failure to stop is a soft warning (continues anyway, may race). Failure
+# to start after success is LOUD — the operator must intervene to restore
+# the safety net.
+pause_self_heal() {
+    local ip="$1"
+    if ssh $SSH_OPTS "root@${ip}" "systemctl stop arc-self-heal.service" 2>/dev/null; then
+        info "  arc-self-heal.service paused on $ip"
+    else
+        warn "  could not pause arc-self-heal.service on $ip (may race the upgrade — continuing)"
+    fi
+}
+resume_self_heal() {
+    local ip="$1"
+    if ssh $SSH_OPTS "root@${ip}" "systemctl start arc-self-heal.service" 2>/dev/null; then
+        info "  arc-self-heal.service re-armed on $ip"
+    else
+        warn "  FAILED to re-arm arc-self-heal.service on $ip — MANUAL: ssh root@${ip} 'systemctl start arc-self-heal.service'"
+    fi
+}
+
 BUILD_ONLY=false
 SKIP_BUILD=false
 RESET_STATE=false
@@ -188,6 +217,12 @@ for idx in $(seq 0 $((TOTAL - 1))); do
     echo ""
     printf "${BOLD}── [$DEPLOYED/$TOTAL] Upgrading $NODE ($IP) ──${RESET}\n"
 
+    # a-1. Pause arc-self-heal BEFORE killing the old binary so the watchdog
+    # can't restart the new binary mid-model-load (the 2026-05-29 race).
+    # Re-armed below after the round-advance check passes; re-armed in every
+    # failure branch too so a halted rollout never leaves a node unprotected.
+    pause_self_heal "$IP"
+
     # a0. Snapshot the live --model flag BEFORE stopping the old process.
     # Doing this after step (b) would read from an empty ps and silently
     # swap the node onto the default TinyLlama model. --model-file=NAME
@@ -311,6 +346,7 @@ REMOTE
     if [ "$HEALTHY" = false ]; then
         warn "$NODE failed health check after 60s - check manually: ssh root@${IP}"
         if [ "$HALT_ON_FAIL" = "true" ]; then
+            resume_self_heal "$IP"
             fail "Halting rollout so a bad binary doesn't propagate to the rest of the chain. \
 Re-run with --continue-on-fail to override, or investigate \`ssh root@${IP} 'tail /root/arc-chain/node.log'\` first."
         else
@@ -332,9 +368,16 @@ Re-run with --continue-on-fail to override, or investigate \`ssh root@${IP} 'tai
     else
         warn "Round did not advance ($R1 -> $R2). Node may be isolated or stuck."
         if [ "$HALT_ON_FAIL" = "true" ]; then
+            resume_self_heal "$IP"
             fail "Halting rollout - consensus progress check failed on $NODE."
         fi
     fi
+
+    # Re-arm the watchdog now that this node is verified healthy + advancing
+    # rounds. MUST come AFTER the round-advance gate; if we re-armed earlier
+    # and the round-check fails, the watchdog would restart the node we're
+    # about to declare bad. Failure to re-arm is a hard warning, not a halt.
+    resume_self_heal "$IP"
 done
 
 # ── 3. Final status ──────────────────────────────────────────────────────────
