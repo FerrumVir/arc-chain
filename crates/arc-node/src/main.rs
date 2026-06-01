@@ -332,6 +332,102 @@ fn auto_discover_model() -> Option<String> {
     None
 }
 
+/// sha256 a file by shelling to `sha256sum` (Linux) or `shasum -a 256` (macOS).
+/// Returns the hex digest, or None if neither tool is available.
+fn sha256_of(path: &str) -> Option<String> {
+    let parse = |stdout: Vec<u8>| -> Option<String> {
+        String::from_utf8(stdout)
+            .ok()
+            .and_then(|s| s.split_whitespace().next().map(|x| x.to_string()))
+    };
+    if let Ok(out) = std::process::Command::new("sha256sum").arg(path).output() {
+        if out.status.success() {
+            return parse(out.stdout);
+        }
+    }
+    if let Ok(out) = std::process::Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+    {
+        if out.status.success() {
+            return parse(out.stdout);
+        }
+    }
+    None
+}
+
+/// Download Llama-2-7B Q4_K_M GGUF from HuggingFace to $HOME/.arc-models/
+/// and verify sha256 against the pinned hash. Returns the local path on
+/// success, None on any failure (network, sha mismatch, missing curl+wget,
+/// disk error). Idempotent: returns the existing path if already present
+/// (auto_discover_model() would have caught that — kept here so a direct
+/// caller can reuse this fn safely). Only invoked when --community was
+/// explicit, so other run modes never silently fetch multi-GB files.
+fn auto_download_model() -> Option<String> {
+    const EXPECTED_SHA: &str =
+        "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa";
+    const URL: &str = "https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q4_K_M.gguf";
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let target_dir = format!("{}/.arc-models", home);
+    let target = format!("{}/llama2-7b.gguf", target_dir);
+
+    if std::path::Path::new(&target).is_file() {
+        return Some(target);
+    }
+
+    tracing::info!("--community: downloading Llama-2-7B Q4_K_M (~4.08 GB)");
+    tracing::info!("  from: {}", URL);
+    tracing::info!("  to:   {}", target);
+    tracing::info!("  one-time; first boot may take several minutes on slow links");
+
+    if let Err(e) = std::fs::create_dir_all(&target_dir) {
+        tracing::warn!("auto-download: could not create {}: {}", target_dir, e);
+        return None;
+    }
+    let tmp = format!("{}.partial", target);
+    let _ = std::fs::remove_file(&tmp);
+
+    // Try curl, then wget. Both are nearly universal; one is virtually always present.
+    let curl_ok = std::process::Command::new("curl")
+        .args(["-fL", "--retry", "3", "--retry-delay", "5", "-o", &tmp, URL])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    let downloaded = curl_ok
+        || std::process::Command::new("wget")
+            .args(["-q", "-O", &tmp, URL])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+    if !downloaded {
+        tracing::warn!("auto-download: curl/wget both failed (install one and retry)");
+        let _ = std::fs::remove_file(&tmp);
+        return None;
+    }
+
+    let got = sha256_of(&tmp).unwrap_or_default();
+    if got != EXPECTED_SHA {
+        tracing::warn!(
+            "auto-download: sha256 mismatch — expected {}, got {} (file kept at {} for inspection)",
+            EXPECTED_SHA, got, tmp
+        );
+        return None;
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        tracing::warn!("auto-download: could not rename {} -> {}: {}", tmp, target, e);
+        return None;
+    }
+    tracing::info!(
+        "--community: downloaded + sha-verified model at {} (sha256 {})",
+        target, EXPECTED_SHA
+    );
+    Some(target)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -356,16 +452,22 @@ async fn main() -> Result<()> {
     }
     if (cli.community || cli.community_mode || cli.stake == 0) && cli.model.is_none() {
         cli.model = auto_discover_model();
+        // If --community was explicit and nothing was found on disk, auto-download
+        // the sha-pinned Llama-2-7B Q4_K_M GGUF from HuggingFace. Sha-mismatch or
+        // any failure falls through to None and we print the manual instructions.
+        if cli.model.is_none() && cli.community {
+            cli.model = auto_download_model();
+        }
         match &cli.model {
-            Some(p) => tracing::info!("community mode: auto-discovered GGUF at {}", p),
+            Some(p) => tracing::info!("community mode: model at {}", p),
             None => {
-                tracing::warn!("community mode: no GGUF model found in standard paths.");
+                tracing::warn!("community mode: no GGUF model found and auto-download did not succeed.");
                 tracing::warn!("  Place a Llama-2-7B Q4_K_M GGUF (~4.08 GB) at one of:");
                 tracing::warn!("    ./llama2-7b.gguf");
                 tracing::warn!("    $HOME/.arc-models/llama2-7b.gguf");
                 tracing::warn!("    /opt/arc/llama2-7b.gguf");
                 tracing::warn!("  Expected sha256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa");
-                tracing::warn!("  Download: huggingface-cli download TheBloke/Llama-2-7B-GGUF llama-2-7b.Q4_K_M.gguf --local-dir $HOME/.arc-models");
+                tracing::warn!("  Manual download: huggingface-cli download TheBloke/Llama-2-7B-GGUF llama-2-7b.Q4_K_M.gguf --local-dir $HOME/.arc-models");
                 tracing::warn!("  Then: mv $HOME/.arc-models/llama-2-7b.Q4_K_M.gguf $HOME/.arc-models/llama2-7b.gguf");
                 tracing::warn!("  Continuing in community routing mode (registered with seeds, no local inference).");
             }
