@@ -357,18 +357,98 @@ fn sha256_of(path: &str) -> Option<String> {
     None
 }
 
-/// Download Llama-2-7B Q4_K_M GGUF from HuggingFace to $HOME/.arc-models/
-/// and verify sha256 against the pinned hash. Returns the local path on
-/// success, None on any failure (network, sha mismatch, missing curl+wget,
-/// disk error). Idempotent: returns the existing path if already present
-/// (auto_discover_model() would have caught that — kept here so a direct
-/// caller can reuse this fn safely). Only invoked when --community was
-/// explicit, so other run modes never silently fetch multi-GB files.
-fn auto_download_model() -> Option<String> {
-    const EXPECTED_SHA: &str =
-        "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa";
-    const URL: &str = "https://huggingface.co/TheBloke/Llama-2-7B-GGUF/resolve/main/llama-2-7b.Q4_K_M.gguf";
+/// SHA256 of the canonical testnet Llama-2-7B Q4_K_M GGUF that every seed
+/// runs. Community workers must download exactly this file (bit-identical)
+/// to produce bitwise-identical inference output. NOTE: this is the seed's
+/// custom-quantized variant — it does NOT match TheBloke's public Q4_K_M
+/// (sha 4567208c…1b0b, same size, different quantization run). For sha
+/// migration, change this AND the file at every URL in DEFAULT_MODEL_SOURCES
+/// in lock-step.
+const TESTNET_MODEL_SHA256: &str =
+    "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa";
 
+/// Primary download sources for the canonical testnet GGUF, tried in order.
+/// First source whose advertised sha matches TESTNET_MODEL_SHA256 wins.
+/// Operators override the list at runtime with ARC_MODEL_URL (comma-
+/// separated; e.g. `ARC_MODEL_URL=https://my-mirror/llama2-7b.gguf`).
+///
+/// HuggingFace is the primary host: free, CDN-backed (CloudFront), supports
+/// git-lfs for 4-GB+ files, and works behind any NAT (HTTPS only). Add
+/// mirrors by appending URLs here, no recompile needed for ad-hoc mirrors
+/// via the env var.
+const DEFAULT_MODEL_SOURCES: &[&str] = &[
+    "https://huggingface.co/FerrumVir/llama-2-7b-arc/resolve/main/llama2-7b.gguf",
+];
+
+/// Resolve a HuggingFace `/resolve/main/` URL to its `/raw/main/` form,
+/// which returns the git-lfs pointer text (~200 bytes) for large files.
+/// The pointer contains the file's real sha256 — letting us fail in 1 KB
+/// instead of 4 GB on a misconfigured mirror. Returns None for non-HF URLs
+/// or non-LFS files (those will be sha-verified the slow way after download).
+fn hf_lfs_pointer_sha(url: &str) -> Option<String> {
+    let raw_url = url.replace("/resolve/", "/raw/");
+    if raw_url == url {
+        return None;
+    }
+    let out = std::process::Command::new("curl")
+        .args(["-sLf", "--max-time", "10", &raw_url])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8(out.stdout).ok()?;
+    for line in body.lines() {
+        if let Some(sha) = line.strip_prefix("oid sha256:") {
+            return Some(sha.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Download URL to `tmp` with resume support (`curl -C -` — partial files
+/// from prior interrupted runs are continued, not restarted) and verify
+/// sha256. Returns true only when the on-disk bytes hash to expected_sha.
+/// Cleans up the partial on sha mismatch so a poisoned file can't infect
+/// a later retry's resume.
+fn download_and_verify(url: &str, tmp: &str, expected_sha: &str) -> bool {
+    let status = std::process::Command::new("curl")
+        .args([
+            "-fL",
+            "--retry", "5",
+            "--retry-delay", "5",
+            "-C", "-",
+            "-o", tmp,
+            url,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !status {
+        return false;
+    }
+    let got = sha256_of(tmp).unwrap_or_default();
+    if got != expected_sha {
+        tracing::warn!("  sha mismatch from {} (got {}); discarding partial", url, got);
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    true
+}
+
+/// Download the canonical testnet GGUF to $HOME/.arc-models/llama2-7b.gguf
+/// from the first source whose sha matches TESTNET_MODEL_SHA256. Tries the
+/// LFS pointer first (fast fail on misconfigured URLs), then the full file
+/// with resume support, then sha-verifies. Returns the local path on success.
+///
+/// Idempotent: returns the existing local path if the file is already
+/// present (auto_discover_model() would normally catch that earlier — this
+/// guard is kept so direct callers can reuse the function safely).
+///
+/// Sources come from ARC_MODEL_URL (comma-separated) if set, else from
+/// DEFAULT_MODEL_SOURCES. Only invoked when `--community` was explicit, so
+/// other run modes never silently fetch multi-GB files.
+fn auto_download_model() -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let target_dir = format!("{}/.arc-models", home);
     let target = format!("{}/llama2-7b.gguf", target_dir);
@@ -376,56 +456,71 @@ fn auto_download_model() -> Option<String> {
     if std::path::Path::new(&target).is_file() {
         return Some(target);
     }
-
-    tracing::info!("--community: downloading Llama-2-7B Q4_K_M (~4.08 GB)");
-    tracing::info!("  from: {}", URL);
-    tracing::info!("  to:   {}", target);
-    tracing::info!("  one-time; first boot may take several minutes on slow links");
-
     if let Err(e) = std::fs::create_dir_all(&target_dir) {
-        tracing::warn!("auto-download: could not create {}: {}", target_dir, e);
+        tracing::warn!("auto-download: cannot create {}: {}", target_dir, e);
         return None;
     }
     let tmp = format!("{}.partial", target);
-    let _ = std::fs::remove_file(&tmp);
 
-    // Try curl, then wget. Both are nearly universal; one is virtually always present.
-    let curl_ok = std::process::Command::new("curl")
-        .args(["-fL", "--retry", "3", "--retry-delay", "5", "-o", &tmp, URL])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    let downloaded = curl_ok
-        || std::process::Command::new("wget")
-            .args(["-q", "-O", &tmp, URL])
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+    let sources: Vec<String> = std::env::var("ARC_MODEL_URL")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v: &Vec<String>| !v.is_empty())
+        .unwrap_or_else(|| {
+            DEFAULT_MODEL_SOURCES.iter().map(|s| s.to_string()).collect()
+        });
 
-    if !downloaded {
-        tracing::warn!("auto-download: curl/wget both failed (install one and retry)");
-        let _ = std::fs::remove_file(&tmp);
-        return None;
-    }
-
-    let got = sha256_of(&tmp).unwrap_or_default();
-    if got != EXPECTED_SHA {
-        tracing::warn!(
-            "auto-download: sha256 mismatch — expected {}, got {} (file kept at {} for inspection)",
-            EXPECTED_SHA, got, tmp
-        );
-        return None;
-    }
-
-    if let Err(e) = std::fs::rename(&tmp, &target) {
-        tracing::warn!("auto-download: could not rename {} -> {}: {}", tmp, target, e);
-        return None;
-    }
     tracing::info!(
-        "--community: downloaded + sha-verified model at {} (sha256 {})",
-        target, EXPECTED_SHA
+        "--community: searching {} model source(s) for sha {} (~4.08 GB)",
+        sources.len(),
+        TESTNET_MODEL_SHA256
     );
-    Some(target)
+    tracing::info!("  target: {}", target);
+
+    for url in &sources {
+        tracing::info!("--community: trying {}", url);
+
+        // 1) Fast LFS pre-check: HuggingFace `/raw/` URL returns the LFS
+        //    pointer (~200 B) containing the file's sha. Skip 4-GB pulls
+        //    against URLs whose advertised sha doesn't match.
+        if let Some(remote_sha) = hf_lfs_pointer_sha(url) {
+            if remote_sha != TESTNET_MODEL_SHA256 {
+                tracing::warn!(
+                    "  LFS sha {} != expected {} — skipping this source",
+                    remote_sha, TESTNET_MODEL_SHA256
+                );
+                continue;
+            }
+            tracing::info!("  LFS sha pre-check OK ({})", remote_sha);
+        }
+
+        // 2) Download with resume + final sha verification.
+        if download_and_verify(url, &tmp, TESTNET_MODEL_SHA256) {
+            if let Err(e) = std::fs::rename(&tmp, &target) {
+                tracing::warn!("  rename {} -> {} failed: {}", tmp, target, e);
+                continue;
+            }
+            tracing::info!(
+                "--community: downloaded + sha-verified model at {} (sha256 {})",
+                target, TESTNET_MODEL_SHA256
+            );
+            return Some(target);
+        }
+    }
+
+    tracing::warn!(
+        "auto-download: all {} source(s) failed. To add a mirror set \
+         ARC_MODEL_URL=<url1[,url2,...]> and retry; the URL must serve a \
+         file whose sha256 == {}.",
+        sources.len(),
+        TESTNET_MODEL_SHA256
+    );
+    None
 }
 
 /// Best-effort detection of total system RAM in MB. Reads /proc/meminfo on
@@ -487,7 +582,20 @@ fn pick_seed_rpc(cli: &Cli) -> Option<String> {
 async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
     let seed = pick_seed_rpc(cli)?;
     let url = format!("http://{}/shards/join", seed);
-    let model_id_hex = hex::encode(arc_node::inference_validator::canonical_testnet_model_id().0);
+    // model_id MUST match the SHARD-REGISTRY convention (BLAKE3 of the model
+    // config signature), NOT the unrelated tier-1 attestation identifier
+    // `hash_bytes("arc-32L-test")` from inference_validator.rs. Two model_id
+    // systems live in this codebase today and they don't match (latent bug,
+    // pre-dates this branch). Shard registry uses
+    // `hash_bytes("arc-{n_layers}L-{d_model}d-{n_heads}h-{vocab_size}v")` —
+    // for the Llama-2-7B testnet that's "arc-32L-4096d-32h-32000v", whose
+    // hash is 0xabec2d58…7fdb (verified live on AMS+LAX /shards). Using
+    // the tier-1 identifier here would register us in an empty parallel
+    // pipeline and the seed would return 0:32 (the full model) for every
+    // joiner. TODO(v0.8): unify these two model_id derivations.
+    let model_id_hex = hex::encode(
+        arc_crypto::hash_bytes(b"arc-32L-4096d-32h-32000v").0,
+    );
 
     let body = serde_json::json!({
         "socket_addr": cli.rpc,
@@ -630,7 +738,16 @@ async fn main() -> Result<()> {
         node_cfg.p2p.port
     };
 
-    let stake = if matches.value_source("stake") == Some(clap::parser::ValueSource::CommandLine) {
+    // --community is treated as an explicit CLI override of stake (the post-
+    // parse block forces cli.stake = 0 for that flag). Without this short-
+    // circuit, matches.value_source() — which only reflects what was on the
+    // actual command line, not later mutations — would fall through to
+    // node_cfg.validator.stake (5M by default) and silently restore a
+    // validator stake on a node the operator explicitly asked to be a
+    // stake-0 community worker.
+    let stake = if cli.community
+        || matches.value_source("stake") == Some(clap::parser::ValueSource::CommandLine)
+    {
         cli.stake
     } else {
         node_cfg.validator.stake
