@@ -739,7 +739,16 @@ async fn main() -> Result<()> {
     }
 
     // ── Validate stake ──────────────────────────────────────────────────
-    if stake < min_stake {
+    // Community-mode workers are stake-0 by definition (no slashing, no
+    // consensus role) — they register via /community/register and route
+    // inference via the seed dispatch. The min_stake gate is for actual
+    // validators, so we bypass it whenever the node is in community-mode-
+    // equivalent state (--community, --community-mode, or --stake 0).
+    // The existing community_mode auto-derive (line ~1188) already treats
+    // stake==0 as community, so this is just the same intent applied
+    // earlier in the boot flow.
+    let community_mode_intent = cli.community || cli.community_mode || stake == 0;
+    if !community_mode_intent && stake < min_stake {
         eprintln!(
             "Error: stake {} ARC is below the minimum required {} ARC",
             stake, min_stake

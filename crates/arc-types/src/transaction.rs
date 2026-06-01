@@ -1727,4 +1727,61 @@ mod tests {
         assert!(TIER1_MAX_TOKENS > 0);
         assert!(TIER1_MAX_TOKENS <= 8192);
     }
+
+    /// Pin the wire size of InferenceAttestationBody to the v0.7.2 layout.
+    /// v0.7.6 added a `beneficiary: Option<Address>` (#[serde(default)])
+    /// which silently shifted the bincode byte stream and partitioned the
+    /// chain on 2026-05-29. v0.7.8 marks it `#[serde(skip)]` so the bytes
+    /// (and tx hash) are byte-identical to v0.7.2 regardless of the field
+    /// value. This test FAILS if anyone removes the skip or adds a new
+    /// wire field — at which point a coordinated activation is required,
+    /// not a rolling upgrade.
+    #[test]
+    fn inference_attestation_body_wire_compat_v072() {
+        // v0.7.2 layout: 3 Hash256 (96 B) + 2 u64 (16 B) = 112 B.
+        const V072_WIRE_BYTES: usize = 32 * 3 + 8 * 2;
+
+        let body_none = InferenceAttestationBody {
+            model_id: Hash256([1u8; 32]),
+            input_hash: Hash256([2u8; 32]),
+            output_hash: Hash256([3u8; 32]),
+            challenge_period: 100,
+            bond: 0,
+            beneficiary: None,
+        };
+        let body_some = InferenceAttestationBody {
+            model_id: Hash256([1u8; 32]),
+            input_hash: Hash256([2u8; 32]),
+            output_hash: Hash256([3u8; 32]),
+            challenge_period: 100,
+            bond: 0,
+            beneficiary: Some(Hash256([9u8; 32])),
+        };
+
+        let bytes_none = bincode::serialize(&body_none).unwrap();
+        let bytes_some = bincode::serialize(&body_some).unwrap();
+
+        assert_eq!(
+            bytes_none.len(),
+            V072_WIRE_BYTES,
+            "wire size MUST match v0.7.2 ({} bytes); change broke rolling-upgrade compat",
+            V072_WIRE_BYTES
+        );
+        assert_eq!(
+            bytes_some.len(),
+            V072_WIRE_BYTES,
+            "beneficiary value MUST NOT affect wire size — field must be #[serde(skip)]"
+        );
+        assert_eq!(
+            bytes_none, bytes_some,
+            "beneficiary value MUST NOT affect wire bytes"
+        );
+
+        // Round-trip restores beneficiary to None (skip default).
+        let round: InferenceAttestationBody = bincode::deserialize(&bytes_some).unwrap();
+        assert_eq!(
+            round.beneficiary, None,
+            "deserialize MUST default to None (skipped on wire)"
+        );
+    }
 }
