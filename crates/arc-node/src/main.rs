@@ -164,6 +164,17 @@ struct Cli {
     /// Recommended for home / residential installs.
     #[arg(long)]
     community_mode: bool,
+
+    /// One-flag community-node setup. Equivalent to `--stake 0
+    /// --community-mode` PLUS auto-discovery of a Llama-2-7B GGUF from
+    /// standard paths (./llama2-7b.gguf, $HOME/.arc-models/, /opt/arc/).
+    /// Lets `arc-node --community` "just work" for home/residential operators
+    /// with no other flags: stake-0 + auto-registers with seeds + serves
+    /// local inference if a model is found on disk. If no model is found
+    /// the node still runs as a community routing/observer member and
+    /// prints clear download instructions with the expected sha256.
+    #[arg(long, default_value_t = false)]
+    community: bool,
 }
 
 /// Rewrites a pulled peer's `self_shard.socket_addr` in place when it carries
@@ -299,13 +310,67 @@ mod tests {
     }
 }
 
+/// Look for a Llama-2-7B GGUF in standard community-node locations.
+/// Returns the first existing path. Covers both the seed convention
+/// (`llama2-7b.gguf`) and TheBloke's published filename
+/// (`llama-2-7b.Q4_K_M.gguf`).
+fn auto_discover_model() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let candidates: [String; 6] = [
+        "./llama2-7b.gguf".to_string(),
+        "./llama-2-7b.Q4_K_M.gguf".to_string(),
+        format!("{}/.arc-models/llama2-7b.gguf", home),
+        format!("{}/.arc-models/llama-2-7b.Q4_K_M.gguf", home),
+        "/opt/arc/llama2-7b.gguf".to_string(),
+        "/var/lib/arc/llama2-7b.gguf".to_string(),
+    ];
+    for p in candidates {
+        if std::path::Path::new(&p).is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("arc=info".parse()?))
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // ── --community: one-flag community-node setup ─────────────────────
+    // Forces stake=0 + community_mode=true, and auto-discovers a local
+    // GGUF if --model wasn't explicitly set. Lets home/residential
+    // operators run `arc-node --community` with zero other flags.
+    if cli.community {
+        if cli.stake != 0 {
+            tracing::info!(
+                "--community: overriding --stake {} to 0 (community workers are stake-0)",
+                cli.stake
+            );
+            cli.stake = 0;
+        }
+        cli.community_mode = true;
+    }
+    if (cli.community || cli.community_mode || cli.stake == 0) && cli.model.is_none() {
+        cli.model = auto_discover_model();
+        match &cli.model {
+            Some(p) => tracing::info!("community mode: auto-discovered GGUF at {}", p),
+            None => {
+                tracing::warn!("community mode: no GGUF model found in standard paths.");
+                tracing::warn!("  Place a Llama-2-7B Q4_K_M GGUF (~4.08 GB) at one of:");
+                tracing::warn!("    ./llama2-7b.gguf");
+                tracing::warn!("    $HOME/.arc-models/llama2-7b.gguf");
+                tracing::warn!("    /opt/arc/llama2-7b.gguf");
+                tracing::warn!("  Expected sha256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa");
+                tracing::warn!("  Download: huggingface-cli download TheBloke/Llama-2-7B-GGUF llama-2-7b.Q4_K_M.gguf --local-dir $HOME/.arc-models");
+                tracing::warn!("  Then: mv $HOME/.arc-models/llama-2-7b.Q4_K_M.gguf $HOME/.arc-models/llama2-7b.gguf");
+                tracing::warn!("  Continuing in community routing mode (registered with seeds, no local inference).");
+            }
+        }
+    }
 
     // ── Load config file and merge with CLI args ────────────────────────
     // Priority: explicit CLI arg > config file value > hardcoded default.
