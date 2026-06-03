@@ -129,14 +129,17 @@ async fn main() {
     };
     let body = TxBody::InferenceRequest(InferenceRequestBody {
         request_id,
-        model_id: hash_bytes(b"Llama-2-7b-chat.gguf"),
+        // Canonical testnet model_id — must match
+        // arc_node::inference_validator::canonical_testnet_model_id(),
+        // otherwise committee members won't run inference for the request.
+        model_id: hash_bytes(b"arc-32L-test"),
         input_hash,
         input_blob,
         max_tokens: 16,
         tier: 1,
         max_reward: 10,
         deadline_blocks: 50,
-        committee_size: 1,
+        committee_size: 15,
     });
     let mut tx = Transaction {
         tx_type: TxType::InferenceRequest,

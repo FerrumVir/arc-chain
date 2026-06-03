@@ -78,11 +78,22 @@ pub struct InferenceValidatorTask {
     /// request from the same validator. State-side `apply_inference_vote`
     /// also rejects duplicates; this avoids burning gas on doomed txs.
     voted: Arc<DashMap<[u8; 32], ()>>,
-    /// Same idea for finalize: only submit once per request from this node.
-    /// (Other nodes may also submit; the first to commit wins, the rest
-    /// reject with a no-op error.)
-    finalize_submitted: Arc<DashMap<[u8; 32], ()>>,
+    /// Last finalize-submit time per request. Used to throttle retries:
+    /// the apply-time eligibility check (`now >= anchor_height +
+    /// deadline_blocks`) can race a finalize tx through mempool→block in a
+    /// window where the height is still 1 below deadline; the tx then
+    /// applies-with-error (consuming the validator's nonce) and the request
+    /// stays Open forever unless we re-submit. Track the timestamp so we
+    /// retry every `FINALIZE_RETRY_AFTER` seconds while the request stays
+    /// non-terminal.
+    finalize_submitted: Arc<DashMap<[u8; 32], std::time::Instant>>,
 }
+
+/// How long to wait after a finalize submit before allowing a retry on the
+/// same request, if it hasn't reached a terminal state. Long enough to give
+/// the original tx time to commit and apply, short enough that a wedged
+/// request unsticks within minutes rather than hours.
+const FINALIZE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl InferenceValidatorTask {
     pub fn new(
@@ -194,11 +205,17 @@ impl InferenceValidatorTask {
             let votes_done = snap.votes.len() >= snap.committee_size as usize;
             let deadline_reached =
                 now >= snap.anchor_height.saturating_add(snap.deadline_blocks);
+            let retry_ok = self
+                .finalize_submitted
+                .get(&request_id)
+                .map(|e| e.value().elapsed() >= FINALIZE_RETRY_AFTER)
+                .unwrap_or(true);
             let can_finalize = (snap.status == TIER1_STATUS_VOTING || snap.status == TIER1_STATUS_OPEN)
                 && (votes_done || deadline_reached)
-                && !self.finalize_submitted.contains_key(&request_id);
+                && retry_ok;
             if can_finalize {
-                self.finalize_submitted.insert(request_id, ());
+                self.finalize_submitted
+                    .insert(request_id, std::time::Instant::now());
                 if let Err(e) = self.submit_finalize(&request_id) {
                     warn!(
                         request_id = %hex::encode(request_id),
