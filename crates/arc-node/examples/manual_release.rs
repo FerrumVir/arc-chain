@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
 
-const COORD: &str = "http://149.28.32.76:9090";
+const COORD: &str = "http://140.82.16.112:9090";
 const PAYER_PHRASE: &str = "milestone-b-live-test";
 const REQUEST_ID_HEX: &str =
     "f404a52ae155907183b428fdac2601a08dbf003416dc16ef7c073e93c2c94d56";

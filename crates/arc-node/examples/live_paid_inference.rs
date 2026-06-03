@@ -32,9 +32,9 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 const DOMAIN_TAG: &str = "ARC-chain-validator-keypair-v1";
-const DEFAULT_COORD: &str = "http://149.28.32.76:9090";
+// NYC (149.28.32.76) is dead as of 2026-06-03 — coordinator defaults to LAX.
+const DEFAULT_COORD: &str = "http://140.82.16.112:9090";
 const SEEDS: &[(&str, &str)] = &[
-    ("NYC", "149.28.32.76"),
     ("LAX", "140.82.16.112"),
     ("AMS", "136.244.109.1"),
     ("LHR", "104.238.171.11"),

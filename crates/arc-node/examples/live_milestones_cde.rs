@@ -44,7 +44,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 const DOMAIN_TAG: &str = "ARC-chain-validator-keypair-v1";
-const DEFAULT_COORD: &str = "http://149.28.32.76:9090";
+const DEFAULT_COORD: &str = "http://140.82.16.112:9090";
 const TREASURY_TAG: &[u8] = b"arc-treasury";
 
 fn keypair(phrase: &str) -> (SigningKey, [u8; 32], Hash256) {

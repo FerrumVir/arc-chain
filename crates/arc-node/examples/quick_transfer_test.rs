@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 
 const DOMAIN_TAG: &str = "ARC-chain-validator-keypair-v1";
-const COORD: &str = "http://149.28.32.76:9090";
+const COORD: &str = "http://140.82.16.112:9090";
 
 fn keypair(phrase: &str) -> (SigningKey, [u8; 32], Hash256) {
     let seed = blake3::derive_key(DOMAIN_TAG, phrase.as_bytes());

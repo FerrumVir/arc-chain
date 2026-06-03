@@ -7,7 +7,7 @@
 // /worker/earnings reflects the on-chain credit.
 //
 // Run against a live seed:
-//   ARC_SEED=http://149.28.32.76:9090 \
+//   ARC_SEED=http://140.82.16.112:9090 \
 //   cargo run --release -p arc-node --example v070_e2e_attestation
 //
 // Default ARC_SEED is the local node at 127.0.0.1:9090.
