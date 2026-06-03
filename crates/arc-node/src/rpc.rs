@@ -3378,6 +3378,70 @@ async fn inference_onchain_submit(
         }
     };
 
+    // ── Caller-signed path (v0.7.9 fix) ────────────────────────────────────
+    // If the caller passes a `signed_tx` field (hex-encoded bincode-serialized
+    // Transaction), bypass the self-sign flow entirely and just relay it.
+    // This is the architecturally correct path: wallets sign with their own
+    // funded keypair, the seed only acts as a relay. The self-sign path below
+    // signs with the node's validator_address, which on multi-validator chains
+    // can hit ordering / committee-self-vote issues that wedge the request at
+    // "no such request" indefinitely. The caller-signed path sidesteps all of
+    // that — it's the same code path the desktop wallet uses via /tx/submit_signed,
+    // just keyed by the /inference/onchain/submit endpoint for consistency.
+    if let Some(signed_hex) = req.get("signed_tx").and_then(|v| v.as_str()) {
+        let bytes = hex::decode(signed_hex.trim_start_matches("0x")).map_err(|e| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("signed_tx hex decode: {}", e),
+            )
+        })?;
+        let tx: Transaction = bincode::deserialize(&bytes).map_err(|e| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("signed_tx bincode decode: {}", e),
+            )
+        })?;
+        if tx.tx_type != TxType::InferenceRequest {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "signed_tx must be InferenceRequest, got {:?}",
+                    tx.tx_type
+                ),
+            ));
+        }
+        let (req_id_arr, mreward, dblocks, csize) = match &tx.body {
+            TxBody::InferenceRequest(b) => {
+                (b.request_id, b.max_reward, b.deadline_blocks, b.committee_size)
+            }
+            _ => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "signed_tx body is not an InferenceRequest variant",
+                ))
+            }
+        };
+        let tx_hash = tx.hash;
+        let anchor_h = node.state.height();
+        let signer = format!("0x{}", hex::encode(tx.from.0));
+        node.mempool.insert(tx).map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mempool insert failed: {:?}", e),
+            )
+        })?;
+        return Ok(Json(json!({
+            "request_id": format!("0x{}", hex::encode(req_id_arr)),
+            "tx_hash": tx_hash.to_hex(),
+            "anchor_height": anchor_h,
+            "committee_size": csize,
+            "deadline_blocks": dblocks,
+            "max_reward": mreward,
+            "signed_by": "caller",
+            "signer_address": signer,
+        })));
+    }
+
     let input_text = req
         .get("input")
         .and_then(|v| v.as_str())
@@ -3488,6 +3552,11 @@ async fn inference_onchain_submit(
         )
     })?;
 
+    // Diagnostic fields make the silent "no such request" failure
+    // debuggable. If the self-signed path is wedging, operators can see at a
+    // glance whether they're hitting the validator-self-submit path (and the
+    // submitter's balance/nonce) and pivot to the `signed_tx` field above.
+    let signer_balance = node.state.get_account(&sender_addr).map(|a| a.balance).unwrap_or(0);
     Ok(Json(json!({
         "request_id": format!("0x{}", hex::encode(request_id)),
         "tx_hash": tx_hash.to_hex(),
@@ -3495,6 +3564,11 @@ async fn inference_onchain_submit(
         "committee_size": committee_size,
         "deadline_blocks": deadline_blocks,
         "max_reward": max_reward,
+        "signed_by": "validator_self",
+        "signer_address": format!("0x{}", hex::encode(sender_addr.0)),
+        "signer_balance": signer_balance,
+        "signer_nonce_at_submit": nonce,
+        "note": "If status stays 'no such request' >60s, retry via the `signed_tx` field with a wallet-signed Transaction (bincode hex) instead of the self-sign path."
     })))
 }
 
