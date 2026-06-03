@@ -962,6 +962,7 @@ impl ConsensusManager {
                     // Verifier: apply received state diff + verify root.
                     if multi_validator {
                         let mut committed_txs: Vec<Transaction> = Vec::new();
+                        let mut unresolved_committed = 0usize;
                         for tx_hash in &dag_block.transactions {
                             if let Some((_, tx)) = pending_txs.remove(&tx_hash.0) {
                                 // Skip transactions already applied via direct RPC path
@@ -970,7 +971,36 @@ impl ConsensusManager {
                                     continue;
                                 }
                                 committed_txs.push(tx);
+                            } else if !state.receipts.contains_key(&tx_hash.0) {
+                                // The committed DAG block references a tx hash this
+                                // node never stored (not proposed locally, not
+                                // received via DagBlockWithTxs) and that was not
+                                // already applied out-of-band. Silently skipping it
+                                // means this node executes a *different* tx set than
+                                // the leader - for Tier 1 this is the on-chain
+                                // "no such request" symptom, and more broadly it is a
+                                // state-divergence hazard. Surface it loudly so the
+                                // gap is observable in production.
+                                unresolved_committed += 1;
+                                warn!(
+                                    round = dag_block.round,
+                                    block = %dag_block.hash,
+                                    tx = %hex::encode(&tx_hash.0[..8]),
+                                    "Committed tx unresolved in pending_txs - dropped \
+                                     (possible state divergence / 'no such request')"
+                                );
                             }
+                        }
+                        if unresolved_committed > 0 {
+                            warn!(
+                                round = dag_block.round,
+                                dropped = unresolved_committed,
+                                total = dag_block.transactions.len(),
+                                "Dropped {} of {} committed txs that were not locally \
+                                 available",
+                                unresolved_committed,
+                                dag_block.transactions.len()
+                            );
                         }
                         if !committed_txs.is_empty() {
                             // ── Pipeline stage overlap: pre-verify signatures ──

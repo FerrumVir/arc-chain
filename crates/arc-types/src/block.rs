@@ -91,6 +91,19 @@ pub struct StateDiff {
     pub changes: Vec<AccountChange>,
     /// The expected state root after applying all changes.
     pub new_root: Hash256,
+    /// Per-address contract/escrow storage entries that changed during the
+    /// block. Required so verifiers reconstruct state that lives *outside* the
+    /// `Account` record - e.g. Tier 1 inference escrows store the prompt blob,
+    /// the vote list and the requester address under storage keys. Without
+    /// these a verifier's `tier1_request_snapshot` comes back empty and the
+    /// request surfaces as "no such request".
+    #[serde(default)]
+    pub storage_changes: Vec<StorageChange>,
+    /// Tier 1 pending-inference index entries (`request_id -> anchor_height`)
+    /// created in this block. Mirrors `StateDB.tier1_pending` so verifier
+    /// nodes can also serve / vote on the request.
+    #[serde(default)]
+    pub tier1_pending: Vec<(Hash256, u64)>,
 }
 
 /// A single account change within a state diff.
@@ -100,6 +113,15 @@ pub struct AccountChange {
     pub address: Hash256,
     /// The new account state after the block.
     pub account: Account,
+}
+
+/// Storage key/value entries for one address within a state diff.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StorageChange {
+    /// The address (contract / escrow) whose storage changed.
+    pub address: Hash256,
+    /// The storage entries `(key, value)` written under that address.
+    pub entries: Vec<(Hash256, Vec<u8>)>,
 }
 
 // ─── Protocol Versioning & Upgrade Scheduling ────────────────────────────────

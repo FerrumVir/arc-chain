@@ -6021,7 +6021,7 @@ impl StateDB {
     /// accounts that changed and the new state root.  Verifiers receive this
     /// diff and call `apply_state_diff()` to cheaply confirm correctness.
     pub fn export_state_diff(&self, dirty_keys: &[Address]) -> arc_types::StateDiff {
-        use arc_types::{AccountChange, StateDiff};
+        use arc_types::{AccountChange, StateDiff, StorageChange};
 
         let changes: Vec<AccountChange> = dirty_keys
             .iter()
@@ -6033,9 +6033,49 @@ impl StateDB {
             })
             .collect();
 
+        // Export storage entries for every changed address. State that lives
+        // outside the `Account` record (contract storage, Tier 1 inference
+        // escrow blobs / votes / requester) is invisible to a verifier unless
+        // it travels in the diff.
+        let storage_changes: Vec<StorageChange> = dirty_keys
+            .iter()
+            .filter_map(|addr| {
+                self.storage.get(&addr.0).and_then(|map| {
+                    let entries: Vec<(Hash256, Vec<u8>)> =
+                        map.iter().map(|e| (*e.key(), e.value().clone())).collect();
+                    if entries.is_empty() {
+                        None
+                    } else {
+                        Some(StorageChange { address: *addr, entries })
+                    }
+                })
+            })
+            .collect();
+
+        // Carry the Tier 1 pending-inference index entries whose escrow account
+        // is part of this diff, so verifiers can also serve / vote on the
+        // request. Scoped to this block's escrows to keep the diff small.
+        let changed: std::collections::HashSet<[u8; 32]> =
+            dirty_keys.iter().map(|a| a.0).collect();
+        let tier1_pending: Vec<(Hash256, u64)> = self
+            .tier1_pending
+            .iter()
+            .filter_map(|e| {
+                let request_id = *e.key();
+                let escrow = hash_bytes(
+                    &[b"arc-infreq".as_ref(), request_id.as_ref()].concat(),
+                );
+                if changed.contains(&escrow.0) {
+                    Some((Hash256(request_id), *e.value()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let new_root = self.compute_state_root();
 
-        StateDiff { changes, new_root }
+        StateDiff { changes, new_root, storage_changes, tier1_pending }
     }
 
     /// Apply a state diff from a proposer and return the resulting state root.
@@ -6047,6 +6087,19 @@ impl StateDB {
         for change in &diff.changes {
             self.accounts.insert(change.address.0, change.account.clone());
             self.dirty_accounts.insert(change.address.0);
+        }
+        // Restore contract / escrow storage so state outside the `Account`
+        // record (e.g. Tier 1 inference escrow blobs, votes, requester) is
+        // reconstructed on the verifier exactly as on the proposer.
+        for sc in &diff.storage_changes {
+            let entry = self.storage.entry(sc.address.0).or_default();
+            for (key, value) in &sc.entries {
+                entry.insert(*key, value.clone());
+            }
+        }
+        // Restore the Tier 1 pending-inference index.
+        for (request_id, anchor_height) in &diff.tier1_pending {
+            self.tier1_pending.insert(request_id.0, *anchor_height);
         }
         self.compute_state_root()
     }
@@ -6897,6 +6950,67 @@ mod tests {
 
         // Verifier applies diff
         assert!(verifier_db.verify_state_diff(&diff));
+    }
+
+    /// Regression for the Tier 1 multi-validator "no such request" bug.
+    ///
+    /// In propose/verify mode a verifier reconstructs state from the
+    /// proposer's `StateDiff` *without re-executing the block*. An
+    /// `InferenceRequest` writes per-escrow storage (`tier1.input_blob`,
+    /// `tier1.votes`, `tier1.requester`) and a `tier1_pending` index entry.
+    /// If the diff only carries `Account` records, every verifier loses that
+    /// data and `tier1_request_snapshot` returns an empty / missing request,
+    /// surfacing as "no such request" on the RPC. The diff MUST round-trip
+    /// the escrow storage and the pending index.
+    #[test]
+    fn test_state_diff_round_trips_tier1_inference() {
+        let requester = addr(1);
+        let proposer = StateDB::with_genesis(&[(requester, 1_000_000)]);
+
+        let request_id = [7u8; 32];
+        let tx = build_tier1_request(requester, 0, request_id, 100, 1, 20);
+        proposer.execute_block(&[tx], addr(99)).unwrap();
+
+        // Proposer sees the full request (sanity).
+        let snap_p = proposer
+            .tier1_request_snapshot(&request_id)
+            .expect("proposer created the request");
+        assert!(!snap_p.input_blob.is_empty(), "proposer stored input_blob");
+        assert!(
+            proposer.tier1_pending.contains_key(&request_id),
+            "proposer indexed tier1_pending"
+        );
+
+        // Export the diff the way the consensus loop does, guaranteeing the
+        // escrow account itself is included.
+        let escrow_addr =
+            hash_bytes(&[b"arc-infreq".as_ref(), request_id.as_ref()].concat());
+        let mut affected = proposer.drain_dirty_addresses();
+        if !affected.iter().any(|a| a.0 == escrow_addr.0) {
+            affected.push(escrow_addr);
+        }
+        let diff = proposer.export_state_diff(&affected);
+
+        // Verifier applies the diff WITHOUT executing the tx.
+        let verifier = StateDB::with_genesis(&[(requester, 1_000_000)]);
+        verifier.apply_state_diff(&diff);
+
+        // The verifier must reconstruct the request exactly.
+        let snap_v = verifier
+            .tier1_request_snapshot(&request_id)
+            .expect("verifier must see the request after applying the diff");
+        assert_eq!(
+            snap_v.input_blob, snap_p.input_blob,
+            "verifier lost tier1 escrow storage (input_blob) via the StateDiff"
+        );
+        assert_eq!(
+            snap_v.committee_size, snap_p.committee_size,
+            "verifier lost committee_size"
+        );
+        assert!(
+            verifier.tier1_pending.contains_key(&request_id),
+            "verifier lost the tier1_pending index via the StateDiff"
+        );
     }
 
     #[test]
