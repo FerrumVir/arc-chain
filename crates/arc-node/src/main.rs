@@ -1160,7 +1160,7 @@ async fn main() -> Result<()> {
                 arc_inference::cached_integer_model::load_cached_model(&tokenizer_path)
             };
             match load_result {
-                Ok(model) => {
+                Ok(mut model) => {
                     let elapsed = load_start.elapsed();
                     let mb_held: usize = model.layers.iter()
                         .filter(|l| l.is_loaded())
@@ -1169,6 +1169,28 @@ async fn main() -> Result<()> {
                             + l.w_down.memory_bytes())
                         .sum::<usize>() / (1024 * 1024);
                     let layers_held = model.layers.iter().filter(|l| l.is_loaded()).count();
+                    // Multi-range / sharded loaders explicitly drop the I16
+                    // quantization at the merge step (cached_integer_model.rs
+                    // line 3311) since each sub-load's i16 slices were keyed
+                    // on its own subrange and rebuilding from f32 is too
+                    // expensive at startup. The single-range loader populates
+                    // i16_layers directly. To make the dispatch order (I16 >
+                    // block-I8 > Q4 > I8) reach I16 on shard-holder seeds —
+                    // and to make `effective_precision_label()` honestly
+                    // report "INT16 integer" — promote the in-memory I8
+                    // weights to I16 storage format here. This is the
+                    // `enable_i16()` path documented at
+                    // cached_integer_model.rs:451: same I8-level precision
+                    // (no f32 source), but the dispatch now flows through
+                    // matmul_i16_into. Real quality improvement requires the
+                    // multi-range loader to stitch per-range f32 I16 weights
+                    // — separate change.
+                    if model.i16_layers.is_none() && layers_held > 0 {
+                        model.enable_i16();
+                        tracing::info!(
+                            "I16 dispatch enabled (promoted from I8); engine label will report \"INT16 integer\""
+                        );
+                    }
                     tracing::info!(
                         "Model loaded in {:.1}s - {} layers held / {} total, {} MB shard weights, vocab {}",
                         elapsed.as_secs_f64(), layers_held, model.config.n_layers, mb_held,
