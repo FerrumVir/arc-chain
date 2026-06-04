@@ -3865,6 +3865,42 @@ async fn inference_run(
         }
     };
 
+    // Partial-model guard: shard-holder seeds only have 3/32 layers loaded
+    // locally, so model.generate(...) produces structured garbage rather
+    // than a real completion. Route to the cross-seed sharded pipeline
+    // instead — that's the path the dashboard demo already exercises and
+    // it returns coherent output. Verified on testnet 2026-06-04: a 3/32
+    // local path produced `" nobody' Begriffe an"` 100% of the time
+    // while the sharded path produced `" George Washington."` for a
+    // historical-fact prompt.
+    //
+    // Only the candle (full Q4 float) path is allowed to skip sharded —
+    // it loads the entire model regardless of --shard-range flags. The
+    // pure-integer path runs against `model.layers` which is what
+    // load_cached_model_ranges populates with `.is_loaded()=false`
+    // sentinels for non-held layers.
+    let local_is_complete = node.candle_engine.is_some()
+        || model.layers.iter().all(|l| l.is_loaded());
+    if !local_is_complete && !force_local {
+        tracing::info!(
+            "local model is partial ({}/{} layers loaded); routing /inference/run \
+             through the sharded pipeline instead of garbage-emitting local fallback",
+            model.layers.iter().filter(|l| l.is_loaded()).count(),
+            model.layers.len()
+        );
+        let sharded_body = json!({
+            "input": input_text,
+            "max_tokens": max_tokens,
+        });
+        // Reuse the live sharded handler instead of duplicating its
+        // tokenize → forward → cache → decode logic. If it succeeds the
+        // dashboard shape is the same as a normal sharded response; if
+        // it fails (no covering pipeline, all seeds down, etc.) surface
+        // the underlying error so the caller can see *why* local fallback
+        // was unsafe.
+        return inference_run_sharded(AxumState(node.clone()), Json(sharded_body)).await;
+    }
+
     let start = std::time::Instant::now();
 
     // Apply chat template from GGUF metadata (wraps input in model-specific format)
@@ -3898,9 +3934,15 @@ async fn inference_run(
             .collect();
         (gen_tokens, result.output_hash, "candle Q4 (float, deterministic per-arch)")
     } else {
-        // Integer engine fallback - bit-identical across architectures
+        // Integer engine — bit-identical across architectures. Precision
+        // label comes from the model itself so it tracks the dispatch
+        // chain (I16 / block-I8 / Q4 / per-row I8 / ternary / hybrid)
+        // instead of hardcoding "INT8 integer". When the loader populates
+        // I16 (default 2026-06-04+) this reports "INT16 integer …";
+        // before that it reported "INT8" even when block-I8 was actually
+        // running. Honest labels matter for "is INT16 working" debugging.
         let (generated, hash) = model.generate(&tokens_with_bos, max_tokens, &model.config.eos_tokens);
-        (generated, hash, "INT8 integer (cross-platform deterministic)")
+        (generated, hash, model.effective_precision_label())
     };
 
     let inference_ms = start.elapsed().as_millis() as u64;
@@ -5272,7 +5314,7 @@ async fn inference_run_sharded(
         "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
         "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
         "tokens_generated": generated.len() as u64,
-        "engine": "INT8 sharded pipeline (cross-platform deterministic)",
+        "engine": format!("{} sharded pipeline", model.effective_precision_label()),
         "deterministic": true,
         "sharded": true,
         "pipeline_length": pipeline.len(),
@@ -5364,7 +5406,7 @@ async fn inference_run_sharded(
         "shard_trace": shard_trace,
         "total_bytes_transferred": total_bytes_transferred,
         "deterministic": true,
-        "engine": "INT8 sharded pipeline (cross-platform deterministic)",
+        "engine": format!("{} sharded pipeline", model.effective_precision_label()),
         "cache": {
             "hit": false,
             "key": format!("0x{}", hex::encode(&cache_key.0)),

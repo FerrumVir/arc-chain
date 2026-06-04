@@ -619,6 +619,50 @@ impl StateDB {
             .collect()
     }
 
+    /// Rebuild `tier1_pending` from on-disk state. Call once at startup,
+    /// after any WAL replay/snapshot load and BEFORE spawning the validator
+    /// task. `tier1_pending` is a DashMap with no WAL op of its own; on
+    /// restart it starts empty even though the underlying escrow accounts
+    /// (with their `OPEN`/`VOTING` status byte) survive in the persistent
+    /// account map.
+    ///
+    /// Strategy: scan every account whose `code_hash[0]` is `TIER1_STATUS_OPEN`
+    /// or `TIER1_STATUS_VOTING`. Those are Tier 1 escrow addresses. Read the
+    /// `tier1.request_id` storage key that `InferenceRequest.apply` writes
+    /// (added in the same change), get the requester-supplied request_id,
+    /// and re-insert it into `tier1_pending` keyed by the escrow's anchor
+    /// height (stored in `escrow.nonce`).
+    ///
+    /// Returns the count of requests rebuilt so the operator can sanity-
+    /// check against `/inference/results` cardinality.
+    pub fn rebuild_tier1_pending(&self) -> usize {
+        let key = hash_bytes(b"tier1.request_id");
+        let mut rebuilt = 0usize;
+        for entry in self.accounts.iter() {
+            let acct = entry.value();
+            // Only escrows whose status is still actionable. Finalized /
+            // refunded escrows have already been pruned from pending via
+            // the apply path; rebuilding them would burn the validator
+            // task's tick cycles for no payoff.
+            let status = acct.code_hash.0[0];
+            if status != TIER1_STATUS_OPEN && status != TIER1_STATUS_VOTING {
+                continue;
+            }
+            let escrow_addr = Hash256(*entry.key());
+            let raw = match self.get_storage(&escrow_addr, &key) {
+                Some(v) if v.len() == 32 => v,
+                _ => continue,
+            };
+            let mut request_id = [0u8; 32];
+            request_id.copy_from_slice(&raw);
+            // anchor_height was stamped into escrow.nonce at apply time.
+            let anchor_height = acct.nonce;
+            self.tier1_pending.insert(request_id, anchor_height);
+            rebuilt += 1;
+        }
+        rebuilt
+    }
+
     /// Read a Tier 1 request's escrow state + storage. Returns `None` if no
     /// such escrow exists. Used by the validator task to check status,
     /// gather votes, and decide whether to vote/finalize.
@@ -4737,6 +4781,19 @@ impl StateDB {
                     hash_bytes(b"tier1.votes"),
                     bincode::serialize(&Vec::<(Address, Hash256)>::new())
                         .unwrap_or_default(),
+                );
+                // Persist the request_id at a known storage key so a node
+                // restart can rebuild `tier1_pending` (which is in-memory
+                // and otherwise lost). Without this, the validator task
+                // wakes up after restart with an empty pending index and
+                // never finalizes the requests it can no longer see. The
+                // bug surfaced 2026-06-04 on the testnet — requests
+                // 0x9d9df698 + 0xbc754b43 stuck Open through two rolling
+                // restarts because the index was never rehydrated.
+                self.set_storage(
+                    &escrow_addr,
+                    hash_bytes(b"tier1.request_id"),
+                    body.request_id.to_vec(),
                 );
 
                 // Index the open request for the validator inference task

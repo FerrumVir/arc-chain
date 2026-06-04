@@ -989,6 +989,22 @@ async fn main() -> Result<()> {
         db
     });
 
+    // Rebuild the in-memory Tier 1 pending-request index from on-disk
+    // escrow state. `tier1_pending` has no WAL op of its own; after a
+    // restart it starts empty even though the OPEN/VOTING escrows survive
+    // in the account map. Without this, the InferenceValidatorTask wakes
+    // up unable to see any outstanding requests and never finalizes them.
+    // The index uses `tier1.request_id` storage entries written by
+    // InferenceRequest.apply — escrows applied before that storage entry
+    // existed (pre-2026-06-04) can't be recovered automatically and stay
+    // stuck.
+    {
+        let rebuilt = state.rebuild_tier1_pending();
+        if rebuilt > 0 {
+            tracing::info!("Rebuilt {} Tier 1 pending requests from on-disk state", rebuilt);
+        }
+    }
+
     // ── State Sync Protocol (A5) - bootstrap from peer snapshot ─────
     // Auto-sync: if this node has peers configured and state is fresh (height 0),
     // automatically sync state from the first reachable peer. This allows new
