@@ -2770,7 +2770,10 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         });
     }
 
-    let max_seq = 2048;
+    // Match the trained Llama-2 4096-position context window. See the
+    // matching note in `load_cached_model_ranges` for the truncation
+    // failure mode at the old 2048 cap.
+    let max_seq = 4096;
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
     // 1/sqrt(d_head) in Q16 - integer_isqrt already returns ONE/sqrt(x/ONE)
     let attn_scale = integer_isqrt((d_head as i64) * ONE);
@@ -3190,7 +3193,15 @@ pub fn load_cached_model_shard(
         }
     }
 
-    let max_seq = 2048;
+    // Llama-2-7B / 7B-Chat were trained on 4096-position RoPE. Capping
+    // max_seq at 2048 here forced every shard-holder seed to truncate
+    // prompts past position 2048 (apply_rope at line 1562 does an
+    // unchecked cos[pos*half + i] read; positions past the table either
+    // panic in debug or return undefined positional signal in release —
+    // either way, tokens past 2048 are useless). Doubling to 4096
+    // matches the trained capacity and only grows the RoPE tables by
+    // ~32 KB total per model — negligible.
+    let max_seq = 4096;
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
     let attn_scale = integer_isqrt((d_head as i64) * ONE);
 

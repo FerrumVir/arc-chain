@@ -4681,10 +4681,19 @@ async fn inference_run_sharded(
         return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
     }
 
+    // Sharded-pipeline output cap. Was 256, which combined with the
+    // model's RoPE table covering 4096 positions meant the user could
+    // never approach the actual context limit on this endpoint.
+    // Bumping to 1024 — still well under the 4096 positional ceiling
+    // (an average 3 KB prompt + 1024 generated tokens fits comfortably)
+    // and matches the practical "long-form completion" budget the
+    // dashboard demo expects. Each hop's KV cache grows linearly with
+    // (prompt_len + max_tokens), so this also caps coordinator memory
+    // pressure under stress.
     let max_tokens = req.get("max_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(20)
-        .min(256) as u32;
+        .min(1024) as u32;
     // Opt-in chat template wrapping. Default OFF because the dashboard is
     // doing autocomplete ("The capital of France is" → " Paris"), not
     // instruction-following. Wrapping in [INST]...[/INST] inflates prompt_len
