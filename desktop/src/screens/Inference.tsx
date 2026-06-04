@@ -116,7 +116,19 @@ export function Inference() {
   const [maxFee, setMaxFee] = useState(10_000);
   // Tier 1 on-chain mode. Selected in Settings. Default `coordinator`
   // (legacy path) until Phase C cuts over.
-  const inferenceMode = useAppStore((s) => s.inferenceMode);
+  // HIDDEN 2026-06-04: tier-1 on-chain submit never lands on the live seeds
+  // — the InferenceRequest tx is accepted but never included in a block
+  // (see docs/INFERENCE_TIER1_INVESTIGATION_2026-06-04.md). Force the working
+  // coordinator (community) path until the consensus inclusion bug is fixed.
+  // Flip TIER1_ONCHAIN_ENABLED back to true to restore the on-chain UI.
+  const TIER1_ONCHAIN_ENABLED = false;
+  const storedInferenceMode = useAppStore((s) => s.inferenceMode);
+  const inferenceMode = TIER1_ONCHAIN_ENABLED ? storedInferenceMode : "coordinator";
+  // HIDDEN 2026-06-04: the paid "Pay per request" path opens an on-chain
+  // InferenceEscrowOpen tx that also never lands on the live seeds (same
+  // inclusion bug). Hide it so only the working free community path shows.
+  // Flip back to true to restore paid/escrow inference.
+  const PAID_ONCHAIN_ENABLED = false;
   const [tier1RequestId, setTier1RequestId] = useState<string | null>(null);
   const [tier1Result, setTier1Result] = useState<Tier1Result | null>(null);
   // Tier 1 user-tunable params. Defaults match the production target
@@ -351,7 +363,7 @@ export function Inference() {
                 />
               </label>
             </>
-          ) : (
+          ) : PAID_ONCHAIN_ENABLED ? (
             <>
               <label
                 style={{
@@ -398,7 +410,7 @@ export function Inference() {
                 Pay per request
               </label>
             </>
-          )}
+          ) : null}
           <div style={{ flex: 1, minWidth: "var(--space-3)" }} />
           <button
             className="btn btn-primary btn-lg"

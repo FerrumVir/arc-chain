@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Check, RefreshCw, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { check as tauriCheckUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch as tauriRelaunch } from "@tauri-apps/plugin-process";
 import { Card, CardHeader } from "../components/Card";
@@ -163,9 +163,7 @@ export function Settings() {
             marginBottom: "var(--space-3)",
           }}
         >
-          Selects how the network executes your inference requests. On-chain
-          mode replaces the coordinator with a VRF-selected committee of
-          validators voting on the output hash.
+          Selects how the network executes your inference requests.
         </p>
         <InferenceModeToggle />
       </Card>
@@ -302,9 +300,18 @@ export function Settings() {
   );
 }
 
+// HIDDEN 2026-06-04: tier-1 on-chain submit never lands on the live seeds
+// (see docs/INFERENCE_TIER1_INVESTIGATION_2026-06-04.md). Hide the on-chain
+// option so users can't select a broken path; coerce any persisted "onchain"
+// state back to "coordinator". Flip to true to restore the on-chain option.
+const TIER1_ONCHAIN_ENABLED = false;
+
 function InferenceModeToggle() {
   const mode = useAppStore((s) => s.inferenceMode);
   const setMode = useAppStore((s) => s.setInferenceMode);
+  useEffect(() => {
+    if (!TIER1_ONCHAIN_ENABLED && mode === "onchain") setMode("coordinator");
+  }, [mode, setMode]);
   return (
     <div style={{ display: "grid", gap: "var(--space-2)" }}>
       <label
@@ -331,32 +338,34 @@ function InferenceModeToggle() {
           </div>
         </div>
       </label>
-      <label
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: "var(--space-3)",
-          cursor: "pointer",
-        }}
-      >
-        <input
-          type="radio"
-          name="inferenceMode"
-          checked={mode === "onchain"}
-          onChange={() => setMode("onchain")}
-          data-testid="inference-mode-onchain"
-        />
-        <div>
-          <div style={{ fontWeight: 500 }}>On-chain (Tier 1)</div>
-          <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
-            Submits an <code>InferenceRequest</code> tx. A VRF committee of
-            validators each run candle Q4 locally and vote on the
-            <code>output_hash</code>. Coherent output, fully verifiable.
-            Requires Phase B model upload across coordinators for committee
-            ≥ 3 in production.
+      {TIER1_ONCHAIN_ENABLED && (
+        <label
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "var(--space-3)",
+            cursor: "pointer",
+          }}
+        >
+          <input
+            type="radio"
+            name="inferenceMode"
+            checked={mode === "onchain"}
+            onChange={() => setMode("onchain")}
+            data-testid="inference-mode-onchain"
+          />
+          <div>
+            <div style={{ fontWeight: 500 }}>On-chain (Tier 1)</div>
+            <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
+              Submits an <code>InferenceRequest</code> tx. A VRF committee of
+              validators each run candle Q4 locally and vote on the
+              <code>output_hash</code>. Coherent output, fully verifiable.
+              Requires Phase B model upload across coordinators for committee
+              ≥ 3 in production.
+            </div>
           </div>
-        </div>
-      </label>
+        </label>
+      )}
     </div>
   );
 }
