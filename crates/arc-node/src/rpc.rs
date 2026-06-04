@@ -3226,10 +3226,32 @@ async fn channel_state(
 
 /// How long /inference/run waits for a community worker to return a
 /// completed job before giving up and falling through to the local
-/// model. 60s covers the worst-case for a 13B model on a slow laptop
-/// generating 64 tokens at ~700ms/token, with headroom for the 30s
-/// claim-poll cycle.
-const COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 60;
+/// model. Scales with `max_tokens` so a 4-token autocomplete doesn't
+/// have to budget for a 13B + 64-token chat completion. Floor is
+/// `MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS` so short generations still
+/// get one claim-poll cycle.
+///
+/// Observed 2026-06-04 on the testnet: a fixed 60s ceiling produced
+/// p50=67.8s end-to-end on a 4-token request because 97/100 calls
+/// waited the full timeout before falling back to local. The math:
+/// 4 tokens × ~3.3 s/tok = ~13s real work, so the budget should be
+/// ~15s not 60s.
+const MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 8;
+const MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 60;
+
+/// Compute the per-request community dispatch timeout. ~3.3s/token
+/// is the EWMA we've observed on testnet workers; we budget 1.5×
+/// that for headroom and floor at `MIN_…` so a 1-token request still
+/// gets a full claim-poll cycle.
+fn community_dispatch_timeout_secs(max_tokens: u32) -> u64 {
+    let per_token_ms: u64 = 3300;
+    let est_ms = (max_tokens as u64).saturating_mul(per_token_ms);
+    let est_with_headroom = est_ms.saturating_mul(3) / 2;
+    let est_secs = est_with_headroom / 1000;
+    est_secs
+        .max(MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS)
+        .min(MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS)
+}
 
 /// Count community workers that haven't expired their TTL and advertise
 /// the "inference" capability. Used by the smart router to decide
@@ -3301,7 +3323,8 @@ async fn dispatch_to_community_worker(
         return Err(format!("queue closed: {}", e));
     }
 
-    let timeout = tokio::time::Duration::from_secs(COMMUNITY_DISPATCH_TIMEOUT_SECS);
+    let timeout_secs = community_dispatch_timeout_secs(max_tokens);
+    let timeout = tokio::time::Duration::from_secs(timeout_secs);
     match tokio::time::timeout(timeout, osh_rx).await {
         Ok(Ok(result)) => {
             if !result.success {
@@ -3332,10 +3355,7 @@ async fn dispatch_to_community_worker(
             // Timeout — orphan our entry so submit_work doesn't crash
             // when the late result arrives.
             results.remove(&job_id);
-            Err(format!(
-                "no worker completed within {}s",
-                COMMUNITY_DISPATCH_TIMEOUT_SECS
-            ))
+            Err(format!("no worker completed within {}s", timeout_secs))
         }
     }
 }
@@ -4673,16 +4693,23 @@ async fn inference_run_sharded(
             }
         }
     }
-    // Filter stubs out of the final replica list - a stub address can't be
-    // dialed so it can never satisfy a coordinator hop. Keep the entry only
-    // if it was the only announcement we have for that node.
+    // Drop stub-addr replicas unconditionally. A stub addr can't be dialed
+    // (127.x = announcer's loopback, 0.0.0.0 = unbound, [::1] = loopback,
+    // empty = malformed) so it can never satisfy a coordinator hop. The old
+    // behaviour preserved a stub when no routable replica existed for the
+    // same range "as a fallback"; that produced the Pipeline-gap regression
+    // observed 2026-06-04 where a community worker announcing
+    // 127.0.0.1:9090 with an off-grid range [0, 8) became the only candidate
+    // for layer-0 and the pipeline walked off the rails. Honest failure
+    // (drop the bucket, surface "Pipeline incomplete" later if nothing
+    // covers those layers) beats fake liveness.
     // #29: also sort each bucket by rolling EWMA latency ascending so the
     // fastest replica for this range wins primary on the next dispatch.
+    by_range.retain(|_, bucket| {
+        bucket.retain(|s| !is_stub(&s.socket_addr));
+        !bucket.is_empty()
+    });
     for bucket in by_range.values_mut() {
-        let routable: Vec<ShardInfo> = bucket.iter().filter(|s| !is_stub(&s.socket_addr)).cloned().collect();
-        if !routable.is_empty() {
-            *bucket = routable;
-        }
         sort_replicas_by_latency(bucket, &node.latency_stats);
     }
     // Pipeline becomes one entry per range with its replica list attached.
@@ -4690,31 +4717,43 @@ async fn inference_run_sharded(
     let mut pipeline_ranges: Vec<((usize, usize), Vec<ShardInfo>)> = by_range
         .into_iter()
         .collect();
-    pipeline_ranges.sort_by_key(|((s, _), _)| *s);
-    let pipeline: Vec<ShardInfo> = pipeline_ranges.iter()
-        .map(|(_, replicas)| replicas[0].clone())
-        .collect();
+    // Sort by (start_layer, end_layer) so the *shortest* range starting at
+    // each layer comes first. We then greedily walk: pick the first range
+    // that starts at covered_to and skip any later range whose start is
+    // already covered (overlapping). Without this skip, a worker that
+    // announces a non-grid range (e.g. [0, 8) while the rest of the
+    // network uses [0, 6)/[6, 12)) collides with the next range and
+    // produces a false "Pipeline gap" error even though the standard
+    // tiling fully covers the model.
+    pipeline_ranges.sort_by_key(|((s, e), _)| (*s, *e));
 
-    if pipeline.is_empty() {
+    if pipeline_ranges.is_empty() {
         return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "No shards announced. Need shard registry to be populated."));
     }
 
-    // Verify the pipeline is contiguous and covers all layers.
-    // Stop early once coverage is complete — stale extra shards in the
-    // registry beyond n_layers must not cause a false gap error.
-    let n_layers = pipeline[0].total_layers;
+    // Greedy contiguous cover: at each step, pick the first range starting
+    // at the current frontier. Skip ranges starting earlier (already
+    // covered) — they're either duplicates of the picked range or
+    // off-grid alternatives we've chosen not to take.
+    let n_layers = pipeline_ranges[0].1[0].total_layers;
+    let mut pipeline: Vec<ShardInfo> = Vec::with_capacity(pipeline_ranges.len());
     let mut covered_to = 0usize;
-    for shard in &pipeline {
+    for ((start, end), replicas) in &pipeline_ranges {
         if covered_to >= n_layers {
             break;
         }
-        if shard.start_layer != covered_to {
+        if *start < covered_to {
+            // Overlapping with a range we already picked — skip.
+            continue;
+        }
+        if *start != covered_to {
             return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
                 "Pipeline gap: expected layer {} next, got shard [{}, {}) (node {}, addr {})",
-                covered_to, shard.start_layer, shard.end_layer, shard.node_name, shard.socket_addr
+                covered_to, start, end, replicas[0].node_name, replicas[0].socket_addr
             )));
         }
-        covered_to = shard.end_layer;
+        pipeline.push(replicas[0].clone());
+        covered_to = *end;
     }
     if covered_to != n_layers {
         return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
@@ -6415,9 +6454,26 @@ async fn community_register(
     // If the worker provided model info, auto-assign shard layers so it
     // can start serving inference immediately. No manual --shard-start
     // / --shard-end flags needed.
+    //
+    // Hard guard: never register a worker shard at a stub addr
+    // (127.x, 0.0.0.0, [::1], or empty). Those announcements were
+    // poisoning the coordinator's shard registry — pipeline assembly at
+    // `inference_run_sharded` picks the stub shard first by (start, end)
+    // ordering and then fails with "Pipeline gap: expected layer N next"
+    // because no other shard starts at the stub's end_layer. Real
+    // workers run on routable IPs; a stub here means a misconfigured
+    // dev binary calling production seeds.
     let shard_assignment = if let (Some(model_id), Some(total_layers), Some(rpc_addr)) =
         (req.model_id.as_ref(), req.total_layers, req.rpc_addr.as_ref())
     {
+        if is_stub_socket_addr(rpc_addr) {
+            tracing::debug!(
+                worker_id = %req.worker_id,
+                rpc_addr = %rpc_addr,
+                "community_register: skipping auto-shard for stub rpc_addr"
+            );
+            None
+        } else
         if total_layers > 0 {
             // Find the biggest uncovered gap for this model
             let existing: Vec<ShardInfo> = fresh_shards(&node.shard_registry)
