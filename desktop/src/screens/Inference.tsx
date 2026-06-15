@@ -11,16 +11,14 @@ import {
   Sparkles,
   Zap,
 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
 import { api } from "../lib/tauri";
-import { useAppStore } from "../lib/store";
 import { formatHash } from "../lib/format";
 import type {
   InferenceResult,
   PaidInferenceResult,
-  Tier1Result,
 } from "../lib/types";
 
 const EXAMPLES = [
@@ -114,27 +112,6 @@ export function Inference() {
   // escrow, coordinator auto-submits the 40/25/15/20 release).
   const [paidMode, setPaidMode] = useState(false);
   const [maxFee, setMaxFee] = useState(10_000);
-  // Tier 1 on-chain mode. Selected in Settings. Default `coordinator`
-  // (legacy path) until Phase C cuts over.
-  // HIDDEN 2026-06-04: tier-1 on-chain submit never lands on the live seeds
-  // — the InferenceRequest tx is accepted but never included in a block
-  // (see docs/INFERENCE_TIER1_INVESTIGATION_2026-06-04.md). Force the working
-  // coordinator (community) path until the consensus inclusion bug is fixed.
-  // Flip TIER1_ONCHAIN_ENABLED back to true to restore the on-chain UI.
-  const TIER1_ONCHAIN_ENABLED = false;
-  const storedInferenceMode = useAppStore((s) => s.inferenceMode);
-  const inferenceMode = TIER1_ONCHAIN_ENABLED ? storedInferenceMode : "coordinator";
-  // HIDDEN 2026-06-04: the paid "Pay per request" path opens an on-chain
-  // InferenceEscrowOpen tx that also never lands on the live seeds (same
-  // inclusion bug). Hide it so only the working free community path shows.
-  // Flip back to true to restore paid/escrow inference.
-  const PAID_ONCHAIN_ENABLED = false;
-  const [tier1RequestId, setTier1RequestId] = useState<string | null>(null);
-  const [tier1Result, setTier1Result] = useState<Tier1Result | null>(null);
-  // Tier 1 user-tunable params. Defaults match the production target
-  // (committee=5, reward=10). On a solo dev chain set committee=1.
-  const [tier1CommitteeSize, setTier1CommitteeSize] = useState(1);
-  const [tier1MaxReward, setTier1MaxReward] = useState(10);
 
   const run = useMutation<InferenceResult, Error, void>({
     mutationFn: async () => {
@@ -148,47 +125,6 @@ export function Inference() {
       return await api.runPaidInference(prompt.trim(), maxTokens, maxFee);
     },
   });
-  const tier1Run = useMutation<{ requestId: string }, Error, void>({
-    mutationFn: async () => {
-      if (!prompt.trim()) throw new Error("Prompt is empty");
-      const sub = await api.tier1Submit(
-        prompt.trim(),
-        maxTokens,
-        tier1MaxReward,
-        20, // deadline_blocks (keep default)
-        tier1CommitteeSize,
-      );
-      setTier1RequestId(sub.requestId);
-      setTier1Result(null);
-      return { requestId: sub.requestId };
-    },
-  });
-
-  // Poll the chain for status until terminal (Finalized / Refunded).
-  // Cancellation is via setTier1RequestId(null) on a new submission.
-  useEffect(() => {
-    if (!tier1RequestId) return;
-    let cancelled = false;
-    const poll = async () => {
-      while (!cancelled) {
-        try {
-          const r = await api.tier1Result(tier1RequestId);
-          if (cancelled) return;
-          setTier1Result(r);
-          if (r.status === "Finalized" || r.status === "Refunded") return;
-        } catch (e) {
-          // Transient error — keep polling unless the request is gone.
-          const msg = String(e instanceof Error ? e.message : e);
-          if (msg.includes("404")) return;
-        }
-        await new Promise((res) => setTimeout(res, 500));
-      }
-    };
-    poll();
-    return () => {
-      cancelled = true;
-    };
-  }, [tier1RequestId]);
 
   const copy = async (key: string, value: string) => {
     await navigator.clipboard.writeText(value);
@@ -318,137 +254,74 @@ export function Inference() {
               data-testid="inference-max-tokens"
             />
           </label>
-          {inferenceMode === "onchain" ? (
-            <>
-              <label
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 4,
-                  flex: "0 0 140px",
-                }}
-              >
-                <span className="field-label">Committee size</span>
-                <input
-                  className="input input-mono"
-                  type="number"
-                  min={1}
-                  max={15}
-                  value={tier1CommitteeSize}
-                  onChange={(e) =>
-                    setTier1CommitteeSize(parseInt(e.target.value, 10) || 1)
-                  }
-                  data-testid="tier1-committee-size"
-                />
-              </label>
-              <label
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 4,
-                  flex: "0 0 140px",
-                }}
-              >
-                <span className="field-label">Max reward (ARC)</span>
-                <input
-                  className="input input-mono"
-                  type="number"
-                  min={1}
-                  max={1_000_000}
-                  value={tier1MaxReward}
-                  onChange={(e) =>
-                    setTier1MaxReward(parseInt(e.target.value, 10) || 10)
-                  }
-                  data-testid="tier1-max-reward"
-                />
-              </label>
-            </>
-          ) : PAID_ONCHAIN_ENABLED ? (
-            <>
-              <label
-                style={{
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: 4,
-                  flex: "0 0 140px",
-                  opacity: paidMode ? 1 : 0.5,
-                }}
-              >
-                <span className="field-label">Max fee (ARC)</span>
-                <input
-                  className="input input-mono"
-                  type="number"
-                  min={1}
-                  max={1_000_000}
-                  step={1}
-                  value={maxFee}
-                  onChange={(e) =>
-                    setMaxFee(parseInt(e.target.value, 10) || 10_000)
-                  }
-                  disabled={!paidMode}
-                  data-testid="inference-max-fee"
-                />
-              </label>
-              <label
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 6,
-                  fontSize: "var(--text-sm)",
-                  color: "var(--text-muted)",
-                  whiteSpace: "nowrap",
-                  paddingBottom: 10,
-                }}
-                data-testid="paid-mode-toggle-label"
-              >
-                <input
-                  type="checkbox"
-                  checked={paidMode}
-                  onChange={(e) => setPaidMode(e.target.checked)}
-                  data-testid="paid-mode-toggle"
-                />
-                Pay per request
-              </label>
-            </>
-          ) : null}
+          <>
+            <label
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                gap: 4,
+                flex: "0 0 140px",
+                opacity: paidMode ? 1 : 0.5,
+              }}
+            >
+              <span className="field-label">Max fee (ARC)</span>
+              <input
+                className="input input-mono"
+                type="number"
+                min={1}
+                max={1_000_000}
+                step={1}
+                value={maxFee}
+                onChange={(e) =>
+                  setMaxFee(parseInt(e.target.value, 10) || 10_000)
+                }
+                disabled={!paidMode}
+                data-testid="inference-max-fee"
+              />
+            </label>
+            <label
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                fontSize: "var(--text-sm)",
+                color: "var(--text-muted)",
+                whiteSpace: "nowrap",
+                paddingBottom: 10,
+              }}
+              data-testid="paid-mode-toggle-label"
+            >
+              <input
+                type="checkbox"
+                checked={paidMode}
+                onChange={(e) => setPaidMode(e.target.checked)}
+                data-testid="paid-mode-toggle"
+              />
+              Pay per request
+            </label>
+          </>
           <div style={{ flex: 1, minWidth: "var(--space-3)" }} />
           <button
             className="btn btn-primary btn-lg"
             onClick={() => {
-              if (inferenceMode === "onchain") {
-                tier1Run.mutate();
-              } else if (paidMode) {
+              if (paidMode) {
                 paidRun.mutate();
               } else {
                 run.mutate();
               }
             }}
             disabled={
-              run.isPending ||
-              paidRun.isPending ||
-              tier1Run.isPending ||
-              (tier1RequestId != null &&
-                tier1Result?.status !== "Finalized" &&
-                tier1Result?.status !== "Refunded") ||
-              !prompt.trim()
+              run.isPending || paidRun.isPending || !prompt.trim()
             }
             data-testid="btn-run-inference"
           >
-            {run.isPending || paidRun.isPending || tier1Run.isPending ? (
+            {run.isPending || paidRun.isPending ? (
               <>
                 <Loader2
                   size={16}
                   style={{ animation: "spin 1s linear infinite" }}
                 />{" "}
-                {inferenceMode === "onchain"
-                  ? "Submitting to chain…"
-                  : paidMode
-                    ? "Paying + computing…"
-                    : "Computing…"}
-              </>
-            ) : inferenceMode === "onchain" ? (
-              <>
-                <ShieldCheck size={16} /> Submit on-chain
+                {paidMode ? "Paying + computing…" : "Computing…"}
               </>
             ) : paidMode ? (
               <>
@@ -462,7 +335,7 @@ export function Inference() {
           </button>
         </div>
 
-        {(run.isError || paidRun.isError || tier1Run.isError) && (
+        {(run.isError || paidRun.isError) && (
           <div
             style={{
               marginTop: "var(--space-4)",
@@ -475,125 +348,10 @@ export function Inference() {
             }}
             data-testid="inference-error"
           >
-            {((run.error || paidRun.error || tier1Run.error) as Error).message}
+            {((run.error || paidRun.error) as Error).message}
           </div>
         )}
       </Card>
-
-      {/* Tier 1 on-chain status panel */}
-      {inferenceMode === "onchain" && tier1RequestId && tier1Result && (
-        <Card
-          style={{ marginBottom: "var(--space-6)" }}
-          data-testid="tier1-status"
-        >
-          <CardHeader
-            title={
-              <span style={{ display: "inline-flex", alignItems: "center" }}>
-                <ShieldCheck size={16} style={{ marginRight: 8 }} />
-                On-chain Tier 1 — {tier1Result.status}
-                <InfoPopover title="What is this?">
-                  <>
-                    Every committee member runs the model locally, submits
-                    their <code>output_hash</code> as a vote tx, and the
-                    chain finalizes once <code>min_agreement</code> votes
-                    agree. No off-chain coordinator.
-                  </>
-                </InfoPopover>
-              </span>
-            }
-            action={
-              <span style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
-                {tier1Result.voteCount} / {tier1Result.committeeSize} votes ·
-                anchor #{tier1Result.anchorHeight}
-              </span>
-            }
-          />
-          <div
-            style={{
-              padding: "var(--space-3) var(--space-4)",
-              display: "grid",
-              gap: "var(--space-2)",
-              fontSize: "var(--text-sm)",
-            }}
-          >
-            <div>
-              <strong>Request:</strong>{" "}
-              <code>{formatHash(tier1Result.requestId)}</code>{" "}
-              <button
-                className="btn btn-ghost btn-sm"
-                onClick={() => copy("tier1-req", tier1Result.requestId)}
-              >
-                {copied === "tier1-req" ? (
-                  <ClipboardCheck size={12} />
-                ) : (
-                  <Copy size={12} />
-                )}
-              </button>
-            </div>
-            <div>
-              <strong>Lock:</strong> {tier1Result.maxReward} ARC in escrow ·
-              deadline +{tier1Result.deadlineBlocks} blocks
-            </div>
-            {tier1Result.votes.length > 0 && (
-              <div>
-                <strong>Votes:</strong>
-                <ul style={{ marginTop: 4, paddingLeft: 18 }}>
-                  {tier1Result.votes.map((v) => (
-                    <li key={v.voter}>
-                      <code>{formatHash(v.voter)}</code> →{" "}
-                      <code>{formatHash(v.outputHash)}</code>
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {tier1Result.status === "Voting" && (
-              <div style={{ color: "var(--text-muted)" }}>
-                <Loader2
-                  size={14}
-                  style={{
-                    animation: "spin 1s linear infinite",
-                    marginRight: 6,
-                    verticalAlign: "middle",
-                  }}
-                />
-                Waiting for{" "}
-                {tier1Result.committeeSize - tier1Result.voteCount} more vote(s)…
-              </div>
-            )}
-            {tier1Result.status === "Finalized" &&
-              (tier1Result.outputText || tier1Result.outputBlob) && (
-                <div
-                  style={{
-                    marginTop: "var(--space-2)",
-                    padding: "var(--space-3)",
-                    background: "var(--surface-2)",
-                    borderRadius: "var(--radius-sm)",
-                    whiteSpace: "pre-wrap",
-                  }}
-                >
-                  <strong style={{ color: "var(--success)" }}>
-                    ✓ Verified on-chain consensus
-                  </strong>
-                  <div style={{ marginTop: 8 }}>
-                    {tier1Result.outputText ?? tier1Result.outputBlob}
-                  </div>
-                  {tier1Result.outputHash && (
-                    <div style={{ marginTop: 8, color: "var(--text-muted)", fontSize: 12 }}>
-                      hash: <code>{formatHash(tier1Result.outputHash)}</code>
-                    </div>
-                  )}
-                </div>
-              )}
-            {tier1Result.status === "Refunded" && (
-              <div style={{ color: "var(--warning)" }}>
-                ⚠ Request refunded (timeout or disagreement). Locked ARC
-                returned minus 1 ARC anti-spam fee.
-              </div>
-            )}
-          </div>
-        </Card>
-      )}
 
       {paidRun.isSuccess && paidRun.data && (
         <Card data-testid="paid-inference-result">
