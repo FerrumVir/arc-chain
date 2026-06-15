@@ -164,6 +164,17 @@ struct Cli {
     /// Recommended for home / residential installs.
     #[arg(long)]
     community_mode: bool,
+
+    /// One-flag community-node setup. Equivalent to `--stake 0
+    /// --community-mode` PLUS auto-discovery of a Llama-2-7B GGUF from
+    /// standard paths (./llama2-7b.gguf, $HOME/.arc-models/, /opt/arc/).
+    /// Lets `arc-node --community` "just work" for home/residential operators
+    /// with no other flags: stake-0 + auto-registers with seeds + serves
+    /// local inference if a model is found on disk. If no model is found
+    /// the node still runs as a community routing/observer member and
+    /// prints clear download instructions with the expected sha256.
+    #[arg(long, default_value_t = false)]
+    community: bool,
 }
 
 /// Rewrites a pulled peer's `self_shard.socket_addr` in place when it carries
@@ -299,13 +310,406 @@ mod tests {
     }
 }
 
+/// Look for a Llama-2-7B GGUF in standard community-node locations.
+/// Returns the first existing path. Covers both the seed convention
+/// (`llama2-7b.gguf`) and TheBloke's published filename
+/// (`llama-2-7b.Q4_K_M.gguf`).
+fn auto_discover_model() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let candidates: [String; 6] = [
+        "./llama2-7b.gguf".to_string(),
+        "./llama-2-7b.Q4_K_M.gguf".to_string(),
+        format!("{}/.arc-models/llama2-7b.gguf", home),
+        format!("{}/.arc-models/llama-2-7b.Q4_K_M.gguf", home),
+        "/opt/arc/llama2-7b.gguf".to_string(),
+        "/var/lib/arc/llama2-7b.gguf".to_string(),
+    ];
+    for p in candidates {
+        if std::path::Path::new(&p).is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// sha256 a file by shelling to `sha256sum` (Linux) or `shasum -a 256` (macOS).
+/// Returns the hex digest, or None if neither tool is available.
+fn sha256_of(path: &str) -> Option<String> {
+    let parse = |stdout: Vec<u8>| -> Option<String> {
+        String::from_utf8(stdout)
+            .ok()
+            .and_then(|s| s.split_whitespace().next().map(|x| x.to_string()))
+    };
+    if let Ok(out) = std::process::Command::new("sha256sum").arg(path).output() {
+        if out.status.success() {
+            return parse(out.stdout);
+        }
+    }
+    if let Ok(out) = std::process::Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+    {
+        if out.status.success() {
+            return parse(out.stdout);
+        }
+    }
+    None
+}
+
+/// SHA256 of the canonical testnet Llama-2-7B Q4_K_M GGUF that every seed
+/// runs. Community workers must download exactly this file (bit-identical)
+/// to produce bitwise-identical inference output. NOTE: this is the seed's
+/// custom-quantized variant — it does NOT match TheBloke's public Q4_K_M
+/// (sha 4567208c…1b0b, same size, different quantization run). For sha
+/// migration, change this AND the file at every URL in DEFAULT_MODEL_SOURCES
+/// in lock-step.
+const TESTNET_MODEL_SHA256: &str =
+    "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa";
+
+/// Primary download sources for the canonical testnet GGUF, tried in order.
+/// First source whose advertised sha matches TESTNET_MODEL_SHA256 wins.
+/// Operators override the list at runtime with ARC_MODEL_URL (comma-
+/// separated; e.g. `ARC_MODEL_URL=https://my-mirror/llama2-7b.gguf`).
+///
+/// HuggingFace is the primary host: free, CDN-backed (CloudFront), supports
+/// git-lfs for 4-GB+ files, and works behind any NAT (HTTPS only). Add
+/// mirrors by appending URLs here, no recompile needed for ad-hoc mirrors
+/// via the env var.
+const DEFAULT_MODEL_SOURCES: &[&str] = &[
+    "https://huggingface.co/FerrumVir/llama-2-7b-arc/resolve/main/llama2-7b.gguf",
+];
+
+/// Resolve a HuggingFace `/resolve/main/` URL to its `/raw/main/` form,
+/// which returns the git-lfs pointer text (~200 bytes) for large files.
+/// The pointer contains the file's real sha256 — letting us fail in 1 KB
+/// instead of 4 GB on a misconfigured mirror. Returns None for non-HF URLs
+/// or non-LFS files (those will be sha-verified the slow way after download).
+fn hf_lfs_pointer_sha(url: &str) -> Option<String> {
+    let raw_url = url.replace("/resolve/", "/raw/");
+    if raw_url == url {
+        return None;
+    }
+    let out = std::process::Command::new("curl")
+        .args(["-sLf", "--max-time", "10", &raw_url])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let body = String::from_utf8(out.stdout).ok()?;
+    for line in body.lines() {
+        if let Some(sha) = line.strip_prefix("oid sha256:") {
+            return Some(sha.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Download URL to `tmp` with resume support (`curl -C -` — partial files
+/// from prior interrupted runs are continued, not restarted) and verify
+/// sha256. Returns true only when the on-disk bytes hash to expected_sha.
+/// Cleans up the partial on sha mismatch so a poisoned file can't infect
+/// a later retry's resume.
+fn download_and_verify(url: &str, tmp: &str, expected_sha: &str) -> bool {
+    let status = std::process::Command::new("curl")
+        .args([
+            "-fL",
+            "--retry", "5",
+            "--retry-delay", "5",
+            "-C", "-",
+            "-o", tmp,
+            url,
+        ])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !status {
+        return false;
+    }
+    let got = sha256_of(tmp).unwrap_or_default();
+    if got != expected_sha {
+        tracing::warn!("  sha mismatch from {} (got {}); discarding partial", url, got);
+        let _ = std::fs::remove_file(tmp);
+        return false;
+    }
+    true
+}
+
+/// Download the canonical testnet GGUF to $HOME/.arc-models/llama2-7b.gguf
+/// from the first source whose sha matches TESTNET_MODEL_SHA256. Tries the
+/// LFS pointer first (fast fail on misconfigured URLs), then the full file
+/// with resume support, then sha-verifies. Returns the local path on success.
+///
+/// Idempotent: returns the existing local path if the file is already
+/// present (auto_discover_model() would normally catch that earlier — this
+/// guard is kept so direct callers can reuse the function safely).
+///
+/// Sources come from ARC_MODEL_URL (comma-separated) if set, else from
+/// DEFAULT_MODEL_SOURCES. Only invoked when `--community` was explicit, so
+/// other run modes never silently fetch multi-GB files.
+fn auto_download_model() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+    let target_dir = format!("{}/.arc-models", home);
+    let target = format!("{}/llama2-7b.gguf", target_dir);
+
+    if std::path::Path::new(&target).is_file() {
+        return Some(target);
+    }
+    if let Err(e) = std::fs::create_dir_all(&target_dir) {
+        tracing::warn!("auto-download: cannot create {}: {}", target_dir, e);
+        return None;
+    }
+    let tmp = format!("{}.partial", target);
+
+    let sources: Vec<String> = std::env::var("ARC_MODEL_URL")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|v: &Vec<String>| !v.is_empty())
+        .unwrap_or_else(|| {
+            DEFAULT_MODEL_SOURCES.iter().map(|s| s.to_string()).collect()
+        });
+
+    tracing::info!(
+        "--community: searching {} model source(s) for sha {} (~4.08 GB)",
+        sources.len(),
+        TESTNET_MODEL_SHA256
+    );
+    tracing::info!("  target: {}", target);
+
+    for url in &sources {
+        tracing::info!("--community: trying {}", url);
+
+        // 1) Fast LFS pre-check: HuggingFace `/raw/` URL returns the LFS
+        //    pointer (~200 B) containing the file's sha. Skip 4-GB pulls
+        //    against URLs whose advertised sha doesn't match.
+        if let Some(remote_sha) = hf_lfs_pointer_sha(url) {
+            if remote_sha != TESTNET_MODEL_SHA256 {
+                tracing::warn!(
+                    "  LFS sha {} != expected {} — skipping this source",
+                    remote_sha, TESTNET_MODEL_SHA256
+                );
+                continue;
+            }
+            tracing::info!("  LFS sha pre-check OK ({})", remote_sha);
+        }
+
+        // 2) Download with resume + final sha verification.
+        if download_and_verify(url, &tmp, TESTNET_MODEL_SHA256) {
+            if let Err(e) = std::fs::rename(&tmp, &target) {
+                tracing::warn!("  rename {} -> {} failed: {}", tmp, target, e);
+                continue;
+            }
+            tracing::info!(
+                "--community: downloaded + sha-verified model at {} (sha256 {})",
+                target, TESTNET_MODEL_SHA256
+            );
+            return Some(target);
+        }
+    }
+
+    tracing::warn!(
+        "auto-download: all {} source(s) failed. To add a mirror set \
+         ARC_MODEL_URL=<url1[,url2,...]> and retry; the URL must serve a \
+         file whose sha256 == {}.",
+        sources.len(),
+        TESTNET_MODEL_SHA256
+    );
+    None
+}
+
+/// Best-effort detection of total system RAM in MB. Reads /proc/meminfo on
+/// Linux; falls back to 8192 (8 GB) on macOS / non-Linux or on parse failure.
+/// Used by validator auto-shard to advertise capacity to the seed.
+fn detect_ram_mb() -> u64 {
+    if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+        for line in meminfo.lines() {
+            if line.starts_with("MemTotal:") {
+                if let Some(kb) = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                {
+                    return kb / 1024;
+                }
+            }
+        }
+    }
+    8192
+}
+
+/// Derive a seed RPC URL ("host:9090") from --peers or --seeds-file.
+/// Convention: seeds expose RPC on port 9090 regardless of the P2P port
+/// they advertise in seeds files. Returns the first usable host.
+fn pick_seed_rpc(cli: &Cli) -> Option<String> {
+    for p in &cli.peers {
+        if let Some(host) = p.split(':').next() {
+            if !host.is_empty() {
+                return Some(format!("{}:9090", host));
+            }
+        }
+    }
+    if let Some(path) = &cli.seeds_file {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for raw in content.lines() {
+                let line = raw.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Some(host) = line.split(':').next() {
+                    if !host.is_empty() {
+                        return Some(format!("{}:9090", host));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Ask a seed for our shard assignment by POSTing /shards/join. Used by
+/// validators that didn't pass an explicit --shard-range; the seed finds
+/// the biggest uncovered layer gap in the pipeline and returns a range
+/// for this node to hold. Returns `Some((start, end))` on success.
+///
+/// Uses the canonical testnet model_id from inference_validator so the
+/// assignment registers in the same pipeline that tier-1 voting reads.
+async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
+    let seed = pick_seed_rpc(cli)?;
+    let url = format!("http://{}/shards/join", seed);
+    // model_id MUST match the SHARD-REGISTRY convention (BLAKE3 of the model
+    // config signature), NOT the unrelated tier-1 attestation identifier
+    // `hash_bytes("arc-32L-test")` from inference_validator.rs. Two model_id
+    // systems live in this codebase today and they don't match (latent bug,
+    // pre-dates this branch). Shard registry uses
+    // `hash_bytes("arc-{n_layers}L-{d_model}d-{n_heads}h-{vocab_size}v")` —
+    // for the Llama-2-7B testnet that's "arc-32L-4096d-32h-32000v", whose
+    // hash is 0xabec2d58…7fdb (verified live on AMS+LAX /shards). Using
+    // the tier-1 identifier here would register us in an empty parallel
+    // pipeline and the seed would return 0:32 (the full model) for every
+    // joiner. TODO(v0.8): unify these two model_id derivations.
+    let model_id_hex = hex::encode(
+        arc_crypto::hash_bytes(b"arc-32L-4096d-32h-32000v").0,
+    );
+
+    let body = serde_json::json!({
+        "socket_addr": cli.rpc,
+        "node_name": cli.validator_seed,
+        "model_id": model_id_hex,
+        "model_name": "Llama-2-7B",
+        "total_layers": 32u32,
+        "available_memory_mb": detect_ram_mb(),
+        "gpu_tier": 0u8,
+    });
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+    let resp = match client.post(&url).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("auto-shard: POST {} failed: {}", url, e);
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!("auto-shard: {} returned HTTP {}", url, resp.status());
+        return None;
+    }
+    let v: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("auto-shard: response parse failed: {}", e);
+            return None;
+        }
+    };
+    let start = v.get("assigned_start_layer")?.as_u64()? as usize;
+    let end = v.get("assigned_end_layer")?.as_u64()? as usize;
+    Some((start, end))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("arc=info".parse()?))
         .init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+
+    // ── --community: one-flag community-node setup ─────────────────────
+    // Forces stake=0 + community_mode=true, and auto-discovers a local
+    // GGUF if --model wasn't explicitly set. Lets home/residential
+    // operators run `arc-node --community` with zero other flags.
+    if cli.community {
+        if cli.stake != 0 {
+            tracing::info!(
+                "--community: overriding --stake {} to 0 (community workers are stake-0)",
+                cli.stake
+            );
+            cli.stake = 0;
+        }
+        cli.community_mode = true;
+    }
+    if (cli.community || cli.community_mode || cli.stake == 0) && cli.model.is_none() {
+        cli.model = auto_discover_model();
+        // If --community was explicit and nothing was found on disk, auto-download
+        // the sha-pinned Llama-2-7B Q4_K_M GGUF from HuggingFace. Sha-mismatch or
+        // any failure falls through to None and we print the manual instructions.
+        if cli.model.is_none() && cli.community {
+            cli.model = auto_download_model();
+        }
+        match &cli.model {
+            Some(p) => tracing::info!("community mode: model at {}", p),
+            None => {
+                tracing::warn!("community mode: no GGUF model found and auto-download did not succeed.");
+                tracing::warn!("  Place a Llama-2-7B Q4_K_M GGUF (~4.08 GB) at one of:");
+                tracing::warn!("    ./llama2-7b.gguf");
+                tracing::warn!("    $HOME/.arc-models/llama2-7b.gguf");
+                tracing::warn!("    /opt/arc/llama2-7b.gguf");
+                tracing::warn!("  Expected sha256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa");
+                tracing::warn!("  Manual download: huggingface-cli download TheBloke/Llama-2-7B-GGUF llama-2-7b.Q4_K_M.gguf --local-dir $HOME/.arc-models");
+                tracing::warn!("  Then: mv $HOME/.arc-models/llama-2-7b.Q4_K_M.gguf $HOME/.arc-models/llama2-7b.gguf");
+                tracing::warn!("  Continuing in community routing mode (registered with seeds, no local inference).");
+            }
+        }
+    }
+
+    // ── Validator auto-shard: ask a seed which layers to hold ──────────
+    // Fires for staked nodes (stake>0) with a model loaded and no explicit
+    // --shard-range / --shard-start / --shard-end. POSTs /shards/join on a
+    // seed, which returns the biggest uncovered layer range in the current
+    // pipeline. Setting shard_ranges here means the later sharded model
+    // load picks up only that slice instead of holding the full model.
+    // Community workers (stake=0) skip this — they hold the full model by
+    // design and auto-register via /community/register.
+    if cli.stake > 0
+        && cli.model.is_some()
+        && cli.shard_ranges.is_empty()
+        && cli.shard_start.is_none()
+        && cli.shard_end.is_none()
+    {
+        match auto_shard_join(&cli).await {
+            Some((start, end)) => {
+                tracing::info!(
+                    "auto-shard: seed assigned this validator layers [{}, {}) — loading shard",
+                    start, end
+                );
+                cli.shard_ranges.push(format!("{}:{}", start, end));
+            }
+            None => {
+                tracing::info!(
+                    "auto-shard: no assignment received; loading FULL model. \
+                     Pass --shard-range a:b to override, or check seed connectivity."
+                );
+            }
+        }
+    }
 
     // ── Load config file and merge with CLI args ────────────────────────
     // Priority: explicit CLI arg > config file value > hardcoded default.
@@ -334,7 +738,16 @@ async fn main() -> Result<()> {
         node_cfg.p2p.port
     };
 
-    let stake = if matches.value_source("stake") == Some(clap::parser::ValueSource::CommandLine) {
+    // --community is treated as an explicit CLI override of stake (the post-
+    // parse block forces cli.stake = 0 for that flag). Without this short-
+    // circuit, matches.value_source() — which only reflects what was on the
+    // actual command line, not later mutations — would fall through to
+    // node_cfg.validator.stake (5M by default) and silently restore a
+    // validator stake on a node the operator explicitly asked to be a
+    // stake-0 community worker.
+    let stake = if cli.community
+        || matches.value_source("stake") == Some(clap::parser::ValueSource::CommandLine)
+    {
         cli.stake
     } else {
         node_cfg.validator.stake
@@ -443,7 +856,16 @@ async fn main() -> Result<()> {
     }
 
     // ── Validate stake ──────────────────────────────────────────────────
-    if stake < min_stake {
+    // Community-mode workers are stake-0 by definition (no slashing, no
+    // consensus role) — they register via /community/register and route
+    // inference via the seed dispatch. The min_stake gate is for actual
+    // validators, so we bypass it whenever the node is in community-mode-
+    // equivalent state (--community, --community-mode, or --stake 0).
+    // The existing community_mode auto-derive (line ~1188) already treats
+    // stake==0 as community, so this is just the same intent applied
+    // earlier in the boot flow.
+    let community_mode_intent = cli.community || cli.community_mode || stake == 0;
+    if !community_mode_intent && stake < min_stake {
         eprintln!(
             "Error: stake {} ARC is below the minimum required {} ARC",
             stake, min_stake
@@ -566,6 +988,22 @@ async fn main() -> Result<()> {
         }
         db
     });
+
+    // Rebuild the in-memory Tier 1 pending-request index from on-disk
+    // escrow state. `tier1_pending` has no WAL op of its own; after a
+    // restart it starts empty even though the OPEN/VOTING escrows survive
+    // in the account map. Without this, the InferenceValidatorTask wakes
+    // up unable to see any outstanding requests and never finalizes them.
+    // The index uses `tier1.request_id` storage entries written by
+    // InferenceRequest.apply — escrows applied before that storage entry
+    // existed (pre-2026-06-04) can't be recovered automatically and stay
+    // stuck.
+    {
+        let rebuilt = state.rebuild_tier1_pending();
+        if rebuilt > 0 {
+            tracing::info!("Rebuilt {} Tier 1 pending requests from on-disk state", rebuilt);
+        }
+    }
 
     // ── State Sync Protocol (A5) - bootstrap from peer snapshot ─────
     // Auto-sync: if this node has peers configured and state is fresh (height 0),
@@ -722,7 +1160,7 @@ async fn main() -> Result<()> {
                 arc_inference::cached_integer_model::load_cached_model(&tokenizer_path)
             };
             match load_result {
-                Ok(model) => {
+                Ok(mut model) => {
                     let elapsed = load_start.elapsed();
                     let mb_held: usize = model.layers.iter()
                         .filter(|l| l.is_loaded())
@@ -731,6 +1169,28 @@ async fn main() -> Result<()> {
                             + l.w_down.memory_bytes())
                         .sum::<usize>() / (1024 * 1024);
                     let layers_held = model.layers.iter().filter(|l| l.is_loaded()).count();
+                    // Multi-range / sharded loaders explicitly drop the I16
+                    // quantization at the merge step (cached_integer_model.rs
+                    // line 3311) since each sub-load's i16 slices were keyed
+                    // on its own subrange and rebuilding from f32 is too
+                    // expensive at startup. The single-range loader populates
+                    // i16_layers directly. To make the dispatch order (I16 >
+                    // block-I8 > Q4 > I8) reach I16 on shard-holder seeds —
+                    // and to make `effective_precision_label()` honestly
+                    // report "INT16 integer" — promote the in-memory I8
+                    // weights to I16 storage format here. This is the
+                    // `enable_i16()` path documented at
+                    // cached_integer_model.rs:451: same I8-level precision
+                    // (no f32 source), but the dispatch now flows through
+                    // matmul_i16_into. Real quality improvement requires the
+                    // multi-range loader to stitch per-range f32 I16 weights
+                    // — separate change.
+                    if model.i16_layers.is_none() && layers_held > 0 {
+                        model.enable_i16();
+                        tracing::info!(
+                            "I16 dispatch enabled (promoted from I8); engine label will report \"INT16 integer\""
+                        );
+                    }
                     tracing::info!(
                         "Model loaded in {:.1}s - {} layers held / {} total, {} MB shard weights, vocab {}",
                         elapsed.as_secs_f64(), layers_held, model.config.n_layers, mb_held,

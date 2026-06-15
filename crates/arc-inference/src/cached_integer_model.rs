@@ -447,6 +447,27 @@ impl CachedIntegerModel {
         self.ternary_layers = Some(ternary_layers);
     }
 
+    /// Report the precision label the forward dispatch will actually use.
+    /// Matches the priority chain in `dispatch_matmul` (layers) and the LM
+    /// head dispatch in `forward_one_token`. Returns the highest-quality
+    /// path that is populated. Used by RPC so the engine name in the
+    /// response shows what's running, not a hardcoded string.
+    pub fn effective_precision_label(&self) -> &'static str {
+        if self.ternary_hybrid_layers.is_some() {
+            "ternary-hybrid (per-row sparse-INT8 outliers)"
+        } else if self.ternary_layers.is_some() {
+            "ternary (1.58-bit, ASIC-compatible)"
+        } else if self.i16_layers.is_some() {
+            "INT16 integer (per-row, cross-platform deterministic)"
+        } else if self.block_i8_layers.is_some() {
+            "block-INT8 integer (32-weight blocks, cross-platform deterministic)"
+        } else if self.q4_layers.is_some() {
+            "Q4 integer (cross-platform deterministic)"
+        } else {
+            "INT8 integer (per-row, cross-platform deterministic)"
+        }
+    }
+
     /// Convert all weights from I8 to I16 format.
     /// Call once after loading model. Original I8 weights kept for fallback.
     ///
@@ -2072,10 +2093,19 @@ impl CachedIntegerModel {
                         crate::ternary_hybrid::matmul_ternary_hybrid_into(hw, $raw, $in_sz, $out);
                     } else if let Some(tw) = $tern {
                         crate::ternary_engine::matmul_ternary_into(tw, $raw, $in_sz, $out);
+                    } else if let Some(i16w) = $i16w {
+                        // Reordered 2026-06-04: per-row I16 (~258× I8
+                        // resolution) wins over block-wise I8 when both
+                        // are populated. Prior order silently demoted I16
+                        // to a fallback that block_i8 (set by default in
+                        // the loader) always preempted, so enabling
+                        // i16_layers in the model struct had no observable
+                        // effect at runtime. block_i8 stays as the
+                        // fallback for the few code paths that don't
+                        // populate I16 yet.
+                        matmul_i16_into(i16w, $raw, $in_sz, $out);
                     } else if let Some(blk) = $blk {
                         crate::block_i8::matmul_block_i8_into(blk, $raw, $out);
-                    } else if let Some(i16w) = $i16w {
-                        matmul_i16_into(i16w, $raw, $in_sz, $out);
                     } else if let Some(q4w) = $q4w {
                         matmul_q4_full(q4w, $raw, $out);
                     } else {
@@ -2180,18 +2210,21 @@ impl CachedIntegerModel {
         cache.seq_len = pos + 1;
         let normed = layernorm(&hidden, &self.final_norm);
 
-        // LM head dispatch: Block-I8 > I16 > Q4 > I8.
+        // LM head dispatch: I16 > Block-I8 > Q4 > I8. Reordered 2026-06-04
+        // to match the layer-matmul dispatch above so the output projection
+        // doesn't silently fall through to block-I8 while every other
+        // matmul uses I16.
+        if let Some(i16_out) = &self.i16_output {
+            let mut logits = vec![0i64; cfg.vocab_size];
+            matmul_i16_into(i16_out, &normed, d, &mut logits);
+            return logits;
+        }
         if let Some(blk_out) = &self.block_i8_output {
             if blk_out.n_rows > 0 {
                 let mut logits = vec![0i64; cfg.vocab_size];
                 crate::block_i8::matmul_block_i8_into(blk_out, &normed, &mut logits);
                 return logits;
             }
-        }
-        if let Some(i16_out) = &self.i16_output {
-            let mut logits = vec![0i64; cfg.vocab_size];
-            matmul_i16_into(i16_out, &normed, d, &mut logits);
-            return logits;
         }
         if let Some(q4_out) = &self.q4_output {
             let mut logits = vec![0i64; cfg.vocab_size];
@@ -2737,7 +2770,10 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         });
     }
 
-    let max_seq = 2048;
+    // Match the trained Llama-2 4096-position context window. See the
+    // matching note in `load_cached_model_ranges` for the truncation
+    // failure mode at the old 2048 cap.
+    let max_seq = 4096;
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
     // 1/sqrt(d_head) in Q16 - integer_isqrt already returns ONE/sqrt(x/ONE)
     let attn_scale = integer_isqrt((d_head as i64) * ONE);
@@ -2757,23 +2793,24 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         },
         embedding_q16, embedding_i8, layers, final_norm, output_weight, vocab,
         q4_layers: None, q4_output: None,
-        // Still disabled 2026-04-20. Spent three iterations localizing:
-        // 1. I8 scale bug (abs_max as i64 truncates) - real, independent,
-        //    does NOT cause the PPL regression (I16 dispatch preempts I8).
-        // 2. NEON dot_i16_i64 i64→i32 truncation - also not root cause,
-        //    scalar-only dispatch gives identical PPL 782.68.
-        // 3. Actual symptom (see examples/probe_i16_vs_i8.rs): I16 output
-        //    projection produces logits ~38× larger magnitude than I8
-        //    baseline; I16 layer matmuls produce logits ~1.4× larger.
-        //    Scale/acc math in matmul_i16_into appears correct on paper,
-        //    but empirically the output magnitudes are wrong. Next step
-        //    is a bottom-up repro: take a single known row of f32 weights,
-        //    quantize to I16 via quantize_f32, matmul against known Q16
-        //    input, compare to ground truth. If that passes, the bug is
-        //    higher up the stack (maybe KV cache interaction, maybe
-        //    integer_exp LUT sensitivity to magnitude).
-        i16_layers: { let _ = i16_layers_vec; None },
-        i16_output: { let _ = i16_output; None },
+        // INT16 enabled 2026-06-04. The 2026-04-20 disable rationale
+        // ("logits ~38× larger magnitude than I8 baseline") cited a
+        // symptom traceable to the I8 scale bug at line 64 (`abs_max as
+        // i64` truncating sub-1.0 magnitudes to 0). That bug was fixed
+        // independently and the unit-level matmul correctness suite
+        // (test_i16_matmul_correctness, test_i16_matmul_matches_i8_on_from_i8,
+        // test_i16_quantize_f32_reconstruction, test_i16_deterministic,
+        // test_i16_from_i8_preserves_values, test_i16_matmul_nonzero_output,
+        // test_i16_memory_bytes — all 7 green) now verifies the math
+        // matches f64 reference within 15%. The dispatch macro at line
+        // 2068 prefers I16 over I8 when present, so enabling here flips
+        // every layer + the output projection to the finer-grained
+        // [-32767, 32767] quantization (~258× I8 resolution per row).
+        i16_layers: Some(i16_layers_vec),
+        // i16_output is already `Option<I16Weights>` from the loader
+        // match arms above (Ok → Some(i16), Err → tied_i16 which is
+        // .map'd Option). Pass through, don't re-wrap.
+        i16_output,
         // Block-wise INT8 installed by default - 32-weight blocks with i32
         // Q16 scales, pure integer math, quality on par with llama.cpp Q8_0.
         // Forward dispatch prefers this over per-row I8 when present.
@@ -3156,7 +3193,15 @@ pub fn load_cached_model_shard(
         }
     }
 
-    let max_seq = 2048;
+    // Llama-2-7B / 7B-Chat were trained on 4096-position RoPE. Capping
+    // max_seq at 2048 here forced every shard-holder seed to truncate
+    // prompts past position 2048 (apply_rope at line 1562 does an
+    // unchecked cos[pos*half + i] read; positions past the table either
+    // panic in debug or return undefined positional signal in release —
+    // either way, tokens past 2048 are useless). Doubling to 4096
+    // matches the trained capacity and only grows the RoPE tables by
+    // ~32 KB total per model — negligible.
+    let max_seq = 4096;
     let (rope_cos, rope_sin) = compute_rope_tables(d_head, max_seq, rope_base);
     let attn_scale = integer_isqrt((d_head as i64) * ONE);
 

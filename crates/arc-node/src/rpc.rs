@@ -3226,10 +3226,32 @@ async fn channel_state(
 
 /// How long /inference/run waits for a community worker to return a
 /// completed job before giving up and falling through to the local
-/// model. 60s covers the worst-case for a 13B model on a slow laptop
-/// generating 64 tokens at ~700ms/token, with headroom for the 30s
-/// claim-poll cycle.
-const COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 60;
+/// model. Scales with `max_tokens` so a 4-token autocomplete doesn't
+/// have to budget for a 13B + 64-token chat completion. Floor is
+/// `MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS` so short generations still
+/// get one claim-poll cycle.
+///
+/// Observed 2026-06-04 on the testnet: a fixed 60s ceiling produced
+/// p50=67.8s end-to-end on a 4-token request because 97/100 calls
+/// waited the full timeout before falling back to local. The math:
+/// 4 tokens × ~3.3 s/tok = ~13s real work, so the budget should be
+/// ~15s not 60s.
+const MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 8;
+const MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS: u64 = 60;
+
+/// Compute the per-request community dispatch timeout. ~3.3s/token
+/// is the EWMA we've observed on testnet workers; we budget 1.5×
+/// that for headroom and floor at `MIN_…` so a 1-token request still
+/// gets a full claim-poll cycle.
+fn community_dispatch_timeout_secs(max_tokens: u32) -> u64 {
+    let per_token_ms: u64 = 3300;
+    let est_ms = (max_tokens as u64).saturating_mul(per_token_ms);
+    let est_with_headroom = est_ms.saturating_mul(3) / 2;
+    let est_secs = est_with_headroom / 1000;
+    est_secs
+        .max(MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS)
+        .min(MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS)
+}
 
 /// Count community workers that haven't expired their TTL and advertise
 /// the "inference" capability. Used by the smart router to decide
@@ -3301,7 +3323,8 @@ async fn dispatch_to_community_worker(
         return Err(format!("queue closed: {}", e));
     }
 
-    let timeout = tokio::time::Duration::from_secs(COMMUNITY_DISPATCH_TIMEOUT_SECS);
+    let timeout_secs = community_dispatch_timeout_secs(max_tokens);
+    let timeout = tokio::time::Duration::from_secs(timeout_secs);
     match tokio::time::timeout(timeout, osh_rx).await {
         Ok(Ok(result)) => {
             if !result.success {
@@ -3332,10 +3355,7 @@ async fn dispatch_to_community_worker(
             // Timeout — orphan our entry so submit_work doesn't crash
             // when the late result arrives.
             results.remove(&job_id);
-            Err(format!(
-                "no worker completed within {}s",
-                COMMUNITY_DISPATCH_TIMEOUT_SECS
-            ))
+            Err(format!("no worker completed within {}s", timeout_secs))
         }
     }
 }
@@ -3377,6 +3397,70 @@ async fn inference_onchain_submit(
             ))
         }
     };
+
+    // ── Caller-signed path (v0.7.9 fix) ────────────────────────────────────
+    // If the caller passes a `signed_tx` field (hex-encoded bincode-serialized
+    // Transaction), bypass the self-sign flow entirely and just relay it.
+    // This is the architecturally correct path: wallets sign with their own
+    // funded keypair, the seed only acts as a relay. The self-sign path below
+    // signs with the node's validator_address, which on multi-validator chains
+    // can hit ordering / committee-self-vote issues that wedge the request at
+    // "no such request" indefinitely. The caller-signed path sidesteps all of
+    // that — it's the same code path the desktop wallet uses via /tx/submit_signed,
+    // just keyed by the /inference/onchain/submit endpoint for consistency.
+    if let Some(signed_hex) = req.get("signed_tx").and_then(|v| v.as_str()) {
+        let bytes = hex::decode(signed_hex.trim_start_matches("0x")).map_err(|e| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("signed_tx hex decode: {}", e),
+            )
+        })?;
+        let tx: Transaction = bincode::deserialize(&bytes).map_err(|e| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                format!("signed_tx bincode decode: {}", e),
+            )
+        })?;
+        if tx.tx_type != TxType::InferenceRequest {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "signed_tx must be InferenceRequest, got {:?}",
+                    tx.tx_type
+                ),
+            ));
+        }
+        let (req_id_arr, mreward, dblocks, csize) = match &tx.body {
+            TxBody::InferenceRequest(b) => {
+                (b.request_id, b.max_reward, b.deadline_blocks, b.committee_size)
+            }
+            _ => {
+                return Err(api_error(
+                    StatusCode::BAD_REQUEST,
+                    "signed_tx body is not an InferenceRequest variant",
+                ))
+            }
+        };
+        let tx_hash = tx.hash;
+        let anchor_h = node.state.height();
+        let signer = format!("0x{}", hex::encode(tx.from.0));
+        node.mempool.insert(tx).map_err(|e| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("mempool insert failed: {:?}", e),
+            )
+        })?;
+        return Ok(Json(json!({
+            "request_id": format!("0x{}", hex::encode(req_id_arr)),
+            "tx_hash": tx_hash.to_hex(),
+            "anchor_height": anchor_h,
+            "committee_size": csize,
+            "deadline_blocks": dblocks,
+            "max_reward": mreward,
+            "signed_by": "caller",
+            "signer_address": signer,
+        })));
+    }
 
     let input_text = req
         .get("input")
@@ -3488,6 +3572,11 @@ async fn inference_onchain_submit(
         )
     })?;
 
+    // Diagnostic fields make the silent "no such request" failure
+    // debuggable. If the self-signed path is wedging, operators can see at a
+    // glance whether they're hitting the validator-self-submit path (and the
+    // submitter's balance/nonce) and pivot to the `signed_tx` field above.
+    let signer_balance = node.state.get_account(&sender_addr).map(|a| a.balance).unwrap_or(0);
     Ok(Json(json!({
         "request_id": format!("0x{}", hex::encode(request_id)),
         "tx_hash": tx_hash.to_hex(),
@@ -3495,6 +3584,11 @@ async fn inference_onchain_submit(
         "committee_size": committee_size,
         "deadline_blocks": deadline_blocks,
         "max_reward": max_reward,
+        "signed_by": "validator_self",
+        "signer_address": format!("0x{}", hex::encode(sender_addr.0)),
+        "signer_balance": signer_balance,
+        "signer_nonce_at_submit": nonce,
+        "note": "If status stays 'no such request' >60s, retry via the `signed_tx` field with a wallet-signed Transaction (bincode hex) instead of the self-sign path."
     })))
 }
 
@@ -3771,6 +3865,42 @@ async fn inference_run(
         }
     };
 
+    // Partial-model guard: shard-holder seeds only have 3/32 layers loaded
+    // locally, so model.generate(...) produces structured garbage rather
+    // than a real completion. Route to the cross-seed sharded pipeline
+    // instead — that's the path the dashboard demo already exercises and
+    // it returns coherent output. Verified on testnet 2026-06-04: a 3/32
+    // local path produced `" nobody' Begriffe an"` 100% of the time
+    // while the sharded path produced `" George Washington."` for a
+    // historical-fact prompt.
+    //
+    // Only the candle (full Q4 float) path is allowed to skip sharded —
+    // it loads the entire model regardless of --shard-range flags. The
+    // pure-integer path runs against `model.layers` which is what
+    // load_cached_model_ranges populates with `.is_loaded()=false`
+    // sentinels for non-held layers.
+    let local_is_complete = node.candle_engine.is_some()
+        || model.layers.iter().all(|l| l.is_loaded());
+    if !local_is_complete && !force_local {
+        tracing::info!(
+            "local model is partial ({}/{} layers loaded); routing /inference/run \
+             through the sharded pipeline instead of garbage-emitting local fallback",
+            model.layers.iter().filter(|l| l.is_loaded()).count(),
+            model.layers.len()
+        );
+        let sharded_body = json!({
+            "input": input_text,
+            "max_tokens": max_tokens,
+        });
+        // Reuse the live sharded handler instead of duplicating its
+        // tokenize → forward → cache → decode logic. If it succeeds the
+        // dashboard shape is the same as a normal sharded response; if
+        // it fails (no covering pipeline, all seeds down, etc.) surface
+        // the underlying error so the caller can see *why* local fallback
+        // was unsafe.
+        return inference_run_sharded(AxumState(node.clone()), Json(sharded_body)).await;
+    }
+
     let start = std::time::Instant::now();
 
     // Apply chat template from GGUF metadata (wraps input in model-specific format)
@@ -3804,9 +3934,15 @@ async fn inference_run(
             .collect();
         (gen_tokens, result.output_hash, "candle Q4 (float, deterministic per-arch)")
     } else {
-        // Integer engine fallback - bit-identical across architectures
+        // Integer engine — bit-identical across architectures. Precision
+        // label comes from the model itself so it tracks the dispatch
+        // chain (I16 / block-I8 / Q4 / per-row I8 / ternary / hybrid)
+        // instead of hardcoding "INT8 integer". When the loader populates
+        // I16 (default 2026-06-04+) this reports "INT16 integer …";
+        // before that it reported "INT8" even when block-I8 was actually
+        // running. Honest labels matter for "is INT16 working" debugging.
         let (generated, hash) = model.generate(&tokens_with_bos, max_tokens, &model.config.eos_tokens);
-        (generated, hash, "INT8 integer (cross-platform deterministic)")
+        (generated, hash, model.effective_precision_label())
     };
 
     let inference_ms = start.elapsed().as_millis() as u64;
@@ -3963,17 +4099,34 @@ async fn worker_earnings(
     let mut last_block: Option<u64> = None;
     let mut last_tx_hash: Option<String> = None;
 
+    // Option C (credit the original requester, not the working validator)
+    // WITHOUT a wire field: map each request's input_hash -> the requester
+    // (the sender of the InferenceRequest tx). The matching attestation
+    // carries the same input_hash, so the original payer is recoverable
+    // from on-chain history. This replaces the v0.7.6 `beneficiary` wire
+    // field, which was a bincode-incompatible change that partitioned the
+    // chain (see InferenceAttestationBody::beneficiary).
+    let mut requester_by_input: HashMap<Hash256, Hash256> = HashMap::new();
+    for entry in node.state.full_transactions.iter() {
+        if let TxBody::InferenceRequest(req) = &entry.value().body {
+            requester_by_input
+                .entry(req.input_hash)
+                .or_insert_with(|| entry.value().from);
+        }
+    }
+
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
         let body = match &tx.body {
             TxBody::InferenceAttestation(b) => b,
             _ => continue,
         };
-        // Option C: prefer the explicit `beneficiary` field if the
-        // attestation was posted with one (e.g. the tier 1 voting path
-        // credits the original requester, not itself). Legacy
-        // attestations without `beneficiary` fall back to `tx.from`.
-        let credited = body.beneficiary.unwrap_or(tx.from);
+        // Credit the original requester (looked up by input_hash) when
+        // known; otherwise fall back to the attestation signer (`tx.from`).
+        let credited = requester_by_input
+            .get(&body.input_hash)
+            .copied()
+            .unwrap_or(tx.from);
         if credited != want {
             continue;
         }
@@ -4528,10 +4681,19 @@ async fn inference_run_sharded(
         return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
     }
 
+    // Sharded-pipeline output cap. Was 256, which combined with the
+    // model's RoPE table covering 4096 positions meant the user could
+    // never approach the actual context limit on this endpoint.
+    // Bumping to 1024 — still well under the 4096 positional ceiling
+    // (an average 3 KB prompt + 1024 generated tokens fits comfortably)
+    // and matches the practical "long-form completion" budget the
+    // dashboard demo expects. Each hop's KV cache grows linearly with
+    // (prompt_len + max_tokens), so this also caps coordinator memory
+    // pressure under stress.
     let max_tokens = req.get("max_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(20)
-        .min(256) as u32;
+        .min(1024) as u32;
     // Opt-in chat template wrapping. Default OFF because the dashboard is
     // doing autocomplete ("The capital of France is" → " Paris"), not
     // instruction-following. Wrapping in [INST]...[/INST] inflates prompt_len
@@ -4582,16 +4744,23 @@ async fn inference_run_sharded(
             }
         }
     }
-    // Filter stubs out of the final replica list - a stub address can't be
-    // dialed so it can never satisfy a coordinator hop. Keep the entry only
-    // if it was the only announcement we have for that node.
+    // Drop stub-addr replicas unconditionally. A stub addr can't be dialed
+    // (127.x = announcer's loopback, 0.0.0.0 = unbound, [::1] = loopback,
+    // empty = malformed) so it can never satisfy a coordinator hop. The old
+    // behaviour preserved a stub when no routable replica existed for the
+    // same range "as a fallback"; that produced the Pipeline-gap regression
+    // observed 2026-06-04 where a community worker announcing
+    // 127.0.0.1:9090 with an off-grid range [0, 8) became the only candidate
+    // for layer-0 and the pipeline walked off the rails. Honest failure
+    // (drop the bucket, surface "Pipeline incomplete" later if nothing
+    // covers those layers) beats fake liveness.
     // #29: also sort each bucket by rolling EWMA latency ascending so the
     // fastest replica for this range wins primary on the next dispatch.
+    by_range.retain(|_, bucket| {
+        bucket.retain(|s| !is_stub(&s.socket_addr));
+        !bucket.is_empty()
+    });
     for bucket in by_range.values_mut() {
-        let routable: Vec<ShardInfo> = bucket.iter().filter(|s| !is_stub(&s.socket_addr)).cloned().collect();
-        if !routable.is_empty() {
-            *bucket = routable;
-        }
         sort_replicas_by_latency(bucket, &node.latency_stats);
     }
     // Pipeline becomes one entry per range with its replica list attached.
@@ -4599,31 +4768,43 @@ async fn inference_run_sharded(
     let mut pipeline_ranges: Vec<((usize, usize), Vec<ShardInfo>)> = by_range
         .into_iter()
         .collect();
-    pipeline_ranges.sort_by_key(|((s, _), _)| *s);
-    let pipeline: Vec<ShardInfo> = pipeline_ranges.iter()
-        .map(|(_, replicas)| replicas[0].clone())
-        .collect();
+    // Sort by (start_layer, end_layer) so the *shortest* range starting at
+    // each layer comes first. We then greedily walk: pick the first range
+    // that starts at covered_to and skip any later range whose start is
+    // already covered (overlapping). Without this skip, a worker that
+    // announces a non-grid range (e.g. [0, 8) while the rest of the
+    // network uses [0, 6)/[6, 12)) collides with the next range and
+    // produces a false "Pipeline gap" error even though the standard
+    // tiling fully covers the model.
+    pipeline_ranges.sort_by_key(|((s, e), _)| (*s, *e));
 
-    if pipeline.is_empty() {
+    if pipeline_ranges.is_empty() {
         return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "No shards announced. Need shard registry to be populated."));
     }
 
-    // Verify the pipeline is contiguous and covers all layers.
-    // Stop early once coverage is complete — stale extra shards in the
-    // registry beyond n_layers must not cause a false gap error.
-    let n_layers = pipeline[0].total_layers;
+    // Greedy contiguous cover: at each step, pick the first range starting
+    // at the current frontier. Skip ranges starting earlier (already
+    // covered) — they're either duplicates of the picked range or
+    // off-grid alternatives we've chosen not to take.
+    let n_layers = pipeline_ranges[0].1[0].total_layers;
+    let mut pipeline: Vec<ShardInfo> = Vec::with_capacity(pipeline_ranges.len());
     let mut covered_to = 0usize;
-    for shard in &pipeline {
+    for ((start, end), replicas) in &pipeline_ranges {
         if covered_to >= n_layers {
             break;
         }
-        if shard.start_layer != covered_to {
+        if *start < covered_to {
+            // Overlapping with a range we already picked — skip.
+            continue;
+        }
+        if *start != covered_to {
             return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
                 "Pipeline gap: expected layer {} next, got shard [{}, {}) (node {}, addr {})",
-                covered_to, shard.start_layer, shard.end_layer, shard.node_name, shard.socket_addr
+                covered_to, start, end, replicas[0].node_name, replicas[0].socket_addr
             )));
         }
-        covered_to = shard.end_layer;
+        pipeline.push(replicas[0].clone());
+        covered_to = *end;
     }
     if covered_to != n_layers {
         return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
@@ -5142,7 +5323,7 @@ async fn inference_run_sharded(
         "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
         "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
         "tokens_generated": generated.len() as u64,
-        "engine": "INT8 sharded pipeline (cross-platform deterministic)",
+        "engine": format!("{} sharded pipeline", model.effective_precision_label()),
         "deterministic": true,
         "sharded": true,
         "pipeline_length": pipeline.len(),
@@ -5234,7 +5415,7 @@ async fn inference_run_sharded(
         "shard_trace": shard_trace,
         "total_bytes_transferred": total_bytes_transferred,
         "deterministic": true,
-        "engine": "INT8 sharded pipeline (cross-platform deterministic)",
+        "engine": format!("{} sharded pipeline", model.effective_precision_label()),
         "cache": {
             "hit": false,
             "key": format!("0x{}", hex::encode(&cache_key.0)),
@@ -6324,9 +6505,26 @@ async fn community_register(
     // If the worker provided model info, auto-assign shard layers so it
     // can start serving inference immediately. No manual --shard-start
     // / --shard-end flags needed.
+    //
+    // Hard guard: never register a worker shard at a stub addr
+    // (127.x, 0.0.0.0, [::1], or empty). Those announcements were
+    // poisoning the coordinator's shard registry — pipeline assembly at
+    // `inference_run_sharded` picks the stub shard first by (start, end)
+    // ordering and then fails with "Pipeline gap: expected layer N next"
+    // because no other shard starts at the stub's end_layer. Real
+    // workers run on routable IPs; a stub here means a misconfigured
+    // dev binary calling production seeds.
     let shard_assignment = if let (Some(model_id), Some(total_layers), Some(rpc_addr)) =
         (req.model_id.as_ref(), req.total_layers, req.rpc_addr.as_ref())
     {
+        if is_stub_socket_addr(rpc_addr) {
+            tracing::debug!(
+                worker_id = %req.worker_id,
+                rpc_addr = %rpc_addr,
+                "community_register: skipping auto-shard for stub rpc_addr"
+            );
+            None
+        } else
         if total_layers > 0 {
             // Find the biggest uncovered gap for this model
             let existing: Vec<ShardInfo> = fresh_shards(&node.shard_registry)
