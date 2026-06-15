@@ -105,7 +105,7 @@ function coordinatorLabel(url: string): string {
 
 export function Inference() {
   const [prompt, setPrompt] = useState("");
-  const [maxTokens, setMaxTokens] = useState(32);
+  const [maxTokens, setMaxTokens] = useState(16);
   const [copied, setCopied] = useState<string | null>(null);
   // Milestone B (#36): toggle between free run_consensus and the paid path
   // (signs InferenceEscrowOpen locally, runs inference gated on that
