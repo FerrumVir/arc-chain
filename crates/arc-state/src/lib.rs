@@ -1117,6 +1117,10 @@ impl StateDB {
         // Index receipts, tx locations, account transactions, and full tx bodies
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
+            // Persist the receipt so /tx/{hash} survives a restart (WAL replay
+            // rebuilds the in-memory receipts map). Was in-memory-only → 404s.
+            self.wal
+                .append(WalOp::SetReceipt(tx.hash, receipts[i].clone()), height);
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.index_account_tx(tx);
             self.full_transactions.insert(tx.hash.0, tx.clone());
@@ -1324,6 +1328,9 @@ impl StateDB {
 
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, final_receipts[i].clone());
+            // Persist the receipt so /tx/{hash} survives a restart.
+            self.wal
+                .append(WalOp::SetReceipt(tx.hash, final_receipts[i].clone()), height);
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.index_account_tx(tx);
             self.full_transactions.insert(tx.hash.0, tx.clone());
@@ -1502,6 +1509,10 @@ impl StateDB {
         // Index receipts, tx locations, account transactions, and full tx bodies
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
+            // Persist the receipt so /tx/{hash} survives a restart (WAL replay
+            // rebuilds the in-memory receipts map). Was in-memory-only → 404s.
+            self.wal
+                .append(WalOp::SetReceipt(tx.hash, receipts[i].clone()), height);
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.index_account_tx(tx);
             self.full_transactions.insert(tx.hash.0, tx.clone());
@@ -1724,6 +1735,10 @@ impl StateDB {
 
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
+            // Persist the receipt so /tx/{hash} survives a restart (WAL replay
+            // rebuilds the in-memory receipts map). Was in-memory-only → 404s.
+            self.wal
+                .append(WalOp::SetReceipt(tx.hash, receipts[i].clone()), height);
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.index_account_tx(tx);
             self.full_transactions.insert(tx.hash.0, tx.clone());
@@ -1838,6 +1853,10 @@ impl StateDB {
 
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
+            // Persist the receipt so /tx/{hash} survives a restart (WAL replay
+            // rebuilds the in-memory receipts map). Was in-memory-only → 404s.
+            self.wal
+                .append(WalOp::SetReceipt(tx.hash, receipts[i].clone()), height);
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.index_account_tx(tx);
             self.full_transactions.insert(tx.hash.0, tx.clone());
@@ -5236,6 +5255,10 @@ impl StateDB {
 
         for (i, tx) in transactions.iter().enumerate() {
             self.receipts.insert(tx.hash.0, receipts[i].clone());
+            // Persist the receipt so /tx/{hash} survives a restart (WAL replay
+            // rebuilds the in-memory receipts map). Was in-memory-only → 404s.
+            self.wal
+                .append(WalOp::SetReceipt(tx.hash, receipts[i].clone()), height);
             self.tx_index.insert(tx.hash.0, (height, i as u32));
             self.index_account_tx(tx);
             self.full_transactions.insert(tx.hash.0, tx.clone());
