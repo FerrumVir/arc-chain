@@ -457,10 +457,10 @@ impl CachedIntegerModel {
             "ternary-hybrid (per-row sparse-INT8 outliers)"
         } else if self.ternary_layers.is_some() {
             "ternary (1.58-bit, ASIC-compatible)"
-        } else if self.i16_layers.is_some() {
-            "INT16 integer (per-row, cross-platform deterministic)"
         } else if self.block_i8_layers.is_some() {
             "block-INT8 integer (32-weight blocks, cross-platform deterministic)"
+        } else if self.i16_layers.is_some() {
+            "INT16 integer (per-row, cross-platform deterministic)"
         } else if self.q4_layers.is_some() {
             "Q4 integer (cross-platform deterministic)"
         } else {
@@ -1065,114 +1065,6 @@ pub fn matmul_fast_preq(weights: &I8Weights, _input_q: &QuantizedInput, input_ra
     // Use scalar i8×i64 path for full input precision.
     // The SIMD i8×i8 path loses too much via double quantization.
     matmul_i8_into(weights, input_raw, in_size, output);
-}
-
-#[cfg(target_arch = "aarch64")]
-fn matmul_simd_preq_neon(weights: &I8Weights, input_q: &QuantizedInput, in_size: usize, output: &mut [i64]) {
-    debug_assert_eq!(output.len(), weights.scales.len(), "matmul output/scales mismatch");
-    use std::arch::aarch64::*;
-    let data = &weights.data;
-    let inp = &input_q.data;
-    let scales = &weights.scales;
-    let isf = input_q.scale_factor;
-
-    output.par_chunks_mut(512).enumerate().for_each(|(ci, chunk)| {
-        let base = ci * 512;
-        for (li, out) in chunk.iter_mut().enumerate() {
-            let i = base + li;
-            let row = unsafe { data.as_ptr().add(i * in_size) };
-            let simd_len = in_size / 32 * 32;
-            let mut acc: i64;
-            unsafe {
-                let mut v0 = vdupq_n_s32(0);
-                let mut v1 = vdupq_n_s32(0);
-                let mut v2 = vdupq_n_s32(0);
-                let mut v3 = vdupq_n_s32(0);
-                let mut j = 0usize;
-                while j < simd_len {
-                    let w0 = vld1q_s8(row.add(j));
-                    let i0 = vld1q_s8(inp.as_ptr().add(j));
-                    v0 = vpadalq_s16(v0, vmull_s8(vget_low_s8(w0), vget_low_s8(i0)));
-                    v1 = vpadalq_s16(v1, vmull_s8(vget_high_s8(w0), vget_high_s8(i0)));
-                    let w1 = vld1q_s8(row.add(j + 16));
-                    let i1 = vld1q_s8(inp.as_ptr().add(j + 16));
-                    v2 = vpadalq_s16(v2, vmull_s8(vget_low_s8(w1), vget_low_s8(i1)));
-                    v3 = vpadalq_s16(v3, vmull_s8(vget_high_s8(w1), vget_high_s8(i1)));
-                    j += 32;
-                }
-                v0 = vaddq_s32(vaddq_s32(v0, v1), vaddq_s32(v2, v3));
-                acc = vaddvq_s32(v0) as i64;
-                while j < in_size { acc += (*row.add(j) as i64) * (*inp.as_ptr().add(j) as i64); j += 1; }
-            }
-            *out = acc * ((scales[i] * isf) >> FRAC_BITS);
-        }
-    });
-}
-
-#[cfg(target_arch = "x86_64")]
-fn matmul_simd_preq_x86(weights: &I8Weights, input_q: &QuantizedInput, in_size: usize, output: &mut [i64]) {
-    debug_assert_eq!(output.len(), weights.scales.len(), "matmul output/scales mismatch");
-    use std::arch::x86_64::*;
-    let data = &weights.data;
-    let inp = &input_q.data;
-    let scales = &weights.scales;
-    let isf = input_q.scale_factor;
-    let use512 = is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512f");
-
-    output.par_chunks_mut(512).enumerate().for_each(|(ci, chunk)| {
-        let base = ci * 512;
-        for (li, out) in chunk.iter_mut().enumerate() {
-            let i = base + li;
-            let row = unsafe { data.as_ptr().add(i * in_size) };
-            let ip = inp.as_ptr();
-            let mut acc: i64 = 0;
-            unsafe {
-                if use512 {
-                    let sl = in_size / 64 * 64;
-                    let mut a0 = _mm512_setzero_si512();
-                    let mut a1 = _mm512_setzero_si512();
-                    let mut j = 0usize;
-                    while j < sl {
-                        let vw = _mm512_loadu_si512(row.add(j) as *const __m512i);
-                        let vi = _mm512_loadu_si512(ip.add(j) as *const __m512i);
-                        a0 = _mm512_add_epi32(a0, _mm512_madd_epi16(
-                            _mm512_cvtepi8_epi16(_mm512_castsi512_si256(vw)),
-                            _mm512_cvtepi8_epi16(_mm512_castsi512_si256(vi))));
-                        a1 = _mm512_add_epi32(a1, _mm512_madd_epi16(
-                            _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(vw, 1)),
-                            _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(vi, 1))));
-                        j += 64;
-                    }
-                    acc = _mm512_reduce_add_epi32(_mm512_add_epi32(a0, a1)) as i64;
-                    while j < in_size { acc += (*row.add(j) as i64) * (*ip.add(j) as i64); j += 1; }
-                } else {
-                    let sl = in_size / 32 * 32;
-                    let mut a0 = _mm256_setzero_si256();
-                    let mut a1 = _mm256_setzero_si256();
-                    let mut j = 0usize;
-                    while j < sl {
-                        let vw = _mm256_loadu_si256(row.add(j) as *const __m256i);
-                        let vi = _mm256_loadu_si256(ip.add(j) as *const __m256i);
-                        a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(
-                            _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vw)),
-                            _mm256_cvtepi8_epi16(_mm256_castsi256_si128(vi))));
-                        a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(
-                            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vw, 1)),
-                            _mm256_cvtepi8_epi16(_mm256_extracti128_si256(vi, 1))));
-                        j += 32;
-                    }
-                    let v = _mm256_add_epi32(a0, a1);
-                    let lo = _mm256_extracti128_si256(v, 0);
-                    let hi = _mm256_extracti128_si256(v, 1);
-                    let s = _mm_hadd_epi32(_mm_add_epi32(lo, hi), _mm_setzero_si128());
-                    let s = _mm_hadd_epi32(s, _mm_setzero_si128());
-                    acc = _mm_extract_epi32(s, 0) as i64;
-                    while j < in_size { acc += (*row.add(j) as i64) * (*ip.add(j) as i64); j += 1; }
-                }
-            }
-            *out = acc * ((scales[i] * isf) >> FRAC_BITS);
-        }
-    });
 }
 
 // ─── Q4 Weights (4-bit, half bandwidth) ──────────────────────────────────────
@@ -2080,10 +1972,13 @@ impl CachedIntegerModel {
         }
 
         // Dispatch priority (highest quality first):
-        //   Block-I8  - 32-weight blocks with i32 Q16 scales (Q8_0-shaped)
-        //   I16       - per-row, 258× finer than I8 on paper (but known PPL
-        //               issue before the attn/LUT rescale lands, see
-        //               project_i16_ppl_bug.md). Kept as a manual override.
+        //   Block-I8  - 32-weight blocks with i32 Q16 scales (Q8_0-shaped).
+        //               PPL ~5.5 (FP16-class), the active default. NEON +
+        //               rayon in matmul_block_i8_into, bit-identical to its
+        //               scalar reference (see block_i8.rs).
+        //   I16       - per-row fallback. Finer levels on paper but a known
+        //               PPL regression until the attn/LUT rescale lands
+        //               (project_i16_ppl_bug.md), so block-i8 now wins.
         //   Q4        - x86 low-bandwidth path
         //   I8        - original per-row fallback
         macro_rules! dispatch_matmul {
@@ -2093,19 +1988,17 @@ impl CachedIntegerModel {
                         crate::ternary_hybrid::matmul_ternary_hybrid_into(hw, $raw, $in_sz, $out);
                     } else if let Some(tw) = $tern {
                         crate::ternary_engine::matmul_ternary_into(tw, $raw, $in_sz, $out);
-                    } else if let Some(i16w) = $i16w {
-                        // Reordered 2026-06-04: per-row I16 (~258× I8
-                        // resolution) wins over block-wise I8 when both
-                        // are populated. Prior order silently demoted I16
-                        // to a fallback that block_i8 (set by default in
-                        // the loader) always preempted, so enabling
-                        // i16_layers in the model struct had no observable
-                        // effect at runtime. block_i8 stays as the
-                        // fallback for the few code paths that don't
-                        // populate I16 yet.
-                        matmul_i16_into(i16w, $raw, $in_sz, $out);
                     } else if let Some(blk) = $blk {
+                        // Reordered 2026-07-07: block-i8 (PPL ~5.5, FP16-class)
+                        // is now the active precision and preempts per-row I16.
+                        // Its matmul is NEON + rayon parallel and provably
+                        // bit-identical to the scalar reference, so this is
+                        // both the higher-quality AND the fast path. I16
+                        // remains as a fallback for any path that populates
+                        // i16_layers but not block_i8_layers.
                         crate::block_i8::matmul_block_i8_into(blk, $raw, $out);
+                    } else if let Some(i16w) = $i16w {
+                        matmul_i16_into(i16w, $raw, $in_sz, $out);
                     } else if let Some(q4w) = $q4w {
                         matmul_q4_full(q4w, $raw, $out);
                     } else {
@@ -2210,21 +2103,20 @@ impl CachedIntegerModel {
         cache.seq_len = pos + 1;
         let normed = layernorm(&hidden, &self.final_norm);
 
-        // LM head dispatch: I16 > Block-I8 > Q4 > I8. Reordered 2026-06-04
+        // LM head dispatch: Block-I8 > I16 > Q4 > I8. Reordered 2026-07-07
         // to match the layer-matmul dispatch above so the output projection
-        // doesn't silently fall through to block-I8 while every other
-        // matmul uses I16.
-        if let Some(i16_out) = &self.i16_output {
-            let mut logits = vec![0i64; cfg.vocab_size];
-            matmul_i16_into(i16_out, &normed, d, &mut logits);
-            return logits;
-        }
+        // uses the same block-i8 precision every other matmul now uses.
         if let Some(blk_out) = &self.block_i8_output {
             if blk_out.n_rows > 0 {
                 let mut logits = vec![0i64; cfg.vocab_size];
                 crate::block_i8::matmul_block_i8_into(blk_out, &normed, &mut logits);
                 return logits;
             }
+        }
+        if let Some(i16_out) = &self.i16_output {
+            let mut logits = vec![0i64; cfg.vocab_size];
+            matmul_i16_into(i16_out, &normed, d, &mut logits);
+            return logits;
         }
         if let Some(q4_out) = &self.q4_output {
             let mut logits = vec![0i64; cfg.vocab_size];
@@ -2399,31 +2291,39 @@ impl CachedIntegerModel {
             // granularity than I8, which is what makes output coherent on
             // smaller models like Llama-7B). Q4 layer ref used on aarch64
             // where matmul_q4_preq_neon delivers ~2× extra bandwidth.
+            let blkl = self.block_i8_layers.as_ref().map(|bl| &bl[layer_idx]);
             let i16l = self.i16_layers.as_ref().map(|il| &il[layer_idx]);
             let q4l = self.q4_layers.as_ref().map(|ql| &ql[layer_idx]);
 
             // Dispatch order (highest quality first, then highest speed):
-            //   NEON + Q4 weights present → matmul_q4_preq_neon (2× bw, SIMD)
-            //   I16 weights present       → matmul_i16_into (NEON SIMD in
-            //                                dot_i16_i64_neon per row)
-            //   I8 fallback               → matmul_fast_preq scalar
+            //   Q4 weights present (opt-in ARC_Q4_SHARD) → matmul_q4_preq_neon
+            //   Block-I8 present  → matmul_block_i8_into (NEON + rayon, PPL ~5.5,
+            //                       the active default precision)
+            //   I16 present       → matmul_i16_into (per-row fallback)
+            //   I8 fallback       → matmul_fast_preq scalar
+            // BlockI8Layer / I16Layer share field names (wq, wk, …) so the
+            // single `$field` ident indexes either struct.
             macro_rules! dispatch {
-                ($i16_field:ident, $i8_field:ident, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
+                ($field:ident, $i8_field:ident, $inq:expr, $raw:expr, $in_sz:expr, $out:expr) => {
                     {
                         #[cfg(target_arch = "aarch64")]
                         {
                             if let Some(q4l) = q4l {
-                                matmul_q4_preq_neon(&q4l.$i16_field, $inq, $out);
+                                matmul_q4_preq_neon(&q4l.$field, $inq, $out);
+                            } else if let Some(blkl) = blkl {
+                                crate::block_i8::matmul_block_i8_into(&blkl.$field, $raw, $out);
                             } else if let Some(i16l) = i16l {
-                                matmul_i16_into(&i16l.$i16_field, $raw, $in_sz, $out);
+                                matmul_i16_into(&i16l.$field, $raw, $in_sz, $out);
                             } else {
                                 matmul_fast_preq(&layer.$i8_field, $inq, $raw, $in_sz, $out);
                             }
                         }
                         #[cfg(not(target_arch = "aarch64"))]
                         {
-                            if let Some(i16l) = i16l {
-                                matmul_i16_into(&i16l.$i16_field, $raw, $in_sz, $out);
+                            if let Some(blkl) = blkl {
+                                crate::block_i8::matmul_block_i8_into(&blkl.$field, $raw, $out);
+                            } else if let Some(i16l) = i16l {
+                                matmul_i16_into(&i16l.$field, $raw, $in_sz, $out);
                             } else {
                                 matmul_fast_preq(&layer.$i8_field, $inq, $raw, $in_sz, $out);
                             }
@@ -2501,7 +2401,20 @@ impl CachedIntegerModel {
         if is_last {
             cache.seq_len = position + 1;
             let normed = layernorm(&hidden, &self.final_norm);
-            let logits = if let Some(ref i16w) = self.i16_output {
+            // LM head: Block-I8 > I16 > I8, matching the layer dispatch.
+            let logits = if let Some(ref blk) = self.block_i8_output {
+                if blk.n_rows > 0 {
+                    let mut logits = vec![0i64; cfg.vocab_size];
+                    crate::block_i8::matmul_block_i8_into(blk, &normed, &mut logits);
+                    logits
+                } else if let Some(ref i16w) = self.i16_output {
+                    let mut logits = vec![0i64; cfg.vocab_size];
+                    matmul_i16_into(i16w, &normed, d, &mut logits);
+                    logits
+                } else {
+                    matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
+                }
+            } else if let Some(ref i16w) = self.i16_output {
                 let mut logits = vec![0i64; cfg.vocab_size];
                 matmul_i16_into(i16w, &normed, d, &mut logits);
                 logits
@@ -3083,11 +2996,18 @@ pub fn load_cached_model_shard(
     // I16 directly from f32 is the only way to get real quality improvement -
     // I16Weights::from_i8() preserves I8-level precision, I16Weights::quantize_f32
     // doesn't.
-    let extract_i8_i16 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, rows: usize, cols: usize| -> Result<(I8Weights, I16Weights), InferenceError> {
+    let extract_i8_i16_block = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, rows: usize, cols: usize| -> Result<(I8Weights, I16Weights, crate::block_i8::BlockI8Weights), InferenceError> {
         let f = extract_f32(reader, content, name)?;
         let i8w = I8Weights::quantize_f32(&f, rows, cols);
         let i16w = I16Weights::quantize_f32(&f, rows, cols);
-        Ok((i8w, i16w))
+        // Block-i8 requires n_cols % BLOCK_SIZE == 0 (all Llama dims satisfy
+        // this); otherwise leave an empty placeholder so dispatch falls back.
+        let blockw = if cols % crate::block_i8::BLOCK_SIZE == 0 {
+            crate::block_i8::BlockI8Weights::quantize_f32(&f, rows, cols)
+        } else {
+            crate::block_i8::BlockI8Weights::empty()
+        };
+        Ok((i8w, i16w, blockw))
     };
 
     let extract_norm = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, size: usize| -> Vec<i64> {
@@ -3108,17 +3028,22 @@ pub fn load_cached_model_shard(
     };
 
     // ── Output head + final norm: ONLY on last shard ─────────────────────────
-    let (output_weight, output_weight_i16, final_norm) = if is_last {
+    let (output_weight, output_weight_i16, output_weight_block, final_norm) = if is_last {
         // Try output.weight first, fall back to token_embd.weight (tied embeddings).
         let f = extract_f32(&mut reader, &content, "output.weight")
             .or_else(|_| extract_f32(&mut reader, &content, "token_embd.weight"))?;
         let i8w = I8Weights::quantize_f32(&f, vocab_size, d_model);
         let i16w = I16Weights::quantize_f32(&f, vocab_size, d_model);
+        let blockw = if d_model % crate::block_i8::BLOCK_SIZE == 0 {
+            Some(crate::block_i8::BlockI8Weights::quantize_f32(&f, vocab_size, d_model))
+        } else {
+            None
+        };
         let fn_ = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
         info!("Shard last: output head + final_norm loaded");
-        (i8w, Some(i16w), fn_)
+        (i8w, Some(i16w), blockw, fn_)
     } else {
-        (I8Weights::empty(), None, Vec::new())
+        (I8Weights::empty(), None, None, Vec::new())
     };
 
     // ── Layers: only [start_layer, end_layer) loaded; rest are placeholders ──
@@ -3136,6 +3061,17 @@ pub fn load_cached_model_shard(
         w_up: I16Weights::empty(),
         w_down: I16Weights::empty(),
     }).collect();
+    // Block-i8 placeholders — held layers are overwritten below, non-held
+    // slots stay empty (matmul_block_i8_into zero-fills on empty weights).
+    let mut block_i8_layers_vec: Vec<BlockI8Layer> = (0..n_layers).map(|_| BlockI8Layer {
+        wq: crate::block_i8::BlockI8Weights::empty(),
+        wk: crate::block_i8::BlockI8Weights::empty(),
+        wv: crate::block_i8::BlockI8Weights::empty(),
+        wo: crate::block_i8::BlockI8Weights::empty(),
+        w_gate: crate::block_i8::BlockI8Weights::empty(),
+        w_up: crate::block_i8::BlockI8Weights::empty(),
+        w_down: crate::block_i8::BlockI8Weights::empty(),
+    }).collect();
     let mut q4_layers_vec: Vec<Q4Layer> = (0..n_layers).map(|_| Q4Layer {
         wq: Q4WeightsX86 { data: Vec::new(), scales: Vec::new(), n_rows: 0, n_cols: 0 },
         wk: Q4WeightsX86 { data: Vec::new(), scales: Vec::new(), n_rows: 0, n_cols: 0 },
@@ -3150,16 +3086,17 @@ pub fn load_cached_model_shard(
     // speed at the cost of additional quantization noise (4-bit vs 16-bit).
     let enable_q4 = std::env::var("ARC_Q4_SHARD").is_ok();
     let mut any_i16 = false;
+    let mut any_block = false;
     let mut any_q4 = false;
     for l in start_layer..end_layer {
         let p = format!("blk.{l}");
-        let (wq8, wq16) = extract_i8_i16(&mut reader, &content, &format!("{p}.attn_q.weight"), d_model, d_model)?;
-        let (wk8, wk16) = extract_i8_i16(&mut reader, &content, &format!("{p}.attn_k.weight"), d_kv, d_model)?;
-        let (wv8, wv16) = extract_i8_i16(&mut reader, &content, &format!("{p}.attn_v.weight"), d_kv, d_model)?;
-        let (wo8, wo16) = extract_i8_i16(&mut reader, &content, &format!("{p}.attn_output.weight"), d_model, d_model)?;
-        let (wg8, wg16) = extract_i8_i16(&mut reader, &content, &format!("{p}.ffn_gate.weight"), d_ff, d_model)?;
-        let (wu8, wu16) = extract_i8_i16(&mut reader, &content, &format!("{p}.ffn_up.weight"), d_ff, d_model)?;
-        let (wd8, wd16) = extract_i8_i16(&mut reader, &content, &format!("{p}.ffn_down.weight"), d_model, d_ff)?;
+        let (wq8, wq16, wqb) = extract_i8_i16_block(&mut reader, &content, &format!("{p}.attn_q.weight"), d_model, d_model)?;
+        let (wk8, wk16, wkb) = extract_i8_i16_block(&mut reader, &content, &format!("{p}.attn_k.weight"), d_kv, d_model)?;
+        let (wv8, wv16, wvb) = extract_i8_i16_block(&mut reader, &content, &format!("{p}.attn_v.weight"), d_kv, d_model)?;
+        let (wo8, wo16, wob) = extract_i8_i16_block(&mut reader, &content, &format!("{p}.attn_output.weight"), d_model, d_model)?;
+        let (wg8, wg16, wgb) = extract_i8_i16_block(&mut reader, &content, &format!("{p}.ffn_gate.weight"), d_ff, d_model)?;
+        let (wu8, wu16, wub) = extract_i8_i16_block(&mut reader, &content, &format!("{p}.ffn_up.weight"), d_ff, d_model)?;
+        let (wd8, wd16, wdb) = extract_i8_i16_block(&mut reader, &content, &format!("{p}.ffn_down.weight"), d_model, d_ff)?;
         layers[l] = CachedLayer {
             wq: wq8, wk: wk8, wv: wv8, wo: wo8,
             w_gate: wg8, w_up: wu8, w_down: wd8,
@@ -3170,7 +3107,12 @@ pub fn load_cached_model_shard(
             wq: wq16, wk: wk16, wv: wv16, wo: wo16,
             w_gate: wg16, w_up: wu16, w_down: wd16,
         };
+        block_i8_layers_vec[l] = BlockI8Layer {
+            wq: wqb, wk: wkb, wv: wvb, wo: wob,
+            w_gate: wgb, w_up: wub, w_down: wdb,
+        };
         any_i16 = true;
+        any_block = true;
         // Convert the just-loaded I8 layer to Q4 if requested.
         if enable_q4 {
             let l8 = &layers[l];
@@ -3225,10 +3167,12 @@ pub fn load_cached_model_shard(
         q4_output: None,
         i16_layers: if any_i16 { Some(i16_layers_vec) } else { None },
         i16_output: output_weight_i16,
-        // Shard loader does not yet emit block-i8 weights; a future pass
-        // should replicate the main loader's triple-quant pattern here.
-        block_i8_layers: None,
-        block_i8_output: None,
+        // Block-i8 is now the default dispatched precision on shards too
+        // (PPL ~5.5, NEON + rayon). Populated for held layers; non-held slots
+        // stay empty and zero-fill in the matmul. `forward_shard_token`
+        // prefers this over I16 when present.
+        block_i8_layers: if any_block { Some(block_i8_layers_vec) } else { None },
+        block_i8_output: output_weight_block,
         ternary_hybrid_layers: None,
         ternary_hybrid_output: None,        ternary_layers: None,
         ternary_output: None,
