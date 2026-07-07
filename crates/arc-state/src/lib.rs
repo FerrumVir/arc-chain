@@ -4220,6 +4220,22 @@ impl StateDB {
                         got: tx.nonce,
                     });
                 }
+                // AUTH GATE: only a staked validator may release an inference
+                // escrow. Without this check ANY account could submit an
+                // InferenceEscrowRelease naming itself as proposer/replicas/
+                // observer/treasury and drain 100% of any open escrow — the
+                // metadata_commitment below covers only the public open-time
+                // fields (payer/model_id/max_tokens/timeout), so it authenticates
+                // WHICH escrow but NOT WHO may release it. The legitimate release
+                // is coordinator-signed with a validator key, so this rejects
+                // only unauthorized drains.
+                if !self.is_validator(&tx.from) {
+                    return Err(StateError::ExecutionError(
+                        "inference escrow release: signer is not a staked \
+                         validator"
+                            .into(),
+                    ));
+                }
                 if body.replicas.is_empty() {
                     return Err(StateError::ExecutionError(
                         "inference escrow release: must name at least one replica"

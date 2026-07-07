@@ -241,6 +241,21 @@ impl InferenceValidatorTask {
             "Tier 1 inference: running for committee membership"
         );
 
+        // Do NOT vote without a real model loaded. compute_output_blocking()
+        // falls back to a deterministic STUB (a hash of the input) when no
+        // engine is present; in a committee where every member lacks a model,
+        // those identical stubs reach consensus and collect the 70% payout for
+        // compute that never ran. A node that cannot run the model must
+        // ABSTAIN from voting, not fabricate an output.
+        if self.engine.is_none() || self.tokenizer.is_none() || self.model_id.is_none()
+        {
+            warn!(
+                request_id = %hex::encode(request_id),
+                "Tier 1: no model loaded — abstaining from vote (no payout for stub output)"
+            );
+            return Ok(());
+        }
+
         // candle.generate() is CPU-bound (5-15 sec on TinyLlama CPU). Running
         // it directly inside an async tokio task blocks the worker thread,
         // and a handful of concurrent inferences starves the whole runtime —
