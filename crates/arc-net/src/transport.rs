@@ -138,6 +138,12 @@ pub enum InboundMessage {
         current_round: u64,
         last_committed_round: u64,
     },
+    /// Data availability: a peer is asking us for the bodies of these tx
+    /// hashes (they committed a block referencing txs they don't hold).
+    TransactionsRequest {
+        source: Hash256,
+        hashes: Vec<Hash256>,
+    },
 }
 
 /// Messages consensus sends TO the transport for outbound delivery.
@@ -202,6 +208,16 @@ pub enum OutboundMessage {
         last_committed_round: u64,
         validator_count: u32,
         total_stake: u64,
+    },
+    /// Data availability: ask all peers for the bodies of these tx hashes
+    /// (fetch-on-miss — a committed block referenced txs we don't hold).
+    RequestTransactions {
+        hashes: Vec<Hash256>,
+    },
+    /// Data availability: send requested tx bodies back to the asking peer.
+    SendTransactions {
+        target: Hash256,
+        transactions: Vec<Transaction>,
     },
 }
 
@@ -828,6 +844,23 @@ pub async fn run_transport(
                     let payload = crate::protocol::TxGossipMessage { transactions: txs };
                     if let Ok(bytes) = bincode::serialize(&payload) {
                         conn_out.broadcast(MessageType::TxGossip, &bytes).await;
+                    }
+                }
+                OutboundMessage::RequestTransactions { hashes } => {
+                    let payload = crate::protocol::RequestTransactionsMessage { hashes };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .broadcast(MessageType::RequestTransactions, &bytes)
+                            .await;
+                    }
+                }
+                OutboundMessage::SendTransactions { target, transactions } => {
+                    let payload =
+                        crate::protocol::TransactionsResponseMessage { transactions };
+                    if let Ok(bytes) = bincode::serialize(&payload) {
+                        conn_out
+                            .send_to(&target, MessageType::TransactionsResponse, &bytes)
+                            .await;
                     }
                 }
                 OutboundMessage::BroadcastStateDiff { block_hash, diff, block_height } => {
@@ -1661,6 +1694,41 @@ async fn handle_peer_recv(
                         }).await;
                     }
                     Err(e) => warn!("Bad RoundSyncResponse from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::RequestTransactions => {
+                match bincode::deserialize::<crate::protocol::RequestTransactionsMessage>(&data) {
+                    Ok(msg) => {
+                        let _ = inbound_tx.send(InboundMessage::TransactionsRequest {
+                            source: peer_address,
+                            hashes: msg.hashes,
+                        }).await;
+                    }
+                    Err(e) => warn!("Bad RequestTransactions from {}: {}", peer_address, e),
+                }
+            }
+            MessageType::TransactionsResponse => {
+                match bincode::deserialize::<crate::protocol::TransactionsResponseMessage>(&data) {
+                    Ok(msg) => {
+                        // Feed recovered bodies through the same path as tx gossip:
+                        // re-serialize + emit Transactions so consensus inserts
+                        // them into pending_txs; the deferred block then executes
+                        // on the next commit tick.
+                        let serialized: Vec<Vec<u8>> = msg
+                            .transactions
+                            .iter()
+                            .filter_map(|tx| bincode::serialize(tx).ok())
+                            .collect();
+                        debug!(
+                            "Received {} recovered tx bodies from {}",
+                            serialized.len(),
+                            peer_address
+                        );
+                        let _ = inbound_tx
+                            .send(InboundMessage::Transactions(serialized))
+                            .await;
+                    }
+                    Err(e) => warn!("Bad TransactionsResponse from {}: {}", peer_address, e),
                 }
             }
             // Handshake messages are handled during connection setup, not here.

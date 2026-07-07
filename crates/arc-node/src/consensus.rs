@@ -218,6 +218,12 @@ impl ConsensusManager {
         // Transactions live here between drain from mempool and execution.
         let pending_txs: DashMap<[u8; 32], Transaction> = DashMap::new();
 
+        // Committed DAG blocks we could not execute yet because we were missing
+        // one or more tx bodies (fetch-on-miss). Retried in round order on each
+        // tick ahead of new commits — head-of-line, so a block missing bodies
+        // blocks all later blocks (executing out of order forks the chain).
+        let mut deferred_blocks: Vec<arc_consensus::DagBlock> = Vec::new();
+
         // Track last proposed round to avoid double-proposing.
         let mut last_proposed_round: Option<u64> = None;
 
@@ -561,6 +567,32 @@ impl ConsensusManager {
                                     current_round.saturating_sub(10),
                                     last_committed_round,
                                 );
+                            }
+                        }
+                        // ── Data availability: a peer is missing tx bodies for a
+                        // committed block. Supply any we hold so it can execute
+                        // the block instead of silently skipping txs. Peers that
+                        // already executed removed the tx from pending_txs, so
+                        // read from persisted state too. ──
+                        InboundMessage::TransactionsRequest { source, hashes } => {
+                            let mut found: Vec<Transaction> =
+                                Vec::with_capacity(hashes.len());
+                            for h in &hashes {
+                                if let Some(tx) = pending_txs.get(&h.0) {
+                                    found.push(tx.value().clone());
+                                } else if let Some(tx) = state.get_transaction(&h.0) {
+                                    found.push(tx);
+                                }
+                            }
+                            if !found.is_empty() {
+                                if let Some(ref tx) = outbound_tx {
+                                    let _ = tx.try_send(
+                                        arc_net::transport::OutboundMessage::SendTransactions {
+                                            target: source,
+                                            transactions: found,
+                                        },
+                                    );
+                                }
                             }
                         }
                         // ── Shard messages (forwarded to inference engine) ───
@@ -917,8 +949,51 @@ impl ConsensusManager {
             // Without this, nodes discover committed blocks at different times
             // and produce chain blocks in different sequences.
             committed.sort_by_key(|b| b.round);
+            // Fetch-on-miss: retry blocks we deferred earlier (missing tx
+            // bodies) in round order, ahead of new commits.
+            if !deferred_blocks.is_empty() {
+                let mut all = std::mem::take(&mut deferred_blocks);
+                all.extend(committed);
+                all.sort_by_key(|b| b.round);
+                committed = all;
+            }
             if !committed.is_empty() {
+                // Head-of-line: once a block defers for missing bodies, every
+                // later block this pass defers too (execution order is strict).
+                let mut da_blocked = false;
                 for dag_block in &committed {
+                    // Data availability check BEFORE any processing. If a
+                    // referenced tx body is missing (not in pending_txs and not
+                    // already applied), request it from peers and defer this
+                    // block — never execute a partial block or reorder execution;
+                    // either forks the chain.
+                    if da_blocked {
+                        deferred_blocks.push(dag_block.clone());
+                        continue;
+                    }
+                    if multi_validator {
+                        let missing: Vec<arc_crypto::Hash256> = dag_block
+                            .transactions
+                            .iter()
+                            .filter(|h| {
+                                !pending_txs.contains_key(&h.0)
+                                    && !state.receipts.contains_key(&h.0)
+                            })
+                            .cloned()
+                            .collect();
+                        if !missing.is_empty() {
+                            if let Some(ref tx) = outbound_tx {
+                                let _ = tx.try_send(
+                                    arc_net::transport::OutboundMessage::RequestTransactions {
+                                        hashes: missing,
+                                    },
+                                );
+                            }
+                            deferred_blocks.push(dag_block.clone());
+                            da_blocked = true;
+                            continue;
+                        }
+                    }
                     // Persist commit to WAL
                     if let Some(ref wal) = self.dag_wal {
                         wal.append(

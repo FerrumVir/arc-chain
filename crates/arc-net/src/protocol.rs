@@ -49,6 +49,12 @@ pub enum MessageType {
     RoundSyncRequest = 0x11,
     /// DAG round sync response - reply with current round and committed round.
     RoundSyncResponse = 0x12,
+    /// Data availability - request specific tx bodies by hash (fetch-on-miss).
+    /// A committed DAG block references txs by hash; a node missing a body must
+    /// pull it before executing, NEVER skip it (skipping forks the chain).
+    RequestTransactions = 0x13,
+    /// Data availability - response carrying the requested tx bodies.
+    TransactionsResponse = 0x14,
 }
 
 impl MessageType {
@@ -72,6 +78,8 @@ impl MessageType {
             0x10 => Some(Self::ShardAnnounce),
             0x11 => Some(Self::RoundSyncRequest),
             0x12 => Some(Self::RoundSyncResponse),
+            0x13 => Some(Self::RequestTransactions),
+            0x14 => Some(Self::TransactionsResponse),
             _ => None,
         }
     }
@@ -86,9 +94,25 @@ impl MessageType {
 /// (2) challenge_sig is a valid Ed25519 signature over
 /// `BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash)`.
 /// Current wire protocol version. Bump on breaking changes.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// v3: adds RequestTransactions/TransactionsResponse (fetch-on-miss data
+/// availability). Peers on v2 don't answer body requests, so replicated-chain
+/// convergence needs the whole validator set on v3 — hard-fork rollout.
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Minimum protocol version we can talk to.
 pub const MIN_COMPATIBLE_VERSION: u32 = 1;
+
+/// Data-availability request: "send me the bodies for these tx hashes."
+/// Sent when a committed DAG block references a tx whose body we don't hold.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestTransactionsMessage {
+    pub hashes: Vec<Hash256>,
+}
+
+/// Data-availability response: the requested tx bodies we could supply.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactionsResponseMessage {
+    pub transactions: Vec<Transaction>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeMessage {
