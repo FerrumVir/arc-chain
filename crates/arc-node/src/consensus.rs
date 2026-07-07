@@ -1047,7 +1047,15 @@ impl ConsensusManager {
 
                             if self.proposer_mode || received_diff.is_none() {
                                 // ── PROPOSER PATH: adaptive execution (auto-selects Sequential vs BlockSTM) ──
-                                match state.execute_block_adaptive(&committed_txs, self.validator_address)
+                                // Model-1 deterministic sealing: seal with the
+                                // committed DagBlock.timestamp (not wall-clock)
+                                // so every validator that executes this same
+                                // ordered tx set produces a bit-identical block.
+                                match state.execute_block_adaptive_at(
+                                    &committed_txs,
+                                    self.validator_address,
+                                    dag_block.timestamp,
+                                )
                                 {
                                     Ok((block, receipts)) => {
                                         let elapsed = start.elapsed();

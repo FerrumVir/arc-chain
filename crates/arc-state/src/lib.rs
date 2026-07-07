@@ -1155,23 +1155,53 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        // Back-compat: callers without a consensus timestamp (RPC, bench,
+        // unit tests) seal with wall-clock. The consensus COMMIT path must use
+        // `execute_block_adaptive_at(dag_block.timestamp)` so every honest
+        // validator sealing the same ordered tx set produces a bit-identical
+        // block (Model-1 replicated chain).
+        self.execute_block_adaptive_at(transactions, producer, Self::wall_clock_ms())
+    }
+
+    /// Deterministic-sealing entry point: seals with the caller-provided
+    /// `timestamp_ms` (the committed `DagBlock.timestamp`) rather than
+    /// wall-clock. Two validators that execute the identical ordered tx set
+    /// with the same timestamp produce the identical block hash.
+    pub fn execute_block_adaptive_at(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp_ms: u64,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         let mode = crate::block_stm::choose_execution_mode(transactions);
         match mode {
             crate::block_stm::AdaptiveMode::Sequential => {
-                self.execute_block_verified(transactions, producer)
+                self.execute_block_verified_at(transactions, producer, timestamp_ms)
             }
             crate::block_stm::AdaptiveMode::BlockSTM => {
                 // Use BlockSTM partitioned execution
-                self.execute_block_blockstm(transactions, producer)
+                self.execute_block_blockstm(transactions, producer, timestamp_ms)
             }
         }
     }
 
+    /// Milliseconds since the Unix epoch (wall-clock). Only for back-compat
+    /// sealing paths; never use in the consensus commit path.
+    fn wall_clock_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    }
+
     /// Execute a block using BlockSTM partitioned parallel execution.
+    /// `timestamp_ms` seals the block header deterministically (see
+    /// `execute_block_adaptive_at`).
     fn execute_block_blockstm(
         &self,
         transactions: &[Transaction],
         producer: Address,
+        timestamp_ms: u64,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         use rayon::prelude::*;
 
@@ -1271,10 +1301,7 @@ impl StateDB {
 
         let header = BlockHeader {
             height,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            timestamp: timestamp_ms,
             parent_hash: parent,
             tx_root,
             state_root,
@@ -1310,10 +1337,23 @@ impl StateDB {
     }
 
     /// Execute a block with sequential verification (original path).
+    /// Back-compat wrapper that seals with wall-clock; the consensus path uses
+    /// `execute_block_verified_at` with the committed DagBlock timestamp.
     pub fn execute_block_verified(
         &self,
         transactions: &[Transaction],
         producer: Address,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.execute_block_verified_at(transactions, producer, Self::wall_clock_ms())
+    }
+
+    /// Deterministic-sealing variant of `execute_block_verified` — seals with
+    /// the caller-provided `timestamp_ms` (see `execute_block_adaptive_at`).
+    pub fn execute_block_verified_at(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp_ms: u64,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut tx_hashes = Vec::with_capacity(transactions.len());
@@ -1438,10 +1478,7 @@ impl StateDB {
 
         let header = BlockHeader {
             height,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            timestamp: timestamp_ms,
             parent_hash: parent,
             tx_root,
             state_root,
@@ -6792,6 +6829,53 @@ mod tests {
         assert!(!receipts2[0].success);
     }
 
+    /// Model-1 deterministic sealing: two independent validators that execute
+    /// the identical ordered tx set with the identical consensus timestamp MUST
+    /// produce a bit-identical block hash. Wall-clock sealing (the old bug) made
+    /// this fail because each node stamped a different SystemTime::now().
+    #[test]
+    fn test_deterministic_sealing_same_timestamp_identical_hash() {
+        use arc_crypto::signature::KeyPair;
+
+        let kp = KeyPair::generate_ed25519();
+        let address = kp.address();
+        let mut tx = Transaction::new_transfer(address, addr(2), 500, 0);
+        tx.sign(&kp).unwrap();
+        let producer = addr(99);
+        let ts: u64 = 1_700_000_000_000;
+
+        // Two independent state machines from the identical genesis.
+        let a = StateDB::with_genesis(&[(address, 1_000_000)]);
+        let b = StateDB::with_genesis(&[(address, 1_000_000)]);
+        let (block_a, _) = a
+            .execute_block_adaptive_at(std::slice::from_ref(&tx), producer, ts)
+            .unwrap();
+        let (block_b, _) = b
+            .execute_block_adaptive_at(std::slice::from_ref(&tx), producer, ts)
+            .unwrap();
+
+        assert_eq!(
+            block_a.header.timestamp, ts,
+            "block must seal with the consensus timestamp, not wall-clock"
+        );
+        assert_eq!(
+            block_a.hash, block_b.hash,
+            "identical txs + timestamp must seal a bit-identical block across nodes"
+        );
+
+        // A different seal timestamp must change the block hash — proving the
+        // timestamp is bound into the hash, which is exactly why per-node
+        // wall-clock sealing produced divergent chains.
+        let c = StateDB::with_genesis(&[(address, 1_000_000)]);
+        let (block_c, _) = c
+            .execute_block_adaptive_at(std::slice::from_ref(&tx), producer, ts + 1)
+            .unwrap();
+        assert_ne!(
+            block_a.hash, block_c.hash,
+            "a different seal timestamp must produce a different block hash"
+        );
+    }
+
 
     #[test]
     fn test_identity_registry() {
@@ -7720,6 +7804,11 @@ mod tests {
         // addr(1) = payer, addr(2) = proposer, addr(3..=5) = replicas,
         // addr(10) = observer pool, addr(11) = treasury.
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        // Escrow release is validator-authorized (anti-drain): the submitter
+        // addr(2) must be a staked validator.
+        state
+            .validators
+            .insert(addr(2).0, StateDB::MIN_VALIDATOR_STAKE);
         let request_id = req(b"release-split");
 
         let open = make_channel_tx(
@@ -8207,11 +8296,71 @@ mod tests {
         assert_ne!(cap.storage_root, Hash256::ZERO);
     }
 
+    /// Anti-drain: an escrow release from a NON-validator must be rejected and
+    /// the escrow left fully funded. Before the fix, ANY account could submit a
+    /// release naming itself as every recipient and drain 100% of an open
+    /// escrow, front-running the honest coordinator.
+    #[test]
+    fn test_escrow_release_rejects_non_validator() {
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        let request_id = req(b"drain-attempt");
+        let open = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceEscrowOpen(InferenceEscrowOpenBody {
+                request_id,
+                model_id: model_id(),
+                max_fee: 10_000,
+                max_tokens: 32,
+                timeout_blocks: 10,
+            }),
+            TxType::InferenceEscrowOpen,
+        );
+        // addr(66) is NOT a staked validator — it tries to drain to itself.
+        let attacker = addr(66);
+        let release = make_channel_tx(
+            attacker,
+            0,
+            TxBody::InferenceEscrowRelease(InferenceEscrowReleaseBody {
+                request_id,
+                payer: addr(1),
+                model_id: model_id(),
+                max_tokens: 32,
+                timeout_blocks: 10,
+                output_hash: hash_bytes(b"whatever"),
+                proposer: attacker,
+                replicas: vec![attacker],
+                observer_pool: attacker,
+                treasury: attacker,
+            }),
+            TxType::InferenceEscrowRelease,
+        );
+        let (_, rs) = state.execute_block(&[open, release], addr(99)).unwrap();
+        assert!(rs[0].success, "open must succeed");
+        assert!(
+            !rs[1].success,
+            "release from a non-validator must be rejected (anti-drain)"
+        );
+        let escrow_addr =
+            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(escrow.balance, 10_000, "escrow must be untouched");
+        assert_eq!(
+            state.get_account(&attacker).map(|a| a.balance).unwrap_or(0),
+            0,
+            "attacker must receive nothing"
+        );
+    }
+
     #[test]
     fn test_escrow_release_cannot_be_replayed() {
         // After a successful release, a second release on the same
         // request_id must fail (escrow cleared).
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
+        // Escrow release is validator-authorized (anti-drain): register addr(2).
+        state
+            .validators
+            .insert(addr(2).0, StateDB::MIN_VALIDATOR_STAKE);
         let request_id = req(b"no-replay");
         let open = make_channel_tx(
             addr(1),
