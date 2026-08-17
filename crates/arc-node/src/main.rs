@@ -59,6 +59,22 @@ struct Cli {
     #[arg(long)]
     seeds_file: Option<String>,
 
+    /// Hosts to pull the sharded-inference registry from over HTTP, WITHOUT
+    /// joining their P2P network or consensus (comma-separated; a bare host
+    /// gets the conventional RPC port 9090).
+    ///
+    /// This exists because coordinating inference and joining a chain are
+    /// separate concerns that --peers/--seeds-file conflates. Those flags
+    /// dial P2P, and a node that dials P2P while carrying stake is merged
+    /// into the remote validator set — the phantom-validator hazard in
+    /// CLAUDE.md rule 2. So there was no way to run a chain of your own
+    /// (stake > 0, sealing its own blocks) while dispatching inference
+    /// across a public network's shard holders. --shard-hosts is HTTP-only:
+    /// GET /shards to learn the pipeline, POST /inference/forward_shard to
+    /// use it. No handshake, no stake advertisement, no consensus.
+    #[arg(long, value_delimiter = ',')]
+    shard_hosts: Vec<String>,
+
     /// Minimum staked ARC required to run this node
     #[arg(long, default_value_t = 500_000)]
     min_stake: u64,
@@ -2212,6 +2228,20 @@ async fn main() -> Result<()> {
             .filter(|h| !h.is_empty())
             .map(|h| format!("{}:9090", h))
             .collect();
+        // --shard-hosts: registry sources reached over HTTP only, never
+        // dialed for P2P. A bare host takes the conventional RPC port; an
+        // explicit host:port is honoured so a non-standard RPC port works.
+        for h in &cli.shard_hosts {
+            let h = h.trim();
+            if h.is_empty() {
+                continue;
+            }
+            v.push(if h.contains(':') {
+                h.to_string()
+            } else {
+                format!("{}:9090", h)
+            });
+        }
         v.sort();
         v.dedup();
         v

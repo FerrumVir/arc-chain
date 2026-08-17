@@ -458,6 +458,66 @@ path is what we just shipped." Do not restart a seed to demonstrate this.
 **Goal:** tell the earnings story without saying anything false. This segment
 has the most ways to go wrong, so the framing matters more than the clicks.
 
+### ⭐ THE STRONG VERSION — verified working 2026-08-17 🔵 BRANCH
+
+Everything below this subsection describes the story against the **live seeds**,
+which run old code where attestations never mine and earnings read 0.00. That
+is still accurate for the seeds. But on the branch build there is now a real,
+auditable income demo, verified end to end on this hardware.
+
+The trick is `--shard-hosts`: it pulls the shard registry over HTTP **without
+joining anyone's P2P network or consensus**, so your node seals its own blocks
+(stake > 0, its own chain) while dispatching inference across the public
+network's shard holders. `--seeds-file` cannot do this — it dials P2P, and a
+staked node that dials P2P becomes a phantom validator (rule 2).
+
+```bash
+arc-node --rpc 127.0.0.1:19955 --p2p-port 19956 --eth-rpc-port 0 \
+  --stake 5000000 --no-community \
+  --data-dir /tmp/arc-income --validator-seed income-demo \
+  --model ~/.arc-models/llama2-7b.gguf --tokenizer-only \
+  --shard-hosts 149.28.32.76,140.82.16.112,136.244.109.1,104.238.171.11,202.182.107.41,149.28.153.31
+```
+
+Confirm `GET /shards` reports `shard_count: 18, fully_covered: true` while
+`GET /health` reports **`peers: 0`** — that pair is the whole point: full
+pipeline, zero consensus involvement. Then:
+
+```bash
+A=$(curl -s 127.0.0.1:19955/node/info | jq -r .validator)
+curl -s -XPOST 127.0.0.1:19955/faucet/claim -H 'Content-Type: application/json' -d "{\"address\":\"$A\"}"
+curl -s 127.0.0.1:19955/account/$A | jq .balance      # record this
+curl -s -XPOST 127.0.0.1:19955/inference/run_sharded -H 'Content-Type: application/json' \
+  -d '{"input":"The largest planet is","max_tokens":3,"force_recompute":true,"redundancy":2}' | jq .attestation
+curl -s 127.0.0.1:19955/account/$A | jq .balance      # up by 2,499,999,000
+```
+
+**Measured, three consecutive runs:** balance rose exactly
+`+2,499,999,000` base units each time — `+2.5 ARC` reward minus the
+`1,000`-unit bond — with the nonce advancing `1 → 2 → 3 → 4`. The attestation
+mined (`/tx/<hash>` returns `block_height`, `success: true`), and
+`/worker/earnings/<addr>` reports a reconciling `onchain_balance_arc`.
+
+What you can say, and defend: *"the worker was faucet-funded, ran one
+inference across six machines, and its on-chain balance went up by the
+protocol's 2.5-ARC attestation reward. Here is the transaction in a block."*
+
+Two caveats to keep it honest:
+- The reward is a **transfer from the testnet treasury**, bounded by the
+  treasury's balance. It is not minted, and it is not revenue from a paying
+  customer. Say "protocol reward," not "revenue."
+- This runs on **your** chain. The six seeds run old code and will not do
+  this until they are upgraded. Do not imply the public testnet pays workers
+  today — it does not.
+
+The bond-release sweep (bond returns after `challenge_period` blocks) is
+covered by unit tests including a supply-conservation invariant; it was not
+exercised over 100 live blocks, because this chain only seals on traffic.
+The amount is 1,000 base units — a rounding error next to the reward — so
+don't build a slide on it.
+
+---
+
 ### The honest story, in order
 
 **1. Faucet credit — this is a real balance change. 🟢**
