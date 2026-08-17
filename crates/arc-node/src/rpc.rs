@@ -98,9 +98,16 @@ pub struct NodeState {
     pub sharded_runs_total: Arc<AtomicU64>,
     /// Total bytes of activations forwarded between shards since boot.
     pub sharded_bytes_total: Arc<AtomicU64>,
-    /// Monotonic counter for inference attestation nonces. Ensures repeat
-    /// submissions of the same prompt+output produce unique tx_hashes
-    /// (otherwise the mempool de-dups them).
+    /// Monotonic in-process counter, used ONLY to derive unique community
+    /// job ids.
+    ///
+    /// It is deliberately no longer mixed into transaction nonces. It used to
+    /// be added to the account's state nonce for every InferenceAttestation,
+    /// but it accumulates forever — including across txs that never land — so
+    /// after the first attestation applied, state advanced AND the counter
+    /// advanced, and every later tx carried state+2 and failed InvalidNonce.
+    /// Transaction nonces now come from account state on each submission; see
+    /// `submit_inference_attestation`.
     pub attestation_nonce: Arc<AtomicU64>,
     /// Network-wide deterministic inference cache. Same prompt + same model
     /// returns the cached output_tokens in O(1), proven correct by the
@@ -139,6 +146,42 @@ pub struct NodeState {
     /// sender and delivers the WorkResult. The coordinator awaits the
     /// oneshot::Receiver to resume the pipeline walk.
     pub community_work_results: Option<Arc<dashmap::DashMap<String, tokio::sync::oneshot::Sender<WorkResult>>>>,
+    /// Shared outbound HTTP client for ALL coordinator→shard traffic.
+    /// Built once at boot so the keep-alive connection pool survives across
+    /// requests. Previously every /inference/run_sharded and
+    /// /inference/run_consensus call built its own `reqwest::Client`, which
+    /// owns the pool — so it was dropped at the end of every request and each
+    /// replica paid a fresh TCP handshake on the first hop of every request
+    /// (40 ms LAX … 215 ms SGP from the probe host).
+    pub inference_http: reqwest::Client,
+    /// Sharded runs served from the deterministic cache. Kept SEPARATE from
+    /// `sharded_runs_total`: a cache hit performs no pipeline walk, and
+    /// counting it as a run inflated every "distributed inference served"
+    /// figure the dashboard shows.
+    pub sharded_cache_hits: Arc<AtomicU64>,
+    /// Provenance of the ORIGINAL sharded run behind each cache key, keyed by
+    /// cache-key hex. Lets a cache hit return the real attestation tx, input
+    /// hash, shard trace and original wall time instead of zeros/empties.
+    pub sharded_run_meta: Arc<dashmap::DashMap<String, Value>>,
+    /// Dedicated rayon pool for local inference compute, rebuildable at
+    /// runtime via POST /node/threads.
+    ///
+    /// `None` means "use rayon's implicit global pool", which is sized from
+    /// `available_parallelism()` unless `RAYON_NUM_THREADS` is set in the
+    /// environment. We default to None so a node that never touches
+    /// /node/threads spawns exactly the threads it did before, and so the
+    /// second `build_node_state` call (the ETH RPC server) doesn't double the
+    /// process's worker threads.
+    pub compute_pool: Arc<parking_lot::RwLock<Option<Arc<rayon::ThreadPool>>>>,
+    /// Width of `compute_pool`. 0 = no dedicated pool (rayon global).
+    pub compute_threads: Arc<AtomicU32>,
+    /// Seed RPC endpoints ("host:9090") this node can pull shard topology
+    /// from when its own registry lacks full coverage. Populated from
+    /// --peers / --seeds-file in main.rs.
+    pub seed_rpc_addrs: Arc<Vec<String>>,
+    /// Last shard-registry bootstrap attempt, so a coordinator under load
+    /// doesn't hammer the seeds once per failing request.
+    pub last_registry_bootstrap: Arc<Mutex<Option<std::time::Instant>>>,
 }
 
 /// Rolling EWMA of forward_shard hop latency for a single replica socket.
@@ -150,6 +193,12 @@ pub struct LatencyEWMA {
     pub ms: f64,
     pub count: u64,
     pub last_updated: std::time::Instant,
+    /// True when this figure came from a cheap GET /health probe rather than
+    /// a real forward_shard hop. Probe RTT is not comparable to hop latency
+    /// (no compute, no activation payload), so it is only ever used to
+    /// REPLACE a value we've decided is poisoned — never blended into one.
+    /// The first real hop clears the flag.
+    pub probe_only: bool,
 }
 
 /// Describes which slice of a model a node holds.
@@ -257,7 +306,28 @@ fn fresh_shards(
 /// primary, but a sustained shift in latency rebalances within ~5-10 hops.
 const LATENCY_ALPHA: f64 = 0.2;
 
-/// Fold a hop observation into the EWMA for `socket`.
+/// How long a latency sample stays authoritative. Past this age the sample
+/// is treated as UNKNOWN rather than as fact.
+///
+/// Without this the map was insert-only: nothing ever removed, decayed or
+/// re-measured an entry. Live evidence (2026-08-16): every seed's table
+/// showed ages of 37,000-39,000 seconds — samples over ten hours old — and
+/// they still drove replica ordering. Worse, the ordering was
+/// self-reinforcing: run_sharded only ever dialled replicas[0], so a replica
+/// demoted by one bad sample received no further samples and could never
+/// climb back. LHR sat at an EWMA of 37,276 ms across all six seeds while
+/// its own recorded hops were 180-410 ms.
+pub const LATENCY_STALE_SECS: u64 = 300;
+
+/// Interval between background GET /health probes of known replica sockets.
+pub const LATENCY_PROBE_INTERVAL_SECS: u64 = 60;
+
+/// A recorded EWMA above this, AND more than `LATENCY_POISON_RATIO` times the
+/// replica's measured health RTT, is treated as poisoned rather than slow.
+pub const LATENCY_POISON_FLOOR_MS: f64 = 5_000.0;
+pub const LATENCY_POISON_RATIO: f64 = 20.0;
+
+/// Fold a real forward_shard hop observation into the EWMA for `socket`.
 pub fn record_latency(
     stats: &dashmap::DashMap<String, LatencyEWMA>,
     socket: &str,
@@ -268,24 +338,74 @@ pub fn record_latency(
     stats
         .entry(socket.to_string())
         .and_modify(|e| {
-            e.ms = LATENCY_ALPHA * hop + (1.0 - LATENCY_ALPHA) * e.ms;
-            e.count = e.count.saturating_add(1);
+            if e.probe_only {
+                // The stored value was a health-probe placeholder, not a hop.
+                // Replace rather than blend — mixing a ~200 ms probe RTT into
+                // a hop EWMA would understate the hop cost for several
+                // dispatches.
+                e.ms = hop;
+                e.count = 1;
+                e.probe_only = false;
+            } else {
+                e.ms = LATENCY_ALPHA * hop + (1.0 - LATENCY_ALPHA) * e.ms;
+                e.count = e.count.saturating_add(1);
+            }
             e.last_updated = now;
         })
-        .or_insert_with(|| LatencyEWMA { ms: hop, count: 1, last_updated: now });
+        .or_insert_with(|| LatencyEWMA {
+            ms: hop,
+            count: 1,
+            last_updated: now,
+            probe_only: false,
+        });
 }
 
-/// Sort a replica bucket by EWMA latency ascending. Unseen replicas (no
-/// sample yet) are placed AFTER seen ones but keep their insertion order
-/// - this keeps cold-start behavior identical to the old first-match logic
-/// and avoids starving an unseen replica of its first try.
+/// Record a health-probe RTT as a PROVISIONAL latency for a socket we have no
+/// fresh hop sample for. Never overwrites a fresh hop measurement.
+pub fn record_probe_latency(
+    stats: &dashmap::DashMap<String, LatencyEWMA>,
+    socket: &str,
+    probe_ms: u64,
+) {
+    let now = std::time::Instant::now();
+    stats
+        .entry(socket.to_string())
+        .and_modify(|e| {
+            if e.probe_only {
+                e.ms = probe_ms as f64;
+                e.last_updated = now;
+            }
+        })
+        .or_insert_with(|| LatencyEWMA {
+            ms: probe_ms as f64,
+            count: 0,
+            last_updated: now,
+            probe_only: true,
+        });
+}
+
+/// The latency we are willing to ACT on for this replica, or `None` when we
+/// genuinely don't know. Ageing happens here rather than by mutating the map,
+/// so /inference/latency_stats can still show the raw sample and its age.
+pub fn effective_latency_ms(stat: &LatencyEWMA) -> Option<f64> {
+    if stat.last_updated.elapsed().as_secs() >= LATENCY_STALE_SECS {
+        None
+    } else {
+        Some(stat.ms)
+    }
+}
+
+/// Sort a replica bucket by *fresh* EWMA latency ascending. Replicas with no
+/// usable sample — never measured, or measured too long ago to trust — are
+/// placed AFTER measured ones but keep their insertion order, so an unknown
+/// replica is never starved of its next try.
 pub fn sort_replicas_by_latency(
-    replicas: &mut Vec<ShardInfo>,
+    replicas: &mut [ShardInfo],
     stats: &dashmap::DashMap<String, LatencyEWMA>,
 ) {
     replicas.sort_by(|a, b| {
-        let a_ms = stats.get(&a.socket_addr).map(|v| v.ms);
-        let b_ms = stats.get(&b.socket_addr).map(|v| v.ms);
+        let a_ms = stats.get(&a.socket_addr).and_then(|v| effective_latency_ms(&v));
+        let b_ms = stats.get(&b.socket_addr).and_then(|v| effective_latency_ms(&v));
         match (a_ms, b_ms) {
             (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -293,6 +413,223 @@ pub fn sort_replicas_by_latency(
             (None, None) => std::cmp::Ordering::Equal,
         }
     });
+}
+
+/// Decide whether a recorded EWMA should be discarded in favour of a fresh
+/// health-probe RTT. Pure function so the policy is unit-testable.
+///
+/// A node can be genuinely slow, and we must not erase that. But an EWMA of
+/// 37 seconds against a socket that answers /health in 200 ms is not "slow" —
+/// it is a fossil from an incident that ended hours ago, and because the
+/// router never re-dials a demoted replica it would never be corrected.
+pub fn probe_supersedes_recorded(recorded_ms: f64, probe_ms: u64) -> bool {
+    recorded_ms > LATENCY_POISON_FLOOR_MS
+        && recorded_ms > LATENCY_POISON_RATIO * (probe_ms.max(1) as f64)
+}
+
+// ─── Runtime compute-pool control ──────────────────────────────────────────
+
+/// Run `f` on this node's dedicated rayon pool when one is configured, else
+/// on rayon's implicit global pool.
+///
+/// Everything inside `f` — including the `into_par_iter()` over attention
+/// heads in `forward_shard_token` and the `par_chunks_mut` inside every
+/// matmul — picks up the installed pool, because rayon resolves the current
+/// pool from the calling thread. That is what makes POST /node/threads
+/// actually move CPU utilisation instead of just changing a number.
+pub fn install_on_compute_pool<R, F>(node: &NodeState, f: F) -> R
+where
+    F: FnOnce() -> R + Send,
+    R: Send,
+{
+    let pool = node.compute_pool.read().clone();
+    match pool {
+        Some(p) => p.install(f),
+        None => f(),
+    }
+}
+
+/// Build (or rebuild) the dedicated compute pool at `threads` width.
+///
+/// `threads == 0` drops the dedicated pool and returns the node to rayon's
+/// global pool. The old pool is dropped once the last in-flight `install()`
+/// releases its Arc, so a rebuild never interrupts a request already running.
+pub fn set_compute_threads(node: &NodeState, threads: usize) -> Result<usize, String> {
+    if threads == 0 {
+        *node.compute_pool.write() = None;
+        node.compute_threads.store(0, Ordering::Relaxed);
+        return Ok(0);
+    }
+    if threads > 1024 {
+        return Err(format!("threads must be <= 1024, got {}", threads));
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|i| format!("arc-infer-{}", i))
+        .build()
+        .map_err(|e| format!("building rayon pool with {} threads: {}", threads, e))?;
+    *node.compute_pool.write() = Some(Arc::new(pool));
+    node.compute_threads.store(threads as u32, Ordering::Relaxed);
+    Ok(threads)
+}
+
+/// Threads rayon's GLOBAL pool will use: `RAYON_NUM_THREADS` when set and
+/// parseable, otherwise the machine's available parallelism.
+pub fn rayon_global_width() -> usize {
+    std::env::var("RAYON_NUM_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+        })
+}
+
+// ─── Shared pipeline assembly ──────────────────────────────────────────────
+
+/// One hop of the pipeline: the layer range, plus every replica that can
+/// serve it, ordered best-first.
+pub type PipelineHop = ((usize, usize), Vec<ShardInfo>);
+
+/// Why the shard registry could not be turned into a runnable pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PipelineError {
+    /// Registry is empty (or every entry was a stub).
+    NoShards,
+    /// Coverage stops before the model does.
+    Gap { expected: usize, got: (usize, usize), node: String, addr: String },
+    /// Coverage ran out before reaching n_layers.
+    Incomplete { covered: usize, total: usize },
+}
+
+impl std::fmt::Display for PipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PipelineError::NoShards => write!(
+                f, "No shards announced. Need shard registry to be populated."
+            ),
+            PipelineError::Gap { expected, got, node, addr } => write!(
+                f, "Pipeline gap: expected layer {} next, got shard [{}, {}) (node {}, addr {})",
+                expected, got.0, got.1, node, addr
+            ),
+            PipelineError::Incomplete { covered, total } => write!(
+                f, "Pipeline incomplete: covered layers 0..{} but model has {} layers",
+                covered, total
+            ),
+        }
+    }
+}
+
+/// Turn a flat list of announced shards into a runnable pipeline: one entry
+/// per layer range in walk order, each carrying its full replica list ordered
+/// best-first.
+///
+/// This is THE pipeline planner. /inference/run_sharded, /inference/run_consensus
+/// and /inference/auto all call it, because three separate implementations of
+/// this logic is exactly how the live network ended up with three different
+/// answers to "is the pipeline complete?":
+///
+///   - run_sharded had the repaired version (commit 30b3113).
+///   - run_consensus — the endpoint the desktop actually calls — still had the
+///     pre-30b3113 version: it PRESERVED a stub-only bucket instead of dropping
+///     it, and its coverage walk had no overlap skip. That is the source of
+///     "Pipeline gap: expected layer 32 next, got [28, 30)" on every coordinator
+///     whenever the retired SAO/JNB shards were still registered.
+///   - /inference/auto walked the raw replica list with no dedupe at all, so on
+///     a 3x-replicated network the second [0, 6) replica made `contiguous`
+///     false immediately. `has_full_pipeline` was therefore false for ANY
+///     replication factor > 1 and /inference/auto never once took its own
+///     documented best path.
+///
+/// Steps, in order:
+///   1. bucket announcements by (start_layer, end_layer);
+///   2. dedupe per node_name inside each bucket, preferring a routable addr
+///      over a stub (a rebooted coordinator's self-announce and the gossiped
+///      copy land under different registry keys);
+///   3. drop stub addrs UNCONDITIONALLY, then drop buckets left empty. The old
+///      run_consensus kept a stub "as a fallback" when no routable replica
+///      existed — that is how a community worker announcing 127.0.0.1:9090
+///      with an off-grid [0, 8) range became the only candidate for layer 0
+///      and walked the pipeline off the rails. Honest failure beats fake
+///      liveness;
+///   4. order each bucket by fresh EWMA latency;
+///   5. greedy contiguous cover from layer 0, skipping any range that starts
+///      inside already-covered territory (an off-grid [0, 8) alongside the
+///      standard [0, 6)/[6, 12) tiling must not manufacture a false gap).
+///
+/// The returned Vec IS the pipeline: callers index prefill workers, the decode
+/// loop, the trace and cleanup off this one vector. Previously run_sharded
+/// built a filtered `pipeline` for some of those and indexed the UNFILTERED
+/// `pipeline_ranges` for the others, so any off-grid range silently shifted
+/// the walk by one hop.
+pub fn assemble_pipeline(
+    announced: Vec<ShardInfo>,
+    stats: &dashmap::DashMap<String, LatencyEWMA>,
+) -> Result<Vec<PipelineHop>, PipelineError> {
+    let mut by_range: std::collections::BTreeMap<(usize, usize), Vec<ShardInfo>> =
+        std::collections::BTreeMap::new();
+    for s in announced {
+        let key = (s.start_layer, s.end_layer);
+        let bucket = by_range.entry(key).or_default();
+        match bucket.iter().position(|existing| existing.node_name == s.node_name) {
+            None => bucket.push(s),
+            Some(i) => {
+                if is_stub_socket_addr(&bucket[i].socket_addr) && !is_stub_socket_addr(&s.socket_addr) {
+                    bucket[i] = s;
+                }
+            }
+        }
+    }
+
+    by_range.retain(|_, bucket| {
+        bucket.retain(|s| !is_stub_socket_addr(&s.socket_addr));
+        !bucket.is_empty()
+    });
+    for bucket in by_range.values_mut() {
+        sort_replicas_by_latency(bucket, stats);
+    }
+
+    // BTreeMap already iterates in (start, end) order, so the SHORTEST range
+    // beginning at each layer is seen first.
+    let candidates: Vec<PipelineHop> = by_range.into_iter().collect();
+    if candidates.is_empty() {
+        return Err(PipelineError::NoShards);
+    }
+
+    let n_layers = candidates[0].1[0].total_layers;
+    let mut chosen: Vec<PipelineHop> = Vec::with_capacity(candidates.len());
+    let mut covered_to = 0usize;
+    for ((start, end), replicas) in candidates {
+        if covered_to >= n_layers {
+            break;
+        }
+        if start < covered_to {
+            // Overlaps a range we already took: a duplicate, or an off-grid
+            // alternative we chose not to walk.
+            continue;
+        }
+        if start != covered_to {
+            return Err(PipelineError::Gap {
+                expected: covered_to,
+                got: (start, end),
+                node: replicas[0].node_name.clone(),
+                addr: replicas[0].socket_addr.clone(),
+            });
+        }
+        covered_to = end;
+        chosen.push(((start, end), replicas));
+    }
+    if covered_to != n_layers {
+        return Err(PipelineError::Incomplete { covered: covered_to, total: n_layers });
+    }
+    Ok(chosen)
+}
+
+/// `assemble_pipeline` against this node's live registry.
+pub fn assemble_pipeline_for(node: &NodeState) -> Result<Vec<PipelineHop>, PipelineError> {
+    assemble_pipeline(fresh_shards(&node.shard_registry), &node.latency_stats)
 }
 
 /// Build a `NodeState` from components.
@@ -350,6 +687,23 @@ pub fn build_node_state(
         community_work_tx: None,
         community_work_queue: None,
         community_work_results: None,
+        // One client, one connection pool, for the life of the process.
+        // `pool_idle_timeout` is deliberately longer than the 15 s shard
+        // announcement tick so an idle inter-seed connection survives between
+        // requests. Falls back to a default client if the builder ever fails
+        // (it can't in practice — no TLS backend selection happens here).
+        inference_http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
+            .build()
+            .unwrap_or_default(),
+        sharded_cache_hits: Arc::new(AtomicU64::new(0)),
+        sharded_run_meta: Arc::new(dashmap::DashMap::new()),
+        compute_pool: Arc::new(parking_lot::RwLock::new(None)),
+        compute_threads: Arc::new(AtomicU32::new(0)),
+        seed_rpc_addrs: Arc::new(Vec::new()),
+        last_registry_bootstrap: Arc::new(Mutex::new(None)),
     }
 }
 
@@ -375,6 +729,12 @@ pub async fn serve(
     dag_round: Option<Arc<AtomicU64>>,
     dag_committed: Option<Arc<AtomicU64>>,
     shard_infos: Vec<ShardInfo>,
+    // seed_rpc_addrs: seed RPC endpoints ("host:9090") used to bootstrap the
+    //   shard registry when this node is asked to coordinate but only knows
+    //   its own shards.
+    // compute_threads: dedicated inference-pool width; 0 = rayon's global pool.
+    seed_rpc_addrs: Vec<String>,
+    compute_threads: usize,
 ) -> anyhow::Result<()> {
     let mut node = build_node_state(state, mempool, validator_address, validator_keypair, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
     if let Some(dv) = dag_validators {
@@ -402,6 +762,7 @@ pub async fn serve(
     node.community_work_results = Some(Arc::new(dashmap::DashMap::new()));
 
     node.shard_infos = shard_infos.clone();
+    node.seed_rpc_addrs = Arc::new(seed_rpc_addrs);
     // Seed the local registry with every range this node holds so /shards
     // reports the full picture the moment RPC comes up. The registry is
     // keyed by (socket_addr + range) so two entries with the same socket but
@@ -411,11 +772,135 @@ pub async fn serve(
         node.shard_registry.insert(key, (si.clone(), std::time::Instant::now()));
     }
 
+    // ── Dedicated inference compute pool ────────────────────────────────
+    if compute_threads > 0 {
+        match set_compute_threads(&node, compute_threads) {
+            Ok(n) => tracing::info!("Inference compute pool: {} threads (--threads)", n),
+            Err(e) => tracing::warn!("could not build {}-thread compute pool: {}", compute_threads, e),
+        }
+    } else {
+        tracing::info!(
+            "Inference compute pool: rayon global ({} threads; set RAYON_NUM_THREADS \
+             or --threads N, or POST /node/threads at runtime)",
+            rayon_global_width()
+        );
+    }
+
+    // ── Coordinator shard-registry puller ───────────────────────────────
+    // A node that holds no shards of its own never learned the network's
+    // topology: the announce/pull background tasks in main.rs are gated on
+    // `!shard_infos.is_empty()`, so a pure coordinator's registry stayed empty
+    // and every sharded request failed with "Pipeline incomplete" even though
+    // the seeds collectively cover the whole model. Requests also bootstrap
+    // on demand; this keeps a warm registry so the FIRST request is fast too.
+    //
+    // GET only. This never writes to a remote node.
+    if node.shard_infos.is_empty() && !node.seed_rpc_addrs.is_empty() {
+        let puller = node.clone();
+        tokio::spawn(async move {
+            loop {
+                bootstrap_shard_registry_from_seeds(&puller).await;
+                tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            }
+        });
+        tracing::info!(
+            seeds = node.seed_rpc_addrs.len(),
+            "coordinator mode: pulling shard topology from seeds every 20s (GET /shards)"
+        );
+    }
+
+    // ── Background replica latency refresher ────────────────────────────
+    // The EWMA map used to be insert-only, so one bad incident pinned a
+    // replica's ordering forever: run_sharded only dialled replicas[0], the
+    // demoted replica received no further samples, and nothing ever
+    // re-measured it. LHR carried an EWMA of 37,276 ms on all six seeds
+    // while answering its own hops in 180-410 ms.
+    //
+    // This task GETs /health (read-only, no side effects) on every socket in
+    // the registry once a minute. It never invents a hop latency: a probe RTT
+    // is only used to (a) provide a provisional ordering hint for a replica we
+    // have no hop sample for at all, or (b) evict a recorded EWMA that the
+    // probe proves is a fossil. See `probe_supersedes_recorded`.
+    {
+        let probe_node = node.clone();
+        tokio::spawn(async move {
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("latency prober disabled: {}", e);
+                    return;
+                }
+            };
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    LATENCY_PROBE_INTERVAL_SECS,
+                ))
+                .await;
+
+                let mut sockets: Vec<String> = fresh_shards(&probe_node.shard_registry)
+                    .into_iter()
+                    .map(|s| s.socket_addr)
+                    .filter(|a| !is_stub_socket_addr(a))
+                    .collect();
+                sockets.sort();
+                sockets.dedup();
+
+                for socket in sockets {
+                    let t0 = std::time::Instant::now();
+                    let ok = client
+                        .get(format!("http://{}/health", socket))
+                        .send()
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false);
+                    if !ok {
+                        // Unreachable: leave the recorded value alone. The
+                        // hop path's failover already handles a dead replica,
+                        // and inventing a latency for it would be a lie.
+                        continue;
+                    }
+                    let probe_ms = t0.elapsed().as_millis() as u64;
+
+                    let recorded = probe_node
+                        .latency_stats
+                        .get(&socket)
+                        .map(|v| (v.ms, v.probe_only));
+                    match recorded {
+                        Some((ms, false)) if probe_supersedes_recorded(ms, probe_ms) => {
+                            probe_node.latency_stats.remove(&socket);
+                            record_probe_latency(
+                                &probe_node.latency_stats,
+                                &socket,
+                                probe_ms,
+                            );
+                            tracing::info!(
+                                socket = %socket,
+                                stale_ewma_ms = ms,
+                                probe_ms,
+                                "replica latency looked poisoned (health RTT contradicts it); \
+                                 reset to a provisional probe value so it can be re-measured"
+                            );
+                        }
+                        Some((_, false)) => { /* plausible hop sample: keep it */ }
+                        _ => record_probe_latency(&probe_node.latency_stats, &socket, probe_ms),
+                    }
+                }
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/", get(index))
         .route("/health", get(health))
         .route("/info", get(chain_info))
         .route("/node/info", get(node_info))
+        // Runtime inference width. GET reports the current pool; POST
+        // rebuilds it live, which is how an operator "adds two cores"
+        // mid-demo without restarting the node.
+        .route("/node/threads", get(get_node_threads).post(set_node_threads))
         .route("/block/latest", get(get_latest_block))
         .route("/block/{height}", get(get_block))
         .route("/account/{address}", get(get_account))
@@ -1577,7 +2062,11 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         "validators": validators,
         "connected_peers": peers,
         "uptime_secs": uptime,
+        // Real pipeline walks only. Cache hits are counted separately —
+        // folding them in here is what inflated every "distributed inference
+        // served" figure the dashboard showed.
         "sharded_runs_total": sharded_runs,
+        "sharded_cache_hits_total": node.sharded_cache_hits.load(Ordering::Relaxed),
         "sharded_bytes_total": sharded_bytes,
     }))
 }
@@ -3924,10 +4413,27 @@ async fn inference_run(
     tokens_with_bos.extend(&prompt_tokens);
 
     // Run inference - use candle float backend if available, else integer engine
+    // Both engines' `generate` is a fully synchronous prefill + decode loop
+    // over max_tokens, so calling it directly from the async handler pinned a
+    // tokio worker thread for tens of seconds. With the default
+    // worker_threads == core count, a handful of concurrent /inference/run
+    // calls occupied every runtime thread and stalled DAG gossip, consensus
+    // and all other RPC on the node. Both paths now go through
+    // spawn_blocking, and inside it through the configurable compute pool.
     let (generated_tokens, output_hash, engine_name) = if let (Some(engine), Some(mid)) = (&node.candle_engine, &node.candle_model_id) {
         // Candle Q4 float backend - coherent output, deterministic on same arch
-        let result = engine.generate(mid, &tokens_with_bos, max_tokens)
-            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Inference failed: {}", e)))?;
+        let engine_c = engine.clone();
+        let mid_c = *mid;
+        let toks = tokens_with_bos.clone();
+        let pool_node = node.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            install_on_compute_pool(&pool_node, move || {
+                engine_c.generate(&mid_c, &toks, max_tokens)
+            })
+        })
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Inference failed: {}", e)))?;
         let gen_tokens: Vec<u32> = result.output.chunks(4)
             .map(|c| u32::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0),
                 c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]))
@@ -3941,7 +4447,16 @@ async fn inference_run(
         // I16 (default 2026-06-04+) this reports "INT16 integer …";
         // before that it reported "INT8" even when block-I8 was actually
         // running. Honest labels matter for "is INT16 working" debugging.
-        let (generated, hash) = model.generate(&tokens_with_bos, max_tokens, &model.config.eos_tokens);
+        let model_c = model.clone();
+        let toks = tokens_with_bos.clone();
+        let pool_node = node.clone();
+        let (generated, hash) = tokio::task::spawn_blocking(move || {
+            install_on_compute_pool(&pool_node, move || {
+                model_c.generate(&toks, max_tokens, &model_c.config.eos_tokens)
+            })
+        })
+        .await
+        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?;
         (generated, hash, model.effective_precision_label())
     };
 
@@ -3961,63 +4476,22 @@ async fn inference_run(
     let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
     let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
 
-    // Create InferenceAttestation transaction.
-    // Bump the per-node attestation_nonce so repeat-prompt attestations
-    // (same model_id + input_hash + output_hash) get unique tx_hashes and
-    // aren't deduped by the mempool.
-    let attester = node.validator_address;
-    let base_nonce = node.state.get_account(&attester)
-        .map(|a| a.nonce)
-        .unwrap_or(0);
-    let bump = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
-    let nonce = base_nonce + bump;
-
-    let mut tx = arc_types::Transaction {
-        tx_type: arc_types::TxType::InferenceAttestation,
-        from: attester,
-        nonce,
-        body: arc_types::TxBody::InferenceAttestation(
-            arc_types::transaction::InferenceAttestationBody {
-                model_id: model_id_hash,
-                input_hash,
-                output_hash,
-                challenge_period,
-                bond,
-                beneficiary: None,
-            },
-        ),
-        fee: 0,
-        gas_limit: 0,
-        hash: arc_crypto::Hash256::ZERO,
-        signature: arc_crypto::Signature::null(),
-        sig_verified: false,
-    };
-    // Sign with the validator keypair so this tx survives `pipeline.rs`'s
-    // verify stage on every peer. Setting `sig_verified=true` alone is not
-    // enough — pipeline.rs only inspects the signature bytes; null sigs
-    // always fail verification regardless of the flag.
-    let tx_hash = if let Some(kp) = node.validator_keypair.as_ref() {
-        match tx.sign(kp) {
-            Ok(()) => {
-                tx.sig_verified = true;
-                let h = tx.hash;
-                let _ = node.mempool.insert(tx);
-                h
-            }
-            Err(e) => {
-                tracing::warn!("inference attestation sign failed: {:?}", e);
-                tx.compute_hash()
-            }
-        }
-    } else {
-        // Test fixture path: keep the legacy null-sig + sig_verified=true
-        // shape so unit tests that don't wire a keypair still execute.
-        tx.sig_verified = true;
-        let h = tx.compute_hash();
-        tx.hash = h;
-        let _ = node.mempool.insert(tx);
-        h
-    };
+    // Create + sign the InferenceAttestation transaction.
+    //
+    // The nonce comes from account state on every submission. It used to be
+    // `state_nonce + attestation_nonce.fetch_add(1)`, an in-process counter
+    // that accumulates forever — including across txs that never land — so
+    // once the first attestation applied, state advanced AND the counter
+    // advanced and every subsequent tx carried state+2. See
+    // `submit_inference_attestation` for the full postmortem.
+    let (tx_hash, attestation_status) = submit_inference_attestation(
+        &node,
+        model_id_hash,
+        input_hash,
+        output_hash,
+        bond,
+        challenge_period,
+    );
 
     // Store inference result for explorer display
     let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
@@ -4056,7 +4530,7 @@ async fn inference_run(
             "tx_hash": tx_hash_hex,
             "bond": bond,
             "challenge_period": challenge_period,
-            "status": "submitted_to_mempool",
+            "status": attestation_status,
         },
         "explorer_url": format!("/tx/0x{}", hex::encode(&tx_hash.0)),
     })))
@@ -4143,21 +4617,34 @@ async fn worker_earnings(
 
     let total_arc = count as f64 * REWARD_PER_ATTESTATION_ARC;
 
-    // Approximate "today" as the most recent 12% of attestations until we
-    // wire block timestamps into this query. Bounded to count so a worker
-    // with one attestation still shows it in "today."
-    let today_count = ((count as f64 * 0.12).round() as u64).max(if count > 0 { 1 } else { 0 });
-    let today_arc = today_count as f64 * REWARD_PER_ATTESTATION_ARC;
-
+    // "Today" is null, not invented.
+    //
+    // This used to report `round(count * 0.12)` attestations as today's, and
+    // derive today_arc from that. It is a fabrication with no relationship to
+    // when anything happened: a worker with one lifetime attestation reported
+    // identical Today and Lifetime; a worker with a hundred reported twelve
+    // today regardless of whether any of them were from this week. Computing
+    // it honestly needs a block_height → timestamp join this endpoint does
+    // not have yet, so until then the field says "unknown" by being null and
+    // the reason ships alongside it.
     Ok(Json(json!({
         "address": format!("0x{}", trimmed),
         "total_attestations": count,
         "total_arc": total_arc,
-        "today_arc": today_arc,
-        "today_attestations": today_count,
+        "today_arc": Value::Null,
+        "today_attestations": Value::Null,
+        "today_unavailable_reason":
+            "per-attestation timestamps are not exposed by this endpoint yet \
+             (needs a block_height -> block timestamp join)",
         "reward_per_attestation_arc": REWARD_PER_ATTESTATION_ARC,
         "last_attestation_block": last_block,
         "last_attestation_tx_hash": last_tx_hash,
+        // Be explicit that this is a scan of an in-memory, pruned map: on a
+        // non-archive node `full_transactions` only retains the last ~1000
+        // blocks and is empty after a restart, so a zero here means "not
+        // visible from this node", not "never earned".
+        "source": "scan of this node's in-memory full_transactions map",
+        "archive_mode": node.state.archive_mode,
     })))
 }
 
@@ -4270,7 +4757,7 @@ async fn inference_list_attestations(
 
     // Get latest block to find recent attestations
     let height = node.state.height();
-    let mut attestations = Vec::new();
+    let mut attestations: Vec<(Option<u64>, Value)> = Vec::new();
 
     // First: add inference results (highest priority - these are what users want to see)
     for entry in node.inference_results.iter() {
@@ -4284,6 +4771,7 @@ async fn inference_list_attestations(
             "inference": inf,
         });
         // Enrich with receipt data if available
+        let mut block_height: Option<u64> = None;
         if let Ok(hash_bytes) = hex::decode(hash_clean) {
             if hash_bytes.len() == 32 {
                 let mut key = [0u8; 32];
@@ -4291,78 +4779,73 @@ async fn inference_list_attestations(
                 if let Some(receipt) = node.state.get_receipt(&key) {
                     att["block_height"] = json!(receipt.block_height);
                     att["gas_used"] = json!(receipt.gas_used);
+                    block_height = Some(receipt.block_height);
                 }
             }
         }
-        attestations.push(att);
-        if attestations.len() >= limit { break; }
+        attestations.push((block_height, att));
     }
 
-    // Then: scan on-chain InferenceAttestation transactions (cross-device visibility).
-    // This lets nodes that didn't run the inference themselves still show the
-    // attestation in their /inference/attestations feed, enabling cross-device
-    // aggregation in the dashboard.
+    // Then: scan on-chain InferenceAttestation transactions (cross-device
+    // visibility) so nodes that didn't run the inference themselves still
+    // show it.
+    //
+    // This endpoint no longer falls through to `_ => ("Other", None, None)`
+    // and emit plain transfers, settles and validator txs as "attestations".
+    // At limit=500 the live seeds returned 500 Other / 0 Inference (LAX, NRT)
+    // and the desktop stamped +2.50 ARC on every one of those rows, rendering
+    // 500 fake earnings lines under three cards reading 0.00 ARC. Non-inference
+    // history already has a home: /account/{addr}/txs.
     for entry in node.state.full_transactions.iter() {
-        if attestations.len() >= limit { break; }
         let hash = entry.key();
         let tx = entry.value();
         let tx_hex = format!("0x{}", hex::encode(hash));
         // Skip if already added from local inference_results cache
         if node.inference_results.contains_key(&tx_hex) { continue; }
 
-        // Inference attestations from other devices - include with hashes
-        if let TxBody::InferenceAttestation(body) = &tx.body {
-            let att = json!({
-                "tx_hash": tx_hex,
-                "tx_type": "Inference",
-                "success": true,
-                "from": tx.from.to_hex(),
-                "block_height": node.state.get_receipt(hash).map(|r| r.block_height),
-                "inference": {
-                    "model_hash": format!("0x{}", hex::encode(&body.model_id.0)),
-                    "input_hash": format!("0x{}", hex::encode(&body.input_hash.0)),
-                    "output_hash": format!("0x{}", hex::encode(&body.output_hash.0)),
-                    "bond": body.bond,
-                    "challenge_period": body.challenge_period,
-                    "deterministic": true,
-                    // input/output text not on-chain; hashes only
-                    "input": format!("[cross-device: hash {}]", hex::encode(&body.input_hash.0)[..16].to_string()),
-                    "output": format!("[hash {}]", hex::encode(&body.output_hash.0)[..16].to_string()),
-                    "model": "on-chain attestation",
-                }
-            });
-            attestations.push(att);
-            continue;
-        }
-
-        if let Some(receipt) = node.state.get_receipt(hash) {
-            if !receipt.success { continue; } // Only show successful txs
-
-            let (tx_type, to, amount) = match &tx.body {
-                TxBody::Transfer(b) => {
-                    let label = if b.amount >= 10_000 { "Faucet" } else { "Transfer" };
-                    (label, Some(b.to.to_hex()), Some(b.amount))
-                }
-                TxBody::Settle(b) => ("Settle", Some(b.agent_id.to_hex()), Some(b.amount)),
-                _ => ("Other", None, None),
-            };
-            let mut att = json!({
-                "tx_hash": tx_hex,
-                "tx_type": tx_type,
-                "from": tx.from.to_hex(),
-                "success": true,
-                "block_height": receipt.block_height,
-                "gas_used": receipt.gas_used,
-            });
-            if let Some(to) = to { att["to"] = json!(to); }
-            if let Some(amt) = amount { att["amount"] = json!(amt); }
-            attestations.push(att);
-        }
+        let TxBody::InferenceAttestation(body) = &tx.body else { continue };
+        let block_height = node.state.get_receipt(hash).map(|r| r.block_height);
+        let att = json!({
+            "tx_hash": tx_hex,
+            "tx_type": "Inference",
+            "success": true,
+            "from": tx.from.to_hex(),
+            "block_height": block_height,
+            "inference": {
+                "model_hash": format!("0x{}", hex::encode(&body.model_id.0)),
+                "input_hash": format!("0x{}", hex::encode(&body.input_hash.0)),
+                "output_hash": format!("0x{}", hex::encode(&body.output_hash.0)),
+                "bond": body.bond,
+                "challenge_period": body.challenge_period,
+                "deterministic": true,
+                // input/output text not on-chain; hashes only
+                "input": format!("[cross-device: hash {}]", hex::encode(&body.input_hash.0)[..16].to_string()),
+                "output": format!("[hash {}]", hex::encode(&body.output_hash.0)[..16].to_string()),
+                "model": "on-chain attestation",
+            }
+        });
+        attestations.push((block_height, att));
     }
 
+    // Newest first. Previously the order was DashMap iteration order — i.e.
+    // hash order, i.e. arbitrary — so "recent attestations" was recent only
+    // by accident, and truncating to `limit` kept an arbitrary subset rather
+    // than the newest ones. Un-mined attestations (no receipt yet) sort to
+    // the front: they are the most recent thing that happened.
+    attestations.sort_by(|a, b| match (a.0, b.0) {
+        (Some(x), Some(y)) => y.cmp(&x),
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    let total_matched = attestations.len();
+    attestations.truncate(limit);
+    let rows: Vec<Value> = attestations.into_iter().map(|(_, v)| v).collect();
+
     Ok(Json(json!({
-        "attestations": attestations,
-        "count": attestations.len(),
+        "attestations": rows,
+        "count": rows.len(),
+        "total_matched": total_matched,
         "chain_height": height,
     })))
 }
@@ -4450,7 +4933,12 @@ async fn inference_cache_stats(
         "size": node.inference_cache.len(),
         "capacity": node.inference_cache.capacity(),
         "total_hits": node.inference_cache.total_hits(),
+        // Sharded requests served WITHOUT walking the pipeline. Tracked apart
+        // from sharded_runs_total so neither number lies about the other.
+        "sharded_cache_hits_total": node.sharded_cache_hits.load(Ordering::Relaxed),
+        "sharded_runs_total": node.sharded_runs_total.load(Ordering::Relaxed),
         "cache_type": "DistributedCache (BLAKE3-keyed, deterministic, LRU)",
+        "bypass": "POST /inference/run_sharded with \"force_recompute\": true to walk the pipeline anyway",
     }))
 }
 
@@ -4469,6 +4957,16 @@ async fn inference_latency_stats(
             "ewma_ms": (stat.ms * 100.0).round() / 100.0,
             "samples": stat.count,
             "age_secs": stat.last_updated.elapsed().as_secs(),
+            // Whether the router will ACT on this figure. Samples past
+            // LATENCY_STALE_SECS are treated as unknown rather than as fact —
+            // the map used to be insert-only, so ten-hour-old numbers still
+            // steered every dispatch.
+            "in_use": effective_latency_ms(&stat).is_some(),
+            "stale_after_secs": LATENCY_STALE_SECS,
+            // "hop" = measured forward_shard round trip. "probe" = provisional
+            // value from a GET /health RTT, used only where no hop sample
+            // exists or where the recorded one was contradicted by the probe.
+            "source": if stat.probe_only { "probe" } else { "hop" },
         }));
     }
     entries.sort_by(|a, b| {
@@ -4616,13 +5114,53 @@ async fn inference_forward_shard(
     let node_name = shard.node_name.clone();
 
     let t0 = std::time::Instant::now();
-    let result = tokio::task::spawn_blocking(move || -> Result<ShardOutput, String> {
-        let cache_arc = cache_arc;
-        let mut cache = cache_arc.lock().map_err(|e| format!("KV lock: {}", e))?;
-        Ok(model_clone.forward_shard_token(input, &mut *cache, start_layer, end_layer, position))
-    }).await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let pool_node = node.clone();
+    // `install_on_compute_pool` puts the whole forward pass — including the
+    // par_iter over attention heads and every matmul's par_chunks_mut — on
+    // this node's configured rayon pool, so POST /node/threads changes real
+    // CPU utilisation on the very next request.
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<ShardOutput, arc_inference::cached_integer_model::ShardForwardError> {
+            install_on_compute_pool(&pool_node, move || {
+                // The KV lock is taken INSIDE the pool job (a MutexGuard is
+                // not Send, so it cannot cross into the pool). Concurrent
+                // jobs for the same request_id serialize here; they cannot
+                // deadlock, because a queued job holds no lock and the
+                // holder is always a running job that will finish.
+                let mut cache = match cache_arc.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                model_clone.forward_shard_token(input, &mut cache, start_layer, end_layer, position)
+            })
+        },
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?;
+
+    // A refused forward is a 409, not a 500: the request is well-formed, this
+    // REPLICA is just not in a state to serve it. The coordinator matches on
+    // the `kind` string to decide whether to drop this replica for the rest
+    // of the request (cold KV cache) or merely retry elsewhere.
+    let result = result.map_err(|e| {
+        let status = match e {
+            arc_inference::cached_integer_model::ShardForwardError::KvCacheOutOfSync { .. } => {
+                StatusCode::CONFLICT
+            }
+            arc_inference::cached_integer_model::ShardForwardError::LayerNotLoaded { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+            _ => StatusCode::BAD_REQUEST,
+        };
+        tracing::warn!(
+            request_id = %req_id,
+            position,
+            range = %format!("[{}, {})", start_layer, end_layer),
+            "forward_shard refused: {}",
+            e
+        );
+        (status, format!("{} ({})", e, e.kind()))
+    })?;
     let compute_ms = t0.elapsed().as_millis() as u64;
 
     // Optionally evict cache after the last token
@@ -4662,161 +5200,1087 @@ async fn inference_forward_shard(
     Ok(Json(response))
 }
 
+// ─── Sharded pipeline execution engine ─────────────────────────────────────
+//
+// One implementation, two endpoints. /inference/run_sharded and
+// /inference/run_consensus differ ONLY in the per-hop replica strategy they
+// pass in; both get the pipelined prefill, the accumulated trace, the shared
+// HTTP client and the parallel cleanup.
+//
+// Before this, run_consensus — the endpoint the desktop actually calls — had
+// its own fully sequential prefill: every prompt position walked all six hops
+// end-to-end before the next position started, and each hop waited for ALL k
+// replicas. That is the ~54-112 s/token the desktop's own comment records.
+
+/// Depth of each inter-shard prefill channel.
+///
+/// Was `(prompt_len + 4).max(16)`. Each queued item carries a d_model = 4096
+/// `Vec<i64>` — 32 KB — so with prompt_len in the thousands a fast shard
+/// feeding a slow one could queue 100+ MB per channel on the coordinator.
+/// Depth beyond `num_shards` buys nothing for pipeline fill anyway; a small
+/// constant keeps backpressure reaching the feed loop.
+const PREFILL_CHANNEL_DEPTH: usize = 16;
+
+/// Timeout for the fire-and-forget end-of-request KV cleanup fan-out.
+const CLEANUP_TIMEOUT_SECS: u64 = 3;
+
+/// Minimum gap between shard-registry bootstrap sweeps against the seeds.
+const REGISTRY_BOOTSTRAP_MIN_INTERVAL_SECS: u64 = 15;
+
+/// How a single hop chooses among the replicas holding its layer range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopStrategy {
+    /// One request in flight: try replicas in order, rotate on failure.
+    Failover,
+    /// Contact `fanout` replicas at once and return as soon as `needed` of
+    /// them agree on the output hash.
+    ///   `needed == 1`          → hedged: first valid answer wins.
+    ///   `needed == fanout/2+1` → k-of-n hash majority (run_consensus).
+    Fanout { fanout: usize, needed: usize },
+}
+
+/// Per-range consensus record for one position.
+#[derive(serde::Serialize, Clone)]
+pub struct RangeVote {
+    pub position: usize,
+    pub range: (usize, usize),
+    pub replicas_contacted: Vec<String>,
+    pub replicas_returned: Vec<String>,
+    pub majority_hash: Option<String>,
+    pub divergent: Vec<(String, String)>,
+    /// "unanimous" | "majority" | "split" | "no_response"
+    pub agreement: String,
+}
+
+/// What one hop produced.
+struct HopOutcome {
+    hidden: Option<Vec<i64>>,
+    hidden_hash: Option<String>,
+    is_terminal: bool,
+    token_id: Option<u32>,
+    served_by: String,
+    compute_ms: u64,
+    wall_ms: u64,
+    layers_processed: u64,
+    req_bytes: usize,
+    resp_bytes: usize,
+    vote: Option<RangeVote>,
+    /// Replicas that answered `kv_cache_out_of_sync`. They are cold for this
+    /// request_id and must not be contacted again for it.
+    cold: Vec<String>,
+}
+
+/// Running totals for one pipeline hop across every position of a request.
+#[derive(Default, Clone)]
+struct HopStats {
+    positions: u64,
+    compute_ms: u64,
+    wall_ms: u64,
+    req_bytes: u64,
+    resp_bytes: u64,
+    layers: u64,
+    is_terminal: bool,
+    served_by: std::collections::BTreeMap<String, u64>,
+}
+
+impl HopStats {
+    fn fold(&mut self, o: &HopOutcome) {
+        self.positions += 1;
+        self.compute_ms += o.compute_ms;
+        self.wall_ms += o.wall_ms;
+        self.req_bytes += o.req_bytes as u64;
+        self.resp_bytes += o.resp_bytes as u64;
+        self.layers = o.layers_processed;
+        self.is_terminal |= o.is_terminal;
+        *self.served_by.entry(o.served_by.clone()).or_insert(0) += 1;
+    }
+}
+
+/// One forward_shard call. Returns the parsed response plus the exact number
+/// of bytes on the wire in each direction, or a typed failure.
+///
+/// `Err(true)` in the tuple position means "this replica is COLD for this
+/// request_id" — it reported `kv_cache_out_of_sync`, so its KV cache does not
+/// line up with the position we asked for and it can never serve this request
+/// again. That happens after a failover or an aborted hedge, and before the
+/// engine-side guard existed it was an out-of-bounds read in
+/// `flash_attention_i64` rather than an error.
+async fn forward_shard_once(
+    client: &reqwest::Client,
+    socket: &str,
+    body: &[u8],
+) -> Result<(ForwardShardResponse, usize), (String, bool)> {
+    let url = format!("http://{}/inference/forward_shard", socket);
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body(body.to_vec())
+        .send()
+        .await
+        .map_err(|e| (format!("send: {}", e), false))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        // The shard holder tags a cold cache with this stable string; see
+        // ShardForwardError::kind().
+        let is_cold = text.contains("kv_cache_out_of_sync");
+        return Err((format!("http {}: {}", status, text.trim()), is_cold));
+    }
+
+    // Read the body as bytes so the response payload can be measured exactly.
+    // `total_bytes_transferred` previously counted only REQUEST bodies, which
+    // undercounted the true wire cost by roughly half — the hidden state comes
+    // back the same size it went out.
+    let raw = resp.bytes().await.map_err(|e| (format!("body: {}", e), false))?;
+    let parsed: ForwardShardResponse = serde_json::from_slice(&raw)
+        .map_err(|e| (format!("parse: {}", e), false))?;
+    Ok((parsed, raw.len()))
+}
+
+/// Execute one pipeline hop under `strategy`.
+///
+/// `replicas` is this hop's live candidate list; the function rotates it so a
+/// working replica stays at the front, and the caller keeps the same Vec
+/// across positions so the choice is sticky (which matters: forward_shard is
+/// stateful per request_id, so bouncing between replicas is what makes a KV
+/// cache go cold in the first place).
+async fn pipeline_hop(
+    client: &reqwest::Client,
+    replicas: &mut Vec<ShardInfo>,
+    strategy: HopStrategy,
+    req: &ForwardShardRequest,
+    lat_stats: &Arc<dashmap::DashMap<String, LatencyEWMA>>,
+    want_vote: bool,
+) -> Result<HopOutcome, String> {
+    let body = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+    let req_bytes = body.len();
+
+    match strategy {
+        HopStrategy::Failover => {
+            let mut last_err = String::new();
+            let mut cold: Vec<String> = Vec::new();
+            let mut attempts = 0usize;
+            while attempts < replicas.len() {
+                let shard = replicas[0].clone();
+                let t_hop = std::time::Instant::now();
+                match forward_shard_once(client, &shard.socket_addr, &body).await {
+                    Ok((resp, resp_bytes)) => {
+                        let wall_ms = t_hop.elapsed().as_millis() as u64;
+                        record_latency(lat_stats, &shard.socket_addr, wall_ms);
+                        return Ok(HopOutcome {
+                            hidden: resp.hidden,
+                            hidden_hash: resp.hidden_hash,
+                            is_terminal: resp.is_terminal,
+                            token_id: resp.token_id,
+                            served_by: shard.node_name.clone(),
+                            compute_ms: resp.compute_ms,
+                            wall_ms,
+                            layers_processed: resp.layers_processed as u64,
+                            req_bytes,
+                            resp_bytes,
+                            vote: None,
+                            cold,
+                        });
+                    }
+                    Err((e, is_cold)) => {
+                        last_err = format!(
+                            "range [{}, {}) replica {} ({}): {}",
+                            req.start_layer, req.end_layer, shard.node_name, shard.socket_addr, e
+                        );
+                        if is_cold {
+                            cold.push(shard.socket_addr.clone());
+                            replicas.retain(|r| r.socket_addr != shard.socket_addr);
+                            // Removing shrinks the list; don't advance attempts.
+                            continue;
+                        }
+                        attempts += 1;
+                        replicas.rotate_left(1);
+                    }
+                }
+            }
+            if !cold.is_empty() && req.position > 0 {
+                // Be explicit about WHY this is unrecoverable, because it
+                // looks like a transient failure and isn't. forward_shard is
+                // stateful per request_id: a replica that missed positions
+                // 0..p cannot serve p, and this coordinator does not replay
+                // history to it. The supported answer is to commit to more
+                // than one replica from the start.
+                return Err(format!(
+                    "range [{}, {}) at position {}: the serving replica failed mid-stream and \
+                     {} standby replica(s) rejected the handover with kv_cache_out_of_sync \
+                     (they never saw positions 0..{}, so their KV caches are cold for this \
+                     request). Re-send with \"redundancy\": 2 to keep a second replica warm \
+                     from position 0. Last error: {}",
+                    req.start_layer,
+                    req.end_layer,
+                    req.position,
+                    cold.len(),
+                    req.position,
+                    last_err
+                ));
+            }
+            Err(format!(
+                "All replicas failed for range [{}, {}) at position {}. Last error: {}",
+                req.start_layer, req.end_layer, req.position, last_err
+            ))
+        }
+
+        HopStrategy::Fanout { fanout, needed } => {
+            let use_n = fanout.min(replicas.len()).max(1);
+            let needed = needed.max(1).min(use_n);
+            let selected: Vec<ShardInfo> = replicas.iter().take(use_n).cloned().collect();
+
+            let mut set: tokio::task::JoinSet<(
+                ShardInfo,
+                u64,
+                Result<(ForwardShardResponse, usize), (String, bool)>,
+            )> = tokio::task::JoinSet::new();
+            for r in &selected {
+                let c = client.clone();
+                let b = body.clone();
+                let shard = r.clone();
+                set.spawn(async move {
+                    let t = std::time::Instant::now();
+                    let out = forward_shard_once(&c, &shard.socket_addr, &b).await;
+                    let wall = t.elapsed().as_millis() as u64;
+                    (shard, wall, out)
+                });
+            }
+
+            // Tally hashes AS THEY LAND and stop the moment `needed` agree.
+            // The old code collected with `for f in futs { f.await }`, so a hop
+            // could not return until the SLOWEST of k answered — with k=3 and
+            // exactly 3 replicas per range (the live topology, and the k the
+            // desktop sends) that made the latency-aware sort a complete no-op
+            // and every hop paid the worst replica. Cost per hop goes from
+            // max(k) to the k/2+1-th order statistic.
+            let mut returned: Vec<(ShardInfo, u64, ForwardShardResponse, usize)> = Vec::new();
+            let mut tally: HashMap<String, Vec<usize>> = HashMap::new();
+            let mut cold: Vec<String> = Vec::new();
+            let mut errors: Vec<String> = Vec::new();
+            let mut winner: Option<(String, Vec<usize>)> = None;
+
+            while let Some(joined) = set.join_next().await {
+                let (shard, wall_ms, out) = match joined {
+                    Ok(v) => v,
+                    Err(e) => {
+                        errors.push(format!("task join: {}", e));
+                        continue;
+                    }
+                };
+                match out {
+                    Ok((resp, resp_bytes)) => {
+                        record_latency(lat_stats, &shard.socket_addr, wall_ms);
+                        let hash = if resp.is_terminal {
+                            resp.logits_hash.clone()
+                        } else {
+                            resp.hidden_hash.clone()
+                        };
+                        let idx = returned.len();
+                        returned.push((shard, wall_ms, resp, resp_bytes));
+                        if let Some(h) = hash {
+                            let bucket = tally.entry(h.clone()).or_default();
+                            bucket.push(idx);
+                            if bucket.len() >= needed {
+                                winner = Some((h, bucket.clone()));
+                                break;
+                            }
+                        }
+                    }
+                    Err((e, is_cold)) => {
+                        if is_cold {
+                            cold.push(shard.socket_addr.clone());
+                        }
+                        errors.push(format!("{} ({}): {}", shard.node_name, shard.socket_addr, e));
+                    }
+                }
+            }
+
+            // Stragglers: drain them DETACHED rather than aborting.
+            //
+            // The point of racing is not to wait for them — that's already
+            // achieved by breaking out above. Actually cancelling them would
+            // be worse than useless here: forward_shard is stateful per
+            // request_id, so a replica that never receives position p is cold
+            // for p+1 onward. Letting the in-flight calls finish keeps every
+            // hedged replica's KV cache aligned (and refreshes its EWMA, which
+            // is how a recovered replica gets rediscovered).
+            if !set.is_empty() {
+                let stats = lat_stats.clone();
+                tokio::spawn(async move {
+                    let mut set = set;
+                    while let Some(Ok((shard, wall_ms, out))) = set.join_next().await {
+                        if out.is_ok() {
+                            record_latency(&stats, &shard.socket_addr, wall_ms);
+                        }
+                    }
+                });
+            }
+
+            for socket in &cold {
+                replicas.retain(|r| &r.socket_addr != socket);
+            }
+
+            let (majority_hash, members) = match winner {
+                Some((h, m)) => (Some(h), m),
+                None => {
+                    // Nobody reached `needed`. Report the largest agreeing
+                    // group so the vote record is still informative.
+                    match tally.into_iter().max_by_key(|(_, v)| v.len()) {
+                        Some((h, m)) => (Some(h), m),
+                        None => (None, Vec::new()),
+                    }
+                }
+            };
+
+            let vote = if want_vote {
+                let divergent: Vec<(String, String)> = returned
+                    .iter()
+                    .filter_map(|(s, _, r, _)| {
+                        let h = if r.is_terminal {
+                            r.logits_hash.clone()
+                        } else {
+                            r.hidden_hash.clone()
+                        };
+                        if h != majority_hash {
+                            Some((s.node_name.clone(), h.unwrap_or_default()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Some(RangeVote {
+                    position: req.position,
+                    range: (req.start_layer, req.end_layer),
+                    replicas_contacted: selected.iter().map(|s| s.node_name.clone()).collect(),
+                    replicas_returned: returned.iter().map(|(s, _, _, _)| s.node_name.clone()).collect(),
+                    majority_hash: majority_hash.clone(),
+                    divergent: divergent.clone(),
+                    agreement: if returned.is_empty() {
+                        "no_response".into()
+                    } else if members.len() == returned.len() {
+                        "unanimous".into()
+                    } else if members.len() >= needed {
+                        "majority".into()
+                    } else {
+                        "split".into()
+                    },
+                })
+            } else {
+                None
+            };
+
+            if members.is_empty() {
+                return Err(format!(
+                    "No replica responded for range [{}, {}) at position {}: {}",
+                    req.start_layer,
+                    req.end_layer,
+                    req.position,
+                    errors.join("; ")
+                ));
+            }
+            if members.len() < needed {
+                return Err(format!(
+                    "No majority for range [{}, {}) at position {} - {} of {} agreed (needed {})",
+                    req.start_layer,
+                    req.end_layer,
+                    req.position,
+                    members.len(),
+                    returned.len(),
+                    needed
+                ));
+            }
+
+            let (shard, wall_ms, resp, resp_bytes) = &returned[members[0]];
+            Ok(HopOutcome {
+                hidden: resp.hidden.clone(),
+                hidden_hash: resp.hidden_hash.clone(),
+                is_terminal: resp.is_terminal,
+                token_id: resp.token_id,
+                served_by: shard.node_name.clone(),
+                compute_ms: resp.compute_ms,
+                wall_ms: *wall_ms,
+                layers_processed: resp.layers_processed as u64,
+                req_bytes,
+                resp_bytes: *resp_bytes,
+                vote,
+                cold,
+            })
+        }
+    }
+}
+
+/// Everything one pipeline run produced.
+struct PipelineRun {
+    generated: Vec<u32>,
+    hop_stats: Vec<HopStats>,
+    total_bytes: usize,
+    votes: Vec<RangeVote>,
+}
+
+/// Item travelling between prefill worker tasks.
+#[derive(Debug)]
+struct PrefillFlow {
+    position: usize,
+    token: Option<u32>,
+    hidden: Option<Vec<i64>>,
+    hidden_hash: Option<String>,
+    terminal_token: Option<u32>,
+}
+
+/// Walk the pipeline: pipelined prefill over the prompt, then sequential
+/// autoregressive decode.
+///
+/// PREFILL streams every prompt position through per-hop mpsc worker tasks, so
+/// at steady state each shard is working on a different position. Wall time is
+/// ~(prompt_len + num_hops - 1) x per_hop instead of prompt_len x num_hops x
+/// per_hop.
+///
+/// DECODE stays sequential: each token depends on the previous token's logits,
+/// so there is nothing to overlap.
+#[allow(clippy::too_many_arguments)]
+async fn run_pipeline(
+    node: &NodeState,
+    model: &Arc<arc_inference::cached_integer_model::CachedIntegerModel>,
+    pipeline: &[PipelineHop],
+    request_id: &str,
+    all_tokens: &[u32],
+    max_tokens: u32,
+    strategy: HopStrategy,
+    collect_votes: bool,
+) -> Result<PipelineRun, String> {
+    let num_hops = pipeline.len();
+    let prompt_len = all_tokens.len();
+    let client = node.inference_http.clone();
+    let mut total_bytes: usize = 0;
+    let mut votes: Vec<RangeVote> = Vec::new();
+    let mut generated: Vec<u32> = Vec::new();
+
+    // Replica lists carried across the whole request so a working replica
+    // stays primary and cold replicas stay evicted.
+    let mut live_replicas: Vec<Vec<ShardInfo>> =
+        pipeline.iter().map(|(_, r)| r.clone()).collect();
+    let mut hop_stats: Vec<HopStats> = vec![HopStats::default(); num_hops];
+
+    // ─── Pipelined prefill ──────────────────────────────────────────────
+    {
+        use tokio::sync::mpsc;
+
+        let mut txs: Vec<mpsc::Sender<PrefillFlow>> = Vec::with_capacity(num_hops + 1);
+        let mut rxs: Vec<Option<mpsc::Receiver<PrefillFlow>>> = Vec::with_capacity(num_hops + 1);
+        for _ in 0..=num_hops {
+            let (tx, rx) = mpsc::channel::<PrefillFlow>(PREFILL_CHANNEL_DEPTH);
+            txs.push(tx);
+            rxs.push(Some(rx));
+        }
+
+        type WorkerOut = Result<(usize, HopStats, Vec<ShardInfo>, Vec<RangeVote>), String>;
+        let mut handles: Vec<tokio::task::JoinHandle<WorkerOut>> = Vec::with_capacity(num_hops);
+
+        for i in 0..num_hops {
+            let (start_layer, end_layer) = pipeline[i].0;
+            let mut replicas = live_replicas[i].clone();
+            let client_c = client.clone();
+            let req_id = request_id.to_string();
+            let mut rx = rxs[i].take().expect("rx slot populated");
+            let tx_out = txs[i + 1].clone();
+            let is_last = i == num_hops - 1;
+            let lat_stats = node.latency_stats.clone();
+
+            handles.push(tokio::spawn(async move {
+                let mut bytes: usize = 0;
+                let mut stats = HopStats::default();
+                let mut local_votes: Vec<RangeVote> = Vec::new();
+                while let Some(item) = rx.recv().await {
+                    let req = ForwardShardRequest {
+                        request_id: req_id.clone(),
+                        token: item.token,
+                        hidden: item.hidden,
+                        hidden_hash: item.hidden_hash,
+                        position: item.position,
+                        start_layer,
+                        end_layer,
+                        last_token: false,
+                    };
+                    let out = pipeline_hop(
+                        &client_c,
+                        &mut replicas,
+                        strategy,
+                        &req,
+                        &lat_stats,
+                        collect_votes,
+                    )
+                    .await?;
+                    bytes += out.req_bytes + out.resp_bytes;
+                    stats.fold(&out);
+                    if let Some(v) = out.vote.clone() {
+                        local_votes.push(v);
+                    }
+                    let flow = PrefillFlow {
+                        position: item.position,
+                        token: None,
+                        hidden: out.hidden,
+                        hidden_hash: out.hidden_hash,
+                        terminal_token: if is_last { out.token_id } else { None },
+                    };
+                    if tx_out.send(flow).await.is_err() {
+                        break;
+                    }
+                }
+                Ok((bytes, stats, replicas, local_votes))
+            }));
+        }
+
+        // Feed the prompt in. Backpressure from PREFILL_CHANNEL_DEPTH stops a
+        // fast head shard from queueing the whole prompt ahead of a slow one.
+        let input_tx = txs.remove(0);
+        drop(txs); // let workers observe EOF when their upstream finishes
+
+        let feeder = {
+            let tokens: Vec<u32> = all_tokens.to_vec();
+            tokio::spawn(async move {
+                for (pos, tok) in tokens.into_iter().enumerate() {
+                    let flow = PrefillFlow {
+                        position: pos,
+                        token: Some(tok),
+                        hidden: None,
+                        hidden_hash: None,
+                        terminal_token: None,
+                    };
+                    if input_tx.send(flow).await.is_err() {
+                        return false;
+                    }
+                }
+                drop(input_tx);
+                true
+            })
+        };
+
+        let mut final_rx = rxs[num_hops].take().expect("tail rx slot populated");
+        let mut positions_seen = 0usize;
+        let mut first_generated: Option<u32> = None;
+        while let Some(flow) = final_rx.recv().await {
+            positions_seen += 1;
+            if flow.position == prompt_len - 1 {
+                first_generated = flow.terminal_token;
+            }
+            if positions_seen >= prompt_len {
+                break;
+            }
+        }
+        let _ = feeder.await;
+
+        // Drain EVERY worker before surfacing an error, so a failure in one
+        // hop doesn't leave the others' JoinHandles dangling.
+        let mut worker_err: Option<String> = None;
+        for (i, h) in handles.into_iter().enumerate() {
+            match h.await {
+                Ok(Ok((bytes, stats, replicas, mut vs))) => {
+                    total_bytes += bytes;
+                    hop_stats[i] = stats;
+                    live_replicas[i] = replicas;
+                    votes.append(&mut vs);
+                }
+                Ok(Err(e)) => {
+                    if worker_err.is_none() {
+                        worker_err = Some(e);
+                    }
+                }
+                Err(e) => {
+                    if worker_err.is_none() {
+                        worker_err = Some(format!("join prefill worker {}: {}", i, e));
+                    }
+                }
+            }
+        }
+        if let Some(e) = worker_err {
+            return Err(e);
+        }
+        if positions_seen < prompt_len {
+            return Err(format!(
+                "Pipelined prefill incomplete: {}/{} positions arrived at the tail shard",
+                positions_seen, prompt_len
+            ));
+        }
+
+        if let Some(tok) = first_generated {
+            if !model.config.eos_tokens.contains(&tok) {
+                generated.push(tok);
+            }
+        }
+    }
+
+    // ─── Sequential decode ──────────────────────────────────────────────
+    for gen_idx in 1..(max_tokens as usize) {
+        if let Some(last) = generated.last() {
+            if model.config.eos_tokens.contains(last) {
+                break;
+            }
+        }
+        let position = prompt_len + gen_idx - 1;
+        let input_token = *generated.last().unwrap_or(&all_tokens[prompt_len - 1]);
+
+        let mut cur_hidden: Option<Vec<i64>> = None;
+        let mut cur_hash: Option<String> = None;
+        let mut next_tok: Option<u32> = None;
+
+        for (i, ((s_layer, e_layer), _)) in pipeline.iter().enumerate() {
+            let req = ForwardShardRequest {
+                request_id: request_id.to_string(),
+                token: if i == 0 { Some(input_token) } else { None },
+                hidden: if i == 0 { None } else { cur_hidden.take() },
+                hidden_hash: if i == 0 { None } else { cur_hash.take() },
+                position,
+                start_layer: *s_layer,
+                end_layer: *e_layer,
+                last_token: false,
+            };
+            let out = pipeline_hop(
+                &client,
+                &mut live_replicas[i],
+                strategy,
+                &req,
+                &node.latency_stats,
+                collect_votes,
+            )
+            .await?;
+            total_bytes += out.req_bytes + out.resp_bytes;
+            hop_stats[i].fold(&out);
+            if let Some(v) = out.vote.clone() {
+                votes.push(v);
+            }
+            if out.is_terminal {
+                next_tok = out.token_id;
+                break;
+            }
+            cur_hidden = out.hidden;
+            cur_hash = out.hidden_hash;
+        }
+
+        match next_tok {
+            Some(t) if model.config.eos_tokens.contains(&t) => break,
+            Some(t) => generated.push(t),
+            None => break,
+        }
+    }
+
+    Ok(PipelineRun { generated, hop_stats, total_bytes, votes })
+}
+
+/// Render the accumulated per-hop statistics as the response's `shard_trace`.
+///
+/// `compute_ms` / `wall_ms` are now TOTALS across every position of the
+/// request, not a snapshot of the first position, and `payload_bytes` is the
+/// real measured wire cost in BOTH directions (it was hardcoded to 0, so the
+/// dashboard's activation-flow view showed nothing per hop).
+fn render_shard_trace(pipeline: &[PipelineHop], stats: &[HopStats]) -> Vec<Value> {
+    pipeline
+        .iter()
+        .enumerate()
+        .map(|(hop, ((s, e), replicas))| {
+            let st = &stats[hop];
+            let primary = &replicas[0];
+            let served: Vec<Value> = st
+                .served_by
+                .iter()
+                .map(|(name, n)| json!({ "node": name, "positions": n }))
+                .collect();
+            let avg = |total: u64| -> u64 {
+                if st.positions == 0 { 0 } else { total / st.positions }
+            };
+            json!({
+                "hop": hop,
+                "node": st.served_by.keys().next().cloned().unwrap_or_else(|| primary.node_name.clone()),
+                "node_name": primary.node_name,
+                "socket": primary.socket_addr,
+                "layers": format!("{}..{}", s, e),
+                "layers_count": st.layers,
+                "positions": st.positions,
+                "compute_ms": st.compute_ms,
+                "wall_ms": st.wall_ms,
+                "avg_compute_ms": avg(st.compute_ms),
+                "avg_wall_ms": avg(st.wall_ms),
+                "payload_bytes": st.req_bytes + st.resp_bytes,
+                "request_bytes": st.req_bytes,
+                "response_bytes": st.resp_bytes,
+                "served_by": served,
+                "replica_count": replicas.len(),
+                "is_terminal": st.is_terminal,
+            })
+        })
+        .collect()
+}
+
+/// Fire the end-of-request KV-cache eviction at every replica of every range
+/// and return IMMEDIATELY.
+///
+/// This used to be `for range { for replica { ...send().await } }` on the
+/// 120-second inference client: 18 sequential round-trips on the live topology
+/// (6 ranges x 3 replicas), 4-10 s of dead tail latency appended to every
+/// request, three of them aimed at the replica with the worst EWMA. The
+/// response never depended on any of it.
+fn spawn_cleanup(node: &NodeState, pipeline: &[PipelineHop], request_id: &str) {
+    let client = node.inference_http.clone();
+    let request_id = request_id.to_string();
+    let sockets: Vec<String> = {
+        let mut s: Vec<String> = pipeline
+            .iter()
+            .flat_map(|(_, replicas)| replicas.iter().map(|r| r.socket_addr.clone()))
+            .collect();
+        s.sort();
+        s.dedup();
+        s
+    };
+    let _ = node.shard_kv_caches.remove(&request_id);
+    tokio::spawn(async move {
+        let payload = json!({ "request_id": request_id, "last_token": true });
+        let mut set = tokio::task::JoinSet::new();
+        for socket in sockets {
+            let c = client.clone();
+            let p = payload.clone();
+            set.spawn(async move {
+                let _ = c
+                    .post(format!("http://{}/inference/forward_shard", socket))
+                    .json(&p)
+                    .timeout(std::time::Duration::from_secs(CLEANUP_TIMEOUT_SECS))
+                    .send()
+                    .await;
+            });
+        }
+        while set.join_next().await.is_some() {}
+    });
+}
+
+/// Pull shard topology from the configured seeds into the local registry.
+///
+/// A freshly started node knows only the shards it holds itself, so asking it
+/// to coordinate a sharded run fails with "Pipeline incomplete" even though
+/// the seeds collectively cover the whole model. This merges what the seeds
+/// report so a local coordinator can drive the live shard-holders.
+///
+/// GET only — this never writes to a remote node.
+///
+/// Address hygiene: a remote node's `self_shards` entries usually carry
+/// `0.0.0.0:<port>` because it binds all interfaces and doesn't know its own
+/// public IP; for those (and only those) the serving seed's own host is the
+/// routable answer, so we substitute it. Stub addresses appearing in a seed's
+/// second-hand `shards` list are dropped outright — we have no idea whose
+/// loopback they are.
+async fn bootstrap_shard_registry_from_seeds(node: &NodeState) -> usize {
+    // Rate-limit. Matched to the shard announcement tick (15 s) and well
+    // under SHARD_REGISTRY_TTL_SECS (60 s), so a coordinator whose merged
+    // entries just aged out can refresh on the very next request instead of
+    // failing until the window reopens.
+    {
+        let mut last = match node.last_registry_bootstrap.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if let Some(t) = *last {
+            if t.elapsed().as_secs() < REGISTRY_BOOTSTRAP_MIN_INTERVAL_SECS {
+                return 0;
+            }
+        }
+        *last = Some(std::time::Instant::now());
+    }
+
+    let seeds = node.seed_rpc_addrs.clone();
+    if seeds.is_empty() {
+        return 0;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+
+    let mut merged = 0usize;
+    let now = std::time::Instant::now();
+    for seed in seeds.iter() {
+        let seed_host = seed.rsplit_once(':').map(|(h, _)| h).unwrap_or(seed.as_str());
+        let resp = match client.get(format!("http://{}/shards", seed)).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => continue,
+        };
+        let body: Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+
+        let mut candidates: Vec<ShardInfo> = Vec::new();
+        // The seed's OWN ranges: a stub here means "me", so map it onto the
+        // host we just talked to.
+        if let Some(arr) = body.get("self_shards").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Ok(mut si) = serde_json::from_value::<ShardInfo>(v.clone()) {
+                    if is_stub_socket_addr(&si.socket_addr) {
+                        let port = si
+                            .socket_addr
+                            .rsplit(':')
+                            .next()
+                            .and_then(|p| p.parse::<u16>().ok())
+                            .unwrap_or(9090);
+                        si.socket_addr = format!("{}:{}", seed_host, port);
+                    }
+                    candidates.push(si);
+                }
+            }
+        }
+        // The seed's second-hand view of everyone else. Stubs here are
+        // unresolvable — we cannot tell whose loopback they are.
+        if let Some(arr) = body.get("shards").and_then(|v| v.as_array()) {
+            for v in arr {
+                if let Ok(si) = serde_json::from_value::<ShardInfo>(v.clone()) {
+                    if !is_stub_socket_addr(&si.socket_addr) {
+                        candidates.push(si);
+                    }
+                }
+            }
+        }
+
+        for si in candidates {
+            if is_stub_socket_addr(&si.socket_addr) {
+                continue;
+            }
+            let key = format!("{}#{}-{}", si.socket_addr, si.start_layer, si.end_layer);
+            if node.shard_registry.insert(key, (si, now)).is_none() {
+                merged += 1;
+            }
+        }
+    }
+    if merged > 0 {
+        tracing::info!(
+            merged,
+            seeds = seeds.len(),
+            "shard registry bootstrapped from seeds (GET /shards)"
+        );
+    }
+    merged
+}
+
+/// Assemble the pipeline, falling back to a seed bootstrap when the local
+/// registry alone can't cover the model.
+async fn assemble_pipeline_with_bootstrap(
+    node: &NodeState,
+) -> Result<Vec<PipelineHop>, PipelineError> {
+    match assemble_pipeline_for(node) {
+        Ok(p) => Ok(p),
+        Err(first) => {
+            if bootstrap_shard_registry_from_seeds(node).await == 0 {
+                return Err(first);
+            }
+            assemble_pipeline_for(node)
+        }
+    }
+}
+
+/// Build, sign and submit an `InferenceAttestation` for a completed run.
+///
+/// Two defects used to live in the sharded copy of this code, and between
+/// them they meant 294 sharded runs produced zero on-chain attestations:
+///
+///  1. The tx was built with `hash: Hash256::ZERO` and `signature: null()`,
+///     `sig_verified` forced true, and `compute_hash()` called into a local
+///     variable that was never assigned back to `tx.hash`. arc-state rejects
+///     it as an unsigned transaction, the hash-integrity check fails, and
+///     because arc-mempool dedupes on `tx.hash.0`, every attestation after
+///     the first came back `Duplicate(0x00..0)`. `sig_verified = true` is not
+///     enough on its own: `pipeline.rs`'s verify stage inspects the signature
+///     BYTES and ignores the flag, so a null-signed tx fails on every peer.
+///
+///  2. The nonce was `state_nonce + attestation_nonce.fetch_add(1)`. The
+///     in-memory counter accumulates forever, including for txs that never
+///     land, so once the first attestation applied the account nonce advanced
+///     AND the counter advanced and every later tx carried state+2 → a
+///     permanent InvalidNonce gap. This is the exact failure already
+///     diagnosed and fixed for escrow release (see `submit_escrow_release`);
+///     the fix is the same one: read the account's current nonce per tx.
+///
+/// Returns `(tx_hash, status)` where status is what the response reports.
+fn submit_inference_attestation(
+    node: &NodeState,
+    model_id: Hash256,
+    input_hash: Hash256,
+    output_hash: Hash256,
+    bond: u64,
+    challenge_period: u64,
+) -> (Hash256, &'static str) {
+    let attester = node.validator_address;
+    let nonce = node
+        .state
+        .get_account(&attester)
+        .map(|a| a.nonce)
+        .unwrap_or(0);
+
+    let mut tx = arc_types::Transaction {
+        tx_type: arc_types::TxType::InferenceAttestation,
+        from: attester,
+        nonce,
+        body: arc_types::TxBody::InferenceAttestation(
+            arc_types::transaction::InferenceAttestationBody {
+                model_id,
+                input_hash,
+                output_hash,
+                challenge_period,
+                bond,
+                // Left None deliberately: the field is #[serde(skip)] and the
+                // 112-byte v0.7.2 wire layout depends on it staying that way.
+                beneficiary: None,
+            },
+        ),
+        fee: 0,
+        gas_limit: 0,
+        hash: arc_crypto::Hash256::ZERO,
+        signature: arc_crypto::Signature::null(),
+        sig_verified: false,
+    };
+
+    match node.validator_keypair.as_ref() {
+        Some(kp) => match tx.sign(kp) {
+            Ok(()) => {
+                // sign() assigns tx.hash as part of signing.
+                tx.sig_verified = true;
+                let h = tx.hash;
+                let _ = node.mempool.insert(tx);
+                (h, "submitted_to_mempool")
+            }
+            Err(e) => {
+                tracing::warn!("inference attestation sign failed: {:?}", e);
+                (tx.compute_hash(), "sign_failed")
+            }
+        },
+        None => {
+            // Test-fixture path: no keypair wired. Keep the legacy shape so
+            // unit tests still execute, but at least assign the hash so the
+            // mempool doesn't dedupe every one of them to 0x00..0.
+            tx.sig_verified = true;
+            let h = tx.compute_hash();
+            tx.hash = h;
+            let _ = node.mempool.insert(tx);
+            (h, "submitted_unsigned_no_keypair")
+        }
+    }
+}
+
+/// Canonical model identity string + hash for the loaded tokenizer/model.
+fn model_identity(
+    model: &arc_inference::cached_integer_model::CachedIntegerModel,
+) -> (String, Hash256) {
+    let data = format!(
+        "arc-{}L-{}d-{}h-{}v",
+        model.config.n_layers, model.config.d_model, model.config.n_heads, model.config.vocab_size
+    );
+    let hash = arc_crypto::hash_bytes(data.as_bytes());
+    (data, hash)
+}
+
 /// POST /inference/run_sharded
 /// Coordinator endpoint: walks the pipeline of shard-holding nodes and
 /// generates `max_tokens` tokens by forwarding hidden states between shards.
 ///
 /// Returns the full output, all per-shard timings, and the network bandwidth
 /// used so the dashboard can show the activation flow.
+///
+/// Request fields (all optional except `input`):
+///   input           string   the prompt
+///   max_tokens      u64      capped at 1024
+///   chat_template   bool     default false (wrapping inflates prompt_len ~5x)
+///   redundancy      u64      1 (default) = one replica per hop with failover;
+///                            2+ = contact that many replicas for EVERY
+///                            position and take the first valid answer
+///   force_recompute bool     bypass the deterministic cache
 async fn inference_run_sharded(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let input_text = req.get("input")
+    let input_text = req
+        .get("input")
         .and_then(|v| v.as_str())
         .ok_or(api_error(StatusCode::BAD_REQUEST, "'input' field required"))?;
 
-    // Validate input: enforce max length
     if input_text.len() > 32_768 {
         return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
     }
 
-    // Sharded-pipeline output cap. Was 256, which combined with the
-    // model's RoPE table covering 4096 positions meant the user could
-    // never approach the actual context limit on this endpoint.
-    // Bumping to 1024 — still well under the 4096 positional ceiling
-    // (an average 3 KB prompt + 1024 generated tokens fits comfortably)
-    // and matches the practical "long-form completion" budget the
-    // dashboard demo expects. Each hop's KV cache grows linearly with
-    // (prompt_len + max_tokens), so this also caps coordinator memory
-    // pressure under stress.
-    let max_tokens = req.get("max_tokens")
+    // Sharded-pipeline output cap. Was 256, which combined with the model's
+    // RoPE table covering 4096 positions meant the user could never approach
+    // the actual context limit on this endpoint.
+    let max_tokens = req
+        .get("max_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(20)
         .min(1024) as u32;
+
     // Opt-in chat template wrapping. Default OFF because the dashboard is
     // doing autocomplete ("The capital of France is" → " Paris"), not
     // instruction-following. Wrapping in [INST]...[/INST] inflates prompt_len
-    // by ~5x (11 tokens for a 3-token input) and since the pipeline walks
-    // all positions, that 5x directly multiplies wall time. Pass
-    // `"chat_template": true` in the body to re-enable it for chat models.
-    let chat_template_enabled = req.get("chat_template")
+    // by ~5x and, since the pipeline walks every position, that 5x multiplies
+    // wall time directly.
+    let chat_template_enabled = req
+        .get("chat_template")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // Replica redundancy. forward_shard is STATEFUL per request_id (each
+    // holder keeps a KV cache keyed by it), so you cannot hedge a single
+    // position onto a fresh replica — it would be handed a mid-stream
+    // position against a cold cache. `redundancy: 2` therefore commits to two
+    // replicas per range for the WHOLE request and sends every position to
+    // both: the first valid answer is used and the other stays warm, so
+    // failover is instant instead of fatal. Default stays 1.
+    let redundancy = req
+        .get("redundancy")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+        .clamp(1, 5) as usize;
+
+    // Bypass the deterministic cache. The public determinism demo runs the
+    // same prompt twice and compares output_hash; without this the second run
+    // is an LRU lookup that returns what was put in it, which proves nothing
+    // about the pipeline. With force_recompute the second run is a real,
+    // independent walk of the same 6 hops.
+    let force_recompute = req
+        .get("force_recompute")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
     // Coordinator needs a model for tokenization (text→tokens and tokens→text).
     // This is the tokenizer vocabulary, not the full model weights.
-    // Shard-holding nodes or nodes with --model serve as coordinators.
-    let model = node.inference_model.as_ref()
-        .ok_or(api_error(StatusCode::SERVICE_UNAVAILABLE,
+    let model = node
+        .inference_model
+        .as_ref()
+        .ok_or(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
             "Coordinator needs a model loaded for tokenization. Start with --model <path.gguf>. \
-             Shard nodes serve inference; the coordinator only uses the tokenizer."))?;
+             Shard nodes serve inference; the coordinator only uses the tokenizer.",
+        ))?
+        .clone();
 
-    // Build the pipeline from the local shard registry, sorted by start_layer.
-    //
-    // Dedupe by (start_layer, end_layer, node_name): after a coordinator
-    // reboot, its own self-announcement (socket_addr=0.0.0.0:9090) and the
-    // peer-to-peer gossip copy (socket_addr=<public IP>:9090) land under
-    // different registry keys, creating two entries for the same layer
-    // range. Prefer the entry with a routable socket_addr so that
-    // forward_shard calls don't try to POST to 0.0.0.0.
-    // Group replicas by (start, end). Every replica holding the same range
-    // is a failover candidate - if the primary stops answering mid-request,
-    // the worker falls back to the next. When multiple announcements for
-    // the same (node_name, range) exist we prefer routable socket_addrs over
-    // stubs (0.0.0.0 / 127.x / empty).
-    fn is_stub(a: &str) -> bool {
-        a.starts_with("0.0.0.0") || a.starts_with("127.") || a.is_empty()
-    }
-    let mut by_range: std::collections::BTreeMap<(usize, usize), Vec<ShardInfo>> =
-        std::collections::BTreeMap::new();
-    for s in fresh_shards(&node.shard_registry) {
-        let key = (s.start_layer, s.end_layer);
-        let bucket = by_range.entry(key).or_default();
-        // Dedupe per node_name within the bucket, preferring routable addrs.
-        let dup_idx = bucket.iter().position(|existing| existing.node_name == s.node_name);
-        match dup_idx {
-            None => bucket.push(s),
-            Some(i) => {
-                if is_stub(&bucket[i].socket_addr) && !is_stub(&s.socket_addr) {
-                    bucket[i] = s;
-                }
-            }
-        }
-    }
-    // Drop stub-addr replicas unconditionally. A stub addr can't be dialed
-    // (127.x = announcer's loopback, 0.0.0.0 = unbound, [::1] = loopback,
-    // empty = malformed) so it can never satisfy a coordinator hop. The old
-    // behaviour preserved a stub when no routable replica existed for the
-    // same range "as a fallback"; that produced the Pipeline-gap regression
-    // observed 2026-06-04 where a community worker announcing
-    // 127.0.0.1:9090 with an off-grid range [0, 8) became the only candidate
-    // for layer-0 and the pipeline walked off the rails. Honest failure
-    // (drop the bucket, surface "Pipeline incomplete" later if nothing
-    // covers those layers) beats fake liveness.
-    // #29: also sort each bucket by rolling EWMA latency ascending so the
-    // fastest replica for this range wins primary on the next dispatch.
-    by_range.retain(|_, bucket| {
-        bucket.retain(|s| !is_stub(&s.socket_addr));
-        !bucket.is_empty()
-    });
-    for bucket in by_range.values_mut() {
-        sort_replicas_by_latency(bucket, &node.latency_stats);
-    }
-    // Pipeline becomes one entry per range with its replica list attached.
-    // The first replica in each Vec is the current primary.
-    let mut pipeline_ranges: Vec<((usize, usize), Vec<ShardInfo>)> = by_range
-        .into_iter()
-        .collect();
-    // Sort by (start_layer, end_layer) so the *shortest* range starting at
-    // each layer comes first. We then greedily walk: pick the first range
-    // that starts at covered_to and skip any later range whose start is
-    // already covered (overlapping). Without this skip, a worker that
-    // announces a non-grid range (e.g. [0, 8) while the rest of the
-    // network uses [0, 6)/[6, 12)) collides with the next range and
-    // produces a false "Pipeline gap" error even though the standard
-    // tiling fully covers the model.
-    pipeline_ranges.sort_by_key(|((s, e), _)| (*s, *e));
+    let pipeline = assemble_pipeline_with_bootstrap(&node)
+        .await
+        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
 
-    if pipeline_ranges.is_empty() {
-        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "No shards announced. Need shard registry to be populated."));
-    }
+    let request_id = format!(
+        "0x{}",
+        hex::encode(
+            arc_crypto::hash_bytes(
+                format!(
+                    "{}-{}",
+                    input_text,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                )
+                .as_bytes()
+            )
+            .0
+        )
+    );
 
-    // Greedy contiguous cover: at each step, pick the first range starting
-    // at the current frontier. Skip ranges starting earlier (already
-    // covered) — they're either duplicates of the picked range or
-    // off-grid alternatives we've chosen not to take.
-    let n_layers = pipeline_ranges[0].1[0].total_layers;
-    let mut pipeline: Vec<ShardInfo> = Vec::with_capacity(pipeline_ranges.len());
-    let mut covered_to = 0usize;
-    for ((start, end), replicas) in &pipeline_ranges {
-        if covered_to >= n_layers {
-            break;
-        }
-        if *start < covered_to {
-            // Overlapping with a range we already picked — skip.
-            continue;
-        }
-        if *start != covered_to {
-            return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
-                "Pipeline gap: expected layer {} next, got shard [{}, {}) (node {}, addr {})",
-                covered_to, start, end, replicas[0].node_name, replicas[0].socket_addr
-            )));
-        }
-        pipeline.push(replicas[0].clone());
-        covered_to = *end;
-    }
-    if covered_to != n_layers {
-        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
-            "Pipeline incomplete: covered layers 0..{} but model has {} layers",
-            covered_to, n_layers
-        )));
-    }
-
-    let request_id = format!("0x{}", hex::encode(arc_crypto::hash_bytes(format!("{}-{}", input_text, std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)).as_bytes()).0));
-
-    // Tokenize input. Only wrap in chat template when explicitly requested;
-    // the default is raw completion.
     let tokenized_text: String = if chat_template_enabled {
         model.apply_chat_template(input_text)
     } else {
@@ -4827,440 +6291,135 @@ async fn inference_run_sharded(
     all_tokens.extend(&prompt_tokens);
 
     let overall_start = std::time::Instant::now();
+    let (model_id_data, model_id_hash) = model_identity(&model);
+    let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
 
     // ─────────────────────────────────────────────────────────────────────
     // DETERMINISTIC CACHE LOOKUP
     // Same model_id + same input tokens = same output tokens, GUARANTEED.
-    // If we've seen this exact input before, return the cached result in
-    // O(1) - no pipeline walk, no HTTP roundtrips, no compute.
     // ─────────────────────────────────────────────────────────────────────
-    let cache_model_id_data = format!(
-        "arc-{}L-{}d-{}h-{}v",
-        model.config.n_layers, model.config.d_model,
-        model.config.n_heads, model.config.vocab_size
-    );
-    let cache_model_id_hash = arc_crypto::hash_bytes(cache_model_id_data.as_bytes());
     let cache_input_with_max: Vec<u32> = {
         let mut v = all_tokens.clone();
-        v.push(max_tokens); // include max_tokens in the cache key so different lengths don't collide
+        v.push(max_tokens);
         v
     };
-    let cache_key = arc_inference::distributed::DistributedCache::cache_key(&cache_model_id_hash, &cache_input_with_max);
+    let cache_key = arc_inference::distributed::DistributedCache::cache_key(
+        &model_id_hash,
+        &cache_input_with_max,
+    );
+    let cache_key_hex = format!("0x{}", hex::encode(&cache_key.0));
 
-    if let Some(cached_tokens) = node.inference_cache.get(&cache_key) {
-        // CACHE HIT - return the cached tokens with the same output_hash
-        let output_text = model.decode(&cached_tokens);
-        let output_bytes: Vec<u8> = cached_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
-        let output_hash = arc_crypto::hash_bytes(&output_bytes);
-        let elapsed_us = overall_start.elapsed().as_micros() as u64;
-        node.sharded_runs_total.fetch_add(1, Ordering::Relaxed);
-        return Ok(Json(json!({
-            "success": true,
-            "request_id": request_id,
-            "input": input_text,
-            "output": output_text,
-            "output_tokens": cached_tokens,
-            "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
-            "model_hash": format!("0x{}", hex::encode(&cache_model_id_hash.0)),
-            "tokens_generated": cached_tokens.len(),
-            "total_ms": elapsed_us / 1000,
-            "total_us": elapsed_us,
-            "ms_per_token": 0,
-            "pipeline_length": pipeline.len(),
-            "model": cache_model_id_data,
-            "shard_trace": [],
-            "total_bytes_transferred": 0,
-            "deterministic": true,
-            "engine": "deterministic cache hit (provably bit-identical to original sharded run)",
-            "cache": {
-                "hit": true,
-                "key": format!("0x{}", hex::encode(&cache_key.0)),
-                "served_in_us": elapsed_us,
-            },
-        })));
-    }
-    // ─────────────────────────────────────────────────────────────────────
+    if !force_recompute {
+        if let Some(cached_tokens) = node.inference_cache.get(&cache_key) {
+            let output_text = model.decode(&cached_tokens);
+            let output_bytes: Vec<u8> =
+                cached_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+            let output_hash = arc_crypto::hash_bytes(&output_bytes);
+            let elapsed_us = overall_start.elapsed().as_micros() as u64;
 
-    let mut generated: Vec<u32> = Vec::new();
-    let mut shard_trace: Vec<Value> = Vec::new();
-    let mut total_bytes_transferred: usize = 0;
+            // A cache hit is NOT a sharded run: no pipeline was walked, no
+            // activations moved, no shard did any work. Counting it in
+            // sharded_runs_total inflated every "distributed inference
+            // served" figure on the dashboard.
+            node.sharded_cache_hits.fetch_add(1, Ordering::Relaxed);
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("HTTP client: {}", e)))?;
-
-    // Pipeline execution.
-    //
-    // PREFILL (positions 0..prompt_len):
-    //   All prompt tokens are known up-front. We stream them through the
-    //   shard chain using per-shard mpsc workers, so at steady state every
-    //   shard is processing a different position simultaneously. Wall time
-    //   is ~(prompt_len + num_shards - 1) × per_shard_time instead of
-    //   prompt_len × num_shards × per_shard_time.
-    //
-    // GENERATION (positions prompt_len..prompt_len+max_tokens):
-    //   Each output token depends on the previous one's logits so we must
-    //   wait for the full pipeline walk before starting the next position.
-    //   Kept as a straight sequential loop - pipeline parallelism does not
-    //   apply to single-stream autoregressive decoding.
-    //
-    // The output from the LAST prompt position is the FIRST generated
-    // token. We capture it via the terminal flag on the pipeline's tail
-    // shard and then continue the sequential loop for the remaining
-    // (max_tokens - 1) tokens.
-    let prompt_len = all_tokens.len();
-
-    // ─── Pipelined prefill ────────────────────────────────────────────
-    {
-        use tokio::sync::mpsc;
-
-        // PrefillFlow is what travels between shard worker tasks. Each
-        // worker reads a PrefillFlow, runs its forward_shard call, and
-        // sends the next PrefillFlow (carrying the new hidden state) to
-        // the next worker. The tail shard sets `terminal_token`.
-        #[derive(Debug)]
-        struct PrefillFlow {
-            position: usize,
-            token: Option<u32>,
-            hidden: Option<Vec<i64>>,
-            hidden_hash: Option<String>,
-            terminal_token: Option<u32>,
-        }
-
-        let num_shards = pipeline.len();
-        let buffer = (prompt_len + 4).max(16);
-
-        // (num_shards + 1) channels: index 0 is the coordinator→shard0
-        // input; index k (1..=num_shards) carries shard(k-1)→shard(k)
-        // outputs; index num_shards is the tail shard→coordinator output.
-        let mut txs: Vec<mpsc::Sender<PrefillFlow>> = Vec::with_capacity(num_shards + 1);
-        let mut rxs: Vec<Option<mpsc::Receiver<PrefillFlow>>> = Vec::with_capacity(num_shards + 1);
-        for _ in 0..=num_shards {
-            let (tx, rx) = mpsc::channel::<PrefillFlow>(buffer);
-            txs.push(tx);
-            rxs.push(Some(rx));
-        }
-
-        // Spawn one worker task per shard. Each loops on its input
-        // channel until the sender is dropped.
-        let mut worker_handles: Vec<tokio::task::JoinHandle<Result<(usize, Option<(u64, u64, bool, u64, String)>), String>>>
-            = Vec::with_capacity(num_shards);
-        for i in 0..num_shards {
-            let replicas = pipeline_ranges[i].1.clone();
-            let (start_layer, end_layer) = pipeline_ranges[i].0;
-            let client_c = client.clone();
-            let req_id = request_id.clone();
-            let mut rx = rxs[i].take().expect("rx slot populated");
-            let tx_out = txs[i + 1].clone();
-            let is_last_shard = i == num_shards - 1;
-            // #29: hand the latency map into the spawn so successful hops fold
-            // into the EWMA used for the next dispatch's sort.
-            let lat_stats = node.latency_stats.clone();
-
-            let handle = tokio::spawn(async move {
-                let mut bytes_this_shard: usize = 0;
-                let mut trace: Option<(u64, u64, bool, u64, String)> = None; // (compute_ms, wall_ms, is_terminal, layers, node_name) - first-seen
-                // Ordered replica list per range. The first entry is the
-                // current primary; on HTTP/parse failure we promote the next
-                // replica and keep going. "Never breaks" guarantee: as long
-                // as any replica for this range is reachable, the request
-                // succeeds.
-                let mut replicas = replicas;
-                while let Some(item) = rx.recv().await {
-                    let req = ForwardShardRequest {
-                        request_id: req_id.clone(),
-                        token: item.token.clone(),
-                        hidden: item.hidden.clone(),
-                        hidden_hash: item.hidden_hash.clone(),
-                        position: item.position,
-                        start_layer,
-                        end_layer,
-                        last_token: false,
-                    };
-                    let payload_bytes = serde_json::to_vec(&req).unwrap_or_default();
-
-                    let t_hop = std::time::Instant::now();
-                    let mut resp_opt: Option<ForwardShardResponse> = None;
-                    let mut last_err: String = String::new();
-                    let mut attempted: usize = 0;
-                    let mut served_by: Option<String> = None;
-                    while attempted < replicas.len() {
-                        let shard = replicas[0].clone();
-                        let url = format!("http://{}/inference/forward_shard", shard.socket_addr);
-                        let attempt = client_c.post(&url)
-                            .header("Content-Type", "application/json")
-                            .body(payload_bytes.clone())
-                            .send()
-                            .await
-                            .and_then(|r| r.error_for_status());
-                        match attempt {
-                            Ok(r) => match r.json::<ForwardShardResponse>().await {
-                                Ok(j) => {
-                                    bytes_this_shard += payload_bytes.len();
-                                    resp_opt = Some(j);
-                                    served_by = Some(shard.node_name.clone());
-                                    record_latency(&lat_stats, &shard.socket_addr, t_hop.elapsed().as_millis() as u64);
-                                    break;
-                                }
-                                Err(e) => {
-                                    last_err = format!("shard [{start_layer}, {end_layer}) replica {} ({}) parse: {}",
-                                        shard.node_name, shard.socket_addr, e);
-                                    attempted += 1;
-                                    replicas.rotate_left(1);
-                                }
-                            },
-                            Err(e) => {
-                                last_err = format!("shard [{start_layer}, {end_layer}) replica {} ({}): {}",
-                                    shard.node_name, shard.socket_addr, e);
-                                attempted += 1;
-                                replicas.rotate_left(1);
-                            }
-                        }
-                    }
-                    let resp = match resp_opt {
-                        Some(r) => r,
-                        None => return Err(format!("All {} replicas failed for range [{start_layer}, {end_layer}). Last error: {}",
-                            replicas.len(), last_err)),
-                    };
-                    let hop_ms = t_hop.elapsed().as_millis() as u64;
-
-                    // Capture trace on the FIRST processed position only
-                    if trace.is_none() {
-                        trace = Some((
-                            resp.compute_ms,
-                            hop_ms,
-                            resp.is_terminal,
-                            resp.layers_processed as u64,
-                            served_by.clone().unwrap_or_else(|| replicas[0].node_name.clone()),
-                        ));
-                    }
-
-                    let flow = PrefillFlow {
-                        position: item.position,
-                        token: None,
-                        hidden: resp.hidden,
-                        hidden_hash: resp.hidden_hash,
-                        terminal_token: if is_last_shard { resp.token_id } else { None },
-                    };
-                    if tx_out.send(flow).await.is_err() {
-                        break;
-                    }
-                }
-                Ok((bytes_this_shard, trace))
+            // Return the ORIGINAL run's provenance rather than zeros: the
+            // attestation tx that recorded it, the trace of the hops that
+            // actually produced it, and how long that real run took. A hit
+            // that reports `shard_trace: []`, `total_ms: 0` and no
+            // attestation looks like the pipeline did the work in 800 µs,
+            // which is what made the "determinism check" demo hollow.
+            let meta = node.sharded_run_meta.get(&cache_key_hex).map(|m| m.clone());
+            let mut resp = json!({
+                "success": true,
+                "request_id": request_id,
+                "input": input_text,
+                "output": output_text,
+                "output_tokens": cached_tokens,
+                "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+                "input_hash": format!("0x{}", hex::encode(&input_hash.0)),
+                "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
+                "tokens_generated": cached_tokens.len(),
+                "total_ms": elapsed_us / 1000,
+                "total_us": elapsed_us,
+                "ms_per_token": 0,
+                "pipeline_length": pipeline.len(),
+                "model": model_id_data,
+                "shard_trace": [],
+                "total_bytes_transferred": 0,
+                "deterministic": true,
+                "engine": "deterministic cache hit (bit-identical to the original sharded run)",
+                "cache": {
+                    "hit": true,
+                    "key": cache_key_hex,
+                    "served_in_us": elapsed_us,
+                    "size": node.inference_cache.len(),
+                },
             });
-            worker_handles.push(handle);
-        }
-
-        // Feed the entire prompt into shard 0's input channel up front.
-        // The workers will stream through in pipeline order. Drop the
-        // coordinator-held copies of all other channel senders so that
-        // workers observe EOF once their upstream drops.
-        let input_tx = txs.remove(0);
-        // txs[0..num_shards-1] are intermediate senders the workers already
-        // cloned. Drop them so workers see EOF. txs[num_shards-1] is the
-        // LAST shard's output channel that the coordinator reads from -
-        // drop our extra copy too so recv()  unblocks after all positions.
-        drop(txs);
-        for (pos, &tok) in all_tokens.iter().enumerate() {
-            let flow = PrefillFlow {
-                position: pos,
-                token: Some(tok),
-                hidden: None,
-                hidden_hash: None,
-                terminal_token: None,
-            };
-            if input_tx.send(flow).await.is_err() {
-                return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, "Prefill input channel closed prematurely"));
-            }
-        }
-        drop(input_tx); // signal end-of-input to shard 0
-
-        // Collect outputs from the tail shard. Order is guaranteed by the
-        // mpsc FIFO and the in-order single-task workers, so items arrive
-        // in ascending position order. The last position's terminal token
-        // is the FIRST generated token.
-        let mut final_rx = rxs[num_shards].take().expect("tail rx slot populated");
-        let mut positions_seen = 0usize;
-        let mut first_generated_token: Option<u32> = None;
-        while let Some(flow) = final_rx.recv().await {
-            positions_seen += 1;
-            if flow.position == prompt_len - 1 {
-                first_generated_token = flow.terminal_token;
-            }
-            if positions_seen >= prompt_len {
-                break;
-            }
-        }
-
-        if positions_seen < prompt_len {
-            return Err(api_error(
-                StatusCode::BAD_GATEWAY,
-                format!("Pipelined prefill incomplete: {}/{} positions arrived at tail shard", positions_seen, prompt_len),
-            ));
-        }
-
-        // Gather per-worker stats (bytes + first-position trace).
-        let mut trace_entries: Vec<(usize, u64, u64, bool, u64, String)> = Vec::new();
-        for (hop, handle) in worker_handles.into_iter().enumerate() {
-            match handle.await {
-                Ok(Ok((bytes, trace))) => {
-                    total_bytes_transferred += bytes;
-                    if let Some((compute_ms, wall_ms, is_terminal, layers, node_name)) = trace {
-                        trace_entries.push((hop, compute_ms, wall_ms, is_terminal, layers, node_name));
+            if let Some(m) = meta {
+                for key in [
+                    "attestation",
+                    "shard_trace",
+                    "total_bytes_transferred",
+                    "committee",
+                    "fee_split",
+                    "explorer_url",
+                    "pipeline_length",
+                ] {
+                    if let Some(v) = m.get(key) {
+                        resp[key] = v.clone();
                     }
                 }
-                Ok(Err(e)) => return Err(api_error(StatusCode::BAD_GATEWAY, e)),
-                Err(e) => return Err(api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Join worker: {}", e))),
-            }
-        }
-        trace_entries.sort_by_key(|(h, _, _, _, _, _)| *h);
-        for (hop, compute_ms, wall_ms, is_terminal, layers, node_name) in trace_entries {
-            let shard = &pipeline[hop];
-            shard_trace.push(json!({
-                "hop": hop,
-                "node": node_name,
-                "node_name": shard.node_name,
-                "socket": shard.socket_addr,
-                "layers": format!("{}..{}", shard.start_layer, shard.end_layer),
-                "layers_count": layers,
-                "compute_ms": compute_ms,
-                "wall_ms": wall_ms,
-                "payload_bytes": 0, // per-shard in-flight; total is in total_bytes_transferred
-                "is_terminal": is_terminal,
-            }));
-        }
-
-        // The LAST prompt position's output at the tail shard is the FIRST
-        // generated token. Record it before starting sequential generation.
-        if let Some(tok) = first_generated_token {
-            if !model.config.eos_tokens.contains(&tok) {
-                generated.push(tok);
-            }
-        }
-    }
-    // ─── End pipelined prefill ────────────────────────────────────────
-
-    // Sequential generation for remaining tokens. Each token depends on
-    // the previous one's logits so pipeline parallelism does not apply.
-    // We skip the first output (already captured during prefill tail).
-    for gen_idx in 1..(max_tokens as usize) {
-        if let Some(last) = generated.last() {
-            if model.config.eos_tokens.contains(last) {
-                break;
-            }
-        }
-        let position = prompt_len + gen_idx - 1; // position of the NEW token we feed in
-        let input_token = *generated.last().unwrap_or(&all_tokens[prompt_len - 1]);
-
-        let mut current_payload: ForwardShardRequest = ForwardShardRequest {
-            request_id: request_id.clone(),
-            token: Some(input_token),
-            hidden: None,
-            hidden_hash: None,
-            position,
-            start_layer: pipeline[0].start_layer,
-            end_layer: pipeline[0].end_layer,
-            last_token: false,
-        };
-
-        let mut next_token_id: Option<u32> = None;
-        for (range_idx, ((s_layer, e_layer), replicas)) in pipeline_ranges.iter().enumerate() {
-            current_payload.start_layer = *s_layer;
-            current_payload.end_layer = *e_layer;
-
-            let payload_bytes = serde_json::to_vec(&current_payload).unwrap_or_default();
-
-            // Iterate through replicas of this range until one succeeds.
-            // Each replica failure rotates the list in-place on the local
-            // copy so subsequent hops favor the working replica first.
-            let mut try_order: Vec<ShardInfo> = replicas.clone();
-            let mut resp_opt: Option<ForwardShardResponse> = None;
-            let mut last_err = String::new();
-            for replica in try_order.drain(..) {
-                let url = format!("http://{}/inference/forward_shard", replica.socket_addr);
-                let t_hop = std::time::Instant::now();
-                let attempt = client.post(&url)
-                    .header("Content-Type", "application/json")
-                    .body(payload_bytes.clone())
-                    .send()
-                    .await
-                    .and_then(|r| r.error_for_status());
-                match attempt {
-                    Ok(r) => match r.json::<ForwardShardResponse>().await {
-                        Ok(j) => {
-                            total_bytes_transferred += payload_bytes.len();
-                            record_latency(&node.latency_stats, &replica.socket_addr, t_hop.elapsed().as_millis() as u64);
-                            resp_opt = Some(j);
-                            break;
-                        }
-                        Err(e) => last_err = format!("replica {} ({}) parse: {}", replica.node_name, replica.socket_addr, e),
-                    },
-                    Err(e) => last_err = format!("replica {} ({}): {}", replica.node_name, replica.socket_addr, e),
+                if let Some(v) = m.get("total_ms") {
+                    resp["original_total_ms"] = v.clone();
+                }
+                if let Some(v) = m.get("ms_per_token") {
+                    resp["original_ms_per_token"] = v.clone();
+                }
+                resp["cached_total_ms"] = json!(elapsed_us / 1000);
+                resp["cached_total_us"] = json!(elapsed_us);
+                if let Some(obj) = resp["cache"].as_object_mut() {
+                    obj.insert("original_request_id".into(), m.get("request_id").cloned().unwrap_or(Value::Null));
                 }
             }
-            let resp = resp_opt.ok_or_else(|| api_error(StatusCode::BAD_GATEWAY, format!(
-                "All replicas failed for range [{s_layer}, {e_layer}) at gen step {gen_idx}. Last: {last_err}"
-            )))?;
-
-            if resp.is_terminal {
-                next_token_id = resp.token_id;
-                let _ = range_idx;
-                break;
-            }
-            current_payload = ForwardShardRequest {
-                request_id: request_id.clone(),
-                token: None,
-                hidden: resp.hidden,
-                hidden_hash: resp.hidden_hash,
-                position,
-                start_layer: 0,
-                end_layer: 0,
-                last_token: false,
-            };
-        }
-
-        if let Some(tok) = next_token_id {
-            if model.config.eos_tokens.contains(&tok) {
-                break;
-            }
-            generated.push(tok);
+            return Ok(Json(resp));
         }
     }
 
-    // Cleanup: fan-out last_token=true to every replica of every range so
-    // each holder drops its per-request KV cache even if generation only
-    // routed through one of them.
-    let _ = node.shard_kv_caches.remove(&request_id);
-    for (_, replicas) in pipeline_ranges.iter() {
-        for replica in replicas {
-            let _ = client.post(format!("http://{}/inference/forward_shard", replica.socket_addr))
-                .json(&serde_json::json!({"request_id": request_id, "last_token": true}))
-                .send()
-                .await;
-        }
-    }
+    // ─── Real pipeline walk ─────────────────────────────────────────────
+    let strategy = if redundancy > 1 {
+        HopStrategy::Fanout { fanout: redundancy, needed: 1 }
+    } else {
+        HopStrategy::Failover
+    };
+
+    let run = run_pipeline(
+        &node,
+        &model,
+        &pipeline,
+        &request_id,
+        &all_tokens,
+        max_tokens,
+        strategy,
+        false,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
+
+    // Fire-and-forget: the response does not depend on cache eviction.
+    spawn_cleanup(&node, &pipeline, &request_id);
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
+    let generated = run.generated;
     let output_text = model.decode(&generated);
     let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
     let output_hash = arc_crypto::hash_bytes(&output_bytes);
+    let shard_trace = render_shard_trace(&pipeline, &run.hop_stats);
 
-    // Bump network-wide counters: how many sharded runs this coordinator has
-    // served and how many bytes of activations were forwarded between shards.
     node.sharded_runs_total.fetch_add(1, Ordering::Relaxed);
-    node.sharded_bytes_total.fetch_add(total_bytes_transferred as u64, Ordering::Relaxed);
+    node.sharded_bytes_total
+        .fetch_add(run.total_bytes as u64, Ordering::Relaxed);
 
-    let model_id_data = format!(
-        "arc-{}L-{}d-{}h-{}v",
-        model.config.n_layers, model.config.d_model,
-        model.config.n_heads, model.config.vocab_size
-    );
-    let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
-    let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
-
-    // Save to the deterministic cache. Future requests with the same prompt
-    // (and same max_tokens) will return this exact result in O(1).
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -5270,78 +6429,53 @@ async fn inference_run_sharded(
         arc_inference::distributed::CacheEntry {
             output_tokens: generated.clone(),
             output_hash,
-            model_id: cache_model_id_hash,
+            model_id: model_id_hash,
             hit_count: 0,
             created_at_secs: now_secs,
         },
     );
 
-    // Submit an InferenceAttestation transaction so this sharded run is
-    // recorded on-chain like single-node /inference/run does. Anyone reading
-    // the chain later can verify model_id + input_hash + output_hash.
-    //
-    // Nonce strategy: bump the in-memory attestation_nonce counter and add
-    // it to the account's persisted nonce. Each sharded run gets a unique
-    // nonce → unique tx_hash → mempool accepts it (no dedupe collision
-    // even when the same prompt is run twice).
-    let attester = node.validator_address;
-    let base_nonce = node.state.get_account(&attester).map(|a| a.nonce).unwrap_or(0);
-    let bump = node.attestation_nonce.fetch_add(1, Ordering::Relaxed);
-    let nonce = base_nonce + bump;
-    let tx = arc_types::Transaction {
-        tx_type: arc_types::TxType::InferenceAttestation,
-        from: attester,
-        nonce,
-        body: arc_types::TxBody::InferenceAttestation(
-            arc_types::transaction::InferenceAttestationBody {
-                model_id: model_id_hash,
-                input_hash,
-                output_hash,
-                challenge_period: 100,
-                bond: 1000,
-                beneficiary: None,
-            },
-        ),
-        fee: 0,
-        gas_limit: 0,
-        hash: arc_crypto::Hash256::ZERO,
-        signature: arc_crypto::Signature::null(),
-        // Coordinator-internal submit; bypass the unsigned-tx reject
-        // at arc-state lib.rs:1186 the same way the faucet path does.
-        sig_verified: true,
-    };
-    let tx_hash = tx.compute_hash();
-    let _ = node.mempool.insert(tx);
+    let (tx_hash, attestation_status) = submit_inference_attestation(
+        &node,
+        model_id_hash,
+        input_hash,
+        output_hash,
+        1000,
+        100,
+    );
     let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
 
-    // Cache result for explorer / cross-device view (same as inference_run does)
-    node.inference_results.insert(tx_hash_hex.clone(), json!({
-        "input": input_text,
-        "output": &output_text,
-        "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
-        "model": &model_id_data,
-        "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
-        "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
-        "tokens_generated": generated.len() as u64,
-        "engine": format!("{} sharded pipeline", model.effective_precision_label()),
-        "deterministic": true,
-        "sharded": true,
-        "pipeline_length": pipeline.len(),
-        "shard_trace": &shard_trace,
-        "total_bytes_transferred": total_bytes_transferred,
-    }));
+    node.inference_results.insert(
+        tx_hash_hex.clone(),
+        json!({
+            "input": input_text,
+            "output": &output_text,
+            "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+            "model": &model_id_data,
+            "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
+            "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
+            "tokens_generated": generated.len() as u64,
+            "engine": format!("{} sharded pipeline", model.effective_precision_label()),
+            "deterministic": true,
+            "sharded": true,
+            "pipeline_length": pipeline.len(),
+            "shard_trace": &shard_trace,
+            "total_bytes_transferred": run.total_bytes,
+        }),
+    );
 
     // ─── VRF Committee Verification ────────────────────────────────────
-    // Select a verification committee from the live validator set using the
-    // output hash as VRF seed. This implements Tier 2 inference verification
-    // from committee.rs - deterministic, reproducible committee selection.
+    // Deterministic, reproducible committee selection seeded by output_hash.
+    // NOTE: votes are not collected — the integer engine guarantees honest
+    // members agree, so this records WHO would have verified, not that they
+    // did. The response says so.
     let committee_info = {
         let validators = node.dag_validators.read();
         let eligible: Vec<arc_inference::committee::InferenceValidator> = validators
             .iter()
             .map(|(addr, stake)| arc_inference::committee::InferenceValidator {
                 address: *addr,
-                max_tier: 2, // All validators eligible for Tier 2
+                max_tier: 2,
                 stake: *stake,
             })
             .collect();
@@ -5350,18 +6484,17 @@ async fn inference_run_sharded(
             let committee = arc_inference::committee::select_committee(
                 &output_hash,
                 &eligible,
-                2, // Tier 2
+                2,
                 eligible.len().min(arc_inference::committee::DEFAULT_COMMITTEE_SIZE),
             );
-            // In a full implementation, we'd collect votes from committee members
-            // and call aggregate_votes(). For now, the deterministic integer engine
-            // guarantees bit-identical output, so all honest committee members
-            // WILL agree. Record the committee for auditability.
-            let member_hexes: Vec<String> = committee.members.iter()
+            let member_hexes: Vec<String> = committee
+                .members
+                .iter()
                 .map(|m| format!("0x{}", hex::encode(&m.0)))
                 .collect();
             json!({
                 "selected": true,
+                "votes_collected": false,
                 "size": committee.members.len(),
                 "min_agreement": committee.min_agreement,
                 "members": member_hexes,
@@ -5372,33 +6505,31 @@ async fn inference_run_sharded(
         } else {
             json!({
                 "selected": false,
+                "votes_collected": false,
                 "reason": "fewer than 3 validators online",
                 "validators_online": eligible.len(),
             })
         }
     };
 
-    // ─── Auto-commit inference result to verification manager ────────
     {
         if let Ok(mut mgr) = node.verification_manager.lock() {
             let commitment = arc_vm::inference_verify::InferenceCommitment {
                 request_id: arc_crypto::hash_bytes(request_id.as_bytes()).0,
                 result_hash: output_hash.0,
                 provider: node.validator_address.0,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
+                timestamp: now_secs,
                 bond_amount: 1000,
             };
             mgr.submit_commitment(commitment);
         }
     }
 
-    // ─── Fee split computation (for dashboard/explorer display) ──────
-    let fee_split = node.revenue_config.split_fee(1000, node.dag_validators.read().len().saturating_sub(1) as u32);
+    let fee_split = node
+        .revenue_config
+        .split_fee(1000, node.dag_validators.read().len().saturating_sub(1) as u32);
 
-    Ok(Json(json!({
+    let response = json!({
         "success": true,
         "request_id": request_id,
         "input": input_text,
@@ -5413,19 +6544,21 @@ async fn inference_run_sharded(
         "pipeline_length": pipeline.len(),
         "model": model_id_data,
         "shard_trace": shard_trace,
-        "total_bytes_transferred": total_bytes_transferred,
+        "total_bytes_transferred": run.total_bytes,
         "deterministic": true,
         "engine": format!("{} sharded pipeline", model.effective_precision_label()),
+        "redundancy": redundancy,
         "cache": {
             "hit": false,
-            "key": format!("0x{}", hex::encode(&cache_key.0)),
+            "key": cache_key_hex,
             "size": node.inference_cache.len(),
+            "bypassed": force_recompute,
         },
         "attestation": {
             "tx_hash": tx_hash_hex,
             "bond": 1000,
             "challenge_period": 100,
-            "status": "submitted_to_mempool",
+            "status": attestation_status,
         },
         "committee": committee_info,
         "fee_split": {
@@ -5435,21 +6568,80 @@ async fn inference_run_sharded(
             "treasury": fee_split.treasury,
         },
         "explorer_url": format!("/tx/0x{}", hex::encode(&tx_hash.0)),
-    })))
+    });
+
+    // Remember this run's provenance so a later cache hit can report the real
+    // attestation, trace and timings instead of zeros. Store only the
+    // provenance fields — not the output text or token vector, which the
+    // inference cache already holds — and keep the map bounded to the same
+    // capacity as that cache so it cannot grow without limit.
+    remember_sharded_run(
+        &node,
+        cache_key_hex,
+        json!({
+            "request_id": response["request_id"],
+            "attestation": response["attestation"],
+            "shard_trace": response["shard_trace"],
+            "total_bytes_transferred": response["total_bytes_transferred"],
+            "committee": response["committee"],
+            "fee_split": response["fee_split"],
+            "explorer_url": response["explorer_url"],
+            "pipeline_length": response["pipeline_length"],
+            "total_ms": response["total_ms"],
+            "ms_per_token": response["ms_per_token"],
+        }),
+    );
+
+    Ok(Json(response))
+}
+
+/// Capacity of `sharded_run_meta`, matched to the inference cache so the two
+/// stay roughly in step. An entry is provenance only (~2 KB), never output.
+const SHARDED_RUN_META_CAP: usize = 10_000;
+
+/// Record a completed run's provenance under its cache key, evicting an
+/// arbitrary existing entry when the map is at capacity.
+fn remember_sharded_run(node: &NodeState, cache_key_hex: String, meta: Value) {
+    if node.sharded_run_meta.len() >= SHARDED_RUN_META_CAP
+        && !node.sharded_run_meta.contains_key(&cache_key_hex)
+    {
+        let victim = node.sharded_run_meta.iter().next().map(|e| e.key().clone());
+        if let Some(k) = victim {
+            node.sharded_run_meta.remove(&k);
+        }
+    }
+    node.sharded_run_meta.insert(cache_key_hex, meta);
 }
 
 /// POST /inference/run_consensus
-/// Slice B: parallel k-of-n forward_shard per range with hash-majority
-/// verification at every shard boundary.
+/// Parallel k-of-n forward_shard per range with hash-majority verification at
+/// every shard boundary.
 ///
 /// Semantics vs /inference/run_sharded:
-/// - run_sharded picks the first replica for each range; on HTTP failure it
-///   rotates to the next. Fast. Silent hash divergence is INVISIBLE.
-/// - run_consensus fires to k replicas in parallel, collects every
-///   hidden_hash, and requires >=ceil(k/2)+1 (strict majority) to agree
-///   before forwarding the majority's hidden state. Divergent replicas
-///   are logged in the response for later on-chain slashing. Slower, but
-///   an individual dishonest replica cannot produce a wrong token.
+/// - run_sharded picks the best replica for each range and rotates on failure.
+///   Fast. Silent hash divergence is INVISIBLE.
+/// - run_consensus fires to k replicas per hop, tallies their output hashes,
+///   and forwards the state only once a strict majority agrees. Divergent
+///   replicas are recorded in the response and auto-challenged.
+///
+/// Two things changed here, and together they are the difference between
+/// ~54-112 s/token and something a person will sit through:
+///
+///  1. It now uses the SAME pipelined prefill as run_sharded. Its own prefill
+///     was fully sequential — every prompt position walked all six hops
+///     end-to-end before the next position started — so prefill cost
+///     prompt_len x num_hops serial hops instead of ~(prompt_len + num_hops).
+///
+///  2. Each hop now races to majority instead of waiting for all k. With the
+///     live topology (exactly 3 replicas per range) and the desktop's k=3,
+///     `take(k)` selected EVERY replica, which made the latency-aware sort a
+///     no-op, and the collect loop then blocked on the slowest of the three.
+///     Three of the six ranges included a replica whose recorded EWMA was
+///     37 s. Hop cost is now the (k/2+1)-th response, not the k-th.
+///
+/// Both endpoints also share one pipeline planner now, which is what fixes
+/// this endpoint's stub-preserving bucket logic and its missing overlap skip —
+/// the "Pipeline gap: expected layer 32 next, got [28, 30)" failure.
 ///
 /// Request body mirrors run_sharded with an optional `k` field (default 3).
 /// Response adds a `consensus` block with per-range vote records.
@@ -5457,16 +6649,23 @@ async fn inference_run_consensus(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let input_text = req.get("input")
+    let input_text = req
+        .get("input")
         .and_then(|v| v.as_str())
         .ok_or(api_error(StatusCode::BAD_REQUEST, "'input' field required"))?;
     if input_text.len() > 32_768 {
         return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
     }
-    let max_tokens = req.get("max_tokens")
-        .and_then(|v| v.as_u64()).unwrap_or(20).min(256) as u32;
+    let max_tokens = req
+        .get("max_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(20)
+        .min(256) as u32;
     let k_req = req.get("k").and_then(|v| v.as_u64()).unwrap_or(3).max(1) as usize;
-    let chat_template_enabled = req.get("chat_template").and_then(|v| v.as_bool()).unwrap_or(false);
+    let chat_template_enabled = req
+        .get("chat_template")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     // Milestone B (#36): if the request carries { payer, request_id,
     // max_fee, model_id, timeout_blocks } it's an escrow-gated call.
@@ -5475,8 +6674,6 @@ async fn inference_run_consensus(
     // InferenceEscrowRelease that pays out the 40/25/15/20 split.
     //
     // Free-mode (no payer) still works: all escrow fields are optional.
-    // Dashboards + old desktop clients keep using the free path - no
-    // breaking change.
     let escrow_payer_hex = req.get("payer").and_then(|v| v.as_str());
     let escrow_req_id_hex = req.get("request_id").and_then(|v| v.as_str());
     let escrow_max_fee = req.get("max_fee").and_then(|v| v.as_u64());
@@ -5491,16 +6688,14 @@ async fn inference_run_consensus(
         escrow_timeout,
     ) {
         (Some(p), Some(r), Some(f), Some(m), Some(t)) => {
-            let payer = decode_address_hex(p).map_err(|e| {
-                api_error(StatusCode::BAD_REQUEST, format!("payer: {}", e))
-            })?;
-            let request_id = decode_hash_hex(r).map_err(|e| {
-                api_error(StatusCode::BAD_REQUEST, format!("request_id: {}", e))
-            })?;
-            let model_id = decode_hash_hex(m).map_err(|e| {
-                api_error(StatusCode::BAD_REQUEST, format!("model_id: {}", e))
-            })?;
-            let escrow_addr = arc_types::transaction::InferenceEscrowOpenBody::escrow_address(&request_id);
+            let payer = decode_address_hex(p)
+                .map_err(|e| api_error(StatusCode::BAD_REQUEST, format!("payer: {}", e)))?;
+            let request_id = decode_hash_hex(r)
+                .map_err(|e| api_error(StatusCode::BAD_REQUEST, format!("request_id: {}", e)))?;
+            let model_id = decode_hash_hex(m)
+                .map_err(|e| api_error(StatusCode::BAD_REQUEST, format!("model_id: {}", e)))?;
+            let escrow_addr =
+                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(&request_id);
             let escrow_account = node.state.get_account(&arc_crypto::Hash256(escrow_addr));
             let locked = escrow_account.map(|a| a.balance).unwrap_or(0);
             if locked < f {
@@ -5534,309 +6729,90 @@ async fn inference_run_consensus(
         }
     };
 
-    let model = node.inference_model.as_ref()
-        .ok_or(api_error(StatusCode::SERVICE_UNAVAILABLE,
-            "Coordinator needs a tokenizer loaded. Start with --model <path.gguf>."))?;
+    let model = node
+        .inference_model
+        .as_ref()
+        .ok_or(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Coordinator needs a tokenizer loaded. Start with --model <path.gguf>.",
+        ))?
+        .clone();
 
-    // Group fresh shard announcements by (start, end). Dedupe per node_name
-    // inside each bucket preferring routable addrs over stubs.
-    fn stub(a: &str) -> bool {
-        a.starts_with("0.0.0.0") || a.starts_with("127.") || a.is_empty()
-    }
-    let mut by_range: std::collections::BTreeMap<(usize, usize), Vec<ShardInfo>> =
-        std::collections::BTreeMap::new();
-    for s in fresh_shards(&node.shard_registry) {
-        let key = (s.start_layer, s.end_layer);
-        let bucket = by_range.entry(key).or_default();
-        let dup = bucket.iter().position(|e| e.node_name == s.node_name);
-        match dup {
-            None => bucket.push(s),
-            Some(i) => {
-                if stub(&bucket[i].socket_addr) && !stub(&s.socket_addr) {
-                    bucket[i] = s;
-                }
-            }
-        }
-    }
-    // #29: sort each bucket by rolling EWMA latency before taking the top-k.
-    // Does not affect determinism (hash-majority still enforces correctness);
-    // just biases us toward lower-latency replicas first.
-    for bucket in by_range.values_mut() {
-        let routable: Vec<ShardInfo> = bucket.iter().filter(|s| !stub(&s.socket_addr)).cloned().collect();
-        if !routable.is_empty() {
-            *bucket = routable;
-        }
-        sort_replicas_by_latency(bucket, &node.latency_stats);
-    }
-    let pipeline_ranges: Vec<((usize, usize), Vec<ShardInfo>)> = by_range.into_iter().collect();
-    if pipeline_ranges.is_empty() {
-        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "No shards announced."));
-    }
-    // Verify contiguous coverage. Stop early once coverage is complete —
-    // stale extra shards beyond n_layers must not cause a false gap error.
-    let n_layers = pipeline_ranges[0].1[0].total_layers;
-    let mut covered = 0usize;
-    for ((s, e), _) in &pipeline_ranges {
-        if covered >= n_layers {
-            break;
-        }
-        if *s != covered {
-            return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
-                "Pipeline gap: expected layer {} next, got [{}, {})", covered, s, e
-            )));
-        }
-        covered = *e;
-    }
-    if covered != n_layers {
-        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
-            "Pipeline incomplete: 0..{} of {}", covered, n_layers
-        )));
-    }
+    let pipeline = assemble_pipeline_with_bootstrap(&node)
+        .await
+        .map_err(|e| api_error(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
 
     // Tokenize
-    let tokenized_text = if chat_template_enabled { model.apply_chat_template(input_text) } else { input_text.to_string() };
+    let tokenized_text = if chat_template_enabled {
+        model.apply_chat_template(input_text)
+    } else {
+        input_text.to_string()
+    };
     let prompt_tokens = model.encode(&tokenized_text);
     let mut all_tokens: Vec<u32> = vec![model.config.bos_token];
     all_tokens.extend(&prompt_tokens);
 
-    let request_id = format!("0x{}", hex::encode(
-        arc_crypto::hash_bytes(format!("{}-{}", input_text,
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos()).unwrap_or(0)).as_bytes()).0
-    ));
-
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("http: {}", e)))?;
-
-    // Per-range consensus records accumulated across all token positions.
-    // Keyed by (position, range). Majority hash + full replica vote list.
-    #[derive(serde::Serialize, Clone)]
-    struct RangeVote {
-        position: usize,
-        range: (usize, usize),
-        replicas_contacted: Vec<String>,
-        replicas_returned: Vec<String>,
-        majority_hash: Option<String>,
-        divergent: Vec<(String, String)>, // (replica, their_hash)
-        agreement: String, // "unanimous" | "majority" | "split" | "no_response"
-    }
-    let mut votes: Vec<RangeVote> = Vec::new();
+    let request_id = format!(
+        "0x{}",
+        hex::encode(
+            arc_crypto::hash_bytes(
+                format!(
+                    "{}-{}",
+                    input_text,
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0)
+                )
+                .as_bytes()
+            )
+            .0
+        )
+    );
 
     let overall_start = std::time::Instant::now();
-    let prompt_len = all_tokens.len();
-    let mut generated: Vec<u32> = Vec::new();
-    let mut first_gen_token: Option<u32> = None;
 
-    // Helper: fire k parallel forward_shard requests to the first k replicas
-    // in `replicas`, collect their responses. Return Result<(majority_hidden,
-    // majority_hash, vote_record), err_string>.
-    async fn consensus_hop(
-        client: &reqwest::Client,
-        replicas: &[ShardInfo],
-        k: usize,
-        req: &ForwardShardRequest,
-        lat_stats: &Arc<dashmap::DashMap<String, LatencyEWMA>>,
-    ) -> Result<(Option<Vec<i64>>, Option<String>, bool, Option<u32>, Option<String>, RangeVote), String> {
-        let use_k = k.min(replicas.len()).max(1);
-        let selected: Vec<ShardInfo> = replicas.iter().take(use_k).cloned().collect();
-        let body = serde_json::to_vec(req).map_err(|e| e.to_string())?;
+    // Strict majority of whatever k this hop can actually reach.
+    // `pipeline_hop` clamps both numbers to the live replica count, so a range
+    // that has lost a replica degrades to a majority of the survivors rather
+    // than failing outright.
+    let strategy = HopStrategy::Fanout {
+        fanout: k_req,
+        needed: (k_req / 2) + 1,
+    };
 
-        let mut futs = Vec::with_capacity(use_k);
-        for r in &selected {
-            let url = format!("http://{}/inference/forward_shard", r.socket_addr);
-            let c = client.clone();
-            let b = body.clone();
-            let r_clone = r.clone();
-            let stats = lat_stats.clone();
-            let socket = r.socket_addr.clone();
-            futs.push(tokio::spawn(async move {
-                let t_hop = std::time::Instant::now();
-                let send_res = c.post(&url).header("Content-Type","application/json").body(b).send().await;
-                let parsed: Result<ForwardShardResponse, String> = match send_res {
-                    Ok(r) => match r.error_for_status() {
-                        Ok(ok_resp) => ok_resp.json::<ForwardShardResponse>().await
-                            .map_err(|e| format!("parse: {}", e)),
-                        Err(e) => Err(format!("http status: {}", e)),
-                    },
-                    Err(e) => Err(format!("send: {}", e)),
-                };
-                if parsed.is_ok() {
-                    record_latency(&stats, &socket, t_hop.elapsed().as_millis() as u64);
-                }
-                (r_clone.node_name.clone(), parsed)
-            }));
-        }
+    let run = run_pipeline(
+        &node,
+        &model,
+        &pipeline,
+        &request_id,
+        &all_tokens,
+        max_tokens,
+        strategy,
+        true,
+    )
+    .await
+    .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
 
-        let mut returned: Vec<(String, ForwardShardResponse)> = Vec::new();
-        for f in futs {
-            match f.await {
-                Ok((name, Ok(r))) => returned.push((name, r)),
-                Ok((name, Err(e))) => tracing::warn!("consensus replica {} failed: {}", name, e),
-                Err(e) => tracing::warn!("consensus task join failed: {}", e),
-            }
-        }
-
-        // Group by hash. For intermediate ranges: compare hidden_hash. For
-        // terminal range: compare logits_hash.
-        let is_terminal_returned = returned.iter().any(|(_, r)| r.is_terminal);
-        let hash_of = |r: &ForwardShardResponse| -> Option<String> {
-            if r.is_terminal { r.logits_hash.clone() } else { r.hidden_hash.clone() }
-        };
-        let mut hash_counts: std::collections::HashMap<String, Vec<&(String, ForwardShardResponse)>> =
-            std::collections::HashMap::new();
-        for item in &returned {
-            if let Some(h) = hash_of(&item.1) {
-                hash_counts.entry(h).or_default().push(item);
-            }
-        }
-        let (majority_hash, majority_items) = hash_counts.into_iter()
-            .max_by_key(|(_, v)| v.len())
-            .map(|(h, v)| (Some(h), v))
-            .unwrap_or((None, Vec::new()));
-
-        let needed = (use_k / 2) + 1;
-        let have = majority_items.len();
-
-        let mut vote = RangeVote {
-            position: req.position,
-            range: (req.start_layer, req.end_layer),
-            replicas_contacted: selected.iter().map(|s| s.node_name.clone()).collect(),
-            replicas_returned: returned.iter().map(|(n, _)| n.clone()).collect(),
-            majority_hash: majority_hash.clone(),
-            divergent: Vec::new(),
-            agreement: if returned.is_empty() { "no_response".into() }
-                else if have == returned.len() { "unanimous".into() }
-                else if have >= needed { "majority".into() }
-                else { "split".into() },
-        };
-        for item in &returned {
-            let h = hash_of(&item.1);
-            if h != majority_hash {
-                vote.divergent.push((item.0.clone(), h.unwrap_or_default()));
-            }
-        }
-
-        if majority_items.is_empty() {
-            return Err(format!(
-                "No replica responded for range [{}, {}) at position {}",
-                req.start_layer, req.end_layer, req.position
-            ));
-        }
-        if have < needed {
-            return Err(format!(
-                "No majority hash for range [{}, {}) at position {} - {} of {} agreed (needed {})",
-                req.start_layer, req.end_layer, req.position, have, returned.len(), needed
-            ));
-        }
-
-        let picked = &majority_items[0].1;
-        Ok((
-            picked.hidden.clone(),
-            picked.hidden_hash.clone(),
-            picked.is_terminal,
-            picked.token_id,
-            picked.logits_hash.clone(),
-            vote,
-        ))
-    }
-
-    // === Prefill: for each position, walk all ranges with k-of-n consensus.
-    // Positions run sequentially here (simpler than the pipelined prefill in
-    // run_sharded). For prompt_len up to ~128, overhead is acceptable.
-    for (pos_idx, &tok) in all_tokens.iter().enumerate() {
-        let mut cur_hidden: Option<Vec<i64>> = None;
-        let mut cur_hash: Option<String> = None;
-        let mut got_first_gen: Option<u32> = None;
-        for (range_idx, ((s_layer, e_layer), replicas)) in pipeline_ranges.iter().enumerate() {
-            let req_body = ForwardShardRequest {
-                request_id: request_id.clone(),
-                token: if range_idx == 0 { Some(tok) } else { None },
-                hidden: if range_idx == 0 { None } else { cur_hidden.clone() },
-                hidden_hash: if range_idx == 0 { None } else { cur_hash.clone() },
-                position: pos_idx,
-                start_layer: *s_layer,
-                end_layer: *e_layer,
-                last_token: false,
-            };
-            let (hid, hash, is_terminal, token_id, _logits_hash, vote) =
-                consensus_hop(&client, replicas, k_req, &req_body, &node.latency_stats).await
-                    .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
-            votes.push(vote);
-            if is_terminal {
-                got_first_gen = token_id;
-                break;
-            }
-            cur_hidden = hid;
-            cur_hash = hash;
-        }
-        if pos_idx == prompt_len - 1 {
-            first_gen_token = got_first_gen;
-        }
-    }
-    if let Some(tok) = first_gen_token {
-        if !model.config.eos_tokens.contains(&tok) {
-            generated.push(tok);
-        }
-    }
-
-    // === Generation: each subsequent token feeds the previous as input.
-    for gen_idx in 1..(max_tokens as usize) {
-        if let Some(last) = generated.last() {
-            if model.config.eos_tokens.contains(last) { break; }
-        }
-        let position = prompt_len + gen_idx - 1;
-        let input_token = *generated.last().unwrap_or(&all_tokens[prompt_len - 1]);
-        let mut cur_hidden: Option<Vec<i64>> = None;
-        let mut cur_hash: Option<String> = None;
-        let mut next_tok: Option<u32> = None;
-        for (range_idx, ((s_layer, e_layer), replicas)) in pipeline_ranges.iter().enumerate() {
-            let req_body = ForwardShardRequest {
-                request_id: request_id.clone(),
-                token: if range_idx == 0 { Some(input_token) } else { None },
-                hidden: if range_idx == 0 { None } else { cur_hidden.clone() },
-                hidden_hash: if range_idx == 0 { None } else { cur_hash.clone() },
-                position,
-                start_layer: *s_layer,
-                end_layer: *e_layer,
-                last_token: false,
-            };
-            let (hid, hash, is_terminal, token_id, _logits_hash, vote) =
-                consensus_hop(&client, replicas, k_req, &req_body, &node.latency_stats).await
-                    .map_err(|e| api_error(StatusCode::BAD_GATEWAY, e))?;
-            votes.push(vote);
-            if is_terminal {
-                next_tok = token_id;
-                break;
-            }
-            cur_hidden = hid;
-            cur_hash = hash;
-        }
-        if let Some(t) = next_tok {
-            if model.config.eos_tokens.contains(&t) { break; }
-            generated.push(t);
-        }
-    }
-
-    // Cleanup - fan out last_token=true to every replica of every range.
-    for (_, replicas) in &pipeline_ranges {
-        for r in replicas {
-            let _ = client.post(format!("http://{}/inference/forward_shard", r.socket_addr))
-                .json(&serde_json::json!({"request_id": request_id, "last_token": true}))
-                .send().await;
-        }
-    }
+    spawn_cleanup(&node, &pipeline, &request_id);
 
     let total_ms = overall_start.elapsed().as_millis() as u64;
+    let generated = run.generated;
+    let votes = run.votes;
     let output_text = model.decode(&generated);
     let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
     let output_hash = arc_crypto::hash_bytes(&output_bytes);
+    let shard_trace = render_shard_trace(&pipeline, &run.hop_stats);
 
-    // Summarize consensus: counts of unanimous/majority/split, list of
-    // divergent (replica, hash) tuples across all positions.
-    let mut unanimous = 0; let mut majority = 0; let mut split = 0;
-    let mut divergent_all: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    node.sharded_bytes_total
+        .fetch_add(run.total_bytes as u64, Ordering::Relaxed);
+
+    // Summarize consensus.
+    let mut unanimous = 0;
+    let mut majority = 0;
+    let mut split = 0;
+    let mut divergent_all: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
     for v in &votes {
         match v.agreement.as_str() {
             "unanimous" => unanimous += 1,
@@ -5852,10 +6828,7 @@ async fn inference_run_consensus(
     // #31: auto-open a verification commitment + challenge for each divergent
     // replica. One commitment per (replica, hash) tuple representing that
     // replica's claimed output; one challenge from this coordinator against
-    // that commitment. Slashing resolution runs on the existing
-    // VerificationManager path. Bond is a placeholder - the final value and
-    // payer (coordinator treasury vs honest-majority split) still needs TJ's
-    // call (open question from the issue body).
+    // that commitment.
     let mut auto_challenges: Vec<Value> = Vec::new();
     if !divergent_all.is_empty() {
         let timestamp = std::time::SystemTime::now()
@@ -5866,20 +6839,12 @@ async fn inference_run_consensus(
         match node.verification_manager.lock() {
             Ok(mut mgr) => {
                 for (replica_name, hashes) in &divergent_all {
-                    // Provider identity for the divergent replica. We don't
-                    // have their real validator_address from the inference
-                    // path - only their node_name + socket. Derive a stable
-                    // pseudo-address by hashing "divergent:<name>" so repeat
-                    // offenses by the same replica resolve to the same ID.
-                    // Reconciling this with the real validator address is
-                    // covered in the open-question section of the issue.
-                    let provider_id = arc_crypto::hash_bytes(
-                        format!("divergent:{replica_name}").as_bytes()
-                    ).0;
-                    // Use the first divergent hash as the offending
-                    // result_hash; additional hashes from the same replica
-                    // (multiple positions) are folded into the same provider
-                    // record but only the first is committed here.
+                    // We don't have the divergent replica's real validator
+                    // address from the inference path — only node_name +
+                    // socket. Derive a stable pseudo-address so repeat
+                    // offences by the same replica resolve to the same ID.
+                    let provider_id =
+                        arc_crypto::hash_bytes(format!("divergent:{replica_name}").as_bytes()).0;
                     let their_hash = hashes.first().cloned().unwrap_or_default();
                     let commit = arc_vm::inference_verify::InferenceCommitment {
                         request_id: request_id_bytes,
@@ -5922,15 +6887,10 @@ async fn inference_run_consensus(
         }
     }
 
-    // Milestone B: if this was an escrow-gated request, collect the
-    // honest-replica set from the votes (the non-divergent agreeing
-    // replicas across every hop) and submit the release tx. The honest
-    // set is a union over all votes - any replica that contributed to the
-    // majority_hash at any hop earned a slice of the per-request payout.
+    // Milestone B: on an escrow-gated request, collect the honest-replica set
+    // (any replica that contributed to the majority hash at any hop) and
+    // submit the release tx.
     let release_tx_hash = if let Some(gate) = &escrow_gate {
-        // Replica names that appeared in majority_hash agreement at
-        // any hop. Excludes divergent replicas (they're handled by
-        // auto-challenges in the slashing path, not paid).
         let mut honest_names: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         for v in &votes {
@@ -5942,11 +6902,6 @@ async fn inference_run_consensus(
                 }
             }
         }
-        // Map replica node_name → synthetic validator address, same
-        // derivation slashing uses (hash("replica:" || name)). Keeps
-        // honest-pays and divergent-slashes symmetric; a later migration
-        // can reconcile both to real on-chain validator addresses once
-        // the shard registry carries them.
         let replicas: Vec<arc_crypto::Hash256> = honest_names
             .iter()
             .map(|name| arc_crypto::hash_bytes(format!("replica:{}", name).as_bytes()))
@@ -5994,8 +6949,15 @@ async fn inference_run_consensus(
         "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
         "tokens_generated": generated.len(),
         "total_ms": total_ms,
-        "pipeline_length": pipeline_ranges.len(),
+        "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
+        "pipeline_length": pipeline.len(),
         "k": k_req,
+        // Additive: same per-hop trace run_sharded emits, so the dashboard's
+        // activation-flow view works against this endpoint too.
+        "shard_trace": shard_trace,
+        "total_bytes_transferred": run.total_bytes,
+        "deterministic": true,
+        "engine": format!("{} sharded pipeline (k-of-n consensus)", model.effective_precision_label()),
         "consensus": {
             "k": k_req,
             "votes_total": votes.len(),
@@ -6524,8 +7486,7 @@ async fn community_register(
                 "community_register: skipping auto-shard for stub rpc_addr"
             );
             None
-        } else
-        if total_layers > 0 {
+        } else if total_layers > 0 {
             // Find the biggest uncovered gap for this model
             let existing: Vec<ShardInfo> = fresh_shards(&node.shard_registry)
                 .into_iter()
@@ -7171,14 +8132,36 @@ async fn get_models(
             let shards_for_model: Vec<&ShardInfo> = flat_shards.iter()
                 .filter(|ss| ss.model_id == s.model_id)
                 .collect();
-            let covered_layers: usize = shards_for_model.iter().map(|ss| ss.end_layer - ss.start_layer).sum();
+            // Coverage is the UNION of the announced layer intervals, not the
+            // sum of their widths. Summing double-counts replicas: on the live
+            // 3x-replicated network 6 ranges x 3 replicas over a 32-layer model
+            // summed to 96 "covered layers" out of 32 — so `fully_covered`
+            // (covered == total) was false on a network with complete,
+            // triple-redundant coverage.
+            let mut intervals: Vec<(usize, usize)> = shards_for_model
+                .iter()
+                .map(|ss| (ss.start_layer, ss.end_layer))
+                .collect();
+            intervals.sort_unstable();
+            let mut covered_layers = 0usize;
+            let mut frontier = 0usize;
+            for (start, end) in &intervals {
+                let from = (*start).max(frontier);
+                if *end > from {
+                    covered_layers += end - from;
+                    frontier = *end;
+                }
+            }
+            let replica_ranges: std::collections::BTreeSet<(usize, usize)> =
+                intervals.iter().copied().collect();
             models_info.push(json!({
                 "model_id": s.model_id,
                 "model_name": s.model_name,
                 "total_layers": s.total_layers,
                 "covered_layers": covered_layers,
-                "fully_covered": covered_layers == s.total_layers,
+                "fully_covered": covered_layers == s.total_layers && s.total_layers > 0,
                 "shard_count": shards_for_model.len(),
+                "distinct_ranges": replica_ranges.len(),
                 "full_model_mb": s.full_model_mb,
             }));
         }
@@ -7626,25 +8609,22 @@ async fn inference_auto(
         .unwrap_or(20)
         .min(256) as u32;
 
-    // Strategy 1: Check if sharded pipeline is available
-    let shards = fresh_shards(&node.shard_registry);
-    let has_full_pipeline = if !shards.is_empty() {
-        let n_layers = shards.iter().map(|s| s.total_layers).max().unwrap_or(0);
-        let mut covered_to = 0usize;
-        let mut contiguous = true;
-        let mut sorted = shards.clone();
-        sorted.sort_by_key(|s| s.start_layer);
-        for s in &sorted {
-            if s.start_layer != covered_to {
-                contiguous = false;
-                break;
-            }
-            covered_to = s.end_layer;
-        }
-        contiguous && covered_to == n_layers && n_layers > 0
-    } else {
-        false
-    };
+    // Strategy 1: is there a sharded pipeline we can actually walk?
+    //
+    // This used to re-implement coverage detection over the RAW replica list,
+    // sorted by start_layer only and with no dedupe. On the live 3x-replicated
+    // network that is 18 entries for 6 ranges: after the first [0, 6) set
+    // covered_to = 6, the SECOND [0, 6) replica had start_layer 0 != 6 and
+    // flipped `contiguous` false immediately. `has_full_pipeline` was
+    // therefore false for any replication factor > 1 and this endpoint never
+    // once took its own documented best path — it always fell through to
+    // `inference_run` and only reached the sharded pipeline by accident, via
+    // the partial-model guard there.
+    //
+    // Asking the real planner also means this routing decision now agrees
+    // with what run_sharded will actually do.
+    let pipeline_check = assemble_pipeline_for(&node);
+    let has_full_pipeline = pipeline_check.is_ok();
 
     // Strategy 2: Check if local model is available
     let has_local_model = node.inference_model.is_some() || node.candle_engine.is_some();
@@ -7705,11 +8685,65 @@ async fn inference_auto(
         Err(api_error(StatusCode::SERVICE_UNAVAILABLE, json!({
             "error": "No inference path available",
             "sharded_pipeline": false,
+            // Say WHY the pipeline was rejected instead of just "false".
+            "sharded_pipeline_error": pipeline_check.err().map(|e| e.to_string()),
             "local_model": false,
             "community_workers": 0,
             "help": "Either: (1) load a model with --model, (2) have shard-holding nodes announce to this coordinator, or (3) start community workers with models"
         }).to_string()))
     }
+}
+
+// ─── Runtime inference width ───────────────────────────────────────────────
+
+/// GET /node/threads
+/// Report the width of the pool that runs local inference compute.
+async fn get_node_threads(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let dedicated = node.compute_threads.load(Ordering::Relaxed);
+    Json(json!({
+        "threads": if dedicated > 0 { dedicated as usize } else { rayon_global_width() },
+        "dedicated_pool": dedicated > 0,
+        "dedicated_threads": dedicated,
+        "rayon_global_threads": rayon_global_width(),
+        "rayon_num_threads_env": std::env::var("RAYON_NUM_THREADS").ok(),
+        "available_parallelism": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+        "note": "POST {\"threads\": n} to rebuild the pool live; n=0 returns to rayon's global pool",
+    }))
+}
+
+#[derive(Deserialize)]
+struct SetThreadsRequest {
+    threads: usize,
+}
+
+/// POST /node/threads  {"threads": 8}
+///
+/// Rebuild the inference compute pool at a new width, live, without a
+/// restart. Requests already running keep the old pool (they hold an Arc to
+/// it); everything dispatched after this call uses the new one.
+///
+/// This is the knob behind "add two cores" during a demo: because
+/// `forward_shard` and local `generate` both run inside
+/// `install_on_compute_pool`, widening the pool immediately widens the
+/// par_iter over attention heads and the par_chunks_mut inside every matmul.
+async fn set_node_threads(
+    AxumState(node): AxumState<NodeState>,
+    Json(req): Json<SetThreadsRequest>,
+) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
+    let before = node.compute_threads.load(Ordering::Relaxed);
+    let applied = set_compute_threads(&node, req.threads)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
+    tracing::info!(
+        before,
+        after = applied,
+        "inference compute pool resized via /node/threads"
+    );
+    Ok(Json(json!({
+        "ok": true,
+        "previous_threads": if before > 0 { before as usize } else { rayon_global_width() },
+        "threads": if applied > 0 { applied } else { rayon_global_width() },
+        "dedicated_pool": applied > 0,
+    })))
 }
 
 #[cfg(test)]
@@ -7948,6 +8982,13 @@ mod tests {
             multi_model_registry: Arc::new(arc_inference::distributed::ShardRegistry::new()),
             verification_manager: Arc::new(std::sync::Mutex::new(arc_vm::inference_verify::VerificationManager::new())),
             revenue_config: RoleRevenueConfig::default(),
+            inference_http: reqwest::Client::new(),
+            sharded_cache_hits: Arc::new(AtomicU64::new(0)),
+            sharded_run_meta: Arc::new(dashmap::DashMap::new()),
+            compute_pool: Arc::new(parking_lot::RwLock::new(None)),
+            compute_threads: Arc::new(AtomicU32::new(0)),
+            seed_rpc_addrs: Arc::new(Vec::new()),
+            last_registry_bootstrap: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -8279,5 +9320,359 @@ mod tests {
                 - (w.sum_total_ms_success as f64 / w.success_count as f64)
         };
         assert_eq!(score, 0.0);
+    }
+
+    // ── assemble_pipeline ───────────────────────────────────────────────
+    //
+    // This is the planner all three inference endpoints now share, so these
+    // pin the behaviour that used to differ between them. Each case below
+    // corresponds to a failure observed on the live network.
+
+    fn shard(node: &str, addr: &str, start: usize, end: usize) -> ShardInfo {
+        ShardInfo {
+            start_layer: start,
+            end_layer: end,
+            total_layers: 32,
+            model_id: "0xabec".into(),
+            model_name: "arc-32L-4096d-32h-32000v".into(),
+            memory_mb: 100,
+            full_model_mb: 4000,
+            socket_addr: addr.into(),
+            node_name: node.into(),
+        }
+    }
+
+    /// The live topology: 32 layers in 6 ranges, each on 3 of 6 nodes.
+    fn live_topology() -> Vec<ShardInfo> {
+        let ranges = [(0, 6), (6, 12), (12, 17), (17, 22), (22, 27), (27, 32)];
+        let nodes = [
+            ("NYC", "149.28.32.76:9090"),
+            ("LAX", "140.82.16.112:9090"),
+            ("AMS", "136.244.109.1:9090"),
+            ("LHR", "104.238.171.11:9090"),
+            ("NRT", "202.182.107.41:9090"),
+            ("SGP", "149.28.153.31:9090"),
+        ];
+        let mut out = Vec::new();
+        for (i, (s, e)) in ranges.iter().enumerate() {
+            for r in 0..3 {
+                let (name, addr) = nodes[(i + r) % nodes.len()];
+                out.push(shard(name, addr, *s, *e));
+            }
+        }
+        out
+    }
+
+    fn no_stats() -> dashmap::DashMap<String, LatencyEWMA> {
+        dashmap::DashMap::new()
+    }
+
+    #[test]
+    fn assemble_accepts_the_live_3x_replicated_topology() {
+        // 18 announcements, 6 hops, 3 replicas each. /inference/auto's old
+        // hand-rolled walk called this "not contiguous" because the SECOND
+        // [0, 6) replica has start_layer 0 != covered_to 6 — so it declared
+        // has_full_pipeline false on a network with complete coverage and
+        // never took the sharded path once.
+        let hops = assemble_pipeline(live_topology(), &no_stats()).expect("live topology covers 0..32");
+        assert_eq!(hops.len(), 6, "one hop per layer range, not per announcement");
+        assert_eq!(
+            hops.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![(0, 6), (6, 12), (12, 17), (17, 22), (22, 27), (27, 32)]
+        );
+        for (range, replicas) in &hops {
+            assert_eq!(replicas.len(), 3, "range {:?} should keep all 3 replicas", range);
+        }
+    }
+
+    #[test]
+    fn assemble_drops_stub_addresses_even_when_they_are_the_only_candidate() {
+        // A community worker announcing 127.0.0.1:9090 for an off-grid [0, 8)
+        // became the ONLY candidate for layer 0 under run_consensus's old
+        // "keep the stub as a fallback" rule, and the pipeline walked off the
+        // rails. A bucket that is stub-only must be dropped entirely.
+        let mut shards = vec![
+            shard("SQUATTER", "127.0.0.1:9090", 0, 8),
+            shard("GHOST", "0.0.0.0:9090", 0, 6),
+            shard("EMPTY", "", 0, 6),
+            shard("V6", "[::1]:9090", 0, 6),
+        ];
+        shards.extend(live_topology().into_iter().filter(|s| s.start_layer != 0));
+
+        let err = assemble_pipeline(shards, &no_stats())
+            .expect_err("layer 0 has only unroutable candidates");
+        // Honest failure: it must NOT claim to have covered 0..6 via a stub.
+        assert!(
+            matches!(err, PipelineError::Gap { expected: 0, .. }),
+            "expected a gap at layer 0, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn assemble_prefers_routable_addr_over_same_nodes_stub_announcement() {
+        // After a coordinator reboot its own self-announce (0.0.0.0:9090) and
+        // the gossiped copy (public IP) land under different registry keys,
+        // producing two entries for the same node and range.
+        let mut shards = live_topology();
+        shards.push(shard("NYC", "0.0.0.0:9090", 0, 6));
+        let hops = assemble_pipeline(shards, &no_stats()).expect("still fully covered");
+        let (_, first) = &hops[0];
+        assert_eq!(first.len(), 3, "the stub duplicate must collapse into the routable entry");
+        assert!(
+            first.iter().all(|r| !is_stub_socket_addr(&r.socket_addr)),
+            "no stub survived: {:?}",
+            first.iter().map(|r| &r.socket_addr).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assemble_skips_offgrid_range_instead_of_reporting_a_false_gap() {
+        // An off-grid [0, 8) alongside the standard [0, 6)/[6, 12) tiling must
+        // be skipped, not collided with. Without the overlap skip this is the
+        // "Pipeline gap: expected layer 6 next, got shard [0, 8)" that took
+        // out sharded inference on the healthiest seed.
+        let mut shards = live_topology();
+        shards.push(shard("JOINER", "203.0.113.7:9090", 0, 8));
+        let hops = assemble_pipeline(shards, &no_stats()).expect("standard tiling still covers");
+        assert_eq!(
+            hops.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
+            vec![(0, 6), (6, 12), (12, 17), (17, 22), (22, 27), (27, 32)],
+            "the off-grid range must be skipped, not walked"
+        );
+    }
+
+    #[test]
+    fn assemble_reports_a_real_gap_as_a_gap() {
+        let shards: Vec<ShardInfo> = live_topology()
+            .into_iter()
+            .filter(|s| s.start_layer != 12)
+            .collect();
+        let err = assemble_pipeline(shards, &no_stats()).expect_err("layers 12..17 are missing");
+        match err {
+            PipelineError::Gap { expected, got, .. } => {
+                assert_eq!(expected, 12);
+                assert_eq!(got, (17, 22));
+            }
+            other => panic!("expected Gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assemble_reports_truncated_coverage_as_incomplete() {
+        let shards: Vec<ShardInfo> = live_topology()
+            .into_iter()
+            .filter(|s| s.end_layer <= 27)
+            .collect();
+        let err = assemble_pipeline(shards, &no_stats()).expect_err("nothing covers 27..32");
+        assert_eq!(err, PipelineError::Incomplete { covered: 27, total: 32 });
+    }
+
+    #[test]
+    fn assemble_orders_replicas_by_fresh_latency() {
+        let stats = no_stats();
+        let now = std::time::Instant::now();
+        // AMS fastest, NYC middle, LAX slowest.
+        for (addr, ms) in [
+            ("136.244.109.1:9090", 20.0),
+            ("149.28.32.76:9090", 200.0),
+            ("140.82.16.112:9090", 900.0),
+        ] {
+            stats.insert(
+                addr.to_string(),
+                LatencyEWMA { ms, count: 10, last_updated: now, probe_only: false },
+            );
+        }
+        let hops = assemble_pipeline(live_topology(), &stats).unwrap();
+        let (_, first) = &hops[0];
+        assert_eq!(
+            first.iter().map(|r| r.node_name.as_str()).collect::<Vec<_>>(),
+            vec!["AMS", "NYC", "LAX"],
+            "primary must be the fastest measured replica"
+        );
+    }
+
+    #[test]
+    fn stale_latency_samples_stop_steering_the_router() {
+        // The LHR case: an EWMA of 37,276 ms recorded over ten hours ago kept
+        // it permanently last, and because only replicas[0] was ever dialled
+        // it could never earn a new sample. Past LATENCY_STALE_SECS a sample
+        // is UNKNOWN, and unknown replicas keep their announcement order
+        // rather than being sorted to the bottom by a fossil.
+        let stats = no_stats();
+        let stale = std::time::Instant::now()
+            - std::time::Duration::from_secs(LATENCY_STALE_SECS + 60);
+        stats.insert(
+            "104.238.171.11:9090".into(),
+            LatencyEWMA { ms: 37_276.0, count: 1370, last_updated: stale, probe_only: false },
+        );
+        let fresh_stat = stats.get("104.238.171.11:9090").unwrap();
+        assert_eq!(effective_latency_ms(&fresh_stat), None, "a 6-minute-old sample is not evidence");
+        drop(fresh_stat);
+
+        // And a fresh one still counts.
+        stats.insert(
+            "140.82.16.112:9090".into(),
+            LatencyEWMA {
+                ms: 300.0,
+                count: 5,
+                last_updated: std::time::Instant::now(),
+                probe_only: false,
+            },
+        );
+        let s = stats.get("140.82.16.112:9090").unwrap();
+        assert_eq!(effective_latency_ms(&s), Some(300.0));
+    }
+
+    #[test]
+    fn health_probe_only_supersedes_an_implausible_recorded_latency() {
+        // LHR: 37 s recorded, 200 ms health RTT → fossil, reset it.
+        assert!(probe_supersedes_recorded(37_276.0, 200));
+        // A genuinely slow node stays slow: 8 s recorded, 6 s health RTT.
+        assert!(!probe_supersedes_recorded(8_000.0, 6_000));
+        // A merely-mediocre node is never reset, however fast /health is.
+        assert!(!probe_supersedes_recorded(900.0, 5));
+        // Right at the floor.
+        assert!(!probe_supersedes_recorded(LATENCY_POISON_FLOOR_MS, 1));
+    }
+
+    #[test]
+    fn probe_latency_never_overwrites_a_real_hop_sample() {
+        let stats = no_stats();
+        record_latency(&stats, "1.2.3.4:9090", 4_000);
+        record_probe_latency(&stats, "1.2.3.4:9090", 12);
+        let s = stats.get("1.2.3.4:9090").unwrap();
+        assert_eq!(s.ms, 4_000.0, "a 12 ms /health RTT is not a forward_shard latency");
+        assert!(!s.probe_only);
+    }
+
+    #[test]
+    fn first_real_hop_replaces_a_provisional_probe_value_rather_than_blending() {
+        let stats = no_stats();
+        record_probe_latency(&stats, "1.2.3.4:9090", 200);
+        {
+            let s = stats.get("1.2.3.4:9090").unwrap();
+            assert!(s.probe_only);
+            assert_eq!(s.count, 0);
+        }
+        record_latency(&stats, "1.2.3.4:9090", 3_000);
+        let s = stats.get("1.2.3.4:9090").unwrap();
+        assert_eq!(s.ms, 3_000.0, "blending would have understated the hop cost");
+        assert!(!s.probe_only);
+        assert_eq!(s.count, 1);
+    }
+
+    // ── race-to-majority tally ──────────────────────────────────────────
+    //
+    // `pipeline_hop`'s Fanout arm returns the instant `needed` responses carry
+    // the same output hash. These exercise that decision rule directly: given
+    // hashes arriving in a known order, at which arrival does the hop return,
+    // and which response does it pick?
+
+    /// Mirror of the tally in `pipeline_hop`'s Fanout arm: fold hashes in
+    /// arrival order and report the index of the arrival that reached
+    /// `needed` agreement, plus the winning group.
+    fn tally_until_majority(
+        arrivals: &[Option<&str>],
+        needed: usize,
+    ) -> Option<(usize, String, Vec<usize>)> {
+        let mut tally: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, h) in arrivals.iter().enumerate() {
+            let Some(h) = h else { continue };
+            let bucket = tally.entry((*h).to_string()).or_default();
+            bucket.push(idx);
+            if bucket.len() >= needed {
+                return Some((idx, (*h).to_string(), bucket.clone()));
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn majority_returns_on_the_second_agreeing_response_not_the_third() {
+        // k=3, needed=2. The whole point: with 3 replicas per range and the
+        // desktop's k=3, the old collect loop waited for the SLOWEST of three.
+        // Hop cost is now the 2nd response.
+        let got = tally_until_majority(&[Some("0xaa"), Some("0xaa"), Some("0xaa")], 2)
+            .expect("two agreed");
+        assert_eq!(got.0, 1, "returned at arrival index 1 — the third never blocks us");
+        assert_eq!(got.1, "0xaa");
+        assert_eq!(got.2, vec![0, 1]);
+    }
+
+    #[test]
+    fn majority_waits_past_a_divergent_first_responder() {
+        // Fastest replica disagrees. We must NOT return its answer just
+        // because it arrived first — that is the difference between consensus
+        // and a race.
+        let got = tally_until_majority(&[Some("0xbad"), Some("0xok"), Some("0xok")], 2)
+            .expect("the honest pair agreed");
+        assert_eq!(got.0, 2, "had to wait for the second honest answer");
+        assert_eq!(got.1, "0xok");
+        assert_eq!(got.2, vec![1, 2], "the divergent first responder is not in the winning group");
+    }
+
+    #[test]
+    fn three_way_split_reaches_no_majority() {
+        assert!(tally_until_majority(&[Some("0xa"), Some("0xb"), Some("0xc")], 2).is_none());
+    }
+
+    #[test]
+    fn failed_replicas_do_not_count_toward_agreement() {
+        // None = the replica errored or timed out.
+        assert!(tally_until_majority(&[None, Some("0xa"), None], 2).is_none());
+        let got = tally_until_majority(&[None, Some("0xa"), Some("0xa")], 2).expect("two agreed");
+        assert_eq!(got.0, 2);
+    }
+
+    #[test]
+    fn hedged_mode_takes_the_first_valid_answer() {
+        // redundancy: 2 is Fanout { fanout: 2, needed: 1 } — first valid wins.
+        let got = tally_until_majority(&[Some("0xaa"), Some("0xbb")], 1).expect("first valid");
+        assert_eq!(got.0, 0);
+        assert_eq!(got.1, "0xaa");
+    }
+
+    #[test]
+    fn needed_is_a_strict_majority_of_the_reachable_replicas() {
+        // The formula pipeline_hop applies, clamped to what's actually live.
+        let needed_for = |k: usize, live: usize| -> usize {
+            let use_n = k.min(live).max(1);
+            ((k / 2) + 1).max(1).min(use_n)
+        };
+        assert_eq!(needed_for(3, 3), 2, "k=3 over 3 replicas: strict majority");
+        assert_eq!(needed_for(3, 2), 2, "one replica lost: both survivors must agree");
+        assert_eq!(needed_for(3, 1), 1, "degraded to a single replica");
+        assert_eq!(needed_for(5, 5), 3);
+        assert_eq!(needed_for(1, 3), 1, "k=1 asks one replica and trusts it");
+    }
+
+    // ── compute pool ────────────────────────────────────────────────────
+
+    #[test]
+    fn compute_pool_rebuilds_and_releases() {
+        let node = fake_node_with_workers(vec![]);
+        assert_eq!(node.compute_threads.load(Ordering::Relaxed), 0);
+        // Work runs fine with no dedicated pool (rayon global).
+        assert_eq!(install_on_compute_pool(&node, || 6 * 7), 42);
+
+        set_compute_threads(&node, 3).expect("3-thread pool");
+        assert_eq!(node.compute_threads.load(Ordering::Relaxed), 3);
+        assert!(node.compute_pool.read().is_some());
+        // Nested rayon work sees the installed pool.
+        let width = install_on_compute_pool(&node, rayon::current_num_threads);
+        assert_eq!(width, 3, "par_iter inside the job must see the resized pool");
+
+        set_compute_threads(&node, 5).expect("resize live");
+        assert_eq!(install_on_compute_pool(&node, rayon::current_num_threads), 5);
+
+        set_compute_threads(&node, 0).expect("back to global");
+        assert_eq!(node.compute_threads.load(Ordering::Relaxed), 0);
+        assert!(node.compute_pool.read().is_none());
+    }
+
+    #[test]
+    fn compute_pool_rejects_absurd_widths() {
+        let node = fake_node_with_workers(vec![]);
+        assert!(set_compute_threads(&node, 100_000).is_err());
     }
 }

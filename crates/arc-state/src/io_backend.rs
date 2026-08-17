@@ -193,6 +193,13 @@ impl PreallocBackend {
     ) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create(true)
+            // MUST NOT truncate: an existing WAL segment's contents are the
+            // data we are here to preserve. The code below reads the current
+            // file length and seeks to the logical end so pre-allocation does
+            // not clobber it. Stated explicitly rather than left to the
+            // default, because `create(true)` without a truncate decision is
+            // exactly the shape of an accidental data-loss bug.
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)?;

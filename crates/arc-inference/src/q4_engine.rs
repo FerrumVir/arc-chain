@@ -36,7 +36,7 @@ impl Q4Weights {
             let row = &i8w.data[i * n_cols..(i + 1) * n_cols];
 
             // Find abs max of i8 row
-            let abs_max = row.iter().map(|&x| (x as i16).abs() as u8).max().unwrap_or(1).max(1);
+            let abs_max = row.iter().map(|&x| (x as i16).unsigned_abs() as u8).max().unwrap_or(1).max(1);
 
             // Q4 scale: maps [-7, 7] to [-abs_max, abs_max]
             // scale_i64 = abs_max_real / 7 in Q16 terms

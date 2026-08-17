@@ -56,6 +56,39 @@ pub struct NodeConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub benchmark: BenchmarkConfig,
+    #[serde(default)]
+    pub inference: InferenceConfig,
+}
+
+/// Inference runtime configuration.
+///
+/// ── How thread width is actually decided ─────────────────────────────────
+///
+/// All inference compute (the `into_par_iter()` over attention heads in
+/// `forward_shard_token`, and the `par_chunks_mut` inside every matmul) runs
+/// on a rayon pool. Which pool, in priority order:
+///
+///   1. A DEDICATED pool, when `--threads N` / `[inference] threads = N` is
+///      non-zero, or after a `POST /node/threads {"threads": N}` at runtime.
+///      This is the only setting that can be changed without a restart.
+///   2. Rayon's implicit GLOBAL pool otherwise. Rayon builds that pool lazily
+///      on first use and sizes it from the `RAYON_NUM_THREADS` environment
+///      variable when it is set and parses to a positive integer, and from
+///      `std::thread::available_parallelism()` when it is not.
+///
+/// `RAYON_NUM_THREADS` is read by rayon itself, not by this crate, and only
+/// at the moment the global pool is first built — exporting it after the
+/// process has started has no effect. `GET /node/threads` reports which of
+/// the two is in force, along with the env var's observed value.
+///
+/// Note that `[benchmark] rayon_threads` is a DIFFERENT knob: it calls
+/// `build_global()` and only under `--benchmark`. It sizes the pool used for
+/// batch signature verification, not inference.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct InferenceConfig {
+    /// Dedicated inference pool width. 0 (default) = use rayon's global pool.
+    #[serde(default)]
+    pub threads: usize,
 }
 
 /// RPC server configuration.
@@ -86,8 +119,14 @@ pub struct ValidatorConfig {
     /// Seed string for deterministic keypair derivation (default: "arc-validator-0").
     #[serde(default = "default_validator_seed")]
     pub seed: String,
-    /// Staked ARC amount (default: 5,000,000).
-    #[serde(default = "default_stake")]
+    /// Staked ARC amount (default: 0 = observer / community node).
+    ///
+    /// Deliberately NOT `default_stake` (which is the GENESIS validator
+    /// default and stays at 5,000,000). A node that omits `[validator] stake`
+    /// must not silently become a voting validator on whatever network it is
+    /// pointed at — see the `--stake` doc comment in main.rs for what that
+    /// costs and why it is unrecoverable without restarting every seed.
+    #[serde(default = "default_node_stake")]
     pub stake: u64,
     /// Minimum stake required to run as a validator (default: 500,000).
     #[serde(default = "default_min_stake")]
@@ -147,8 +186,15 @@ fn default_validator_seed() -> String {
     "arc-validator-0".to_string()
 }
 
+/// Default stake for a GENESIS validator entry. Genesis files describe a
+/// network being created, where a validator with no stake is meaningless.
 fn default_stake() -> u64 {
     5_000_000
+}
+
+/// Default stake for THIS node. Zero: joining as a validator is an explicit act.
+fn default_node_stake() -> u64 {
+    0
 }
 
 fn default_min_stake() -> u64 {
@@ -189,7 +235,14 @@ impl Default for NodeConfig {
             validator: ValidatorConfig::default(),
             storage: StorageConfig::default(),
             benchmark: BenchmarkConfig::default(),
+            inference: InferenceConfig::default(),
         }
+    }
+}
+
+impl Default for InferenceConfig {
+    fn default() -> Self {
+        Self { threads: 0 }
     }
 }
 
@@ -215,7 +268,7 @@ impl Default for ValidatorConfig {
     fn default() -> Self {
         Self {
             seed: default_validator_seed(),
-            stake: default_stake(),
+            stake: default_node_stake(),
             min_stake: default_min_stake(),
         }
     }
@@ -279,9 +332,33 @@ mod tests {
         assert_eq!(cfg.p2p.port, 9945);
         assert!(cfg.p2p.peers.is_empty());
         assert_eq!(cfg.validator.seed, "arc-validator-0");
-        assert_eq!(cfg.validator.stake, 5_000_000);
+        // Zero by default: a node must opt IN to being a voting validator.
+        // See ValidatorConfig::stake.
+        assert_eq!(cfg.validator.stake, 0);
         assert_eq!(cfg.validator.min_stake, 500_000);
         assert_eq!(cfg.storage.data_dir, "./arc-data");
+        assert_eq!(cfg.inference.threads, 0);
+    }
+
+    #[test]
+    fn genesis_validator_stake_default_is_unchanged() {
+        // The node's own stake default moved to 0, but a genesis file that
+        // omits `stake` for a validator still means a real validator.
+        let toml_str = r#"
+            [chain]
+            name = "arc-testnet"
+
+            [[validators]]
+            seed = "arc-validator-0"
+        "#;
+        let cfg: GenesisConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.validators[0].stake, 5_000_000);
+    }
+
+    #[test]
+    fn inference_threads_parses() {
+        let cfg: NodeConfig = toml::from_str("[inference]\nthreads = 12\n").unwrap();
+        assert_eq!(cfg.inference.threads, 12);
     }
 
     #[test]

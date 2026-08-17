@@ -518,29 +518,34 @@ impl QuantizedInput {
 /// Core i8×i64 dot product. Unsafe, 8-element unroll, 4 independent accumulators.
 #[inline(always)]
 unsafe fn dot_i8_i64(row: *const i8, input: *const i64, len: usize) -> i64 {
-    let mut acc0: i64 = 0;
-    let mut acc1: i64 = 0;
-    let mut acc2: i64 = 0;
-    let mut acc3: i64 = 0;
-    let full = len / 8 * 8;
-    let mut j = 0usize;
-    while j < full {
-        acc0 += (*row.add(j) as i64) * (*input.add(j));
-        acc1 += (*row.add(j + 1) as i64) * (*input.add(j + 1));
-        acc2 += (*row.add(j + 2) as i64) * (*input.add(j + 2));
-        acc3 += (*row.add(j + 3) as i64) * (*input.add(j + 3));
-        acc0 += (*row.add(j + 4) as i64) * (*input.add(j + 4));
-        acc1 += (*row.add(j + 5) as i64) * (*input.add(j + 5));
-        acc2 += (*row.add(j + 6) as i64) * (*input.add(j + 6));
-        acc3 += (*row.add(j + 7) as i64) * (*input.add(j + 7));
-        j += 8;
+    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
+    // The contract is unchanged: the caller guarantees the pointers are valid
+    // for `len` reads. Wrapping is purely lexical - no semantics change.
+    unsafe {
+        let mut acc0: i64 = 0;
+        let mut acc1: i64 = 0;
+        let mut acc2: i64 = 0;
+        let mut acc3: i64 = 0;
+        let full = len / 8 * 8;
+        let mut j = 0usize;
+        while j < full {
+            acc0 += (*row.add(j) as i64) * (*input.add(j));
+            acc1 += (*row.add(j + 1) as i64) * (*input.add(j + 1));
+            acc2 += (*row.add(j + 2) as i64) * (*input.add(j + 2));
+            acc3 += (*row.add(j + 3) as i64) * (*input.add(j + 3));
+            acc0 += (*row.add(j + 4) as i64) * (*input.add(j + 4));
+            acc1 += (*row.add(j + 5) as i64) * (*input.add(j + 5));
+            acc2 += (*row.add(j + 6) as i64) * (*input.add(j + 6));
+            acc3 += (*row.add(j + 7) as i64) * (*input.add(j + 7));
+            j += 8;
+        }
+        let mut acc = acc0 + acc1 + acc2 + acc3;
+        while j < len {
+            acc += (*row.add(j) as i64) * (*input.add(j));
+            j += 1;
+        }
+        acc
     }
-    let mut acc = acc0 + acc1 + acc2 + acc3;
-    while j < len {
-        acc += (*row.add(j) as i64) * (*input.add(j));
-        j += 1;
-    }
-    acc
 }
 
 /// Write matmul result into pre-allocated output buffer (zero-alloc).
@@ -558,8 +563,12 @@ fn matmul_i8_into(weights: &I8Weights, input: &[i64], in_size: usize, output: &m
     debug_assert_eq!(output.len(), weights.scales.len(), "matmul output/scales mismatch");
     let data = &weights.data;
     let scales = &weights.scales;
-    output.par_chunks_mut(512).enumerate().for_each(|(chunk_idx, chunk)| {
-        let start = chunk_idx * 512;
+    // Chunk width 256, matching matmul_i16_into. At 512 a 4096-row output
+    // yields only 8 rayon tasks, so the I8 path saturated at 8 cores no
+    // matter how wide the pool was — which made "add two cores" a no-op on
+    // any node that hadn't been promoted to I16. 256 gives 16 tasks.
+    output.par_chunks_mut(256).enumerate().for_each(|(chunk_idx, chunk)| {
+        let start = chunk_idx * 256;
         for (local_i, out) in chunk.iter_mut().enumerate() {
             let i = start + local_i;
             let acc = unsafe {
@@ -594,29 +603,34 @@ fn matmul_i8(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize
 /// Core i16×i64 dot product with 8-element unroll. Scalar fallback.
 #[inline(always)]
 unsafe fn dot_i16_i64_scalar(row: *const i16, input: *const i64, len: usize) -> i64 {
-    let mut acc0: i64 = 0;
-    let mut acc1: i64 = 0;
-    let mut acc2: i64 = 0;
-    let mut acc3: i64 = 0;
-    let full = len / 8 * 8;
-    let mut j = 0usize;
-    while j < full {
-        acc0 += (*row.add(j) as i64) * (*input.add(j));
-        acc1 += (*row.add(j + 1) as i64) * (*input.add(j + 1));
-        acc2 += (*row.add(j + 2) as i64) * (*input.add(j + 2));
-        acc3 += (*row.add(j + 3) as i64) * (*input.add(j + 3));
-        acc0 += (*row.add(j + 4) as i64) * (*input.add(j + 4));
-        acc1 += (*row.add(j + 5) as i64) * (*input.add(j + 5));
-        acc2 += (*row.add(j + 6) as i64) * (*input.add(j + 6));
-        acc3 += (*row.add(j + 7) as i64) * (*input.add(j + 7));
-        j += 8;
+    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
+    // The contract is unchanged: the caller guarantees the pointers are valid
+    // for `len` reads. Wrapping is purely lexical - no semantics change.
+    unsafe {
+        let mut acc0: i64 = 0;
+        let mut acc1: i64 = 0;
+        let mut acc2: i64 = 0;
+        let mut acc3: i64 = 0;
+        let full = len / 8 * 8;
+        let mut j = 0usize;
+        while j < full {
+            acc0 += (*row.add(j) as i64) * (*input.add(j));
+            acc1 += (*row.add(j + 1) as i64) * (*input.add(j + 1));
+            acc2 += (*row.add(j + 2) as i64) * (*input.add(j + 2));
+            acc3 += (*row.add(j + 3) as i64) * (*input.add(j + 3));
+            acc0 += (*row.add(j + 4) as i64) * (*input.add(j + 4));
+            acc1 += (*row.add(j + 5) as i64) * (*input.add(j + 5));
+            acc2 += (*row.add(j + 6) as i64) * (*input.add(j + 6));
+            acc3 += (*row.add(j + 7) as i64) * (*input.add(j + 7));
+            j += 8;
+        }
+        let mut acc = acc0 + acc1 + acc2 + acc3;
+        while j < len {
+            acc += (*row.add(j) as i64) * (*input.add(j));
+            j += 1;
+        }
+        acc
     }
-    let mut acc = acc0 + acc1 + acc2 + acc3;
-    while j < len {
-        acc += (*row.add(j) as i64) * (*input.add(j));
-        j += 1;
-    }
-    acc
 }
 
 /// NEON SIMD i16×i32 dot product. Mac M2 / aarch64.
@@ -631,54 +645,61 @@ unsafe fn dot_i16_i64_scalar(row: *const i16, input: *const i64, len: usize) -> 
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn dot_i16_i64_neon(row: *const i16, input: *const i64, len: usize) -> i64 {
-    use std::arch::aarch64::*;
-    let mut acc0: i64 = 0;
-    let mut acc1: i64 = 0;
-    let mut acc2: i64 = 0;
-    let mut acc3: i64 = 0;
-    let simd_len = len / 8 * 8;
-    let mut j = 0usize;
-    // Vector accumulators for 8 i64 partial sums
-    let mut va0 = vdupq_n_s64(0);
-    let mut va1 = vdupq_n_s64(0);
-    let mut va2 = vdupq_n_s64(0);
-    let mut va3 = vdupq_n_s64(0);
-    while j < simd_len {
-        // Load 8 weights as i16
-        let w16 = vld1q_s16(row.add(j));
-        // Widen the bottom 4 i16 to i32
-        let w32_lo = vmovl_s16(vget_low_s16(w16));
-        // Widen the top 4 i16 to i32
-        let w32_hi = vmovl_s16(vget_high_s16(w16));
-        // Load 8 i64 inputs and narrow to i32 (truncate)
-        let i64_0 = vld1q_s64(input.add(j));      // input[j..j+2]
-        let i64_1 = vld1q_s64(input.add(j + 2));  // input[j+2..j+4]
-        let i64_2 = vld1q_s64(input.add(j + 4));  // input[j+4..j+6]
-        let i64_3 = vld1q_s64(input.add(j + 6));  // input[j+6..j+8]
-        // Pack 4×i64 into 4×i32 (truncating)
-        let i32_lo = vcombine_s32(vmovn_s64(i64_0), vmovn_s64(i64_1));
-        let i32_hi = vcombine_s32(vmovn_s64(i64_2), vmovn_s64(i64_3));
-        // Multiply low half: i32 × i32 → i64 widening
-        va0 = vmlal_s32(va0, vget_low_s32(w32_lo),  vget_low_s32(i32_lo));
-        va1 = vmlal_high_s32(va1, w32_lo, i32_lo);
-        // Multiply high half
-        va2 = vmlal_s32(va2, vget_low_s32(w32_hi),  vget_low_s32(i32_hi));
-        va3 = vmlal_high_s32(va3, w32_hi, i32_hi);
-        j += 8;
+    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
+    // The contract is unchanged: the caller guarantees the pointers are valid
+    // for `len` reads. Wrapping is purely lexical - no semantics change.
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut acc0: i64 = 0;
+        let mut acc1: i64 = 0;
+        // acc2/acc3 exist to keep the horizontal-sum expression symmetric with
+        // the scalar path; they are never reassigned here.
+        let acc2: i64 = 0;
+        let acc3: i64 = 0;
+        let simd_len = len / 8 * 8;
+        let mut j = 0usize;
+        // Vector accumulators for 8 i64 partial sums
+        let mut va0 = vdupq_n_s64(0);
+        let mut va1 = vdupq_n_s64(0);
+        let mut va2 = vdupq_n_s64(0);
+        let mut va3 = vdupq_n_s64(0);
+        while j < simd_len {
+            // Load 8 weights as i16
+            let w16 = vld1q_s16(row.add(j));
+            // Widen the bottom 4 i16 to i32
+            let w32_lo = vmovl_s16(vget_low_s16(w16));
+            // Widen the top 4 i16 to i32
+            let w32_hi = vmovl_s16(vget_high_s16(w16));
+            // Load 8 i64 inputs and narrow to i32 (truncate)
+            let i64_0 = vld1q_s64(input.add(j));      // input[j..j+2]
+            let i64_1 = vld1q_s64(input.add(j + 2));  // input[j+2..j+4]
+            let i64_2 = vld1q_s64(input.add(j + 4));  // input[j+4..j+6]
+            let i64_3 = vld1q_s64(input.add(j + 6));  // input[j+6..j+8]
+            // Pack 4×i64 into 4×i32 (truncating)
+            let i32_lo = vcombine_s32(vmovn_s64(i64_0), vmovn_s64(i64_1));
+            let i32_hi = vcombine_s32(vmovn_s64(i64_2), vmovn_s64(i64_3));
+            // Multiply low half: i32 × i32 → i64 widening
+            va0 = vmlal_s32(va0, vget_low_s32(w32_lo),  vget_low_s32(i32_lo));
+            va1 = vmlal_high_s32(va1, w32_lo, i32_lo);
+            // Multiply high half
+            va2 = vmlal_s32(va2, vget_low_s32(w32_hi),  vget_low_s32(i32_hi));
+            va3 = vmlal_high_s32(va3, w32_hi, i32_hi);
+            j += 8;
+        }
+        // Horizontal sum the four i64x2 accumulators
+        let s01 = vaddq_s64(va0, va1);
+        let s23 = vaddq_s64(va2, va3);
+        let s = vaddq_s64(s01, s23);
+        acc0 = vgetq_lane_s64(s, 0);
+        acc1 = vgetq_lane_s64(s, 1);
+        let mut acc = acc0 + acc1 + acc2 + acc3;
+        // Tail
+        while j < len {
+            acc += (*row.add(j) as i64) * (*input.add(j));
+            j += 1;
+        }
+        acc
     }
-    // Horizontal sum the four i64x2 accumulators
-    let s01 = vaddq_s64(va0, va1);
-    let s23 = vaddq_s64(va2, va3);
-    let s = vaddq_s64(s01, s23);
-    acc0 = vgetq_lane_s64(s, 0);
-    acc1 = vgetq_lane_s64(s, 1);
-    let mut acc = acc0 + acc1 + acc2 + acc3;
-    // Tail
-    while j < len {
-        acc += (*row.add(j) as i64) * (*input.add(j));
-        j += 1;
-    }
-    acc
 }
 
 /// x86_64 i16×i64 dot product. Falls through to the scalar 8-element
@@ -689,18 +710,28 @@ unsafe fn dot_i16_i64_neon(row: *const i16, input: *const i64, len: usize) -> i6
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 unsafe fn dot_i16_i64_avx2(row: *const i16, input: *const i64, len: usize) -> i64 {
-    dot_i16_i64_scalar(row, input, len)
+    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
+    // The contract is unchanged: the caller guarantees the pointers are valid
+    // for `len` reads. Wrapping is purely lexical - no semantics change.
+    unsafe {
+        dot_i16_i64_scalar(row, input, len)
+    }
 }
 
 /// Dispatch wrapper - picks NEON on aarch64, AVX2 on x86_64, scalar elsewhere.
 #[inline(always)]
 unsafe fn dot_i16_i64(row: *const i16, input: *const i64, len: usize) -> i64 {
-    #[cfg(target_arch = "aarch64")]
-    { dot_i16_i64_neon(row, input, len) }
-    #[cfg(target_arch = "x86_64")]
-    { dot_i16_i64_avx2(row, input, len) }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-    { dot_i16_i64_scalar(row, input, len) }
+    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
+    // The contract is unchanged: the caller guarantees the pointers are valid
+    // for `len` reads. Wrapping is purely lexical - no semantics change.
+    unsafe {
+        #[cfg(target_arch = "aarch64")]
+        { dot_i16_i64_neon(row, input, len) }
+        #[cfg(target_arch = "x86_64")]
+        { dot_i16_i64_avx2(row, input, len) }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        { dot_i16_i64_scalar(row, input, len) }
+    }
 }
 
 // ─── NEON attention Q·K / attention·V SIMD ────────────────────────────────────
@@ -717,40 +748,50 @@ unsafe fn dot_i16_i64(row: *const i16, input: *const i64, len: usize) -> i64 {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64 {
-    use std::arch::aarch64::*;
-    let mut acc = vdupq_n_s64(0);
-    let simd_len = len / 4 * 4;
-    let mut j = 0usize;
-    while j < simd_len {
-        // Load 4 i64 from each operand
-        let a0 = vld1q_s64(a.add(j));      // a[j..j+2]
-        let a1 = vld1q_s64(a.add(j + 2));  // a[j+2..j+4]
-        let b0 = vld1q_s64(b.add(j));
-        let b1 = vld1q_s64(b.add(j + 2));
-        // Narrow to i32 (truncate - values are bounded by Q16)
-        let a32 = vcombine_s32(vmovn_s64(a0), vmovn_s64(a1));
-        let b32 = vcombine_s32(vmovn_s64(b0), vmovn_s64(b1));
-        // Multiply i32×i32 → i64 via vmull
-        acc = vmlal_s32(acc, vget_low_s32(a32), vget_low_s32(b32));
-        acc = vmlal_high_s32(acc, a32, b32);
-        j += 4;
+    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
+    // The contract is unchanged: the caller guarantees the pointers are valid
+    // for `len` reads. Wrapping is purely lexical - no semantics change.
+    unsafe {
+        use std::arch::aarch64::*;
+        let mut acc = vdupq_n_s64(0);
+        let simd_len = len / 4 * 4;
+        let mut j = 0usize;
+        while j < simd_len {
+            // Load 4 i64 from each operand
+            let a0 = vld1q_s64(a.add(j));      // a[j..j+2]
+            let a1 = vld1q_s64(a.add(j + 2));  // a[j+2..j+4]
+            let b0 = vld1q_s64(b.add(j));
+            let b1 = vld1q_s64(b.add(j + 2));
+            // Narrow to i32 (truncate - values are bounded by Q16)
+            let a32 = vcombine_s32(vmovn_s64(a0), vmovn_s64(a1));
+            let b32 = vcombine_s32(vmovn_s64(b0), vmovn_s64(b1));
+            // Multiply i32×i32 → i64 via vmull
+            acc = vmlal_s32(acc, vget_low_s32(a32), vget_low_s32(b32));
+            acc = vmlal_high_s32(acc, a32, b32);
+            j += 4;
+        }
+        let mut sum = vgetq_lane_s64(acc, 0) + vgetq_lane_s64(acc, 1);
+        while j < len {
+            sum += (*a.add(j)) * (*b.add(j));
+            j += 1;
+        }
+        sum
     }
-    let mut sum = vgetq_lane_s64(acc, 0) + vgetq_lane_s64(acc, 1);
-    while j < len {
-        sum += (*a.add(j)) * (*b.add(j));
-        j += 1;
-    }
-    sum
 }
 
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 unsafe fn dot_i64xi64_attn_neon(a: *const i64, b: *const i64, len: usize) -> i64 {
-    let mut sum: i64 = 0;
-    for i in 0..len {
-        sum += (*a.add(i)) * (*b.add(i));
+    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
+    // The contract is unchanged: the caller guarantees the pointers are valid
+    // for `len` reads. Wrapping is purely lexical - no semantics change.
+    unsafe {
+        let mut sum: i64 = 0;
+        for i in 0..len {
+            sum += (*a.add(i)) * (*b.add(i));
+        }
+        sum
     }
-    sum
 }
 
 /// Write i16 matmul result into pre-allocated output buffer (zero-alloc).
@@ -1207,7 +1248,7 @@ impl Q4WeightsX86 {
             let row = &w.data[i * n_cols..(i + 1) * n_cols];
 
             // Per-row abs_max of i8 values
-            let abs_max = row.iter().map(|&x| (x as i16).abs() as u8).max().unwrap_or(1).max(1);
+            let abs_max = row.iter().map(|&x| (x as i16).unsigned_abs() as u8).max().unwrap_or(1).max(1);
             // How many i8 units per Q4 step: ceil(abs_max / 7)
             let q4_per_unit = ((abs_max as i64 + 6) / 7).max(1);
 
@@ -1655,32 +1696,37 @@ fn quantize_for_dot(v: &[i64]) -> (Vec<i8>, i64) {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn dot_i8_kv_neon(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i32 {
-    use std::arch::aarch64::*;
+    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
+    // The contract is unchanged: the caller guarantees the pointers are valid
+    // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
-        let simd_len = d_head / 32 * 32;
-        let mut vacc0 = vdupq_n_s32(0);
-        let mut vacc1 = vdupq_n_s32(0);
-        let mut vacc2 = vdupq_n_s32(0);
-        let mut vacc3 = vdupq_n_s32(0);
-        let mut j = 0usize;
-        while j < simd_len {
-            let vq0 = vld1q_s8(q_i8.add(j));
-            let vk0 = vld1q_s8(k_ptr.add(j));
-            vacc0 = vpadalq_s16(vacc0, vmull_s8(vget_low_s8(vq0), vget_low_s8(vk0)));
-            vacc1 = vpadalq_s16(vacc1, vmull_s8(vget_high_s8(vq0), vget_high_s8(vk0)));
-            let vq1 = vld1q_s8(q_i8.add(j + 16));
-            let vk1 = vld1q_s8(k_ptr.add(j + 16));
-            vacc2 = vpadalq_s16(vacc2, vmull_s8(vget_low_s8(vq1), vget_low_s8(vk1)));
-            vacc3 = vpadalq_s16(vacc3, vmull_s8(vget_high_s8(vq1), vget_high_s8(vk1)));
-            j += 32;
+        use std::arch::aarch64::*;
+        unsafe {
+            let simd_len = d_head / 32 * 32;
+            let mut vacc0 = vdupq_n_s32(0);
+            let mut vacc1 = vdupq_n_s32(0);
+            let mut vacc2 = vdupq_n_s32(0);
+            let mut vacc3 = vdupq_n_s32(0);
+            let mut j = 0usize;
+            while j < simd_len {
+                let vq0 = vld1q_s8(q_i8.add(j));
+                let vk0 = vld1q_s8(k_ptr.add(j));
+                vacc0 = vpadalq_s16(vacc0, vmull_s8(vget_low_s8(vq0), vget_low_s8(vk0)));
+                vacc1 = vpadalq_s16(vacc1, vmull_s8(vget_high_s8(vq0), vget_high_s8(vk0)));
+                let vq1 = vld1q_s8(q_i8.add(j + 16));
+                let vk1 = vld1q_s8(k_ptr.add(j + 16));
+                vacc2 = vpadalq_s16(vacc2, vmull_s8(vget_low_s8(vq1), vget_low_s8(vk1)));
+                vacc3 = vpadalq_s16(vacc3, vmull_s8(vget_high_s8(vq1), vget_high_s8(vk1)));
+                j += 32;
+            }
+            vacc0 = vaddq_s32(vaddq_s32(vacc0, vacc1), vaddq_s32(vacc2, vacc3));
+            let mut acc = vaddvq_s32(vacc0);
+            while j < d_head {
+                acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
+                j += 1;
+            }
+            acc
         }
-        vacc0 = vaddq_s32(vaddq_s32(vacc0, vacc1), vaddq_s32(vacc2, vacc3));
-        let mut acc = vaddvq_s32(vacc0);
-        while j < d_head {
-            acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
-            j += 1;
-        }
-        acc
     }
 }
 
@@ -1688,36 +1734,41 @@ unsafe fn dot_i8_kv_neon(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i3
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn dot_i8_kv_avx2(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i32 {
-    use std::arch::x86_64::*;
-    if !is_x86_feature_detected!("avx2") {
-        let mut acc: i32 = 0;
-        for j in 0..d_head {
-            acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
+    // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
+    // The contract is unchanged: the caller guarantees the pointers are valid
+    // for `len` reads. Wrapping is purely lexical - no semantics change.
+    unsafe {
+        use std::arch::x86_64::*;
+        if !is_x86_feature_detected!("avx2") {
+            let mut acc: i32 = 0;
+            for j in 0..d_head {
+                acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
+            }
+            return acc;
         }
-        return acc;
+        let simd_len = d_head / 32 * 32;
+        let ones = _mm256_set1_epi16(1);
+        let mut vacc = _mm256_setzero_si256();
+        let mut j = 0usize;
+        while j < simd_len {
+            let vq = _mm256_loadu_si256(q_i8.add(j) as *const __m256i);
+            let vk = _mm256_loadu_si256(k_ptr.add(j) as *const __m256i);
+            let ax = _mm256_sign_epi8(vq, vq);
+            let sy = _mm256_sign_epi8(vk, vq);
+            vacc = _mm256_add_epi32(vacc, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), ones));
+            j += 32;
+        }
+        let lo = _mm256_extracti128_si256(vacc, 0);
+        let hi = _mm256_extracti128_si256(vacc, 1);
+        let sum128 = _mm_hadd_epi32(_mm_add_epi32(lo, hi), _mm_setzero_si128());
+        let sum128 = _mm_hadd_epi32(sum128, _mm_setzero_si128());
+        let mut acc = _mm_extract_epi32(sum128, 0);
+        while j < d_head {
+            acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
+            j += 1;
+        }
+        acc
     }
-    let simd_len = d_head / 32 * 32;
-    let ones = _mm256_set1_epi16(1);
-    let mut vacc = _mm256_setzero_si256();
-    let mut j = 0usize;
-    while j < simd_len {
-        let vq = _mm256_loadu_si256(q_i8.add(j) as *const __m256i);
-        let vk = _mm256_loadu_si256(k_ptr.add(j) as *const __m256i);
-        let ax = _mm256_sign_epi8(vq, vq);
-        let sy = _mm256_sign_epi8(vk, vq);
-        vacc = _mm256_add_epi32(vacc, _mm256_madd_epi16(_mm256_maddubs_epi16(ax, sy), ones));
-        j += 32;
-    }
-    let lo = _mm256_extracti128_si256(vacc, 0);
-    let hi = _mm256_extracti128_si256(vacc, 1);
-    let sum128 = _mm_hadd_epi32(_mm_add_epi32(lo, hi), _mm_setzero_si128());
-    let sum128 = _mm_hadd_epi32(sum128, _mm_setzero_si128());
-    let mut acc = _mm_extract_epi32(sum128, 0);
-    while j < d_head {
-        acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
-        j += 1;
-    }
-    acc
 }
 
 /// Cross-platform SIMD dot product dispatch for attention.
@@ -2356,11 +2407,56 @@ impl CachedIntegerModel {
         start_layer: usize,
         end_layer: usize,
         position: usize,
-    ) -> ShardOutput {
+    ) -> Result<ShardOutput, ShardForwardError> {
         let cfg = &self.config;
         let d = cfg.d_model;
         let is_first = start_layer == 0;
         let is_last = end_layer == cfg.n_layers;
+        let end = end_layer.min(self.layers.len());
+
+        // ── Preflight guards ────────────────────────────────────────────
+        // Everything below used to be a `debug_assert!` — i.e. absent in
+        // release — in front of an unchecked read. See ShardForwardError.
+
+        // RoPE table bound. `apply_rope` indexes cos[pos * half + i] with no
+        // bounds check on `pos`.
+        if position >= cfg.max_seq {
+            return Err(ShardForwardError::PositionOutOfRange {
+                position,
+                max_seq: cfg.max_seq,
+            });
+        }
+
+        // KV-cache continuity. `flash_attention_i64` walks j in 0..(position+1)
+        // and dereferences `k_cache.as_ptr().add(j * d_kv + ...)` UNCHECKED, so
+        // a cache holding fewer than `position` prior entries is an
+        // out-of-bounds read (UB), not a wrong answer. This is the state a
+        // replica is in when the coordinator failed over to it mid-stream, or
+        // when a hedged/raced request to it was dropped before it landed.
+        //
+        // We require exact equality, not >=: a cache that is somehow LONGER
+        // than the position implies the coordinator is replaying a position
+        // this replica already consumed, which would double-push K/V and
+        // silently corrupt every later token.
+        for layer_idx in start_layer..end {
+            let cached = cache.k_data[layer_idx].len() / cfg.d_kv.max(1);
+            if cached != position {
+                return Err(ShardForwardError::KvCacheOutOfSync {
+                    layer: layer_idx,
+                    expected_positions: position,
+                    cached_positions: cached,
+                });
+            }
+        }
+
+        // Layer residency. A non-resident layer carries empty weight buffers;
+        // matmul against them produces garbage at best and indexes off the end
+        // at worst.
+        for layer_idx in start_layer..end {
+            if !self.layers[layer_idx].is_loaded() {
+                return Err(ShardForwardError::LayerNotLoaded { layer: layer_idx });
+            }
+        }
 
         // ── Input: token id (first shard) → embedding lookup ──
         // ── Input: hidden state (middle/last) → use directly ──
@@ -2372,8 +2468,15 @@ impl CachedIntegerModel {
                 self.embedding_q16[emb_start..emb_start + d].to_vec()
             }
             ShardInput::Hidden(state) => {
-                debug_assert!(state.len() == d,
-                    "Shard hidden state has wrong dimension: got {}, expected {}", state.len(), d);
+                // A short hidden state from a peer used to panic on
+                // `hidden[i] += projected[i]`, which aborts the process under
+                // the release profile's `panic = "abort"`.
+                if state.len() != d {
+                    return Err(ShardForwardError::BadHiddenDim {
+                        got: state.len(),
+                        expected: d,
+                    });
+                }
                 state
             }
         };
@@ -2388,12 +2491,8 @@ impl CachedIntegerModel {
         let mut up = vec![0i64; cfg.d_ff];
         let mut ff_out = vec![0i64; d];
 
-        let end = end_layer.min(self.layers.len());
-
         for layer_idx in start_layer..end {
             let layer = &self.layers[layer_idx];
-            debug_assert!(layer.is_loaded(),
-                "Shard does not hold layer {} (range was [{}, {}))", layer_idx, start_layer, end);
 
             // I16 layer ref (preferred - quantized from f32 with 258x finer
             // granularity than I8, which is what makes output coherent on
@@ -2511,10 +2610,10 @@ impl CachedIntegerModel {
             let token_id = argmax_i64(&logits) as u32;
             let logits_bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
             let logits_hash = arc_crypto::hash_bytes(&logits_bytes);
-            ShardOutput::Token { id: token_id, logits_hash }
+            Ok(ShardOutput::Token { id: token_id, logits_hash })
         } else {
             cache.seq_len = position + 1;
-            ShardOutput::Hidden(hidden)
+            Ok(ShardOutput::Hidden(hidden))
         }
     }
 }
@@ -2537,6 +2636,86 @@ pub enum ShardOutput {
     /// for cryptographic determinism verification.
     Token { id: u32, logits_hash: Hash256 },
 }
+
+/// Why a shard forward pass refused to run.
+///
+/// Every variant here replaces something that used to be a `debug_assert!`
+/// (compiled out in release) followed by an out-of-bounds read or an index
+/// panic. Because the workspace builds release with `panic = "abort"`, an
+/// index panic inside `spawn_blocking` takes the whole node down — so a
+/// coordinator that dispatched one bad request could kill a shard holder.
+/// These are now honest, typed refusals the coordinator can act on.
+///
+/// The KV-cache variant is the load-bearing one: `forward_shard_token`
+/// reads `k_cache` through an UNCHECKED raw pointer in `flash_attention_i64`,
+/// so running position `p` against a cache holding fewer than `p` positions
+/// is undefined behaviour, not merely a wrong answer. That happens whenever
+/// a coordinator fails over to a replica that missed earlier positions —
+/// which is exactly what replica failover and hedged dispatch do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShardForwardError {
+    /// This node's per-request KV cache does not line up with the requested
+    /// position: running position `p` requires exactly `p` cached positions
+    /// for every layer in the range. Means "this replica is cold for this
+    /// request" — the coordinator should treat it as a replica failure and
+    /// either replay from position 0 or use a warm replica.
+    KvCacheOutOfSync {
+        layer: usize,
+        expected_positions: usize,
+        cached_positions: usize,
+    },
+    /// A layer in the requested range is not resident on this node.
+    LayerNotLoaded { layer: usize },
+    /// The hidden state from the previous shard has the wrong dimension.
+    BadHiddenDim { got: usize, expected: usize },
+    /// Position is past the model's precomputed RoPE tables.
+    PositionOutOfRange { position: usize, max_seq: usize },
+}
+
+impl ShardForwardError {
+    /// Stable machine-readable tag. The coordinator matches on this string
+    /// over the wire, so treat it as part of the RPC contract.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ShardForwardError::KvCacheOutOfSync { .. } => "kv_cache_out_of_sync",
+            ShardForwardError::LayerNotLoaded { .. } => "layer_not_loaded",
+            ShardForwardError::BadHiddenDim { .. } => "bad_hidden_dim",
+            ShardForwardError::PositionOutOfRange { .. } => "position_out_of_range",
+        }
+    }
+}
+
+impl std::fmt::Display for ShardForwardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ShardForwardError::KvCacheOutOfSync {
+                layer,
+                expected_positions,
+                cached_positions,
+            } => write!(
+                f,
+                "kv_cache_out_of_sync: layer {} holds {} cached positions but \
+                 this request needs exactly {} (replica is cold for this request_id)",
+                layer, cached_positions, expected_positions
+            ),
+            ShardForwardError::LayerNotLoaded { layer } => {
+                write!(f, "layer_not_loaded: layer {} is not resident on this node", layer)
+            }
+            ShardForwardError::BadHiddenDim { got, expected } => write!(
+                f,
+                "bad_hidden_dim: hidden state has {} elements, expected {}",
+                got, expected
+            ),
+            ShardForwardError::PositionOutOfRange { position, max_seq } => write!(
+                f,
+                "position_out_of_range: position {} is past the model's {}-position RoPE table",
+                position, max_seq
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ShardForwardError {}
 
 // ─── RoPE Tables ──────────────────────────────────────────────────────────────
 
@@ -3671,7 +3850,7 @@ mod tests {
             &mut cache_a,
             0, n_layers,
             0,
-        );
+        ).expect("whole-model shard at position 0 is always in sync");
         let token_a = match result_a {
             ShardOutput::Token { id, .. } => id,
             _ => panic!("Whole-model shard should produce a token, not a hidden state"),
@@ -3686,7 +3865,7 @@ mod tests {
             &mut cache_b,
             0, k,
             0,
-        );
+        ).expect("first shard at position 0 is always in sync");
         let hidden = match mid {
             ShardOutput::Hidden(h) => h,
             _ => panic!("First shard should produce a hidden state, not a token"),
@@ -3696,7 +3875,7 @@ mod tests {
             &mut cache_b,
             k, n_layers,
             0,
-        );
+        ).expect("last shard at position 0 is always in sync");
         let token_b = match result_b {
             ShardOutput::Token { id, .. } => id,
             _ => panic!("Last shard should produce a token"),
@@ -3718,7 +3897,7 @@ mod tests {
         // Path A: one shard covering everything
         let mut cache_a = KVCache::new(n_layers);
         let result_a = model.forward_shard_token(
-            ShardInput::Token(token), &mut cache_a, 0, n_layers, 0);
+            ShardInput::Token(token), &mut cache_a, 0, n_layers, 0).unwrap();
         let token_a = match result_a {
             ShardOutput::Token { id, .. } => id,
             _ => panic!("expected Token"),
@@ -3727,17 +3906,17 @@ mod tests {
         // Path B: 3 shards [0, 2), [2, 4), [4, 6)
         let mut cache_b = KVCache::new(n_layers);
         let h1 = match model.forward_shard_token(
-            ShardInput::Token(token), &mut cache_b, 0, 2, 0) {
+            ShardInput::Token(token), &mut cache_b, 0, 2, 0).unwrap() {
             ShardOutput::Hidden(h) => h,
             _ => panic!("expected Hidden"),
         };
         let h2 = match model.forward_shard_token(
-            ShardInput::Hidden(h1), &mut cache_b, 2, 4, 0) {
+            ShardInput::Hidden(h1), &mut cache_b, 2, 4, 0).unwrap() {
             ShardOutput::Hidden(h) => h,
             _ => panic!("expected Hidden"),
         };
         let token_b = match model.forward_shard_token(
-            ShardInput::Hidden(h2), &mut cache_b, 4, 6, 0) {
+            ShardInput::Hidden(h2), &mut cache_b, 4, 6, 0).unwrap() {
             ShardOutput::Token { id, .. } => id,
             _ => panic!("expected Token"),
         };
@@ -3768,7 +3947,7 @@ mod tests {
         let mut tokens_a = Vec::new();
         for (pos, &tok) in prompt.iter().enumerate() {
             let res = model.forward_shard_token(
-                ShardInput::Token(tok), &mut cache_a, 0, n_layers, pos);
+                ShardInput::Token(tok), &mut cache_a, 0, n_layers, pos).unwrap();
             match res {
                 ShardOutput::Token { id, .. } => tokens_a.push(id),
                 _ => panic!("Expected Token at pos {}", pos),
@@ -3782,12 +3961,12 @@ mod tests {
         let mut tokens_b = Vec::new();
         for (pos, &tok) in prompt.iter().enumerate() {
             let mid = match model.forward_shard_token(
-                ShardInput::Token(tok), &mut cache_b, 0, k, pos) {
+                ShardInput::Token(tok), &mut cache_b, 0, k, pos).unwrap() {
                 ShardOutput::Hidden(h) => h,
                 _ => panic!("First shard at pos {} should produce Hidden", pos),
             };
             let res = model.forward_shard_token(
-                ShardInput::Hidden(mid), &mut cache_b, k, n_layers, pos);
+                ShardInput::Hidden(mid), &mut cache_b, k, n_layers, pos).unwrap();
             match res {
                 ShardOutput::Token { id, .. } => tokens_b.push(id),
                 _ => panic!("Last shard at pos {} should produce Token", pos),
@@ -3796,6 +3975,103 @@ mod tests {
 
         assert_eq!(tokens_a, tokens_b,
             "Multi-position shard split diverged. A={:?} B={:?}", tokens_a, tokens_b);
+    }
+
+    // ── KV-cache continuity guard ───────────────────────────────────────
+    //
+    // These pin the behaviour that makes replica failover and hedged
+    // dispatch safe. Before the guard, running a position against a cold
+    // cache read past the end of `k_data` through an unchecked raw pointer
+    // in `flash_attention_i64` — undefined behaviour, and under the release
+    // profile's `panic = "abort"` any resulting index panic takes the whole
+    // node down.
+
+    #[test]
+    fn cold_replica_mid_stream_is_rejected_not_undefined() {
+        // Exactly the failover scenario: the coordinator ran positions 0..3
+        // against replica A, replica A stopped answering, and the request is
+        // handed to replica B whose cache for this request_id is empty.
+        let model = build_test_model(15, 32, 2, 64, 4);
+        let n_layers = model.config.n_layers;
+
+        let mut cold = KVCache::new(n_layers);
+        let err = model
+            .forward_shard_token(ShardInput::Token(5), &mut cold, 0, n_layers, 3)
+            .expect_err("cold cache at position 3 must be refused");
+
+        assert_eq!(err.kind(), "kv_cache_out_of_sync");
+        match err {
+            ShardForwardError::KvCacheOutOfSync {
+                expected_positions,
+                cached_positions,
+                ..
+            } => {
+                assert_eq!(expected_positions, 3);
+                assert_eq!(cached_positions, 0);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replayed_position_is_rejected_so_kv_cannot_double_push() {
+        // A coordinator that retries a position this replica already
+        // consumed would double-push K/V and corrupt every later token.
+        // Require exact equality, not >=.
+        let model = build_test_model(15, 32, 2, 64, 4);
+        let n_layers = model.config.n_layers;
+        let mut cache = KVCache::new(n_layers);
+
+        model
+            .forward_shard_token(ShardInput::Token(1), &mut cache, 0, n_layers, 0)
+            .expect("position 0 on a fresh cache");
+        model
+            .forward_shard_token(ShardInput::Token(2), &mut cache, 0, n_layers, 1)
+            .expect("position 1 follows position 0");
+
+        // Replay position 1 — cache now holds 2 positions, not 1.
+        let err = model
+            .forward_shard_token(ShardInput::Token(2), &mut cache, 0, n_layers, 1)
+            .expect_err("replayed position must be refused");
+        assert_eq!(err.kind(), "kv_cache_out_of_sync");
+    }
+
+    #[test]
+    fn warm_replica_in_sequence_is_accepted() {
+        // The guard must not reject the normal path: every position in
+        // ascending order on the same cache.
+        let model = build_test_model(15, 32, 2, 64, 4);
+        let n_layers = model.config.n_layers;
+        let mut cache = KVCache::new(n_layers);
+        for pos in 0..6 {
+            model
+                .forward_shard_token(ShardInput::Token(pos as u32 + 1), &mut cache, 0, n_layers, pos)
+                .unwrap_or_else(|e| panic!("in-sequence position {pos} rejected: {e}"));
+        }
+    }
+
+    #[test]
+    fn short_hidden_state_from_peer_is_rejected_not_panic() {
+        let model = build_test_model(15, 32, 2, 64, 4);
+        let n_layers = model.config.n_layers;
+        let mut cache = KVCache::new(n_layers);
+        let err = model
+            .forward_shard_token(ShardInput::Hidden(vec![0i64; 3]), &mut cache, 2, n_layers, 0)
+            .expect_err("truncated hidden state must be refused");
+        assert_eq!(err.kind(), "bad_hidden_dim");
+    }
+
+    #[test]
+    fn position_past_rope_table_is_rejected_not_panic() {
+        // apply_rope indexes cos[pos * half + i] with no bounds check.
+        let model = build_test_model(15, 32, 2, 64, 4);
+        let n_layers = model.config.n_layers;
+        let max_seq = model.config.max_seq;
+        let mut cache = KVCache::new(n_layers);
+        let err = model
+            .forward_shard_token(ShardInput::Token(1), &mut cache, 0, n_layers, max_seq)
+            .expect_err("position past the RoPE table must be refused");
+        assert_eq!(err.kind(), "position_out_of_range");
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]

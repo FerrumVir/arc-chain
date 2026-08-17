@@ -26,8 +26,24 @@ struct Cli {
     #[arg(long, default_value_t = 9945)]
     p2p_port: u16,
 
-    /// Validator stake in ARC (0 = observer node)
-    #[arg(long, default_value_t = 5_000_000)]
+    /// Validator stake in ARC. 0 (the default) = observer / community node.
+    ///
+    /// DEFAULT CHANGED from 5,000,000 to 0, deliberately.
+    ///
+    /// A plain `arc-node` used to join as a full-stake validator. Any peer
+    /// announcing stake >= min_stake is merged into the live ValidatorSet and
+    /// queued into the consensus engine; at the next epoch boundary
+    /// `freeze_epoch()` absorbs it, its stake is normalised to the maximum
+    /// observed, and it owns 1/N of the leader slots on EVERY seed.
+    /// `PeerDisconnected` explicitly refuses to remove an address from a
+    /// frozen set, so the damage survives until every seed is restarted —
+    /// which is itself forbidden, because a seed restart destroys all
+    /// in-memory inference evidence. This has already happened once on the
+    /// live network: genesis declares 6 validators and LAX reports 7.
+    ///
+    /// Becoming a validator must be an explicit act. Pass `--stake N` to opt
+    /// in; the node prints a loud warning if you do it against public peers.
+    #[arg(long, default_value_t = 0)]
     stake: u64,
 
     /// Data directory for WAL/snapshots
@@ -175,6 +191,61 @@ struct Cli {
     /// prints clear download instructions with the expected sha256.
     #[arg(long, default_value_t = false)]
     community: bool,
+
+    /// Run as a silent observer: no community registration, no heartbeat, no
+    /// work claiming. The node still reads from its peers (GET only) and can
+    /// act as a sharded-inference coordinator against them.
+    ///
+    /// Needed because community mode is auto-enabled whenever stake == 0, and
+    /// stake now defaults to 0. Without this flag a plain
+    /// `arc-node --seeds-file <public seeds>` would begin POSTing
+    /// /community/register and /community/heartbeat to every seed in the file
+    /// — writes to someone else's network that the operator never asked for.
+    /// This is the flag to use when pointing a local coordinator at a network
+    /// you are only allowed to read.
+    #[arg(long, default_value_t = false)]
+    no_community: bool,
+
+    /// Ask a seed to assign this node a layer range at boot (POST /shards/join).
+    ///
+    /// OFF by default, and it used to be implicit for any staked node with a
+    /// model and no explicit --shard-range. That implicit trigger is how a
+    /// joining node injected an off-grid `[0, 8)` shard into a pipeline
+    /// already fully covered by the 6-range tiling: the seed inserts the
+    /// announcement verbatim with no stub-address check, and v0.7.9 seeds'
+    /// pipeline assemblers then abort with
+    /// `503 Pipeline gap: expected layer 6 next, got shard [0, 8)` — taking
+    /// out sharded inference network-wide. Opt in only when you mean it, and
+    /// prefer an explicit on-grid `--shard-range`.
+    #[arg(long, default_value_t = false)]
+    auto_shard_join: bool,
+
+    /// Number of threads for inference compute (rayon pool width).
+    ///
+    /// 0 (default) uses rayon's implicit global pool, which is sized from
+    /// `RAYON_NUM_THREADS` when that env var is set and from
+    /// `available_parallelism()` otherwise. Any non-zero value builds a
+    /// dedicated pool that `forward_shard` and local `generate` run inside,
+    /// and that pool can be resized at runtime via
+    /// `POST /node/threads {"threads": n}` with no restart.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
+    /// Promote INT8 weights to INT16 storage after load.
+    ///
+    /// Only meaningful on aarch64, where `matmul_i16_into` dispatches to a
+    /// real NEON widening kernel. On x86 this is a pure loss: `enable_i16`
+    /// builds every I16Weights via `I16Weights::from_i8`, which has no f32
+    /// source and therefore carries no additional precision, and the x86
+    /// `dot_i16_i64` is `dot_i16_i64_avx2` → `dot_i16_i64_scalar` (the AVX-512
+    /// path was reverted after segfaults). Net effect per layer: double the
+    /// weight bytes streamed, identical arithmetic, identical output — plus
+    /// the I8 weights are retained alongside the I16 ones, so a 15-layer
+    /// holder's resident set grows by several GB.
+    ///
+    /// Defaults to on for aarch64, off elsewhere. Pass the flag to force it.
+    #[arg(long, default_value_t = false)]
+    enable_i16: bool,
 }
 
 /// Rewrites a pulled peer's `self_shard.socket_addr` in place when it carries
@@ -688,7 +759,8 @@ async fn main() -> Result<()> {
     // load picks up only that slice instead of holding the full model.
     // Community workers (stake=0) skip this — they hold the full model by
     // design and auto-register via /community/register.
-    if cli.stake > 0
+    if cli.auto_shard_join
+        && cli.stake > 0
         && cli.model.is_some()
         && cli.shard_ranges.is_empty()
         && cli.shard_start.is_none()
@@ -871,6 +943,40 @@ async fn main() -> Result<()> {
             stake, min_stake
         );
         std::process::exit(1);
+    }
+
+    // ── Loud warning: staking into a network you don't own ─────────────
+    // Joining a public network with stake > 0 is a one-way door. The peer is
+    // merged into every seed's ValidatorSet, absorbed by `freeze_epoch()` at
+    // the next boundary, and `PeerDisconnected` refuses to remove an address
+    // from a frozen set — so it keeps drawing leader slots on every seed
+    // until all of them restart. Nothing here blocks it (an operator running
+    // their own network needs it), but nobody should do it by accident.
+    if stake > 0 && !peers.is_empty() {
+        let public_peers: Vec<&String> = peers
+            .iter()
+            .filter(|p| {
+                let host = p.split(':').next().unwrap_or("");
+                !(host.starts_with("127.")
+                    || host.starts_with("10.")
+                    || host.starts_with("192.168.")
+                    || host == "localhost"
+                    || host.is_empty())
+            })
+            .collect();
+        if !public_peers.is_empty() {
+            tracing::warn!("╔══════════════════════════════════════════════════════════════╗");
+            tracing::warn!("║  JOINING A PUBLIC NETWORK AS A VOTING VALIDATOR              ║");
+            tracing::warn!("╚══════════════════════════════════════════════════════════════╝");
+            tracing::warn!("  --stake {} against {} non-local peer(s).", stake, public_peers.len());
+            tracing::warn!("  This node will be merged into every seed's validator set and");
+            tracing::warn!("  absorbed by the next epoch freeze. Frozen sets do NOT release a");
+            tracing::warn!("  validator on disconnect, so it will keep drawing leader slots on");
+            tracing::warn!("  every seed until all of them are restarted.");
+            tracing::warn!("  If you meant to contribute compute, not consensus: use --community");
+            tracing::warn!("  (or --stake 0). Continuing in 5s...");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
     }
 
     // ── Derive validator keypair and address from seed ─────────────────
@@ -1185,10 +1291,31 @@ async fn main() -> Result<()> {
                     // matmul_i16_into. Real quality improvement requires the
                     // multi-range loader to stitch per-range f32 I16 weights
                     // — separate change.
-                    if model.i16_layers.is_none() && layers_held > 0 {
+                    //
+                    // GATED as of this change. On aarch64 the promotion is a
+                    // real win: `matmul_i16_into` dispatches to
+                    // `dot_i16_i64_neon`, an actual widening SIMD kernel. On
+                    // x86 it is a pure loss — `from_i8` carries no extra
+                    // precision (no f32 source), and `dot_i16_i64` resolves to
+                    // `dot_i16_i64_avx2`, which is literally a call to
+                    // `dot_i16_i64_scalar` (the AVX-512 path was reverted after
+                    // segfaults). So an x86 seed doubled the weight bytes it
+                    // streamed per layer, kept the I8 weights resident
+                    // alongside the I16 ones, and got byte-identical output out
+                    // of the same scalar loop. `--enable-i16` forces it on any
+                    // architecture.
+                    let want_i16 = cli.enable_i16 || cfg!(target_arch = "aarch64");
+                    if model.i16_layers.is_none() && layers_held > 0 && want_i16 {
                         model.enable_i16();
                         tracing::info!(
                             "I16 dispatch enabled (promoted from I8); engine label will report \"INT16 integer\""
+                        );
+                    } else if model.i16_layers.is_none() && layers_held > 0 {
+                        tracing::info!(
+                            "I16 promotion SKIPPED on {}: from_i8 adds no precision and this \
+                             target's i16 dot product is scalar, so promoting would double \
+                             per-layer weight bytes for identical output. Pass --enable-i16 to force.",
+                            std::env::consts::ARCH
                         );
                     }
                     tracing::info!(
@@ -1645,7 +1772,18 @@ async fn main() -> Result<()> {
     // heartbeats before eviction.
     // Auto-enable community mode for observer nodes (stake=0).
     // If you join with no stake, you're a community contributor - no flag needed.
-    let community_mode = cli.community_mode || stake == 0;
+    //
+    // `--no-community` opts out. That escape hatch exists because --stake now
+    // defaults to 0: without it, a bare `arc-node --seeds-file <public seeds>`
+    // would start POSTing /community/register and /community/heartbeat to
+    // every seed listed. Read-only coordinators need to be able to say no.
+    let community_mode = (cli.community_mode || stake == 0) && !cli.no_community;
+    if cli.no_community && (cli.community_mode || stake == 0) {
+        tracing::info!(
+            "--no-community: observer mode. This node will NOT register, heartbeat or \
+             claim work from its peers; it only reads from them."
+        );
+    }
 
     if community_mode {
         tracing::info!("╔═══════════════════════════════════════╗");
@@ -1708,11 +1846,24 @@ async fn main() -> Result<()> {
                 Err(_) => return,
             };
 
-            // Model info for auto-shard assignment is pre-computed above the spawn.
+            // Advertise "inference" ONLY when a model is actually loaded.
+            //
+            // This was hardcoded to ["inference"] regardless. All three live
+            // registered workers reported `model: null` yet still counted as
+            // live inference workers on the seed side (which checks
+            // capabilities alone), so the router dispatched real jobs into a
+            // black hole and blocked in dispatch_to_community_worker for the
+            // full community_dispatch_timeout — 60 s at the desktop's 16-token
+            // default — before falling back to local.
+            let capabilities: Vec<&str> = if model_name_c.is_some() {
+                vec!["inference"]
+            } else {
+                vec!["relay"]
+            };
             let register_payload = serde_json::json!({
                 "worker_id": worker_id_c,
                 "name": format!("{} ({})", validator_seed_c, hostname_c),
-                "capabilities": ["inference"],
+                "capabilities": capabilities,
                 "model": model_name_c,
                 "platform": platform_c,
                 "model_id": &model_id_hex,
@@ -1726,47 +1877,72 @@ async fn main() -> Result<()> {
             });
 
             // Register once, then heartbeat + re-register periodically.
-            // Community gateway runs on port 3001 as a sidecar alongside
-            // the main arc-node on 9090. Try both 3001 (gateway) and 9090
-            // (if the seed runs the dd0 binary with built-in endpoints).
+            //
+            // ORDER: arc-node's own RPC (:9090) FIRST, the legacy Python
+            // community gateway (:3001) only as a fallback. This was
+            // inverted, and the inversion is the direct cause of AMS
+            // reporting `count_visible: 0` with `count_total: 4`: AMS runs a
+            // :3001 gateway that answers, so the fallback to :9090 never
+            // fired, arc-node's own registry never saw a heartbeat, its
+            // entries aged past COMMUNITY_WORKER_TTL_SECS and were filtered
+            // out of the scoreboard. Seeds without a gateway were fine — LAX
+            // 3/3, NYC 3/8 — which is exactly the signature of "the seed with
+            // the extra service is the broken one". The claim loop below
+            // already used the correct order; these two now agree.
+            //
+            // Seeds are contacted CONCURRENTLY. Serially, one unreachable
+            // seed's 5 s timeout delayed every seed after it, and with six
+            // seeds a full round could exceed the 15 s tick.
             let mut ticks: u64 = 0;
             loop {
+                let register_tick = ticks % 4 == 0;
+                let mut set = tokio::task::JoinSet::new();
                 for addr in &seed_rpc_addrs_c {
-                    // Derive gateway port from RPC addr: replace :9090 with :3001
-                    let host = addr.split(':').next().unwrap_or(addr);
-                    let gateway_addr = format!("{}:3001", host);
-                    // Every 4th tick (60s), do a full re-register to pick up metadata changes
-                    if ticks % 4 == 0 {
-                        // Try gateway first (port 3001), then arc-node (port 9090)
-                        let r = client.post(format!("http://{}/community/register", gateway_addr))
-                            .json(&register_payload).send().await;
-                        let resp = if let Ok(resp) = r {
-                            resp.json::<serde_json::Value>().await.ok()
-                        } else {
-                            let r2 = client.post(format!("http://{}/community/register", addr))
-                                .json(&register_payload).send().await;
-                            if let Ok(resp) = r2 { resp.json::<serde_json::Value>().await.ok() } else { None }
-                        };
-                        // Log shard assignment from coordinator (auto-sharding)
-                        if let Some(ref resp) = resp {
-                            if let Some(sa) = resp.get("shard_assignment") {
-                                if !sa.is_null() {
-                                    tracing::info!(
-                                        start = sa.get("start_layer").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        end = sa.get("end_layer").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        total = sa.get("total_layers").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        seed = %addr,
-                                        "Auto-shard assignment received from coordinator"
-                                    );
-                                }
-                            }
-                        }
+                    let client = client.clone();
+                    let addr = addr.clone();
+                    let payload = if register_tick {
+                        register_payload.clone()
                     } else {
-                        let r = client.post(format!("http://{}/community/heartbeat", gateway_addr))
-                            .json(&heartbeat_payload).send().await;
-                        if r.is_err() {
-                            let _ = client.post(format!("http://{}/community/heartbeat", addr))
-                                .json(&heartbeat_payload).send().await;
+                        heartbeat_payload.clone()
+                    };
+                    let path = if register_tick { "register" } else { "heartbeat" };
+                    set.spawn(async move {
+                        let host = addr.split(':').next().unwrap_or(&addr).to_string();
+                        let gateway_addr = format!("{}:3001", host);
+                        // arc-node first…
+                        let primary = client
+                            .post(format!("http://{}/community/{}", addr, path))
+                            .json(&payload)
+                            .send()
+                            .await;
+                        let resp = match primary {
+                            Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+                            // …legacy gateway only if arc-node didn't answer.
+                            _ => match client
+                                .post(format!("http://{}/community/{}", gateway_addr, path))
+                                .json(&payload)
+                                .send()
+                                .await
+                            {
+                                Ok(r) => r.json::<serde_json::Value>().await.ok(),
+                                Err(_) => None,
+                            },
+                        };
+                        (addr, resp)
+                    });
+                }
+                while let Some(Ok((addr, resp))) = set.join_next().await {
+                    if let Some(resp) = resp {
+                        if let Some(sa) = resp.get("shard_assignment") {
+                            if !sa.is_null() {
+                                tracing::info!(
+                                    start = sa.get("start_layer").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    end = sa.get("end_layer").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    total = sa.get("total_layers").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    seed = %addr,
+                                    "Auto-shard assignment received from coordinator"
+                                );
+                            }
                         }
                     }
                 }
@@ -1813,47 +1989,82 @@ async fn main() -> Result<()> {
                     "Community inference worker started - polling for jobs"
                 );
                 loop {
-                    // Try each seed: prefer the v0.7.0+ arc-node queue on
-                    // port 9090; fall back to the legacy Python gateway on
-                    // port 3001 for seeds that haven't upgraded yet.
+                    // Long-poll EVERY seed at once and take the first to hand
+                    // us work.
+                    //
+                    // This used to be a sequential `for addr in seeds`, each
+                    // awaiting a long-poll of up to COMMUNITY_CLAIM_TIMEOUT_SECS
+                    // (30 s) on :9090 and then again on :3001. With six seeds
+                    // the worst-case revisit interval for any one seed was
+                    // ~6 minutes, against a dispatcher that gives up after at
+                    // most 60 s — so a job queued on seed 5 expired before the
+                    // worker got back around to asking. Every live seed
+                    // reported total_work_completed = 0 despite three
+                    // registered workers.
+                    //
+                    // Now: one in-flight claim per seed, first responder wins,
+                    // the rest are dropped and re-armed on the next pass.
+                    let claim_body = serde_json::json!({
+                        "worker_id": worker_id_w,
+                        "capabilities": ["inference"],
+                    });
+                    let mut claims = tokio::task::JoinSet::new();
                     for addr in &seed_rpc_addrs_w {
-                        let host = addr.split(':').next().unwrap_or(addr);
-                        let primary = addr.clone(); // host:9090 (new arc-node)
+                        let client = client.clone();
+                        let body = claim_body.clone();
+                        let primary = addr.clone(); // host:9090 (arc-node)
+                        let host = addr.split(':').next().unwrap_or(addr).to_string();
                         let legacy = format!("{}:3001", host); // python gateway
-                        let claim_body = serde_json::json!({
-                            "worker_id": worker_id_w,
-                            "capabilities": ["inference"],
-                        });
-
-                        let try_post = |target: String| {
-                            let client = client.clone();
-                            let body = claim_body.clone();
-                            async move {
-                                let resp = client
-                                    .post(format!("http://{}/community/claim_work", target))
-                                    .json(&body)
-                                    .send()
-                                    .await
-                                    .ok()?;
-                                let job: serde_json::Value = resp.json().await.ok()?;
-                                if job.get("status").and_then(|s| s.as_str()) == Some("work") {
-                                    Some((target, job))
-                                } else {
-                                    None
+                        claims.spawn(async move {
+                            let try_post = |target: String| {
+                                let client = client.clone();
+                                let body = body.clone();
+                                async move {
+                                    let resp = client
+                                        .post(format!("http://{}/community/claim_work", target))
+                                        .json(&body)
+                                        .send()
+                                        .await
+                                        .ok()?;
+                                    let job: serde_json::Value = resp.json().await.ok()?;
+                                    if job.get("status").and_then(|s| s.as_str()) == Some("work") {
+                                        Some((target, job))
+                                    } else {
+                                        None
+                                    }
                                 }
+                            };
+                            match try_post(primary).await {
+                                Some(p) => Some(p),
+                                None => try_post(legacy).await,
                             }
-                        };
+                        });
+                    }
 
-                        let claimed = match try_post(primary.clone()).await {
-                            Some(p) => Some(p),
-                            None => try_post(legacy.clone()).await,
+                    let mut claimed: Option<(String, serde_json::Value)> = None;
+                    while let Some(res) = claims.join_next().await {
+                        if let Ok(Some(hit)) = res {
+                            claimed = Some(hit);
+                            break;
+                        }
+                    }
+                    // Dropping `claims` aborts the other outstanding polls;
+                    // they carry no state, so re-arming next pass is free.
+                    drop(claims);
+
+                    {
+                        let Some((winner, job)) = claimed else {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
                         };
-                        let Some((winner, job)) = claimed else { continue };
 
                         let job_id = job.get("job_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
                         let input = job.get("input").and_then(|s| s.as_str()).unwrap_or("").to_string();
                         let max_tokens = job.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
-                        if input.is_empty() || job_id.is_empty() { continue; }
+                        if input.is_empty() || job_id.is_empty() {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
 
                         tracing::info!("Claimed job {} from {}: {:?} (max_tokens={})",
                             job_id, winner, &input[..input.len().min(40)], max_tokens);
@@ -1982,7 +2193,6 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        break; // after completing a job, go back to the top and poll again
                     }
                     // Brief sleep between poll rounds to avoid hammering
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1991,6 +2201,32 @@ async fn main() -> Result<()> {
             tracing::info!("Community inference worker loop spawned");
         }
     }
+
+    // Seed RPC endpoints the coordinator can pull shard topology from when
+    // its own registry doesn't cover the model. Convention: seeds serve RPC
+    // on 9090 regardless of the P2P port advertised in the seeds file.
+    let coordinator_seed_rpcs: Vec<String> = {
+        let mut v: Vec<String> = peers
+            .iter()
+            .filter_map(|p| p.split(':').next())
+            .filter(|h| !h.is_empty())
+            .map(|h| format!("{}:9090", h))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+
+    // Inference pool width: explicit --threads wins, then [inference] threads
+    // from the config file, else 0 = rayon's global pool (which honours
+    // RAYON_NUM_THREADS; see config::InferenceConfig).
+    let compute_threads = if matches.value_source("threads")
+        == Some(clap::parser::ValueSource::CommandLine)
+    {
+        cli.threads
+    } else {
+        node_cfg.inference.threads
+    };
 
     rpc::serve(
         &rpc_addr,
@@ -2008,6 +2244,8 @@ async fn main() -> Result<()> {
         Some(dag_round),
         Some(dag_committed),
         shard_infos,
+        coordinator_seed_rpcs,
+        compute_threads,
     )
     .await?;
 
