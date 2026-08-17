@@ -1,62 +1,336 @@
 name: CI
+
+# Parallel sibling jobs. Nothing uses `needs:` except where a job genuinely
+# consumes another's output, so every gate occupies its own runner and total
+# wall clock stays roughly the Rust build time even as coverage widens.
+#
+# STAGING CONTRACT (read before editing):
+#   Jobs marked `continue-on-error: true` carry a "FLIP TO BLOCKING" TODO.
+#   They exist to MEASURE debt, not to hide it. Each one must be flipped to
+#   blocking in the order documented in the TODO, and a job whose debt has
+#   been paid down but is still non-blocking is a bug.
+#
+# No `paths:` filter is set deliberately: once these checks are required by
+# branch protection, a docs-only PR that skips them sits forever in "Expected
+# — Waiting for status to be reported". Cheap jobs on every PR beats that.
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  # Weekly canary so advisory data (audit job) is re-evaluated even in a quiet
+  # week, and so bit-rot in the non-blocking jobs surfaces without a PR.
+  schedule:
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately NOT setting `RUSTFLAGS: -D warnings` here. It would apply to
+  # every job including the blocking `test` job, promoting ordinary rustc
+  # warnings (unused variables, dead code) to hard errors on a workspace that
+  # has never been gated on them. Warning-denial belongs to the clippy job,
+  # which is staged behind its own flip-to-blocking TODO.
 
 jobs:
-  rust-check:
+  # ---------------------------------------------------------------- fmt ----
+  # Cheapest gate in the repo, so it runs alone and fails in seconds instead
+  # of waiting behind a multi-minute cargo build.
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # TODO(FLIP-1, first in the sequence): remove `continue-on-error` after
+    # landing the one-time `make fmt` commit. That commit must be pure
+    # formatting — no logic changes — so it is trivially reviewable and easy
+    # to skip in a bisect. rustfmt.toml was authored in the same change that
+    # added this job, so the very first run of this job reports the size of
+    # the formatting diff; it is expected to be large and is NOT a regression.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # ------------------------------------------------------------- clippy ----
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # TODO(FLIP-3): remove `continue-on-error` once the warning count from
+    # [workspace.lints.clippy] (root Cargo.toml) is at zero. That table was
+    # empty until this change while all 16 crates opted into it via
+    # `[lints] workspace = true`, so the lint plumbing was connected to
+    # nothing. The curated set now in place is bug-catching (correctness +
+    # suspicious denied, a handful of targeted lints), NOT stylistic, so the
+    # debt should be small and real. Measure with one run, fix, then flip.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  # --------------------------------------------------------------- test ----
+  # The merge gate. macos-14 is Apple Silicon, so this matrix is the only
+  # place in the repo where the ARM half of the "bit-identical across
+  # ARM/x86" claim is exercised at all. Note that an OS matrix alone does
+  # NOT prove cross-platform determinism — every determinism test in the
+  # workspace compares a run to another run in the same process on the same
+  # machine. See .github/workflows/golden-vectors.yml for the missing half.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            optional: false
+          # TODO(FLIP-4): drop `optional: true` from these two legs once they
+          # have been observed green. The workspace has NEVER been tested on
+          # macOS or Windows — release.yml builds arc-node there, but runs
+          # zero tests — so their first run is a measurement, not a gate.
+          - os: macos-14
+            optional: true
+          - os: windows-latest
+            optional: true
+    continue-on-error: ${{ matrix.optional }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # `--lib` skips examples/bins. Several examples under
-      # crates/arc-inference/examples/*.rs reference fields on
-      # CachedIntegerModel that no longer exist (the struct was refactored
-      # but the examples weren't), and a couple under crates/arc-crypto/examples
-      # depend on the nightly-only `stwo-prover` feature. Neither blocks
-      # library correctness. Library tests still run below.
-      - run: cargo check --workspace --lib --tests
-      # Clippy runs as a warning surface, not a gate. Each Rust release adds
-      # new stylistic lints that fire on existing code; letting them break CI
-      # either forces mechanical rewrites of crypto hot-paths (which risks
-      # on-chain attestation divergence) or a running war of allowlists.
-      # Real regressions still fail via `cargo check` and `cargo test`.
-      - run: cargo clippy --workspace --lib --tests
-      - run: cargo test --workspace --lib
+        with:
+          shared-key: test-${{ matrix.os }}
+      # Compile-check everything the test step does not build: the 15
+      # [[bin]] targets in arc-bench (which produce the numbers in
+      # docs/BENCHMARK-RESULTS.md and were never compiled by CI), the
+      # arc-crypto criterion bench, and every example. A manifest or
+      # compile break in those targets is exactly the class of failure that
+      # shipped v0.5.5 and v0.5.6 with no arc-node binaries attached.
+      #
+      # TODO(FLIP-2): remove this step's `continue-on-error` once verified
+      # green. It is scoped to the step, not the job, so a broken example
+      # cannot redden the blocking test gate in the meantime. If it fails,
+      # the fix is `required-features` on the offending target (the pattern
+      # already used by crates/arc-crypto and crates/arc-inference), not a
+      # return to the workspace-wide `--lib` blindfold.
+      - name: cargo check (all targets)
+        continue-on-error: true
+        run: cargo check --workspace --all-targets --locked
+      - name: cargo test (lib)
+        run: cargo test --workspace --lib --locked
 
-  # explorer/ has no package.json - it ships as static HTML served by the
-  # dashboard node. The old `explorer-build` job below tried to `npm ci`
-  # inside it and failed every run since the TypeScript port was reverted.
-  # Guard the job with a file-existence check so it only runs when a real
-  # node project lands. The previous hardcoded `cache-dependency-path:
-  # explorer/package-lock.json` failed the cache bootstrap before any
-  # condition could be evaluated, so we drop the cache entry and rely on
-  # setup-node's default.
-  explorer-build:
+  # -------------------------------------------------------- integration ----
+  # Separate job so a slow multi-node run neither serializes behind nor
+  # blocks fast unit feedback.
+  integration:
+    name: integration tests
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # TODO(FLIP-6, last): this stays non-blocking until the flakiness is
+    # addressed. crates/arc-node/tests/multi_node.rs binds real ephemeral
+    # UDP sockets and one of its tests is already self-described as
+    # "Flaky: 3-node DAG consensus timing-sensitive with validator set
+    # transitions" (#[ignore]d at multi_node.rs:451). Making a known-flaky
+    # suite blocking is how teams learn to re-run CI until it passes, which
+    # is worse than not gating at all.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - id: has_npm_project
-        run: |
-          if [ -f explorer/package.json ]; then
-            echo "found=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "found=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::explorer/ has no package.json - skipping npm build"
-          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration
+      # --test-threads=1 because these tests bind sockets and race each
+      # other for ports when run in parallel.
+      - run: cargo test --workspace --test '*' --locked -- --test-threads=1
+      - name: Doc tests
+        run: cargo test --workspace --doc --locked
+
+  # ---------------------------------------------------- desktop typecheck --
+  # Blocking from day one: desktop/package.json's `build` script already runs
+  # `tsc --noEmit`, and tauri.conf.json calls that script as
+  # beforeBuildCommand, so it necessarily passed when v0.7.11 was tagged.
+  # The only thing changing here is WHEN it runs — PR time instead of mid
+  # release, across four parallel platform bundles.
+  desktop-typecheck:
+    name: desktop typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: desktop
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        if: steps.has_npm_project.outputs.found == 'true'
         with:
           node-version: 20
-      - if: steps.has_npm_project.outputs.found == 'true'
-        working-directory: explorer
-        run: npm ci && npx tsc --noEmit && npm run build
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
 
-  sdk-check:
+  # -------------------------------------------------------- desktop e2e ----
+  # The 15-spec Playwright suite that exists, is CI-aware, and has never been
+  # run by any workflow. playwright.config.ts drives the mock Tauri backend,
+  # so no arc-node binary is required and a plain ubuntu runner suffices.
+  desktop-e2e:
+    name: desktop e2e (playwright)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: desktop
+    # TODO(FLIP-5): remove `continue-on-error` after the suite has been
+    # observed green twice in a row on main. These specs have never executed
+    # on a CI runner — only locally, if at all — so the first runs are
+    # measuring which specs assume a developer machine.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      # webServer in playwright.config.ts runs `npm run build && npm run
+      # preview` on :4173 and CI=true turns on forbidOnly/retries/1 worker.
+      - run: npx playwright test
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: desktop/playwright-report/
+          retention-days: 7
+
+  # -------------------------------------------------------------- audit ----
+  audit:
+    name: supply chain (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # TODO(FLIP-7): remove `continue-on-error` once the first run's findings
+    # are triaged. There has never been an advisory, license, or yanked-crate
+    # check on this repo, and deny.toml's [licenses] allow-list is a
+    # best-effort first draft — the first run's job is to tell us which
+    # licenses are actually in the graph. Every entry added to
+    # [advisories] ignore must carry a dated comment; see deny.toml.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources licenses
+
+  # ------------------------------------------------------- shell syntax ----
+  # Zero-debt gate, blocking from day one: `bash -n` parses without executing,
+  # so it can only fail on a genuine syntax error.
+  shell-syntax:
+    name: shell syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n every shell script
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            if ! bash -n "$f"; then
+              echo "::error file=$f::bash syntax error"
+              fail=1
+            fi
+          done < <(find scripts deploy -type f -name '*.sh' | sort)
+          exit "$fail"
+
+  # --------------------------------------------------------- shellcheck ----
+  # 33 shell scripts, several of which are curl|bash'd onto third-party
+  # machines straight off main (scripts/install-community-node.sh,
+  # scripts/install-node.sh), plus the per-seed self-heal daemon that decides
+  # when to restart production nodes. None have ever been linted.
+  shellcheck:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # TODO(FLIP-8): ratchet, don't flip in one step. Sequence:
+    #   a) fix findings at -S error, make the job blocking at -S error
+    #   b) fix findings at -S warning, change the flag below to match
+    #   c) only then consider -S style
+    # Prioritise fixes by blast radius: install-community-node.sh and
+    # arc-self-heal.sh before anything else.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      # shellcheck is preinstalled on ubuntu-latest runners; no third-party
+      # action needed for a one-line invocation.
+      - name: shellcheck
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          find scripts deploy -type f -name '*.sh' -print0 \
+            | xargs -0 shellcheck -S warning
+
+  # ------------------------------------------------------------- forge ----
+  # 8 Solidity files including a bridge, a staking contract, a state-root
+  # anchor and a UUPS proxy. foundry.toml has been configured this whole
+  # time; nothing has ever compiled them.
+  forge:
+    name: contracts (forge)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # TODO(FLIP-9): remove `continue-on-error` once `forge build` is green.
+    # It is expected RED on first run: contracts/ imports
+    # @openzeppelin/contracts/**, foundry.toml sets libs = ["lib"], and there
+    # is no lib/ directory and no git submodule in the repo — so the
+    # dependency has never been resolvable from a clean checkout. The npm
+    # install + FOUNDRY_REMAPPINGS below is the minimal fix that adds no new
+    # tracked files; the durable fix is committing a remappings.txt or a
+    # foundry submodule, and pinning the OpenZeppelin major version to
+    # whichever one these contracts were written against (v5 changed
+    # Ownable's constructor signature, so a v4-era contract fails to compile
+    # against the v5 pinned below — that is the first thing to check).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      # Runs without dependencies resolved, so it reports honestly even while
+      # `forge build` is still red.
+      - name: forge fmt --check
+        run: forge fmt --check
+      - name: Resolve OpenZeppelin
+        run: npm install --no-save @openzeppelin/contracts@5.0.2
+      - name: forge build --sizes
+        env:
+          FOUNDRY_REMAPPINGS: '@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/'
+        run: forge build --sizes
+
+  # --------------------------------------------------------- sdk-check ----
+  # Was `npm install` (resolves a fresh tree, so CI could pass on a dependency
+  # set no developer has); now `npm ci`, which honours the tracked lockfile.
+  #
+  # RISK ON FIRST RUN: `npm ci` fails hard if package.json and
+  # package-lock.json have drifted apart, where `npm install` would silently
+  # reconcile them. This job is blocking, so if it goes red on the first run
+  # with an EUSAGE / "lock file does not satisfy" error, the fix is one
+  # command - `cd sdk/typescript && npm install` - and commit the updated
+  # lockfile. Do not revert to `npm install` to make it green.
+  sdk-check:
+    name: sdk typecheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: sdk/typescript
@@ -65,5 +339,23 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - run: npm ci
       - run: npx tsc --noEmit
+
+# REMOVED: the `explorer-build` job. It probed for explorer/package.json,
+# never found it (explorer/ ships two static HTML files), emitted a
+# ::notice:: and exited — a runner burned on every push to print a message.
+# If a real node project ever lands in explorer/, add the job back rather
+# than keeping a permanent no-op.
+#
+# NOT ADDED (deliberate, tracked as follow-up): jobs for sdks/typescript
+# (a complete jest + ts-jest suite that has never run), sdks/python
+# (tests/test_client.py, no pytest/ruff/mypy anywhere), and
+# desktop/src-tauri (excluded from the workspace at Cargo.toml:3, so every
+# `--workspace` command here skips the code that supervises the arc-node
+# child process and downloads its binary). All three are real gaps; none are
+# in scope for this change. Note that three separate package.json files
+# declare the name "@arc-chain/sdk" — that collision should be resolved
+# before writing CI against them.

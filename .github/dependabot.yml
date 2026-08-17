@@ -1,14 +1,51 @@
 version: 2
 updates:
+  # NOTE: the cargo ecosystem is only useful once Cargo.lock is tracked.
+  # While the lock was gitignored, Dependabot had nothing to bump and no
+  # lock-based advisory matching was possible.
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    # A 16-crate workspace produces a large weekly bump wave; cap it so the
+    # PR queue stays reviewable.
+    open-pull-requests-limit: 5
+
+  # The desktop app: 11 runtime deps (react, framer-motion, @tauri-apps/*)
+  # in the process that holds validator identity material. This is the npm
+  # surface that most needed watching and was not watched.
   - package-ecosystem: npm
-    directory: /explorer
+    directory: /desktop
     schedule:
       interval: weekly
+    open-pull-requests-limit: 5
+
+  # Verified present: sdks/typescript/package.json + package-lock.json.
+  - package-ecosystem: npm
+    directory: /sdks/typescript
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
+  # Verified present: sdk/typescript/package.json + package-lock.json.
+  # This is the only JS package ci.yml has ever typechecked.
+  - package-ecosystem: npm
+    directory: /sdk/typescript
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+
+# REMOVED: `npm` at /explorer. explorer/ contains two static HTML files and
+# no package.json, so that entry watched nothing.
+#
+# NOT ADDED: /sdk (has package.json but no package-lock.json, so Dependabot
+# cannot resolve it) and /sdks/python (pip ecosystem; add once
+# sdks/python/pyproject.toml declares dev extras and a python job exists to
+# validate the bumps). Also note three separate package.json files all
+# declare the name "@arc-chain/sdk" - resolve that collision before adding
+# more automation on top of them.

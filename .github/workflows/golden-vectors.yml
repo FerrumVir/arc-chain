@@ -1,0 +1,85 @@
+name: Golden vectors
+
+# SCAFFOLDING. This workflow is expected to pass trivially today.
+#
+# WHY IT EXISTS
+# The headline product claim is that the pure-integer inference engine
+# produces bitwise identical output across ARM, x86 and GPU, and that this is
+# what makes hash-based verification of AI computation possible at O(1) cost.
+# There is currently ZERO automated evidence for that claim, and adding an OS
+# matrix does not create any, because of how the determinism tests are built:
+#
+#   crates/arc-inference/src/integer_engine.rs generates output twice and
+#   asserts hash1 == hash2, and loops 1000 times against a hash computed
+#   moments earlier — in the SAME process, on the SAME machine.
+#
+# A self-comparison passes 100% on every platform independently. An ARM-vs-x86
+# divergence — the failure mode that would fork on-chain attestation across the
+# live seeds — is invisible to it. INFERENCE_DETERMINISM.md cites exactly these
+# self-comparing tests as the evidence for the cross-platform claim.
+#
+# WHAT ACTUALLY PROVES IT
+# Known-answer vectors (KATs): expected digests committed to git as fixtures,
+# generated once on the x86 seed that defines canonical chain state, then
+# asserted byte-for-byte on every platform. A grep for hardcoded expected
+# digests across crates/ currently returns nothing — there are none.
+#
+# THE PLAN (follow-up, owned by whoever owns crates/arc-inference):
+#   1. Add crates/arc-inference/tests/fixtures/int16_kat.json holding ~8 cases
+#      of {model_params, prompt_tokens, max_tokens, seed,
+#      expected_output_tokens, expected_blake3_hex}, spanning the deterministic
+#      paths named in INFERENCE_DETERMINISM.md: scalar, SIMD, flash-attention,
+#      and 2-way and 3-way shard splits.
+#   2. Add tests named `golden_*` that load the fixture and assert byte
+#      equality. The name matters: the filter below matches on `golden`.
+#   3. Do the same for arc-crypto's attestation / model-hash derivation.
+#   4. Flip `continue-on-error` off below, and update
+#      INFERENCE_DETERMINISM.md to cite this workflow instead of the
+#      self-comparing tests.
+#
+# Until step 2 lands, `cargo test ... golden` matches no tests and exits 0.
+# That is intended: the scaffolding is here so the work has somewhere to land
+# and so the gap is visible in the Actions tab rather than only in a doc.
+#
+# OUT OF SCOPE FOR CI: GPU determinism. Hosted runners have no GPU, so the
+# Metal/CUDA half of the claim cannot be covered here and must stay a manual,
+# documented gate. Do not let a green check on this workflow be read as
+# covering it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  golden:
+    name: golden vectors (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    # TODO: flip to blocking once real `golden_*` tests exist (step 4 above).
+    # While the filter matches nothing, blocking would be a green light with
+    # nothing behind it — worse than an honest non-blocking placeholder.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 is Apple Silicon: this pairing (ARM + x86 + Windows x86) is
+        # what makes the KAT fixtures meaningful once they exist.
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: golden-${{ matrix.os }}
+      - name: Run golden known-answer vectors
+        run: cargo test -p arc-inference --lib --locked golden -- --nocapture

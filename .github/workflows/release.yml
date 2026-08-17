@@ -1,5 +1,19 @@
 name: Release
 
+# Builds and publishes the arc-node CLI binaries for a tag.
+#
+# THE FAILURE THIS WORKFLOW MUST NEVER REPEAT
+# v0.7.10 and v0.7.11 (and earlier, v0.5.5 and v0.5.6) were published with the
+# desktop bundles attached but NO arc-node assets. Everything downstream reads
+# those asset names literally:
+#   - the desktop app's binary bootstrap fetches arc-node from
+#     releases/latest/download/, so it 404s
+#   - the README / install-community-node.sh installer 404s
+# A release missing these assets is not a partial release, it is a broken one.
+# The `preflight` step in the publish job below turns that into a hard failure
+# here, and .github/workflows/release-desktop.yml refuses to publish the
+# desktop side unless these assets exist. Do not weaken either check.
+
 on:
   push:
     tags:
@@ -11,10 +25,22 @@ on:
         required: true
         default: 'v0.4.0'
 
+# Never cancel a release mid-flight; serialise per tag instead.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    # Optional legs may fail without failing the job (and therefore without
+    # blocking the release); required legs may not.
+    continue-on-error: ${{ matrix.optional == true }}
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +63,18 @@ jobs:
             target: x86_64-unknown-linux-gnu
             asset: arc-node-linux-x86_64
             binary: arc-node
+          # ARM64 Linux: the cheap way to serve Raspberry Pi / Ampere / Graviton
+          # node operators, and a second ARM data point for the determinism
+          # story. Marked optional because GitHub's `ubuntu-22.04-arm` hosted
+          # runners are not available on every plan for private repos - if this
+          # leg is skipped or fails, the release still publishes without it.
+          # Once it has been observed green, drop `optional` and add
+          # arc-node-linux-arm64 to REQUIRED_ASSETS in the publish job.
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: arc-node-linux-arm64
+            binary: arc-node
+            optional: true
 
     steps:
       - uses: actions/checkout@v4
@@ -52,9 +90,14 @@ jobs:
           shared-key: release-${{ matrix.target }}
           workspaces: . -> target
 
+      # --locked: a release binary must be built from the exact dependency
+      # graph recorded in the tracked Cargo.lock. Without it, the binary
+      # attached to a tag cannot be reproduced from that tag - which was the
+      # situation for every release before the lockfile was committed and the
+      # stwo git dependency was pinned.
       - name: Build arc-node release
         shell: bash
-        run: cargo build --release -p arc-node --features candle --target ${{ matrix.target }}
+        run: cargo build --release --locked -p arc-node --features candle --target ${{ matrix.target }}
 
       - name: Strip binary
         if: runner.os != 'Windows'
@@ -71,11 +114,13 @@ jobs:
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
+          if-no-files-found: error
 
   release:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
     steps:
@@ -90,6 +135,35 @@ jobs:
           mkdir -p release-files
           find artifacts -type f -exec cp {} release-files/ \;
           ls -lh release-files
+
+      # HARD GATE. `continue-on-error` on the optional matrix leg means the
+      # build job can succeed with assets missing, and a half-populated
+      # release is exactly the demo-fatal failure this workflow exists to
+      # prevent. Enumerate what must be present and refuse to publish
+      # otherwise.
+      - name: Preflight - every required arc-node asset is present
+        run: |
+          set -euo pipefail
+          REQUIRED_ASSETS="
+          arc-node-macos-arm64
+          arc-node-macos-x86_64
+          arc-node-windows-x86_64.exe
+          arc-node-linux-x86_64
+          "
+          missing=0
+          for asset in $REQUIRED_ASSETS; do
+            if [ -s "release-files/$asset" ]; then
+              echo "ok: $asset ($(stat -c%s "release-files/$asset") bytes)"
+            else
+              echo "::error::missing or empty required release asset: $asset"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Refusing to publish. A release without the arc-node binaries 404s the desktop app's binary bootstrap and the README installer. Fix the failed build leg and re-run - do not publish a partial release."
+            exit 1
+          fi
+          echo "All required arc-node assets present."
 
       - name: Determine tag
         id: tag
@@ -119,4 +193,7 @@ jobs:
             ```
           files: release-files/*
           generate_release_notes: false
-          fail_on_unmatched_files: false
+          # Was `false`, which silently tolerated an empty upload set. The
+          # preflight above already guarantees the files exist; this makes a
+          # glob that matches nothing an error rather than a quiet no-op.
+          fail_on_unmatched_files: true
