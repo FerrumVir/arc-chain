@@ -200,6 +200,31 @@ Backups, also verified clean: `What is cross-chain bridging?`,
 `What is post-quantum cryptography?`. And `The largest planet is` — the
 `arc-demo.sh` default — returns " Jupiter, which is more than ".
 
+#### ✅ Re-vetted live 2026-08-17 through the branch coordinator
+
+The four above were read from LHR's *recorded* set. These were run fresh
+through a local v0.7.11 coordinator against the live seeds (`redundancy: 2`,
+`force_recompute: true`, no `[INST]` wrapper, 6 tokens), so they are verified
+on the path the demo actually uses. All four hashes are distinct, which is what
+the isolation check needs.
+
+| Prompt | Output | Hash | Wall |
+|---|---|---|---|
+| `The largest planet is` | " Jupiter, which is more" | `0xb8bfa3d0…` | 14.3 s |
+| `Water boils at` | " 100 degrees Cel" | `0xcd54aff0…` | 14.1 s |
+| `The sun is a` | " star, and the stars are" | `0x6dee54b8…` | 13.2 s |
+| `Bitcoin is a` | " digital and decentralized currency" | `0xc3ae1c6b…` | 14.2 s |
+
+Two more answer **correctly** but render raw newline tokens, so they read badly
+on a projector even though the model is right — keep them as spares, not
+openers: `The capital of France is` → " Paris.`<0x0A><0x0A><0x0A>`The", and
+`The first president of the United States was` → " George Washington.`<0x0A>`
+He was".
+
+Note the shape of a sentence-completion prompt: this is a **base** model, so
+`The largest planet is` completes naturally while an instruction phrasing
+invites the newline spam documented below.
+
 The recorded runs wrap prompts as `[INST] <prompt> [/INST]`. Match that format
 if you want to hit a recorded hash.
 
