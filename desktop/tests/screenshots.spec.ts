@@ -1,5 +1,5 @@
 import { test } from "@playwright/test";
-import { clearState, seedOnboarded } from "./helpers";
+import { clearState, seedOnboarded, walkToLaunch } from "./helpers";
 
 // Captures a gallery of the finished UI. Failing this suite does NOT fail CI -
 // it's meant for design review. Run with: npx playwright test screenshots.spec.ts
@@ -23,9 +23,8 @@ test.describe("Screenshot gallery", () => {
   test("onboarding - launch ready", async ({ page }) => {
     await clearState(page);
     await page.goto("/");
-    await page.getByTestId("btn-continue-welcome").click();
-    await page.getByTestId("btn-reveal-seed").click();
-    await page.getByTestId("btn-continue-identity").click();
+    // Four steps, not three - see walkToLaunch in helpers.ts.
+    await walkToLaunch(page);
     await page.waitForSelector('[data-testid="step-launch"]');
     await page.screenshot({ path: "screenshots/03-onboarding-launch.png" });
   });

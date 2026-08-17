@@ -101,13 +101,18 @@ test.describe("Mobile layout (Pixel 7, 412×915) - seeded", () => {
 
 test.describe("Mobile layout (Pixel 7, 412×915) - onboarding", () => {
   // Intentionally NO beforeEach - this test needs a fresh, un-seeded store.
-  test("all three steps reachable at phone size", async ({ page }) => {
+  test("all four steps reachable at phone size", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByTestId("step-welcome")).toBeVisible();
     await page.getByTestId("btn-continue-welcome").click();
     await expect(page.getByTestId("step-identity")).toBeVisible();
     await page.getByTestId("btn-reveal-seed").click();
     await page.getByTestId("btn-continue-identity").click();
+    // The model picker must be usable at phone width too - it was missing
+    // from this walk entirely, so a layout break here went uncaught.
+    await expect(page.getByTestId("step-model")).toBeVisible();
+    await page.getByTestId("tier-skip").click();
+    await page.getByTestId("btn-continue-model").click();
     await expect(page.getByTestId("step-launch")).toBeVisible();
   });
 });

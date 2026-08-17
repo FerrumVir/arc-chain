@@ -15,6 +15,15 @@ pub struct HardwareInfo {
     pub estimated_daily_arc: f64,
 }
 
+/// On-disk identity. Carries the BIP-39 phrase because the phrase is what
+/// derives the validator keypair arc-node is launched with.
+///
+/// This type must NOT cross the IPC boundary — see [`IdentityPublic`]. The
+/// WebView is a browser: anything handed to it can be read by DevTools, by
+/// any script that gets injected, and (once the frontend persisted it) by
+/// anything that can read the WebView profile directory. The phrase stays
+/// Rust-side and is handed out exactly once, on explicit request, by
+/// `commands::reveal_seed_phrase`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Identity {
@@ -22,6 +31,27 @@ pub struct Identity {
     pub public_key: String,
     pub seed_phrase: String,
     pub created_at: i64,
+}
+
+/// The half of [`Identity`] that is safe to show the UI. Everything the
+/// frontend actually renders — the address, the public key, the creation
+/// date — with the signing material left behind.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IdentityPublic {
+    pub address: String,
+    pub public_key: String,
+    pub created_at: i64,
+}
+
+impl From<&Identity> for IdentityPublic {
+    fn from(id: &Identity) -> Self {
+        Self {
+            address: id.address.clone(),
+            public_key: id.public_key.clone(),
+            created_at: id.created_at,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +64,14 @@ pub struct NodeConfig {
     pub auto_start: bool,
     pub auto_update: bool,
     pub data_dir: String,
+    /// How many CPU cores the node may use for parallel work (rayon's global
+    /// pool). `None` = let rayon size itself, which means every logical core.
+    /// Surfaced as the Settings "Compute contribution" slider.
+    ///
+    /// `#[serde(default)]` so a `store.json` written by an older build still
+    /// deserializes instead of resetting the whole config to defaults.
+    #[serde(default)]
+    pub worker_threads: Option<u32>,
 }
 
 impl Default for NodeConfig {
@@ -49,6 +87,7 @@ impl Default for NodeConfig {
             auto_start: true,
             auto_update: true,
             data_dir: "~/.arc".into(),
+            worker_threads: None,
         }
     }
 }
@@ -80,17 +119,60 @@ pub struct NodeStatus {
     /// non-standard ports.
     #[serde(default)]
     pub coordinator_url: Option<String>,
+
+    // ── Network-wide numbers ────────────────────────────────────────────
+    // Everything above this line describes the user's OWN node. The three
+    // fields below describe the public chain, read from whichever seed is
+    // currently freshest. They are deliberately separate: rendering a
+    // datacenter's block height in a tile labelled "your node" is the exact
+    // dishonesty this split exists to prevent.
+    /// Origin of the seed these chain numbers came from, for attribution in
+    /// the UI ("Network · via LAX"). `None` when no seed answered.
+    #[serde(default)]
+    pub chain_host: Option<String>,
+    #[serde(default)]
+    pub chain_height: Option<u64>,
+    #[serde(default)]
+    pub chain_round: Option<u64>,
+    /// Age in seconds of the freshest block the chosen seed knows about.
+    /// Large values mean block production has stalled network-wide, which
+    /// is worth showing rather than hiding behind a green "Live" pill.
+    #[serde(default)]
+    pub chain_block_age_seconds: Option<u64>,
+
+    /// Cores the running node was launched with (`worker_threads` from the
+    /// config that started it). `None` = unconstrained / not started by us.
+    #[serde(default)]
+    pub worker_threads: Option<u32>,
+    /// Logical cores on this machine — the upper bound for the Settings
+    /// slider, carried here so the Dashboard can render "6 of 12 cores"
+    /// without a second IPC round trip.
+    #[serde(default)]
+    pub cpu_cores: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Earnings {
     pub total_arc: f64,
-    pub today_arc: f64,
-    pub pending_arc: f64,
+    /// Earned since 00:00 UTC. `None` when the chain does not report it —
+    /// which is not the same as zero, and must not be rendered as "0.00".
+    pub today_arc: Option<f64>,
+    /// Submitted but not yet released. `None` until the chain exposes the
+    /// distinction; previously this was invented client-side.
+    pub pending_arc: Option<f64>,
     pub rank: Option<u32>,
     pub attestations: u64,
+    /// Epoch millis of the last payout. Only ever a real timestamp.
     pub last_payout_at: Option<i64>,
+    /// Block height of the last attestation. Kept apart from
+    /// `last_payout_at` because feeding a block height (~123,462) into a
+    /// relative-time formatter renders "20770d ago".
+    pub last_payout_block: Option<u64>,
+    /// True when these numbers came from the chain's `/worker/earnings`
+    /// endpoint. False means they were synthesized locally and should be
+    /// labelled as an estimate.
+    pub from_chain: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,10 +182,23 @@ pub struct Attestation {
     pub input_preview: String,
     pub output_hash: String,
     pub model_hash: String,
-    pub tokens: u32,
-    pub latency_ms: u32,
-    pub reward_arc: f64,
-    pub timestamp: i64,
+    /// `None` when the record carries no token count, so the UI can omit
+    /// the meta line instead of printing a confident "0 tokens".
+    pub tokens: Option<u32>,
+    pub latency_ms: Option<u32>,
+    /// Only set for attestations credited to THIS user. Showing another
+    /// validator's work as "+2.50" in the user's own earnings feed is the
+    /// single most misleading thing this screen could do.
+    pub reward_arc: Option<f64>,
+    /// Real epoch millis when the record carries one. `None` means "recent,
+    /// exact time unknown" — previously this was a fabricated
+    /// `now - i * 30s` series that looked like real telemetry.
+    pub timestamp: Option<i64>,
+    pub block_height: Option<u64>,
+    /// Submitting address, when present.
+    pub from: Option<String>,
+    /// `from` matches the user's address.
+    pub mine: bool,
     pub verified: bool,
 }
 
@@ -125,12 +220,10 @@ pub struct NetworkStats {
     pub latest_block: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateCheck {
-    pub has_update: bool,
-    pub version: String,
-}
+// `UpdateCheck` was removed along with the `check_for_update` command it
+// served. Update state now comes solely from the Tauri updater plugin, which
+// reads the signed release manifest — the only source that can actually
+// install anything.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -173,6 +266,22 @@ pub struct InferenceConsensus {
     pub divergent_replica_count: u32,
 }
 
+/// One shard in the pipeline that served an inference. The chain returns
+/// these as `shard_trace`; surfacing them is what turns "the network
+/// answered" into "these six machines each ran their slice of the model".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InferenceHop {
+    pub hop: u32,
+    /// Human label for the machine that ran this slice.
+    pub node: String,
+    /// Layer range, e.g. `"0..6"`.
+    pub layers: String,
+    pub compute_ms: u64,
+    pub wall_ms: u64,
+    pub is_terminal: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InferenceResult {
@@ -190,6 +299,35 @@ pub struct InferenceResult {
     pub consensus: Option<InferenceConsensus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coordinator: Option<String>,
+    /// Per-shard pipeline trace, when the serving node reported one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace: Option<Vec<InferenceHop>>,
+    /// True when the request was served by the arc-node on this machine
+    /// rather than a remote seed. Lets the UI say so plainly.
+    #[serde(default)]
+    pub served_locally: bool,
+}
+
+/// Outcome of a compute-contribution change. The chain is growing a
+/// `POST /node/threads` endpoint that reconfigures rayon's pool in place;
+/// until every node has it, a 404 means we fall back to a node restart.
+/// `restarted` tells the UI which of the two happened so it can say
+/// "applied live" versus "restarted with 6 cores".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadsApplied {
+    pub worker_threads: u32,
+    pub restarted: bool,
+    pub message: String,
+}
+
+/// Where `save_logs` wrote the log file, or `None` if the user cancelled
+/// the save dialog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedLogs {
+    pub path: Option<String>,
+    pub lines: usize,
 }
 
 /// One entry in the desktop's model-tier picker. The frontend renders this

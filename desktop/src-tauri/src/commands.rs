@@ -1,6 +1,6 @@
 use crate::node_manager::{managed_binary_path, TestnetResources};
 use crate::types::*;
-use crate::{hardware, identity, rpc_client, AppState};
+use crate::{hardware, identity, paths, rpc_client, AppState};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -13,45 +13,89 @@ fn map_err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
-#[tauri::command]
-pub async fn detect_hardware() -> CmdResult<HardwareInfo> {
-    Ok(hardware::detect())
+/// Hardware detection is expensive — `System::new_all()` plus, on macOS, a
+/// `system_profiler` call that routinely takes 1-3s on a cold cache. It was
+/// being run twice per onboarding (once here, once inside `recommended_tier`)
+/// on a tokio worker with no `spawn_blocking`. The result never changes
+/// during a session, so detect once and hand out clones.
+fn cached_hardware() -> HardwareInfo {
+    use std::sync::OnceLock;
+    static HW: OnceLock<HardwareInfo> = OnceLock::new();
+    HW.get_or_init(hardware::detect).clone()
 }
 
 #[tauri::command]
-pub async fn generate_identity(state: State<'_, AppState>) -> CmdResult<Identity> {
+pub async fn detect_hardware() -> CmdResult<HardwareInfo> {
+    // Off the async worker: the first call does real blocking I/O.
+    tokio::task::spawn_blocking(cached_hardware)
+        .await
+        .map_err(map_err)
+}
+
+// ── Identity / IPC boundary ────────────────────────────────────────────────
+//
+// These three commands return `IdentityPublic`, never `Identity`. The BIP-39
+// phrase is the user's signing key; handing it to the WebView put it within
+// reach of DevTools, of any injected script, and — because the frontend
+// persisted whatever it received — of anything able to read the WebView
+// profile directory, where it sat in plaintext localStorage.
+//
+// The phrase stays Rust-side. `reveal_seed_phrase` hands it out exactly once,
+// on an explicit user action, for the backup screen.
+
+#[tauri::command]
+pub async fn generate_identity(state: State<'_, AppState>) -> CmdResult<IdentityPublic> {
     let id = identity::generate();
+    let public = IdentityPublic::from(&id);
     {
         let mut store = state.store.lock().await;
-        store.identity = Some(id.clone());
+        store.identity = Some(id);
         let dir = state.data_dir.lock().await.clone();
         store.save_to(&dir).map_err(map_err)?;
     }
-    Ok(id)
+    Ok(public)
 }
 
 #[tauri::command]
 pub async fn import_identity(
     state: State<'_, AppState>,
     phrase: String,
-) -> CmdResult<Identity> {
+) -> CmdResult<IdentityPublic> {
     // Restoration path: user types their 12-word phrase on a new device
     // and gets back the exact same address + signing keys.
     identity::validate_bip39(&phrase)?;
     let id = identity::derive(&phrase)?;
+    let public = IdentityPublic::from(&id);
     {
         let mut store = state.store.lock().await;
-        store.identity = Some(id.clone());
+        store.identity = Some(id);
         let dir = state.data_dir.lock().await.clone();
         store.save_to(&dir).map_err(map_err)?;
     }
-    Ok(id)
+    Ok(public)
 }
 
 #[tauri::command]
-pub async fn load_identity(state: State<'_, AppState>) -> CmdResult<Option<Identity>> {
+pub async fn load_identity(state: State<'_, AppState>) -> CmdResult<Option<IdentityPublic>> {
     let store = state.store.lock().await;
-    Ok(store.identity.clone())
+    Ok(store.identity.as_ref().map(IdentityPublic::from))
+}
+
+/// Hand the recovery phrase to the UI for the "write this down" screen.
+///
+/// Deliberately a separate, explicit call rather than a field on the identity
+/// object: it makes every place the phrase reaches the WebView a single
+/// greppable call site, and it means the phrase is only in WebView memory
+/// while the backup screen is actually open. The frontend must never persist
+/// what this returns.
+#[tauri::command]
+pub async fn reveal_seed_phrase(state: State<'_, AppState>) -> CmdResult<String> {
+    let store = state.store.lock().await;
+    store
+        .identity
+        .as_ref()
+        .map(|i| i.seed_phrase.clone())
+        .ok_or_else(|| "no identity on this device".to_string())
 }
 
 #[tauri::command]
@@ -94,20 +138,23 @@ pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeCon
     Ok(store.config.clone())
 }
 
-#[tauri::command]
-pub async fn start_node(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    config: NodeConfig,
-) -> CmdResult<()> {
-    // Version-check (and upgrade if needed) the arc-node binary on every
-    // start. Cheap if it's current - one --version call - and ensures
-    // existing users picked up by the desktop auto-updater don't keep
-    // running a stale arc-node from a previous release. Without this,
-    // chain-side bug fixes (e.g. the v0.5.7 ephemeral-UDP fallback that
-    // unblocks Windows users whose Hyper-V port range covers 9091) never
-    // reach anyone past their first launch.
-    ensure_binary(app.clone()).await?;
+/// The one path that actually starts arc-node.
+///
+/// Factored out of the `start_node` command so `lib.rs` `setup()` can launch
+/// the node on app start through exactly the same code — previously
+/// `auto_start` only toggled the OS login item, and nothing in the app ever
+/// spawned arc-node after onboarding finished.
+///
+/// Takes `&AppState` rather than `State<'_, AppState>` so it is callable both
+/// from a command and from a background task holding an `AppHandle`.
+pub async fn start_node_inner(
+    app: &AppHandle,
+    state: &AppState,
+    config: &NodeConfig,
+) -> Result<(), String> {
+    // Make sure we have a runnable binary. This must never be able to block
+    // a start when a usable binary already exists — see `ensure_binary`.
+    ensure_binary_inner(app).await?;
 
     let validator_seed = {
         let store = state.store.lock().await;
@@ -119,11 +166,20 @@ pub async fn start_node(
                 "no identity - run onboarding so we can derive an on-chain validator address before starting arc-node".to_string()
             })?
     };
-    let resources = resolve_testnet_resources(&app);
+    let resources = resolve_testnet_resources(app);
     let mut node = state.node.lock().await;
-    node.start(&config, &validator_seed, &resources)
+    node.start(config, &validator_seed, &resources)
         .await
         .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn start_node(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config: NodeConfig,
+) -> CmdResult<()> {
+    start_node_inner(&app, &state, &config).await
 }
 
 #[tauri::command]
@@ -134,11 +190,6 @@ pub async fn stop_node(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResult<()> {
-    // Same version-check as start_node - a restart is a great moment to
-    // pick up a newer arc-node, since the user is already incurring the
-    // restart cost.
-    ensure_binary(app.clone()).await?;
-
     let (cfg, validator_seed) = {
         let store = state.store.lock().await;
         let cfg = store.config.clone().unwrap_or_default();
@@ -149,9 +200,30 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
             .ok_or_else(|| "no identity - cannot restart arc-node".to_string())?;
         (cfg, seed)
     };
+
+    // ORDER MATTERS: stop the child BEFORE ensure_binary may rename over the
+    // executable.
+    //
+    // ensure_binary installs a download by renaming it over
+    // ~/.arc/bin/arc-node(.exe). On POSIX that succeeds against the old
+    // inode even while the process runs. Windows locks a running
+    // executable's image file, so MoveFileEx returns ERROR_ACCESS_DENIED —
+    // which made Restart fail on Windows only, and only when a version
+    // mismatch pushed it down the download path. Doing this in the old
+    // order also meant the same failure hit the observer→worker upgrade
+    // flow, which restarts immediately after switching roles.
+    {
+        let mut node = state.node.lock().await;
+        node.stop().await.map_err(map_err)?;
+    }
+
+    // A restart is a good moment to pick up a newer arc-node, since the user
+    // is already paying the restart cost. Now safe: nothing holds the file.
+    ensure_binary_inner(&app).await?;
+
     let resources = resolve_testnet_resources(&app);
     let mut node = state.node.lock().await;
-    node.restart(&cfg, &validator_seed, &resources)
+    node.start(&cfg, &validator_seed, &resources)
         .await
         .map_err(map_err)
 }
@@ -167,21 +239,15 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
 /// the peer dial cache is removed.
 #[tauri::command]
 pub async fn reset_peer_state(app: AppHandle, state: State<'_, AppState>) -> CmdResult<ResetPeerStateResult> {
-    use std::path::PathBuf;
-
-    // Resolve the data dir the same way node_manager does
+    // Resolve the data dir through the SAME helper node_manager uses.
+    // Duplicating the expansion here (HOME-only) meant this deleted
+    // known_peers.json from a different directory than the node actually
+    // uses on Windows, then reported success.
     let cfg = {
         let store = state.store.lock().await;
         store.config.clone().unwrap_or_default()
     };
-    let data_dir: PathBuf = if let Some(rest) = cfg.data_dir.strip_prefix("~/") {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(rest)
-    } else {
-        PathBuf::from(&cfg.data_dir)
-    };
+    let data_dir = crate::node_manager::resolve_data_dir(&cfg.data_dir);
     let peers_path = data_dir.join("known_peers.json");
 
     // Stop first so the node isn't holding the file open or racing on writes.
@@ -210,30 +276,62 @@ pub async fn reset_peer_state(app: AppHandle, state: State<'_, AppState>) -> Cmd
     })
 }
 
+/// Health and progress of the node running on THIS machine.
+///
+/// The single most damaging bug in the app was that this read a remote seed:
+/// `wallet_host()` discarded its port argument and returned the LAX seed, so
+/// the Dashboard reported a datacenter's peers, uptime, version and height as
+/// the user's own. Consequences cascaded — `running` was always true, so the
+/// Start button was never rendered, Stop appeared to do nothing, and the
+/// entire lite/syncing UI was unreachable. The tray, which had always polled
+/// 127.0.0.1 correctly, contradicted the window on the same screen.
+///
+/// Local state now comes from the local node. Chain-wide numbers are still
+/// returned, but in clearly separate `chain*` fields.
 #[tauri::command]
 pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
-    let (port, pid, address, crash) = {
+    let (port, pid, crash, worker_threads) = {
         let mut node = state.node.lock().await;
         // Opportunistic crash detection - checks if our child process exited
         // unexpectedly since the last poll.
         node.try_reap_if_crashed().await;
         let pid = if node.is_running() { node.pid() } else { None };
         let port = node.rpc_port;
+        let worker_threads = node.active_worker_threads;
         let crash = node
             .crash_info
             .lock()
             .await
             .as_ref()
             .map(|c| c.message.clone());
-        drop(node);
-        let address = {
-            let store = state.store.lock().await;
-            store.identity.as_ref().map(|i| i.address.clone())
-        };
-        (port, pid, address, crash)
+        (port, pid, crash, worker_threads)
     };
-    let host = wallet_host(port);
-    Ok(rpc_client::fetch_status(&state.http, &host, port, pid, address, crash).await)
+    let address = {
+        let store = state.store.lock().await;
+        store.identity.as_ref().map(|i| i.address.clone())
+    };
+
+    let local = paths::local_host(port);
+    let chain = chain_host(&state).await;
+    let chain_choice = cached_chain_choice(&state).await;
+
+    let mut status = rpc_client::fetch_status(
+        &state.http,
+        &local,
+        &chain,
+        port,
+        pid,
+        address,
+        crash,
+    )
+    .await;
+
+    status.chain_host = Some(chain);
+    status.chain_height = chain_choice.as_ref().map(|c| c.height);
+    status.chain_block_age_seconds = chain_choice.as_ref().map(|c| c.block_age_seconds());
+    status.worker_threads = worker_threads;
+    status.cpu_cores = Some(cached_hardware().cpu_cores);
+    Ok(status)
 }
 
 #[tauri::command]
@@ -244,12 +342,11 @@ pub async fn clear_crash(state: State<'_, AppState>) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn fetch_earnings(state: State<'_, AppState>) -> CmdResult<Earnings> {
-    let port = state.node.lock().await.rpc_port;
     let address = {
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
     };
-    let host = wallet_host(port);
+    let host = chain_host(&state).await;
     Ok(rpc_client::fetch_earnings(&state.http, &host, address.as_deref()).await)
 }
 
@@ -258,9 +355,21 @@ pub async fn fetch_attestations(
     state: State<'_, AppState>,
     limit: Option<u32>,
 ) -> CmdResult<Vec<Attestation>> {
-    let port = state.node.lock().await.rpc_port;
-    let host = wallet_host(port);
-    Ok(rpc_client::fetch_attestations(&state.http, &host, limit.unwrap_or(20)).await)
+    // The user's address is needed here, not just for display: it decides
+    // which attestations are credited as theirs. Without it the feed showed
+    // every validator's work as "+2.50 ARC" in the user's own earnings view.
+    let address = {
+        let store = state.store.lock().await;
+        store.identity.as_ref().map(|i| i.address.clone())
+    };
+    let host = chain_host(&state).await;
+    Ok(rpc_client::fetch_attestations(
+        &state.http,
+        &host,
+        limit.unwrap_or(20),
+        address.as_deref(),
+    )
+    .await)
 }
 
 #[tauri::command]
@@ -276,8 +385,7 @@ pub async fn fetch_logs(
 
 #[tauri::command]
 pub async fn fetch_network_stats(state: State<'_, AppState>) -> CmdResult<NetworkStats> {
-    let port = state.node.lock().await.rpc_port;
-    let host = wallet_host(port);
+    let host = chain_host(&state).await;
     Ok(rpc_client::fetch_network_stats(&state.http, &host).await)
 }
 
@@ -289,63 +397,284 @@ pub async fn open_external(app: AppHandle, url: String) -> CmdResult<()> {
 
 #[tauri::command]
 pub async fn fetch_balance(state: State<'_, AppState>) -> CmdResult<AccountBalance> {
-    let port = state.node.lock().await.rpc_port;
     let addr = {
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
     }
     .ok_or_else(|| "no identity".to_string())?;
-    let host = wallet_host(port);
+    let host = chain_host(&state).await;
     rpc_client::fetch_balance(&state.http, &host, &addr).await
 }
 
 #[tauri::command]
 pub async fn faucet_claim(state: State<'_, AppState>) -> CmdResult<FaucetResult> {
-    let port = state.node.lock().await.rpc_port;
     let addr = {
         let store = state.store.lock().await;
         store.identity.as_ref().map(|i| i.address.clone())
     }
     .ok_or_else(|| "no identity".to_string())?;
-    let host = wallet_host(port);
+    let host = chain_host(&state).await;
     rpc_client::faucet_claim(&state.http, &host, &addr).await
 }
 
-/// Where the wallet RPCs (balance / faucet / earnings / status /
-/// attestations / network / legacy run_inference) go. Pinned to
-/// `WALLET_HOSTS[0]` (LAX) — the public testnet seeds form a real
-/// multi-validator consensus network (27 validators, shared DAG
-/// round), so reading from any one of them returns consistent state.
-/// LAX is the canonical pin so every wallet RPC hits the same chain
-/// view within a session. Tier 1 still goes elsewhere (alpha) until
-/// the BlockSTM regression on InferenceRequest apply is fixed; once
-/// that lands, tier 1 will route here too.
-fn wallet_host(_port: u16) -> String {
-    if let Ok(env) = std::env::var("ARC_TIER1_RPC") {
-        let trimmed = env.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_string();
+// The chain host is elected ONCE and then pinned for the life of the
+// process. It is deliberately NOT re-elected on a timer.
+//
+// The seeds are not one chain. They share a DAG round but not state:
+// `/block/43000` returns a different hash on each, heights span 51k-135k, and
+// a faucet credit on LAX never appears on AMS. Silently migrating the wallet
+// to a different seed mid-session would make the user's balance change for no
+// visible reason, or make a faucet claim they just watched succeed vanish.
+// (See CLAUDE.md rule 4.)
+//
+// So: pick the freshest seed at startup — which is the part the old code got
+// wrong, hard-pinning LAX even when it was six days stale — then stay there.
+// Re-election happens only if the pinned host stops answering, since a dead
+// host is worse than an inconsistent one.
+
+/// The seed whose chain view we read balances, earnings, attestations and
+/// network stats from.
+///
+/// Chosen dynamically rather than pinned. The previous code hard-pinned LAX,
+/// which was a reasonable choice when it was written and a bad one now: four
+/// of the six seeds have not produced a block in roughly six days, and which
+/// of the remaining two is ahead changes over the course of a day. A pin
+/// means the wallet silently reads a stalled chain.
+///
+/// Selection is by freshest `/block/latest` header timestamp — the direct
+/// measure of "is this host still producing?", where `/health` alone is not
+/// (a stalled seed still reports `status: ok` and a healthy peer count, and
+/// its DAG round keeps advancing even while block height stands still).
+///
+/// All candidates are probed concurrently. Sequential probing with a 2s
+/// timeout each is up to 12s of dead air on a screen that repaints every
+/// 1.5s.
+async fn probe_chain_host(http: &reqwest::Client) -> Option<ChainHostChoice> {
+    let mut set = tokio::task::JoinSet::new();
+    for host in WALLET_HOSTS {
+        let http = http.clone();
+        let host = host.to_string();
+        set.spawn(async move {
+            let url = format!("{}/block/latest", host);
+            let resp = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                http.get(&url).send(),
+            )
+            .await
+            .ok()?
+            .ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
+            let v: serde_json::Value = resp.json().await.ok()?;
+            let header = v.get("header")?;
+            let timestamp = header.get("timestamp").and_then(|t| t.as_u64())?;
+            let height = header.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+            Some(ChainHostChoice {
+                host,
+                block_timestamp_ms: timestamp,
+                height,
+            })
+        });
+    }
+
+    // Drain every probe rather than taking the first to answer: we want the
+    // FRESHEST host, not the FASTEST one. The quickest responder is often a
+    // stalled seed that simply has lower latency.
+    let mut best: Option<ChainHostChoice> = None;
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some(choice)) = joined {
+            if best
+                .as_ref()
+                .map(|b| choice.block_timestamp_ms > b.block_timestamp_ms)
+                .unwrap_or(true)
+            {
+                best = Some(choice);
+            }
         }
     }
-    WALLET_HOSTS[0].to_string()
+    best
 }
 
+#[derive(Clone, Debug)]
+pub struct ChainHostChoice {
+    pub host: String,
+    pub block_timestamp_ms: u64,
+    pub height: u64,
+}
+
+impl ChainHostChoice {
+    /// Age of this host's newest block. Surfaced so the UI can say "network
+    /// last produced a block 6 days ago" instead of implying everything is
+    /// fine.
+    pub fn block_age_seconds(&self) -> u64 {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        now.saturating_sub(self.block_timestamp_ms) / 1000
+    }
+}
+
+/// Resolve (and cache) the chain host for read-only chain queries.
+///
+/// `ARC_WALLET_HOST` pins it explicitly — the documented override for
+/// pointing the app at a local devnet or a specific seed. `ARC_TIER1_RPC` is
+/// still honored for backward compatibility with existing dev shells, but it
+/// is deliberately no longer the *first* thing checked and no longer silently
+/// redirects tier 1 alone: it redirects chain reads, which is what it always
+/// actually did.
+async fn chain_host(state: &AppState) -> String {
+    for key in ["ARC_WALLET_HOST", "ARC_TIER1_RPC"] {
+        if let Ok(env) = std::env::var(key) {
+            let trimmed = env.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    // Stay on the pinned host as long as it still answers.
+    let pinned = {
+        let cached = state.chain_host.lock().await;
+        cached.as_ref().map(|(c, _)| c.host.clone())
+    };
+    if let Some(host) = pinned {
+        if health_ok(&state.http, &host, std::time::Duration::from_secs(3)).await {
+            return host;
+        }
+        tracing::warn!("pinned chain host {} stopped answering - re-electing", host);
+    }
+
+    match probe_chain_host(&state.http).await {
+        Some(choice) => {
+            let host = choice.host.clone();
+            tracing::info!(
+                "chain host pinned to {} (height {}, newest block {}s old) for this session",
+                host,
+                choice.height,
+                choice.block_age_seconds()
+            );
+            *state.chain_host.lock().await = Some((choice, std::time::Instant::now()));
+            host
+        }
+        None => {
+            // Every seed refused or timed out. Fall back to the first
+            // candidate so the caller still produces a well-formed error
+            // against a real host rather than panicking on an empty string.
+            tracing::warn!("no seed answered /block/latest; falling back to {}", WALLET_HOSTS[0]);
+            WALLET_HOSTS[0].to_string()
+        }
+    }
+}
+
+/// The cached chain choice, without triggering a probe. Used by
+/// `node_status` to attach chain height/round/age after `chain_host` has
+/// already run.
+async fn cached_chain_choice(state: &AppState) -> Option<ChainHostChoice> {
+    state
+        .chain_host
+        .lock()
+        .await
+        .as_ref()
+        .map(|(c, _)| c.clone())
+}
+
+/// Per-request inference timeout.
+///
+/// Was 600s per host, tried across hosts sequentially — a single dead
+/// coordinator could burn ten minutes before the next was attempted, and
+/// five of them meant the UI could hang for the better part of an hour. 120s
+/// is generous for a short prompt through the sharded pipeline and bounded
+/// enough that a wedged host costs one visible pause, not a demo.
+const INFERENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a coordinator gets to answer `/health` before we skip it.
+const COORDINATOR_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+fn inference_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(INFERENCE_TIMEOUT)
+        .build()
+        .map_err(map_err)
+}
+
+async fn health_ok(http: &reqwest::Client, host: &str, timeout: std::time::Duration) -> bool {
+    matches!(
+        tokio::time::timeout(timeout, http.get(format!("{}/health", host)).send()).await,
+        Ok(Ok(r)) if r.status().is_success()
+    )
+}
+
+/// Coordinators to try, best first.
+///
+/// Two changes from the original, both of which matter on this network:
+///
+/// 1. **The local node goes first when it is up.** It is the only node
+///    running the current build — the public seeds are still on v0.7.9,
+///    whose coordinator is markedly slower — and routing through a
+///    datacenter to compute something the user's own machine can compute is
+///    both slower and a worse story to tell.
+/// 2. **Remotes are probed concurrently**, and only reachable ones are
+///    returned, ordered by how fast they answered. The previous code walked
+///    a fixed list sequentially with a per-host inference timeout, so an
+///    unreachable host cost a full timeout before the next was tried.
+async fn coordinator_candidates(state: &AppState) -> Vec<String> {
+    let mut ordered = Vec::new();
+
+    let port = state.node.lock().await.rpc_port;
+    let local = paths::local_host(port);
+    if health_ok(&state.http, &local, COORDINATOR_HEALTH_TIMEOUT).await {
+        ordered.push(local);
+    }
+
+    let mut set = tokio::task::JoinSet::new();
+    for host in COORDINATOR_HOSTS {
+        let http = state.http.clone();
+        let host = host.to_string();
+        set.spawn(async move {
+            let started = std::time::Instant::now();
+            if health_ok(&http, &host, COORDINATOR_HEALTH_TIMEOUT).await {
+                Some((host, started.elapsed()))
+            } else {
+                None
+            }
+        });
+    }
+    let mut remotes: Vec<(String, std::time::Duration)> = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some(hit)) = joined {
+            remotes.push(hit);
+        }
+    }
+    remotes.sort_by_key(|(_, elapsed)| *elapsed);
+    ordered.extend(remotes.into_iter().map(|(h, _)| h));
+    ordered
+}
+
+/// Run inference on the local node.
+///
+/// Kept as its own command so the UI can show "served by your machine"
+/// truthfully. Previously this went to the LAX seed via `wallet_host`, while
+/// the Inference screen's help text claimed "your prompt goes to the local
+/// node" — it did not.
 #[tauri::command]
 pub async fn run_inference(
     state: State<'_, AppState>,
     prompt: String,
     max_tokens: Option<u32>,
+    chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
     let port = state.node.lock().await.rpc_port;
-    let host = wallet_host(port);
-    // Inference can take 3-30s depending on token count and hardware.
-    // The shared state.http has a 3s timeout (fine for health polls) which
-    // is too short here — build a dedicated client with a generous limit.
-    let long_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .build()
-        .map_err(map_err)?;
-    rpc_client::run_inference(&long_client, &host, &prompt, max_tokens.unwrap_or(32)).await
+    let host = paths::local_host(port);
+    let client = inference_client()?;
+    let mut result = rpc_client::run_inference(
+        &client,
+        &host,
+        &prompt,
+        max_tokens.unwrap_or(32),
+        chat_template.unwrap_or(true),
+    )
+    .await?;
+    result.served_locally = true;
+    Ok(result)
 }
 
 /// Milestone A (#35): observer / no-model nodes route inference through a
@@ -361,33 +690,40 @@ pub async fn run_inference(
 /// the Rust side having to know about the local node's role.
 #[tauri::command]
 pub async fn run_inference_via_coordinator(
+    state: State<'_, AppState>,
     prompt: String,
     max_tokens: Option<u32>,
     k: Option<u32>,
+    chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
-    // 600s / 10 min per-host timeout. Observed testnet behavior: a 3-token
-    // generation through the 6-range pipeline at k=3 takes ~160s (≈54s/
-    // token × 3), and prompts with longer prefill scale linearly until
-    // run_consensus gains pipelined prefill (the followup noted in #35's
-    // close comment).
-    let long_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .map_err(map_err)?;
+    let client = inference_client()?;
     let max_tokens = max_tokens.unwrap_or(32);
     let k = k.unwrap_or(3);
+    let chat_template = chat_template.unwrap_or(true);
+
+    let candidates = coordinator_candidates(&state).await;
+    if candidates.is_empty() {
+        return Err("no coordinator answered /health - check your internet connection".into());
+    }
+    let local_prefix = paths::local_host(state.node.lock().await.rpc_port);
+
     let mut last_err = String::new();
-    for host in COORDINATOR_HOSTS {
-        match rpc_client::run_inference_consensus(&long_client, host, &prompt, max_tokens, k)
-            .await
+    for host in &candidates {
+        match rpc_client::run_inference_consensus(
+            &client, host, &prompt, max_tokens, k, chat_template,
+        )
+        .await
         {
-            Ok(r) => return Ok(r),
+            Ok(mut r) => {
+                r.served_locally = *host == local_prefix;
+                return Ok(r);
+            }
             Err(e) => last_err = e,
         }
     }
     Err(format!(
-        "all {} coordinators failed; last: {}",
-        COORDINATOR_HOSTS.len(),
+        "all {} reachable coordinators failed; last: {}",
+        candidates.len(),
         last_err
     ))
 }
@@ -404,25 +740,38 @@ pub async fn run_inference_via_coordinator(
 /// answer instead of an error.
 #[tauri::command]
 pub async fn run_inference_via_coordinator_direct(
+    state: State<'_, AppState>,
     prompt: String,
     max_tokens: Option<u32>,
+    chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
-    let long_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(180))
-        .build()
-        .map_err(map_err)?;
+    let client = inference_client()?;
     let max_tokens = max_tokens.unwrap_or(32);
+    let chat_template = chat_template.unwrap_or(true);
+
+    let candidates = coordinator_candidates(&state).await;
+    if candidates.is_empty() {
+        return Err("no coordinator answered /health - check your internet connection".into());
+    }
+    let local_prefix = paths::local_host(state.node.lock().await.rpc_port);
+
     let mut last_err = String::new();
-    for host in COORDINATOR_HOSTS {
-        match rpc_client::run_inference_remote(&long_client, host, &prompt, max_tokens).await
+    for host in &candidates {
+        match rpc_client::run_inference_remote(
+            &client, host, &prompt, max_tokens, chat_template,
+        )
+        .await
         {
-            Ok(r) => return Ok(r),
+            Ok(mut r) => {
+                r.served_locally = *host == local_prefix;
+                return Ok(r);
+            }
             Err(e) => last_err = e,
         }
     }
     Err(format!(
-        "all {} coordinators failed (direct path); last: {}",
-        COORDINATOR_HOSTS.len(),
+        "all {} reachable coordinators failed (direct path); last: {}",
+        candidates.len(),
         last_err
     ))
 }
@@ -655,7 +1004,12 @@ fn tier1_candidate_hosts() -> Vec<String> {
 /// speculative executor silently dropped the tx; the alpha solo host
 /// was the temporary stopgap. With v0.7.6 rolled out, alpha retires
 /// and tier 1 lives on the public testnet alongside everything else.
-const COORDINATOR_HOSTS: [&str; 5] = [
+///
+/// NYC was missing from this list. It is a live seed and, for long stretches,
+/// the healthiest one — so both the coordinator fallback and the chain-host
+/// election were choosing among five hosts while ignoring the sixth.
+const COORDINATOR_HOSTS: [&str; 6] = [
+    "http://149.28.32.76:9090",   // NYC
     "http://140.82.16.112:9090",  // LAX
     "http://136.244.109.1:9090",  // AMS
     "http://104.238.171.11:9090", // LHR
@@ -663,12 +1017,13 @@ const COORDINATOR_HOSTS: [&str; 5] = [
     "http://149.28.153.31:9090",  // SGP
 ];
 
-/// The public testnet — 5 seed VPSes running a real 27-validator
-/// consensus network with shared DAG round. Every wallet RPC pins to
-/// `WALLET_HOSTS[0]` (LAX) so per-session reads are consistent (the
-/// seeds DO replicate state via consensus, but anchoring to one host
-/// avoids confusion if a node lags briefly).
-const WALLET_HOSTS: [&str; 5] = [
+/// The public testnet seeds, as candidates for chain reads.
+///
+/// No longer a priority list with a pinned `[0]` — `chain_host()` elects
+/// among these by block freshness on every TTL expiry. Order is
+/// presentational only.
+const WALLET_HOSTS: [&str; 6] = [
+    "http://149.28.32.76:9090",   // NYC
     "http://140.82.16.112:9090",  // LAX
     "http://136.244.109.1:9090",  // AMS
     "http://104.238.171.11:9090", // LHR
@@ -732,23 +1087,20 @@ pub async fn run_paid_inference(
     // ARC address = BLAKE3(public_key) - matches chain derivation.
     let payer_addr = arc_crypto::Hash256(*blake3::hash(&public_key).as_bytes());
 
-    // Pick the first reachable coordinator.
+    // Pick the best reachable coordinator (parallel probe, local first).
+    // The escrow is opened against whichever host is chosen, so this must
+    // resolve before any transaction is signed.
     let probe = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(6))
         .build()
         .map_err(map_err)?;
-    let mut coord_url: Option<String> = None;
-    for host in COORDINATOR_HOSTS {
-        if let Ok(r) = probe.get(format!("{}/health", host)).send().await {
-            if r.status().is_success() {
-                coord_url = Some(host.to_string());
-                break;
-            }
-        }
-    }
-    let coord_url = coord_url.ok_or_else(|| {
-        "no coordinator reachable - all 6 testnet seeds timed out on /health".to_string()
-    })?;
+    let coord_url = coordinator_candidates(&state)
+        .await
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            "no coordinator reachable - every testnet seed timed out on /health".to_string()
+        })?;
 
     // Pull the payer's current on-chain nonce so the open tx lands.
     let account_url = format!(
@@ -843,20 +1195,20 @@ pub async fn run_paid_inference(
     }
 
     // Run inference with the escrow-gated flags.
+    //
+    // The prompt is sent raw with `chat_template: true` rather than wrapped
+    // client-side in `[INST] ... [/INST]`. The node applies the model's own
+    // template from GGUF metadata, which is correct for whatever model is
+    // actually loaded; hardcoding Llama-2's tags corrupted the prompt for
+    // every other architecture and double-wrapped when the node templated
+    // too.
     let k = k.unwrap_or(3);
-    let wrapped = if prompt.contains("[INST]") {
-        prompt.clone()
-    } else {
-        format!("[INST] {} [/INST]", prompt)
-    };
-    let infer_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(600))
-        .build()
-        .map_err(map_err)?;
+    let infer_client = inference_client()?;
     let infer_resp = infer_client
         .post(format!("{}/inference/run_consensus", coord_url))
         .json(&serde_json::json!({
-            "input": wrapped,
+            "input": prompt,
+            "chat_template": true,
             "max_tokens": max_tokens,
             "k": k,
             "payer": format!("0x{}", hex::encode(&payer_addr.0)),
@@ -930,29 +1282,162 @@ pub async fn run_paid_inference(
     })
 }
 
+// `check_for_update` (GitHub releases API) was deleted here deliberately.
+//
+// It was a second, independent notion of "is there an update" that
+// disagreed with the one the Install button actually used. Settings rendered
+// the button from this command's `tag_name != CARGO_PKG_VERSION`, but
+// clicking it called the Tauri updater's `check()`, which reads the signed
+// `latest.json`. Any tag that ships arc-node binaries without a desktop
+// bundle — exactly what a normal tag push produces — advanced `tag_name`
+// while publishing no manifest, so the app offered an update and then
+// reported "No update available." It was also an unauthenticated
+// api.github.com call subject to a 60/hr rate limit and the first thing to
+// fail behind a corporate proxy.
+//
+// Both the badge and the button now come from the updater plugin, which
+// reads the signed manifest and is the only source that can actually
+// install anything. The version string for display comes off the `Update`
+// object. See `Settings.tsx`.
+
+/// Write the in-memory log ring to a file the user picks.
+///
+/// The Download button built a `Blob`, made an `<a download>` and clicked it.
+/// WKWebView — the macOS webview — does not implement the `download`
+/// attribute for `blob:` URLs without a host-side download delegate, so the
+/// click was a silent no-op on macOS while appearing to work on Windows and
+/// Linux. Handing logs to support is the whole point of the button, so the
+/// failure was both invisible and consequential. Doing the write in Rust
+/// works identically everywhere.
 #[tauri::command]
-pub async fn check_for_update() -> CmdResult<UpdateCheck> {
-    // Query the public GitHub releases API for the latest tag.
-    let client = reqwest::Client::builder()
-        .user_agent("arc-desktop/0.1")
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(map_err)?;
-    let resp = client
-        .get("https://api.github.com/repos/FerrumVir/arc-chain/releases/latest")
+pub async fn save_logs(app: AppHandle, state: State<'_, AppState>) -> CmdResult<SavedLogs> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let entries = {
+        let node = state.node.lock().await;
+        node.logs_snapshot(5000).await
+    };
+    let body = entries
+        .iter()
+        .map(|l| {
+            let ts = chrono::DateTime::from_timestamp_millis(l.timestamp)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_else(|| l.timestamp.to_string());
+            format!("[{}] {:<5} {}", ts, l.level.to_uppercase(), l.message)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let default_name = format!(
+        "arc-node-{}.log",
+        chrono::Utc::now().format("%Y%m%d-%H%M%S")
+    );
+
+    // The dialog plugin's blocking picker would deadlock the async runtime;
+    // hop it onto a oneshot instead.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&default_name)
+        .add_filter("Log file", &["log", "txt"])
+        .save_file(move |path| {
+            let _ = tx.send(path);
+        });
+    let picked = rx.await.map_err(map_err)?;
+
+    let Some(path) = picked else {
+        // User cancelled - not an error.
+        return Ok(SavedLogs { path: None, lines: entries.len() });
+    };
+    let path: PathBuf = path
+        .into_path()
+        .map_err(|e| format!("could not resolve the chosen path: {}", e))?;
+
+    std::fs::write(&path, body).map_err(|e| format!("write {}: {}", path.display(), e))?;
+
+    Ok(SavedLogs {
+        path: Some(path.to_string_lossy().into_owned()),
+        lines: entries.len(),
+    })
+}
+
+/// Change how many cores the node contributes.
+///
+/// Tries the cheap path first: `POST /node/threads` on the local node
+/// resizes rayon's pool in place, so "add two cores" takes effect without
+/// dropping the node off the network. That endpoint is being added
+/// chain-side and does not exist on shipped nodes yet, so a 404 (or any
+/// other refusal) falls back to a graceful restart with the new width. Both
+/// outcomes are reported honestly via `ThreadsApplied.restarted`, because
+/// "applied live" and "restarted your node" are very different things to
+/// have just done to someone.
+#[tauri::command]
+pub async fn set_worker_threads(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    threads: u32,
+) -> CmdResult<ThreadsApplied> {
+    let cores = cached_hardware().cpu_cores.max(1);
+    if threads == 0 || threads > cores {
+        return Err(format!(
+            "core count must be between 1 and {} on this machine",
+            cores
+        ));
+    }
+
+    // Persist first, so whichever path we take below (live reconfigure or
+    // restart) the new width survives — including if the user quits before
+    // it is applied. `restart_node` re-reads the config from the store, so
+    // this write is what it will pick up.
+    let was_running = {
+        let mut store = state.store.lock().await;
+        let mut cfg = store.config.clone().unwrap_or_default();
+        cfg.worker_threads = Some(threads);
+        store.config = Some(cfg);
+        let dir = state.data_dir.lock().await.clone();
+        store.save_to(&dir).map_err(map_err)?;
+        state.node.lock().await.is_running()
+    };
+
+    if !was_running {
+        return Ok(ThreadsApplied {
+            worker_threads: threads,
+            restarted: false,
+            message: format!("Saved. The node will use {} cores when it starts.", threads),
+        });
+    }
+
+    // Attempt the live reconfigure.
+    let port = state.node.lock().await.rpc_port;
+    let url = format!("{}/node/threads", paths::local_host(port));
+    let live = state
+        .http
+        .post(&url)
+        .json(&serde_json::json!({ "threads": threads }))
         .send()
-        .await
-        .map_err(map_err)?;
-    let v: serde_json::Value = resp.json().await.map_err(map_err)?;
-    let version = v
-        .get("tag_name")
-        .and_then(|x| x.as_str())
-        .map(|s| s.trim_start_matches('v').to_string())
-        .unwrap_or_else(|| "unknown".into());
-    let current = env!("CARGO_PKG_VERSION");
-    Ok(UpdateCheck {
-        has_update: version != current && version != "unknown",
-        version,
+        .await;
+    match live {
+        Ok(r) if r.status().is_success() => {
+            let mut node = state.node.lock().await;
+            node.active_worker_threads = Some(threads);
+            return Ok(ThreadsApplied {
+                worker_threads: threads,
+                restarted: false,
+                message: format!("Now contributing {} cores (applied live).", threads),
+            });
+        }
+        Ok(r) => tracing::info!(
+            "POST /node/threads returned {} - falling back to a restart",
+            r.status()
+        ),
+        Err(e) => tracing::info!("POST /node/threads failed ({}) - falling back to a restart", e),
+    }
+
+    restart_node(app, state).await?;
+    Ok(ThreadsApplied {
+        worker_threads: threads,
+        restarted: true,
+        message: format!("Restarted the node with {} cores.", threads),
     })
 }
 
@@ -973,43 +1458,131 @@ const EXPECTED_NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// always get the matching arc-node binary instead of running a stale one.
 #[tauri::command]
 pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
+    ensure_binary_inner(&app).await
+}
+
+fn installed(path: &Path) -> BinaryStatus {
+    BinaryStatus {
+        path: path.to_string_lossy().into_owned(),
+        downloaded_bytes: 0,
+        total_bytes: 0,
+        already_installed: true,
+    }
+}
+
+/// Make sure *some* runnable arc-node exists, and prefer a current one.
+///
+/// The governing rule, learned the hard way: **a usable binary that is
+/// present must never be blocked by a failed refresh.** The previous version
+/// returned `Err` on any non-200 from GitHub, and `start_node` propagated it
+/// with `?`. Because v0.7.10 and v0.7.11 were both published desktop-only via
+/// `workflow_dispatch`, the release carries no `arc-node-*` assets at all, so
+/// that download 404s on every platform — and every Start click, on every
+/// machine, failed before arc-node was ever spawned. A stale arc-node beats
+/// no arc-node; no arc-node beats nothing.
+///
+/// Resolution order mirrors `node_manager::resolve_binary` so the thing this
+/// function blesses is the thing that actually gets spawned.
+async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
+    // 1. An explicitly configured binary is the operator's decision. Never
+    //    version-check it, never overwrite it.
+    if let Some(p) = crate::node_manager::env_binary_override() {
+        if p.exists() {
+            tracing::info!("using arc-node from env override: {}", p.display());
+            return Ok(installed(&p));
+        }
+        return Err(format!(
+            "ARC_NODE_BIN points at {}, which does not exist",
+            p.display()
+        ));
+    }
+
     let target = managed_binary_path();
+
+    // 2. A binary already in the managed location. Compare versions and
+    //    *warn* — do not force a redownload. A hand-built or locally patched
+    //    arc-node is a deliberate act; clobbering it because its version
+    //    string differs from the desktop's is user-hostile, and with the
+    //    release assets missing it replaces something that works with
+    //    nothing at all. Only a genuinely OLDER binary is worth refreshing.
     if target.exists() {
         match read_arc_node_version(&target) {
-            Some(ref v) if v == EXPECTED_NODE_VERSION => {
-                return Ok(BinaryStatus {
-                    path: target.to_string_lossy().into_owned(),
-                    downloaded_bytes: 0,
-                    total_bytes: 0,
-                    already_installed: true,
-                });
-            }
+            Some(ref v) if v == EXPECTED_NODE_VERSION => return Ok(installed(&target)),
             Some(v) => {
-                let relation = if semver_gt(&v, EXPECTED_NODE_VERSION) { "newer" } else { "older" };
-                tracing::info!(
-                    "arc-node {} at {} is {} than desktop's expected {} - replacing with matched version",
-                    v,
-                    target.display(),
-                    relation,
-                    EXPECTED_NODE_VERSION
-                );
+                if semver_gt(EXPECTED_NODE_VERSION, &v) {
+                    tracing::info!(
+                        "arc-node {} at {} is older than this desktop's {} - attempting refresh",
+                        v, target.display(), EXPECTED_NODE_VERSION
+                    );
+                    // Fall through to the download attempt below.
+                } else {
+                    tracing::warn!(
+                        "arc-node {} at {} does not match this desktop's {} - keeping it \
+                         (newer or unrecognized versions are left alone)",
+                        v, target.display(), EXPECTED_NODE_VERSION
+                    );
+                    return Ok(installed(&target));
+                }
             }
             None => {
                 tracing::warn!(
-                    "arc-node binary at {} is unreadable or missing --version - replacing",
+                    "arc-node at {} did not report a parseable --version - attempting refresh",
                     target.display()
                 );
             }
         }
-        // Fall through to download. We don't pre-remove the target; the
-        // download writes to a `.download` sidecar then atomically renames
-        // over the existing binary, so a failed download leaves the working
-        // copy in place.
+    } else if let Some(dev) = crate::node_manager::dev_build_binary() {
+        // 3. A release build in this repo checkout. This is how the demo
+        //    machine runs: the checkout has a matching arc-node while the
+        //    published release has none.
+        tracing::info!("using locally built arc-node: {}", dev.display());
+        return Ok(installed(&dev));
     }
 
+    // 4. Download. Any failure past this point is non-fatal when we already
+    //    have something to run.
+    let have_fallback = target.exists();
+    match download_arc_node(&target).await {
+        Ok(total_bytes) => {
+            let _ = app; // reserved for progress events via app.emit(...)
+            Ok(BinaryStatus {
+                path: target.to_string_lossy().into_owned(),
+                downloaded_bytes: total_bytes,
+                total_bytes,
+                already_installed: false,
+            })
+        }
+        Err(e) if have_fallback => {
+            tracing::warn!(
+                "arc-node refresh failed ({}) - continuing with the existing binary at {}",
+                e, target.display()
+            );
+            Ok(installed(&target))
+        }
+        Err(e) => {
+            // Last chance: a dev build we skipped earlier because the
+            // managed path existed but turned out unusable.
+            if let Some(dev) = crate::node_manager::dev_build_binary() {
+                tracing::warn!("arc-node download failed ({}) - falling back to {}", e, dev.display());
+                return Ok(installed(&dev));
+            }
+            Err(format!(
+                "{}. No arc-node is available to run. Build one with \
+                 `cargo build --release -p arc-node` in the arc-chain checkout, or set \
+                 ARC_NODE_BIN to an existing binary.",
+                e
+            ))
+        }
+    }
+}
+
+/// Fetch the platform's arc-node release asset and install it at `target`.
+/// Returns the byte count on success.
+async fn download_arc_node(target: &Path) -> Result<u64, String> {
     let asset = platform_release_asset().ok_or_else(|| {
         format!(
-            "no prebuilt arc-node binary for platform {}-{} - build from source or open an issue",
+            "no prebuilt arc-node binary for platform {}-{}; build from source with \
+             `cargo build --release -p arc-node`",
             std::env::consts::OS,
             std::env::consts::ARCH
         )
@@ -1045,13 +1618,14 @@ pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
         file.write_all(&bytes).map_err(map_err)?;
         file.sync_all().ok();
     }
-    std::fs::rename(&tmp, &target).map_err(map_err)?;
+
+    install_over(&tmp, target)?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&target, perms).map_err(map_err)?;
+        std::fs::set_permissions(target, perms).map_err(map_err)?;
     }
 
     // Best-effort: strip any macOS quarantine flag on our own download.
@@ -1060,17 +1634,39 @@ pub async fn ensure_binary(app: AppHandle) -> CmdResult<BinaryStatus> {
     {
         let _ = std::process::Command::new("xattr")
             .args(["-d", "com.apple.quarantine"])
-            .arg(&target)
+            .arg(target)
             .output();
     }
 
-    let _ = app; // reserved for future progress events via app.emit(...)
+    Ok(total_bytes)
+}
 
-    Ok(BinaryStatus {
-        path: target.to_string_lossy().into_owned(),
-        downloaded_bytes: total_bytes,
-        total_bytes,
-        already_installed: false,
+/// Move `tmp` onto `target`, tolerating a locked destination.
+///
+/// Windows refuses to overwrite a running executable's image file, but it
+/// *does* allow renaming one out of the way. So on a failed direct rename,
+/// displace the old binary to `.old` first and retry. The stale `.old` is
+/// cleaned up opportunistically on the next successful install.
+fn install_over(tmp: &Path, target: &Path) -> Result<(), String> {
+    if std::fs::rename(tmp, target).is_ok() {
+        let _ = std::fs::remove_file(target.with_extension("old"));
+        return Ok(());
+    }
+    let displaced = target.with_extension("old");
+    let _ = std::fs::remove_file(&displaced);
+    if let Err(e) = std::fs::rename(target, &displaced) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(format!(
+            "could not replace {} (in use, and moving it aside failed: {})",
+            target.display(),
+            e
+        ));
+    }
+    std::fs::rename(tmp, target).map_err(|e| {
+        // Put the original back rather than leaving the user with nothing.
+        let _ = std::fs::rename(&displaced, target);
+        let _ = std::fs::remove_file(tmp);
+        format!("could not install new arc-node at {}: {}", target.display(), e)
     })
 }
 
@@ -1201,11 +1797,7 @@ fn tier_spec(id: &str) -> Option<&'static ModelTierSpec> {
 }
 
 fn models_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".arc").join("models")
+    paths::arc_home().join("models")
 }
 
 fn model_path_for(tier: &str) -> PathBuf {

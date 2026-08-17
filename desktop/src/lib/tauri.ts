@@ -18,6 +18,8 @@ import type {
   NodeStatus,
   PaidInferenceResult,
   ResetPeerStateResult,
+  SavedLogs,
+  ThreadsApplied,
   Tier1Result,
   Tier1Submitted,
   Tier1Vote,
@@ -46,6 +48,16 @@ function liveBase(): string | null {
 }
 
 const REWARD_PER_ATTESTATION = 2.5;
+
+/** Mirrors commands.rs::COORDINATOR_HOSTS, NYC included. */
+const COORDINATOR_HOSTS = [
+  "http://149.28.32.76:9090", // NYC
+  "http://140.82.16.112:9090", // LAX
+  "http://136.244.109.1:9090", // AMS
+  "http://104.238.171.11:9090", // LHR
+  "http://202.182.107.41:9090", // NRT
+  "http://149.28.153.31:9090", // SGP
+];
 
 async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   const base = liveBase()!;
@@ -83,10 +95,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           [...crypto.getRandomValues(new Uint8Array(32))]
             .map((b) => b.toString(16).padStart(2, "0"))
             .join(""),
-        seedPhrase:
-          "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment",
         createdAt: Date.now(),
       } as T;
+    case "reveal_seed_phrase":
+      return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
     case "save_config":
@@ -100,29 +112,26 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       // health to "lite". This is what unlocks the v0.7.0 Client-mode
       // banner in the dashboard. Pre-v0.7 the JS mock hardcoded
       // coordinatorUrl: null so the banner was untestable in live mode.
-      const COORDINATOR_HOSTS = [
-        "http://149.28.32.76:9090",
-        "http://140.82.16.112:9090",
-        "http://136.244.109.1:9090",
-        "http://104.238.171.11:9090",
-        "http://202.182.107.41:9090",
-        "http://149.28.153.31:9090",
-      ];
+      // Probed concurrently, matching rpc_client.rs::probe_coordinator.
       const probeCoordinator = async (): Promise<string | null> => {
-        for (const origin of COORDINATOR_HOSTS) {
-          try {
-            const r = await fetch(`${origin}/health`, {
-              method: "GET",
-              signal: AbortSignal.timeout(2000),
-            });
-            if (r.ok) return origin;
-          } catch {
-            // try next
-          }
+        const attempts = COORDINATOR_HOSTS.map(async (origin) => {
+          const r = await fetch(`${origin}/health`, {
+            method: "GET",
+            signal: AbortSignal.timeout(2000),
+          });
+          if (!r.ok) throw new Error(`${origin} → ${r.status}`);
+          return origin;
+        });
+        try {
+          return await Promise.any(attempts);
+        } catch {
+          return null;
         }
-        return null;
       };
 
+      const rpcPort = Number(
+        (window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__,
+      );
       try {
         const h = await fetchJson("/health");
         const peers = h.peers ?? 0;
@@ -146,9 +155,15 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           height: h.height ?? 0,
           uptimeSeconds: uptime,
           address: null,
-          rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
+          rpcPort,
           lastError: null,
           coordinatorUrl,
+          chainHost: coordinatorUrl,
+          chainHeight: null,
+          chainRound: null,
+          chainBlockAgeSeconds: null,
+          workerThreads: null,
+          cpuCores: navigator.hardwareConcurrency ?? null,
         } as T;
       } catch {
         const coordinatorUrl = await probeCoordinator();
@@ -163,67 +178,104 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           height: 0,
           uptimeSeconds: 0,
           address: null,
-          rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
+          rpcPort,
           lastError: coordinatorUrl ? null : "No response",
           coordinatorUrl,
+          chainHost: coordinatorUrl,
+          chainHeight: null,
+          chainRound: null,
+          chainBlockAgeSeconds: null,
+          workerThreads: null,
+          cpuCores: navigator.hardwareConcurrency ?? null,
         } as T;
       }
     }
     case "fetch_earnings": {
+      // No synthesized "today" (was total × 12%) and no invented "pending"
+      // (was a flat 2.5). This path genuinely does not know either, and
+      // null renders as "—" rather than a confident number.
       try {
         const r = await fetchJson("/inference/results?limit=1");
         const count = r.count ?? 0;
         return {
           totalArc: count * REWARD_PER_ATTESTATION,
-          todayArc: Math.round(count * 0.12) * REWARD_PER_ATTESTATION,
-          pendingArc: 2.5,
+          todayArc: null,
+          pendingArc: null,
           rank: null,
           attestations: count,
-          lastPayoutAt: Date.now() - 60_000,
+          lastPayoutAt: null,
+          lastPayoutBlock: null,
+          fromChain: false,
         } as T;
       } catch {
         return {
           totalArc: 0,
-          todayArc: 0,
-          pendingArc: 0,
+          todayArc: null,
+          pendingArc: null,
           rank: null,
           attestations: 0,
           lastPayoutAt: null,
+          lastPayoutBlock: null,
+          fromChain: false,
         } as T;
       }
     }
     case "fetch_attestations": {
+      // Shape-tolerant, matching rpc_client.rs::fetch_attestations. The live
+      // seeds return flat tx records with no nested `inference` object, so
+      // reading only the nested shape produced blank rows with "0 tokens",
+      // "0ms" and a hardcoded "+2.50".
       try {
         const limit = (args as { limit?: number } | undefined)?.limit ?? 20;
         const r = await fetchJson(`/inference/attestations?limit=${limit}`);
-        const arr = (r.attestations ?? []) as Array<{
-          tx_hash: string;
-          success: boolean;
-          inference: {
-            input: string;
-            output_hash: string;
-            model_hash: string;
-            tokens_generated: number;
-            ms_per_token: number;
-          };
-        }>;
-        const now = Date.now();
-        return arr.map((v, i) => ({
-          txHash: v.tx_hash,
-          inputPreview: (v.inference?.input ?? "")
-            .replace("[INST] ", "")
-            .replace(" [/INST]", "")
-            .slice(0, 140),
-          outputHash: v.inference?.output_hash ?? "",
-          modelHash: v.inference?.model_hash ?? "",
-          tokens: v.inference?.tokens_generated ?? 0,
-          latencyMs:
-            (v.inference?.tokens_generated ?? 0) *
-            (v.inference?.ms_per_token ?? 0),
-          rewardArc: REWARD_PER_ATTESTATION,
-          timestamp: now - i * 30_000,
-          verified: !!v.success,
-        })) as T;
+        type Raw = Record<string, unknown>;
+        const arr = (r.attestations ?? []) as Raw[];
+        const stored = localStorage.getItem("arc-desktop-state-v1");
+        const mineAddr = stored
+          ? (JSON.parse(stored).identity?.address as string | undefined)
+              ?.replace(/^0x/, "")
+              .toLowerCase()
+          : undefined;
+
+        const num = (o: Raw, k: string): number | null => {
+          const v = o[k];
+          return typeof v === "number" && v > 0 ? v : null;
+        };
+
+        return arr
+          .map((v) => {
+            const inf = (v.inference as Raw | undefined) ?? v;
+            const txHash = (v.tx_hash as string) ?? "";
+            if (!txHash) return null;
+            const tokens = num(inf, "tokens_generated");
+            const msPerTok = num(inf, "ms_per_token");
+            const from = ((v.from as string) ?? "")
+              .replace(/^0x/, "")
+              .toLowerCase();
+            const mine = !!mineAddr && !!from && from === mineAddr;
+            return {
+              txHash,
+              inputPreview: ((inf.input as string) ?? "")
+                .replace("[INST] ", "")
+                .replace(" [/INST]", "")
+                .slice(0, 140),
+              outputHash: (inf.output_hash as string) ?? "",
+              modelHash: (inf.model_hash as string) ?? "",
+              tokens,
+              latencyMs:
+                tokens !== null && msPerTok !== null
+                  ? tokens * msPerTok
+                  : num(inf, "inference_ms"),
+              rewardArc: mine ? REWARD_PER_ATTESTATION : null,
+              timestamp: num(v, "timestamp"),
+              blockHeight: num(v, "block_height"),
+              from: from || null,
+              mine,
+              verified: !!v.success,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null)
+          .sort((a, b) => (b.blockHeight ?? 0) - (a.blockHeight ?? 0)) as T;
       } catch {
         return [] as T;
       }
@@ -313,17 +365,19 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     }
     case "run_inference": {
-      const { prompt, maxTokens } = args as {
+      const { prompt, maxTokens, chatTemplate } = args as {
         prompt: string;
         maxTokens?: number;
+        chatTemplate?: boolean;
       };
-      const wrapped = prompt.includes("[INST]")
-        ? prompt
-        : `[INST] ${prompt} [/INST]`;
       const r = await fetch(`${base}/inference/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: wrapped, max_tokens: maxTokens ?? 32 }),
+        body: JSON.stringify({
+          input: prompt,
+          max_tokens: maxTokens ?? 32,
+          chat_template: chatTemplate ?? true,
+        }),
       });
       if (!r.ok) throw new Error(`inference error ${r.status}`);
       const v = await r.json();
@@ -338,38 +392,32 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         deterministic: v.inference?.deterministic ?? false,
         engine: v.inference?.engine ?? "",
         explorerUrl: v.explorer_url ?? "",
+        // liveBase() is 127.0.0.1 - this IS the local node.
+        servedLocally: true,
+        trace: v.shard_trace ?? undefined,
       } as T;
     }
     case "run_inference_via_coordinator": {
-      const { prompt, maxTokens, k } = args as {
+      const { prompt, maxTokens, k, chatTemplate } = args as {
         prompt: string;
         maxTokens?: number;
         k?: number;
+        chatTemplate?: boolean;
       };
-      const wrapped = prompt.includes("[INST]")
-        ? prompt
-        : `[INST] ${prompt} [/INST]`;
       // Live mode iterates the same seed list the Rust side uses so the
       // browser E2E path exercises the coordinator fallback against a
       // real chain host.
-      const hosts = [
-        "http://149.28.32.76:9090",
-        "http://140.82.16.112:9090",
-        "http://136.244.109.1:9090",
-        "http://104.238.171.11:9090",
-        "http://202.182.107.41:9090",
-        "http://149.28.153.31:9090",
-      ];
       let lastErr = "";
-      for (const host of hosts) {
+      for (const host of COORDINATOR_HOSTS) {
         try {
           const r = await fetch(`${host}/inference/run_consensus`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              input: wrapped,
+              input: prompt,
               max_tokens: maxTokens ?? 32,
               k: k ?? 3,
+              chat_template: chatTemplate ?? true,
             }),
           });
           if (!r.ok) {
@@ -408,30 +456,21 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       throw new Error(`all coordinators failed; last: ${lastErr}`);
     }
     case "run_inference_via_coordinator_direct": {
-      const { prompt, maxTokens } = args as {
+      const { prompt, maxTokens, chatTemplate } = args as {
         prompt: string;
         maxTokens?: number;
+        chatTemplate?: boolean;
       };
-      const wrapped = prompt.includes("[INST]")
-        ? prompt
-        : `[INST] ${prompt} [/INST]`;
-      const hosts = [
-        "http://149.28.32.76:9090",
-        "http://140.82.16.112:9090",
-        "http://136.244.109.1:9090",
-        "http://104.238.171.11:9090",
-        "http://202.182.107.41:9090",
-        "http://149.28.153.31:9090",
-      ];
       let lastErr = "";
-      for (const host of hosts) {
+      for (const host of COORDINATOR_HOSTS) {
         try {
           const r = await fetch(`${host}/inference/run`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              input: wrapped,
+              input: prompt,
               max_tokens: maxTokens ?? 32,
+              chat_template: chatTemplate ?? true,
             }),
           });
           if (!r.ok) {
@@ -454,6 +493,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             explorerUrl: v.explorer_url ?? "",
             consensus: undefined,
             coordinator: host,
+            servedLocally: false,
+            trace: v.shard_trace ?? undefined,
           } as T;
         } catch (e) {
           lastErr = `${host} → ${String(e)}`;
@@ -530,8 +571,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return undefined as T;
     case "clear_crash":
       return undefined as T;
-    case "check_for_update":
-      return { hasUpdate: false, version: "0.5.2" } as T;
     case "ensure_binary":
       // Browser (live mode) can't install a native binary - pretend it's
       // already installed so the UI doesn't block onboarding.
@@ -579,6 +618,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
 
 // Mock state - only used in browser preview. Tauri env always hits the real backend.
 let mockStartedAt: number | null = null;
+let mockWorkerThreads: number | null = null;
 const mockLogs: LogEntry[] = [];
 let mockEarnings: Earnings = {
   totalArc: 12_847.5,
@@ -587,7 +627,15 @@ let mockEarnings: Earnings = {
   rank: 147,
   attestations: 1283,
   lastPayoutAt: Date.now() - 1000 * 60 * 12,
+  lastPayoutBlock: 123_462,
+  fromChain: true,
 };
+
+// The mock deliberately exercises BOTH attestation shapes the UI must
+// survive: rows that are the user's own (with a reward, tokens and a real
+// timestamp) and a row from another validator with no telemetry — which is
+// what the live seeds actually return today.
+const MOCK_ADDRESS = "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p";
 
 const mockAttestations: Attestation[] = [
   {
@@ -597,8 +645,11 @@ const mockAttestations: Attestation[] = [
     modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
     tokens: 42,
     latencyMs: 147,
-    rewardArc: 12.5,
+    rewardArc: REWARD_PER_ATTESTATION,
     timestamp: Date.now() - 1000 * 34,
+    blockHeight: 123_462,
+    from: MOCK_ADDRESS,
+    mine: true,
     verified: true,
   },
   {
@@ -608,19 +659,28 @@ const mockAttestations: Attestation[] = [
     modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
     tokens: 128,
     latencyMs: 412,
-    rewardArc: 34.8,
+    rewardArc: REWARD_PER_ATTESTATION,
     timestamp: Date.now() - 1000 * 89,
+    blockHeight: 123_455,
+    from: MOCK_ADDRESS,
+    mine: true,
     verified: true,
   },
   {
+    // Someone else's work, flat shape, no telemetry: no reward, no token
+    // count, no timestamp. The UI must render this without inventing any of
+    // the three.
     txHash: "0x14ab23bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca28335f2",
-    inputPreview: "Explain zero-knowledge proofs to a 10 year old",
-    outputHash: "0xbe91fe12aab4c7d2e44a88b1f91023c8",
-    modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
-    tokens: 256,
-    latencyMs: 783,
-    rewardArc: 67.2,
-    timestamp: Date.now() - 1000 * 214,
+    inputPreview: "",
+    outputHash: "",
+    modelHash: "",
+    tokens: null,
+    latencyMs: null,
+    rewardArc: null,
+    timestamp: null,
+    blockHeight: 123_401,
+    from: "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
+    mine: false,
     verified: true,
   },
 ];
@@ -683,13 +743,13 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return DEFAULT_HARDWARE as T;
     case "generate_identity":
       return {
-        address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
+        address: MOCK_ADDRESS,
         publicKey:
           "0x7c31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
-        seedPhrase:
-          "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment",
         createdAt: Date.now(),
       } as T;
+    case "reveal_seed_phrase":
+      return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
     case "save_config":
@@ -705,16 +765,24 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         running,
         pid: running ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
-        version: "0.5.2",
+        version: "0.7.11",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,
         height: running ? 43_820 + Math.floor(uptime / 4) : 0,
         uptimeSeconds: uptime,
-        address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
-        rpcPort: 9944,
+        address: MOCK_ADDRESS,
+        rpcPort: 9090,
         lastError: null,
         coordinatorUrl: null,
+        // Chain numbers are the network's, not this node's - and the mock
+        // reflects the real testnet's stalled block production.
+        chainHost: "http://140.82.16.112:9090",
+        chainHeight: 123_469,
+        chainRound: 9_596_644,
+        chainBlockAgeSeconds: 400,
+        workerThreads: running ? mockWorkerThreads : null,
+        cpuCores: 24,
       } as T;
     }
     case "start_node":
@@ -775,7 +843,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 900));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output: "  This is a mock response for local preview mode.",
         outputHash:
           "0xbe91fe12aab4c7d2e44a88b1f91023c811112222333344445555666677778888",
@@ -788,13 +856,14 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         deterministic: true,
         engine: "mock",
         explorerUrl: "/tx/0x1a2b3c4d5e6f7a8b",
+        servedLocally: true,
       } as T;
     }
     case "run_inference_via_coordinator": {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 1200));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output:
           "  Mock coordinator response - browser preview. In Tauri + live testnet, this is served by one of the 6 seed nodes via /inference/run_consensus with k=3 majority verification.",
         outputHash:
@@ -806,6 +875,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         deterministic: true,
         engine: "consensus",
         explorerUrl: "",
+        servedLocally: false,
         consensus: {
           k: 3,
           votesTotal: 48,
@@ -821,7 +891,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 800));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output:
           "  Mock direct-coordinator response - browser preview. In Tauri + live testnet, this hits a single coordinator's /inference/run as a fallback when the sharded /inference/run_consensus path is degraded.",
         outputHash:
@@ -836,6 +906,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         explorerUrl: "/tx/0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
         consensus: undefined,
         coordinator: "http://140.82.16.112:9090",
+        servedLocally: false,
       } as T;
     }
     case "tier1_submit": {
@@ -901,7 +972,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       };
       await new Promise((r) => setTimeout(r, 1500));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output:
           "  Mock paid-inference response - browser preview. In the native app, this flow: signs an InferenceEscrowOpen tx locally, POSTs it to a coordinator, waits for commit, then runs /inference/run_consensus which auto-submits the release.",
         outputHash:
@@ -928,8 +999,26 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     }
     case "clear_crash":
       return undefined as T;
-    case "check_for_update":
-      return { hasUpdate: false, version: "0.5.2" } as T;
+    case "save_logs":
+      return {
+        path: "/mock/Downloads/arc-node-20260817-120000.log",
+        lines: mockLogs.length,
+      } as T;
+    case "set_worker_threads": {
+      const { threads } = args as { threads: number };
+      mockWorkerThreads = threads;
+      // Mirrors the real fallback: no /node/threads endpoint exists yet, so
+      // applying a new width restarts the node.
+      if (mockStartedAt !== null) mockStartedAt = Date.now();
+      return {
+        workerThreads: threads,
+        restarted: mockStartedAt !== null,
+        message:
+          mockStartedAt !== null
+            ? `Restarted the node with ${threads} cores.`
+            : `Saved. The node will use ${threads} cores when it starts.`,
+      } as T;
+    }
     case "ensure_binary":
       // Mock path - no real download. Pretend it completed instantly.
       return {
@@ -993,6 +1082,14 @@ export const api = {
   detectHardware: () => invoke<HardwareInfo>("detect_hardware"),
   generateIdentity: () => invoke<Identity>("generate_identity"),
   loadIdentity: () => invoke<Identity | null>("load_identity"),
+  /**
+   * Fetch the BIP-39 recovery phrase for the backup screen.
+   *
+   * The result MUST NOT be persisted, logged, or put into app state that
+   * gets serialized. It exists only for as long as the user is looking at
+   * it. See `IdentityPublic` in the Rust types for why.
+   */
+  revealSeedPhrase: () => invoke<string>("reveal_seed_phrase"),
   saveConfig: (config: NodeConfig) => invoke<void>("save_config", { config }),
   loadConfig: () => invoke<NodeConfig | null>("load_config"),
   startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
@@ -1007,18 +1104,33 @@ export const api = {
   fetchNetworkStats: () => invoke<NetworkStats>("fetch_network_stats"),
   fetchBalance: () => invoke<AccountBalance>("fetch_balance"),
   faucetClaim: () => invoke<FaucetResult>("faucet_claim"),
-  runInference: (prompt: string, maxTokens = 32) =>
-    invoke<InferenceResult>("run_inference", { prompt, maxTokens }),
-  runInferenceViaCoordinator: (prompt: string, maxTokens = 32, k = 3) =>
+  // `chatTemplate` asks the serving node to apply the loaded model's own
+  // chat template. The client no longer wraps prompts in Llama-2's
+  // `[INST] ... [/INST]` tags, which were wrong for other architectures and
+  // got double-applied when the node templated too.
+  runInference: (prompt: string, maxTokens = 32, chatTemplate = true) =>
+    invoke<InferenceResult>("run_inference", { prompt, maxTokens, chatTemplate }),
+  runInferenceViaCoordinator: (
+    prompt: string,
+    maxTokens = 32,
+    k = 3,
+    chatTemplate = true,
+  ) =>
     invoke<InferenceResult>("run_inference_via_coordinator", {
       prompt,
       maxTokens,
       k,
+      chatTemplate,
     }),
-  runInferenceViaCoordinatorDirect: (prompt: string, maxTokens = 32) =>
+  runInferenceViaCoordinatorDirect: (
+    prompt: string,
+    maxTokens = 32,
+    chatTemplate = true,
+  ) =>
     invoke<InferenceResult>("run_inference_via_coordinator_direct", {
       prompt,
       maxTokens,
+      chatTemplate,
     }),
   // ── Tier 1 on-chain inference ────────────────────────────────────────────
   tier1Submit: (
@@ -1051,8 +1163,15 @@ export const api = {
     }),
   clearCrash: () => invoke<void>("clear_crash"),
   openExternal: (url: string) => invoke<void>("open_external", { url }),
-  checkForUpdate: () =>
-    invoke<{ hasUpdate: boolean; version: string }>("check_for_update"),
+  /**
+   * Write the log ring to a file via a native save dialog. Replaces a
+   * `Blob` + `<a download>` click, which WKWebView silently ignores — so
+   * the button did nothing at all on macOS.
+   */
+  saveLogs: () => invoke<SavedLogs>("save_logs"),
+  /** Change how many cores the node contributes. */
+  setWorkerThreads: (threads: number) =>
+    invoke<ThreadsApplied>("set_worker_threads", { threads }),
   ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
   getAutostart: () => invoke<boolean>("get_autostart"),
   listModelTiers: () => invoke<ModelTierInfo[]>("list_model_tiers"),

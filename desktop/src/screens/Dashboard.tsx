@@ -31,6 +31,7 @@ import {
   formatUptime,
 } from "../lib/format";
 import { useAppStore } from "../lib/store";
+import { DEFAULT_NODE_CONFIG } from "../lib/types";
 
 const COORDINATOR_LABELS: Record<string, string> = {
   "149.28.32.76": "NYC",
@@ -76,17 +77,7 @@ export function Dashboard() {
 
   const startMutation = useMutation({
     mutationFn: () =>
-      api.startNode(
-        config ?? {
-          role: "worker",
-          modelPath: null,
-          rpcPort: 9090,
-          p2pPort: 9091,
-          autoStart: true,
-          autoUpdate: true,
-          dataDir: "~/.arc",
-        },
-      ),
+      api.startNode(config ?? DEFAULT_NODE_CONFIG),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["status"] });
     },
@@ -128,6 +119,10 @@ export function Dashboard() {
 
   const running = !!status?.running;
   const isExternal = running && status?.pid == null;
+  // The node is up but not peered — the state "Reset peer state" exists to
+  // fix. Covers both "lite" (a seed is reachable over HTTP) and "syncing"
+  // (nothing is).
+  const stuckWithoutPeers = running && (status?.peers ?? 0) === 0;
   const isCrashed =
     !!status?.lastError && status.lastError.includes("exited unexpectedly");
   // Spawned but RPC not yet bound. arc-node spends most of its startup time
@@ -345,17 +340,39 @@ export function Dashboard() {
         </div>
       )}
 
-      {status?.health === "lite" && status?.coordinatorUrl && (
+      {/* Recovery is gated on the actual problem — the node is up but has
+          no peers — rather than on the "lite" health level specifically.
+          "Reset peer state" is the documented fix for "stuck at 0 peers",
+          but it lived inside the lite-mode banner, which was unreachable in
+          the shipped app, so the one recovery action the docs point at could
+          never be clicked. It now also covers "syncing", which is the state
+          a genuinely stuck node sits in. */}
+      {stuckWithoutPeers && (
         <div
           className="lite-banner"
-          data-testid="lite-mode-banner"
+          data-testid={
+            status?.health === "lite" ? "lite-mode-banner" : "no-peers-banner"
+          }
           role="status"
         >
-          <strong>Client mode</strong> — your node has 0 peers, so the app is
-          using the public network through{" "}
-          {coordinatorLabel(status.coordinatorUrl)}. You can faucet, send, and
-          run inference, but{" "}
-          <strong>you won&rsquo;t earn ARC until you have at least one peer</strong>.
+          {status?.coordinatorUrl ? (
+            <>
+              <strong>Client mode</strong> — your node has 0 peers, so the app
+              is using the public network through{" "}
+              {coordinatorLabel(status.coordinatorUrl)}. You can faucet, send,
+              and run inference, but{" "}
+              <strong>
+                you won&rsquo;t earn ARC until you have at least one peer
+              </strong>
+              .
+            </>
+          ) : (
+            <>
+              <strong>No peers yet</strong> — your node is running but
+              hasn&rsquo;t completed a handshake with any seed. You
+              won&rsquo;t earn ARC until it does.
+            </>
+          )}{" "}
           The most common cause is a stale peer cache from a prior session
           pinning to seeds that have rotated.
           <div
@@ -369,7 +386,7 @@ export function Dashboard() {
           >
             <button
               type="button"
-              className="btn-secondary"
+              className="btn btn-secondary"
               data-testid="reset-peer-state-btn"
               onClick={() => resetPeersMutation.mutate()}
               disabled={resetPeersMutation.isPending}
@@ -445,21 +462,31 @@ export function Dashboard() {
                 fontSize: "var(--text-sm)",
               }}
             >
-              <div>
-                <span style={{ color: "var(--success)" }}>+</span>{" "}
-                <NumberTicker
-                  value={earnings?.todayArc ?? 0}
-                  digits={2}
-                  suffix=" today"
-                />
-              </div>
-              {!!earnings?.pendingArc && (
+              {/* Rendered only when the chain actually reports it. It used
+                  to fall back to `?? 0`, which showed a confident "+0.00
+                  today" for a number nobody knew. */}
+              {earnings?.todayArc != null && (
+                <div>
+                  <span style={{ color: "var(--success)" }}>+</span>{" "}
+                  <NumberTicker
+                    value={earnings.todayArc}
+                    digits={2}
+                    suffix=" today"
+                  />
+                </div>
+              )}
+              {earnings?.pendingArc != null && earnings.pendingArc > 0 && (
                 <div>
                   <NumberTicker
                     value={earnings.pendingArc}
                     digits={2}
                     suffix=" pending"
                   />
+                </div>
+              )}
+              {earnings && !earnings.fromChain && (
+                <div title="Synthesized from this host's recent-inference buffer, not from the chain's earnings endpoint.">
+                  estimated
                 </div>
               )}
             </div>
@@ -469,10 +496,17 @@ export function Dashboard() {
               <dt>Attestations</dt>
               <dd>{formatInt(earnings?.attestations ?? 0)}</dd>
               <dt>Last payout</dt>
-              <dd>
+              {/* A block height is not a timestamp. Passing
+                  `last_attestation_block` (~123,462) to formatRelativeTime
+                  rendered "20770d ago" the moment the account earned
+                  anything. The two are now separate fields and rendered
+                  differently. */}
+              <dd data-testid="last-payout">
                 {earnings?.lastPayoutAt
                   ? formatRelativeTime(earnings.lastPayoutAt)
-                  : "-"}
+                  : earnings?.lastPayoutBlock
+                    ? `block #${formatInt(earnings.lastPayoutBlock)}`
+                    : "-"}
               </dd>
               <dt>Address</dt>
               <dd>
@@ -654,12 +688,29 @@ export function Dashboard() {
                     <Zap />
                   </div>
                   <div className="feed-item-body">
-                    <div className="feed-item-title">{a.inputPreview}</div>
+                    {/* The live seeds return flat tx records with no prompt
+                        text. Say so rather than rendering an empty title. */}
+                    <div className="feed-item-title">
+                      {a.inputPreview || (
+                        <span style={{ color: "var(--text-muted)" }}>
+                          Inference attestation
+                        </span>
+                      )}
+                    </div>
                     <div className="feed-item-meta">
-                      <span>{a.tokens} tokens</span>
-                      <span>{a.latencyMs}ms</span>
+                      {/* Each of these is omitted when unknown, instead of
+                          being printed as a confident "0 tokens / 0ms". */}
+                      {a.tokens != null && <span>{a.tokens} tokens</span>}
+                      {a.latencyMs != null && <span>{a.latencyMs}ms</span>}
                       <span>{formatHash(a.txHash, 8)}</span>
-                      <span>{formatRelativeTime(a.timestamp)}</span>
+                      {a.blockHeight != null && (
+                        <span>#{formatInt(a.blockHeight)}</span>
+                      )}
+                      <span>
+                        {a.timestamp != null
+                          ? formatRelativeTime(a.timestamp)
+                          : "recent"}
+                      </span>
                     </div>
                   </div>
                   <div
@@ -667,11 +718,22 @@ export function Dashboard() {
                       textAlign: "right",
                       fontFamily: "var(--font-mono)",
                       fontSize: "var(--text-sm)",
-                      color: "var(--success)",
+                      color: a.mine ? "var(--success)" : "var(--text-muted)",
                       fontWeight: 600,
+                      whiteSpace: "nowrap",
                     }}
+                    title={
+                      a.mine
+                        ? "Credited to your address."
+                        : "Submitted by another validator - not your earnings."
+                    }
                   >
-                    +{a.rewardArc.toFixed(2)}
+                    {/* Every row used to read "+2.50" regardless of who
+                        submitted it, so other validators' work appeared as
+                        the user's income. */}
+                    {a.rewardArc != null
+                      ? `+${a.rewardArc.toFixed(2)}`
+                      : "network"}
                   </div>
                 </div>
               ))
@@ -680,18 +742,28 @@ export function Dashboard() {
         </Card>
 
         <Card>
-          <CardHeader title="Node status" />
+          {/* Everything in this card is YOUR node, read from
+              127.0.0.1:<rpcPort>. It used to be a remote seed's numbers. */}
+          <CardHeader title="Your node" />
           <div className="kv">
             <dt>Health</dt>
             <dd>
               <StatusPill level={status?.health ?? "offline"} />
             </dd>
             <dt>Version</dt>
-            <dd>v{status?.version ?? "-"}</dd>
+            <dd>{status?.running ? `v${status.version}` : "-"}</dd>
             <dt>Block height</dt>
-            <dd>{formatInt(status?.committed ?? 0)}</dd>
+            <dd>{status?.running ? formatInt(status.committed) : "-"}</dd>
             <dt>Round</dt>
-            <dd>{formatInt(status?.round ?? 0)}</dd>
+            <dd>{status?.running ? formatInt(status.round) : "-"}</dd>
+            <dt>Cores</dt>
+            <dd data-testid="compute-width">
+              {status?.running
+                ? status.workerThreads != null
+                  ? `${status.workerThreads} of ${status.cpuCores ?? "?"}`
+                  : `all${status.cpuCores ? ` (${status.cpuCores})` : ""}`
+                : "-"}
+            </dd>
             <dt>RPC port</dt>
             <dd className="mono">:{status?.rpcPort ?? "-"}</dd>
             <dt>PID</dt>
@@ -717,7 +789,21 @@ export function Dashboard() {
           <div className="divider" />
 
           <div className="section-heading">
-            <h2 style={{ fontSize: "var(--text-base)" }}>Network</h2>
+            <h2 style={{ fontSize: "var(--text-base)" }}>
+              Network
+              {status?.chainHost && (
+                <span
+                  style={{
+                    marginLeft: 8,
+                    fontSize: "var(--text-xs)",
+                    color: "var(--text-muted)",
+                    fontWeight: 400,
+                  }}
+                >
+                  via {coordinatorLabel(status.chainHost)}
+                </span>
+              )}
+            </h2>
           </div>
           <div className="kv">
             <dt>Total inferences</dt>
@@ -726,6 +812,25 @@ export function Dashboard() {
             <dd>{formatInt(network?.avgTps ?? 0)}</dd>
             <dt>Latest block</dt>
             <dd>{formatInt(network?.latestBlock ?? 0)}</dd>
+            {/* Block production has been stalled on most seeds for days.
+                `/health` still reports "ok" because DAG rounds keep
+                advancing, so without this the network looks healthy. */}
+            {status?.chainBlockAgeSeconds != null && (
+              <>
+                <dt>Last block</dt>
+                <dd
+                  data-testid="chain-block-age"
+                  style={{
+                    color:
+                      status.chainBlockAgeSeconds > 3600
+                        ? "var(--warning)"
+                        : undefined,
+                  }}
+                >
+                  {formatUptime(status.chainBlockAgeSeconds)} ago
+                </dd>
+              </>
+            )}
           </div>
 
           <button

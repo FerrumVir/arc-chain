@@ -150,13 +150,21 @@ export function Inference() {
             <span style={{ display: "inline-flex", alignItems: "center" }}>
               Prompt
               <InfoPopover title="How this works">
+                {/* This used to claim the prompt goes to the local node.
+                    It did not — the call was routed to a remote seed. Now
+                    it is true: the local node is tried first, and the UI
+                    labels which machine actually served each response. */}
                 <p>
-                  Your prompt goes to the local node's{" "}
-                  <code>POST /inference/run</code>. That endpoint:
+                  Your prompt goes to your own node first, at{" "}
+                  <code>POST /inference/run</code> on{" "}
+                  <code>127.0.0.1</code>. If your node isn&rsquo;t running or
+                  has no model loaded, it falls back to the fastest
+                  reachable seed coordinator. Either way the response below
+                  says which machine served it.
                 </p>
                 <p>
                   1. Runs the prompt through the model (or the sharded
-                  pipeline if this node doesn't hold all layers).
+                  pipeline if that node doesn't hold all layers).
                 </p>
                 <p>
                   2. Hashes the output tokens with BLAKE3.
@@ -485,45 +493,109 @@ export function Inference() {
             }
           />
 
-          {run.data.coordinator && run.data.consensus && (
+          {/* Who served this. Always shown — a local answer is as much a
+              fact worth stating as a remote one, and it's the difference
+              between "the network did this" and "your machine did this". */}
+          <div
+            style={{
+              display: "flex",
+              flexWrap: "wrap",
+              alignItems: "center",
+              gap: "var(--space-3)",
+              padding: "var(--space-3) var(--space-4)",
+              marginBottom: "var(--space-4)",
+              background: "var(--success-bg, rgba(80, 200, 120, 0.08))",
+              border: "1px solid rgba(80, 200, 120, 0.25)",
+              borderRadius: "var(--radius-sm)",
+              fontSize: "var(--text-sm)",
+              color: "var(--text)",
+            }}
+            data-testid="inference-consensus"
+          >
+            <Globe size={14} style={{ color: "var(--success)" }} />
+            <span>
+              Served by{" "}
+              <strong data-testid="inference-coordinator">
+                {run.data.servedLocally
+                  ? "your node"
+                  : run.data.coordinator
+                    ? coordinatorLabel(run.data.coordinator)
+                    : "the network"}
+              </strong>
+              {run.data.consensus && (
+                <>
+                  {" "}
+                  · k={run.data.consensus.k} · {run.data.consensus.unanimous}/
+                  {run.data.consensus.votesTotal}{" "}
+                  {run.data.consensus.split === 0 &&
+                  run.data.consensus.majority === 0
+                    ? "unanimous"
+                    : `${run.data.consensus.majority} majority / ${run.data.consensus.split} split`}
+                  {run.data.consensus.divergentReplicaCount > 0 && (
+                    <>
+                      {" "}
+                      ·{" "}
+                      <span style={{ color: "var(--danger)" }}>
+                        {run.data.consensus.divergentReplicaCount} divergent
+                      </span>
+                    </>
+                  )}
+                </>
+              )}
+            </span>
+          </div>
+
+          {/* Per-hop pipeline trace. The chain returns `shard_trace` on
+              sharded runs and the app was discarding it — this is the
+              evidence that the model really was split across machines. */}
+          {run.data.trace && run.data.trace.length > 0 && (
             <div
-              style={{
-                display: "flex",
-                flexWrap: "wrap",
-                alignItems: "center",
-                gap: "var(--space-3)",
-                padding: "var(--space-3) var(--space-4)",
-                marginBottom: "var(--space-4)",
-                background: "var(--success-bg, rgba(80, 200, 120, 0.08))",
-                border: "1px solid rgba(80, 200, 120, 0.25)",
-                borderRadius: "var(--radius-sm)",
-                fontSize: "var(--text-sm)",
-                color: "var(--text)",
-              }}
-              data-testid="inference-consensus"
+              style={{ marginBottom: "var(--space-4)" }}
+              data-testid="inference-trace"
             >
-              <Globe size={14} style={{ color: "var(--success)" }} />
-              <span>
-                Served by{" "}
-                <strong data-testid="inference-coordinator">
-                  {coordinatorLabel(run.data.coordinator)}
-                </strong>{" "}
-                · k={run.data.consensus.k} · {run.data.consensus.unanimous}/
-                {run.data.consensus.votesTotal}{" "}
-                {run.data.consensus.split === 0 &&
-                run.data.consensus.majority === 0
-                  ? "unanimous"
-                  : `${run.data.consensus.majority} majority / ${run.data.consensus.split} split`}
-                {run.data.consensus.divergentReplicaCount > 0 && (
-                  <>
-                    {" "}
-                    ·{" "}
-                    <span style={{ color: "var(--danger)" }}>
-                      {run.data.consensus.divergentReplicaCount} divergent
+              <div
+                style={{
+                  fontSize: "var(--text-xs)",
+                  color: "var(--text-muted)",
+                  textTransform: "uppercase",
+                  letterSpacing: "var(--tracking-wide)",
+                  marginBottom: "var(--space-2)",
+                }}
+              >
+                Pipeline · {run.data.trace.length} hops
+              </div>
+              <div style={{ display: "grid", gap: 4 }}>
+                {run.data.trace.map((h) => (
+                  <div
+                    key={h.hop}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "var(--space-3)",
+                      fontFamily: "var(--font-mono)",
+                      fontSize: "var(--text-xs)",
+                      color: "var(--text-secondary)",
+                      padding: "4px 8px",
+                      background: "var(--bg)",
+                      borderRadius: "var(--radius-sm)",
+                    }}
+                  >
+                    <span style={{ color: "var(--text-muted)", minWidth: 24 }}>
+                      {h.hop}
                     </span>
-                  </>
-                )}
-              </span>
+                    <span style={{ flex: 1 }}>{h.node}</span>
+                    <span style={{ color: "var(--text-muted)" }}>
+                      layers {h.layers}
+                    </span>
+                    <span style={{ fontVariantNumeric: "tabular-nums" }}>
+                      {h.computeMs}ms
+                    </span>
+                    {h.isTerminal && (
+                      <span style={{ color: "var(--success)" }}>output</span>
+                    )}
+                  </div>
+                ))}
+              </div>
             </div>
           )}
 

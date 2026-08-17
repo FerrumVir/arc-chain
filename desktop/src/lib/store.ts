@@ -32,53 +32,89 @@ interface AppState {
 
 const STORAGE_KEY = "arc-desktop-state-v1";
 
+/**
+ * The only inference flow the UI still offers.
+ *
+ * The On-chain (Tier 1) radio was removed, but every default here stayed
+ * `"onchain"` — so on a fresh install Settings rendered a lone, unselected
+ * radio button. Anything persisted as `"onchain"` is coerced on load.
+ */
+const DEFAULT_INFERENCE_MODE: InferenceMode = "coordinator";
+
+function coerceMode(v: unknown): InferenceMode {
+  return v === "coordinator" ? "coordinator" : DEFAULT_INFERENCE_MODE;
+}
+
+/**
+ * Drop the BIP-39 phrase from anything read out of localStorage.
+ *
+ * Older builds persisted the full identity — recovery phrase included — in
+ * plaintext under this key, where DevTools, any injected script, or anything
+ * that can read the WebView profile directory could take it. The backend no
+ * longer sends the phrase across the IPC boundary at all, but copies written
+ * by previous versions are still sitting on disk, so scrub on load and let
+ * the next `persist()` overwrite the stored record without it.
+ */
+function scrubIdentity(raw: unknown): Identity | null {
+  if (!raw || typeof raw !== "object") return null;
+  const { address, publicKey, createdAt } = raw as Record<string, unknown>;
+  if (typeof address !== "string") return null;
+  return {
+    address,
+    publicKey: typeof publicKey === "string" ? publicKey : "",
+    createdAt: typeof createdAt === "number" ? createdAt : 0,
+  };
+}
+
+const EMPTY = {
+  onboarded: false,
+  identity: null,
+  config: null,
+  inferenceMode: DEFAULT_INFERENCE_MODE,
+} as const;
+
 function loadInitial(): Pick<
   AppState,
   "onboarded" | "identity" | "config" | "inferenceMode"
 > {
-  if (typeof localStorage === "undefined") {
-    return {
-      onboarded: false,
-      identity: null,
-      config: null,
-      inferenceMode: "onchain",
-    };
-  }
+  if (typeof localStorage === "undefined") return { ...EMPTY };
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw)
-      return {
-        onboarded: false,
-        identity: null,
-        config: null,
-        inferenceMode: "onchain",
-      };
+    if (!raw) return { ...EMPTY };
     const parsed = JSON.parse(raw);
-    return {
+    const identity = scrubIdentity(parsed.identity);
+    const loaded = {
       onboarded: !!parsed.onboarded,
-      identity: parsed.identity ?? null,
+      identity,
       config: parsed.config ?? null,
-      inferenceMode:
-        parsed.inferenceMode === "coordinator" ? "coordinator" : "onchain",
+      inferenceMode: coerceMode(parsed.inferenceMode),
     };
+    // If the stored blob carried a seed phrase, rewrite it immediately
+    // rather than waiting for the next state change to evict it.
+    if (parsed.identity && "seedPhrase" in parsed.identity) {
+      writeStorage(loaded);
+    }
+    return loaded;
   } catch {
-    return {
-      onboarded: false,
-      identity: null,
-      config: null,
-      inferenceMode: "onchain",
-    };
+    return { ...EMPTY };
   }
 }
 
-function persist(state: AppState) {
+function writeStorage(state: {
+  onboarded: boolean;
+  identity: Identity | null;
+  config: NodeConfig | null;
+  inferenceMode: InferenceMode;
+}) {
   if (typeof localStorage === "undefined") return;
   try {
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
         onboarded: state.onboarded,
-        identity: state.identity,
+        // scrubIdentity guarantees no seedPhrase field, but go through it
+        // again so a future caller can't reintroduce one by accident.
+        identity: state.identity ? scrubIdentity(state.identity) : null,
         config: state.config,
         inferenceMode: state.inferenceMode,
       }),
@@ -86,6 +122,10 @@ function persist(state: AppState) {
   } catch {
     /* ignore quota errors */
   }
+}
+
+function persist(state: AppState) {
+  writeStorage(state);
 }
 
 export const useAppStore = create<AppState>((set, get) => ({

@@ -42,7 +42,16 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 var(--space-4) 0 80px; /* 80px on mac to clear traffic lights */
+  /* No platform-specific padding by default.
+     This was unconditionally `0 var(--space-4) 0 80px` "to clear traffic
+     lights" — but traffic lights only exist on macOS, where
+     titleBarStyle: "Overlay" (a macOS-only tauri.conf key) floats them over
+     the web content. On Windows and Linux that key is ignored and a native
+     title bar is drawn ABOVE this one, so the 80px reserved nothing and just
+     shoved the app name into the middle of the bar with dead space beside
+     it. The macOS pad is applied via [data-platform] below, stamped on
+     <html> at boot by main.tsx. */
+  padding: 0 var(--space-4);
   background: rgba(13, 13, 24, 0.7);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
@@ -52,8 +61,15 @@
   position: relative;
 }
 
+/* macOS only: clear the traffic lights that Overlay mode floats over the
+   content. Scoped so Windows and Linux keep a symmetric bar. */
+[data-platform="macos"] .titlebar {
+  padding-left: 80px;
+}
+
 @media (max-width: 768px) {
-  .titlebar {
+  .titlebar,
+  [data-platform="macos"] .titlebar {
     padding: 0 var(--space-4);
     padding-top: env(safe-area-inset-top);
     height: calc(44px + env(safe-area-inset-top));

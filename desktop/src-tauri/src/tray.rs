@@ -38,10 +38,17 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
         &[&open_i, &sep1, &status_i, &round_i, &sep2, &quit_i],
     )?;
 
+    // Left-click-to-open is a macOS/Windows menu-bar convention, and
+    // `TrayIconEvent::Click` is what implements it. Linux AppIndicator never
+    // delivers that event, so on Linux a left click would do nothing at all
+    // unless it opens the menu — which is the platform convention there
+    // anyway, and the only route to Quit.
+    let menu_on_left_click = cfg!(target_os = "linux");
+
     let tray = TrayIconBuilder::with_id("main")
         .tooltip("ARC Node")
         .menu(&menu)
-        .show_menu_on_left_click(false)
+        .show_menu_on_left_click(menu_on_left_click)
         .on_menu_event(|app, event| match event.id().as_ref() {
             "open" => {
                 if let Some(win) = app.get_webview_window("main") {

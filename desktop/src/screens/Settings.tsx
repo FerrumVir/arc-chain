@@ -1,12 +1,13 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Check, RefreshCw, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { check as tauriCheckUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch as tauriRelaunch } from "@tauri-apps/plugin-process";
 import { Card, CardHeader } from "../components/Card";
 import { StatusPill } from "../components/StatusPill";
-import { api } from "../lib/tauri";
+import { api, isTauri } from "../lib/tauri";
 import { useAppStore } from "../lib/store";
+import { DEFAULT_NODE_CONFIG, type NodeConfig } from "../lib/types";
 
 export function Settings() {
   const config = useAppStore((s) => s.config);
@@ -14,14 +15,37 @@ export function Settings() {
   const setOnboarded = useAppStore((s) => s.setOnboarded);
   const setConfig = useAppStore((s) => s.setConfig);
   const setIdentity = useAppStore((s) => s.setIdentity);
-  const [rpcPort, setRpcPort] = useState(config?.rpcPort ?? 9944);
+  // Defaults now match the real ones (types.ts DEFAULT_NODE_CONFIG and the
+  // Rust NodeConfig::default). The RPC field used to default to 9944 while
+  // onboarding wrote 9090 and the node bound 9090.
+  const [rpcPort, setRpcPort] = useState(
+    config?.rpcPort ?? DEFAULT_NODE_CONFIG.rpcPort,
+  );
+  const [p2pPort, setP2pPort] = useState(
+    config?.p2pPort ?? DEFAULT_NODE_CONFIG.p2pPort,
+  );
   const [autoUpdate, setAutoUpdate] = useState(config?.autoUpdate ?? true);
   const [autoStart, setAutoStart] = useState(config?.autoStart ?? true);
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
 
-  const { data: update, refetch: checkUpdate, isFetching } = useQuery({
+  // A single source of update truth: the Tauri updater plugin, which reads
+  // the signed manifest. The old `api.checkForUpdate` hit the GitHub
+  // releases API instead, so the badge and the Install button could — and
+  // routinely did — disagree.
+  const {
+    data: update,
+    refetch: checkUpdate,
+    isFetching,
+  } = useQuery({
     queryKey: ["update-check"],
-    queryFn: api.checkForUpdate,
+    queryFn: async () => {
+      // The updater plugin only exists inside the native shell. In the
+      // browser preview say so plainly rather than throwing.
+      if (!isTauri) return { hasUpdate: false, version: null };
+      const u = await tauriCheckUpdate();
+      return { hasUpdate: !!u, version: u?.version ?? null };
+    },
     enabled: false,
   });
   const [installing, setInstalling] = useState(false);
@@ -52,12 +76,29 @@ export function Settings() {
   };
 
   const save = async () => {
-    if (!config) return;
-    const next = { ...config, rpcPort, autoUpdate, autoStart };
-    await api.saveConfig(next);
-    setConfig(next);
-    setSaved(true);
-    setTimeout(() => setSaved(false), 1500);
+    // Previously `if (!config) return;` — so on a fresh install, where
+    // config is null, Save silently did nothing and never showed the Saved
+    // state. Fall back to defaults instead of no-oping, and surface errors.
+    setSaveError(null);
+    const next: NodeConfig = {
+      ...(config ?? DEFAULT_NODE_CONFIG),
+      rpcPort,
+      p2pPort,
+      autoUpdate,
+      autoStart,
+    };
+    try {
+      await api.saveConfig(next);
+      setConfig(next);
+      setSaved(true);
+      // 2.5s, not 1.5s. A confirmation short enough to miss isn't a
+      // confirmation - and this screen now also runs a polling status query
+      // for the core slider, so on a loaded machine the old window could
+      // close before the user (or a test) saw it.
+      setTimeout(() => setSaved(false), 2500);
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   return (
@@ -88,9 +129,30 @@ export function Settings() {
               data-testid="input-rpc-port"
             />
             <span className="field-hint">
-              Default 9944. P2P port is automatically RPC + 1.
+              Default 9090. HTTP, used by this app to talk to your node.
             </span>
           </div>
+
+          <div className="field">
+            <label className="field-label">P2P port</label>
+            <input
+              className="input input-mono"
+              type="number"
+              value={p2pPort}
+              onChange={(e) => setP2pPort(parseInt(e.target.value, 10) || 0)}
+              data-testid="input-p2p-port"
+            />
+            {/* The old hint claimed "P2P port is automatically RPC + 1".
+                It is not — p2pPort is an independent stored field, so
+                raising RPC to 9500 left P2P on 9091. It is now an explicit
+                input rather than a false promise. */}
+            <span className="field-hint">
+              Default 9091. UDP/QUIC, used to reach other nodes. Set
+              independently of the RPC port.
+            </span>
+          </div>
+
+          <ComputeContribution />
 
           <label
             style={{
@@ -150,6 +212,27 @@ export function Settings() {
                 "Save changes"
               )}
             </button>
+            {saveError && (
+              <p
+                style={{
+                  marginTop: "var(--space-2)",
+                  fontSize: "var(--text-sm)",
+                  color: "var(--danger)",
+                }}
+                data-testid="save-error"
+              >
+                Could not save: {saveError}
+              </p>
+            )}
+            <p
+              style={{
+                marginTop: "var(--space-2)",
+                fontSize: "var(--text-sm)",
+                color: "var(--text-muted)",
+              }}
+            >
+              Port changes take effect the next time the node restarts.
+            </p>
           </div>
         </div>
       </Card>
@@ -162,7 +245,11 @@ export function Settings() {
       <Card style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader
           title="Updates"
-          action={update ? <StatusPill level="info" label={`v${update.version}`} /> : null}
+          action={
+            update?.version ? (
+              <StatusPill level="info" label={`v${update.version}`} />
+            ) : null
+          }
         />
         <p
           style={{
@@ -171,9 +258,11 @@ export function Settings() {
             marginBottom: "var(--space-3)",
           }}
         >
-          {update?.hasUpdate
-            ? `Version ${update.version} is available. Click below to download, install, and relaunch.`
-            : "You're running the latest version."}
+          {update === undefined
+            ? "Check for a new signed release."
+            : update.hasUpdate
+              ? `Version ${update.version} is available. Click below to download, install, and relaunch.`
+              : "You're running the latest version."}
         </p>
         {installError && (
           <p
@@ -287,6 +376,114 @@ export function Settings() {
       </Card>
 
       <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
+/**
+ * How many CPU cores the node contributes.
+ *
+ * There was previously no such control at any layer — not in the UI, not in
+ * NodeConfig, not in the node's CLI — so rayon silently took every logical
+ * core and there was no way to raise or lower it.
+ *
+ * Applying tries a live reconfigure first and only restarts if the node
+ * can't do it in place; the result message says which happened, because
+ * "applied live" and "restarted your node" are very different things to
+ * have just done to someone mid-demo.
+ */
+function ComputeContribution() {
+  const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
+
+  const { data: status } = useQuery({
+    queryKey: ["status"],
+    queryFn: api.nodeStatus,
+    refetchInterval: 3000,
+  });
+
+  const maxCores = status?.cpuCores ?? 8;
+  const active = status?.workerThreads ?? config?.workerThreads ?? maxCores;
+  const [value, setValue] = useState<number | null>(null);
+  const shown = value ?? active;
+
+  const apply = useMutation({
+    mutationFn: (n: number) => api.setWorkerThreads(n),
+    onSuccess: (r) => {
+      if (config) setConfig({ ...config, workerThreads: r.workerThreads });
+      setValue(null);
+    },
+  });
+
+  const dirty = value !== null && value !== active;
+
+  return (
+    <div className="field" data-testid="compute-contribution">
+      <label className="field-label" htmlFor="worker-threads">
+        Compute contribution
+      </label>
+      <div
+        style={{ display: "flex", alignItems: "center", gap: "var(--space-3)" }}
+      >
+        <input
+          id="worker-threads"
+          type="range"
+          min={1}
+          max={maxCores}
+          step={1}
+          value={shown}
+          onChange={(e) => setValue(parseInt(e.target.value, 10))}
+          style={{ flex: 1 }}
+          data-testid="slider-worker-threads"
+          aria-valuemin={1}
+          aria-valuemax={maxCores}
+          aria-valuenow={shown}
+        />
+        <span
+          className="mono"
+          style={{ minWidth: 72, textAlign: "right" }}
+          data-testid="worker-threads-value"
+        >
+          {shown} / {maxCores}
+        </span>
+        <button
+          className="btn btn-secondary"
+          onClick={() => apply.mutate(shown)}
+          disabled={!dirty || apply.isPending}
+          data-testid="btn-apply-threads"
+        >
+          {apply.isPending ? "Applying…" : "Apply"}
+        </button>
+      </div>
+      <span className="field-hint">
+        Cores your node may use for inference and verification. More cores
+        means more work served — and more earnings — at the cost of
+        responsiveness elsewhere on this machine.
+      </span>
+      {apply.data && (
+        <p
+          style={{
+            marginTop: "var(--space-2)",
+            fontSize: "var(--text-sm)",
+            color: "var(--text-muted)",
+          }}
+          data-testid="threads-result"
+        >
+          {apply.data.message}
+        </p>
+      )}
+      {apply.error && (
+        <p
+          style={{
+            marginTop: "var(--space-2)",
+            fontSize: "var(--text-sm)",
+            color: "var(--danger)",
+          }}
+          data-testid="threads-error"
+        >
+          {String(apply.error)}
+        </p>
+      )}
     </div>
   );
 }

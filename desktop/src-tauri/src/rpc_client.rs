@@ -14,7 +14,7 @@
 //                                          we synthesize from attestations)
 
 use crate::types::{
-    AccountBalance, Attestation, Earnings, FaucetResult, InferenceConsensus,
+    AccountBalance, Attestation, Earnings, FaucetResult, InferenceConsensus, InferenceHop,
     InferenceResult, NetworkStats, NodeStatus,
 };
 use serde_json::Value;
@@ -27,7 +27,8 @@ const REWARD_PER_ATTESTATION: f64 = 2.5; // ARC; matches testnet flat rate
 /// (HTTPS RPC fallback) instead of showing a hard "offline" — most consumer
 /// ISPs silently drop outbound UDP on non-standard ports, which kills our
 /// QUIC handshake to seed UDP 9091. Order biases North America first.
-const STATUS_COORDINATORS: [&str; 5] = [
+const STATUS_COORDINATORS: [&str; 6] = [
+    "http://149.28.32.76:9090",   // NYC
     "http://140.82.16.112:9090",  // LAX
     "http://136.244.109.1:9090",  // AMS
     "http://104.238.171.11:9090", // LHR
@@ -35,51 +36,77 @@ const STATUS_COORDINATORS: [&str; 5] = [
     "http://149.28.153.31:9090",  // SGP
 ];
 
-/// Probe each coordinator in order; return the first to answer 200 on
-/// `/health` within 2s. None means every public seed is unreachable (genuine
-/// offline — total network failure or full ISP captive portal). Sequential
-/// instead of parallel to avoid pulling in a futures dep; the typical hit is
-/// the first host and returns sub-200ms, so the worst-case 12s only applies
-/// when the user has *no* working internet.
+/// Return the first coordinator to answer 200 on `/health`, or `None` if
+/// every public seed is unreachable (genuine offline — total network failure
+/// or a captive portal).
+///
+/// Probed concurrently. Sequentially, with a 2s timeout per host, the
+/// worst case was 12s — inside a poll that repeats every 1.5s, so the polls
+/// stacked up on exactly the broken-network path this is meant to detect.
+/// Here the whole probe is bounded by the single slowest host.
 pub async fn probe_coordinator(http: &reqwest::Client) -> Option<String> {
+    let mut set = tokio::task::JoinSet::new();
     for origin in STATUS_COORDINATORS.iter() {
-        let url = format!("{}/health", origin);
-        let r = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            http.get(&url).send(),
-        )
-        .await;
-        if let Ok(Ok(resp)) = r {
-            if resp.status().is_success() {
-                return Some(origin.to_string());
+        let http = http.clone();
+        let origin = origin.to_string();
+        set.spawn(async move {
+            let url = format!("{}/health", origin);
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                http.get(&url).send(),
+            )
+            .await;
+            match r {
+                Ok(Ok(resp)) if resp.status().is_success() => Some(origin),
+                _ => None,
             }
+        });
+    }
+    // First success wins; the rest are dropped (and cancelled) with the set.
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some(origin)) = joined {
+            return Some(origin);
         }
     }
     None
 }
 
+async fn get_json(http: &reqwest::Client, url: String) -> Option<Value> {
+    match http.get(url).send().await {
+        Ok(r) if r.status().is_success() => r.json().await.ok(),
+        _ => None,
+    }
+}
+
+/// Build the node status.
+///
+/// `local_url` is the arc-node on this machine; `chain_url` is the elected
+/// public seed. Keeping both is the point: everything describing "your node"
+/// comes from `local_url`, and the chain-wide numbers are carried separately
+/// so the UI can show network context without dressing it up as the user's
+/// own machine.
 pub async fn fetch_status(
     http: &reqwest::Client,
-    base_url: &str,
+    local_url: &str,
+    chain_url: &str,
     port: u16,
     owned_pid: Option<u32>,
     address: Option<String>,
     crash_message: Option<String>,
 ) -> NodeStatus {
-    let base = base_url.to_string();
+    // Independent requests - issue them together.
+    let (local, chain) = tokio::join!(
+        get_json(http, format!("{}/health", local_url)),
+        get_json(http, format!("{}/health", chain_url)),
+    );
 
-    let resp = http.get(format!("{}/health", base)).send().await;
-    let parsed: Option<Value> = match resp {
-        Ok(r) if r.status().is_success() => r.json().await.ok(),
-        _ => None,
-    };
+    // Running if the LOCAL /health responds - whether or not we spawned it.
+    // This still recognizes externally-managed nodes (a community installer
+    // launchd daemon, or our own child surviving a dev rebuild), which is
+    // why `running` is not simply `pid.is_some()`.
+    let running = local.is_some();
 
-    // Running if /health responds - whether or not we spawned it. This lets the
-    // app recognize externally-managed nodes (e.g. a community installer launchd
-    // daemon).
-    let running = parsed.is_some();
-
-    let (peers, round, committed, height, uptime, version, validators) = match parsed {
+    let (peers, round, committed, height, uptime, version) = match local {
         Some(ref h) => (
             h.get("peers").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
             h.get("dag_round").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -90,20 +117,29 @@ pub async fn fetch_status(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string(),
-            h.get("validators").and_then(|v| v.as_u64()).unwrap_or(0),
         ),
-        None => (0, 0, 0, 0, 0, "unknown".into(), 0),
+        None => (0, 0, 0, 0, 0, "unknown".into()),
     };
 
-    // Always probe coordinators in parallel with the local check. The result
-    // gates the "lite" health level + the Onboarding "online" check, so
-    // residential ISPs that block UDP 9091 don't strand the user at "offline".
+    let chain_round = chain
+        .as_ref()
+        .and_then(|h| h.get("dag_round"))
+        .and_then(|v| v.as_u64());
+
+    // Probe the public seeds only when the local node can't carry the user
+    // on its own. This gates the "lite" health level and the onboarding
+    // online-check, so residential ISPs that drop outbound UDP on 9091 don't
+    // strand the user at a hard "offline".
     let coordinator_url = if !running || peers == 0 {
         probe_coordinator(http).await
     } else {
         None
     };
 
+    // These branches are reachable again now that the inputs are local.
+    // Previously `running` was true and `peers` was 8 on every poll (they
+    // were a datacenter's), so "lite" and "syncing" were dead code and the
+    // recovery UI behind them could never render.
     let health_level = if running && peers >= 1 && uptime >= 8 {
         "live"
     } else if coordinator_url.is_some() {
@@ -127,21 +163,25 @@ pub async fn fetch_status(
         address,
         rpc_port: port,
         last_error: crash_message.or_else(|| {
-            if running {
-                None
-            } else if coordinator_url.is_some() {
+            if running || coordinator_url.is_some() {
                 None
             } else {
-                let _ = port;
                 Some(format!(
-                    "No response from {} and every public seed is unreachable. Check internet/firewall.",
-                    base
+                    "No node is answering on {} and every public seed is unreachable. \
+                     Start your node, or check your internet connection and firewall.",
+                    local_url
                 ))
             }
         }),
         coordinator_url,
+        // Filled in by the command layer, which owns the host election.
+        chain_host: None,
+        chain_height: None,
+        chain_round,
+        chain_block_age_seconds: None,
+        worker_threads: None,
+        cpu_cores: None,
     }
-    .with_validators_hint(validators)
 }
 
 /// Fetch this worker's earnings. v0.7.0+: hits the chain-side
@@ -180,21 +220,29 @@ pub async fn fetch_earnings(
                         .and_then(|x| x.as_u64());
                     return Earnings {
                         total_arc,
-                        today_arc,
-                        // Pending = an attestation submitted but not yet
+                        // `today_arc` is a real chain-reported field, so it
+                        // is passed through as-is - but only because the
+                        // chain sent it. It is never synthesized.
+                        today_arc: Some(today_arc),
+                        // Pending = submitted but not yet
                         // unchallenged-released. The chain doesn't expose
-                        // this distinction yet — when it does, fold it in
-                        // here. For now report 0 so the UI doesn't show
-                        // imaginary pending rewards.
-                        pending_arc: 0.0,
+                        // that distinction yet, so report None ("not
+                        // available") rather than a made-up figure.
+                        pending_arc: None,
                         rank: None,
                         attestations,
-                        // Prefer block height (cleanly chain-derived) when
-                        // available; else now-1m so the UI doesn't show
-                        // a Unix epoch zero.
-                        last_payout_at: last_block
-                            .map(|h| h as i64)
-                            .or_else(|| Some(chrono::Utc::now().timestamp_millis() - 60_000)),
+                        // A block height is NOT a timestamp. Feeding
+                        // `last_attestation_block` (~123,462) to the UI's
+                        // relative-time formatter rendered "20770d ago" -
+                        // masked today only because the field is null until
+                        // the account actually earns something. Keep the two
+                        // concepts in separate fields; emit a timestamp only
+                        // if the chain ever sends a real one.
+                        last_payout_at: v
+                            .get("last_attestation_at")
+                            .and_then(|x| x.as_i64()),
+                        last_payout_block: last_block,
+                        from_chain: true,
                     };
                 }
             }
@@ -216,29 +264,54 @@ pub async fn fetch_earnings(
         Err(_) => return empty_earnings(),
     };
     let total = v.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
-    let results = v
-        .get("results")
-        .and_then(|x| x.as_array())
-        .cloned()
-        .unwrap_or_default();
 
-    // Approximation: "today" is the tail ~12% of attestations by order.
-    let today = (total as f64 * 0.12).round() as u64;
-
+    // Everything below is an estimate from the host's ring buffer of recent
+    // inferences, flagged as such via `from_chain: false`.
+    //
+    // The invented numbers are gone. "Today" used to be `total * 0.12`
+    // rounded — a made-up 12% of lifetime earnings presented in the same
+    // typeface as a real balance. "Pending" was
+    // `min(results, 5) * 2.5 / 2`, which is not an approximation of anything.
+    // Both are None now: the fallback genuinely does not know them, and
+    // saying so is better than filling the gap with arithmetic.
     Earnings {
         total_arc: total as f64 * REWARD_PER_ATTESTATION,
-        today_arc: today as f64 * REWARD_PER_ATTESTATION,
-        pending_arc: (results.len().min(5) as f64) * REWARD_PER_ATTESTATION / 2.0,
+        today_arc: None,
+        pending_arc: None,
         rank: None,
         attestations: total,
-        last_payout_at: Some(chrono::Utc::now().timestamp_millis() - 60_000),
+        last_payout_at: None,
+        last_payout_block: None,
+        from_chain: false,
     }
 }
 
+/// Recent attestations, parsed shape-tolerantly and attributed honestly.
+///
+/// Three separate problems lived here.
+///
+/// **Shape.** Every field was read out of a nested `inference` object. The
+/// deployed seeds return a flat transaction record —
+/// `{block_height, from, gas_used, success, tx_hash, tx_type}` — with no such
+/// key, so every field collapsed to `""` or `0` while `reward_arc` stayed
+/// hardcoded at 2.5. The Dashboard rendered rows with a blank prompt,
+/// "0 tokens", "0ms" and a confident "+2.50". Both shapes are accepted now,
+/// and absent values stay absent instead of becoming zero.
+///
+/// **Attribution.** `reward_arc` was 2.5 for every row regardless of who
+/// submitted it, so the user's own earnings feed showed other validators'
+/// work as their income. A reward is now attached only when `from` matches
+/// the user's address.
+///
+/// **Time.** Timestamps were fabricated as `now - i * 30s`, producing a
+/// plausible-looking "34s ago / 1m ago / 2m ago" ladder that was pure
+/// invention. Real timestamps are used when present; otherwise `None`, and
+/// the UI says "recent".
 pub async fn fetch_attestations(
     http: &reqwest::Client,
     base_url: &str,
     limit: u32,
+    address: Option<&str>,
 ) -> Vec<Attestation> {
     let url = format!("{}/inference/attestations?limit={}", base_url, limit);
     let resp = match http.get(url).send().await {
@@ -247,47 +320,70 @@ pub async fn fetch_attestations(
     };
     let root: Value = resp.json().await.unwrap_or(Value::Null);
 
-    // Real shape: { attestations: [ { inference: {...}, tx_hash, success } ], count }
     let arr = root
         .get("attestations")
         .and_then(|x| x.as_array())
         .cloned()
         .unwrap_or_default();
 
-    // Synthesize descending timestamps so the UI's relative-time strings make sense.
-    let now = chrono::Utc::now().timestamp_millis();
-    arr.into_iter()
-        .enumerate()
-        .map(|(i, v)| {
-            let inf = v.get("inference").cloned().unwrap_or(Value::Null);
-            let tokens = inf
-                .get("tokens_generated")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0) as u32;
-            let ms_per_tok = inf
-                .get("ms_per_token")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0) as u32;
-            let latency = tokens.saturating_mul(ms_per_tok);
+    // Compare addresses without the `0x` prefix and case-insensitively; the
+    // chain returns bare lowercase hex while identities are shown prefixed.
+    let want = address.map(|a| a.trim_start_matches("0x").to_ascii_lowercase());
 
-            let input = inf
+    let mut out: Vec<Attestation> = arr
+        .into_iter()
+        .filter_map(|v| {
+            // Flat records fall through to the record itself, so the same
+            // field lookups work against either shape.
+            let inf = v.get("inference").cloned().unwrap_or_else(|| v.clone());
+
+            let tx_hash = v
+                .get("tx_hash")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            // A record with no transaction hash is not something we can show
+            // or link to - drop it rather than rendering an empty row.
+            if tx_hash.is_empty() {
+                return None;
+            }
+
+            let opt_u32 = |o: &Value, k: &str| {
+                o.get(k).and_then(|x| x.as_u64()).filter(|n| *n > 0).map(|n| n as u32)
+            };
+            let tokens = opt_u32(&inf, "tokens_generated");
+            let ms_per_tok = opt_u32(&inf, "ms_per_token");
+            // Only a real product, never 0 × 0.
+            let latency_ms = match (tokens, ms_per_tok) {
+                (Some(t), Some(ms)) => Some(t.saturating_mul(ms)),
+                _ => opt_u32(&inf, "inference_ms").or_else(|| opt_u32(&inf, "total_ms")),
+            };
+
+            let input_preview = inf
                 .get("input")
                 .and_then(|x| x.as_str())
                 .unwrap_or("")
-                // Strip the Llama chat tags that clutter the UI preview
+                // Strip Llama chat tags that clutter the preview. Kept for
+                // records produced before the client-side wrapping was
+                // removed - they are still on-chain.
                 .replace("[INST] ", "")
                 .replace(" [/INST]", "")
                 .chars()
                 .take(140)
                 .collect::<String>();
 
-            Attestation {
-                tx_hash: v
-                    .get("tx_hash")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                input_preview: input,
+            let from = v
+                .get("from")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim_start_matches("0x").to_ascii_lowercase());
+            let mine = match (&want, &from) {
+                (Some(w), Some(f)) => w == f,
+                _ => false,
+            };
+
+            Some(Attestation {
+                tx_hash,
+                input_preview,
                 output_hash: inf
                     .get("output_hash")
                     .and_then(|x| x.as_str())
@@ -299,15 +395,30 @@ pub async fn fetch_attestations(
                     .unwrap_or("")
                     .to_string(),
                 tokens,
-                latency_ms: latency,
-                reward_arc: REWARD_PER_ATTESTATION,
-                // The node doesn't give us a timestamp per attestation, so stagger
-                // them at 30s intervals so the UI shows a natural "recent activity" order.
-                timestamp: now - (i as i64) * 30_000,
+                latency_ms,
+                reward_arc: mine.then_some(REWARD_PER_ATTESTATION),
+                timestamp: v
+                    .get("timestamp")
+                    .or_else(|| inf.get("timestamp"))
+                    .and_then(|x| x.as_i64())
+                    .filter(|t| *t > 0),
+                block_height: v.get("block_height").and_then(|x| x.as_u64()),
+                from,
+                mine,
                 verified: v.get("success").and_then(|x| x.as_bool()).unwrap_or(false),
-            }
+            })
         })
-        .collect()
+        .collect();
+
+    // Newest first. Block height is the reliable ordering key on this data -
+    // it is present on the flat records where timestamps are not.
+    out.sort_by(|a, b| {
+        b.block_height
+            .unwrap_or(0)
+            .cmp(&a.block_height.unwrap_or(0))
+            .then(b.timestamp.unwrap_or(0).cmp(&a.timestamp.unwrap_or(0)))
+    });
+    out
 }
 
 pub async fn fetch_network_stats(http: &reqwest::Client, base_url: &str) -> NetworkStats {
@@ -385,11 +496,13 @@ pub async fn fetch_network_stats(http: &reqwest::Client, base_url: &str) -> Netw
 fn empty_earnings() -> Earnings {
     Earnings {
         total_arc: 0.0,
-        today_arc: 0.0,
-        pending_arc: 0.0,
+        today_arc: None,
+        pending_arc: None,
         rank: None,
         attestations: 0,
         last_payout_at: None,
+        last_payout_block: None,
+        from_chain: false,
     }
 }
 
@@ -467,22 +580,70 @@ pub async fn faucet_claim(
     })
 }
 
+/// Parse the `shard_trace` array a coordinator returns alongside a sharded
+/// run, so the UI can show which machines actually ran which layers.
+fn parse_trace(v: &Value) -> Option<Vec<InferenceHop>> {
+    let arr = v.get("shard_trace")?.as_array()?;
+    if arr.is_empty() {
+        return None;
+    }
+    Some(
+        arr.iter()
+            .map(|h| InferenceHop {
+                hop: h.get("hop").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+                node: h
+                    .get("node")
+                    .or_else(|| h.get("node_name"))
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                layers: h
+                    .get("layers")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                compute_ms: h.get("compute_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+                wall_ms: h.get("wall_ms").and_then(|x| x.as_u64()).unwrap_or(0),
+                is_terminal: h
+                    .get("is_terminal")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false),
+            })
+            .collect(),
+    )
+}
+
+/// Prompts are sent RAW, with `chat_template` as a flag.
+///
+/// The client used to wrap every prompt in `[INST] ... [/INST]` unless the
+/// user had typed those tags themselves. That is Llama-2's instruction
+/// format specifically — wrong for every other architecture, and wrong even
+/// for Llama-2 when the node applies its own template from the GGUF metadata
+/// (the tags then appear twice in the tokenized input). arc-node accepts
+/// `"chat_template": true` and applies the loaded model's own template,
+/// which is correct for whatever is actually loaded.
 pub async fn run_inference(
     http: &reqwest::Client,
     base_url: &str,
     prompt: &str,
     max_tokens: u32,
+    chat_template: bool,
 ) -> Result<InferenceResult, String> {
     let base = base_url.to_string();
-    let wrapped = if prompt.contains("[INST]") {
-        prompt.to_string()
-    } else {
-        format!("[INST] {} [/INST]", prompt)
-    };
-    info!("[inference/run] → POST {}/inference/run  prompt={:?}  max_tokens={}", base, &wrapped[..wrapped.len().min(80)], max_tokens);
+    info!(
+        "[inference/run] → POST {}/inference/run  prompt={:?}  max_tokens={}  chat_template={}",
+        base,
+        &prompt[..prompt.len().min(80)],
+        max_tokens,
+        chat_template
+    );
     let resp = http
         .post(format!("{}/inference/run", base))
-        .json(&serde_json::json!({ "input": wrapped, "max_tokens": max_tokens }))
+        .json(&serde_json::json!({
+            "input": prompt,
+            "max_tokens": max_tokens,
+            "chat_template": chat_template,
+        }))
         .send()
         .await
         .map_err(|e| {
@@ -549,6 +710,8 @@ pub async fn run_inference(
             .to_string(),
         consensus: None,
         coordinator: None,
+        trace: parse_trace(&v),
+        served_locally: false,
     })
 }
 
@@ -564,20 +727,17 @@ pub async fn run_inference_consensus(
     prompt: &str,
     max_tokens: u32,
     k: u32,
+    chat_template: bool,
 ) -> Result<InferenceResult, String> {
-    let wrapped = if prompt.contains("[INST]") {
-        prompt.to_string()
-    } else {
-        format!("[INST] {} [/INST]", prompt)
-    };
     info!("[inference/consensus] → POST {}/inference/run_consensus  k={}  max_tokens={}  prompt={:?}",
-        coord_base, k, max_tokens, &wrapped[..wrapped.len().min(80)]);
+        coord_base, k, max_tokens, &prompt[..prompt.len().min(80)]);
     let resp = http
         .post(format!("{}/inference/run_consensus", coord_base.trim_end_matches('/')))
         .json(&serde_json::json!({
-            "input": wrapped,
+            "input": prompt,
             "max_tokens": max_tokens,
             "k": k,
+            "chat_template": chat_template,
         }))
         .send()
         .await
@@ -648,6 +808,8 @@ pub async fn run_inference_consensus(
         explorer_url: String::new(),
         consensus: Some(consensus),
         coordinator: Some(coord_base.to_string()),
+        trace: parse_trace(&v),
+        served_locally: false,
     })
 }
 
@@ -662,18 +824,18 @@ pub async fn run_inference_remote(
     coord_base: &str,
     prompt: &str,
     max_tokens: u32,
+    chat_template: bool,
 ) -> Result<InferenceResult, String> {
-    let wrapped = if prompt.contains("[INST]") {
-        prompt.to_string()
-    } else {
-        format!("[INST] {} [/INST]", prompt)
-    };
     let resp = http
         .post(format!(
             "{}/inference/run",
             coord_base.trim_end_matches('/')
         ))
-        .json(&serde_json::json!({ "input": wrapped, "max_tokens": max_tokens }))
+        .json(&serde_json::json!({
+            "input": prompt,
+            "max_tokens": max_tokens,
+            "chat_template": chat_template,
+        }))
         .send()
         .await
         .map_err(|e| format!("{}: {}", coord_base, e))?;
@@ -733,16 +895,9 @@ pub async fn run_inference_remote(
             .to_string(),
         consensus: None,
         coordinator: Some(coord_base.to_string()),
+        trace: parse_trace(&v),
+        served_locally: false,
     })
-}
-
-// NodeStatus doesn't expose `validators` directly, but we can stash it in
-// `last_error` when the node is live, to avoid a schema change. Kept as a
-// no-op for now (hook here later if we expose validator count in the UI).
-impl NodeStatus {
-    fn with_validators_hint(self, _validators: u64) -> Self {
-        self
-    }
 }
 
 // ── Tier 1 on-chain inference (VRF committee voting) ───────────────────────
@@ -758,6 +913,12 @@ impl NodeStatus {
 /// (`/inference/onchain/submit`). The seed signs with its validator keypair on
 /// the user's behalf. Returns the request_id which the UI then polls via
 /// `tier1_result` against the SAME `base_url`.
+/// Currently unused: `commands::tier1_submit` builds and signs the
+/// `InferenceRequest` locally so the tx is attributed to the user rather than
+/// to the seed's validator key, and posts it to `/tx/submit_signed` instead.
+/// Kept because the seed-signed convenience route is still the fallback if
+/// local signing has to be dropped.
+#[allow(dead_code)]
 pub async fn tier1_submit(
     http: &reqwest::Client,
     base_url: &str,

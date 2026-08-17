@@ -1,6 +1,7 @@
+use crate::paths;
 use crate::types::{LogEntry, NodeConfig};
 use std::collections::VecDeque;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,6 +23,11 @@ pub struct NodeManager {
     /// Intentional-stop flag - `stop()` sets this before killing, so the reaper
     /// doesn't misreport a clean shutdown as a crash.
     stopping: Arc<std::sync::atomic::AtomicBool>,
+    /// Core count the *running* child was actually launched with. Read back
+    /// by `node_status` so the Dashboard reports the node's real compute
+    /// width rather than whatever the config currently says — those diverge
+    /// the moment the user moves the slider without applying it.
+    pub active_worker_threads: Option<u32>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -52,6 +58,7 @@ impl NodeManager {
             logs: Arc::new(Mutex::new(VecDeque::with_capacity(LOG_RING_SIZE))),
             crash_info: Arc::new(Mutex::new(None)),
             stopping: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            active_worker_threads: None,
         }
     }
 
@@ -134,8 +141,64 @@ impl NodeManager {
             .arg(validator_seed)
             .arg("--eth-rpc-port")
             .arg("0")
+            // ── LIVE-NETWORK SAFETY: join as an observer, never a validator ──
+            //
+            // Current arc-node builds default `--stake` to 0, but every
+            // released binary through v0.7.11 defaults to 5,000,000 ARC — and
+            // this manager may spawn any of them. Passing the flag explicitly
+            // keeps the desktop safe regardless of binary vintage: without it,
+            // an old binary announces itself to the public seeds as a 5M-stake
+            // validator and tries to shard-join the testnet — welding a
+            // phantom validator into validator sets
+            // that are currently frozen, on a network where four of six
+            // seeds have not produced a block in ~6 days. Recovering from
+            // that means hand-editing state on six VPSes.
+            //
+            // `--stake 0` is the observer path: full consensus participation
+            // and DAG validation, zero claim on the validator set. It exists
+            // in every arc-node version the desktop can encounter, which is
+            // why it is passed unconditionally rather than probed for.
+            //
+            // TODO(chain-core): arc-node v0.7.11 gained `--community`, which
+            // is exactly `--stake 0 --community-mode` plus GGUF
+            // auto-discovery. Prefer it once the minimum supported node
+            // version is >= 0.7.11 — passing an unknown flag to an older
+            // binary makes clap abort before the node ever starts, so it
+            // cannot simply be swapped in while 0.7.9 nodes are still in the
+            // field. Gate it on `binary_supports_flag(&binary, "--community")`.
+            .arg("--stake")
+            .arg("0")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // ── Compute contribution ────────────────────────────────────────
+        // rayon sizes its global pool from RAYON_NUM_THREADS the first time
+        // that pool is built, and arc-node only ever calls ThreadPoolBuilder
+        // explicitly under `--benchmark`. Setting the env var is therefore
+        // the one control that works on every shipped node version, with no
+        // chain-side change required.
+        //
+        // `--threads` is the explicit flag the chain-core agent is adding.
+        // It is probed rather than assumed for the same reason as
+        // `--community` above: an unknown flag is a hard clap failure, and a
+        // node that will not start is a worse outcome than a node running at
+        // its default width.
+        if let Some(n) = config.worker_threads.filter(|n| *n > 0) {
+            cmd.env("RAYON_NUM_THREADS", n.to_string());
+            if binary_supports_flag(&binary, "--threads") {
+                cmd.arg("--threads").arg(n.to_string());
+            } else {
+                push_log(
+                    &self.logs,
+                    "info",
+                    format!(
+                        "limiting node to {} cores via RAYON_NUM_THREADS (this arc-node has no --threads flag)",
+                        n
+                    ),
+                )
+                .await;
+            }
+        }
 
         // Windows: detach from the GUI parent's console.
         //
@@ -214,7 +277,7 @@ impl NodeManager {
             &self.logs,
             "info",
             format!(
-                "spawning {} --rpc 127.0.0.1:{} --p2p-port {} --validator-seed <{}…> {}{}",
+                "spawning {} --rpc 127.0.0.1:{} --p2p-port {} --stake 0 --validator-seed <{}…> {}{}{}",
                 binary.display(),
                 rpc_port,
                 p2p_port,
@@ -222,11 +285,16 @@ impl NodeManager {
                     .chars()
                     .take(8)
                     .collect::<String>(),
-                if config.role == "worker" {
+                if config.role == "worker" && config.model_path.is_some() {
                     "--community-mode "
                 } else {
                     ""
                 },
+                config
+                    .worker_threads
+                    .filter(|n| *n > 0)
+                    .map(|n| format!("({} cores) ", n))
+                    .unwrap_or_default(),
                 config
                     .model_path
                     .as_deref()
@@ -246,6 +314,7 @@ impl NodeManager {
 
         self.rpc_port = rpc_port;
         self.started_at = Some(Instant::now());
+        self.active_worker_threads = config.worker_threads.filter(|n| *n > 0);
 
         // Drain stdout/stderr into the log ring.
         if let Some(stdout) = child.stdout.take() {
@@ -295,6 +364,7 @@ impl NodeManager {
                     .swap(false, std::sync::atomic::Ordering::SeqCst);
                 self.child = None;
                 self.started_at = None;
+                self.active_worker_threads = None;
                 if !was_stopping {
                     let code = status.code();
                     let message = format!(
@@ -322,6 +392,7 @@ impl NodeManager {
             let _ = child.kill().await;
             let _ = child.wait().await;
             self.started_at = None;
+            self.active_worker_threads = None;
             *self.crash_info.lock().await = None;
             push_log(&self.logs, "info", "arc-node stopped".into()).await;
             return Ok(());
@@ -404,28 +475,140 @@ fn classify_level(line: &str) -> &'static str {
     }
 }
 
-fn resolve_binary() -> anyhow::Result<PathBuf> {
-    // Allow override for tests
-    if let Ok(p) = std::env::var("ARC_NODE_BINARY") {
-        return Ok(PathBuf::from(p));
+/// An explicitly configured binary path, if the operator set one.
+///
+/// `ARC_NODE_BIN` is the documented name; `ARC_NODE_BINARY` is kept because
+/// existing test fixtures and dev scripts already export it. Both win over
+/// every other resolution step — if someone names a binary, that is the
+/// binary, and `ensure_binary` must not second-guess it with a download.
+pub fn env_binary_override() -> Option<PathBuf> {
+    for key in ["ARC_NODE_BIN", "ARC_NODE_BINARY"] {
+        if let Some(v) = std::env::var_os(key) {
+            if !v.is_empty() {
+                return Some(PathBuf::from(v));
+            }
+        }
+    }
+    None
+}
+
+/// A locally built `target/release/arc-node`, if this app is running from a
+/// repo checkout.
+///
+/// This is the path the demo machine takes: the repo has a freshly built
+/// arc-node that matches the desktop version, while the published GitHub
+/// release ships no arc-node assets at all. Without this, a dev-mode run has
+/// nothing to launch even with the binary sitting two directories away.
+///
+/// Searched relative to both the working directory (`cargo tauri dev` runs
+/// from `desktop/src-tauri`, some tooling from `desktop/`) and the running
+/// executable's ancestors (`target/debug/arc-desktop` lives inside the same
+/// checkout), so it resolves whichever way the app was launched.
+pub fn dev_build_binary() -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) { "arc-node.exe" } else { "arc-node" };
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        // desktop/src-tauri → ../.. = repo root; desktop → .. = repo root.
+        roots.push(cwd.join("..").join(".."));
+        roots.push(cwd.join(".."));
+        roots.push(cwd.clone());
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        // Walk up from the executable; one of these ancestors is the repo
+        // root when running a dev build out of target/.
+        roots.extend(exe.ancestors().take(8).map(PathBuf::from));
     }
 
-    // Canonical app-managed path. Auto-download (commands::ensure_binary)
-    // writes here on first launch.
-    let p = managed_binary_path();
-    if p.exists() {
+    for root in roots {
+        let cand = root.join("target").join("release").join(exe_name);
+        if cand.is_file() {
+            // Canonicalize so the `../..` forms turn into a clean absolute
+            // path in logs and in the "detached process" comparison.
+            return Some(cand.canonicalize().unwrap_or(cand));
+        }
+    }
+    None
+}
+
+fn resolve_binary() -> anyhow::Result<PathBuf> {
+    // 1. Explicit override (env). Highest precedence, no questions asked.
+    if let Some(p) = env_binary_override() {
         return Ok(p);
     }
 
-    // Fall back to PATH lookup for devs who built arc-node themselves
+    // 2. Canonical app-managed path. Auto-download (commands::ensure_binary)
+    //    writes here on first launch.
+    let managed = managed_binary_path();
+    if managed.exists() {
+        return Ok(managed);
+    }
+
+    // 3. A release build sitting in this repo checkout (dev + demo machines).
+    if let Some(p) = dev_build_binary() {
+        return Ok(p);
+    }
+
+    // 4. PATH lookup, for devs who installed arc-node system-wide.
     if let Ok(p) = which_on_path("arc-node") {
         return Ok(p);
     }
 
     Err(anyhow::anyhow!(
-        "arc-node binary not found. Expected at {} or on PATH. The app should download it on first launch - check Settings → Diagnostics.",
-        p.display()
+        "arc-node binary not found. Looked at $ARC_NODE_BIN, {}, ./target/release/arc-node in this checkout, and PATH. \
+         Build one with `cargo build --release -p arc-node`, or set ARC_NODE_BIN to an existing binary.",
+        managed.display()
     ))
+}
+
+/// Does this arc-node accept `flag`?
+///
+/// clap aborts the process on an unrecognized argument, so every optional
+/// flag must be probed before use or a node that would have started fine at
+/// default settings refuses to start at all. `--help` output is the only
+/// version-independent way to ask.
+///
+/// Cached per (binary, flag): `--help` costs a process spawn, and `start()`
+/// runs on every user-visible Start click.
+pub fn binary_supports_flag(binary: &Path, flag: &str) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    static CACHE: OnceLock<StdMutex<HashMap<String, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| StdMutex::new(HashMap::new()));
+    let key = format!("{}\u{0}{}", binary.display(), flag);
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(&key) {
+            return *hit;
+        }
+    }
+
+    let mut cmd = std::process::Command::new(binary);
+    cmd.arg("--help");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let supported = match cmd.output() {
+        Ok(out) => {
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // Match the flag followed by a boundary so `--threads` does not
+            // report true because `--bench-rayon-threads` is present.
+            text.split(|c: char| !(c.is_alphanumeric() || c == '-' || c == '_'))
+                .any(|tok| tok == flag)
+        }
+        Err(_) => false,
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, supported);
+    }
+    supported
 }
 
 /// Canonical location for the auto-downloaded arc-node binary.
@@ -435,29 +618,35 @@ fn resolve_binary() -> anyhow::Result<PathBuf> {
 /// binary path. Returns the count killed. Used by `stop()` when the in-memory
 /// child handle is gone (typically after a Tauri-side dev rebuild).
 fn kill_detached_arc_node() -> usize {
-    let managed = managed_binary_path();
-    let managed_canon = managed.canonicalize().unwrap_or(managed.clone());
+    // Match every path the node could have been launched from, not just the
+    // managed one — otherwise Stop is a silent no-op for anyone running the
+    // dev build or an ARC_NODE_BIN override, which is exactly the demo
+    // machine's configuration.
+    let candidates: Vec<PathBuf> = [
+        env_binary_override(),
+        Some(managed_binary_path()),
+        dev_build_binary(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|p| p.canonicalize().unwrap_or(p))
+    .collect();
+
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
     let mut killed = 0;
-    for (_pid, proc_) in sys.processes() {
+    for proc_ in sys.processes().values() {
         let Some(exe) = proc_.exe() else { continue };
         let exe_canon = exe.canonicalize().unwrap_or(exe.to_path_buf());
-        if exe_canon == managed_canon {
-            if proc_.kill() {
-                killed += 1;
-            }
+        if candidates.contains(&exe_canon) && proc_.kill() {
+            killed += 1;
         }
     }
     killed
 }
 
 pub fn managed_binary_path() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".arc").join("bin").join(if cfg!(windows) {
+    paths::arc_home().join("bin").join(if cfg!(windows) {
         "arc-node.exe"
     } else {
         "arc-node"
@@ -480,32 +669,48 @@ fn which_on_path(name: &str) -> anyhow::Result<PathBuf> {
     Err(anyhow::anyhow!("{} not found on PATH", name))
 }
 
-fn resolve_data_dir(s: &str) -> PathBuf {
-    if let Some(rest) = s.strip_prefix("~/") {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        return home.join(rest);
-    }
-    PathBuf::from(s)
+/// Resolve the configured data dir. Goes through [`paths::expand_tilde`] so
+/// the default `~/.arc` lands in the user's profile on Windows instead of
+/// `./.arc` relative to the GUI's CWD.
+pub fn resolve_data_dir(s: &str) -> PathBuf {
+    paths::expand_tilde(s)
 }
 
-fn port_available(port: u16) -> bool {
+/// Can we bind TCP on this port? Correct probe for the RPC listener.
+fn tcp_available(port: u16) -> bool {
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
     TcpListener::bind(addr).is_ok()
 }
 
+/// Can we bind UDP on this port? Correct probe for the P2P listener, which
+/// is QUIC and therefore UDP.
+///
+/// The previous code TCP-probed the P2P port, which made the probe blind to
+/// the exact failure it was written to survive: with WSL2 or Docker Desktop
+/// installed, Hyper-V reserves dynamic UDP exclusion ranges that frequently
+/// cover 9000-9100. UDP 9091 is then un-bindable by any user-mode process
+/// while TCP 9091 binds fine — so the probe passed, arc-node got a port it
+/// could not use, and the only sign was a silent fall back to an ephemeral
+/// port with no inbound reachability.
+fn udp_available(port: u16) -> bool {
+    let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+    UdpSocket::bind(addr).is_ok()
+}
+
 fn choose_port_pair(preferred_rpc: u16, preferred_p2p: u16) -> anyhow::Result<(u16, u16)> {
-    // Try up to 5 offsets in +10 increments. Both RPC and P2P must be free.
+    // Try up to 5 offsets in +10 increments. RPC must be TCP-bindable and
+    // P2P must be UDP-bindable.
     for i in 0..5 {
-        let rpc = preferred_rpc + (i * 10);
-        let p2p = preferred_p2p + (i * 10);
-        if port_available(rpc) && port_available(p2p) {
+        let rpc = preferred_rpc.saturating_add(i * 10);
+        let p2p = preferred_p2p.saturating_add(i * 10);
+        if tcp_available(rpc) && udp_available(p2p) {
             return Ok((rpc, p2p));
         }
     }
     Err(anyhow::anyhow!(
-        "ports {}/{} and 5 fallbacks all busy. Free a port and retry, or change RPC port in Settings.",
+        "RPC ports {}+ (TCP) and P2P ports {}+ (UDP) are all busy across 5 fallbacks. \
+         On Windows this is usually a Hyper-V/WSL2 UDP exclusion range - run \
+         `netsh int ipv4 show excludedportrange protocol=udp` to check. Change the RPC port in Settings to move both.",
         preferred_rpc,
         preferred_p2p
     ))
@@ -546,6 +751,51 @@ mod tests {
         assert!(result.is_ok(), "probe should find a free pair");
         let (rpc, _p2p) = result.unwrap();
         assert_ne!(rpc, busy, "should have picked a fallback rpc port");
+    }
+
+    /// The P2P listener is QUIC/UDP. A TCP bind on the same number proves
+    /// nothing about it, which is what made the old probe blind to Hyper-V's
+    /// UDP exclusion ranges.
+    #[test]
+    fn p2p_probe_is_udp_not_tcp() {
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let busy_udp = udp.local_addr().unwrap().port();
+        assert!(!udp_available(busy_udp), "held UDP port must read as busy");
+        // The same port number is still free for TCP - the exact blind spot
+        // the old probe had.
+        assert!(
+            tcp_available(busy_udp),
+            "TCP on a UDP-busy port is typically free; this is why the probes must differ"
+        );
+    }
+
+    #[test]
+    fn choose_port_pair_skips_udp_busy_p2p() {
+        let rpc_l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let rpc = rpc_l.local_addr().unwrap().port();
+        drop(rpc_l);
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let busy_p2p = udp.local_addr().unwrap().port();
+        let (_, chosen_p2p) = choose_port_pair(rpc, busy_p2p).expect("should find a free pair");
+        assert_ne!(chosen_p2p, busy_p2p, "must not hand back a UDP-busy p2p port");
+    }
+
+    /// `--threads` must not report as supported just because
+    /// `--bench-rayon-threads` appears in the same help text.
+    #[test]
+    fn flag_probe_requires_whole_token_match() {
+        // `/bin/echo` is not arc-node, so the probe returns false rather
+        // than panicking - the safe default for an unknown binary.
+        assert!(!binary_supports_flag(Path::new("/nonexistent/arc-node"), "--threads"));
+    }
+
+    #[test]
+    fn data_dir_lands_under_home_not_cwd() {
+        // The Windows bug in miniature: `~/.arc` must never resolve to a
+        // relative `./.arc`.
+        let p = resolve_data_dir("~/.arc");
+        assert!(p.is_absolute() || p.starts_with(paths::home_dir()));
+        assert!(!p.starts_with("./"));
     }
 }
 

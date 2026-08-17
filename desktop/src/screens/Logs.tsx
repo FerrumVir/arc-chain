@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { Download, ScrollText } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { Card, CardHeader } from "../components/Card";
@@ -28,22 +28,16 @@ export function Logs() {
     }
   }, [logs]);
 
-  const download = () => {
-    if (!logs) return;
-    const text = logs
-      .map(
-        (l) =>
-          `[${new Date(l.timestamp).toISOString()}] ${l.level.toUpperCase()} ${l.message}`,
-      )
-      .join("\n");
-    const blob = new Blob([text], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `arc-node-${Date.now()}.log`;
-    a.click();
-    URL.revokeObjectURL(url);
-  };
+  // The write happens in Rust behind a native save dialog.
+  //
+  // This used to build a Blob and click a synthetic `<a download>`.
+  // WKWebView (the macOS webview) doesn't implement the download attribute
+  // for blob: URLs without a host-side download delegate, so the button was
+  // a silent no-op on macOS while working on Windows and Linux. Handing logs
+  // to support is the entire purpose of this button.
+  const save = useMutation({
+    mutationFn: () => api.saveLogs(),
+  });
 
   return (
     <div className="main-inner" data-testid="logs-screen">
@@ -54,14 +48,42 @@ export function Logs() {
             Live output from your node process. Useful for debugging.
           </p>
         </div>
-        <button
-          className="btn btn-secondary"
-          onClick={download}
-          disabled={!logs?.length}
-          data-testid="btn-download-logs"
-        >
-          <Download size={14} /> Download
-        </button>
+        <div style={{ textAlign: "right" }}>
+          <button
+            className="btn btn-secondary"
+            onClick={() => save.mutate()}
+            disabled={!logs?.length || save.isPending}
+            data-testid="btn-download-logs"
+          >
+            <Download size={14} />{" "}
+            {save.isPending ? "Saving…" : "Save logs"}
+          </button>
+          {save.data?.path && (
+            <p
+              style={{
+                marginTop: "var(--space-2)",
+                fontSize: "var(--text-sm)",
+                color: "var(--text-muted)",
+                wordBreak: "break-all",
+              }}
+              data-testid="logs-saved-path"
+            >
+              Saved {save.data.lines} lines to {save.data.path}
+            </p>
+          )}
+          {save.error && (
+            <p
+              style={{
+                marginTop: "var(--space-2)",
+                fontSize: "var(--text-sm)",
+                color: "var(--danger)",
+              }}
+              data-testid="logs-save-error"
+            >
+              {String(save.error)}
+            </p>
+          )}
+        </div>
       </div>
 
       <Card>
