@@ -535,6 +535,35 @@ Two caveats to keep it honest:
   this until they are upgraded. Do not imply the public testnet pays workers
   today — it does not.
 
+**Tested against the live chain 2026-08-17, and it does not work there.** Do
+not attempt the income segment on the public seeds. The full sequence was run:
+faucet-funded a fresh attester on NYC (credit **mined in block 135,089**, so
+NYC does seal blocks when a valid transaction arrives), then relayed a signed
+attestation to NYC via `ARC_ATTEST_RELAY`. The relay was accepted (HTTP 2xx
+into the mempool) and then **never reached a block** — `/tx/<hash>` reports
+not-found and the attester's nonce stayed at 0 with its balance unchanged,
+so the transaction never applied.
+
+It is not a wire or validity problem: v0.7.2's apply path is effectively
+identical to ours (nonce check, `balance >= bond`, debit bond), our
+transaction satisfied every condition (nonce 0 against NYC's 0, balance
+10,000 against a 1,000 bond), the beneficiary field is `#[serde(skip)]` with a
+test pinning the 112-byte v0.7.2 layout, and `gas_limit: 0` means unlimited
+for backward compatibility. The same signed attestation mines correctly on a
+node running this branch — verified three times, +2.5 ARC each.
+
+The likely mechanism is that blocks are assembled from **DAG-committed**
+transactions, and a transaction injected straight into a seed's mempool over
+`/tx/submit_signed` never joins a DAG batch. That also fits the seed-wide
+stall: `run_block_producer` (`crates/arc-node/src/producer.rs:15`) is dead
+code, so blocks only come from the consensus path, which needs committed DAG
+transactions. Confirming it needs a seed's logs.
+
+**What this means for the demo:** show income on your own chain, which works.
+On the public network, show the faucet credit (real, mines) and the inference
+itself — and say plainly that worker settlement lands once the seeds run this
+build.
+
 The bond-release sweep (bond returns after `challenge_period` blocks) is
 covered by unit tests including a supply-conservation invariant; it was not
 exercised over 100 live blocks, because this chain only seals on traffic.
