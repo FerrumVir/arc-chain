@@ -4,11 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ARC Chain - Sharded AI Inference Across the Network</title>
-<meta name="description" content="Run a Llama-2-7B model split across 7 separate VPS in 7 cities. Per-row INT16 weights, BLAKE3-verified hidden states, bit-identical output on every chip. Pipeline-parallel sharded inference, cryptographically verifiable.">
+<meta name="description" content="Run a Llama-2-7B model split across 6 separate VPS in 6 cities, with every layer range replicated 3x. Per-row INT16 weights, BLAKE3-verified hidden states, bit-identical output on every chip. Pipeline-parallel sharded inference, cryptographically verifiable.">
 
 <!-- Open Graph -->
 <meta property="og:title" content="ARC Chain - Sharded AI Inference Across the Network">
-<meta property="og:description" content="A real Llama-7B model split across 7 separate machines. Type a prompt, watch the activation hop through every shard. BLAKE3-verified, bit-identical, deterministic.">
+<meta property="og:description" content="A real Llama-2-7B model split across 6 separate machines, 3x replicated. Type a prompt, watch the activation hop through every shard. BLAKE3-verified, bit-identical, deterministic.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="http://140.82.16.112:3200">
 <meta property="og:site_name" content="ARC Chain Testnet">
@@ -16,7 +16,7 @@
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="ARC Chain - Sharded AI Inference">
-<meta name="twitter:description" content="Run a Llama-7B model split across 7 cheap VPS. Cryptographically verifiable. Type a prompt, watch the trace.">
+<meta name="twitter:description" content="Run a Llama-2-7B model split across 6 cheap VPS, 3x replicated. Cryptographically verifiable. Type a prompt, watch the trace.">
 
 <link rel="icon" href="data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22&gt;&lt;rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%236366f1%22/&gt;&lt;text x=%2216%22 y=%2222%22 font-family=%22Arial%22 font-size=%2218%22 font-weight=%22bold%22 fill=%22white%22 text-anchor=%22middle%22&gt;A&lt;/text&gt;&lt;/svg&gt;">
 <script src="https://cdn.tailwindcss.com"></script>
@@ -356,13 +356,14 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
 <script>
 // Try multiple nodes - use first one that responds
 let RPC='http://140.82.16.112:9090';
-const RPC_FALLBACKS=['http://136.244.109.1:9090','http://139.84.237.49:9090','http://104.238.171.11:9090','http://149.28.32.76:9090'];
-// Sharded inference goes to a dedicated coordinator (Mac M2 Ultra, hidden
-// behind an SSH reverse tunnel on NYC:10000). Mac runs the full 27-layer
-// tail shard (layers 5..31 + LM head) plus the coordinator role, and walks
-// the pipeline through NYC [0,2) and LAX [2,5) via HTTP. Mac has the
-// DistributedCache so repeat prompts return in ~100 ms.
-const SHARDED_COORDINATOR = 'http://149.28.32.76:10000';
+const RPC_FALLBACKS=['http://136.244.109.1:9090','http://104.238.171.11:9090','http://149.28.32.76:9090','http://202.182.107.41:9090'];
+// Sharded inference goes to a seed coordinator on port 9090.
+// 2026-08-17: this used to point at http://149.28.32.76:10000, an SSH reverse
+// tunnel to a Mac M2 Ultra that is no longer reachable (connect fails, code
+// 000). The pipeline it described - Mac holding a 27-layer tail shard, NYC
+// [0,2), LAX [2,5) - has not been the topology since April. The live layout is
+// 6 layer ranges replicated 3x across the 6 seeds; any seed can coordinate.
+const SHARDED_COORDINATOR = 'http://104.238.171.11:9090';
 async function findRPC(){
   try{const r=await fetch(RPC+'/health',{signal:AbortSignal.timeout(3000)});if(r.ok)return}catch(e){}
   for(const fb of RPC_FALLBACKS){
@@ -376,8 +377,9 @@ const NODES=[
   {name:'LHR',ip:'104.238.171.11',loc:'London',flag:'🇬🇧',inference:true},
   {name:'NRT',ip:'202.182.107.41',loc:'Tokyo',flag:'🇯🇵',inference:true},
   {name:'SGP',ip:'149.28.153.31',loc:'Singapore',flag:'🇸🇬',inference:true},
-  {name:'SAO',ip:'216.238.120.27',loc:'São Paulo',flag:'🇧🇷',inference:true},
-  {name:'JNB',ip:'139.84.237.49',loc:'Johannesburg',flag:'🇿🇦',inference:true},
+  // SAO 216.238.120.27 and JNB 139.84.237.49 were retired 2026-04-22 (GH #32)
+  // and no longer accept connections. Removed 2026-08-17 - they rendered as
+  // permanently-dead tiles.
 ];
 
 let lastRound=0,lastTime=Date.now(),lastTxCount=0;
@@ -1455,39 +1457,54 @@ async function probePresetCache(){
   }catch(e){/* silent - /inference/cache_check only exists on v0.5.1+ coordinators */}
 }
 
-// ── Community workers - poll gateways and display live worker list ──────
-// Try all 8 gateways, merge unique workers by worker_id, render in the
-// Community Network section. Updates every 10 seconds.
+// ── Community workers - poll the seeds and display the live worker list ──
+// Merge unique workers by worker_id, render in the Community Network section.
+// Updates every 10 seconds.
+//
+// 2026-08-17, two corrections:
+//  1. This used to hit `:3001/community/list`. Port 3001 is the community
+//     gateway and it does NOT serve the worker list - GET /workers/scoreboard
+//     on :3001 returns 404. Read the scoreboard from :9090 instead.
+//  2. /community/list PRUNES the registry as a side effect; /workers/scoreboard
+//     does not. Polling community/list every 10s was actively emptying the
+//     list it was trying to display. AMS now reports count_total 0.
+// Worker registrations are node-local, not replicated, so merging across seeds
+// is still required: NYC and LAX report 6, LHR 9, AMS 0.
 const GATEWAY_SEEDS = [
   '149.28.32.76','140.82.16.112','136.244.109.1','104.238.171.11',
-  '202.182.107.41','149.28.153.31','216.238.120.27','139.84.237.49'
+  '202.182.107.41','149.28.153.31'
 ];
 
 async function refreshCommunityWorkers(){
   const seen = new Map(); // worker_id -> worker
   let totalJobs = 0;
-  // Query all gateways in parallel, merge results
+  // Query all seeds in parallel, merge results
   const results = await Promise.allSettled(GATEWAY_SEEDS.map(ip =>
-    fetch(`http://${ip}:3001/community/list`, {signal: AbortSignal.timeout(3000)})
+    fetch(`http://${ip}:9090/workers/scoreboard`, {signal: AbortSignal.timeout(3000)})
       .then(r => r.json())
   ));
   for(const r of results){
     if(r.status !== 'fulfilled') continue;
     const d = r.value;
-    totalJobs = Math.max(totalJobs, d.total_work_completed || 0);
     for(const w of (d.workers || [])){
       if(!seen.has(w.worker_id)){
         seen.set(w.worker_id, w);
       } else {
-        // Keep the one with higher work_completed
-        const existing = seen.get(w.worker_id);
-        if((w.work_completed||0) > (existing.work_completed||0)){
+        // Keep the record with the most completed work. The scoreboard reports
+        // success_count; the older community/list shape used work_completed.
+        const jobsOf = x => (x.success_count ?? x.work_completed ?? 0);
+        if(jobsOf(w) > jobsOf(seen.get(w.worker_id))){
           seen.set(w.worker_id, w);
         }
       }
     }
   }
   const workers = Array.from(seen.values());
+  // /workers/scoreboard has no total_work_completed field, so sum per-worker
+  // successes. Expect 0 today: no worker on the live net has a nonzero
+  // success_count, because the sharded pipeline dispatches to shard nodes
+  // rather than to scoreboard workers.
+  totalJobs = workers.reduce((n, w) => n + (w.success_count ?? w.work_completed ?? 0), 0);
   // Update count badge
   const countEl = document.getElementById('communityCount');
   if(countEl) countEl.textContent = `${workers.length} worker${workers.length !== 1 ? 's' : ''}`;

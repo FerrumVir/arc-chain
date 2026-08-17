@@ -1,5 +1,16 @@
 # ARC Growth Engine - Evolution Log
 
+> **Scope note (2026-08-17).** This file is the market-intelligence log for the
+> ARC Growth Engine and carries **no engineering state**. Do not read it as a
+> record of what the chain is doing.
+>
+> The line below reading "No changes to ALERTS.md. Nothing material." was
+> accurate for this log's own purposes on 2026-04-01, but
+> [`ALERTS.md`](ALERTS.md) is now an engineering-owned file and currently
+> carries four active alerts. For chain and network state see
+> [`ALERTS.md`](ALERTS.md), [`CLAUDE.md`](CLAUDE.md), and
+> [`CHANGELOG.md`](CHANGELOG.md).
+
 ## v2.0.5 - 2026-04-01 (overnight monitoring)
 
 **Type:** Monitoring cycle (light)

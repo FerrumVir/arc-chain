@@ -42,22 +42,22 @@ This guide walks you from a fresh install through your first earned ARC token. R
 ### Linux (Ubuntu / Debian)
 
 ```bash
-sudo apt install ./ARC.Node_0.5.4_amd64.deb
+sudo apt install ./ARC.Node_0.7.11_amd64.deb
 arc-node-desktop
 ```
 
 ### Linux (Fedora / RHEL)
 
 ```bash
-sudo rpm -i ARC.Node-0.5.4-1.x86_64.rpm
+sudo rpm -i ARC.Node-0.7.11-1.x86_64.rpm
 arc-node-desktop
 ```
 
 ### Linux (any distro, AppImage)
 
 ```bash
-chmod +x ARC.Node_0.5.4_amd64.AppImage
-./ARC.Node_0.5.4_amd64.AppImage
+chmod +x ARC.Node_0.7.11_amd64.AppImage
+./ARC.Node_0.7.11_amd64.AppImage
 ```
 
 ---
@@ -112,26 +112,64 @@ Within ~30 seconds:
 2. Type a prompt. Example: `What is the capital of France?`
 3. Click **Run inference**.
 4. The network will:
-   - Route your prompt through the live shard pipeline (Llama-2-7B distributed across 6 seeds).
+   - Route your prompt through the live shard pipeline (Llama-2-7B split into 6 layer ranges across the 6 seeds, each range replicated 3×).
    - Run it through the pure-integer engine.
-   - Return the output, the BLAKE3 input/output hashes, and the on-chain attestation `tx_hash`.
-   - You can paste the `tx_hash` into the [live dashboard](http://140.82.16.112:3200) to see it landed on-chain.
+   - Return the output, the BLAKE3 input/output hashes, and an attestation `tx_hash`.
 
-The first inference may take 15-60 seconds. Subsequent ones are faster (cached attention KV).
+**How long this takes, honestly.** Roughly **10 seconds per token** on the
+public testnet, so the default 16-token response takes **1–3 minutes**. A first
+request against a shard that has not served recently is slower still — a
+measured cold run spent 14.5 s and 16.5 s on two individual layer ranges. The
+millisecond figures in the README are single-node local measurements, not
+network ones. Repeating the *exact* same prompt returns in microseconds because
+it is served from a result cache, not recomputed.
+
+**About that `tx_hash`.** It is real, and the attestation genuinely enters the
+mempool — but four of the six seeds have not sealed a block in about six days,
+so it will most likely **not be mined**. Looking it up returns
+`block_height: null`. That is the current state of the testnet, not a bug in
+your node.
+
+**Prompt quality.** The INT16 engine on this build degrades badly on some
+prompts. Prompts phrased as `Explain <topic>` reliably return newline spam.
+`What is …?` and `How does … work?` phrasings behave. See
+`INFERENCE_DETERMINISM.md` for the underlying quantization defect.
 
 ### Claim from the testnet faucet
 
 1. Click the **Wallet** tab.
 2. Click **Claim from faucet** (top right).
-3. Within ~10 seconds, your balance will show 1,000 testnet ARC.
+3. Within ~10 seconds, your balance will show **10,000 testnet ARC**.
 
-This is testnet ARC — no real-world value. It's for paying the per-inference fee on the testnet so you can submit prompts.
+There is a **60-second cooldown** per address. Check the live figures yourself:
+
+```bash
+curl http://140.82.16.112:9090/faucet/status
+# {"claim_amount":10000,"rate_limit_secs":60,...}
+```
+
+This is testnet ARC — no real-world value.
+
+> **Read your balance from one seed only.** The six seeds are independent
+> chains today, not replicas. A faucet credit on one seed does not appear on
+> another, so a balance that "disappears" is almost always a different seed
+> answering, not a lost transaction.
 
 ### See your earnings
 
 1. Click the **Earnings** tab.
-2. Every inference your node helped serve appears here as an attestation row, with the per-attestation reward (default 2.5 ARC).
-3. The **24h / 7d / lifetime** totals update in real time.
+2. Attestations your node helped serve appear here, valued at 2.5 ARC each.
+
+**What that number is.** It is display arithmetic — an attestation count
+multiplied by a 2.5 ARC constant. It does not read an on-chain balance and will
+not reconcile against your wallet balance. It is also computed from an
+in-memory transaction map that gets pruned, so the lifetime figure can go
+*down* between refreshes and resets to zero if the node restarts. Attestation
+rewards are not actually paid out on the current chain.
+
+Expect this tab to read **0.0 ARC** today: `/worker/earnings` returns
+`total_attestations: 0` for every address on every seed, because attestations
+are not being mined (see above).
 
 If you're a fresh worker node, you may not see earnings for the first few minutes — the network has to assign you a shard range and announce you to the coordinators. After that, attestations roll in passively.
 
@@ -157,7 +195,7 @@ The node runs at ~5-15% CPU when idle, spiking briefly during inference. RAM usa
 
 **How do I update?**
 
-Auto. When `v0.5.5` ships, ARC Node downloads the signed update and applies it on next launch. You'll see a small badge in the status pill. No action needed. The signing key is pinned to the GitHub release pipeline — you can verify by reading `desktop/src-tauri/tauri.conf.json` in the repo.
+Auto. When a version newer than `v0.7.11` ships, ARC Node downloads the signed update and applies it on next launch. You'll see a small badge in the status pill. No action needed. The signing key is pinned to the GitHub release pipeline — you can verify by reading `desktop/src-tauri/tauri.conf.json` in the repo.
 
 **How do I uninstall?**
 
