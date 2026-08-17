@@ -1085,6 +1085,19 @@ async fn main() -> Result<()> {
         Vec::new()
     };
 
+    // Chain identity as DECLARED by the genesis file. Only a genesis file can
+    // name the network, so a node started without --genesis carries None here
+    // and GET /network/info reports the name and chain_id as null with a
+    // reason rather than inventing one (and never says "mainnet").
+    let genesis_chain_identity: Option<rpc::ChainIdentity> = cli
+        .genesis
+        .as_ref()
+        .and_then(|p| config::load_genesis(p).ok())
+        .map(|cfg| rpc::ChainIdentity {
+            name: cfg.chain.name,
+            chain_id: cfg.chain.chain_id,
+        });
+
     let genesis_accounts: Vec<(Hash256, u64)> = if let Some(genesis_path) = &cli.genesis {
         let genesis_cfg = config::load_genesis(genesis_path)
             .expect("Failed to load genesis config");
@@ -1561,7 +1574,7 @@ async fn main() -> Result<()> {
     // ── Start ETH JSON-RPC server (MetaMask, Hardhat, Foundry) ──────────
     if eth_rpc_port > 0 {
         let eth_addr = format!("0.0.0.0:{}", eth_rpc_port);
-        let eth_node = rpc::build_node_state(
+        let mut eth_node = rpc::build_node_state(
             state.clone(),
             mempool.clone(),
             validator_address,
@@ -1573,6 +1586,8 @@ async fn main() -> Result<()> {
             candle_engine.clone(),
             candle_model_id,
         );
+        // Same declared identity on the ETH port's state.
+        eth_node.chain_identity = genesis_chain_identity.clone();
         tracing::info!("ETH RPC    : {} (MetaMask/Hardhat/Foundry)", eth_addr);
         tokio::spawn(async move {
             if let Err(e) = rpc::serve_eth(&eth_addr, eth_node).await {
@@ -2318,6 +2333,7 @@ async fn main() -> Result<()> {
         shard_infos,
         coordinator_seed_rpcs,
         compute_threads,
+        genesis_chain_identity,
     )
     .await?;
 

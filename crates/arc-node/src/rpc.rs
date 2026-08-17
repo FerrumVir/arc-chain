@@ -40,6 +40,54 @@ const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute - intentiona
 const REWARD_PER_ATTESTATION_ARC: f64 = arc_types::economics::INFERENCE_ATTESTATION_REWARD as f64
     / arc_types::economics::ARC_BASE_UNITS as f64;
 
+/// Bond posted with an auto-submitted `InferenceAttestation`, in base units.
+///
+/// This was a bare `1000` literal in two places (`/inference/run`'s request
+/// default and the sharded-run submission). It is named here so
+/// `/economics/rewards` can report the bond a client will ACTUALLY be charged
+/// rather than a number typed twice into a JSON body. The bond is returnable:
+/// `arc-state`'s attestation arm locks it in a deterministic escrow and the
+/// maturation sweep refunds it after `challenge_period` blocks.
+pub const DEFAULT_ATTESTATION_BOND: u64 = 1_000;
+
+/// Challenge period, in blocks, on an auto-submitted `InferenceAttestation`.
+/// Same story as the bond: previously a duplicated `100` literal.
+pub const DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS: u64 = 100;
+
+/// How recently this node must have sealed a block for `/network/info` to
+/// report `is_block_producing: true`.
+///
+/// Sized for the observed live failure, not for theory: four of six seeds have
+/// not sealed a block in ~6 days while `GET /health` still answers `"ok"`,
+/// because DAG rounds keep advancing without blocks. At the ~400 ms target
+/// block time, 120 s is 300 missed blocks — far past any plausible hiccup, and
+/// far short of the 6-day stall the desktop needs to surface.
+pub const BLOCK_PRODUCTION_FRESH_SECS: u64 = 120;
+
+/// How many blocks back `/network/info` scans for a block sealed by THIS
+/// node's validator address. Bounded so the handler stays O(1)-ish on a node
+/// with a 135 K-block store.
+pub const SELF_PRODUCED_SCAN_BLOCKS: u64 = 512;
+
+/// Ring capacity for this node's own measured `forward_shard` compute times.
+/// Display-only, in-memory, and bounded: `/node/contribution` reports mean and
+/// p50 over these samples so "more cores → more throughput" can be shown with
+/// measurements instead of a fabricated earnings-per-core figure.
+pub const OWN_COMPUTE_SAMPLE_CAP: usize = 256;
+
+/// Chain identity as DECLARED by a genesis file, when the node was started
+/// with one. Deliberately `Option`al everywhere downstream: a node booted
+/// without `--genesis` genuinely does not know its network's declared name,
+/// and `/network/info` reports that as null-plus-reason rather than guessing
+/// (and never invents the word "mainnet").
+#[derive(Debug, Clone)]
+pub struct ChainIdentity {
+    /// `chain.name` verbatim from the genesis TOML.
+    pub name: String,
+    /// `chain.chain_id` from the genesis TOML (defaults to `0x415243`).
+    pub chain_id: String,
+}
+
 /// Shared node state passed to all handlers.
 #[derive(Clone)]
 pub struct NodeState {
@@ -189,6 +237,22 @@ pub struct NodeState {
     /// Last shard-registry bootstrap attempt, so a coordinator under load
     /// doesn't hammer the seeds once per failing request.
     pub last_registry_bootstrap: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Chain identity declared by the `--genesis` file, if one was supplied.
+    /// `None` on a node started without `--genesis`: `/network/info` then
+    /// reports the name and chain_id as null with a reason, since the only
+    /// thing such a node actually knows about its chain is its genesis hash.
+    pub chain_identity: Option<ChainIdentity>,
+    /// Ring of this node's OWN measured `forward_shard` compute times (ms),
+    /// newest last, capped at `OWN_COMPUTE_SAMPLE_CAP`.
+    ///
+    /// `latency_stats` cannot answer "how fast is this node's own compute":
+    /// it is an EWMA of round-trip times to OTHER replicas, it holds one
+    /// smoothed scalar rather than samples (so no percentile is derivable from
+    /// it), and it contains no entry for this node at all unless this node
+    /// dialled itself. These are real per-hop measurements taken by the local
+    /// shard handler, which is what `/node/contribution` needs to report a
+    /// mean and a p50 honestly. Display-only; never consensus input.
+    pub own_compute_ms: Arc<parking_lot::Mutex<std::collections::VecDeque<u64>>>,
 }
 
 /// Rolling EWMA of forward_shard hop latency for a single replica socket.
@@ -711,7 +775,206 @@ pub fn build_node_state(
         compute_threads: Arc::new(AtomicU32::new(0)),
         seed_rpc_addrs: Arc::new(Vec::new()),
         last_registry_bootstrap: Arc::new(Mutex::new(None)),
+        // No genesis file is visible from here; `serve` overwrites this when
+        // main.rs was given --genesis.
+        chain_identity: None,
+        own_compute_ms: Arc::new(parking_lot::Mutex::new(
+            std::collections::VecDeque::with_capacity(OWN_COMPUTE_SAMPLE_CAP),
+        )),
     }
+}
+
+/// Push `v` onto a bounded sample ring, evicting the oldest first so the ring
+/// always holds the most RECENT `cap` measurements. Split out from
+/// `record_own_compute_ms` so the eviction policy is unit-testable without
+/// constructing a whole `NodeState`.
+fn push_bounded(ring: &mut std::collections::VecDeque<u64>, v: u64, cap: usize) {
+    if cap == 0 {
+        return;
+    }
+    while ring.len() >= cap {
+        ring.pop_front();
+    }
+    ring.push_back(v);
+}
+
+/// Record one of THIS node's own `forward_shard` compute measurements.
+/// Keeps at most `OWN_COMPUTE_SAMPLE_CAP` samples, evicting oldest first.
+fn record_own_compute_ms(node: &NodeState, compute_ms: u64) {
+    push_bounded(
+        &mut node.own_compute_ms.lock(),
+        compute_ms,
+        OWN_COMPUTE_SAMPLE_CAP,
+    );
+}
+
+/// Arithmetic mean of `samples`. `None` for an empty slice — an average of no
+/// measurements is not zero, it is unknown.
+fn mean_u64(samples: &[u64]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let sum: u128 = samples.iter().map(|&v| v as u128).sum();
+    Some(sum as f64 / samples.len() as f64)
+}
+
+/// Median (p50) of `samples`. For an even sample count this returns the LOWER
+/// of the two middle values rather than interpolating, so the reported figure
+/// is always a value that was actually measured. `None` for an empty slice.
+fn p50_u64(samples: &[u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    Some(sorted[(sorted.len() - 1) / 2])
+}
+
+/// How many more attestation rewards the treasury can still pay:
+/// `floor(treasury_balance / reward_per_attestation)`.
+///
+/// The reward is a TRANSFER out of a finite treasury, not an emission, so a
+/// projection that ignores the remaining pool is dishonest — this is the term
+/// that makes "you will earn X/day forever" false. `None` when the reward per
+/// attestation is zero, where the quotient is undefined rather than infinite.
+pub fn rewards_remaining(treasury_balance: u64, reward_per_attestation: u64) -> Option<u64> {
+    if reward_per_attestation == 0 {
+        return None;
+    }
+    Some(treasury_balance / reward_per_attestation)
+}
+
+/// Registered-vs-active split of a validator set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatorSplit {
+    /// Every entry in the set, including zero-stake ones.
+    pub registered: usize,
+    /// Entries whose stake meets `min_active_stake`.
+    pub active: usize,
+    /// Entries carrying exactly zero stake.
+    pub zero_stake: usize,
+    /// Sum of all stake in the set.
+    pub total_stake: u64,
+    /// Sum of stake across active entries only.
+    pub active_stake: u64,
+}
+
+/// Split a validator set into registered vs active at `min_active_stake`.
+///
+/// Exists because `/validators`, `/health` and `/stats` all report
+/// `dag_validators.len()`, which counts zero-stake peers. On the live network
+/// that inflates the set by 4 of 14: those peers cannot vote and cannot
+/// produce, so every count derived from the raw length overstates the network.
+/// A zero `min_active_stake` still leaves zero-stake entries inactive — a
+/// validator with no stake at risk is not securing anything.
+pub fn split_validators(validators: &[(Hash256, u64)], min_active_stake: u64) -> ValidatorSplit {
+    let mut split = ValidatorSplit {
+        registered: validators.len(),
+        active: 0,
+        zero_stake: 0,
+        total_stake: 0,
+        active_stake: 0,
+    };
+    for (_, stake) in validators {
+        split.total_stake = split.total_stake.saturating_add(*stake);
+        if *stake == 0 {
+            split.zero_stake += 1;
+            continue;
+        }
+        if *stake >= min_active_stake {
+            split.active += 1;
+            split.active_stake = split.active_stake.saturating_add(*stake);
+        }
+    }
+    split
+}
+
+/// Observed attestation rate, in attestations per day, measured from the block
+/// TIMESTAMPS of the first and last attestation this node can see.
+///
+/// Returns `Err(reason)` — never a number — whenever the rate is not
+/// computable. No assumed block time is involved: a nominal 400 ms block time
+/// applied to a chain that has sealed nothing for six days would manufacture a
+/// throughput figure out of a stall.
+///
+/// `n` attestations spanning the window define `n - 1` intervals, so the rate
+/// is `(n - 1) / elapsed_days`. Using `n / elapsed_days` would overstate the
+/// rate by a full interval, which matters most at the low counts real workers
+/// have (2 attestations would read as double the observed rate).
+pub fn attestations_per_day_observed(
+    count: u64,
+    first_ts_ms: Option<u64>,
+    last_ts_ms: Option<u64>,
+) -> Result<f64, &'static str> {
+    if count == 0 {
+        return Err("no attestations for this address are visible from this node");
+    }
+    if count < 2 {
+        return Err("a single attestation defines no interval; a rate needs at least two");
+    }
+    let (Some(first), Some(last)) = (first_ts_ms, last_ts_ms) else {
+        return Err("block timestamps for the observed window are not retained by this node \
+                    (non-archive nodes prune old blocks)");
+    };
+    if first == 0 || last == 0 {
+        return Err("a block in the observed window carries a zero timestamp");
+    }
+    if last <= first {
+        return Err("first and last attestation fall in the same instant; no elapsed time to \
+                    divide by");
+    }
+    let elapsed_ms = (last - first) as f64;
+    Ok((count - 1) as f64 * 86_400_000.0 / elapsed_ms)
+}
+
+/// The most recent block actually PRESENT in this node's block store.
+///
+/// Not the same as `get_block(state.height())`, and the difference is not
+/// theoretical: on a chain sealing blocks every ~100 ms, the height counter
+/// advances before the block body is inserted, so a direct lookup at `height()`
+/// misses most of the time. A producing node then reports no block hash, no
+/// block timestamp and a null age — i.e. it looks exactly like a stalled one,
+/// which is the single distinction `/network/info` exists to make. Non-archive
+/// pruning can also leave the newest retained block below `height()`.
+///
+/// Scans back at most `SELF_PRODUCED_SCAN_BLOCKS` and returns the first block
+/// found, so the reported height/hash/timestamp always describe a real block.
+fn latest_available_block(node: &NodeState) -> Option<Block> {
+    let h = node.state.height();
+    let floor = h.saturating_sub(SELF_PRODUCED_SCAN_BLOCKS);
+    let mut i = h;
+    loop {
+        if let Some(b) = node.state.get_block(i) {
+            return Some(b);
+        }
+        if i == 0 || i <= floor {
+            return None;
+        }
+        i -= 1;
+    }
+}
+
+/// Wall-clock unix milliseconds, for display-only age math. Never consensus
+/// input: nothing derived from this reaches a block, a hash or a vote.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Age in seconds of a unix-millis timestamp, saturating at zero. `None` when
+/// the timestamp is zero (absent) or lies in the future by more than a second
+/// — a negative age is a clock disagreement, not an age.
+fn age_secs_from_ms(ts_ms: u64) -> Option<u64> {
+    if ts_ms == 0 {
+        return None;
+    }
+    let now = now_unix_ms();
+    if ts_ms > now.saturating_add(1_000) {
+        return None;
+    }
+    Some(now.saturating_sub(ts_ms) / 1_000)
 }
 
 /// Capacity of the community work mpsc. Each slot is a single whole-prompt
@@ -742,8 +1005,13 @@ pub async fn serve(
     // compute_threads: dedicated inference-pool width; 0 = rayon's global pool.
     seed_rpc_addrs: Vec<String>,
     compute_threads: usize,
+    // chain_identity: the genesis file's declared chain name / chain_id, when
+    //   the node was started with --genesis. Surfaced by GET /network/info so
+    //   the desktop never has to guess which chain it is talking to.
+    chain_identity: Option<ChainIdentity>,
 ) -> anyhow::Result<()> {
     let mut node = build_node_state(state, mempool, validator_address, validator_keypair, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
+    node.chain_identity = chain_identity;
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
     }
@@ -908,6 +1176,10 @@ pub async fn serve(
         // rebuilds it live, which is how an operator "adds two cores"
         // mid-demo without restarting the node.
         .route("/node/threads", get(get_node_threads).post(set_node_threads))
+        // Additive honest-projection routes (v0.7.11+). Absent on every live
+        // seed (v0.7.2 / v0.7.9) — clients must treat 404 as "unknown".
+        .route("/network/info", get(network_info))
+        .route("/node/contribution", get(node_contribution))
         .route("/block/latest", get(get_latest_block))
         .route("/block/{height}", get(get_block))
         .route("/account/{address}", get(get_account))
@@ -986,6 +1258,7 @@ pub async fn serve(
         .route("/inference/verification_status", get(inference_verification_status))
         // Revenue split info
         .route("/economics/revenue_split", get(get_revenue_split))
+        .route("/economics/rewards", get(economics_rewards))
         // Milestone C: read-only registry + demand discovery. Workers use
         // these to discover what models exist and what ranges are open
         // for the taking. Writes go through /tx/submit_signed like any
@@ -4245,10 +4518,10 @@ async fn inference_run(
         .min(4096) as u32; // Cap at 4K tokens to prevent resource exhaustion
     let bond = req.get("bond")
         .and_then(|v| v.as_u64())
-        .unwrap_or(1000);
+        .unwrap_or(DEFAULT_ATTESTATION_BOND);
     let challenge_period = req.get("challenge_period")
         .and_then(|v| v.as_u64())
-        .unwrap_or(100);
+        .unwrap_or(DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS);
     let force_local = req.get("force_local")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
@@ -4579,6 +4852,7 @@ async fn worker_earnings(
 
     let mut count: u64 = 0;
     let mut last_block: Option<u64> = None;
+    let mut first_block: Option<u64> = None;
     let mut last_tx_hash: Option<String> = None;
 
     // Option C (credit the original requester, not the working validator)
@@ -4620,6 +4894,10 @@ async fn worker_earnings(
                 last_block = Some(bh);
                 last_tx_hash = Some(format!("0x{}", hex::encode(entry.key())));
             }
+            // Earliest attestation block, for the observed-window span below.
+            if first_block.map(|cur| bh < cur).unwrap_or(true) {
+                first_block = Some(bh);
+            }
         }
     }
 
@@ -4640,6 +4918,28 @@ async fn worker_earnings(
         .unwrap_or(0);
     let onchain_balance_arc =
         onchain_balance as f64 / arc_types::economics::ARC_BASE_UNITS as f64;
+
+    // ── Observed rate, measured from real block timestamps ────────────────
+    //
+    // Everything a client needs to project a rate, or to know it cannot. The
+    // window is bounded by the first and last attestation THIS NODE can see,
+    // and its length is read from those blocks' own header timestamps — no
+    // nominal block time is assumed anywhere. That matters concretely: at a
+    // notional 400 ms/block, four of the six live seeds would report brisk
+    // throughput across a window in which they sealed nothing for six days.
+    let block_ts = |h: Option<u64>| -> Option<u64> {
+        h.and_then(|h| node.state.get_block(h))
+            .map(|b| b.header.timestamp)
+            .filter(|t| *t != 0)
+    };
+    let first_ts = block_ts(first_block);
+    let last_ts = block_ts(last_block);
+    let blocks_observed = match (first_block, last_block) {
+        // Inclusive span: a single attestation spans one block, not zero.
+        (Some(f), Some(l)) if l >= f => Some(l - f + 1),
+        _ => None,
+    };
+    let rate = attestations_per_day_observed(count, first_ts, last_ts);
 
     // "Today" is null, not invented.
     //
@@ -4672,8 +4972,38 @@ async fn worker_earnings(
             "per-attestation timestamps are not exposed by this endpoint yet \
              (needs a block_height -> block timestamp join)",
         "reward_per_attestation_arc": REWARD_PER_ATTESTATION_ARC,
+        // Base units too, so a client can do the whole projection in integers
+        // and never round. Same constant arc-state credits on apply.
+        "reward_per_attestation_base": arc_types::economics::INFERENCE_ATTESTATION_REWARD,
         "last_attestation_block": last_block,
         "last_attestation_tx_hash": last_tx_hash,
+        // ── Observed window + rate (v0.7.11+, additive) ───────────────────
+        "first_attestation_block": first_block,
+        "blocks_observed": blocks_observed,
+        "blocks_observed_unavailable_reason": if blocks_observed.is_none() {
+            Value::String(
+                "no attestation for this address has a receipt in this node's index, so there \
+                 is no observed block window"
+                    .to_string(),
+            )
+        } else {
+            Value::Null
+        },
+        "observed_window_first_timestamp_ms": first_ts,
+        "observed_window_last_timestamp_ms": last_ts,
+        "attestations_per_day_observed": rate.as_ref().ok().copied(),
+        "attestations_per_day_unavailable_reason": match rate.as_ref() {
+            Ok(_) => Value::Null,
+            Err(reason) => Value::String((*reason).to_string()),
+        },
+        "attestations_per_day_formula": "(total_attestations - 1) * 86400000 / \
+             (observed_window_last_timestamp_ms - observed_window_first_timestamp_ms) — measured \
+             from real block header timestamps, with no assumed block time. n attestations \
+             define n-1 intervals; dividing by n would overstate the rate by one interval.",
+        "attestations_per_day_caveat": "an OBSERVED backward-looking rate over this node's \
+             retained window, not a forecast. It says nothing about future work available, and \
+             any projection built on it must also respect /economics/rewards.rewards_remaining \
+             — the treasury funding these rewards is finite.",
         // Be explicit that this is a scan of an in-memory, pruned map: on a
         // non-archive node `full_transactions` only retains the last ~1000
         // blocks and is empty after a restart, so a zero here means "not
@@ -5197,6 +5527,11 @@ async fn inference_forward_shard(
         (status, format!("{} ({})", e, e.kind()))
     })?;
     let compute_ms = t0.elapsed().as_millis() as u64;
+    // Keep this node's own measurement. This is the only place the node
+    // observes its OWN compute cost for a shard hop (everything in
+    // `latency_stats` is a round trip to somebody else), so it is what
+    // /node/contribution reports as mean/p50.
+    record_own_compute_ms(&node, compute_ms);
 
     // Optionally evict cache after the last token
     if req.last_token {
@@ -6585,8 +6920,8 @@ async fn inference_run_sharded(
         model_id_hash,
         input_hash,
         output_hash,
-        1000,
-        100,
+        DEFAULT_ATTESTATION_BOND,
+        DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS,
     )
     .await;
     let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
@@ -8844,6 +9179,532 @@ async fn inference_auto(
 
 /// GET /node/threads
 /// Report the width of the pool that runs local inference compute.
+// ---------------------------------------------------------------------------
+// Honest projection endpoints (v0.7.11+)
+//
+// Three additive read-only endpoints so a client never has to hardcode a
+// reward, guess a network, or invent a rate:
+//   GET /economics/rewards    — reward rate + the finite treasury behind it
+//   GET /network/info         — which chain, and whether it is actually alive
+//   GET /node/contribution    — what this node contributes, measured
+//
+// ⚠ CLIENTS MUST DEGRADE ON 404. No host on the live testnet serves these:
+// NYC runs v0.7.2 and the other five run v0.7.9, both predating this code, so
+// all three routes answer `404 Not Found` there. A 404 means "this node is too
+// old to tell you", which is NOT the same as a zero, an empty set, or a
+// stalled chain — a client that renders 0 ARC or "not producing" on a 404 is
+// reporting a fact it does not have.
+// ---------------------------------------------------------------------------
+
+/// Everything needed to project attestation earnings without inventing a
+/// number.
+///
+/// GET /economics/rewards
+///
+/// The reward rate comes from `arc_types::economics::INFERENCE_ATTESTATION_REWARD`,
+/// the same base-unit constant `arc-state` credits when an attestation
+/// applies, so the projected rate and the paid rate cannot drift.
+///
+/// `rewards_remaining` is the field that makes a projection honest. The reward
+/// is a pure TRANSFER from the treasury (`faucet_pool_address()`), bounded by
+/// its balance and never minted, so the pool is finite and exhaustible: at
+/// 2.5 ARC a shot, a treasury holding 1000 ARC funds exactly 400 more
+/// attestations and then pays zero. Any "ARC per day" figure that omits this
+/// term is describing an emission the chain does not have.
+///
+/// ⚠ Live v0.7.2 (NYC) and v0.7.9 (LAX/AMS/LHR/NRT/SGP) seeds do not have
+/// this route and return 404. Treat that as "reward rate unknown from this
+/// host", not as zero — clients that need a rate from an old seed can read
+/// `reward_per_attestation_arc` from `/worker/earnings/{address}`, which those
+/// versions do serve.
+async fn economics_rewards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let reward_base = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+    let base_units = arc_types::economics::ARC_BASE_UNITS;
+    let treasury_addr = arc_types::transaction::faucet_pool_address();
+
+    // The treasury account may be absent from this node's state entirely (a
+    // fresh data dir, or a snapshot that never included it). Absent is not
+    // zero: zero means "the pool is empty and rewards will stop", absent means
+    // "this node cannot see the pool". They must not render the same.
+    let treasury = node.state.get_account(&treasury_addr);
+    let treasury_balance = treasury.as_ref().map(|a| a.balance);
+    let remaining = treasury_balance.and_then(|bal| rewards_remaining(bal, reward_base));
+
+    Json(json!({
+        // ── Reward rate (from the shared on-chain constant, never a literal) ──
+        "reward_per_attestation_base": reward_base,
+        "reward_per_attestation_arc": REWARD_PER_ATTESTATION_ARC,
+        "arc_base_units": base_units,
+        "reward_source": "arc_types::economics::INFERENCE_ATTESTATION_REWARD — the same \
+                          base-unit constant arc-state credits when an InferenceAttestation \
+                          applies",
+
+        // ── The finite pool behind that rate ──────────────────────────────
+        "treasury_address": format!("0x{}", hex::encode(treasury_addr.0)),
+        "treasury_balance_base": treasury_balance,
+        "treasury_balance_arc": treasury_balance.map(|b| b as f64 / base_units as f64),
+        "treasury_balance_unavailable_reason": if treasury_balance.is_none() {
+            Value::String(
+                "the treasury account (faucet_pool_address) is not present in this node's \
+                 state; absent is not the same as empty"
+                    .to_string(),
+            )
+        } else {
+            Value::Null
+        },
+        "rewards_remaining": remaining,
+        "rewards_remaining_unavailable_reason": match (treasury_balance, remaining) {
+            (None, _) => Value::String(
+                "treasury balance unknown on this node, so the remaining count cannot be \
+                 divided out"
+                    .to_string(),
+            ),
+            (Some(_), None) => Value::String(
+                "reward_per_attestation_base is zero on this build; the quotient is undefined"
+                    .to_string(),
+            ),
+            _ => Value::Null,
+        },
+        "rewards_remaining_formula": "floor(treasury_balance_base / reward_per_attestation_base)",
+        // arc-state credits min(reward, treasury_balance), so after the last
+        // FULL reward one more attestation can still collect whatever is left.
+        // Reporting only the floor would quietly drop that tail.
+        "treasury_partial_remainder_base": match treasury_balance {
+            Some(bal) if reward_base > 0 => Value::from(bal % reward_base),
+            _ => Value::Null,
+        },
+        "rewards_remaining_note": "counts FULL rewards only. arc-state pays \
+             min(reward_per_attestation_base, treasury_balance_base), so once the full rewards \
+             are gone one further attestation collects treasury_partial_remainder_base and \
+             every attestation after that earns zero — the attestation itself still applies \
+             successfully.",
+        "treasury_is_finite": true,
+
+        // ── Bond, so net-per-attestation is derivable ─────────────────────
+        "bond_per_attestation_base": DEFAULT_ATTESTATION_BOND,
+        "bond_per_attestation_arc": DEFAULT_ATTESTATION_BOND as f64 / base_units as f64,
+        "challenge_period_blocks": DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS,
+        "bond_refunded_after_challenge_period": true,
+        // Both derived from the two named constants above, nothing else:
+        //   while locked  = reward − bond   (bond sits in escrow)
+        //   after release = reward          (escrow refunds the bond in full)
+        "net_per_attestation_while_bond_locked_base": reward_base.saturating_sub(DEFAULT_ATTESTATION_BOND),
+        "net_per_attestation_after_bond_release_base": reward_base,
+        "bond_note": "the bond is locked in a deterministic escrow keyed by \
+                      BLAKE3(\"arc-inference\" || attestation_hash) and refunded in full by \
+                      the maturation sweep challenge_period blocks later; it is collateral, \
+                      not a fee. A client overriding `bond` on /inference/run changes these \
+                      figures.",
+
+        // ── Where the money comes from (so no UI can imply revenue) ───────
+        "funding": "testnet treasury transfer, not customer revenue",
+        "funding_detail": "each reward is a pure transfer out of a prefunded testnet treasury \
+                           account, bounded by its balance and never minted. No customer pays \
+                           for these attestations, no fee revenue backs them, and total supply \
+                           is conserved. When the treasury empties, the reward silently \
+                           becomes zero — the attestation still applies.",
+        "is_emission": false,
+        "is_revenue_share": false,
+
+        "height": node.state.height(),
+        "unavailable_on_seeds_note": "live v0.7.2 / v0.7.9 seeds return 404 for this route",
+    }))
+}
+
+/// Which chain this is, and whether it is actually alive.
+///
+/// GET /network/info
+///
+/// Three things the desktop could not previously know, each of which has
+/// burned someone on the live network:
+///
+/// 1. **Which network.** `network` and `chain_id` are the genesis file's
+///    declared values, verbatim. A node started without `--genesis` reports
+///    both as null with a reason — its genesis HASH still identifies the chain
+///    it is on, and that is reported unconditionally. Nothing here says
+///    "mainnet" unless a genesis file literally declared it; `declares_mainnet`
+///    is a string fact about that name, not a judgement.
+///
+/// 2. **Whether blocks are being sealed.** `/health` answers `"ok"` on all six
+///    seeds, but four of them have not sealed a block in ~6 days: DAG rounds
+///    keep advancing, so the liveness signal `/health` reports is not block
+///    production. `is_block_producing` and `last_block_age_secs` let a client
+///    say "this node last sealed a block 6 days ago" instead of "healthy".
+///
+/// 3. **How many validators actually count.** `validators_registered` is the
+///    raw set length that `/validators` and `/health` report;
+///    `validators_active` excludes zero-stake peers. Four of fourteen live
+///    validators carry stake 0 and inflate every count derived from the length.
+///
+/// ⚠ Live v0.7.2 / v0.7.9 seeds return 404 here. On a 404 a client knows
+/// nothing about liveness — it must NOT render "not producing", which is a
+/// different and much stronger claim. Fall back to reading
+/// `/block/latest`.`header.timestamp` for age, which every seed serves.
+async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let height = node.state.height();
+    // The newest block that actually EXISTS here — see
+    // `latest_available_block`: looking up `height()` directly reports a
+    // producing node as blockless.
+    let latest = latest_available_block(&node);
+    let genesis = node.state.get_block(0);
+
+    // Declared identity (genesis file), or null + reason.
+    let (network, chain_id) = match node.chain_identity.as_ref() {
+        Some(id) => (
+            Value::String(id.name.clone()),
+            Value::String(id.chain_id.clone()),
+        ),
+        None => (Value::Null, Value::Null),
+    };
+    let identity_missing_reason = "this node was started without --genesis, so it has no \
+                                   declared chain name or chain_id; genesis_hash still \
+                                   identifies the chain it is running";
+    // A pure string fact about the declared name — not an inference about what
+    // kind of network this is.
+    let declares_mainnet = node
+        .chain_identity
+        .as_ref()
+        .map(|id| id.name.to_ascii_lowercase().contains("mainnet"));
+
+    // Block liveness. `last_block_age_secs` uses the latest block's own header
+    // timestamp (unix millis, display-only), so a stalled chain reads as
+    // stalled instead of as healthy.
+    let last_block_ts = latest.as_ref().map(|b| b.header.timestamp).unwrap_or(0);
+    let last_block_age = age_secs_from_ms(last_block_ts);
+    let chain_advancing = last_block_age.map(|age| age <= BLOCK_PRODUCTION_FRESH_SECS);
+
+    // Has THIS node sealed one of the recent blocks? Bounded backward scan for
+    // a block whose producer is this validator address.
+    let mut self_produced: Option<(u64, u64)> = None;
+    let floor = height.saturating_sub(SELF_PRODUCED_SCAN_BLOCKS);
+    let mut h = height;
+    while h > floor {
+        if let Some(b) = node.state.get_block(h) {
+            if b.header.producer == node.validator_address {
+                self_produced = Some((b.header.height, b.header.timestamp));
+                break;
+            }
+        }
+        h -= 1;
+    }
+    let self_produced_age = self_produced.and_then(|(_, ts)| age_secs_from_ms(ts));
+    // "Producing" = this node sealed a block, recently. Both halves matter: a
+    // node that sealed block 5 a week ago is not producing, and a node watching
+    // someone else's fresh blocks is not producing either.
+    let is_block_producing = self_produced_age
+        .map(|age| age <= BLOCK_PRODUCTION_FRESH_SECS)
+        .unwrap_or(false);
+
+    let vals = node.dag_validators.read().clone();
+    let split = split_validators(&vals, arc_consensus::STAKE_SPARK);
+
+    let protocol_version = latest
+        .as_ref()
+        .or(genesis.as_ref())
+        .map(|b| {
+            let pv = &b.header.protocol_version;
+            format!("{}.{}.{}", pv.major, pv.minor, pv.patch)
+        });
+
+    Json(json!({
+        // ── Identity ──────────────────────────────────────────────────────
+        "network": network,
+        "chain_id": chain_id,
+        "network_source": if node.chain_identity.is_some() {
+            Value::String("genesis file chain.name / chain.chain_id".to_string())
+        } else {
+            Value::Null
+        },
+        "network_unavailable_reason": if node.chain_identity.is_none() {
+            Value::String(identity_missing_reason.to_string())
+        } else {
+            Value::Null
+        },
+        "chain_id_unavailable_reason": if node.chain_identity.is_none() {
+            Value::String(identity_missing_reason.to_string())
+        } else {
+            Value::Null
+        },
+        "declares_mainnet": declares_mainnet,
+        "declares_mainnet_note": "true only when a genesis file's chain.name literally contains \
+                                  \"mainnet\". null means no genesis was supplied to this node, \
+                                  so nothing has declared anything — do not render either as a \
+                                  network kind.",
+        "genesis_hash": genesis
+            .as_ref()
+            .map(|b| format!("0x{}", hex::encode(b.hash.0))),
+        "genesis_timestamp_ms": genesis.as_ref().map(|b| b.header.timestamp),
+        "genesis_unavailable_reason": if genesis.is_none() {
+            Value::String("block 0 is not present in this node's block store".to_string())
+        } else {
+            Value::Null
+        },
+        "protocol_version": protocol_version,
+        "protocol_version_source": if latest.is_some() {
+            "latest block header"
+        } else if genesis.is_some() {
+            "genesis block header"
+        } else {
+            "unknown"
+        },
+        "node_version": env!("CARGO_PKG_VERSION"),
+
+        // ── Liveness ──────────────────────────────────────────────────────
+        "height": height,
+        "last_block_height": latest.as_ref().map(|b| b.header.height),
+        "last_block_hash": latest.as_ref().map(|b| format!("0x{}", hex::encode(b.hash.0))),
+        "last_block_timestamp_ms": latest.as_ref().map(|b| b.header.timestamp),
+        "last_block_age_secs": last_block_age,
+        // How far the newest RETAINED block trails the height counter. Nonzero
+        // is normal on a fast chain (the counter moves before the body lands)
+        // and large means pruning; either way the fields above describe a real
+        // block, not the counter.
+        "blocks_behind_height": latest
+            .as_ref()
+            .map(|b| height.saturating_sub(b.header.height)),
+        "last_block_age_unavailable_reason": if last_block_age.is_none() {
+            Value::String(
+                "no block above genesis is retained here, or its header timestamp is zero / \
+                 ahead of this host's clock"
+                    .to_string(),
+            )
+        } else {
+            Value::Null
+        },
+        "chain_advancing": chain_advancing,
+        "is_block_producing": is_block_producing,
+        "is_block_producing_basis": format!(
+            "true only when a block sealed by this node's own validator address appears within \
+             the last {} blocks AND is under {}s old. Watching someone else's fresh blocks is \
+             not producing, and a stale self-produced block is not producing.",
+            SELF_PRODUCED_SCAN_BLOCKS, BLOCK_PRODUCTION_FRESH_SECS
+        ),
+        "last_self_produced_block": self_produced.map(|(h, _)| h),
+        "last_self_produced_age_secs": self_produced_age,
+        "last_self_produced_unavailable_reason": if self_produced.is_none() {
+            Value::String(format!(
+                "no block in the last {} retained blocks was sealed by this node's validator \
+                 address (an observer never seals any)",
+                SELF_PRODUCED_SCAN_BLOCKS
+            ))
+        } else {
+            Value::Null
+        },
+        "block_production_fresh_secs": BLOCK_PRODUCTION_FRESH_SECS,
+        "self_produced_scan_blocks": SELF_PRODUCED_SCAN_BLOCKS,
+        "dag_round": node.dag_round.load(Ordering::Relaxed),
+        "dag_committed": node.dag_committed.load(Ordering::Relaxed),
+        "liveness_note": "DAG rounds advance even while no block is sealed, which is why \
+                          /health reports ok on seeds that have produced nothing for days. \
+                          Use is_block_producing / last_block_age_secs, not /health.",
+
+        // ── Validator set: active vs merely registered ─────────────────────
+        "validators_registered": split.registered,
+        "validators_active": split.active,
+        "validators_zero_stake": split.zero_stake,
+        "min_active_stake": arc_consensus::STAKE_SPARK,
+        "total_stake": split.total_stake,
+        "active_stake": split.active_stake,
+        "validator_source": "this node's live DAG validator set (the same set /validators and \
+                             /health count); registered is the raw length, active requires \
+                             stake >= min_active_stake",
+
+        "unavailable_on_seeds_note": "live v0.7.2 / v0.7.9 seeds return 404 for this route",
+    }))
+}
+
+/// What this node is contributing right now, measured.
+///
+/// GET /node/contribution
+///
+/// The honest basis for a Settings slider that claims "more cores → more
+/// throughput": thread width against `available_parallelism`, the shard ranges
+/// actually held, whether a model is loaded at all, real work counters, and
+/// this node's own measured per-hop compute time.
+///
+/// Deliberately absent: any ARC-per-core or earnings-per-thread figure. The
+/// node has no measurement that would support one — attestation rewards are a
+/// flat per-attestation transfer that does not scale with core count, and
+/// nothing here observes a causal link between threads and attestations
+/// earned. A UI wanting to explain the benefit should say what widening the
+/// pool measurably does (more parallel work inside each hop, visible as
+/// `own_compute_ms`) rather than quote income.
+///
+/// ⚠ Live v0.7.2 / v0.7.9 seeds return 404 here. `/node/threads` exists on
+/// newer seeds and covers the thread fields alone.
+async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let dedicated = node.compute_threads.load(Ordering::Relaxed);
+    let threads_in_use = if dedicated > 0 {
+        dedicated as usize
+    } else {
+        rayon_global_width()
+    };
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+
+    // Shard ranges held by this node, and their total layer count.
+    let ranges: Vec<Value> = node
+        .shard_infos
+        .iter()
+        .map(|s| {
+            json!({
+                "start_layer": s.start_layer,
+                "end_layer": s.end_layer,
+                "layers": s.end_layer.saturating_sub(s.start_layer),
+                "total_layers": s.total_layers,
+                "model_id": s.model_id,
+                "model_name": s.model_name,
+                "memory_mb": s.memory_mb,
+                "full_model_mb": s.full_model_mb,
+                "node_name": s.node_name,
+                "socket_addr": s.socket_addr,
+            })
+        })
+        .collect();
+    // Layers held, counted as a UNION of the held ranges rather than a sum of
+    // their spans. Summing overlapping replica spans is exactly the bug that
+    // makes /models report 96 layers of a 32-layer model.
+    let mut covered: Vec<(usize, usize)> = node
+        .shard_infos
+        .iter()
+        .map(|s| (s.start_layer, s.end_layer))
+        .collect();
+    covered.sort_unstable();
+    let mut layers_held = 0usize;
+    let mut cursor = 0usize;
+    for (start, end) in covered {
+        let from = start.max(cursor);
+        if end > from {
+            layers_held += end - from;
+            cursor = end;
+        }
+    }
+    let total_layers = node.shard_infos.first().map(|s| s.total_layers);
+
+    // Own measured hop compute. Real samples from this node's own
+    // forward_shard handler; null with a reason when it has served none.
+    let samples: Vec<u64> = node.own_compute_ms.lock().iter().copied().collect();
+    let own_mean = mean_u64(&samples);
+    let own_p50 = p50_u64(&samples);
+
+    // This node's own entry in the latency table, if one exists. Usually
+    // absent: the table records round trips to OTHER replicas.
+    let own_sockets: std::collections::HashSet<&str> = node
+        .shard_infos
+        .iter()
+        .map(|s| s.socket_addr.as_str())
+        .collect();
+    let latency_self = node
+        .latency_stats
+        .iter()
+        .find(|kv| own_sockets.contains(kv.key().as_str()))
+        .map(|kv| {
+            let stat = kv.value();
+            json!({
+                "socket": kv.key(),
+                "ewma_ms": (stat.ms * 100.0).round() / 100.0,
+                "samples": stat.count,
+                "age_secs": stat.last_updated.elapsed().as_secs(),
+                "source": if stat.probe_only { "probe" } else { "hop" },
+            })
+        });
+
+    Json(json!({
+        // ── Compute offered ───────────────────────────────────────────────
+        "threads": {
+            "in_use": threads_in_use,
+            "dedicated_pool": dedicated > 0,
+            "dedicated_threads": dedicated,
+            "rayon_global_threads": rayon_global_width(),
+            "rayon_num_threads_env": std::env::var("RAYON_NUM_THREADS").ok(),
+            "available_parallelism": available,
+            "fraction_of_available": if available > 0 {
+                Value::from((threads_in_use as f64 / available as f64 * 1000.0).round() / 1000.0)
+            } else {
+                Value::Null
+            },
+            "available_parallelism_unavailable_reason": if available == 0 {
+                Value::String(
+                    "std::thread::available_parallelism() failed on this platform".to_string(),
+                )
+            } else {
+                Value::Null
+            },
+        },
+
+        // ── Model slice held ──────────────────────────────────────────────
+        "shards": {
+            "holds_shards": !node.shard_infos.is_empty(),
+            "range_count": node.shard_infos.len(),
+            "ranges": ranges,
+            "layers_held": layers_held,
+            "total_layers": total_layers,
+            "layers_held_note": "union of the held ranges, not a sum of their spans, so \
+                                 overlapping replicas cannot exceed total_layers",
+            "coverage_fraction": match total_layers {
+                Some(t) if t > 0 => Value::from(
+                    (layers_held as f64 / t as f64 * 1000.0).round() / 1000.0,
+                ),
+                _ => Value::Null,
+            },
+        },
+        "model": {
+            "int8_engine_loaded": node.inference_model.is_some(),
+            "candle_engine_loaded": node.candle_engine.is_some(),
+            "any_model_loaded": node.inference_model.is_some() || node.candle_engine.is_some(),
+            "candle_model_id": node
+                .candle_model_id
+                .map(|h| format!("0x{}", hex::encode(h.0))),
+        },
+
+        // ── Work actually done since boot ─────────────────────────────────
+        "sharded_runs_total": node.sharded_runs_total.load(Ordering::Relaxed),
+        "sharded_cache_hits": node.sharded_cache_hits.load(Ordering::Relaxed),
+        "sharded_bytes_total": node.sharded_bytes_total.load(Ordering::Relaxed),
+        "counters_note": "in-memory and reset by a restart; cache hits are counted separately \
+                          from runs because a hit performs no pipeline walk",
+
+        // ── This node's own measured hop compute ──────────────────────────
+        "own_compute_ms": {
+            "samples": samples.len(),
+            "mean_ms": own_mean.map(|m| (m * 100.0).round() / 100.0),
+            "p50_ms": own_p50,
+            "unavailable_reason": if samples.is_empty() {
+                Value::String(
+                    "this node has served no forward_shard hop since boot, so it has no \
+                     measurement of its own compute time"
+                        .to_string(),
+                )
+            } else {
+                Value::Null
+            },
+            "sample_cap": OWN_COMPUTE_SAMPLE_CAP,
+            "source": "wall time of this node's own forward_shard forward pass, one sample per \
+                       hop served, newest-capped ring",
+        },
+        "latency_self": latency_self,
+        "latency_self_unavailable_reason": if latency_self.is_none() {
+            Value::String(
+                "the latency table holds round trips to OTHER replicas; it has no entry for \
+                 this node's own socket unless this node dialled itself"
+                    .to_string(),
+            )
+        } else {
+            Value::Null
+        },
+
+        "earnings_per_core": Value::Null,
+        "earnings_per_core_unavailable_reason": "not measurable: the attestation reward is a \
+            flat per-attestation transfer that does not scale with core count, and this node \
+            observes no causal link between thread width and attestations earned. Widening the \
+            pool measurably speeds up each hop (own_compute_ms) — it does not measurably \
+            increase income.",
+        "uptime_secs": node.boot_time.elapsed().as_secs(),
+        "unavailable_on_seeds_note": "live v0.7.2 / v0.7.9 seeds return 404 for this route",
+    }))
+}
+
 async fn get_node_threads(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let dedicated = node.compute_threads.load(Ordering::Relaxed);
     Json(json!({
@@ -9135,6 +9996,10 @@ mod tests {
             compute_threads: Arc::new(AtomicU32::new(0)),
             seed_rpc_addrs: Arc::new(Vec::new()),
             last_registry_bootstrap: Arc::new(Mutex::new(None)),
+            chain_identity: None,
+            own_compute_ms: Arc::new(parking_lot::Mutex::new(
+                std::collections::VecDeque::new(),
+            )),
         }
     }
 
@@ -9820,5 +10685,267 @@ mod tests {
     fn compute_pool_rejects_absurd_widths() {
         let node = fake_node_with_workers(vec![]);
         assert!(set_compute_threads(&node, 100_000).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for the honest-projection math (v0.7.11+)
+//
+// Every assertion here targets a way a projection can lie: a finite pool
+// treated as infinite, a validator count inflated by peers with nothing at
+// stake, or a rate manufactured from a window too small to measure one.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use arc_types::economics::{ARC_BASE_UNITS, INFERENCE_ATTESTATION_REWARD};
+
+    fn addr(n: u8) -> Hash256 {
+        let mut b = [0u8; 32];
+        b[0] = n;
+        Hash256(b)
+    }
+
+    // ── Reward / treasury math ────────────────────────────────────────────
+
+    #[test]
+    fn reward_constant_is_the_shared_one_not_a_literal() {
+        // /economics/rewards and /worker/earnings must both quote the constant
+        // arc-state actually credits. If someone re-hardcodes 2.5 anywhere,
+        // this catches the drift.
+        assert_eq!(INFERENCE_ATTESTATION_REWARD, 2_500_000_000);
+        assert!(
+            (REWARD_PER_ATTESTATION_ARC
+                - INFERENCE_ATTESTATION_REWARD as f64 / ARC_BASE_UNITS as f64)
+                .abs()
+                < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn rewards_remaining_divides_the_finite_treasury() {
+        // The genesis faucet pool holds 1000 ARC → exactly 400 more rewards.
+        let treasury = 1_000 * ARC_BASE_UNITS;
+        assert_eq!(
+            rewards_remaining(treasury, INFERENCE_ATTESTATION_REWARD),
+            Some(400)
+        );
+    }
+
+    #[test]
+    fn rewards_remaining_is_zero_when_treasury_is_empty() {
+        // An empty pool funds nothing. This is the case a naive "count × 2.5
+        // ARC forever" projection gets wrong.
+        assert_eq!(rewards_remaining(0, INFERENCE_ATTESTATION_REWARD), Some(0));
+    }
+
+    #[test]
+    fn rewards_remaining_is_zero_when_treasury_holds_less_than_one_reward() {
+        // 2.4999... ARC cannot pay a 2.5 ARC reward. Floor division must not
+        // round up to 1, and the attestation still applies — the attester just
+        // receives min(reward, treasury_balance), i.e. less than the rate.
+        let almost = INFERENCE_ATTESTATION_REWARD - 1;
+        assert_eq!(
+            rewards_remaining(almost, INFERENCE_ATTESTATION_REWARD),
+            Some(0)
+        );
+        // Exactly one reward funds exactly one.
+        assert_eq!(
+            rewards_remaining(INFERENCE_ATTESTATION_REWARD, INFERENCE_ATTESTATION_REWARD),
+            Some(1)
+        );
+        // One base unit short of two rewards funds one, not two.
+        assert_eq!(
+            rewards_remaining(
+                INFERENCE_ATTESTATION_REWARD * 2 - 1,
+                INFERENCE_ATTESTATION_REWARD
+            ),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn rewards_remaining_is_null_when_reward_is_zero() {
+        // Undefined, not infinite — the endpoint reports null plus a reason.
+        assert_eq!(rewards_remaining(1_000_000, 0), None);
+        assert_eq!(rewards_remaining(0, 0), None);
+    }
+
+    #[test]
+    fn net_per_attestation_is_positive_after_bond_release() {
+        // The bond is collateral, not a fee: net while locked is reward−bond,
+        // net after release is the full reward. Both must stay positive or the
+        // "earnings" story is inverted.
+        assert!(DEFAULT_ATTESTATION_BOND < INFERENCE_ATTESTATION_REWARD);
+        assert_eq!(
+            INFERENCE_ATTESTATION_REWARD.saturating_sub(DEFAULT_ATTESTATION_BOND),
+            2_499_999_000
+        );
+        assert!(DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS > 0);
+    }
+
+    // ── Active vs registered validators ───────────────────────────────────
+
+    #[test]
+    fn validator_split_excludes_zero_stake_peers() {
+        // The live shape: 14 registered, 4 of them carrying stake 0.
+        let mut vals: Vec<(Hash256, u64)> = (0..10)
+            .map(|i| (addr(i), arc_consensus::STAKE_SPARK))
+            .collect();
+        for i in 10..14 {
+            vals.push((addr(i), 0));
+        }
+        let split = split_validators(&vals, arc_consensus::STAKE_SPARK);
+        assert_eq!(split.registered, 14, "registered is the raw set length");
+        assert_eq!(split.active, 10, "zero-stake peers are not active");
+        assert_eq!(split.zero_stake, 4);
+        assert_eq!(split.total_stake, 10 * arc_consensus::STAKE_SPARK);
+        assert_eq!(split.active_stake, split.total_stake);
+    }
+
+    #[test]
+    fn validator_split_respects_the_min_stake_boundary() {
+        let vals = vec![
+            (addr(1), arc_consensus::STAKE_SPARK),     // exactly at min → active
+            (addr(2), arc_consensus::STAKE_SPARK - 1), // one under → not active
+            (addr(3), arc_consensus::STAKE_CORE),      // well over → active
+        ];
+        let split = split_validators(&vals, arc_consensus::STAKE_SPARK);
+        assert_eq!(split.registered, 3);
+        assert_eq!(split.active, 2);
+        assert_eq!(split.zero_stake, 0);
+        assert_eq!(
+            split.active_stake,
+            arc_consensus::STAKE_SPARK + arc_consensus::STAKE_CORE
+        );
+        // Stake below the threshold still counts toward total_stake.
+        assert_eq!(split.total_stake, split.active_stake + arc_consensus::STAKE_SPARK - 1);
+    }
+
+    #[test]
+    fn validator_split_all_zero_stake_reports_no_active_validators() {
+        let vals: Vec<(Hash256, u64)> = (0..6).map(|i| (addr(i), 0)).collect();
+        let split = split_validators(&vals, arc_consensus::STAKE_SPARK);
+        assert_eq!(split.registered, 6);
+        assert_eq!(split.active, 0);
+        assert_eq!(split.zero_stake, 6);
+        assert_eq!(split.total_stake, 0);
+    }
+
+    #[test]
+    fn validator_split_zero_min_still_excludes_zero_stake() {
+        // A validator with nothing at risk secures nothing, even if the
+        // threshold is configured to zero.
+        let vals = vec![(addr(1), 0), (addr(2), 1)];
+        let split = split_validators(&vals, 0);
+        assert_eq!(split.active, 1);
+        assert_eq!(split.zero_stake, 1);
+    }
+
+    #[test]
+    fn validator_split_of_empty_set() {
+        let split = split_validators(&[], arc_consensus::STAKE_SPARK);
+        assert_eq!(split.registered, 0);
+        assert_eq!(split.active, 0);
+        assert_eq!(split.total_stake, 0);
+    }
+
+    // ── Observed rate: the null paths ─────────────────────────────────────
+
+    const DAY_MS: u64 = 86_400_000;
+
+    #[test]
+    fn rate_is_null_with_no_attestations() {
+        let err = attestations_per_day_observed(0, None, None).unwrap_err();
+        assert!(err.contains("no attestations"), "got: {}", err);
+    }
+
+    #[test]
+    fn rate_is_null_with_a_single_attestation() {
+        // One event defines no interval. This is the case the old "12% of
+        // lifetime" fabrication papered over.
+        let err = attestations_per_day_observed(1, Some(1_000), Some(1_000)).unwrap_err();
+        assert!(err.contains("single attestation"), "got: {}", err);
+    }
+
+    #[test]
+    fn rate_is_null_when_block_timestamps_are_pruned() {
+        // Non-archive nodes drop old blocks, so the window's endpoints have no
+        // timestamps. Null plus a reason — never a nominal-block-time guess.
+        let err = attestations_per_day_observed(10, None, Some(DAY_MS)).unwrap_err();
+        assert!(err.contains("not retained"), "got: {}", err);
+        let err = attestations_per_day_observed(10, Some(1), None).unwrap_err();
+        assert!(err.contains("not retained"), "got: {}", err);
+        let err = attestations_per_day_observed(10, None, None).unwrap_err();
+        assert!(err.contains("not retained"), "got: {}", err);
+    }
+
+    #[test]
+    fn rate_is_null_on_zero_or_non_advancing_timestamps() {
+        assert!(attestations_per_day_observed(5, Some(0), Some(DAY_MS)).is_err());
+        assert!(attestations_per_day_observed(5, Some(DAY_MS), Some(0)).is_err());
+        // Same instant → no elapsed time to divide by.
+        let err = attestations_per_day_observed(5, Some(DAY_MS), Some(DAY_MS)).unwrap_err();
+        assert!(err.contains("same instant"), "got: {}", err);
+        // Clock going backwards across the window is not a negative rate.
+        assert!(attestations_per_day_observed(5, Some(2 * DAY_MS), Some(DAY_MS)).is_err());
+    }
+
+    #[test]
+    fn rate_uses_intervals_not_events() {
+        // A real epoch-millis base: 0 is reserved for "absent timestamp".
+        const T0: u64 = 1_700_000_000_000;
+
+        // 3 attestations spanning exactly 2 days = 2 intervals = 1.0/day.
+        // Dividing by the event count instead would report 1.5/day.
+        let rate = attestations_per_day_observed(3, Some(T0), Some(T0 + 2 * DAY_MS)).unwrap();
+        assert!((rate - 1.0).abs() < 1e-9, "got {}", rate);
+
+        // 25 attestations over one day = 24 intervals/day.
+        let rate = attestations_per_day_observed(25, Some(T0), Some(T0 + DAY_MS)).unwrap();
+        assert!((rate - 24.0).abs() < 1e-9, "got {}", rate);
+
+        // Two attestations one hour apart → 24/day, and never an integer-
+        // division zero.
+        let rate = attestations_per_day_observed(2, Some(T0), Some(T0 + DAY_MS / 24)).unwrap();
+        assert!((rate - 24.0).abs() < 1e-9, "got {}", rate);
+    }
+
+    // ── Own-compute statistics ────────────────────────────────────────────
+
+    #[test]
+    fn mean_and_p50_are_null_without_samples() {
+        // An average of no measurements is unknown, not 0 ms.
+        assert_eq!(mean_u64(&[]), None);
+        assert_eq!(p50_u64(&[]), None);
+    }
+
+    #[test]
+    fn p50_returns_a_value_that_was_actually_measured() {
+        assert_eq!(p50_u64(&[5]), Some(5));
+        assert_eq!(p50_u64(&[9, 1, 5]), Some(5));
+        // Even count → lower middle, so the figure is a real sample rather
+        // than an interpolated number nothing measured.
+        assert_eq!(p50_u64(&[10, 20, 30, 40]), Some(20));
+        assert_eq!(mean_u64(&[10, 20, 30, 40]), Some(25.0));
+    }
+
+    #[test]
+    fn own_compute_ring_is_bounded_and_keeps_newest() {
+        let mut ring = std::collections::VecDeque::new();
+        let extra = 50u64;
+        for i in 0..(OWN_COMPUTE_SAMPLE_CAP as u64 + extra) {
+            push_bounded(&mut ring, i, OWN_COMPUTE_SAMPLE_CAP);
+        }
+        assert_eq!(ring.len(), OWN_COMPUTE_SAMPLE_CAP, "ring must stay bounded");
+        assert_eq!(
+            *ring.back().unwrap(),
+            OWN_COMPUTE_SAMPLE_CAP as u64 + extra - 1,
+            "newest sample retained"
+        );
+        assert_eq!(*ring.front().unwrap(), extra, "oldest evicted first");
+        // p50 over a full ring is still a real sample from it.
+        let samples: Vec<u64> = ring.iter().copied().collect();
+        assert!(p50_u64(&samples).map(|v| samples.contains(&v)).unwrap_or(false));
     }
 }
