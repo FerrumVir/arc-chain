@@ -31,7 +31,14 @@ const FAUCET_GLOBAL_RATE_LIMIT: usize = 5000; // 5000 claims/minute - intentiona
 /// chain side: the desktop reads this back via /worker/earnings rather
 /// than hardcoding it client-side, so a future change here surfaces in
 /// every UI without a coordinated frontend release.
-const REWARD_PER_ATTESTATION_ARC: f64 = 2.5;
+///
+/// DERIVED from the single on-chain source of truth
+/// (`arc_types::economics::INFERENCE_ATTESTATION_REWARD`, in base units) so
+/// the number shown here and the value actually credited on-chain when an
+/// attestation is applied can never drift apart. Change the reward by tuning
+/// that one constant.
+const REWARD_PER_ATTESTATION_ARC: f64 = arc_types::economics::INFERENCE_ATTESTATION_REWARD as f64
+    / arc_types::economics::ARC_BASE_UNITS as f64;
 
 /// Shared node state passed to all handlers.
 #[derive(Clone)]
@@ -4484,14 +4491,15 @@ async fn inference_run(
     // once the first attestation applied, state advanced AND the counter
     // advanced and every subsequent tx carried state+2. See
     // `submit_inference_attestation` for the full postmortem.
-    let (tx_hash, attestation_status) = submit_inference_attestation(
+    let (tx_hash, attestation_status) = submit_or_relay_attestation(
         &node,
         model_id_hash,
         input_hash,
         output_hash,
         bond,
         challenge_period,
-    );
+    )
+    .await;
 
     // Store inference result for explorer display
     let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
@@ -4615,7 +4623,23 @@ async fn worker_earnings(
         }
     }
 
-    let total_arc = count as f64 * REWARD_PER_ATTESTATION_ARC;
+    // Count-based figure: attestations seen × the flat reward rate. This is an
+    // ESTIMATE of gross reward and is labeled as such — it scans an in-memory,
+    // pruned map (so it can undercount) and does not net out bonds or spends.
+    let estimated_total_arc = count as f64 * REWARD_PER_ATTESTATION_ARC;
+
+    // Reconciled figure: the address's ACTUAL on-chain balance. Now that the
+    // attestation reward is a real treasury→attester credit (and bonds are
+    // real escrow debits), this reconciles against GET /account/{addr}. It is
+    // the honest "what this address holds" number; prefer it over the
+    // count-based estimate. Base units and whole-ARC are both surfaced.
+    let onchain_balance: u64 = node
+        .state
+        .get_account(&want)
+        .map(|a| a.balance)
+        .unwrap_or(0);
+    let onchain_balance_arc =
+        onchain_balance as f64 / arc_types::economics::ARC_BASE_UNITS as f64;
 
     // "Today" is null, not invented.
     //
@@ -4630,7 +4654,18 @@ async fn worker_earnings(
     Ok(Json(json!({
         "address": format!("0x{}", trimmed),
         "total_attestations": count,
-        "total_arc": total_arc,
+        // On-chain-reconciled balance (preferred, honest figure).
+        "onchain_balance": onchain_balance,
+        "onchain_balance_arc": onchain_balance_arc,
+        // Count-based estimate of gross reward earned (clearly labeled).
+        "estimated_total_arc": estimated_total_arc,
+        "estimated_total_arc_note":
+            "estimate = total_attestations × reward_per_attestation_arc; scans a \
+             pruned in-memory map and does not net out bonds/spends. Prefer \
+             onchain_balance_arc, which reconciles against /account/{addr}.",
+        // Back-compat alias for pre-existing clients; same value as the
+        // estimate above, and NOT the reconciled balance.
+        "total_arc": estimated_total_arc,
         "today_arc": Value::Null,
         "today_attestations": Value::Null,
         "today_unavailable_reason":
@@ -6165,6 +6200,116 @@ fn submit_inference_attestation(
     }
 }
 
+/// Submit the attestation to the chain that can actually mine it.
+///
+/// When `ARC_ATTEST_RELAY` is set (e.g. `http://149.28.32.76:9090`), the
+/// signed attestation is submitted to that host instead of the local
+/// mempool. Two facts make this necessary for observer/coordinator nodes:
+/// the testnet seeds are independent chains (a tx in a local mempool never
+/// reaches them), and an observer never seals blocks, so a locally pooled
+/// attestation would sit pending forever. The nonce is read from the relay
+/// target's account state — the attester address may not exist there, or may
+/// have a different nonce than any local view. Falls back to the local
+/// mempool on any relay failure so the attestation is never silently lost.
+async fn submit_or_relay_attestation(
+    node: &NodeState,
+    model_id: Hash256,
+    input_hash: Hash256,
+    output_hash: Hash256,
+    bond: u64,
+    challenge_period: u64,
+) -> (Hash256, String) {
+    let relay = match std::env::var("ARC_ATTEST_RELAY") {
+        Ok(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
+        _ => {
+            let (h, s) = submit_inference_attestation(
+                node, model_id, input_hash, output_hash, bond, challenge_period,
+            );
+            return (h, s.to_string());
+        }
+    };
+    let Some(kp) = node.validator_keypair.as_ref() else {
+        let (h, s) = submit_inference_attestation(
+            node, model_id, input_hash, output_hash, bond, challenge_period,
+        );
+        return (h, s.to_string());
+    };
+
+    let attester = node.validator_address;
+    let nonce = match node
+        .inference_http
+        .get(format!("{}/account/0x{}", relay, hex::encode(attester.0)))
+        .timeout(std::time::Duration::from_secs(8))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r
+            .json::<serde_json::Value>()
+            .await
+            .ok()
+            .and_then(|v| v.get("nonce").and_then(|n| n.as_u64()))
+            .unwrap_or(0),
+        // 404 = the address has no account on that chain yet: nonce 0.
+        _ => 0,
+    };
+
+    let mut tx = arc_types::Transaction {
+        tx_type: arc_types::TxType::InferenceAttestation,
+        from: attester,
+        nonce,
+        body: arc_types::TxBody::InferenceAttestation(
+            arc_types::transaction::InferenceAttestationBody {
+                model_id,
+                input_hash,
+                output_hash,
+                challenge_period,
+                bond,
+                // Stays None: #[serde(skip)] and the 112-byte v0.7.2 wire
+                // layout depend on it.
+                beneficiary: None,
+            },
+        ),
+        fee: 0,
+        gas_limit: 0,
+        hash: arc_crypto::Hash256::ZERO,
+        signature: arc_crypto::Signature::null(),
+        sig_verified: false,
+    };
+    if tx.sign(kp).is_err() {
+        let (h, s) = submit_inference_attestation(
+            node, model_id, input_hash, output_hash, bond, challenge_period,
+        );
+        return (h, s.to_string());
+    }
+    tx.sig_verified = true;
+    let h = tx.hash;
+
+    let posted = node
+        .inference_http
+        .post(format!("{}/tx/submit_signed", relay))
+        .json(&tx)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await;
+    match posted {
+        Ok(r) if r.status().is_success() => (h, format!("relayed_to {}", relay)),
+        Ok(r) => {
+            tracing::warn!("attestation relay to {} rejected: {}", relay, r.status());
+            let (h2, s) = submit_inference_attestation(
+                node, model_id, input_hash, output_hash, bond, challenge_period,
+            );
+            (h2, format!("{} (relay_rejected {})", s, r.status()))
+        }
+        Err(e) => {
+            tracing::warn!("attestation relay to {} failed: {}", relay, e);
+            let (h2, s) = submit_inference_attestation(
+                node, model_id, input_hash, output_hash, bond, challenge_period,
+            );
+            (h2, format!("{} (relay_unreachable)", s))
+        }
+    }
+}
+
 /// Canonical model identity string + hash for the loaded tokenizer/model.
 fn model_identity(
     model: &arc_inference::cached_integer_model::CachedIntegerModel,
@@ -6435,14 +6580,15 @@ async fn inference_run_sharded(
         },
     );
 
-    let (tx_hash, attestation_status) = submit_inference_attestation(
+    let (tx_hash, attestation_status) = submit_or_relay_attestation(
         &node,
         model_id_hash,
         input_hash,
         output_hash,
         1000,
         100,
-    );
+    )
+    .await;
     let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
 
     node.inference_results.insert(

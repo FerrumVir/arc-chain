@@ -23,7 +23,7 @@ use serde::{Serialize, Deserialize};
 use dashmap::{DashMap, DashSet};
 use parking_lot::RwLock;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -147,6 +147,39 @@ pub const TIER1_STATUS_VOTING: u8 = 1;
 pub const TIER1_STATUS_FINALIZED: u8 = 2;
 pub const TIER1_STATUS_REFUNDED: u8 = 3;
 
+// ── Tier 2 optimistic-attestation escrow encoding ─────────────────────────
+// A Tier 2 attestation bond is locked in a deterministic escrow account keyed
+// by BLAKE3("arc-inference" || attestation_tx_hash). Its balance holds the
+// bond; the other Account fields carry INTERNAL metadata (never wire-
+// serialized tx data) that the maturation sweep needs to refund the bond:
+//
+//   balance      = locked funds (attester bond, plus challenger bond if
+//                  the attestation was challenged)
+//   code_hash    = the original attester's address (refund target)
+//   nonce        = release height (deadline = apply_height + challenge_period);
+//                  the sweep refunds once current_height >= this value
+//   storage_root = [ MAGIC (8 bytes) | STATUS (1 byte) | zero... ]
+//
+// The 8-byte MAGIC lets `rebuild_pending_bond_releases()` re-identify these
+// escrows on restart with ~2^-64 false-positive odds (no collision with the
+// Tier 1 escrows, which key their status off `code_hash[0]`). The STATUS byte
+// distinguishes an OPEN (refundable-after-deadline) escrow from a CHALLENGED
+// one, whose bond stays locked pending dispute resolution.
+//
+// NOTE: this is escrow-account *storage*, not `TxBody`/`Transaction` wire
+// layout — changing it does not touch the v0.7.2 112-byte attestation wire
+// format or the `#[serde(skip)] beneficiary` field.
+const ATTEST_ESCROW_MAGIC: [u8; 8] = *b"ARCATB2\x01";
+pub const ATTEST_STATUS_OPEN: u8 = 0;
+pub const ATTEST_STATUS_CHALLENGED: u8 = 1;
+
+/// Max Tier 2 bonds refunded per block by the maturation sweep. Bounds the
+/// per-block work so a backlog of matured escrows can never stall block
+/// production; any excess is carried to the next block (still in deterministic
+/// order). Community workers attest with `bond == 0` (no escrow is created),
+/// so on the demo path this sweep is a no-op.
+pub const MAX_BOND_RELEASES_PER_BLOCK: usize = 256;
+
 /// Read-only snapshot of a Tier 1 inference request — returned by
 /// `StateDB::tier1_request_snapshot()` so the validator inference task can
 /// pick its next action without holding state locks.
@@ -265,6 +298,13 @@ pub struct StateDB {
     /// `apply_inference_finalize`. The `inference_validator` background task
     /// polls this to discover requests where its address is in the committee.
     pub tier1_pending: DashMap<[u8; 32], u64>,
+    /// Maturation queue for Tier 2 attestation bond escrows:
+    /// `release_height → sorted list of escrow addresses`. Populated when an
+    /// attestation with `bond > 0` is applied; drained deterministically by
+    /// `sweep_matured_bond_releases()` inside `commit_executed_block`. A
+    /// derived, in-memory index with no WAL op of its own — rebuilt on restart
+    /// from the surviving escrow accounts by `rebuild_pending_bond_releases()`.
+    pending_bond_releases: parking_lot::Mutex<BTreeMap<u64, Vec<[u8; 32]>>>,
 }
 
 impl StateDB {
@@ -300,6 +340,7 @@ impl StateDB {
             gpu_cache: None,
             archive_mode: false,
             tier1_pending: DashMap::new(),
+            pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -337,6 +378,7 @@ impl StateDB {
             gpu_cache: None,
             archive_mode: false,
             tier1_pending: DashMap::new(),
+            pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -1082,6 +1124,14 @@ impl StateDB {
         }
 
         // Build Merkle tree from transaction hashes
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
 
@@ -1265,6 +1315,14 @@ impl StateDB {
             .collect();
 
         // Build block (same as sequential path)
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
         let state_root = self.compute_state_root();
@@ -1430,6 +1488,14 @@ impl StateDB {
         }
 
         // Build Merkle tree from transaction hashes
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
 
@@ -1656,6 +1722,14 @@ impl StateDB {
             tracing::warn!(total_gas, limit = gas_costs::BLOCK_GAS_LIMIT, "Block nearing gas limit");
         }
 
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
         let state_root = self.compute_state_root();
@@ -1768,6 +1842,14 @@ impl StateDB {
                 logs: vec![],
             })
             .collect();
+
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -1893,6 +1975,14 @@ impl StateDB {
                 logs: vec![],
             })
             .collect();
+
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
 
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
@@ -4009,7 +4099,14 @@ impl StateDB {
             }
             TxBody::InferenceAttestation(body) => {
                 // --- Tier 2 Optimistic Inference Attestation ---
-                // 1. Verify sender nonce
+                //
+                // Net effect for the attester: +reward (a pure transfer from
+                // the treasury) − bond (into a returnable escrow released after
+                // `challenge_period` by the maturation sweep). With reward
+                // 2.5 ARC and a small/zero bond, on-chain income is visibly
+                // positive and auditable against /account/{addr}.
+
+                // 1. Verify sender nonce.
                 let mut sender = self.get_or_create_account(&tx.from);
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
@@ -4018,7 +4115,11 @@ impl StateDB {
                     });
                 }
 
-                // 2. Verify sender has sufficient balance for bond
+                // 2. Verify sender has sufficient balance for the bond.
+                //    The reward is funded by the treasury, NOT the sender, so it
+                //    does not relax this check: an unfunded worker still gets
+                //    InsufficientBalance and must be faucet-funded before it can
+                //    post a bond — behavior unchanged from before.
                 if sender.balance < body.bond {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -4026,28 +4127,87 @@ impl StateDB {
                     });
                 }
 
-                // 3. Debit bond from sender and increment nonce
-                sender.balance -= body.bond;
+                // 3. Treasury-funded reward: a PURE TRANSFER from
+                //    faucet_pool_address (the testnet treasury sink) to the
+                //    attester, bounded by the treasury's balance. Never minted,
+                //    so total supply is conserved. If the treasury account is
+                //    absent or empty, the reward is skipped (no panic, no
+                //    negative balance, no synthetic tokens). Debit mirrors the
+                //    FaucetClaim conventions (JMT leaf update when enabled, WAL
+                //    append when active). Skipped when the attester *is* the
+                //    treasury, since a self-transfer would otherwise mint.
+                let treasury_addr = arc_types::transaction::faucet_pool_address();
+                let mut paid_reward: u64 = 0;
+                if tx.from != treasury_addr {
+                    let reward = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+                    if let Some(mut treasury) = self.accounts.get_mut(&treasury_addr.0) {
+                        paid_reward = reward.min(treasury.balance);
+                        if paid_reward > 0 {
+                            treasury.balance -= paid_reward;
+                            if self.use_jmt {
+                                let h = hash_bytes(
+                                    &bincode::serialize(treasury.value()).unwrap_or_default(),
+                                );
+                                self.jmt.lock().update_leaf(treasury_addr.0, h);
+                            }
+                            if self.wal.is_active() {
+                                let snap = treasury.clone();
+                                drop(treasury);
+                                self.wal.append(
+                                    WalOp::SetAccount(treasury_addr, snap),
+                                    self.height(),
+                                );
+                            }
+                        }
+                    }
+                    // Mark the treasury dirty so the debit is captured in this
+                    // block's state root (the per-tx dirty pass does not know
+                    // about the treasury for this tx type).
+                    if paid_reward > 0 {
+                        self.dirty_accounts.insert(treasury_addr.0);
+                    }
+                }
+
+                // 4. Apply both deltas to the (freshly loaded) sender together
+                //    and persist: attester ends at start + paid_reward − bond.
+                sender.balance = sender.balance - body.bond + paid_reward;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // 4. Lock bond in deterministic escrow: BLAKE3("arc-inference" || attestation_hash)
-                let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
-                let mut escrow = self.get_or_create_account(&escrow_addr);
-                escrow.balance = body.bond;
-                // Store model_id fingerprint in nonce (for lookup)
-                escrow.nonce = u64::from_le_bytes(body.model_id.0[..8].try_into().unwrap_or([0u8; 8]));
-                // Store the current block height in storage_root (as metadata)
-                // so the challenge period can be verified later.
-                let mut meta_input = Vec::new();
-                meta_input.extend_from_slice(&body.input_hash.0);
-                meta_input.extend_from_slice(&body.output_hash.0);
-                meta_input.extend_from_slice(&body.challenge_period.to_le_bytes());
-                meta_input.extend_from_slice(&self.height().to_le_bytes());
-                escrow.storage_root = hash_bytes(&meta_input);
-                self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                // 5. Bond handling.
+                //    bond == 0 (community-worker path): nothing to lock, so no
+                //    escrow is created and there is nothing to release — the
+                //    attester is simply +reward. bond > 0: lock the bond in a
+                //    deterministic escrow keyed by BLAKE3("arc-inference" ||
+                //    attestation_hash) and queue it for release after
+                //    `challenge_period` blocks. See the escrow encoding at the
+                //    top of this file (code_hash = attester, nonce = release
+                //    height, storage_root = MAGIC|status).
+                if body.bond > 0 {
+                    let escrow_addr =
+                        hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
+                    let release_height = self.height().saturating_add(body.challenge_period);
+                    let mut escrow = self.get_or_create_account(&escrow_addr);
+                    escrow.balance = body.bond;
+                    escrow.code_hash = tx.from; // refund target
+                    escrow.nonce = release_height; // maturation deadline
+                    let mut sr = [0u8; 32];
+                    sr[..8].copy_from_slice(&ATTEST_ESCROW_MAGIC);
+                    sr[8] = ATTEST_STATUS_OPEN;
+                    escrow.storage_root = Hash256(sr);
+                    self.accounts.insert(escrow_addr.0, escrow.clone());
+                    self.wal
+                        .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+
+                    // Queue for the maturation sweep. Buckets are kept sorted
+                    // so the per-block drain order is deterministic.
+                    let mut q = self.pending_bond_releases.lock();
+                    let bucket = q.entry(release_height).or_default();
+                    if let Err(pos) = bucket.binary_search(&escrow_addr.0) {
+                        bucket.insert(pos, escrow_addr.0);
+                    }
+                }
 
                 Ok(gas.consumed)
             }
@@ -4085,10 +4245,19 @@ impl StateDB {
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // 5. Lock challenger's bond in the same escrow
+                // 5. Lock challenger's bond in the same escrow AND mark the
+                //    escrow CHALLENGED so the bond-maturation sweep leaves it
+                //    locked. A disputed/slashed bond must never be auto-refunded
+                //    to the attester; it stays escrowed pending dispute
+                //    resolution (see the escrow-encoding note at file top).
                 let total_bond = escrow.balance + body.challenger_bond;
                 let mut escrow = escrow.clone();
                 escrow.balance = total_bond;
+                let mut sr = escrow.storage_root.0;
+                if sr[..8] == ATTEST_ESCROW_MAGIC {
+                    sr[8] = ATTEST_STATUS_CHALLENGED;
+                    escrow.storage_root = Hash256(sr);
+                }
                 self.accounts.insert(escrow_addr.0, escrow.clone());
                 self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
@@ -5276,6 +5445,14 @@ impl StateDB {
             })
             .collect();
 
+        // Refund matured, unchallenged Tier 2 attestation bonds at this height
+        // BEFORE the state root is computed so refunds land in this block.
+        // Bounded, deterministic, and a no-op when nothing has matured (always
+        // so on the bond==0 community-worker demo path). Applied uniformly to
+        // every real block-application path so the bond lifecycle advances the
+        // same way regardless of which execution engine sealed the block.
+        self.sweep_matured_bond_releases(height);
+
         let tree = MerkleTree::from_leaves(tx_hashes.clone());
         let tx_root = tree.root();
         let state_root = self.compute_state_root();
@@ -5325,6 +5502,174 @@ impl StateDB {
         }
 
         Ok((block, receipts))
+    }
+
+    /// Refund matured, unchallenged Tier 2 attestation bonds to their original
+    /// attesters and zero the escrows.
+    ///
+    /// Runs during block commit at the new `current_height`. Deterministic and
+    /// bounded: it drains up to [`MAX_BOND_RELEASES_PER_BLOCK`] escrows whose
+    /// release height is `<= current_height`, visiting them in
+    /// `pending_bond_releases` order (ascending release height, then ascending
+    /// escrow address — no map-iteration-order or wall-clock dependence). Each
+    /// escrow is validated against live account state before refunding.
+    /// Missing/already-zeroed escrows are dropped; CHALLENGED escrows are
+    /// dropped with the bond left locked pending dispute resolution; an OPEN,
+    /// matured escrow has its `balance` refunded to the attester
+    /// (`escrow.code_hash`) and is then zeroed.
+    ///
+    /// Conservation: every unit removed from an escrow is credited to exactly
+    /// one attester — a pure move, never a mint. Returns the number of bonds
+    /// refunded.
+    pub fn sweep_matured_bond_releases(&self, current_height: u64) -> usize {
+        // Phase 1: under the queue lock, collect up to the per-block cap of due
+        // escrow addresses and remove them from the queue. Kept short so the
+        // account mutations below run without holding the queue lock.
+        let due: Vec<[u8; 32]> = {
+            let mut q = self.pending_bond_releases.lock();
+            let mut picked: Vec<[u8; 32]> = Vec::new();
+            let mut empty_heights: Vec<u64> = Vec::new();
+            for (&h, bucket) in q.range_mut(..=current_height) {
+                if picked.len() >= MAX_BOND_RELEASES_PER_BLOCK {
+                    break;
+                }
+                let remaining = MAX_BOND_RELEASES_PER_BLOCK - picked.len();
+                let take = remaining.min(bucket.len());
+                picked.extend(bucket.drain(..take));
+                if bucket.is_empty() {
+                    empty_heights.push(h);
+                }
+            }
+            for h in empty_heights {
+                q.remove(&h);
+            }
+            picked
+        };
+
+        // Phase 2: refund each due escrow (order is already deterministic).
+        let mut refunded = 0usize;
+        for escrow_key in due {
+            let escrow_addr = Hash256(escrow_key);
+            let escrow = match self.accounts.get(&escrow_key) {
+                Some(e) => e.clone(),
+                None => continue, // already pruned/resolved
+            };
+            if escrow.balance == 0 {
+                continue; // already resolved
+            }
+            if escrow.storage_root.0[..8] != ATTEST_ESCROW_MAGIC {
+                continue; // not a Tier 2 attestation escrow
+            }
+            if escrow.storage_root.0[8] != ATTEST_STATUS_OPEN {
+                continue; // challenged/slashed: leave locked
+            }
+            if current_height < escrow.nonce {
+                // Not actually matured — defensive; the queue key equals the
+                // release height, so this only fires on a corrupt rebuild.
+                // Re-queue and skip rather than refund early.
+                let mut q = self.pending_bond_releases.lock();
+                let bucket = q.entry(escrow.nonce).or_default();
+                if let Err(pos) = bucket.binary_search(&escrow_key) {
+                    bucket.insert(pos, escrow_key);
+                }
+                continue;
+            }
+
+            let attester = escrow.code_hash;
+            let amount = escrow.balance;
+
+            // Credit the attester (mirrors the FaucetClaim credit conventions:
+            // JMT leaf update when enabled, WAL append when active).
+            {
+                let mut acct = self
+                    .accounts
+                    .entry(attester.0)
+                    .or_insert_with(|| Account::new(attester, 0));
+                acct.balance = acct.balance.saturating_add(amount);
+                if self.use_jmt {
+                    let h = hash_bytes(&bincode::serialize(acct.value()).unwrap_or_default());
+                    self.jmt.lock().update_leaf(attester.0, h);
+                }
+                if self.wal.is_active() {
+                    let snap = acct.clone();
+                    drop(acct);
+                    self.wal
+                        .append(WalOp::SetAccount(attester, snap), current_height);
+                }
+            }
+            self.dirty_accounts.insert(attester.0);
+
+            // Zero the escrow and clear the MAGIC (marks it resolved: a later
+            // challenge sees balance==0 and a rebuild will not re-queue it).
+            {
+                let mut esc = self
+                    .accounts
+                    .entry(escrow_key)
+                    .or_insert_with(|| Account::new(escrow_addr, 0));
+                esc.balance = 0;
+                esc.storage_root = Hash256::ZERO;
+                if self.use_jmt {
+                    let h = hash_bytes(&bincode::serialize(esc.value()).unwrap_or_default());
+                    self.jmt.lock().update_leaf(escrow_key, h);
+                }
+                if self.wal.is_active() {
+                    let snap = esc.clone();
+                    drop(esc);
+                    self.wal
+                        .append(WalOp::SetAccount(escrow_addr, snap), current_height);
+                }
+            }
+            self.dirty_accounts.insert(escrow_key);
+
+            refunded += 1;
+        }
+        refunded
+    }
+
+    /// Rebuild `pending_bond_releases` from surviving escrow accounts. Call
+    /// once at startup after any WAL replay / snapshot load (parallel to
+    /// [`rebuild_tier1_pending`]), since the queue is a derived, in-memory
+    /// index with no WAL op of its own.
+    ///
+    /// Strategy: scan every account whose `storage_root` carries the Tier 2
+    /// attestation MAGIC and is still OPEN with a non-zero balance, and
+    /// re-queue it under its release height (`escrow.nonce`). Zeroed/challenged
+    /// escrows are skipped. Returns the count re-queued.
+    pub fn rebuild_pending_bond_releases(&self) -> usize {
+        let mut q = self.pending_bond_releases.lock();
+        q.clear();
+        let mut rebuilt = 0usize;
+        for entry in self.accounts.iter() {
+            let acct = entry.value();
+            if acct.balance == 0 {
+                continue;
+            }
+            if acct.storage_root.0[..8] != ATTEST_ESCROW_MAGIC {
+                continue;
+            }
+            if acct.storage_root.0[8] != ATTEST_STATUS_OPEN {
+                continue;
+            }
+            let release_height = acct.nonce;
+            let escrow_key = *entry.key();
+            let bucket = q.entry(release_height).or_default();
+            if let Err(pos) = bucket.binary_search(&escrow_key) {
+                bucket.insert(pos, escrow_key);
+            }
+            rebuilt += 1;
+        }
+        rebuilt
+    }
+
+    /// Test/introspection helper: number of escrows currently queued for
+    /// bond release across all maturation heights.
+    #[cfg(test)]
+    fn pending_bond_release_count(&self) -> usize {
+        self.pending_bond_releases
+            .lock()
+            .values()
+            .map(|v| v.len())
+            .sum()
     }
 
     /// Prune old JMT state, keeping the last `keep_versions` versions.
@@ -8703,5 +9048,385 @@ mod tests {
             !r2[0].success,
             "vote from non-committee member must be rejected"
         );
+    }
+
+    // ── Tier 2 attestation economics: reward credit + bond release ──────────
+    //
+    // These exercise the "demonstrate income to users" settlement path: a
+    // treasury-funded reward is credited on attestation apply, the bond is a
+    // returnable stake released after the challenge window by the in-block
+    // maturation sweep, and total supply is conserved across every combination
+    // of {faucet, attestation, challenge, bond-release}. This is the bug class
+    // of `test_channel_close_releases_funds`, so conservation is asserted after
+    // every block.
+
+    const REWARD: u64 = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+
+    /// Total spendable + staked balance across every account (escrows and the
+    /// treasury included). The conservation invariant for all tests below.
+    fn sum_all_balances(state: &StateDB) -> u128 {
+        state
+            .accounts
+            .iter()
+            .map(|e| e.value().balance as u128 + e.value().staked_balance as u128)
+            .sum()
+    }
+
+    fn make_attestation(
+        from: Address,
+        nonce: u64,
+        bond: u64,
+        challenge_period: u64,
+        tag: &[u8],
+    ) -> Transaction {
+        make_channel_tx(
+            from,
+            nonce,
+            TxBody::InferenceAttestation(arc_types::transaction::InferenceAttestationBody {
+                model_id: model_id(),
+                input_hash: hash_bytes(tag),
+                output_hash: hash_bytes(&[tag, b"-out"].concat()),
+                challenge_period,
+                bond,
+                beneficiary: None,
+            }),
+            TxType::InferenceAttestation,
+        )
+    }
+
+    #[test]
+    fn attestation_reward_credited_from_treasury_bond_locked() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(60);
+        let treasury_start = 10 * REWARD;
+        let worker_start = 5 * REWARD;
+        let bond = REWARD / 2;
+        let state = StateDB::with_genesis(&[(pool, treasury_start), (worker, worker_start)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, bond, 100, b"job-1");
+        let att_hash = tx.hash;
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        // Attester: start − bond + reward, nonce +1.
+        let w = state.get_account(&worker).unwrap();
+        assert_eq!(w.balance, worker_start - bond + REWARD);
+        assert_eq!(w.nonce, 1);
+
+        // Treasury debited by exactly the reward.
+        assert_eq!(state.get_account(&pool).unwrap().balance, treasury_start - REWARD);
+
+        // Bond locked in escrow, tagged OPEN, refund target = worker.
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        let esc = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(esc.balance, bond);
+        assert_eq!(esc.code_hash, worker);
+        assert_eq!(esc.storage_root.0[8], ATTEST_STATUS_OPEN);
+
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn attestation_bond_zero_no_escrow_just_reward() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(61);
+        let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 0)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, 0, 100, b"job-community");
+        let att_hash = tx.hash;
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        assert_eq!(
+            state.get_account(&worker).unwrap().balance,
+            REWARD,
+            "community worker (bond 0) earns exactly the reward"
+        );
+        // No escrow account is created for a zero bond.
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        assert!(state.get_account(&escrow_addr).map(|e| e.balance).unwrap_or(0) == 0);
+        assert_eq!(state.pending_bond_release_count(), 0);
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn attestation_unfunded_attester_still_insufficient_balance() {
+        // A worker whose balance is below the bond must still fail with the
+        // unchanged InsufficientBalance error — the treasury-funded reward does
+        // NOT relax the bond check.
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(62);
+        let bond = REWARD;
+        let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 100)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, bond, 100, b"job-broke");
+        let err = state.execute_tx_pub(&tx).unwrap_err();
+        assert!(
+            matches!(err, StateError::InsufficientBalance { have: 100, need } if need == bond),
+            "error must be unchanged InsufficientBalance, got {:?}",
+            err
+        );
+
+        // Treasury untouched (reward never paid), worker untouched.
+        assert_eq!(state.get_account(&pool).unwrap().balance, 10 * REWARD);
+        let w = state.get_account(&worker).unwrap();
+        assert_eq!(w.balance, 100);
+        assert_eq!(w.nonce, 0);
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn attestation_treasury_dry_bounds_reward_no_mint() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(63);
+        let treasury_start = REWARD / 5; // less than a full reward
+        let state = StateDB::with_genesis(&[(pool, treasury_start), (worker, 0)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, 0, 100, b"job-drain");
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        // Reward is drained to whatever the treasury held — never more, never
+        // negative, never minted.
+        assert_eq!(state.get_account(&worker).unwrap().balance, treasury_start);
+        assert_eq!(state.get_account(&pool).unwrap().balance, 0);
+        assert_eq!(sum_all_balances(&state), before, "no tokens minted");
+    }
+
+    #[test]
+    fn attestation_treasury_absent_skips_reward() {
+        // With no faucet-pool account at all, the reward is skipped (no panic,
+        // no synthetic balance) and the attester is simply −bond into escrow.
+        let worker = addr(64);
+        let bond = REWARD / 4;
+        let state = StateDB::with_genesis(&[(worker, REWARD)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, bond, 100, b"job-notreasury");
+        let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
+        assert!(r[0].success);
+
+        assert_eq!(state.get_account(&worker).unwrap().balance, REWARD - bond);
+        assert!(state
+            .get_account(&arc_types::transaction::faucet_pool_address())
+            .is_none());
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn bond_released_after_challenge_window_conserved() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(65);
+        let bond = REWARD / 2;
+        let cp = 3u64;
+        let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 2 * REWARD)]);
+        let before = sum_all_balances(&state);
+
+        let tx = make_attestation(worker, 0, bond, cp, b"job-release");
+        let att_hash = tx.hash;
+        assert!(state.execute_block(&[tx], addr(99)).unwrap().1[0].success);
+
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        let release_h = state.get_account(&escrow_addr).unwrap().nonce;
+        assert_eq!(release_h, 1 + cp, "attestation anchored at block 1");
+        let worker_after_attest = state.get_account(&worker).unwrap().balance;
+        assert_eq!(worker_after_attest, 2 * REWARD - bond + REWARD);
+
+        // Not released before the window: a sweep one block early is a no-op.
+        assert_eq!(state.sweep_matured_bond_releases(release_h - 1), 0);
+        assert_eq!(state.get_account(&escrow_addr).unwrap().balance, bond);
+        assert_eq!(state.get_account(&worker).unwrap().balance, worker_after_attest);
+
+        // Released exactly at the deadline: escrow → 0, worker regains the bond.
+        assert_eq!(state.sweep_matured_bond_releases(release_h), 1);
+        assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 0);
+        assert_eq!(
+            state.get_account(&worker).unwrap().balance,
+            worker_after_attest + bond
+        );
+        // Idempotent: sweeping again does nothing.
+        assert_eq!(state.sweep_matured_bond_releases(release_h), 0);
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn challenged_bond_not_released_and_conserved() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(66);
+        let challenger = addr(67);
+        let bond = REWARD / 2;
+        let ch_bond = REWARD;
+        let cp = 3u64;
+        let state = StateDB::with_genesis(&[
+            (pool, 10 * REWARD),
+            (worker, 2 * REWARD),
+            (challenger, 3 * REWARD),
+        ]);
+        let before = sum_all_balances(&state);
+
+        // Block 1: attestation.
+        let att = make_attestation(worker, 0, bond, cp, b"job-challenged");
+        let att_hash = att.hash;
+        assert!(state.execute_block(&[att], addr(99)).unwrap().1[0].success);
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        let release_h = state.get_account(&escrow_addr).unwrap().nonce;
+
+        // Block 2: challenge (challenger bonds ch_bond).
+        let challenge = make_channel_tx(
+            challenger,
+            0,
+            TxBody::InferenceChallenge(arc_types::transaction::InferenceChallengeBody {
+                attestation_hash: att_hash,
+                challenger_output_hash: hash_bytes(b"disagree"),
+                challenger_bond: ch_bond,
+            }),
+            TxType::InferenceChallenge,
+        );
+        assert!(state.execute_block(&[challenge], addr(99)).unwrap().1[0].success);
+
+        // Escrow now holds both bonds and is marked CHALLENGED.
+        let esc = state.get_account(&escrow_addr).unwrap();
+        assert_eq!(esc.balance, bond + ch_bond);
+        assert_eq!(esc.storage_root.0[8], ATTEST_STATUS_CHALLENGED);
+
+        // A challenged/slashed escrow is NEVER auto-refunded, at the deadline or
+        // long after it.
+        assert_eq!(state.sweep_matured_bond_releases(release_h), 0);
+        assert_eq!(state.sweep_matured_bond_releases(release_h + 100), 0);
+        assert_eq!(
+            state.get_account(&escrow_addr).unwrap().balance,
+            bond + ch_bond,
+            "challenged bond stays locked pending dispute resolution"
+        );
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn conservation_across_faucet_attestation_challenge_release() {
+        // A full multi-step scenario mixing every settlement operation; the
+        // total balance (treasury + workers + challenger + escrows) is invariant
+        // after every single block.
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = addr(70);
+        let worker_c = addr(71); // community worker (bond 0)
+        let worker_b = addr(72); // bonded worker whose bond is later released
+        let worker_x = addr(73); // bonded worker whose attestation is challenged
+        let challenger = addr(74);
+        let state = StateDB::with_genesis(&[
+            (pool, 50 * REWARD),
+            (validator, 0),
+            (worker_c, 0),
+            (worker_b, 5 * REWARD),
+            (worker_x, 5 * REWARD),
+            (challenger, 5 * REWARD),
+        ]);
+        seed_validator(&state, validator);
+        let genesis_total = sum_all_balances(&state);
+
+        macro_rules! conserved {
+            () => {
+                assert_eq!(
+                    sum_all_balances(&state),
+                    genesis_total,
+                    "supply must be conserved at height {}",
+                    state.height()
+                );
+            };
+        }
+
+        // Block 1: faucet the community worker.
+        let faucet = make_channel_tx(
+            validator,
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody { recipient: worker_c, amount: 10_000 }),
+            TxType::FaucetClaim,
+        );
+        assert!(state.execute_block(&[faucet], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Block 2: community worker attests (bond 0) → +reward only.
+        let a_c = make_attestation(worker_c, 0, 0, 5, b"c");
+        assert!(state.execute_block(&[a_c], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Block 3: bonded worker (release path) attests, cp = 4 → matures at 7.
+        let a_b = make_attestation(worker_b, 0, REWARD, 4, b"b");
+        let hb = a_b.hash;
+        assert!(state.execute_block(&[a_b], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Block 4: bonded worker (challenge path) attests with a long window.
+        let a_x = make_attestation(worker_x, 0, REWARD, 50, b"x");
+        let hx = a_x.hash;
+        assert!(state.execute_block(&[a_x], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Block 5: challenge worker_x's attestation.
+        let ch = make_channel_tx(
+            challenger,
+            0,
+            TxBody::InferenceChallenge(arc_types::transaction::InferenceChallengeBody {
+                attestation_hash: hx,
+                challenger_output_hash: hash_bytes(b"nope"),
+                challenger_bond: 2 * REWARD,
+            }),
+            TxType::InferenceChallenge,
+        );
+        assert!(state.execute_block(&[ch], validator).unwrap().1[0].success);
+        conserved!();
+
+        // Advance empty blocks until worker_b's bond matures; the in-block
+        // sweep refunds it during ordinary block application.
+        let esc_b = hash_bytes(&[b"arc-inference", hb.as_ref()].concat());
+        let release_b = state.get_account(&esc_b).unwrap().nonce;
+        assert!(release_b > state.height(), "not matured yet");
+        while state.height() < release_b {
+            state.execute_block(&[], validator).unwrap();
+            conserved!();
+        }
+
+        // worker_b's bond was auto-released by the sweep.
+        assert_eq!(state.get_account(&esc_b).unwrap().balance, 0);
+        // worker_x's escrow remains locked (challenged), never auto-released.
+        let esc_x = hash_bytes(&[b"arc-inference", hx.as_ref()].concat());
+        assert_eq!(state.get_account(&esc_x).unwrap().balance, 3 * REWARD);
+        assert_eq!(
+            state.get_account(&esc_x).unwrap().storage_root.0[8],
+            ATTEST_STATUS_CHALLENGED
+        );
+        conserved!();
+    }
+
+    #[test]
+    fn rebuild_pending_bond_releases_recovers_open_escrows() {
+        // Restart durability: the in-memory release queue is rebuilt from the
+        // surviving OPEN escrow accounts, and a rebuilt queue releases exactly
+        // like the original.
+        let pool = arc_types::transaction::faucet_pool_address();
+        let worker = addr(75);
+        let bond = REWARD / 2;
+        let cp = 3u64;
+        let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 2 * REWARD)]);
+        let tx = make_attestation(worker, 0, bond, cp, b"job-rebuild");
+        let att_hash = tx.hash;
+        assert!(state.execute_block(&[tx], addr(99)).unwrap().1[0].success);
+        let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
+        let release_h = state.get_account(&escrow_addr).unwrap().nonce;
+
+        // Simulate a restart: the queue is empty but the escrow account
+        // survives. Rebuild it from account state.
+        state.pending_bond_releases.lock().clear();
+        assert_eq!(state.pending_bond_release_count(), 0);
+        assert_eq!(state.rebuild_pending_bond_releases(), 1);
+        assert_eq!(state.pending_bond_release_count(), 1);
+
+        // The rebuilt queue releases at the correct deadline.
+        assert_eq!(state.sweep_matured_bond_releases(release_h - 1), 0);
+        assert_eq!(state.sweep_matured_bond_releases(release_h), 1);
+        assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 0);
     }
 }
