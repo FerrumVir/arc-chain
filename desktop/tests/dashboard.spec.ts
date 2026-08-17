@@ -37,10 +37,11 @@ test.describe("Dashboard", () => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
     await expect(feed).toBeVisible();
-    // The mock includes one attestation from another validator. It must
+    // The mock includes two rows that are not the user's: another
+    // validator's attestation, and one old-seed padding row. Both must
     // render as "network", never as a "+2.50" credit - showing other
     // validators' work as the user's income was the original bug.
-    await expect(feed.getByText("network", { exact: true })).toHaveCount(1);
+    await expect(feed.getByText("network", { exact: true })).toHaveCount(2);
   });
 
   test("unknown telemetry renders as 'recent', not fabricated zeros", async ({
@@ -48,8 +49,9 @@ test.describe("Dashboard", () => {
   }) => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
-    // The flat-shaped attestation carries no tokens, latency or timestamp.
-    await expect(feed.getByText("recent", { exact: true })).toHaveCount(1);
+    // Two rows carry no tokens, latency or timestamp: the flat-shaped
+    // attestation and the padding row. Neither may invent them.
+    await expect(feed.getByText("recent", { exact: true })).toHaveCount(2);
     await expect(feed.getByText("0 tokens")).toHaveCount(0);
     await expect(feed.getByText("0ms")).toHaveCount(0);
   });
@@ -91,7 +93,9 @@ test.describe("Dashboard", () => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
     await expect(feed).toBeVisible();
-    await expect(feed.locator(".feed-item")).toHaveCount(3, { timeout: 8000 });
+    // Four fixtures: two of the user's, one other validator's, one old-seed
+    // padding row (kept so the Network screen's filter is demonstrable).
+    await expect(feed.locator(".feed-item")).toHaveCount(4, { timeout: 8000 });
   });
 
   test("shows the node's compute width", async ({ page }) => {

@@ -136,9 +136,10 @@ test.describe("Earnings chart uses real attestation data", () => {
     await page.getByTestId("nav-earnings").click();
     const feed = page.getByTestId("all-attestations");
     await expect(feed).toBeVisible();
-    // Two of three mock attestations are the user's.
-    await expect(page.getByText(/2 yours · 3 shown/)).toBeVisible();
-    await expect(feed.getByText("network", { exact: true })).toHaveCount(1);
+    // Two of four mock attestations are the user's; the other two (another
+    // validator's row and an old-seed padding row) must not be counted.
+    await expect(page.getByText(/2 yours · 4 shown/)).toBeVisible();
+    await expect(feed.getByText("network", { exact: true })).toHaveCount(2);
   });
 });
 

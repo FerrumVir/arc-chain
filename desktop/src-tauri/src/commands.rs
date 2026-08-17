@@ -395,6 +395,101 @@ pub async fn open_external(app: AppHandle, url: String) -> CmdResult<()> {
     app.opener().open_url(url, None::<&str>).map_err(map_err)
 }
 
+// ── Chain visibility + projection (v0.7.12) ──────────────────────────────
+//
+// Every command here reads the pinned chain host from `chain_host()`, except
+// `fetch_node_contribution`, which describes the user's own machine and so
+// reads 127.0.0.1. None of them read a second seed: the seeds are independent
+// chains (CLAUDE.md rule 4), so comparing two would report a structural
+// disagreement as if it were a fault.
+//
+// Several of the endpoints behind these are newer than the deployed seed
+// binaries. That is expected, and each returns a struct carrying an
+// `unavailable` reason rather than an error — a 404 is information about the
+// host, not a failure of the app, and the UI states it.
+
+/// The finite reward treasury. Feeds the "how much is left" line that keeps a
+/// projection from implying an unlimited payout.
+#[tauri::command]
+pub async fn fetch_reward_economics(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::types::RewardEconomics> {
+    let host = chain_host(&state).await;
+    Ok(rpc_client::fetch_reward_economics(&state.http, &host).await)
+}
+
+/// Projection inputs for this device's address.
+#[tauri::command]
+pub async fn fetch_earnings_projection(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::types::EarningsProjection> {
+    let address = {
+        let store = state.store.lock().await;
+        store.identity.as_ref().map(|i| i.address.clone())
+    };
+    let host = chain_host(&state).await;
+    Ok(
+        rpc_client::fetch_earnings_projection(&state.http, &host, address.as_deref())
+            .await,
+    )
+}
+
+/// What the node on THIS machine is contributing. Local read by design — the
+/// whole bug class this app has been unwinding was showing a datacenter's
+/// numbers as the user's own.
+#[tauri::command]
+pub async fn fetch_node_contribution(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::types::NodeContribution> {
+    let port = state.node.lock().await.rpc_port;
+    let local = paths::local_host(port);
+    let cores = Some(cached_hardware().cpu_cores);
+    Ok(rpc_client::fetch_node_contribution(&state.http, &local, cores).await)
+}
+
+/// Height, block age, validator split, peers and DAG round for the pinned host.
+#[tauri::command]
+pub async fn fetch_network_overview(
+    state: State<'_, AppState>,
+) -> CmdResult<crate::types::NetworkOverview> {
+    let host = chain_host(&state).await;
+    Ok(rpc_client::fetch_network_overview(&state.http, &host).await)
+}
+
+#[tauri::command]
+pub async fn fetch_recent_blocks(
+    state: State<'_, AppState>,
+    limit: Option<u32>,
+) -> CmdResult<crate::types::RecentBlocks> {
+    let host = chain_host(&state).await;
+    Ok(rpc_client::fetch_recent_blocks(&state.http, &host, limit.unwrap_or(10)).await)
+}
+
+/// Transactions inside one block. Called on expand, never on the poll path.
+#[tauri::command]
+pub async fn fetch_block_txs(
+    state: State<'_, AppState>,
+    height: u64,
+    limit: Option<u32>,
+) -> CmdResult<crate::types::BlockTxs> {
+    let host = chain_host(&state).await;
+    Ok(
+        rpc_client::fetch_block_txs(&state.http, &host, height, limit.unwrap_or(50))
+            .await,
+    )
+}
+
+/// Look one hash up on the pinned host. Replaces an `openExternal` to a
+/// hardcoded LAX IP serving a page that is not a block explorer.
+#[tauri::command]
+pub async fn lookup_tx(
+    state: State<'_, AppState>,
+    hash: String,
+) -> CmdResult<crate::types::TxLookup> {
+    let host = chain_host(&state).await;
+    Ok(rpc_client::lookup_tx(&state.http, &host, &hash).await)
+}
+
 #[tauri::command]
 pub async fn fetch_balance(state: State<'_, AppState>) -> CmdResult<AccountBalance> {
     let addr = {

@@ -69,6 +69,102 @@ export async function seedOnboardedLegacy(page: Page) {
   });
 }
 
+/**
+ * Force specific mock command results, so the degraded paths are reachable.
+ *
+ * The endpoints behind the projection and Network screens are newer than the
+ * deployed seed binaries, so their real behaviour today is a 404 that has to
+ * degrade to a stated reason. A test cannot make a Rust process 404 on demand,
+ * and the honest-degradation copy is the part most worth locking down — so the
+ * mock layer takes per-command overrides (see `mockOverride` in lib/tauri.ts).
+ *
+ * Keys are Tauri command names, e.g. `fetch_earnings_projection`.
+ */
+export async function seedMockOverrides(
+  page: Page,
+  overrides: Record<string, unknown>,
+) {
+  await page.addInitScript((o) => {
+    (window as unknown as { __ARC_MOCK__?: unknown }).__ARC_MOCK__ = o;
+  }, overrides);
+}
+
+/** A `/worker/earnings` 404, phrased the way the fetch layer phrases it. */
+export const PROJECTION_404 = {
+  sourceHost: "http://140.82.16.112:9090",
+  unavailable:
+    "http://140.82.16.112:9090 does not serve /worker/earnings/abc (HTTP 404).",
+  rewardPerAttestation: null,
+  rewardRateSource: "unknown",
+  attestationsTotal: 0,
+  firstAttestationBlock: null,
+  attestationsPerDay: null,
+  rateUnavailableReason: null,
+  observedOverBlocks: null,
+  rateCaveat: null,
+};
+
+/**
+ * The endpoint answered, but has no attestation history to measure a rate
+ * from. This is the state a brand-new node is in, and the one where inventing
+ * a projection would be easiest and worst.
+ */
+export const PROJECTION_NO_HISTORY = {
+  sourceHost: "http://140.82.16.112:9090",
+  unavailable: null,
+  rewardPerAttestation: 2.5,
+  rewardRateSource: "chain",
+  attestationsTotal: 0,
+  firstAttestationBlock: null,
+  attestationsPerDay: null,
+  rateUnavailableReason:
+    "No attestations credited to this address yet, so there is no history to measure a rate from.",
+  observedOverBlocks: null,
+  rateCaveat: null,
+};
+
+/**
+ * A `/economics/rewards` 404 — no treasury figures and, importantly, no bond.
+ *
+ * Losing this endpoint costs the projection its ceiling AND its bond, so the
+ * assumptions line has to say nothing is being netted out.
+ */
+export const ECONOMICS_404 = {
+  sourceHost: "http://140.82.16.112:9090",
+  unavailable:
+    "http://140.82.16.112:9090 does not serve /economics/rewards (HTTP 404).",
+  rewardPerAttestation: null,
+  treasuryBalanceArc: null,
+  treasuryBalanceUnavailableReason: null,
+  attestationsRemaining: null,
+  attestationsRemainingUnavailableReason: null,
+  treasuryIsFinite: null,
+  bondPerAttestation: null,
+  challengePeriodBlocks: null,
+  bondRefundedAfterChallengePeriod: null,
+  fundingDetail: null,
+};
+
+/**
+ * The treasury endpoint answered, but could not read the treasury account.
+ *
+ * A distinct state from a 404: the endpoint exists and gave a reason, which
+ * must be shown instead of a figure.
+ */
+export const ECONOMICS_NO_BALANCE = {
+  ...ECONOMICS_404,
+  unavailable: null,
+  rewardPerAttestation: 2.5,
+  treasuryBalanceUnavailableReason:
+    "Treasury account 0xtreasury… is not present in this host's state.",
+  attestationsRemainingUnavailableReason:
+    "Cannot compute a remaining count without a treasury balance.",
+  treasuryIsFinite: true,
+  bondPerAttestation: 0.000001,
+  challengePeriodBlocks: 100,
+  bondRefundedAfterChallengePeriod: true,
+};
+
 export async function clearState(page: Page) {
   await page.addInitScript(() => {
     localStorage.clear();

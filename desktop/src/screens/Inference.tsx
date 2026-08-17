@@ -1,11 +1,11 @@
 import { useMutation } from "@tanstack/react-query";
 import {
-  ArrowUpRight,
   Coins,
   Copy,
   ClipboardCheck,
   Globe,
   Loader2,
+  Search,
   Send,
   ShieldCheck,
   Sparkles,
@@ -16,6 +16,7 @@ import { Card, CardHeader } from "../components/Card";
 import { InfoPopover } from "../components/InfoPopover";
 import { api } from "../lib/tauri";
 import { formatHash } from "../lib/format";
+import { useAppStore } from "../lib/store";
 import type {
   InferenceResult,
   PaidInferenceResult,
@@ -104,6 +105,7 @@ function coordinatorLabel(url: string): string {
 }
 
 export function Inference() {
+  const lookupHash = useAppStore((s) => s.lookupHash);
   const [prompt, setPrompt] = useState("");
   const [maxTokens, setMaxTokens] = useState(16);
   const [copied, setCopied] = useState<string | null>(null);
@@ -667,17 +669,20 @@ export function Inference() {
               Engine: {run.data.engine}{" "}
               {run.data.deterministic && "· deterministic"}
             </span>
-            {run.data.explorerUrl && (
+            {/* Was openExternal to `http://140.82.16.112:3200<explorerUrl>`:
+                a hardcoded LAX IP, on a page that is a network dashboard
+                rather than a block explorer, for a chain that is usually not
+                the one this session is pinned to. The in-app lookup resolves
+                the hash against the pinned host, which is the only place it
+                can honestly be confirmed — including telling the user it is
+                not in a block yet. */}
+            {run.data.txHash && (
               <button
                 className="btn btn-ghost btn-sm"
-                onClick={() =>
-                  api.openExternal(
-                    `http://140.82.16.112:3200${run.data!.explorerUrl}`,
-                  )
-                }
-                data-testid="btn-open-explorer-tx"
+                onClick={() => lookupHash(run.data!.txHash)}
+                data-testid="btn-lookup-tx"
               >
-                View on explorer <ArrowUpRight size={12} />
+                Look up this attestation <Search size={12} />
               </button>
             )}
           </div>

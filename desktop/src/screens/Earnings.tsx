@@ -1,16 +1,19 @@
 import { useQuery } from "@tanstack/react-query";
-import { ArrowUpRight, Calendar, FileSignature } from "lucide-react";
+import { Calendar, FileSignature, Search } from "lucide-react";
 import { useMemo } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { EmptyState } from "../components/EmptyState";
 import { NumberTicker } from "../components/NumberTicker";
+import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { api } from "../lib/tauri";
 import { formatHash, formatInt, formatRelativeTime } from "../lib/format";
+import { useAppStore } from "../lib/store";
 
 /** Testnet flat rate per settled attestation. Mirrors rpc_client.rs. */
 const REWARD_PER_ATTESTATION = 2.5;
 
 export function Earnings() {
+  const lookupHash = useAppStore((s) => s.lookupHash);
   const { data: earnings } = useQuery({
     queryKey: ["earnings"],
     queryFn: api.fetchEarnings,
@@ -81,6 +84,13 @@ export function Earnings() {
             Your share of network rewards, paid in ARC.
           </p>
         </div>
+      </div>
+
+      {/* Primary home for the projection. Placed above lifetime totals
+          because "what will this earn me" is the question people arrive with,
+          and it is the one figure that must never be guessed. */}
+      <div style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-projection">
+        <ProjectedEarnings />
       </div>
 
       {/* When nothing has been earned, three cards reading "0.00 ARC" next
@@ -341,16 +351,17 @@ export function Earnings() {
                     ? `+${a.rewardArc.toFixed(2)} ARC`
                     : "network"}
                 </div>
+                {/* Was openExternal to a hardcoded LAX :3200 URL — the wrong
+                    host for this session and not a block explorer. Resolves
+                    against the pinned chain host instead, which is the only
+                    place this hash can be confirmed. */}
                 <button
                   className="btn btn-ghost btn-sm"
-                  onClick={() =>
-                    api.openExternal(
-                      `http://140.82.16.112:3200/tx/${a.txHash}`,
-                    )
-                  }
-                  aria-label="Open in explorer"
+                  onClick={() => lookupHash(a.txHash)}
+                  data-testid={`btn-lookup-earnings-${a.txHash.slice(0, 10)}`}
+                  aria-label="Look up on the pinned chain host"
                 >
-                  <ArrowUpRight size={13} />
+                  <Search size={13} />
                 </button>
               </div>
             ))

@@ -97,6 +97,45 @@ test.describe("Mobile layout (Pixel 7, 412×915) - seeded", () => {
     const box = await bal.boundingBox();
     expect(box!.height).toBeLessThan(90);
   });
+
+  test("network screen doesn't horizontally overflow the viewport", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("nav-network").click();
+    await expect(page.getByTestId("network-screen")).toBeVisible();
+    // Long hex hashes and the lookup form are the risks here.
+    const viewportWidth = page.viewportSize()!.width;
+    const scrollWidth = await page.evaluate(
+      () => document.documentElement.scrollWidth,
+    );
+    expect(scrollWidth).toBeLessThanOrEqual(viewportWidth + 1);
+  });
+
+  test("the tx lookup form is usable at phone width", async ({ page }) => {
+    await page.goto("/");
+    await page.getByTestId("nav-network").click();
+    const input = page.getByTestId("tx-lookup-input");
+    await expect(input).toBeVisible();
+    const submit = page.getByTestId("tx-lookup-submit");
+    await expect(submit).toBeVisible();
+    // The input must not be squeezed out by the button on a narrow screen.
+    const inputBox = await input.boundingBox();
+    expect(inputBox!.width).toBeGreaterThan(180);
+  });
+
+  test("earnings screen with the projection doesn't overflow", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("projection-card")).toBeVisible();
+    const viewportWidth = page.viewportSize()!.width;
+    const scrollWidth = await page.evaluate(
+      () => document.documentElement.scrollWidth,
+    );
+    expect(scrollWidth).toBeLessThanOrEqual(viewportWidth + 1);
+  });
 });
 
 test.describe("Mobile layout (Pixel 7, 412×915) - onboarding", () => {

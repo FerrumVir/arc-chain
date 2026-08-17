@@ -22,12 +22,27 @@ interface AppState {
   config: NodeConfig | null;
   route: Route;
   inferenceMode: InferenceMode;
+  /**
+   * A tx/attestation hash to prefill into the Network screen's lookup box.
+   *
+   * This is how "view this attestation" works now. It used to be an
+   * `openExternal` to `http://140.82.16.112:3200/tx/<hash>` — a hardcoded LAX
+   * IP, pointing at a network dashboard that is not a block explorer, on a
+   * host that is usually not the seed this session is actually reading. A
+   * lookup against the pinned chain host is the only view that can answer
+   * "is my attestation in a block" truthfully.
+   */
+  pendingLookup: string | null;
 
   setOnboarded: (v: boolean) => void;
   setIdentity: (i: Identity | null) => void;
   setConfig: (c: NodeConfig | null) => void;
   setRoute: (r: Route) => void;
   setInferenceMode: (m: InferenceMode) => void;
+  /** Jump to the Network screen with `hash` loaded into the lookup box. */
+  lookupHash: (hash: string) => void;
+  /** Consume the prefill so a later visit to Network starts empty. */
+  clearPendingLookup: () => void;
 }
 
 const STORAGE_KEY = "arc-desktop-state-v1";
@@ -131,6 +146,9 @@ function persist(state: AppState) {
 export const useAppStore = create<AppState>((set, get) => ({
   ...loadInitial(),
   route: "dashboard" as Route,
+  // Deliberately NOT persisted: a hash the user clicked three days ago is not
+  // something to restore into a search box on next launch.
+  pendingLookup: null,
 
   setOnboarded: (v) => {
     set({ onboarded: v });
@@ -149,4 +167,6 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ inferenceMode: m });
     persist(get());
   },
+  lookupHash: (hash) => set({ pendingLookup: hash, route: "network" }),
+  clearPendingLookup: () => set({ pendingLookup: null }),
 }));

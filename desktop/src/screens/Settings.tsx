@@ -4,8 +4,10 @@ import { useState } from "react";
 import { check as tauriCheckUpdate } from "@tauri-apps/plugin-updater";
 import { relaunch as tauriRelaunch } from "@tauri-apps/plugin-process";
 import { Card, CardHeader } from "../components/Card";
+import { NotAvailable } from "../components/NotAvailable";
 import { StatusPill } from "../components/StatusPill";
 import { api, isTauri } from "../lib/tauri";
+import { formatInt } from "../lib/format";
 import { useAppStore } from "../lib/store";
 import { DEFAULT_NODE_CONFIG, type NodeConfig } from "../lib/types";
 
@@ -109,6 +111,8 @@ export function Settings() {
           <p className="page-subtitle">Configure your node and app preferences.</p>
         </div>
       </div>
+
+      <PersistenceCard />
 
       <Card style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader title="Node" />
@@ -455,11 +459,21 @@ function ComputeContribution() {
           {apply.isPending ? "Applying…" : "Apply"}
         </button>
       </div>
+      {/* The mechanism, in one sentence, with no multiplier implied.
+          This hint used to read "More cores means more work served — and more
+          earnings", which states a causal link from cores to ARC that does not
+          exist: the network routes work by its own scheduling, and a node with
+          every core dedicated earns nothing if it is sent nothing. */}
       <span className="field-hint">
         Cores your node may use for inference and verification. More cores
-        means more work served — and more earnings — at the cost of
-        responsiveness elsewhere on this machine.
+        serve each hop faster, at the cost of responsiveness elsewhere on this
+        machine. Earnings follow the attestations you actually serve, not the
+        cores you own — there is no multiplier from cores to ARC, and a faster
+        node earns nothing if the network sends it no work.
       </span>
+
+      <ActualContribution />
+
       {apply.data && (
         <p
           style={{
@@ -485,6 +499,265 @@ function ComputeContribution() {
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * What this node is actually contributing, next to the slider that sets it.
+ *
+ * The slider on its own says what was requested. This says what happened —
+ * which is a different thing, and the gap between them is the interesting part
+ * (a node that is stopped, or was launched before the last change, contributes
+ * what it was started with, not what the slider reads).
+ *
+ * Read from the LOCAL node. Every figure is a measurement or absent.
+ */
+function ActualContribution() {
+  const { data: c } = useQuery({
+    queryKey: ["node-contribution"],
+    queryFn: api.fetchNodeContribution,
+    refetchInterval: 10_000,
+  });
+
+  if (!c) return null;
+
+  if (c.unavailable) {
+    return (
+      <div style={{ marginTop: "var(--space-3)" }}>
+        <NotAvailable
+          reason={c.unavailable}
+          title="Currently contributing: unknown"
+          testId="contribution-unavailable"
+        />
+      </div>
+    );
+  }
+
+  const rows: Array<[string, string]> = [];
+  if (c.threadsInUse != null) {
+    rows.push([
+      "Cores in use",
+      c.threadsAvailable != null
+        ? `${formatInt(c.threadsInUse)} of ${formatInt(c.threadsAvailable)}`
+        : formatInt(c.threadsInUse),
+    ]);
+  }
+  if (c.layersHeld) {
+    // layerCount is a UNION of the layers held, not a sum over replicas, so
+    // "6 of 32" is honest even when two ranges overlap.
+    const held =
+      c.layerCount != null
+        ? c.totalLayers != null
+          ? `${c.layersHeld} — ${formatInt(c.layerCount)} of ${formatInt(c.totalLayers)} layers`
+          : `${c.layersHeld} (${formatInt(c.layerCount)} layers)`
+        : c.layersHeld;
+    rows.push(["Model layers held", held]);
+  }
+  if (c.runsServed != null) {
+    rows.push(["Pipeline runs served", formatInt(c.runsServed)]);
+  }
+  // Kept separate from runs served: a cache hit is not work performed, and
+  // summing the two would inflate the count of hops this node actually ran.
+  if (c.cacheHits != null) {
+    rows.push(["Served from cache", formatInt(c.cacheHits)]);
+  }
+  if (c.hopMsMean != null) {
+    // The sample count is part of the claim: a mean over 2 samples and a mean
+    // over 200 are not the same statement.
+    rows.push([
+      "Measured time per hop",
+      c.hopSamples != null
+        ? `${Math.round(c.hopMsMean)} ms (mean of ${formatInt(c.hopSamples)})`
+        : `${Math.round(c.hopMsMean)} ms`,
+    ]);
+  }
+
+  return (
+    <div
+      style={{
+        marginTop: "var(--space-3)",
+        padding: "var(--space-3) var(--space-4)",
+        background: "var(--bg)",
+        border: "1px solid var(--border)",
+        borderRadius: "var(--radius-sm)",
+      }}
+      data-testid="actual-contribution"
+    >
+      <div
+        className="stat-label"
+        style={{ marginBottom: "var(--space-2)" }}
+      >
+        Currently contributing
+      </div>
+      {rows.length === 0 ? (
+        <p
+          style={{
+            margin: 0,
+            fontSize: "var(--text-sm)",
+            color: "var(--text-muted)",
+          }}
+        >
+          Your node answered, but reported none of these figures yet. They
+          appear once it has served work.
+        </p>
+      ) : (
+        <div className="kv">
+          {rows.map(([k, v]) => (
+            <div key={k} style={{ display: "contents" }}>
+              <dt>{k}</dt>
+              <dd data-testid={`contrib-${k.toLowerCase().replace(/[^a-z]+/g, "-")}`}>
+                {v}
+              </dd>
+            </div>
+          ))}
+        </div>
+      )}
+      {/* The host's own reason for having no timing, shown verbatim rather
+          than leaving the row silently missing. */}
+      {c.hopMsMean == null && c.hopUnavailableReason && (
+        <p
+          style={{
+            margin: "var(--space-2) 0 0",
+            fontSize: "var(--text-xs)",
+            color: "var(--text-muted)",
+            lineHeight: 1.6,
+          }}
+          data-testid="contrib-hop-unavailable"
+        >
+          No per-hop timing: {c.hopUnavailableReason}
+        </p>
+      )}
+      <p
+        style={{
+          margin: "var(--space-3) 0 0",
+          fontSize: "var(--text-xs)",
+          color: "var(--text-muted)",
+          lineHeight: 1.6,
+        }}
+      >
+        Read from your own node at {c.sourceHost}
+        {c.source === "composed" && (
+          <>
+            {" "}
+            via <code>/node/threads</code> and <code>/stats</code>, because it
+            does not serve <code>/node/contribution</code>
+          </>
+        )}
+        . Anything this node does not measure is left out rather than shown as
+        zero.
+      </p>
+    </div>
+  );
+}
+
+/**
+ * Persistence, stated plainly — the owner's first question was whether mining
+ * survives a restart without the user doing anything.
+ *
+ * It has to be truthful about what resumes, not just that something does.
+ * Auto-start brings the node back, but the ROLE it comes back in depends on
+ * whether a model is configured: with one it serves inference and can earn,
+ * without one it follows consensus and is never sent inference work. Saying
+ * "mining resumes" to an observer-mode install would be a lie by omission.
+ */
+function PersistenceCard() {
+  const config = useAppStore((s) => s.config);
+
+  const { data: loginItem } = useQuery({
+    queryKey: ["autostart"],
+    queryFn: api.getAutostart,
+    refetchInterval: 30_000,
+  });
+  const { data: status } = useQuery({
+    queryKey: ["status"],
+    queryFn: api.nodeStatus,
+    refetchInterval: 5_000,
+  });
+
+  const autoStart = config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart;
+  const hasModel = !!config?.modelPath;
+  const running = !!status?.running;
+
+  return (
+    <Card style={{ marginBottom: "var(--space-6)" }} data-testid="persistence-card">
+      <CardHeader
+        title="Runs with your computer"
+        action={
+          <StatusPill
+            level={running ? "live" : "offline"}
+            label={running ? "Node running" : "Node stopped"}
+          />
+        }
+      />
+      <div
+        style={{
+          fontSize: "var(--text-sm)",
+          color: "var(--text-secondary)",
+          lineHeight: 1.7,
+        }}
+      >
+        <p style={{ marginTop: 0 }} data-testid="persistence-summary">
+          {autoStart ? (
+            <>
+              <strong>
+                Your node starts with this computer and keeps contributing.
+              </strong>{" "}
+              You do not need to switch it back on after a reboot, and turning
+              it off and on again does not reset anything. The only thing that
+              changes this is the{" "}
+              <strong>&ldquo;Start node on app launch&rdquo;</strong> setting
+              below — while it is on, the behaviour persists.
+            </>
+          ) : (
+            <>
+              <strong>Your node does not start on its own.</strong>{" "}
+              &ldquo;Start node on app launch&rdquo; is off, so after a reboot
+              you have to start it yourself from the Dashboard, and it earns
+              nothing until you do. Turn the setting on to have it resume
+              automatically.
+            </>
+          )}
+        </p>
+
+        <p data-testid="persistence-role">
+          When it does resume, it comes back as{" "}
+          {hasModel ? (
+            <>
+              a <strong>worker</strong>: a model is configured, so it serves
+              slices of inference requests and can earn attestations.
+            </>
+          ) : (
+            <>
+              an <strong>observer</strong>: no model is configured, so it
+              follows consensus but is never sent inference work — and{" "}
+              <strong>an observer earns nothing</strong>. Download a model to
+              be sent work.
+            </>
+          )}
+        </p>
+
+        <div className="kv" style={{ marginTop: "var(--space-4)" }}>
+          <dt>Start on app launch</dt>
+          <dd data-testid="persistence-autostart">
+            {autoStart ? "on" : "off"}
+          </dd>
+          <dt>Registered with the OS</dt>
+          {/* The login item is the mechanism that survives a full reboot, and
+              it is registered independently of the config flag. Reported
+              separately so a disagreement between the two is visible rather
+              than averaged into one reassuring line. */}
+          <dd data-testid="persistence-login-item">
+            {loginItem == null
+              ? "—"
+              : loginItem
+                ? "yes — login item registered"
+                : "no login item"}
+          </dd>
+          <dt>Right now</dt>
+          <dd>{running ? "running" : "stopped"}</dd>
+        </div>
+      </div>
+    </Card>
   );
 }
 

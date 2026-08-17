@@ -21,6 +21,7 @@ import { EmptyState } from "../components/EmptyState";
 import { InfoPopover } from "../components/InfoPopover";
 import { NumberTicker } from "../components/NumberTicker";
 import { ObserverUpgradeBanner } from "../components/ObserverUpgradeBanner";
+import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { StatusPill } from "../components/StatusPill";
 import { api } from "../lib/tauri";
 import {
@@ -30,29 +31,19 @@ import {
   formatRelativeTime,
   formatUptime,
 } from "../lib/format";
+import { hostLabel } from "../lib/hosts";
 import { useAppStore } from "../lib/store";
 import { DEFAULT_NODE_CONFIG } from "../lib/types";
 
-const COORDINATOR_LABELS: Record<string, string> = {
-  "149.28.32.76": "NYC",
-  "140.82.16.112": "LAX",
-  "136.244.109.1": "AMS",
-  "104.238.171.11": "LHR",
-  "202.182.107.41": "NRT",
-  "149.28.153.31": "SGP",
-};
-
-function coordinatorLabel(url: string): string {
-  for (const [ip, label] of Object.entries(COORDINATOR_LABELS)) {
-    if (url.includes(ip)) return label;
-  }
-  return url;
-}
+// Host labels live in lib/hosts.ts so every screen names a seed identically.
+// "Which host" is load-bearing context for any chain number here, because the
+// seeds are independent chains (CLAUDE.md rule 4).
 
 export function Dashboard() {
   const queryClient = useQueryClient();
   const identity = useAppStore((s) => s.identity);
   const config = useAppStore((s) => s.config);
+  const setRoute = useAppStore((s) => s.setRoute);
 
   const { data: status } = useQuery({
     queryKey: ["status"],
@@ -73,6 +64,14 @@ export function Dashboard() {
     queryKey: ["network"],
     queryFn: api.fetchNetworkStats,
     refetchInterval: 10_000,
+  });
+  // Whether the OS will bring the node back by itself. Polled rather than
+  // assumed from the config flag: the login item is registered separately, so
+  // the two can disagree and that disagreement is worth seeing.
+  const { data: loginItem } = useQuery({
+    queryKey: ["autostart"],
+    queryFn: api.getAutostart,
+    refetchInterval: 30_000,
   });
 
   const startMutation = useMutation({
@@ -359,7 +358,7 @@ export function Dashboard() {
             <>
               <strong>Client mode</strong> — your node has 0 peers, so the app
               is using the public network through{" "}
-              {coordinatorLabel(status.coordinatorUrl)}. You can faucet, send,
+              {hostLabel(status.coordinatorUrl)}. You can faucet, send,
               and run inference, but{" "}
               <strong>
                 you won&rsquo;t earn ARC until you have at least one peer
@@ -534,6 +533,12 @@ export function Dashboard() {
           </div>
         </div>
       </Card>
+
+      {/* Compact projection. The full version, with the treasury ceiling and
+          the complete assumptions line, lives on the Earnings screen. */}
+      <div style={{ marginBottom: "var(--space-6)" }} data-testid="dashboard-projection">
+        <ProjectedEarnings variant="tile" />
+      </div>
 
       <div
         className="grid-stats"
@@ -768,7 +773,44 @@ export function Dashboard() {
             <dd className="mono">:{status?.rpcPort ?? "-"}</dd>
             <dt>PID</dt>
             <dd>{status?.pid ?? "-"}</dd>
+            {/* The owner's first question: does this survive a restart on its
+                own? Answered here from the two things that decide it — the
+                config flag and the OS login item — rather than implied. */}
+            <dt>Starts with OS</dt>
+            <dd data-testid="dashboard-persistence">
+              {(config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart)
+                ? loginItem === false
+                  ? "set, but no login item"
+                  : "yes"
+                : "no"}
+            </dd>
           </div>
+          <p
+            style={{
+              marginTop: "var(--space-3)",
+              marginBottom: 0,
+              fontSize: "var(--text-xs)",
+              color: "var(--text-muted)",
+              lineHeight: 1.6,
+            }}
+            data-testid="dashboard-persistence-note"
+          >
+            {(config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart) ? (
+              <>
+                Your node starts with this computer and resumes contributing as{" "}
+                {config?.modelPath ? "a worker" : "an observer"}
+                {config?.modelPath
+                  ? " — it serves inference and can earn."
+                  : " — no model is configured, so it follows consensus but is never sent inference work, and earns nothing."}{" "}
+                Governed by &ldquo;Start node on app launch&rdquo; in Settings.
+              </>
+            ) : (
+              <>
+                Auto-start is off, so nothing resumes after a reboot until you
+                press Start. Turn it on in Settings.
+              </>
+            )}
+          </p>
           {status?.lastError && (
             <div
               style={{
@@ -800,7 +842,7 @@ export function Dashboard() {
                     fontWeight: 400,
                   }}
                 >
-                  via {coordinatorLabel(status.chainHost)}
+                  via {hostLabel(status.chainHost)}
                 </span>
               )}
             </h2>
@@ -833,6 +875,12 @@ export function Dashboard() {
             )}
           </div>
 
+          {/* Was `openExternal("http://140.82.16.112:3200")` labelled "Open
+              network explorer". Three things were wrong with that: the IP was
+              hardcoded to LAX rather than the seed this session actually reads,
+              :3200 is a network dashboard and not a block explorer, and the
+              deployed page carries dead tiles and stale copy. The in-app
+              Network screen reads the pinned host and can be trusted. */}
           <button
             className="btn btn-secondary"
             style={{
@@ -840,12 +888,11 @@ export function Dashboard() {
               marginTop: "var(--space-4)",
               justifyContent: "center",
             }}
-            onClick={() =>
-              api.openExternal("http://140.82.16.112:3200")
-            }
-            data-testid="btn-open-explorer"
+            onClick={() => setRoute("network")}
+            data-testid="btn-open-network"
           >
-            <ArrowUpRight size={14} /> Open network explorer
+            <ArrowUpRight size={14} /> Check the chain
+            {status?.chainHost && <> ({hostLabel(status.chainHost)})</>}
           </button>
         </Card>
       </div>
