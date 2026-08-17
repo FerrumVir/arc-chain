@@ -694,6 +694,26 @@ You are pointed at AMS (`count_total: 0`). Switch to NYC, LAX, or LHR. And
 confirm nothing called `/community/list` first — that handler prunes the
 registry as a side effect.
 
+### The node restarts and sits at 0 peers 🔵 BRANCH
+
+**Measured 2026-08-17.** Stopping a node and immediately restarting it **on the
+same P2P port** produced `peers: 0` and stayed there for minutes, while
+`dag_round` kept advancing (so the node looks alive and the failure is easy to
+miss). A node started at the same moment on a *fresh* P2P port reached 7 peers
+in seconds, and moving the restarted node to a fresh port took it to 3 peers in
+19 seconds. The seeds appear to hold the old `(ip, port)` entry for a while and
+ignore the re-handshake.
+
+This matters because it is exactly what the Dashboard's **Restart** button
+does. If you restart mid-demo and the peer count sticks at zero:
+
+1. Don't keep clicking Restart — it will reuse the same port every time.
+2. Change the P2P port in Settings (any unused value) and start again, or
+3. Wait it out rather than restarting, if the node is otherwise serving.
+
+Prefer **not restarting during the demo at all**. Nothing in the run-of-show
+requires it, and a healthy node that has already peered will stay peered.
+
 ### The desktop replaces your binary
 
 The desktop force-redownloads `~/.arc/bin/arc-node` from `releases/latest` on

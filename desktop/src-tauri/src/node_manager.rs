@@ -137,8 +137,6 @@ impl NodeManager {
             .arg(p2p_port.to_string())
             .arg("--data-dir")
             .arg(&data_dir)
-            .arg("--validator-seed")
-            .arg(validator_seed)
             .arg("--eth-rpc-port")
             .arg("0")
             // ── LIVE-NETWORK SAFETY: join as an observer, never a validator ──
@@ -303,6 +301,31 @@ impl NodeManager {
             ),
         )
         .await;
+
+        // The validator seed is the wallet's BIP-39 phrase, so it goes in the
+        // environment rather than argv. A process's command line is readable
+        // by every user on the machine (`ps -ax -o command`), which would put
+        // the phrase that controls the user's funds in the process table;
+        // its environment is readable only by the owning user. arc-node reads
+        // ARC_VALIDATOR_SEED as the fallback for --validator-seed.
+        //
+        // Older binaries (<= v0.7.11) predate the env fallback and would
+        // silently derive the DEFAULT identity from "arc-validator-0" — a
+        // different address, so earnings would accrue to a key the user does
+        // not hold. Only omit the flag when the binary advertises the env var.
+        // clap prints `[env: ARC_VALIDATOR_SEED=]` in --help for an arg with an
+        // env fallback, so the existing --help probe answers this too.
+        if binary_supports_flag(&binary, "ARC_VALIDATOR_SEED") {
+            cmd.env("ARC_VALIDATOR_SEED", validator_seed);
+        } else {
+            tracing::warn!(
+                "arc-node at {} predates ARC_VALIDATOR_SEED; passing the seed on \
+                 the command line, where other users on this machine can read it. \
+                 Update the node binary to keep it out of the process table.",
+                binary.display()
+            );
+            cmd.arg("--validator-seed").arg(validator_seed);
+        }
 
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(

@@ -82,8 +82,24 @@ struct Cli {
     /// Validator identity seed (used to derive a unique address).
     /// Different seeds produce different validator addresses.
     /// Default: "arc-validator-0"
-    #[arg(long, default_value = "arc-validator-0")]
+    ///
+    /// Prefer the ARC_VALIDATOR_SEED environment variable when this value is
+    /// secret material. The desktop app derives this from the wallet's BIP-39
+    /// phrase, and a process's argv is world-readable — any user on the
+    /// machine can recover it with `ps`. An environment variable is readable
+    /// only by the owning user, so the phrase stays out of the process table.
+    #[arg(long, env = "ARC_VALIDATOR_SEED", default_value = "arc-validator-0")]
     validator_seed: String,
+
+    /// Public label for this node in the shard registry (shown by GET /shards
+    /// on every seed, so treat it as public).
+    ///
+    /// Defaults to a short hash of the validator seed. It must never default
+    /// to the seed itself: the desktop app uses the wallet's BIP-39 phrase as
+    /// the seed, and this value is broadcast to every seed and served to any
+    /// caller of /shards.
+    #[arg(long, env = "ARC_NODE_NAME")]
+    node_name: Option<String>,
 
     /// Archive mode - disable all pruning, keep full transaction history.
     /// Use for block explorers and analytics. Requires more disk space.
@@ -666,6 +682,23 @@ fn pick_seed_rpc(cli: &Cli) -> Option<String> {
 ///
 /// Uses the canonical testnet model_id from inference_validator so the
 /// assignment registers in the same pipeline that tier-1 voting reads.
+/// The node's public label for the shard registry.
+///
+/// Deliberately never `cli.validator_seed`: the desktop derives that from the
+/// wallet's BIP-39 phrase, and this string is POSTed to every seed and handed
+/// out by GET /shards. A short hash is a stable public identifier that leaks
+/// nothing about the key.
+fn public_node_name(cli: &Cli) -> String {
+    if let Some(n) = cli.node_name.as_deref() {
+        let n = n.trim();
+        if !n.is_empty() {
+            return n.to_string();
+        }
+    }
+    let digest = arc_crypto::hash_bytes(cli.validator_seed.as_bytes());
+    format!("arc-{}", &hex::encode(digest.0)[..8])
+}
+
 async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
     let seed = pick_seed_rpc(cli)?;
     let url = format!("http://{}/shards/join", seed);
@@ -686,7 +719,7 @@ async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
 
     let body = serde_json::json!({
         "socket_addr": cli.rpc,
-        "node_name": cli.validator_seed,
+        "node_name": public_node_name(cli),
         "model_id": model_id_hex,
         "model_name": "Llama-2-7B",
         "total_layers": 32u32,
@@ -853,10 +886,16 @@ async fn main() -> Result<()> {
         node_cfg.validator.min_stake
     };
 
-    let validator_seed = if matches.value_source("validator_seed") == Some(clap::parser::ValueSource::CommandLine) {
-        cli.validator_seed.clone()
-    } else {
-        node_cfg.validator.seed.clone()
+    // Precedence: --validator-seed, then ARC_VALIDATOR_SEED, then the config
+    // file. EnvVariable must be honoured alongside CommandLine — the desktop
+    // passes the wallet phrase through the environment so it stays out of the
+    // world-readable process table, and treating that as "unset" would run the
+    // node under the default identity and accrue earnings to a key the user
+    // does not hold.
+    let validator_seed = match matches.value_source("validator_seed") {
+        Some(clap::parser::ValueSource::CommandLine)
+        | Some(clap::parser::ValueSource::EnvVariable) => cli.validator_seed.clone(),
+        _ => node_cfg.validator.seed.clone(),
     };
 
     let eth_rpc_port = if matches.value_source("eth_rpc_port") == Some(clap::parser::ValueSource::CommandLine) {
@@ -1648,7 +1687,10 @@ async fn main() -> Result<()> {
                 memory_mb: per_layer_mb * (end - start),
                 full_model_mb,
                 socket_addr: socket_addr.clone(),
-                node_name: validator_seed.clone(),
+                // NOT validator_seed: this ShardInfo is POSTed to every seed
+                // every 15s and served publicly by GET /shards, and the
+                // desktop's seed is the wallet's BIP-39 phrase.
+                node_name: public_node_name(&cli),
             }).collect()
         }
         _ => Vec::new(),
