@@ -977,6 +977,67 @@ fn age_secs_from_ms(ts_ms: u64) -> Option<u64> {
     Some(now.saturating_sub(ts_ms) / 1_000)
 }
 
+/// An explorer link for an attestation tx, and the reason when there isn't one.
+///
+/// Returns `(explorer_url, unavailable_reason)`. The URL is non-null ONLY when
+/// the transaction actually exists in a block on this node.
+///
+/// This used to be an unconditional `format!("/tx/0x{hash}")`, emitted the
+/// instant the tx was inserted into the mempool. On a chain that is not sealing
+/// blocks that link never resolves: `/tx/{hash}` answers
+/// `{"error":"Transaction ... not found"}` forever, so the demo handed the
+/// caller a receipt for a transaction that did not exist and never would. A
+/// link that is not yet valid is not a link — it is an invented fact, and the
+/// caller cannot tell the difference from a real one.
+///
+/// When the chain is stalled this says so explicitly rather than saying
+/// "pending", because "pending" implies it is coming.
+fn explorer_url_for(
+    node: &NodeState,
+    tx_hash: &arc_crypto::Hash256,
+    attestation_status: &str,
+) -> (Value, Option<String>) {
+    let hex_hash = hex::encode(&tx_hash.0);
+
+    if node.state.get_transaction(&tx_hash.0).is_some() {
+        return (Value::String(format!("/tx/0x{hex_hash}")), None);
+    }
+
+    if attestation_status != "submitted_to_mempool" {
+        return (
+            Value::Null,
+            Some(format!(
+                "no explorer link: the attestation was not submitted (status {attestation_status}), \
+                 so no transaction exists to link to."
+            )),
+        );
+    }
+
+    // Submitted, not yet in a block. Whether it ever will be depends on this
+    // chain still sealing — which is a fact we hold, so state it.
+    let chain_advancing = latest_available_block(node)
+        .and_then(|b| age_secs_from_ms(b.header.timestamp))
+        .map(|age| age <= BLOCK_PRODUCTION_FRESH_SECS);
+
+    let reason = match chain_advancing {
+        Some(false) => format!(
+            "no explorer link: tx 0x{hex_hash} is in this node's mempool but block production on \
+             this node is STALLED, so it will not be mined and /tx/0x{hex_hash} will keep \
+             returning 'not found'. Submit against a seed that is sealing blocks."
+        ),
+        Some(true) => format!(
+            "no explorer link yet: tx 0x{hex_hash} is in the mempool and this node is sealing \
+             blocks, so poll /tx/0x{hex_hash} — the link becomes valid once it is mined."
+        ),
+        None => format!(
+            "no explorer link: tx 0x{hex_hash} is in the mempool, but this node cannot determine \
+             whether it is sealing blocks, so it cannot say the link will ever resolve."
+        ),
+    };
+
+    (Value::Null, Some(reason))
+}
+
 /// Capacity of the community work mpsc. Each slot is a single whole-prompt
 /// job; under heavy load the dispatcher's `.send().await` provides natural
 /// backpressure without unbounded memory growth.
@@ -1354,16 +1415,79 @@ struct HealthResponse {
     dag_round: u64,
     dag_committed: u64,
     validators: usize,
+    /// Age of the newest block this node holds, from that block's own header
+    /// timestamp. `null` only when the node holds no block at all (or the
+    /// header timestamp is unreadable) — which is "unknown", not "fresh".
+    last_block_age_secs: Option<u64>,
+    /// Whether the chain this node serves is still sealing blocks.
+    /// `null` when `last_block_age_secs` is unknown.
+    chain_advancing: Option<bool>,
+    /// Populated only when `status != "ok"`, so an operator reading a
+    /// degraded response is told what specifically is degraded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    degraded_reason: Option<String>,
 }
 
+/// Map block liveness to a `/health` status. Pure, so both directions are
+/// testable without standing up a block-producing node.
+///
+/// Unknown age is NOT treated as healthy: a node that cannot say when it last
+/// sealed a block must not answer `"ok"`.
+fn health_status_from(
+    chain_advancing: Option<bool>,
+    last_block_age_secs: Option<u64>,
+) -> (&'static str, Option<String>) {
+    match (chain_advancing, last_block_age_secs) {
+        (Some(true), _) => ("ok", None),
+        (Some(false), Some(age)) => (
+            "degraded",
+            Some(format!(
+                "block production stalled: newest block is {age}s old (> {BLOCK_PRODUCTION_FRESH_SECS}s). \
+                 DAG rounds may still be advancing; round progress is not block production."
+            )),
+        ),
+        _ => (
+            "degraded",
+            Some(
+                "block liveness unknown: this node holds no block with a readable header \
+                 timestamp, so it cannot assert that the chain is advancing."
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
+/// `status` is NOT hardcoded `"ok"`.
+///
+/// It used to be, and that is precisely what let four seeds sit for eight days
+/// answering `{"status":"ok","syncing":false}` while sealing no blocks: DAG
+/// rounds and block commits are separate paths, so `dag_round` kept advancing
+/// and every liveness check on the network read green. A monitor, a dashboard
+/// or a desktop client polling `/health` had no field that could tell it
+/// otherwise.
+///
+/// `status` is `"ok"` only when this node's newest block is younger than
+/// [`BLOCK_PRODUCTION_FRESH_SECS`]. A stalled chain reports `"degraded"` with
+/// a reason. Callers that treat any non-`"ok"` status as "do not route chain
+/// reads here" get the correct behaviour for free; callers that only check for
+/// the string `"ok"` now fail closed instead of open.
 async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
     let validators = node.dag_validators.read().len();
     // Periodic cleanup: evict stale tx rate limit entries (>60s old)
     if node.tx_rate_limit.len() > 1000 {
         node.tx_rate_limit.retain(|_, v| v.elapsed().as_secs() < 60);
     }
+
+    // The newest block that actually EXISTS here — see `latest_available_block`:
+    // looking up `height()` directly reports a producing node as blockless.
+    let last_block_age_secs =
+        latest_available_block(&node).and_then(|b| age_secs_from_ms(b.header.timestamp));
+    let chain_advancing = last_block_age_secs.map(|age| age <= BLOCK_PRODUCTION_FRESH_SECS);
+
+    let (status, degraded_reason) = health_status_from(chain_advancing, last_block_age_secs);
+
     Json(HealthResponse {
-        status: "ok".to_string(),
+        status: status.to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         height: node.state.height(),
         peers: node.peer_count.load(Ordering::Relaxed),
@@ -1371,6 +1495,9 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
         dag_round: node.dag_round.load(Ordering::Relaxed),
         dag_committed: node.dag_committed.load(Ordering::Relaxed),
         validators,
+        last_block_age_secs,
+        chain_advancing,
+        degraded_reason,
     })
 }
 
@@ -4776,6 +4903,8 @@ async fn inference_run(
 
     // Store inference result for explorer display
     let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
+    let (explorer_url, explorer_url_unavailable_reason) =
+        explorer_url_for(&node, &tx_hash, &attestation_status);
     node.inference_results.insert(tx_hash_hex.clone(), json!({
         "input": input_text,
         "output": &output_text,
@@ -4813,7 +4942,8 @@ async fn inference_run(
             "challenge_period": challenge_period,
             "status": attestation_status,
         },
-        "explorer_url": format!("/tx/0x{}", hex::encode(&tx_hash.0)),
+        "explorer_url": explorer_url,
+        "explorer_url_unavailable_reason": explorer_url_unavailable_reason,
     })))
 }
 
@@ -6844,6 +6974,11 @@ async fn inference_run_sharded(
                     "committee",
                     "fee_split",
                     "explorer_url",
+                    // Carry the reason with the link. Copying `explorer_url`
+                    // alone would let a cache hit serve a null link with no
+                    // explanation — or, once the tx does get mined, a stale
+                    // reason alongside a now-valid link.
+                    "explorer_url_unavailable_reason",
                     "pipeline_length",
                 ] {
                     if let Some(v) = m.get(key) {
@@ -7010,6 +7145,9 @@ async fn inference_run_sharded(
         .revenue_config
         .split_fee(1000, node.dag_validators.read().len().saturating_sub(1) as u32);
 
+    let (explorer_url, explorer_url_unavailable_reason) =
+        explorer_url_for(&node, &tx_hash, &attestation_status);
+
     let response = json!({
         "success": true,
         "request_id": request_id,
@@ -7048,7 +7186,8 @@ async fn inference_run_sharded(
             "observer_pool": fee_split.observer_pool,
             "treasury": fee_split.treasury,
         },
-        "explorer_url": format!("/tx/0x{}", hex::encode(&tx_hash.0)),
+        "explorer_url": explorer_url,
+        "explorer_url_unavailable_reason": explorer_url_unavailable_reason,
     });
 
     // Remember this run's provenance so a later cache hit can report the real
@@ -10532,6 +10671,91 @@ mod tests {
         );
         let s = stats.get("140.82.16.112:9090").unwrap();
         assert_eq!(effective_latency_ms(&s), Some(300.0));
+    }
+
+    /// A node with no blocks must not claim the chain is advancing, and must
+    /// not answer `"ok"`. This is the regression that let four seeds report
+    /// `{"status":"ok"}` for eight days while sealing nothing.
+    #[test]
+    fn health_status_is_not_ok_when_block_liveness_is_unknown() {
+        let node = fake_node_with_workers(Vec::new());
+        let age = latest_available_block(&node).and_then(|b| age_secs_from_ms(b.header.timestamp));
+        let chain_advancing = age.map(|a| a <= BLOCK_PRODUCTION_FRESH_SECS);
+
+        // An empty StateDB knows nothing about liveness. "Unknown" must not
+        // collapse into "fresh".
+        assert_ne!(
+            chain_advancing,
+            Some(true),
+            "a node with no readable block must never report the chain as advancing"
+        );
+    }
+
+    /// Both directions of the status mapping, including the one a stake-0
+    /// community node can never reach locally (it takes no consensus role, so
+    /// it never seals and never goes fresh).
+    #[test]
+    fn health_status_tracks_block_liveness_in_both_directions() {
+        // Sealing normally → ok, and no reason field to render.
+        let (status, reason) = health_status_from(Some(true), Some(29));
+        assert_eq!(status, "ok");
+        assert!(reason.is_none(), "a healthy node must not carry a reason");
+
+        // The observed AMS/NRT/SGP stall: 8 days.
+        let (status, reason) = health_status_from(Some(false), Some(670_501));
+        assert_eq!(status, "degraded");
+        let reason = reason.expect("a degraded node must explain itself");
+        assert!(reason.contains("670501"), "reason must cite the real age: {reason}");
+        assert!(
+            reason.contains("round progress is not block production"),
+            "reason must name the DAG/commit distinction that hid this: {reason}"
+        );
+
+        // Unknown liveness must not collapse into healthy.
+        let (status, reason) = health_status_from(None, None);
+        assert_eq!(status, "degraded");
+        assert!(reason.expect("reason required").contains("unknown"));
+    }
+
+    /// The freshness boundary is inclusive, so a node sealing exactly at the
+    /// window edge is not flapped to degraded.
+    #[test]
+    fn block_age_at_the_freshness_boundary_is_still_ok() {
+        assert_eq!(
+            health_status_from(Some(true), Some(BLOCK_PRODUCTION_FRESH_SECS)).0,
+            "ok"
+        );
+        let advancing = |age: u64| age <= BLOCK_PRODUCTION_FRESH_SECS;
+        assert!(advancing(BLOCK_PRODUCTION_FRESH_SECS));
+        assert!(!advancing(BLOCK_PRODUCTION_FRESH_SECS + 1));
+    }
+
+    /// The demo hands back a receipt. If the tx is not in a block, that receipt
+    /// must not carry a link — `/tx/{hash}` answers "not found" and the caller
+    /// cannot distinguish an unmined tx from a real one.
+    #[test]
+    fn explorer_url_is_null_until_the_tx_is_actually_in_a_block() {
+        let node = fake_node_with_workers(Vec::new());
+        let tx_hash = Hash256::ZERO;
+
+        let (url, reason) = explorer_url_for(&node, &tx_hash, "submitted_to_mempool");
+        assert!(
+            url.is_null(),
+            "a mempool-only tx must not be given an explorer link, got {url:?}"
+        );
+        let reason = reason.expect("a null link must always carry a reason");
+        assert!(
+            reason.contains("mempool"),
+            "the reason must say why there is no link: {reason}"
+        );
+
+        // A tx that was never submitted gets its own distinct explanation.
+        let (url, reason) = explorer_url_for(&node, &tx_hash, "sign_failed");
+        assert!(url.is_null());
+        assert!(
+            reason.expect("reason required").contains("sign_failed"),
+            "a non-submitted attestation must name its actual status"
+        );
     }
 
     #[test]
