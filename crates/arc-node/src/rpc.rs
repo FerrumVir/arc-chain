@@ -1428,6 +1428,21 @@ struct HealthResponse {
     degraded_reason: Option<String>,
 }
 
+/// How stale the newest block must be before `/health` calls the node
+/// degraded.
+///
+/// Deliberately NOT [`BLOCK_PRODUCTION_FRESH_SECS`] (120 s). That constant is
+/// the freshness window `/network/info` reports against, and it is far tighter
+/// than this network's real cadence: measured over 10.3 h on 2026-08-18/19,
+/// NYC sealed 50 blocks (~12 min/block) and LAX 108 (~5.7 min/block). Driving
+/// the top-level `status` field off a 120 s window would mark both of the only
+/// seeds that ARE sealing as degraded, which is a worse lie than the one this
+/// replaced and would train operators to ignore the field.
+///
+/// 30 minutes cleanly separates "slow but sealing" (≤ ~12 min) from the
+/// failure this exists to catch (the four seeds stalled for ~8 days).
+pub const HEALTH_STALL_SECS: u64 = 1_800;
+
 /// Map block liveness to a `/health` status. Pure, so both directions are
 /// testable without standing up a block-producing node.
 ///
@@ -1442,7 +1457,7 @@ fn health_status_from(
         (Some(false), Some(age)) => (
             "degraded",
             Some(format!(
-                "block production stalled: newest block is {age}s old (> {BLOCK_PRODUCTION_FRESH_SECS}s). \
+                "block production stalled: newest block is {age}s old (> {HEALTH_STALL_SECS}s). \
                  DAG rounds may still be advancing; round progress is not block production."
             )),
         ),
@@ -1482,7 +1497,9 @@ async fn health(AxumState(node): AxumState<NodeState>) -> Json<HealthResponse> {
     // looking up `height()` directly reports a producing node as blockless.
     let last_block_age_secs =
         latest_available_block(&node).and_then(|b| age_secs_from_ms(b.header.timestamp));
-    let chain_advancing = last_block_age_secs.map(|age| age <= BLOCK_PRODUCTION_FRESH_SECS);
+    // Judged against HEALTH_STALL_SECS, not BLOCK_PRODUCTION_FRESH_SECS — see
+    // that constant for why 120 s would flag the healthy seeds as degraded.
+    let chain_advancing = last_block_age_secs.map(|age| age <= HEALTH_STALL_SECS);
 
     let (status, degraded_reason) = health_status_from(chain_advancing, last_block_age_secs);
 
@@ -10721,13 +10738,38 @@ mod tests {
     /// window edge is not flapped to degraded.
     #[test]
     fn block_age_at_the_freshness_boundary_is_still_ok() {
-        assert_eq!(
-            health_status_from(Some(true), Some(BLOCK_PRODUCTION_FRESH_SECS)).0,
-            "ok"
-        );
-        let advancing = |age: u64| age <= BLOCK_PRODUCTION_FRESH_SECS;
-        assert!(advancing(BLOCK_PRODUCTION_FRESH_SECS));
-        assert!(!advancing(BLOCK_PRODUCTION_FRESH_SECS + 1));
+        assert_eq!(health_status_from(Some(true), Some(HEALTH_STALL_SECS)).0, "ok");
+        let advancing = |age: u64| age <= HEALTH_STALL_SECS;
+        assert!(advancing(HEALTH_STALL_SECS));
+        assert!(!advancing(HEALTH_STALL_SECS + 1));
+    }
+
+    /// The threshold must not flag a slow-but-sealing node.
+    ///
+    /// Measured on the live network over 10.3 h on 2026-08-18/19: NYC sealed
+    /// 50 blocks (~744 s/block) and LAX 108 (~344 s/block), while AMS/NRT/SGP
+    /// sat at ~670,000 s. A window that calls NYC and LAX degraded would be a
+    /// worse lie than the hardcoded "ok" this replaced, because it would mark
+    /// the only two healthy seeds as broken.
+    #[test]
+    fn health_threshold_separates_slow_sealing_from_an_eight_day_stall() {
+        let advancing = |age: u64| age <= HEALTH_STALL_SECS;
+
+        // Real observed inter-block times on the two sealing seeds.
+        assert!(advancing(744), "NYC cadence ~12 min must read as advancing");
+        assert!(advancing(344), "LAX cadence ~5.7 min must read as advancing");
+        // And the ages actually observed while probing them.
+        assert!(advancing(677));
+        assert!(advancing(460));
+
+        // The failure this exists to catch: ~7.8 days.
+        assert!(!advancing(670_501));
+        assert_eq!(health_status_from(Some(false), Some(670_501)).0, "degraded");
+
+        // The old 120 s window would have called both healthy seeds degraded —
+        // guard against anyone re-pointing the status field at it.
+        assert!(744 > BLOCK_PRODUCTION_FRESH_SECS);
+        assert!(HEALTH_STALL_SECS > BLOCK_PRODUCTION_FRESH_SECS);
     }
 
     /// The demo hands back a receipt. If the tx is not in a block, that receipt
