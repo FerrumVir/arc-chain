@@ -82,7 +82,7 @@ fn rle_decode(data: &[u8]) -> Vec<u8> {
     while i + 1 < data.len() {
         let count = data[i] as usize;
         let byte = data[i + 1];
-        out.extend(std::iter::repeat(byte).take(count));
+        out.extend(std::iter::repeat_n(byte, count));
         i += 2;
     }
     out
@@ -339,7 +339,7 @@ impl ProofAggregator {
             .collect();
 
         // Pad to even length.
-        if leaves.len() % 2 != 0 {
+        if !leaves.len().is_multiple_of(2) {
             leaves.push(*leaves.last().unwrap());
         }
 
@@ -355,7 +355,7 @@ impl ProofAggregator {
                 })
                 .collect();
 
-            if leaves.len() > 1 && leaves.len() % 2 != 0 {
+            if leaves.len() > 1 && !leaves.len().is_multiple_of(2) {
                 leaves.push(*leaves.last().unwrap());
             }
         }

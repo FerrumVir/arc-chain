@@ -477,11 +477,10 @@ impl WalWriter {
     /// If no segments exist, returns (0, dir/wal-00000000.bin).
     fn find_latest_segment(dir: &Path) -> (u64, PathBuf) {
         let segments = Self::list_segments(dir);
-        if let Some(last) = segments.last() {
-            if let Some(num) = Self::parse_segment_number(last) {
+        if let Some(last) = segments.last()
+            && let Some(num) = Self::parse_segment_number(last) {
                 return (num, last.clone());
             }
-        }
         (0, dir.join("wal-00000000.bin"))
     }
 
@@ -491,11 +490,10 @@ impl WalWriter {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("wal-") && name.ends_with(".bin") {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && name.starts_with("wal-") && name.ends_with(".bin") {
                         segments.push(path);
                     }
-                }
             }
         }
         segments.sort();
@@ -591,11 +589,10 @@ pub fn latest_block_height_in_wal_dir(dir: impl AsRef<Path>) -> u64 {
     if let Ok(entries) = fs::read_dir(dir.as_ref()) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("wal-") && name.ends_with(".bin") {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.starts_with("wal-") && name.ends_with(".bin") {
                     segments.push(path);
                 }
-            }
         }
     }
     segments.sort();
@@ -663,7 +660,7 @@ impl Snapshot {
     /// Write snapshot to disk as LZ4-compressed bincode.
     pub fn write_to(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let data = bincode::serialize(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| std::io::Error::other(e))?;
         let compressed = lz4_flex::compress_prepend_size(&data);
 
         let mut file = File::create(path)?;

@@ -374,7 +374,7 @@ impl NeuralNet {
             } else {
                 // Out-of-vocabulary - emit zeros matching embed_dim.
                 let dim = if table.is_empty() { 0 } else { table[0].len() };
-                output.extend(std::iter::repeat(0.0f32).take(dim));
+                output.extend(std::iter::repeat_n(0.0f32, dim));
             }
         }
         output

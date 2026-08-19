@@ -68,7 +68,7 @@ pub struct TxInclusionProof {
 /// This is a pure function - light clients can call it with raw values
 /// obtained from a FinalityProof (defined in arc-consensus).
 pub fn verify_finality_stake(signing_stake: u64, total_stake: u64) -> bool {
-    let quorum = (2 * total_stake + 2) / 3;
+    let quorum = (2 * total_stake).div_ceil(3);
     signing_stake >= quorum
 }
 
@@ -253,7 +253,7 @@ impl FinalityProof {
     /// strictly more than two-thirds of stake have attested.
     pub fn supermajority_threshold(total_stake: u64) -> u64 {
         // ceil(2 * total / 3) = (2 * total + 2) / 3  (integer arithmetic)
-        let two_thirds_ceil = (2 * total_stake + 2) / 3;
+        let two_thirds_ceil = (2 * total_stake).div_ceil(3);
         two_thirds_ceil + 1
     }
 

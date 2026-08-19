@@ -126,7 +126,7 @@ fn abi_type_string(t: &AbiType) -> String {
         AbiType::BytesN(n) => format!("bytes{}", n),
         AbiType::Array(inner) => format!("{}[]", abi_type_string(inner)),
         AbiType::Tuple(types) => {
-            let inner: Vec<String> = types.iter().map(|t| abi_type_string(t)).collect();
+            let inner: Vec<String> = types.iter().map(abi_type_string).collect();
             format!("({})", inner.join(","))
         }
     }

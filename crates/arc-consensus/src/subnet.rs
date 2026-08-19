@@ -256,14 +256,13 @@ impl SubnetRegistry {
         drop(subnet);
 
         // Enforce monotonically increasing subnet heights.
-        if let Some(latest) = self.latest_anchor.get(&anchor.subnet_id) {
-            if anchor.subnet_height <= latest.subnet_height {
+        if let Some(latest) = self.latest_anchor.get(&anchor.subnet_id)
+            && anchor.subnet_height <= latest.subnet_height {
                 return Err(SubnetError::InvalidAnchorHeight {
                     new: anchor.subnet_height,
                     latest: latest.subnet_height,
                 });
             }
-        }
 
         // Store the anchor.
         self.latest_anchor
@@ -344,11 +343,10 @@ impl SubnetRegistry {
         drop(vals);
 
         // Auto-activate subnet when minimum validators reached.
-        if let Some(mut subnet) = self.subnets.get_mut(subnet_id) {
-            if subnet.status == SubnetStatus::Pending && active_count >= subnet.min_validators {
+        if let Some(mut subnet) = self.subnets.get_mut(subnet_id)
+            && subnet.status == SubnetStatus::Pending && active_count >= subnet.min_validators {
                 subnet.status = SubnetStatus::Active;
             }
-        }
 
         Ok(())
     }

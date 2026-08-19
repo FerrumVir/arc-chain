@@ -35,19 +35,17 @@ pub fn diff_synthesize(
     });
 
     // Strategy 1: Consistent color mapping
-    if same_size {
-        if let Some(r) = strategy_color_mapping(train_pairs, test_inputs) {
+    if same_size
+        && let Some(r) = strategy_color_mapping(train_pairs, test_inputs) {
             return Some(r);
         }
-    }
     if elapsed() > timeout_ms { return None; }
 
     // Strategy 2: Positional diff - cells that change share a spatial pattern
-    if same_size {
-        if let Some(r) = strategy_positional_diff(train_pairs, test_inputs) {
+    if same_size
+        && let Some(r) = strategy_positional_diff(train_pairs, test_inputs) {
             return Some(r);
         }
-    }
     if elapsed() > timeout_ms { return None; }
 
     // Strategy 3: Object diff - detect what happened to objects
@@ -57,11 +55,10 @@ pub fn diff_synthesize(
     if elapsed() > timeout_ms { return None; }
 
     // Strategy 4: Conditional color replace
-    if same_size {
-        if let Some(r) = strategy_conditional_replace(train_pairs, test_inputs) {
+    if same_size
+        && let Some(r) = strategy_conditional_replace(train_pairs, test_inputs) {
             return Some(r);
         }
-    }
     if elapsed() > timeout_ms { return None; }
 
     // Strategy 5: Pattern stamp / copy
@@ -71,19 +68,17 @@ pub fn diff_synthesize(
     if elapsed() > timeout_ms { return None; }
 
     // Strategy 6: Remove or keep specific objects
-    if same_size {
-        if let Some(r) = strategy_remove_objects(train_pairs, test_inputs) {
+    if same_size
+        && let Some(r) = strategy_remove_objects(train_pairs, test_inputs) {
             return Some(r);
         }
-    }
     if elapsed() > timeout_ms { return None; }
 
     // Strategy 7: Fill between objects
-    if same_size {
-        if let Some(r) = strategy_fill_between(train_pairs, test_inputs) {
+    if same_size
+        && let Some(r) = strategy_fill_between(train_pairs, test_inputs) {
             return Some(r);
         }
-    }
 
     None
 }
@@ -141,11 +136,10 @@ fn is_isolated(g: &Grid, r: usize, c: usize) -> bool {
     for (dr, dc) in &neighbors {
         let nr = r as isize + dr;
         let nc = c as isize + dc;
-        if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
-            if g[nr as usize][nc as usize] == color {
+        if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize
+            && g[nr as usize][nc as usize] == color {
                 return false;
             }
-        }
     }
     true
 }
@@ -411,7 +405,7 @@ fn positional_adjacent_fill_any(
 
                 let consistent = train_pairs.iter().all(|(inp, out)| {
                     let h = inp.len();
-                    if h == 0 || inp[0].len() != out.get(0).map_or(0, |r| r.len()) { return false; }
+                    if h == 0 || inp[0].len() != out.first().map_or(0, |r| r.len()) { return false; }
                     let w = inp[0].len();
                     if inp.len() != out.len() { return false; }
 
@@ -1334,11 +1328,10 @@ fn object_recolor(
             Some(existing) => {
                 // Must be consistent across pairs
                 for (k, v) in &pair_map {
-                    if let Some(&ev) = existing.get(k) {
-                        if ev != *v {
+                    if let Some(&ev) = existing.get(k)
+                        && ev != *v {
                             return None;
                         }
-                    }
                 }
                 let mut merged = existing.clone();
                 merged.extend(pair_map);
@@ -1624,11 +1617,10 @@ fn has_neighbor(g: &Grid, r: usize, c: usize, color: Color) -> bool {
     for (dr, dc) in &neighbors {
         let nr = r as isize + dr;
         let nc = c as isize + dc;
-        if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
-            if g[nr as usize][nc as usize] == color {
+        if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize
+            && g[nr as usize][nc as usize] == color {
                 return true;
             }
-        }
     }
     false
 }

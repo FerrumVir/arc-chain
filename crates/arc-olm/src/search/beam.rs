@@ -227,8 +227,8 @@ pub fn beam_search_steered(
 
         // Check for exact match (fitness = 1.0)
         for candidate in &deduped {
-            if candidate.fitness >= 0.9999 {
-                if let DagValue::Grid(ref result_grid) = candidate.current_value {
+            if candidate.fitness >= 0.9999
+                && let DagValue::Grid(ref result_grid) = candidate.current_value {
                     // Verify on ALL training pairs
                     let all_match = verify_on_all_pairs(
                         &candidate.steps, &catalog, train_pairs,
@@ -249,7 +249,6 @@ pub fn beam_search_steered(
                         }
                     }
                 }
-            }
         }
 
         // Sort by fitness, keep top beam_width
@@ -446,11 +445,10 @@ fn exhaustive_dfs(
     for prim in catalog {
         // Amortized timeout check: every 5,000 iterations
         let count = EXHAUST_ITER_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count % 5_000 == 0 && count > 0 {
-            if start.elapsed().as_millis() as u64 > timeout_ms {
+        if count.is_multiple_of(5_000) && count > 0
+            && start.elapsed().as_millis() as u64 > timeout_ms {
                 return None;
             }
-        }
 
         // Type check: unary or binary
         let accepts = (prim.input_types.len() == 1 && prim.input_types[0] == *current_type)

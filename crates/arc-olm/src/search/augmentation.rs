@@ -122,7 +122,7 @@ fn heap_permutations(
     }
     for i in 0..k {
         heap_permutations(arr, k - 1, original, out);
-        if k % 2 == 0 {
+        if k.is_multiple_of(2) {
             arr.swap(i, k - 1);
         } else {
             arr.swap(0, k - 1);

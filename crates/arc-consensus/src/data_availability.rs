@@ -95,7 +95,7 @@ pub fn encode_block_data(data: &[u8], data_chunks: u16, parity_chunks: u16) -> E
     let chunk_size = if original_size == 0 {
         1
     } else {
-        (original_size + k - 1) / k
+        original_size.div_ceil(k)
     };
 
     // Split data into k chunks, padding with zeros as needed
@@ -237,15 +237,14 @@ pub fn decode_block_data(encoding: &ErasureEncoding) -> Result<Vec<u8>, String> 
 
                 // XOR with all present data chunks in the group
                 for &i in &group_indices {
-                    if i != missing_idx {
-                        if let Some(ref chunk_data) = data_slots[i] {
+                    if i != missing_idx
+                        && let Some(ref chunk_data) = data_slots[i] {
                             for (byte_idx, &byte) in chunk_data.iter().enumerate() {
                                 if byte_idx < reconstructed.len() {
                                     reconstructed[byte_idx] ^= byte;
                                 }
                             }
                         }
-                    }
                 }
 
                 data_slots[missing_idx] = Some(reconstructed);

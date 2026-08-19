@@ -354,7 +354,7 @@ pub fn gpu_batch_commit(data: &[&[u8]]) -> Result<Vec<Hash256>, GpuError> {
 
     // Dispatch compute
     let workgroup_size = 256u32;
-    let num_workgroups = (n + workgroup_size - 1) / workgroup_size;
+    let num_workgroups = n.div_ceil(workgroup_size);
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("BLAKE3 Encoder"),
@@ -422,7 +422,7 @@ pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
     let mut current: Vec<Hash256> = leaves.to_vec();
 
     // Pad to even length with zero hash if needed
-    if current.len() % 2 != 0 {
+    if !current.len().is_multiple_of(2) {
         current.push(Hash256([0u8; 32]));
     }
 
@@ -448,7 +448,7 @@ pub fn gpu_merkle_root(leaves: &[Hash256]) -> Result<Hash256, GpuError> {
         };
 
         // Pad again if odd
-        if current.len() > 1 && current.len() % 2 != 0 {
+        if current.len() > 1 && !current.len().is_multiple_of(2) {
             current.push(Hash256([0u8; 32]));
         }
     }

@@ -22,7 +22,7 @@ impl fmt::Debug for AgentId {
 
 impl fmt::Display for AgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(&self.0))
+        write!(f, "{}", hex::encode(self.0))
     }
 }
 

@@ -210,11 +210,10 @@ fn output_type_of(steps: &[String], catalog: &[TypedPrimitive]) -> DagType {
     if steps.is_empty() {
         return DagType::Grid;
     }
-    if let Some(last) = steps.last() {
-        if let Some(prim) = catalog.iter().find(|p| p.name == last.as_str()) {
+    if let Some(last) = steps.last()
+        && let Some(prim) = catalog.iter().find(|p| p.name == last.as_str()) {
             return prim.output_type.clone();
         }
-    }
     DagType::Grid
 }
 
@@ -245,11 +244,10 @@ fn mutate_swap(parent: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Candidate>
             // next step (if any).
             if pos + 1 < parent.steps.len() {
                 let next_name = &parent.steps[pos + 1];
-                if let Some(next_prim) = catalog.iter().find(|p| p.name == next_name.as_str()) {
-                    if next_prim.input_types[0] != op.output_type {
+                if let Some(next_prim) = catalog.iter().find(|p| p.name == next_name.as_str())
+                    && next_prim.input_types[0] != op.output_type {
                         continue; // type mismatch with next step
                     }
-                }
             }
 
             let mut new_steps = parent.steps.clone();
@@ -397,13 +395,12 @@ pub fn evolve(
             };
 
             // If we already have a perfect solution, verify and return
-            if fitness >= 1.0 - f64::EPSILON {
-                if let Some(result) = try_produce_result(
+            if fitness >= 1.0 - f64::EPSILON
+                && let Some(result) = try_produce_result(
                     &candidate, train_pairs, test_inputs, &catalog,
                 ) {
                     return Some(result);
                 }
-            }
 
             population.push(candidate);
         }
@@ -453,13 +450,11 @@ pub fn evolve(
     sort_population(&mut population);
 
     // Check for perfect candidate in generation 1
-    if let Some(best) = population.first() {
-        if best.fitness >= 1.0 - f64::EPSILON {
-            if let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog) {
+    if let Some(best) = population.first()
+        && best.fitness >= 1.0 - f64::EPSILON
+            && let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog) {
                 return Some(result);
             }
-        }
-    }
 
     // ----------------------------------------------------------
     // Generations 2..N: evolve
@@ -521,13 +516,11 @@ pub fn evolve(
         population.truncate(config.n_initial * 2);
 
         // Check for perfect candidate
-        if let Some(best) = population.first() {
-            if best.fitness >= 1.0 - f64::EPSILON {
-                if let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog) {
+        if let Some(best) = population.first()
+            && best.fitness >= 1.0 - f64::EPSILON
+                && let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog) {
                     return Some(result);
                 }
-            }
-        }
     }
 
     // No perfect solution found

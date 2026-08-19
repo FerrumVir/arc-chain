@@ -18,6 +18,12 @@ pub struct NeonVerifier {
     avg_throughput: f64,
 }
 
+impl Default for NeonVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl NeonVerifier {
     pub fn new() -> Self {
         Self {
@@ -71,21 +77,21 @@ impl NeonVerifier {
 /// 3. Verify each: [s]B == R + [k]A  via vartime_double_scalar_mul_basepoint
 #[cfg(target_arch = "aarch64")]
 fn neon_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
-    use curve25519_dalek::edwards::CompressedEdwardsY;
-    use curve25519_dalek::scalar::Scalar;
+    
+    
     use rayon::prelude::*;
-    use sha2::{Sha512, Digest};
+    
 
     if tasks.len() < 64 {
         // Small batch: sequential with custom verification path
-        tasks.iter().map(|t| verify_custom(t)).collect()
+        tasks.iter().map(verify_custom).collect()
     } else {
         // Large batch: parallel custom verification.
         // Pre-compute k-scalars in pairs (NEON 2-wide SHA-512 via hardware).
         // Then verify in parallel via rayon.
         tasks.par_chunks(2).flat_map(|pair| {
             // Compute k-scalars for this pair
-            let results: Vec<bool> = pair.iter().map(|task| verify_custom(task)).collect();
+            let results: Vec<bool> = pair.iter().map(verify_custom).collect();
             results
         }).collect()
     }
@@ -238,7 +244,7 @@ mod tests {
     #[test]
     fn test_custom_verify_matches_dalek() {
         // Verify that our custom path produces the same results as ed25519-dalek
-        use ed25519_dalek::{Signer, VerifyingKey};
+        use ed25519_dalek::Signer;
         let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let vk = sk.verifying_key();
 

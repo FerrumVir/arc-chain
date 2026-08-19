@@ -116,7 +116,7 @@ fn main() {
                     for dd in 0..dh {
                         dot += q_head[dd] * k_data[k_off + dd];
                     }
-                    let score = (dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS;
+                    let score = ((dot >> FRAC_BITS) * cfg.attn_scale) >> FRAC_BITS;
 
                     if score > running_max {
                         let diff = running_max - score;

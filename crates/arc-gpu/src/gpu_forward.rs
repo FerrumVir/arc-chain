@@ -494,7 +494,7 @@ impl GpuForward {
             }
         };
         // Activations always packed as u32 (quantize kernel outputs u32)
-        let pack_i8 = |data: &[i8]| -> Vec<u8> {
+        let _pack_i8 = |data: &[i8]| -> Vec<u8> {
             let packed = super::gpu_matmul::pack_i8_to_u32_pub(data);
             bytemuck::cast_slice(&packed).to_vec()
         };
@@ -544,7 +544,7 @@ impl GpuForward {
         let max_seq = 2048u32;
 
         let i32_size = |n: u32| (n as usize) * 4;
-        let u32_size = |n: u32| ((n as usize + 3) / 4) * 4;
+        let u32_size = |n: u32| (n as usize).div_ceil(4) * 4;
 
         // Create all buffers as local variables first
         let output_weight_buf = self.buf("out_w", &pack_weights(output_data), sto);
@@ -579,7 +579,7 @@ impl GpuForward {
 
         // Static params (don't change between tokens)
         let ln_params = LayerNormParams { size: d_model, _p1: 0, _p2: 0, _p3: 0 };
-        let ln_params_buf = self.buf(&format!("ln_p"), bytemuck::bytes_of(&ln_params), wgpu::BufferUsages::UNIFORM);
+        let ln_params_buf = self.buf("ln_p", bytemuck::bytes_of(&ln_params), wgpu::BufferUsages::UNIFORM);
         let mm_q_params = self.buf("mm_q_p", bytemuck::bytes_of(&MatmulParams { in_size: d_model, out_size: d_model, scale_offset: 0, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
         let mm_k_params = self.buf("mm_k_p", bytemuck::bytes_of(&MatmulParams { in_size: d_model, out_size: d_kv, scale_offset: 0, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
         let mm_v_params = self.buf("mm_v_p", bytemuck::bytes_of(&MatmulParams { in_size: d_model, out_size: d_kv, scale_offset: 0, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
@@ -712,8 +712,8 @@ impl GpuForward {
         // Encode ALL dispatches - just pipeline+bindgroup+dispatch, zero allocation
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
-        let rt = (model.n_heads * (dh / 2) + 255) / 256; // RoPE Q workgroups
-        let rtk = (model.n_kv_heads * (dh / 2) + 255) / 256; // RoPE K
+        let rt = (model.n_heads * (dh / 2)).div_ceil(256); // RoPE Q workgroups
+        let rtk = (model.n_kv_heads * (dh / 2)).div_ceil(256); // RoPE K
 
         // Matmul pipeline: prefer Q4 Metal → Q8 Metal → WGSL
         // Q4 and Q8 Metal both use same dispatch pattern (4 rows/threadgroup)
@@ -722,7 +722,7 @@ impl GpuForward {
             .unwrap_or(&self.matmul_pipeline);
         let use_metal = self.msl_matmul_q4_pipeline.is_some() || self.msl_matmul_pipeline.is_some();
         let mm_wg = |out_size: u32| -> u32 {
-            if use_metal { (out_size + 3) / 4 } else { (out_size + 255) / 256 }
+            if use_metal { out_size.div_ceil(4) } else { out_size.div_ceil(256) }
         };
 
         let wd = mm_wg(d);
@@ -731,8 +731,8 @@ impl GpuForward {
         let wv = mm_wg(model.vocab_size);
 
         // Non-matmul workgroup counts (unchanged, WGSL kernels)
-        let wd_wgsl = (d + 255) / 256;
-        let wf_wgsl = (dff + 255) / 256;
+        let wd_wgsl = d.div_ceil(256);
+        let wf_wgsl = dff.div_ceil(256);
 
         for i in 0..model.n_layers as usize {
             let bg = &model.layer_bgs[i];
@@ -831,7 +831,7 @@ fn dispatch(
 }
 
 /// Helper: create a bind group entry.
-fn bg_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry {
+fn bg_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
@@ -845,7 +845,7 @@ mod tests {
     #[test]
     fn test_gpu_forward_init() {
         match GpuForward::new() {
-            Ok(gpu) => println!("GPU forward engine initialized"),
+            Ok(_gpu) => println!("GPU forward engine initialized"),
             Err(e) => println!("GPU not available: {}", e),
         }
     }

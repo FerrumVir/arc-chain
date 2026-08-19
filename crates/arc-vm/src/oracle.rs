@@ -251,11 +251,7 @@ impl PriceOracle {
         }
 
         let latest_ts = state.twap_buffer.last().unwrap().timestamp;
-        let cutoff = if latest_ts >= window_secs {
-            latest_ts - window_secs
-        } else {
-            0
-        };
+        let cutoff = latest_ts.saturating_sub(window_secs);
 
         // Filter entries within the window
         let entries: Vec<&TwapEntry> = state

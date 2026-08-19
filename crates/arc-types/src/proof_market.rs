@@ -309,9 +309,7 @@ impl ProofMarketplace {
         }
 
         // Ensure the prover exists in the stats registry (auto-register).
-        if !self.prover_stats.contains_key(&offer.prover) {
-            self.prover_stats.insert(offer.prover, ProverStats::new(offer.prover));
-        }
+        self.prover_stats.entry(offer.prover).or_insert_with(|| ProverStats::new(offer.prover));
 
         entry.offers.push(offer);
         Ok(())

@@ -183,9 +183,7 @@ impl BridgeTransfer {
     ///
     /// Fee = amount * fee_bps / 10_000
     pub fn estimated_fee(&self, config: &BridgeConfig) -> u128 {
-        self.amount
-            .checked_mul(config.fee_bps as u128)
-            .unwrap_or(u128::MAX)
+        self.amount.saturating_mul(config.fee_bps as u128)
             / 10_000
     }
 }
@@ -223,7 +221,7 @@ impl BridgeProof {
 
         for sibling in &self.merkle_siblings {
             let mut hasher = blake3::Hasher::new();
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 // Current is the left child
                 hasher.update(&current);
                 hasher.update(sibling);

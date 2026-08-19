@@ -70,7 +70,7 @@ fn run_eval(dir: &str, config: &SolverConfig, max_tasks: Option<usize>) {
         .expect("Cannot read directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "json"))
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .collect();
     paths.sort();
     if let Some(max) = max_tasks { paths.truncate(max); }

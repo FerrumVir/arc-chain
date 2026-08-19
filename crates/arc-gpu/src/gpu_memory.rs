@@ -34,6 +34,7 @@ pub enum MemoryModel {
 /// into GPU storage buffers.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub struct GpuAccountRepr {
     pub address: [u8; 32],      // 32
     pub balance: u64,           // 8
@@ -48,19 +49,6 @@ pub struct GpuAccountRepr {
 unsafe impl bytemuck::Pod for GpuAccountRepr {}
 unsafe impl bytemuck::Zeroable for GpuAccountRepr {}
 
-impl Default for GpuAccountRepr {
-    fn default() -> Self {
-        Self {
-            address: [0u8; 32],
-            balance: 0,
-            nonce: 0,
-            code_hash: [0u8; 32],
-            storage_root: [0u8; 32],
-            staked_balance: 0,
-            _padding: [0u8; 8],
-        }
-    }
-}
 
 /// Size of one account slot in bytes.
 pub const ACCOUNT_SLOT_SIZE: usize = std::mem::size_of::<GpuAccountRepr>(); // 128
@@ -567,11 +555,10 @@ impl Drop for GpuAccountBuffer {
     fn drop(&mut self) {
         // Best-effort zeroing on drop (secure_shutdown is preferred).
         // We can't do async map here, but queue.write_buffer is synchronous-enough.
-        if self.memory_model == MemoryModel::CpuOnly {
-            if let Some(ref mut backing) = self.cpu_backing {
+        if self.memory_model == MemoryModel::CpuOnly
+            && let Some(ref mut backing) = self.cpu_backing {
                 backing.fill(0);
             }
-        }
     }
 }
 

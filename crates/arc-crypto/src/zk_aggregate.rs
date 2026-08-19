@@ -78,7 +78,7 @@ fn parallel_merkle_root(hashes: &[Hash256]) -> Hash256 {
     }
 
     let mut current: Vec<Hash256> = hashes.to_vec();
-    if current.len() % 2 != 0 {
+    if !current.len().is_multiple_of(2) {
         current.push(*current.last().unwrap());
     }
 
@@ -93,7 +93,7 @@ fn parallel_merkle_root(hashes: &[Hash256]) -> Hash256 {
                 }
             })
             .collect();
-        if current.len() > 1 && current.len() % 2 != 0 {
+        if current.len() > 1 && !current.len().is_multiple_of(2) {
             current.push(*current.last().unwrap());
         }
     }

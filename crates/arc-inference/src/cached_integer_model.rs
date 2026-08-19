@@ -1831,7 +1831,7 @@ fn flash_attention_i8(
         // SIMD dot product: Q_i8 · K_i8 (both already quantized)
         let dot_i32 = dot_i8_kv(&q_i8, k_data, k_off, d_head);
         let dot = (dot_i32 as i64) * q_sf * k_scale;
-        let score = (dot >> (FRAC_BITS * 2)) * attn_scale >> FRAC_BITS;
+        let score = ((dot >> (FRAC_BITS * 2)) * attn_scale) >> FRAC_BITS;
 
         // Online softmax update
         if score > running_max {
@@ -1905,7 +1905,7 @@ fn flash_attention_i64(
                 d_head,
             )
         };
-        let score = (dot >> FRAC_BITS) * attn_scale >> FRAC_BITS;
+        let score = ((dot >> FRAC_BITS) * attn_scale) >> FRAC_BITS;
 
         // Online softmax update
         if score > running_max {
@@ -2036,13 +2036,12 @@ impl CachedIntegerModel {
             let mut best_id = 0u32;
             let max_try = (bytes.len() - pos).min(32);
             for try_len in (1..=max_try).rev() {
-                if let Ok(candidate) = std::str::from_utf8(&bytes[pos..pos + try_len]) {
-                    if let Some(id) = self.vocab.iter().position(|v| v == candidate) {
+                if let Ok(candidate) = std::str::from_utf8(&bytes[pos..pos + try_len])
+                    && let Some(id) = self.vocab.iter().position(|v| v == candidate) {
                         best_len = try_len;
                         best_id = id as u32;
                         break;
                     }
-                }
             }
             if best_len > 0 {
                 tokens.push(best_id);
@@ -2270,13 +2269,12 @@ impl CachedIntegerModel {
             matmul_i16_into(i16_out, &normed, d, &mut logits);
             return logits;
         }
-        if let Some(blk_out) = &self.block_i8_output {
-            if blk_out.n_rows > 0 {
+        if let Some(blk_out) = &self.block_i8_output
+            && blk_out.n_rows > 0 {
                 let mut logits = vec![0i64; cfg.vocab_size];
                 crate::block_i8::matmul_block_i8_into(blk_out, &normed, &mut logits);
                 return logits;
             }
-        }
         if let Some(q4_out) = &self.q4_output {
             let mut logits = vec![0i64; cfg.vocab_size];
             matmul_q4_full(q4_out, &normed, &mut logits);
@@ -2776,7 +2774,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         };
         let dff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
         let vs = content.tensor_infos.get("token_embd.weight")
-            .map(|t| t.shape.dims()[0] as usize).unwrap_or(32000);
+            .map(|t| t.shape.dims()[0]).unwrap_or(32000);
 
         // Read RoPE base frequency from metadata (LLaMA-3 uses 500000, most others use 10000)
         // Handle both F32 and F64 storage - some quantizers write F64
@@ -2853,7 +2851,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
             .map_err(|e| InferenceError::Runtime(format!("tovec: {e}")))
     };
 
-    let extract_i8 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, rows: usize, cols: usize| -> Result<I8Weights, InferenceError> {
+    let _extract_i8 = |reader: &mut std::fs::File, content: &gguf_file::Content, name: &str, rows: usize, cols: usize| -> Result<I8Weights, InferenceError> {
         let f = extract_f32(reader, content, name)?;
         Ok(I8Weights::quantize_f32(&f, rows, cols))
     };
@@ -2870,7 +2868,7 @@ pub fn load_cached_model(path: &str) -> Result<CachedIntegerModel, crate::Infere
         // every Llama-family dimension (4096, 11008, 32000) satisfies this,
         // but fall back to an empty placeholder otherwise so shards with
         // irregular shapes don't panic at load.
-        let block = if cols % crate::block_i8::BLOCK_SIZE == 0 {
+        let block = if cols.is_multiple_of(crate::block_i8::BLOCK_SIZE) {
             crate::block_i8::BlockI8Weights::quantize_f32(&f, rows, cols)
         } else {
             crate::block_i8::BlockI8Weights::empty()
@@ -3045,7 +3043,7 @@ pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::Infe
     };
     let d_ff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
     let vocab_size = content.tensor_infos.get("token_embd.weight")
-        .map(|t| t.shape.dims()[0] as usize).unwrap_or(32000);
+        .map(|t| t.shape.dims()[0]).unwrap_or(32000);
     let d_head = if n_heads > 0 { d_model / n_heads } else { 128 };
     let d_kv = d_head * n_kv_heads;
 
@@ -3179,7 +3177,7 @@ pub fn load_cached_model_shard(
         };
         let dff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
         let vs = content.tensor_infos.get("token_embd.weight")
-            .map(|t| t.shape.dims()[0] as usize).unwrap_or(32000);
+            .map(|t| t.shape.dims()[0]).unwrap_or(32000);
 
         let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {
             Some(gguf_file::Value::F32(v)) => *v as f64,
@@ -3364,7 +3362,7 @@ pub fn load_cached_model_shard(
             };
             any_q4 = true;
         }
-        if (l - start_layer) % 4 == 0 || l == end_layer - 1 {
+        if (l - start_layer).is_multiple_of(4) || l == end_layer - 1 {
             info!("Shard layer {}/{} loaded as I8+I16{} ({} of {})",
                 l + 1, n_layers,
                 if any_q4 { "+Q4" } else { "" },
@@ -4197,7 +4195,7 @@ mod tests {
         // Verify scale magnitudes are reasonable
         for (i, (&q4s, &i8s)) in q4.scales.iter().zip(weights.scales.iter()).enumerate() {
             let ratio = q4s as f64 / i8s.max(1) as f64;
-            assert!(ratio >= 0.5 && ratio <= 20.0, "Q4 scale ratio out of range at row {}: {}", i, ratio);
+            assert!((0.5..=20.0).contains(&ratio), "Q4 scale ratio out of range at row {}: {}", i, ratio);
         }
     }
 }

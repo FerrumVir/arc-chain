@@ -34,8 +34,7 @@ use crate::cached_integer_model::{
 };
 use crate::integer_lut::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 // ─── Memory Tier Detection ─────────────────────────────────────────────────
 
@@ -112,13 +111,11 @@ impl MemoryTierConfig {
                 .args(["-n", "hw.memsize"])
                 .output()
                 .ok();
-            if let Some(out) = output {
-                if let Ok(s) = String::from_utf8(out.stdout) {
-                    if let Ok(bytes) = s.trim().parse::<u64>() {
+            if let Some(out) = output
+                && let Ok(s) = String::from_utf8(out.stdout)
+                    && let Ok(bytes) = s.trim().parse::<u64>() {
                         return bytes;
                     }
-                }
-            }
             16 * 1024 * 1024 * 1024 // default 16GB
         }
         #[cfg(target_os = "linux")]
@@ -413,7 +410,7 @@ pub fn speculative_decode(
         let mut draft_input = *all_tokens.last().unwrap_or(&1);
 
         // Save draft cache position so we can rollback on rejection
-        let draft_seq_before = draft_cache.seq_len;
+        let _draft_seq_before = draft_cache.seq_len;
 
         for _ in 0..speculation_depth {
             let logits = draft.forward_one_token(draft_input, &mut draft_cache);
@@ -435,7 +432,7 @@ pub fn speculative_decode(
         let mut accepted_this_round = 0usize;
         let mut rejected = false;
 
-        for (i, &draft_tok) in draft_tokens.iter().enumerate() {
+        for &draft_tok in draft_tokens.iter() {
             let verify_input = *all_tokens.last().unwrap_or(&1);
             let target_logits = target.forward_one_token(verify_input, &mut target_cache);
 
@@ -536,7 +533,7 @@ pub fn select_experts(
         for col in 0..d {
             acc += (gate_weights.data[row * d + col] as i64) * hidden[col];
         }
-        logits[row] = (acc / 127) * scale >> FRAC_BITS;
+        logits[row] = ((acc / 127) * scale) >> FRAC_BITS;
     }
 
     // Top-k selection
@@ -842,7 +839,7 @@ mod tests {
 
         // Use the same model as both draft and target
         let result = speculative_decode(&model, &model, &[1, 5, 10], 8, 4);
-        assert!(result.accepted_tokens.len() > 0, "Should produce at least 1 token");
+        assert!(!result.accepted_tokens.is_empty(), "Should produce at least 1 token");
         assert!(result.accepted_tokens.len() <= 8, "Should respect max_tokens");
         // With identical models, every draft token should be accepted
         assert_eq!(result.acceptance_rate, 1.0,
@@ -887,7 +884,7 @@ mod tests {
         let target = make_model(2000);
 
         let result = speculative_decode(&draft, &target, &[1, 5], 6, 3);
-        assert!(result.accepted_tokens.len() > 0, "Should produce at least 1 token");
+        assert!(!result.accepted_tokens.is_empty(), "Should produce at least 1 token");
         assert!(result.accepted_tokens.len() <= 6, "Should respect max_tokens");
         assert!(result.proposed > 0, "Draft should propose tokens");
         // Acceptance rate with different models should be < 1.0 (probably 0.3-0.7)

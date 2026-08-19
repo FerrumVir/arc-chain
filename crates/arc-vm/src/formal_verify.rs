@@ -108,14 +108,13 @@ impl ModelState {
                         }
                     }
                     // Uint comparison.
-                    if let StateValue::Uint(v) = val {
-                        if let Ok(lit) = literal.parse::<u64>() {
+                    if let StateValue::Uint(v) = val
+                        && let Ok(lit) = literal.parse::<u64>() {
                             return Some(cmp_fn(*v, lit));
                         }
-                    }
                     // Int comparison.
-                    if let StateValue::Int(v) = val {
-                        if let Ok(lit) = literal.parse::<i64>() {
+                    if let StateValue::Int(v) = val
+                        && let Ok(lit) = literal.parse::<i64>() {
                             return Some(match op {
                                 ">=" => *v >= lit,
                                 "==" => *v == lit,
@@ -124,7 +123,6 @@ impl ModelState {
                                 _ => return None,
                             });
                         }
-                    }
                 }
             }
         }
@@ -361,8 +359,8 @@ impl ModelChecker {
     pub fn generate_counterexample(&self, property: &str) -> Option<CounterExample> {
         // Search invariants.
         for inv in &self.invariants {
-            if inv.name == property {
-                if let Some(false) = inv.holds {
+            if inv.name == property
+                && let Some(false) = inv.holds {
                     return Some(CounterExample {
                         states: vec![],
                         transitions: vec![],
@@ -372,7 +370,6 @@ impl ModelChecker {
                         ),
                     });
                 }
-            }
         }
 
         // Search safety properties.
@@ -439,7 +436,7 @@ impl ConsensusModel {
 
         checker.add_invariant(Invariant {
             name: "bft_fault_tolerance".to_string(),
-            expression: format!("faulty < {}", (validators + 2) / 3),
+            expression: format!("faulty < {}", validators.div_ceil(3)),
             holds: Some(3 * faulty < validators),
             checked_at: Some(0),
         });
@@ -451,7 +448,7 @@ impl ConsensusModel {
                 "No two honest validators commit conflicting blocks (n={}, f={})",
                 validators, faulty
             ),
-            formula: format!("conflicting_commits == 0"),
+            formula: "conflicting_commits == 0".to_string(),
             status: if 3 * faulty < validators {
                 VerificationStatus::Verified
             } else {
@@ -467,7 +464,7 @@ impl ConsensusModel {
                 "Chain makes progress when > 2/3 validators are honest (honest={}, n={})",
                 honest, validators
             ),
-            formula: format!("committed_blocks > 0"),
+            formula: "committed_blocks > 0".to_string(),
             status: if 3 * honest > 2 * validators {
                 VerificationStatus::Verified
             } else {

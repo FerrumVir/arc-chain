@@ -1585,15 +1585,14 @@ async fn handle_peer_recv(
             MessageType::Heartbeat => {
                 // Heartbeat now carries round info for partition detection.
                 // Old heartbeats (empty payload) are still valid - just skip parse.
-                if !data.is_empty() {
-                    if let Ok(hb) = bincode::deserialize::<crate::protocol::HeartbeatMessage>(&data) {
+                if !data.is_empty()
+                    && let Ok(hb) = bincode::deserialize::<crate::protocol::HeartbeatMessage>(&data) {
                         let _ = inbound_tx.send(InboundMessage::HeartbeatWithRound {
                             peer: peer_address,
                             dag_round: hb.dag_round,
                             committed_round: hb.committed_round,
                         }).await;
                     }
-                }
             }
             MessageType::ShardForward => {
                 match bincode::deserialize::<crate::protocol::ShardForwardMessage>(&data) {

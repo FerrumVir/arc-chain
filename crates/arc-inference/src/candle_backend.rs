@@ -174,7 +174,7 @@ impl GgufEngine {
                     .map_err(|e| InferenceError::Runtime(format!("Unsqueeze: {e}")))?
             };
 
-            let seq_len = context.dim(1)
+            let _seq_len = context.dim(1)
                 .map_err(|e| InferenceError::Runtime(format!("Dim: {e}")))?;
 
             // Forward pass through quantized transformer

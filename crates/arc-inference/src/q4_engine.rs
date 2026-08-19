@@ -27,7 +27,7 @@ impl Q4Weights {
     pub fn from_i8(i8w: &I8Weights) -> Self {
         let n_rows = i8w.n_rows;
         let n_cols = i8w.n_cols;
-        assert!(n_cols % 2 == 0, "Q4 requires even column count");
+        assert!(n_cols.is_multiple_of(2), "Q4 requires even column count");
 
         let mut data = Vec::with_capacity(n_rows * n_cols / 2);
         let mut scales = Vec::with_capacity(n_rows);
@@ -44,7 +44,7 @@ impl Q4Weights {
             // and Q4 values will be in [-7, 7]:
             // Q4 scale = i8_scale * (abs_max_i8 / 7)
             let q4_per_unit = (abs_max as i64 + 6) / 7; // ceiling division
-            let q4_scale = (i8w.scales[i] * q4_per_unit.max(1)) >> 0; // combined scale
+            let q4_scale = i8w.scales[i] * q4_per_unit.max(1); // combined scale
 
             // Quantize each i8 value to 4-bit [-7, 7], store as [1, 15] (bias +8)
             for pair in 0..(n_cols / 2) {
@@ -189,12 +189,12 @@ mod tests {
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 2, 4);
         let q4 = Q4Weights::from_i8(&i8w);
         assert_eq!(q4.data.len(), 2 * 2); // 2 rows × 4/2 = 4 bytes
-        assert_eq!(q4.memory_bytes() < i8w.memory_bytes(), true);
+        assert!(q4.memory_bytes() < i8w.memory_bytes());
     }
 
     #[test]
     fn test_q4_matmul_basic() {
-        let i8w = I8Weights::quantize_f32(
+        let _i8w = I8Weights::quantize_f32(
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
         // Q4 requires even cols - pad to 4
         let i8w = I8Weights::quantize_f32(

@@ -390,11 +390,7 @@ impl SessionKeyManager {
             if k.status == SessionKeyStatus::Active && now >= k.expires_at {
                 // This key expired; don't retain.
                 false
-            } else if k.status == SessionKeyStatus::Expired {
-                false
-            } else {
-                true
-            }
+            } else { k.status != SessionKeyStatus::Expired }
         });
         before - self.active_keys.len()
     }

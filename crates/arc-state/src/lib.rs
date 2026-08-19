@@ -9,7 +9,6 @@ pub mod wal;
 
 use arc_crypto::{Hash256, IncrementalMerkle, MerkleTree, hash_bytes, hash_pair};
 use arc_types::{Account, Address, Identity, IdentityLevel, Transaction, TxBody, TxType, TxReceipt, TransferBody, Block, BlockHeader, ProtocolVersion};
-use arc_types::block::{StateDiff, AccountChange};
 use arc_types::economics::StateRentConfig;
 use arc_types::transaction::{
     GasMeter, gas_costs, CapacityAdvertisementBody, InferenceEscrowOpenBody,
@@ -641,12 +640,11 @@ impl StateDB {
             return Some(tx);
         }
         // Check signed benchmark block data
-        if let Some(&(height, idx)) = self.tx_index.get(tx_hash).as_deref() {
-            if let Some(block_data) = self.signed_block_data.get(&height) {
+        if let Some(&(height, idx)) = self.tx_index.get(tx_hash).as_deref()
+            && let Some(block_data) = self.signed_block_data.get(&height) {
                 let (txs_vec, _, _) = &*block_data;
                 return txs_vec.get(idx as usize).cloned();
             }
-        }
         None
     }
 
@@ -775,7 +773,7 @@ impl StateDB {
             .iter()
             .map(|kv| Hash256(*kv.key()))
             .collect();
-        eligible.sort_by(|a, b| a.0.cmp(&b.0));
+        eligible.sort_by_key(|a| a.0);
         let mut scored: Vec<(Address, Hash256)> = eligible
             .into_iter()
             .map(|a| {
@@ -785,7 +783,7 @@ impl StateDB {
                 (a, arc_crypto::hash_bytes(&input))
             })
             .collect();
-        scored.sort_by(|a, b| a.1 .0.cmp(&b.1 .0));
+        scored.sort_by_key(|a| a.1 .0);
         scored
             .into_iter()
             .take(committee_size as usize)
@@ -837,11 +835,10 @@ impl StateDB {
     /// bandwidth improvement on hot accounts.
     pub fn get_account(&self, addr: &Address) -> Option<Account> {
         // Fast path: check GPU cache first.
-        if let Some(ref cache) = self.gpu_cache {
-            if let Some(acct) = cache.get_account_fast(&addr.0) {
+        if let Some(ref cache) = self.gpu_cache
+            && let Some(acct) = cache.get_account_fast(&addr.0) {
                 return Some(acct);
             }
-        }
         self.accounts.get(&addr.0).map(|a| a.clone())
     }
 
@@ -974,11 +971,10 @@ impl StateDB {
         // delete_segments_before() was never called. Keep segments
         // from the last 1000 entries for crash recovery.
         let wal_seq = self.wal.sequence();
-        if wal_seq > 1000 {
-            if let Err(e) = self.wal.delete_segments_before(wal_seq - 1000) {
+        if wal_seq > 1000
+            && let Err(e) = self.wal.delete_segments_before(wal_seq - 1000) {
                 tracing::warn!("WAL segment cleanup failed: {}", e);
             }
-        }
     }
 
     /// Get a block by height.
@@ -990,11 +986,10 @@ impl StateDB {
     pub fn get_block_by_hash(&self, hash: &[u8; 32]) -> Option<Block> {
         let h = self.height();
         for height in (0..=h).rev() {
-            if let Some(block) = self.blocks.get(&height) {
-                if block.hash.0 == *hash {
+            if let Some(block) = self.blocks.get(&height)
+                && block.hash.0 == *hash {
                     return Some(block.clone());
                 }
-            }
         }
         None
     }
@@ -1181,7 +1176,7 @@ impl StateDB {
 
         // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
-        if count > 0 && count % 10_000 == 0 {
+        if count > 0 && count.is_multiple_of(10_000) {
             tracing::info!("Snapshot trigger at block {}", height);
             // Snapshot is taken asynchronously in production - here we just log
         }
@@ -1343,7 +1338,7 @@ impl StateDB {
             state_diff: None,
         };
 
-        let mut block = Block::new(header, tx_hashes);
+        let block = Block::new(header, tx_hashes);
 
         let mut final_receipts = receipts;
         for (i, receipt) in final_receipts.iter_mut().enumerate() {
@@ -1409,8 +1404,8 @@ impl StateDB {
                     continue;
                 }
                 if let arc_crypto::signature::Signature::Ed25519 { public_key, signature } = &tx.signature {
-                    if signature.len() == 64 {
-                        if let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key) {
+                    if signature.len() == 64
+                        && let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key) {
                             let mut sig_bytes = [0u8; 64];
                             sig_bytes.copy_from_slice(signature);
                             ed_indices.push(i);
@@ -1419,7 +1414,6 @@ impl StateDB {
                             ed_vks.push(vk);
                             continue;
                         }
-                    }
                     batch_sig_valid[i] = Some(false); // malformed
                 }
                 // Non-Ed25519 signatures fall through to individual verification
@@ -1545,7 +1539,7 @@ impl StateDB {
 
         // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
-        if count > 0 && count % 10_000 == 0 {
+        if count > 0 && count.is_multiple_of(10_000) {
             tracing::info!("Snapshot trigger at block {}", height);
         }
 
@@ -1771,7 +1765,7 @@ impl StateDB {
         self.wal.append(WalOp::Checkpoint(state_root), height);
 
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
-        if count > 0 && count % 10_000 == 0 {
+        if count > 0 && count.is_multiple_of(10_000) {
             tracing::info!("Snapshot trigger at block {}", height);
         }
 
@@ -5046,7 +5040,7 @@ impl StateDB {
                     .map(|kv| Hash256(*kv.key()))
                     .collect();
                 // Deterministic ordering before scoring (HashMap iteration is not).
-                eligible.sort_by(|a, b| a.0.cmp(&b.0));
+                eligible.sort_by_key(|a| a.0);
                 let mut scored: Vec<(Address, Hash256)> = eligible
                     .into_iter()
                     .map(|a| {
@@ -5056,7 +5050,7 @@ impl StateDB {
                         (a, hash_bytes(&input))
                     })
                     .collect();
-                scored.sort_by(|a, b| a.1.0.cmp(&b.1.0));
+                scored.sort_by_key(|a| a.1.0);
                 let members: Vec<Address> = scored
                     .into_iter()
                     .take(committee_size)
@@ -6014,11 +6008,10 @@ impl StateDB {
                 self.dirty_accounts.insert(escrow_addr.0);
                 // Also mark the counterparty as dirty - their balance is modified during close.
                 // The counterparty address is stored in the escrow account's storage_root.
-                if let Some(escrow) = self.accounts.get(&escrow_addr.0) {
-                    if escrow.storage_root != Hash256::ZERO {
+                if let Some(escrow) = self.accounts.get(&escrow_addr.0)
+                    && escrow.storage_root != Hash256::ZERO {
                         self.dirty_accounts.insert(escrow.storage_root.0);
                     }
-                }
             }
             TxBody::ChannelDispute(body) => {
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
@@ -6529,7 +6522,7 @@ impl StateDB {
         let tree = self.incremental_merkle.lock();
         let index = tree
             .get_index(&address.0)
-            .ok_or_else(|| StateError::AccountNotFound(*address))?;
+            .ok_or(StateError::AccountNotFound(*address))?;
 
         let merkle_proof = tree.proof(index).ok_or_else(|| {
             StateError::ExecutionError("failed to generate Merkle proof".into())
@@ -6647,7 +6640,7 @@ impl StateDB {
         let total_chunks = if all_accounts.is_empty() {
             1 // Even empty state produces one (empty) chunk
         } else {
-            ((all_accounts.len() + chunk_size - 1) / chunk_size) as u32
+            all_accounts.len().div_ceil(chunk_size) as u32
         };
 
         let mut chunks = Vec::with_capacity(total_chunks as usize);
@@ -6730,7 +6723,7 @@ impl StateDB {
         let total_chunks = if all_accounts.is_empty() {
             1u32
         } else {
-            ((all_accounts.len() + chunk_size - 1) / chunk_size) as u32
+            all_accounts.len().div_ceil(chunk_size) as u32
         };
 
         if chunk_index >= total_chunks {
@@ -6856,7 +6849,7 @@ impl StateDB {
         let total_chunks = if total_accounts == 0 {
             1u32
         } else {
-            ((total_accounts as usize + chunk_size - 1) / chunk_size) as u32
+            (total_accounts as usize).div_ceil(chunk_size) as u32
         };
 
         let version = self.height();
@@ -6984,7 +6977,7 @@ fn compute_merkle_root_only(mut leaves: Vec<Hash256>) -> Hash256 {
         return leaves[0];
     }
     // Pad to even length
-    if leaves.len() % 2 != 0 {
+    if !leaves.len().is_multiple_of(2) {
         leaves.push(*leaves.last().unwrap());
     }
     while leaves.len() > 1 {
@@ -6992,7 +6985,7 @@ fn compute_merkle_root_only(mut leaves: Vec<Hash256>) -> Hash256 {
             .par_chunks(2)
             .map(|pair| hash_pair(&pair[0], &pair[1]))
             .collect();
-        if leaves.len() > 1 && leaves.len() % 2 != 0 {
+        if leaves.len() > 1 && !leaves.len().is_multiple_of(2) {
             leaves.push(*leaves.last().unwrap());
         }
     }

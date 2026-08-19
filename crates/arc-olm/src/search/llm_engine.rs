@@ -244,11 +244,8 @@ fn parse_program(response: &str, catalog: &[TypedPrimitive]) -> Vec<String> {
 
     // Clean up the response: remove quotes, backticks, newlines, commas
     let cleaned = response
-        .replace('`', "")
-        .replace('"', "")
-        .replace('\'', "")
-        .replace(',', " ")
-        .replace('\n', " ")
+        .replace(['`', '"', '\''], "")
+        .replace([',', '\n'], " ")
         .replace("->", " ")
         .replace("→", " ");
 

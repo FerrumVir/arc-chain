@@ -124,8 +124,8 @@ impl ShredEncoder {
             }];
         }
 
-        let total_shreds = ((block_data.len() + SHRED_DATA_SIZE - 1) / SHRED_DATA_SIZE) as u16;
-        let num_parity = (total_shreds as usize + 1) / 2; // 50% redundancy
+        let total_shreds = block_data.len().div_ceil(SHRED_DATA_SIZE) as u16;
+        let num_parity = (total_shreds as usize).div_ceil(2); // 50% redundancy
 
         let mut data_shreds: Vec<ShredMessage> = block_data
             .chunks(SHRED_DATA_SIZE)
@@ -201,7 +201,7 @@ impl ShredEncoder {
 
         // Collect data shreds and parity shreds into indexed slots.
         let mut data_slots: Vec<Option<Vec<u8>>> = vec![None; total_shreds as usize];
-        let num_parity = (total_shreds as usize + 1) / 2;
+        let num_parity = (total_shreds as usize).div_ceil(2);
         let mut parity_slots: Vec<Option<Vec<u8>>> = vec![None; num_parity];
 
         for s in shreds {

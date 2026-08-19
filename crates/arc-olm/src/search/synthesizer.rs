@@ -279,14 +279,14 @@ fn level_1(
         let mut valid = true;
 
         for (inp, out) in train_pairs {
-            if inp.len() != out.len() || (inp.len() > 0 && inp[0].len() != out[0].len()) {
+            if inp.len() != out.len() || (!inp.is_empty() && inp[0].len() != out[0].len()) {
                 valid = false;
                 break;
             }
             let mut this_map: Vec<(u8, u8)> = Vec::new();
             let mut consistent = true;
-            for (_r, (irow, orow)) in inp.iter().zip(out.iter()).enumerate() {
-                for (_c, (&iv, &ov)) in irow.iter().zip(orow.iter()).enumerate() {
+            for (irow, orow) in inp.iter().zip(out.iter()) {
+                for (&iv, &ov) in irow.iter().zip(orow.iter()) {
                     if let Some(&(_, mapped)) = this_map.iter().find(|&&(from, _)| from == iv) {
                         if mapped != ov { consistent = false; break; }
                     } else {
@@ -301,17 +301,16 @@ fn level_1(
                 Some(existing) => {
                     // Verify same mapping across pairs
                     for &(from, to) in &this_map {
-                        if let Some(&(_, eto)) = existing.iter().find(|&&(f, _)| f == from) {
-                            if eto != to { valid = false; break; }
-                        }
+                        if let Some(&(_, eto)) = existing.iter().find(|&&(f, _)| f == from)
+                            && eto != to { valid = false; break; }
                     }
                     if !valid { break; }
                 }
             }
         }
-        if valid {
-            if let Some(mapping) = color_map {
-                if let Some(test_outputs) = verify_and_apply(
+        if valid
+            && let Some(mapping) = color_map
+                && let Some(test_outputs) = verify_and_apply(
                     &|g: &Grid| {
                         g.iter().map(|row| {
                             row.iter().map(|&c| {
@@ -327,8 +326,6 @@ fn level_1(
                         test_outputs, level: 1,
                     });
                 }
-            }
-        }
     }
 
     // 1f. Self-concat patterns
@@ -1199,12 +1196,11 @@ fn level_3(
                 let mut queue = std::collections::VecDeque::new();
                 for r in 0..h {
                     for c in 0..w {
-                        if (r == 0 || r == h-1 || c == 0 || c == w-1) && inp[r][c] == bg {
-                            if !reachable[r][c] {
+                        if (r == 0 || r == h-1 || c == 0 || c == w-1) && inp[r][c] == bg
+                            && !reachable[r][c] {
                                 reachable[r][c] = true;
                                 queue.push_back((r, c));
                             }
-                        }
                     }
                 }
                 while let Some((r, c)) = queue.pop_front() {
@@ -1293,8 +1289,8 @@ fn level_3(
         if ih > 0 && iw > 0 && oh % ih == 0 && ow % iw == 0 {
             let nr = oh / ih;
             let nc = ow / iw;
-            if nr >= 1 && nc >= 1 && (nr > 1 || nc > 1) {
-                if let Some(test_outputs) = verify_and_apply(
+            if nr >= 1 && nc >= 1 && (nr > 1 || nc > 1)
+                && let Some(test_outputs) = verify_and_apply(
                     &|inp: &Grid| {
                         let h = inp.len();
                         let w = if h > 0 { inp[0].len() } else { 0 };
@@ -1317,7 +1313,6 @@ fn level_3(
                         test_outputs, level: 3,
                     });
                 }
-            }
         }
     }
 
@@ -2103,9 +2098,9 @@ fn level_4(
             let w = inp[0].len();
             // Try all possible tile sizes
             for th in 1..=h/2 {
-                if h % th != 0 { continue; }
+                if !h.is_multiple_of(th) { continue; }
                 for tw in 1..=w/2 {
-                    if w % tw != 0 { continue; }
+                    if !w.is_multiple_of(tw) { continue; }
                     let tile = grid::crop(inp, 0, 0, th, tw);
                     let mut matches = true;
                     'outer: for tr in (0..h).step_by(th) {

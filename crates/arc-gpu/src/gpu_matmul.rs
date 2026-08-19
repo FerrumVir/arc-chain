@@ -368,10 +368,10 @@ impl GpuMatmul {
             || !weights.is_q4 && self.msl_pipeline.is_some();
         let wg_count = if use_metal_dispatch {
             // Metal: 4 rows per threadgroup (4 simdgroups × 32 threads)
-            (n_rows as u32 + 3) / 4
+            (n_rows as u32).div_ceil(4)
         } else {
             // WGSL: 1 row per thread, 256 threads per workgroup
-            (n_rows as u32 + 255) / 256
+            (n_rows as u32).div_ceil(256)
         };
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
@@ -440,9 +440,9 @@ impl GpuMatmul {
 
             let active = self.msl_pipeline.as_ref().unwrap_or(&self.pipeline);
             let wg_count = if self.msl_pipeline.is_some() {
-                (n_rows as u32 + 3) / 4
+                (n_rows as u32).div_ceil(4)
             } else {
-                (n_rows as u32 + 255) / 256
+                (n_rows as u32).div_ceil(256)
             };
             {
                 let mut pass = encoder.begin_compute_pass(&Default::default());
@@ -480,7 +480,7 @@ pub fn pack_i8_to_u32_pub(data: &[i8]) -> Vec<u32> {
 /// Values clamped to [-8, 7], stored with bias +8 encoding [0, 15].
 /// Decode: value = nibble - 8.
 pub fn pack_i8_to_q4(data: &[i8]) -> Vec<u8> {
-    let mut packed = Vec::with_capacity((data.len() + 1) / 2);
+    let mut packed = Vec::with_capacity(data.len().div_ceil(2));
     for pair in data.chunks(2) {
         let lo = ((pair[0].max(-8).min(7) + 8) as u8) & 0x0F;
         let hi = if pair.len() > 1 { ((pair[1].max(-8).min(7) + 8) as u8) & 0x0F } else { 8 };
@@ -490,7 +490,7 @@ pub fn pack_i8_to_q4(data: &[i8]) -> Vec<u8> {
 }
 
 fn pack_i8_to_u32(data: &[i8]) -> Vec<u32> {
-    let padded_len = (data.len() + 3) / 4 * 4;
+    let padded_len = data.len().div_ceil(4) * 4;
     let mut packed = Vec::with_capacity(padded_len / 4);
     for chunk in data.chunks(4) {
         let mut val = 0u32;
@@ -762,7 +762,7 @@ mod tests {
         // Byte 1: lo=3+8=11(0x0B), hi=-4+8=4(0x04) → 0x4B
         assert_eq!(packed[1], 0x0B | (0x04 << 4));
         // Byte 2: lo=7+8=15(0x0F), hi=-8+8=0(0x00) → 0x0F
-        assert_eq!(packed[2], 0x0F | (0x00 << 4));
+        assert_eq!(packed[2], 0x0F);
         // Verify decode: nibble - 8 recovers original value
         for (i, &orig) in data.iter().enumerate() {
             let byte = packed[i / 2];

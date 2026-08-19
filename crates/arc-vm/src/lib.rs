@@ -22,7 +22,6 @@ use arc_crypto::Hash256;
 use arc_state::StateDB;
 use arc_types::Address;
 use thiserror::Error;
-use tracing;
 use wasmer::{
     imports, Function, FunctionEnv, FunctionEnvMut, Instance, Memory, Module, Store, Value,
 };

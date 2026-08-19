@@ -82,7 +82,7 @@ impl NibblePath {
     /// Build from an explicit nibble slice (each element 0..15).
     fn from_nibbles(nibbles: &[u8]) -> Self {
         let num_nibbles = nibbles.len();
-        let byte_len = (num_nibbles + 1) / 2;
+        let byte_len = num_nibbles.div_ceil(2);
         let mut bytes = vec![0u8; byte_len];
         for (i, &nib) in nibbles.iter().enumerate() {
             if i % 2 == 0 {
@@ -117,7 +117,7 @@ impl NibblePath {
             return None;
         }
         let byte = self.bytes[i / 2];
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             Some(byte >> 4)
         } else {
             Some(byte & 0x0F)
@@ -800,7 +800,7 @@ impl JmtStore {
     fn get_leaf(&self, version: u64, path: &NibblePath) -> Option<LeafNode> {
         let root_key = self.root_keys.get(&version)?;
         let root_node = self.nodes.get(&*root_key)?;
-        self.traverse_to_leaf(&*root_node, version, path, 0)
+        self.traverse_to_leaf(&root_node, version, path, 0)
     }
 
     /// Recursively traverse the trie to find a leaf.
@@ -834,7 +834,7 @@ impl JmtStore {
                     nibble_path: path.prefix(depth + 1),
                 };
                 let child = self.nodes.get(&child_key)?;
-                self.traverse_to_leaf(&*child, child_ver, path, depth + 1)
+                self.traverse_to_leaf(&child, child_ver, path, depth + 1)
             }
         }
     }
@@ -974,7 +974,7 @@ impl JmtStateTree {
             .iter()
             .map(|(k, v)| (*k, *v))
             .collect();
-        sorted_leaves.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted_leaves.sort_by_key(|a| a.0);
 
         // Build Merkle tree bottom-up from sorted leaf hashes.
         let leaf_hashes: Vec<Hash256> = sorted_leaves
@@ -1005,7 +1005,7 @@ impl JmtStateTree {
 
         let mut current_level = hashes.to_vec();
         while current_level.len() > 1 {
-            let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+            let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
             for chunk in current_level.chunks(2) {
                 if chunk.len() == 2 {
                     let mut hasher = blake3::Hasher::new_derive_key("arc-jmt-internal-v1");
@@ -1034,7 +1034,6 @@ impl JmtStateTree {
         // use it.
         if version > self.version {
             // Cannot prune past the current version - clamp silently.
-            return;
         }
         // In the full VersionedJmtStore this would drop old nodes.
         // Here it is intentionally a no-op on the node set.
@@ -1072,7 +1071,7 @@ impl JmtStateTree {
             .iter()
             .map(|(k, v)| (*k, *v))
             .collect();
-        sorted_leaves.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted_leaves.sort_by_key(|a| a.0);
 
         let leaf_hashes: Vec<Hash256> = sorted_leaves
             .iter()
@@ -1100,7 +1099,7 @@ impl JmtStateTree {
         let mut current_level = hashes.to_vec();
 
         while current_level.len() > 1 {
-            let sibling_idx = if index % 2 == 0 { index + 1 } else { index - 1 };
+            let sibling_idx = if index.is_multiple_of(2) { index + 1 } else { index - 1 };
             if sibling_idx < current_level.len() {
                 siblings.push(current_level[sibling_idx]);
             } else {
@@ -1109,7 +1108,7 @@ impl JmtStateTree {
             }
 
             // Move to next level.
-            let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+            let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
             for chunk in current_level.chunks(2) {
                 if chunk.len() == 2 {
                     let mut hasher = blake3::Hasher::new_derive_key("arc-jmt-internal-v1");
@@ -1147,7 +1146,7 @@ impl JmtProof {
 
         for sibling in &self.siblings {
             let mut hasher = blake3::Hasher::new_derive_key("arc-jmt-internal-v1");
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 hasher.update(current.as_ref());
                 hasher.update(sibling.as_ref());
             } else {

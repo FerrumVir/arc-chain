@@ -214,7 +214,7 @@ impl PreallocBackend {
             prealloc_chunk
         } else {
             // Round up to next chunk boundary.
-            let chunks = (file_size + prealloc_chunk - 1) / prealloc_chunk;
+            let chunks = file_size.div_ceil(prealloc_chunk);
             let target = chunks * prealloc_chunk;
             if target > file_size {
                 Self::preallocate_file(&file, target)?;
