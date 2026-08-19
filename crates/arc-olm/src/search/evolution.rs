@@ -533,7 +533,7 @@ pub fn evolve(
 
 /// Sort population by fitness (descending), breaking ties by cell_accuracy,
 /// then by shorter program length.
-fn sort_population(pop: &mut Vec<Candidate>) {
+fn sort_population(pop: &mut [Candidate]) {
     pop.sort_by(|a, b| {
         b.fitness
             .partial_cmp(&a.fitness)

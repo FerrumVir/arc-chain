@@ -716,6 +716,12 @@ pub struct SupplyTracker {
     pub current_block: u64,
 }
 
+impl Default for SupplyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SupplyTracker {
     /// Initialize the tracker at genesis.
     pub fn new() -> Self {
@@ -1033,7 +1039,7 @@ mod tests {
     #[test]
     fn test_supply_tracker_staking_ratio() {
         let mut tracker = SupplyTracker::new();
-        assert_eq!(tracker.staking_ratio(), 0.0);
+        assert!(tracker.staking_ratio().abs() < f64::EPSILON);
 
         // Stake 10% of total supply
         let ten_percent = TOTAL_SUPPLY / 10;

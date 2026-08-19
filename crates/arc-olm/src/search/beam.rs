@@ -424,6 +424,11 @@ pub fn exhaustive_search(
 
 /// Recursive DFS worker for exhaustive search.
 /// Tries every type-valid primitive at each level, no pruning.
+// allow: this is the recursive worker of the exhaustive search. Every argument is
+// either search state that has to be threaded through each recursive call or a
+// borrow of shared read-only data. Bundling them into a context struct would only
+// move the same 12 values behind one name and make the recursion harder to follow.
+#[allow(clippy::too_many_arguments)]
 fn exhaustive_dfs(
     current: &DagValue,
     current_type: &DagType,
@@ -546,6 +551,11 @@ fn exhaustive_dfs(
 mod tests {
     use super::*;
 
+    // allow: the success path of `beam_search` sets `fitness: 1.0` as a literal, so
+    // this compares against an exact value rather than the result of a calculation.
+    // An epsilon compare would let a near-miss fitness pass, which is exactly what
+    // this test exists to catch.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_beam_search_rot90() {
         let input = vec![vec![1, 0], vec![0, 0]];
@@ -578,6 +588,11 @@ mod tests {
         assert_eq!(result.unwrap().output, output);
     }
 
+    // allow: the success paths of `beam_search` / `exhaustive_search` set
+    // `fitness: 1.0` as a literal, so this is comparing against an exact value, not
+    // against the result of a calculation. An epsilon compare would let a
+    // near-miss fitness pass, which is exactly what this test exists to catch.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_exhaustive_search_rot90() {
         let input = vec![vec![1, 0], vec![0, 0]];

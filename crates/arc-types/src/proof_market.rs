@@ -558,7 +558,7 @@ mod tests {
         // Check prover stats.
         let stats = mp.get_stats(&test_hash(0x10)).unwrap();
         assert_eq!(stats.total_proofs, 1);
-        assert_eq!(stats.success_rate, 1.0);
+        assert!((stats.success_rate - 1.0).abs() < f64::EPSILON);
         assert_eq!(stats.total_earned, 500);
     }
 
@@ -584,7 +584,7 @@ mod tests {
 
         let stats = mp.get_stats(&test_hash(0x10)).unwrap();
         assert_eq!(stats.total_proofs, 1);
-        assert_eq!(stats.success_rate, 0.0);
+        assert!(stats.success_rate.abs() < f64::EPSILON);
         assert_eq!(stats.total_earned, 0);
     }
 
@@ -595,13 +595,13 @@ mod tests {
 
         stats.record_proof(true, 100, 500);
         assert_eq!(stats.total_proofs, 1);
-        assert_eq!(stats.success_rate, 1.0);
+        assert!((stats.success_rate - 1.0).abs() < f64::EPSILON);
         assert_eq!(stats.avg_time_ms, 100);
         assert_eq!(stats.total_earned, 500);
 
         stats.record_proof(false, 200, 0);
         assert_eq!(stats.total_proofs, 2);
-        assert_eq!(stats.success_rate, 0.5);
+        assert!((stats.success_rate - 0.5).abs() < f64::EPSILON);
         assert_eq!(stats.avg_time_ms, 150);
         assert_eq!(stats.total_earned, 500);
 
@@ -615,10 +615,10 @@ mod tests {
     // 10. ProofPriority cost multipliers.
     #[test]
     fn test_priority_cost_multipliers() {
-        assert_eq!(ProofPriority::Economy.cost_multiplier(), 0.5);
-        assert_eq!(ProofPriority::Standard.cost_multiplier(), 1.0);
-        assert_eq!(ProofPriority::Express.cost_multiplier(), 2.0);
-        assert_eq!(ProofPriority::Instant.cost_multiplier(), 5.0);
+        assert!((ProofPriority::Economy.cost_multiplier() - 0.5).abs() < f64::EPSILON);
+        assert!((ProofPriority::Standard.cost_multiplier() - 1.0).abs() < f64::EPSILON);
+        assert!((ProofPriority::Express.cost_multiplier() - 2.0).abs() < f64::EPSILON);
+        assert!((ProofPriority::Instant.cost_multiplier() - 5.0).abs() < f64::EPSILON);
     }
 
     // 11. Cannot submit proof for non-existent request.

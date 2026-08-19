@@ -242,7 +242,10 @@ impl ContractManifest {
 #[derive(Debug, Clone)]
 pub enum TestAction {
     DeployContract {
-        manifest: ContractManifest,
+        /// Boxed: a bare `ContractManifest` is ~312 bytes and would make every
+        /// `TestAction` that big, including the tiny `AdvanceBlocks`/`SetTimestamp`
+        /// ones that get pushed by the hundreds into a scenario's action list.
+        manifest: Box<ContractManifest>,
         bytecode: Vec<u8>,
     },
     CallFunction {
@@ -683,14 +686,14 @@ mod tests {
 
         assert_eq!(stats.chain_id, 1);
         assert_eq!(stats.block_height, 0);
-        assert_eq!(stats.tps_current, 0.0);
-        assert_eq!(stats.tps_peak, 0.0);
+        assert!(stats.tps_current.abs() < f64::EPSILON);
+        assert!(stats.tps_peak.abs() < f64::EPSILON);
         assert_eq!(stats.validator_count, 0);
         assert_eq!(stats.total_staked, 0);
         assert_eq!(stats.total_accounts, 0);
         assert_eq!(stats.total_transactions, 0);
         assert_eq!(stats.total_contracts, 0);
         assert_eq!(stats.avg_block_time_ms, 400);
-        assert_eq!(stats.uptime_percentage, 100.0);
+        assert!((stats.uptime_percentage - 100.0).abs() < f64::EPSILON);
     }
 }

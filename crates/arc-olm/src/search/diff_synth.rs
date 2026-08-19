@@ -146,21 +146,20 @@ fn is_isolated(g: &Grid, r: usize, c: usize) -> bool {
 
 /// Cells in the same row or column as any cell of a given color (excluding that color).
 fn line_from_color(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
-    let (h, w) = grid_dims(g);
     let mut rows_with = BTreeSet::new();
     let mut cols_with = BTreeSet::new();
-    for r in 0..h {
-        for c in 0..w {
-            if g[r][c] == color {
+    for (r, row) in g.iter().enumerate() {
+        for (c, &cell) in row.iter().enumerate() {
+            if cell == color {
                 rows_with.insert(r);
                 cols_with.insert(c);
             }
         }
     }
     let mut result = BTreeSet::new();
-    for r in 0..h {
-        for c in 0..w {
-            if g[r][c] != color && (rows_with.contains(&r) || cols_with.contains(&c)) {
+    for (r, row) in g.iter().enumerate() {
+        for (c, &cell) in row.iter().enumerate() {
+            if cell != color && (rows_with.contains(&r) || cols_with.contains(&c)) {
                 result.insert((r, c));
             }
         }
@@ -177,11 +176,9 @@ fn enclosed_by_color(g: &Grid, boundary_color: Color) -> BTreeSet<(usize, usize)
     // BFS from all border cells that are not boundary_color to find exterior
     let mut exterior = vec![vec![false; w]; h];
     let mut queue = std::collections::VecDeque::new();
-    for r in 0..h {
-        for c in 0..w {
-            if (r == 0 || r == h - 1 || c == 0 || c == w - 1)
-                && g[r][c] != boundary_color
-            {
+    for (r, row) in g.iter().enumerate() {
+        for (c, &cell) in row.iter().enumerate() {
+            if (r == 0 || r == h - 1 || c == 0 || c == w - 1) && cell != boundary_color {
                 exterior[r][c] = true;
                 queue.push_back((r, c));
             }
@@ -203,9 +200,9 @@ fn enclosed_by_color(g: &Grid, boundary_color: Color) -> BTreeSet<(usize, usize)
     }
     // Interior = non-boundary cells that are not exterior
     let mut result = BTreeSet::new();
-    for r in 0..h {
-        for c in 0..w {
-            if g[r][c] != boundary_color && !exterior[r][c] {
+    for (r, row) in g.iter().enumerate() {
+        for (c, &cell) in row.iter().enumerate() {
+            if cell != boundary_color && !exterior[r][c] {
                 result.insert((r, c));
             }
         }
@@ -220,14 +217,14 @@ fn gap_cells(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     let mut result = BTreeSet::new();
 
     // Horizontal gaps
-    for r in 0..h {
-        let cols: Vec<usize> = (0..w).filter(|&c| g[r][c] == color).collect();
+    for (r, row) in g.iter().enumerate() {
+        let cols: Vec<usize> = (0..w).filter(|&c| row[c] == color).collect();
         for i in 0..cols.len() {
             for j in (i + 1)..cols.len() {
                 let c1 = cols[i];
                 let c2 = cols[j];
                 // Only fill if all cells between are background
-                let all_bg = (c1 + 1..c2).all(|c| g[r][c] == bg);
+                let all_bg = (c1 + 1..c2).all(|c| row[c] == bg);
                 if all_bg && c2 > c1 + 1 {
                     for c in (c1 + 1)..c2 {
                         result.insert((r, c));
@@ -238,6 +235,10 @@ fn gap_cells(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
     }
 
     // Vertical gaps
+    // allow: this walks the grid column by column, so `c` is the *second* index
+    // (g[r][c]) rather than something we can iterate over. There is no column
+    // iterator to enumerate here, and clippy's suggested rewrite would be wrong.
+    #[allow(clippy::needless_range_loop)]
     for c in 0..w {
         let rows: Vec<usize> = (0..h).filter(|&r| g[r][c] == color).collect();
         for i in 0..rows.len() {
@@ -597,10 +598,10 @@ fn positional_intersection_fill(
 
                     let mut rows_with = BTreeSet::new();
                     let mut cols_with = BTreeSet::new();
-                    for r in 0..h {
-                        for c in 0..w {
-                            if inp[r][c] == row_marker { rows_with.insert(r); }
-                            if inp[r][c] == col_marker { cols_with.insert(c); }
+                    for (r, row) in inp.iter().enumerate() {
+                        for (c, &cell) in row.iter().enumerate() {
+                            if cell == row_marker { rows_with.insert(r); }
+                            if cell == col_marker { cols_with.insert(c); }
                         }
                     }
                     if rows_with.is_empty() || cols_with.is_empty() { return false; }
@@ -622,21 +623,20 @@ fn positional_intersection_fill(
 
                 if consistent {
                     let test_outputs: Vec<Grid> = test_inputs.iter().map(|inp| {
-                        let (h, w) = grid_dims(inp);
                         let bg = grid::mostcolor(inp);
                         let mut rows_with = BTreeSet::new();
                         let mut cols_with = BTreeSet::new();
-                        for r in 0..h {
-                            for c in 0..w {
-                                if inp[r][c] == row_marker { rows_with.insert(r); }
-                                if inp[r][c] == col_marker { cols_with.insert(c); }
+                        for (r, row) in inp.iter().enumerate() {
+                            for (c, &cell) in row.iter().enumerate() {
+                                if cell == row_marker { rows_with.insert(r); }
+                                if cell == col_marker { cols_with.insert(c); }
                             }
                         }
                         let mut out = inp.clone();
-                        for r in 0..h {
-                            for c in 0..w {
-                                if rows_with.contains(&r) && cols_with.contains(&c) && out[r][c] == bg {
-                                    out[r][c] = fill_color;
+                        for (r, row) in out.iter_mut().enumerate() {
+                            for (c, cell) in row.iter_mut().enumerate() {
+                                if rows_with.contains(&r) && cols_with.contains(&c) && *cell == bg {
+                                    *cell = fill_color;
                                 }
                             }
                         }
@@ -1193,12 +1193,11 @@ fn positional_noise_removal(
         .iter()
         .map(|inp| {
             let bg = grid::mostcolor(inp);
-            let (h, w) = grid_dims(inp);
             let mut out = inp.clone();
-            for r in 0..h {
-                for c in 0..w {
-                    if out[r][c] != bg && is_isolated(inp, r, c) {
-                        out[r][c] = bg;
+            for (r, row) in out.iter_mut().enumerate() {
+                for (c, cell) in row.iter_mut().enumerate() {
+                    if *cell != bg && is_isolated(inp, r, c) {
+                        *cell = bg;
                     }
                 }
             }
@@ -1523,14 +1522,13 @@ fn strategy_conditional_replace(
                     let test_outputs: Vec<Grid> = test_inputs
                         .iter()
                         .map(|inp| {
-                            let (h, w) = grid_dims(inp);
                             let mut out = inp.clone();
-                            for r in 0..h {
-                                for c in 0..w {
-                                    if out[r][c] == from_color
+                            for (r, row) in out.iter_mut().enumerate() {
+                                for (c, cell) in row.iter_mut().enumerate() {
+                                    if *cell == from_color
                                         && has_neighbor(inp, r, c, adj_color)
                                     {
-                                        out[r][c] = to_color;
+                                        *cell = to_color;
                                     }
                                 }
                             }
@@ -1560,9 +1558,9 @@ fn strategy_conditional_replace(
             let consistent = train_pairs.iter().all(|(inp, out)| {
                 let (h, w) = grid_dims(inp);
                 let mut expected = BTreeSet::new();
-                for r in 0..h {
-                    for c in 0..w {
-                        if inp[r][c] == from_color
+                for (r, row) in inp.iter().enumerate() {
+                    for (c, &cell) in row.iter().enumerate() {
+                        if cell == from_color
                             && (r == 0 || r == h - 1 || c == 0 || c == w - 1)
                         {
                             expected.insert((r, c));
@@ -1584,12 +1582,12 @@ fn strategy_conditional_replace(
                     .map(|inp| {
                         let (h, w) = grid_dims(inp);
                         let mut out = inp.clone();
-                        for r in 0..h {
-                            for c in 0..w {
-                                if out[r][c] == from_color
+                        for (r, row) in out.iter_mut().enumerate() {
+                            for (c, cell) in row.iter_mut().enumerate() {
+                                if *cell == from_color
                                     && (r == 0 || r == h - 1 || c == 0 || c == w - 1)
                                 {
-                                    out[r][c] = to_color;
+                                    *cell = to_color;
                                 }
                             }
                         }
@@ -1657,9 +1655,9 @@ fn pattern_extract(
         let mut max_r = 0;
         let mut min_c = w;
         let mut max_c = 0;
-        for r in 0..h {
-            for c in 0..w {
-                if inp[r][c] != bg {
+        for (r, row) in inp.iter().enumerate() {
+            for (c, &cell) in row.iter().enumerate() {
+                if cell != bg {
                     min_r = min_r.min(r);
                     max_r = max_r.max(r);
                     min_c = min_c.min(c);
@@ -1687,9 +1685,9 @@ fn pattern_extract(
             let mut max_r = 0;
             let mut min_c = w;
             let mut max_c = 0;
-            for r in 0..h {
-                for c in 0..w {
-                    if inp[r][c] != bg {
+            for (r, row) in inp.iter().enumerate() {
+                for (c, &cell) in row.iter().enumerate() {
+                    if cell != bg {
                         min_r = min_r.min(r);
                         max_r = max_r.max(r);
                         min_c = min_c.min(c);

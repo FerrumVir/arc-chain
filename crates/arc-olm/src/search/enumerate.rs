@@ -33,18 +33,25 @@ impl DagValue {
     }
 }
 
+/// The body of a catalog primitive: takes its already-evaluated arguments and
+/// returns the result, or `None` if the arguments do not fit.
+pub type PrimitiveApply = Box<dyn Fn(&[DagValue]) -> Option<DagValue> + Send + Sync>;
+
+/// A grid->grid transform paired with the name used for it in a program string.
+type NamedGridFn = (&'static str, fn(&Grid) -> Grid);
+
 pub struct TypedPrimitive {
     pub name: &'static str,
     pub input_types: Vec<DagType>,
     pub output_type: DagType,
-    pub apply: Box<dyn Fn(&[DagValue]) -> Option<DagValue> + Send + Sync>,
+    pub apply: PrimitiveApply,
 }
 
 pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
     let mut cat: Vec<TypedPrimitive> = Vec::new();
 
     // Unary Grid → Grid
-    let g2g: Vec<(&str, fn(&Grid) -> Grid)> = vec![
+    let g2g: Vec<NamedGridFn> = vec![
         ("rot90", grid::rot90), ("rot180", grid::rot180), ("rot270", grid::rot270),
         ("hmirror", grid::hmirror), ("vmirror", grid::vmirror),
         ("dmirror", grid::dmirror), ("cmirror", grid::cmirror),
@@ -64,7 +71,7 @@ pub fn build_primitive_catalog(colors: &[Color]) -> Vec<TypedPrimitive> {
     }
 
     // Self-concat patterns
-    let concat_patterns: Vec<(&str, fn(&Grid) -> Grid)> = vec![
+    let concat_patterns: Vec<NamedGridFn> = vec![
         ("hconcat_self", |g| grid::hconcat(g, g)),
         ("vconcat_self", |g| grid::vconcat(g, g)),
         ("hconcat_vm", |g| grid::hconcat(g, &grid::vmirror(g))),

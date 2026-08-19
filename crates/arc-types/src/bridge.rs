@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn test_success_rate() {
         let mut stats = BridgeStats::default();
-        assert_eq!(stats.success_rate(), 0.0);
+        assert!(stats.success_rate().abs() < f64::EPSILON);
 
         stats.completed_transfers = 9;
         stats.failed_transfers = 1;
@@ -826,6 +826,6 @@ mod tests {
 
         stats.completed_transfers = 0;
         stats.failed_transfers = 5;
-        assert_eq!(stats.success_rate(), 0.0);
+        assert!(stats.success_rate().abs() < f64::EPSILON);
     }
 }

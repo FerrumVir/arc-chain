@@ -430,6 +430,11 @@ fn verify_program(
 // Single attempt: generate program, verify, try variants
 // ============================================================
 
+// allow: one LLM attempt genuinely needs all of this - the task, the catalog, the
+// endpoint config, the sampling temperature, the shared deadline and the verbosity
+// flag. Grouping them into a struct just to hit the argument limit would add a type
+// that exists for the lint's sake and nothing else.
+#[allow(clippy::too_many_arguments)]
 fn single_attempt(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
