@@ -9331,10 +9331,6 @@ async fn inference_auto(
     }
 }
 
-// ─── Runtime inference width ───────────────────────────────────────────────
-
-/// GET /node/threads
-/// Report the width of the pool that runs local inference compute.
 // ---------------------------------------------------------------------------
 // Honest projection endpoints (v0.7.11+)
 //
@@ -9861,6 +9857,11 @@ async fn node_contribution(AxumState(node): AxumState<NodeState>) -> Json<Value>
     }))
 }
 
+// ─── Runtime inference width ───────────────────────────────────────────────
+
+/// GET /node/threads
+///
+/// Report the width of the pool that runs local inference compute.
 async fn get_node_threads(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let dedicated = node.compute_threads.load(Ordering::Relaxed);
     Json(json!({
