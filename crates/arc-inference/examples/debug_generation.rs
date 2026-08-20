@@ -1,5 +1,4 @@
 use arc_inference::cached_integer_model::{load_cached_model, KVCache};
-use arc_inference::integer_lut::*;
 
 fn main() {
     let model = load_cached_model("/tmp/llama-2-7b-chat.Q4_K_M.gguf").unwrap();
@@ -29,7 +28,7 @@ fn main() {
         }
         
         let mut indexed: Vec<(usize, i64)> = logits.iter().enumerate().map(|(i,&v)| (i,v)).collect();
-        indexed.sort_by(|a,b| b.1.cmp(&a.1));
+        indexed.sort_by_key(|x| std::cmp::Reverse(x.1));
         let next = indexed[0].0 as u32;
         let word = model.vocab.get(next as usize).map(|s| s.as_str()).unwrap_or("?");
         

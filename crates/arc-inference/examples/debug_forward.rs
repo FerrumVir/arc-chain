@@ -17,12 +17,15 @@ fn main() {
     let tok = 1724u32;
     let idx = tok as usize;
 
-    // Embedding
-    let emb_scale = model.embedding.scales[idx];
-    let hidden: Vec<i64> = model.embedding.data[idx*d..(idx+1)*d]
-        .iter().map(|&w| (w as i64) * emb_scale).collect();
+    // Embedding.
+    //
+    // Read from embedding_q16, not embedding_i8. Embeddings are stored at full
+    // Q16 precision precisely because INT8 destroys values around 1e-6, so
+    // dequantising the I8 copy here would print numbers the engine does not
+    // use. embedding_i8 is retained only for weight_hash / save_weights.
+    let hidden: Vec<i64> = model.embedding_q16[idx * d..(idx + 1) * d].to_vec();
     println!("\n=== Embedding (token {}) ===", tok);
-    println!("scale={} first8={:?}", emb_scale, &hidden[0..8]);
+    println!("Q16 (no dequant) first8={:?}", &hidden[0..8]);
     println!("range=[{}, {}] mean={}",
         hidden.iter().min().unwrap(), hidden.iter().max().unwrap(),
         hidden.iter().sum::<i64>() / d as i64);
@@ -57,7 +60,7 @@ fn main() {
 
     // Top 5 tokens
     let mut indexed: Vec<(usize, i64)> = logits.iter().enumerate().map(|(i,&v)| (i,v)).collect();
-    indexed.sort_by(|a,b| b.1.cmp(&a.1));
+    indexed.sort_by_key(|x| std::cmp::Reverse(x.1));
     println!("\nTop 5 tokens:");
     for (i, (tok_id, val)) in indexed[0..5].iter().enumerate() {
         let word = model.vocab.get(*tok_id).map(|s| s.as_str()).unwrap_or("?");

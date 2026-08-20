@@ -27,7 +27,9 @@ fn matmul_f32(w: &[f32], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> {
 fn matmul_i8_scalar(w: &I8Weights, input: &[i64]) -> Vec<i64> {
     (0..w.n_rows).map(|i| {
         let mut a: i64 = 0;
-        for j in 0..w.n_cols { a += (w.data[i * w.n_cols + j] as i64) * input[j]; }
+        for (j, &inp) in input.iter().enumerate().take(w.n_cols) {
+            a += (w.data[i * w.n_cols + j] as i64) * inp;
+        }
         (a * w.scales[i]) >> 16
     }).collect()
 }

@@ -23,7 +23,7 @@ fn main() {
     
     // Show top 10 predictions after the full prompt
     let mut indexed: Vec<(usize, i64)> = last_logits.iter().enumerate().map(|(i,&v)| (i,v)).collect();
-    indexed.sort_by(|a,b| b.1.cmp(&a.1));
+    indexed.sort_by_key(|x| std::cmp::Reverse(x.1));
     
     println!("\nTop 10 next tokens after prompt:");
     for (rank, (tok_id, logit)) in indexed[0..10].iter().enumerate() {

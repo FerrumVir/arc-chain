@@ -1,6 +1,4 @@
 use arc_inference::cached_integer_model::load_cached_model;
-use arc_inference::cached_integer_model::KVCache;
-use arc_inference::integer_lut::ONE;
 use std::time::Instant;
 
 fn main() {

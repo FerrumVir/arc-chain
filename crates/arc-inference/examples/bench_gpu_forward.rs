@@ -43,7 +43,7 @@ fn main() {
     )).collect();
 
     let gpu_model = gpu.upload_model(
-        &model.embedding.data, &model.embedding.scales,
+        &model.embedding_i8.data, &model.embedding_i8.scales,
         &model.output_weight.data, &model.output_weight.scales,
         &model.final_norm,
         &layer_data,

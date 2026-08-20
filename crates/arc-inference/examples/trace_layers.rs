@@ -16,14 +16,14 @@ fn main() {
     let cfg = &model.config;
 
     // Process BOS + "What is 2+2?" and trace hidden states
-    let prompt = vec![1u32, 1724, 338, 29871, 29906, 29974, 29906, 29973]; // BOS + "What is 2+2?"
+    let prompt = [1u32, 1724, 338, 29871, 29906, 29974, 29906, 29973]; // BOS + "What is 2+2?"
 
     let mut cache = KVCache::new(cfg.n_layers);
     println!("Processing {} tokens through {} layers, d={}", prompt.len(), cfg.n_layers, cfg.d_model);
 
     for (t_idx, &tok) in prompt.iter().enumerate() {
         let logits = model.forward_one_token(tok, &mut cache);
-        let (min, max, mean) = stats(&logits);
+        let (min, max, _mean) = stats(&logits);
         let top = logits.iter().enumerate().max_by_key(|(_,v)| *v).unwrap();
         let top_word = model.vocab.get(top.0).map(|s| s.as_str()).unwrap_or("?");
         println!("  tok[{}]={:5} -> logits[{:.0},{:.0}] top={}({}) {:?}",

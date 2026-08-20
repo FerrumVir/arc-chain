@@ -38,10 +38,12 @@ fn main() {
         let layer_count = cfg.n_layers;
         for l in 0..layer_count {
             let kv_len = cfg.d_kv;
+            // KVCache holds full-precision Q16 i64 and no longer carries
+            // per-entry scales, so truncating k_data/v_data is the whole
+            // reset. The k_scales/v_scales truncations that used to sit here
+            // referenced fields that no longer exist.
             cache.k_data[l].truncate(cache.seq_len * kv_len);
-            cache.k_scales[l].truncate(cache.seq_len);
             cache.v_data[l].truncate(cache.seq_len * kv_len);
-            cache.v_scales[l].truncate(cache.seq_len);
         }
     }
 
