@@ -90,7 +90,7 @@ pub fn evaluate_directory(dir: &Path, config: &BeamConfig, max_tasks: Option<usi
         .expect("Cannot read directory")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().map_or(false, |e| e == "json"))
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
         .collect();
 
     paths.sort();

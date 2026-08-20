@@ -19,6 +19,12 @@ pub struct Avx512Verifier {
     total_batches: u64,
 }
 
+impl Default for Avx512Verifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Avx512Verifier {
     pub fn new() -> Self {
         Self { min_batch: 64, total_verified: 0, total_batches: 0 }

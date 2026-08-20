@@ -6,21 +6,30 @@ import type {
   AccountBalance,
   Attestation,
   BinaryStatus,
+  BlockTxs,
   Earnings,
+  EarningsProjection,
   FaucetResult,
   HardwareInfo,
   Identity,
   InferenceResult,
   LogEntry,
   ModelTierInfo,
+  NetworkOverview,
   NetworkStats,
   NodeConfig,
+  NodeContribution,
   NodeStatus,
   PaidInferenceResult,
+  RecentBlocks,
   ResetPeerStateResult,
+  RewardEconomics,
+  SavedLogs,
+  ThreadsApplied,
   Tier1Result,
   Tier1Submitted,
   Tier1Vote,
+  TxLookup,
 } from "./types";
 
 const IS_TAURI =
@@ -47,12 +56,136 @@ function liveBase(): string | null {
 
 const REWARD_PER_ATTESTATION = 2.5;
 
+/** Mirrors commands.rs::COORDINATOR_HOSTS, NYC included. */
+const COORDINATOR_HOSTS = [
+  "http://149.28.32.76:9090", // NYC
+  "http://140.82.16.112:9090", // LAX
+  "http://136.244.109.1:9090", // AMS
+  "http://104.238.171.11:9090", // LHR
+  "http://202.182.107.41:9090", // NRT
+  "http://149.28.153.31:9090", // SGP
+];
+
+/**
+ * Per-command mock overrides, for tests only.
+ *
+ * The endpoints behind the projection and Network screens are newer than the
+ * deployed seeds, so their real-world behaviour today is a 404 that degrades
+ * to a stated reason. Both the populated path and each degraded path have to
+ * be exercisable, and a test cannot reach into a Rust process to make a seed
+ * 404 on demand.
+ *
+ * This seam lives inside `mockInvoke` only. It is unreachable in the Tauri app
+ * (which never calls the mock) and unreachable from a production bundle opened
+ * outside Tauri (which refuses to mock at all — see the guard in
+ * `mockInvoke`). Setting it cannot make the real app show a fabricated number.
+ */
+type MockOverrides = Record<string, unknown>;
+function mockOverride<T>(cmd: string): T | undefined {
+  if (typeof window === "undefined") return undefined;
+  const o = (window as Window & { __ARC_MOCK__?: MockOverrides }).__ARC_MOCK__;
+  if (!o || !(cmd in o)) return undefined;
+  return o[cmd] as T;
+}
+
+/** Strip an optional `0x` and lowercase. Mirrors rpc_client.rs::strip_0x. */
+function strip0x(s: string): string {
+  return s.trim().replace(/^0[xX]/, "").toLowerCase();
+}
+
+/** ARC base units per whole ARC. Mirrors rpc_client.rs::ARC_BASE_UNITS. */
+const ARC_BASE_UNITS = 1_000_000_000;
+
 async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   const base = liveBase()!;
   const fetchJson = async (path: string) => {
     const r = await fetch(`${base}${path}`);
     if (!r.ok) throw new Error(`${path} → ${r.status}`);
     return r.json();
+  };
+
+  // Mirrors rpc_client.rs::get_detailed — keeps "this host has no such
+  // endpoint" (404) apart from "this host is unreachable", because the two
+  // degrade to different sentences in the UI.
+  type Detailed =
+    | { kind: "ok"; body: Record<string, unknown> }
+    | { kind: "notFound" }
+    | { kind: "badRequest" }
+    | { kind: "status"; code: number }
+    | { kind: "unreachable"; error: string }
+    | { kind: "unparseable" };
+  const getDetailed = async (path: string): Promise<Detailed> => {
+    try {
+      const r = await fetch(`${base}${path}`);
+      if (r.ok) {
+        try {
+          return { kind: "ok", body: await r.json() };
+        } catch {
+          return { kind: "unparseable" };
+        }
+      }
+      if (r.status === 404) return { kind: "notFound" };
+      if (r.status === 400) return { kind: "badRequest" };
+      return { kind: "status", code: r.status };
+    } catch (e) {
+      return { kind: "unreachable", error: String(e) };
+    }
+  };
+  const reason = (path: string, d: Detailed): string => {
+    switch (d.kind) {
+      case "notFound":
+        return `${base} does not serve ${path} (HTTP 404).`;
+      case "badRequest":
+        return `${base} rejected ${path} as malformed (HTTP 400).`;
+      case "status":
+        return `${base} answered ${path} with HTTP ${d.code}.`;
+      case "unreachable":
+        return `Could not reach ${base} — ${d.error}`;
+      default:
+        return `${base} answered ${path} with a response this build could not parse.`;
+    }
+  };
+  const numOf = (
+    o: Record<string, unknown>,
+    keys: string[],
+  ): number | null => {
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === "number" && Number.isFinite(v)) return v;
+    }
+    return null;
+  };
+  // `/node/contribution` and `/network/info` nest their figures, so a flat
+  // lookup for "threads" returns the OBJECT and reads as absent.
+  const at = (o: unknown, path: string): unknown => {
+    let cur: unknown = o;
+    for (const seg of path.split(".")) {
+      if (cur === null || typeof cur !== "object") return undefined;
+      cur = (cur as Record<string, unknown>)[seg];
+    }
+    return cur;
+  };
+  const nNum = (o: unknown, path: string): number | null => {
+    const v = at(o, path);
+    return typeof v === "number" && Number.isFinite(v) ? v : null;
+  };
+  const nStr = (o: unknown, path: string): string | null => {
+    const v = at(o, path);
+    return typeof v === "string" && v.length > 0 ? v : null;
+  };
+  const nBool = (o: unknown, path: string): boolean | null => {
+    const v = at(o, path);
+    return typeof v === "boolean" ? v : null;
+  };
+  const strOf = (
+    o: Record<string, unknown>,
+    keys: string[],
+  ): string | null => {
+    for (const k of keys) {
+      const v = o[k];
+      if (typeof v === "string" && v.length > 0) return v;
+    }
+    return null;
   };
 
   switch (cmd) {
@@ -83,10 +216,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           [...crypto.getRandomValues(new Uint8Array(32))]
             .map((b) => b.toString(16).padStart(2, "0"))
             .join(""),
-        seedPhrase:
-          "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment",
         createdAt: Date.now(),
       } as T;
+    case "reveal_seed_phrase":
+      return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
     case "save_config":
@@ -100,29 +233,26 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       // health to "lite". This is what unlocks the v0.7.0 Client-mode
       // banner in the dashboard. Pre-v0.7 the JS mock hardcoded
       // coordinatorUrl: null so the banner was untestable in live mode.
-      const COORDINATOR_HOSTS = [
-        "http://149.28.32.76:9090",
-        "http://140.82.16.112:9090",
-        "http://136.244.109.1:9090",
-        "http://104.238.171.11:9090",
-        "http://202.182.107.41:9090",
-        "http://149.28.153.31:9090",
-      ];
+      // Probed concurrently, matching rpc_client.rs::probe_coordinator.
       const probeCoordinator = async (): Promise<string | null> => {
-        for (const origin of COORDINATOR_HOSTS) {
-          try {
-            const r = await fetch(`${origin}/health`, {
-              method: "GET",
-              signal: AbortSignal.timeout(2000),
-            });
-            if (r.ok) return origin;
-          } catch {
-            // try next
-          }
+        const attempts = COORDINATOR_HOSTS.map(async (origin) => {
+          const r = await fetch(`${origin}/health`, {
+            method: "GET",
+            signal: AbortSignal.timeout(2000),
+          });
+          if (!r.ok) throw new Error(`${origin} → ${r.status}`);
+          return origin;
+        });
+        try {
+          return await Promise.any(attempts);
+        } catch {
+          return null;
         }
-        return null;
       };
 
+      const rpcPort = Number(
+        (window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__,
+      );
       try {
         const h = await fetchJson("/health");
         const peers = h.peers ?? 0;
@@ -146,9 +276,15 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           height: h.height ?? 0,
           uptimeSeconds: uptime,
           address: null,
-          rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
+          rpcPort,
           lastError: null,
           coordinatorUrl,
+          chainHost: coordinatorUrl,
+          chainHeight: null,
+          chainRound: null,
+          chainBlockAgeSeconds: null,
+          workerThreads: null,
+          cpuCores: navigator.hardwareConcurrency ?? null,
         } as T;
       } catch {
         const coordinatorUrl = await probeCoordinator();
@@ -163,67 +299,105 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           height: 0,
           uptimeSeconds: 0,
           address: null,
-          rpcPort: Number((window as Window & { __ARC_LIVE__?: number }).__ARC_LIVE__),
+          rpcPort,
           lastError: coordinatorUrl ? null : "No response",
           coordinatorUrl,
+          chainHost: coordinatorUrl,
+          chainHeight: null,
+          chainRound: null,
+          chainBlockAgeSeconds: null,
+          workerThreads: null,
+          cpuCores: navigator.hardwareConcurrency ?? null,
         } as T;
       }
     }
     case "fetch_earnings": {
+      // No synthesized "today" (was total × 12%) and no invented "pending"
+      // (was a flat 2.5). This path genuinely does not know either, and
+      // null renders as "—" rather than a confident number.
       try {
         const r = await fetchJson("/inference/results?limit=1");
         const count = r.count ?? 0;
         return {
           totalArc: count * REWARD_PER_ATTESTATION,
-          todayArc: Math.round(count * 0.12) * REWARD_PER_ATTESTATION,
-          pendingArc: 2.5,
+          todayArc: null,
+          pendingArc: null,
           rank: null,
           attestations: count,
-          lastPayoutAt: Date.now() - 60_000,
+          lastPayoutAt: null,
+          lastPayoutBlock: null,
+          fromChain: false,
         } as T;
       } catch {
         return {
           totalArc: 0,
-          todayArc: 0,
-          pendingArc: 0,
+          todayArc: null,
+          pendingArc: null,
           rank: null,
           attestations: 0,
           lastPayoutAt: null,
+          lastPayoutBlock: null,
+          fromChain: false,
         } as T;
       }
     }
     case "fetch_attestations": {
+      // Shape-tolerant, matching rpc_client.rs::fetch_attestations. The live
+      // seeds return flat tx records with no nested `inference` object, so
+      // reading only the nested shape produced blank rows with "0 tokens",
+      // "0ms" and a hardcoded "+2.50".
       try {
         const limit = (args as { limit?: number } | undefined)?.limit ?? 20;
         const r = await fetchJson(`/inference/attestations?limit=${limit}`);
-        const arr = (r.attestations ?? []) as Array<{
-          tx_hash: string;
-          success: boolean;
-          inference: {
-            input: string;
-            output_hash: string;
-            model_hash: string;
-            tokens_generated: number;
-            ms_per_token: number;
-          };
-        }>;
-        const now = Date.now();
-        return arr.map((v, i) => ({
-          txHash: v.tx_hash,
-          inputPreview: (v.inference?.input ?? "")
-            .replace("[INST] ", "")
-            .replace(" [/INST]", "")
-            .slice(0, 140),
-          outputHash: v.inference?.output_hash ?? "",
-          modelHash: v.inference?.model_hash ?? "",
-          tokens: v.inference?.tokens_generated ?? 0,
-          latencyMs:
-            (v.inference?.tokens_generated ?? 0) *
-            (v.inference?.ms_per_token ?? 0),
-          rewardArc: REWARD_PER_ATTESTATION,
-          timestamp: now - i * 30_000,
-          verified: !!v.success,
-        })) as T;
+        type Raw = Record<string, unknown>;
+        const arr = (r.attestations ?? []) as Raw[];
+        const stored = localStorage.getItem("arc-desktop-state-v1");
+        const mineAddr = stored
+          ? (JSON.parse(stored).identity?.address as string | undefined)
+              ?.replace(/^0x/, "")
+              .toLowerCase()
+          : undefined;
+
+        const num = (o: Raw, k: string): number | null => {
+          const v = o[k];
+          return typeof v === "number" && v > 0 ? v : null;
+        };
+
+        return arr
+          .map((v) => {
+            const inf = (v.inference as Raw | undefined) ?? v;
+            const txHash = (v.tx_hash as string) ?? "";
+            if (!txHash) return null;
+            const tokens = num(inf, "tokens_generated");
+            const msPerTok = num(inf, "ms_per_token");
+            const from = ((v.from as string) ?? "")
+              .replace(/^0x/, "")
+              .toLowerCase();
+            const mine = !!mineAddr && !!from && from === mineAddr;
+            return {
+              txHash,
+              inputPreview: ((inf.input as string) ?? "")
+                .replace("[INST] ", "")
+                .replace(" [/INST]", "")
+                .slice(0, 140),
+              outputHash: (inf.output_hash as string) ?? "",
+              modelHash: (inf.model_hash as string) ?? "",
+              tokens,
+              latencyMs:
+                tokens !== null && msPerTok !== null
+                  ? tokens * msPerTok
+                  : num(inf, "inference_ms"),
+              rewardArc: mine ? REWARD_PER_ATTESTATION : null,
+              timestamp: num(v, "timestamp"),
+              blockHeight: num(v, "block_height"),
+              txType: (v.tx_type as string) ?? null,
+              from: from || null,
+              mine,
+              verified: !!v.success,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null)
+          .sort((a, b) => (b.blockHeight ?? 0) - (a.blockHeight ?? 0)) as T;
       } catch {
         return [] as T;
       }
@@ -313,17 +487,19 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     }
     case "run_inference": {
-      const { prompt, maxTokens } = args as {
+      const { prompt, maxTokens, chatTemplate } = args as {
         prompt: string;
         maxTokens?: number;
+        chatTemplate?: boolean;
       };
-      const wrapped = prompt.includes("[INST]")
-        ? prompt
-        : `[INST] ${prompt} [/INST]`;
       const r = await fetch(`${base}/inference/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ input: wrapped, max_tokens: maxTokens ?? 32 }),
+        body: JSON.stringify({
+          input: prompt,
+          max_tokens: maxTokens ?? 32,
+          chat_template: chatTemplate ?? true,
+        }),
       });
       if (!r.ok) throw new Error(`inference error ${r.status}`);
       const v = await r.json();
@@ -338,38 +514,32 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         deterministic: v.inference?.deterministic ?? false,
         engine: v.inference?.engine ?? "",
         explorerUrl: v.explorer_url ?? "",
+        // liveBase() is 127.0.0.1 - this IS the local node.
+        servedLocally: true,
+        trace: v.shard_trace ?? undefined,
       } as T;
     }
     case "run_inference_via_coordinator": {
-      const { prompt, maxTokens, k } = args as {
+      const { prompt, maxTokens, k, chatTemplate } = args as {
         prompt: string;
         maxTokens?: number;
         k?: number;
+        chatTemplate?: boolean;
       };
-      const wrapped = prompt.includes("[INST]")
-        ? prompt
-        : `[INST] ${prompt} [/INST]`;
       // Live mode iterates the same seed list the Rust side uses so the
       // browser E2E path exercises the coordinator fallback against a
       // real chain host.
-      const hosts = [
-        "http://149.28.32.76:9090",
-        "http://140.82.16.112:9090",
-        "http://136.244.109.1:9090",
-        "http://104.238.171.11:9090",
-        "http://202.182.107.41:9090",
-        "http://149.28.153.31:9090",
-      ];
       let lastErr = "";
-      for (const host of hosts) {
+      for (const host of COORDINATOR_HOSTS) {
         try {
           const r = await fetch(`${host}/inference/run_consensus`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              input: wrapped,
+              input: prompt,
               max_tokens: maxTokens ?? 32,
               k: k ?? 3,
+              chat_template: chatTemplate ?? true,
             }),
           });
           if (!r.ok) {
@@ -408,30 +578,21 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       throw new Error(`all coordinators failed; last: ${lastErr}`);
     }
     case "run_inference_via_coordinator_direct": {
-      const { prompt, maxTokens } = args as {
+      const { prompt, maxTokens, chatTemplate } = args as {
         prompt: string;
         maxTokens?: number;
+        chatTemplate?: boolean;
       };
-      const wrapped = prompt.includes("[INST]")
-        ? prompt
-        : `[INST] ${prompt} [/INST]`;
-      const hosts = [
-        "http://149.28.32.76:9090",
-        "http://140.82.16.112:9090",
-        "http://136.244.109.1:9090",
-        "http://104.238.171.11:9090",
-        "http://202.182.107.41:9090",
-        "http://149.28.153.31:9090",
-      ];
       let lastErr = "";
-      for (const host of hosts) {
+      for (const host of COORDINATOR_HOSTS) {
         try {
           const r = await fetch(`${host}/inference/run`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              input: wrapped,
+              input: prompt,
               max_tokens: maxTokens ?? 32,
+              chat_template: chatTemplate ?? true,
             }),
           });
           if (!r.ok) {
@@ -454,6 +615,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             explorerUrl: v.explorer_url ?? "",
             consensus: undefined,
             coordinator: host,
+            servedLocally: false,
+            trace: v.shard_trace ?? undefined,
           } as T;
         } catch (e) {
           lastErr = `${host} → ${String(e)}`;
@@ -525,13 +688,463 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         maxReward: v.max_reward,
       } as T;
     }
+    // ── Chain visibility + projection ────────────────────────────────────
+    // These mirror rpc_client.rs exactly. In live browser mode `base` is the
+    // local node, which is also the chain host being read, so every number
+    // below is attributable to one host — the same invariant the Rust side
+    // holds (CLAUDE.md rule 4).
+    case "fetch_reward_economics": {
+      const path = "/economics/rewards";
+      const d = await getDetailed(path);
+      const shell = {
+        sourceHost: base,
+        rewardPerAttestation: null,
+        treasuryBalanceArc: null,
+        treasuryBalanceUnavailableReason: null,
+        attestationsRemaining: null,
+        attestationsRemainingUnavailableReason: null,
+        treasuryIsFinite: null,
+        bondPerAttestation: null,
+        challengePeriodBlocks: null,
+        bondRefundedAfterChallengePeriod: null,
+        fundingDetail: null,
+      };
+      if (d.kind !== "ok") {
+        return { ...shell, unavailable: reason(path, d) } as T;
+      }
+      // Prefer the exact `_base` integer and divide; the `_arc` floats are
+      // produced by dividing by 1e9 and carry rounding.
+      const baseOrArc = (baseKey: string, arcKey: string) => {
+        const b = numOf(d.body, [baseKey]);
+        if (b !== null) return b / ARC_BASE_UNITS;
+        return numOf(d.body, [arcKey]);
+      };
+      return {
+        ...shell,
+        unavailable: null,
+        rewardPerAttestation: baseOrArc(
+          "reward_per_attestation_base",
+          "reward_per_attestation_arc",
+        ),
+        treasuryBalanceArc: baseOrArc(
+          "treasury_balance_base",
+          "treasury_balance_arc",
+        ),
+        treasuryBalanceUnavailableReason: strOf(d.body, [
+          "treasury_balance_unavailable_reason",
+        ]),
+        // `rewards_remaining` is a COUNT of attestations, NOT an ARC amount.
+        // Renamed on ingest so no call site can mistake it for currency.
+        attestationsRemaining: numOf(d.body, ["rewards_remaining"]),
+        attestationsRemainingUnavailableReason: strOf(d.body, [
+          "rewards_remaining_unavailable_reason",
+        ]),
+        treasuryIsFinite: nBool(d.body, "treasury_is_finite"),
+        bondPerAttestation: baseOrArc(
+          "bond_per_attestation_base",
+          "bond_per_attestation_arc",
+        ),
+        challengePeriodBlocks: numOf(d.body, ["challenge_period_blocks"]),
+        bondRefundedAfterChallengePeriod: nBool(
+          d.body,
+          "bond_refunded_after_challenge_period",
+        ),
+        fundingDetail: strOf(d.body, ["funding_detail", "funding"]),
+      } as T;
+    }
+    case "fetch_earnings_projection": {
+      const stored = localStorage.getItem("arc-desktop-state-v1");
+      const addr = stored
+        ? (JSON.parse(stored).identity?.address as string | undefined)
+        : undefined;
+      const empty = {
+        sourceHost: base,
+        rewardPerAttestation: null,
+        rewardRateSource: "unknown" as const,
+        attestationsTotal: 0,
+        firstAttestationBlock: null,
+        attestationsPerDay: null,
+        rateUnavailableReason: null,
+        observedOverBlocks: null,
+        rateCaveat: null,
+      };
+      if (!addr) {
+        return {
+          ...empty,
+          unavailable:
+            "No identity on this device yet, so there is nothing to project.",
+        } as T;
+      }
+      const path = `/worker/earnings/${strip0x(addr)}`;
+      const d = await getDetailed(path);
+      if (d.kind !== "ok") {
+        return { ...empty, unavailable: reason(path, d) } as T;
+      }
+      const rateBase = numOf(d.body, ["reward_per_attestation_base"]);
+      const chainRate =
+        rateBase !== null
+          ? rateBase / ARC_BASE_UNITS
+          : numOf(d.body, ["reward_per_attestation_arc"]);
+      const attestationsTotal =
+        numOf(d.body, ["total_attestations", "attestations"]) ?? 0;
+      const perDay = numOf(d.body, ["attestations_per_day_observed"]);
+      return {
+        sourceHost: base,
+        unavailable: null,
+        // Falls back to the named constant, and says so via rewardRateSource
+        // rather than passing a constant off as a measurement.
+        rewardPerAttestation: chainRate ?? REWARD_PER_ATTESTATION,
+        rewardRateSource: chainRate !== null ? "chain" : "constant",
+        attestationsTotal,
+        firstAttestationBlock: numOf(d.body, ["first_attestation_block"]),
+        attestationsPerDay: perDay,
+        rateUnavailableReason:
+          perDay !== null
+            ? null
+            : (strOf(d.body, ["attestations_per_day_unavailable_reason"]) ??
+              (attestationsTotal === 0
+                ? "No attestations credited to this address yet, so there is no history to measure a rate from."
+                : `${base} reports ${attestationsTotal} attestation(s) for this address but no observed rate, so a per-day figure cannot be measured here.`)),
+        // `blocks_observed` on the wire.
+        observedOverBlocks: numOf(d.body, ["blocks_observed"]),
+        // Shown verbatim: the host knows its own method, this build does not.
+        rateCaveat: strOf(d.body, ["attestations_per_day_caveat"]),
+        // The bond is NOT on this endpoint — it comes from /economics/rewards.
+      } as T;
+    }
+    case "fetch_node_contribution": {
+      const cores = navigator.hardwareConcurrency ?? null;
+      const shell = {
+        sourceHost: base,
+        layersHeld: null as string | null,
+        layerCount: null as number | null,
+        totalLayers: null as number | null,
+        hopMsMean: null as number | null,
+        hopSamples: null as number | null,
+        hopUnavailableReason: null as string | null,
+      };
+      const direct = await getDetailed("/node/contribution");
+      if (direct.kind === "ok") {
+        // Nested: `threads`, `shards` and `own_compute_ms` are objects.
+        const ranges =
+          (at(direct.body, "shards.ranges") as
+            | Array<Record<string, unknown>>
+            | undefined) ?? [];
+        const rendered = ranges
+          .map((r) =>
+            typeof r.start_layer === "number" && typeof r.end_layer === "number"
+              ? `${r.start_layer}..${r.end_layer}`
+              : null,
+          )
+          .filter((x): x is string => x !== null);
+        const avail = nNum(direct.body, "threads.available_parallelism");
+        return {
+          ...shell,
+          unavailable: null,
+          source: "contribution",
+          threadsInUse: nNum(direct.body, "threads.in_use"),
+          // The host reports 0 when it could not read the core count. Zero
+          // cores is not a measurement, so fall back to ours.
+          threadsAvailable: avail !== null && avail > 0 ? avail : cores,
+          layersHeld: rendered.length > 0 ? rendered.join(", ") : null,
+          // A UNION of layers held, which the host computes. Summing the
+          // ranges would double-count replicated layers.
+          layerCount: nNum(direct.body, "shards.layers_held"),
+          totalLayers: nNum(direct.body, "shards.total_layers"),
+          runsServed: numOf(direct.body, ["sharded_runs_total"]),
+          // `sharded_cache_hits` — no `_total` suffix here, unlike
+          // `sharded_runs_total` and `sharded_bytes_total`.
+          cacheHits: numOf(direct.body, ["sharded_cache_hits"]),
+          hopMsMean: nNum(direct.body, "own_compute_ms.mean_ms"),
+          hopSamples: nNum(direct.body, "own_compute_ms.samples"),
+          hopUnavailableReason: nStr(
+            direct.body,
+            "own_compute_ms.unavailable_reason",
+          ),
+        } as T;
+      }
+      const [threads, stats] = await Promise.all([
+        getDetailed("/node/threads"),
+        getDetailed("/stats"),
+      ]);
+      const threadsInUse =
+        threads.kind === "ok"
+          ? numOf(threads.body, ["threads", "threads_in_use", "worker_threads"])
+          : null;
+      const runsServed =
+        stats.kind === "ok" ? numOf(stats.body, ["sharded_runs_total"]) : null;
+      if (threadsInUse === null && runsServed === null) {
+        return {
+          ...shell,
+          unavailable:
+            "Your node did not answer /node/contribution, /node/threads or /stats, so what it is contributing cannot be read right now.",
+          source: "none",
+          threadsInUse: null,
+          threadsAvailable: cores,
+          runsServed: null,
+          cacheHits: null,
+        } as T;
+      }
+      return {
+        ...shell,
+        unavailable: null,
+        source: "composed",
+        threadsInUse,
+        threadsAvailable:
+          (threads.kind === "ok"
+            ? numOf(threads.body, ["available", "cpu_cores", "max_threads"])
+            : null) ?? cores,
+        runsServed,
+        // /stats spells it with `_total`; /node/contribution does not.
+        cacheHits:
+          stats.kind === "ok"
+            ? numOf(stats.body, [
+                "sharded_cache_hits_total",
+                "sharded_cache_hits",
+              ])
+            : null,
+      } as T;
+    }
+    case "fetch_network_overview": {
+      const [info, health, latest, validators] = await Promise.all([
+        getDetailed("/network/info"),
+        getDetailed("/health"),
+        getDetailed("/block/latest"),
+        getDetailed("/validators"),
+      ]);
+      const iv = info.kind === "ok" ? info.body : null;
+      const h = health.kind === "ok" ? health.body : null;
+
+      // Only /network/info may name the network. `/info` is deliberately not
+      // consulted: its `chain` field is the constant "ARC Chain" everywhere,
+      // so it cannot tell a testnet from a mainnet.
+      const networkName = iv ? strOf(iv, ["network"]) : null;
+
+      const rawValidators =
+        validators.kind === "ok"
+          ? ((validators.body.validators as Array<Record<string, unknown>>) ??
+            [])
+          : [];
+      const list = rawValidators
+        .map((v) => {
+          const address = typeof v.address === "string" ? v.address : null;
+          if (!address) return null;
+          const stake = typeof v.stake === "number" ? v.stake : 0;
+          return { address: strip0x(address), stake, active: stake > 0 };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null);
+
+      // /network/info applies the real min_active_stake threshold; counting
+      // stake > 0 only approximates it. Prefer the reported figures and record
+      // which was used, so an approximation is never shown as the host's own.
+      const reportedActive = iv ? numOf(iv, ["validators_active"]) : null;
+      const reportedRegistered = iv
+        ? numOf(iv, ["validators_registered"])
+        : null;
+
+      const header =
+        latest.kind === "ok"
+          ? (latest.body.header as Record<string, unknown> | undefined)
+          : undefined;
+      const tsMs =
+        header && typeof header.timestamp === "number" && header.timestamp > 0
+          ? header.timestamp
+          : null;
+      const height = h ? numOf(h, ["height", "block_height"]) : null;
+      // Prefer the host's own age; fall back to computing it from the header.
+      const lastBlockAgeSecs =
+        (iv ? numOf(iv, ["last_block_age_secs"]) : null) ??
+        (tsMs !== null ? Math.max(0, Math.floor((Date.now() - tsMs) / 1000)) : null);
+
+      return {
+        sourceHost: base,
+        unavailable:
+          height === null && lastBlockAgeSecs === null && list.length === 0
+            ? reason("/health", health)
+            : null,
+        networkName,
+        networkNameUnavailableReason:
+          (iv ? strOf(iv, ["network_unavailable_reason"]) : null) ??
+          (info.kind === "ok" ? null : reason("/network/info", info)),
+        chainId: iv ? strOf(iv, ["chain_id"]) : null,
+        // The ONLY input allowed to make this app describe a network as mainnet.
+        declaresMainnet: nBool(iv ?? {}, "declares_mainnet"),
+        isBlockProducing: nBool(iv ?? {}, "is_block_producing"),
+        isBlockProducingBasis: iv
+          ? strOf(iv, ["is_block_producing_basis"])
+          : null,
+        hostVersion: h ? strOf(h, ["version"]) : null,
+        height,
+        lastBlockAgeSecs,
+        dagRound: h ? numOf(h, ["dag_round"]) : null,
+        dagCommitted: h ? numOf(h, ["dag_committed"]) : null,
+        peers: h ? numOf(h, ["peers", "connected_peers"]) : null,
+        validatorsActive:
+          reportedActive ??
+          (validators.kind === "ok"
+            ? list.filter((v) => v.active).length
+            : null),
+        validatorsRegistered:
+          reportedRegistered ??
+          (validators.kind === "ok"
+            ? (numOf(validators.body, ["count"]) ?? list.length)
+            : null),
+        minActiveStake: iv ? numOf(iv, ["min_active_stake"]) : null,
+        validatorSplitDerived: reportedActive === null,
+        validators: list,
+      } as T;
+    }
+    case "fetch_recent_blocks": {
+      const limit = Math.min(
+        100,
+        Math.max(1, (args as { limit?: number } | undefined)?.limit ?? 10),
+      );
+      // The range must be computed. `/blocks` defaults `from` to 0, so
+      // `?limit=10` returns the ten OLDEST blocks starting at genesis — not
+      // the newest ten. Verified against the live NYC seed, which answered
+      // `?limit=2` with height 0. Anchor the window to the tip instead.
+      const health = await getDetailed("/health");
+      const tip =
+        health.kind === "ok" ? numOf(health.body, ["height", "block_height"]) : null;
+      if (tip === null) {
+        return {
+          sourceHost: base,
+          unavailable: `Could not read the current height from ${base}, so the newest blocks cannot be located.`,
+          blocks: [],
+        } as T;
+      }
+      const from = Math.max(0, tip - limit + 1);
+      const path = `/blocks?from=${from}&to=${tip}&limit=${limit}`;
+      const d = await getDetailed(path);
+      if (d.kind !== "ok") {
+        return {
+          sourceHost: base,
+          unavailable: reason(path, d),
+          blocks: [],
+        } as T;
+      }
+      const arr = (d.body.blocks as Array<Record<string, unknown>>) ?? [];
+      return {
+        sourceHost: base,
+        unavailable: null,
+        blocks: arr
+          .map((b) => {
+            const height = typeof b.height === "number" ? b.height : null;
+            if (height === null) return null;
+            // A zero timestamp is not a time: genesis carries `timestamp: 0`,
+            // and the UI's relative-time formatter renders that as "20770d
+            // ago". Same reasoning for an all-zero producer, which is a
+            // placeholder rather than an address.
+            const ts = numOf(b, ["timestamp"]);
+            const producer =
+              typeof b.producer === "string" ? strip0x(b.producer) : null;
+            return {
+              height,
+              hash: typeof b.hash === "string" ? strip0x(b.hash) : "",
+              timestampMs: ts !== null && ts > 0 ? ts : null,
+              txCount: numOf(b, ["tx_count"]),
+              proposer:
+                producer && /[^0]/.test(producer) ? producer : null,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null)
+          .sort((a, b) => b.height - a.height),
+      } as T;
+    }
+    case "fetch_block_txs": {
+      const { height, limit } = args as { height: number; limit?: number };
+      const path = `/block/${height}/txs?limit=${Math.min(1000, Math.max(1, limit ?? 50))}`;
+      const d = await getDetailed(path);
+      if (d.kind !== "ok") {
+        return {
+          sourceHost: base,
+          unavailable: reason(path, d),
+          height,
+          txCount: null,
+          txs: [],
+        } as T;
+      }
+      const rows =
+        (d.body.transactions as Array<Record<string, unknown>>) ?? [];
+      return {
+        sourceHost: base,
+        unavailable: null,
+        height,
+        txCount: numOf(d.body, ["tx_count"]),
+        txs: rows
+          .map((t) => {
+            const hash = typeof t.hash === "string" ? strip0x(t.hash) : null;
+            if (!hash) return null;
+            return {
+              index: numOf(t, ["index"]) ?? 0,
+              hash,
+              txType: strOf(t, ["tx_type"]),
+              from: typeof t.from === "string" ? strip0x(t.from) : null,
+            };
+          })
+          .filter((x): x is NonNullable<typeof x> => x !== null),
+      } as T;
+    }
+    case "lookup_tx": {
+      const raw = (args as { hash: string }).hash;
+      const hash = strip0x(raw);
+      const shell = {
+        sourceHost: base,
+        hash,
+        blockHeight: null,
+        blockHash: null,
+        txIndex: null,
+        success: null,
+        gasUsed: null,
+      };
+      if (hash.length !== 64 || !/^[0-9a-f]+$/.test(hash)) {
+        return {
+          ...shell,
+          status: "invalid_hash",
+          unavailable: `A transaction hash is 64 hex characters (an optional 0x prefix is fine). That one is ${hash.length}.`,
+        } as T;
+      }
+      const path = `/tx/${hash}`;
+      const d = await getDetailed(path);
+      if (d.kind === "ok") {
+        return {
+          ...shell,
+          unavailable: null,
+          status: "mined",
+          blockHeight: numOf(d.body, ["block_height"]),
+          blockHash:
+            typeof d.body.block_hash === "string"
+              ? strip0x(d.body.block_hash)
+              : null,
+          txIndex: numOf(d.body, ["index"]),
+          success:
+            typeof d.body.success === "boolean" ? d.body.success : null,
+          gasUsed: numOf(d.body, ["gas_used"]),
+        } as T;
+      }
+      // A 404 is ALSO what a pending attestation looks like — /tx/{hash} is a
+      // receipt lookup and a mempool tx has no receipt. Never "invalid".
+      if (d.kind === "notFound") {
+        return { ...shell, unavailable: null, status: "not_found" } as T;
+      }
+      if (d.kind === "badRequest") {
+        return {
+          ...shell,
+          status: "invalid_hash",
+          unavailable: `${base} rejected that hash as malformed.`,
+        } as T;
+      }
+      return {
+        ...shell,
+        status: "error",
+        unavailable: reason(path, d),
+      } as T;
+    }
     case "open_external":
       window.open((args as { url: string }).url, "_blank");
       return undefined as T;
     case "clear_crash":
       return undefined as T;
-    case "check_for_update":
-      return { hasUpdate: false, version: "0.5.2" } as T;
     case "ensure_binary":
       // Browser (live mode) can't install a native binary - pretend it's
       // already installed so the UI doesn't block onboarding.
@@ -579,6 +1192,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
 
 // Mock state - only used in browser preview. Tauri env always hits the real backend.
 let mockStartedAt: number | null = null;
+let mockWorkerThreads: number | null = null;
 const mockLogs: LogEntry[] = [];
 let mockEarnings: Earnings = {
   totalArc: 12_847.5,
@@ -587,7 +1201,15 @@ let mockEarnings: Earnings = {
   rank: 147,
   attestations: 1283,
   lastPayoutAt: Date.now() - 1000 * 60 * 12,
+  lastPayoutBlock: 123_462,
+  fromChain: true,
 };
+
+// The mock deliberately exercises BOTH attestation shapes the UI must
+// survive: rows that are the user's own (with a reward, tokens and a real
+// timestamp) and a row from another validator with no telemetry — which is
+// what the live seeds actually return today.
+const MOCK_ADDRESS = "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p";
 
 const mockAttestations: Attestation[] = [
   {
@@ -597,8 +1219,12 @@ const mockAttestations: Attestation[] = [
     modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
     tokens: 42,
     latencyMs: 147,
-    rewardArc: 12.5,
+    rewardArc: REWARD_PER_ATTESTATION,
     timestamp: Date.now() - 1000 * 34,
+    blockHeight: 123_462,
+    txType: "Inference",
+    from: MOCK_ADDRESS,
+    mine: true,
     verified: true,
   },
   {
@@ -608,22 +1234,96 @@ const mockAttestations: Attestation[] = [
     modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
     tokens: 128,
     latencyMs: 412,
-    rewardArc: 34.8,
+    rewardArc: REWARD_PER_ATTESTATION,
     timestamp: Date.now() - 1000 * 89,
+    blockHeight: 123_455,
+    txType: "Inference",
+    from: MOCK_ADDRESS,
+    mine: true,
     verified: true,
   },
   {
+    // Someone else's work, flat shape, no telemetry: no reward, no token
+    // count, no timestamp. The UI must render this without inventing any of
+    // the three.
     txHash: "0x14ab23bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca28335f2",
-    inputPreview: "Explain zero-knowledge proofs to a 10 year old",
-    outputHash: "0xbe91fe12aab4c7d2e44a88b1f91023c8",
-    modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
-    tokens: 256,
-    latencyMs: 783,
-    rewardArc: 67.2,
-    timestamp: Date.now() - 1000 * 214,
+    inputPreview: "",
+    outputHash: "",
+    modelHash: "",
+    tokens: null,
+    latencyMs: null,
+    rewardArc: null,
+    timestamp: null,
+    blockHeight: 123_401,
+    txType: "Inference",
+    from: "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
+    mine: false,
+    verified: true,
+  },
+  {
+    // Old-seed PADDING. `/inference/attestations` on the deployed v0.7.9 seeds
+    // tops its list up with unrelated transactions tagged `tx_type: "Other"`
+    // once genuine attestation rows run out — at limit=500 some seeds returned
+    // 500 of these and zero real ones. The Network screen filters them out;
+    // this row is here so that filter is demonstrably doing something.
+    txHash: "0x77cc23bb8a4446f23a62033001cb22e1e9298d5ce1cfea8111762c1ca2833aa1",
+    inputPreview: "",
+    outputHash: "",
+    modelHash: "",
+    tokens: null,
+    latencyMs: null,
+    rewardArc: null,
+    timestamp: null,
+    blockHeight: 123_390,
+    txType: "Other",
+    from: "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
+    mine: false,
     verified: true,
   },
 ];
+
+/** The seed the mock pretends to have pinned. Mirrors mock `node_status`. */
+const MOCK_CHAIN_HOST = "http://140.82.16.112:9090";
+
+/**
+ * Fourteen validators, four of them at stake 0.
+ *
+ * That ratio is not decorative — it is what the live network actually reports,
+ * and it is why the Network screen separates active from registered. `/health`
+ * and `/validators` both count the zero-stake entries, so the set looks four
+ * larger than the number of nodes that can actually lead a round.
+ */
+const MOCK_VALIDATORS = Array.from({ length: 14 }, (_, i) => ({
+  address: `${(i + 1).toString(16).padStart(2, "0")}cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e93${(i + 16).toString(16)}`,
+  stake: i < 10 ? 500_000 * ARC_BASE_UNITS : 0,
+  active: i < 10,
+}));
+
+/**
+ * Recent blocks, descending. Heights and gaps are fixed literals rather than
+ * derived from `Date.now()`: a fabricated "seconds ago" ladder that shifts on
+ * every poll is exactly the class of invention this app removed.
+ */
+const MOCK_BLOCKS = [
+  { height: 123_469, gapSecs: 400, txCount: 2 },
+  { height: 123_468, gapSecs: 407, txCount: 0 },
+  { height: 123_467, gapSecs: 415, txCount: 1 },
+  { height: 123_466, gapSecs: 422, txCount: 0 },
+  { height: 123_465, gapSecs: 430, txCount: 3 },
+  { height: 123_464, gapSecs: 438, txCount: 0 },
+  { height: 123_463, gapSecs: 445, txCount: 0 },
+  { height: 123_462, gapSecs: 453, txCount: 1 },
+  { height: 123_461, gapSecs: 460, txCount: 0 },
+  { height: 123_460, gapSecs: 468, txCount: 2 },
+].map((b) => ({
+  height: b.height,
+  hash: `${b.height.toString(16)}c41ab77e0d5c3b8a16e94f20d7a5589cc31be4470a2e6d1f8039b5ca7e4`
+    .padEnd(64, "0")
+    .slice(0, 64),
+  timestampMs: Date.now() - b.gapSecs * 1000,
+  txCount: b.txCount,
+  proposer: "0cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e938e",
+}));
 
 function seedMockLogs() {
   if (mockLogs.length > 0) return;
@@ -677,19 +1377,26 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       "ARC desktop is running outside its native host. Open the arc app, not the HTML bundle.",
     );
   }
+  // Test seam (see `mockOverride`). Checked after the production guard above,
+  // so it cannot fabricate anything in a real bundle.
+  const override = mockOverride<T>(cmd);
+  if (override !== undefined) {
+    await new Promise((r) => setTimeout(r, 20));
+    return override;
+  }
   await new Promise((r) => setTimeout(r, 120));
   switch (cmd) {
     case "detect_hardware":
       return DEFAULT_HARDWARE as T;
     case "generate_identity":
       return {
-        address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
+        address: MOCK_ADDRESS,
         publicKey:
           "0x7c31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
-        seedPhrase:
-          "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment",
         createdAt: Date.now(),
       } as T;
+    case "reveal_seed_phrase":
+      return "galaxy stellar quantum horizon crystal ember aurora silent mirror ocean celestial fragment" as T;
     case "load_identity":
       return null as T;
     case "save_config":
@@ -705,16 +1412,24 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         running,
         pid: running ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
-        version: "0.5.2",
+        version: "0.7.11",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,
         height: running ? 43_820 + Math.floor(uptime / 4) : 0,
         uptimeSeconds: uptime,
-        address: "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p",
-        rpcPort: 9944,
+        address: MOCK_ADDRESS,
+        rpcPort: 9090,
         lastError: null,
         coordinatorUrl: null,
+        // Chain numbers are the network's, not this node's - and the mock
+        // reflects the real testnet's stalled block production.
+        chainHost: "http://140.82.16.112:9090",
+        chainHeight: 123_469,
+        chainRound: 9_596_644,
+        chainBlockAgeSeconds: 400,
+        workerThreads: running ? mockWorkerThreads : null,
+        cpuCores: 24,
       } as T;
     }
     case "start_node":
@@ -755,6 +1470,152 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         avgTps: 33_221,
         latestBlock: 43_821,
       } as T;
+    // ── Chain visibility + projection ────────────────────────────────────
+    // Populated, so browser preview and the screenshot suite show the real
+    // layout. The 404 / no-history / degraded paths are reached by tests via
+    // `window.__ARC_MOCK__` — see `mockOverride`.
+    case "fetch_reward_economics":
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        rewardPerAttestation: REWARD_PER_ATTESTATION,
+        treasuryBalanceArc: 4_182_500,
+        treasuryBalanceUnavailableReason: null,
+        // A COUNT of attestations the treasury can still pay for:
+        // 4,182,500 ARC / 2.5 ARC = 1,673,000.
+        attestationsRemaining: 1_673_000,
+        attestationsRemainingUnavailableReason: null,
+        treasuryIsFinite: true,
+        // DEFAULT_ATTESTATION_BOND is 1_000 base units = 0.000001 ARC.
+        bondPerAttestation: 1_000 / ARC_BASE_UNITS,
+        challengePeriodBlocks: 100,
+        bondRefundedAfterChallengePeriod: true,
+        fundingDetail:
+          "Transferred from a pre-funded testnet treasury account. Not an emission and not revenue share.",
+      } as T;
+    case "fetch_earnings_projection":
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        rewardPerAttestation: REWARD_PER_ATTESTATION,
+        rewardRateSource: "chain",
+        attestationsTotal: 1_283,
+        firstAttestationBlock: 118_011,
+        attestationsPerDay: 43.2,
+        rateUnavailableReason: null,
+        observedOverBlocks: 5_458,
+        rateCaveat:
+          "Derived from the first and last attestation timestamps in this node's scan window; a node offline for part of that window will read low.",
+      } as T;
+    case "fetch_node_contribution":
+      return {
+        sourceHost: "http://127.0.0.1:9090",
+        unavailable: null,
+        source: "contribution",
+        threadsInUse: mockWorkerThreads ?? 24,
+        threadsAvailable: 24,
+        layersHeld: "0..6",
+        layerCount: 6,
+        totalLayers: 32,
+        runsServed: 15,
+        cacheHits: 3,
+        hopMsMean: 182,
+        hopSamples: 15,
+        hopUnavailableReason: null,
+      } as T;
+    case "fetch_network_overview":
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        networkName: "arc-testnet-1",
+        networkNameUnavailableReason: null,
+        chainId: "arc-testnet-1",
+        // The host declares itself NOT mainnet. The UI must never say mainnet
+        // unless this is explicitly true.
+        declaresMainnet: false,
+        isBlockProducing: false,
+        isBlockProducingBasis:
+          "no block sealed within block_production_fresh_secs (120s)",
+        hostVersion: "0.7.9",
+        height: 123_469,
+        // Matches the mock node_status: the real testnet's block production
+        // is stalled, and the mock reflects that rather than a healthy fiction.
+        lastBlockAgeSecs: 400,
+        dagRound: 9_596_644,
+        dagCommitted: 9_596_640,
+        peers: 8,
+        validatorsActive: 10,
+        validatorsRegistered: 14,
+        minActiveStake: 500_000,
+        validatorSplitDerived: false,
+        validators: MOCK_VALIDATORS,
+      } as T;
+    case "fetch_recent_blocks": {
+      const limit = (args as { limit?: number } | undefined)?.limit ?? 10;
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        blocks: MOCK_BLOCKS.slice(0, limit),
+      } as T;
+    }
+    case "fetch_block_txs": {
+      const { height } = args as { height: number };
+      const block = MOCK_BLOCKS.find((b) => b.height === height);
+      const n = block?.txCount ?? 0;
+      return {
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        height,
+        txCount: n,
+        // Derived from the block's own tx_count so an expanded block never
+        // shows more rows than the list said it had.
+        txs: Array.from({ length: n }, (_, i) => ({
+          index: i,
+          hash: strip0x(
+            mockAttestations[i % mockAttestations.length].txHash,
+          ),
+          txType: i === 0 ? "Inference" : "Transfer",
+          from: MOCK_ADDRESS,
+        })),
+      } as T;
+    }
+    case "lookup_tx": {
+      const hash = strip0x((args as { hash: string }).hash);
+      const shell = {
+        sourceHost: MOCK_CHAIN_HOST,
+        hash,
+        blockHeight: null,
+        blockHash: null,
+        txIndex: null,
+        success: null,
+        gasUsed: null,
+      };
+      if (hash.length !== 64 || !/^[0-9a-f]+$/.test(hash)) {
+        return {
+          ...shell,
+          status: "invalid_hash",
+          unavailable: `A transaction hash is 64 hex characters (an optional 0x prefix is fine). That one is ${hash.length}.`,
+        } as T;
+      }
+      // The first mock attestation is mined; anything else well-formed is
+      // treated as not yet in a block, which is the honest answer for a hash
+      // this host has no receipt for.
+      const mined = strip0x(mockAttestations[0].txHash);
+      if (hash === mined) {
+        return {
+          ...shell,
+          unavailable: null,
+          status: "mined",
+          blockHeight: 123_462,
+          blockHash:
+            "9f2c41ab77e0d5c3b8a16e94f20d7a5589cc31be4470a2e6d1f8039b5ca7e412",
+          txIndex: 0,
+          success: true,
+          gasUsed: 21_000,
+        } as T;
+      }
+      return { ...shell, unavailable: null, status: "not_found" } as T;
+    }
     case "open_external":
       return undefined as T;
     case "fetch_balance":
@@ -775,7 +1636,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 900));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output: "  This is a mock response for local preview mode.",
         outputHash:
           "0xbe91fe12aab4c7d2e44a88b1f91023c811112222333344445555666677778888",
@@ -788,13 +1649,14 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         deterministic: true,
         engine: "mock",
         explorerUrl: "/tx/0x1a2b3c4d5e6f7a8b",
+        servedLocally: true,
       } as T;
     }
     case "run_inference_via_coordinator": {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 1200));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output:
           "  Mock coordinator response - browser preview. In Tauri + live testnet, this is served by one of the 6 seed nodes via /inference/run_consensus with k=3 majority verification.",
         outputHash:
@@ -806,6 +1668,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         deterministic: true,
         engine: "consensus",
         explorerUrl: "",
+        servedLocally: false,
         consensus: {
           k: 3,
           votesTotal: 48,
@@ -821,7 +1684,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const { prompt } = args as { prompt: string };
       await new Promise((r) => setTimeout(r, 800));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output:
           "  Mock direct-coordinator response - browser preview. In Tauri + live testnet, this hits a single coordinator's /inference/run as a fallback when the sharded /inference/run_consensus path is degraded.",
         outputHash:
@@ -830,12 +1693,13 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           "0xabec2d582beb97a876c21d7ccc5e8e4833e8fd34aee0cb5b64e9f14f5ea57fdb",
         tokensGenerated: 28,
         inferenceMs: 7_800,
-        txHash: "0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
+        txHash: "0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
         deterministic: true,
         engine: "INT8 integer (cross-platform deterministic)",
-        explorerUrl: "/tx/0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
+        explorerUrl: "/tx/0xfafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafa",
         consensus: undefined,
         coordinator: "http://140.82.16.112:9090",
+        servedLocally: false,
       } as T;
     }
     case "tier1_submit": {
@@ -901,7 +1765,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       };
       await new Promise((r) => setTimeout(r, 1500));
       return {
-        input: `[INST] ${prompt} [/INST]`,
+        input: prompt,
         output:
           "  Mock paid-inference response - browser preview. In the native app, this flow: signs an InferenceEscrowOpen tx locally, POSTs it to a coordinator, waits for commit, then runs /inference/run_consensus which auto-submits the release.",
         outputHash:
@@ -928,8 +1792,26 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     }
     case "clear_crash":
       return undefined as T;
-    case "check_for_update":
-      return { hasUpdate: false, version: "0.5.2" } as T;
+    case "save_logs":
+      return {
+        path: "/mock/Downloads/arc-node-20260817-120000.log",
+        lines: mockLogs.length,
+      } as T;
+    case "set_worker_threads": {
+      const { threads } = args as { threads: number };
+      mockWorkerThreads = threads;
+      // Mirrors the real fallback: no /node/threads endpoint exists yet, so
+      // applying a new width restarts the node.
+      if (mockStartedAt !== null) mockStartedAt = Date.now();
+      return {
+        workerThreads: threads,
+        restarted: mockStartedAt !== null,
+        message:
+          mockStartedAt !== null
+            ? `Restarted the node with ${threads} cores.`
+            : `Saved. The node will use ${threads} cores when it starts.`,
+      } as T;
+    }
     case "ensure_binary":
       // Mock path - no real download. Pretend it completed instantly.
       return {
@@ -993,6 +1875,14 @@ export const api = {
   detectHardware: () => invoke<HardwareInfo>("detect_hardware"),
   generateIdentity: () => invoke<Identity>("generate_identity"),
   loadIdentity: () => invoke<Identity | null>("load_identity"),
+  /**
+   * Fetch the BIP-39 recovery phrase for the backup screen.
+   *
+   * The result MUST NOT be persisted, logged, or put into app state that
+   * gets serialized. It exists only for as long as the user is looking at
+   * it. See `IdentityPublic` in the Rust types for why.
+   */
+  revealSeedPhrase: () => invoke<string>("reveal_seed_phrase"),
   saveConfig: (config: NodeConfig) => invoke<void>("save_config", { config }),
   loadConfig: () => invoke<NodeConfig | null>("load_config"),
   startNode: (config: NodeConfig) => invoke<void>("start_node", { config }),
@@ -1005,20 +1895,59 @@ export const api = {
     invoke<Attestation[]>("fetch_attestations", { limit }),
   fetchLogs: (limit = 200) => invoke<LogEntry[]>("fetch_logs", { limit }),
   fetchNetworkStats: () => invoke<NetworkStats>("fetch_network_stats"),
+
+  // ── Chain visibility + projection ──────────────────────────────────────
+  // Each of these resolves to a struct carrying `unavailable` rather than
+  // rejecting, because "this host does not serve that endpoint" is a fact to
+  // display, not an exception to swallow. Callers render the reason.
+  /** The finite reward treasury — the ceiling on any projection. */
+  fetchRewardEconomics: () =>
+    invoke<RewardEconomics>("fetch_reward_economics"),
+  /** Measured inputs for the earnings projection. */
+  fetchEarningsProjection: () =>
+    invoke<EarningsProjection>("fetch_earnings_projection"),
+  /** What the node on THIS machine is contributing. */
+  fetchNodeContribution: () =>
+    invoke<NodeContribution>("fetch_node_contribution"),
+  /** Height, block age, validator split and peers for the pinned host. */
+  fetchNetworkOverview: () =>
+    invoke<NetworkOverview>("fetch_network_overview"),
+  fetchRecentBlocks: (limit = 10) =>
+    invoke<RecentBlocks>("fetch_recent_blocks", { limit }),
+  /** Transactions in one block. Called on expand, never on the poll path. */
+  fetchBlockTxs: (height: number, limit = 50) =>
+    invoke<BlockTxs>("fetch_block_txs", { height, limit }),
+  /** Resolve one tx/attestation hash against the pinned host. */
+  lookupTx: (hash: string) => invoke<TxLookup>("lookup_tx", { hash }),
   fetchBalance: () => invoke<AccountBalance>("fetch_balance"),
   faucetClaim: () => invoke<FaucetResult>("faucet_claim"),
-  runInference: (prompt: string, maxTokens = 32) =>
-    invoke<InferenceResult>("run_inference", { prompt, maxTokens }),
-  runInferenceViaCoordinator: (prompt: string, maxTokens = 32, k = 3) =>
+  // `chatTemplate` asks the serving node to apply the loaded model's own
+  // chat template. The client no longer wraps prompts in Llama-2's
+  // `[INST] ... [/INST]` tags, which were wrong for other architectures and
+  // got double-applied when the node templated too.
+  runInference: (prompt: string, maxTokens = 32, chatTemplate = true) =>
+    invoke<InferenceResult>("run_inference", { prompt, maxTokens, chatTemplate }),
+  runInferenceViaCoordinator: (
+    prompt: string,
+    maxTokens = 32,
+    k = 3,
+    chatTemplate = true,
+  ) =>
     invoke<InferenceResult>("run_inference_via_coordinator", {
       prompt,
       maxTokens,
       k,
+      chatTemplate,
     }),
-  runInferenceViaCoordinatorDirect: (prompt: string, maxTokens = 32) =>
+  runInferenceViaCoordinatorDirect: (
+    prompt: string,
+    maxTokens = 32,
+    chatTemplate = true,
+  ) =>
     invoke<InferenceResult>("run_inference_via_coordinator_direct", {
       prompt,
       maxTokens,
+      chatTemplate,
     }),
   // ── Tier 1 on-chain inference ────────────────────────────────────────────
   tier1Submit: (
@@ -1051,8 +1980,15 @@ export const api = {
     }),
   clearCrash: () => invoke<void>("clear_crash"),
   openExternal: (url: string) => invoke<void>("open_external", { url }),
-  checkForUpdate: () =>
-    invoke<{ hasUpdate: boolean; version: string }>("check_for_update"),
+  /**
+   * Write the log ring to a file via a native save dialog. Replaces a
+   * `Blob` + `<a download>` click, which WKWebView silently ignores — so
+   * the button did nothing at all on macOS.
+   */
+  saveLogs: () => invoke<SavedLogs>("save_logs"),
+  /** Change how many cores the node contributes. */
+  setWorkerThreads: (threads: number) =>
+    invoke<ThreadsApplied>("set_worker_threads", { threads }),
   ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
   getAutostart: () => invoke<boolean>("get_autostart"),
   listModelTiers: () => invoke<ModelTierInfo[]>("list_model_tiers"),

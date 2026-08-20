@@ -9,7 +9,7 @@
 //! sequentially (lower overhead).  Blocks with smart contract calls or high
 //! receiver diversity use BlockSTM for parallelism.
 
-use arc_types::{Account, Address, Transaction, TxBody};
+use arc_types::{Account, Transaction, TxBody};
 use dashmap::DashMap;
 use std::collections::{HashMap, HashSet};
 
@@ -224,7 +224,10 @@ pub fn partition_batches(transactions: &[Transaction]) -> Vec<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `Address` is used only by these tests, so it is imported here rather
+    // than at module scope where the lib target would see it as unused.
     use arc_crypto::hash_bytes;
+    use arc_types::Address;
 
     fn addr(n: u8) -> Address {
         hash_bytes(&[n])
@@ -390,6 +393,12 @@ pub struct MVHashMap {
     data: DashMap<[u8; 32], Vec<(usize, u64, u64)>>,
 }
 
+impl Default for MVHashMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MVHashMap {
     /// Create a new empty multi-version hash map.
     pub fn new() -> Self {
@@ -398,7 +407,7 @@ impl MVHashMap {
 
     /// Write a value for an account at a specific transaction index.
     pub fn write(&self, account: [u8; 32], tx_index: usize, balance: u64, nonce: u64) {
-        let mut entry = self.data.entry(account).or_insert_with(Vec::new);
+        let mut entry = self.data.entry(account).or_default();
         // Remove any existing write from this tx_index (for re-execution)
         entry.retain(|(idx, _, _)| *idx != tx_index);
         entry.push((tx_index, balance, nonce));
@@ -839,6 +848,7 @@ pub fn execute_speculative(
 #[cfg(test)]
 mod speculative_tests {
     use super::*;
+    use arc_types::Address;
     use arc_crypto::hash_bytes;
 
     fn addr(n: u8) -> Address {

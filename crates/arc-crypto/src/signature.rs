@@ -1043,7 +1043,7 @@ mod tests {
         match sig {
             Signature::Falcon512 { signature, public_key } => {
                 assert!(signature.len() <= FALCON_SIG_MAX_LEN);
-                assert!(signature.len() > 0);
+                assert!(!signature.is_empty());
                 assert_eq!(public_key.len(), FALCON_PK_LEN);
             }
             _ => panic!("expected Falcon512 signature"),

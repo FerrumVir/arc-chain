@@ -1,5 +1,14 @@
 # ARC Testnet Seed Nodes
-# 8 nodes across 6 continents. Your node connects to these on startup.
+# 6 nodes across 4 continents. Your node connects to these on startup.
+# (The header used to say "8 nodes across 6 continents"; SAO and JNB were
+# retired 2026-04-22 and are commented out at the bottom of this file.)
+#
+# NOTE for anything that reads the FIRST entry as a default: the first line
+# below is NYC. On 2026-08-17 NYC is the only seed reliably sealing blocks,
+# but it also runs the oldest binary on the network (v0.7.2 vs 0.7.9
+# elsewhere). Auto-shard-join and auto-state-sync both target this first
+# entry - see the safety rules in CLAUDE.md before joining with a model
+# loaded or with stake above zero.
 #
 # Each seed is listed TWICE: once on UDP 9091 (the native P2P port) and
 # once on UDP 443 (which is forwarded to 9091 via iptables). Dial both

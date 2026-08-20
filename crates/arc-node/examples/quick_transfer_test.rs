@@ -1,12 +1,12 @@
 //! Quick diagnostic: submit a Transfer tx, see if it lands.
 //! Verifies block production is actually happening + tx-submission path
 //! works, before debugging the C/D/E specific tx types.
-use arc_crypto::{hash_bytes, Hash256, Signature};
+use arc_crypto::{Hash256, Signature};
 use arc_types::transaction::{TransferBody, TxBody};
 use arc_types::{Transaction, TxType};
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::time::Duration;
 
 const DOMAIN_TAG: &str = "ARC-chain-validator-keypair-v1";

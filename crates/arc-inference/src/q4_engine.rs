@@ -27,7 +27,7 @@ impl Q4Weights {
     pub fn from_i8(i8w: &I8Weights) -> Self {
         let n_rows = i8w.n_rows;
         let n_cols = i8w.n_cols;
-        assert!(n_cols % 2 == 0, "Q4 requires even column count");
+        assert!(n_cols.is_multiple_of(2), "Q4 requires even column count");
 
         let mut data = Vec::with_capacity(n_rows * n_cols / 2);
         let mut scales = Vec::with_capacity(n_rows);
@@ -36,7 +36,7 @@ impl Q4Weights {
             let row = &i8w.data[i * n_cols..(i + 1) * n_cols];
 
             // Find abs max of i8 row
-            let abs_max = row.iter().map(|&x| (x as i16).abs() as u8).max().unwrap_or(1).max(1);
+            let abs_max = row.iter().map(|&x| (x as i16).unsigned_abs() as u8).max().unwrap_or(1).max(1);
 
             // Q4 scale: maps [-7, 7] to [-abs_max, abs_max]
             // scale_i64 = abs_max_real / 7 in Q16 terms
@@ -44,7 +44,7 @@ impl Q4Weights {
             // and Q4 values will be in [-7, 7]:
             // Q4 scale = i8_scale * (abs_max_i8 / 7)
             let q4_per_unit = (abs_max as i64 + 6) / 7; // ceiling division
-            let q4_scale = (i8w.scales[i] * q4_per_unit.max(1)) >> 0; // combined scale
+            let q4_scale = i8w.scales[i] * q4_per_unit.max(1); // combined scale
 
             // Quantize each i8 value to 4-bit [-7, 7], store as [1, 15] (bias +8)
             for pair in 0..(n_cols / 2) {
@@ -147,7 +147,10 @@ pub fn matmul_q4_preq(weights: &Q4Weights, input_q: &QuantizedInput, in_size: us
                         p += 16;
                     }
                     vacc0 = vaddq_s32(vacc0, vacc1);
-                    acc = vaddvq_s32(vacc0) as i64;
+                    // `acc` is still 0 here, so `+=` is bit-identical to `=`;
+                    // it just avoids a dead store on the non-aarch64 build
+                    // where the scalar block below owns the accumulator.
+                    acc += vaddvq_s32(vacc0) as i64;
 
                     // Scalar remainder
                     for pp in simd_len..half_cols {
@@ -189,12 +192,12 @@ mod tests {
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 2, 4);
         let q4 = Q4Weights::from_i8(&i8w);
         assert_eq!(q4.data.len(), 2 * 2); // 2 rows × 4/2 = 4 bytes
-        assert_eq!(q4.memory_bytes() < i8w.memory_bytes(), true);
+        assert!(q4.memory_bytes() < i8w.memory_bytes());
     }
 
     #[test]
     fn test_q4_matmul_basic() {
-        let i8w = I8Weights::quantize_f32(
+        let _i8w = I8Weights::quantize_f32(
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 2, 3);
         // Q4 requires even cols - pad to 4
         let i8w = I8Weights::quantize_f32(

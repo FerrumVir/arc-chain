@@ -15,7 +15,7 @@
 //! **Security**: GPU is a hot cache, not source of truth. WAL + CPU DashMap
 //! remains authoritative. On shutdown, GPU memory is explicitly zeroed.
 
-use arc_gpu::gpu_memory::{GpuAccountBuffer, GpuAccountRepr, MemoryModel, ACCOUNT_SLOT_SIZE};
+use arc_gpu::gpu_memory::{GpuAccountBuffer, GpuAccountRepr, MemoryModel};
 use arc_types::Account;
 use arc_crypto::Hash256;
 use dashmap::DashMap;
@@ -674,7 +674,7 @@ impl GpuStateCache {
         let buffer = Arc::try_unwrap(self.gpu_buffer);
         match buffer {
             Ok(buf) => buf.secure_shutdown(),
-            Err(arc_buf) => {
+            Err(_arc_buf) => {
                 warn!("GPU buffer has multiple owners, cannot secure-shutdown (will be zeroed on drop)");
             }
         }
@@ -909,7 +909,7 @@ mod tests {
             ..Default::default()
         };
         let cache = GpuStateCache::new(config);
-        let addrs: Vec<[u8; 32]> = (0..5).map(|i| addr(i)).collect();
+        let addrs: Vec<[u8; 32]> = (0..5).map(addr).collect();
 
         cache.prefetch(&addrs);
 

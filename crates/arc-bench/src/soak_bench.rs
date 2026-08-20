@@ -96,7 +96,7 @@ fn rss_bytes() -> u64 {
                 &mut count,
             );
             if kr == libc::KERN_SUCCESS {
-                return info.resident_size as u64;
+                return info.resident_size;
             }
         }
         0
@@ -280,14 +280,16 @@ fn print_dashboard(
         format_tps(metrics.avg_tps(elapsed_secs))
     );
     println!("  Peak TPS:       {}", format_tps(metrics.peak_tps));
-    println!(
-        "  Min TPS:        {}",
-        if metrics.min_tps == f64::MAX {
-            "N/A".to_string()
-        } else {
-            format_tps(metrics.min_tps)
-        }
-    );
+    // `min_tps` is initialised to the sentinel f64::MAX and only ever replaced
+    // by an assignment, never by arithmetic, so this is a sentinel identity
+    // test ("no sample recorded yet"), not a comparison of computed floats.
+    #[allow(clippy::float_cmp)]
+    let min_tps_display = if metrics.min_tps == f64::MAX {
+        "N/A".to_string()
+    } else {
+        format_tps(metrics.min_tps)
+    };
+    println!("  Min TPS:        {}", min_tps_display);
     println!(
         "  Total Txs:      {}",
         format_count(metrics.total_txs)
@@ -317,14 +319,16 @@ fn print_final_report(total_duration: Duration, metrics: &SoakMetrics) {
     );
     println!("  Average TPS:    {}", format_tps(avg_tps));
     println!("  Peak TPS:       {}", format_tps(metrics.peak_tps));
-    println!(
-        "  Min TPS:        {}",
-        if metrics.min_tps == f64::MAX {
-            "N/A".to_string()
-        } else {
-            format_tps(metrics.min_tps)
-        }
-    );
+    // `min_tps` is initialised to the sentinel f64::MAX and only ever replaced
+    // by an assignment, never by arithmetic, so this is a sentinel identity
+    // test ("no sample recorded yet"), not a comparison of computed floats.
+    #[allow(clippy::float_cmp)]
+    let min_tps_display = if metrics.min_tps == f64::MAX {
+        "N/A".to_string()
+    } else {
+        format_tps(metrics.min_tps)
+    };
+    println!("  Min TPS:        {}", min_tps_display);
     println!("  Std Dev:        {}", format_tps(std_dev));
     println!("  Success Rate:   {:.1}%", metrics.success_rate());
     println!("  Memory (RSS):   {}", format_bytes(rss_bytes()));

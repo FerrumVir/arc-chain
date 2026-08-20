@@ -163,7 +163,7 @@ pub fn generate_dense_trace(layer: &DenseLayerInput) -> Vec<Vec<i64>> {
             input_col[row] = inp;
             product[row] = prod;
             acc_prev[row] = acc;
-            acc = acc + prod;
+            acc += prod;
             acc_next[row] = acc;
 
             let is_last = if j == layer.in_size - 1 { 1 } else { 0 };
@@ -434,7 +434,7 @@ pub fn prove_sharded_dense(
         return Err("shard_cols must be > 0 and <= in_size".into());
     }
 
-    let n_shards = (in_size + shard_cols - 1) / shard_cols;
+    let n_shards = in_size.div_ceil(shard_cols);
     let mut shard_proofs = Vec::with_capacity(n_shards);
 
     // Running partial sums per output row (accumulated across shards)

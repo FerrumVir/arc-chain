@@ -169,7 +169,7 @@ pub fn upscale(grid: &Grid, factor: usize) -> Grid {
     let mut out = Vec::new();
     for row in grid {
         let expanded_row: Vec<u8> = row.iter()
-            .flat_map(|&c| std::iter::repeat(c).take(factor))
+            .flat_map(|&c| std::iter::repeat_n(c, factor))
             .collect();
         for _ in 0..factor {
             out.push(expanded_row.clone());

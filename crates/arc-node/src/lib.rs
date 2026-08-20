@@ -10,3 +10,9 @@ pub mod producer;
 pub mod rpc;
 pub mod state_sync;
 pub mod vrf;
+
+/// The live validator set — `(address, stake)` — shared between the consensus
+/// loop (which updates it on peer connect/disconnect) and the RPC layer (which
+/// reads it for `/validators` and `/health`).
+pub type SharedValidators =
+    std::sync::Arc<parking_lot::RwLock<Vec<(arc_crypto::Hash256, u64)>>>;

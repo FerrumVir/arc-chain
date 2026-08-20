@@ -1,9 +1,24 @@
-# ARC Chain - Status (2026-04-22)
+# ARC Chain - Status (2026-04-22, partially refreshed 2026-08-17)
 
-Current production state of the ARC testnet. Refreshed 2026-04-22 to reflect
-the cluster self-heal / latency-aware routing / slashing wire-up / SAO+JNB
-retirement landing this week. **The source of truth for what actually runs;
-CHANGELOG.md tracks what changed when.**
+> ## ⚠ This document is largely stale. Read this box first.
+>
+> The body below is a **2026-04-22 snapshot** and much of it describes a v0.4.6
+> world: the release table stops at v0.4.6, it refers to a Mac joining as a
+> "9th node", and it says the community installer pulls v0.4.6. The workspace
+> is now at **v0.7.11**.
+>
+> Two sections have been corrected in place because they were actively
+> misleading — the precision claim (see "On precision" below) and the pointers
+> in "What to look at first". Everything else is a historical record.
+>
+> **For current state, use these instead:**
+> - [`ALERTS.md`](../ALERTS.md) — what is broken on the live network right now
+> - [`docs/DEMO-RUNBOOK.md`](DEMO-RUNBOOK.md) — the current run-of-show
+> - [`CLAUDE.md`](../CLAUDE.md) — live network table and safety rules
+> - [`docs/TESTNET_STATE_DIVERGENCE_2026-06-03.md`](TESTNET_STATE_DIVERGENCE_2026-06-03.md) — why the seeds are not one chain
+>
+> The most important thing this document does *not* say: block production is
+> stalled on four of the six seeds, and the seeds are independent chains.
 
 ## TL;DR
 
@@ -140,16 +155,53 @@ All 7 releases have Mac arm64 + Linux x86_64 binaries on GitHub. The community i
 - **~10-13 sec/token** wall time end-to-end via `/inference/run_sharded`; `/inference/run_consensus` with k=3 is slower per-hop but catches hash divergence
 - **10/10 unique output_hashes** under 10x concurrent load
 - **9/10 factually correct** answers in the 10-prompt benchmark
-- **0% precision loss** vs the source GGUF model (per-row INT16 quantized from f32)
 
-## What TJ should look at first when he wakes up
+### On precision — corrected 2026-08-17
 
-1. **Open the dashboard**: http://140.82.16.112:3200 - see the live pipeline, click "Run Through Pipeline" with the default prompt, watch the cards animate, see the trace
-2. **Read** `docs/SERO-DEMO.md` for the screen-recording flow
-3. **Read** `docs/ANNOUNCEMENT.md` for the social-post version
-4. **Try the verifier**: `bash scripts/arc-verify.sh --latest` - see the cryptographic proof
-5. **Check the autoloop log**: `/tmp/arc-autoloop-state.md` for iter-by-iter progress
-6. **Ship the install link to Sero**: `curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash`
+This document previously claimed **"0% precision loss vs the source GGUF
+model"**, and the dashboard shows a field reading *"Quality loss vs FP16:
+0.00%"*. Both are wrong as stated, and the second is wrong in a way that
+matters: it measures quantization error against the **already-quantized**
+weights, not against FP16.
+
+The defensible claims, which are the ones the evidence actually supports:
+
+- **Argmax parity** with candle's Q8_0 reference implementation.
+- **Bit-identical output hashes across platforms** — ARM macOS and x86 Linux
+  produce the same BLAKE3 digest for the same input. This is the property the
+  whole verification story rests on, and it holds.
+
+What is *not* supported is quality parity with FP16. `INFERENCE_DETERMINISM.md`
+records WikiText-2 perplexity of **~107** (63-token run) and **~155** (256-token
+run) against a published FP16 baseline of **5.47** — roughly **20–30× worse**.
+The root cause is `I8Weights::quantize_f32` truncating the f32 per-row
+`abs_max`, and it is explicitly documented as not a one-line fix, because
+downstream integer primitives were tuned against the undersized output.
+
+`docs/SCALE_ARCHITECTURE.md` §2.6 labels "matches FP16 quality" as overreach.
+The visible symptom is that some prompts return degenerate output: every prompt
+phrased `Explain <topic>` in the recorded set produced newline spam.
+
+Determinism and quality are separate axes here. The engine is reproducible. It
+is not yet accurate.
+
+## What to look at first (refreshed 2026-08-17)
+
+1. **Read** [`ALERTS.md`](../ALERTS.md) — four active alerts, including block
+   production stalled on 4 of 6 seeds for ~6 days.
+2. **Read** [`docs/DEMO-RUNBOOK.md`](DEMO-RUNBOOK.md) — the current run-of-show.
+   It supersedes `docs/SERO-DEMO.md`, which describes a 7-node topology that no
+   longer exists.
+3. **Try the verifier**: `bash scripts/arc-verify.sh --latest`. It now sweeps
+   every seed and reports whether the re-run was recomputed or served from
+   cache.
+4. **Open the dashboard**: http://140.82.16.112:3200 — but note the deployed
+   copy still carries pre-April topology copy and references retired hosts. The
+   repo copy in `dashboard/index.html` has been corrected; the live one has not
+   been redeployed.
+5. **Check the installer** before sending it to anyone:
+   `curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash`
+   It was broken from v0.7.10 until 2026-08-17.
 
 ## Live endpoints
 

@@ -413,8 +413,8 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     for i in 1..args.nodes {
         let seed = format!("bench-validator-{}", i);
         let mut bootstrap: Vec<SocketAddr> = vec![addr_0];
-        for j in 1..i {
-            bootstrap.push(format!("127.0.0.1:{}", ports[j]).parse().unwrap());
+        for port in ports.iter().take(i).skip(1) {
+            bootstrap.push(format!("127.0.0.1:{}", port).parse().unwrap());
         }
         let node = BenchNode::start(&seed, stake, ports[i], bootstrap, &genesis).await;
         nodes.push(node);
@@ -530,7 +530,6 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     let mut per_second_txs: Vec<usize> = Vec::new(); // TXs committed per 1-second window
     let mut last_window_committed = 0usize;
     let mut last_window_time = Instant::now();
-    let total_committed: usize;
 
     // Poll until all transactions are committed or timeout
     loop {
@@ -574,7 +573,7 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         }
 
         // Check if all mempools are drained and heights have stabilized
-        let all_drained = nodes.iter().all(|n| n.mempool.len() == 0);
+        let all_drained = nodes.iter().all(|n| n.mempool.is_empty());
         if all_drained && elapsed > Duration::from_secs(3) {
             // Wait a few more seconds for final blocks to commit
             let h_before = nodes[0].state.height();
@@ -608,7 +607,7 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
 
     // Calculate committed transactions = total injected - remaining in mempools
     let remaining_in_mempools: usize = nodes.iter().map(|n| n.mempool.len()).sum();
-    total_committed = args.txs - remaining_in_mempools;
+    let total_committed = args.txs - remaining_in_mempools;
 
     let total_elapsed = inject_start.elapsed(); // From injection start to completion
     let commit_elapsed = commit_start.elapsed();

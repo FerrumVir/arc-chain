@@ -277,11 +277,10 @@ impl GovernanceState {
             .map(|p| p.created_at)
             .next();
 
-        if let Some(last_height) = last_proposal_height {
-            if current_height < last_height + config.proposal_cooldown_blocks {
+        if let Some(last_height) = last_proposal_height
+            && current_height < last_height + config.proposal_cooldown_blocks {
                 return Err(GovernanceError::CooldownNotExpired);
             }
-        }
 
         let voting_starts = current_height;
         let voting_ends = current_height + config.voting_period_blocks;

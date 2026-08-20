@@ -22,7 +22,7 @@ impl fmt::Debug for AgentId {
 
 impl fmt::Display for AgentId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", hex::encode(&self.0))
+        write!(f, "{}", hex::encode(self.0))
     }
 }
 
@@ -306,20 +306,20 @@ impl AgentRegistry {
         }
 
         // Validate transition.
-        let valid = match (&agent.state, &state) {
-            (AgentState::Created, AgentState::Active) => true,
-            (AgentState::Active, AgentState::Paused)
-            | (AgentState::Active, AgentState::Suspended)
-            | (AgentState::Active, AgentState::OutOfFunds)
-            | (AgentState::Active, AgentState::Terminated) => true,
-            (AgentState::Paused, AgentState::Active)
-            | (AgentState::Paused, AgentState::Terminated) => true,
-            (AgentState::Suspended, AgentState::Active)
-            | (AgentState::Suspended, AgentState::Terminated) => true,
-            (AgentState::OutOfFunds, AgentState::Active)
-            | (AgentState::OutOfFunds, AgentState::Terminated) => true,
-            _ => false,
-        };
+        let valid = matches!(
+            (&agent.state, &state),
+            (AgentState::Created, AgentState::Active)
+                | (AgentState::Active, AgentState::Paused)
+                | (AgentState::Active, AgentState::Suspended)
+                | (AgentState::Active, AgentState::OutOfFunds)
+                | (AgentState::Active, AgentState::Terminated)
+                | (AgentState::Paused, AgentState::Active)
+                | (AgentState::Paused, AgentState::Terminated)
+                | (AgentState::Suspended, AgentState::Active)
+                | (AgentState::Suspended, AgentState::Terminated)
+                | (AgentState::OutOfFunds, AgentState::Active)
+                | (AgentState::OutOfFunds, AgentState::Terminated)
+        );
 
         if !valid {
             return Err(AgentError::InvalidState);

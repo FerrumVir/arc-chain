@@ -88,6 +88,11 @@ impl ArcSubmitter {
     }
 
     /// Set the last scanned ARC Chain block height (e.g. from the database).
+    // Nothing calls this yet, for the same reason as
+    // `EthWatcher::set_last_scanned_block`: there is no persistence layer to
+    // load a saved height from. Kept so the resume path stays available once
+    // one exists; removing it would just make that fix harder to land.
+    #[allow(dead_code)]
     pub fn set_last_scanned_height(&mut self, height: u64) {
         self.last_scanned_height = height;
     }

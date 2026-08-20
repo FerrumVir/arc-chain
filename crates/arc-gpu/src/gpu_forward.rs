@@ -43,7 +43,14 @@ pub struct GpuForward {
     matmul_pipeline: wgpu::ComputePipeline,
     msl_matmul_pipeline: Option<wgpu::ComputePipeline>,
     msl_matmul_q4_pipeline: Option<wgpu::ComputePipeline>,
+    // Compiled at init and reported in the pipeline count, but `forward()`
+    // currently dispatches the separate layernorm + quantize kernels instead
+    // (see the dispatch list in `forward`). Kept because dropping them would
+    // change what this constructor builds and what it logs, and because the
+    // fused path is meant to be switched on, not deleted.
+    #[allow(dead_code)]
     fused_lnq_pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
     msl_fused_lnq_pipeline: Option<wgpu::ComputePipeline>,
     layernorm_pipeline: wgpu::ComputePipeline,
     quantize_pipeline: wgpu::ComputePipeline,
@@ -66,7 +73,12 @@ pub struct GpuForward {
 
 /// Pre-built bind groups for one layer - created once, reused every token.
 struct LayerBindGroups {
+    // Bind groups for the fused LN+Q pipeline above, which `forward()` does
+    // not dispatch today. Built once at upload; kept so the fused path can be
+    // enabled without rebuilding bind groups.
+    #[allow(dead_code)]
     fused_lnq_attn: wgpu::BindGroup,
+    #[allow(dead_code)]
     fused_lnq_ffn: wgpu::BindGroup,
     ln_attn: wgpu::BindGroup,
     quantize_normed: wgpu::BindGroup,
@@ -89,7 +101,29 @@ struct LayerBindGroups {
     residual_ffn: wgpu::BindGroup,
 }
 
+/// One transformer layer's quantized weights, in the order `upload_model`
+/// consumes them: `(data, scales)` for wq, wk, wv, wo, w_gate, w_up, w_down,
+/// then the attn_norm gamma and the ffn_norm gamma.
+pub type LayerWeights<'a> = (
+    &'a [i8], &'a [i64], // wq data, scales
+    &'a [i8], &'a [i64], // wk
+    &'a [i8], &'a [i64], // wv
+    &'a [i8], &'a [i64], // wo
+    &'a [i8], &'a [i64], // w_gate
+    &'a [i8], &'a [i64], // w_up
+    &'a [i8], &'a [i64], // w_down
+    &'a [i64],           // attn_norm gamma
+    &'a [i64],           // ffn_norm gamma
+);
+
 /// All GPU buffers + pre-built bind groups for one model.
+///
+/// Most fields are never read back after `upload_model` builds them: the
+/// bind groups in `layer_bgs` already hold the bindings, and the fields exist
+/// to own the buffers for as long as the model lives. Dropping any of them
+/// would free GPU memory that a pre-built bind group still points at, so the
+/// dead_code allow below covers the whole struct rather than pruning fields.
+#[allow(dead_code)]
 pub struct GpuModel {
     // Embedding table: CPU-side i32 data [vocab_size * d_model].
     // Stored CPU-side because embedding lookup is a simple gather
@@ -459,22 +493,19 @@ impl GpuForward {
 
     /// Upload model weights to GPU. Call once at startup.
     /// Returns GpuModel with all buffers ready for forward pass.
+    ///
+    /// The argument list is long because it mirrors the model file layout one
+    /// tensor at a time. Bundling it into a config struct would move the same
+    /// 17 values behind a new public type without making any caller simpler,
+    /// so the lint is allowed here rather than reshaping a public API in a
+    /// crate whose output has to stay bit-identical.
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_model(
         &self,
         embedding_data: &[i8], embedding_scales: &[i64],
         output_data: &[i8], output_scales: &[i64],
         final_norm: &[i64],
-        layers: &[(
-            &[i8], &[i64], // wq data, scales
-            &[i8], &[i64], // wk
-            &[i8], &[i64], // wv
-            &[i8], &[i64], // wo
-            &[i8], &[i64], // w_gate
-            &[i8], &[i64], // w_up
-            &[i8], &[i64], // w_down
-            &[i64],        // attn_norm gamma
-            &[i64],        // ffn_norm gamma
-        )],
+        layers: &[LayerWeights<'_>],
         rope_cos: &[i64], rope_sin: &[i64],
         d_model: u32, d_ff: u32, d_head: u32, d_kv: u32,
         n_heads: u32, n_kv_heads: u32, vocab_size: u32, attn_scale: i32,
@@ -494,7 +525,7 @@ impl GpuForward {
             }
         };
         // Activations always packed as u32 (quantize kernel outputs u32)
-        let pack_i8 = |data: &[i8]| -> Vec<u8> {
+        let _pack_i8 = |data: &[i8]| -> Vec<u8> {
             let packed = super::gpu_matmul::pack_i8_to_u32_pub(data);
             bytemuck::cast_slice(&packed).to_vec()
         };
@@ -544,7 +575,7 @@ impl GpuForward {
         let max_seq = 2048u32;
 
         let i32_size = |n: u32| (n as usize) * 4;
-        let u32_size = |n: u32| ((n as usize + 3) / 4) * 4;
+        let u32_size = |n: u32| (n as usize).div_ceil(4) * 4;
 
         // Create all buffers as local variables first
         let output_weight_buf = self.buf("out_w", &pack_weights(output_data), sto);
@@ -579,7 +610,7 @@ impl GpuForward {
 
         // Static params (don't change between tokens)
         let ln_params = LayerNormParams { size: d_model, _p1: 0, _p2: 0, _p3: 0 };
-        let ln_params_buf = self.buf(&format!("ln_p"), bytemuck::bytes_of(&ln_params), wgpu::BufferUsages::UNIFORM);
+        let ln_params_buf = self.buf("ln_p", bytemuck::bytes_of(&ln_params), wgpu::BufferUsages::UNIFORM);
         let mm_q_params = self.buf("mm_q_p", bytemuck::bytes_of(&MatmulParams { in_size: d_model, out_size: d_model, scale_offset: 0, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
         let mm_k_params = self.buf("mm_k_p", bytemuck::bytes_of(&MatmulParams { in_size: d_model, out_size: d_kv, scale_offset: 0, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
         let mm_v_params = self.buf("mm_v_p", bytemuck::bytes_of(&MatmulParams { in_size: d_model, out_size: d_kv, scale_offset: 0, _pad: 0 }), wgpu::BufferUsages::UNIFORM);
@@ -712,8 +743,8 @@ impl GpuForward {
         // Encode ALL dispatches - just pipeline+bindgroup+dispatch, zero allocation
         let mut encoder = self.device.create_command_encoder(&Default::default());
 
-        let rt = (model.n_heads * (dh / 2) + 255) / 256; // RoPE Q workgroups
-        let rtk = (model.n_kv_heads * (dh / 2) + 255) / 256; // RoPE K
+        let rt = (model.n_heads * (dh / 2)).div_ceil(256); // RoPE Q workgroups
+        let rtk = (model.n_kv_heads * (dh / 2)).div_ceil(256); // RoPE K
 
         // Matmul pipeline: prefer Q4 Metal → Q8 Metal → WGSL
         // Q4 and Q8 Metal both use same dispatch pattern (4 rows/threadgroup)
@@ -722,7 +753,7 @@ impl GpuForward {
             .unwrap_or(&self.matmul_pipeline);
         let use_metal = self.msl_matmul_q4_pipeline.is_some() || self.msl_matmul_pipeline.is_some();
         let mm_wg = |out_size: u32| -> u32 {
-            if use_metal { (out_size + 3) / 4 } else { (out_size + 255) / 256 }
+            if use_metal { out_size.div_ceil(4) } else { out_size.div_ceil(256) }
         };
 
         let wd = mm_wg(d);
@@ -731,8 +762,8 @@ impl GpuForward {
         let wv = mm_wg(model.vocab_size);
 
         // Non-matmul workgroup counts (unchanged, WGSL kernels)
-        let wd_wgsl = (d + 255) / 256;
-        let wf_wgsl = (dff + 255) / 256;
+        let wd_wgsl = d.div_ceil(256);
+        let wf_wgsl = dff.div_ceil(256);
 
         for i in 0..model.n_layers as usize {
             let bg = &model.layer_bgs[i];
@@ -805,6 +836,11 @@ impl GpuForward {
     }
 
     /// Create a small uniform buffer inline.
+    ///
+    /// Unused: every uniform this file needs is now pre-allocated in
+    /// `upload_model` and reused per token. Kept as the one place that knows
+    /// the correct usage flags for a small uniform, for the fused/ICB paths.
+    #[allow(dead_code)]
     fn buf_inline<T: Pod>(&self, data: &T) -> wgpu::Buffer {
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -831,7 +867,7 @@ fn dispatch(
 }
 
 /// Helper: create a bind group entry.
-fn bg_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry {
+fn bg_entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
     wgpu::BindGroupEntry {
         binding,
         resource: buffer.as_entire_binding(),
@@ -845,7 +881,7 @@ mod tests {
     #[test]
     fn test_gpu_forward_init() {
         match GpuForward::new() {
-            Ok(gpu) => println!("GPU forward engine initialized"),
+            Ok(_gpu) => println!("GPU forward engine initialized"),
             Err(e) => println!("GPU not available: {}", e),
         }
     }

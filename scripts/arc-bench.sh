@@ -140,7 +140,7 @@ cat <<FOOTER
 
 - **Pass rate**: $PASS / $TOTAL ($(( PASS * 100 / TOTAL ))%)
 - **Average ms/token**: $AVG_MS
-- **Pipeline length**: 7 shards (Llama-2-7B-Chat Q4_K_M, 32 layers split across 7 nodes in 7 cities)
+- **Pipeline length**: 6 hops (Llama-2-7B-Chat Q4_K_M, 32 layers in 6 ranges, each range replicated on 3 of the 6 nodes)
 - **All output_hashes** are deterministic - re-running this benchmark on any node will produce the same hashes
 
 To reproduce:

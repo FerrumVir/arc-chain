@@ -3,6 +3,135 @@
 All notable changes to ARC Chain are tracked here. This project follows
 [semantic versioning](https://semver.org/).
 
+> **Backfill note (2026-08-17).** Entries for v0.7.1 through v0.7.11 were
+> reconstructed from `git log` in a single pass; this file had stopped at
+> v0.7.0. They are terser than the hand-written entries below.
+>
+> **Release-topology caveat.** The version on the seeds, the version with a
+> git tag, and the version with a downloadable binary are three different
+> things right now:
+> - **v0.7.10 and v0.7.11** were shipped **desktop-only** via
+>   `release-desktop.yml`, so they carry Tauri bundles and **no `arc-node` CLI
+>   asset**. v0.7.7 is the newest release with a CLI binary.
+> - **v0.7.8 and v0.7.9 have no release and no tag.** The five non-NYC seeds
+>   run a binary built out-of-band from branch `fix/v078-attestation-wire-compat`,
+>   which was merged to main only on 2026-06-16 (f6bee03).
+> - **Nothing on the live network runs v0.7.11.**
+
+## v0.7.11 - 2026-06-15 (desktop-only)
+
+- Removed the On-chain Tier 1 radio and the tier1 mutation, polling, and
+  status panel from the desktop UI (`Inference.tsx` -348 lines,
+  `Settings.tsx` -55). The feature was withdrawn rather than fixed: a
+  caller-signed `InferenceRequest` is accepted with HTTP 200 by
+  `/inference/onchain/submit` but never lands in a block, so escrow never
+  opens and the committee never votes. See
+  `docs/INFERENCE_TIER1_INVESTIGATION_2026-06-04.md`. (57ff20d)
+- Desktop default `max_tokens` halved 32 → 16, noted as "~3 min vs ~6 min per
+  request on the public testnet" — i.e. ~11 s/token. (d60632a)
+
+## v0.7.10 - 2026-06-11 (desktop-only)
+
+- Aligned the desktop with live chain state. Deliberately released without a
+  tag push so `release.yml` would **not** publish `arc-node` binaries from a
+  main that lacked the wire-compat fixes the seeds were running. This is the
+  change that broke `install-community-node.sh`, which resolved
+  `releases/latest` and then 404'd on a CLI asset that was no longer there.
+  (281bdd0)
+- Hid the on-chain inference submit path (tier-1 + paid escrow) in the desktop
+  and coerced persisted `"onchain"` mode back to `"coordinator"`. (306ebb7)
+- Documented the tier-1 inclusion failure. (fe1ed8d)
+- Wrote the replicated-chain (Model 1, full re-execution) implementation plan.
+  Not started as of 2026-08-17. (99cf84f)
+- Investigated and documented that the testnet seeds are **independent
+  chains**, not one network. (95a9686)
+
+## v0.7.8 / v0.7.9 - 2026-06-01 → 2026-06-04 (no tag, no release)
+
+The binary the five non-NYC seeds actually run. Built from
+`fix/v078-attestation-wire-compat`; merged to main 2026-06-16 (f6bee03).
+
+- `InferenceAttestation` made wire-compatible with v0.7.2 validators — the
+  reason NYC (still v0.7.2) can interoperate at all. Wire size pinned by a
+  unit test. (24150b3, 5279838)
+- `--community`: one-flag setup with auto-model-discovery, and auto-download
+  of a sha-pinned Llama-2-7B GGUF. (dcab105, 397698e)
+- Validator auto-shard via `/shards/join`, plus a canonical `model_id`
+  function. (ff46e53) — note this is the path that can wedge a fully-covered
+  public pipeline; see the safety rules in `CLAUDE.md`.
+- Scalable model distribution: multi-source fetch, LFS pre-check, resume.
+  (601194c)
+- Sharded inference unblocked; smart-router timeout cut. (30b3113)
+- INT16 enabled on shard-holders — `enable_i16()` now called after load so the
+  I16 dispatch path is actually taken. (0d9d6a4, 613a232)
+- `tier1_pending` restored across restarts; partial-local requests routed to
+  the sharded path. (0d9d6a4)
+- Context window doubled: RoPE 2048 → 4096, sharded output cap 256 → 1024.
+  (96b87fe)
+- `/inference/onchain/submit` accepts a caller-signed tx and reports
+  diagnostics; inference-validator retries finalize on a stuck request. Neither
+  made the transaction land in a block. (34e1fd0, 631e5b0)
+- `rolling-upgrade.sh` pauses `arc-self-heal` per node and re-arms it after the
+  health gate. (9dc7618)
+
+## v0.7.7 - 2026-05-29
+
+- Desktop Tier 1 routes to the public testnet seeds; the alpha VPS is retired.
+  (37df67b)
+- **Last release to ship `arc-node` CLI binaries** (linux-x86_64,
+  macos-arm64, macos-x86_64, windows-x86_64.exe).
+
+## v0.7.6 - 2026-05-29
+
+Ten commits of wallet-host churn, which is worth reading as one story: the
+desktop wallet was pointed at alpha, then at 5 seeds, then at LAX, then back to
+localhost, then at the live testnet. It settled on pinning a single seed —
+`docs/TESTNET_STATE_DIVERGENCE_2026-06-03.md` later explained why aggregation
+across seeds could never work. (800d828, 6226342, b05bed5, 8e151de, bf1e14c,
+4876820, f040d23, 671cf03)
+
+- "Option C": beneficiary credit for tier-1 `InferenceAttestation`. The
+  `beneficiary` wire field was subsequently marked `#[serde(skip)]` after it
+  partitioned the validator set on 2026-05-29. (9d75170)
+- arc-state: speculative `success=false` routed to unresolved — a BlockSTM fix
+  for tier 1. (4cff9ea)
+
+## v0.7.5 - 2026-05-28
+
+- arc-node posts an `InferenceAttestation` after every Tier 1 vote. (28e18dc)
+- Desktop wallet (balance / faucet / earnings) routed to alpha rather than
+  127.0.0.1. (671cf03)
+
+## v0.7.4 - 2026-05-28
+
+- Desktop actually invokes the Tauri auto-update and relaunches after install —
+  previously the update was downloaded but never applied. (b3014b9)
+- README download links bumped v0.6.0 → v0.7.3. (3218d8f)
+
+## v0.7.3 - 2026-05-26
+
+- Tier 1 on-chain inference gains load balancing and error handling. (9cbbaab)
+- Desktop tier1 pinned to the alpha solo node (v0.7.2) while the
+  multi-validator inclusion bug stayed open. (295ee6f)
+
+## v0.7.2 - 2026-05-20
+
+- **Tier 1 on-chain inference, Phase A.** (73eaee9)
+- Inference timeout raised 3 s → 120 s, and a false `503 Pipeline gap` fixed.
+  The 3-second timeout had made sharded inference unusable. (4acbcbb)
+- Connecting UX: syncing banner + onboarding progress. (0510fa4)
+- Alpha VPS hardening and UX polish. (34a393f, 9308d9d)
+- This is the version **NYC still runs today**.
+
+## v0.7.1 - 2026-05-12
+
+- **Validator-signed `FaucetClaim` TxType**, gated behind `FAUCET_V2_ENABLED`
+  and then defaulted on. This is why faucet credits propagate while
+  coordinator-minted attestations do not. (e0ad962, 548d3c3)
+- Signer-nonce check dropped from the `FaucetClaim` executor. (564468c)
+- `StateDB.validators` seeded from genesis at startup, and
+  `seed_genesis_validators` clears the set first. (4771d35, 40bab32)
+
 ## v0.7.0 - "Just be a node, and earn for real"
 
 The community-worker system actually works for the first time. Pre-v0.7

@@ -266,12 +266,13 @@ impl BatchProver {
             self.stats.peak_prove_time_ms = prove_elapsed;
         }
         let total_proofs = self.stats.total_proved + self.stats.total_failed;
-        if total_proofs > 0 {
-            // Rolling average.
-            self.stats.avg_prove_time_ms = ((self.stats.avg_prove_time_ms
-                * (total_proofs - 1))
-                + prove_elapsed)
-                / total_proofs;
+        // Rolling average. checked_div carries the "total_proofs > 0" guard,
+        // so the divisor cannot be zero here by construction.
+        if let Some(avg) = ((self.stats.avg_prove_time_ms * total_proofs.saturating_sub(1))
+            + prove_elapsed)
+            .checked_div(total_proofs)
+        {
+            self.stats.avg_prove_time_ms = avg;
         }
 
         // Public outputs: the first 32 bytes of the proof re-hashed.

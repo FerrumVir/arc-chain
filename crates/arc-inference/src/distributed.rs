@@ -22,9 +22,7 @@
 use arc_crypto::Hash256;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
 
 // ─── Shard Registry ─────────────────────────────────────────────────────────
 
@@ -53,6 +51,12 @@ pub struct ShardRegistry {
     models: DashMap<Hash256, Vec<ShardAssignment>>,
     /// node_address → list of (model_id, shard) pairs this node holds.
     node_shards: DashMap<Hash256, Vec<(Hash256, ShardAssignment)>>,
+}
+
+impl Default for ShardRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ShardRegistry {
@@ -166,9 +170,9 @@ impl ShardRegistry {
 /// Compute the optimal shard assignment for a model across N available nodes.
 /// Balances layer count per node based on available memory and GPU capability.
 pub fn compute_shard_plan(
-    model_id: Hash256,
+    _model_id: Hash256,
     total_layers: u32,
-    total_params_b: f64,
+    _total_params_b: f64,
     nodes: &[NodeCapability],
 ) -> Vec<ShardAssignment> {
     if nodes.is_empty() {
@@ -226,10 +230,10 @@ pub fn compute_shard_plan(
 /// Each node is assigned a subset of experts. The router token dispatch
 /// happens at inference time based on the gating network output.
 pub fn compute_expert_shard_plan(
-    model_id: Hash256,
+    _model_id: Hash256,
     total_layers: u32,
     num_experts: u32,
-    top_k: u32,
+    _top_k: u32,
     nodes: &[NodeCapability],
 ) -> Vec<ShardAssignment> {
     if nodes.is_empty() || num_experts == 0 {
@@ -306,7 +310,7 @@ pub fn deserialize_activations(
     }
 
     // Deserialize
-    if bytes.len() % 8 != 0 {
+    if !bytes.len().is_multiple_of(8) {
         return Err(InferenceShardError::InvalidActivationSize {
             size: bytes.len(),
         });
@@ -477,10 +481,10 @@ pub enum PipelineAction {
 // ─── Shard Forward Pass (Layer-Level Execution) ─────────────────────────────
 
 use super::cached_integer_model::{
-    CachedIntegerModel, CachedLayer, KVCache, I8Weights, QuantizedInput,
+    CachedIntegerModel, KVCache, QuantizedInput,
     layernorm, matmul_fast_preq, silu_i64, apply_rope,
 };
-use super::integer_lut::{FRAC_BITS, ONE, softmax_i64, argmax_i64, integer_exp};
+use super::integer_lut::{FRAC_BITS, ONE, argmax_i64, integer_exp};
 
 /// Execute a subset of transformer layers on locally-held shard weights.
 /// Takes an input hidden state (from the previous shard or embedding layer)
@@ -565,7 +569,6 @@ pub fn forward_shard_layers(
         // O(d_head) memory per head instead of O(full_seq) for scores array.
         let full_seq = token_position + 1;
         let head_results: Vec<Vec<i64>> = (0..cfg.n_heads)
-            .into_iter()
             .map(|h| {
                 let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
                 let dh = cfg.d_head;
@@ -578,17 +581,17 @@ pub fn forward_shard_layers(
                 for j in 0..full_seq {
                     let k_off = j * cfg.d_kv + kv_h * dh;
                     let mut dot: i64 = 0;
-                    for dd in 0..dh {
-                        dot += q_head[dd] * cache.k_data[layer_idx][k_off + dd];
+                    for (dd, &qv) in q_head.iter().enumerate() {
+                        dot += qv * cache.k_data[layer_idx][k_off + dd];
                     }
-                    let score = (dot >> FRAC_BITS) * cfg.attn_scale >> FRAC_BITS;
+                    let score = ((dot >> FRAC_BITS) * cfg.attn_scale) >> FRAC_BITS;
 
                     if score > running_max {
                         let diff = running_max - score;
                         let correction = integer_exp(diff);
                         running_sum = (running_sum * correction) >> FRAC_BITS;
-                        for dd in 0..dh {
-                            out[dd] = (out[dd] * correction) >> FRAC_BITS;
+                        for o in out.iter_mut() {
+                            *o = (*o * correction) >> FRAC_BITS;
                         }
                         running_max = score;
                     }
@@ -597,15 +600,15 @@ pub fn forward_shard_layers(
                     running_sum += w;
 
                     let v_off = j * cfg.d_kv + kv_h * dh;
-                    for dd in 0..dh {
-                        out[dd] += (w * cache.v_data[layer_idx][v_off + dd])
+                    for (dd, o) in out.iter_mut().enumerate() {
+                        *o += (w * cache.v_data[layer_idx][v_off + dd])
                             >> FRAC_BITS;
                     }
                 }
 
                 if running_sum > 0 {
-                    for dd in 0..dh {
-                        out[dd] = (out[dd] * ONE) / running_sum;
+                    for o in out.iter_mut() {
+                        *o = (*o * ONE) / running_sum;
                     }
                 }
                 out

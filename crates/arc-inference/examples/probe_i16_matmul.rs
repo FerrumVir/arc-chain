@@ -14,13 +14,13 @@ fn matmul_i16_scalar(weights: &I16Weights, input: &[i64]) -> Vec<i64> {
     let n_cols = weights.n_cols;
     assert_eq!(input.len(), n_cols);
     let mut out = vec![0i64; n_rows];
-    for i in 0..n_rows {
+    for (i, o) in out.iter_mut().enumerate() {
         let mut acc: i128 = 0;
-        for j in 0..n_cols {
-            acc += (weights.data[i * n_cols + j] as i128) * (input[j] as i128);
+        for (j, &x) in input[..n_cols].iter().enumerate() {
+            acc += (weights.data[i * n_cols + j] as i128) * (x as i128);
         }
         let wide = acc * (weights.scales[i] as i128);
-        out[i] = ((wide / 32767) >> 16) as i64;
+        *o = ((wide / 32767) >> 16) as i64;
     }
     out
 }
@@ -29,12 +29,12 @@ fn matmul_i8_scalar(weights: &I8Weights, input: &[i64]) -> Vec<i64> {
     let n_rows = weights.n_rows;
     let n_cols = weights.n_cols;
     let mut out = vec![0i64; n_rows];
-    for i in 0..n_rows {
+    for (i, o) in out.iter_mut().enumerate() {
         let mut acc: i64 = 0;
-        for j in 0..n_cols {
-            acc += (weights.data[i * n_cols + j] as i64) * input[j];
+        for (j, &x) in input[..n_cols].iter().enumerate() {
+            acc += (weights.data[i * n_cols + j] as i64) * x;
         }
-        out[i] = (acc * weights.scales[i]) >> 16;
+        *o = (acc * weights.scales[i]) >> 16;
     }
     out
 }

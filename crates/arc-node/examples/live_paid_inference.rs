@@ -224,12 +224,10 @@ async fn main() {
             .get(format!("{}/tx/0x{}", coord, open_hash_hex))
             .send()
             .await
-        {
-            if r.status().is_success() {
+            && r.status().is_success() {
                 committed = true;
                 break;
             }
-        }
     }
     if !committed {
         eprintln!("open tx did not commit in 30s");
@@ -279,11 +277,9 @@ async fn main() {
             .get(format!("{}/tx/0x{}", coord, release_hex))
             .send()
             .await
-        {
-            if r.status().is_success() {
+            && r.status().is_success() {
                 break;
             }
-        }
     }
 
     // Step 8: record post-balances.
@@ -296,7 +292,7 @@ async fn main() {
         replica_post.push((*name, b));
     }
 
-    println!("");
+    println!();
     println!("=== BALANCE DELTAS ===");
     println!("payer:    {} → {}  (Δ {:+})", bal_pre, bal_post, bal_post as i64 - bal_pre as i64);
     println!("treasury: {} → {}  (Δ {:+})", tre_pre, tre_post, tre_post as i64 - tre_pre as i64);
@@ -313,7 +309,7 @@ async fn main() {
     let total_in = (tre_post as i64 - tre_pre as i64)
         + (obs_post as i64 - obs_pre as i64)
         + sum_replica_delta;
-    println!("");
+    println!();
     println!("payer sent: {}", payer_out);
     println!("beneficiaries received (treasury+observer+replicas): {}", total_in);
     println!("conservation residual: {} (positive = still in escrow or proposer)", payer_out - total_in);

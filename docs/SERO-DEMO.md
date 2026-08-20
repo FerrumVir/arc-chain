@@ -1,12 +1,33 @@
-# ARC Chain - Demo Script
+# ARC Chain - Demo Script (HISTORICAL — superseded)
 
-A 5-minute walkthrough that shows the thing nobody else has: **a model that doesn't fit on any one machine running across all of them, with cryptographically verifiable output**.
-
-This script is for a screen recording or live walkthrough. Each step is a visible artifact; nothing is hidden behind ssh.
+> # ⛔ DO NOT USE THIS AS A RUN-OF-SHOW
+>
+> **This document describes a network topology that no longer exists.** It is
+> kept as a record of the April 2026 demo. Following it live will have you
+> narrating node cards, a pipeline length, and a quality figure that the
+> dashboard will not show and the network will not produce.
+>
+> **Use [`docs/DEMO-RUNBOOK.md`](DEMO-RUNBOOK.md) instead.**
+>
+> Specifically wrong here, as of 2026-08-17:
+> - **"7 separate VPS" / "8 node cards"** — the network is **6 nodes**. SAO
+>   (216.238.120.27) and JNB (139.84.237.49) were retired 2026-04-22 and no
+>   longer respond. Step 3's trace table shows a final hop on JNB.
+> - **"Each VPS holds 4–5 layers"** — each node holds **15–17 layers (~3 GB)**.
+>   The 32 layers are split into 6 ranges, each replicated on 3 of the 6 nodes.
+> - **"Quality loss vs FP16: 0.00%"** — that field compares against the
+>   already-quantized weights, not FP16. Real WikiText-2 perplexity is ~107–155
+>   against an FP16 baseline of 5.47. See `INFERENCE_DETERMINISM.md`.
+> - **Step 7's installer description** — it does *not* pull a v0.4.1 binary and
+>   does *not* download a 4 GB GGUF. No model download is required to join.
+> - **Timings throughout** — the public testnet runs at roughly 10 s/token, so
+>   a short response takes minutes, not seconds.
+> - **Anything that follows a transaction on-chain** — four of six seeds have
+>   not sealed a block in ~6 days, so attestations read `block_height: null`.
 
 ---
 
-## What you're about to see
+## What this described (April 2026)
 
 Llama-2-7B (4 GB on disk, 32 transformer layers) running across **7 separate VPS** in 7 different cities. Each VPS holds 4–5 of those layers and forwards the activation state to the next via HTTP. Every hop is BLAKE3-verified. The output text is bit-identical regardless of which machine ran which slice - pure i64 arithmetic with per-row INT16 quantization, no floating point.
 

@@ -53,6 +53,12 @@ impl EthWatcher {
     }
 
     /// Set the starting block for scanning (e.g. loaded from the database).
+    // Nothing calls this yet. The config carries a `db_path`, but the relayer
+    // has no persistence layer, so the resume point is never restored at
+    // startup. Deleting this setter would hide that gap instead of closing it:
+    // the fix is a caller that loads the saved block and calls this, not the
+    // removal of the only way to set it. Kept, with the lint silenced here only.
+    #[allow(dead_code)]
     pub fn set_last_scanned_block(&mut self, block: u64) {
         self.last_scanned_block = block;
     }

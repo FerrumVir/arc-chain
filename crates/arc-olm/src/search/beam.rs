@@ -227,8 +227,8 @@ pub fn beam_search_steered(
 
         // Check for exact match (fitness = 1.0)
         for candidate in &deduped {
-            if candidate.fitness >= 0.9999 {
-                if let DagValue::Grid(ref result_grid) = candidate.current_value {
+            if candidate.fitness >= 0.9999
+                && let DagValue::Grid(ref result_grid) = candidate.current_value {
                     // Verify on ALL training pairs
                     let all_match = verify_on_all_pairs(
                         &candidate.steps, &catalog, train_pairs,
@@ -249,7 +249,6 @@ pub fn beam_search_steered(
                         }
                     }
                 }
-            }
         }
 
         // Sort by fitness, keep top beam_width
@@ -425,6 +424,11 @@ pub fn exhaustive_search(
 
 /// Recursive DFS worker for exhaustive search.
 /// Tries every type-valid primitive at each level, no pruning.
+// allow: this is the recursive worker of the exhaustive search. Every argument is
+// either search state that has to be threaded through each recursive call or a
+// borrow of shared read-only data. Bundling them into a context struct would only
+// move the same 12 values behind one name and make the recursion harder to follow.
+#[allow(clippy::too_many_arguments)]
 fn exhaustive_dfs(
     current: &DagValue,
     current_type: &DagType,
@@ -446,11 +450,10 @@ fn exhaustive_dfs(
     for prim in catalog {
         // Amortized timeout check: every 5,000 iterations
         let count = EXHAUST_ITER_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count % 5_000 == 0 && count > 0 {
-            if start.elapsed().as_millis() as u64 > timeout_ms {
+        if count.is_multiple_of(5_000) && count > 0
+            && start.elapsed().as_millis() as u64 > timeout_ms {
                 return None;
             }
-        }
 
         // Type check: unary or binary
         let accepts = (prim.input_types.len() == 1 && prim.input_types[0] == *current_type)
@@ -548,6 +551,11 @@ fn exhaustive_dfs(
 mod tests {
     use super::*;
 
+    // allow: the success path of `beam_search` sets `fitness: 1.0` as a literal, so
+    // this compares against an exact value rather than the result of a calculation.
+    // An epsilon compare would let a near-miss fitness pass, which is exactly what
+    // this test exists to catch.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_beam_search_rot90() {
         let input = vec![vec![1, 0], vec![0, 0]];
@@ -580,6 +588,11 @@ mod tests {
         assert_eq!(result.unwrap().output, output);
     }
 
+    // allow: the success paths of `beam_search` / `exhaustive_search` set
+    // `fitness: 1.0` as a literal, so this is comparing against an exact value, not
+    // against the result of a calculation. An epsilon compare would let a
+    // near-miss fitness pass, which is exactly what this test exists to catch.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_exhaustive_search_rot90() {
         let input = vec![vec![1, 0], vec![0, 0]];

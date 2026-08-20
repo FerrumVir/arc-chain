@@ -535,7 +535,7 @@ mod tests {
 
         // Compute expected post root.
         let mut clone = state.clone();
-        let post_root = clone.apply_batch(&[tx.clone()]).unwrap();
+        let post_root = clone.apply_batch(std::slice::from_ref(&tx)).unwrap();
 
         let batch = RollupBatch {
             batch_id: 0,
@@ -593,7 +593,7 @@ mod tests {
 
         let tx = make_tx(alice(), bob(), 100, 0);
         let mut exec_state = state.clone();
-        let post_root = exec_state.apply_batch(&[tx.clone()]).unwrap();
+        let post_root = exec_state.apply_batch(std::slice::from_ref(&tx)).unwrap();
 
         let batch = RollupBatch {
             batch_id: 0,

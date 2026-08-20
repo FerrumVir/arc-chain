@@ -307,11 +307,10 @@ fn lagrange_interpolate_at_zero(points: &[(u64, u64)]) -> Result<u64, ThresholdE
         let mut numerator: u64 = 1;
         let mut denominator: u64 = 1;
 
-        for j in 0..n {
+        for (j, &(x_j, _)) in points.iter().enumerate().take(n) {
             if i == j {
                 continue;
             }
-            let (x_j, _) = points[j];
             // Numerator: product of (0 - x_j) = product of (-x_j) = product of (p - x_j).
             numerator = field_mul(numerator, field_sub(0, x_j));
             // Denominator: product of (x_i - x_j).
@@ -952,7 +951,7 @@ mod tests {
         let key = [99u8; 32];
         let plaintext = b"";
         let ciphertext = ThresholdEncryption::encrypt(&key, plaintext);
-        assert_eq!(ciphertext.len(), 12 + 0 + THRESHOLD_TAG_LEN);
+        assert_eq!(ciphertext.len(), 12 + THRESHOLD_TAG_LEN);
 
         let decrypted = ThresholdEncryption::decrypt(&key, &ciphertext).unwrap();
         assert!(decrypted.is_empty());

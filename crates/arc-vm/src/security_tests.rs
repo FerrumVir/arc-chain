@@ -481,7 +481,7 @@ mod tests {
         let report = scanner.scan_contract(&bytecode);
         assert_eq!(report.critical, 0);
         assert_eq!(report.high, 0);
-        assert_eq!(report.score, 100.0);
+        assert!((report.score - 100.0).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -11,8 +11,13 @@ use candle_core::{Device, Tensor};
 #[cfg(feature = "candle")]
 use candle_core::quantized::gguf_file;
 
+// Everything these bring in is used only by the `candle`-gated GGUF loader
+// and forward pass below, so the imports are gated the same way.
+#[cfg(feature = "candle")]
 use crate::integer_lut::*;
+#[cfg(feature = "candle")]
 use crate::integer_engine::*;
+#[cfg(feature = "candle")]
 use crate::cached_integer_model::{silu_i64, compute_rope_tables, apply_rope};
 use crate::InferenceError;
 
@@ -103,7 +108,7 @@ pub fn generate_integer_from_gguf(
     let n_kv_heads = get_meta_u32(&content, &format!("{arch}.attention.head_count_kv")).unwrap_or(n_heads as u32) as usize;
     let d_ff = get_meta_u32(&content, &format!("{arch}.feed_forward_length"))? as usize;
     let vocab_size = content.tensor_infos.get("token_embd.weight")
-        .map(|t| t.shape.dims()[0] as usize)
+        .map(|t| t.shape.dims()[0])
         .unwrap_or(32000);
 
     // Read RoPE base frequency from metadata (LLaMA-3 uses 500000, most others use 10000)

@@ -36,25 +36,21 @@ fn keypair(phrase: &str) -> (SigningKey, [u8; 32], Hash256) {
 
 async fn balance(c: &Client, coord: &str, addr_hex: &str) -> u64 {
     let url = format!("{}/account/{}", coord, addr_hex);
-    if let Ok(r) = c.get(&url).send().await {
-        if r.status().is_success() {
-            if let Ok(v) = r.json::<Value>().await {
+    if let Ok(r) = c.get(&url).send().await
+        && r.status().is_success()
+            && let Ok(v) = r.json::<Value>().await {
                 return v.get("balance").and_then(|b| b.as_u64()).unwrap_or(0);
             }
-        }
-    }
     0
 }
 
 async fn nonce_of(c: &Client, coord: &str, addr_hex: &str) -> u64 {
     let url = format!("{}/account/{}", coord, addr_hex);
-    if let Ok(r) = c.get(&url).send().await {
-        if r.status().is_success() {
-            if let Ok(v) = r.json::<Value>().await {
+    if let Ok(r) = c.get(&url).send().await
+        && r.status().is_success()
+            && let Ok(v) = r.json::<Value>().await {
                 return v.get("nonce").and_then(|n| n.as_u64()).unwrap_or(0);
             }
-        }
-    }
     0
 }
 

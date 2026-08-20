@@ -176,8 +176,15 @@ test.describe("Inference - coordinator fallback (Milestone A, #35)", () => {
       timeout: 10_000,
     });
 
-    // Consensus banner must NOT be shown - local served directly.
-    await expect(page.getByTestId("inference-consensus")).toHaveCount(0);
+    // The provenance banner is now always shown - it reports WHICH machine
+    // served the request, not merely that consensus happened. For a locally
+    // served run it must say so, and the consensus details (k=, votes) must
+    // be absent. This is a stronger assertion than the previous
+    // `toHaveCount(0)`, which only proved the banner was missing.
+    const banner = page.getByTestId("inference-consensus");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("your node");
+    await expect(banner).not.toContainText("k=");
     expect(hitConsensus).toBe(false);
   });
 });

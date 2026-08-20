@@ -15,8 +15,13 @@ use std::path::Path;
 
 /// Extract 32-dimensional features from a single grid.
 fn grid_features(g: &Grid) -> Vec<f32> {
-    let h = g.len() as f32;
-    let w = if g.is_empty() { 0.0 } else { g[0].len() as f32 };
+    // Keep the integer dimensions around: the square/diagonal-symmetry checks below
+    // are asking "is this grid square?", which is an exact integer question, not a
+    // floating-point one.
+    let h_cells = g.len();
+    let w_cells = if g.is_empty() { 0 } else { g[0].len() };
+    let h = h_cells as f32;
+    let w = w_cells as f32;
     let total = h * w;
 
     // Color histogram (10 values, normalized to 0-1)
@@ -54,14 +59,14 @@ fn grid_features(g: &Grid) -> Vec<f32> {
     // Symmetry checks (fast)
     let sym_h = if *g == grid::hmirror(g) { 1.0 } else { 0.0 };
     let sym_v = if *g == grid::vmirror(g) { 1.0 } else { 0.0 };
-    let sym_d = if h == w && *g == grid::dmirror(g) {
+    let sym_d = if h_cells == w_cells && *g == grid::dmirror(g) {
         1.0
     } else {
         0.0
     };
     let sym_r = if *g == grid::rot180(g) { 1.0 } else { 0.0 };
 
-    let is_square = if h == w { 1.0 } else { 0.0 };
+    let is_square = if h_cells == w_cells { 1.0 } else { 0.0 };
     let bg_frac = hist[bg];
 
     // Assemble 32-dim vector
@@ -193,13 +198,14 @@ fn read_weight_matrix(
 
 fn matmul(matrix: &WeightMatrix, input: &[f32]) -> Vec<f32> {
     let mut output = vec![0.0f32; matrix.n_rows];
-    for i in 0..matrix.n_rows {
+    for (i, out) in output.iter_mut().enumerate() {
         let mut sum = matrix.bias[i];
         let row_start = i * matrix.n_cols;
-        for j in 0..matrix.n_cols.min(input.len()) {
-            sum += matrix.weights[row_start + j] * input[j];
+        // `take(n_cols)` on `input` gives exactly the old `0..n_cols.min(input.len())`.
+        for (j, &x) in input.iter().enumerate().take(matrix.n_cols) {
+            sum += matrix.weights[row_start + j] * x;
         }
-        output[i] = sum;
+        *out = sum;
     }
     output
 }

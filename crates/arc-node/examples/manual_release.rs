@@ -130,12 +130,10 @@ async fn main() {
             .get(format!("{}/tx/0x{}", COORD, release_hash))
             .send()
             .await
-        {
-            if r.status().is_success() {
+            && r.status().is_success() {
                 committed = true;
                 break;
             }
-        }
     }
     if !committed {
         eprintln!("release tx did not commit in 60s");

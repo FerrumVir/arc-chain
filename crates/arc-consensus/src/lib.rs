@@ -224,7 +224,7 @@ impl ValidatorSet {
     pub fn new(validators: Vec<Validator>, epoch: u64) -> Self {
         let total_stake: u64 = validators.iter().map(|v| v.stake).sum();
         // quorum = ceil(2 * total_stake / 3)
-        let quorum = (2 * total_stake + 2) / 3;
+        let quorum = (2 * total_stake).div_ceil(3);
         Self {
             validators,
             total_stake,
@@ -364,7 +364,7 @@ impl ValidatorSet {
         }
         // Recalculate total stake and quorum
         self.total_stake = self.validators.iter().map(|v| v.stake).sum();
-        self.quorum = (self.total_stake * 2 + 2) / 3; // ceil(2/3 * total)
+        self.quorum = (self.total_stake * 2).div_ceil(3); // ceil(2/3 * total)
     }
 }
 
@@ -528,7 +528,7 @@ impl FinalityProof {
     /// Verify that the proof has sufficient stake (>= 2/3 total).
     pub fn has_sufficient_stake(&self) -> bool {
         // quorum = ceil(2/3 * total_stake)
-        let quorum = (2 * self.total_stake + 2) / 3;
+        let quorum = (2 * self.total_stake).div_ceil(3);
         self.signing_stake >= quorum
     }
 }
@@ -767,7 +767,7 @@ impl ConsensusEngine {
     }
 
     /// Get the frozen validator set (used for leader selection and commit decisions).
-    pub fn frozen_validator_set(&self) -> parking_lot::RwLockReadGuard<ValidatorSet> {
+    pub fn frozen_validator_set(&self) -> parking_lot::RwLockReadGuard<'_, ValidatorSet> {
         self.frozen_validator_set.read()
     }
 
@@ -862,7 +862,7 @@ impl ConsensusEngine {
             .ok_or_else(|| ConsensusError::InvalidBlock("invalid stake".into()))?;
         vs.validators.push(validator);
         vs.total_stake += stake;
-        vs.quorum = (2 * vs.total_stake + 2) / 3;
+        vs.quorum = (2 * vs.total_stake).div_ceil(3);
         drop(vs);
         self.register_validator_key(address, pubkey);
         info!(%address, stake, "Validator joined the active set");
@@ -880,7 +880,7 @@ impl ConsensusEngine {
         vs.validators.retain(|v| v.address != *address);
         vs.total_stake = vs.validators.iter().map(|v| v.stake).sum();
         vs.quorum = if vs.total_stake > 0 {
-            (2 * vs.total_stake + 2) / 3
+            (2 * vs.total_stake).div_ceil(3)
         } else {
             0
         };
@@ -909,7 +909,7 @@ impl ConsensusEngine {
                 .unwrap_or(StakeTier::Spark);
             let new_tier = vs.validators[idx].tier;
             vs.total_stake = vs.validators.iter().map(|v| v.stake).sum();
-            vs.quorum = (2 * vs.total_stake + 2) / 3;
+            vs.quorum = (2 * vs.total_stake).div_ceil(3);
             info!(%address, new_stake, new_tier = ?new_tier, "Validator stake updated");
             Ok(())
         } else {
@@ -926,7 +926,7 @@ impl ConsensusEngine {
         vs.epoch += 1;
         vs.total_stake = vs.validators.iter().map(|v| v.stake).sum();
         vs.quorum = if vs.total_stake > 0 {
-            (2 * vs.total_stake + 2) / 3
+            (2 * vs.total_stake).div_ceil(3)
         } else {
             0
         };
@@ -1004,12 +1004,11 @@ impl ConsensusEngine {
             let mut accumulated_stake = 0u64;
 
             for hash in &prev_hashes {
-                if let Some(block) = self.dag.get(hash) {
-                    if let Some(validator) = vs.get_validator(&block.author) {
+                if let Some(block) = self.dag.get(hash)
+                    && let Some(validator) = vs.get_validator(&block.author) {
                         selected_parents.push(*hash);
                         accumulated_stake += validator.stake;
                     }
-                }
             }
 
             // Verify we have quorum-worth of parents.
@@ -1036,7 +1035,7 @@ impl ConsensusEngine {
         // This removes proposer discretion - transactions MUST be ordered by hash,
         // not by the proposer's chosen (potentially MEV-extracting) sequence.
         let mut transactions = transactions;
-        transactions.sort_by(|a, b| a.0.cmp(&b.0));
+        transactions.sort_by_key(|a| a.0);
 
         let ordering_commitment = DagBlock::compute_ordering_commitment(&transactions);
         let mut block = DagBlock {
@@ -1160,17 +1159,15 @@ impl ConsensusEngine {
                     ConsensusError::InvalidSignature
                 })?;
             // If we have a registered key, cross-check it matches the signature's pubkey
-            if let Some(registered_key) = self.validator_keys.get(&block.author) {
-                if let CryptoSignature::Ed25519 { public_key, .. } = &sig {
-                    if public_key != registered_key.value() {
+            if let Some(registered_key) = self.validator_keys.get(&block.author)
+                && let CryptoSignature::Ed25519 { public_key, .. } = &sig
+                    && public_key != registered_key.value() {
                         warn!(
                             author = %block.author,
                             "Block signed with key that doesn't match registered key"
                         );
                         return Err(ConsensusError::InvalidSignature);
                     }
-                }
-            }
         } else if self.local_keypair.is_some() {
             // Production mode: reject unsigned blocks
             return Err(ConsensusError::InvalidSignature);
@@ -1427,7 +1424,7 @@ impl ConsensusEngine {
         let frozen_vals = {
             let fvs = self.frozen_validator_set.read();
             let mut addrs: Vec<Address> = fvs.validators.iter().map(|v| v.address).collect();
-            addrs.sort_by(|a, b| a.0.cmp(&b.0));
+            addrs.sort_by_key(|a| a.0);
             addrs
         };
 
@@ -1458,13 +1455,11 @@ impl ConsensusEngine {
                 // Only commit the leader's block for this round.
                 // Other blocks are valid DAG nodes (needed for parent references)
                 // but only the leader's block carries transactions to the chain.
-                if let Some(leader_addr) = leader {
-                    if let Some(block_b) = self.dag.get(block_b_hash) {
-                        if block_b.author != leader_addr {
+                if let Some(leader_addr) = leader
+                    && let Some(block_b) = self.dag.get(block_b_hash)
+                        && block_b.author != leader_addr {
                             continue; // Not the leader - skip
                         }
-                    }
-                }
 
                 // Step 1: Find a block C in round R+1 that references B
                 let round_r1_blocks = self.blocks_in_round(r + 1);
@@ -1480,9 +1475,9 @@ impl ConsensusEngine {
                         let mut certifier_sigs: Vec<(Address, Vec<u8>)> = Vec::new();
 
                         for block_d_hash in &round_r2_blocks {
-                            if let Some(block_d) = self.dag.get(block_d_hash) {
-                                if block_d.parents.contains(block_c_hash) {
-                                    if let Some(validator) =
+                            if let Some(block_d) = self.dag.get(block_d_hash)
+                                && block_d.parents.contains(block_c_hash)
+                                    && let Some(validator) =
                                         vs.get_validator(&block_d.author)
                                     {
                                         supporting_stake += validator.stake;
@@ -1491,8 +1486,6 @@ impl ConsensusEngine {
                                             block_d.signature.clone(),
                                         ));
                                     }
-                                }
-                            }
                         }
 
                         if supporting_stake >= vs.quorum {
@@ -1561,11 +1554,10 @@ impl ConsensusEngine {
                     // from other validators (round happened, leader was offline).
                     let mut stake = 0u64;
                     for h in &round_r_blocks {
-                        if let Some(b) = self.dag.get(h) {
-                            if let Some(v) = vs.get_validator(&b.author) {
+                        if let Some(b) = self.dag.get(h)
+                            && let Some(v) = vs.get_validator(&b.author) {
                                 stake += v.stake;
                             }
-                        }
                     }
                     if stake >= vs.quorum {
                         // Quorum without leader - skip this round
@@ -1754,11 +1746,10 @@ impl ConsensusEngine {
         for hash in &round_blocks {
             if let Some(block) = self.dag.get(hash) {
                 // Only count each author once per round
-                if seen_authors.insert(block.author) {
-                    if let Some(validator) = vs.get_validator(&block.author) {
+                if seen_authors.insert(block.author)
+                    && let Some(validator) = vs.get_validator(&block.author) {
                         round_stake += validator.stake;
                     }
-                }
             }
         }
 
@@ -2001,12 +1992,11 @@ impl ConsensusEngine {
             for r in start..=current {
                 if let Some(blocks) = self.rounds.get(&r) {
                     for hash in blocks.value() {
-                        if let Some(block) = self.dag.get(hash) {
-                            if block.author == validator.address {
+                        if let Some(block) = self.dag.get(hash)
+                            && block.author == validator.address {
                                 seen = true;
                                 break;
                             }
-                        }
                     }
                 }
                 if seen { break; }
@@ -2051,7 +2041,7 @@ impl ConsensusEngine {
         self.dag.insert(block.hash, block.clone());
         self.rounds
             .entry(block.round)
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(block.hash);
     }
 
@@ -2234,9 +2224,9 @@ impl ConsensusEngine {
                 }
                 // Find blocks in R+2 that reference C
                 for d_hash in &round_r2_blocks {
-                    if let Some(d_block) = self.dag.get(d_hash) {
-                        if d_block.parents.contains(c_hash) {
-                            if let Some(validator) = vs.get_validator(&d_block.author) {
+                    if let Some(d_block) = self.dag.get(d_hash)
+                        && d_block.parents.contains(c_hash)
+                            && let Some(validator) = vs.get_validator(&d_block.author) {
                                 // Avoid duplicates (same author counted once)
                                 if !quorum_sigs.iter().any(|(addr, _)| *addr == d_block.author) {
                                     quorum_sigs.push((
@@ -2246,8 +2236,6 @@ impl ConsensusEngine {
                                     signing_stake += validator.stake;
                                 }
                             }
-                        }
-                    }
                 }
             }
         }
@@ -2339,8 +2327,8 @@ impl ConsensusEngine {
     /// from that author in this round.
     pub fn detect_equivocation(&self, block: &DagBlock) -> Option<EquivocationProof> {
         let key = (block.author, block.round);
-        if let Some(existing_hash) = self.author_round_blocks.get(&key) {
-            if *existing_hash.value() != block.hash {
+        if let Some(existing_hash) = self.author_round_blocks.get(&key)
+            && *existing_hash.value() != block.hash {
                 return Some(EquivocationProof {
                     author: block.author,
                     round: block.round,
@@ -2348,7 +2336,6 @@ impl ConsensusEngine {
                     block2_hash: block.hash,
                 });
             }
-        }
         None
     }
 
@@ -2573,7 +2560,7 @@ mod tests {
         timestamp: u64,
     ) -> DagBlock {
         let mut transactions = transactions;
-        transactions.sort_by(|a, b| a.0.cmp(&b.0));
+        transactions.sort_by_key(|tx| tx.0);
         let ordering_commitment = DagBlock::compute_ordering_commitment(&transactions);
         let mut block = DagBlock {
             author,
@@ -2599,7 +2586,7 @@ mod tests {
         assert_eq!(vs.len(), 4);
         assert_eq!(vs.epoch, 1);
         // quorum = ceil(2/3 * 20M) = ceil(40M/3) = 13_333_334
-        assert_eq!(vs.quorum, (2 * vs.total_stake + 2) / 3);
+        assert_eq!(vs.quorum, (2 * vs.total_stake).div_ceil(3));
         assert!(vs.quorum > vs.total_stake * 2 / 3);
         // 3 validators have 15M stake, which should exceed quorum (~13.3M)
         assert!(vs.has_quorum(&[test_addr(0), test_addr(1), test_addr(2)]));
@@ -3630,7 +3617,7 @@ mod tests {
 
         // Sort to get canonical order
         let mut expected = vec![tx_a, tx_b, tx_c];
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        expected.sort_by_key(|tx| tx.0);
 
         // Feed them in reverse canonical order
         let reversed: Vec<Hash256> = expected.iter().rev().copied().collect();
@@ -3799,7 +3786,7 @@ mod tests {
                 );
                 // Insert directly into DAG (bypass validation for test scaffolding)
                 engine.dag.insert(block.hash, block.clone());
-                engine.rounds.entry(round).or_insert_with(Vec::new).push(block.hash);
+                engine.rounds.entry(round).or_default().push(block.hash);
                 engine.author_round_blocks.insert((block.author, round), block.hash);
             }
         }
@@ -3844,7 +3831,7 @@ mod tests {
                 round * 100,
             );
             engine.dag.insert(block.hash, block.clone());
-            engine.rounds.entry(round).or_insert_with(Vec::new).push(block.hash);
+            engine.rounds.entry(round).or_default().push(block.hash);
         }
 
         let initial_size = engine.dag_size();
@@ -4087,7 +4074,7 @@ mod tests {
         // block lands at "current+1 = block.round"). Check we got close.
         let after = engine.current_round();
         assert!(
-            after >= 4_999_999 && after <= 5_000_000,
+            (4_999_999..=5_000_000).contains(&after),
             "engine should be at the peer's round (~5_000_000); got {after}"
         );
     }

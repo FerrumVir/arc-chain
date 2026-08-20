@@ -8,10 +8,68 @@ These four are the ones a visitor or community node operator runs.
 
 | Script | When to use |
 |--------|-------------|
-| [`install-community-node.sh`](install-community-node.sh) | **Joining the network.** One-command installer that downloads the binary, model, seeds, and genesis, generates a unique validator seed, and installs as a persistent launchd / systemd service with daily auto-update. |
+| [`install-community-node.sh`](install-community-node.sh) | **Joining the network.** One-command installer. Downloads the `arc-node` binary, seeds, and genesis, generates a unique validator seed, and installs a launchd / systemd service with daily auto-update. It does **not** download a model — a node joins without one and contributes consensus immediately; pass `--model /path/to.gguf` to also serve inference. |
 | [`arc-demo.sh`](arc-demo.sh) | **Trying the demo.** End-to-end: discover the live shard pipeline → run real inference → re-run for determinism check → run a different prompt for isolation check → print summary. Single command, no install. |
-| [`arc-verify.sh`](arc-verify.sh) | **Auditing a past inference.** Takes any attestation `tx_hash` (or `--latest`) and re-derives the inference, comparing both `output_hash` and `model_hash` to the on-chain claim. The cryptographic verifier. |
+| [`arc-verify.sh`](arc-verify.sh) | **Auditing a past inference.** Takes any attestation `tx_hash` (or `--latest`) and re-derives the inference, comparing both `output_hash` and `model_hash` to the recorded claim. |
 | [`arc-bench.sh`](arc-bench.sh) | **Reproducing the factual benchmark.** Runs 5 (or 10 with `ARC_BENCH_FULL=1`) factual prompts through the sharded pipeline, checks each output for an expected keyword, emits a markdown report. |
+| [`arc-pick-coordinator.sh`](arc-pick-coordinator.sh) | **Choosing a seed.** Every script above calls this. Scores all reachable seeds and prints the best URL. |
+
+### What these four actually do on the live network (2026-08-17)
+
+Read this before putting any of them in front of an audience.
+
+**`arc-pick-coordinator.sh`** scores every reachable seed and returns the best,
+rather than short-circuiting on the first hit as it used to. Ranking is
+liveness → capability tier → node version → holds attestation data → latency.
+Today that resolves to LHR `104.238.171.11`, the only seed with a real
+attestation history. Useful knobs:
+
+```bash
+ARC_PICK_VERBOSE=1 bash scripts/arc-pick-coordinator.sh        # show the scoring
+ARC_PICK_BLOCK_WINDOW=300 bash scripts/arc-pick-coordinator.sh # also require a block in 300s
+ARC_SEEDS="1.2.3.4:9090" bash scripts/arc-pick-coordinator.sh  # override the seed list
+```
+
+`ARC_PICK_BLOCK_WINDOW` costs that many seconds of wall time and only means
+something at ≥300 s: the fastest seed is currently sealing roughly one block
+every few minutes, so a short window reports every seed as stalled.
+
+**`arc-demo.sh`** step 3 asks for `force_recompute` on the re-run. A coordinator
+that supports it recomputes and the script prints `✓ DETERMINISTIC`. A
+coordinator that does not (every live seed today) answers from its
+content-addressed cache in microseconds, and the script prints
+`● SERVED FROM CACHE (hash match)` instead — deliberately, because a cache
+lookup is not a determinism proof. Step 2's per-hop table also now says how
+much of the wall time it actually covers; the trace samples prefill only, so
+expect roughly half.
+
+**`arc-verify.sh`** sweeps every seed and both `/inference/results` and
+`/inference/attestations`, because results is empty on most seeds and
+attestations pads its list with unrelated transactions tagged `tx_type:"Other"`
+once the real rows run out. Those padding rows are filtered. It re-runs against
+whichever seed actually holds the record, and reports
+`VERIFIED (recomputed)` or `VERIFIED (from cache)` rather than collapsing both
+into one verdict.
+
+**`install-community-node.sh`** no longer resolves `releases/latest`. The two
+newest releases are desktop-only bundles with no `arc-node` CLI asset, so the
+old logic downloaded a 404 and died under `set -euo pipefail`. It now walks the
+release list newest-first and picks the first tag whose asset for your platform
+is actually fetchable (v0.7.7 today), and prints an actionable message listing
+the desktop app, `ARC_NODE_VERSION`, and build-from-source when nothing matches.
+The generated daily auto-updater carries the same fix.
+
+```bash
+ARC_NODE_VERSION=0.7.7 bash scripts/install-community-node.sh   # pin a tag
+```
+
+The service it installs launches with `--stake 0 --min-stake 0
+--community-mode`. Keep it that way: a node that joins with stake above the
+500,000 minimum is merged into the frozen validator set at the next epoch
+boundary and cannot be removed without restarting every seed.
+
+`arc-node-linux-aarch64` has never been published in any release. ARM Linux
+must build from source.
 
 ## Operator scripts (testnet maintenance)
 

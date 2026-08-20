@@ -62,7 +62,7 @@ fn main() {
     println!("\n--- Warmup ---");
     let eos = vec![2u32, 0];
     let warmup_start = Instant::now();
-    let (warmup_tokens, warmup_hash) = model.generate(&prompt_tokens, 2, &eos);
+    let (warmup_tokens, _warmup_hash) = model.generate(&prompt_tokens, 2, &eos);
     let warmup_ms = warmup_start.elapsed().as_millis();
     println!("Warmup: {} tokens in {}ms", warmup_tokens.len(), warmup_ms);
 
@@ -73,7 +73,7 @@ fn main() {
     let bench_elapsed = bench_start.elapsed();
     let total_ms = bench_elapsed.as_millis() as u64;
     let n_gen = generated.len() as u64;
-    let ms_per_token = if n_gen > 0 { total_ms / n_gen } else { 0 };
+    let ms_per_token = total_ms.checked_div(n_gen).unwrap_or(0);
 
     let output_text = model.decode(&generated);
 

@@ -262,7 +262,14 @@ struct BenchResults {
     signed_tps: f64,
     batch_verified_tps: f64,
     ml_dsa_batch_tps: f64,
+    // SUSPECTED BUG, left as-is deliberately: both percentages are computed in
+    // `main` and stored here, but `print_results` never prints them, so the
+    // signature-overhead numbers the benchmark measures are silently dropped.
+    // Printing them would change this binary's output, so the dead-code lint is
+    // suppressed rather than the behaviour changed. See the task report.
+    #[allow(dead_code)]
     sig_overhead_pct: f64,
+    #[allow(dead_code)]
     batch_overhead_pct: f64,
 }
 
@@ -316,7 +323,7 @@ fn bench_batch_verify(transactions: &[Transaction]) -> f64 {
     // giving ~2x speedup per batch. We chunk at 4096 and parallelize the chunks.
     let chunk_size = 4096;
     let n = transactions.len();
-    let num_chunks = (n + chunk_size - 1) / chunk_size;
+    let num_chunks = n.div_ceil(chunk_size);
 
     let start = Instant::now();
 
@@ -420,7 +427,7 @@ fn bench_batch_verified_execution(
     let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
     let chunk_size = 4096;
     let n = transactions.len();
-    let num_chunks = (n + chunk_size - 1) / chunk_size;
+    let num_chunks = n.div_ceil(chunk_size);
 
     let chunks: Vec<(usize, usize)> = (0..num_chunks)
         .map(|i| {
@@ -686,7 +693,7 @@ fn main() {
             println!();
         }
 
-        "all" | _ => {
+        _ => {
             // ── Ed25519: Generate signed transactions ────────────────
             println!("[1/9] Generating {} Ed25519 keypairs + signed transactions...", format_number(n));
             let (txs, keypairs, keygen_time, sign_time) = generate_signed_transactions(n);

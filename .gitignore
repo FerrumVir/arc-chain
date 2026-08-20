@@ -1,9 +1,27 @@
 # Rust
-/target/
+# Unanchored so it matches at ANY depth. The previous root-anchored `/target/`
+# missed faucet/target/, which is how 1,115 build-artifact files (fingerprint
+# stamps, .rustc_info.json, a stale .cargo-lock) ended up tracked in git.
+# INTEGRATOR: `git rm -r --cached faucet/target` is still required - this
+# pattern stops new artifacts, it does not untrack existing ones.
+target/
 **/*.rs.bk
-Cargo.lock
+
+# Cargo.lock is intentionally NOT ignored.
+# This workspace ships binaries (arc-node) to third-party operators, and
+# binary-producing workspaces commit their lockfile; only libraries omit it.
+# Without a tracked lock, no build is reproducible from its tag, `--locked`
+# cannot be used in CI, cargo-deny/advisory scanning has nothing stable to
+# walk, and Dependabot has no lock to bump.
+# INTEGRATOR: the lockfile is currently untracked, so it needs an explicit
+# `git add -f Cargo.lock` once (the -f is only needed if a stale ignore entry
+# is still cached).
 
 # Node / Explorer
+# Unanchored: desktop/, sdk/typescript/ and sdks/typescript/ all have npm
+# projects and were previously unignored, escaping tracking only because
+# nobody had run npm install there.
+**/node_modules/
 explorer/node_modules/
 explorer/.next/
 explorer/dist/
@@ -33,7 +51,6 @@ explorer/public/benchmark-data/
 
 # Deploy state
 deploy/.node-ips
-desktop/src-tauri/target/
 rustc-ice*
 __pycache__/
 *.pyc

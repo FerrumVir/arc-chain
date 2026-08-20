@@ -137,16 +137,76 @@ elif [ "$OS" = "Linux" ]; then
 fi
 ok "Detected ${TOTAL_RAM_GB} GB RAM"
 
-# ── Get latest version from GitHub ──────────────────────────────────────────
-info "Checking latest release..."
-VERSION=$(curl -sf "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep -m1 '"tag_name"' \
-    | sed -E 's/.*"v?([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' || echo "")
-if [ -z "$VERSION" ]; then
-    warn "Could not fetch GitHub release, falling back to v0.5.2"
-    VERSION="0.5.2"
+# ── Find the newest release that actually ships this platform's binary ──────
+#
+# Do NOT use releases/latest. Desktop-only releases (v0.7.10, v0.7.11) carry
+# only Tauri bundles - .dmg/.exe/.deb/.rpm/.AppImage - and no arc-node CLI
+# asset, so resolving "latest" and then downloading $ASSET is a guaranteed 404
+# and, under `set -euo pipefail`, an immediate abort. Instead walk the release
+# list newest-first and take the first tag whose $ASSET is actually fetchable.
+#
+# Override with ARC_NODE_VERSION=0.7.7 to pin a specific tag.
+resolve_version_for_asset() {
+    local asset="$1" tags v probes=0
+    tags=$(curl -sf -m 20 "https://api.github.com/repos/${REPO}/releases?per_page=40" 2>/dev/null \
+        | grep '"tag_name"' \
+        | sed -E 's/.*"tag_name":[[:space:]]*"v?([^"]+)".*/\1/') || return 1
+    [ -z "$tags" ] && return 1
+    for v in $tags; do
+        probes=$((probes + 1))
+        [ "$probes" -gt 12 ] && break
+        # Range-GET one byte: cheaper than a download, and unlike HEAD it is
+        # reliably served through the release CDN redirect.
+        if curl -sfL -r 0-0 -o /dev/null -m 25 \
+            "https://github.com/${REPO}/releases/download/v${v}/${asset}" 2>/dev/null; then
+            echo "$v"
+            return 0
+        fi
+    done
+    return 1
+}
+
+if [ -n "${ARC_NODE_VERSION:-}" ]; then
+    VERSION="${ARC_NODE_VERSION#v}"
+    info "Using pinned version v$VERSION (ARC_NODE_VERSION)"
+    if ! curl -sfL -r 0-0 -o /dev/null -m 25 \
+        "https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET}" 2>/dev/null; then
+        fail "Release v${VERSION} has no ${ASSET} asset.
+       Pick a release that ships the CLI binary:
+         https://github.com/${REPO}/releases
+       Or unset ARC_NODE_VERSION to auto-detect."
+    fi
+else
+    info "Finding the newest release that ships ${ASSET}..."
+    VERSION="$(resolve_version_for_asset "$ASSET" || echo "")"
 fi
-ok "Latest version: v$VERSION"
+
+if [ -z "$VERSION" ]; then
+    fail "No published release contains a ${ASSET} binary.
+
+       The most recent releases are desktop-only bundles (.dmg/.exe/.deb/.rpm/
+       .AppImage) and do not include the arc-node command-line binary, and no
+       older release carries this platform's asset either.
+
+       What you can do instead:
+         1. Install the desktop app, which bundles a node:
+            https://github.com/${REPO}/releases/latest
+         2. Pin a release that does ship the CLI for your platform:
+            ARC_NODE_VERSION=0.7.7 bash install-community-node.sh
+         3. Build from source:
+            git clone https://github.com/${REPO} && cd arc-chain
+            cargo build --release -p arc-node
+            # then copy target/release/arc-node to ${ARC_DIR}/bin/arc-node
+
+       Note: arc-node-linux-aarch64 has never been published. ARM Linux must
+       build from source today."
+fi
+ok "Newest release with a ${ASSET} binary: v$VERSION"
+if [ "$VERSION" != "$(curl -sf -m 10 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+        | grep -m1 '"tag_name"' | sed -E 's/.*"v?([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' || echo "$VERSION")" ]; then
+    warn "This is older than the newest release, which is desktop-only."
+    warn "The CLI node and the desktop app are versioned separately right now."
+fi
 
 # ── Set up ARC directory ────────────────────────────────────────────────────
 mkdir -p "$ARC_DIR" "$ARC_DIR/bin" "$ARC_DIR/data"
@@ -157,8 +217,14 @@ if [ -x "$ARC_DIR/bin/arc-node" ] && "$ARC_DIR/bin/arc-node" --version 2>/dev/nu
     ok "Binary already at v$VERSION"
 else
     info "Downloading $ASSET v$VERSION..."
-    curl -fL --progress-bar -o "$ARC_DIR/bin/arc-node.tmp" \
-        "https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET}"
+    if ! curl -fL --progress-bar -o "$ARC_DIR/bin/arc-node.tmp" \
+        "https://github.com/${REPO}/releases/download/v${VERSION}/${ASSET}"; then
+        rm -f "$ARC_DIR/bin/arc-node.tmp"
+        fail "Download failed: v${VERSION}/${ASSET}
+       The release asset resolved a moment ago but did not download. This is
+       usually a network or GitHub CDN problem - retry, or pin a version:
+         ARC_NODE_VERSION=0.7.7 bash install-community-node.sh"
+    fi
     chmod +x "$ARC_DIR/bin/arc-node.tmp"
     mv "$ARC_DIR/bin/arc-node.tmp" "$ARC_DIR/bin/arc-node"
     ok "Binary installed: $ARC_DIR/bin/arc-node"
@@ -234,17 +300,39 @@ case "$OS" in
     Linux)  case "$ARCH" in x86_64|amd64) ASSET="arc-node-linux-x86_64" ;; aarch64|arm64) ASSET="arc-node-linux-aarch64" ;; *) exit 0 ;; esac ;;
     *) exit 0 ;;
 esac
-LATEST=$(curl -sf "https://api.github.com/repos/${REPO}/releases/latest" \
-    | grep -m1 '"tag_name"' \
-    | sed -E 's/.*"v?([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' || echo "")
-[ -z "$LATEST" ] && { echo "no version, exit"; exit 0; }
+# Resolve the newest release that actually ships $ASSET. releases/latest is
+# NOT usable here: desktop-only releases carry no arc-node CLI asset, so the
+# old logic downloaded a 404 every single day and, under `set -euo pipefail`,
+# killed the updater before it could report anything.
+LATEST=""
+TAGS=$(curl -sf -m 20 "https://api.github.com/repos/${REPO}/releases?per_page=40" 2>/dev/null \
+    | grep '"tag_name"' \
+    | sed -E 's/.*"tag_name":[[:space:]]*"v?([^"]+)".*/\1/' || echo "")
+PROBES=0
+for V in $TAGS; do
+    PROBES=$((PROBES + 1))
+    [ "$PROBES" -gt 12 ] && break
+    if curl -sfL -r 0-0 -o /dev/null -m 25 \
+        "https://github.com/${REPO}/releases/download/v${V}/${ASSET}" 2>/dev/null; then
+        LATEST="$V"
+        break
+    fi
+done
+if [ -z "$LATEST" ]; then
+    echo "[$(date)] no release currently ships ${ASSET} - nothing to update to. Staying on $(cat "$ARC_DIR/version.txt" 2>/dev/null || echo unknown)."
+    exit 0
+fi
 LOCAL=$(cat "$ARC_DIR/version.txt" 2>/dev/null || echo "")
 if [ "$LATEST" = "$LOCAL" ]; then
     echo "[$(date)] up to date ($LOCAL)"
     exit 0
 fi
 echo "[$(date)] new version available: $LOCAL → $LATEST. Downloading."
-curl -fL -o "$ARC_DIR/bin/arc-node.new" "https://github.com/${REPO}/releases/download/v${LATEST}/${ASSET}"
+if ! curl -fL -o "$ARC_DIR/bin/arc-node.new" "https://github.com/${REPO}/releases/download/v${LATEST}/${ASSET}"; then
+    rm -f "$ARC_DIR/bin/arc-node.new"
+    echo "[$(date)] download of v${LATEST}/${ASSET} failed - keeping current binary."
+    exit 0
+fi
 chmod +x "$ARC_DIR/bin/arc-node.new"
 # Keep the old binary as rollback in case the new one crashes
 cp "$ARC_DIR/bin/arc-node" "$ARC_DIR/bin/arc-node.prev" 2>/dev/null || true

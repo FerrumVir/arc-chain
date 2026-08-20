@@ -40,8 +40,35 @@ sha2 = "0.10"
 sha3 = "0.10"
 blst = { version = "0.3", features = ["portable"] }
 # STARK prover (Stwo - StarkWare's Circle STARK)
-stwo = { git = "https://github.com/starkware-libs/stwo.git", default-features = false, features = ["prover"] }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo.git", default-features = false, features = ["prover"] }
+# PINNED. These were unpinned git deps tracking starkware-libs/stwo's default
+# branch, so every fresh checkout - including every CI run and every release
+# build of the arc-node binaries distributed to third-party operators -
+# resolved whatever HEAD happened to be at that moment. Consequences that were
+# live until this pin: a release could not be reproduced from its tag, an
+# upstream force-push turned every build red with zero commits here, and no
+# lockfile-based advisory scanning was meaningful.
+#
+# The rev below is the exact commit already resolved in the tracked
+# Cargo.lock, so this pin is behaviour-preserving - it records what was
+# already being built, it does not change it. Bump deliberately, never
+# implicitly. (The icicle deps below were already correctly pinned to a tag.)
+#
+# !! INTEGRATOR, READ BEFORE FIRST CI RUN !!
+# Adding `rev =` CHANGES HOW THE SOURCE IS SPELLED IN Cargo.lock:
+#   before:  source = "git+https://github.com/starkware-libs/stwo.git#826591c6..."
+#   after:   source = "git+https://github.com/starkware-libs/stwo.git?rev=826591c6...#826591c6..."
+# So the lockfile on disk does NOT satisfy `--locked` against this manifest
+# until it is regenerated, and every `--locked` command in CI (which is all of
+# them) will fail with "the lock file needs to be updated". One-time fix,
+# before committing:
+#   1. cargo check --workspace          # refreshes Cargo.lock in place
+#   2. git diff Cargo.lock              # EXPECT: only the two stwo source
+#                                       #   lines change. If any other package
+#                                       #   version moved, stop - the pin was
+#                                       #   supposed to be behaviour-preserving.
+#   3. git add -f Cargo.lock            # it was gitignored until now
+stwo = { git = "https://github.com/starkware-libs/stwo.git", rev = "826591c6c371376810ca8213b5812d5daf6d5092", default-features = false, features = ["prover"] }
+stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo.git", rev = "826591c6c371376810ca8213b5812d5daf6d5092", default-features = false, features = ["prover"] }
 # GPU acceleration (ICICLE - Ingonyama's GPU library for M31 field ops)
 icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
 icicle-core = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
@@ -93,6 +120,15 @@ anyhow = "1.0"
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Property-based testing
+# Seeded here so the follow-up work has a dependency to reach for. Nothing
+# consumes it yet: every one of the workspace's ~1,356 test attributes is
+# example-based, and there is no proptest, quickcheck or fuzz target anywhere
+# in the repo. Add `proptest.workspace = true` to the [dev-dependencies] of a
+# crate to start. Chosen over cargo-fuzz because it runs under plain
+# `cargo test` on stable with no extra CI infrastructure.
+proptest = "1"
+
 # Config
 toml = "0.8"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
@@ -103,7 +139,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.0", features = ["v4"] }
 parking_lot = "0.12"
 bytes = "1.0"
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 
 [profile.release]
 opt-level = 3
@@ -116,10 +152,74 @@ strip = true
 inherits = "release"
 debug = true
 
-# CI runs `cargo clippy --workspace` without -D warnings, so we don't need
-# workspace-level allowlists for stylistic lints. Real bugs (rustc errors,
-# test failures) still gate merges. If you want to enforce a specific lint
-# workspace-wide, add it here as `<lint> = "deny"`.
+# ---------------------------------------------------------------- lints ----
+# All 16 workspace members opt in with `[lints] workspace = true`. Until this
+# change both tables below were EMPTY, so that plumbing was connected to
+# nothing and CI ran clippy without `-D warnings` - the lint apparatus existed
+# and gated zero things.
+#
+# The curated set below is deliberately BUG-CATCHING, not stylistic. The
+# previous comment here argued that enforcing lints would force mechanical
+# rewrites of crypto hot-paths and risk on-chain attestation divergence. That
+# concern is legitimate and is why no formatting-adjacent or "idiomatic style"
+# lint appears here: nothing in this list asks anyone to rewrite a working
+# kernel. Where a hot path must genuinely opt out, use a file-level
+# `#![allow(clippy::x)]` with a comment naming the divergence risk, rather
+# than leaving the whole workspace ungated.
 [workspace.lints.clippy]
+# Groups need `priority = -1` so the individual lints below can override them.
+# `correctness` is deny-by-default in clippy; stated explicitly so that
+# remains true if a future clippy reshuffles a lint between groups.
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+perf = { level = "warn", priority = -1 }
 
+# Individually selected: each of these is a class of real defect.
+await_holding_lock = "deny"          # deadlock in async paths
+await_holding_refcell_ref = "deny"   # same, RefCell flavour
+mem_forget = "deny"                  # leaks Drop guards (zeroize!)
+float_cmp = "warn"                   # exact float equality in an integer-determinism codebase is a red flag
+lossy_float_literal = "warn"
+todo = "warn"
+unimplemented = "warn"
+dbg_macro = "warn"
+
+# DELIBERATELY ALLOWED - each was considered and rejected, with the condition
+# that would make it enforceable. Do not "tidy" these away.
+#
+# unwrap_used/expect_used: the right lints for this codebase, but unusable
+#   today. This workspace keeps its ~1,356 tests INSIDE src/ (#[cfg(test)]
+#   modules), and suppressing the lint in test code requires
+#   `allow-unwrap-in-tests = true` in a clippy.toml, which does not exist.
+#   Without it these fire tens of thousands of times from test bodies and
+#   bury every real finding. Land clippy.toml with allow-unwrap-in-tests and
+#   allow-expect-in-tests, then promote these to "warn" in lib code.
+unwrap_used = "allow"
+expect_used = "allow"
+# arithmetic_side_effects / indexing_slicing: genuinely relevant to a
+#   pure-integer inference engine and to overflow hardening, but they fire on
+#   essentially every line of a numeric kernel. Workspace-wide they are noise
+#   that would make `-D warnings` unreachable. Correct move is a targeted
+#   crate-level or module-level opt-in on the arithmetic that handles
+#   untrusted input (wire decode, balance math), not a workspace default.
+arithmetic_side_effects = "allow"
+indexing_slicing = "allow"
+# print_stdout/print_stderr: arc-cli and the 15 arc-bench binaries print as
+#   their entire purpose.
+print_stdout = "allow"
+print_stderr = "allow"
+
+# NOTE ON SCOPE: rustc lints (unlike clippy lints) apply to `cargo build`,
+# `cargo check` and `cargo test`, not just to the clippy job. Promoting
+# anything here from "warn" to "deny" therefore changes the BLOCKING test
+# gate, not the non-blocking lint gate, and must be staged accordingly:
+# measure the warning count first, fix, then promote. That is why the two
+# entries below are "warn" and not "deny" despite both being worth denying.
 [workspace.lints.rust]
+# warn-by-default in edition 2024 (NOT a hard error — earlier comment here
+# overstated it). Denying it surfaced 139 real sites in arc-inference, all
+# now wrapped in explicit `unsafe {}` blocks with SAFETY comments.
+unsafe_op_in_unsafe_fn = "deny"
+# TODO: promote to "deny" once the count is zero. An ignored Result in a
+# consensus or state-transition path is a silent correctness bug.
+unused_must_use = "warn"

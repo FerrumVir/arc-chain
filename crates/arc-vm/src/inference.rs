@@ -374,7 +374,7 @@ impl NeuralNet {
             } else {
                 // Out-of-vocabulary - emit zeros matching embed_dim.
                 let dim = if table.is_empty() { 0 } else { table[0].len() };
-                output.extend(std::iter::repeat(0.0f32).take(dim));
+                output.extend(std::iter::repeat_n(0.0f32, dim));
             }
         }
         output
@@ -566,10 +566,8 @@ impl InferenceEngine {
         let net = if model_data.is_empty() {
             None
         } else {
-            match NeuralNet::from_bytes(model_data) {
-                Ok(n) => Some(n),
-                Err(_) => None, // fall back to mock
-            }
+            // A parse failure falls back to mock mode (see doc comment above).
+            NeuralNet::from_bytes(model_data).ok()
         };
         self.load_model_inner(id, info, net)
     }

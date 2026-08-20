@@ -170,7 +170,7 @@ impl MetalVerifier {
 
         let results: Vec<bool> = tasks
             .iter()
-            .map(|task| verify_single(task))
+            .map(verify_single)
             .collect();
 
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -224,7 +224,7 @@ impl MetalVerifier {
         } else {
             tasks
                 .chunks(self.max_batch_size)
-                .flat_map(|chunk| gpu_parallel_verify(chunk))
+                .flat_map(gpu_parallel_verify)
                 .collect()
         };
 
@@ -777,7 +777,7 @@ fn dispatch_ed25519_verify_timed(
     let t_compute = Instant::now();
 
     let workgroup_size = 64u32;
-    let num_workgroups = (n as u32 + workgroup_size - 1) / workgroup_size;
+    let num_workgroups = (n as u32).div_ceil(workgroup_size);
 
     let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Ed25519 Encoder"),
@@ -936,7 +936,7 @@ fn dispatch_ed25519_verify_async(packed: &[[u8; 128]]) -> Result<GpuVerifyFuture
         ctx.queue.write_buffer(&pool.params_buffer, 0, bytemuck::cast_slice(&params));
 
         let workgroup_size = 64u32;
-        let num_workgroups = (n as u32 + workgroup_size - 1) / workgroup_size;
+        let num_workgroups = (n as u32).div_ceil(workgroup_size);
 
         let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Ed25519 Async Encoder"),
@@ -1084,7 +1084,7 @@ fn gpu_parallel_verify(tasks: &[VerifyTask]) -> Vec<bool> {
         Ok(raw) => raw.iter().map(|&v| v == 1).collect(),
         Err(e) => {
             tracing::warn!("GPU Ed25519 dispatch failed ({}), falling back to CPU", e);
-            tasks.par_iter().map(|task| verify_single(task)).collect()
+            tasks.par_iter().map(verify_single).collect()
         }
     }
 }
@@ -1278,7 +1278,13 @@ mod tests {
         verifier.reset_stats();
         assert_eq!(verifier.stats().total_verified, 0);
         assert_eq!(verifier.stats().cpu_batches, 0);
-        assert_eq!(verifier.stats().avg_cpu_throughput, 0.0);
+        // reset_stats() assigns VerifyStats::default(), which sets this field to
+        // exactly 0.0. The assert checks that the reset happened at all, so exact
+        // equality is the correct test; an epsilon would make it weaker, not safer.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(verifier.stats().avg_cpu_throughput, 0.0);
+        }
     }
 
     #[test]
@@ -2082,6 +2088,11 @@ mod tests {
          cpu_fe_mul(&f, &g), cpu_fe_mul(&e, &h))
     }
 
+    // CPU mirror of the shader's `ge_double`, kept beside `cpu_ge_add` as the
+    // reference pair the WGSL/MSL point arithmetic is validated against. Only
+    // `cpu_ge_add` is needed by the current table generator, but deleting this
+    // would leave the reference implementation half-present.
+    #[allow(dead_code)]
     fn cpu_ge_double(p: &CpuGePoint) -> CpuGePoint {
         let a = cpu_fe_mul(&p.0, &p.0);
         let b = cpu_fe_mul(&p.1, &p.1);
@@ -2149,8 +2160,8 @@ mod tests {
 
         // Convert all to affine and verify against curve25519-dalek
         let mut affine_table: Vec<CpuGePoint> = Vec::with_capacity(16);
-        for i in 0..16 {
-            let aff = if i == 0 { cpu_ge_zero() } else { cpu_ge_to_affine(&table[i]) };
+        for (i, entry) in table.iter().enumerate() {
+            let aff = if i == 0 { cpu_ge_zero() } else { cpu_ge_to_affine(entry) };
             // Verify against dalek for non-zero points
             if i > 0 {
                 let dalek_point = Scalar::from(i as u64) * ED25519_BASEPOINT_POINT;
@@ -2170,8 +2181,7 @@ mod tests {
         // Print WGSL constant table
         println!("\n// Precomputed base point table: B_TABLE[i] = i * B (affine extended)");
         println!("// Generated from curve25519-dalek-verified CPU arithmetic");
-        for i in 0..16 {
-            let (x, y, _, t) = &affine_table[i];
+        for (i, (x, y, _, t)) in affine_table.iter().enumerate() {
             let xf = cpu_fe_freeze(x);
             let yf = cpu_fe_freeze(y);
             let tf = cpu_fe_freeze(t);
@@ -2218,7 +2228,7 @@ mod tests {
             // CPU sequential (skip for large batches - too slow)
             let (cpu_vps, cpu_results) = if n <= 10_000 {
                 let cpu_start = Instant::now();
-                let results: Vec<bool> = tasks.iter().map(|t| verify_single(t)).collect();
+                let results: Vec<bool> = tasks.iter().map(verify_single).collect();
                 let elapsed = cpu_start.elapsed();
                 (n as f64 / elapsed.as_secs_f64(), Some(results))
             } else {
@@ -2227,7 +2237,7 @@ mod tests {
 
             // CPU parallel (rayon)
             let par_start = Instant::now();
-            let par_results: Vec<bool> = tasks.par_iter().map(|t| verify_single(t)).collect();
+            let par_results: Vec<bool> = tasks.par_iter().map(verify_single).collect();
             let par_elapsed = par_start.elapsed();
             let par_vps = n as f64 / par_elapsed.as_secs_f64();
 
@@ -2254,7 +2264,7 @@ mod tests {
             let mut timing = DispatchTiming::default();
             let gpu_raw = dispatch_ed25519_verify_timed(&packed, Some(&mut timing))
                 .expect("GPU dispatch should succeed");
-            let t_dispatch = t1.elapsed();
+            let _t_dispatch = t1.elapsed();
 
             let gpu_results: Vec<bool> = gpu_raw.iter().map(|&v| v == 1).collect();
             let gpu_elapsed = t0.elapsed();

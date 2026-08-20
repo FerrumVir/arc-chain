@@ -22,7 +22,7 @@ pub const ONE: i64 = 1 << FRAC_BITS; // 65536
 pub const EXP_LUT_SIZE: usize = 4096;
 pub const EXP_LUT_RANGE: i64 = 16 * ONE; // covers [-16*ONE, 0]
 
-pub const EXP_LUT: [i64; 4097] = {
+pub static EXP_LUT: [i64; 4097] = {
     let mut table = [0i64; 4097];
     table[4096] = ONE;
     // exp(-1/256) = 0.99610544... × 65536 = 65280.76..., rounded to 65281.
@@ -158,7 +158,7 @@ mod tests {
     #[test]
     fn test_exp_monotonic() {
         let mut prev = 0i64;
-        for i in (-16 * ONE as i64)..=0 {
+        for i in (-16 * ONE)..=0 {
             let val = integer_exp(i);
             assert!(val >= prev, "exp not monotonic at {}: {} < {}", i, val, prev);
             prev = val;

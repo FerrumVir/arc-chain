@@ -1,0 +1,96 @@
+# cargo-deny configuration.
+#
+# Run locally with `make audit` (cargo deny check), in CI via the `audit` job
+# in .github/workflows/ci.yml.
+#
+# PRECONDITION: this file is only meaningful once Cargo.lock is tracked.
+# cargo-deny walks the lockfile; with the lock gitignored (as it was until the
+# change that added this file) advisory matching, yanked-crate detection and
+# duplicate analysis all operate on a tree that is re-resolved from scratch on
+# every run and therefore differs between runs. Commit the lock first.
+#
+# The CI job is `continue-on-error: true` on first landing — this repo has
+# never had an advisory, license or yanked-crate check of any kind, so the
+# first run's purpose is to enumerate reality. Triage, then flip it blocking.
+
+[graph]
+all-features = false
+
+# ----------------------------------------------------------- advisories ----
+[advisories]
+version = 2
+# Yanked crates are denied rather than warned: a yanked dependency in a
+# workspace that ships signed binaries to third-party node operators via
+# `curl | bash` is a release-blocking fact, not a note.
+yanked = "deny"
+
+# POLICY FOR THIS LIST — no exceptions, including "just for now":
+#   Every entry MUST carry a comment with (a) the date it was added, (b) who
+#   accepted the risk, (c) why it is not exploitable here, and (d) the
+#   condition under which it gets removed. An entry with no expiry condition
+#   is a permanent silent vulnerability, which is strictly worse than no
+#   scanner at all. Re-review the whole list at every release.
+#
+# Format:
+#   "RUSTSEC-0000-0000", # 2026-08-17 <owner>: <why not exploitable>; remove when <condition>
+ignore = []
+
+# ------------------------------------------------------------- licenses ----
+[licenses]
+version = 2
+# DRAFT. This list is a best-effort first pass authored without running
+# cargo (the workspace target lock was held elsewhere). The first CI run of
+# the audit job will report the licences actually present in the graph;
+# reconcile this list against that output rather than trusting it.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    # Weak, file-level copyleft. Acceptable while these crates are consumed
+    # unmodified; if anyone vendors and patches an MPL crate, the modified
+    # files must be published. Flagged here so that is a decision and not an
+    # accident.
+    "MPL-2.0",
+    # The workspace's own crates (Cargo.toml [workspace.package] license).
+    "BUSL-1.1",
+]
+confidence-threshold = 0.9
+
+# Per-crate exceptions go here rather than widening `allow` above, so an
+# unusual licence stays scoped to the one crate that needs it.
+# Format:
+#   { allow = ["<SPDX>"], crate = "<name>" },  # <date> <owner>: <rationale>
+exceptions = []
+
+# ----------------------------------------------------------------- bans ----
+[bans]
+# Starts at "warn", not "deny". A 16-crate workspace pulling revm, wasmer,
+# wgpu and quinn will have a substantial duplicate-version tail; denying on
+# day one would mean an immediate allowlist war and the check being disabled.
+# Ratchet: fix the duplicates that matter (anything in the crypto or wire
+# path), then consider "deny" with a curated `skip` list.
+multiple-versions = "warn"
+# Path dependencies inside the workspace use wildcards legitimately.
+wildcards = "allow"
+deny = []
+skip = []
+
+# -------------------------------------------------------------- sources ----
+[sources]
+unknown-registry = "deny"
+# This is the check that converts an unpinned git dependency from an invisible
+# reproducibility problem into a visible CI failure. Both git sources below
+# are pinned by `rev`/`tag` in the root Cargo.toml; a new unpinned git
+# dependency, or a new git host, fails here.
+unknown-git = "deny"
+allow-git = [
+    "https://github.com/starkware-libs/stwo.git",
+    "https://github.com/ingonyama-zk/icicle.git",
+]

@@ -110,6 +110,11 @@ async fn faucet_and_wait(c: &Client, coord: &str, addr_hex: &str, target: u64) {
     );
 }
 
+// Every argument is a distinct piece of the transaction being signed, and
+// several share a type (`Hash256`, `u64`, `[u8; 32]`). Bundling them into a
+// struct would move the ordering mistake from the compiler's reach into a
+// silent field mix-up, so the wide signature stays.
+#[allow(clippy::too_many_arguments)]
 async fn submit_signed(
     c: &Client,
     coord: &str,
@@ -161,11 +166,9 @@ async fn wait_committed(c: &Client, coord: &str, hash_hex: &str) -> bool {
             .get(format!("{}/tx/0x{}", coord, hash_hex))
             .send()
             .await
-        {
-            if r.status().is_success() {
+            && r.status().is_success() {
                 return true;
             }
-        }
     }
     false
 }

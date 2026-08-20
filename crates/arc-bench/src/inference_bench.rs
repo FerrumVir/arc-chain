@@ -237,7 +237,7 @@ fn main() {
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         let success_count = receipts.iter().filter(|r| r.success).count();
-        let tps = if elapsed_ms > 0 { 1000 * 1000 / elapsed_ms } else { 0 };
+        let tps = (1000u64 * 1000).checked_div(elapsed_ms).unwrap_or(0);
 
         eprintln!(
             "  1000 attestations: {}ms, {}/{} success, ~{} attestations/sec",

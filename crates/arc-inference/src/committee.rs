@@ -87,7 +87,7 @@ pub fn select_committee(
         .collect();
 
     // Sort by score (deterministic ordering)
-    candidates.sort_by(|a, b| a.1.0.cmp(&b.1.0));
+    candidates.sort_by_key(|a| a.1.0);
 
     // Take top k
     let members: Vec<Hash256> = candidates.iter().take(k).map(|(addr, _)| *addr).collect();
@@ -136,7 +136,7 @@ pub fn aggregate_votes(
     }
 
     // Check if any output_hash has sufficient agreement
-    for (_, (output_hash, count)) in &vote_counts {
+    for (output_hash, count) in vote_counts.values() {
         if *count >= committee.min_agreement {
             return CommitteeResult::Consensus {
                 output_hash: *output_hash,

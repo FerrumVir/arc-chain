@@ -251,11 +251,7 @@ impl PriceOracle {
         }
 
         let latest_ts = state.twap_buffer.last().unwrap().timestamp;
-        let cutoff = if latest_ts >= window_secs {
-            latest_ts - window_secs
-        } else {
-            0
-        };
+        let cutoff = latest_ts.saturating_sub(window_secs);
 
         // Filter entries within the window
         let entries: Vec<&TwapEntry> = state
@@ -349,12 +345,13 @@ mod tests {
     #[test]
     fn test_update_and_get_price_single_source() {
         let mut oracle = PriceOracle::new(default_config());
+        // 5_000_000_000_000 == 50,000.00000000 at the feed's 8 decimals.
         oracle
-            .update_price(feed(btc_usd(), 50_000_0000_0000, PriceSource::Chainlink, 1000))
+            .update_price(feed(btc_usd(), 5_000_000_000_000, PriceSource::Chainlink, 1000))
             .unwrap();
 
         let agg = oracle.get_price(&btc_usd()).unwrap();
-        assert_eq!(agg.price, 50_000_0000_0000);
+        assert_eq!(agg.price, 5_000_000_000_000);
         assert_eq!(agg.sources, 1);
         assert_eq!(agg.decimals, 8);
     }
@@ -486,7 +483,7 @@ mod tests {
         // Weights: 100*10=1000, 200*10=2000, 150*10=1500
         // Total weight: 30, sum: 4500 => 150
         assert!(twap > 0);
-        assert!(twap >= 100 && twap <= 200);
+        assert!((100..=200).contains(&twap));
     }
 
     #[test]

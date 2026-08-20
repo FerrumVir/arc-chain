@@ -31,8 +31,10 @@ fn matmul_f32(w: &[f32], rows: usize, cols: usize, input: &[f32]) -> Vec<f32> {
 fn matmul_i8_scalar(w: &I8Weights, input: &[i64]) -> Vec<i64> {
     (0..w.n_rows).map(|i| {
         let mut acc: i64 = 0;
-        for j in 0..w.n_cols {
-            acc += (w.data[i * w.n_cols + j] as i64) * input[j];
+        // enumerate().take(n_cols) yields j in the same order as 0..n_cols,
+        // so the accumulation sequence — and therefore the result — is identical.
+        for (j, &inp) in input.iter().enumerate().take(w.n_cols) {
+            acc += (w.data[i * w.n_cols + j] as i64) * inp;
         }
         (acc * w.scales[i]) >> 16
     }).collect()
@@ -41,8 +43,8 @@ fn matmul_i8_scalar(w: &I8Weights, input: &[i64]) -> Vec<i64> {
 fn matmul_i16_scalar(w: &I16Weights, input: &[i64]) -> Vec<i64> {
     (0..w.n_rows).map(|i| {
         let mut acc: i128 = 0;
-        for j in 0..w.n_cols {
-            acc += (w.data[i * w.n_cols + j] as i128) * (input[j] as i128);
+        for (j, &inp) in input.iter().enumerate().take(w.n_cols) {
+            acc += (w.data[i * w.n_cols + j] as i128) * (inp as i128);
         }
         let wide = acc * (w.scales[i] as i128);
         ((wide / 32767) >> 16) as i64

@@ -26,8 +26,24 @@ struct Cli {
     #[arg(long, default_value_t = 9945)]
     p2p_port: u16,
 
-    /// Validator stake in ARC (0 = observer node)
-    #[arg(long, default_value_t = 5_000_000)]
+    /// Validator stake in ARC. 0 (the default) = observer / community node.
+    ///
+    /// DEFAULT CHANGED from 5,000,000 to 0, deliberately.
+    ///
+    /// A plain `arc-node` used to join as a full-stake validator. Any peer
+    /// announcing stake >= min_stake is merged into the live ValidatorSet and
+    /// queued into the consensus engine; at the next epoch boundary
+    /// `freeze_epoch()` absorbs it, its stake is normalised to the maximum
+    /// observed, and it owns 1/N of the leader slots on EVERY seed.
+    /// `PeerDisconnected` explicitly refuses to remove an address from a
+    /// frozen set, so the damage survives until every seed is restarted —
+    /// which is itself forbidden, because a seed restart destroys all
+    /// in-memory inference evidence. This has already happened once on the
+    /// live network: genesis declares 6 validators and LAX reports 7.
+    ///
+    /// Becoming a validator must be an explicit act. Pass `--stake N` to opt
+    /// in; the node prints a loud warning if you do it against public peers.
+    #[arg(long, default_value_t = 0)]
     stake: u64,
 
     /// Data directory for WAL/snapshots
@@ -43,6 +59,22 @@ struct Cli {
     #[arg(long)]
     seeds_file: Option<String>,
 
+    /// Hosts to pull the sharded-inference registry from over HTTP, WITHOUT
+    /// joining their P2P network or consensus (comma-separated; a bare host
+    /// gets the conventional RPC port 9090).
+    ///
+    /// This exists because coordinating inference and joining a chain are
+    /// separate concerns that --peers/--seeds-file conflates. Those flags
+    /// dial P2P, and a node that dials P2P while carrying stake is merged
+    /// into the remote validator set — the phantom-validator hazard in
+    /// CLAUDE.md rule 2. So there was no way to run a chain of your own
+    /// (stake > 0, sealing its own blocks) while dispatching inference
+    /// across a public network's shard holders. --shard-hosts is HTTP-only:
+    /// GET /shards to learn the pipeline, POST /inference/forward_shard to
+    /// use it. No handshake, no stake advertisement, no consensus.
+    #[arg(long, value_delimiter = ',')]
+    shard_hosts: Vec<String>,
+
     /// Minimum staked ARC required to run this node
     #[arg(long, default_value_t = 500_000)]
     min_stake: u64,
@@ -50,8 +82,24 @@ struct Cli {
     /// Validator identity seed (used to derive a unique address).
     /// Different seeds produce different validator addresses.
     /// Default: "arc-validator-0"
-    #[arg(long, default_value = "arc-validator-0")]
+    ///
+    /// Prefer the ARC_VALIDATOR_SEED environment variable when this value is
+    /// secret material. The desktop app derives this from the wallet's BIP-39
+    /// phrase, and a process's argv is world-readable — any user on the
+    /// machine can recover it with `ps`. An environment variable is readable
+    /// only by the owning user, so the phrase stays out of the process table.
+    #[arg(long, env = "ARC_VALIDATOR_SEED", default_value = "arc-validator-0")]
     validator_seed: String,
+
+    /// Public label for this node in the shard registry (shown by GET /shards
+    /// on every seed, so treat it as public).
+    ///
+    /// Defaults to a short hash of the validator seed. It must never default
+    /// to the seed itself: the desktop app uses the wallet's BIP-39 phrase as
+    /// the seed, and this value is broadcast to every seed and served to any
+    /// caller of /shards.
+    #[arg(long, env = "ARC_NODE_NAME")]
+    node_name: Option<String>,
 
     /// Archive mode - disable all pruning, keep full transaction history.
     /// Use for block explorers and analytics. Requires more disk space.
@@ -175,6 +223,61 @@ struct Cli {
     /// prints clear download instructions with the expected sha256.
     #[arg(long, default_value_t = false)]
     community: bool,
+
+    /// Run as a silent observer: no community registration, no heartbeat, no
+    /// work claiming. The node still reads from its peers (GET only) and can
+    /// act as a sharded-inference coordinator against them.
+    ///
+    /// Needed because community mode is auto-enabled whenever stake == 0, and
+    /// stake now defaults to 0. Without this flag a plain
+    /// `arc-node --seeds-file <public seeds>` would begin POSTing
+    /// /community/register and /community/heartbeat to every seed in the file
+    /// — writes to someone else's network that the operator never asked for.
+    /// This is the flag to use when pointing a local coordinator at a network
+    /// you are only allowed to read.
+    #[arg(long, default_value_t = false)]
+    no_community: bool,
+
+    /// Ask a seed to assign this node a layer range at boot (POST /shards/join).
+    ///
+    /// OFF by default, and it used to be implicit for any staked node with a
+    /// model and no explicit --shard-range. That implicit trigger is how a
+    /// joining node injected an off-grid `[0, 8)` shard into a pipeline
+    /// already fully covered by the 6-range tiling: the seed inserts the
+    /// announcement verbatim with no stub-address check, and v0.7.9 seeds'
+    /// pipeline assemblers then abort with
+    /// `503 Pipeline gap: expected layer 6 next, got shard [0, 8)` — taking
+    /// out sharded inference network-wide. Opt in only when you mean it, and
+    /// prefer an explicit on-grid `--shard-range`.
+    #[arg(long, default_value_t = false)]
+    auto_shard_join: bool,
+
+    /// Number of threads for inference compute (rayon pool width).
+    ///
+    /// 0 (default) uses rayon's implicit global pool, which is sized from
+    /// `RAYON_NUM_THREADS` when that env var is set and from
+    /// `available_parallelism()` otherwise. Any non-zero value builds a
+    /// dedicated pool that `forward_shard` and local `generate` run inside,
+    /// and that pool can be resized at runtime via
+    /// `POST /node/threads {"threads": n}` with no restart.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
+    /// Promote INT8 weights to INT16 storage after load.
+    ///
+    /// Only meaningful on aarch64, where `matmul_i16_into` dispatches to a
+    /// real NEON widening kernel. On x86 this is a pure loss: `enable_i16`
+    /// builds every I16Weights via `I16Weights::from_i8`, which has no f32
+    /// source and therefore carries no additional precision, and the x86
+    /// `dot_i16_i64` is `dot_i16_i64_avx2` → `dot_i16_i64_scalar` (the AVX-512
+    /// path was reverted after segfaults). Net effect per layer: double the
+    /// weight bytes streamed, identical arithmetic, identical output — plus
+    /// the I8 weights are retained alongside the I16 ones, so a 15-layer
+    /// holder's resident set grows by several GB.
+    ///
+    /// Defaults to on for aarch64, off elsewhere. Pass the flag to force it.
+    #[arg(long, default_value_t = false)]
+    enable_i16: bool,
 }
 
 /// Rewrites a pulled peer's `self_shard.socket_addr` in place when it carries
@@ -215,101 +318,6 @@ fn rewrite_pulled_self_shard(self_shard: &mut serde_json::Value, pulled_from_add
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn pulled_stub_rewritten_to_seed_host_port() {
-        // AMS announces self_shard with socket_addr=0.0.0.0:9090. We pulled
-        // from http://136.244.109.1:9090/shards, so the routable addr for AMS
-        // IS the URL we pulled from - use it.
-        let mut v = json!({
-            "start_layer": 10, "end_layer": 14, "socket_addr": "0.0.0.0:9090",
-            "node_name": "AMS"
-        });
-        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
-        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
-    }
-
-    #[test]
-    fn pulled_routable_addr_is_left_alone() {
-        let mut v = json!({
-            "start_layer": 10, "end_layer": 14, "socket_addr": "136.244.109.1:9090",
-            "node_name": "AMS"
-        });
-        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
-        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
-    }
-
-    #[test]
-    fn pulled_stub_uses_declared_port_over_pulled_url_port() {
-        // Peer bound to 9090 but we pulled from its port 8545 (hypothetical) -
-        // prefer the port the peer declared for its listener.
-        let mut v = json!({
-            "socket_addr": "0.0.0.0:9090", "node_name": "X"
-        });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:8545");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_stub_falls_back_to_pulled_url_port_when_declared_is_bad() {
-        let mut v = json!({
-            "socket_addr": "0.0.0.0:junk", "node_name": "X"
-        });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_loopback_stub_also_rewritten() {
-        // Seed set up with --rpc 127.0.0.1 on a misconfigured run would announce
-        // 127.0.0.1:9090. The pulled URL is the routable address, use it.
-        let mut v = json!({
-            "socket_addr": "127.0.0.1:9090", "node_name": "X"
-        });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_ipv6_stub_rewritten() {
-        let mut v = json!({"socket_addr": "[::]:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-
-        let mut v = json!({"socket_addr": "[::1]:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_empty_addr_rewritten() {
-        let mut v = json!({"socket_addr": "", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn missing_socket_addr_field_is_noop() {
-        // Malformed / partial self_shard JSON should not panic.
-        let mut v = json!({"node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert!(v.get("socket_addr").is_none());
-    }
-
-    #[test]
-    fn pulled_url_with_no_port_is_tolerated() {
-        // Defensive: if seed_addrs_pull accidentally carries a host without a port,
-        // rewrite still produces a sensible string (host + default 9090).
-        let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "136.244.109.1");
-        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
-    }
-}
-
 /// Look for a Llama-2-7B GGUF in standard community-node locations.
 /// Returns the first existing path. Covers both the seed convention
 /// (`llama2-7b.gguf`) and TheBloke's published filename
@@ -324,12 +332,9 @@ fn auto_discover_model() -> Option<String> {
         "/opt/arc/llama2-7b.gguf".to_string(),
         "/var/lib/arc/llama2-7b.gguf".to_string(),
     ];
-    for p in candidates {
-        if std::path::Path::new(&p).is_file() {
-            return Some(p);
-        }
-    }
-    None
+    candidates
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
 }
 
 /// sha256 a file by shelling to `sha256sum` (Linux) or `shasum -a 256` (macOS).
@@ -340,20 +345,17 @@ fn sha256_of(path: &str) -> Option<String> {
             .ok()
             .and_then(|s| s.split_whitespace().next().map(|x| x.to_string()))
     };
-    if let Ok(out) = std::process::Command::new("sha256sum").arg(path).output() {
-        if out.status.success() {
+    if let Ok(out) = std::process::Command::new("sha256sum").arg(path).output()
+        && out.status.success() {
             return parse(out.stdout);
         }
-    }
     if let Ok(out) = std::process::Command::new("shasum")
         .args(["-a", "256"])
         .arg(path)
         .output()
-    {
-        if out.status.success() {
+        && out.status.success() {
             return parse(out.stdout);
         }
-    }
     None
 }
 
@@ -529,15 +531,14 @@ fn auto_download_model() -> Option<String> {
 fn detect_ram_mb() -> u64 {
     if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
         for line in meminfo.lines() {
-            if line.starts_with("MemTotal:") {
-                if let Some(kb) = line
+            if line.starts_with("MemTotal:")
+                && let Some(kb) = line
                     .split_whitespace()
                     .nth(1)
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     return kb / 1024;
                 }
-            }
         }
     }
     8192
@@ -548,27 +549,24 @@ fn detect_ram_mb() -> u64 {
 /// they advertise in seeds files. Returns the first usable host.
 fn pick_seed_rpc(cli: &Cli) -> Option<String> {
     for p in &cli.peers {
-        if let Some(host) = p.split(':').next() {
-            if !host.is_empty() {
+        if let Some(host) = p.split(':').next()
+            && !host.is_empty() {
                 return Some(format!("{}:9090", host));
             }
-        }
     }
-    if let Some(path) = &cli.seeds_file {
-        if let Ok(content) = std::fs::read_to_string(path) {
+    if let Some(path) = &cli.seeds_file
+        && let Ok(content) = std::fs::read_to_string(path) {
             for raw in content.lines() {
                 let line = raw.trim();
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                if let Some(host) = line.split(':').next() {
-                    if !host.is_empty() {
+                if let Some(host) = line.split(':').next()
+                    && !host.is_empty() {
                         return Some(format!("{}:9090", host));
                     }
-                }
             }
         }
-    }
     None
 }
 
@@ -579,6 +577,23 @@ fn pick_seed_rpc(cli: &Cli) -> Option<String> {
 ///
 /// Uses the canonical testnet model_id from inference_validator so the
 /// assignment registers in the same pipeline that tier-1 voting reads.
+/// The node's public label for the shard registry.
+///
+/// Deliberately never `cli.validator_seed`: the desktop derives that from the
+/// wallet's BIP-39 phrase, and this string is POSTed to every seed and handed
+/// out by GET /shards. A short hash is a stable public identifier that leaks
+/// nothing about the key.
+fn public_node_name(cli: &Cli) -> String {
+    if let Some(n) = cli.node_name.as_deref() {
+        let n = n.trim();
+        if !n.is_empty() {
+            return n.to_string();
+        }
+    }
+    let digest = arc_crypto::hash_bytes(cli.validator_seed.as_bytes());
+    format!("arc-{}", &hex::encode(digest.0)[..8])
+}
+
 async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
     let seed = pick_seed_rpc(cli)?;
     let url = format!("http://{}/shards/join", seed);
@@ -599,7 +614,7 @@ async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
 
     let body = serde_json::json!({
         "socket_addr": cli.rpc,
-        "node_name": cli.validator_seed,
+        "node_name": public_node_name(cli),
         "model_id": model_id_hex,
         "model_name": "Llama-2-7B",
         "total_layers": 32u32,
@@ -688,7 +703,8 @@ async fn main() -> Result<()> {
     // load picks up only that slice instead of holding the full model.
     // Community workers (stake=0) skip this — they hold the full model by
     // design and auto-register via /community/register.
-    if cli.stake > 0
+    if cli.auto_shard_join
+        && cli.stake > 0
         && cli.model.is_some()
         && cli.shard_ranges.is_empty()
         && cli.shard_start.is_none()
@@ -765,10 +781,16 @@ async fn main() -> Result<()> {
         node_cfg.validator.min_stake
     };
 
-    let validator_seed = if matches.value_source("validator_seed") == Some(clap::parser::ValueSource::CommandLine) {
-        cli.validator_seed.clone()
-    } else {
-        node_cfg.validator.seed.clone()
+    // Precedence: --validator-seed, then ARC_VALIDATOR_SEED, then the config
+    // file. EnvVariable must be honoured alongside CommandLine — the desktop
+    // passes the wallet phrase through the environment so it stays out of the
+    // world-readable process table, and treating that as "unset" would run the
+    // node under the default identity and accrue earnings to a key the user
+    // does not hold.
+    let validator_seed = match matches.value_source("validator_seed") {
+        Some(clap::parser::ValueSource::CommandLine)
+        | Some(clap::parser::ValueSource::EnvVariable) => cli.validator_seed.clone(),
+        _ => node_cfg.validator.seed.clone(),
     };
 
     let eth_rpc_port = if matches.value_source("eth_rpc_port") == Some(clap::parser::ValueSource::CommandLine) {
@@ -873,6 +895,40 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // ── Loud warning: staking into a network you don't own ─────────────
+    // Joining a public network with stake > 0 is a one-way door. The peer is
+    // merged into every seed's ValidatorSet, absorbed by `freeze_epoch()` at
+    // the next boundary, and `PeerDisconnected` refuses to remove an address
+    // from a frozen set — so it keeps drawing leader slots on every seed
+    // until all of them restart. Nothing here blocks it (an operator running
+    // their own network needs it), but nobody should do it by accident.
+    if stake > 0 && !peers.is_empty() {
+        let public_peers: Vec<&String> = peers
+            .iter()
+            .filter(|p| {
+                let host = p.split(':').next().unwrap_or("");
+                !(host.starts_with("127.")
+                    || host.starts_with("10.")
+                    || host.starts_with("192.168.")
+                    || host == "localhost"
+                    || host.is_empty())
+            })
+            .collect();
+        if !public_peers.is_empty() {
+            tracing::warn!("╔══════════════════════════════════════════════════════════════╗");
+            tracing::warn!("║  JOINING A PUBLIC NETWORK AS A VOTING VALIDATOR              ║");
+            tracing::warn!("╚══════════════════════════════════════════════════════════════╝");
+            tracing::warn!("  --stake {} against {} non-local peer(s).", stake, public_peers.len());
+            tracing::warn!("  This node will be merged into every seed's validator set and");
+            tracing::warn!("  absorbed by the next epoch freeze. Frozen sets do NOT release a");
+            tracing::warn!("  validator on disconnect, so it will keep drawing leader slots on");
+            tracing::warn!("  every seed until all of them are restarted.");
+            tracing::warn!("  If you meant to contribute compute, not consensus: use --community");
+            tracing::warn!("  (or --stake 0). Continuing in 5s...");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+        }
+    }
+
     // ── Derive validator keypair and address from seed ─────────────────
     // Deterministic: same seed → same keypair → same address across restarts.
     let validator_seed_bytes = blake3::derive_key("ARC-chain-validator-keypair-v1", validator_seed.as_bytes());
@@ -923,6 +979,19 @@ async fn main() -> Result<()> {
     } else {
         Vec::new()
     };
+
+    // Chain identity as DECLARED by the genesis file. Only a genesis file can
+    // name the network, so a node started without --genesis carries None here
+    // and GET /network/info reports the name and chain_id as null with a
+    // reason rather than inventing one (and never says "mainnet").
+    let genesis_chain_identity: Option<rpc::ChainIdentity> = cli
+        .genesis
+        .as_ref()
+        .and_then(|p| config::load_genesis(p).ok())
+        .map(|cfg| rpc::ChainIdentity {
+            name: cfg.chain.name,
+            chain_id: cfg.chain.chain_id,
+        });
 
     let genesis_accounts: Vec<(Hash256, u64)> = if let Some(genesis_path) = &cli.genesis {
         let genesis_cfg = config::load_genesis(genesis_path)
@@ -1083,11 +1152,10 @@ async fn main() -> Result<()> {
         }
         held_ranges.push((start, end));
     }
-    if held_ranges.is_empty() {
-        if let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end) {
+    if held_ranges.is_empty()
+        && let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end) {
             held_ranges.push((start, end));
         }
-    }
     held_ranges.sort();
     for i in 1..held_ranges.len() {
         if held_ranges[i].0 < held_ranges[i - 1].1 {
@@ -1185,10 +1253,31 @@ async fn main() -> Result<()> {
                     // matmul_i16_into. Real quality improvement requires the
                     // multi-range loader to stitch per-range f32 I16 weights
                     // — separate change.
-                    if model.i16_layers.is_none() && layers_held > 0 {
+                    //
+                    // GATED as of this change. On aarch64 the promotion is a
+                    // real win: `matmul_i16_into` dispatches to
+                    // `dot_i16_i64_neon`, an actual widening SIMD kernel. On
+                    // x86 it is a pure loss — `from_i8` carries no extra
+                    // precision (no f32 source), and `dot_i16_i64` resolves to
+                    // `dot_i16_i64_avx2`, which is literally a call to
+                    // `dot_i16_i64_scalar` (the AVX-512 path was reverted after
+                    // segfaults). So an x86 seed doubled the weight bytes it
+                    // streamed per layer, kept the I8 weights resident
+                    // alongside the I16 ones, and got byte-identical output out
+                    // of the same scalar loop. `--enable-i16` forces it on any
+                    // architecture.
+                    let want_i16 = cli.enable_i16 || cfg!(target_arch = "aarch64");
+                    if model.i16_layers.is_none() && layers_held > 0 && want_i16 {
                         model.enable_i16();
                         tracing::info!(
                             "I16 dispatch enabled (promoted from I8); engine label will report \"INT16 integer\""
+                        );
+                    } else if model.i16_layers.is_none() && layers_held > 0 {
+                        tracing::info!(
+                            "I16 promotion SKIPPED on {}: from_i8 adds no precision and this \
+                             target's i16 dot product is scalar, so promoting would double \
+                             per-layer weight bytes for identical output. Pass --enable-i16 to force.",
+                            std::env::consts::ARCH
                         );
                     }
                     tracing::info!(
@@ -1379,7 +1468,7 @@ async fn main() -> Result<()> {
     // ── Start ETH JSON-RPC server (MetaMask, Hardhat, Foundry) ──────────
     if eth_rpc_port > 0 {
         let eth_addr = format!("0.0.0.0:{}", eth_rpc_port);
-        let eth_node = rpc::build_node_state(
+        let mut eth_node = rpc::build_node_state(
             state.clone(),
             mempool.clone(),
             validator_address,
@@ -1391,6 +1480,8 @@ async fn main() -> Result<()> {
             candle_engine.clone(),
             candle_model_id,
         );
+        // Same declared identity on the ETH port's state.
+        eth_node.chain_identity = genesis_chain_identity.clone();
         tracing::info!("ETH RPC    : {} (MetaMask/Hardhat/Foundry)", eth_addr);
         tokio::spawn(async move {
             if let Err(e) = rpc::serve_eth(&eth_addr, eth_node).await {
@@ -1500,12 +1591,15 @@ async fn main() -> Result<()> {
                 start_layer: start,
                 end_layer: end,
                 total_layers,
-                model_id: format!("0x{}", hex::encode(&model_id_hash.0)),
+                model_id: format!("0x{}", hex::encode(model_id_hash.0)),
                 model_name: model_id_data.clone(),
                 memory_mb: per_layer_mb * (end - start),
                 full_model_mb,
                 socket_addr: socket_addr.clone(),
-                node_name: validator_seed.clone(),
+                // NOT validator_seed: this ShardInfo is POSTed to every seed
+                // every 15s and served publicly by GET /shards, and the
+                // desktop's seed is the wallet's BIP-39 phrase.
+                node_name: public_node_name(&cli),
             }).collect()
         }
         _ => Vec::new(),
@@ -1526,13 +1620,11 @@ async fn main() -> Result<()> {
             // p is a SocketAddr string like "1.2.3.4:9091"
             if let Some(host) = p.split(':').next() {
                 seed_addrs.push(format!("{}:9090", host));
-                if let Some(port_str) = p.split(':').nth(1) {
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        if port > 1 && port - 1 != 9090 {
+                if let Some(port_str) = p.split(':').nth(1)
+                    && let Ok(port) = port_str.parse::<u16>()
+                        && port > 1 && port - 1 != 9090 {
                             seed_addrs.push(format!("{}:{}", host, port - 1));
                         }
-                    }
-                }
             }
         }
         seed_addrs.sort();
@@ -1603,8 +1695,8 @@ async fn main() -> Result<()> {
                 // holder, and it's what the receiver-side fix for direct
                 // /shards/announce broadcasts produces too.
                 for addr in &seed_addrs_pull {
-                    if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await {
-                        if let Ok(mut json) = resp.json::<serde_json::Value>().await {
+                    if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await
+                        && let Ok(mut json) = resp.json::<serde_json::Value>().await {
                             // New peers emit `self_shards: [ShardInfo, ...]`; legacy
                             // peers still emit `self_shard: ShardInfo` - accept both
                             // so a rolling upgrade never loses shard visibility.
@@ -1617,18 +1709,16 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            if let Some(self_shard) = json.get_mut("self_shard") {
-                                if !self_shard.is_null() {
+                            if let Some(self_shard) = json.get_mut("self_shard")
+                                && !self_shard.is_null() {
                                     rewrite_pulled_self_shard(self_shard, addr);
                                     to_announce.push(self_shard.clone());
                                 }
-                            }
                             for shard_val in to_announce {
                                 let payload = serde_json::json!({"shard": shard_val});
                                 let _ = client.post(&local_announce).json(&payload).send().await;
                             }
                         }
-                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             }
@@ -1645,7 +1735,18 @@ async fn main() -> Result<()> {
     // heartbeats before eviction.
     // Auto-enable community mode for observer nodes (stake=0).
     // If you join with no stake, you're a community contributor - no flag needed.
-    let community_mode = cli.community_mode || stake == 0;
+    //
+    // `--no-community` opts out. That escape hatch exists because --stake now
+    // defaults to 0: without it, a bare `arc-node --seeds-file <public seeds>`
+    // would start POSTing /community/register and /community/heartbeat to
+    // every seed listed. Read-only coordinators need to be able to say no.
+    let community_mode = (cli.community_mode || stake == 0) && !cli.no_community;
+    if cli.no_community && (cli.community_mode || stake == 0) {
+        tracing::info!(
+            "--no-community: observer mode. This node will NOT register, heartbeat or \
+             claim work from its peers; it only reads from them."
+        );
+    }
 
     if community_mode {
         tracing::info!("╔═══════════════════════════════════════╗");
@@ -1657,7 +1758,7 @@ async fn main() -> Result<()> {
 
     if community_mode {
         let validator_seed_c = validator_seed.clone();
-        let worker_id = format!("0x{}", hex::encode(&validator_address.0));
+        let worker_id = format!("0x{}", hex::encode(validator_address.0));
         let hostname = std::process::Command::new("hostname")
             .output()
             .ok()
@@ -1708,11 +1809,24 @@ async fn main() -> Result<()> {
                 Err(_) => return,
             };
 
-            // Model info for auto-shard assignment is pre-computed above the spawn.
+            // Advertise "inference" ONLY when a model is actually loaded.
+            //
+            // This was hardcoded to ["inference"] regardless. All three live
+            // registered workers reported `model: null` yet still counted as
+            // live inference workers on the seed side (which checks
+            // capabilities alone), so the router dispatched real jobs into a
+            // black hole and blocked in dispatch_to_community_worker for the
+            // full community_dispatch_timeout — 60 s at the desktop's 16-token
+            // default — before falling back to local.
+            let capabilities: Vec<&str> = if model_name_c.is_some() {
+                vec!["inference"]
+            } else {
+                vec!["relay"]
+            };
             let register_payload = serde_json::json!({
                 "worker_id": worker_id_c,
                 "name": format!("{} ({})", validator_seed_c, hostname_c),
-                "capabilities": ["inference"],
+                "capabilities": capabilities,
                 "model": model_name_c,
                 "platform": platform_c,
                 "model_id": &model_id_hex,
@@ -1726,49 +1840,72 @@ async fn main() -> Result<()> {
             });
 
             // Register once, then heartbeat + re-register periodically.
-            // Community gateway runs on port 3001 as a sidecar alongside
-            // the main arc-node on 9090. Try both 3001 (gateway) and 9090
-            // (if the seed runs the dd0 binary with built-in endpoints).
+            //
+            // ORDER: arc-node's own RPC (:9090) FIRST, the legacy Python
+            // community gateway (:3001) only as a fallback. This was
+            // inverted, and the inversion is the direct cause of AMS
+            // reporting `count_visible: 0` with `count_total: 4`: AMS runs a
+            // :3001 gateway that answers, so the fallback to :9090 never
+            // fired, arc-node's own registry never saw a heartbeat, its
+            // entries aged past COMMUNITY_WORKER_TTL_SECS and were filtered
+            // out of the scoreboard. Seeds without a gateway were fine — LAX
+            // 3/3, NYC 3/8 — which is exactly the signature of "the seed with
+            // the extra service is the broken one". The claim loop below
+            // already used the correct order; these two now agree.
+            //
+            // Seeds are contacted CONCURRENTLY. Serially, one unreachable
+            // seed's 5 s timeout delayed every seed after it, and with six
+            // seeds a full round could exceed the 15 s tick.
             let mut ticks: u64 = 0;
             loop {
+                let register_tick = ticks.is_multiple_of(4);
+                let mut set = tokio::task::JoinSet::new();
                 for addr in &seed_rpc_addrs_c {
-                    // Derive gateway port from RPC addr: replace :9090 with :3001
-                    let host = addr.split(':').next().unwrap_or(addr);
-                    let gateway_addr = format!("{}:3001", host);
-                    // Every 4th tick (60s), do a full re-register to pick up metadata changes
-                    if ticks % 4 == 0 {
-                        // Try gateway first (port 3001), then arc-node (port 9090)
-                        let r = client.post(format!("http://{}/community/register", gateway_addr))
-                            .json(&register_payload).send().await;
-                        let resp = if let Ok(resp) = r {
-                            resp.json::<serde_json::Value>().await.ok()
-                        } else {
-                            let r2 = client.post(format!("http://{}/community/register", addr))
-                                .json(&register_payload).send().await;
-                            if let Ok(resp) = r2 { resp.json::<serde_json::Value>().await.ok() } else { None }
-                        };
-                        // Log shard assignment from coordinator (auto-sharding)
-                        if let Some(ref resp) = resp {
-                            if let Some(sa) = resp.get("shard_assignment") {
-                                if !sa.is_null() {
-                                    tracing::info!(
-                                        start = sa.get("start_layer").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        end = sa.get("end_layer").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        total = sa.get("total_layers").and_then(|v| v.as_u64()).unwrap_or(0),
-                                        seed = %addr,
-                                        "Auto-shard assignment received from coordinator"
-                                    );
-                                }
-                            }
-                        }
+                    let client = client.clone();
+                    let addr = addr.clone();
+                    let payload = if register_tick {
+                        register_payload.clone()
                     } else {
-                        let r = client.post(format!("http://{}/community/heartbeat", gateway_addr))
-                            .json(&heartbeat_payload).send().await;
-                        if r.is_err() {
-                            let _ = client.post(format!("http://{}/community/heartbeat", addr))
-                                .json(&heartbeat_payload).send().await;
-                        }
-                    }
+                        heartbeat_payload.clone()
+                    };
+                    let path = if register_tick { "register" } else { "heartbeat" };
+                    set.spawn(async move {
+                        let host = addr.split(':').next().unwrap_or(&addr).to_string();
+                        let gateway_addr = format!("{}:3001", host);
+                        // arc-node first…
+                        let primary = client
+                            .post(format!("http://{}/community/{}", addr, path))
+                            .json(&payload)
+                            .send()
+                            .await;
+                        let resp = match primary {
+                            Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+                            // …legacy gateway only if arc-node didn't answer.
+                            _ => match client
+                                .post(format!("http://{}/community/{}", gateway_addr, path))
+                                .json(&payload)
+                                .send()
+                                .await
+                            {
+                                Ok(r) => r.json::<serde_json::Value>().await.ok(),
+                                Err(_) => None,
+                            },
+                        };
+                        (addr, resp)
+                    });
+                }
+                while let Some(Ok((addr, resp))) = set.join_next().await {
+                    if let Some(resp) = resp
+                        && let Some(sa) = resp.get("shard_assignment")
+                            && !sa.is_null() {
+                                tracing::info!(
+                                    start = sa.get("start_layer").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    end = sa.get("end_layer").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    total = sa.get("total_layers").and_then(|v| v.as_u64()).unwrap_or(0),
+                                    seed = %addr,
+                                    "Auto-shard assignment received from coordinator"
+                                );
+                            }
                 }
                 ticks += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
@@ -1809,51 +1946,86 @@ async fn main() -> Result<()> {
                     Err(_) => return,
                 };
                 tracing::info!(
-                    address = %format!("0x{}", hex::encode(&worker_address.0)),
+                    address = %format!("0x{}", hex::encode(worker_address.0)),
                     "Community inference worker started - polling for jobs"
                 );
                 loop {
-                    // Try each seed: prefer the v0.7.0+ arc-node queue on
-                    // port 9090; fall back to the legacy Python gateway on
-                    // port 3001 for seeds that haven't upgraded yet.
+                    // Long-poll EVERY seed at once and take the first to hand
+                    // us work.
+                    //
+                    // This used to be a sequential `for addr in seeds`, each
+                    // awaiting a long-poll of up to COMMUNITY_CLAIM_TIMEOUT_SECS
+                    // (30 s) on :9090 and then again on :3001. With six seeds
+                    // the worst-case revisit interval for any one seed was
+                    // ~6 minutes, against a dispatcher that gives up after at
+                    // most 60 s — so a job queued on seed 5 expired before the
+                    // worker got back around to asking. Every live seed
+                    // reported total_work_completed = 0 despite three
+                    // registered workers.
+                    //
+                    // Now: one in-flight claim per seed, first responder wins,
+                    // the rest are dropped and re-armed on the next pass.
+                    let claim_body = serde_json::json!({
+                        "worker_id": worker_id_w,
+                        "capabilities": ["inference"],
+                    });
+                    let mut claims = tokio::task::JoinSet::new();
                     for addr in &seed_rpc_addrs_w {
-                        let host = addr.split(':').next().unwrap_or(addr);
-                        let primary = addr.clone(); // host:9090 (new arc-node)
+                        let client = client.clone();
+                        let body = claim_body.clone();
+                        let primary = addr.clone(); // host:9090 (arc-node)
+                        let host = addr.split(':').next().unwrap_or(addr).to_string();
                         let legacy = format!("{}:3001", host); // python gateway
-                        let claim_body = serde_json::json!({
-                            "worker_id": worker_id_w,
-                            "capabilities": ["inference"],
-                        });
-
-                        let try_post = |target: String| {
-                            let client = client.clone();
-                            let body = claim_body.clone();
-                            async move {
-                                let resp = client
-                                    .post(format!("http://{}/community/claim_work", target))
-                                    .json(&body)
-                                    .send()
-                                    .await
-                                    .ok()?;
-                                let job: serde_json::Value = resp.json().await.ok()?;
-                                if job.get("status").and_then(|s| s.as_str()) == Some("work") {
-                                    Some((target, job))
-                                } else {
-                                    None
+                        claims.spawn(async move {
+                            let try_post = |target: String| {
+                                let client = client.clone();
+                                let body = body.clone();
+                                async move {
+                                    let resp = client
+                                        .post(format!("http://{}/community/claim_work", target))
+                                        .json(&body)
+                                        .send()
+                                        .await
+                                        .ok()?;
+                                    let job: serde_json::Value = resp.json().await.ok()?;
+                                    if job.get("status").and_then(|s| s.as_str()) == Some("work") {
+                                        Some((target, job))
+                                    } else {
+                                        None
+                                    }
                                 }
+                            };
+                            match try_post(primary).await {
+                                Some(p) => Some(p),
+                                None => try_post(legacy).await,
                             }
-                        };
+                        });
+                    }
 
-                        let claimed = match try_post(primary.clone()).await {
-                            Some(p) => Some(p),
-                            None => try_post(legacy.clone()).await,
+                    let mut claimed: Option<(String, serde_json::Value)> = None;
+                    while let Some(res) = claims.join_next().await {
+                        if let Ok(Some(hit)) = res {
+                            claimed = Some(hit);
+                            break;
+                        }
+                    }
+                    // Dropping `claims` aborts the other outstanding polls;
+                    // they carry no state, so re-arming next pass is free.
+                    drop(claims);
+
+                    {
+                        let Some((winner, job)) = claimed else {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
                         };
-                        let Some((winner, job)) = claimed else { continue };
 
                         let job_id = job.get("job_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
                         let input = job.get("input").and_then(|s| s.as_str()).unwrap_or("").to_string();
                         let max_tokens = job.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
-                        if input.is_empty() || job_id.is_empty() { continue; }
+                        if input.is_empty() || job_id.is_empty() {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
 
                         tracing::info!("Claimed job {} from {}: {:?} (max_tokens={})",
                             job_id, winner, &input[..input.len().min(40)], max_tokens);
@@ -1872,7 +2044,7 @@ async fn main() -> Result<()> {
                         let elapsed_ms = start.elapsed().as_millis() as u64;
                         let output_text = model.decode(&generated);
                         let tokens_gen = generated.len() as u64;
-                        let ms_per_tok = if tokens_gen > 0 { elapsed_ms / tokens_gen } else { 0 };
+                        let ms_per_tok = elapsed_ms.checked_div(tokens_gen).unwrap_or(0);
 
                         tracing::info!("Job {} done: {} tokens in {}ms = {} ms/tok",
                             job_id, tokens_gen, elapsed_ms, ms_per_tok);
@@ -1883,14 +2055,13 @@ async fn main() -> Result<()> {
                         // there. Subsequent attestations increment locally.
                         if !attestation_nonce_initialized.load(std::sync::atomic::Ordering::Relaxed) {
                             let q_url = format!("http://{}/account/0x{}",
-                                winner, hex::encode(&worker_address.0));
-                            if let Ok(resp) = client.get(&q_url).send().await {
-                                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                winner, hex::encode(worker_address.0));
+                            if let Ok(resp) = client.get(&q_url).send().await
+                                && let Ok(v) = resp.json::<serde_json::Value>().await {
                                     let n = v.get("nonce").and_then(|x| x.as_u64()).unwrap_or(0);
                                     attestation_nonce.store(n, std::sync::atomic::Ordering::Relaxed);
                                     tracing::info!(starting_nonce = n, "worker attestation nonce initialized from chain");
                                 }
-                            }
                             attestation_nonce_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
 
@@ -1945,10 +2116,10 @@ async fn main() -> Result<()> {
 
                         let mut result_body = serde_json::json!({
                             "job_id": job_id,
-                            "worker_id": format!("0x{}", hex::encode(&worker_address.0)),
+                            "worker_id": format!("0x{}", hex::encode(worker_address.0)),
                             "success": true,
                             "output": output_text,
-                            "output_hash": format!("0x{}", hex::encode(&hash.0)),
+                            "output_hash": format!("0x{}", hex::encode(hash.0)),
                             "tokens_generated": tokens_gen,
                             "total_ms": elapsed_ms,
                             "ms_per_token": ms_per_tok,
@@ -1967,8 +2138,8 @@ async fn main() -> Result<()> {
 
                         // If submit reports invalid_nonce, force a re-query
                         // of the chain on the next loop iteration.
-                        if let Ok(resp) = submit_resp {
-                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Ok(resp) = submit_resp
+                            && let Ok(body) = resp.json::<serde_json::Value>().await {
                                 let attestation = body.get("attestation");
                                 if let Some(a) = attestation {
                                     let status = a.get("status").and_then(|s| s.as_str()).unwrap_or("");
@@ -1980,9 +2151,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                        }
 
-                        break; // after completing a job, go back to the top and poll again
                     }
                     // Brief sleep between poll rounds to avoid hammering
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1991,6 +2160,46 @@ async fn main() -> Result<()> {
             tracing::info!("Community inference worker loop spawned");
         }
     }
+
+    // Seed RPC endpoints the coordinator can pull shard topology from when
+    // its own registry doesn't cover the model. Convention: seeds serve RPC
+    // on 9090 regardless of the P2P port advertised in the seeds file.
+    let coordinator_seed_rpcs: Vec<String> = {
+        let mut v: Vec<String> = peers
+            .iter()
+            .filter_map(|p| p.split(':').next())
+            .filter(|h| !h.is_empty())
+            .map(|h| format!("{}:9090", h))
+            .collect();
+        // --shard-hosts: registry sources reached over HTTP only, never
+        // dialed for P2P. A bare host takes the conventional RPC port; an
+        // explicit host:port is honoured so a non-standard RPC port works.
+        for h in &cli.shard_hosts {
+            let h = h.trim();
+            if h.is_empty() {
+                continue;
+            }
+            v.push(if h.contains(':') {
+                h.to_string()
+            } else {
+                format!("{}:9090", h)
+            });
+        }
+        v.sort();
+        v.dedup();
+        v
+    };
+
+    // Inference pool width: explicit --threads wins, then [inference] threads
+    // from the config file, else 0 = rayon's global pool (which honours
+    // RAYON_NUM_THREADS; see config::InferenceConfig).
+    let compute_threads = if matches.value_source("threads")
+        == Some(clap::parser::ValueSource::CommandLine)
+    {
+        cli.threads
+    } else {
+        node_cfg.inference.threads
+    };
 
     rpc::serve(
         &rpc_addr,
@@ -2008,8 +2217,106 @@ async fn main() -> Result<()> {
         Some(dag_round),
         Some(dag_committed),
         shard_infos,
+        coordinator_seed_rpcs,
+        compute_threads,
+        genesis_chain_identity,
     )
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pulled_stub_rewritten_to_seed_host_port() {
+        // AMS announces self_shard with socket_addr=0.0.0.0:9090. We pulled
+        // from http://136.244.109.1:9090/shards, so the routable addr for AMS
+        // IS the URL we pulled from - use it.
+        let mut v = json!({
+            "start_layer": 10, "end_layer": 14, "socket_addr": "0.0.0.0:9090",
+            "node_name": "AMS"
+        });
+        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
+        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+    }
+
+    #[test]
+    fn pulled_routable_addr_is_left_alone() {
+        let mut v = json!({
+            "start_layer": 10, "end_layer": 14, "socket_addr": "136.244.109.1:9090",
+            "node_name": "AMS"
+        });
+        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
+        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+    }
+
+    #[test]
+    fn pulled_stub_uses_declared_port_over_pulled_url_port() {
+        // Peer bound to 9090 but we pulled from its port 8545 (hypothetical) -
+        // prefer the port the peer declared for its listener.
+        let mut v = json!({
+            "socket_addr": "0.0.0.0:9090", "node_name": "X"
+        });
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:8545");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_stub_falls_back_to_pulled_url_port_when_declared_is_bad() {
+        let mut v = json!({
+            "socket_addr": "0.0.0.0:junk", "node_name": "X"
+        });
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_loopback_stub_also_rewritten() {
+        // Seed set up with --rpc 127.0.0.1 on a misconfigured run would announce
+        // 127.0.0.1:9090. The pulled URL is the routable address, use it.
+        let mut v = json!({
+            "socket_addr": "127.0.0.1:9090", "node_name": "X"
+        });
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_ipv6_stub_rewritten() {
+        let mut v = json!({"socket_addr": "[::]:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+
+        let mut v = json!({"socket_addr": "[::1]:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_empty_addr_rewritten() {
+        let mut v = json!({"socket_addr": "", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn missing_socket_addr_field_is_noop() {
+        // Malformed / partial self_shard JSON should not panic.
+        let mut v = json!({"node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert!(v.get("socket_addr").is_none());
+    }
+
+    #[test]
+    fn pulled_url_with_no_port_is_tolerated() {
+        // Defensive: if seed_addrs_pull accidentally carries a host without a port,
+        // rewrite still produces a sensible string (host + default 9090).
+        let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "136.244.109.1");
+        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+    }
 }

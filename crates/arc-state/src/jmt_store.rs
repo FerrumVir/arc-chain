@@ -82,7 +82,7 @@ impl NibblePath {
     /// Build from an explicit nibble slice (each element 0..15).
     fn from_nibbles(nibbles: &[u8]) -> Self {
         let num_nibbles = nibbles.len();
-        let byte_len = (num_nibbles + 1) / 2;
+        let byte_len = num_nibbles.div_ceil(2);
         let mut bytes = vec![0u8; byte_len];
         for (i, &nib) in nibbles.iter().enumerate() {
             if i % 2 == 0 {
@@ -107,17 +107,13 @@ impl NibblePath {
         self.num_nibbles
     }
 
-    fn is_empty(&self) -> bool {
-        self.num_nibbles == 0
-    }
-
     /// Get the nibble at position `i`, or `None` if out of bounds.
     fn get(&self, i: usize) -> Option<u8> {
         if i >= self.num_nibbles {
             return None;
         }
         let byte = self.bytes[i / 2];
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             Some(byte >> 4)
         } else {
             Some(byte & 0x0F)
@@ -142,26 +138,6 @@ impl NibblePath {
         Self::from_nibbles(&nibbles)
     }
 
-    /// Concatenate this path with another.
-    fn concat(&self, other: &NibblePath) -> Self {
-        // Safety: both loops iterate within respective num_nibbles bounds
-        let mut nibbles: Vec<u8> = (0..self.num_nibbles).map(|i| self.get(i).unwrap()).collect();
-        for i in 0..other.num_nibbles {
-            nibbles.push(other.get(i).unwrap());
-        }
-        Self::from_nibbles(&nibbles)
-    }
-
-    /// Prepend a single nibble to produce a new path.
-    fn prepend_nibble(&self, nibble: u8) -> Self {
-        let mut nibbles = vec![nibble];
-        // Safety: iterating within num_nibbles bounds
-        for i in 0..self.num_nibbles {
-            nibbles.push(self.get(i).unwrap());
-        }
-        Self::from_nibbles(&nibbles)
-    }
-
     /// Length of the common prefix shared with `other`.
     fn common_prefix_len(&self, other: &NibblePath) -> usize {
         let limit = self.num_nibbles.min(other.num_nibbles);
@@ -174,19 +150,13 @@ impl NibblePath {
         limit
     }
 
-    /// Unpack all nibbles into a Vec.
-    fn to_nibbles(&self) -> Vec<u8> {
-        // Safety: iterating within num_nibbles bounds
-        (0..self.num_nibbles).map(|i| self.get(i).unwrap()).collect()
-    }
-
     /// Convert a full 64-nibble path back to an Address.
     fn to_address(path: &NibblePath) -> Address {
         let mut addr = [0u8; 32];
-        for i in 0..32 {
+        for (i, byte) in addr.iter_mut().enumerate() {
             let hi = path.get(i * 2).unwrap_or(0);
             let lo = path.get(i * 2 + 1).unwrap_or(0);
-            addr[i] = (hi << 4) | lo;
+            *byte = (hi << 4) | lo;
         }
         Hash256(addr)
     }
@@ -214,7 +184,10 @@ pub struct NodeKey {
 pub enum Node {
     /// 16-ary branch node. `children[nibble]` is `Some((child_hash, child_version))`
     /// when that child exists.
-    Internal(InternalNode),
+    ///
+    /// Boxed: an `InternalNode` is 16 slots wide, an order of magnitude larger
+    /// than `LeafNode`, and leaves dominate the node map.
+    Internal(Box<InternalNode>),
     /// Stores the full address, remaining suffix, and value hash.
     Leaf(LeafNode),
     /// Sentinel / empty subtree.
@@ -247,24 +220,6 @@ impl InternalNode {
         }
         Hash256(*hasher.finalize().as_bytes())
     }
-
-    /// Count of non-None children.
-    fn child_count(&self) -> usize {
-        self.children.iter().filter(|c| c.is_some()).count()
-    }
-
-    /// If exactly one child, return its (nibble, hash, version).
-    fn single_child(&self) -> Option<(u8, Hash256, u64)> {
-        if self.child_count() != 1 {
-            return None;
-        }
-        for (i, slot) in self.children.iter().enumerate() {
-            if let Some((h, v)) = slot {
-                return Some((i as u8, *h, *v));
-            }
-        }
-        None
-    }
 }
 
 /// Leaf node: stores the full key (address), a suffix of the nibble path
@@ -287,6 +242,21 @@ impl LeafNode {
         hasher.update(&self.value_hash.0);
         Hash256(*hasher.finalize().as_bytes())
     }
+}
+
+/// The two diverging leaves handed to `build_split`, each with the full nibble
+/// path of its address. Grouped into one struct purely to keep `build_split`'s
+/// parameter list readable - the fields are used exactly as before.
+#[derive(Clone, Copy)]
+struct SplitPair<'a> {
+    /// Full nibble path of the leaf already in the trie.
+    existing_path: &'a NibblePath,
+    /// The leaf already in the trie.
+    existing_leaf: &'a LeafNode,
+    /// Full nibble path of the leaf being inserted.
+    new_path: &'a NibblePath,
+    /// The leaf being inserted.
+    new_leaf: &'a LeafNode,
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +292,12 @@ pub struct JmtStore {
     /// Root NodeKey path (always empty) - stored per version.
     /// Maps version → root node key for traversal.
     root_keys: DashMap<u64, NodeKey>,
+}
+
+impl Default for JmtStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl JmtStore {
@@ -589,7 +565,6 @@ impl JmtStore {
             };
             root_node = Some(self.insert_recursive(
                 root_node,
-                prev_version,
                 new_version,
                 &path,
                 0,
@@ -619,7 +594,6 @@ impl JmtStore {
     fn insert_recursive(
         &self,
         node: Option<Node>,
-        prev_version: u64,
         new_version: u64,
         path: &NibblePath,
         depth: usize,
@@ -660,10 +634,12 @@ impl JmtStore {
                     depth,
                     depth + common_len,
                     new_version,
-                    &existing_full_path,
-                    &existing,
-                    new_full_path,
-                    &new_leaf,
+                    SplitPair {
+                        existing_path: &existing_full_path,
+                        existing_leaf: &existing,
+                        new_path: new_full_path,
+                        new_leaf: &new_leaf,
+                    },
                 )
             }
             Some(Node::Internal(internal)) => {
@@ -692,7 +668,6 @@ impl JmtStore {
 
                 let new_child = self.insert_recursive(
                     child_node,
-                    prev_version,
                     new_version,
                     path,
                     depth + 1,
@@ -721,11 +696,14 @@ impl JmtStore {
         base_depth: usize,
         split_depth: usize,
         new_version: u64,
-        existing_path: &NibblePath,
-        existing_leaf: &LeafNode,
-        new_path: &NibblePath,
-        new_leaf: &LeafNode,
+        pair: SplitPair<'_>,
     ) -> Node {
+        let SplitPair {
+            existing_path,
+            existing_leaf,
+            new_path,
+            new_leaf,
+        } = pair;
         let existing_nibble = existing_path.get(split_depth)
             .expect("split_depth within existing path bounds") as usize;
         let new_nibble = new_path.get(split_depth)
@@ -763,7 +741,7 @@ impl JmtStore {
         internal.children[existing_nibble] = Some((existing_hash, new_version));
         internal.children[new_nibble] = Some((new_hash, new_version));
 
-        let mut current = Node::Internal(internal);
+        let mut current = Node::Internal(Box::new(internal));
 
         // Wrap in additional internal nodes for each shared-prefix nibble
         // between base_depth and split_depth (if any).
@@ -781,7 +759,7 @@ impl JmtStore {
 
             let mut wrapper = InternalNode::new();
             wrapper.children[nibble] = Some((current_hash, new_version));
-            current = Node::Internal(wrapper);
+            current = Node::Internal(Box::new(wrapper));
         }
 
         current
@@ -800,7 +778,7 @@ impl JmtStore {
     fn get_leaf(&self, version: u64, path: &NibblePath) -> Option<LeafNode> {
         let root_key = self.root_keys.get(&version)?;
         let root_node = self.nodes.get(&*root_key)?;
-        self.traverse_to_leaf(&*root_node, version, path, 0)
+        self.traverse_to_leaf(&root_node, version, path, 0)
     }
 
     /// Recursively traverse the trie to find a leaf.
@@ -834,7 +812,7 @@ impl JmtStore {
                     nibble_path: path.prefix(depth + 1),
                 };
                 let child = self.nodes.get(&child_key)?;
-                self.traverse_to_leaf(&*child, child_ver, path, depth + 1)
+                self.traverse_to_leaf(&child, child_ver, path, depth + 1)
             }
         }
     }
@@ -919,6 +897,12 @@ pub struct JmtStateTree {
     version: u64,
 }
 
+impl Default for JmtStateTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JmtStateTree {
     /// Create a new, empty JMT state tree.
     pub fn new() -> Self {
@@ -974,7 +958,7 @@ impl JmtStateTree {
             .iter()
             .map(|(k, v)| (*k, *v))
             .collect();
-        sorted_leaves.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted_leaves.sort_by_key(|a| a.0);
 
         // Build Merkle tree bottom-up from sorted leaf hashes.
         let leaf_hashes: Vec<Hash256> = sorted_leaves
@@ -1005,7 +989,7 @@ impl JmtStateTree {
 
         let mut current_level = hashes.to_vec();
         while current_level.len() > 1 {
-            let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+            let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
             for chunk in current_level.chunks(2) {
                 if chunk.len() == 2 {
                     let mut hasher = blake3::Hasher::new_derive_key("arc-jmt-internal-v1");
@@ -1034,7 +1018,6 @@ impl JmtStateTree {
         // use it.
         if version > self.version {
             // Cannot prune past the current version - clamp silently.
-            return;
         }
         // In the full VersionedJmtStore this would drop old nodes.
         // Here it is intentionally a no-op on the node set.
@@ -1072,7 +1055,7 @@ impl JmtStateTree {
             .iter()
             .map(|(k, v)| (*k, *v))
             .collect();
-        sorted_leaves.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted_leaves.sort_by_key(|a| a.0);
 
         let leaf_hashes: Vec<Hash256> = sorted_leaves
             .iter()
@@ -1100,7 +1083,7 @@ impl JmtStateTree {
         let mut current_level = hashes.to_vec();
 
         while current_level.len() > 1 {
-            let sibling_idx = if index % 2 == 0 { index + 1 } else { index - 1 };
+            let sibling_idx = if index.is_multiple_of(2) { index + 1 } else { index - 1 };
             if sibling_idx < current_level.len() {
                 siblings.push(current_level[sibling_idx]);
             } else {
@@ -1109,7 +1092,7 @@ impl JmtStateTree {
             }
 
             // Move to next level.
-            let mut next_level = Vec::with_capacity((current_level.len() + 1) / 2);
+            let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
             for chunk in current_level.chunks(2) {
                 if chunk.len() == 2 {
                     let mut hasher = blake3::Hasher::new_derive_key("arc-jmt-internal-v1");
@@ -1147,7 +1130,7 @@ impl JmtProof {
 
         for sibling in &self.siblings {
             let mut hasher = blake3::Hasher::new_derive_key("arc-jmt-internal-v1");
-            if index % 2 == 0 {
+            if index.is_multiple_of(2) {
                 hasher.update(current.as_ref());
                 hasher.update(sibling.as_ref());
             } else {
@@ -1176,8 +1159,8 @@ mod tests {
         let mut addr = [0u8; 32];
         // Fill with a deterministic pattern based on seed so different seeds
         // produce very different nibble paths.
-        for i in 0..32 {
-            addr[i] = seed.wrapping_mul(17).wrapping_add(i as u8);
+        for (i, byte) in addr.iter_mut().enumerate() {
+            *byte = seed.wrapping_mul(17).wrapping_add(i as u8);
         }
         Hash256(addr)
     }

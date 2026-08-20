@@ -1,6 +1,6 @@
 # ARC Chain - Sharded AI Inference Across the Network
 
-A real Llama-2-7B model running across **7 separate VPS in 7 cities**. Each holds ~1 GB of weights. No single one of them has the full model. Together they answer prompts in real time, with **bit-identical output on every chip on earth**.
+A real Llama-2-7B model running across **6 separate VPS in 6 cities**. The 32 transformer layers are split into 6 contiguous ranges, each replicated on 3 of the 6 machines, so every node holds 15–17 layers (~3 GB) and no single one has the full model. Together they answer prompts, with **bit-identical output on every chip on earth**.
 
 **Live demo (open in any browser):**
 http://140.82.16.112:3200
@@ -59,7 +59,7 @@ Anyone can run a node and contribute compute. Persistent service, daily auto-upd
 curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
 ```
 
-The installer auto-detects your platform (macOS arm64/x86, Linux x86_64/aarch64), pulls the latest pre-built binary from GitHub releases, downloads Llama-2-7B-Chat Q4_K_M, generates a unique validator seed, and installs as a launchd / systemd service that auto-starts and auto-restarts. A daily timer at 04:17 local checks for new releases and seamlessly upgrades the binary.
+The installer auto-detects your platform (macOS arm64/x86, Linux x86_64), pulls the newest pre-built binary that actually ships an `arc-node` CLI asset for it, generates a unique validator seed, and installs as a launchd / systemd service that auto-starts and auto-restarts. It joins with `--stake 0 --community-mode`, which takes no consensus role. A daily timer checks for new releases. **No model download is required to join** — pass `--model /path/to.gguf` if you also want to serve inference. (ARM Linux is not covered: `arc-node-linux-aarch64` has never been published, so it must build from source.)
 
 After install your node is running, joined to the testnet, and visible at the live dashboard above.
 
@@ -115,7 +115,7 @@ A 10-concurrent stress test (10 different prompts sent in parallel through the 6
 
 - **6 layer ranges × 3 replicas** of Llama-2-7B (4 GB total, ~1.1 GB per range-replica)
 - **6 testnet seed nodes** in NYC, LAX, AMS, LHR, NRT, SGP
-- **32 transformer layers** split contiguously across the 7 shard nodes
+- **32 transformer layers** split contiguously into 6 ranges across the 6 shard nodes (18 replica entries)
 - **~150 KB** transferred per token across the network (i64 hidden states + JSON envelope + BLAKE3 hashes)
 - **Bit-identical output** across every replay, every machine, every CPU architecture
 

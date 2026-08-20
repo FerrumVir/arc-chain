@@ -1,0 +1,18 @@
+# Deliberately minimal.
+#
+# Every option here is stable, so `cargo fmt` behaves identically on the
+# stable toolchain CI uses and on a contributor's machine. Do not add nightly
+# options (imports_granularity, group_imports, wrap_comments, ...) — they are
+# silently ignored on stable, which produces the worst possible outcome: a
+# formatting gate that disagrees with itself depending on who ran it.
+#
+# Keeping the option set small also keeps the one-time `make fmt` commit
+# mechanical and reviewable. Widen this file later if there is appetite; the
+# cost of doing so is another repo-wide diff.
+
+edition = "2024"
+max_width = 100
+
+# Normalise line endings so the Windows leg of the test matrix and any
+# contributor with core.autocrlf=true produce the same bytes as CI.
+newline_style = "Unix"

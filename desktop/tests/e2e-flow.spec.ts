@@ -7,7 +7,12 @@ import { expect, test } from "@playwright/test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { clearState, seedOnboarded } from "./helpers";
+import {
+  clearState,
+  seedOnboarded,
+  seedOnboardedLegacy,
+  walkToLaunch,
+} from "./helpers";
 
 const __dirnameHere = path.dirname(fileURLToPath(import.meta.url));
 const REPO_DESKTOP = path.resolve(__dirnameHere, "..");
@@ -17,13 +22,19 @@ test.describe("Onboarding → launch end-to-end", () => {
     await clearState(page);
   });
 
-  test("three-step launch: welcome → identity → join", async ({ page }) => {
+  test("four-step launch: welcome → identity → model → join", async ({
+    page,
+  }) => {
     await page.goto("/");
 
     await page.getByTestId("btn-continue-welcome").click();
     await expect(page.getByTestId("step-identity")).toBeVisible();
     await page.getByTestId("btn-reveal-seed").click();
     await page.getByTestId("btn-continue-identity").click();
+    // Model picker (v0.6.0). This spec used to assert step-launch here.
+    await expect(page.getByTestId("step-model")).toBeVisible();
+    await page.getByTestId("tier-skip").click();
+    await page.getByTestId("btn-continue-model").click();
     await expect(page.getByTestId("step-launch")).toBeVisible();
     await expect(page.getByText(/ready to join/i)).toBeVisible();
 
@@ -38,27 +49,31 @@ test.describe("Onboarding → launch end-to-end", () => {
     page,
   }) => {
     await page.goto("/");
-    await page.getByTestId("btn-continue-welcome").click();
-    await page.getByTestId("btn-reveal-seed").click();
-    await page.getByTestId("btn-continue-identity").click();
+    await walkToLaunch(page);
     await expect(page.getByTestId("btn-launch")).toBeVisible();
     await expect(page.getByTestId("btn-launch")).toContainText(
       /join the network/i,
     );
   });
 
-  test("launch pipeline stops off on observer role + null modelPath", () => {
-    // Regression guard: we ship with role="observer" and no model so users
-    // don't have to pick anything. Onboarding.tsx must not regress to
-    // role=worker (which would trigger the inference-worker path we don't
-    // want to default users into).
+  test("node role is derived from whether a model was downloaded", () => {
+    // This previously asserted a literal `role: "observer"` + `modelPath:
+    // null`, from the v0.5.x design where onboarding always shipped an
+    // observer and the user picked nothing. v0.6.0 deliberately replaced
+    // that: the user chooses a model tier, and the role is a CONSEQUENCE of
+    // whether a model landed on disk. That is the behaviour to guard now -
+    // the old assertion would force a regression back to a node that can
+    // never earn.
     const src = fs.readFileSync(
       path.resolve(REPO_DESKTOP, "src", "screens", "Onboarding.tsx"),
       "utf8",
     );
-    expect(src).toMatch(/role:\s*"observer"/);
-    expect(src).toMatch(/modelPath:\s*null/);
-    // And no more role picker
+    // Role is computed from modelPath, and observer is still the no-model
+    // outcome.
+    expect(src).toMatch(/role:\s*modelPath\s*\?\s*"worker"\s*:\s*"observer"/);
+    // Skipping the model picker must still yield a null modelPath.
+    expect(src).toMatch(/let modelPath: string \| null = null/);
+    // And still no role picker - that part of the old contract stands.
     expect(src).not.toMatch(/ROLE_META/);
     expect(src).not.toMatch(/setRole/);
   });
@@ -81,40 +96,84 @@ test.describe("Earnings chart uses real attestation data", () => {
     await seedOnboarded(page);
   });
 
-  test("seven-day bars sum to the mock attestations' rewardArc total (114.5)", async ({
+  test("seven-day bars count only the user's own dated attestations", async ({
     page,
   }) => {
     await page.goto("/");
     await page.getByTestId("nav-earnings").click();
     await expect(page.getByTestId("earnings-screen")).toBeVisible();
 
-    // Mock attestations: rewardArc values 12.5, 34.8, 67.2 - sum 114.5.
-    // All three timestamped within the last ~4 minutes so they all land
-    // in today's bucket. The bar values rendered as toFixed(0) - today's
-    // bar should read "115" (rounded from 114.5) and the other 6 should
-    // read "0". The old Math.random implementation would land every bar
-    // in the 100-400 range so any bar > 200 would prove regression.
-    const labels = await page
-      .locator("[data-testid='earnings-screen']")
+    // The mock has three attestations: two credited to this user at
+    // 2.5 ARC each with real timestamps, and one from another validator
+    // with no timestamp and no reward. Only the first two are bucketable,
+    // so today's bar is 5 ARC and the other six are 0.
+    //
+    // The previous version of this test expected 114.5 across bars, from
+    // per-attestation rewards of 12.5/34.8/67.2 - figures the chain never
+    // produced. The real testnet rate is a flat 2.5 per attestation.
+    const chart = page.getByTestId("weekly-chart");
+    await expect(chart).toBeVisible();
+
+    const labels = await chart
       .locator("div")
       .filter({ hasText: /^(\d+)$/ })
       .allTextContents();
 
-    // Extract numeric bar-top labels (the div above each bar).
-    // The simplest check: at least one bar shows a non-zero number that's
-    // below the Math.random() floor (100), and the majority of bars read 0.
-    // Count the "0" bars - expect ≥ 5 of 7.
     const zeroCount = labels.filter((l) => l === "0").length;
-    expect(zeroCount).toBeGreaterThanOrEqual(5);
+    expect(zeroCount).toBeGreaterThanOrEqual(6);
 
-    // And assert that at least one bar has a value in the expected
-    // 100-200 range for the Math.random regression check. Since the mock
-    // has 114.5 ARC today, any value from "110"–"120" is acceptable.
-    const hasExpectedTodayBar = labels.some((l) => {
-      const n = Number(l);
-      return Number.isFinite(n) && n >= 100 && n <= 200;
-    });
-    expect(hasExpectedTodayBar).toBe(true);
+    // Today's bar: 2 × 2.5 = 5, rendered with toFixed(0).
+    expect(labels).toContain("5");
+
+    // The other validator's attestation must not have been counted.
+    expect(labels.some((l) => Number(l) > 5)).toBe(false);
+  });
+
+  test("another validator's attestation is not shown as the user's income", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("nav-earnings").click();
+    const feed = page.getByTestId("all-attestations");
+    await expect(feed).toBeVisible();
+    // Two of four mock attestations are the user's; the other two (another
+    // validator's row and an old-seed padding row) must not be counted.
+    await expect(page.getByText(/2 yours · 4 shown/)).toBeVisible();
+    await expect(feed.getByText("network", { exact: true })).toHaveCount(2);
+  });
+});
+
+test.describe("Recovery phrase never reaches localStorage", () => {
+  test("a phrase persisted by an older build is scrubbed on load", async ({
+    page,
+  }) => {
+    // Older builds wrote the full identity - seedPhrase included - into
+    // localStorage in plaintext. Those blobs are still on disk, so the
+    // store scrubs them on load rather than only avoiding new writes.
+    await seedOnboardedLegacy(page);
+    await page.goto("/");
+    await expect(page.getByTestId("dashboard")).toBeVisible();
+
+    const stored = await page.evaluate(() =>
+      localStorage.getItem("arc-desktop-state-v1"),
+    );
+    expect(stored).toBeTruthy();
+    expect(stored).not.toContain("seedPhrase");
+    expect(stored).not.toContain("galaxy stellar quantum");
+
+    // The address survives - only the signing material is dropped.
+    expect(stored).toContain("arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p");
+  });
+
+  test("the removed on-chain inference mode is coerced to coordinator", async ({
+    page,
+  }) => {
+    await seedOnboardedLegacy(page);
+    await page.goto("/");
+    await page.getByTestId("nav-settings").click();
+    // The on-chain radio was deleted but every default still said
+    // "onchain", so this radio rendered unchecked on a fresh install.
+    await expect(page.getByTestId("inference-mode-coordinator")).toBeChecked();
   });
 });
 
@@ -193,8 +252,24 @@ test.describe("Spawn CLI contract (Rust source)", () => {
     }
   });
 
-  test("community-mode only toggled for worker role", () => {
-    expect(src).toMatch(/if\s+config\.role\s*==\s*"worker"\s*\{[\s\S]*?--community-mode/);
+  test("community-mode only toggled for worker role WITH a model", () => {
+    // The old regex was `if config.role == "worker" {` followed by
+    // `--community-mode`, and it passed against the *log-line* formatting
+    // rather than the spawn gate. The real gate has always additionally
+    // required a model (a worker with no model would have the gateway
+    // forward requests it cannot answer), so the test was green for the
+    // wrong reason and would have stayed green if the gate were deleted.
+    // Assert the actual argv condition.
+    expect(src).toMatch(
+      /if\s+config\.role\s*==\s*"worker"\s*&&\s*config\.model_path\.is_some\(\)\s*\{[\s\S]{0,200}?--community-mode/,
+    );
+  });
+
+  test("never joins the public network as a staked validator", () => {
+    // LIVE-NETWORK SAFETY (CLAUDE.md rules 2 and 3): arc-node's --stake
+    // defaults to 5,000,000, and stake > 0 with a model set is what triggers
+    // auto-shard-join. A desktop node must always announce stake 0.
+    expect(src).toMatch(/\.arg\("--stake"\)\s*\n?\s*\.arg\("0"\)/);
   });
 });
 
@@ -212,11 +287,35 @@ test.describe("ensure_binary auto-download", () => {
   });
 
   test("downloaded binary is written to ~/.arc/bin/arc-node", () => {
+    // The path is composed across two files now: paths.rs owns
+    // `home_dir()/.arc` (so Windows resolves USERPROFILE instead of silently
+    // falling back to `./.arc`), and node_manager.rs appends `bin/arc-node`.
+    // The old single-file regex matched the literal `.arc"` that used to sit
+    // inside managed_binary_path.
     const nm = fs.readFileSync(
       path.resolve(REPO_DESKTOP, "src-tauri", "src", "node_manager.rs"),
       "utf8",
     );
-    expect(nm).toMatch(/\.arc"[\s\S]*?"bin"[\s\S]*?arc-node/);
+    const paths = fs.readFileSync(
+      path.resolve(REPO_DESKTOP, "src-tauri", "src", "paths.rs"),
+      "utf8",
+    );
+    expect(paths).toMatch(/fn arc_home\(\)[\s\S]*?home_dir\(\)\.join\("\.arc"\)/);
+    expect(nm).toMatch(
+      /fn managed_binary_path\(\)[\s\S]*?arc_home\(\)[\s\S]*?"bin"[\s\S]*?arc-node/,
+    );
+  });
+
+  test("home dir resolution honours USERPROFILE, not just HOME", () => {
+    // Windows normally has no HOME. Reading only HOME turned the default
+    // `~/.arc` data dir into `./.arc` relative to the GUI's CWD - typically
+    // an unwritable directory under Program Files.
+    const paths = fs.readFileSync(
+      path.resolve(REPO_DESKTOP, "src-tauri", "src", "paths.rs"),
+      "utf8",
+    );
+    expect(paths).toMatch(/"HOME"/);
+    expect(paths).toMatch(/"USERPROFILE"/);
   });
 
   test("writes 0o755 perms on unix so it's executable", () => {

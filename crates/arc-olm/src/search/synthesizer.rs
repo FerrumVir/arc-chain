@@ -14,6 +14,15 @@ use crate::primitives::{grid, object};
 use std::collections::BTreeSet;
 use std::time::Instant;
 
+/// A grid->grid transform paired with the name used for it in a program string.
+type NamedGridFn = (&'static str, fn(&Grid) -> Grid);
+
+/// An object->cell-set function paired with the name used for it in a program string.
+type NamedRegionFn = (&'static str, fn(&Object) -> BTreeSet<(usize, usize)>);
+
+/// Cells grouped by color: color -> set of (color, (row, col)).
+type ColorGroups = std::collections::HashMap<u8, BTreeSet<(u8, (usize, usize))>>;
+
 /// Result of synthesis.
 pub struct SynthResult {
     pub program_desc: String,
@@ -121,7 +130,7 @@ fn level_0(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
 ) -> Option<SynthResult> {
-    let unary_prims: Vec<(&str, fn(&Grid) -> Grid)> = vec![
+    let unary_prims: Vec<NamedGridFn> = vec![
         ("rot90",       grid::rot90),
         ("rot180",      grid::rot180),
         ("rot270",      grid::rot270),
@@ -279,14 +288,14 @@ fn level_1(
         let mut valid = true;
 
         for (inp, out) in train_pairs {
-            if inp.len() != out.len() || (inp.len() > 0 && inp[0].len() != out[0].len()) {
+            if inp.len() != out.len() || (!inp.is_empty() && inp[0].len() != out[0].len()) {
                 valid = false;
                 break;
             }
             let mut this_map: Vec<(u8, u8)> = Vec::new();
             let mut consistent = true;
-            for (_r, (irow, orow)) in inp.iter().zip(out.iter()).enumerate() {
-                for (_c, (&iv, &ov)) in irow.iter().zip(orow.iter()).enumerate() {
+            for (irow, orow) in inp.iter().zip(out.iter()) {
+                for (&iv, &ov) in irow.iter().zip(orow.iter()) {
                     if let Some(&(_, mapped)) = this_map.iter().find(|&&(from, _)| from == iv) {
                         if mapped != ov { consistent = false; break; }
                     } else {
@@ -301,17 +310,16 @@ fn level_1(
                 Some(existing) => {
                     // Verify same mapping across pairs
                     for &(from, to) in &this_map {
-                        if let Some(&(_, eto)) = existing.iter().find(|&&(f, _)| f == from) {
-                            if eto != to { valid = false; break; }
-                        }
+                        if let Some(&(_, eto)) = existing.iter().find(|&&(f, _)| f == from)
+                            && eto != to { valid = false; break; }
                     }
                     if !valid { break; }
                 }
             }
         }
-        if valid {
-            if let Some(mapping) = color_map {
-                if let Some(test_outputs) = verify_and_apply(
+        if valid
+            && let Some(mapping) = color_map
+                && let Some(test_outputs) = verify_and_apply(
                     &|g: &Grid| {
                         g.iter().map(|row| {
                             row.iter().map(|&c| {
@@ -327,12 +335,10 @@ fn level_1(
                         test_outputs, level: 1,
                     });
                 }
-            }
-        }
     }
 
     // 1f. Self-concat patterns
-    let concat_patterns: Vec<(&str, fn(&Grid) -> Grid)> = vec![
+    let concat_patterns: Vec<NamedGridFn> = vec![
         ("hconcat(I,I)",            |g| grid::hconcat(g, g)),
         ("vconcat(I,I)",            |g| grid::vconcat(g, g)),
         ("hconcat(I,vmirror(I))",   |g| grid::hconcat(g, &grid::vmirror(g))),
@@ -374,7 +380,7 @@ fn level_2(
     start: &Instant,
     timeout_ms: u64,
 ) -> Option<SynthResult> {
-    let unary_prims: Vec<(&str, fn(&Grid) -> Grid)> = vec![
+    let unary_prims: Vec<NamedGridFn> = vec![
         ("rot90",       grid::rot90),
         ("rot180",      grid::rot180),
         ("rot270",      grid::rot270),
@@ -661,7 +667,7 @@ fn level_3(
     // 3d. fill(input, fill_color, region(selector(objects(input, ...))))
     //     region in {delta, backdrop, obj_box}
     //     selector in {argmax_size, argmin_size}
-    let region_fns: Vec<(&str, fn(&Object) -> BTreeSet<(usize, usize)>)> = vec![
+    let region_fns: Vec<NamedRegionFn> = vec![
         ("delta",    object::delta),
         ("backdrop", object::backdrop),
         ("obj_box",  object::obj_box),
@@ -964,7 +970,7 @@ fn level_3(
     // 3l. Partition by color (group cells by color as objects)
     {
         fn partition(grid: &Grid) -> Vec<Object> {
-            let mut color_groups: std::collections::HashMap<u8, BTreeSet<(u8, (usize, usize))>> =
+            let mut color_groups: ColorGroups =
                 std::collections::HashMap::new();
             for (r, row) in grid.iter().enumerate() {
                 for (c, &v) in row.iter().enumerate() {
@@ -1199,12 +1205,11 @@ fn level_3(
                 let mut queue = std::collections::VecDeque::new();
                 for r in 0..h {
                     for c in 0..w {
-                        if (r == 0 || r == h-1 || c == 0 || c == w-1) && inp[r][c] == bg {
-                            if !reachable[r][c] {
+                        if (r == 0 || r == h-1 || c == 0 || c == w-1) && inp[r][c] == bg
+                            && !reachable[r][c] {
                                 reachable[r][c] = true;
                                 queue.push_back((r, c));
                             }
-                        }
                     }
                 }
                 while let Some((r, c)) = queue.pop_front() {
@@ -1293,8 +1298,8 @@ fn level_3(
         if ih > 0 && iw > 0 && oh % ih == 0 && ow % iw == 0 {
             let nr = oh / ih;
             let nc = ow / iw;
-            if nr >= 1 && nc >= 1 && (nr > 1 || nc > 1) {
-                if let Some(test_outputs) = verify_and_apply(
+            if nr >= 1 && nc >= 1 && (nr > 1 || nc > 1)
+                && let Some(test_outputs) = verify_and_apply(
                     &|inp: &Grid| {
                         let h = inp.len();
                         let w = if h > 0 { inp[0].len() } else { 0 };
@@ -1317,7 +1322,6 @@ fn level_3(
                         test_outputs, level: 3,
                     });
                 }
-            }
         }
     }
 
@@ -1329,7 +1333,7 @@ fn level_3(
         let ow = if oh > 0 { first_out[0].len() } else { 0 };
         if ih > 0 && iw > 0 && oh == ih * 2 && ow == iw * 2 {
             // Try 2x2 arrangements with transforms
-            let transforms: Vec<(&str, fn(&Grid) -> Grid)> = vec![
+            let transforms: Vec<NamedGridFn> = vec![
                 ("id", |g: &Grid| g.clone()),
                 ("rot90", grid::rot90 as fn(&Grid) -> Grid),
                 ("rot180", grid::rot180 as fn(&Grid) -> Grid),
@@ -1426,9 +1430,9 @@ fn level_3(
             let bg = grid::mostcolor(inp);
             let mut min_r = h; let mut max_r = 0;
             let mut min_c = w; let mut max_c = 0;
-            for r in 0..h {
-                for c in 0..w {
-                    if inp[r][c] != bg {
+            for (r, row) in inp.iter().enumerate() {
+                for (c, &cell) in row.iter().enumerate() {
+                    if cell != bg {
                         min_r = min_r.min(r);
                         max_r = max_r.max(r);
                         min_c = min_c.min(c);
@@ -1454,7 +1458,7 @@ fn level_3(
         if let Some(test_outputs) = verify_and_apply(
             &|inp: &Grid| {
                 let mut objs = object::objects(inp, uni, diag, nobg);
-                objs.sort_by(|a, b| b.size().cmp(&a.size()));
+                objs.sort_by_key(|o| std::cmp::Reverse(o.size()));
                 if objs.len() >= 2 {
                     object::subgrid(&objs[1], inp)
                 } else {
@@ -1525,11 +1529,11 @@ fn level_3(
                     })
                 }).collect();
                 for &(r, c) in &positions {
-                    for cc in 0..w {
-                        if result[r][cc] == bg { result[r][cc] = line_c; }
+                    for cell in result[r].iter_mut().take(w) {
+                        if *cell == bg { *cell = line_c; }
                     }
-                    for rr in 0..h {
-                        if result[rr][c] == bg { result[rr][c] = line_c; }
+                    for row in result.iter_mut().take(h) {
+                        if row[c] == bg { row[c] = line_c; }
                     }
                 }
                 result
@@ -1552,8 +1556,8 @@ fn level_3(
                 let mut result = inp.clone();
                 for r in 0..h {
                     if (0..w).any(|c| inp[r][c] == line_c) {
-                        for c in 0..w {
-                            if result[r][c] == bg { result[r][c] = line_c; }
+                        for cell in result[r].iter_mut().take(w) {
+                            if *cell == bg { *cell = line_c; }
                         }
                     }
                 }
@@ -1577,8 +1581,8 @@ fn level_3(
                 let mut result = inp.clone();
                 for c in 0..w {
                     if (0..h).any(|r| inp[r][c] == line_c) {
-                        for r in 0..h {
-                            if result[r][c] == bg { result[r][c] = line_c; }
+                        for row in result.iter_mut().take(h) {
+                            if row[c] == bg { row[c] = line_c; }
                         }
                     }
                 }
@@ -1603,6 +1607,12 @@ fn level_3(
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
             for r in 0..h {
+                // allow: each cell is filled in place from the mirrored row of the
+                // SAME grid we are writing, and later rows can legitimately read
+                // cells that earlier rows already changed. An iterator over one row
+                // cannot read another row of the same grid, so any rewrite would
+                // need a defensive copy and would change what this reads.
+                #[allow(clippy::needless_range_loop)]
                 for c in 0..w {
                     let mirror_r = h - 1 - r;
                     if result[r][c] == bg && result[mirror_r][c] != bg {
@@ -1628,11 +1638,11 @@ fn level_3(
             let w = inp[0].len();
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
-            for r in 0..h {
+            for row in result.iter_mut().take(h) {
                 for c in 0..w {
                     let mirror_c = w - 1 - c;
-                    if result[r][c] == bg && result[r][mirror_c] != bg {
-                        result[r][c] = result[r][mirror_c];
+                    if row[c] == bg && row[mirror_c] != bg {
+                        row[c] = row[mirror_c];
                     }
                 }
             }
@@ -1688,6 +1698,10 @@ fn level_3(
             if h != w { return inp.clone(); }
             let bg = grid::mostcolor(inp);
             let mut result = inp.clone();
+            // allow: this reads the transposed cell result[c][r] of the same grid it
+            // writes, in place, so an earlier cell can change what a later one sees.
+            // Iterating rows would make the transposed read impossible to express.
+            #[allow(clippy::needless_range_loop)]
             for r in 0..h {
                 for c in 0..w {
                     if result[r][c] == bg && result[c][r] != bg {
@@ -1812,7 +1826,7 @@ fn level_4(
     }
 
     // 4c. hconcat/vconcat of transformed halves
-    let half_transforms: Vec<(&str, fn(&Grid) -> Grid)> = vec![
+    let half_transforms: Vec<NamedGridFn> = vec![
         ("rot90",    grid::rot90),
         ("rot180",   grid::rot180),
         ("rot270",   grid::rot270),
@@ -2103,9 +2117,9 @@ fn level_4(
             let w = inp[0].len();
             // Try all possible tile sizes
             for th in 1..=h/2 {
-                if h % th != 0 { continue; }
+                if !h.is_multiple_of(th) { continue; }
                 for tw in 1..=w/2 {
-                    if w % tw != 0 { continue; }
+                    if !w.is_multiple_of(tw) { continue; }
                     let tile = grid::crop(inp, 0, 0, th, tw);
                     let mut matches = true;
                     'outer: for tr in (0..h).step_by(th) {

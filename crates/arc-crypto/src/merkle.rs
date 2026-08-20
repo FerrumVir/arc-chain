@@ -38,7 +38,7 @@ impl MerkleTree {
         let mut current = leaves;
 
         // Pad to even length if needed
-        if current.len() % 2 != 0 {
+        if !current.len().is_multiple_of(2) {
             current.push(*current.last().unwrap());
         }
 
@@ -58,7 +58,7 @@ impl MerkleTree {
                 .collect();
 
             let mut padded = next;
-            if padded.len() > 1 && padded.len() % 2 != 0 {
+            if padded.len() > 1 && !padded.len().is_multiple_of(2) {
                 padded.push(*padded.last().unwrap());
             }
             current = padded.clone();
@@ -92,13 +92,13 @@ impl MerkleTree {
         let mut idx = index;
 
         for level in &self.levels[..self.levels.len() - 1] {
-            let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
             let sibling = if sibling_idx < level.len() {
                 level[sibling_idx]
             } else {
                 level[idx] // duplicate for odd-length levels
             };
-            let is_left = idx % 2 != 0; // sibling is on the left if our index is odd
+            let is_left = !idx.is_multiple_of(2); // sibling is on the left if our index is odd
             siblings.push((sibling, is_left));
             idx /= 2;
         }
@@ -146,6 +146,12 @@ pub struct IncrementalMerkle {
     real_lengths: Vec<usize>,
     /// Key → index in `keys` for O(1) lookup.
     key_index: HashMap<[u8; 32], usize>,
+}
+
+impl Default for IncrementalMerkle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IncrementalMerkle {
@@ -214,7 +220,7 @@ impl IncrementalMerkle {
         let mut real_lengths = vec![current.len()];
 
         // Pad to even length (duplicate last).
-        if current.len() % 2 != 0 {
+        if !current.len().is_multiple_of(2) {
             current.push(*current.last().unwrap());
         }
 
@@ -235,7 +241,7 @@ impl IncrementalMerkle {
             real_lengths.push(next.len());
 
             let mut padded = next;
-            if padded.len() > 1 && padded.len() % 2 != 0 {
+            if padded.len() > 1 && !padded.len().is_multiple_of(2) {
                 padded.push(*padded.last().unwrap());
             }
             current = padded.clone();
@@ -305,11 +311,10 @@ impl IncrementalMerkle {
 
             // Prepare dirty set for next level.
             dirty_at_level = dirty_parents;
-            if next_real > 0 && self.levels[next_lv].len() > next_real {
-                if dirty_at_level.contains(&(next_real - 1)) {
+            if next_real > 0 && self.levels[next_lv].len() > next_real
+                && dirty_at_level.contains(&(next_real - 1)) {
                     dirty_at_level.insert(next_real);
                 }
-            }
         }
     }
 
@@ -350,13 +355,13 @@ impl IncrementalMerkle {
         let mut idx = index;
 
         for level in &self.levels[..self.levels.len() - 1] {
-            let sibling_idx = if idx % 2 == 0 { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
             let sibling = if sibling_idx < level.len() {
                 level[sibling_idx]
             } else {
                 level[idx]
             };
-            let is_left = idx % 2 != 0;
+            let is_left = !idx.is_multiple_of(2);
             siblings.push((sibling, is_left));
             idx /= 2;
         }

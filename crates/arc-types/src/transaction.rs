@@ -1325,6 +1325,11 @@ impl Transaction {
     }
 
     /// Create a new agent registration transaction (unsigned).
+    // These eight parameters are the five wire fields of `RegisterBody` plus the
+    // three envelope fields (from/fee/nonce) every `new_*` constructor here takes.
+    // Bundling them into a params struct would change a public API of the shared
+    // type crate that every downstream SDK builds against, for no behaviour gain.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_register_agent(
         from: Address,
         agent_name: String,
@@ -1610,8 +1615,8 @@ mod tests {
     #[test]
     fn test_gas_costs_constants() {
         assert_eq!(gas_costs::TX_BASE, 21_000);
-        assert!(gas_costs::DEPLOY_CONTRACT > gas_costs::TRANSFER);
-        assert!(gas_costs::BLOCK_GAS_LIMIT >= 30_000_000);
+        const { assert!(gas_costs::DEPLOY_CONTRACT > gas_costs::TRANSFER) };
+        const { assert!(gas_costs::BLOCK_GAS_LIMIT >= 30_000_000) };
     }
 
     // ── Tier 1 on-chain inference tx round-trip ──
@@ -1695,8 +1700,8 @@ mod tests {
 
     #[test]
     fn tier1_constants_sane() {
-        assert!(TIER1_INPUT_BLOB_MAX > 0 && TIER1_INPUT_BLOB_MAX <= 1024 * 1024);
-        assert!(TIER1_OUTPUT_BLOB_MAX > 0);
+        const { assert!(TIER1_INPUT_BLOB_MAX > 0 && TIER1_INPUT_BLOB_MAX <= 1024 * 1024) };
+        const { assert!(TIER1_OUTPUT_BLOB_MAX > 0) };
         // Output blob ceiling should comfortably hold the max-token output:
         // TIER1_MAX_TOKENS × ~8 bytes/token UTF-8 worst case = 16 KB.
         assert!(TIER1_OUTPUT_BLOB_MAX as u32 >= TIER1_MAX_TOKENS * 8);
@@ -1714,9 +1719,9 @@ mod tests {
         // Must be a real range, and min must leave validators time to
         // observe + run inference + submit a vote tx (single block is
         // not enough even on the fastest hardware).
-        assert!(TIER1_MIN_DEADLINE_BLOCKS >= 5);
-        assert!(TIER1_MAX_DEADLINE_BLOCKS > TIER1_MIN_DEADLINE_BLOCKS);
-        assert!(TIER1_MAX_DEADLINE_BLOCKS <= 100_000);
+        const { assert!(TIER1_MIN_DEADLINE_BLOCKS >= 5) };
+        const { assert!(TIER1_MAX_DEADLINE_BLOCKS > TIER1_MIN_DEADLINE_BLOCKS) };
+        const { assert!(TIER1_MAX_DEADLINE_BLOCKS <= 100_000) };
     }
 
     #[test]
@@ -1724,8 +1729,8 @@ mod tests {
         // A single request must not be allowed to consume hours of
         // validator compute. 2048 caps each request at ~5-15 minutes
         // of CPU inference, manageable as a worst case.
-        assert!(TIER1_MAX_TOKENS > 0);
-        assert!(TIER1_MAX_TOKENS <= 8192);
+        const { assert!(TIER1_MAX_TOKENS > 0) };
+        const { assert!(TIER1_MAX_TOKENS <= 8192) };
     }
 
     /// Pin the wire size of InferenceAttestationBody to the v0.7.2 layout.

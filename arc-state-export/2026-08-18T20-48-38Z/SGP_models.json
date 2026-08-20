@@ -1,0 +1,1 @@
+{"fully_covered_models":0,"models":[{"covered_layers":96,"full_model_mb":6176,"fully_covered":false,"model_id":"0xabec2d582beb97a876c21d7ccc5e8e4833e8fd34aee0cb5b64e9f14f5ea57fdb","model_name":"arc-32L-4096d-32h-32000v","shard_count":18,"total_layers":32}],"total_models":1,"total_shard_nodes":1}

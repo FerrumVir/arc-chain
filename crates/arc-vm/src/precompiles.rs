@@ -109,11 +109,15 @@ impl Default for OracleRegistry {
 // Precompile registry
 // ---------------------------------------------------------------------------
 
+/// Boxed body of a precompile: input bytes in, [`PrecompileResult`] out.
+/// `Send + Sync` because the registry is shared across executor threads.
+type PrecompileHandler = Box<dyn Fn(&[u8]) -> PrecompileResult + Send + Sync>;
+
 struct PrecompileEntry {
     name: String,
     base_gas: u64,
     per_word_gas: u64,
-    handler: Box<dyn Fn(&[u8]) -> PrecompileResult + Send + Sync>,
+    handler: PrecompileHandler,
 }
 
 /// Registry of precompiled contracts.
@@ -318,7 +322,7 @@ impl PrecompileRegistry {
 
                     // Each sibling entry = 32 bytes hash + 1 byte is_left flag.
                     let entry_size = 33;
-                    if proof_data.len() % entry_size != 0 {
+                    if !proof_data.len().is_multiple_of(entry_size) {
                         return PrecompileResult {
                             success: true,
                             output: vec![0],
@@ -536,7 +540,7 @@ impl PrecompileRegistry {
 
                     let circuit_id: [u8; 32] = input[..32].try_into().unwrap();
                     let count = input[32] as usize;
-                    let pi_end = match 33usize.checked_add(count.checked_mul(8).unwrap_or(usize::MAX)) {
+                    let pi_end = match 33usize.checked_add(count.saturating_mul(8)) {
                         Some(v) => v,
                         None => return PrecompileResult {
                             success: false,
@@ -727,7 +731,7 @@ impl PrecompileRegistry {
     pub fn gas_cost(&self, address: &PrecompileAddress, input_len: usize) -> u64 {
         match self.precompiles.get(address) {
             Some(entry) => {
-                let words = (input_len as u64 + 31) / 32; // ceiling division
+                let words = (input_len as u64).div_ceil(32); // ceiling division
                 entry.base_gas + words * entry.per_word_gas
             }
             None => 0,

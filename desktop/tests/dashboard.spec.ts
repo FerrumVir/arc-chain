@@ -17,12 +17,54 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("dashboard")).toBeVisible();
   });
 
-  test("shows earnings card with gradient number", async ({ page }) => {
+  test("shows earnings card formatted as an ARC amount", async ({ page }) => {
     await page.goto("/");
     const earnings = page.getByTestId("earnings-total");
     await expect(earnings).toBeVisible();
-    // Wait for the ticker to animate in - at least a non-zero value shows up.
-    await expect(earnings).not.toHaveText(/^0\.00/);
+    // Assert the FORMAT, not the magnitude.
+    //
+    // This used to assert `not.toHaveText(/^0\.00/)`, i.e. that earnings are
+    // non-zero. That is a property of the mock fixture, not of the app: zero
+    // is the correct and expected reading for a fresh identity on the real
+    // network, so the assertion would fail against live data while telling us
+    // nothing about whether the card renders.
+    await expect(earnings).toHaveText(/[\d,]+\.\d{2}\s*ARC total/);
+  });
+
+  test("attestations not credited to this user are not shown as earnings", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const feed = page.getByTestId("attestation-feed");
+    await expect(feed).toBeVisible();
+    // The mock includes two rows that are not the user's: another
+    // validator's attestation, and one old-seed padding row. Both must
+    // render as "network", never as a "+2.50" credit - showing other
+    // validators' work as the user's income was the original bug.
+    await expect(feed.getByText("network", { exact: true })).toHaveCount(2);
+  });
+
+  test("unknown telemetry renders as 'recent', not fabricated zeros", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const feed = page.getByTestId("attestation-feed");
+    // Two rows carry no tokens, latency or timestamp: the flat-shaped
+    // attestation and the padding row. Neither may invent them.
+    await expect(feed.getByText("recent", { exact: true })).toHaveCount(2);
+    await expect(feed.getByText("0 tokens")).toHaveCount(0);
+    await expect(feed.getByText("0ms")).toHaveCount(0);
+  });
+
+  test("last payout renders a block height as a block, not a date", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    const payout = page.getByTestId("last-payout");
+    await expect(payout).toBeVisible();
+    // Regression guard for the "20770d ago" bug: a block height must never
+    // reach the relative-time formatter.
+    await expect(payout).not.toHaveText(/\d{3,}d ago/);
   });
 
   test("start / stop controls toggle node state", async ({ page }) => {
@@ -47,13 +89,23 @@ test.describe("Dashboard", () => {
     await expect(tiles).toHaveCount(4);
   });
 
-  test("attestation feed renders at least 3 mock attestations", async ({
-    page,
-  }) => {
+  test("attestation feed renders the mock attestations", async ({ page }) => {
     await page.goto("/");
     const feed = page.getByTestId("attestation-feed");
     await expect(feed).toBeVisible();
-    await expect(feed.locator(".feed-item")).toHaveCount(3, { timeout: 8000 });
+    // Four fixtures: two of the user's, one other validator's, one old-seed
+    // padding row (kept so the Network screen's filter is demonstrable).
+    await expect(feed.locator(".feed-item")).toHaveCount(4, { timeout: 8000 });
+  });
+
+  test("shows the node's compute width", async ({ page }) => {
+    await page.goto("/");
+    await page.getByTestId("btn-start").click();
+    // "add two cores" is only demonstrable if the current width is visible.
+    await expect(page.getByTestId("compute-width")).toHaveText(
+      /\d+|all/,
+      { timeout: 8000 },
+    );
   });
 
   test("copy address button shows confirmation", async ({ page, context }) => {

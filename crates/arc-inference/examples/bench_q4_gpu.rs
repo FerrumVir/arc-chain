@@ -62,9 +62,8 @@ fn main() {
     for _ in 0..iters { matmul_q4_preq(&q4_wq, &input_d_q, d, &mut out_d); }
     let q4_wq_preq = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    println!("  Wq  [{}×{}]: INT8 {:.2}ms, Q4 {:.2}ms, Q4+preq {:.2}ms ({}x)",
-        d, d, i8_wq, q4_wq_ms, q4_wq_preq,
-        format!("{:.1}", i8_wq / q4_wq_preq.max(0.001)));
+    println!("  Wq  [{}×{}]: INT8 {:.2}ms, Q4 {:.2}ms, Q4+preq {:.2}ms ({:.1}x)",
+        d, d, i8_wq, q4_wq_ms, q4_wq_preq, i8_wq / q4_wq_preq.max(0.001));
 
     // INT8 W_gate
     let start = Instant::now();
@@ -77,9 +76,8 @@ fn main() {
     for _ in 0..iters { matmul_q4_preq(&q4_gate, &input_d_q, d, &mut out_ff); }
     let q4_gate_preq = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    println!("  gate[{}×{}]: INT8 {:.2}ms, Q4+preq {:.2}ms ({}x)",
-        dff, d, i8_gate, q4_gate_preq,
-        format!("{:.1}", i8_gate / q4_gate_preq.max(0.001)));
+    println!("  gate[{}×{}]: INT8 {:.2}ms, Q4+preq {:.2}ms ({:.1}x)",
+        dff, d, i8_gate, q4_gate_preq, i8_gate / q4_gate_preq.max(0.001));
 
     // INT8 W_down
     let start = Instant::now();
@@ -91,9 +89,8 @@ fn main() {
     for _ in 0..iters { matmul_q4_preq(&q4_down, &input_ff_q, dff, &mut out_d2); }
     let q4_down_preq = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
 
-    println!("  down[{}×{}]: INT8 {:.2}ms, Q4+preq {:.2}ms ({}x)",
-        d, dff, i8_down, q4_down_preq,
-        format!("{:.1}", i8_down / q4_down_preq.max(0.001)));
+    println!("  down[{}×{}]: INT8 {:.2}ms, Q4+preq {:.2}ms ({:.1}x)",
+        d, dff, i8_down, q4_down_preq, i8_down / q4_down_preq.max(0.001));
 
     // Estimate total with Q4
     let total_i8_est = (i8_wq * 4.0 + i8_gate * 2.0 + i8_down) * cfg.n_layers as f64;
@@ -114,8 +111,8 @@ fn main() {
             let start = Instant::now();
             for _ in 0..iters { let _ = gpu.matmul(&gw, &input_i8); }
             let gpu_ms = start.elapsed().as_secs_f64() * 1000.0 / iters as f64;
-            println!("  GPU Wq [{}×{}]: {:.2}ms ({}x vs INT8 CPU)",
-                d, d, gpu_ms, format!("{:.1}", i8_wq / gpu_ms.max(0.001)));
+            println!("  GPU Wq [{}×{}]: {:.2}ms ({:.1}x vs INT8 CPU)",
+                d, d, gpu_ms, i8_wq / gpu_ms.max(0.001));
         }
         Err(e) => println!("  No GPU: {}", e),
     }

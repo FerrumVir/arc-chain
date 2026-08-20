@@ -29,6 +29,12 @@ pub struct CudaVerifier {
     total_batches: u64,
 }
 
+impl Default for CudaVerifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CudaVerifier {
     /// Create a new CUDA verifier. Probes for NVIDIA GPU availability.
     pub fn new() -> Self {

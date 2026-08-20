@@ -688,7 +688,7 @@ mod tests {
     fn test_solver_reputation() {
         let mut solver = Solver::new(test_addr(1), 10_000);
 
-        assert_eq!(solver.success_rate(), 0.0);
+        assert!(solver.success_rate().abs() < f64::EPSILON);
         assert_eq!(solver.total_solved, 0);
         assert_eq!(solver.total_failed, 0);
         assert!(solver.is_active);

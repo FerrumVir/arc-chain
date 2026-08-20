@@ -131,8 +131,7 @@ impl ChunkCache {
         // Evict until we have room for `bytes.len()`.
         let needed = bytes.len() as u64;
         if needed > self.cap_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "chunk larger than cap",
             ));
         }
@@ -204,7 +203,7 @@ impl ChunkCache {
             entries: self.last_served.clone(),
         };
         let bytes = serde_json::to_vec(&index)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         fs::write(self.cache_dir.join("_index.json"), bytes)
     }
 
@@ -219,7 +218,7 @@ impl ChunkCache {
 
 fn is_hex_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() % 2 == 0
+        && name.len().is_multiple_of(2)
         && name.chars().all(|c| c.is_ascii_hexdigit())
 }
 

@@ -151,7 +151,6 @@ fn main() {
         .collect();
 
     let n_parallel = 5_000_000usize;
-    let mut phase2_tps = 0.0f64;
     {
         let state = StateDB::with_genesis(&agent_accounts);
         let txs_per_agent = (n_parallel as u32) / num_agents;
@@ -170,7 +169,7 @@ fn main() {
         let start = Instant::now();
         let (success, total) = state.execute_optimistic(&transactions);
         let elapsed = start.elapsed();
-        phase2_tps = actual_n as f64 / elapsed.as_secs_f64();
+        let phase2_tps = actual_n as f64 / elapsed.as_secs_f64();
 
         println!(
             "    Parallel state ({}K agents):  {:>12.0} TPS  (success={}/{})  ({:.2}s)",
@@ -184,8 +183,7 @@ fn main() {
 
     // 2c: Full pipeline - hash + execute + merkle
     let n_full = 5_000_000usize;
-    let mut phase2_full_tps = 0.0f64;
-    {
+    let phase2_full_tps = {
         let state = StateDB::with_genesis(&agent_accounts);
         let txs_per_agent = (n_full as u32) / num_agents;
         let actual_n = (txs_per_agent * num_agents) as usize;
@@ -211,12 +209,12 @@ fn main() {
         let _commits = cpu_batch_commit(&refs);
 
         // Step 2: Parallel sharded state execution
-        let (block, receipts) = state
+        let (_block, receipts) = state
             .execute_block_parallel(&transactions, hash_bytes(&[0]))
             .unwrap();
 
         let elapsed = start.elapsed();
-        phase2_full_tps = actual_n as f64 / elapsed.as_secs_f64();
+        let phase2_full_tps = actual_n as f64 / elapsed.as_secs_f64();
         let success = receipts.iter().filter(|r| r.success).count();
 
         println!(
@@ -226,7 +224,9 @@ fn main() {
             format_number(actual_n),
             elapsed.as_secs_f64(),
         );
-    }
+
+        phase2_full_tps
+    };
     phase_results.push(("Phase 2: Multi-core parallel", phase2_full_tps, format!("{} cores, 768B tx, Rayon sharded", num_cores)));
     println!();
 
@@ -243,7 +243,7 @@ fn main() {
     let compact_data: Vec<[u8; COMPACT_TX_SIZE]> = (0..n_compact_hash)
         .map(|i| {
             let from = hash_bytes(&(i as u32).to_le_bytes());
-            let to = hash_bytes(&((i as u32 + 1)).to_le_bytes());
+            let to = hash_bytes(&(i as u32 + 1).to_le_bytes());
             CompactTransfer::new(from, to, 1, i as u64).to_bytes()
         })
         .collect();
@@ -265,8 +265,7 @@ fn main() {
     // We still use the full Transaction type for state execution
     // but the compact format reduces hash/serialization overhead
     let n_compact_exec = 5_000_000usize;
-    let mut phase3_tps = 0.0f64;
-    {
+    let phase3_tps = {
         let state = StateDB::with_genesis(&agent_accounts);
         let txs_per_agent = (n_compact_exec as u32) / num_agents;
         let actual_n = (txs_per_agent * num_agents) as usize;
@@ -301,7 +300,7 @@ fn main() {
         let (success, total) = state.execute_optimistic(&transactions);
 
         let elapsed = start.elapsed();
-        phase3_tps = actual_n as f64 / elapsed.as_secs_f64();
+        let phase3_tps = actual_n as f64 / elapsed.as_secs_f64();
 
         println!(
             "    Compact pipeline (250B + opt): {:>12.0} TPS  (success={}/{})  ({:.2}s)",
@@ -316,7 +315,9 @@ fn main() {
             "    Improvement over Phase 2:      {:>12.1}x  (bandwidth reduction: 768B -> 250B)",
             improvement,
         );
-    }
+
+        phase3_tps
+    };
     phase_results.push(("Phase 3: Compact tx (250B)", phase3_tps, format!("{} cores, 250B tx, optimistic", num_cores)));
     println!();
 
@@ -497,12 +498,17 @@ fn main() {
     let baseline_tps = phase_results[0].1;
     for (name, tps, desc) in &phase_results {
         let multiplier = tps / baseline_tps;
+        // Not `clamp`: `min(30.0).max(1.0)` and `clamp(1.0, 30.0)` disagree when
+        // `multiplier` is NaN (a zero baseline TPS makes it NaN). min/max return
+        // 30.0 there, clamp returns NaN, which casts to a bar length of 0. Keep
+        // the existing full-bar-on-NaN rendering rather than change output.
+        #[allow(clippy::manual_clamp)]
         let bar_len = ((multiplier.log10() + 1.0) * 8.0).min(30.0).max(1.0) as usize;
         let bar: String = "#".repeat(bar_len);
         println!("║                                                            ║");
         println!("║  {:<44} {:>10.0} TPS ║", name, tps);
         println!("║    {:<40} {:>8.0}x     ║", bar, multiplier);
-        println!("║    {}  ║", format!("{:<56}", desc));
+        println!("║    {:<56}  ║", desc);
     }
 
     println!("║                                                            ║");

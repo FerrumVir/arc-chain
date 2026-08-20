@@ -17,6 +17,12 @@ use std::thread;
 
 // ── WAL Types ───────────────────────────────────────────────────────────────
 
+/// Contract storage as carried in a snapshot: `(contract_address, [(key, value)])`.
+///
+/// A named alias for the shape used by `Snapshot::storage` and by the
+/// `StateDB` snapshot exporters, so the same nested tuple is spelled once.
+pub type ContractStorage = Vec<(Address, Vec<(Hash256, Vec<u8>)>)>;
+
 /// A single WAL entry recording one state mutation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WalEntry {
@@ -61,8 +67,11 @@ pub enum WalOp {
 
 /// Internal command for the WAL background thread.
 enum WalCommand {
-    /// Append an entry to the WAL.
-    Append(WalEntry),
+    /// Append an entry to the WAL. Boxed: a `WalEntry` dwarfs the other
+    /// variants, and every message through the channel would otherwise be
+    /// sized for it. `Box<WalEntry>` serialises identically to `WalEntry`,
+    /// so the on-disk format is unchanged.
+    Append(Box<WalEntry>),
     /// Flush all pending writes and fsync.
     Sync(channel::Sender<()>),
     /// Rotate: close the current segment, open a new one.
@@ -214,7 +223,7 @@ impl WalWriter {
 
         // Best effort - if the channel is full or disconnected, we log and continue.
         // In production, this should never happen (writer is faster than execution).
-        if self.sender.send(WalCommand::Append(entry)).is_err() {
+        if self.sender.send(WalCommand::Append(Box::new(entry))).is_err() {
             tracing::error!("WAL writer channel disconnected");
         }
     }
@@ -477,11 +486,10 @@ impl WalWriter {
     /// If no segments exist, returns (0, dir/wal-00000000.bin).
     fn find_latest_segment(dir: &Path) -> (u64, PathBuf) {
         let segments = Self::list_segments(dir);
-        if let Some(last) = segments.last() {
-            if let Some(num) = Self::parse_segment_number(last) {
+        if let Some(last) = segments.last()
+            && let Some(num) = Self::parse_segment_number(last) {
                 return (num, last.clone());
             }
-        }
         (0, dir.join("wal-00000000.bin"))
     }
 
@@ -491,11 +499,10 @@ impl WalWriter {
         if let Ok(entries) = fs::read_dir(dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with("wal-") && name.ends_with(".bin") {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && name.starts_with("wal-") && name.ends_with(".bin") {
                         segments.push(path);
                     }
-                }
             }
         }
         segments.sort();
@@ -591,11 +598,10 @@ pub fn latest_block_height_in_wal_dir(dir: impl AsRef<Path>) -> u64 {
     if let Ok(entries) = fs::read_dir(dir.as_ref()) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with("wal-") && name.ends_with(".bin") {
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && name.starts_with("wal-") && name.ends_with(".bin") {
                     segments.push(path);
                 }
-            }
         }
     }
     segments.sort();
@@ -654,7 +660,7 @@ pub struct Snapshot {
     /// All accounts sorted by address.
     pub accounts: Vec<(Address, Account)>,
     /// Contract storage: (contract_address, [(key, value)])
-    pub storage: Vec<(Address, Vec<(Hash256, Vec<u8>)>)>,
+    pub storage: ContractStorage,
     /// Contract bytecode cache: (address, wasm_bytes)
     pub contracts: Vec<(Address, Vec<u8>)>,
 }
@@ -663,7 +669,7 @@ impl Snapshot {
     /// Write snapshot to disk as LZ4-compressed bincode.
     pub fn write_to(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let data = bincode::serialize(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         let compressed = lz4_flex::compress_prepend_size(&data);
 
         let mut file = File::create(path)?;

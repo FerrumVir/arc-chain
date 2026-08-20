@@ -8,7 +8,9 @@ test.describe("Visual polish smoke tests", () => {
     // Hero title and three value props (one-click-join copy)
     await expect(page.getByText("One click")).toBeVisible();
     await expect(page.getByText("Your identity, on-chain")).toBeVisible();
-    await expect(page.getByText("Keeps running")).toBeVisible();
+    // The third value-prop card is titled "Always on". This asserted
+    // "Keeps running", which the copy has never said in this file's history.
+    await expect(page.getByText("Always on")).toBeVisible();
 
     // Logo gradient uses our brand gradient
     const logo = page.getByTestId("logo-mark").first();

@@ -4,13 +4,13 @@
 //! engine finds a program that maps every training input to its expected output.
 //!
 //! Engine priority (with default time budgets):
-//! 1.   **Synthesizer** (~10%) - exhaustive DFS up to depth 5, fast for simple tasks
-//! 1.5  **Diff-synth** (~20%) - diff-guided synthesis: analyze how output differs from input
-//! 1.8  **Exhaustive** (~15%) - deterministic DFS over ALL type-valid programs, no pruning
-//! 2.   **Beam search** (~10%) - fitness-guided parallel search
-//! 3.   **Augmented beam search** (~30%) - D4 + PoE voting over beam search
-//! 4.   **Evolution** (~30%) - genetic refinement of partial solutions
-//! 5.   **LLM-guided** (remaining time) - Ollama LLM picks operations step by step
+//! - **1.** **Synthesizer** (~10%) - exhaustive DFS up to depth 5, fast for simple tasks
+//! - **1.5** **Diff-synth** (~20%) - diff-guided synthesis: analyze how output differs from input
+//! - **1.8** **Exhaustive** (~15%) - deterministic DFS over ALL type-valid programs, no pruning
+//! - **2.** **Beam search** (~10%) - fitness-guided parallel search
+//! - **3.** **Augmented beam search** (~30%) - D4 + PoE voting over beam search
+//! - **4.** **Evolution** (~30%) - genetic refinement of partial solutions
+//! - **5.** **LLM-guided** (remaining time) - Ollama LLM picks operations step by step
 
 use crate::Grid;
 use crate::search::beam::{beam_search, beam_search_steered, exhaustive_search, BeamConfig};
@@ -70,12 +70,12 @@ pub struct SolveResult {
 /// Solve a single ARC-AGI task using all engines in sequence.
 ///
 /// Engine priority:
-/// 1.   Synthesizer (5-level, ~10% time budget) -- fast, covers simple tasks
-/// 1.5  Diff-synth (~20% time budget) -- diff-guided synthesis
-/// 1.8  Exhaustive (~15% time budget) -- all type-valid programs, no pruning
-/// 2.   Beam search (~10% time budget) -- type-driven parallel search
-/// 3.   Augmented beam search (~30% time budget) -- D4 + PoE over beam search
-/// 4.   Evolution (~30% time budget) -- refine partial solutions
+/// - 1.   Synthesizer (5-level, ~10% time budget) -- fast, covers simple tasks
+/// - 1.5  Diff-synth (~20% time budget) -- diff-guided synthesis
+/// - 1.8  Exhaustive (~15% time budget) -- all type-valid programs, no pruning
+/// - 2.   Beam search (~10% time budget) -- type-driven parallel search
+/// - 3.   Augmented beam search (~30% time budget) -- D4 + PoE over beam search
+/// - 4.   Evolution (~30% time budget) -- refine partial solutions
 pub fn solve(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
@@ -107,7 +107,7 @@ pub fn solve(
                     .map(|(_, p)| p.clone())
                     .collect();
                 let held = &train_pairs[hold_out];
-                match synthesizer::synthesize(&sub_pairs, &[held.0.clone()], synth_budget / 2) {
+                match synthesizer::synthesize(&sub_pairs, std::slice::from_ref(&held.0), synth_budget / 2) {
                     Some(cv_result) => {
                         !cv_result.test_outputs.is_empty() && cv_result.test_outputs[0] == held.1
                     }
@@ -160,7 +160,7 @@ pub fn solve(
                     .map(|(_, p)| p.clone())
                     .collect();
                 let held = &train_pairs[hold_out];
-                match diff_synth::diff_synthesize(&sub_pairs, &[held.0.clone()], diff_budget / 2) {
+                match diff_synth::diff_synthesize(&sub_pairs, std::slice::from_ref(&held.0), diff_budget / 2) {
                     Some(cv_result) => {
                         !cv_result.test_outputs.is_empty() && cv_result.test_outputs[0] == held.1
                     }
@@ -285,7 +285,7 @@ pub fn solve(
                 // Wrap beam search as a multi-test solver
                 let mut outputs: Vec<Option<Grid>> = Vec::new();
                 for test_input in aug_tests {
-                    match beam_search(aug_train, &[test_input.clone()], &aug_beam_config) {
+                    match beam_search(aug_train, std::slice::from_ref(test_input), &aug_beam_config) {
                         Some(sr) => outputs.push(Some(sr.output)),
                         None => outputs.push(None),
                     }

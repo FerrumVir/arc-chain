@@ -10,6 +10,36 @@ use crate::account::Address;
 pub const TOTAL_SUPPLY: u128 = 1_030_000_000_000_000_000; // 1.03B * 10^9
 pub const DECIMALS: u8 = 9;
 
+/// Base units (smallest indivisible unit, "nanoARC") per whole ARC = 10^DECIMALS.
+/// Every balance, bond, and reward in the state DB is denominated in these
+/// units. The genesis faucet pool is prefunded with `1_000_000_000_000`
+/// base units (= 1000 ARC) and the testnet faucet grants `FAUCET_CLAIM_MAX`
+/// base units per claim — both are counts of *this* unit.
+pub const ARC_BASE_UNITS: u64 = 10u64.pow(DECIMALS as u32); // 1_000_000_000
+
+/// Reward paid to the attester of each accepted `InferenceAttestation`, in
+/// base units. Demo default: **2.5 ARC** (`2.5 * 10^9` base units).
+///
+/// This is the single on-chain source of truth for the attestation reward.
+/// `arc-node`'s `/worker/earnings` derives its human-facing
+/// `reward_per_attestation_arc` from this same constant (see
+/// [`inference_attestation_reward_arc`]) so the number shown in every
+/// earnings UI and the value actually credited on-chain can never drift.
+///
+/// Testnet monetary policy: this reward is a **pure transfer** FROM the
+/// treasury (`arc_types::transaction::faucet_pool_address()`) TO the
+/// attester, bounded by the treasury's current balance. It is NEVER minted —
+/// total supply is conserved. Tune this single constant to change the rate;
+/// production will replace the flat rate with a halving-curve emission.
+pub const INFERENCE_ATTESTATION_REWARD: u64 = 2_500_000_000; // 2.5 ARC
+
+/// The attestation reward expressed in whole ARC as an `f64`, for display
+/// only. Derived from [`INFERENCE_ATTESTATION_REWARD`] so the two cannot
+/// drift. Do not use for on-chain accounting — use the base-unit constant.
+pub fn inference_attestation_reward_arc() -> f64 {
+    INFERENCE_ATTESTATION_REWARD as f64 / ARC_BASE_UNITS as f64
+}
+
 /// Blocks per year at ~400ms block time.
 pub const BLOCKS_PER_YEAR: u64 = 78_840_000;
 
@@ -686,6 +716,12 @@ pub struct SupplyTracker {
     pub current_block: u64,
 }
 
+impl Default for SupplyTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SupplyTracker {
     /// Initialize the tracker at genesis.
     pub fn new() -> Self {
@@ -1003,7 +1039,7 @@ mod tests {
     #[test]
     fn test_supply_tracker_staking_ratio() {
         let mut tracker = SupplyTracker::new();
-        assert_eq!(tracker.staking_ratio(), 0.0);
+        assert!(tracker.staking_ratio().abs() < f64::EPSILON);
 
         // Stake 10% of total supply
         let ten_percent = TOTAL_SUPPLY / 10;
@@ -1106,5 +1142,24 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.epochs_until_archive(100), u64::MAX);
+    }
+
+    // ── Attestation reward constant ─────────────────────────────────────────
+
+    #[test]
+    fn test_arc_base_units_matches_decimals() {
+        // Base units per ARC must equal 10^DECIMALS exactly.
+        assert_eq!(ARC_BASE_UNITS, 10u64.pow(DECIMALS as u32));
+        assert_eq!(ARC_BASE_UNITS, 1_000_000_000);
+    }
+
+    #[test]
+    fn test_inference_attestation_reward_is_2_5_arc() {
+        // The base-unit constant must equal exactly 2.5 ARC so that the
+        // on-chain credit and the "2.5 ARC/attestation" display agree.
+        assert_eq!(INFERENCE_ATTESTATION_REWARD, 2_500_000_000);
+        assert_eq!(INFERENCE_ATTESTATION_REWARD, ARC_BASE_UNITS * 5 / 2);
+        // Display helper derives 2.5 from the same base-unit source.
+        assert!((inference_attestation_reward_arc() - 2.5).abs() < 1e-9);
     }
 }

@@ -351,8 +351,8 @@ impl LiquidityPool {
         // Effective price: amount_out / amount_in_after_fee.
         // Impact = 1 - (effective / spot)
         //        = 1 - (amount_out * reserve_in) / (amount_in_after_fee * reserve_out)
-        let effective_numerator = amount_out as u128 * reserve_in as u128;
-        let effective_denominator = amount_in_after_fee as u128 * reserve_out as u128;
+        let effective_numerator = amount_out * reserve_in;
+        let effective_denominator = amount_in_after_fee * reserve_out;
 
         if effective_denominator == 0 {
             return 10_000;
@@ -362,8 +362,8 @@ impl LiquidityPool {
         if effective_numerator >= effective_denominator {
             return 0; // No negative impact (shouldn't happen in AMM)
         }
-        let impact = 10_000 - (effective_numerator * 10_000 / effective_denominator) as u16;
-        impact
+        
+        10_000 - (effective_numerator * 10_000 / effective_denominator) as u16
     }
 
     /// Total value locked in USD (18-decimal fixed point).
@@ -538,7 +538,7 @@ impl StablecoinVault {
         }
 
         let elapsed = current_height - self.last_fee_update;
-        let fee = self.debt_amount as u128
+        let fee = self.debt_amount
             * self.stability_fee_bps as u128
             * elapsed as u128
             / (10_000u128 * blocks_per_year as u128);
@@ -570,9 +570,7 @@ impl StablecoinVault {
         // This works as long as collateral * price_bps fits in u128,
         // which holds for collateral up to ~10^34 and price_bps up to ~10^5.
         let price_bps = price * 10_000 / PRICE_PRECISION;
-        let ratio = collateral
-            .checked_mul(price_bps)
-            .unwrap_or(u128::MAX)
+        let ratio = collateral.saturating_mul(price_bps)
             / debt;
         ratio.min(u16::MAX as u128) as u16
     }
@@ -675,7 +673,7 @@ fn isqrt(n: u128) -> u128 {
         return 0;
     }
     let mut x = n;
-    let mut y = (x + 1) / 2;
+    let mut y = x.div_ceil(2);
     while y < x {
         x = y;
         y = (x + n / x) / 2;

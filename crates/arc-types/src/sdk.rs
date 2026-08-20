@@ -208,7 +208,7 @@ fn abi_type_to_param_type(abi: &AbiType) -> ParamType {
         AbiType::BytesN(n) => ParamType::FixedBytes(*n as usize),
         AbiType::Array(inner) => ParamType::Array(Box::new(abi_type_to_param_type(inner))),
         AbiType::Tuple(types) => ParamType::Tuple(
-            types.iter().map(|t| abi_type_to_param_type(t)).collect()
+            types.iter().map(abi_type_to_param_type).collect()
         ),
     }
 }
@@ -228,7 +228,7 @@ impl ContractBinding {
     /// Create a new contract binding.
     pub fn new(contract_name: &str, address: [u8; 32], abi: ContractAbi) -> Self {
         let methods = abi.functions.iter()
-            .map(|f| MethodBinding::from_abi_function(f))
+            .map(MethodBinding::from_abi_function)
             .collect();
         Self {
             contract_name: contract_name.to_string(),

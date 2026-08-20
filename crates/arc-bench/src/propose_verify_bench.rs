@@ -65,32 +65,6 @@ fn format_duration(d: Duration) -> String {
     }
 }
 
-/// Build a genesis balance set for proposer `proposer_id`.
-/// Each proposer gets its own non-overlapping set of senders and receivers
-/// so there are zero cross-proposer conflicts.
-fn build_proposer_genesis(
-    proposer_id: usize,
-    senders_per_proposer: u8,
-) -> Vec<(Hash256, u64)> {
-    let sender_base = (proposer_id as u8) * senders_per_proposer;
-    let mut genesis = Vec::new();
-
-    // Senders with large balances
-    for i in 0..senders_per_proposer {
-        let addr = benchmark_address(sender_base + i);
-        genesis.push((addr, u64::MAX / 4));
-    }
-
-    // Receivers (shared pool is fine - propose-verify doesn't require
-    // non-overlapping receivers, only that each proposer's diff is
-    // independently verifiable)
-    for r in 200u8..=255 {
-        genesis.push((benchmark_address(r), 0));
-    }
-
-    genesis
-}
-
 /// Build a unified genesis (all proposers' senders + receivers) for
 /// the verifier StateDB that checks all diffs.
 fn build_verifier_genesis(

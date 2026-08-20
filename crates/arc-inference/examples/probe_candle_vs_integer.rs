@@ -20,7 +20,7 @@ fn top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
 
 fn top_k_i64(logits: &[i64], k: usize) -> Vec<(usize, i64)> {
     let mut indexed: Vec<(usize, i64)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    indexed.sort_by(|a, b| b.1.cmp(&a.1));
+    indexed.sort_by_key(|x| std::cmp::Reverse(x.1));
     indexed.truncate(k);
     indexed
 }
