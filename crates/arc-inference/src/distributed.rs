@@ -569,7 +569,6 @@ pub fn forward_shard_layers(
         // O(d_head) memory per head instead of O(full_seq) for scores array.
         let full_seq = token_position + 1;
         let head_results: Vec<Vec<i64>> = (0..cfg.n_heads)
-            .into_iter()
             .map(|h| {
                 let kv_h = h * cfg.n_kv_heads / cfg.n_heads;
                 let dh = cfg.d_head;
@@ -582,8 +581,8 @@ pub fn forward_shard_layers(
                 for j in 0..full_seq {
                     let k_off = j * cfg.d_kv + kv_h * dh;
                     let mut dot: i64 = 0;
-                    for dd in 0..dh {
-                        dot += q_head[dd] * cache.k_data[layer_idx][k_off + dd];
+                    for (dd, &qv) in q_head.iter().enumerate() {
+                        dot += qv * cache.k_data[layer_idx][k_off + dd];
                     }
                     let score = ((dot >> FRAC_BITS) * cfg.attn_scale) >> FRAC_BITS;
 
@@ -591,8 +590,8 @@ pub fn forward_shard_layers(
                         let diff = running_max - score;
                         let correction = integer_exp(diff);
                         running_sum = (running_sum * correction) >> FRAC_BITS;
-                        for dd in 0..dh {
-                            out[dd] = (out[dd] * correction) >> FRAC_BITS;
+                        for o in out.iter_mut() {
+                            *o = (*o * correction) >> FRAC_BITS;
                         }
                         running_max = score;
                     }
@@ -601,15 +600,15 @@ pub fn forward_shard_layers(
                     running_sum += w;
 
                     let v_off = j * cfg.d_kv + kv_h * dh;
-                    for dd in 0..dh {
-                        out[dd] += (w * cache.v_data[layer_idx][v_off + dd])
+                    for (dd, o) in out.iter_mut().enumerate() {
+                        *o += (w * cache.v_data[layer_idx][v_off + dd])
                             >> FRAC_BITS;
                     }
                 }
 
                 if running_sum > 0 {
-                    for dd in 0..dh {
-                        out[dd] = (out[dd] * ONE) / running_sum;
+                    for o in out.iter_mut() {
+                        *o = (*o * ONE) / running_sum;
                     }
                 }
                 out

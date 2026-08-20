@@ -583,7 +583,7 @@ impl StateDB {
                 .map(|e| (Hash256(*e.key()), e.value().clone()))
                 .collect();
 
-            let storage: Vec<(Address, Vec<(Hash256, Vec<u8>)>)> = self
+            let storage: wal::ContractStorage = self
                 .storage
                 .iter()
                 .map(|e| {
@@ -6317,7 +6317,7 @@ impl StateDB {
             .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
             .collect();
 
-        let storage: Vec<(Address, Vec<(Hash256, Vec<u8>)>)> = self.storage
+        let storage: wal::ContractStorage = self.storage
             .iter()
             .map(|entry| {
                 let key = Hash256(*entry.key());

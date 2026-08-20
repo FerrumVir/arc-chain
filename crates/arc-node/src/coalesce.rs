@@ -24,7 +24,7 @@
 //! returned as a remainder for the normal execution path.
 
 use arc_state::{StateDB, StateError};
-use arc_types::{Account, Address, Transaction, TxBody, TxType};
+use arc_types::{Address, Transaction, TxBody, TxType};
 use std::collections::HashMap;
 
 /// Result of coalescing a batch of transactions.

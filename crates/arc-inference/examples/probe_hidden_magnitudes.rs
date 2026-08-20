@@ -122,8 +122,8 @@ fn main() {
                         let diff = running_max - score;
                         let correction = integer_exp(diff);
                         running_sum = (running_sum * correction) >> FRAC_BITS;
-                        for dd in 0..dh {
-                            out_head[dd] = (out_head[dd] * correction) >> FRAC_BITS;
+                        for o in out_head.iter_mut() {
+                            *o = (*o * correction) >> FRAC_BITS;
                         }
                         running_max = score;
                     }
@@ -137,8 +137,8 @@ fn main() {
                 }
 
                 if running_sum > 0 {
-                    for dd in 0..dh {
-                        out_head[dd] = (out_head[dd] * ONE) / running_sum;
+                    for o in out_head.iter_mut() {
+                        *o = (*o * ONE) / running_sum;
                     }
                 }
 

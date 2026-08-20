@@ -44,6 +44,18 @@ const ROUTING_FEE: u64 = 10;
 // Routing table
 // ---------------------------------------------------------------------------
 
+/// Seed data for one demo provider, in the order the demo table lists them:
+/// (routing key, display name, cost per request, average latency in ms,
+/// capabilities, reputation).
+type ProviderSeed = (
+    &'static str,
+    &'static str,
+    u64,
+    u64,
+    Vec<&'static str>,
+    f64,
+);
+
 /// An entry in the routing table representing an available inference provider.
 #[derive(Debug, Clone)]
 struct ProviderEntry {
@@ -264,7 +276,7 @@ fn main() {
     println!("[2/5] Populating routing table with inference providers\n");
     let mut routing_table = RoutingTable::new();
 
-    let providers_data: Vec<(&str, &str, u64, u64, Vec<&str>, f64)> = vec![
+    let providers_data: Vec<ProviderSeed> = vec![
         ("sentiment-fast",  "SentimentFast",  50,  10, vec!["sentiment"],                   0.95),
         ("sentiment-cheap", "SentimentCheap", 20,  50, vec!["sentiment"],                   0.88),
         ("oracle-primary",  "OraclePrimary",  30,   5, vec!["price-oracle"],                0.99),
@@ -314,7 +326,7 @@ fn main() {
     // 4. Process sample routing requests.
     println!("\n[4/5] Processing inference routing requests\n");
 
-    let requests = vec![
+    let requests = [
         InferenceRoutingRequest {
             capability: "sentiment".to_string(),
             input_data: b"I love ARC Chain!".to_vec(),

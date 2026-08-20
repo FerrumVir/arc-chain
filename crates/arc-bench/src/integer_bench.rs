@@ -5,8 +5,7 @@
 //!
 //! Usage: cargo run --release --bin arc-bench-integer
 
-use arc_inference::integer_engine::{build_test_model, IntTransformerModel};
-use arc_inference::integer_lut::*;
+use arc_inference::integer_engine::build_test_model;
 use std::time::Instant;
 
 fn hex_encode(bytes: &[u8]) -> String {

@@ -12,10 +12,10 @@
 //! 4. **Resume**: The node then joins consensus and catches up on blocks
 //!    produced since the snapshot height.
 
-use arc_state::{SnapshotManifest, StateDB, StateSnapshot, SyncProgress};
+use arc_state::{SnapshotManifest, StateDB, StateSnapshot};
 use reqwest::Client;
 use std::sync::Arc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Maximum number of parallel chunk downloads.
 const MAX_PARALLEL_CHUNKS: usize = 8;
@@ -58,6 +58,12 @@ pub enum SyncError {
 /// Manages the state sync process over HTTP (RPC endpoints).
 pub struct StateSyncManager {
     client: Client,
+}
+
+impl Default for StateSyncManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StateSyncManager {

@@ -2560,7 +2560,7 @@ mod tests {
         timestamp: u64,
     ) -> DagBlock {
         let mut transactions = transactions;
-        transactions.sort_by(|a, b| a.0.cmp(&b.0));
+        transactions.sort_by_key(|tx| tx.0);
         let ordering_commitment = DagBlock::compute_ordering_commitment(&transactions);
         let mut block = DagBlock {
             author,
@@ -2586,7 +2586,7 @@ mod tests {
         assert_eq!(vs.len(), 4);
         assert_eq!(vs.epoch, 1);
         // quorum = ceil(2/3 * 20M) = ceil(40M/3) = 13_333_334
-        assert_eq!(vs.quorum, (2 * vs.total_stake + 2) / 3);
+        assert_eq!(vs.quorum, (2 * vs.total_stake).div_ceil(3));
         assert!(vs.quorum > vs.total_stake * 2 / 3);
         // 3 validators have 15M stake, which should exceed quorum (~13.3M)
         assert!(vs.has_quorum(&[test_addr(0), test_addr(1), test_addr(2)]));
@@ -3617,7 +3617,7 @@ mod tests {
 
         // Sort to get canonical order
         let mut expected = vec![tx_a, tx_b, tx_c];
-        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        expected.sort_by_key(|tx| tx.0);
 
         // Feed them in reverse canonical order
         let reversed: Vec<Hash256> = expected.iter().rev().copied().collect();
@@ -3786,7 +3786,7 @@ mod tests {
                 );
                 // Insert directly into DAG (bypass validation for test scaffolding)
                 engine.dag.insert(block.hash, block.clone());
-                engine.rounds.entry(round).or_insert_with(Vec::new).push(block.hash);
+                engine.rounds.entry(round).or_default().push(block.hash);
                 engine.author_round_blocks.insert((block.author, round), block.hash);
             }
         }
@@ -3831,7 +3831,7 @@ mod tests {
                 round * 100,
             );
             engine.dag.insert(block.hash, block.clone());
-            engine.rounds.entry(round).or_insert_with(Vec::new).push(block.hash);
+            engine.rounds.entry(round).or_default().push(block.hash);
         }
 
         let initial_size = engine.dag_size();
@@ -4074,7 +4074,7 @@ mod tests {
         // block lands at "current+1 = block.round"). Check we got close.
         let after = engine.current_round();
         assert!(
-            after >= 4_999_999 && after <= 5_000_000,
+            (4_999_999..=5_000_000).contains(&after),
             "engine should be at the peer's round (~5_000_000); got {after}"
         );
     }

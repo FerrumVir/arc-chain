@@ -36,9 +36,10 @@ use tracing::{debug, info, warn};
 // ---------------------------------------------------------------------------
 
 /// How the execute stage processes transactions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ExecutionMode {
     /// Execute transactions one-by-one (original behaviour).
+    #[default]
     Sequential,
     /// Optimistic parallel execution via Block-STM with automatic fallback to
     /// sequential if too many conflict rounds occur.
@@ -53,16 +54,11 @@ pub enum ExecutionMode {
     GpuResident,
 }
 
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        Self::Sequential
-    }
-}
-
 /// How the verify stage verifies Ed25519 signatures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum VerifyMode {
     /// CPU-only verification via rayon parallel iterator.
+    #[default]
     Cpu,
     /// GPU-accelerated verification via Metal (Apple Silicon) with automatic
     /// fallback to CPU for small batches or non-Apple platforms.
@@ -76,12 +72,6 @@ pub enum VerifyMode {
     /// CPU SIMD verification using ARM NEON intrinsics (aarch64).
     /// Falls back to scalar CPU until the NEON kernel is implemented (week 8).
     CpuNeon,
-}
-
-impl Default for VerifyMode {
-    fn default() -> Self {
-        Self::Cpu
-    }
 }
 
 /// Auto-detect the best verification mode based on runtime hardware probing.
@@ -528,8 +518,8 @@ impl Pipeline {
                                     // Handle EVM logs for any WasmCall txs in the batch.
                                     let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
                                     for (j, tx) in valid_txs.iter().enumerate() {
-                                        if let TxBody::WasmCall(ref body) = tx.body {
-                                            if exec_state.is_evm_contract(&body.contract) {
+                                        if let TxBody::WasmCall(ref body) = tx.body
+                                            && exec_state.is_evm_contract(&body.contract) {
                                                 let result = arc_vm::evm::evm_execute(
                                                     &exec_state,
                                                     tx.from,
@@ -546,7 +536,6 @@ impl Pipeline {
                                                     block_logs.push(log);
                                                 }
                                             }
-                                        }
                                     }
                                     if !block_logs.is_empty() {
                                         let height = exec_state.height();
@@ -606,9 +595,9 @@ impl Pipeline {
                             // EVM execution for WasmCall txs.
                             let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
                             for (j, tx) in valid_txs.iter().enumerate() {
-                                if receipt_success[orig_indices[j]] {
-                                    if let TxBody::WasmCall(ref body) = tx.body {
-                                        if exec_state.is_evm_contract(&body.contract) {
+                                if receipt_success[orig_indices[j]]
+                                    && let TxBody::WasmCall(ref body) = tx.body
+                                        && exec_state.is_evm_contract(&body.contract) {
                                             let result = arc_vm::evm::evm_execute(
                                                 &exec_state,
                                                 tx.from,
@@ -625,8 +614,6 @@ impl Pipeline {
                                                 block_logs.push(log);
                                             }
                                         }
-                                    }
-                                }
                             }
                             if !block_logs.is_empty() {
                                 let height = exec_state.height();
@@ -696,11 +683,10 @@ impl Pipeline {
                                 }
                                 TxBody::Stake(body) => {
                                     // Pre-load the validator address account if different from sender
-                                    if body.validator != sender_addr {
-                                        if let Some(acct) = exec_state.get_account(&body.validator) {
+                                    if body.validator != sender_addr
+                                        && let Some(acct) = exec_state.get_account(&body.validator) {
                                             account_snapshot.insert(body.validator.0, acct);
                                         }
-                                    }
                                 }
                                 TxBody::FaucetClaim(body) => {
                                     let pool_addr = arc_types::transaction::faucet_pool_address();
@@ -769,9 +755,9 @@ impl Pipeline {
                         // EVM execution for WasmCall txs.
                         let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
                         for (j, tx) in valid_txs.iter().enumerate() {
-                            if receipt_success[orig_indices[j]] {
-                                if let TxBody::WasmCall(ref body) = tx.body {
-                                    if exec_state.is_evm_contract(&body.contract) {
+                            if receipt_success[orig_indices[j]]
+                                && let TxBody::WasmCall(ref body) = tx.body
+                                    && exec_state.is_evm_contract(&body.contract) {
                                         let result = arc_vm::evm::evm_execute(
                                             &exec_state,
                                             tx.from,
@@ -788,8 +774,6 @@ impl Pipeline {
                                             block_logs.push(log);
                                         }
                                     }
-                                }
-                            }
                         }
                         if !block_logs.is_empty() {
                             let height = exec_state.height();
@@ -824,7 +808,7 @@ impl Pipeline {
                     // Hot accounts are read from GPU unified/managed memory.
                     if exec_mode == ExecutionMode::GpuResident && !valid_txs.is_empty() {
                         // Prefetch accounts that transactions will touch into GPU cache.
-                        if let Some(ref cache) = exec_state.gpu_cache() {
+                        if let Some(cache) = exec_state.gpu_cache() {
                             let mut addrs: Vec<[u8; 32]> = Vec::with_capacity(valid_txs.len() * 2);
                             for tx in &valid_txs {
                                 addrs.push(tx.from.0);
@@ -850,7 +834,7 @@ impl Pipeline {
                             }
 
                             // Sync GPU cache after execution.
-                            if let Some(ref cache) = exec_state.gpu_cache() {
+                            if let Some(cache) = exec_state.gpu_cache() {
                                 cache.sync();
                             }
 
@@ -896,9 +880,9 @@ impl Pipeline {
 
                             // For EVM contract calls, run actual EVM execution
                             // to handle storage writes, internal transfers, and event logs.
-                            if tx_ok {
-                                if let TxBody::WasmCall(ref body) = tx.body {
-                                    if exec_state.is_evm_contract(&body.contract) {
+                            if tx_ok
+                                && let TxBody::WasmCall(ref body) = tx.body
+                                    && exec_state.is_evm_contract(&body.contract) {
                                         let result = arc_vm::evm::evm_execute(
                                             &exec_state,
                                             tx.from,
@@ -915,8 +899,6 @@ impl Pipeline {
                                             block_logs.push(log);
                                         }
                                     }
-                                }
-                            }
                         }
                     }
 

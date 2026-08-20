@@ -109,8 +109,6 @@ fn run_mode(
     let mut batches_submitted = 0usize;
     let mut total_success = 0usize;
 
-    let num_batches = (transactions.len() + batch_size - 1) / batch_size;
-
     for chunk in transactions.chunks(batch_size) {
         pipeline
             .submit(PipelineBatch {
@@ -236,7 +234,7 @@ fn main() {
         coalesce: bool,
     }
 
-    let modes = vec![
+    let modes = [
         BenchMode { name: "CPU verify + Sequential exec",          verify: VerifyMode::Cpu,      exec: ExecutionMode::Sequential, coalesce: false },
         BenchMode { name: "CPU verify + Block-STM exec",           verify: VerifyMode::Cpu,      exec: ExecutionMode::BlockSTM,   coalesce: false },
         BenchMode { name: "CPU verify + Block-STM + Coalesce",     verify: VerifyMode::Cpu,      exec: ExecutionMode::BlockSTM,   coalesce: true },

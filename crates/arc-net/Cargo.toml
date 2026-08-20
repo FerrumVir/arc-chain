@@ -5,6 +5,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Declared so the `#[cfg(feature = "strict-tls")]` branches in transport.rs are
+# real, checkable configuration rather than dead code the compiler cannot see.
+# Off by default, so the built configuration is unchanged.
+strict-tls = []
+
 [dependencies]
 arc-crypto = { path = "../arc-crypto" }
 arc-types = { path = "../arc-types" }

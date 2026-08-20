@@ -43,7 +43,14 @@ pub struct GpuForward {
     matmul_pipeline: wgpu::ComputePipeline,
     msl_matmul_pipeline: Option<wgpu::ComputePipeline>,
     msl_matmul_q4_pipeline: Option<wgpu::ComputePipeline>,
+    // Compiled at init and reported in the pipeline count, but `forward()`
+    // currently dispatches the separate layernorm + quantize kernels instead
+    // (see the dispatch list in `forward`). Kept because dropping them would
+    // change what this constructor builds and what it logs, and because the
+    // fused path is meant to be switched on, not deleted.
+    #[allow(dead_code)]
     fused_lnq_pipeline: wgpu::ComputePipeline,
+    #[allow(dead_code)]
     msl_fused_lnq_pipeline: Option<wgpu::ComputePipeline>,
     layernorm_pipeline: wgpu::ComputePipeline,
     quantize_pipeline: wgpu::ComputePipeline,
@@ -66,7 +73,12 @@ pub struct GpuForward {
 
 /// Pre-built bind groups for one layer - created once, reused every token.
 struct LayerBindGroups {
+    // Bind groups for the fused LN+Q pipeline above, which `forward()` does
+    // not dispatch today. Built once at upload; kept so the fused path can be
+    // enabled without rebuilding bind groups.
+    #[allow(dead_code)]
     fused_lnq_attn: wgpu::BindGroup,
+    #[allow(dead_code)]
     fused_lnq_ffn: wgpu::BindGroup,
     ln_attn: wgpu::BindGroup,
     quantize_normed: wgpu::BindGroup,
@@ -89,7 +101,29 @@ struct LayerBindGroups {
     residual_ffn: wgpu::BindGroup,
 }
 
+/// One transformer layer's quantized weights, in the order `upload_model`
+/// consumes them: `(data, scales)` for wq, wk, wv, wo, w_gate, w_up, w_down,
+/// then the attn_norm gamma and the ffn_norm gamma.
+pub type LayerWeights<'a> = (
+    &'a [i8], &'a [i64], // wq data, scales
+    &'a [i8], &'a [i64], // wk
+    &'a [i8], &'a [i64], // wv
+    &'a [i8], &'a [i64], // wo
+    &'a [i8], &'a [i64], // w_gate
+    &'a [i8], &'a [i64], // w_up
+    &'a [i8], &'a [i64], // w_down
+    &'a [i64],           // attn_norm gamma
+    &'a [i64],           // ffn_norm gamma
+);
+
 /// All GPU buffers + pre-built bind groups for one model.
+///
+/// Most fields are never read back after `upload_model` builds them: the
+/// bind groups in `layer_bgs` already hold the bindings, and the fields exist
+/// to own the buffers for as long as the model lives. Dropping any of them
+/// would free GPU memory that a pre-built bind group still points at, so the
+/// dead_code allow below covers the whole struct rather than pruning fields.
+#[allow(dead_code)]
 pub struct GpuModel {
     // Embedding table: CPU-side i32 data [vocab_size * d_model].
     // Stored CPU-side because embedding lookup is a simple gather
@@ -459,22 +493,19 @@ impl GpuForward {
 
     /// Upload model weights to GPU. Call once at startup.
     /// Returns GpuModel with all buffers ready for forward pass.
+    ///
+    /// The argument list is long because it mirrors the model file layout one
+    /// tensor at a time. Bundling it into a config struct would move the same
+    /// 17 values behind a new public type without making any caller simpler,
+    /// so the lint is allowed here rather than reshaping a public API in a
+    /// crate whose output has to stay bit-identical.
+    #[allow(clippy::too_many_arguments)]
     pub fn upload_model(
         &self,
         embedding_data: &[i8], embedding_scales: &[i64],
         output_data: &[i8], output_scales: &[i64],
         final_norm: &[i64],
-        layers: &[(
-            &[i8], &[i64], // wq data, scales
-            &[i8], &[i64], // wk
-            &[i8], &[i64], // wv
-            &[i8], &[i64], // wo
-            &[i8], &[i64], // w_gate
-            &[i8], &[i64], // w_up
-            &[i8], &[i64], // w_down
-            &[i64],        // attn_norm gamma
-            &[i64],        // ffn_norm gamma
-        )],
+        layers: &[LayerWeights<'_>],
         rope_cos: &[i64], rope_sin: &[i64],
         d_model: u32, d_ff: u32, d_head: u32, d_kv: u32,
         n_heads: u32, n_kv_heads: u32, vocab_size: u32, attn_scale: i32,
@@ -805,6 +836,11 @@ impl GpuForward {
     }
 
     /// Create a small uniform buffer inline.
+    ///
+    /// Unused: every uniform this file needs is now pre-allocated in
+    /// `upload_model` and reused per token. Kept as the one place that knows
+    /// the correct usage flags for a small uniform, for the fused/ICB paths.
+    #[allow(dead_code)]
     fn buf_inline<T: Pod>(&self, data: &T) -> wgpu::Buffer {
         let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: None,

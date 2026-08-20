@@ -34,7 +34,10 @@ use crate::cached_integer_model::{
 };
 use crate::integer_lut::*;
 use std::collections::HashMap;
-use tracing::{debug, info};
+use tracing::info;
+// `debug!` is only called from the `candle`-gated disk-streaming loader.
+#[cfg(feature = "candle")]
+use tracing::debug;
 
 // ─── Memory Tier Detection ─────────────────────────────────────────────────
 
@@ -527,18 +530,18 @@ pub fn select_experts(
 
     // Compute gating logits: gate_weights × hidden
     let mut logits = vec![0i64; num_experts];
-    for row in 0..num_experts {
+    for (row, logit) in logits.iter_mut().enumerate() {
         let mut acc: i64 = 0;
         let scale = gate_weights.scales[row];
-        for col in 0..d {
-            acc += (gate_weights.data[row * d + col] as i64) * hidden[col];
+        for (col, &h) in hidden[..d].iter().enumerate() {
+            acc += (gate_weights.data[row * d + col] as i64) * h;
         }
-        logits[row] = ((acc / 127) * scale) >> FRAC_BITS;
+        *logit = ((acc / 127) * scale) >> FRAC_BITS;
     }
 
     // Top-k selection
     let mut indexed: Vec<(usize, i64)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
-    indexed.sort_by(|a, b| b.1.cmp(&a.1));
+    indexed.sort_by_key(|e| std::cmp::Reverse(e.1));
     indexed.truncate(top_k);
 
     // Softmax over selected experts for gating weights
@@ -654,6 +657,10 @@ mod tests {
         assert_eq!(tiers.iter().filter(|&&t| t == MemoryTier::Ssd).count(), 72);
     }
 
+    // estimate_ssd_latency_ms early-returns the literal 0.0 when ssd_layers is
+    // 0, so no arithmetic or rounding is involved - comparing to exactly 0.0 is
+    // the assertion we want here, and loosening it would stop testing anything.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_ssd_latency_estimate() {
         let config = MemoryTierConfig {
@@ -796,6 +803,10 @@ mod tests {
 
     // ── Speculative Decoding Tests ─────────────────────────────────────
 
+    // acceptance_rate is accepted/total computed in f64; when every draft token
+    // is accepted those are the same integer, so the quotient is an exact 1.0.
+    // The exact comparison is the point of the test - it must not be loosened.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_speculative_decode_identical_models() {
         // When draft == target (same model), acceptance rate should be 100%

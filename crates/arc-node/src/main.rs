@@ -318,101 +318,6 @@ fn rewrite_pulled_self_shard(self_shard: &mut serde_json::Value, pulled_from_add
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn pulled_stub_rewritten_to_seed_host_port() {
-        // AMS announces self_shard with socket_addr=0.0.0.0:9090. We pulled
-        // from http://136.244.109.1:9090/shards, so the routable addr for AMS
-        // IS the URL we pulled from - use it.
-        let mut v = json!({
-            "start_layer": 10, "end_layer": 14, "socket_addr": "0.0.0.0:9090",
-            "node_name": "AMS"
-        });
-        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
-        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
-    }
-
-    #[test]
-    fn pulled_routable_addr_is_left_alone() {
-        let mut v = json!({
-            "start_layer": 10, "end_layer": 14, "socket_addr": "136.244.109.1:9090",
-            "node_name": "AMS"
-        });
-        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
-        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
-    }
-
-    #[test]
-    fn pulled_stub_uses_declared_port_over_pulled_url_port() {
-        // Peer bound to 9090 but we pulled from its port 8545 (hypothetical) -
-        // prefer the port the peer declared for its listener.
-        let mut v = json!({
-            "socket_addr": "0.0.0.0:9090", "node_name": "X"
-        });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:8545");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_stub_falls_back_to_pulled_url_port_when_declared_is_bad() {
-        let mut v = json!({
-            "socket_addr": "0.0.0.0:junk", "node_name": "X"
-        });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_loopback_stub_also_rewritten() {
-        // Seed set up with --rpc 127.0.0.1 on a misconfigured run would announce
-        // 127.0.0.1:9090. The pulled URL is the routable address, use it.
-        let mut v = json!({
-            "socket_addr": "127.0.0.1:9090", "node_name": "X"
-        });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_ipv6_stub_rewritten() {
-        let mut v = json!({"socket_addr": "[::]:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-
-        let mut v = json!({"socket_addr": "[::1]:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn pulled_empty_addr_rewritten() {
-        let mut v = json!({"socket_addr": "", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
-    }
-
-    #[test]
-    fn missing_socket_addr_field_is_noop() {
-        // Malformed / partial self_shard JSON should not panic.
-        let mut v = json!({"node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert!(v.get("socket_addr").is_none());
-    }
-
-    #[test]
-    fn pulled_url_with_no_port_is_tolerated() {
-        // Defensive: if seed_addrs_pull accidentally carries a host without a port,
-        // rewrite still produces a sensible string (host + default 9090).
-        let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
-        rewrite_pulled_self_shard(&mut v, "136.244.109.1");
-        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
-    }
-}
-
 /// Look for a Llama-2-7B GGUF in standard community-node locations.
 /// Returns the first existing path. Covers both the seed convention
 /// (`llama2-7b.gguf`) and TheBloke's published filename
@@ -427,12 +332,9 @@ fn auto_discover_model() -> Option<String> {
         "/opt/arc/llama2-7b.gguf".to_string(),
         "/var/lib/arc/llama2-7b.gguf".to_string(),
     ];
-    for p in candidates {
-        if std::path::Path::new(&p).is_file() {
-            return Some(p);
-        }
-    }
-    None
+    candidates
+        .into_iter()
+        .find(|p| std::path::Path::new(p).is_file())
 }
 
 /// sha256 a file by shelling to `sha256sum` (Linux) or `shasum -a 256` (macOS).
@@ -443,20 +345,17 @@ fn sha256_of(path: &str) -> Option<String> {
             .ok()
             .and_then(|s| s.split_whitespace().next().map(|x| x.to_string()))
     };
-    if let Ok(out) = std::process::Command::new("sha256sum").arg(path).output() {
-        if out.status.success() {
+    if let Ok(out) = std::process::Command::new("sha256sum").arg(path).output()
+        && out.status.success() {
             return parse(out.stdout);
         }
-    }
     if let Ok(out) = std::process::Command::new("shasum")
         .args(["-a", "256"])
         .arg(path)
         .output()
-    {
-        if out.status.success() {
+        && out.status.success() {
             return parse(out.stdout);
         }
-    }
     None
 }
 
@@ -632,15 +531,14 @@ fn auto_download_model() -> Option<String> {
 fn detect_ram_mb() -> u64 {
     if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
         for line in meminfo.lines() {
-            if line.starts_with("MemTotal:") {
-                if let Some(kb) = line
+            if line.starts_with("MemTotal:")
+                && let Some(kb) = line
                     .split_whitespace()
                     .nth(1)
                     .and_then(|s| s.parse::<u64>().ok())
                 {
                     return kb / 1024;
                 }
-            }
         }
     }
     8192
@@ -651,27 +549,24 @@ fn detect_ram_mb() -> u64 {
 /// they advertise in seeds files. Returns the first usable host.
 fn pick_seed_rpc(cli: &Cli) -> Option<String> {
     for p in &cli.peers {
-        if let Some(host) = p.split(':').next() {
-            if !host.is_empty() {
+        if let Some(host) = p.split(':').next()
+            && !host.is_empty() {
                 return Some(format!("{}:9090", host));
             }
-        }
     }
-    if let Some(path) = &cli.seeds_file {
-        if let Ok(content) = std::fs::read_to_string(path) {
+    if let Some(path) = &cli.seeds_file
+        && let Ok(content) = std::fs::read_to_string(path) {
             for raw in content.lines() {
                 let line = raw.trim();
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                if let Some(host) = line.split(':').next() {
-                    if !host.is_empty() {
+                if let Some(host) = line.split(':').next()
+                    && !host.is_empty() {
                         return Some(format!("{}:9090", host));
                     }
-                }
             }
         }
-    }
     None
 }
 
@@ -1257,11 +1152,10 @@ async fn main() -> Result<()> {
         }
         held_ranges.push((start, end));
     }
-    if held_ranges.is_empty() {
-        if let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end) {
+    if held_ranges.is_empty()
+        && let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end) {
             held_ranges.push((start, end));
         }
-    }
     held_ranges.sort();
     for i in 1..held_ranges.len() {
         if held_ranges[i].0 < held_ranges[i - 1].1 {
@@ -1697,7 +1591,7 @@ async fn main() -> Result<()> {
                 start_layer: start,
                 end_layer: end,
                 total_layers,
-                model_id: format!("0x{}", hex::encode(&model_id_hash.0)),
+                model_id: format!("0x{}", hex::encode(model_id_hash.0)),
                 model_name: model_id_data.clone(),
                 memory_mb: per_layer_mb * (end - start),
                 full_model_mb,
@@ -1726,13 +1620,11 @@ async fn main() -> Result<()> {
             // p is a SocketAddr string like "1.2.3.4:9091"
             if let Some(host) = p.split(':').next() {
                 seed_addrs.push(format!("{}:9090", host));
-                if let Some(port_str) = p.split(':').nth(1) {
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        if port > 1 && port - 1 != 9090 {
+                if let Some(port_str) = p.split(':').nth(1)
+                    && let Ok(port) = port_str.parse::<u16>()
+                        && port > 1 && port - 1 != 9090 {
                             seed_addrs.push(format!("{}:{}", host, port - 1));
                         }
-                    }
-                }
             }
         }
         seed_addrs.sort();
@@ -1803,8 +1695,8 @@ async fn main() -> Result<()> {
                 // holder, and it's what the receiver-side fix for direct
                 // /shards/announce broadcasts produces too.
                 for addr in &seed_addrs_pull {
-                    if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await {
-                        if let Ok(mut json) = resp.json::<serde_json::Value>().await {
+                    if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await
+                        && let Ok(mut json) = resp.json::<serde_json::Value>().await {
                             // New peers emit `self_shards: [ShardInfo, ...]`; legacy
                             // peers still emit `self_shard: ShardInfo` - accept both
                             // so a rolling upgrade never loses shard visibility.
@@ -1817,18 +1709,16 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                            if let Some(self_shard) = json.get_mut("self_shard") {
-                                if !self_shard.is_null() {
+                            if let Some(self_shard) = json.get_mut("self_shard")
+                                && !self_shard.is_null() {
                                     rewrite_pulled_self_shard(self_shard, addr);
                                     to_announce.push(self_shard.clone());
                                 }
-                            }
                             for shard_val in to_announce {
                                 let payload = serde_json::json!({"shard": shard_val});
                                 let _ = client.post(&local_announce).json(&payload).send().await;
                             }
                         }
-                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             }
@@ -1868,7 +1758,7 @@ async fn main() -> Result<()> {
 
     if community_mode {
         let validator_seed_c = validator_seed.clone();
-        let worker_id = format!("0x{}", hex::encode(&validator_address.0));
+        let worker_id = format!("0x{}", hex::encode(validator_address.0));
         let hostname = std::process::Command::new("hostname")
             .output()
             .ok()
@@ -1968,7 +1858,7 @@ async fn main() -> Result<()> {
             // seeds a full round could exceed the 15 s tick.
             let mut ticks: u64 = 0;
             loop {
-                let register_tick = ticks % 4 == 0;
+                let register_tick = ticks.is_multiple_of(4);
                 let mut set = tokio::task::JoinSet::new();
                 for addr in &seed_rpc_addrs_c {
                     let client = client.clone();
@@ -2005,9 +1895,9 @@ async fn main() -> Result<()> {
                     });
                 }
                 while let Some(Ok((addr, resp))) = set.join_next().await {
-                    if let Some(resp) = resp {
-                        if let Some(sa) = resp.get("shard_assignment") {
-                            if !sa.is_null() {
+                    if let Some(resp) = resp
+                        && let Some(sa) = resp.get("shard_assignment")
+                            && !sa.is_null() {
                                 tracing::info!(
                                     start = sa.get("start_layer").and_then(|v| v.as_u64()).unwrap_or(0),
                                     end = sa.get("end_layer").and_then(|v| v.as_u64()).unwrap_or(0),
@@ -2016,8 +1906,6 @@ async fn main() -> Result<()> {
                                     "Auto-shard assignment received from coordinator"
                                 );
                             }
-                        }
-                    }
                 }
                 ticks += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
@@ -2058,7 +1946,7 @@ async fn main() -> Result<()> {
                     Err(_) => return,
                 };
                 tracing::info!(
-                    address = %format!("0x{}", hex::encode(&worker_address.0)),
+                    address = %format!("0x{}", hex::encode(worker_address.0)),
                     "Community inference worker started - polling for jobs"
                 );
                 loop {
@@ -2156,7 +2044,7 @@ async fn main() -> Result<()> {
                         let elapsed_ms = start.elapsed().as_millis() as u64;
                         let output_text = model.decode(&generated);
                         let tokens_gen = generated.len() as u64;
-                        let ms_per_tok = if tokens_gen > 0 { elapsed_ms / tokens_gen } else { 0 };
+                        let ms_per_tok = elapsed_ms.checked_div(tokens_gen).unwrap_or(0);
 
                         tracing::info!("Job {} done: {} tokens in {}ms = {} ms/tok",
                             job_id, tokens_gen, elapsed_ms, ms_per_tok);
@@ -2167,14 +2055,13 @@ async fn main() -> Result<()> {
                         // there. Subsequent attestations increment locally.
                         if !attestation_nonce_initialized.load(std::sync::atomic::Ordering::Relaxed) {
                             let q_url = format!("http://{}/account/0x{}",
-                                winner, hex::encode(&worker_address.0));
-                            if let Ok(resp) = client.get(&q_url).send().await {
-                                if let Ok(v) = resp.json::<serde_json::Value>().await {
+                                winner, hex::encode(worker_address.0));
+                            if let Ok(resp) = client.get(&q_url).send().await
+                                && let Ok(v) = resp.json::<serde_json::Value>().await {
                                     let n = v.get("nonce").and_then(|x| x.as_u64()).unwrap_or(0);
                                     attestation_nonce.store(n, std::sync::atomic::Ordering::Relaxed);
                                     tracing::info!(starting_nonce = n, "worker attestation nonce initialized from chain");
                                 }
-                            }
                             attestation_nonce_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
                         }
 
@@ -2229,10 +2116,10 @@ async fn main() -> Result<()> {
 
                         let mut result_body = serde_json::json!({
                             "job_id": job_id,
-                            "worker_id": format!("0x{}", hex::encode(&worker_address.0)),
+                            "worker_id": format!("0x{}", hex::encode(worker_address.0)),
                             "success": true,
                             "output": output_text,
-                            "output_hash": format!("0x{}", hex::encode(&hash.0)),
+                            "output_hash": format!("0x{}", hex::encode(hash.0)),
                             "tokens_generated": tokens_gen,
                             "total_ms": elapsed_ms,
                             "ms_per_token": ms_per_tok,
@@ -2251,8 +2138,8 @@ async fn main() -> Result<()> {
 
                         // If submit reports invalid_nonce, force a re-query
                         // of the chain on the next loop iteration.
-                        if let Ok(resp) = submit_resp {
-                            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        if let Ok(resp) = submit_resp
+                            && let Ok(body) = resp.json::<serde_json::Value>().await {
                                 let attestation = body.get("attestation");
                                 if let Some(a) = attestation {
                                     let status = a.get("status").and_then(|s| s.as_str()).unwrap_or("");
@@ -2264,7 +2151,6 @@ async fn main() -> Result<()> {
                                     }
                                 }
                             }
-                        }
 
                     }
                     // Brief sleep between poll rounds to avoid hammering
@@ -2338,4 +2224,99 @@ async fn main() -> Result<()> {
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pulled_stub_rewritten_to_seed_host_port() {
+        // AMS announces self_shard with socket_addr=0.0.0.0:9090. We pulled
+        // from http://136.244.109.1:9090/shards, so the routable addr for AMS
+        // IS the URL we pulled from - use it.
+        let mut v = json!({
+            "start_layer": 10, "end_layer": 14, "socket_addr": "0.0.0.0:9090",
+            "node_name": "AMS"
+        });
+        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
+        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+    }
+
+    #[test]
+    fn pulled_routable_addr_is_left_alone() {
+        let mut v = json!({
+            "start_layer": 10, "end_layer": 14, "socket_addr": "136.244.109.1:9090",
+            "node_name": "AMS"
+        });
+        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
+        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+    }
+
+    #[test]
+    fn pulled_stub_uses_declared_port_over_pulled_url_port() {
+        // Peer bound to 9090 but we pulled from its port 8545 (hypothetical) -
+        // prefer the port the peer declared for its listener.
+        let mut v = json!({
+            "socket_addr": "0.0.0.0:9090", "node_name": "X"
+        });
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:8545");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_stub_falls_back_to_pulled_url_port_when_declared_is_bad() {
+        let mut v = json!({
+            "socket_addr": "0.0.0.0:junk", "node_name": "X"
+        });
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_loopback_stub_also_rewritten() {
+        // Seed set up with --rpc 127.0.0.1 on a misconfigured run would announce
+        // 127.0.0.1:9090. The pulled URL is the routable address, use it.
+        let mut v = json!({
+            "socket_addr": "127.0.0.1:9090", "node_name": "X"
+        });
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_ipv6_stub_rewritten() {
+        let mut v = json!({"socket_addr": "[::]:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+
+        let mut v = json!({"socket_addr": "[::1]:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn pulled_empty_addr_rewritten() {
+        let mut v = json!({"socket_addr": "", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+    }
+
+    #[test]
+    fn missing_socket_addr_field_is_noop() {
+        // Malformed / partial self_shard JSON should not panic.
+        let mut v = json!({"node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert!(v.get("socket_addr").is_none());
+    }
+
+    #[test]
+    fn pulled_url_with_no_port_is_tolerated() {
+        // Defensive: if seed_addrs_pull accidentally carries a host without a port,
+        // rewrite still produces a sensible string (host + default 9090).
+        let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "136.244.109.1");
+        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+    }
 }

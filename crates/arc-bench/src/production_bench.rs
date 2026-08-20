@@ -155,7 +155,7 @@ fn run_single_proposer(
     let mut total_success = 0usize;
 
     // Submit all batches
-    let num_batches = (transactions.len() + batch_size - 1) / batch_size;
+    let num_batches = transactions.len().div_ceil(batch_size);
     let mut tx_iter = transactions.into_iter();
 
     for _ in 0..num_batches {
@@ -368,7 +368,7 @@ fn main() {
         println!("    Avg per proposer:    {}", format_tps(avg_individual_tps));
         println!();
 
-        let scaling = aggregate_tps / per_proposer_tps.get(0).copied().unwrap_or(1.0);
+        let scaling = aggregate_tps / per_proposer_tps.first().copied().unwrap_or(1.0);
         println!("    Scaling efficiency:  {:.1}x from {} proposers ({:.0}% of linear)",
             scaling, args.proposers, (scaling / args.proposers as f64) * 100.0);
     }

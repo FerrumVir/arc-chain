@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     //    for this address.
     let kp = KeyPair::generate_ed25519();
     let address = kp.address();
-    let address_hex = format!("0x{}", hex::encode(&address.0));
+    let address_hex = format!("0x{}", hex::encode(address.0));
     println!("Generated worker address: {}", address_hex);
 
     let client = reqwest::Client::builder()
@@ -172,8 +172,8 @@ async fn main() -> anyhow::Result<()> {
     tx.sign(&kp)?;
     let bytes = bincode::serialize(&tx)?;
     let signed_hex = format!("0x{}", hex::encode(&bytes));
-    println!("  ↳ tx_hash {}", hex::encode(&tx.hash.0));
-    println!("  ↳ from    {}", hex::encode(&tx.from.0));
+    println!("  ↳ tx_hash {}", hex::encode(tx.hash.0));
+    println!("  ↳ from    {}", hex::encode(tx.from.0));
     println!("  ↳ nonce   {}", tx.nonce);
     println!("  ↳ {} bytes signed", bytes.len());
 
@@ -186,7 +186,7 @@ async fn main() -> anyhow::Result<()> {
             "worker_id": address_hex,
             "success": true,
             "output": output_text,
-            "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+            "output_hash": format!("0x{}", hex::encode(output_hash.0)),
             "tokens_generated": 1,
             "total_ms": 50,
             "ms_per_token": 50,

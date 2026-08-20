@@ -11,6 +11,9 @@
 
 use crate::{InferenceError, InferenceResult};
 use arc_crypto::Hash256;
+// Only the `candle` feature has code paths that log here; without it this
+// import would be unused.
+#[cfg(feature = "candle")]
 use tracing::info;
 
 /// GGUF model inference engine.
@@ -32,6 +35,14 @@ struct LoadedGgufModel {
     /// Quantized model weights loaded via candle.
     model: candle_transformers::models::quantized_llama::ModelWeights,
     /// Tokenizer (simple byte-level for determinism).
+    ///
+    /// Recorded but never read. Kept because it is part of this struct's
+    /// record of what was loaded — and because the value is currently
+    /// hardcoded to 32000 ("standard for Llama family", see `load`) rather
+    /// than read from the GGUF metadata. Deleting the field would remove the
+    /// only trace of that assumption; it should instead be sourced from the
+    /// file and actually used when a non-32000-vocab model is supported.
+    #[allow(dead_code)]
     vocab_size: u32,
 }
 

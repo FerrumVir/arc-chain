@@ -56,6 +56,9 @@ pub struct StateTransition {
     pub action: String,
 }
 
+/// Comparison applied to a `uint` state variable and a parsed literal.
+type UintCmp = dyn Fn(u64, u64) -> bool;
+
 /// A snapshot of the model's state.
 #[derive(Debug, Clone)]
 pub struct ModelState {
@@ -87,7 +90,7 @@ impl ModelState {
         }
 
         // Try relational operators (longest first to avoid partial match).
-        let operators: &[(&str, &dyn Fn(u64, u64) -> bool)] = &[
+        let operators: &[(&str, &UintCmp)] = &[
             (">=", &|a: u64, b: u64| a >= b),
             ("==", &|a: u64, b: u64| a == b),
             (">", &|a: u64, b: u64| a > b),

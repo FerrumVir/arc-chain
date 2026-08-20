@@ -11,8 +11,13 @@ use candle_core::{Device, Tensor};
 #[cfg(feature = "candle")]
 use candle_core::quantized::gguf_file;
 
+// Everything these bring in is used only by the `candle`-gated GGUF loader
+// and forward pass below, so the imports are gated the same way.
+#[cfg(feature = "candle")]
 use crate::integer_lut::*;
+#[cfg(feature = "candle")]
 use crate::integer_engine::*;
+#[cfg(feature = "candle")]
 use crate::cached_integer_model::{silu_i64, compute_rope_tables, apply_rope};
 use crate::InferenceError;
 

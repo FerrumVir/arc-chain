@@ -109,11 +109,15 @@ impl Default for OracleRegistry {
 // Precompile registry
 // ---------------------------------------------------------------------------
 
+/// Boxed body of a precompile: input bytes in, [`PrecompileResult`] out.
+/// `Send + Sync` because the registry is shared across executor threads.
+type PrecompileHandler = Box<dyn Fn(&[u8]) -> PrecompileResult + Send + Sync>;
+
 struct PrecompileEntry {
     name: String,
     base_gas: u64,
     per_word_gas: u64,
-    handler: Box<dyn Fn(&[u8]) -> PrecompileResult + Send + Sync>,
+    handler: PrecompileHandler,
 }
 
 /// Registry of precompiled contracts.

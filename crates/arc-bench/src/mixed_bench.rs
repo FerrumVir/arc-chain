@@ -388,7 +388,7 @@ fn run_transfer_only(
     let producer = benchmark_address(255);
 
     let start = Instant::now();
-    let num_batches = (transactions.len() + batch_size - 1) / batch_size;
+    let num_batches = transactions.len().div_ceil(batch_size);
     let mut tx_iter = transactions.into_iter();
     let mut batches_submitted = 0usize;
 
@@ -449,7 +449,7 @@ fn run_mixed_workload(
     let producer = benchmark_address(255);
 
     let start = Instant::now();
-    let num_batches = (transactions.len() + batch_size - 1) / batch_size;
+    let num_batches = transactions.len().div_ceil(batch_size);
     let mut tx_iter = transactions.into_iter();
     let mut type_iter = tx_types.chunks(batch_size);
     let mut batches_submitted = 0usize;

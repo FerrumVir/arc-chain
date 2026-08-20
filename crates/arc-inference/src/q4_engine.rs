@@ -147,7 +147,10 @@ pub fn matmul_q4_preq(weights: &Q4Weights, input_q: &QuantizedInput, in_size: us
                         p += 16;
                     }
                     vacc0 = vaddq_s32(vacc0, vacc1);
-                    acc = vaddvq_s32(vacc0) as i64;
+                    // `acc` is still 0 here, so `+=` is bit-identical to `=`;
+                    // it just avoids a dead store on the non-aarch64 build
+                    // where the scalar block below owns the accumulator.
+                    acc += vaddvq_s32(vacc0) as i64;
 
                     // Scalar remainder
                     for pp in simd_len..half_cols {

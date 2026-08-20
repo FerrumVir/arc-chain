@@ -316,8 +316,10 @@ impl TestRunner {
 
     /// Compute a summary from all collected results.
     pub fn summary(&self) -> TestSummary {
-        let mut s = TestSummary::default();
-        s.total = self.results.len();
+        let mut s = TestSummary {
+            total: self.results.len(),
+            ..Default::default()
+        };
         for r in &self.results {
             if r.passed {
                 s.passed += 1;

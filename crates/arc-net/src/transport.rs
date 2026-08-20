@@ -27,6 +27,13 @@ const MAX_PEERS: u32 = 256;
 
 /// Target number of outbound peers. We maintain this many active outbound
 /// connections and accept inbound connections up to MAX_PEERS.
+//
+// Kept rather than deleted: this is the documented outbound-peer target for the
+// transport, but nothing reads it yet — the dial paths (bootstrap, persisted,
+// PEX, reconnect) are only bounded by MAX_PEERS. Deleting the constant would
+// erase the record of that gap, so it is allowed to stay unused until the
+// outbound-target logic is actually wired up.
+#[allow(dead_code)]
 const TARGET_OUTBOUND: u32 = 16;
 
 /// Per-peer message rate limit (messages per second).
@@ -244,6 +251,12 @@ fn make_server_config() -> quinn::ServerConfig {
 /// not yet implemented. This feature flag exists to prevent accidental production
 /// deployment without TLS-layer peer verification.
 fn make_client_config() -> quinn::ClientConfig {
+    // NOTE: the doc comment above claims this path panics at startup, but the
+    // code below does not panic — it installs the same accept-all
+    // `TestnetCertVerifier` as the default path, only with different timeouts.
+    // The doc and the code disagree about what `strict-tls` does. Left exactly
+    // as written rather than guessed at; see the review notes. Do not treat
+    // building with `strict-tls` as enabling certificate verification.
     #[cfg(feature = "strict-tls")]
     {
         // Production mode: accept any self-signed cert but verify the peer's
@@ -596,6 +609,11 @@ impl PeerConnections {
 ///
 /// Binds a QUIC endpoint, dials bootstrap peers, accepts incoming connections,
 /// and bridges network I/O to/from the consensus layer via channels.
+//
+// Collapsing these into a config struct would be a breaking change to a public
+// entry point that arc-node and arc-bench both call, and those crates are out of
+// scope for this change, so the argument list stays as-is.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_transport(
     listen_addr: SocketAddr,
     bootstrap_peers: Vec<SocketAddr>,
@@ -731,11 +749,14 @@ pub async fn run_transport(
             let handshake_msg = make_signed_handshake(
                 local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
             );
-            let c = connections.clone();
-            let itx = inbound_tx.clone();
-            let pc = peer_count.clone();
-            let pdt = pex_dial_tx.clone();
-            let rl = rate_limiter.clone();
+            let ctx = PeerContext::new(
+                local_address,
+                &connections,
+                &inbound_tx,
+                &peer_count,
+                &pex_dial_tx,
+                &rate_limiter,
+            );
             dial_handles.push(tokio::spawn(async move {
                 // Try up to 3 times with increasing timeouts. Intercontinental
                 // QUIC handshakes (e.g., US→Singapore) can need >5s on first attempt.
@@ -743,7 +764,7 @@ pub async fn run_transport(
                     let timeout_secs = 5 * attempt as u64; // 5s, 10s, 15s
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(timeout_secs),
-                        dial_peer(&ep, addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl),
+                        dial_peer(&ep, addr, &handshake_msg, &ctx),
                     ).await {
                         Ok(Ok(())) => {
                             info!("Connected to bootstrap peer {} (attempt {})", addr, attempt);
@@ -787,17 +808,15 @@ pub async fn run_transport(
         let handshake_msg = make_signed_handshake(
             local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
         );
-        match dial_peer(
-            &endpoint,
-            *peer_addr,
-            &handshake_msg,
+        let ctx = PeerContext::new(
             local_address,
             &connections,
             &inbound_tx,
             &peer_count,
             &pex_dial_tx,
             &rate_limiter,
-        )
+        );
+        match dial_peer(&endpoint, *peer_addr, &handshake_msg, &ctx)
         .await
         {
             Ok(()) => info!("Connected to persisted peer {}", peer_addr),
@@ -1015,16 +1034,19 @@ pub async fn run_transport(
                             let handshake_msg = make_signed_handshake(
                                 local_address, local_stake, listen_addr.port(), genesis_hash, &kp,
                             );
-                            let c = conn_bg.clone();
-                            let itx2 = itx.clone();
-                            let pc2 = pc.clone();
                             let ep2 = ep.clone();
-                            let pdt2 = pdt.clone();
-                            let rl2 = rl.clone();
+                            let ctx = PeerContext::new(
+                                local_address,
+                                &conn_bg,
+                                &itx,
+                                &pc,
+                                &pdt,
+                                &rl,
+                            );
                             tokio::spawn(async move {
                                 match tokio::time::timeout(
                                     std::time::Duration::from_secs(10),
-                                    dial_peer(&ep2, addr, &handshake_msg, local_address, &c, &itx2, &pc2, &pdt2, &rl2),
+                                    dial_peer(&ep2, addr, &handshake_msg, &ctx),
                                 ).await {
                                     Ok(Ok(())) => info!("Reconnect: connected to {}", addr),
                                     Ok(Err(e)) => debug!("Reconnect to {} failed: {}", addr, e),
@@ -1069,12 +1091,15 @@ pub async fn run_transport(
                     continue;
                 }
 
-                let connections_clone = connections.clone();
-                let inbound_clone = inbound_tx.clone();
-                let peer_count_clone = peer_count.clone();
                 let keypair_clone = keypair.clone();
-                let pex_dial_clone = pex_dial_tx.clone();
-                let rate_limiter_clone = rate_limiter.clone();
+                let ctx = PeerContext::new(
+                    local_address,
+                    &connections,
+                    &inbound_tx,
+                    &peer_count,
+                    &pex_dial_tx,
+                    &rate_limiter,
+                );
 
                 tokio::spawn(async move {
                     // 10-second handshake timeout - prevents attackers from
@@ -1084,18 +1109,9 @@ pub async fn run_transport(
                     );
                     let result = tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        accept_peer(
-                            conn,
-                            &handshake_msg,
-                            local_address,
-                            &connections_clone,
-                            &inbound_clone,
-                            &peer_count_clone,
-                            &pex_dial_clone,
-                            &rate_limiter_clone,
-                        )
+                        accept_peer(conn, &handshake_msg, &ctx)
                     ).await;
-                    if let Err(_) = result {
+                    if result.is_err() {
                         warn!("Handshake timeout from {}", remote_addr);
                     } else if let Ok(Err(e)) = result
                     {
@@ -1117,13 +1133,16 @@ pub async fn run_transport(
                     let handshake_msg = make_signed_handshake(
                         local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
                     );
-                    let c = connections.clone();
                     let conn_pex_clone = conn_pex.clone();
-                    let itx = inbound_tx.clone();
-                    let pc = peer_count.clone();
                     let ep = endpoint.clone();
-                    let pdt = pex_dial_tx.clone();
-                    let rl = rate_limiter.clone();
+                    let ctx = PeerContext::new(
+                        local_address,
+                        &connections,
+                        &inbound_tx,
+                        &peer_count,
+                        &pex_dial_tx,
+                        &rate_limiter,
+                    );
                     tokio::spawn(async move {
                         // Skip if already connected (moved out of select body)
                         let already = conn_pex_clone.meta.iter().any(|e| e.value().dial_addr == peer_addr);
@@ -1131,7 +1150,7 @@ pub async fn run_transport(
                         info!("PEX: dialing discovered peer {}", peer_addr);
                         match tokio::time::timeout(
                             std::time::Duration::from_secs(10),
-                            dial_peer(&ep, peer_addr, &handshake_msg, local_address, &c, &itx, &pc, &pdt, &rl),
+                            dial_peer(&ep, peer_addr, &handshake_msg, &ctx),
                         ).await {
                             Ok(Ok(())) => info!("PEX: connected to {}", peer_addr),
                             Ok(Err(e)) => debug!("PEX: failed to dial {}: {}", peer_addr, e),
@@ -1146,19 +1165,59 @@ pub async fn run_transport(
     }
 }
 
+// ─── Shared Connection-Setup Context ───────────────────────────────────────
+
+/// The node-wide handles that every connection-setup path needs.
+///
+/// `dial_peer` and `accept_peer` both require the same six values, and every
+/// call site was cloning them into individually named locals. Bundling them
+/// keeps the setup functions to a readable arity and keeps the two paths from
+/// drifting apart. All fields are cheap clones (`Arc` / mpsc `Sender`).
+struct PeerContext {
+    local_address: Hash256,
+    connections: Arc<PeerConnections>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
+    pex_dial_tx: mpsc::Sender<SocketAddr>,
+    rate_limiter: Arc<PeerRateLimiter>,
+}
+
+impl PeerContext {
+    /// Build a context from the transport's own long-lived handles.
+    fn new(
+        local_address: Hash256,
+        connections: &Arc<PeerConnections>,
+        inbound_tx: &mpsc::Sender<InboundMessage>,
+        peer_count: &Arc<AtomicU32>,
+        pex_dial_tx: &mpsc::Sender<SocketAddr>,
+        rate_limiter: &Arc<PeerRateLimiter>,
+    ) -> Self {
+        Self {
+            local_address,
+            connections: connections.clone(),
+            inbound_tx: inbound_tx.clone(),
+            peer_count: peer_count.clone(),
+            pex_dial_tx: pex_dial_tx.clone(),
+            rate_limiter: rate_limiter.clone(),
+        }
+    }
+}
+
 // ─── Dial (Outbound Connection) ─────────────────────────────────────────────
 
 async fn dial_peer(
     endpoint: &quinn::Endpoint,
     peer_addr: SocketAddr,
     local_handshake: &HandshakeMessage,
-    local_address: Hash256,
-    connections: &Arc<PeerConnections>,
-    inbound_tx: &mpsc::Sender<InboundMessage>,
-    peer_count: &Arc<AtomicU32>,
-    pex_dial_tx: &mpsc::Sender<SocketAddr>,
-    rate_limiter: &Arc<PeerRateLimiter>,
+    ctx: &PeerContext,
 ) -> anyhow::Result<()> {
+    let local_address = ctx.local_address;
+    let connections = &ctx.connections;
+    let inbound_tx = &ctx.inbound_tx;
+    let peer_count = &ctx.peer_count;
+    let pex_dial_tx = &ctx.pex_dial_tx;
+    let rate_limiter = &ctx.rate_limiter;
+
     let conn = endpoint.connect(peer_addr, "localhost")?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -1257,13 +1316,15 @@ async fn dial_peer(
 async fn accept_peer(
     conn: quinn::Connection,
     local_handshake: &HandshakeMessage,
-    local_address: Hash256,
-    connections: &Arc<PeerConnections>,
-    inbound_tx: &mpsc::Sender<InboundMessage>,
-    peer_count: &Arc<AtomicU32>,
-    pex_dial_tx: &mpsc::Sender<SocketAddr>,
-    rate_limiter: &Arc<PeerRateLimiter>,
+    ctx: &PeerContext,
 ) -> anyhow::Result<()> {
+    let local_address = ctx.local_address;
+    let connections = &ctx.connections;
+    let inbound_tx = &ctx.inbound_tx;
+    let peer_count = &ctx.peer_count;
+    let pex_dial_tx = &ctx.pex_dial_tx;
+    let rate_limiter = &ctx.rate_limiter;
+
     let (mut send, mut recv) = conn.accept_bi().await?;
 
     // Read their handshake

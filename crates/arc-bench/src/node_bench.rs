@@ -1,16 +1,16 @@
-/// ARC Chain - Multi-Node Live Benchmark
-///
-/// Modes:
-///   live     - Live dashboard + WebSocket coordinator
-///   worker   - Benchmark worker (standalone HTTP or reporting to coordinator)
-///   coord    - One-shot aggregation of worker nodes
-///   local    - Run benchmark locally, output JSON
-///
-/// Usage:
-///   arc-bench-node live [--port 8080]
-///   arc-bench-node worker [--port 9944] [--coord http://coordinator:8080]
-///   arc-bench-node coord --nodes http://node1:9944,http://node2:9944 [--n 1000000]
-///   arc-bench-node local [--n 1000000]
+//! ARC Chain - Multi-Node Live Benchmark
+//!
+//! Modes:
+//!   live     - Live dashboard + WebSocket coordinator
+//!   worker   - Benchmark worker (standalone HTTP or reporting to coordinator)
+//!   coord    - One-shot aggregation of worker nodes
+//!   local    - Run benchmark locally, output JSON
+//!
+//! Usage:
+//!   arc-bench-node live [--port 8080]
+//!   arc-bench-node worker [--port 9944] [--coord http://coordinator:8080]
+//!   arc-bench-node coord --nodes http://node1:9944,http://node2:9944 [--n 1000000]
+//!   arc-bench-node local [--n 1000000]
 
 use arc_crypto::*;
 use arc_gpu::{cpu_batch_commit, gpu_batch_commit, probe_gpu};

@@ -122,13 +122,16 @@ pub fn matmul_block_i8_into(
 
     let blocks_per_row = n_cols / BLOCK_SIZE;
 
-    for row_idx in 0..n_rows {
+    // `output.len() == n_rows` is asserted above, and `row_scales` is built with
+    // exactly `blocks_per_row` elements, so iterating them covers exactly the
+    // same indices in the same order as the original ranges.
+    for (row_idx, out_row) in output.iter_mut().enumerate() {
         let row_data = &weights.data[row_idx * n_cols..(row_idx + 1) * n_cols];
         let row_scales = &weights.scales[row_idx * blocks_per_row
             ..(row_idx + 1) * blocks_per_row];
 
         let mut acc: i128 = 0;
-        for block_idx in 0..blocks_per_row {
+        for (block_idx, &row_scale) in row_scales.iter().enumerate() {
             let block_start = block_idx * BLOCK_SIZE;
             let block_end = block_start + BLOCK_SIZE;
             let wblock = &row_data[block_start..block_end];
@@ -141,13 +144,13 @@ pub fn matmul_block_i8_into(
                 block_dot += (wblock[j] as i64) * iblock[j];
             }
 
-            let scale = row_scales[block_idx] as i128;
+            let scale = row_scale as i128;
             acc += (block_dot as i128) * scale;
         }
 
         // Finalize Q16: (row_acc >> FRAC_BITS) gives the Q16 output
         // equivalent of sum(weight_real × input_real) × ONE.
-        output[row_idx] = (acc >> FRAC_BITS as i128) as i64;
+        *out_row = (acc >> FRAC_BITS as i128) as i64;
     }
 }
 

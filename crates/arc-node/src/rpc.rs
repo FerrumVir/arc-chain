@@ -1,4 +1,5 @@
 use arc_consensus::StakeTier;
+use crate::SharedValidators;
 use arc_crypto::{Hash256, MerkleProof};
 use arc_gpu::probe_gpu;
 use arc_mempool::Mempool;
@@ -114,7 +115,7 @@ pub struct NodeState {
     /// Model ID for candle engine.
     pub candle_model_id: Option<arc_crypto::Hash256>,
     /// Live DAG validator set (updated by consensus loop via PeerConnected).
-    pub dag_validators: Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>,
+    pub dag_validators: SharedValidators,
     /// Per-sender rate limiter for tx submission: sender_address → last submit time.
     /// Limits to 10 tx/sec per sender to prevent mempool flood DoS.
     pub tx_rate_limit: Arc<dashmap::DashMap<[u8; 32], Instant>>,
@@ -704,6 +705,11 @@ pub fn assemble_pipeline_for(node: &NodeState) -> Result<Vec<PipelineHop>, Pipel
 }
 
 /// Build a `NodeState` from components.
+// These are the node's runtime handles, not a parameter list that wants
+// grouping: four of them are `Option<Arc<..>>` and two are `Hash256`, so
+// collapsing them into a struct trades a compiler-checked positional error
+// for a silent field mix-up at every call site. Kept explicit on purpose.
+#[allow(clippy::too_many_arguments)]
 pub fn build_node_state(
     state: Arc<StateDB>,
     mempool: Arc<Mempool>,
@@ -997,7 +1003,7 @@ fn explorer_url_for(
     tx_hash: &arc_crypto::Hash256,
     attestation_status: &str,
 ) -> (Value, Option<String>) {
-    let hex_hash = hex::encode(&tx_hash.0);
+    let hex_hash = hex::encode(tx_hash.0);
 
     if node.state.get_transaction(&tx_hash.0).is_some() {
         return (Value::String(format!("/tx/0x{hex_hash}")), None);
@@ -1044,6 +1050,12 @@ fn explorer_url_for(
 const COMMUNITY_WORK_QUEUE_CAP: usize = 256;
 
 /// Start the RPC server.
+// Same reasoning as `build_node_state`, more so: this is the single process
+// entry point for the RPC layer and several parameters share a type
+// (`Option<Arc<AtomicU64>>` twice, `Vec<String>`/`Vec<ShardInfo>`). A params
+// struct would compile just as happily with two of them transposed, which is
+// exactly the failure this signature makes impossible.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve(
     addr: &str,
     state: Arc<StateDB>,
@@ -1056,7 +1068,7 @@ pub async fn serve(
     inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>>,
     candle_engine: Option<Arc<arc_inference::candle_backend::GgufEngine>>,
     candle_model_id: Option<arc_crypto::Hash256>,
-    dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
+    dag_validators: Option<SharedValidators>,
     dag_round: Option<Arc<AtomicU64>>,
     dag_committed: Option<Arc<AtomicU64>>,
     shard_infos: Vec<ShardInfo>,
@@ -1568,11 +1580,6 @@ async fn chain_info(AxumState(node): AxumState<NodeState>) -> Json<ChainInfoResp
 // Block & Account endpoints
 // ---------------------------------------------------------------------------
 
-#[derive(Deserialize)]
-struct BlockPath {
-    height: u64,
-}
-
 async fn get_latest_block(
     AxumState(node): AxumState<NodeState>,
 ) -> Result<Json<Block>, StatusCode> {
@@ -1618,6 +1625,11 @@ struct SubmitTxRequest {
     to: String,
     amount: u64,
     nonce: u64,
+    /// Accepted for wire compatibility with the TypeScript SDK, which documents
+    /// `tx_type` as an optional field on this request. `submit_tx` only ever
+    /// builds a transfer, so the value is parsed and then ignored — dropping the
+    /// field would not change that, it would just hide the mismatch.
+    #[allow(dead_code)]
     tx_type: Option<String>,
     /// Ed25519 signature (128-char hex, optional). Required for mainnet.
     signature: Option<String>,
@@ -1639,16 +1651,15 @@ async fn submit_tx(
     let to = Hash256::from_hex(&req.to).map_err(|_| (StatusCode::BAD_REQUEST, "invalid to address".to_string()))?;
 
     // Per-sender rate limit: 10 tx/sec (100ms cooldown)
-    if let Some(last) = node.tx_rate_limit.get(&from.0) {
-        if last.elapsed().as_millis() < 100 {
+    if let Some(last) = node.tx_rate_limit.get(&from.0)
+        && last.elapsed().as_millis() < 100 {
             return Err((StatusCode::TOO_MANY_REQUESTS, "rate limited: max 10 tx/sec per sender".to_string()));
         }
-    }
     node.tx_rate_limit.insert(from.0, Instant::now());
 
     // Check if a signature was provided
-    if let Some(ref sig_hex) = req.signature {
-        if let Some(ref pubkey_hex) = req.public_key {
+    if let Some(ref sig_hex) = req.signature
+        && let Some(ref pubkey_hex) = req.public_key {
             // Build signed transaction
             let mut tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
 
@@ -1681,7 +1692,6 @@ async fn submit_tx(
                 status: "pending".to_string(),
             }));
         }
-    }
 
     // No signature provided - reject. Unsigned transfers are a security hole
     // (anyone could drain any account). Require a signature for all transfers.
@@ -1811,7 +1821,7 @@ async fn get_validators(
         .collect();
 
     // Sort by stake descending
-    validators.sort_by(|a, b| b.stake.cmp(&a.stake));
+    validators.sort_by_key(|v| std::cmp::Reverse(v.stake));
     let total_stake: u64 = validators.iter().map(|v| v.stake).sum();
     let count = validators.len();
 
@@ -1955,7 +1965,7 @@ async fn faucet_claim(
             return Err((StatusCode::TOO_MANY_REQUESTS, Json(FaucetErrorResponse {
                 error: format!(
                     "Rate limited. Try again in {} minutes.",
-                    (remaining + 59) / 60
+                    remaining.div_ceil(60)
                 ),
             })));
         }
@@ -2153,7 +2163,7 @@ async fn faucet_status(
         .unwrap_or(0);
     Json(FaucetStatusResponse {
         address: faucet_addr.to_hex(),
-        node_url: format!("http://localhost:9944"),
+        node_url: "http://localhost:9944".to_string(),
         claims_today: node.faucet_claims_total.load(Ordering::Relaxed),
         claim_amount: FAUCET_CLAIM_AMOUNT,
         rate_limit_secs: FAUCET_RATE_LIMIT_SECS,
@@ -2201,9 +2211,9 @@ async fn get_tx_proof(
     let tx_hash = parse_hash(&hash)?;
 
     // Try indexed receipt with stored proof first
-    if let Some(receipt) = node.state.get_receipt(&tx_hash) {
-        if let Some(ref proof_bytes) = receipt.inclusion_proof {
-            if let Ok(merkle_proof) = bincode::deserialize::<MerkleProof>(proof_bytes) {
+    if let Some(receipt) = node.state.get_receipt(&tx_hash)
+        && let Some(ref proof_bytes) = receipt.inclusion_proof
+            && let Ok(merkle_proof) = bincode::deserialize::<MerkleProof>(proof_bytes) {
                 let siblings: Vec<Value> = merkle_proof
                     .siblings
                     .iter()
@@ -2228,8 +2238,6 @@ async fn get_tx_proof(
                     "pedersen_commitment": receipt.value_commitment.map(hex::encode),
                 })));
             }
-        }
-    }
 
     // Fall back to on-demand proof reconstruction for benchmark txs
     let (height, idx) = node
@@ -2286,9 +2294,9 @@ async fn get_block_proofs(
 
     let mut proofs = Vec::new();
     for tx_hash in &block.tx_hashes {
-        if let Some(receipt) = node.state.get_receipt(&tx_hash.0) {
-            if let Some(ref proof_bytes) = receipt.inclusion_proof {
-                if let Ok(proof) = bincode::deserialize::<MerkleProof>(proof_bytes) {
+        if let Some(receipt) = node.state.get_receipt(&tx_hash.0)
+            && let Some(ref proof_bytes) = receipt.inclusion_proof
+                && let Ok(proof) = bincode::deserialize::<MerkleProof>(proof_bytes) {
                     let siblings: Vec<Value> = proof
                         .siblings
                         .iter()
@@ -2305,8 +2313,6 @@ async fn get_block_proofs(
                         "root": proof.root.to_hex(),
                     }));
                 }
-            }
-        }
     }
 
     Ok(Json(json!({
@@ -2467,7 +2473,7 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let validators = node.dag_validators.read().len();
     let peers = node.peer_count.load(Ordering::Relaxed);
     let uptime = node.boot_time.elapsed().as_secs();
-    let bench_tps = if uptime > 0 { executed as u64 / uptime } else { 0 };
+    let bench_tps = (executed as u64).checked_div(uptime).unwrap_or(0);
     let sharded_runs = node.sharded_runs_total.load(Ordering::Relaxed);
     let sharded_bytes = node.sharded_bytes_total.load(Ordering::Relaxed);
     Json(json!({
@@ -2759,21 +2765,21 @@ async fn get_full_transaction(
         }
         TxBody::ChannelOpen(body) => json!({
             "type": "ChannelOpen",
-            "channel_id": format!("0x{}", hex::encode(&body.channel_id.0)),
-            "counterparty": format!("0x{}", hex::encode(&body.counterparty.0)),
+            "channel_id": format!("0x{}", hex::encode(body.channel_id.0)),
+            "counterparty": format!("0x{}", hex::encode(body.counterparty.0)),
             "deposit": body.deposit,
             "timeout_blocks": body.timeout_blocks,
         }),
         TxBody::ChannelClose(body) => json!({
             "type": "ChannelClose",
-            "channel_id": format!("0x{}", hex::encode(&body.channel_id.0)),
+            "channel_id": format!("0x{}", hex::encode(body.channel_id.0)),
             "opener_balance": body.opener_balance,
             "counterparty_balance": body.counterparty_balance,
             "state_nonce": body.state_nonce,
         }),
         TxBody::ChannelDispute(body) => json!({
             "type": "ChannelDispute",
-            "channel_id": format!("0x{}", hex::encode(&body.channel_id.0)),
+            "channel_id": format!("0x{}", hex::encode(body.channel_id.0)),
             "opener_balance": body.opener_balance,
             "counterparty_balance": body.counterparty_balance,
             "state_nonce": body.state_nonce,
@@ -2785,21 +2791,21 @@ async fn get_full_transaction(
             "block_height": body.block_height,
             "tx_count": body.tx_count,
             "proof_size": body.proof_data.len(),
-            "prev_state_root": format!("0x{}", hex::encode(&body.prev_state_root.0)),
-            "post_state_root": format!("0x{}", hex::encode(&body.post_state_root.0)),
+            "prev_state_root": format!("0x{}", hex::encode(body.prev_state_root.0)),
+            "post_state_root": format!("0x{}", hex::encode(body.post_state_root.0)),
         }),
         TxBody::InferenceAttestation(body) => json!({
             "type": "InferenceAttestation",
-            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
-            "input_hash": format!("0x{}", hex::encode(&body.input_hash.0)),
-            "output_hash": format!("0x{}", hex::encode(&body.output_hash.0)),
+            "model_id": format!("0x{}", hex::encode(body.model_id.0)),
+            "input_hash": format!("0x{}", hex::encode(body.input_hash.0)),
+            "output_hash": format!("0x{}", hex::encode(body.output_hash.0)),
             "challenge_period": body.challenge_period,
             "bond": body.bond,
         }),
         TxBody::InferenceChallenge(body) => json!({
             "type": "InferenceChallenge",
-            "attestation_hash": format!("0x{}", hex::encode(&body.attestation_hash.0)),
-            "challenger_output_hash": format!("0x{}", hex::encode(&body.challenger_output_hash.0)),
+            "attestation_hash": format!("0x{}", hex::encode(body.attestation_hash.0)),
+            "challenger_output_hash": format!("0x{}", hex::encode(body.challenger_output_hash.0)),
             "challenger_bond": body.challenger_bond,
         }),
         TxBody::InferenceRegister(body) => json!({
@@ -2809,57 +2815,57 @@ async fn get_full_transaction(
         }),
         TxBody::InferenceEscrowOpen(body) => json!({
             "type": "InferenceEscrowOpen",
-            "request_id": format!("0x{}", hex::encode(&body.request_id)),
-            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "request_id": format!("0x{}", hex::encode(body.request_id)),
+            "model_id": format!("0x{}", hex::encode(body.model_id.0)),
             "max_fee": body.max_fee,
             "max_tokens": body.max_tokens,
             "timeout_blocks": body.timeout_blocks,
         }),
         TxBody::InferenceEscrowRelease(body) => json!({
             "type": "InferenceEscrowRelease",
-            "request_id": format!("0x{}", hex::encode(&body.request_id)),
-            "payer": format!("0x{}", hex::encode(&body.payer.0)),
-            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "request_id": format!("0x{}", hex::encode(body.request_id)),
+            "payer": format!("0x{}", hex::encode(body.payer.0)),
+            "model_id": format!("0x{}", hex::encode(body.model_id.0)),
             "max_tokens": body.max_tokens,
             "timeout_blocks": body.timeout_blocks,
-            "output_hash": format!("0x{}", hex::encode(&body.output_hash.0)),
-            "proposer": format!("0x{}", hex::encode(&body.proposer.0)),
+            "output_hash": format!("0x{}", hex::encode(body.output_hash.0)),
+            "proposer": format!("0x{}", hex::encode(body.proposer.0)),
             "replicas": body.replicas.iter()
-                .map(|r| format!("0x{}", hex::encode(&r.0)))
+                .map(|r| format!("0x{}", hex::encode(r.0)))
                 .collect::<Vec<_>>(),
-            "observer_pool": format!("0x{}", hex::encode(&body.observer_pool.0)),
-            "treasury": format!("0x{}", hex::encode(&body.treasury.0)),
+            "observer_pool": format!("0x{}", hex::encode(body.observer_pool.0)),
+            "treasury": format!("0x{}", hex::encode(body.treasury.0)),
         }),
         TxBody::InferenceEscrowRefund(body) => json!({
             "type": "InferenceEscrowRefund",
-            "request_id": format!("0x{}", hex::encode(&body.request_id)),
-            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "request_id": format!("0x{}", hex::encode(body.request_id)),
+            "model_id": format!("0x{}", hex::encode(body.model_id.0)),
             "max_tokens": body.max_tokens,
             "timeout_blocks": body.timeout_blocks,
         }),
         TxBody::ModelRegistration(body) => json!({
             "type": "ModelRegistration",
-            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
-            "metadata_hash": format!("0x{}", hex::encode(&body.metadata_hash.0)),
-            "chunk_tree_root": format!("0x{}", hex::encode(&body.chunk_tree_root.0)),
+            "model_id": format!("0x{}", hex::encode(body.model_id.0)),
+            "metadata_hash": format!("0x{}", hex::encode(body.metadata_hash.0)),
+            "chunk_tree_root": format!("0x{}", hex::encode(body.chunk_tree_root.0)),
             "n_layers": body.n_layers,
             "d_model": body.d_model,
             "quantization": body.quantization,
             "registration_fee": body.registration_fee,
-            "royalty_recipient": format!("0x{}", hex::encode(&body.royalty_recipient.0)),
+            "royalty_recipient": format!("0x{}", hex::encode(body.royalty_recipient.0)),
         }),
         TxBody::ModelRequest(body) => json!({
             "type": "ModelRequest",
-            "request_id": format!("0x{}", hex::encode(&body.request_id)),
-            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+            "request_id": format!("0x{}", hex::encode(body.request_id)),
+            "model_id": format!("0x{}", hex::encode(body.model_id.0)),
             "target_k_replication": body.target_k_replication,
             "bond_per_layer_epoch": body.bond_per_layer_epoch,
             "max_wait_secs": body.max_wait_secs,
         }),
         TxBody::ShardCoverageClaim(body) => json!({
             "type": "ShardCoverageClaim",
-            "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
-            "node_pubkey": format!("0x{}", hex::encode(&body.node_pubkey)),
+            "model_id": format!("0x{}", hex::encode(body.model_id.0)),
+            "node_pubkey": format!("0x{}", hex::encode(body.node_pubkey)),
             "ranges": body.ranges.iter()
                 .map(|(s, e)| json!([s, e])).collect::<Vec<_>>(),
             "bond": body.bond,
@@ -2867,7 +2873,7 @@ async fn get_full_transaction(
         }),
         TxBody::CapacityAdvertisement(body) => json!({
             "type": "CapacityAdvertisement",
-            "node_pubkey": format!("0x{}", hex::encode(&body.node_pubkey)),
+            "node_pubkey": format!("0x{}", hex::encode(body.node_pubkey)),
             "ram_bytes": body.ram_bytes,
             "vram_bytes": body.vram_bytes,
             "bandwidth_mbps": body.bandwidth_mbps,
@@ -2878,10 +2884,10 @@ async fn get_full_transaction(
         TxBody::ShardAssignmentProposal(body) => json!({
             "type": "ShardAssignmentProposal",
             "epoch_blocks": body.epoch_blocks,
-            "input_snapshot_hash": format!("0x{}", hex::encode(&body.input_snapshot_hash.0)),
+            "input_snapshot_hash": format!("0x{}", hex::encode(body.input_snapshot_hash.0)),
             "assignments": body.assignments.iter().map(|a| json!({
-                "node_pubkey": format!("0x{}", hex::encode(&a.node_pubkey)),
-                "model_id": format!("0x{}", hex::encode(&a.model_id.0)),
+                "node_pubkey": format!("0x{}", hex::encode(a.node_pubkey)),
+                "model_id": format!("0x{}", hex::encode(a.model_id.0)),
                 "ranges": a.ranges.iter().map(|(s, e)| json!([s, e])).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
         }),
@@ -3007,7 +3013,7 @@ async fn call_contract(
         .and_then(|f| Hash256::from_hex(f).ok())
         .unwrap_or(Hash256::ZERO);
 
-    let calldata = req
+    let _calldata = req
         .calldata
         .as_ref()
         .map(|h| hex::decode(h).unwrap_or_default())
@@ -3485,20 +3491,18 @@ fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
         if let Some(logs) = node.state.event_logs.get(&height) {
             for log in logs.iter() {
                 // Address filter
-                if let Some(ref addrs) = address_filter {
-                    if !addrs.iter().any(|a| a.0 == log.address.0) {
+                if let Some(ref addrs) = address_filter
+                    && !addrs.iter().any(|a| a.0 == log.address.0) {
                         continue;
                     }
-                }
                 // Topic filter
                 let mut topic_match = true;
                 for (i, filter_topic) in topic_filters.iter().enumerate() {
-                    if let Some(expected) = filter_topic {
-                        if log.topics.get(i).map(|t| t.0) != Some(expected.0) {
+                    if let Some(expected) = filter_topic
+                        && log.topics.get(i).map(|t| t.0) != Some(expected.0) {
                             topic_match = false;
                             break;
                         }
-                    }
                 }
                 if !topic_match { continue; }
 
@@ -4120,8 +4124,8 @@ async fn channel_state(
                 "locked_balance": account.balance,
                 "state_nonce": account.nonce,
                 "challenge_expiry": account.staked_balance,
-                "opener": format!("0x{}", hex::encode(&account.code_hash.0)),
-                "counterparty": format!("0x{}", hex::encode(&account.storage_root.0)),
+                "opener": format!("0x{}", hex::encode(account.code_hash.0)),
+                "counterparty": format!("0x{}", hex::encode(account.storage_root.0)),
                 "active": account.balance > 0,
             })))
         }
@@ -4161,9 +4165,10 @@ fn community_dispatch_timeout_secs(max_tokens: u32) -> u64 {
     let est_ms = (max_tokens as u64).saturating_mul(per_token_ms);
     let est_with_headroom = est_ms.saturating_mul(3) / 2;
     let est_secs = est_with_headroom / 1000;
-    est_secs
-        .max(MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS)
-        .min(MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS)
+    est_secs.clamp(
+        MIN_COMMUNITY_DISPATCH_TIMEOUT_SECS,
+        MAX_COMMUNITY_DISPATCH_TIMEOUT_SECS,
+    )
 }
 
 /// Count community workers that haven't expired their TTL and advertise
@@ -4728,7 +4733,7 @@ async fn inference_run(
                         "model": "community-served",
                         "model_hash": "",
                         "input": input_text,
-                        "input_hash": format!("0x{}", hex::encode(&input_hash.0)),
+                        "input_hash": format!("0x{}", hex::encode(input_hash.0)),
                         "output": result.output,
                         "output_hash": result.output_hash,
                         "tokens_generated": result.tokens_generated,
@@ -4886,7 +4891,7 @@ async fn inference_run(
 
     let inference_ms = start.elapsed().as_millis() as u64;
     let tokens_generated = generated_tokens.len() as u64;
-    let ms_per_token = if tokens_generated > 0 { inference_ms / tokens_generated } else { 0 };
+    let ms_per_token = inference_ms.checked_div(tokens_generated).unwrap_or(0);
 
     // Decode output tokens to text
     let output_text = model.decode(&generated_tokens);
@@ -4919,15 +4924,15 @@ async fn inference_run(
     .await;
 
     // Store inference result for explorer display
-    let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
+    let tx_hash_hex = format!("0x{}", hex::encode(tx_hash.0));
     let (explorer_url, explorer_url_unavailable_reason) =
         explorer_url_for(&node, &tx_hash, &attestation_status);
     node.inference_results.insert(tx_hash_hex.clone(), json!({
         "input": input_text,
         "output": &output_text,
-        "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+        "output_hash": format!("0x{}", hex::encode(output_hash.0)),
         "model": &model_id_data,
-        "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
+        "model_hash": format!("0x{}", hex::encode(model_id_hash.0)),
         "ms_per_token": ms_per_token,
         "tokens_generated": tokens_generated,
         "engine": &engine_name,
@@ -4939,13 +4944,13 @@ async fn inference_run(
         "routed_via": "local",
         "inference": {
             "model": model_id_data,
-            "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
+            "model_hash": format!("0x{}", hex::encode(model_id_hash.0)),
             "input": input_text,
             "input_tokens": prompt_tokens.len(),
-            "input_hash": format!("0x{}", hex::encode(&input_hash.0)),
+            "input_hash": format!("0x{}", hex::encode(input_hash.0)),
             "output": output_text,
             "output_tokens": generated_tokens,
-            "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+            "output_hash": format!("0x{}", hex::encode(output_hash.0)),
             "tokens_generated": tokens_generated,
             "inference_ms": inference_ms,
             "ms_per_token": ms_per_token,
@@ -5284,8 +5289,8 @@ async fn inference_list_attestations(
         });
         // Enrich with receipt data if available
         let mut block_height: Option<u64> = None;
-        if let Ok(hash_bytes) = hex::decode(hash_clean) {
-            if hash_bytes.len() == 32 {
+        if let Ok(hash_bytes) = hex::decode(hash_clean)
+            && hash_bytes.len() == 32 {
                 let mut key = [0u8; 32];
                 key.copy_from_slice(&hash_bytes);
                 if let Some(receipt) = node.state.get_receipt(&key) {
@@ -5294,7 +5299,6 @@ async fn inference_list_attestations(
                     block_height = Some(receipt.block_height);
                 }
             }
-        }
         attestations.push((block_height, att));
     }
 
@@ -5324,15 +5328,15 @@ async fn inference_list_attestations(
             "from": tx.from.to_hex(),
             "block_height": block_height,
             "inference": {
-                "model_hash": format!("0x{}", hex::encode(&body.model_id.0)),
-                "input_hash": format!("0x{}", hex::encode(&body.input_hash.0)),
-                "output_hash": format!("0x{}", hex::encode(&body.output_hash.0)),
+                "model_hash": format!("0x{}", hex::encode(body.model_id.0)),
+                "input_hash": format!("0x{}", hex::encode(body.input_hash.0)),
+                "output_hash": format!("0x{}", hex::encode(body.output_hash.0)),
                 "bond": body.bond,
                 "challenge_period": body.challenge_period,
                 "deterministic": true,
                 // input/output text not on-chain; hashes only
-                "input": format!("[cross-device: hash {}]", hex::encode(&body.input_hash.0)[..16].to_string()),
-                "output": format!("[hash {}]", hex::encode(&body.output_hash.0)[..16].to_string()),
+                "input": format!("[cross-device: hash {}]", hex::encode(body.input_hash.0)[..16].to_string()),
+                "output": format!("[hash {}]", hex::encode(body.output_hash.0)[..16].to_string()),
                 "model": "on-chain attestation",
             }
         });
@@ -5597,7 +5601,7 @@ async fn inference_forward_shard(
         if let Some(expected_hex) = &req.hidden_hash {
             let bytes: Vec<u8> = hidden.iter().flat_map(|v| v.to_le_bytes()).collect();
             let actual = arc_crypto::hash_bytes(&bytes);
-            let actual_hex = format!("0x{}", hex::encode(&actual.0));
+            let actual_hex = format!("0x{}", hex::encode(actual.0));
             if &actual_hex != expected_hex {
                 return Err((StatusCode::BAD_REQUEST, format!(
                     "Hidden state integrity check failed: expected {}, got {}", expected_hex, actual_hex
@@ -5693,7 +5697,7 @@ async fn inference_forward_shard(
             ForwardShardResponse {
                 is_terminal: false,
                 hidden: Some(state),
-                hidden_hash: Some(format!("0x{}", hex::encode(&h.0))),
+                hidden_hash: Some(format!("0x{}", hex::encode(h.0))),
                 token_id: None,
                 logits_hash: None,
                 layers_processed,
@@ -5707,7 +5711,7 @@ async fn inference_forward_shard(
                 hidden: None,
                 hidden_hash: None,
                 token_id: Some(id),
-                logits_hash: Some(format!("0x{}", hex::encode(&logits_hash.0))),
+                logits_hash: Some(format!("0x{}", hex::encode(logits_hash.0))),
                 layers_processed,
                 compute_ms,
                 node_name,
@@ -5769,6 +5773,11 @@ pub struct RangeVote {
     pub agreement: String,
 }
 
+/// In-flight fan-out calls for one hop: `(replica, wall_ms, response)`, where
+/// the error side carries `(message, is_cold_cache)`.
+type FanoutJoinSet =
+    tokio::task::JoinSet<(ShardInfo, u64, Result<(ForwardShardResponse, usize), (String, bool)>)>;
+
 /// What one hop produced.
 struct HopOutcome {
     hidden: Option<Vec<i64>>,
@@ -5782,9 +5791,6 @@ struct HopOutcome {
     req_bytes: usize,
     resp_bytes: usize,
     vote: Option<RangeVote>,
-    /// Replicas that answered `kv_cache_out_of_sync`. They are cold for this
-    /// request_id and must not be contacted again for it.
-    cold: Vec<String>,
 }
 
 /// Running totals for one pipeline hop across every position of a request.
@@ -5897,7 +5903,6 @@ async fn pipeline_hop(
                             req_bytes,
                             resp_bytes,
                             vote: None,
-                            cold,
                         });
                     }
                     Err((e, is_cold)) => {
@@ -5948,11 +5953,7 @@ async fn pipeline_hop(
             let needed = needed.max(1).min(use_n);
             let selected: Vec<ShardInfo> = replicas.iter().take(use_n).cloned().collect();
 
-            let mut set: tokio::task::JoinSet<(
-                ShardInfo,
-                u64,
-                Result<(ForwardShardResponse, usize), (String, bool)>,
-            )> = tokio::task::JoinSet::new();
+            let mut set: FanoutJoinSet = tokio::task::JoinSet::new();
             for r in &selected {
                 let c = client.clone();
                 let b = body.clone();
@@ -6122,7 +6123,6 @@ async fn pipeline_hop(
                 req_bytes,
                 resp_bytes: *resp_bytes,
                 vote,
-                cold,
             })
         }
     }
@@ -6321,20 +6321,18 @@ async fn run_pipeline(
             ));
         }
 
-        if let Some(tok) = first_generated {
-            if !model.config.eos_tokens.contains(&tok) {
+        if let Some(tok) = first_generated
+            && !model.config.eos_tokens.contains(&tok) {
                 generated.push(tok);
             }
-        }
     }
 
     // ─── Sequential decode ──────────────────────────────────────────────
     for gen_idx in 1..(max_tokens as usize) {
-        if let Some(last) = generated.last() {
-            if model.config.eos_tokens.contains(last) {
+        if let Some(last) = generated.last()
+            && model.config.eos_tokens.contains(last) {
                 break;
             }
-        }
         let position = prompt_len + gen_idx - 1;
         let input_token = *generated.last().unwrap_or(&all_tokens[prompt_len - 1]);
 
@@ -6403,9 +6401,7 @@ fn render_shard_trace(pipeline: &[PipelineHop], stats: &[HopStats]) -> Vec<Value
                 .iter()
                 .map(|(name, n)| json!({ "node": name, "positions": n }))
                 .collect();
-            let avg = |total: u64| -> u64 {
-                if st.positions == 0 { 0 } else { total / st.positions }
-            };
+            let avg = |total: u64| -> u64 { total.checked_div(st.positions).unwrap_or(0) };
             json!({
                 "hop": hop,
                 "node": st.served_by.keys().next().cloned().unwrap_or_else(|| primary.node_name.clone()),
@@ -6494,11 +6490,10 @@ async fn bootstrap_shard_registry_from_seeds(node: &NodeState) -> usize {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if let Some(t) = *last {
-            if t.elapsed().as_secs() < REGISTRY_BOOTSTRAP_MIN_INTERVAL_SECS {
+        if let Some(t) = *last
+            && t.elapsed().as_secs() < REGISTRY_BOOTSTRAP_MIN_INTERVAL_SECS {
                 return 0;
             }
-        }
         *last = Some(std::time::Instant::now());
     }
 
@@ -6550,11 +6545,10 @@ async fn bootstrap_shard_registry_from_seeds(node: &NodeState) -> usize {
         // unresolvable — we cannot tell whose loopback they are.
         if let Some(arr) = body.get("shards").and_then(|v| v.as_array()) {
             for v in arr {
-                if let Ok(si) = serde_json::from_value::<ShardInfo>(v.clone()) {
-                    if !is_stub_socket_addr(&si.socket_addr) {
+                if let Ok(si) = serde_json::from_value::<ShardInfo>(v.clone())
+                    && !is_stub_socket_addr(&si.socket_addr) {
                         candidates.push(si);
                     }
-                }
             }
         }
 
@@ -6934,10 +6928,10 @@ async fn inference_run_sharded(
         &model_id_hash,
         &cache_input_with_max,
     );
-    let cache_key_hex = format!("0x{}", hex::encode(&cache_key.0));
+    let cache_key_hex = format!("0x{}", hex::encode(cache_key.0));
 
-    if !force_recompute {
-        if let Some(cached_tokens) = node.inference_cache.get(&cache_key) {
+    if !force_recompute
+        && let Some(cached_tokens) = node.inference_cache.get(&cache_key) {
             let output_text = model.decode(&cached_tokens);
             let output_bytes: Vec<u8> =
                 cached_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
@@ -6963,9 +6957,9 @@ async fn inference_run_sharded(
                 "input": input_text,
                 "output": output_text,
                 "output_tokens": cached_tokens,
-                "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
-                "input_hash": format!("0x{}", hex::encode(&input_hash.0)),
-                "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
+                "output_hash": format!("0x{}", hex::encode(output_hash.0)),
+                "input_hash": format!("0x{}", hex::encode(input_hash.0)),
+                "model_hash": format!("0x{}", hex::encode(model_id_hash.0)),
                 "tokens_generated": cached_tokens.len(),
                 "total_ms": elapsed_us / 1000,
                 "total_us": elapsed_us,
@@ -7016,7 +7010,6 @@ async fn inference_run_sharded(
             }
             return Ok(Json(resp));
         }
-    }
 
     // ─── Real pipeline walk ─────────────────────────────────────────────
     let strategy = if redundancy > 1 {
@@ -7076,16 +7069,16 @@ async fn inference_run_sharded(
         DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS,
     )
     .await;
-    let tx_hash_hex = format!("0x{}", hex::encode(&tx_hash.0));
+    let tx_hash_hex = format!("0x{}", hex::encode(tx_hash.0));
 
     node.inference_results.insert(
         tx_hash_hex.clone(),
         json!({
             "input": input_text,
             "output": &output_text,
-            "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+            "output_hash": format!("0x{}", hex::encode(output_hash.0)),
             "model": &model_id_data,
-            "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
+            "model_hash": format!("0x{}", hex::encode(model_id_hash.0)),
             "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
             "tokens_generated": generated.len() as u64,
             "engine": format!("{} sharded pipeline", model.effective_precision_label()),
@@ -7123,7 +7116,7 @@ async fn inference_run_sharded(
             let member_hexes: Vec<String> = committee
                 .members
                 .iter()
-                .map(|m| format!("0x{}", hex::encode(&m.0)))
+                .map(|m| format!("0x{}", hex::encode(m.0)))
                 .collect();
             json!({
                 "selected": true,
@@ -7131,7 +7124,7 @@ async fn inference_run_sharded(
                 "size": committee.members.len(),
                 "min_agreement": committee.min_agreement,
                 "members": member_hexes,
-                "vrf_seed": format!("0x{}", hex::encode(&output_hash.0)),
+                "vrf_seed": format!("0x{}", hex::encode(output_hash.0)),
                 "tier": 2,
                 "corruption_probability": arc_inference::committee::corruption_probability(0.1, committee.members.len(), committee.min_agreement),
             })
@@ -7171,9 +7164,9 @@ async fn inference_run_sharded(
         "input": input_text,
         "output": output_text,
         "output_tokens": generated,
-        "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
-        "input_hash": format!("0x{}", hex::encode(&input_hash.0)),
-        "model_hash": format!("0x{}", hex::encode(&model_id_hash.0)),
+        "output_hash": format!("0x{}", hex::encode(output_hash.0)),
+        "input_hash": format!("0x{}", hex::encode(input_hash.0)),
+        "model_hash": format!("0x{}", hex::encode(model_id_hash.0)),
         "tokens_generated": generated.len(),
         "total_ms": total_ms,
         "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
@@ -7556,7 +7549,7 @@ async fn inference_run_consensus(
                 Some(tx_hash) => {
                     tracing::info!(
                         request_id = %request_id,
-                        tx = %format!("0x{}", hex::encode(&tx_hash.0)),
+                        tx = %format!("0x{}", hex::encode(tx_hash.0)),
                         replicas = replicas.len(),
                         max_fee = gate.max_fee,
                         "InferenceEscrowRelease submitted"
@@ -7583,7 +7576,7 @@ async fn inference_run_consensus(
         "input": input_text,
         "output": output_text,
         "output_tokens": generated,
-        "output_hash": format!("0x{}", hex::encode(&output_hash.0)),
+        "output_hash": format!("0x{}", hex::encode(output_hash.0)),
         "tokens_generated": generated.len(),
         "total_ms": total_ms,
         "ms_per_token": if generated.is_empty() { 0 } else { total_ms / generated.len() as u64 },
@@ -7607,8 +7600,8 @@ async fn inference_run_consensus(
     });
     if let Some(h) = release_tx_hash {
         response["escrow"] = json!({
-            "release_tx_hash": format!("0x{}", hex::encode(&h.0)),
-            "payer": format!("0x{}", hex::encode(&escrow_gate.as_ref().unwrap().payer.0)),
+            "release_tx_hash": format!("0x{}", hex::encode(h.0)),
+            "payer": format!("0x{}", hex::encode(escrow_gate.as_ref().unwrap().payer.0)),
             "max_fee": escrow_gate.as_ref().unwrap().max_fee,
         });
     }
@@ -7628,16 +7621,16 @@ async fn list_model_registry(
         let tx = entry.value();
         if let arc_types::TxBody::ModelRegistration(body) = &tx.body {
             rows.push(json!({
-                "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
-                "metadata_hash": format!("0x{}", hex::encode(&body.metadata_hash.0)),
-                "chunk_tree_root": format!("0x{}", hex::encode(&body.chunk_tree_root.0)),
+                "model_id": format!("0x{}", hex::encode(body.model_id.0)),
+                "metadata_hash": format!("0x{}", hex::encode(body.metadata_hash.0)),
+                "chunk_tree_root": format!("0x{}", hex::encode(body.chunk_tree_root.0)),
                 "n_layers": body.n_layers,
                 "d_model": body.d_model,
                 "quantization": &body.quantization,
                 "registration_fee": body.registration_fee,
-                "royalty_recipient": format!("0x{}", hex::encode(&body.royalty_recipient.0)),
-                "registered_by": format!("0x{}", hex::encode(&tx.from.0)),
-                "tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+                "royalty_recipient": format!("0x{}", hex::encode(body.royalty_recipient.0)),
+                "registered_by": format!("0x{}", hex::encode(tx.from.0)),
+                "tx_hash": format!("0x{}", hex::encode(tx.hash.0)),
             }));
         }
     }
@@ -7655,13 +7648,13 @@ async fn list_open_model_requests(
         let tx = entry.value();
         if let arc_types::TxBody::ModelRequest(body) = &tx.body {
             rows.push(json!({
-                "request_id": format!("0x{}", hex::encode(&body.request_id)),
-                "model_id": format!("0x{}", hex::encode(&body.model_id.0)),
+                "request_id": format!("0x{}", hex::encode(body.request_id)),
+                "model_id": format!("0x{}", hex::encode(body.model_id.0)),
                 "target_k_replication": body.target_k_replication,
                 "bond_per_layer_epoch": body.bond_per_layer_epoch,
                 "max_wait_secs": body.max_wait_secs,
-                "requester": format!("0x{}", hex::encode(&tx.from.0)),
-                "tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+                "requester": format!("0x{}", hex::encode(tx.from.0)),
+                "tx_hash": format!("0x{}", hex::encode(tx.hash.0)),
             }));
         }
     }
@@ -7679,15 +7672,15 @@ async fn list_capacity_advertisements(
         let tx = entry.value();
         if let arc_types::TxBody::CapacityAdvertisement(body) = &tx.body {
             rows.push(json!({
-                "node_pubkey": format!("0x{}", hex::encode(&body.node_pubkey)),
+                "node_pubkey": format!("0x{}", hex::encode(body.node_pubkey)),
                 "ram_bytes": body.ram_bytes,
                 "vram_bytes": body.vram_bytes,
                 "bandwidth_mbps": body.bandwidth_mbps,
                 "uptime_hint_mins": body.uptime_hint_mins,
                 "stake": body.stake,
                 "region": &body.region,
-                "advertised_by": format!("0x{}", hex::encode(&tx.from.0)),
-                "tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+                "advertised_by": format!("0x{}", hex::encode(tx.from.0)),
+                "tx_hash": format!("0x{}", hex::encode(tx.hash.0)),
             }));
         }
     }
@@ -7721,13 +7714,13 @@ async fn get_assignment_for_me(
                     assignments.push(json!({
                         "epoch_blocks": body.epoch_blocks,
                         "input_snapshot_hash": format!(
-                            "0x{}", hex::encode(&body.input_snapshot_hash.0)
+                            "0x{}", hex::encode(body.input_snapshot_hash.0)
                         ),
-                        "model_id": format!("0x{}", hex::encode(&a.model_id.0)),
+                        "model_id": format!("0x{}", hex::encode(a.model_id.0)),
                         "ranges": a.ranges.iter()
                             .map(|(s, e)| json!([s, e]))
                             .collect::<Vec<_>>(),
-                        "proposal_tx_hash": format!("0x{}", hex::encode(&tx.hash.0)),
+                        "proposal_tx_hash": format!("0x{}", hex::encode(tx.hash.0)),
                     }));
                 }
             }
@@ -7866,8 +7859,8 @@ fn submit_escrow_release(
 ///     the witness bond.
 ///   - Amount: 100_000 ARC. Sized to be ~2% of a 5M genesis-validator stake
 ///     - cheap enough that a coordinator never declines to challenge, large
-///     enough to deter spurious challenges. Revisit if community-tier
-///     validators with smaller stakes become common coordinators.
+///       enough to deter spurious challenges. Revisit if community-tier
+///       validators with smaller stakes become common coordinators.
 ///
 /// The divergent replica's actual stake (via VerificationManager slashing)
 /// is the real deterrent; this bond is just the coordinator's skin in the
@@ -8132,8 +8125,12 @@ async fn community_register(
 
             let mut covered: Vec<bool> = vec![false; total_layers as usize];
             for s in &existing {
-                for l in s.start_layer..s.end_layer.min(total_layers as usize) {
-                    covered[l] = true;
+                for c in covered
+                    .iter_mut()
+                    .take(s.end_layer.min(total_layers as usize))
+                    .skip(s.start_layer)
+                {
+                    *c = true;
                 }
             }
 
@@ -8142,8 +8139,8 @@ async fn community_register(
             let mut best_len = 0usize;
             let mut run_start = 0usize;
             let mut in_run = false;
-            for i in 0..covered.len() {
-                if !covered[i] {
+            for (i, &is_covered) in covered.iter().enumerate() {
+                if !is_covered {
                     if !in_run { run_start = i; in_run = true; }
                     let run_len = i - run_start + 1;
                     if run_len > best_len { best_start = run_start; best_len = run_len; }
@@ -8156,8 +8153,12 @@ async fn community_register(
             if best_len == 0 {
                 let mut counts: Vec<usize> = vec![0; total_layers as usize];
                 for s in &existing {
-                    for l in s.start_layer..s.end_layer.min(total_layers as usize) {
-                        counts[l] += 1;
+                    for c in counts
+                        .iter_mut()
+                        .take(s.end_layer.min(total_layers as usize))
+                        .skip(s.start_layer)
+                    {
+                        *c += 1;
                     }
                 }
                 let min_c = *counts.iter().min().unwrap_or(&0);
@@ -8278,7 +8279,7 @@ async fn community_list(
     // IS the registration.
     let validators = node.dag_validators.read();
     for (addr, stake) in validators.iter() {
-        let hex_addr = format!("0x{}", hex::encode(&addr.0));
+        let hex_addr = format!("0x{}", hex::encode(addr.0));
         // Skip self and already-registered workers
         if *addr == node.validator_address || registered_ids.contains(&hex_addr) {
             continue;
@@ -8476,8 +8477,8 @@ pub async fn community_claim_work(
             // Optionally verify model match. If the worker specified a model
             // and the work item has a model_id, they must agree. If the
             // worker doesn't filter by model, accept any work.
-            if let (Some(worker_model), Some(item_model)) = (&req.model, &item.model_id) {
-                if worker_model != item_model {
+            if let (Some(worker_model), Some(item_model)) = (&req.model, &item.model_id)
+                && worker_model != item_model {
                     // Model mismatch - put the item back on the queue so
                     // another worker can pick it up, then tell this worker
                     // there's no matching work.
@@ -8489,7 +8490,6 @@ pub async fn community_claim_work(
                         "reason": "model_mismatch",
                     })));
                 }
-            }
 
             // Flat response shape — the worker (arc-node main.rs) reads
             // `job_id`, `input`, `max_tokens` directly off the top-level
@@ -8613,8 +8613,8 @@ pub async fn community_submit_work(
         if let Some(hex_bytes) = result.signed_attestation_hex.as_ref() {
             match decode_and_verify_worker_attestation(hex_bytes, &result.worker_id) {
                 Ok(tx) => {
-                    let tx_hash_hex = format!("0x{}", hex::encode(&tx.hash.0));
-                    let tx_from_hex = format!("0x{}", hex::encode(&tx.from.0));
+                    let tx_hash_hex = format!("0x{}", hex::encode(tx.hash.0));
+                    let tx_from_hex = format!("0x{}", hex::encode(tx.from.0));
                     match node.mempool.insert(tx) {
                         Ok(_) => {
                             tracing::info!(
@@ -8735,7 +8735,7 @@ fn decode_and_verify_worker_attestation(
     let claim_address = expected_worker_id
         .trim_start_matches("0x")
         .to_string();
-    let tx_from_hex = hex::encode(&tx.from.0);
+    let tx_from_hex = hex::encode(tx.from.0);
     if claim_address != tx_from_hex {
         return Err(format!(
             "tx.from ({}) does not match worker_id ({})",
@@ -8840,7 +8840,7 @@ async fn get_model_shards(
                 "pipeline": shards,
                 "shard_count": pipeline.len(),
                 "total_layers": total_layers,
-                "fully_covered": node.multi_model_registry.is_model_fully_covered(&model_hash, total_layers as u32),
+                "fully_covered": node.multi_model_registry.is_model_fully_covered(&model_hash, total_layers),
             })))
         }
         None => Err(api_error(StatusCode::NOT_FOUND, "model not found in registry")),
@@ -8884,7 +8884,7 @@ async fn inference_commit(
 
     Ok(Json(json!({
         "ok": true,
-        "commitment_id": format!("0x{}", hex::encode(&commitment_id)),
+        "commitment_id": format!("0x{}", hex::encode(commitment_id)),
         "provider": node.validator_address.to_hex(),
         "bond_amount": req.bond_amount,
     })))
@@ -8921,7 +8921,7 @@ async fn inference_challenge(
 
     Ok(Json(json!({
         "ok": true,
-        "challenge_id": format!("0x{}", hex::encode(&challenge_id)),
+        "challenge_id": format!("0x{}", hex::encode(challenge_id)),
         "challenger": node.validator_address.to_hex(),
         "bond_amount": req.bond_amount,
     })))
@@ -9018,8 +9018,8 @@ async fn compute_auto_shard_plan(
     let now = std::time::Instant::now();
     for entry in node.community_workers.iter() {
         let (worker, ts) = entry.value();
-        if now.duration_since(*ts).as_secs() < COMMUNITY_WORKER_TTL_SECS {
-            if seen_nodes.insert(worker.name.clone()) {
+        if now.duration_since(*ts).as_secs() < COMMUNITY_WORKER_TTL_SECS
+            && seen_nodes.insert(worker.name.clone()) {
                 capabilities.push(arc_inference::distributed::NodeCapability {
                     address: Hash256(parse_hash(&worker.worker_id).unwrap_or([0u8; 32])),
                     socket_addr: worker.name.clone(),
@@ -9027,7 +9027,6 @@ async fn compute_auto_shard_plan(
                     available_memory: 8 * 1024 * 1024 * 1024, // default 8GB estimate
                 });
             }
-        }
     }
 
     if capabilities.is_empty() {
@@ -9047,7 +9046,7 @@ async fn compute_auto_shard_plan(
     }
 
     let plan_json: Vec<Value> = plan.iter().map(|a| json!({
-        "node_address": format!("0x{}", hex::encode(&a.node_address.0)),
+        "node_address": format!("0x{}", hex::encode(a.node_address.0)),
         "socket_addr": a.socket_addr,
         "start_layer": a.start_layer,
         "end_layer": a.end_layer,
@@ -9117,8 +9116,12 @@ async fn shard_join(
     // 2. Find the biggest uncovered gap in the pipeline
     let mut covered: Vec<bool> = vec![false; req.total_layers as usize];
     for s in &existing {
-        for l in s.start_layer..s.end_layer.min(req.total_layers as usize) {
-            covered[l] = true;
+        for c in covered
+            .iter_mut()
+            .take(s.end_layer.min(req.total_layers as usize))
+            .skip(s.start_layer)
+        {
+            *c = true;
         }
     }
 
@@ -9128,8 +9131,8 @@ async fn shard_join(
     let mut run_start = 0usize;
     let mut in_run = false;
 
-    for i in 0..covered.len() {
-        if !covered[i] {
+    for (i, &is_covered) in covered.iter().enumerate() {
+        if !is_covered {
             if !in_run {
                 run_start = i;
                 in_run = true;
@@ -9150,8 +9153,12 @@ async fn shard_join(
         // Count how many shards cover each layer
         let mut coverage_count: Vec<usize> = vec![0; req.total_layers as usize];
         for s in &existing {
-            for l in s.start_layer..s.end_layer.min(req.total_layers as usize) {
-                coverage_count[l] += 1;
+            for c in coverage_count
+                .iter_mut()
+                .take(s.end_layer.min(req.total_layers as usize))
+                .skip(s.start_layer)
+            {
+                *c += 1;
             }
         }
         // Find the layer with minimum coverage
@@ -9197,8 +9204,12 @@ async fn shard_join(
     // Check if pipeline is now fully covered
     let mut new_covered: Vec<bool> = vec![false; req.total_layers as usize];
     for s in fresh_shards(&node.shard_registry).iter().filter(|s| s.model_id == req.model_id) {
-        for l in s.start_layer..s.end_layer.min(req.total_layers as usize) {
-            new_covered[l] = true;
+        for c in new_covered
+            .iter_mut()
+            .take(s.end_layer.min(req.total_layers as usize))
+            .skip(s.start_layer)
+        {
+            *c = true;
         }
     }
     let fully_covered = new_covered.iter().all(|&c| c);
@@ -9531,12 +9542,11 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let floor = height.saturating_sub(SELF_PRODUCED_SCAN_BLOCKS);
     let mut h = height;
     while h > floor {
-        if let Some(b) = node.state.get_block(h) {
-            if b.header.producer == node.validator_address {
+        if let Some(b) = node.state.get_block(h)
+            && b.header.producer == node.validator_address {
                 self_produced = Some((b.header.height, b.header.timestamp));
                 break;
             }
-        }
         h -= 1;
     }
     let self_produced_age = self_produced.and_then(|(_, ts)| age_secs_from_ms(ts));
@@ -10328,7 +10338,7 @@ mod tests {
     fn decode_and_verify_accepts_worker_signed_attestation() {
         let kp = KeyPair::generate_ed25519();
         let (orig, hex_s) = sign_attestation_for(&kp, 0, 0);
-        let worker_id = format!("0x{}", hex::encode(&kp.address().0));
+        let worker_id = format!("0x{}", hex::encode(kp.address().0));
         let got = decode_and_verify_worker_attestation(&hex_s, &worker_id)
             .expect("verify ok");
         assert_eq!(got.hash, orig.hash, "hash should round-trip exactly");
@@ -10340,7 +10350,7 @@ mod tests {
         let kp = KeyPair::generate_ed25519();
         let (_, hex_with_0x) = sign_attestation_for(&kp, 0, 0);
         let bare = hex_with_0x.trim_start_matches("0x").to_string();
-        let worker_id = hex::encode(&kp.address().0); // no 0x
+        let worker_id = hex::encode(kp.address().0); // no 0x
         decode_and_verify_worker_attestation(&bare, &worker_id)
             .expect("bare hex + bare worker_id should work");
     }
@@ -10351,7 +10361,7 @@ mod tests {
         let kp_b = KeyPair::generate_ed25519();
         let (_, hex_s) = sign_attestation_for(&kp_a, 0, 0);
         // Submit kp_a's signed tx but claim to be kp_b
-        let worker_id_b = format!("0x{}", hex::encode(&kp_b.address().0));
+        let worker_id_b = format!("0x{}", hex::encode(kp_b.address().0));
         let err = decode_and_verify_worker_attestation(&hex_s, &worker_id_b)
             .expect_err("must reject worker_id mismatch");
         assert!(err.contains("does not match worker_id"), "got: {err}");
@@ -10366,7 +10376,7 @@ mod tests {
         tx.sign(&kp).unwrap();
         let bytes = bincode::serialize(&tx).unwrap();
         let hex_s = format!("0x{}", hex::encode(bytes));
-        let worker_id = format!("0x{}", hex::encode(&kp.address().0));
+        let worker_id = format!("0x{}", hex::encode(kp.address().0));
         let err = decode_and_verify_worker_attestation(&hex_s, &worker_id)
             .expect_err("must reject non-attestation tx");
         assert!(err.contains("expected InferenceAttestation"), "got: {err}");
@@ -10383,7 +10393,7 @@ mod tests {
         }
         let bytes = bincode::serialize(&tx).unwrap();
         let hex_s = format!("0x{}", hex::encode(bytes));
-        let worker_id = format!("0x{}", hex::encode(&kp.address().0));
+        let worker_id = format!("0x{}", hex::encode(kp.address().0));
         let err = decode_and_verify_worker_attestation(&hex_s, &worker_id)
             .expect_err("tampered tx must fail signature verification");
         assert!(err.contains("signature verify failed"), "got: {err}");
@@ -10467,6 +10477,10 @@ mod tests {
     }
 
     #[test]
+    // `score` is assigned the literal 0.0 by the branch under test, so exact
+    // equality is the assertion: an epsilon would also pass for a wrong-but-tiny
+    // score, which is the bug this is here to catch.
+    #[allow(clippy::float_cmp)]
     fn scoreboard_score_handles_pure_failure() {
         // A worker with all failures and no successes scores 0 (no
         // success_count means no avg_ms; we don't punish to -∞ because
@@ -10753,6 +10767,11 @@ mod tests {
     /// worse lie than the hardcoded "ok" this replaced, because it would mark
     /// the only two healthy seeds as broken.
     #[test]
+    // The last two assertions compare named constants, so clippy sees a value
+    // fixed at compile time. That is the point: they fail the build's test run
+    // if anyone edits HEALTH_STALL_SECS or BLOCK_PRODUCTION_FRESH_SECS back into
+    // an ordering that would mark the two healthy seeds degraded.
+    #[allow(clippy::assertions_on_constants)]
     fn health_threshold_separates_slow_sealing_from_an_eight_day_stall() {
         let advancing = |age: u64| age <= HEALTH_STALL_SECS;
 
@@ -10814,6 +10833,9 @@ mod tests {
     }
 
     #[test]
+    // `record_latency` stores 4_000 exactly; the test asserts the probe did not
+    // blend into it, so any tolerance would hide exactly the regression tested.
+    #[allow(clippy::float_cmp)]
     fn probe_latency_never_overwrites_a_real_hop_sample() {
         let stats = no_stats();
         record_latency(&stats, "1.2.3.4:9090", 4_000);
@@ -10824,6 +10846,9 @@ mod tests {
     }
 
     #[test]
+    // Same reason: the assertion is "replaced, not blended", which is only
+    // expressible as exact equality with the recorded sample.
+    #[allow(clippy::float_cmp)]
     fn first_real_hop_replaces_a_provisional_probe_value_rather_than_blending() {
         let stats = no_stats();
         record_probe_latency(&stats, "1.2.3.4:9090", 200);
@@ -11039,6 +11064,10 @@ mod projection_tests {
     }
 
     #[test]
+    // Both bare assertions relate two named constants, so their value is known
+    // at compile time. They are the guard: change DEFAULT_ATTESTATION_BOND above
+    // the reward, or the challenge period to zero, and this test fails.
+    #[allow(clippy::assertions_on_constants)]
     fn net_per_attestation_is_positive_after_bond_release() {
         // The bond is collateral, not a fee: net while locked is reward−bond,
         // net after release is the full reward. Both must stay positive or the

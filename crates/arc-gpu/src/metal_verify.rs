@@ -1278,7 +1278,13 @@ mod tests {
         verifier.reset_stats();
         assert_eq!(verifier.stats().total_verified, 0);
         assert_eq!(verifier.stats().cpu_batches, 0);
-        assert_eq!(verifier.stats().avg_cpu_throughput, 0.0);
+        // reset_stats() assigns VerifyStats::default(), which sets this field to
+        // exactly 0.0. The assert checks that the reset happened at all, so exact
+        // equality is the correct test; an epsilon would make it weaker, not safer.
+        #[allow(clippy::float_cmp)]
+        {
+            assert_eq!(verifier.stats().avg_cpu_throughput, 0.0);
+        }
     }
 
     #[test]
@@ -2082,6 +2088,11 @@ mod tests {
          cpu_fe_mul(&f, &g), cpu_fe_mul(&e, &h))
     }
 
+    // CPU mirror of the shader's `ge_double`, kept beside `cpu_ge_add` as the
+    // reference pair the WGSL/MSL point arithmetic is validated against. Only
+    // `cpu_ge_add` is needed by the current table generator, but deleting this
+    // would leave the reference implementation half-present.
+    #[allow(dead_code)]
     fn cpu_ge_double(p: &CpuGePoint) -> CpuGePoint {
         let a = cpu_fe_mul(&p.0, &p.0);
         let b = cpu_fe_mul(&p.1, &p.1);
@@ -2149,8 +2160,8 @@ mod tests {
 
         // Convert all to affine and verify against curve25519-dalek
         let mut affine_table: Vec<CpuGePoint> = Vec::with_capacity(16);
-        for i in 0..16 {
-            let aff = if i == 0 { cpu_ge_zero() } else { cpu_ge_to_affine(&table[i]) };
+        for (i, entry) in table.iter().enumerate() {
+            let aff = if i == 0 { cpu_ge_zero() } else { cpu_ge_to_affine(entry) };
             // Verify against dalek for non-zero points
             if i > 0 {
                 let dalek_point = Scalar::from(i as u64) * ED25519_BASEPOINT_POINT;
@@ -2170,8 +2181,7 @@ mod tests {
         // Print WGSL constant table
         println!("\n// Precomputed base point table: B_TABLE[i] = i * B (affine extended)");
         println!("// Generated from curve25519-dalek-verified CPU arithmetic");
-        for i in 0..16 {
-            let (x, y, _, t) = &affine_table[i];
+        for (i, (x, y, _, t)) in affine_table.iter().enumerate() {
             let xf = cpu_fe_freeze(x);
             let yf = cpu_fe_freeze(y);
             let tf = cpu_fe_freeze(t);

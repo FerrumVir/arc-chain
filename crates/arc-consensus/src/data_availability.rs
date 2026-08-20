@@ -217,10 +217,10 @@ pub fn decode_block_data(encoding: &ErasureEncoding) -> Result<Vec<u8>, String> 
     let mut recovered = true;
     while recovered {
         recovered = false;
-        for j in 0..p {
-            if parity_slots[j].is_none() {
+        for (j, parity) in parity_slots.iter().enumerate() {
+            let Some(parity_data) = parity.as_ref() else {
                 continue;
-            }
+            };
 
             // Find which data chunks belong to parity group j
             let group_indices: Vec<usize> = (0..k).filter(|&i| i % p == j).collect();
@@ -233,7 +233,7 @@ pub fn decode_block_data(encoding: &ErasureEncoding) -> Result<Vec<u8>, String> 
             if missing.len() == 1 {
                 // Can recover the single missing chunk
                 let missing_idx = missing[0];
-                let mut reconstructed = parity_slots[j].as_ref().unwrap().clone();
+                let mut reconstructed = parity_data.clone();
 
                 // XOR with all present data chunks in the group
                 for &i in &group_indices {
@@ -635,6 +635,10 @@ mod tests {
         assert!(result.is_err(), "should fail with too few chunks");
     }
 
+    // `confidence` is assigned the literal 0.0 on the empty-encoding early-return
+    // path in `sample_availability`, never computed, so exact equality is the
+    // correct assertion here. An epsilon comparison would weaken the test.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn test_das_sampler_empty_encoding() {
         let sampler = DASampler::new(5);

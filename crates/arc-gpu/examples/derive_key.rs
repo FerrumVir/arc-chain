@@ -1,11 +1,11 @@
-/// Extract the correct BLAKE3 derived key for "ARC-chain-tx-v1" and verify
-/// against the blake3 crate's output.
-///
-/// BLAKE3 `new_derive_key(context)` works in two phases:
-/// 1. Hash the context string with DERIVE_KEY_CONTEXT flag → 32-byte key
-/// 2. Hash data using that key as initial CV with DERIVE_KEY_MATERIAL flag
-///
-/// We need the key from phase 1 to bake into the GPU shader.
+//! Extract the correct BLAKE3 derived key for "ARC-chain-tx-v1" and verify
+//! against the blake3 crate's output.
+//!
+//! BLAKE3 `new_derive_key(context)` works in two phases:
+//! 1. Hash the context string with DERIVE_KEY_CONTEXT flag → 32-byte key
+//! 2. Hash data using that key as initial CV with DERIVE_KEY_MATERIAL flag
+//!
+//! We need the key from phase 1 to bake into the GPU shader.
 
 const IV: [u32; 8] = [
     0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A,
@@ -52,8 +52,7 @@ fn compress(cv: &[u32; 8], block: &[u32; 16], counter: u64, block_len: u32, flag
         counter as u32, (counter >> 32) as u32, block_len, flags,
     ];
 
-    for round in 0..7 {
-        let s = &MSG_SCHEDULE[round];
+    for s in &MSG_SCHEDULE {
         // Column step
         g(&mut state, 0, 4, 8,  12, block[s[0]],  block[s[1]]);
         g(&mut state, 1, 5, 9,  13, block[s[2]],  block[s[3]]);

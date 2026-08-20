@@ -125,6 +125,14 @@ pub fn compute_contract_address(deployer: &Address, nonce: u64) -> Address {
 // Host environment - shared state accessible by all host functions
 // ---------------------------------------------------------------------------
 
+/// Read cache for contract storage: key -> `Some(value)`, or `None` when the
+/// key is confirmed absent from state.
+type StorageCache = Arc<Mutex<HashMap<[u8; 32], Option<Vec<u8>>>>>;
+
+/// Write buffer for contract storage: (key, value) pairs accumulated during
+/// execution and flushed to the `StateDB` afterwards.
+type StorageWrites = Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>;
+
 /// Environment data shared across all WASM host imports for a single execution.
 ///
 /// Stored inside a Wasmer `FunctionEnv<VmHostEnv>`. Host functions receive
@@ -156,9 +164,9 @@ struct VmHostEnv {
 
     // Storage: read cache + write buffer
     // Reads: key -> Option<value> (None = confirmed absent from state)
-    storage_cache: Arc<Mutex<HashMap<[u8; 32], Option<Vec<u8>>>>>,
+    storage_cache: StorageCache,
     // Writes: key -> value (accumulated during execution, flushed to StateDB after)
-    storage_writes: Arc<Mutex<Vec<([u8; 32], Vec<u8>)>>>,
+    storage_writes: StorageWrites,
 
     // Contract address for StateDB lookups
     contract_address: [u8; 32],

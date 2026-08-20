@@ -285,6 +285,11 @@ impl GpuAccountBuffer {
         self.len.load(Ordering::Relaxed)
     }
 
+    /// True when no slot has been written yet.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Write an account into a specific slot.
     ///
     /// On Metal: writes directly to unified memory (zero copy).

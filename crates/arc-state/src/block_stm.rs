@@ -393,6 +393,12 @@ pub struct MVHashMap {
     data: DashMap<[u8; 32], Vec<(usize, u64, u64)>>,
 }
 
+impl Default for MVHashMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MVHashMap {
     /// Create a new empty multi-version hash map.
     pub fn new() -> Self {

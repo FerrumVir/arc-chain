@@ -243,6 +243,9 @@ impl KVCache {
 }
 
 /// Quantize an i64 Q16 vector to i8 with per-vector scale.
+// Reference helper: no live caller today, kept alongside `quantize_for_dot`
+// so the two quantisation conventions stay side by side for comparison.
+#[allow(dead_code)]
 #[inline]
 fn quantize_vec_i8(v: &[i64]) -> (Vec<i8>, i64) {
     let abs_max = v.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
@@ -601,6 +604,10 @@ fn matmul_i8(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize
 // ─── INT16 Matmul (Feature-Gated) ────────────────────────────────────────────
 
 /// Core i16×i64 dot product with 8-element unroll. Scalar fallback.
+// Live on x86_64 (via dot_i16_i64_avx2) and on targets with no SIMD path, and
+// used directly by the unit tests as the bit-exact reference. On aarch64 the
+// NEON path takes over, so the lib-only build sees it as unused.
+#[allow(dead_code)]
 #[inline(always)]
 unsafe fn dot_i16_i64_scalar(row: *const i16, input: *const i64, len: usize) -> i64 {
     // SAFETY: body wrapped for `unsafe_op_in_unsafe_fn` (denied workspace-wide).
@@ -650,10 +657,9 @@ unsafe fn dot_i16_i64_neon(row: *const i16, input: *const i64, len: usize) -> i6
     // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         use std::arch::aarch64::*;
-        let mut acc0: i64 = 0;
-        let mut acc1: i64 = 0;
-        // acc2/acc3 exist to keep the horizontal-sum expression symmetric with
-        // the scalar path; they are never reassigned here.
+        // acc0/acc1 are bound below from the horizontal sum of the vector
+        // accumulators; acc2/acc3 exist to keep the horizontal-sum expression
+        // symmetric with the scalar path and stay zero here.
         let acc2: i64 = 0;
         let acc3: i64 = 0;
         let simd_len = len / 8 * 8;
@@ -690,8 +696,8 @@ unsafe fn dot_i16_i64_neon(row: *const i16, input: *const i64, len: usize) -> i6
         let s01 = vaddq_s64(va0, va1);
         let s23 = vaddq_s64(va2, va3);
         let s = vaddq_s64(s01, s23);
-        acc0 = vgetq_lane_s64(s, 0);
-        acc1 = vgetq_lane_s64(s, 1);
+        let acc0 = vgetq_lane_s64(s, 0);
+        let acc1 = vgetq_lane_s64(s, 1);
         let mut acc = acc0 + acc1 + acc2 + acc3;
         // Tail
         while j < len {
@@ -829,6 +835,9 @@ fn matmul_i16_into(weights: &I16Weights, input: &[i64], in_size: usize, output: 
 }
 
 /// Allocating i16 matmul (for compatibility and small outputs).
+// Only the unit tests call this today; the forward pass uses the `_into`
+// variant. Kept because the tests use it as the reference i16 result.
+#[allow(dead_code)]
 fn matmul_i16(weights: &I16Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     let mut output = vec![0i64; out_size];
     if weights.n_rows == 0 || weights.data.is_empty() {
@@ -842,6 +851,9 @@ fn matmul_i16(weights: &I16Weights, input: &[i64], in_size: usize, out_size: usi
 
 /// NEON i8×i8→i32 SIMD matmul with per-row scales.
 /// Processes 32 elements per iteration (2 × 16-byte NEON loads).
+// Only the unit tests call this today; the forward pass uses the scalar
+// i8xi64 path (see matmul_simd_preq). Kept as the SIMD cross-check.
+#[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 fn matmul_i8xi8_simd(weights: &I8Weights, input: &[i64], in_size: usize, out_size: usize) -> Vec<i64> {
     use std::arch::aarch64::*;
@@ -1108,6 +1120,10 @@ pub fn matmul_fast_preq(weights: &I8Weights, _input_q: &QuantizedInput, input_ra
     matmul_i8_into(weights, input_raw, in_size, output);
 }
 
+// Superseded by the full-precision scalar path in matmul_simd_preq (the
+// double-quantised SIMD version loses too much accuracy). Retained as the
+// reference for the NEON datapath rather than deleted.
+#[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 fn matmul_simd_preq_neon(weights: &I8Weights, input_q: &QuantizedInput, in_size: usize, output: &mut [i64]) {
     debug_assert_eq!(output.len(), weights.scales.len(), "matmul output/scales mismatch");
@@ -1510,6 +1526,10 @@ pub fn matmul_q4_preq_neon(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: 
     });
 }
 
+// Scalar fallback for the AVX2 Q4 path; its only caller, matmul_q4_preq_x86,
+// is x86_64-only, so gate it the same way instead of leaving it unused
+// elsewhere.
+#[cfg(target_arch = "x86_64")]
 fn matmul_q4_scalar(q4: &Q4WeightsX86, input_q: &QuantizedInput, output: &mut [i64]) {
     if q4.n_rows == 0 || q4.data.is_empty() {
         for o in output.iter_mut() { *o = 0; }
@@ -1630,6 +1650,8 @@ pub fn silu_i64(x: i64) -> i64 {
 // ─── Fused LayerNorm + Projection ─────────────────────────────────────────────
 
 /// Compute layernorm stats (mean, inv_std) without materializing the normed vector.
+// Only caller is fused_layernorm_matmul, which is itself off the live path.
+#[allow(dead_code)]
 #[inline]
 fn layernorm_stats(input: &[i64]) -> (i64, i64) {
     let n = input.len() as i64;
@@ -1647,6 +1669,9 @@ fn layernorm_stats(input: &[i64]) -> (i64, i64) {
 /// Computes: output = matmul(weights, layernorm(input, gamma))
 /// Without allocating the intermediate normed vector.
 /// One pass over input to compute stats, then stream through weight rows.
+// The live forward pass still calls layernorm and matmul separately; this
+// fused variant is kept as the reference for the fused kernel work.
+#[allow(dead_code)]
 fn fused_layernorm_matmul(
     input: &[i64],
     gamma: &[i64],
@@ -1682,6 +1707,9 @@ fn fused_layernorm_matmul(
 
 /// Quantize a Q16 i64 vector to i8 for SIMD dot products.
 /// Returns (i8 data, scale factor).
+// Only caller is flash_attention_i8, which is off the live path (the i64 KV
+// cache variant is what runs today).
+#[allow(dead_code)]
 #[inline]
 fn quantize_for_dot(v: &[i64]) -> (Vec<i8>, i64) {
     let abs_max = v.iter().map(|x| x.abs()).max().unwrap_or(1).max(1);
@@ -1693,6 +1721,9 @@ fn quantize_for_dot(v: &[i64]) -> (Vec<i8>, i64) {
 /// SIMD i8×i8 dot product for attention K scores.
 /// q_i8: query head quantized to i8, k_ptr: pointer into KV cache i8 data.
 /// Returns i32 dot product (caller applies scales).
+// Reached only through dot_i8_kv, which only flash_attention_i8 calls; that
+// i8-KV attention path is not the live one today.
+#[allow(dead_code)]
 #[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn dot_i8_kv_neon(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i32 {
@@ -1701,32 +1732,30 @@ unsafe fn dot_i8_kv_neon(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i3
     // for `len` reads. Wrapping is purely lexical - no semantics change.
     unsafe {
         use std::arch::aarch64::*;
-        unsafe {
-            let simd_len = d_head / 32 * 32;
-            let mut vacc0 = vdupq_n_s32(0);
-            let mut vacc1 = vdupq_n_s32(0);
-            let mut vacc2 = vdupq_n_s32(0);
-            let mut vacc3 = vdupq_n_s32(0);
-            let mut j = 0usize;
-            while j < simd_len {
-                let vq0 = vld1q_s8(q_i8.add(j));
-                let vk0 = vld1q_s8(k_ptr.add(j));
-                vacc0 = vpadalq_s16(vacc0, vmull_s8(vget_low_s8(vq0), vget_low_s8(vk0)));
-                vacc1 = vpadalq_s16(vacc1, vmull_s8(vget_high_s8(vq0), vget_high_s8(vk0)));
-                let vq1 = vld1q_s8(q_i8.add(j + 16));
-                let vk1 = vld1q_s8(k_ptr.add(j + 16));
-                vacc2 = vpadalq_s16(vacc2, vmull_s8(vget_low_s8(vq1), vget_low_s8(vk1)));
-                vacc3 = vpadalq_s16(vacc3, vmull_s8(vget_high_s8(vq1), vget_high_s8(vk1)));
-                j += 32;
-            }
-            vacc0 = vaddq_s32(vaddq_s32(vacc0, vacc1), vaddq_s32(vacc2, vacc3));
-            let mut acc = vaddvq_s32(vacc0);
-            while j < d_head {
-                acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
-                j += 1;
-            }
-            acc
+        let simd_len = d_head / 32 * 32;
+        let mut vacc0 = vdupq_n_s32(0);
+        let mut vacc1 = vdupq_n_s32(0);
+        let mut vacc2 = vdupq_n_s32(0);
+        let mut vacc3 = vdupq_n_s32(0);
+        let mut j = 0usize;
+        while j < simd_len {
+            let vq0 = vld1q_s8(q_i8.add(j));
+            let vk0 = vld1q_s8(k_ptr.add(j));
+            vacc0 = vpadalq_s16(vacc0, vmull_s8(vget_low_s8(vq0), vget_low_s8(vk0)));
+            vacc1 = vpadalq_s16(vacc1, vmull_s8(vget_high_s8(vq0), vget_high_s8(vk0)));
+            let vq1 = vld1q_s8(q_i8.add(j + 16));
+            let vk1 = vld1q_s8(k_ptr.add(j + 16));
+            vacc2 = vpadalq_s16(vacc2, vmull_s8(vget_low_s8(vq1), vget_low_s8(vk1)));
+            vacc3 = vpadalq_s16(vacc3, vmull_s8(vget_high_s8(vq1), vget_high_s8(vk1)));
+            j += 32;
         }
+        vacc0 = vaddq_s32(vaddq_s32(vacc0, vacc1), vaddq_s32(vacc2, vacc3));
+        let mut acc = vaddvq_s32(vacc0);
+        while j < d_head {
+            acc += (*q_i8.add(j) as i32) * (*k_ptr.add(j) as i32);
+            j += 1;
+        }
+        acc
     }
 }
 
@@ -1772,6 +1801,8 @@ unsafe fn dot_i8_kv_avx2(q_i8: *const i8, k_ptr: *const i8, d_head: usize) -> i3
 }
 
 /// Cross-platform SIMD dot product dispatch for attention.
+// Only caller is flash_attention_i8, which is off the live path.
+#[allow(dead_code)]
 #[inline]
 fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
     #[cfg(target_arch = "aarch64")]
@@ -1808,6 +1839,14 @@ fn dot_i8_kv(q_i8: &[i8], k_ptr: &[i8], k_offset: usize, d_head: usize) -> i32 {
 /// d_head: dimension per head
 /// full_seq: number of positions in cache
 /// attn_scale: 1/sqrt(d_head) in Q16
+// The live attention path is flash_attention_i64 (i64 KV cache). This i8-KV
+// variant is kept as the reference implementation for the quantised KV cache
+// and is exercised by hand when that path is revisited.
+#[allow(dead_code)]
+// Every argument is a separate KV-cache slice or a shape constant. Packing
+// them into a struct would only move the same 10 values behind an extra
+// indirection in a hot integer kernel, so the count stays as is.
+#[allow(clippy::too_many_arguments)]
 fn flash_attention_i8(
     q_head: &[i64],
     k_data: &[i8], k_scales: &[i64],
@@ -1840,8 +1879,8 @@ fn flash_attention_i8(
             let correction = integer_exp(diff); // exp(old_max - new_max) < 1
             // Scale down existing sum and output
             running_sum = (running_sum * correction) >> FRAC_BITS;
-            for dd in 0..d_head {
-                out[dd] = (out[dd] * correction) >> FRAC_BITS;
+            for o in out.iter_mut() {
+                *o = (*o * correction) >> FRAC_BITS;
             }
             running_max = score;
         }
@@ -1861,8 +1900,8 @@ fn flash_attention_i8(
 
     // Normalize by sum
     if running_sum > 0 {
-        for dd in 0..d_head {
-            out[dd] = (out[dd] * ONE) / running_sum;
+        for o in out.iter_mut() {
+            *o = (*o * ONE) / running_sum;
         }
     }
 
@@ -1878,6 +1917,10 @@ fn flash_attention_i8(
 /// path that allocated a scores Vec<i64> of size full_seq per head.
 ///
 /// Returns the attention output for this head: [d_head] i64 Q16.
+// Every argument is a separate KV-cache slice or a shape constant. Packing
+// them into a struct would only move the same 8 values behind an extra
+// indirection in the hottest integer kernel in the crate, so the count stays.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn flash_attention_i64(
     q_head: &[i64],            // [d_head] i64 Q16
@@ -1913,8 +1956,8 @@ fn flash_attention_i64(
             let diff = running_max - score; // negative
             let correction = integer_exp(diff);
             running_sum = (running_sum * correction) >> FRAC_BITS;
-            for dd in 0..d_head {
-                out[dd] = (out[dd] * correction) >> FRAC_BITS;
+            for o in out.iter_mut() {
+                *o = (*o * correction) >> FRAC_BITS;
             }
             running_max = score;
         }
@@ -1931,8 +1974,8 @@ fn flash_attention_i64(
 
     // Normalize by sum
     if running_sum > 0 {
-        for dd in 0..d_head {
-            out[dd] = (out[dd] * ONE) / running_sum;
+        for o in out.iter_mut() {
+            *o = (*o * ONE) / running_sum;
         }
     }
 
@@ -2057,8 +2100,8 @@ impl CachedIntegerModel {
                     _ => 1, // continuation byte (shouldn't happen at valid char boundary)
                 };
                 let char_end = (pos + char_len).min(bytes.len());
-                for i in pos..char_end {
-                    let byte_tok = format!("<0x{:02X}>", bytes[i]);
+                for b in &bytes[pos..char_end] {
+                    let byte_tok = format!("<0x{b:02X}>");
                     if let Some(id) = self.vocab.iter().position(|v| v == &byte_tok) {
                         tokens.push(id as u32);
                     }
@@ -3044,7 +3087,10 @@ pub fn load_tokenizer_only(path: &str) -> Result<CachedIntegerModel, crate::Infe
     let d_ff = get_u32(&format!("{arch}.feed_forward_length")) as usize;
     let vocab_size = content.tensor_infos.get("token_embd.weight")
         .map(|t| t.shape.dims()[0]).unwrap_or(32000);
-    let d_head = if n_heads > 0 { d_model / n_heads } else { 128 };
+    // checked_div carries the `n_heads > 0` guard: it returns None only when
+    // the divisor is zero, so this is the same integer division and the same
+    // 128 fallback, bit for bit.
+    let d_head = d_model.checked_div(n_heads).unwrap_or(128);
     let d_kv = d_head * n_kv_heads;
 
     let rope_base: f64 = match content.metadata.get(&format!("{arch}.rope.freq_base")) {

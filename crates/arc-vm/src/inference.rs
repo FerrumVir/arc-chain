@@ -566,10 +566,8 @@ impl InferenceEngine {
         let net = if model_data.is_empty() {
             None
         } else {
-            match NeuralNet::from_bytes(model_data) {
-                Ok(n) => Some(n),
-                Err(_) => None, // fall back to mock
-            }
+            // A parse failure falls back to mock mode (see doc comment above).
+            NeuralNet::from_bytes(model_data).ok()
         };
         self.load_model_inner(id, info, net)
     }

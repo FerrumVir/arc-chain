@@ -71,7 +71,7 @@ impl MultiVersionMemory {
     fn write(&self, key: [u8; 32], tx_idx: usize, value: WriteValue) {
         self.data
             .entry(key)
-            .or_insert_with(BTreeMap::new)
+            .or_default()
             .insert(tx_idx, value);
     }
 

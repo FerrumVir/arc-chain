@@ -26,8 +26,18 @@ struct BufferPool {
     output_buf: wgpu::Buffer,
     staging_buf: wgpu::Buffer,
     params_buf: wgpu::Buffer,
+    // Allocated up front but not yet bound by any dispatch path in this file:
+    // the scales binding is currently supplied per-weight from `GpuWeights`.
+    // Keeping the field alive keeps the pooled allocation alive, so removing
+    // it would change how much GPU memory this engine reserves at startup.
+    // Not deleted for that reason - it is reserved capacity, not stale code.
+    #[allow(dead_code)]
     scales_buf: wgpu::Buffer,
+    // Recorded pool capacity. Not read today; kept so the pool carries the
+    // sizes it was built with rather than re-deriving them at a call site.
+    #[allow(dead_code)]
     max_in_size: usize,
+    #[allow(dead_code)]
     max_out_size: usize,
 }
 
@@ -482,8 +492,8 @@ pub fn pack_i8_to_u32_pub(data: &[i8]) -> Vec<u32> {
 pub fn pack_i8_to_q4(data: &[i8]) -> Vec<u8> {
     let mut packed = Vec::with_capacity(data.len().div_ceil(2));
     for pair in data.chunks(2) {
-        let lo = ((pair[0].max(-8).min(7) + 8) as u8) & 0x0F;
-        let hi = if pair.len() > 1 { ((pair[1].max(-8).min(7) + 8) as u8) & 0x0F } else { 8 };
+        let lo = ((pair[0].clamp(-8, 7) + 8) as u8) & 0x0F;
+        let hi = if pair.len() > 1 { ((pair[1].clamp(-8, 7) + 8) as u8) & 0x0F } else { 8 };
         packed.push(lo | (hi << 4));
     }
     packed
@@ -722,12 +732,12 @@ mod tests {
             if data[4] != 77777 {
                 println!("  SENTINEL MISMATCH: output buffer(2) may not map to binding(2)!");
                 // Try to find the actual data
-                for i in 0..5 {
-                    if data[i] == 77777 { println!("  Found sentinel at output[{}]", i); }
-                    if data[i] == 111 { println!("  Found buf0 marker at output[{}]", i); }
-                    if data[i] == 222 { println!("  Found buf1 marker at output[{}]", i); }
-                    if data[i] == 333 { println!("  Found buf3 marker at output[{}]", i); }
-                    if data[i] == 444 { println!("  Found buf4 marker at output[{}]", i); }
+                for (i, &v) in data[..5].iter().enumerate() {
+                    if v == 77777 { println!("  Found sentinel at output[{}]", i); }
+                    if v == 111 { println!("  Found buf0 marker at output[{}]", i); }
+                    if v == 222 { println!("  Found buf1 marker at output[{}]", i); }
+                    if v == 333 { println!("  Found buf3 marker at output[{}]", i); }
+                    if v == 444 { println!("  Found buf4 marker at output[{}]", i); }
                 }
             }
         }
@@ -809,11 +819,11 @@ mod tests {
                 let mut weights = vec![0i8; n * n];
                 let mut input = vec![0i8; n];
                 // Fill with small values to avoid overflow
-                for i in 0..weights.len() {
-                    weights[i] = ((i % 5) as i8) - 2; // -2, -1, 0, 1, 2
+                for (i, w) in weights.iter_mut().enumerate() {
+                    *w = ((i % 5) as i8) - 2; // -2, -1, 0, 1, 2
                 }
-                for i in 0..input.len() {
-                    input[i] = ((i % 3) as i8) - 1; // -1, 0, 1
+                for (i, x) in input.iter_mut().enumerate() {
+                    *x = ((i % 3) as i8) - 1; // -1, 0, 1
                 }
 
                 let gw = gpu.upload_weights(&weights, n, n, None);
@@ -853,8 +863,8 @@ mod tests {
             let gpu_wgsl = GpuMatmul::new_wgsl_only(n, n).unwrap();
             let mut weights = vec![0i8; n * n];
             let mut input = vec![0i8; n];
-            for i in 0..weights.len() { weights[i] = ((i % 5) as i8) - 2; }
-            for i in 0..input.len() { input[i] = ((i % 3) as i8) - 1; }
+            for (i, w) in weights.iter_mut().enumerate() { *w = ((i % 5) as i8) - 2; }
+            for (i, x) in input.iter_mut().enumerate() { *x = ((i % 3) as i8) - 1; }
             let gw_wgsl = gpu_wgsl.upload_weights(&weights, n, n, None);
             let _ = gpu_wgsl.matmul(&gw_wgsl, &input);
             let _ = gpu_wgsl.matmul(&gw_wgsl, &input);

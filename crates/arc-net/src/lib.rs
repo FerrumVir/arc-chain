@@ -218,13 +218,15 @@ impl ShredEncoder {
         }
 
         // Attempt FEC recovery for any missing data shreds.
-        for pair_idx in 0..num_parity {
+        // `parity_slots` was allocated with exactly `num_parity` entries, so
+        // enumerating it visits the same pair indices as `0..num_parity` did.
+        for (pair_idx, parity_slot) in parity_slots.iter().enumerate() {
             let a_idx = pair_idx * 2;
             let b_idx = a_idx + 1;
 
             let a_present = data_slots[a_idx].is_some();
             let b_present = b_idx < total_shreds as usize && data_slots[b_idx].is_some();
-            let parity_present = parity_slots[pair_idx].is_some();
+            let parity_present = parity_slot.is_some();
 
             if a_present && b_present {
                 continue; // Both data shreds present, no recovery needed.
@@ -233,7 +235,7 @@ impl ShredEncoder {
             if b_idx >= total_shreds as usize {
                 // Unpaired shred - parity is a copy, use it if data is missing.
                 if !a_present && parity_present {
-                    data_slots[a_idx] = parity_slots[pair_idx].clone();
+                    data_slots[a_idx] = parity_slot.clone();
                 }
                 continue;
             }
@@ -241,7 +243,7 @@ impl ShredEncoder {
             // One data shred missing - recover via XOR with parity.
             if !a_present && b_present && parity_present {
                 let b_data = data_slots[b_idx].as_ref().unwrap();
-                let parity = parity_slots[pair_idx].as_ref().unwrap();
+                let parity = parity_slot.as_ref().unwrap();
                 let max_len = b_data.len().max(parity.len());
                 let mut recovered = vec![0u8; max_len];
                 for i in 0..max_len {
@@ -252,7 +254,7 @@ impl ShredEncoder {
                 data_slots[a_idx] = Some(recovered);
             } else if a_present && !b_present && parity_present {
                 let a_data = data_slots[a_idx].as_ref().unwrap();
-                let parity = parity_slots[pair_idx].as_ref().unwrap();
+                let parity = parity_slot.as_ref().unwrap();
                 let max_len = a_data.len().max(parity.len());
                 let mut recovered = vec![0u8; max_len];
                 for i in 0..max_len {
@@ -761,8 +763,8 @@ mod tests {
         let hash = hash_bytes(&data);
         let shreds = ShredEncoder::encode(&data, hash, 999, 7);
 
-        let total_data = 79;
-        let num_parity = (total_data + 1) / 2; // 40
+        let total_data = 79usize;
+        let num_parity = total_data.div_ceil(2); // 40
         assert_eq!(shreds.len(), total_data + num_parity);
 
         // Shuffle shreds to simulate out-of-order reception.

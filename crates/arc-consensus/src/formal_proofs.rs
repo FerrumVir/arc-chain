@@ -45,7 +45,7 @@ fn make_block(
     timestamp: u64,
 ) -> DagBlock {
     let mut transactions = transactions;
-    transactions.sort_by(|a, b| a.0.cmp(&b.0));
+    transactions.sort_by_key(|tx| tx.0);
     let ordering_commitment = DagBlock::compute_ordering_commitment(&transactions);
     let mut block = DagBlock {
         author,
@@ -173,7 +173,7 @@ mod formal_tests {
         let byzantine = addrs[3];
 
         // Each honest validator gets its own engine (simulating separate nodes)
-        let mut engines: Vec<ConsensusEngine> = honest
+        let engines: Vec<ConsensusEngine> = honest
             .iter()
             .map(|addr| ConsensusEngine::new(vs.clone(), *addr))
             .collect();
@@ -186,7 +186,7 @@ mod formal_tests {
         }
 
         // Byzantine validator also creates a CONFLICTING block for round 0
-        let byz_conflicting = make_block(
+        let _byz_conflicting = make_block(
             byzantine,
             0,
             vec![],
@@ -614,7 +614,7 @@ mod formal_tests {
         }
 
         // Try commit again -- should have more committed blocks now
-        let committed_after = engine.try_commit();
+        let _committed_after = engine.try_commit();
         let total_committed = engine.committed_blocks().len();
 
         assert!(
@@ -707,12 +707,11 @@ mod formal_tests {
         let mut effective_stake = 0u64;
         let validator_set = engine.validator_set();
         for hash in &blocks_in_r0 {
-            if let Some(block) = engine.get_block(hash) {
-                if unique_authors.insert(block.author) {
-                    if let Some(v) = validator_set.get_validator(&block.author) {
-                        effective_stake += v.stake;
-                    }
-                }
+            if let Some(block) = engine.get_block(hash)
+                && unique_authors.insert(block.author)
+                && let Some(v) = validator_set.get_validator(&block.author)
+            {
+                effective_stake += v.stake;
             }
         }
 
@@ -1162,7 +1161,7 @@ mod formal_tests {
         let (vs, addrs) = make_test_validators(&stakes);
 
         assert_eq!(vs.total_stake, STAKE_CORE + 2 * STAKE_ARC); // 60M
-        assert_eq!(vs.quorum, (2 * 60_000_000 + 2) / 3); // 40_000_002
+        assert_eq!(vs.quorum, (2u64 * 60_000_000).div_ceil(3)); // 40_000_000
 
         // Core alone reaches quorum
         assert!(
@@ -1214,7 +1213,7 @@ mod formal_tests {
             let (vs, addrs) = make_test_validators(&stakes);
 
             let total_stake = total_validators as u64 * STAKE_ARC;
-            let expected_quorum = (2 * total_stake + 2) / 3;
+            let expected_quorum = (2 * total_stake).div_ceil(3);
             assert_eq!(
                 vs.quorum, expected_quorum,
                 "N={}: quorum mismatch",
@@ -1242,7 +1241,7 @@ mod formal_tests {
             );
 
             // Verify minimum number of equal-stake validators for quorum
-            let min_validators_for_quorum = (expected_quorum + STAKE_ARC - 1) / STAKE_ARC;
+            let min_validators_for_quorum = expected_quorum.div_ceil(STAKE_ARC);
             let max_validators_below_quorum = min_validators_for_quorum - 1;
 
             let quorum_addrs: Vec<Hash256> = addrs[..min_validators_for_quorum as usize].to_vec();
@@ -1296,12 +1295,16 @@ mod formal_tests {
                 .collect();
 
             // First: insert below-quorum blocks in R+2
-            for i in 0..max_validators_below_quorum as usize {
-                let block = make_block(addrs[i], 2, r1_parents.clone(), vec![], 300 + i as u64);
+            for (i, addr) in addrs
+                .iter()
+                .enumerate()
+                .take(max_validators_below_quorum as usize)
+            {
+                let block = make_block(*addr, 2, r1_parents.clone(), vec![], 300 + i as u64);
                 engine.receive_block(&block).unwrap();
             }
 
-            let committed_below = engine.try_commit();
+            let _committed_below = engine.try_commit();
             // There may or may not be commits here depending on which R1 certifier
             // the below-quorum R2 blocks happen to support. The key invariant is that
             // for a specific B->C path, below quorum R2 support is insufficient.
@@ -1314,7 +1317,7 @@ mod formal_tests {
                 let _ = engine.receive_block(&block);
             }
 
-            let committed_at_quorum = engine.try_commit();
+            let _committed_at_quorum = engine.try_commit();
             let total_committed = engine.committed_blocks().len();
             assert!(
                 total_committed > 0,

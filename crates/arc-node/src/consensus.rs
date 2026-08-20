@@ -9,6 +9,7 @@ use arc_mempool::{EncryptedMempool, Mempool};
 use arc_net::transport::{InboundMessage, OutboundMessage};
 use arc_state::StateDB;
 use crate::pipeline::{Pipeline, PipelineBatch};
+use crate::SharedValidators;
 use crate::vrf::ProposerSelector;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,7 +41,7 @@ pub struct ConsensusManager {
     /// Runs alongside the regular mempool when `Some`.
     encrypted_mempool: Option<Arc<EncryptedMempool>>,
     /// Shared validator list for RPC - updated on PeerConnected/Disconnected.
-    pub dag_validators: Option<Arc<parking_lot::RwLock<Vec<(Hash256, u64)>>>>,
+    pub dag_validators: Option<SharedValidators>,
     /// Shared DAG round counter for health endpoint.
     pub dag_round: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// Shared DAG committed block counter for health endpoint.
@@ -140,11 +141,10 @@ impl ConsensusManager {
         // This keeps observers out of the quorum calculation so they
         // don't break consensus when they go offline.
         let mut validators = Vec::new();
-        if stake > 0 {
-            if let Some(v) = Validator::new(validator_address, stake, 0) {
+        if stake > 0
+            && let Some(v) = Validator::new(validator_address, stake, 0) {
                 validators.push(v);
             }
-        }
         for (addr, peer_stake) in peer_validators {
             if let Some(v) = Validator::new(*addr, *peer_stake, 0) {
                 validators.push(v);
@@ -302,11 +302,10 @@ impl ConsensusManager {
                                     // Queue for next epoch freeze
                                     self.engine.queue_validator(v);
                                 }
-                                if !validators.iter().any(|v| v.address == self.validator_address) {
-                                    if let Some(v) = Validator::new(self.validator_address, self.stake, 0) {
+                                if !validators.iter().any(|v| v.address == self.validator_address)
+                                    && let Some(v) = Validator::new(self.validator_address, self.stake, 0) {
                                         validators.push(v);
                                     }
-                                }
                                 let was_single = current_vs.len() <= 1;
                                 let new_set = ValidatorSet::new(validators, current_vs.epoch);
                                 self.engine.update_validator_set(new_set);
@@ -367,11 +366,10 @@ impl ConsensusManager {
                                 .collect();
                             // Ensure local validator is present
                             let mut validators = remaining;
-                            if !validators.iter().any(|v| v.address == self.validator_address) {
-                                if let Some(v) = Validator::new(self.validator_address, self.stake, 0) {
+                            if !validators.iter().any(|v| v.address == self.validator_address)
+                                && let Some(v) = Validator::new(self.validator_address, self.stake, 0) {
                                     validators.push(v);
                                 }
-                            }
                             let now_single = validators.len() <= 1;
                             let new_set = ValidatorSet::new(validators, current_vs.epoch);
                             self.engine.update_validator_set(new_set);
@@ -408,14 +406,13 @@ impl ConsensusManager {
                             match self.engine.receive_block(&block) {
                                 Ok(()) => {
                                     // Persist DAG block to WAL for crash recovery
-                                    if let Some(ref wal) = self.dag_wal {
-                                        if let Ok(bytes) = bincode::serialize(&block) {
+                                    if let Some(ref wal) = self.dag_wal
+                                        && let Ok(bytes) = bincode::serialize(&block) {
                                             wal.append(
                                                 arc_state::WalOp::SetDagBlock(block.hash, bytes),
                                                 block.round,
                                             );
                                         }
-                                    }
                                     debug!(
                                         author = %block.author,
                                         round = block.round,
@@ -487,7 +484,7 @@ impl ConsensusManager {
                         | InboundMessage::SnapshotChunkResponse { .. } => {
                             debug!("State sync message (handled by RPC layer)");
                         }
-                        InboundMessage::InferenceRequest { request_id, input, max_tokens, requester } => {
+                        InboundMessage::InferenceRequest { request_id, input: _, max_tokens, requester: _ } => {
                             // Community GPU node received an inference request.
                             // TODO: Run model locally and send response via outbound_tx.
                             info!(
@@ -496,7 +493,7 @@ impl ConsensusManager {
                                 "Received inference request from network"
                             );
                         }
-                        InboundMessage::InferenceResponse { request_id, output, output_hash, model_hash, ms_per_token, responder } => {
+                        InboundMessage::InferenceResponse { request_id, output: _, output_hash: _, model_hash: _, ms_per_token, responder } => {
                             // Seed node received inference result from community GPU.
                             // Store for the waiting RPC handler to pick up.
                             info!(
@@ -564,7 +561,7 @@ impl ConsensusManager {
                             }
                         }
                         // ── Shard messages (forwarded to inference engine) ───
-                        InboundMessage::ShardForward { request_id, model_id, next_layer, total_layers, token_position, activations, activation_hash } => {
+                        InboundMessage::ShardForward { request_id, model_id: _, next_layer, total_layers: _, token_position: _, activations: _, activation_hash: _ } => {
                             info!(
                                 request_id = %request_id,
                                 layer = next_layer,
@@ -572,7 +569,7 @@ impl ConsensusManager {
                             );
                             // Shard processing handled by inference coordinator (Phase 2)
                         }
-                        InboundMessage::ShardResult { request_id, token_id, logits_hash, responder } => {
+                        InboundMessage::ShardResult { request_id, token_id, logits_hash: _, responder } => {
                             info!(
                                 request_id = %request_id,
                                 token_id = token_id,
@@ -580,7 +577,7 @@ impl ConsensusManager {
                                 "Received shard result"
                             );
                         }
-                        InboundMessage::ShardAnnounce { model_id, start_layer, end_layer, expert_indices, node_address, available_memory, gpu_tier } => {
+                        InboundMessage::ShardAnnounce { model_id, start_layer, end_layer, expert_indices, node_address, available_memory: _, gpu_tier } => {
                             info!(
                                 node = %node_address,
                                 model = %model_id,
@@ -603,8 +600,8 @@ impl ConsensusManager {
             // Do this BEFORE the propose check so transactions are always
             // available regardless of round/parent state.
             // Cap mempool at 50K to prevent unbounded memory growth.
-            if self.benchmark && multi_validator && mempool.len() < 5_000 {
-                if let Some(ref pool) = benchmark_pool {
+            if self.benchmark && multi_validator && mempool.len() < 5_000
+                && let Some(ref pool) = benchmark_pool {
                     let signed_txs = pool.drain(200);
                     let fed = signed_txs.len();
                     for tx in signed_txs {
@@ -614,7 +611,6 @@ impl ConsensusManager {
                         info!("Benchmark pre-feed: {} txs (mempool: {})", fed, mempool.len());
                     }
                 }
-            }
 
             // ── 1. Propose a block ─────────────────────────────────────────
             // In multi-validator mode, propose every round (even empty) so the
@@ -624,7 +620,7 @@ impl ConsensusManager {
             // IMPORTANT: Check parent readiness BEFORE draining the mempool.
             // If the peer's block from the previous round hasn't arrived yet,
             // we would fail to propose and lose the drained transactions.
-            let has_quorum_parents = if current_round == 0 {
+            let _has_quorum_parents = if current_round == 0 {
                 true // Round 0 has no parent requirement
             } else if self.engine.is_force_advanced() {
                 // After a view-change (force_advance_round), relax the parent
@@ -637,11 +633,10 @@ impl ConsensusManager {
                 let prev_blocks = self.engine.blocks_in_round(current_round - 1);
                 let mut parent_stake = 0u64;
                 for hash in &prev_blocks {
-                    if let Some(block) = self.engine.get_block(&hash) {
-                        if let Some(validator) = vs.get_validator(&block.author) {
+                    if let Some(block) = self.engine.get_block(hash)
+                        && let Some(validator) = vs.get_validator(&block.author) {
                             parent_stake += validator.stake;
                         }
-                    }
                 }
                 parent_stake >= vs.quorum
             };
@@ -680,8 +675,8 @@ impl ConsensusManager {
             // runs in parallel. The benchmark_tx_count reflects actual execution
             // throughput (20K+ TPS sustained). Batch size is tuned so each
             // execution takes <40ms, leaving time for peer messages.
-            if self.benchmark && can_produce {
-                if let Some(ref pool) = benchmark_pool {
+            if self.benchmark && can_produce
+                && let Some(ref pool) = benchmark_pool {
                     let batch_size = if multi_validator { 1_500 } else { 1_000_000 };
                     let signed_txs = pool.drain(batch_size);
                     if !signed_txs.is_empty() {
@@ -712,7 +707,6 @@ impl ConsensusManager {
                         }
                     }
                 }
-            }
 
             if can_produce && !already_proposed && allow_propose && vrf_approved {
                 if !multi_validator && self.benchmark {
@@ -805,14 +799,13 @@ impl ConsensusManager {
                         match self.engine.propose_block(tx_hashes, timestamp) {
                             Ok(block) => {
                                 // Persist our own proposed block to WAL
-                                if let Some(ref wal) = self.dag_wal {
-                                    if let Ok(bytes) = bincode::serialize(&block) {
+                                if let Some(ref wal) = self.dag_wal
+                                    && let Ok(bytes) = bincode::serialize(&block) {
                                         wal.append(
                                             arc_state::WalOp::SetDagBlock(block.hash, bytes),
                                             block.round,
                                         );
                                     }
-                                }
                                 info!(
                                     round = block.round,
                                     txs = block.transactions.len(),
@@ -937,9 +930,9 @@ impl ConsensusManager {
                     // After DAG commit, decrypt encrypted transactions from
                     // the batch that was included in this block. Revealed
                     // transactions are fed back into pending_txs for execution.
-                    if let Some(ref emp) = self.encrypted_mempool {
-                        if let Some((_, enc_batch)) = pending_encrypted.remove(&dag_block.hash.0) {
-                            if !enc_batch.is_empty() {
+                    if let Some(ref emp) = self.encrypted_mempool
+                        && let Some((_, enc_batch)) = pending_encrypted.remove(&dag_block.hash.0)
+                            && !enc_batch.is_empty() {
                                 let revealed = emp.reveal_batch(&enc_batch, dag_block.round);
                                 let revealed_count = revealed.len();
                                 for rtx in revealed {
@@ -954,8 +947,6 @@ impl ConsensusManager {
                                     );
                                 }
                             }
-                        }
-                    }
 
                     // In multi-validator mode, process committed transactions.
                     // Proposer: full execution + export state diff.
@@ -981,11 +972,10 @@ impl ConsensusManager {
                                 let mut txs = committed_txs.clone();
                                 tokio::spawn(async move {
                                     for tx in txs.iter_mut() {
-                                        if !tx.is_unsigned() && !tx.sig_verified {
-                                            if tx.verify_signature().is_ok() {
+                                        if !tx.is_unsigned() && !tx.sig_verified
+                                            && tx.verify_signature().is_ok() {
                                                 tx.sig_verified = true;
                                             }
-                                        }
                                     }
                                     txs
                                 })
@@ -1062,9 +1052,9 @@ impl ConsensusManager {
                                         // Run EVM execution for any EVM contract calls.
                                         let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
                                         for (i, tx) in committed_txs.iter().enumerate() {
-                                            if receipts[i].success {
-                                                if let arc_types::TxBody::WasmCall(ref body) = tx.body {
-                                                    if state.is_evm_contract(&body.contract) {
+                                            if receipts[i].success
+                                                && let arc_types::TxBody::WasmCall(ref body) = tx.body
+                                                    && state.is_evm_contract(&body.contract) {
                                                         let result = arc_vm::evm::evm_execute(
                                                             &state,
                                                             tx.from,
@@ -1079,8 +1069,6 @@ impl ConsensusManager {
                                                             block_logs.push(log);
                                                         }
                                                     }
-                                                }
-                                            }
                                         }
                                         if !block_logs.is_empty() {
                                             state.store_event_logs(block.header.height, block_logs);
@@ -1210,7 +1198,7 @@ impl ConsensusManager {
                     }
 
                     // Prune old security data every 10000 rounds to bound memory
-                    if current_round % 10_000 == 0 && current_round > 10_000 {
+                    if current_round.is_multiple_of(10_000) && current_round > 10_000 {
                         tracker.prune_votes(current_round - 10_000);
                     }
                 }
@@ -1262,8 +1250,8 @@ impl ConsensusManager {
             static HEARTBEAT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let hb_count = HEARTBEAT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let hb_interval = if self.is_multi_validator() { 600 } else { 6000 }; // ~30s at 50ms/600 or 1ms/6000
-            if hb_count % hb_interval == 0 {
-                if let Some(ref tx) = outbound_tx {
+            if hb_count.is_multiple_of(hb_interval)
+                && let Some(ref tx) = outbound_tx {
                     // Use try_send to avoid blocking the consensus loop when
                     // the outbound channel is full (root cause of P2P deadlock).
                     let _ = tx.try_send(arc_net::transport::OutboundMessage::BroadcastHeartbeatWithRound {
@@ -1271,7 +1259,6 @@ impl ConsensusManager {
                         committed_round: self.engine.last_committed_round(),
                     });
                 }
-            }
 
             // ── 4. Epoch management: freeze validator set when stable ─────
             // Freeze when: multi-validator AND we have 3+ validators AND
@@ -1283,7 +1270,7 @@ impl ConsensusManager {
             // absorb new validators that joined via staking.
             // CRITICAL: do NOT freeze at round 0 - that would overwrite the
             // genesis freeze with whatever PeerConnected events arrived.
-            if multi_validator && current_round >= 1000 && current_round % 1000 == 0 {
+            if multi_validator && current_round >= 1000 && current_round.is_multiple_of(1000) {
                 self.engine.freeze_epoch();
             }
 
@@ -1292,7 +1279,7 @@ impl ConsensusManager {
             // Run every ~100 iterations to amortize overhead.
             static EVICTION_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let count = EVICTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count % 100 == 0 {
+            if count.is_multiple_of(100) {
                 state.evict_transactions(1_000_000); // Keep last ~1M tx bodies
 
                 // Evict stale pending data (txs, diffs, encrypted batches).

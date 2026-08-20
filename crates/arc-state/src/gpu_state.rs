@@ -909,7 +909,7 @@ mod tests {
             ..Default::default()
         };
         let cache = GpuStateCache::new(config);
-        let addrs: Vec<[u8; 32]> = (0..5).map(|i| addr(i)).collect();
+        let addrs: Vec<[u8; 32]> = (0..5).map(addr).collect();
 
         cache.prefetch(&addrs);
 

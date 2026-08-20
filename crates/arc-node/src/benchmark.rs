@@ -49,7 +49,7 @@ impl BenchmarkPool {
             .collect();
 
         // Partition senders across threads
-        let senders_per_thread = (sender_count as usize + num_threads - 1) / num_threads;
+        let senders_per_thread = (sender_count as usize).div_ceil(num_threads);
 
         let mut handles = Vec::with_capacity(num_threads);
         for thread_id in 0..num_threads {
@@ -114,11 +114,10 @@ impl BenchmarkPool {
                             }
                         }
 
-                        if !batch.is_empty() {
-                            if tx.send(batch).is_err() {
+                        if !batch.is_empty()
+                            && tx.send(batch).is_err() {
                                 break; // Channel closed
                             }
-                        }
                     }
                 })
                 .expect("spawn signing thread");

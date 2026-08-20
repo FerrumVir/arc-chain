@@ -44,7 +44,7 @@ pub struct GenesisValidator {
 
 /// Top-level node runtime configuration loaded from a TOML file.
 /// All sections are optional and fall back to defaults matching the CLI defaults.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct NodeConfig {
     #[serde(default)]
     pub rpc: RpcConfig,
@@ -84,7 +84,7 @@ pub struct NodeConfig {
 /// Note that `[benchmark] rayon_threads` is a DIFFERENT knob: it calls
 /// `build_global()` and only under `--benchmark`. It sizes the pool used for
 /// batch signature verification, not inference.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct InferenceConfig {
     /// Dedicated inference pool width. 0 (default) = use rayon's global pool.
     #[serde(default)]
@@ -226,25 +226,9 @@ fn default_bench_rayon_threads() -> usize {
 }
 
 // ─── Default trait implementations ──────────────────────────────────────
-
-impl Default for NodeConfig {
-    fn default() -> Self {
-        Self {
-            rpc: RpcConfig::default(),
-            p2p: P2pConfig::default(),
-            validator: ValidatorConfig::default(),
-            storage: StorageConfig::default(),
-            benchmark: BenchmarkConfig::default(),
-            inference: InferenceConfig::default(),
-        }
-    }
-}
-
-impl Default for InferenceConfig {
-    fn default() -> Self {
-        Self { threads: 0 }
-    }
-}
+//
+// `NodeConfig` and `InferenceConfig` derive theirs (all-default fields); the
+// rest need non-zero field defaults and are written out below.
 
 impl Default for RpcConfig {
     fn default() -> Self {

@@ -82,7 +82,6 @@ fn main() {
     // Run inference multiple times and check determinism
     let mut output_hashes = Vec::new();
     let mut latencies = Vec::new();
-    let mut first_output = None;
 
     for i in 0..runs {
         let start = Instant::now();
@@ -92,7 +91,6 @@ fn main() {
         latencies.push(elapsed.as_millis() as u64);
 
         if i == 0 {
-            first_output = Some(result.output.clone());
             eprintln!("  Run 0: {} tokens in {}ms, output_hash={}",
                 result.tokens_used, result.elapsed_ms,
                 hex_encode(&result.output_hash.0[..8]));
