@@ -649,6 +649,313 @@ fn to_m31(v: i64) -> M31 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Packed Dense Layer AIR - K multiply-accumulates per row
+// ---------------------------------------------------------------------------
+//
+// The one-MAC-per-row layout costs 9 cells per multiply-accumulate and makes a
+// 2^24-row trace for a 7B attention projection. Proving cost is dominated by
+// FFTs and FRI over that trace, and a tall-thin trace is close to the worst
+// shape to hand them.
+//
+// This layout puts PACK_K MACs on a single row, which cuts the row count by
+// PACK_K and the cells per MAC from 9 to about 3.2:
+//
+//   columns: w[0..K] | x[0..K] | p[0..K] | acc | out | bias   = 3K + 3
+//   rows:    out_size * (in_size / K)
+//
+// Constraints (all degree <= 2):
+//   1. p_i - w_i * x_i = 0                              (K constraints)
+//   2. acc - is_start*S - (is_active - is_start)*(acc_prev + S) = 0, S = sum p_i
+//   3. out - is_last*(acc + bias) = 0
+//   4. bias - is_last*bias = 0
+//   5. w_i - is_active*w_i = 0, x_i - is_active*x_i = 0  (2K constraints)
+//
+// Same soundness argument as the unpacked AIR: the selectors are preprocessed
+// from the public dimensions, so the prover cannot choose where a dot product
+// starts or ends, and `out` is bound to the completed accumulator.
+
+/// Multiply-accumulates packed into one trace row.
+pub const PACK_K: usize = 32;
+
+/// Trace columns for the packed layout: 3*K value columns + acc + out + bias.
+pub const PACKED_STARK_COLS: usize = 3 * PACK_K + 3;
+
+fn packed_pp_ids() -> Vec<stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId> {
+    use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+    ["pk_is_active", "pk_is_start", "pk_is_last"]
+        .iter()
+        .map(|id| PreProcessedColumnId { id: (*id).to_string() })
+        .collect()
+}
+
+#[derive(Clone)]
+pub struct PackedDenseEval {
+    pub log_size: u32,
+}
+
+pub type PackedDenseComponent = FrameworkComponent<PackedDenseEval>;
+
+impl FrameworkEval for PackedDenseEval {
+    fn log_size(&self) -> u32 {
+        self.log_size
+    }
+    fn max_constraint_log_degree_bound(&self) -> u32 {
+        self.log_size + 1
+    }
+    fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+
+        let is_active = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: "pk_is_active".to_string(),
+        });
+        let is_start = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: "pk_is_start".to_string(),
+        });
+        let is_last = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: "pk_is_last".to_string(),
+        });
+
+        let w: Vec<_> = (0..PACK_K).map(|_| eval.next_trace_mask()).collect();
+        let x: Vec<_> = (0..PACK_K).map(|_| eval.next_trace_mask()).collect();
+        let p: Vec<_> = (0..PACK_K).map(|_| eval.next_trace_mask()).collect();
+        let [acc, acc_prev] = eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, -1]);
+        let out = eval.next_trace_mask();
+        let bias = eval.next_trace_mask();
+
+        // 1. each product is correct
+        for i in 0..PACK_K {
+            eval.add_constraint(p[i].clone() - w[i].clone() * x[i].clone());
+        }
+
+        // running sum of this row's products
+        let mut row_sum = p[0].clone();
+        for item in p.iter().take(PACK_K).skip(1) {
+            row_sum = row_sum + item.clone();
+        }
+
+        // 2. accumulation chain with per-neuron reset
+        eval.add_constraint(
+            acc.clone()
+                - is_start.clone() * row_sum.clone()
+                - (is_active.clone() - is_start.clone()) * (acc_prev + row_sum),
+        );
+
+        // 3. output binds to the completed accumulator
+        eval.add_constraint(out.clone() - is_last.clone() * (acc + bias.clone()));
+
+        // 4. bias only on a neuron's final row
+        eval.add_constraint(bias.clone() - is_last * bias);
+
+        // 5. padding rows carry no factors
+        for i in 0..PACK_K {
+            eval.add_constraint(w[i].clone() - is_active.clone() * w[i].clone());
+            eval.add_constraint(x[i].clone() - is_active.clone() * x[i].clone());
+        }
+
+        eval
+    }
+}
+
+/// Rows needed for a packed trace of the given dimensions.
+pub fn packed_log_size(in_size: usize, out_size: usize) -> u32 {
+    let rows_per_neuron = in_size.div_ceil(PACK_K);
+    compute_log_size(out_size * rows_per_neuron)
+}
+
+/// Preprocessed selectors for the packed layout.
+pub fn generate_packed_preprocessed_trace(
+    in_size: usize,
+    out_size: usize,
+) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+    let rows_per_neuron = in_size.div_ceil(PACK_K);
+    let n_rows = out_size * rows_per_neuron;
+    let log_size = packed_log_size(in_size, out_size);
+    let trace_size = 1usize << log_size;
+    let domain = CanonicCoset::new(log_size).circle_domain();
+
+    let one = M31::from(1u32);
+    let zero = M31::from(0u32);
+    let mut is_active = vec![zero; trace_size];
+    let mut is_start = vec![zero; trace_size];
+    let mut is_last = vec![zero; trace_size];
+
+    for row in 0..n_rows.min(trace_size) {
+        is_active[row] = one;
+        let r = row % rows_per_neuron;
+        if r == 0 {
+            is_start[row] = one;
+        }
+        if r == rows_per_neuron - 1 {
+            is_last[row] = one;
+        }
+    }
+
+    [is_active, is_start, is_last]
+        .into_iter()
+        .map(|mut col| {
+            bit_reverse_coset_to_circle_domain_order(&mut col);
+            CircleEvaluation::new(domain, col.into_iter().collect())
+        })
+        .collect()
+}
+
+/// Packed trace. `output` is written as claimed, not recomputed.
+pub fn generate_packed_trace(
+    weights: &[i64],
+    input: &[i64],
+    output: &[i64],
+    bias: &[i64],
+    in_size: usize,
+    out_size: usize,
+) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+    let rows_per_neuron = in_size.div_ceil(PACK_K);
+    let log_size = packed_log_size(in_size, out_size);
+    let trace_size = 1usize << log_size;
+    let domain = CanonicCoset::new(log_size).circle_domain();
+
+    let mut cols: Vec<Vec<M31>> = (0..PACKED_STARK_COLS)
+        .map(|_| vec![M31::from(0u32); trace_size])
+        .collect();
+
+    for i in 0..out_size {
+        let mut acc = M31::from(0u32);
+        for r in 0..rows_per_neuron {
+            let row = i * rows_per_neuron + r;
+            if row >= trace_size {
+                break;
+            }
+            let mut row_sum = M31::from(0u32);
+            for k in 0..PACK_K {
+                let j = r * PACK_K + k;
+                if j >= in_size {
+                    break;
+                }
+                let w = to_m31(weights[i * in_size + j]);
+                let xv = to_m31(input[j]);
+                let prod = w * xv;
+                cols[k][row] = w;
+                cols[PACK_K + k][row] = xv;
+                cols[2 * PACK_K + k][row] = prod;
+                row_sum = row_sum + prod;
+            }
+            acc = if r == 0 { row_sum } else { acc + row_sum };
+            cols[3 * PACK_K][row] = acc;
+            if r == rows_per_neuron - 1 {
+                cols[3 * PACK_K + 1][row] = to_m31(output[i]);
+                cols[3 * PACK_K + 2][row] = if bias.is_empty() {
+                    M31::from(0u32)
+                } else {
+                    to_m31(bias[i])
+                };
+            }
+        }
+    }
+
+    cols.into_iter()
+        .map(|mut col| {
+            bit_reverse_coset_to_circle_domain_order(&mut col);
+            CircleEvaluation::new(domain, col.into_iter().collect())
+        })
+        .collect()
+}
+
+/// Prove a Dense layer with the packed AIR. Same statement as
+/// [`try_prove_dense_stark`], a much cheaper trace.
+pub fn try_prove_dense_packed(
+    weights: &[i64],
+    input: &[i64],
+    output: &[i64],
+    bias: &[i64],
+    in_size: usize,
+    out_size: usize,
+) -> Result<(Vec<u8>, usize, u64), String> {
+    let start = Instant::now();
+
+    if weights.len() < in_size * out_size || input.len() < in_size || output.len() < out_size {
+        return Err("input slices too short".into());
+    }
+
+    let log_size = packed_log_size(in_size, out_size);
+    let preprocessed = generate_packed_preprocessed_trace(in_size, out_size);
+    let trace = generate_packed_trace(weights, input, output, bias, in_size, out_size);
+
+    let config = PcsConfig::default();
+    let twiddles = SimdBackend::precompute_twiddles(
+        CanonicCoset::new(log_size + 1 + config.fri_config.log_blowup_factor)
+            .circle_domain()
+            .half_coset,
+    );
+
+    let prover_channel = &mut Blake2sChannel::default();
+    let mut commitment_scheme =
+        CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
+    commitment_scheme.set_store_polynomials_coefficients();
+
+    let mut tb = commitment_scheme.tree_builder();
+    tb.extend_evals(preprocessed);
+    tb.commit(prover_channel);
+
+    let mut tb = commitment_scheme.tree_builder();
+    tb.extend_evals(trace);
+    tb.commit(prover_channel);
+
+    let pp_ids = packed_pp_ids();
+    let component = PackedDenseComponent::new(
+        &mut TraceLocationAllocator::new_with_preprocessed_columns(&pp_ids),
+        PackedDenseEval { log_size },
+        SecureField::zero(),
+    );
+
+    let proof = stwo_prover_mod::prove::<SimdBackend, Blake2sMerkleChannel>(
+        &[&component],
+        prover_channel,
+        commitment_scheme,
+    )
+    .map_err(|e| format!("packed dense proving failed: {e:?}"))?;
+
+    let verifier_channel = &mut Blake2sChannel::default();
+    let mut verifier_scheme = CommitmentSchemeVerifier::<Blake2sMerkleChannel>::new(config);
+    let sizes = component.trace_log_degree_bounds();
+    verifier_scheme.commit(proof.commitments[0], &sizes[0], verifier_channel);
+    verifier_scheme.commit(proof.commitments[1], &sizes[1], verifier_channel);
+    verify::<Blake2sMerkleChannel>(
+        &[&component],
+        verifier_channel,
+        &mut verifier_scheme,
+        proof.clone(),
+    )
+    .map_err(|e| format!("packed dense verification failed: {e:?}"))?;
+
+    let commitment_roots: Vec<[u8; 32]> = proof
+        .commitments
+        .iter()
+        .map(|c| *blake3::hash(format!("{:?}", c).as_bytes()).as_bytes())
+        .collect();
+
+    let mut h = blake3::Hasher::new_derive_key("ARC-dense-packed-v1");
+    for root in &commitment_roots {
+        h.update(root);
+    }
+    h.update(&(log_size).to_le_bytes());
+    h.update(&(out_size as u32).to_le_bytes());
+    h.update(&(in_size as u32).to_le_bytes());
+    let binding_hash = *h.finalize().as_bytes();
+
+    let receipt = StwoproofReceipt {
+        version: PROOF_VERSION,
+        log_size,
+        pow_bits: config.pow_bits,
+        log_blowup_factor: config.fri_config.log_blowup_factor,
+        n_queries: config.fri_config.n_queries as u32,
+        commitment_roots,
+        binding_hash,
+    };
+    let data = receipt.to_bytes();
+    let len = data.len();
+    Ok((data, len, start.elapsed().as_millis() as u64))
+}
+
 /// Prove a Dense layer forward pass with a REAL Circle STARK proof.
 ///
 /// Panics if the claimed `output` is not the correct dot product - use
