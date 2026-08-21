@@ -24,6 +24,57 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 
 ---
 
+## Why this doesn't exist anywhere else
+
+Five things, in one runtime. Every row is checkable, and the commands are in
+[`docs/RECEIPTS.md`](docs/RECEIPTS.md).
+
+| | Everywhere else | Here |
+|---|---|---|
+| **Verifying an AI answer** | Trust the API, or pay orders of magnitude more to prove it in zero-knowledge | Re-run it and compare one 32-byte hash — the cost of a single forward pass |
+| **Same answer on different chips** | Floating-point drifts; no one claims bit-identity | Bit-identical on ARM, x86 and GPU — with the float backend run alongside as a control that *does* diverge |
+| **Inference inside consensus** | Oracles, trusted hardware, optimistic challenge windows | Validators re-execute the inference and vote on it, exactly like a transaction. Disagree and you get slashed |
+| **Post-quantum signatures** | Ethereum: nothing live, roadmap ~2029. Algorand: PQ accounts Q3 2026 | ML-DSA-65 and Falcon-512 as first-class transaction types, running today |
+| **Post-quantum verify inside a contract** | Ethereum's EIP-8052 is still a proposal | `falcon512_verify` precompile at address `0x08`, live |
+
+**I don't know of another chain that has all five.** If you know one, open an
+issue and I'll put it in this table myself.
+
+And a result that surprised me: **the post-quantum signature verifies faster
+than the classical one it replaces.** Falcon-512 at 20.9 µs against Ed25519's
+30.1 µs, through the same code path the mempool uses. Everyone assumes
+quantum-safe means slow and heavy. On Apple silicon it's the opposite.
+
+```bash
+cargo run --release -p arc-crypto --example pq_bench
+```
+
+### On the zero-knowledge side, to be straight with you
+
+The Circle STARK prover here is **StarkWare's Stwo** — the best prover in the
+world, and I use it on purpose. What's mine is the circuit built on top of it:
+an AIR that proves a Llama-2-7B dense layer and actually *binds* the result.
+A full 4096 × 4096 attention projection — 16.7 million multiply-accumulates,
+a 2²⁴-row trace — proves as a single STARK in 30 seconds on a desktop.
+
+The interesting part isn't that it proves. It's that it refuses:
+
+```bash
+cargo run --release --example soundness_check --features stwo-prover
+```
+
+Four forged outputs, all rejected. My first version of that circuit had four
+constraints, two of which did nothing, and it would have signed off on a fake
+answer. I found it, fixed it, and left the test in so nobody has to take my
+word for it.
+
+**Lagrange's DeepProve is ahead of me on zkML and it isn't close** — they prove
+full LLM inference in production. I went the other direction: make the
+computation reproducible so you don't need the expensive proof. Different
+trade, not a better prover.
+
+---
+
 ## What's live right now
 
 | | |
@@ -46,12 +97,12 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 
 | Your computer | One-click download |
 |---|---|
-| 🍎 **Mac (Apple Silicon - M1/M2/M3/M4)** | **[Download for Apple Silicon Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.11/ARC.Node_0.7.11_aarch64.dmg)** |
-| 🍎 **Mac (Intel)** | **[Download for Intel Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.11/ARC.Node_0.7.11_x64.dmg)** |
-| 🪟 **Windows 10 / 11** | **[Download for Windows](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.11/ARC.Node_0.7.11_x64-setup.exe)** |
-| 🐧 **Linux (Ubuntu / Debian)** | **[Download .deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.11/ARC.Node_0.7.11_amd64.deb)** |
-| 🐧 **Linux (Fedora / RHEL)** | **[Download .rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.11/ARC.Node-0.7.11-1.x86_64.rpm)** |
-| 🐧 **Linux (any distro)** | **[Download .AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.11/ARC.Node_0.7.11_amd64.AppImage)** |
+| 🍎 **Mac (Apple Silicon - M1/M2/M3/M4)** | **[Download for Apple Silicon Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/ARC.Node_0.7.7_aarch64.dmg)** |
+| 🍎 **Mac (Intel)** | **[Download for Intel Mac](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/ARC.Node_0.7.7_x64.dmg)** |
+| 🪟 **Windows 10 / 11** | **[Download for Windows](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/ARC.Node_0.7.7_x64-setup.exe)** |
+| 🐧 **Linux (Ubuntu / Debian)** | **[Download .deb](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/ARC.Node_0.7.7_amd64.deb)** |
+| 🐧 **Linux (Fedora / RHEL)** | **[Download .rpm](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/ARC.Node-0.7.7-1.x86_64.rpm)** |
+| 🐧 **Linux (any distro)** | **[Download .AppImage](https://github.com/FerrumVir/arc-chain/releases/download/v0.7.7/ARC.Node_0.7.7_amd64.AppImage)** |
 
 > **Not sure which Mac?** Apple menu → *About This Mac*. If chip says "Apple M1/M2/M3/M4" → Apple Silicon. If "Intel" → Intel.
 
@@ -59,9 +110,9 @@ ARC makes inference **verifiable by a blockchain the same way transactions are v
 
 - **Mac**: open the `.dmg` → drag ARC Node to Applications → first launch right-click → Open
 - **Windows**: run the `.exe` → "More info" → "Run anyway" → Next → Install → Finish
-- **Linux**: `sudo apt install ./ARC.Node_0.7.11_amd64.deb` (or `rpm -i`, or `chmod +x` the AppImage)
+- **Linux**: `sudo apt install ./ARC.Node_0.7.7_amd64.deb` (or `rpm -i`, or `chmod +x` the AppImage)
 
-The app onboards in 3 clicks (welcome → identity → join), runs in your tray, auto-starts on login, auto-updates when v0.7.11+ ships.
+The app onboards in 3 clicks (welcome → identity → join), runs in your tray, auto-starts on login, auto-updates when v0.7.7+ ships.
 
 **📖 Full walkthrough:** [Getting Started with ARC Node](docs/GETTING_STARTED.md) - install, identity, first inference, faucet, earnings, and FAQ.
 
@@ -103,7 +154,7 @@ The core thesis - "inference that passes consensus" - only works if the arithmet
 
 2. **Cross-architecture bit identity, proven.** Same prompt → same output hash on Apple M2 Ultra and x86_64 Vultr VPS. No approximations, no tolerance thresholds. Byte-for-byte equal.
 
-3. **BLAKE3 verification in O(1).** Consensus participants re-run an inference, compare one 32-byte hash. zkML proof-of-inference costs 10⁵–10⁶× the original compute; hash-match costs the same as one forward pass. At 7 B parameters we're already 700× the largest model ever verified by zkML.
+3. **BLAKE3 verification in O(1).** Consensus participants re-run an inference and compare one 32-byte hash. That costs the same as one forward pass — where proving the same inference in zero-knowledge costs orders of magnitude more. This is the whole trade: reproducibility instead of proof.
 
 4. **Sharded inference with hop-level integrity.** 32-layer model split across 8 VPS. Each shard verifies the previous shard's BLAKE3 hash before computing its own layers. A single corrupted hop invalidates the whole chain - the network notices immediately.
 
