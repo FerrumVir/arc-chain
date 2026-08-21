@@ -196,7 +196,7 @@ restart_one() {
     # source of truth.
     local argv
     argv="$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" \
-        'pid=$(pgrep -f arc-node | head -1); [ -n "$pid" ] && tr "\0" " " < /proc/$pid/cmdline' 2>&1)"
+        'pid=$( pgrep -x arc-node | head -1); [ -n "$pid" ] && tr "\0" " " < /proc/$pid/cmdline' 2>&1)"
     if [ -z "$argv" ] || printf '%s' "$argv" | grep -qi 'denied\|refused\|timed out'; then
         bad "cannot read live argv over ssh: ${argv:-no response}"
         return 1
@@ -212,7 +212,10 @@ restart_one() {
 
     if [ "$DRY_RUN" -eq 1 ]; then
         say "${DIM}would: systemctl stop ${HEAL_SERVICE}${RESET}"
-        say "${DIM}would: systemctl restart ${NODE_SERVICE}${RESET}"
+        say "${DIM}would: pipe scripts/arc-remote-relaunch.sh over ssh — capture argv+env+cwd${RESET}"
+        say "${DIM}         from /proc, pkill -9 -x arc-node, re-exec the SAME argv from cwd.${RESET}"
+        say "${DIM}         NOT systemctl: arc-node is not under systemd here and the unit${RESET}"
+        say "${DIM}         file lacks --genesis, --model and every --shard-range.${RESET}"
         say "${DIM}would: poll /health up to ${BOOT_WAIT}s, then require height to advance within ${SEAL_WAIT}s${RESET}"
         say "${DIM}would: systemctl start ${HEAL_SERVICE}${RESET}"
         printf "\n"
@@ -224,12 +227,19 @@ restart_one() {
     ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "systemctl stop ${HEAL_SERVICE}" >/dev/null 2>&1 \
         && ok "self-heal stopped for the duration" || warn "could not stop ${HEAL_SERVICE} (may not be installed)"
 
-    if ! ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "systemctl restart ${NODE_SERVICE}" >/dev/null 2>&1; then
-        bad "systemctl restart ${NODE_SERVICE} failed"
+    # NOT `systemctl restart` — arc-node is not under systemd on these seeds and
+    # the unit on disk differs materially from the live process. See the header
+    # of arc-remote-relaunch.sh for the verified evidence.
+    local out
+    out=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" 'bash -s' < "$(dirname "$0")/arc-remote-relaunch.sh" 2>&1)
+    if ! printf '%s' "$out" | grep -q RELAUNCH_OK; then
+        bad "relaunch failed:"
+        printf '%s\n' "$out" | sed 's/^/        /' | head -8
         ssh "${SSH_OPTS[@]}" "${SSH_USER}@${ip}" "systemctl start ${HEAL_SERVICE}" >/dev/null 2>&1
         return 1
     fi
-    ok "restart issued; waiting for RPC (up to ${BOOT_WAIT}s — cold boot reloads shards)"
+    printf '%s\n' "$out" | grep -E '^CAPTURED_CWD' | sed "s/^/    ${DIM}/; s/$/${RESET}/"
+    ok "relaunched with live argv preserved; waiting for RPC (up to ${BOOT_WAIT}s)"
 
     local waited=0 back=0
     while [ "$waited" -lt "$BOOT_WAIT" ]; do
