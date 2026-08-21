@@ -163,14 +163,30 @@ post-quantum means slow and heavy. On Apple silicon it's the opposite.
 
 `cargo run --release --example stark_scale --features stwo-prover`
 
-| Layer | Multiply-accumulates | Trace rows | Prove time | Receipt |
-|---|---|---|---|---|
-| 1024 × 4096 | 4.2M | 2²² | 7.4 s | 152 B |
-| 2048 × 4096 | 8.4M | 2²³ | 14.6 s | 152 B |
-| **4096 × 4096** | **16.8M** | **2²⁴** | **29.9 s** | 152 B |
+`cargo run --release --example air_shootout --features stwo-prover`
+
+The circuit packs 32 multiply-accumulates into each trace row. The original
+layout used one per row, which made a 2²⁴-row trace for a 7B projection — a
+tall, thin shape that is close to the worst thing you can hand an FFT.
+
+| Layer | Multiply-accumulates | Rows (1/row) | Rows (32/row) | Was | Now | Speedup |
+|---|---|---|---|---|---|---|
+| 256 × 1024 | 262K | 2¹⁸ | 2¹³ | 446 ms | 33 ms | 13.5× |
+| 512 × 2048 | 1.0M | 2²⁰ | 2¹⁵ | 1,758 ms | 143 ms | 12.3× |
+| 1024 × 4096 | 4.2M | 2²² | 2¹⁷ | 7,174 ms | 615 ms | 11.7× |
+| **4096 × 4096** | **16.8M** | **2²⁴** | **2¹⁹** | **29,336 ms** | **2,564 ms** | **11.4×** |
 
 The last row is a full Llama-2-7B attention projection proved as a single
-Circle STARK, on a desktop.
+Circle STARK in **2.6 seconds on a desktop** — about 6.5 million
+multiply-accumulates proved per second.
+
+The packed circuit proves the same statement and rejects the same forgeries;
+`air_shootout` runs the adversarial checks against it every time.
+
+**The prover is StarkWare's Stwo.** I'm not competing with it — I'm using it,
+and it is far from saturated. Stwo is published at hundreds of millions of
+trace cells per second on Poseidon workloads; this circuit extracts about 20
+million. The remaining gap is mine to close, not theirs.
 
 ### Full 7B layer suite
 

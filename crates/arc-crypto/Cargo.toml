@@ -69,5 +69,9 @@ required-features = ["stwo-prover"]
 name = "block_witness_check"
 required-features = ["stwo-prover"]
 
+[[example]]
+name = "air_shootout"
+required-features = ["stwo-prover"]
+
 [lints]
 workspace = true
