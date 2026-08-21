@@ -1,0 +1,11 @@
+/Users/tjdunham/arc-chain/vendor/stwo/target/release/deps/zeroize-d41191e5978d0cff.d: /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/lib.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/aarch64.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/barrier.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/stack.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/../README.md
+
+/Users/tjdunham/arc-chain/vendor/stwo/target/release/deps/libzeroize-d41191e5978d0cff.rlib: /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/lib.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/aarch64.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/barrier.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/stack.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/../README.md
+
+/Users/tjdunham/arc-chain/vendor/stwo/target/release/deps/libzeroize-d41191e5978d0cff.rmeta: /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/lib.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/aarch64.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/barrier.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/stack.rs /Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/../README.md
+
+/Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/lib.rs:
+/Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/aarch64.rs:
+/Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/barrier.rs:
+/Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/stack.rs:
+/Users/tjdunham/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/zeroize-1.9.0/src/../README.md:
