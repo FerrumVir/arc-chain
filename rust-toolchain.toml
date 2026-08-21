@@ -1,0 +1,9 @@
+# Pinned because the `stwo-prover` feature depends on upstream Stwo, which uses
+# the nightly `array_chunks_mut` API. That API was removed from later nightlies,
+# so newer toolchains fail to build the real Circle STARK prover and silently
+# fall back to the BLAKE3 mock path.
+#
+# Verified building `--features stwo-prover` on this toolchain.
+[toolchain]
+channel = "nightly-2025-06-01"
+components = ["rustfmt", "clippy"]

@@ -39,6 +39,7 @@ use stwo::core::fields::m31::{BaseField, M31};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
 use stwo::core::poly::circle::CanonicCoset;
+use stwo::core::utils::bit_reverse_coset_to_circle_domain_order;
 use stwo::core::verifier::verify;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::prover::backend::simd::SimdBackend;
@@ -46,7 +47,7 @@ use stwo::prover::poly::circle::{CircleEvaluation, PolyOps};
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::{self as stwo_prover_mod, CommitmentSchemeProver};
 use stwo_constraint_framework::{
-    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
+    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator, ORIGINAL_TRACE_IDX,
 };
 
 use num_traits::Zero;
@@ -372,15 +373,83 @@ impl FrameworkEval for ArcBlockWitnessEval {
 // Dense Layer AIR (inference proving)
 // ---------------------------------------------------------------------------
 //
-// Proves: output[i] = Σ weight[i][j] * input[j] + bias[i]
-// 6 columns: active, weight, input, product, acc, output
-// 3 constraints (degree ≤ 2):
-//   1. active is boolean: active² - active = 0
-//   2. product = weight * input: active * (product - weight * input) = 0
-//   3. accumulation: active * (acc - product) = 0 (simplified for STARK)
+// Proves, over M31:  output[i] = Σ_j weight[i][j] · input[j] + bias[i]
+//
+// ## Trace layout
+//
+// One row per multiply-accumulate. Row `r` corresponds to output neuron
+// `i = r / in_size` and input index `j = r % in_size`. Rows past
+// `out_size · in_size` are padding and are forced to zero.
+//
+// Preprocessed columns (tree 0) are derived **only from the public dimensions**
+// `(in_size, out_size, log_size)`, so the prover cannot choose them:
+//
+// | Column      | Meaning                                        |
+// |-------------|------------------------------------------------|
+// | `is_active` | 1 if `r < out_size · in_size`, else 0          |
+// | `is_start`  | 1 if the row begins a neuron (`j == 0`)        |
+// | `is_last`   | 1 if the row ends a neuron (`j == in_size-1`)  |
+//
+// Trace columns (tree 1), supplied by the prover:
+//
+// | Column    | Meaning                                          |
+// |-----------|--------------------------------------------------|
+// | `weight`  | weight[i][j]                                     |
+// | `input`   | input[j]                                         |
+// | `product` | weight · input                                   |
+// | `acc`     | running dot-product accumulator for neuron `i`   |
+// | `output`  | claimed output[i] — nonzero only when `is_last`  |
+// | `bias`    | bias[i] — nonzero only when `is_last`            |
+//
+// ## Constraints (6, all degree ≤ 2)
+//
+// 1. `product − weight · input = 0`
+//    Multiplication is correct. Holds on padding rows because 5 and 6 zero
+//    the factors there.
+//
+// 2. `acc − is_start·product − (is_active − is_start)·(acc_prev + product) = 0`
+//    The accumulation chain. At a neuron's first row `acc = product`; on every
+//    later row `acc = acc_prev + product`; on padding `acc = 0`. `acc_prev` is
+//    the row-offset −1 mask. Row 0 wraps to the final row, but row 0 always has
+//    `is_start = 1`, so the wrapped value is multiplied by zero.
+//
+// 3. `output − is_last·(acc + bias) = 0`
+//    Binds the claimed output to the completed accumulator. This is the
+//    constraint that makes the proof mean "the dot product is correct" rather
+//    than "some multiplications happened".
+//
+// 4. `bias − is_last·bias = 0`      bias is zero off the neuron's last row
+// 5. `weight − is_active·weight = 0`  padding rows carry no weight
+// 6. `input − is_active·input = 0`    padding rows carry no input
+//
+// Constraints 4–6 are canonicalisation: they make the trace — and therefore the
+// commitment — a deterministic function of `(weights, input, output, bias)`,
+// which is what lets a 152-byte receipt be reproduced by an independent party.
+//
+// ## What this does and does not prove
+//
+// Proven: the claimed outputs are the correct dot products **of the M31
+// reductions** of the trace's weights and inputs.
+//
+// Not proven: that trace weights equal the model's weights (that binding comes
+// from the receipt's weight hash plus deterministic re-execution), and that no
+// value wrapped modulo 2^31 − 1. Range-checking the accumulator to rule out
+// field wrap needs a lookup argument and is not implemented here.
 
-/// Number of columns in Dense layer STARK trace.
+/// Number of prover-supplied columns in the Dense layer STARK trace.
 pub const DENSE_STARK_COLS: usize = 6;
+
+/// Number of preprocessed (verifier-derived) columns for the Dense layer AIR.
+pub const DENSE_STARK_PP_COLS: usize = 3;
+
+/// Preprocessed column identifiers, in commit order.
+fn dense_pp_ids() -> Vec<stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId> {
+    use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+    ["dense_is_active", "dense_is_start", "dense_is_last"]
+        .iter()
+        .map(|id| PreProcessedColumnId { id: (*id).to_string() })
+        .collect()
+}
 
 /// AIR evaluator for Dense layer forward pass.
 #[derive(Clone)]
@@ -400,38 +469,55 @@ impl FrameworkEval for DenseLayerStarkEval {
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
-        // Read 6 columns
-        let active = eval.next_trace_mask();
+        use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
+
+        // Preprocessed selectors - fixed by the public dimensions.
+        let is_active = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: "dense_is_active".to_string(),
+        });
+        let is_start = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: "dense_is_start".to_string(),
+        });
+        let is_last = eval.get_preprocessed_column(PreProcessedColumnId {
+            id: "dense_is_last".to_string(),
+        });
+
+        // Trace columns. `acc` is read at offsets [0, -1] so the accumulation
+        // chain can reference the previous row.
         let weight = eval.next_trace_mask();
         let input = eval.next_trace_mask();
         let product = eval.next_trace_mask();
-        let acc = eval.next_trace_mask();
+        let [acc, acc_prev] = eval.next_interaction_mask(ORIGINAL_TRACE_IDX, [0, -1]);
         let output = eval.next_trace_mask();
+        let bias = eval.next_trace_mask();
 
-        // Constraint 1: active is boolean
-        eval.add_constraint(active.clone() * active.clone() - active.clone());
+        // 1. product = weight * input
+        eval.add_constraint(product.clone() - weight.clone() * input.clone());
 
-        // Constraint 2: product = weight * input (when active)
+        // 2. accumulation chain with per-neuron reset
         eval.add_constraint(
-            active.clone() * (product.clone() - weight.clone() * input.clone()),
+            acc.clone()
+                - is_start.clone() * product.clone()
+                - (is_active.clone() - is_start.clone()) * (acc_prev + product),
         );
 
-        // Constraint 3: output consistency (padding zeros)
-        eval.add_constraint(output.clone() - active.clone() * output.clone());
+        // 3. output binds to the completed accumulator
+        eval.add_constraint(output.clone() - is_last.clone() * (acc + bias.clone()));
 
-        // Constraint 4: accumulator consistency (padding zeros)
-        eval.add_constraint(acc.clone() - active.clone() * acc.clone());
+        // 4. bias only on a neuron's last row
+        eval.add_constraint(bias.clone() - is_last * bias);
+
+        // 5-6. padding rows carry no factors
+        eval.add_constraint(weight.clone() - is_active.clone() * weight);
+        eval.add_constraint(input.clone() - is_active * input);
 
         eval
     }
 }
 
-/// Generate STARK trace for a Dense layer shard.
-/// Values are reduced modulo M31 (2^31 - 1) for the STARK field.
-pub fn generate_dense_stark_trace(
-    weights: &[i64],
-    input: &[i64],
-    output: &[i64],
+/// Build the preprocessed selector columns for a Dense layer of the given
+/// public dimensions. Depends on nothing the prover controls.
+pub fn generate_dense_preprocessed_trace(
     in_size: usize,
     out_size: usize,
 ) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
@@ -440,50 +526,134 @@ pub fn generate_dense_stark_trace(
     let trace_size = 1usize << log_size;
     let domain = CanonicCoset::new(log_size).circle_domain();
 
-    // Initialize columns
+    let one = M31::from(1u32);
+    let zero = M31::from(0u32);
+
+    let mut is_active = vec![zero; trace_size];
+    let mut is_start = vec![zero; trace_size];
+    let mut is_last = vec![zero; trace_size];
+
+    for (row, ((a, s), l)) in is_active
+        .iter_mut()
+        .zip(is_start.iter_mut())
+        .zip(is_last.iter_mut())
+        .enumerate()
+    {
+        if row >= n_ops {
+            break;
+        }
+        *a = one;
+        let j = row % in_size;
+        if j == 0 {
+            *s = one;
+        }
+        if j == in_size - 1 {
+            *l = one;
+        }
+    }
+
+    [is_active, is_start, is_last]
+        .into_iter()
+        .map(|mut col| {
+            // Constraint 2 reads a row offset, so the values must sit in
+            // circle-domain bit-reversed order, not coset order.
+            bit_reverse_coset_to_circle_domain_order(&mut col);
+            CircleEvaluation::new(domain, col.into_iter().collect())
+        })
+        .collect()
+}
+
+/// Generate the Dense layer STARK trace.
+///
+/// The `output` slice is written into the trace **as claimed** - it is not
+/// recomputed. A wrong claim therefore violates constraint 3 and the proof
+/// fails to verify, which is what makes this AIR binding.
+pub fn generate_dense_stark_trace(
+    weights: &[i64],
+    input: &[i64],
+    output: &[i64],
+    in_size: usize,
+    out_size: usize,
+) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+    generate_dense_stark_trace_with_bias(weights, input, output, &[], in_size, out_size)
+}
+
+/// As [`generate_dense_stark_trace`], with an explicit bias vector. An empty
+/// `bias` is treated as all zeros.
+pub fn generate_dense_stark_trace_with_bias(
+    weights: &[i64],
+    input: &[i64],
+    output: &[i64],
+    bias: &[i64],
+    in_size: usize,
+    out_size: usize,
+) -> Vec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>> {
+    let n_ops = out_size * in_size;
+    let log_size = compute_log_size(n_ops);
+    let trace_size = 1usize << log_size;
+    let domain = CanonicCoset::new(log_size).circle_domain();
+
     let mut cols: Vec<Vec<M31>> = (0..DENSE_STARK_COLS)
         .map(|_| vec![M31::from(0u32); trace_size])
         .collect();
 
-    let m31_mod = (1u64 << 31) - 1;
-    let to_m31 = |v: i64| -> M31 {
-        let v_abs = v.unsigned_abs();
-        if v >= 0 {
-            M31::from((v_abs % m31_mod) as u32)
-        } else {
-            M31::from(0u32) - M31::from((v_abs % m31_mod) as u32)
-        }
-    };
-
-    let mut row = 0;
+    let mut row = 0usize;
     for i in 0..out_size {
-        let mut acc: i64 = 0;
+        // Accumulate in the field, not in i64: for wide layers the true integer
+        // sum can exceed i64, and the constraint is a statement about M31.
+        let mut acc = M31::from(0u32);
         for j in 0..in_size {
-            if row >= trace_size { break; }
+            if row >= trace_size {
+                break;
+            }
 
-            let w = weights[i * in_size + j];
-            let inp = input[j];
-            let prod = w * inp;
-            acc += prod;
+            let w = to_m31(weights[i * in_size + j]);
+            let x = to_m31(input[j]);
+            let prod = w * x;
+            acc = if j == 0 { prod } else { acc + prod };
 
-            cols[0][row] = M31::from(1u32); // active
-            cols[1][row] = to_m31(w);       // weight
-            cols[2][row] = to_m31(inp);     // input
-            cols[3][row] = to_m31(prod);    // product
-            cols[4][row] = to_m31(acc);     // acc
-            cols[5][row] = if j == in_size - 1 { to_m31(output[i]) } else { M31::from(0u32) };
+            cols[0][row] = w;
+            cols[1][row] = x;
+            cols[2][row] = prod;
+            cols[3][row] = acc;
+            if j == in_size - 1 {
+                // Claimed output and bias land on the neuron's final row.
+                cols[4][row] = to_m31(output[i]);
+                cols[5][row] = if bias.is_empty() {
+                    M31::from(0u32)
+                } else {
+                    to_m31(bias[i])
+                };
+            }
 
             row += 1;
         }
     }
 
-    // Convert to CircleEvaluations (collect into SimdBackend column type)
     cols.into_iter()
-        .map(|col| CircleEvaluation::new(domain, col.into_iter().collect()))
+        .map(|mut col| {
+            bit_reverse_coset_to_circle_domain_order(&mut col);
+            CircleEvaluation::new(domain, col.into_iter().collect())
+        })
         .collect()
 }
 
+/// Map an i64 into M31, preserving the ring homomorphism for negatives.
+fn to_m31(v: i64) -> M31 {
+    const M31_MOD: u64 = (1u64 << 31) - 1;
+    let v_abs = (v.unsigned_abs() % M31_MOD) as u32;
+    if v >= 0 {
+        M31::from(v_abs)
+    } else {
+        M31::from(0u32) - M31::from(v_abs)
+    }
+}
+
 /// Prove a Dense layer forward pass with a REAL Circle STARK proof.
+///
+/// Panics if the claimed `output` is not the correct dot product - use
+/// [`try_prove_dense_stark`] to get the failure as a `Result`.
+///
 /// Returns (proof_bytes, proof_size, proving_time_ms).
 pub fn prove_dense_stark(
     weights: &[i64],
@@ -492,11 +662,47 @@ pub fn prove_dense_stark(
     in_size: usize,
     out_size: usize,
 ) -> (Vec<u8>, usize, u64) {
+    try_prove_dense_stark(weights, input, output, &[], in_size, out_size)
+        .expect("Dense layer STARK proving failed")
+}
+
+/// Prove a Dense layer forward pass, returning an error instead of panicking
+/// when the constraints do not hold.
+pub fn try_prove_dense_stark(
+    weights: &[i64],
+    input: &[i64],
+    output: &[i64],
+    bias: &[i64],
+    in_size: usize,
+    out_size: usize,
+) -> Result<(Vec<u8>, usize, u64), String> {
     let start = Instant::now();
+
+    if weights.len() < in_size * out_size {
+        return Err(format!(
+            "weights too short: got {}, need {}",
+            weights.len(),
+            in_size * out_size
+        ));
+    }
+    if input.len() < in_size {
+        return Err(format!("input too short: got {}, need {in_size}", input.len()));
+    }
+    if output.len() < out_size {
+        return Err(format!(
+            "output too short: got {}, need {out_size}",
+            output.len()
+        ));
+    }
+    if !bias.is_empty() && bias.len() < out_size {
+        return Err(format!("bias too short: got {}, need {out_size}", bias.len()));
+    }
 
     let n_ops = out_size * in_size;
     let log_size = compute_log_size(n_ops);
-    let trace = generate_dense_stark_trace(weights, input, output, in_size, out_size);
+    let preprocessed = generate_dense_preprocessed_trace(in_size, out_size);
+    let trace =
+        generate_dense_stark_trace_with_bias(weights, input, output, bias, in_size, out_size);
 
     let config = PcsConfig::default();
     let twiddles = SimdBackend::precompute_twiddles(
@@ -510,9 +716,9 @@ pub fn prove_dense_stark(
         CommitmentSchemeProver::<SimdBackend, Blake2sMerkleChannel>::new(config, &twiddles);
     commitment_scheme.set_store_polynomials_coefficients();
 
-    // Tree 0: preprocessed (empty)
+    // Tree 0: preprocessed selectors
     let mut tree_builder = commitment_scheme.tree_builder();
-    tree_builder.extend_evals(vec![]);
+    tree_builder.extend_evals(preprocessed);
     tree_builder.commit(prover_channel);
 
     // Tree 1: execution trace
@@ -521,8 +727,9 @@ pub fn prove_dense_stark(
     tree_builder.commit(prover_channel);
 
     // Create AIR component
+    let pp_ids = dense_pp_ids();
     let component = DenseLayerStarkComponent::new(
-        &mut TraceLocationAllocator::default(),
+        &mut TraceLocationAllocator::new_with_preprocessed_columns(&pp_ids),
         DenseLayerStarkEval { log_size },
         SecureField::zero(),
     );
@@ -533,7 +740,7 @@ pub fn prove_dense_stark(
         prover_channel,
         commitment_scheme,
     )
-    .expect("Dense layer STARK proving failed");
+    .map_err(|e| format!("Dense layer STARK proving failed: {e:?}"))?;
 
     // Inline verification
     let verifier_channel = &mut Blake2sChannel::default();
@@ -548,22 +755,39 @@ pub fn prove_dense_stark(
         &mut verifier_scheme,
         proof.clone(),
     )
-    .expect("Dense layer STARK verification failed");
+    .map_err(|e| format!("Dense layer STARK verification failed: {e:?}"))?;
 
     // Serialize proof
-    let commitment_roots: Vec<[u8; 32]> = proof.commitments.iter()
+    let commitment_roots: Vec<[u8; 32]> = proof
+        .commitments
+        .iter()
         .map(|c| {
             let debug_str = format!("{:?}", c);
             *blake3::hash(debug_str.as_bytes()).as_bytes()
         })
         .collect();
 
+    // Bind the receipt to the actual computation, not just to the trace shape.
+    let hash_i64 = |vals: &[i64]| -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        for v in vals {
+            h.update(&v.to_le_bytes());
+        }
+        *h.finalize().as_bytes()
+    };
+
     let binding_hash = {
-        let mut h = blake3::Hasher::new_derive_key("ARC-dense-stark-v1");
-        for root in &commitment_roots { h.update(root); }
+        let mut h = blake3::Hasher::new_derive_key("ARC-dense-stark-v2");
+        for root in &commitment_roots {
+            h.update(root);
+        }
         h.update(&(log_size as u32).to_le_bytes());
         h.update(&(out_size as u32).to_le_bytes());
         h.update(&(in_size as u32).to_le_bytes());
+        h.update(&hash_i64(&weights[..in_size * out_size]));
+        h.update(&hash_i64(&input[..in_size]));
+        h.update(&hash_i64(&output[..out_size]));
+        h.update(&hash_i64(if bias.is_empty() { &[] } else { &bias[..out_size] }));
         *h.finalize().as_bytes()
     };
 
@@ -581,7 +805,7 @@ pub fn prove_dense_stark(
     let proof_size = proof_data.len();
     let proving_time_ms = start.elapsed().as_millis() as u64;
 
-    (proof_data, proof_size, proving_time_ms)
+    Ok((proof_data, proof_size, proving_time_ms))
 }
 
 // ---------------------------------------------------------------------------
@@ -843,6 +1067,12 @@ impl StwoproofReceipt {
 /// the ICICLE crates are available for future GPU Backend integration but
 /// the proving path is identical.
 pub fn prove_block(input: &BlockProofInput) -> (Vec<u8>, usize, u64) {
+    try_prove_block(input).expect("Stwo STARK proving failed")
+}
+
+/// As [`prove_block`], but returns an error instead of panicking when the
+/// witness does not satisfy the AIR.
+pub fn try_prove_block(input: &BlockProofInput) -> Result<(Vec<u8>, usize, u64), String> {
     let start = Instant::now();
 
     let n_rows = input.state_diffs.len().max(input.transfers.len());
@@ -885,7 +1115,7 @@ pub fn prove_block(input: &BlockProofInput) -> (Vec<u8>, usize, u64) {
         prover_channel,
         commitment_scheme,
     )
-    .expect("Stwo STARK proving failed");
+    .map_err(|e| format!("Stwo STARK proving failed: {e:?}"))?;
 
     // --- Verifier side (inline verification) ---
     let verifier_channel = &mut Blake2sChannel::default();
@@ -902,7 +1132,7 @@ pub fn prove_block(input: &BlockProofInput) -> (Vec<u8>, usize, u64) {
         &mut verifier_scheme,
         proof.clone(),
     )
-    .expect("Stwo STARK inline verification failed");
+    .map_err(|e| format!("Stwo STARK inline verification failed: {e:?}"))?;
 
     // --- Build proof receipt ---
     // Extract commitment roots as raw bytes
@@ -941,7 +1171,7 @@ pub fn prove_block(input: &BlockProofInput) -> (Vec<u8>, usize, u64) {
     let proof_size = proof_data.len();
     let proving_time_ms = start.elapsed().as_millis() as u64;
 
-    (proof_data, proof_size, proving_time_ms)
+    Ok((proof_data, proof_size, proving_time_ms))
 }
 
 /// Verify a Stwo proof receipt.

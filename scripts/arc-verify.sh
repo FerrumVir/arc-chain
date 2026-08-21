@@ -19,6 +19,8 @@
 set -uo pipefail
 
 # ── Pick a live coordinator by probing seeds (override with ARC_COORDINATOR)
+# Remember whether the caller pinned one, before the picker overwrites the var.
+USER_COORDINATOR="${ARC_COORDINATOR:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 PICK="$SCRIPT_DIR/arc-pick-coordinator.sh"
 if [ ! -f "$PICK" ]; then
@@ -34,6 +36,29 @@ TX_HASH="${1:-}"
 # --latest mode: pick the newest entry from /inference/results so users
 # don't need a prior tx_hash to try the verifier.
 if [ "$TX_HASH" = "--latest" ] || [ "$TX_HASH" = "-l" ]; then
+    # A seed can be perfectly healthy and still hold zero attestations, so
+    # "is it up?" is the wrong question here - probe for one that actually has
+    # results. Honour an explicit ARC_COORDINATOR without second-guessing it.
+    if [ -z "$USER_COORDINATOR" ]; then
+        for CAND in "$COORDINATOR" \
+                    http://104.238.171.11:9090 \
+                    http://136.244.109.1:9090 \
+                    http://140.82.16.112:9090 \
+                    http://149.28.32.76:9090 \
+                    http://139.84.237.49:9090; do
+            PROBE=$(curl -sf -m 10 "${CAND}/inference/results" 2>/dev/null || echo "")
+            [ -z "$PROBE" ] && continue
+            COUNT=$(ARC_PROBE="$PROBE" python3 -c '
+import json, os
+print(len(json.loads(os.environ["ARC_PROBE"]).get("results", [])))
+' 2>/dev/null || echo 0)
+            if [ "${COUNT:-0}" -gt 0 ]; then
+                COORDINATOR="$CAND"
+                break
+            fi
+        done
+    fi
+
     LATEST_RESPONSE=$(curl -sf -m 30 "${COORDINATOR}/inference/results" 2>/dev/null || echo "")
     if [ -z "$LATEST_RESPONSE" ]; then
         echo "ERROR: Could not reach $COORDINATOR/inference/results" >&2

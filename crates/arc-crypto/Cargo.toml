@@ -57,5 +57,17 @@ required-features = ["stwo-prover"]
 name = "prove_7b_layers"
 required-features = ["stwo-prover"]
 
+[[example]]
+name = "soundness_check"
+required-features = ["stwo-prover"]
+
+[[example]]
+name = "stark_scale"
+required-features = ["stwo-prover"]
+
+[[example]]
+name = "block_witness_check"
+required-features = ["stwo-prover"]
+
 [lints]
 workspace = true
