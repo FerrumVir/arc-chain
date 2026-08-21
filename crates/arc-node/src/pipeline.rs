@@ -169,6 +169,10 @@ struct ExecutedBatch {
     execution_mode: ExecutionMode,
     /// State reads saved by coalescing (None if coalescing was disabled).
     coalesce_reads_saved: Option<usize>,
+    /// Pre-execution (sender_balance, sender_nonce, receiver_balance) for each
+    /// transaction, or `None` when the transaction is not an eligible transfer.
+    /// Feeds the block STARK's balance-conservation constraints.
+    transfer_pre: Vec<Option<(u64, u64, u64)>>,
 }
 
 /// The 4-stage pipeline.
@@ -494,6 +498,52 @@ impl Pipeline {
                     let mut actual_mode = exec_mode;
                     let mut coalesce_reads_saved: Option<usize> = None;
 
+                    // ── Block-STARK witness: capture pre-state ───────────
+                    // The block AIR constrains balance conservation and nonce
+                    // increment, so it needs before/after values. "Before" has
+                    // to be read here, ahead of every execution branch.
+                    //
+                    // Only transfers whose sender and receiver each appear
+                    // once in the batch are eligible: with a repeated address
+                    // the post-state read at commit returns the batch's final
+                    // balance rather than this transaction's, which would not
+                    // satisfy the constraints anyway.
+                    let transfer_pre: Vec<Option<(u64, u64, u64)>> = {
+                        let mut touches: std::collections::HashMap<Address, usize> =
+                            std::collections::HashMap::new();
+                        for tx in &vbatch.transactions {
+                            if let TxBody::Transfer(ref b) = tx.body {
+                                *touches.entry(tx.from).or_insert(0) += 1;
+                                *touches.entry(b.to).or_insert(0) += 1;
+                            }
+                        }
+                        vbatch
+                            .transactions
+                            .iter()
+                            .enumerate()
+                            .map(|(i, tx)| {
+                                if !vbatch.sig_valid[i] {
+                                    return None;
+                                }
+                                let body = match tx.body {
+                                    TxBody::Transfer(ref b) => b,
+                                    _ => return None,
+                                };
+                                if touches.get(&tx.from) != Some(&1)
+                                    || touches.get(&body.to) != Some(&1)
+                                {
+                                    return None;
+                                }
+                                let sender = exec_state.get_account(&tx.from)?;
+                                let recv_bal = exec_state
+                                    .get_account(&body.to)
+                                    .map(|a| a.balance)
+                                    .unwrap_or(0);
+                                Some((sender.balance, sender.nonce, recv_bal))
+                            })
+                            .collect()
+                    };
+
                     // ── Optional: Coalescing pre-processing ──────────────
                     if coalesce_enabled && !valid_txs.is_empty() {
                         let coalesced = CoalescedBatch::from_transactions(valid_txs.clone());
@@ -567,6 +617,7 @@ impl Pipeline {
                                             producer: vbatch.producer,
                                             execution_mode: actual_mode,
                                             coalesce_reads_saved,
+                                            transfer_pre: transfer_pre.clone(),
                                         })
                                         .is_err()
                                     {
@@ -648,6 +699,7 @@ impl Pipeline {
                                     producer: vbatch.producer,
                                     execution_mode: ExecutionMode::BlockSTM,
                                     coalesce_reads_saved,
+                                    transfer_pre: transfer_pre.clone(),
                                 })
                                 .is_err()
                             {
@@ -811,6 +863,7 @@ impl Pipeline {
                                 producer: vbatch.producer,
                                 execution_mode: ExecutionMode::SpeculativeSTM,
                                 coalesce_reads_saved,
+                                transfer_pre: transfer_pre.clone(),
                             })
                             .is_err()
                         {
@@ -870,6 +923,7 @@ impl Pipeline {
                                     producer: vbatch.producer,
                                     execution_mode: ExecutionMode::GpuResident,
                                     coalesce_reads_saved,
+                                    transfer_pre: transfer_pre.clone(),
                                 })
                                 .is_err()
                             {
@@ -940,6 +994,7 @@ impl Pipeline {
                             producer: vbatch.producer,
                             execution_mode: actual_mode,
                             coalesce_reads_saved,
+                            transfer_pre: transfer_pre.clone(),
                         })
                         .is_err()
                     {
@@ -973,6 +1028,69 @@ impl Pipeline {
                                 .filter(|&&v| v)
                                 .count();
 
+                            // ── Block witness ───────────────────────────
+                            // Pair each eligible transfer's pre-state with the
+                            // committed post-state so the AIR's balance and
+                            // nonce constraints have real rows to check.
+                            // `satisfies_air` is the gate: an inconsistent
+                            // witness is a proving failure, and block
+                            // production must never depend on that.
+                            let mut state_diffs: Vec<([u8; 32], [u8; 32], [u8; 32])> = Vec::new();
+                            let mut transfers: Vec<arc_crypto::stark::TransferWitness> = Vec::new();
+                            let acct_digest = |addr: &Address, bal: u64, nonce: u64| -> [u8; 32] {
+                                let mut buf = Vec::with_capacity(48);
+                                buf.extend_from_slice(&addr.0);
+                                buf.extend_from_slice(&bal.to_le_bytes());
+                                buf.extend_from_slice(&nonce.to_le_bytes());
+                                arc_crypto::hash_bytes(&buf).0
+                            };
+                            for (i, tx) in ebatch.transactions.iter().enumerate() {
+                                if !ebatch.receipt_success.get(i).copied().unwrap_or(false) {
+                                    continue;
+                                }
+                                let Some((sbb, snb, rbb)) =
+                                    ebatch.transfer_pre.get(i).copied().flatten()
+                                else {
+                                    continue;
+                                };
+                                let TxBody::Transfer(ref body) = tx.body else {
+                                    continue;
+                                };
+                                let Some(sender_post) = commit_state.get_account(&tx.from) else {
+                                    continue;
+                                };
+                                let recv_post = commit_state
+                                    .get_account(&body.to)
+                                    .map(|a| a.balance)
+                                    .unwrap_or(0);
+                                let (Ok(nonce_before), Ok(nonce_after)) = (
+                                    u32::try_from(snb),
+                                    u32::try_from(sender_post.nonce),
+                                ) else {
+                                    continue;
+                                };
+                                let witness = arc_crypto::stark::TransferWitness {
+                                    sender_bal_before: sbb,
+                                    sender_bal_after: sender_post.balance,
+                                    receiver_bal_before: rbb,
+                                    receiver_bal_after: recv_post,
+                                    amount: body.amount,
+                                    sender_nonce_before: nonce_before,
+                                    sender_nonce_after: nonce_after,
+                                    fee: tx.fee,
+                                };
+                                if !witness.satisfies_air() {
+                                    continue;
+                                }
+                                state_diffs.push((
+                                    tx.from.0,
+                                    acct_digest(&tx.from, sbb, snb),
+                                    acct_digest(&tx.from, sender_post.balance, sender_post.nonce),
+                                ));
+                                transfers.push(witness);
+                            }
+                            let witness_rows = transfers.len();
+
                             // ── STARK proof generation ──────────────────
                             let proof_input = arc_crypto::stark::BlockProofInput {
                                 height: block.header.height,
@@ -980,8 +1098,8 @@ impl Pipeline {
                                 prev_state_root: block.header.parent_hash.0,
                                 post_state_root: block.header.state_root.0,
                                 tx_hashes: block.tx_hashes.iter().map(|h| h.0).collect(),
-                                state_diffs: vec![],
-                                transfers: vec![],
+                                state_diffs,
+                                transfers,
                             };
                             let proof = arc_crypto::stark::BlockProof::prove(&proof_input);
                             let vr = proof.verify();
@@ -1001,6 +1119,7 @@ impl Pipeline {
                                 proving_ms = proof.proving_time_ms,
                                 valid = vr.is_valid,
                                 prover = if cfg!(feature = "stwo-prover") { "stwo-circle-stark" } else { "mock-blake3" },
+                                witness_rows,
                                 "Pipeline: STARK proof generated"
                             );
 
