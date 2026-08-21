@@ -1,0 +1,15 @@
+[package]
+name = "stwo-air-utils-derive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Derive macros for AIR utilities"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+syn = "2.0.90"
+quote = "1.0.37"
+itertools = "0.13.0"
+proc-macro2 = "1.0.92"

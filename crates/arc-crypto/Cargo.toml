@@ -73,5 +73,9 @@ required-features = ["stwo-prover"]
 name = "air_shootout"
 required-features = ["stwo-prover"]
 
+[[example]]
+name = "receipt_probe"
+required-features = ["stwo-prover"]
+
 [lints]
 workspace = true

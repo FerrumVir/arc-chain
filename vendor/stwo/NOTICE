@@ -1,0 +1,69 @@
+Stwo — StarkWare's Circle STARK prover
+Copyright StarkWare Industries Ltd.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Vendored into ARC Chain from https://github.com/starkware-libs/stwo
+at commit 76dd75715ce87e2fe2258083480b6228c23bb70b.
+
+WHY THIS IS VENDORED
+
+ARC's real proving path is feature-gated behind `stwo-prover`. While Stwo was
+tracked as a git dependency, two things were outside our control:
+
+  1. Upstream uses nightly-only APIs. `array_chunks_mut` was removed from later
+     nightlies, which broke the build entirely — and because the feature is
+     optional, the failure mode was a silent fall back to the BLAKE3 mock path
+     rather than a hard error. rust-toolchain.toml pins around it; vendoring
+     removes the dependency on that pin holding.
+
+  2. The prover internals were not ours to change. The GPU backend work needs
+     to modify them.
+
+MODIFICATIONS FROM UPSTREAM
+
+  * The `examples` crate is not vendored (not used by ARC).
+  * Cargo.toml is a workspace root over the vendored crates rather than
+    `crates/*`; the ARC root workspace excludes this directory.
+
+Source changes, all confined to stwo/src/ and all mechanical API migrations
+required to build on Rust nightlies newer than 2025-06-01:
+
+  * `<[T]>::array_chunks` / `array_chunks_mut` were renamed to `as_chunks` /
+    `as_chunks_mut`, and now return `(&[[T; N]], &[T])` rather than an
+    iterator. Call sites updated to `.as_chunks::<N>().0.iter()`.
+      prover/backend/cpu/circle.rs
+      prover/backend/cpu/fri.rs
+      prover/backend/simd/circle.rs
+      prover/backend/simd/column.rs
+      prover/backend/simd/prefix_sum.rs
+      prover/backend/simd/lookups/gkr.rs
+      prover/backend/cpu/lookups/gkr.rs
+
+    `Iterator::array_chunks` (feature `iter_array_chunks`) is a different
+    method and still exists; those call sites are unchanged.
+
+  * `ArrayChunks::into_remainder` now returns the remainder directly instead
+    of `Option<_>`. Three sites in prover/backend/simd/column.rs updated.
+
+  * The `array_chunks` feature gate was dropped from stwo/src/lib.rs, as the
+    slice methods are no longer behind it. `portable_simd`, `slice_ptr_get`
+    and `iter_array_chunks` are still required, so a nightly toolchain is
+    still needed — just not a nine-month-old one.
+
+VERIFICATION
+
+The migration was checked for behavioural equivalence, not just compilation.
+`examples/receipt_probe.rs` proves fixed layers through both the packed and
+unpacked AIRs and prints the full proof receipts. Receipts from the patched
+vendored copy on nightly-2026-03-16 are byte-identical to those from
+unmodified upstream on nightly-2025-06-01, across both circuits and both
+layer sizes. Stwo's own test suite passes, including the FRI negative tests
+that check invalid proofs are rejected.
+
+Re-run the comparison after any future upstream sync:
+
+    cargo run --release -p arc-crypto --features stwo-prover --example receipt_probe
+
+Apache-2.0 permits this use, including in a proprietary product. ARC Chain
+itself is licensed BUSL-1.1; that license does not extend to this directory,
+which remains Apache-2.0.

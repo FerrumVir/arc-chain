@@ -1,0 +1,179 @@
+use std::cmp::Reverse;
+use std::collections::BTreeMap;
+
+use hashbrown::HashMap;
+use itertools::Itertools;
+use tracing::{span, Level};
+
+use super::ops::MerkleOps;
+use crate::core::fields::m31::BaseField;
+use crate::core::utils::PeekableExt;
+use crate::core::vcs::utils::{next_decommitment_node, option_flatten_peekable};
+use crate::core::vcs::verifier::{
+    ExtendedMerkleDecommitment, MerkleDecommitment, MerkleDecommitmentAux,
+};
+use crate::core::vcs::MerkleHasher;
+use crate::prover::backend::{Col, Column};
+
+pub struct MerkleProver<B: MerkleOps<H>, H: MerkleHasher> {
+    /// Layers of the Merkle tree.
+    /// The first layer is the root layer.
+    /// The last layer is the largest layer.
+    /// See [MerkleOps::commit_on_layer] for more details.
+    pub layers: Vec<Col<B, H::Hash>>,
+}
+/// The MerkleProver struct represents a prover for a Merkle commitment scheme.
+/// It is generic over the types `B` and `H`, which represent the Merkle operations and Merkle
+/// hasher respectively.
+impl<B: MerkleOps<H>, H: MerkleHasher> MerkleProver<B, H> {
+    /// Commits to columns.
+    /// Columns must be of power of 2 sizes.
+    ///
+    /// # Arguments
+    ///
+    /// * `columns` - A vector of references to columns.
+    ///
+    /// # Returns
+    ///
+    /// A new instance of `MerkleProver` with the committed layers.
+    pub fn commit(columns: Vec<&Col<B, BaseField>>) -> Self {
+        let _span = span!(Level::TRACE, "Merkle", class = "MerkleCommitment").entered();
+        if columns.is_empty() {
+            return Self {
+                layers: vec![B::commit_on_layer(0, None, &[])],
+            };
+        }
+
+        let columns = &mut columns
+            .into_iter()
+            .sorted_by_key(|c| Reverse(c.len()))
+            .peekable();
+
+        let mut layers: Vec<Col<B, H::Hash>> = Vec::new();
+
+        let max_log_size = columns.peek().unwrap().len().ilog2();
+        for log_size in (0..=max_log_size).rev() {
+            // Take columns of the current log_size.
+            let layer_columns = columns
+                .peek_take_while(|column| column.len().ilog2() == log_size)
+                .collect_vec();
+
+            layers.push(B::commit_on_layer(log_size, layers.last(), &layer_columns));
+        }
+        layers.reverse();
+        Self { layers }
+    }
+
+    /// Decommits to columns on the given queries.
+    /// Queries are given as indices to the largest column.
+    ///
+    /// # Arguments
+    ///
+    /// * `queries_per_log_size` - Maps a log_size to a vector of queries for columns of that size.
+    /// * `columns` - A vector of references to columns.
+    ///
+    /// # Returns
+    ///
+    /// A tuple containing:
+    /// * A vector queried values sorted by the order they were queried from the largest layer to
+    ///   the smallest.
+    /// * A `MerkleDecommitment` containing the hash and column witnesses.
+    pub fn decommit(
+        &self,
+        queries_per_log_size: &BTreeMap<u32, Vec<usize>>,
+        columns: Vec<&Col<B, BaseField>>,
+    ) -> (Vec<BaseField>, ExtendedMerkleDecommitment<H>) {
+        // Prepare output buffers.
+        let mut queried_values = vec![];
+        let mut decommitment = MerkleDecommitment::empty();
+        let mut all_node_values: Vec<HashMap<usize, <H as MerkleHasher>::Hash>> = vec![];
+
+        // Sort columns by layer.
+        let mut columns_by_layer = columns
+            .iter()
+            .sorted_by_key(|c| Reverse(c.len()))
+            .peekable();
+
+        let mut last_layer_queries = vec![];
+        for layer_log_size in (0..self.layers.len() as u32).rev() {
+            let mut all_node_values_for_layer = HashMap::<usize, <H as MerkleHasher>::Hash>::new();
+
+            // Prepare write buffer for queries to the current layer. This will propagate to the
+            // next layer.
+            let mut layer_total_queries = vec![];
+
+            // Each layer node is a hash of column values as previous layer hashes.
+            // Prepare the relevant columns and previous layer hashes to read from.
+            let layer_columns = columns_by_layer
+                .peek_take_while(|column| column.len().ilog2() == layer_log_size)
+                .collect_vec();
+            let previous_layer_hashes = self.layers.get(layer_log_size as usize + 1);
+
+            // Queries to this layer come from queried node in the previous layer and queried
+            // columns in this one.
+            let mut prev_layer_queries = last_layer_queries.into_iter().peekable();
+            let mut layer_column_queries =
+                option_flatten_peekable(queries_per_log_size.get(&layer_log_size));
+
+            // Merge previous layer queries and column queries.
+            while let Some(node_index) =
+                next_decommitment_node(&mut prev_layer_queries, &mut layer_column_queries)
+            {
+                if let Some(previous_layer_hashes) = previous_layer_hashes {
+                    // Copy values to all_node_values.
+                    all_node_values_for_layer
+                        .insert(2 * node_index, previous_layer_hashes.at(2 * node_index));
+                    all_node_values_for_layer.insert(
+                        2 * node_index + 1,
+                        previous_layer_hashes.at(2 * node_index + 1),
+                    );
+
+                    // If the left child was not computed, add it to the witness.
+                    if prev_layer_queries.next_if_eq(&(2 * node_index)).is_none() {
+                        decommitment
+                            .hash_witness
+                            .push(previous_layer_hashes.at(2 * node_index));
+                    }
+
+                    // If the right child was not computed, add it to the witness.
+                    if prev_layer_queries
+                        .next_if_eq(&(2 * node_index + 1))
+                        .is_none()
+                    {
+                        decommitment
+                            .hash_witness
+                            .push(previous_layer_hashes.at(2 * node_index + 1));
+                    }
+                }
+
+                // If the column values were queried, return them.
+                let node_values = layer_columns.iter().map(|c| c.at(node_index));
+                if layer_column_queries.next_if_eq(&node_index).is_some() {
+                    queried_values.extend(node_values);
+                } else {
+                    // Otherwise, add them to the witness.
+                    decommitment.column_witness.extend(node_values);
+                }
+
+                layer_total_queries.push(node_index);
+            }
+
+            all_node_values.push(all_node_values_for_layer);
+
+            // Propagate queries to the next layer.
+            last_layer_queries = layer_total_queries;
+        }
+
+        (
+            queried_values,
+            ExtendedMerkleDecommitment {
+                decommitment,
+                aux: MerkleDecommitmentAux { all_node_values },
+            },
+        )
+    }
+
+    pub fn root(&self) -> H::Hash {
+        self.layers.first().unwrap().at(0)
+    }
+}

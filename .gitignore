@@ -40,3 +40,6 @@ __pycache__/
 
 # Claude Code local config (per-machine, not for git)
 .claude/
+
+# vendored crates build into their own target dir
+vendor/**/target/

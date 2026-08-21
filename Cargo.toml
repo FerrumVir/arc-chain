@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["desktop/src-tauri"]
+exclude = ["desktop/src-tauri", "vendor/stwo"]
 members = [
     "crates/arc-crypto",
     "crates/arc-types",
@@ -40,8 +40,8 @@ sha2 = "0.10"
 sha3 = "0.10"
 blst = { version = "0.3", features = ["portable"] }
 # STARK prover (Stwo - StarkWare's Circle STARK)
-stwo = { git = "https://github.com/starkware-libs/stwo.git", default-features = false, features = ["prover"] }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo.git", default-features = false, features = ["prover"] }
+stwo = { path = "vendor/stwo/stwo", default-features = false, features = ["prover"] }
+stwo-constraint-framework = { path = "vendor/stwo/constraint-framework", default-features = false, features = ["prover"] }
 # GPU acceleration (ICICLE - Ingonyama's GPU library for M31 field ops)
 icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
 icicle-core = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
