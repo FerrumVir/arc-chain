@@ -127,7 +127,7 @@ jobs:
         # Each artifact stays in its own subdir so the Mac arm64 vs x86_64
         # `ARC Node.app.tar.gz` archives (same filename, different bytes)
         # don't clobber each other.
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: bundles
           pattern: arc-desktop-*
