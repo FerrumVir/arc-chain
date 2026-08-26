@@ -4,11 +4,11 @@ name: CI
 # consumes another's output, so every gate occupies its own runner and total
 # wall clock stays roughly the Rust build time even as coverage widens.
 #
-# STAGING CONTRACT (read before editing):
-#   Jobs marked `continue-on-error: true` carry a "FLIP TO BLOCKING" TODO.
-#   They exist to MEASURE debt, not to hide it. Each one must be flipped to
-#   blocking in the order documented in the TODO, and a job whose debt has
-#   been paid down but is still non-blocking is a bug.
+# OPTIONAL-GATE CONTRACT (read before editing):
+#   Every remaining `continue-on-error` has a named TODO and a concrete exit
+#   condition. Optional jobs measure known platform/tooling debt; required
+#   fmt, clippy, check, unit, integration, web-contract, and desktop gates fail
+#   the workflow immediately when they regress.
 #
 # No `paths:` filter is set deliberately: once these checks are required by
 # branch protection, a docs-only PR that skips them sits forever in "Expected
@@ -33,8 +33,8 @@ env:
   # Deliberately NOT setting `RUSTFLAGS: -D warnings` here. It would apply to
   # every job including the blocking `test` job, promoting ordinary rustc
   # warnings (unused variables, dead code) to hard errors on a workspace that
-  # has never been gated on them. Warning-denial belongs to the clippy job,
-  # which is staged behind its own flip-to-blocking TODO.
+  # has never been gated on them. Warning-denial belongs to the blocking
+  # clippy job instead.
 
 jobs:
   # ----------------------------------------------- release/install contract --
@@ -61,6 +61,32 @@ jobs:
             tests/release/*.sh \
             tests/release/helpers/*.sh
 
+  # ----------------------------------------------- static web contracts ----
+  # These sites intentionally have no package manifest or build step. Their
+  # dependency-free Node contracts validate JavaScript syntax, supported RPC
+  # sources, CSP boundaries, safe rendering, and honest liveness semantics.
+  dashboard-contract:
+    name: dashboard contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node dashboard/test-contract.mjs
+
+  explorer-contract:
+    name: explorer contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: node explorer/test-contract.mjs
+
   # ---------------------------------------------------------------- fmt ----
   # Cheapest gate in the repo, so it runs alone and fails in seconds instead
   # of waiting behind a multi-minute cargo build.
@@ -68,17 +94,13 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # TODO(FLIP-1, first in the sequence): remove `continue-on-error` after
-    # landing the one-time `make fmt` commit. That commit must be pure
-    # formatting — no logic changes — so it is trivially reviewable and easy
-    # to skip in a bisect. rustfmt.toml was authored in the same change that
-    # added this job, so the very first run of this job reports the size of
-    # the formatting diff; it is expected to be large and is NOT a regression.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep this dated toolchain aligned with rust-toolchain.toml. Custom
+      # toolchain inputs use the action's master revision by design.
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-03-16
           components: rustfmt
       - run: ./scripts/rustfmt-workspace.sh --check
 
@@ -87,18 +109,11 @@ jobs:
     name: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # TODO(FLIP-3): remove `continue-on-error` once the warning count from
-    # [workspace.lints.clippy] (root Cargo.toml) is at zero. That table was
-    # empty until this change while all 16 crates opted into it via
-    # `[lints] workspace = true`, so the lint plumbing was connected to
-    # nothing. The curated set now in place is bug-catching (correctness +
-    # suspicious denied, a handful of targeted lints), NOT stylistic, so the
-    # debt should be small and real. Measure with one run, fix, then flip.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-03-16
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
@@ -122,10 +137,9 @@ jobs:
         include:
           - os: ubuntu-latest
             optional: false
-          # TODO(FLIP-4): drop `optional: true` from these two legs once they
-          # have been observed green. The workspace has NEVER been tested on
-          # macOS or Windows — release.yml builds arc-node there, but runs
-          # zero tests — so their first run is a measurement, not a gate.
+          # TODO(OPTIONAL-PLATFORMS): make these required after their
+          # platform-specific dependencies and timing behavior are proven
+          # stable enough for branch protection. Linux remains the merge gate.
           - os: macos-14
             optional: true
           - os: windows-latest
@@ -133,7 +147,9 @@ jobs:
     continue-on-error: ${{ matrix.optional }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-16
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: test-${{ matrix.os }}
@@ -143,15 +159,7 @@ jobs:
       # arc-crypto criterion bench, and every example. A manifest or
       # compile break in those targets is exactly the class of failure that
       # shipped v0.5.5 and v0.5.6 with no arc-node binaries attached.
-      #
-      # TODO(FLIP-2): remove this step's `continue-on-error` once verified
-      # green. It is scoped to the step, not the job, so a broken example
-      # cannot redden the blocking test gate in the meantime. If it fails,
-      # the fix is `required-features` on the offending target (the pattern
-      # already used by crates/arc-crypto and crates/arc-inference), not a
-      # return to the workspace-wide `--lib` blindfold.
       - name: cargo check (all targets)
-        continue-on-error: true
         run: cargo check --workspace --all-targets --locked
       - name: cargo test (lib)
         run: cargo test --workspace --lib --locked
@@ -163,17 +171,13 @@ jobs:
     name: integration tests
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # TODO(FLIP-6, last): this stays non-blocking until the flakiness is
-    # addressed. crates/arc-node/tests/multi_node.rs binds real ephemeral
-    # UDP sockets and one of its tests is already self-described as
-    # "Flaky: 3-node DAG consensus timing-sensitive with validator set
-    # transitions" (#[ignore]d at multi_node.rs:451). Making a known-flaky
-    # suite blocking is how teams learn to re-run CI until it passes, which
-    # is worse than not gating at all.
-    continue-on-error: true
+    # The timing-sensitive three-node transition scenario remains explicitly
+    # ignored; every integration test that actually runs is a required gate.
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-03-16
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: integration
@@ -207,9 +211,9 @@ jobs:
       - run: npx tsc --noEmit
 
   # -------------------------------------------------------- desktop e2e ----
-  # The 15-spec Playwright suite that exists, is CI-aware, and has never been
-  # run by any workflow. playwright.config.ts drives the mock Tauri backend,
-  # so no arc-node binary is required and a plain ubuntu runner suffices.
+  # playwright.config.ts drives the mock Tauri backend, so no arc-node binary
+  # is required and a plain Ubuntu runner suffices. The green suite is a
+  # required gate alongside the desktop typecheck.
   desktop-e2e:
     name: desktop e2e (playwright)
     runs-on: ubuntu-latest
@@ -217,11 +221,6 @@ jobs:
     defaults:
       run:
         working-directory: desktop
-    # TODO(FLIP-5): remove `continue-on-error` after the suite has been
-    # observed green twice in a row on main. These specs have never executed
-    # on a CI runner — only locally, if at all — so the first runs are
-    # measuring which specs assume a developer machine.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -246,12 +245,9 @@ jobs:
     name: supply chain (cargo-deny)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # TODO(FLIP-7): remove `continue-on-error` once the first run's findings
-    # are triaged. There has never been an advisory, license, or yanked-crate
-    # check on this repo, and deny.toml's [licenses] allow-list is a
-    # best-effort first draft — the first run's job is to tell us which
-    # licenses are actually in the graph. Every entry added to
-    # [advisories] ignore must carry a dated comment; see deny.toml.
+    # TODO(OPTIONAL-AUDIT): make blocking after the current advisory, license,
+    # and yanked-crate findings are triaged. Every entry added to [advisories]
+    # ignore must carry a dated comment; see deny.toml.
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -289,7 +285,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # TODO(FLIP-8): ratchet, don't flip in one step. Sequence:
+    # TODO(OPTIONAL-SHELLCHECK): ratchet, don't flip in one step. Sequence:
     #   a) fix findings at -S error, make the job blocking at -S error
     #   b) fix findings at -S warning, change the flag below to match
     #   c) only then consider -S style
@@ -315,8 +311,8 @@ jobs:
     name: contracts (forge)
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # TODO(FLIP-9): remove `continue-on-error` once `forge build` is green.
-    # It is expected RED on first run: contracts/ imports
+    # TODO(OPTIONAL-FORGE): make blocking after dependency resolution is
+    # reproducible. contracts/ imports
     # @openzeppelin/contracts/**, foundry.toml sets libs = ["lib"], and there
     # is no lib/ directory and no git submodule in the repo — so the
     # dependency has never been resolvable from a clean checkout. The npm
@@ -345,12 +341,10 @@ jobs:
   # Was `npm install` (resolves a fresh tree, so CI could pass on a dependency
   # set no developer has); now `npm ci`, which honours the tracked lockfile.
   #
-  # RISK ON FIRST RUN: `npm ci` fails hard if package.json and
-  # package-lock.json have drifted apart, where `npm install` would silently
-  # reconcile them. This job is blocking, so if it goes red on the first run
-  # with an EUSAGE / "lock file does not satisfy" error, the fix is one
-  # command - `cd sdk/typescript && npm install` - and commit the updated
-  # lockfile. Do not revert to `npm install` to make it green.
+  # `npm ci` fails hard if package.json and package-lock.json drift apart,
+  # where `npm install` would silently reconcile them. Fix lock drift with
+  # `cd sdk/typescript && npm install` and commit the lockfile; do not weaken
+  # this gate by reverting to `npm install`.
   sdk-check:
     name: sdk typecheck
     runs-on: ubuntu-latest
@@ -368,11 +362,11 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
 
-# REMOVED: the `explorer-build` job. It probed for explorer/package.json,
-# never found it (explorer/ ships two static HTML files), emitted a
-# ::notice:: and exited — a runner burned on every push to print a message.
-# If a real node project ever lands in explorer/, add the job back rather
-# than keeping a permanent no-op.
+# REMOVED: the old `explorer-build` job. It probed for explorer/package.json,
+# emitted a ::notice:: and exited. Explorer is intentionally dependency-free
+# static HTML/CSS/JavaScript now, and its executable contract is enforced by
+# the blocking `explorer-contract` job above. Add a build job only if a real
+# package/build pipeline lands in explorer/.
 #
 # NOT ADDED (deliberate, tracked as follow-up): jobs for sdks/typescript
 # (a complete jest + ts-jest suite that has never run), sdks/python
