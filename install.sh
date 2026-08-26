@@ -470,6 +470,10 @@ if [ -n "$MODEL_PATH" ]; then
         || die "Install user $TARGET_USER cannot read model $MODEL_PATH"
 fi
 
+TRANSACTION_ACTIVE=false
+TRANSACTION_COMMITTED=false
+TRANSACTION_ROLLING_BACK=false
+
 LOCK_DIR="$ARC_DIR/.install.lock"
 if [ "$SERVICE_SCOPE" = system ]; then
     if ! as_root mkdir "$LOCK_DIR" 2>/dev/null; then
@@ -482,14 +486,25 @@ else
 fi
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/arc-install.XXXXXX")"
 cleanup() {
+    local status=$?
+    trap - EXIT HUP INT TERM
+    if [ "$TRANSACTION_ACTIVE" = true ] \
+        && [ "$TRANSACTION_COMMITTED" = false ] \
+        && [ "$TRANSACTION_ROLLING_BACK" = false ]; then
+        rollback_install_transaction || true
+    fi
     rm -rf -- "$TMP_DIR"
     if [ "$SERVICE_SCOPE" = system ]; then
         as_root rmdir "$LOCK_DIR" 2>/dev/null || true
     else
         rmdir "$LOCK_DIR" 2>/dev/null || true
     fi
+    exit "$status"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 NODE_ASSET="arc-node-$PLATFORM"
 CLI_ASSET="arc-cli-$PLATFORM"
@@ -636,39 +651,299 @@ atomic_copy() {
     local ownership="${4:-target}"
     local staged="${destination}.new.$$"
     if [ "$SERVICE_SCOPE" = system ]; then
-        as_root cp -- "$source" "$staged"
-        as_root chmod "$mode" "$staged"
+        as_root cp -- "$source" "$staged" || return 1
+        as_root chmod "$mode" "$staged" || return 1
         if [ "$ownership" = root ]; then
-            as_root chown root:root "$staged"
+            as_root chown root:root "$staged" || return 1
         else
-            as_root chown "$TARGET_USER:$TARGET_GROUP" "$staged"
+            as_root chown "$TARGET_USER:$TARGET_GROUP" "$staged" || return 1
         fi
-        as_root mv -f -- "$staged" "$destination"
+        as_root mv -f -- "$staged" "$destination" || return 1
     else
-        cp -- "$source" "$staged"
-        chmod "$mode" "$staged"
-        set_target_owner "$staged"
-        mv -f -- "$staged" "$destination"
+        cp -- "$source" "$staged" || return 1
+        chmod "$mode" "$staged" || return 1
+        set_target_owner "$staged" || return 1
+        mv -f -- "$staged" "$destination" || return 1
     fi
 }
 
-ROLLBACK_NODE=""
-if [ -f "$ARC_DIR/bin/arc-node" ]; then
-    cp -- "$ARC_DIR/bin/arc-node" "$TMP_DIR/arc-node.rollback"
-    ROLLBACK_NODE="$TMP_DIR/arc-node.rollback"
-fi
+TRANSACTION_PATHS=()
+TRANSACTION_BACKUPS=()
+TRANSACTION_EXISTED=()
+TRANSACTION_COPY_COUNT=0
+PRIOR_NODE_ACTIVE=false
+PRIOR_NODE_ENABLED=false
+PRIOR_UPDATER_ACTIVE=false
+PRIOR_UPDATER_ENABLED=false
+PRIOR_LAUNCHD_NODE_LOADED=false
+PRIOR_LAUNCHD_NODE_DISABLED=false
+PRIOR_LAUNCHD_UPDATER_LOADED=false
+PRIOR_LAUNCHD_UPDATER_DISABLED=false
+LAUNCHD_DOMAIN=""
+USER_UNIT_DIR="$TARGET_HOME/.config/systemd/user"
+LAUNCH_AGENT_DIR="$TARGET_HOME/Library/LaunchAgents"
+NODE_PLIST="$LAUNCH_AGENT_DIR/network.arc.node.plist"
+UPDATE_PLIST="$LAUNCH_AGENT_DIR/network.arc.update.plist"
+SEED_FILE="$ARC_DIR/identity/validator-seed"
+
+transaction_as_owner() {
+    if [ "$SERVICE_SCOPE" = system ]; then
+        as_root "$@"
+    else
+        "$@"
+    fi
+}
+
+snapshot_transaction_path() {
+    local path="$1"
+    local index="${#TRANSACTION_PATHS[@]}"
+    local backup="$TMP_DIR/transaction-backup-$index"
+
+    if transaction_as_owner test -L "$path"; then
+        die "Refusing symlinked managed install path: $path"
+    fi
+    TRANSACTION_PATHS[$index]="$path"
+    TRANSACTION_BACKUPS[$index]="$backup"
+    if transaction_as_owner test -e "$path"; then
+        transaction_as_owner test -f "$path" \
+            || die "Managed install path is not a regular file: $path"
+        transaction_as_owner cp -p -- "$path" "$backup" \
+            || die "Could not snapshot managed install path: $path"
+        TRANSACTION_EXISTED[$index]=true
+    else
+        TRANSACTION_EXISTED[$index]=false
+    fi
+}
+
+capture_service_state() {
+    case "$SERVICE_SCOPE" in
+        system)
+            if as_root systemctl is-active --quiet arc-node.service; then
+                PRIOR_NODE_ACTIVE=true
+            fi
+            if as_root systemctl is-enabled --quiet arc-node.service; then
+                PRIOR_NODE_ENABLED=true
+            fi
+            if as_root systemctl is-active --quiet arc-node-update.timer; then
+                PRIOR_UPDATER_ACTIVE=true
+            fi
+            if as_root systemctl is-enabled --quiet arc-node-update.timer; then
+                PRIOR_UPDATER_ENABLED=true
+            fi
+            ;;
+        user)
+            if systemctl --user is-active --quiet arc-node.service; then
+                PRIOR_NODE_ACTIVE=true
+            fi
+            if systemctl --user is-enabled --quiet arc-node.service; then
+                PRIOR_NODE_ENABLED=true
+            fi
+            if systemctl --user is-active --quiet arc-node-update.timer; then
+                PRIOR_UPDATER_ACTIVE=true
+            fi
+            if systemctl --user is-enabled --quiet arc-node-update.timer; then
+                PRIOR_UPDATER_ENABLED=true
+            fi
+            ;;
+        launchd)
+            LAUNCHD_DOMAIN="user/$TARGET_UID"
+            if launchctl print "gui/$TARGET_UID" >/dev/null 2>&1; then
+                LAUNCHD_DOMAIN="gui/$TARGET_UID"
+            fi
+            if launchctl print "$LAUNCHD_DOMAIN/network.arc.node" >/dev/null 2>&1; then
+                PRIOR_LAUNCHD_NODE_LOADED=true
+            fi
+            if launchctl print "$LAUNCHD_DOMAIN/network.arc.update" >/dev/null 2>&1; then
+                PRIOR_LAUNCHD_UPDATER_LOADED=true
+            fi
+            local disabled_state
+            disabled_state="$(launchctl print-disabled "$LAUNCHD_DOMAIN" 2>/dev/null)" \
+                || die "Could not capture the prior launchd enablement state"
+            case "$disabled_state" in
+                *'"network.arc.node" => true'*) PRIOR_LAUNCHD_NODE_DISABLED=true ;;
+            esac
+            case "$disabled_state" in
+                *'"network.arc.update" => true'*) PRIOR_LAUNCHD_UPDATER_DISABLED=true ;;
+            esac
+            ;;
+    esac
+}
+
+begin_install_transaction() {
+    case "${ARC_INSTALL_TEST_FAIL_AFTER_COPY:-}" in
+        ''|*[!0-9]*)
+            [ -z "${ARC_INSTALL_TEST_FAIL_AFTER_COPY:-}" ] \
+                || die "ARC_INSTALL_TEST_FAIL_AFTER_COPY must be a positive integer"
+            ;;
+        0) die "ARC_INSTALL_TEST_FAIL_AFTER_COPY must be a positive integer" ;;
+    esac
+
+    snapshot_transaction_path "$ARC_DIR/bin/arc-node"
+    snapshot_transaction_path "$ARC_DIR/bin/arc-cli"
+    snapshot_transaction_path "$ARC_DIR/testnet-seeds.txt"
+    snapshot_transaction_path "$ARC_DIR/genesis.toml"
+    snapshot_transaction_path "$ARC_DIR/bin/arc-installer"
+    snapshot_transaction_path "$SEED_FILE"
+    snapshot_transaction_path "$ARC_DIR/node.env"
+    snapshot_transaction_path "$ARC_DIR/bin/run-arc-node"
+    snapshot_transaction_path "$CONFIG_FILE"
+
+    case "$SERVICE_SCOPE" in
+        system)
+            snapshot_transaction_path /etc/systemd/system/arc-node.service
+            snapshot_transaction_path /etc/systemd/system/arc-node-update.service
+            snapshot_transaction_path /etc/systemd/system/arc-node-update.timer
+            ;;
+        user)
+            snapshot_transaction_path "$USER_UNIT_DIR/arc-node.service"
+            snapshot_transaction_path "$USER_UNIT_DIR/arc-node-update.service"
+            snapshot_transaction_path "$USER_UNIT_DIR/arc-node-update.timer"
+            ;;
+        launchd)
+            snapshot_transaction_path "$NODE_PLIST"
+            snapshot_transaction_path "$UPDATE_PLIST"
+            ;;
+    esac
+    capture_service_state
+    TRANSACTION_ACTIVE=true
+}
+
+transactional_copy() {
+    atomic_copy "$@" || return 1
+    TRANSACTION_COPY_COUNT=$((TRANSACTION_COPY_COUNT + 1))
+    if [ -n "${ARC_INSTALL_TEST_FAIL_AFTER_COPY:-}" ] \
+        && [ "$TRANSACTION_COPY_COUNT" -eq "$ARC_INSTALL_TEST_FAIL_AFTER_COPY" ]; then
+        warn "Injected installer failure after managed copy $TRANSACTION_COPY_COUNT"
+        return 97
+    fi
+}
+
+restore_transaction_path() {
+    local index="$1"
+    local path="${TRANSACTION_PATHS[$index]}"
+    local backup="${TRANSACTION_BACKUPS[$index]}"
+    local staged="${path}.rollback.$$"
+    transaction_as_owner rm -f -- "${path}.new.$$" || return 1
+    if [ "${TRANSACTION_EXISTED[$index]}" = true ]; then
+        transaction_as_owner cp -p -- "$backup" "$staged" || return 1
+        transaction_as_owner mv -f -- "$staged" "$path" || return 1
+    else
+        transaction_as_owner rm -f -- "$staged" "$path" || return 1
+    fi
+}
+
+restore_systemd_state() {
+    local status=0
+    if [ "$SERVICE_SCOPE" = system ]; then
+        as_root systemctl daemon-reload || status=1
+        if [ "$PRIOR_NODE_ENABLED" = true ]; then
+            as_root systemctl enable arc-node.service >/dev/null || status=1
+        else
+            as_root systemctl disable arc-node.service >/dev/null 2>&1 || true
+        fi
+        if [ "$PRIOR_UPDATER_ENABLED" = true ]; then
+            as_root systemctl enable arc-node-update.timer >/dev/null || status=1
+        else
+            as_root systemctl disable arc-node-update.timer >/dev/null 2>&1 || true
+        fi
+        if [ "$PRIOR_UPDATER_ACTIVE" = true ]; then
+            as_root systemctl restart arc-node-update.timer || status=1
+        else
+            as_root systemctl stop arc-node-update.timer >/dev/null 2>&1 || true
+        fi
+        if [ "$PRIOR_NODE_ACTIVE" = true ]; then
+            as_root systemctl restart arc-node.service || status=1
+        else
+            as_root systemctl stop arc-node.service >/dev/null 2>&1 || true
+        fi
+    else
+        systemctl --user daemon-reload || status=1
+        if [ "$PRIOR_NODE_ENABLED" = true ]; then
+            systemctl --user enable arc-node.service >/dev/null || status=1
+        else
+            systemctl --user disable arc-node.service >/dev/null 2>&1 || true
+        fi
+        if [ "$PRIOR_UPDATER_ENABLED" = true ]; then
+            systemctl --user enable arc-node-update.timer >/dev/null || status=1
+        else
+            systemctl --user disable arc-node-update.timer >/dev/null 2>&1 || true
+        fi
+        if [ "$PRIOR_UPDATER_ACTIVE" = true ]; then
+            systemctl --user restart arc-node-update.timer || status=1
+        else
+            systemctl --user stop arc-node-update.timer >/dev/null 2>&1 || true
+        fi
+        if [ "$PRIOR_NODE_ACTIVE" = true ]; then
+            systemctl --user restart arc-node.service || status=1
+        else
+            systemctl --user stop arc-node.service >/dev/null 2>&1 || true
+        fi
+    fi
+    return "$status"
+}
+
+restore_launchd_state() {
+    local status=0
+    launchctl bootout "$LAUNCHD_DOMAIN/network.arc.node" 2>/dev/null || true
+    launchctl bootout "$LAUNCHD_DOMAIN/network.arc.update" 2>/dev/null || true
+    if [ "$PRIOR_LAUNCHD_NODE_DISABLED" = true ]; then
+        launchctl disable "$LAUNCHD_DOMAIN/network.arc.node" || status=1
+    else
+        launchctl enable "$LAUNCHD_DOMAIN/network.arc.node" || status=1
+    fi
+    if [ "$PRIOR_LAUNCHD_UPDATER_DISABLED" = true ]; then
+        launchctl disable "$LAUNCHD_DOMAIN/network.arc.update" || status=1
+    else
+        launchctl enable "$LAUNCHD_DOMAIN/network.arc.update" || status=1
+    fi
+    if [ "$PRIOR_LAUNCHD_NODE_LOADED" = true ]; then
+        launchctl bootstrap "$LAUNCHD_DOMAIN" "$NODE_PLIST" || status=1
+    fi
+    if [ "$PRIOR_LAUNCHD_UPDATER_LOADED" = true ]; then
+        launchctl bootstrap "$LAUNCHD_DOMAIN" "$UPDATE_PLIST" || status=1
+    fi
+    return "$status"
+}
+
+rollback_install_transaction() {
+    local status=0
+    local index
+    TRANSACTION_ROLLING_BACK=true
+    warn "Install/update failed; restoring every previously managed file and service state"
+    for ((index=${#TRANSACTION_PATHS[@]} - 1; index >= 0; index--)); do
+        restore_transaction_path "$index" || status=1
+    done
+    case "$SERVICE_SCOPE" in
+        system|user) restore_systemd_state || status=1 ;;
+        launchd) restore_launchd_state || status=1 ;;
+    esac
+    TRANSACTION_ACTIVE=false
+    TRANSACTION_ROLLING_BACK=false
+    if [ "$status" -eq 0 ]; then
+        ok "Previous ARC installation and service state restored"
+    else
+        warn "Rollback encountered an error; inspect all managed files and service state before restarting ARC"
+    fi
+    return "$status"
+}
+
+commit_install_transaction() {
+    TRANSACTION_COMMITTED=true
+    TRANSACTION_ACTIVE=false
+}
+
 if [ "$SERVICE_SCOPE" = system ]; then PROGRAM_MODE=755; CONFIG_MODE=644
 else PROGRAM_MODE=700; CONFIG_MODE=600
 fi
-atomic_copy "$TMP_DIR/$NODE_ASSET" "$ARC_DIR/bin/arc-node" "$PROGRAM_MODE" root
-atomic_copy "$TMP_DIR/$CLI_ASSET" "$ARC_DIR/bin/arc-cli" "$PROGRAM_MODE" root
-atomic_copy "$TMP_DIR/testnet-seeds.txt" "$ARC_DIR/testnet-seeds.txt" "$CONFIG_MODE" root
-atomic_copy "$TMP_DIR/genesis.toml" "$ARC_DIR/genesis.toml" "$CONFIG_MODE" root
+begin_install_transaction
+transactional_copy "$TMP_DIR/$NODE_ASSET" "$ARC_DIR/bin/arc-node" "$PROGRAM_MODE" root
+transactional_copy "$TMP_DIR/$CLI_ASSET" "$ARC_DIR/bin/arc-cli" "$PROGRAM_MODE" root
+transactional_copy "$TMP_DIR/testnet-seeds.txt" "$ARC_DIR/testnet-seeds.txt" "$CONFIG_MODE" root
+transactional_copy "$TMP_DIR/genesis.toml" "$ARC_DIR/genesis.toml" "$CONFIG_MODE" root
 if [ "$INSTALL_UPDATER" = true ]; then
-    atomic_copy "$TMP_DIR/install.sh" "$ARC_DIR/bin/arc-installer" "$PROGRAM_MODE" root
+    transactional_copy "$TMP_DIR/install.sh" "$ARC_DIR/bin/arc-installer" "$PROGRAM_MODE" root
 fi
 
-SEED_FILE="$ARC_DIR/identity/validator-seed"
 if [ -e "$SEED_FILE" ]; then
     [ -f "$SEED_FILE" ] && [ ! -L "$SEED_FILE" ] && [ -s "$SEED_FILE" ] \
         || die "Identity seed is not a non-empty regular file: $SEED_FILE"
@@ -680,7 +955,7 @@ else
         GENERATED_SEED="arc-community-$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')"
     fi
     printf '%s\n' "$GENERATED_SEED" > "$TMP_DIR/validator-seed"
-    atomic_copy "$TMP_DIR/validator-seed" "$SEED_FILE" 600
+    transactional_copy "$TMP_DIR/validator-seed" "$SEED_FILE" 600
     unset GENERATED_SEED
 fi
 set_target_owner "$SEED_FILE"
@@ -688,12 +963,12 @@ set_target_owner "$SEED_FILE"
 VALIDATOR_SEED="$(sed -n '1p' "$SEED_FILE")"
 case "$VALIDATOR_SEED" in *$'\n'*|*$'\r'*|'') die "Identity seed contains invalid data" ;; esac
 printf 'ARC_VALIDATOR_SEED=%s\n' "$VALIDATOR_SEED" > "$TMP_DIR/node.env"
-atomic_copy "$TMP_DIR/node.env" "$ARC_DIR/node.env" 600
+transactional_copy "$TMP_DIR/node.env" "$ARC_DIR/node.env" 600
 unset VALIDATOR_SEED
 
 NODE_ARGS=(
     "$ARC_DIR/bin/arc-node"
-    --rpc "0.0.0.0:$RPC_PORT"
+    --rpc "127.0.0.1:$RPC_PORT"
     --p2p-port "$P2P_PORT"
     --seeds-file "$ARC_DIR/testnet-seeds.txt"
     --genesis "$ARC_DIR/genesis.toml"
@@ -715,7 +990,7 @@ fi
     for argument in "${NODE_ARGS[@]}"; do printf ' %q' "$argument"; done
     printf ' "$@"\n'
 } > "$TMP_DIR/run-arc-node"
-atomic_copy "$TMP_DIR/run-arc-node" "$ARC_DIR/bin/run-arc-node" "$PROGRAM_MODE" root
+transactional_copy "$TMP_DIR/run-arc-node" "$ARC_DIR/bin/run-arc-node" "$PROGRAM_MODE" root
 
 {
     printf '%s\n' '# ARC installer state v1'
@@ -726,7 +1001,7 @@ atomic_copy "$TMP_DIR/run-arc-node" "$ARC_DIR/bin/run-arc-node" "$PROGRAM_MODE" 
     printf 'model_path=%s\n' "$MODEL_PATH"
     printf 'service_scope=%s\n' "$SERVICE_SCOPE"
 } > "$TMP_DIR/install.conf"
-atomic_copy "$TMP_DIR/install.conf" "$CONFIG_FILE" "$CONFIG_MODE" root
+transactional_copy "$TMP_DIR/install.conf" "$CONFIG_FILE" "$CONFIG_MODE" root
 
 systemd_escape() {
     local value="$1"
@@ -776,12 +1051,11 @@ install_systemd_system() {
             '' \
             '[Install]' \
             'WantedBy=multi-user.target'
-    } > "$TMP_DIR/arc-node.service"
-    as_root cp -- "$TMP_DIR/arc-node.service" /etc/systemd/system/arc-node.service
-    as_root chmod 644 /etc/systemd/system/arc-node.service
-    as_root systemctl daemon-reload
-    as_root systemctl enable arc-node.service >/dev/null
-    as_root systemctl restart arc-node.service
+    } > "$TMP_DIR/arc-node.service" || return 1
+    transactional_copy "$TMP_DIR/arc-node.service" /etc/systemd/system/arc-node.service 644 root || return 1
+    as_root systemctl daemon-reload || return 1
+    as_root systemctl enable arc-node.service >/dev/null || return 1
+    as_root systemctl restart arc-node.service || return 1
 }
 
 install_systemd_user() {
@@ -793,10 +1067,9 @@ install_systemd_user() {
         warn "No per-user systemd manager is reachable from this session. Rerun with sudo --system-service, or use --no-service."
         return 1
     fi
-    USER_UNIT_DIR="$TARGET_HOME/.config/systemd/user"
-    ensure_private_dir "$TARGET_HOME/.config"
-    ensure_private_dir "$TARGET_HOME/.config/systemd"
-    ensure_private_dir "$USER_UNIT_DIR"
+    ensure_private_dir "$TARGET_HOME/.config" || return 1
+    ensure_private_dir "$TARGET_HOME/.config/systemd" || return 1
+    ensure_private_dir "$USER_UNIT_DIR" || return 1
     {
         printf '%s\n' \
             '[Unit]' \
@@ -823,11 +1096,11 @@ install_systemd_user() {
             '' \
             '[Install]' \
             'WantedBy=default.target'
-    } > "$TMP_DIR/arc-node.service"
-    atomic_copy "$TMP_DIR/arc-node.service" "$USER_UNIT_DIR/arc-node.service" 600
-    systemctl --user daemon-reload
-    systemctl --user enable arc-node.service >/dev/null
-    systemctl --user restart arc-node.service
+    } > "$TMP_DIR/arc-node.service" || return 1
+    transactional_copy "$TMP_DIR/arc-node.service" "$USER_UNIT_DIR/arc-node.service" 600 || return 1
+    systemctl --user daemon-reload || return 1
+    systemctl --user enable arc-node.service >/dev/null || return 1
+    systemctl --user restart arc-node.service || return 1
 }
 
 xml_escape() {
@@ -840,16 +1113,9 @@ xml_escape() {
     printf '%s' "$value"
 }
 
-LAUNCHD_DOMAIN=""
 install_launchd() {
     command -v launchctl >/dev/null 2>&1 || return 1
-    LAUNCHD_DOMAIN="user/$TARGET_UID"
-    if launchctl print "gui/$TARGET_UID" >/dev/null 2>&1; then
-        LAUNCHD_DOMAIN="gui/$TARGET_UID"
-    fi
-    LAUNCH_AGENT_DIR="$TARGET_HOME/Library/LaunchAgents"
-    mkdir -p -- "$LAUNCH_AGENT_DIR"
-    NODE_PLIST="$LAUNCH_AGENT_DIR/network.arc.node.plist"
+    mkdir -p -- "$LAUNCH_AGENT_DIR" || return 1
     {
         printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -866,15 +1132,15 @@ install_launchd() {
         printf '<key>StandardOutPath</key><string>%s</string>\n' "$(xml_escape "$ARC_DIR/node.log")"
         printf '<key>StandardErrorPath</key><string>%s</string>\n' "$(xml_escape "$ARC_DIR/node.log")"
         printf '%s\n' '</dict></plist>'
-    } > "$TMP_DIR/network.arc.node.plist"
+    } > "$TMP_DIR/network.arc.node.plist" || return 1
     if command -v plutil >/dev/null 2>&1; then
         plutil -lint "$TMP_DIR/network.arc.node.plist" >/dev/null || return 1
     fi
-    atomic_copy "$TMP_DIR/network.arc.node.plist" "$NODE_PLIST" 600
+    transactional_copy "$TMP_DIR/network.arc.node.plist" "$NODE_PLIST" 600 || return 1
     launchctl bootout "$LAUNCHD_DOMAIN/network.arc.node" 2>/dev/null || true
-    launchctl bootstrap "$LAUNCHD_DOMAIN" "$NODE_PLIST"
-    launchctl enable "$LAUNCHD_DOMAIN/network.arc.node"
-    launchctl kickstart -k "$LAUNCHD_DOMAIN/network.arc.node"
+    launchctl bootstrap "$LAUNCHD_DOMAIN" "$NODE_PLIST" || return 1
+    launchctl enable "$LAUNCHD_DOMAIN/network.arc.node" || return 1
+    launchctl kickstart -k "$LAUNCHD_DOMAIN/network.arc.node" || return 1
 }
 
 install_systemd_updater_system() {
@@ -882,7 +1148,7 @@ install_systemd_updater_system() {
         printf '%s\n' '[Unit]' 'Description=Update ARC Chain from a checksummed release' '' '[Service]' 'Type=oneshot'
         printf 'Environment="ARC_TARGET_USER=%s"\n' "$(systemd_escape "$TARGET_USER")"
         write_exec_start "$ARC_DIR/bin/arc-installer" --update-only --install-dir "$ARC_DIR" --service-scope system
-    } > "$TMP_DIR/arc-node-update.service"
+    } > "$TMP_DIR/arc-node-update.service" || return 1
     {
         printf '%s\n' \
             '[Unit]' \
@@ -895,12 +1161,11 @@ install_systemd_updater_system() {
             '' \
             '[Install]' \
             'WantedBy=timers.target'
-    } > "$TMP_DIR/arc-node-update.timer"
-    as_root cp -- "$TMP_DIR/arc-node-update.service" /etc/systemd/system/arc-node-update.service
-    as_root cp -- "$TMP_DIR/arc-node-update.timer" /etc/systemd/system/arc-node-update.timer
-    as_root chmod 644 /etc/systemd/system/arc-node-update.service /etc/systemd/system/arc-node-update.timer
-    as_root systemctl daemon-reload
-    as_root systemctl enable --now arc-node-update.timer >/dev/null
+    } > "$TMP_DIR/arc-node-update.timer" || return 1
+    transactional_copy "$TMP_DIR/arc-node-update.service" /etc/systemd/system/arc-node-update.service 644 root || return 1
+    transactional_copy "$TMP_DIR/arc-node-update.timer" /etc/systemd/system/arc-node-update.timer 644 root || return 1
+    as_root systemctl daemon-reload || return 1
+    as_root systemctl enable --now arc-node-update.timer >/dev/null || return 1
 }
 
 install_systemd_updater_user() {
@@ -908,7 +1173,7 @@ install_systemd_updater_user() {
     {
         printf '%s\n' '[Unit]' 'Description=Update ARC Chain from a checksummed release' '' '[Service]' 'Type=oneshot'
         write_exec_start "$ARC_DIR/bin/arc-installer" --update-only --install-dir "$ARC_DIR" --service-scope user
-    } > "$TMP_DIR/arc-node-update.service"
+    } > "$TMP_DIR/arc-node-update.service" || return 1
     {
         printf '%s\n' \
             '[Unit]' \
@@ -921,15 +1186,14 @@ install_systemd_updater_user() {
             '' \
             '[Install]' \
             'WantedBy=timers.target'
-    } > "$TMP_DIR/arc-node-update.timer"
-    atomic_copy "$TMP_DIR/arc-node-update.service" "$unit_dir/arc-node-update.service" 600
-    atomic_copy "$TMP_DIR/arc-node-update.timer" "$unit_dir/arc-node-update.timer" 600
-    systemctl --user daemon-reload
-    systemctl --user enable --now arc-node-update.timer >/dev/null
+    } > "$TMP_DIR/arc-node-update.timer" || return 1
+    transactional_copy "$TMP_DIR/arc-node-update.service" "$unit_dir/arc-node-update.service" 600 || return 1
+    transactional_copy "$TMP_DIR/arc-node-update.timer" "$unit_dir/arc-node-update.timer" 600 || return 1
+    systemctl --user daemon-reload || return 1
+    systemctl --user enable --now arc-node-update.timer >/dev/null || return 1
 }
 
 install_launchd_updater() {
-    local plist="$TARGET_HOME/Library/LaunchAgents/network.arc.update.plist"
     {
         printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
@@ -945,48 +1209,36 @@ install_launchd_updater() {
         printf '<key>StandardOutPath</key><string>%s</string>\n' "$(xml_escape "$ARC_DIR/update.log")"
         printf '<key>StandardErrorPath</key><string>%s</string>\n' "$(xml_escape "$ARC_DIR/update.log")"
         printf '%s\n' '</dict></plist>'
-    } > "$TMP_DIR/network.arc.update.plist"
+    } > "$TMP_DIR/network.arc.update.plist" || return 1
     if command -v plutil >/dev/null 2>&1; then
         plutil -lint "$TMP_DIR/network.arc.update.plist" >/dev/null || return 1
     fi
-    atomic_copy "$TMP_DIR/network.arc.update.plist" "$plist" 600
+    transactional_copy "$TMP_DIR/network.arc.update.plist" "$UPDATE_PLIST" 600 || return 1
     launchctl bootout "$LAUNCHD_DOMAIN/network.arc.update" 2>/dev/null || true
-    launchctl bootstrap "$LAUNCHD_DOMAIN" "$plist"
-    launchctl enable "$LAUNCHD_DOMAIN/network.arc.update"
+    launchctl bootstrap "$LAUNCHD_DOMAIN" "$UPDATE_PLIST" || return 1
+    launchctl enable "$LAUNCHD_DOMAIN/network.arc.update" || return 1
 }
 
 disable_updater() {
     case "$SERVICE_SCOPE" in
         system)
             as_root systemctl disable --now arc-node-update.timer 2>/dev/null || true
-            as_root rm -f -- /etc/systemd/system/arc-node-update.service /etc/systemd/system/arc-node-update.timer
-            as_root systemctl daemon-reload ;;
+            as_root rm -f -- /etc/systemd/system/arc-node-update.service /etc/systemd/system/arc-node-update.timer || return 1
+            as_root systemctl daemon-reload || return 1 ;;
         user)
             systemctl --user disable --now arc-node-update.timer 2>/dev/null || true
-            rm -f -- "$TARGET_HOME/.config/systemd/user/arc-node-update.service" "$TARGET_HOME/.config/systemd/user/arc-node-update.timer"
-            systemctl --user daemon-reload ;;
+            rm -f -- "$TARGET_HOME/.config/systemd/user/arc-node-update.service" "$TARGET_HOME/.config/systemd/user/arc-node-update.timer" || return 1
+            systemctl --user daemon-reload || return 1 ;;
         launchd)
             [ -n "$LAUNCHD_DOMAIN" ] || LAUNCHD_DOMAIN="user/$TARGET_UID"
             launchctl bootout "$LAUNCHD_DOMAIN/network.arc.update" 2>/dev/null || true
-            rm -f -- "$TARGET_HOME/Library/LaunchAgents/network.arc.update.plist" ;;
-    esac
-}
-
-restart_after_rollback() {
-    case "$SERVICE_SCOPE" in
-        system) as_root systemctl restart arc-node.service || true ;;
-        user) systemctl --user restart arc-node.service || true ;;
-        launchd) launchctl kickstart -k "$LAUNCHD_DOMAIN/network.arc.node" || true ;;
+            rm -f -- "$UPDATE_PLIST" || return 1 ;;
     esac
 }
 
 rollback_and_die() {
     local reason="$1"
-    if [ -n "$ROLLBACK_NODE" ] && [ -f "$ROLLBACK_NODE" ]; then
-        warn "Update failed; restoring the previous arc-node binary"
-        atomic_copy "$ROLLBACK_NODE" "$ARC_DIR/bin/arc-node" "$PROGRAM_MODE" root
-        restart_after_rollback
-    fi
+    rollback_install_transaction || true
     die "$reason"
 }
 
@@ -1005,31 +1257,42 @@ if [ "$SERVICE_SCOPE" != none ]; then
             launchd) install_launchd_updater || rollback_and_die "Could not install the launchd updater" ;;
         esac
     else
-        disable_updater
+        disable_updater || rollback_and_die "Could not disable the previous update schedule"
     fi
 
     HEALTH_TIMEOUT="${ARC_HEALTH_TIMEOUT:-180}"
     if [ -n "$MODEL_PATH" ] && [ "${ARC_HEALTH_TIMEOUT+x}" != x ]; then HEALTH_TIMEOUT=600; fi
     case "$HEALTH_TIMEOUT" in ''|*[!0-9]*) rollback_and_die "ARC_HEALTH_TIMEOUT must be an integer" ;; esac
     info "Waiting up to ${HEALTH_TIMEOUT}s for http://127.0.0.1:$RPC_PORT/health"
-    healthy=false
+    health_ready=false
+    health_status=""
     elapsed=0
     while [ "$elapsed" -lt "$HEALTH_TIMEOUT" ]; do
-        if curl --fail --silent --show-error --max-time 2 \
-            "http://127.0.0.1:$RPC_PORT/health" >/dev/null 2>&1; then
-            healthy=true
-            break
+        if health_status="$("$ARC_DIR/bin/arc-cli" \
+            --rpc "http://127.0.0.1:$RPC_PORT" health 2>/dev/null)"; then
+            case "$health_status" in
+                ok|degraded)
+                    health_ready=true
+                    break
+                    ;;
+            esac
         fi
         sleep 2
         elapsed=$((elapsed + 2))
     done
-    [ "$healthy" = true ] \
-        || rollback_and_die "Node service did not become healthy on RPC port $RPC_PORT"
-    ok "ARC node v$VERSION is healthy on RPC port $RPC_PORT"
+    [ "$health_ready" = true ] \
+        || rollback_and_die "Node service did not return an ok/degraded health status on RPC port $RPC_PORT"
+    if [ "$health_status" = ok ]; then
+        ok "ARC node v$VERSION is reachable and reports status=ok on RPC port $RPC_PORT"
+    else
+        warn "ARC node v$VERSION is reachable but reports status=degraded on RPC port $RPC_PORT. Inspect /health before claiming chain or inference readiness."
+    fi
 else
     ok "ARC node v$VERSION and CLI installed without starting a service"
     printf 'Run it with: %q\n' "$ARC_DIR/bin/run-arc-node"
 fi
+
+commit_install_transaction
 
 if [ "$SERVICE_SCOPE" = user ] && command -v loginctl >/dev/null 2>&1; then
     if [ "$(loginctl show-user "$TARGET_USER" -p Linger --value 2>/dev/null || true)" != yes ]; then

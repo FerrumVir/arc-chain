@@ -3,6 +3,15 @@
 **Status:** Draft v1 — 2026-05-16
 **Goal:** Migrate all inference from off-chain coordinator orchestration to fully on-chain VRF-committee voting. Eliminates the hardcoded coordinator list, shard-registry drift, and the INT8 gibberish output problem in one architectural change.
 
+> **Historical proposal, not current rollout state.** Do not use the endpoints,
+> committee sizes, rewards, or deployment expectations below as evidence that
+> Tier 1 is live. The 2026-08-26 public fleet is forked/version-skewed and the
+> v0.7.12 recovery candidate is not published or deployed. See
+> [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
+> The candidate desktop disables both Tier 1 request submission and paid
+> escrow before signing or network I/O. VRF selection is not validator
+> authorization.
+
 ---
 
 ## Context

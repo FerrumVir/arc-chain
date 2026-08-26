@@ -9,6 +9,10 @@ chain_id = "0x415243"  # "ARC" in ASCII hex
 # Fail closed until each operator generates a fresh Ed25519 keyfile off-repo
 # and the team commits only the corresponding public addresses below.
 validator_set_complete = false
+# Consensus reward settlement is disabled while this is absent. Before a
+# coordinated fleet cutover, choose one future block height and uncomment it
+# in the canonical genesis/checkpoint used by every validator:
+# community_rewards_v1_activation_height = 12345678
 
 # ── Prefunded Genesis Accounts ──────────────────────────────────────────
 # blake3::hash(&[i]) for i in 0..10, each with 1 trillion ARC
@@ -36,7 +40,10 @@ balance = 1_000_000_000_000
 # ── Genesis Validators (migration required) ────────────────────────────
 # Do not put keyfile contents or deterministic seeds in this repository.
 # After collecting fresh public addresses from the approved validator
-# operators, add one entry per validator and then set the flag above to true:
+# operators, add each address both here and as an explicit [[accounts]] entry
+# above (with its approved starting balance), then set the flag above to true.
+# Startup and release validation reject a production validator that is absent
+# from the shared account state; nodes never add their local identity.
 #
 # [[validators]]
 # address = "<64-character public ARC address from arc keygen>"

@@ -18,16 +18,8 @@ if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../install.sh" ]; then
     exec bash "$SCRIPT_DIR/../install.sh" "$@"
 fi
 
-command -v curl >/dev/null 2>&1 || {
-    printf 'install-node.sh: curl is required to load the supported installer\n' >&2
-    exit 1
-}
-
-TEMP_INSTALLER="$(mktemp "${TMPDIR:-/tmp}/arc-install.XXXXXX")"
-cleanup() { rm -f -- "$TEMP_INSTALLER"; }
-trap cleanup EXIT HUP INT TERM
-
-curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
-    https://raw.githubusercontent.com/FerrumVir/arc-chain/main/install.sh \
-    >"$TEMP_INSTALLER"
-bash "$TEMP_INSTALLER" "$@"
+printf '%s\n' \
+    'install-node.sh: canonical ../install.sh was not found.' \
+    'Refusing to download or execute an installer from a mutable branch.' \
+    'After v0.7.12 is approved and published, download that exact tag and verify its release checksum.' >&2
+exit 78

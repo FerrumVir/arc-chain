@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_crypto::{Hash256, KeyPair, hash_bytes};
+use arc_crypto::{Hash256, KeyPair};
 use arc_inference::cached_integer_model::CachedIntegerModel;
 use arc_inference::candle_backend::GgufEngine;
 use arc_mempool::Mempool;
@@ -35,23 +35,7 @@ use arc_types::transaction::{
 };
 use dashmap::DashMap;
 use tokio::time;
-use tracing::{debug, info, warn};
-
-/// Canonical model_id for the v0.7.x testnet Llama-2-7B model.
-///
-/// Returns `BLAKE3("arc-32L-test")` (32 bytes). Every caller that talks
-/// about "the testnet Llama-2-7B" — tier-1 voting attestations
-/// (`InferenceAttestationBody`), validator auto-shard join requests
-/// (`POST /shards/join`), shard-registry entries — MUST use this exact
-/// identifier or it won't link with existing on-chain attestations or
-/// the registered shard pipeline.
-///
-/// TODO(v0.8): migrate to content-addressed model_id (BLAKE3 of the GGUF
-/// file) so different quantizations / fine-tunes can coexist on one
-/// chain. That's a coordinated state-format change, not a drop-in.
-pub fn canonical_testnet_model_id() -> Hash256 {
-    hash_bytes(b"arc-32L-test")
-}
+use tracing::{info, warn};
 
 /// How often the task scans for new work. 500 ms balances reactivity against
 /// state-lock contention. The chain's block tempo (~1-3 s) is the natural
@@ -70,8 +54,8 @@ pub struct InferenceValidatorTask {
     pub engine: Option<Arc<GgufEngine>>,
     /// Cached integer model used for tokenizer encode/decode + chat template.
     pub tokenizer: Option<Arc<CachedIntegerModel>>,
-    /// The model_id the candle engine was loaded with — required to call
-    /// `engine.generate(model_id, ...)`. None if no model.
+    /// Streaming BLAKE3 of every byte in the source artifact loaded into the
+    /// candle engine. None means this validator must abstain from inference.
     pub model_id: Option<Hash256>,
     /// In-memory dedup so the task never submits two votes for the same
     /// request from the same validator. State-side `apply_inference_vote`
@@ -243,10 +227,28 @@ impl InferenceValidatorTask {
         // tokio workers stay free for I/O.
         let engine = self.engine.clone();
         let tokenizer = self.tokenizer.clone();
-        let model_id = self.model_id;
+        let model_id = self
+            .model_id
+            .ok_or_else(|| anyhow::anyhow!("exact loaded model artifact commitment unavailable"))?;
+        let requested_model_id = self.request_model_id(&request_id).ok_or_else(|| {
+            anyhow::anyhow!("request model identity unavailable from chain state")
+        })?;
+        if model_id != requested_model_id {
+            anyhow::bail!(
+                "request model 0x{} does not match loaded artifact 0x{}",
+                requested_model_id.to_hex(),
+                model_id.to_hex()
+            );
+        }
         let snap_for_inf = snap.clone();
         let (output_hash, output_blob) = tokio::task::spawn_blocking(move || {
-            Self::compute_output_blocking(&engine, &tokenizer, &model_id, &snap_for_inf)
+            Self::compute_output_blocking(
+                &engine,
+                &tokenizer,
+                model_id,
+                requested_model_id,
+                &snap_for_inf,
+            )
         })
         .await
         .map_err(|e| anyhow::anyhow!("inference task join: {}", e))??;
@@ -296,24 +298,12 @@ impl InferenceValidatorTask {
             "Tier 1 vote submitted"
         );
 
-        // Also post an InferenceAttestation tx for the same work. Tier 1
-        // votes are real inference jobs the validator just executed, so
-        // they deserve the same earnings accounting (/worker/earnings)
-        // that community-mode worker attestations get. Without this, the
-        // alpha solo validator never accrues earnings even though it does
-        // real inference on every tier1 request. Best-effort: a failure
-        // here logs but doesn't block the vote.
-        let model_id = canonical_testnet_model_id();
+        // Also post a raw InferenceAttestation as challengeable evidence for
+        // the same work. Raw 0x16 attestations never transfer treasury funds
+        // and `/worker/earnings` counts only successfully mined threshold-
+        // authorized CommunityInferenceReward (0x25) receipts. Best-effort: a
+        // failure here logs but does not block the Tier 1 vote.
         let input_hash = arc_crypto::hash_bytes(&snap.input_blob);
-        // Option C: credit the requester (user) for the work, not the
-        // signing validator. If the requester address equals the escrow
-        // address (legacy snapshot fallback) skip the beneficiary so the
-        // attestation behaves like pre-Option-C and credits the signer.
-        let beneficiary = if snap.requester == snap.escrow_addr {
-            None
-        } else {
-            Some(snap.requester)
-        };
         let mut att_tx = Transaction {
             tx_type: TxType::InferenceAttestation,
             from: self.validator_address,
@@ -324,7 +314,7 @@ impl InferenceValidatorTask {
                 output_hash,
                 challenge_period: 100,
                 bond: 0,
-                beneficiary,
+                beneficiary: None,
             }),
             fee: 0,
             gas_limit: 0,
@@ -345,8 +335,7 @@ impl InferenceValidatorTask {
         } else {
             info!(
                 request_id = %hex::encode(request_id),
-                "Tier 1 attestation submitted (earnings +{} ARC)",
-                2.5
+                "Tier 1 raw attestation submitted (evidence only; no ARC reward)"
             );
         }
         Ok(())
@@ -355,44 +344,49 @@ impl InferenceValidatorTask {
     /// Compute the model output for a request. Synchronous — call this
     /// from `tokio::task::spawn_blocking` only. The candle path is CPU-bound.
     ///
-    /// Falls back to a deterministic stub when the candle engine isn't
-    /// loaded. The stub hashes the input so single-validator tests can
-    /// still finalize. In multi-validator production, stub voters
-    /// disagree with real-model voters by design — they effectively
-    /// abstain from consensus.
+    /// Missing or mismatched model state is an abstention, never a synthetic
+    /// vote. A stub output would falsely claim execution of an unavailable
+    /// artifact and could influence consensus.
     fn compute_output_blocking(
         engine: &Option<Arc<GgufEngine>>,
         tokenizer: &Option<Arc<CachedIntegerModel>>,
-        model_id: &Option<Hash256>,
+        loaded_model_id: Hash256,
+        requested_model_id: Hash256,
         snap: &Tier1RequestSnapshot,
     ) -> anyhow::Result<(Hash256, Vec<u8>)> {
-        // Candle path (real inference, coherent output).
-        if let (Some(engine), Some(tok), Some(model_id)) = (engine, tokenizer, model_id) {
-            let text = String::from_utf8_lossy(&snap.input_blob).to_string();
-            let templated = tok.apply_chat_template(&text);
-            let tokens = tok.encode(&templated);
-            if tokens.is_empty() {
-                anyhow::bail!("tokenizer produced 0 tokens");
-            }
-            let result = engine
-                .generate(model_id, &tokens, 32)
-                .map_err(|e| anyhow::anyhow!("candle generate: {:?}", e))?;
-            // Engine already provides bitwise-deterministic output bytes
-            // and the BLAKE3 hash over them.
-            return Ok((result.output_hash, result.output));
+        if loaded_model_id != requested_model_id {
+            anyhow::bail!("loaded model artifact does not match the requested model");
         }
-        // Stub path — used only when the validator has no model loaded.
-        // Deterministic so a single-validator test (Phase A.6) can finalize.
-        // We commit to a blob whose BLAKE3 equals our claimed output_hash so
-        // the state apply's "hash matches blob" sanity check passes.
-        let mut stub_blob = b"tier1-stub-output:".to_vec();
-        stub_blob.extend_from_slice(&snap.input_blob);
-        let stub_hash = hash_bytes(&stub_blob);
-        debug!(
-            request_id = %hex::encode(snap.request_id),
-            "Tier 1 stub output (no candle engine loaded)"
-        );
-        Ok((stub_hash, stub_blob))
+        let engine = engine
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("candle engine unavailable for requested artifact"))?;
+        let tok = tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tokenizer unavailable for requested artifact"))?;
+        let text = String::from_utf8_lossy(&snap.input_blob).to_string();
+        let templated = tok.apply_chat_template(&text);
+        let tokens = tok.encode(&templated);
+        if tokens.is_empty() {
+            anyhow::bail!("tokenizer produced 0 tokens");
+        }
+        let result = engine
+            .generate(&loaded_model_id, &tokens, 32)
+            .map_err(|e| anyhow::anyhow!("candle generate: {:?}", e))?;
+        // Engine already provides bitwise-deterministic output bytes and the
+        // BLAKE3 hash over them.
+        Ok((result.output_hash, result.output))
+    }
+
+    /// Recover the model commitment from the canonical request transaction.
+    /// If pruning or incomplete state makes it unavailable, voting fails
+    /// closed instead of guessing from model dimensions or a display name.
+    fn request_model_id(&self, request_id: &[u8; 32]) -> Option<Hash256> {
+        self.state.full_transactions.iter().find_map(|entry| {
+            let TxBody::InferenceRequest(body) = &entry.value().body else {
+                return None;
+            };
+            (body.request_id == *request_id).then_some(body.model_id)
+        })
     }
 
     /// Submit an `InferenceFinalize` tx. Any validator can submit; the

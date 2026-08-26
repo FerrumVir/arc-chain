@@ -22,7 +22,7 @@ use zeroize::Zeroize;
 #[command(name = "arc-node", version, about = "ARC Chain Node")]
 struct Cli {
     /// RPC listen address (changed from 9090 to avoid Prometheus default port conflict)
-    #[arg(long, default_value = "0.0.0.0:9944")]
+    #[arg(long, default_value = "127.0.0.1:9944")]
     rpc: String,
 
     /// P2P listen port (QUIC) (changed from 9091 to avoid Transmission BitTorrent default)
@@ -33,19 +33,10 @@ struct Cli {
     ///
     /// DEFAULT CHANGED from 5,000,000 to 0, deliberately.
     ///
-    /// A plain `arc-node` used to join as a full-stake validator. Any peer
-    /// announcing stake >= min_stake is merged into the live ValidatorSet and
-    /// queued into the consensus engine; at the next epoch boundary
-    /// `freeze_epoch()` absorbs it, its stake is normalised to the maximum
-    /// observed, and it owns 1/N of the leader slots on EVERY seed.
-    /// `PeerDisconnected` explicitly refuses to remove an address from a
-    /// frozen set, so the damage survives until every seed is restarted —
-    /// which is itself forbidden, because a seed restart destroys all
-    /// in-memory inference evidence. This has already happened once on the
-    /// live network: genesis declares 6 validators and LAX reports 7.
-    ///
-    /// Becoming a validator must be an explicit act. Pass `--stake N` to opt
-    /// in; the node prints a loud warning if you do it against public peers.
+    /// Voting membership and voting power come only from the approved genesis
+    /// or checkpoint. A transport peer's `--stake` claim never joins or changes
+    /// the live validator set. Operators must keep this value consistent with
+    /// the local validator's approved genesis entry.
     #[arg(long, default_value_t = 0)]
     stake: u64,
 
@@ -67,12 +58,11 @@ struct Cli {
     /// gets the conventional RPC port 9090).
     ///
     /// This exists because coordinating inference and joining a chain are
-    /// separate concerns that --peers/--seeds-file conflates. Those flags
-    /// dial P2P, and a node that dials P2P while carrying stake is merged
-    /// into the remote validator set — the phantom-validator hazard in
-    /// CLAUDE.md rule 2. So there was no way to run a chain of your own
-    /// (stake > 0, sealing its own blocks) while dispatching inference
-    /// across a public network's shard holders. --shard-hosts is HTTP-only:
+    /// separate concerns that --peers/--seeds-file conflate. Those flags join
+    /// P2P and consensus traffic; older protocol versions also trusted a
+    /// peer's advertised stake, creating the phantom-validator hazard that v3
+    /// now removes. A node still should not join another chain merely to use
+    /// its inference pipeline. --shard-hosts is HTTP-only:
     /// GET /shards to learn the pipeline, POST /inference/forward_shard to
     /// use it. No handshake, no stake advertisement, no consensus.
     #[arg(long, value_delimiter = ',')]
@@ -148,10 +138,10 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     proposer_mode: bool,
 
-    /// ETH-compatible JSON-RPC port (default: 8545).
+    /// ETH-compatible JSON-RPC port (default: disabled).
     /// Enables MetaMask, Hardhat, Foundry, and other EVM tooling.
     /// Set to 0 to disable the ETH RPC server.
-    #[arg(long, default_value_t = 8545)]
+    #[arg(long, default_value_t = 0)]
     eth_rpc_port: u16,
 
     /// Bootstrap from a peer's snapshot (e.g., "127.0.0.1:9090").
@@ -209,7 +199,7 @@ struct Cli {
     shard_ranges: Vec<String>,
 
     /// Enable community-mode HTTP registration. When set, the node
-    /// registers itself with all seeds via outbound HTTPS POST to
+    /// registers itself with all seeds via outbound HTTP POST to
     /// /community/register every 60s and sends a heartbeat every 15s.
     /// This makes the node visible on the dashboard and lets it
     /// participate in compute contributions without requiring inbound
@@ -217,6 +207,19 @@ struct Cli {
     /// Recommended for home / residential installs.
     #[arg(long)]
     community_mode: bool,
+
+    /// Allow this validator to issue the v1, job-bound community inference
+    /// reward transaction after a worker result is verified.
+    ///
+    /// Keep this OFF while any validator still runs a pre-v0.7.12 binary:
+    /// older nodes cannot decode the new transaction variant. Deploy the new
+    /// binary to the entire validator set first, verify one chain tip/state
+    /// root, and commit one future
+    /// `[chain].community_rewards_v1_activation_height` in the canonical
+    /// genesis/checkpoint. This flag only opens local issuance after that
+    /// consensus height is reached.
+    #[arg(long, default_value_t = false)]
+    enable_community_rewards_v1: bool,
 
     /// One-flag community-node setup. Equivalent to `--stake 0
     /// --community-mode` PLUS auto-discovery of a Llama-2-7B GGUF from
@@ -323,13 +326,37 @@ fn rewrite_pulled_self_shard(self_shard: &mut serde_json::Value, pulled_from_add
     }
 }
 
-/// Look for a Llama-2-7B GGUF in standard community-node locations.
-/// Returns the first existing path. Covers both the seed convention
-/// (`llama2-7b.gguf`) and TheBloke's published filename
-/// (`llama-2-7b.Q4_K_M.gguf`).
+/// Return the first candidate whose complete SHA-256 matches the canonical
+/// community artifact. A similarly named or same-sized GGUF is not eligible.
+fn discover_matching_model(candidates: Vec<String>, expected_sha: &str) -> Option<String> {
+    for path in candidates {
+        if !std::path::Path::new(&path).is_file() {
+            continue;
+        }
+        match sha256_of(&path) {
+            Some(digest) if digest == expected_sha => return Some(path),
+            Some(digest) => tracing::warn!(
+                path = %path,
+                expected_sha,
+                actual_sha = %digest,
+                "ignoring auto-discovered GGUF with the wrong artifact identity"
+            ),
+            None => tracing::warn!(
+                path = %path,
+                "ignoring auto-discovered GGUF because it could not be hashed"
+            ),
+        }
+    }
+    None
+}
+
+/// Look for the canonical Llama-2-7B Chat GGUF in standard community-node
+/// locations. Covers both the seed convention (`llama2-7b.gguf`) and the
+/// historical non-chat filename, but accepts bytes only when the full digest
+/// matches [`TESTNET_MODEL_SHA256`].
 fn auto_discover_model() -> Option<String> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let candidates: [String; 6] = [
+    let candidates = vec![
         "./llama2-7b.gguf".to_string(),
         "./llama-2-7b.Q4_K_M.gguf".to_string(),
         format!("{}/.arc-models/llama2-7b.gguf", home),
@@ -337,42 +364,34 @@ fn auto_discover_model() -> Option<String> {
         "/opt/arc/llama2-7b.gguf".to_string(),
         "/var/lib/arc/llama2-7b.gguf".to_string(),
     ];
-    candidates
-        .into_iter()
-        .find(|p| std::path::Path::new(p).is_file())
+    discover_matching_model(candidates, TESTNET_MODEL_SHA256)
 }
 
-/// sha256 a file by shelling to `sha256sum` (Linux) or `shasum -a 256` (macOS).
-/// Returns the hex digest, or None if neither tool is available.
+/// Stream a file through SHA-256 in-process. This works identically on Linux,
+/// macOS and Windows and keeps memory bounded for multi-gigabyte GGUF files.
 fn sha256_of(path: &str) -> Option<String> {
-    let parse = |stdout: Vec<u8>| -> Option<String> {
-        String::from_utf8(stdout)
-            .ok()
-            .and_then(|s| s.split_whitespace().next().map(|x| x.to_string()))
-    };
-    if let Ok(out) = std::process::Command::new("sha256sum").arg(path).output()
-        && out.status.success()
-    {
-        return parse(out.stdout);
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::with_capacity(1024 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
     }
-    if let Ok(out) = std::process::Command::new("shasum")
-        .args(["-a", "256"])
-        .arg(path)
-        .output()
-        && out.status.success()
-    {
-        return parse(out.stdout);
-    }
-    None
+    Some(hex::encode(hasher.finalize()))
 }
 
 /// SHA256 of the canonical testnet Llama-2-7B Q4_K_M GGUF that every seed
-/// runs. Community workers must download exactly this file (bit-identical)
-/// to produce bitwise-identical inference output. NOTE: this is the seed's
-/// custom-quantized variant — it does NOT match TheBloke's public Q4_K_M
-/// (sha 4567208c…1b0b, same size, different quantization run). For sha
-/// migration, change this AND the file at every URL in DEFAULT_MODEL_SOURCES
-/// in lock-step.
+/// runs. Community workers must use exactly these Llama-2-7B Chat Q4_K_M
+/// bytes. The similarly named non-chat Q4_K_M artifact has a different digest
+/// and is not interchangeable. For a migration, change this and every URL in
+/// `DEFAULT_MODEL_SOURCES` together.
 const TESTNET_MODEL_SHA256: &str =
     "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa";
 
@@ -470,7 +489,20 @@ fn auto_download_model() -> Option<String> {
     let target = format!("{}/llama2-7b.gguf", target_dir);
 
     if std::path::Path::new(&target).is_file() {
-        return Some(target);
+        match sha256_of(&target) {
+            Some(digest) if digest == TESTNET_MODEL_SHA256 => return Some(target),
+            Some(digest) => tracing::warn!(
+                path = %target,
+                expected_sha = TESTNET_MODEL_SHA256,
+                actual_sha = %digest,
+                "existing default model has the wrong digest; move it aside before retrying auto-download"
+            ),
+            None => tracing::warn!(
+                path = %target,
+                "existing default model could not be hashed; move it aside before retrying auto-download"
+            ),
+        }
+        return None;
     }
     if let Err(e) = std::fs::create_dir_all(&target_dir) {
         tracing::warn!("auto-download: cannot create {}: {}", target_dir, e);
@@ -597,8 +629,9 @@ fn pick_seed_rpc(cli: &Cli) -> Option<String> {
 /// the biggest uncovered layer gap in the pipeline and returns a range
 /// for this node to hold. Returns `Some((start, end))` on success.
 ///
-/// Uses the canonical testnet model_id from inference_validator so the
-/// assignment registers in the same pipeline that tier-1 voting reads.
+/// The exact source-artifact commitment is sent with the join request so the
+/// assignment cannot enter a pipeline for same-shape, different-weight bytes.
+///
 /// The node's public label for the shard registry.
 ///
 /// Deliberately never derived from validator signing material: this string is
@@ -618,6 +651,29 @@ fn public_node_name(cli: &Cli) -> String {
     format!("arc-{}", &hex::encode(digest.0)[..8])
 }
 
+/// POST one authenticated community mutation. A new timestamp and CSPRNG
+/// nonce are signed for every attempt; callers must invoke this again for a
+/// retry or a different coordinator rather than reusing the wire envelope.
+async fn post_signed_community<T: serde::Serialize>(
+    client: &reqwest::Client,
+    target: &str,
+    path: &str,
+    payload: T,
+    keypair: &arc_crypto::KeyPair,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Response> {
+    let signed = rpc::sign_community_request(path, payload, keypair)
+        .map_err(anyhow::Error::msg)
+        .context("sign community HTTP mutation")?;
+    client
+        .post(format!("http://{target}{path}"))
+        .json(&signed)
+        .timeout(timeout)
+        .send()
+        .await
+        .with_context(|| format!("POST authenticated community mutation to {target}{path}"))
+}
+
 /// A stake-zero node may continue providing outbound community inference
 /// while the shipped production genesis awaits its public validator keys.
 /// It must not treat that placeholder as a consensus validator set.
@@ -631,21 +687,12 @@ fn is_genesis_migration_observer(
         && genesis.is_some_and(|config| !config.chain.validator_set_complete)
 }
 
-async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
+async fn auto_shard_join(cli: &Cli, model_artifact_id: Hash256) -> Option<(usize, usize)> {
     let seed = pick_seed_rpc(cli)?;
     let url = format!("http://{}/shards/join", seed);
-    // model_id MUST match the SHARD-REGISTRY convention (BLAKE3 of the model
-    // config signature), NOT the unrelated tier-1 attestation identifier
-    // `hash_bytes("arc-32L-test")` from inference_validator.rs. Two model_id
-    // systems live in this codebase today and they don't match (latent bug,
-    // pre-dates this branch). Shard registry uses
-    // `hash_bytes("arc-{n_layers}L-{d_model}d-{n_heads}h-{vocab_size}v")` —
-    // for the Llama-2-7B testnet that's "arc-32L-4096d-32h-32000v", whose
-    // hash is 0xabec2d58…7fdb (verified live on AMS+LAX /shards). Using
-    // the tier-1 identifier here would register us in an empty parallel
-    // pipeline and the seed would return 0:32 (the full model) for every
-    // joiner. TODO(v0.8): unify these two model_id derivations.
-    let model_id_hex = hex::encode(arc_crypto::hash_bytes(b"arc-32L-4096d-32h-32000v").0);
+    // Every joiner presents the BLAKE3 commitment of the exact source
+    // artifact. Shape metadata cannot distinguish different weights.
+    let model_id_hex = hex::encode(model_artifact_id.0);
 
     let body = serde_json::json!({
         "socket_addr": cli.rpc,
@@ -728,10 +775,10 @@ async fn main() -> Result<()> {
                     "  Expected sha256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
                 );
                 tracing::warn!(
-                    "  Manual download: huggingface-cli download TheBloke/Llama-2-7B-GGUF llama-2-7b.Q4_K_M.gguf --local-dir $HOME/.arc-models"
+                    "  Manual download: huggingface-cli download TheBloke/Llama-2-7B-Chat-GGUF llama-2-7b-chat.Q4_K_M.gguf --local-dir $HOME/.arc-models"
                 );
                 tracing::warn!(
-                    "  Then: mv $HOME/.arc-models/llama-2-7b.Q4_K_M.gguf $HOME/.arc-models/llama2-7b.gguf"
+                    "  Then verify the expected SHA-256 and move llama-2-7b-chat.Q4_K_M.gguf to $HOME/.arc-models/llama2-7b.gguf"
                 );
                 tracing::warn!(
                     "  Continuing in community routing mode (registered with seeds, no local inference)."
@@ -746,7 +793,7 @@ async fn main() -> Result<()> {
     let matches = Cli::command().get_matches_from(std::env::args_os());
 
     let mut node_cfg = if let Some(config_path) = &cli.config {
-        let cfg = config::load_config(config_path).expect("Failed to load node config");
+        let cfg = config::load_config(config_path)?;
         tracing::info!("Loaded node config from {}", config_path);
         cfg
     } else {
@@ -1007,6 +1054,17 @@ async fn main() -> Result<()> {
         tracing::warn!("╚══════════════════════════════════════════════════════════════╝");
     }
 
+    // Establish one exact model identity before any shard registration or
+    // inference-capability advertisement. Failure to open/read --model is a
+    // startup error: proceeding with a guessed identity would mix weights.
+    let model_artifact = cli
+        .model
+        .as_deref()
+        .map(arc_inference::model_artifact::ModelArtifactCommitment::from_path)
+        .transpose()
+        .context("cannot establish the exact --model artifact commitment")?;
+    let model_artifact_id = model_artifact.as_ref().map(|artifact| artifact.model_id());
+
     // Ask for a shard only after the signing identity and genesis membership
     // have passed validation, so a misconfigured validator performs no remote
     // mutation before failing startup.
@@ -1017,7 +1075,12 @@ async fn main() -> Result<()> {
         && cli.shard_start.is_none()
         && cli.shard_end.is_none()
     {
-        match auto_shard_join(&cli).await {
+        match auto_shard_join(
+            &cli,
+            model_artifact_id.expect("--model commitment established above"),
+        )
+        .await
+        {
             Some((start, end)) => {
                 tracing::info!(
                     "auto-shard: seed assigned this validator layers [{}, {}) — loading shard",
@@ -1035,13 +1098,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Loud warning: staking into a network you don't own ─────────────
-    // Joining a public network with stake > 0 is a one-way door. The peer is
-    // merged into every seed's ValidatorSet, absorbed by `freeze_epoch()` at
-    // the next boundary, and `PeerDisconnected` refuses to remove an address
-    // from a frozen set — so it keeps drawing leader slots on every seed
-    // until all of them restart. Nothing here blocks it (an operator running
-    // their own network needs it), but nobody should do it by accident.
+    // ── Loud warning: local stake must match approved membership ────────
+    // Remote peers ignore self-reported stake for consensus membership and
+    // voting power. A nonzero value is meaningful only when the local
+    // identity and stake are present in the approved genesis/checkpoint.
     if stake > 0 && !peers.is_empty() {
         let public_peers: Vec<&String> = peers
             .iter()
@@ -1056,17 +1116,16 @@ async fn main() -> Result<()> {
             .collect();
         if !public_peers.is_empty() {
             tracing::warn!("╔══════════════════════════════════════════════════════════════╗");
-            tracing::warn!("║  JOINING A PUBLIC NETWORK AS A VOTING VALIDATOR              ║");
+            tracing::warn!("║  NONZERO STAKE AGAINST A PUBLIC NETWORK                     ║");
             tracing::warn!("╚══════════════════════════════════════════════════════════════╝");
             tracing::warn!(
                 "  --stake {} against {} non-local peer(s).",
                 stake,
                 public_peers.len()
             );
-            tracing::warn!("  This node will be merged into every seed's validator set and");
-            tracing::warn!("  absorbed by the next epoch freeze. Frozen sets do NOT release a");
-            tracing::warn!("  validator on disconnect, so it will keep drawing leader slots on");
-            tracing::warn!("  every seed until all of them are restarted.");
+            tracing::warn!("  This value does not grant validator membership or voting power.");
+            tracing::warn!("  Consensus uses only the approved genesis/checkpoint set.");
+            tracing::warn!("  A configured validator must use the exact approved stake.");
             tracing::warn!("  If you meant to contribute compute, not consensus: use --community");
             tracing::warn!("  (or --stake 0). Continuing in 5s...");
             std::thread::sleep(std::time::Duration::from_secs(5));
@@ -1152,24 +1211,22 @@ async fn main() -> Result<()> {
             .collect()
     };
 
-    // ── Ensure the validator/faucet address is funded ───────────────────
-    // The faucet sends tokens from the validator address. If it's not already
-    // a genesis account, add it so the faucet can actually fund new users.
-    let genesis_accounts = {
-        let mut accounts = genesis_accounts;
-        if !accounts.iter().any(|(addr, _)| *addr == validator_address) {
-            tracing::info!(
-                "Adding validator {} to genesis with faucet balance",
-                validator_address
-            );
-            accounts.push((validator_address, 1_000_000_000_000));
-        }
-        accounts
-    };
-
     let state = Arc::new({
-        let mut db = StateDB::with_genesis_persistent(&genesis_accounts, &data_dir)
-            .expect("Failed to initialize state with WAL persistence");
+        let mut db = StateDB::with_genesis_persistent(&genesis_accounts, &data_dir, genesis_hash)
+            .context("failed to initialize genesis-bound persistent state")?;
+        let reward_activation_height = genesis_cfg
+            .as_ref()
+            .and_then(|config| config.chain.community_rewards_v1_activation_height);
+        db.set_community_rewards_v1_activation_height(reward_activation_height);
+        match reward_activation_height {
+            Some(height) => tracing::info!(
+                height,
+                "Community reward v1 consensus activation is committed by genesis"
+            ),
+            None => tracing::info!(
+                "Community reward v1 consensus activation is absent; tx 0x25 is disabled"
+            ),
+        }
         if cli.archive {
             db.archive_mode = true;
             tracing::info!("Archive mode ENABLED - no pruning, full transaction history retained");
@@ -1323,7 +1380,10 @@ async fn main() -> Result<()> {
     } else if let Some(model_path) = &cli.model {
         if !model_path.ends_with(".arc-int8") {
             let engine = Arc::new(arc_inference::candle_backend::GgufEngine::new(120_000));
-            match engine.load_gguf_file(model_path) {
+            let artifact = model_artifact
+                .as_ref()
+                .expect("--model commitment established before model loading");
+            match engine.load_gguf_artifact(artifact) {
                 Ok(mid) => {
                     tracing::info!("Candle float inference ENABLED (Q4 GGUF)");
                     (Some(engine), Some(mid))
@@ -1340,34 +1400,20 @@ async fn main() -> Result<()> {
         (None, None)
     };
 
-    // ── Load tokenizer model (lightweight: vocab-only from TinyLlama if available, else from GGUF) ──
+    // ── Load the integer model or tokenizer from the committed artifact ──
+    // Model configuration and tokenization are part of model identity just as
+    // much as transformer weights. Never substitute a nearby "small tokenizer"
+    // artifact here: doing so would advertise the `--model` content hash while
+    // actually tokenizing with unrelated bytes.
     let inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>> =
         if let Some(model_path) = &cli.model {
-            // If candle is handling inference via GGUF, we only need the tokenizer.
-            // Try loading a small tokenizer model first (tinyllama), fall back to full GGUF.
-            let tokenizer_path = if candle_engine.is_some() {
-                // Check for a small tokenizer model alongside the main model
-                let dir = std::path::Path::new(model_path)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."));
-                let tiny = dir.join("tinyllama-1.1b.arc-int8");
-                if tiny.exists() {
-                    tracing::info!("Using TinyLlama tokenizer (lightweight)");
-                    tiny.to_string_lossy().to_string()
-                } else {
-                    model_path.clone()
-                }
-            } else {
-                model_path.clone()
-            };
-
-            tracing::info!("Loading model from {}...", tokenizer_path);
+            tracing::info!("Loading model from {}...", model_path);
             let load_start = Instant::now();
-            let load_result = if cli.tokenizer_only {
+            let load_result = if cli.tokenizer_only || candle_engine.is_some() {
                 tracing::info!("TOKENIZER-ONLY MODE: loading vocab + config, no weights (~30MB)");
-                arc_inference::cached_integer_model::load_tokenizer_only(&tokenizer_path)
-            } else if tokenizer_path.ends_with(".arc-int8") {
-                arc_inference::cached_integer_model::load_cached_model_binary(&tokenizer_path)
+                arc_inference::cached_integer_model::load_tokenizer_only(model_path)
+            } else if model_path.ends_with(".arc-int8") {
+                arc_inference::cached_integer_model::load_cached_model_binary(model_path)
             } else if !held_ranges.is_empty() {
                 let summary: Vec<String> = held_ranges
                     .iter()
@@ -1375,11 +1421,11 @@ async fn main() -> Result<()> {
                     .collect();
                 tracing::info!("SHARD MODE: loading ranges {}", summary.join(", "));
                 arc_inference::cached_integer_model::load_cached_model_ranges(
-                    &tokenizer_path,
+                    model_path,
                     &held_ranges,
                 )
             } else {
-                arc_inference::cached_integer_model::load_cached_model(&tokenizer_path)
+                arc_inference::cached_integer_model::load_cached_model(model_path)
             };
             match load_result {
                 Ok(mut model) => {
@@ -1462,6 +1508,12 @@ async fn main() -> Result<()> {
             None
         };
 
+    if let Some(artifact) = &model_artifact {
+        artifact
+            .verify_unchanged()
+            .context("--model changed while the inference runtime was loading it")?;
+    }
+
     // ── Record boot time for uptime tracking ──────────────────────────
     let boot_time = Instant::now();
 
@@ -1517,15 +1569,9 @@ async fn main() -> Result<()> {
     };
 
     // ── Start DAG consensus in background ─────────────────────────────
-    // Initialize with ALL known validators from seeds file. This ensures
-    // all nodes have the same validator set from boot - critical for
-    // deterministic leader selection. Without this, nodes that connect
-    // peers at different speeds have different validator counts, causing
-    // different leader selection for the same round.
-    // If genesis validators are provided, use them. This ensures ALL nodes
-    // have the SAME validator set from round 0 - the key to consensus.
-    // Without this, nodes discover peers at different times → different
-    // validator counts → different epoch freezes → different leaders.
+    // Initialize the exact approved genesis validator identities and stakes.
+    // Seed addresses and transport discovery are connectivity inputs only;
+    // they never define or mutate voting membership.
     let peer_vals: Vec<(Hash256, u64)> = genesis_validators
         .iter()
         .filter(|(addr, _)| *addr != validator_address)
@@ -1569,28 +1615,28 @@ async fn main() -> Result<()> {
         //
         // The fix: scan dag-wal/ for the highest block_height we've ever
         // persisted. That's the round we WERE at the moment we crashed/
-        // shutdown. Hand it to consensus.set_initial_round so the engine
+        // shutdown. Hand it to the local-WAL restore path so the engine
         // resumes from there instead of fighting peers about it.
         //
         // We don't replay block contents — peers will re-deliver any DAG
-        // blocks we still need on the normal consensus path. We only need
-        // the round number to skip the max-jump rejection.
+        // blocks we still need on the normal consensus path. Only locally
+        // persisted cursors may restore consensus position; peer hints cannot.
         // Bounded read: scans only the latest segment (≤64 MB), not every
         // segment. NYC's dag-wal is 5 GB+ and growing; reading the whole
         // history at boot would balloon memory and slow startup minutes.
         let recovered_round = arc_state::latest_block_height_in_wal_dir(&dag_wal_path);
         if recovered_round > 0 {
-            // committed lags round by PRUNE_DEPTH (100) under the consensus
-            // engine's normal pruning rule; saturating_sub keeps it sane on
-            // tiny round numbers.
-            let recovered_committed = recovered_round.saturating_sub(100);
+            // The highest WAL round does not prove that any earlier leader was
+            // committed. Preserve the commit cursor until an exact local commit
+            // record or quorum-certified checkpoint recovery path is available.
+            let recovered_committed = 0;
             consensus
                 .engine
-                .set_initial_round(recovered_round, recovered_committed);
+                .restore_round_from_local_wal(recovered_round, recovered_committed);
             tracing::info!(
                 recovered_round,
                 recovered_committed,
-                "DAG WAL recovered from disk - resuming consensus mid-stream"
+                "DAG WAL round restored from local disk; commit cursor remains fail-closed pending certified recovery"
             );
         } else {
             tracing::info!("DAG WAL is empty - starting fresh from round 0");
@@ -1640,7 +1686,7 @@ async fn main() -> Result<()> {
                 // Exit the process - a node without consensus must restart
                 std::process::exit(1);
             })
-            .expect("spawn consensus thread");
+            .context("failed to spawn consensus thread")?;
     } else {
         drop(inbound_rx);
         drop(outbound_tx);
@@ -1651,7 +1697,11 @@ async fn main() -> Result<()> {
 
     // ── Start ETH JSON-RPC server (MetaMask, Hardhat, Foundry) ──────────
     if eth_rpc_port > 0 {
-        let eth_addr = format!("0.0.0.0:{}", eth_rpc_port);
+        // Keep this unauthenticated compatibility surface local by default.
+        // Operators that need remote access should publish it through an
+        // authenticated, rate-limited reverse proxy rather than exposing the
+        // raw JSON-RPC listener directly.
+        let eth_addr = format!("127.0.0.1:{}", eth_rpc_port);
         let mut eth_node = rpc::build_node_state(
             state.clone(),
             mempool.clone(),
@@ -1663,6 +1713,7 @@ async fn main() -> Result<()> {
             inference_model.clone(),
             candle_engine.clone(),
             candle_model_id,
+            model_artifact_id,
         );
         // Same declared identity on the ETH port's state.
         eth_node.chain_identity = genesis_chain_identity.clone();
@@ -1689,10 +1740,9 @@ async fn main() -> Result<()> {
     // submits InferenceVote / InferenceFinalize txs. See
     // `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
     //
-    // Safe to spawn even without a model loaded — the task uses a
-    // deterministic stub output in that case (single-validator dev mode).
-    // In multi-validator production, stub voters disagree with real-model
-    // voters, so they effectively abstain from consensus.
+    // Safe to spawn without a model: missing engine/tokenizer/exact artifact
+    // identity makes this validator abstain. Synthetic fallback votes are
+    // forbidden because they would claim execution of bytes never loaded.
     if chain_participation_enabled {
         let validator_task = arc_node::inference_validator::InferenceValidatorTask::new(
             state.clone(),
@@ -1701,7 +1751,7 @@ async fn main() -> Result<()> {
             validator_keypair.clone(),
             candle_engine.clone(),
             inference_model.clone(),
-            candle_model_id,
+            model_artifact_id,
         );
         tokio::spawn(async move { validator_task.run().await });
         tracing::info!(
@@ -1741,9 +1791,12 @@ async fn main() -> Result<()> {
     {
         let shutdown_state = state.clone();
         tokio::spawn(async move {
-            let mut sigterm =
+            let Ok(mut sigterm) =
                 tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("SIGTERM handler");
+            else {
+                tracing::warn!("Failed to install SIGTERM handler");
+                return;
+            };
             sigterm.recv().await;
             tracing::info!("SIGTERM received - initiating graceful shutdown...");
             shutdown_state.sync_wal();
@@ -1756,62 +1809,78 @@ async fn main() -> Result<()> {
     // broadcast each so the network's shard registry records every replica
     // slot this node contributes (supports nodes that hold multiple disjoint
     // layer ranges for 3× replication).
-    let shard_infos_for_broadcast: Vec<rpc::ShardInfo> = match (&held_ranges, &inference_model) {
-        (ranges, Some(model)) if !ranges.is_empty() => {
-            let total_layers = model.config.n_layers;
-            let layers_held_total: usize = ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-            let memory_mb_total: usize = model
-                .layers
-                .iter()
-                .filter(|l| l.is_loaded())
-                .map(|l| {
-                    l.wq.memory_bytes()
-                        + l.wk.memory_bytes()
-                        + l.wv.memory_bytes()
-                        + l.wo.memory_bytes()
-                        + l.w_gate.memory_bytes()
-                        + l.w_up.memory_bytes()
-                        + l.w_down.memory_bytes()
-                })
-                .sum::<usize>()
-                / (1024 * 1024);
-            let per_layer_mb = memory_mb_total / layers_held_total.max(1);
-            let full_model_mb = per_layer_mb * total_layers;
-            let model_id_data = format!(
-                "arc-{}L-{}d-{}h-{}v",
-                model.config.n_layers,
-                model.config.d_model,
-                model.config.n_heads,
-                model.config.vocab_size
-            );
-            let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
-            let socket_addr = std::env::var("ARC_PUBLIC_SOCKET").unwrap_or_else(|_| {
-                format!(
-                    "{}:{}",
-                    rpc_addr.split(':').next().unwrap_or("127.0.0.1"),
-                    rpc_addr.split(':').nth(1).unwrap_or("9090")
-                )
-            });
-            ranges
-                .iter()
-                .map(|&(start, end)| rpc::ShardInfo {
-                    start_layer: start,
-                    end_layer: end,
-                    total_layers,
-                    model_id: format!("0x{}", hex::encode(model_id_hash.0)),
-                    model_name: model_id_data.clone(),
-                    memory_mb: per_layer_mb * (end - start),
-                    full_model_mb,
-                    socket_addr: socket_addr.clone(),
-                    // NOT validator_seed: this ShardInfo is POSTed to every seed
-                    // every 15s and served publicly by GET /shards, and the
-                    // desktop's seed is the wallet's BIP-39 phrase.
-                    node_name: public_node_name(&cli),
-                })
-                .collect()
-        }
-        _ => Vec::new(),
-    };
+    let shard_ranges_are_loaded = inference_model.as_ref().is_some_and(|model| {
+        held_ranges.iter().all(|(start, end)| {
+            *end <= model.layers.len()
+                && model.layers[*start..*end]
+                    .iter()
+                    .all(arc_inference::cached_integer_model::CachedLayer::is_loaded)
+        })
+    });
+    if !held_ranges.is_empty() && !shard_ranges_are_loaded {
+        tracing::warn!(
+            "Configured shard ranges are not fully loaded; this node will not announce or serve them"
+        );
+    }
+    let shard_infos_for_broadcast: Vec<rpc::ShardInfo> =
+        match (&held_ranges, &inference_model, model_artifact_id) {
+            (ranges, Some(model), Some(artifact_id))
+                if !ranges.is_empty() && shard_ranges_are_loaded =>
+            {
+                let total_layers = model.config.n_layers;
+                let layers_held_total: usize =
+                    ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+                let memory_mb_total: usize = model
+                    .layers
+                    .iter()
+                    .filter(|l| l.is_loaded())
+                    .map(|l| {
+                        l.wq.memory_bytes()
+                            + l.wk.memory_bytes()
+                            + l.wv.memory_bytes()
+                            + l.wo.memory_bytes()
+                            + l.w_gate.memory_bytes()
+                            + l.w_up.memory_bytes()
+                            + l.w_down.memory_bytes()
+                    })
+                    .sum::<usize>()
+                    / (1024 * 1024);
+                let per_layer_mb = memory_mb_total / layers_held_total.max(1);
+                let full_model_mb = per_layer_mb * total_layers;
+                let model_display_name = format!(
+                    "arc-{}L-{}d-{}h-{}v",
+                    model.config.n_layers,
+                    model.config.d_model,
+                    model.config.n_heads,
+                    model.config.vocab_size
+                );
+                let socket_addr = std::env::var("ARC_PUBLIC_SOCKET").unwrap_or_else(|_| {
+                    format!(
+                        "{}:{}",
+                        rpc_addr.split(':').next().unwrap_or("127.0.0.1"),
+                        rpc_addr.split(':').nth(1).unwrap_or("9090")
+                    )
+                });
+                ranges
+                    .iter()
+                    .map(|&(start, end)| rpc::ShardInfo {
+                        start_layer: start,
+                        end_layer: end,
+                        total_layers,
+                        model_id: format!("0x{}", hex::encode(artifact_id.0)),
+                        model_name: model_display_name.clone(),
+                        memory_mb: per_layer_mb * (end - start),
+                        full_model_mb,
+                        socket_addr: socket_addr.clone(),
+                        // NOT validator_seed: this ShardInfo is POSTed to every seed
+                        // every 15s and served publicly by GET /shards, and the
+                        // desktop's seed is the wallet's BIP-39 phrase.
+                        node_name: public_node_name(&cli),
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
     let shard_infos = shard_infos_for_broadcast.clone();
 
     // Spawn a background task that announces each held range to every seed
@@ -1954,10 +2023,12 @@ async fn main() -> Result<()> {
     }
 
     // ── Community-mode HTTP registration + heartbeat ──────────────────
-    // Spawned when --community-mode is set. Outbound-HTTPS only - works
+    // Spawned when --community-mode is set. Outbound HTTP only - works
     // behind any NAT/residential firewall. Registers with every seed on
     // startup + every 60s, sends a heartbeat every 15s to keep the
-    // registry entry alive. Each seed's TTL is 90s so 5 missed
+    // registry entry alive. Signatures authenticate mutations but do not
+    // encrypt them; production deployments must supply TLS at a reverse proxy.
+    // Each seed's TTL is 90s so 5 missed
     // heartbeats before eviction.
     // Auto-enable community mode for observer nodes (stake=0).
     // If you join with no stake, you're a community contributor - no flag needed.
@@ -1978,7 +2049,7 @@ async fn main() -> Result<()> {
         tracing::info!("╔═══════════════════════════════════════╗");
         tracing::info!("║  COMMUNITY MODE ACTIVE                ║");
         tracing::info!("║  Registering with seed coordinators   ║");
-        tracing::info!("║  Your node provides TPS + inference   ║");
+        tracing::info!("║  Capability is verified after load    ║");
         tracing::info!("╚═══════════════════════════════════════╝");
     }
 
@@ -1992,12 +2063,24 @@ async fn main() -> Result<()> {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-        let model_name = inference_model.as_ref().map(|m| {
-            format!(
+        let worker_model = inference_model.as_ref().and_then(|m| {
+            if !m.has_all_transformer_layers() {
+                return None;
+            }
+            let artifact_id = model_artifact_id?;
+            let model_name = format!(
                 "arc-{}L-{}d-{}h-{}v",
                 m.config.n_layers, m.config.d_model, m.config.n_heads, m.config.vocab_size
-            )
+            );
+            let model_id = format!("0x{}", hex::encode(artifact_id.0));
+            Some((model_name, model_id, artifact_id))
         });
+        if inference_model.is_some() && worker_model.is_none() {
+            tracing::warn!(
+                "Loaded model is partial or tokenizer-only; registering as relay/observer and \
+                 disabling the full inference worker"
+            );
+        }
 
         // Derive seed RPC endpoints from the peers list (P2P port - 1, usually 9090)
         let mut seed_rpc_addrs: Vec<String> = Vec::new();
@@ -2012,26 +2095,12 @@ async fn main() -> Result<()> {
         let worker_id_c = worker_id.clone();
         let hostname_c = hostname.clone();
         let platform_c = platform.clone();
-        let model_name_c = model_name.clone();
-        let seed_rpc_addrs_c = seed_rpc_addrs.clone();
-        let rpc_addr_c = rpc_addr.clone();
-        // Pre-compute model info for auto-shard registration
-        let model_id_hex = inference_model.as_ref().map(|m| {
-            let id_data = format!(
-                "arc-{}L-{}d-{}h-{}v",
-                m.config.n_layers, m.config.d_model, m.config.n_heads, m.config.vocab_size
-            );
-            format!(
-                "0x{}",
-                hex::encode(arc_crypto::hash_bytes(id_data.as_bytes()).0)
-            )
-        });
-        let total_layers = inference_model.as_ref().map(|m| m.config.n_layers as u32);
-        let avail_mem_mb: u64 = inference_model
+        let model_name_c = worker_model.as_ref().map(|(name, _, _)| name.clone());
+        let model_id_c = worker_model
             .as_ref()
-            .map(|m| (m.config.d_model * m.config.n_layers * 4 / 1024 / 1024) as u64 * 2)
-            .unwrap_or(8192)
-            .max(4096);
+            .map(|(_, model_id, _)| model_id.clone());
+        let seed_rpc_addrs_c = seed_rpc_addrs.clone();
+        let registration_keypair = validator_keypair.clone();
 
         tokio::spawn(async move {
             // Settle before first POST
@@ -2053,40 +2122,29 @@ async fn main() -> Result<()> {
             // black hole and blocked in dispatch_to_community_worker for the
             // full community_dispatch_timeout — 60 s at the desktop's 16-token
             // default — before falling back to local.
-            let capabilities: Vec<&str> = if model_name_c.is_some() {
-                vec!["inference"]
+            let capabilities: Vec<String> = if model_name_c.is_some() && model_id_c.is_some() {
+                vec!["inference".to_string()]
             } else {
-                vec!["relay"]
+                vec!["relay".to_string()]
             };
-            let register_payload = serde_json::json!({
-                "worker_id": worker_id_c,
-                "name": format!("{} ({})", public_node_name_c, hostname_c),
-                "capabilities": capabilities,
-                "model": model_name_c,
-                "platform": platform_c,
-                "model_id": &model_id_hex,
-                "total_layers": &total_layers,
-                "rpc_addr": &rpc_addr_c,
-                "available_memory_mb": avail_mem_mb,
-            });
-            let heartbeat_payload = serde_json::json!({
-                "worker_id": worker_id_c,
-                "work_completed": 0,
-            });
+            let register_payload = rpc::CommunityRegisterRequest {
+                worker_id: worker_id_c.clone(),
+                name: format!("{} ({})", public_node_name_c, hostname_c),
+                capabilities,
+                model: model_name_c,
+                model_id: model_id_c,
+                platform: platform_c,
+            };
+            let heartbeat_payload = rpc::CommunityHeartbeatRequest {
+                worker_id: worker_id_c,
+                work_completed: None,
+            };
 
             // Register once, then heartbeat + re-register periodically.
             //
-            // ORDER: arc-node's own RPC (:9090) FIRST, the legacy Python
-            // community gateway (:3001) only as a fallback. This was
-            // inverted, and the inversion is the direct cause of AMS
-            // reporting `count_visible: 0` with `count_total: 4`: AMS runs a
-            // :3001 gateway that answers, so the fallback to :9090 never
-            // fired, arc-node's own registry never saw a heartbeat, its
-            // entries aged past COMMUNITY_WORKER_TTL_SECS and were filtered
-            // out of the scoreboard. Seeds without a gateway were fine — LAX
-            // 3/3, NYC 3/8 — which is exactly the signature of "the seed with
-            // the extra service is the broken one". The claim loop below
-            // already used the correct order; these two now agree.
+            // V3 intentionally contacts arc-node's authenticated RPC only.
+            // Retrying the old unsigned :3001 gateway would downgrade proof
+            // of possession and make rollout failures look like success.
             //
             // Seeds are contacted CONCURRENTLY. Serially, one unreachable
             // seed's 5 s timeout delayed every seed after it, and with six
@@ -2098,57 +2156,47 @@ async fn main() -> Result<()> {
                 for addr in &seed_rpc_addrs_c {
                     let client = client.clone();
                     let addr = addr.clone();
-                    let payload = if register_tick {
-                        register_payload.clone()
-                    } else {
-                        heartbeat_payload.clone()
-                    };
-                    let path = if register_tick {
-                        "register"
-                    } else {
-                        "heartbeat"
-                    };
+                    let register_payload = register_payload.clone();
+                    let heartbeat_payload = heartbeat_payload.clone();
+                    let keypair = registration_keypair.clone();
                     set.spawn(async move {
-                        let host = addr.split(':').next().unwrap_or(&addr).to_string();
-                        let gateway_addr = format!("{}:3001", host);
-                        // arc-node first…
-                        let primary = client
-                            .post(format!("http://{}/community/{}", addr, path))
-                            .json(&payload)
-                            .send()
-                            .await;
-                        let resp = match primary {
-                            Ok(r) if r.status().is_success() => {
-                                r.json::<serde_json::Value>().await.ok()
-                            }
-                            // …legacy gateway only if arc-node didn't answer.
-                            _ => match client
-                                .post(format!("http://{}/community/{}", gateway_addr, path))
-                                .json(&payload)
-                                .send()
-                                .await
-                            {
-                                Ok(r) => r.json::<serde_json::Value>().await.ok(),
-                                Err(_) => None,
-                            },
+                        let response = if register_tick {
+                            post_signed_community(
+                                &client,
+                                &addr,
+                                rpc::COMMUNITY_REGISTER_PATH,
+                                register_payload,
+                                &keypair,
+                                std::time::Duration::from_secs(5),
+                            )
+                            .await
+                        } else {
+                            post_signed_community(
+                                &client,
+                                &addr,
+                                rpc::COMMUNITY_HEARTBEAT_PATH,
+                                heartbeat_payload,
+                                &keypair,
+                                std::time::Duration::from_secs(5),
+                            )
+                            .await
                         };
-                        (addr, resp)
+                        match response {
+                            Ok(response) if response.status().is_success() => {}
+                            Ok(response) => {
+                                tracing::warn!(
+                                    seed = %addr,
+                                    status = %response.status(),
+                                    "coordinator rejected authenticated community presence"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::debug!(seed = %addr, %error, "community presence POST failed");
+                            }
+                        }
                     });
                 }
-                while let Some(Ok((addr, resp))) = set.join_next().await {
-                    if let Some(resp) = resp
-                        && let Some(sa) = resp.get("shard_assignment")
-                        && !sa.is_null()
-                    {
-                        tracing::info!(
-                            start = sa.get("start_layer").and_then(|v| v.as_u64()).unwrap_or(0),
-                            end = sa.get("end_layer").and_then(|v| v.as_u64()).unwrap_or(0),
-                            total = sa.get("total_layers").and_then(|v| v.as_u64()).unwrap_or(0),
-                            seed = %addr,
-                            "Auto-shard assignment received from coordinator"
-                        );
-                    }
-                }
+                while set.join_next().await.is_some() {}
                 ticks += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             }
@@ -2163,7 +2211,9 @@ async fn main() -> Result<()> {
         // a job arrives, run inference locally using the loaded model, then
         // POST the result back to /community/submit_work. This is what
         // makes community nodes provide REAL inference compute.
-        if let Some(model) = inference_model.clone() {
+        if let (Some(model), Some((_, worker_model_id, worker_model_id_hash))) =
+            (inference_model.clone(), worker_model.clone())
+        {
             let worker_id_w = worker_id.clone();
             let seed_rpc_addrs_w = seed_rpc_addrs.clone();
             // Worker keypair + address for signing InferenceAttestation txs
@@ -2208,41 +2258,43 @@ async fn main() -> Result<()> {
                     // reported total_work_completed = 0 despite three
                     // registered workers.
                     //
-                    // Now: one in-flight claim per seed, first responder wins,
-                    // the rest are dropped and re-armed on the next pass.
-                    let claim_body = serde_json::json!({
-                        "worker_id": worker_id_w,
-                        "capabilities": ["inference"],
-                    });
+                    // Now: one in-flight claim per seed, first responder wins.
+                    // The remaining polls are drained in the background. If
+                    // two independent coordinators assign work at the same
+                    // instant, every extra assignment is explicitly declined
+                    // so its dispatcher falls back immediately instead of
+                    // silently losing the dequeued job when a request future
+                    // is canceled.
+                    let claim_body = rpc::ClaimWorkRequest {
+                        worker_id: worker_id_w.clone(),
+                        capabilities: vec!["inference".to_string()],
+                        model_id: worker_model_id.clone(),
+                    };
                     let mut claims = tokio::task::JoinSet::new();
                     for addr in &seed_rpc_addrs_w {
                         let client = client.clone();
                         let body = claim_body.clone();
-                        let primary = addr.clone(); // host:9090 (arc-node)
-                        let host = addr.split(':').next().unwrap_or(addr).to_string();
-                        let legacy = format!("{}:3001", host); // python gateway
+                        let target = addr.clone();
+                        let keypair = worker_keypair.clone();
                         claims.spawn(async move {
-                            let try_post = |target: String| {
-                                let client = client.clone();
-                                let body = body.clone();
-                                async move {
-                                    let resp = client
-                                        .post(format!("http://{}/community/claim_work", target))
-                                        .json(&body)
-                                        .send()
-                                        .await
-                                        .ok()?;
-                                    let job: serde_json::Value = resp.json().await.ok()?;
-                                    if job.get("status").and_then(|s| s.as_str()) == Some("work") {
-                                        Some((target, job))
-                                    } else {
-                                        None
-                                    }
-                                }
-                            };
-                            match try_post(primary).await {
-                                Some(p) => Some(p),
-                                None => try_post(legacy).await,
+                            let response = post_signed_community(
+                                &client,
+                                &target,
+                                rpc::COMMUNITY_CLAIM_WORK_PATH,
+                                body,
+                                &keypair,
+                                std::time::Duration::from_secs(35),
+                            )
+                            .await
+                            .ok()?;
+                            if !response.status().is_success() {
+                                return None;
+                            }
+                            let job: serde_json::Value = response.json().await.ok()?;
+                            if job.get("status").and_then(|s| s.as_str()) == Some("work") {
+                                Some((target, job))
+                            } else {
+                                None
                             }
                         });
                     }
@@ -2254,9 +2306,81 @@ async fn main() -> Result<()> {
                             break;
                         }
                     }
-                    // Dropping `claims` aborts the other outstanding polls;
-                    // they carry no state, so re-arming next pass is free.
-                    drop(claims);
+                    // A request can already have consumed a remote queue item
+                    // by the time its future is canceled. Keep the remaining
+                    // polls alive and explicitly decline any additional jobs;
+                    // the seed then releases its worker slot and immediately
+                    // falls back to local inference.
+                    if claimed.is_some() {
+                        let decline_client = client.clone();
+                        let decline_worker = worker_id_w.clone();
+                        let decline_keypair = worker_keypair.clone();
+                        tokio::spawn(async move {
+                            while let Some(result) = claims.join_next().await {
+                                let Ok(Some((coordinator, job))) = result else {
+                                    continue;
+                                };
+                                let Some(job_id) = job
+                                    .get("job_id")
+                                    .and_then(|value| value.as_str())
+                                    .filter(|value| !value.is_empty())
+                                else {
+                                    continue;
+                                };
+                                let decline = rpc::WorkResult {
+                                    job_id: job_id.to_string(),
+                                    worker_id: decline_worker.clone(),
+                                    success: false,
+                                    declined: true,
+                                    output: String::new(),
+                                    output_hash: String::new(),
+                                    tokens_generated: 0,
+                                    total_ms: 0,
+                                    ms_per_token: 0,
+                                    engine: String::new(),
+                                    error: Some(
+                                        "worker already accepted a concurrent coordinator job"
+                                            .to_string(),
+                                    ),
+                                    signed_attestation_hex: None,
+                                };
+                                match post_signed_community(
+                                    &decline_client,
+                                    &coordinator,
+                                    rpc::COMMUNITY_SUBMIT_WORK_PATH,
+                                    decline,
+                                    &decline_keypair,
+                                    std::time::Duration::from_secs(10),
+                                )
+                                .await
+                                {
+                                    Ok(response) if response.status().is_success() => {
+                                        tracing::debug!(
+                                            job_id,
+                                            seed = %coordinator,
+                                            "declined concurrent community job without dropping it"
+                                        );
+                                    }
+                                    Ok(response) => {
+                                        tracing::warn!(
+                                            job_id,
+                                            seed = %coordinator,
+                                            status = %response.status(),
+                                            "coordinator rejected concurrent-job decline"
+                                        );
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            job_id,
+                                            seed = %coordinator,
+                                            %error,
+                                            "could not decline concurrent community job"
+                                        );
+                                    }
+                                }
+                            }
+                        });
+                    }
 
                     {
                         let Some((winner, job)) = claimed else {
@@ -2276,32 +2400,145 @@ async fn main() -> Result<()> {
                             .to_string();
                         let max_tokens =
                             job.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
-                        if input.is_empty() || job_id.is_empty() {
+                        if job_id.is_empty() {
+                            tracing::warn!(
+                                seed = %winner,
+                                "coordinator returned a community assignment without a job_id"
+                            );
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue;
                         }
+                        let assignment_model_id = job
+                            .get("model_id")
+                            .and_then(|value| value.as_str())
+                            .and_then(|value| {
+                                let bare = value
+                                    .strip_prefix("0x")
+                                    .or_else(|| value.strip_prefix("0X"))
+                                    .unwrap_or(value);
+                                Hash256::from_hex(bare).ok()
+                            });
+                        let assignment_model_matches =
+                            assignment_model_id == Some(worker_model_id_hash);
+                        if !assignment_model_matches
+                            || input.is_empty()
+                            || input.len() > 32_768
+                            || max_tokens == 0
+                            || max_tokens > rpc::INFERENCE_RUN_MAX_TOKENS
+                        {
+                            let reason = if !assignment_model_matches {
+                                "assignment omitted or mismatched the worker's exact model artifact"
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "invalid assignment bounds (input_bytes={}, max_tokens={})",
+                                    input.len(),
+                                    max_tokens
+                                )
+                            };
+                            tracing::warn!(
+                                job_id,
+                                seed = %winner,
+                                reason,
+                                "declining malformed community assignment"
+                            );
+                            let failure = rpc::WorkResult {
+                                job_id: job_id.clone(),
+                                worker_id: worker_id_w.clone(),
+                                success: false,
+                                // A coordinator identity mismatch is not a
+                                // model failure by this worker.
+                                declined: !assignment_model_matches,
+                                output: String::new(),
+                                output_hash: String::new(),
+                                tokens_generated: 0,
+                                total_ms: 0,
+                                ms_per_token: 0,
+                                engine: String::new(),
+                                error: Some(reason),
+                                signed_attestation_hex: None,
+                            };
+                            let _ = post_signed_community(
+                                &client,
+                                &winner,
+                                rpc::COMMUNITY_SUBMIT_WORK_PATH,
+                                failure,
+                                &worker_keypair,
+                                std::time::Duration::from_secs(10),
+                            )
+                            .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            continue;
+                        }
+
+                        let input_preview: String = input.chars().take(40).collect();
 
                         tracing::info!(
                             "Claimed job {} from {}: {:?} (max_tokens={})",
                             job_id,
                             winner,
-                            &input[..input.len().min(40)],
+                            input_preview,
                             max_tokens
                         );
 
-                        // Run inference locally
+                        // Model generation is CPU-heavy and synchronous. Running it
+                        // directly inside this Tokio task starved registration,
+                        // heartbeat, claim, and submit I/O on small community hosts.
+                        // Move the complete encode/generate/decode path to Tokio's
+                        // blocking pool so networking remains responsive.
                         let start = std::time::Instant::now();
-                        let (generated, hash) = model.generate(
-                            &{
-                                let mut toks = vec![model.config.bos_token];
-                                toks.extend(model.encode(&input));
-                                toks
-                            },
-                            max_tokens,
-                            &model.config.eos_tokens,
-                        );
+                        let inference_model = model.clone();
+                        let inference_input = input.clone();
+                        let inference = tokio::task::spawn_blocking(move || {
+                            let (generated, hash) = inference_model.generate(
+                                &{
+                                    let mut toks = vec![inference_model.config.bos_token];
+                                    toks.extend(inference_model.encode(&inference_input));
+                                    toks
+                                },
+                                max_tokens,
+                                &inference_model.config.eos_tokens,
+                            );
+                            let output_text = inference_model.decode(&generated);
+                            (generated, hash, output_text)
+                        })
+                        .await;
+                        let (generated, hash, output_text) = match inference {
+                            Ok(result) => result,
+                            Err(error) => {
+                                tracing::error!(
+                                    job_id,
+                                    seed = %winner,
+                                    %error,
+                                    "community inference worker task failed"
+                                );
+                                let failure = rpc::WorkResult {
+                                    job_id: job_id.clone(),
+                                    worker_id: worker_id_w.clone(),
+                                    success: false,
+                                    declined: false,
+                                    output: String::new(),
+                                    output_hash: String::new(),
+                                    tokens_generated: 0,
+                                    total_ms: 0,
+                                    ms_per_token: 0,
+                                    engine: String::new(),
+                                    error: Some(format!("local inference task failed: {error}")),
+                                    signed_attestation_hex: None,
+                                };
+                                let _ = post_signed_community(
+                                    &client,
+                                    &winner,
+                                    rpc::COMMUNITY_SUBMIT_WORK_PATH,
+                                    failure,
+                                    &worker_keypair,
+                                    std::time::Duration::from_secs(10),
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
                         let elapsed_ms = start.elapsed().as_millis() as u64;
-                        let output_text = model.decode(&generated);
                         let tokens_gen = generated.len() as u64;
                         let ms_per_tok = elapsed_ms.checked_div(tokens_gen).unwrap_or(0);
 
@@ -2340,14 +2577,6 @@ async fn main() -> Result<()> {
 
                         // Build the InferenceAttestation body. Mirrors what
                         // /inference/run does on the local-served path.
-                        let model_id_data = format!(
-                            "arc-{}L-{}d-{}h-{}v",
-                            model.config.n_layers,
-                            model.config.d_model,
-                            model.config.n_heads,
-                            model.config.vocab_size
-                        );
-                        let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
                         let input_hash = arc_crypto::hash_bytes(input.as_bytes());
 
                         let nonce =
@@ -2358,7 +2587,7 @@ async fn main() -> Result<()> {
                             nonce,
                             body: arc_types::TxBody::InferenceAttestation(
                                 arc_types::transaction::InferenceAttestationBody {
-                                    model_id: model_id_hash,
+                                    model_id: worker_model_id_hash,
                                     input_hash,
                                     output_hash: hash,
                                     challenge_period: 100,
@@ -2387,46 +2616,90 @@ async fn main() -> Result<()> {
                             }
                         };
 
-                        let mut result_body = serde_json::json!({
-                            "job_id": job_id,
-                            "worker_id": format!("0x{}", hex::encode(worker_address.0)),
-                            "success": true,
-                            "output": output_text,
-                            "output_hash": format!("0x{}", hex::encode(hash.0)),
-                            "tokens_generated": tokens_gen,
-                            "total_ms": elapsed_ms,
-                            "ms_per_token": ms_per_tok,
-                            "engine": "INT8 integer (community worker)",
-                        });
-                        if let Some(hex_str) = signed_attestation_hex {
-                            result_body["signed_attestation_hex"] =
-                                serde_json::Value::String(hex_str);
-                        }
+                        let result_body = rpc::WorkResult {
+                            job_id: job_id.clone(),
+                            worker_id: format!("0x{}", hex::encode(worker_address.0)),
+                            success: true,
+                            declined: false,
+                            output: output_text,
+                            output_hash: format!("0x{}", hex::encode(hash.0)),
+                            tokens_generated: tokens_gen,
+                            total_ms: elapsed_ms,
+                            ms_per_token: ms_per_tok,
+                            engine: "INT8 integer (community worker)".to_string(),
+                            error: None,
+                            signed_attestation_hex,
+                        };
 
-                        let submit_resp = client
-                            .post(format!("http://{}/community/submit_work", winner))
-                            .json(&result_body)
-                            .timeout(std::time::Duration::from_secs(10))
-                            .send()
-                            .await;
+                        let submit_resp = post_signed_community(
+                            &client,
+                            &winner,
+                            rpc::COMMUNITY_SUBMIT_WORK_PATH,
+                            result_body,
+                            &worker_keypair,
+                            // The coordinator independently repeats inference through
+                            // a 2-of-3 validator quorum before acknowledging success.
+                            // Its verified-dispatch budget is capped at 600 seconds;
+                            // allow network/serialization headroom beyond that cap.
+                            std::time::Duration::from_secs(660),
+                        )
+                        .await;
 
                         // If submit reports invalid_nonce, force a re-query
                         // of the chain on the next loop iteration.
-                        if let Ok(resp) = submit_resp
-                            && let Ok(body) = resp.json::<serde_json::Value>().await
-                        {
-                            let attestation = body.get("attestation");
-                            if let Some(a) = attestation {
-                                let status = a.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                                let err = a.get("error").and_then(|s| s.as_str()).unwrap_or("");
-                                if status == "rejected" && err.contains("InvalidNonce") {
-                                    tracing::warn!(
-                                        "attestation nonce drifted; will re-query chain on next submit"
-                                    );
-                                    attestation_nonce_initialized
-                                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                        match submit_resp {
+                            Ok(resp) => {
+                                let status_code = resp.status();
+                                match resp.json::<serde_json::Value>().await {
+                                    Ok(body) => {
+                                        if !status_code.is_success() {
+                                            tracing::warn!(
+                                                job_id,
+                                                seed = %winner,
+                                                status = %status_code,
+                                                response = %body,
+                                                "coordinator rejected community result"
+                                            );
+                                        }
+                                        let attestation = body.get("attestation");
+                                        if let Some(a) = attestation {
+                                            let status = a
+                                                .get("status")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or("");
+                                            let err = a
+                                                .get("error")
+                                                .and_then(|s| s.as_str())
+                                                .unwrap_or("");
+                                            if status == "rejected" && err.contains("InvalidNonce")
+                                            {
+                                                tracing::warn!(
+                                                    "attestation nonce drifted; will re-query chain on next submit"
+                                                );
+                                                attestation_nonce_initialized.store(
+                                                    false,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            job_id,
+                                            seed = %winner,
+                                            status = %status_code,
+                                            %error,
+                                            "coordinator returned an invalid submit response"
+                                        );
+                                    }
                                 }
                             }
+                            Err(error) => tracing::warn!(
+                                job_id,
+                                seed = %winner,
+                                %error,
+                                "could not submit verified community result"
+                            ),
                         }
                     }
                     // Brief sleep between poll rounds to avoid hammering
@@ -2488,6 +2761,7 @@ async fn main() -> Result<()> {
         inference_model,
         candle_engine,
         candle_model_id,
+        model_artifact_id,
         Some(dag_validators),
         Some(dag_round),
         Some(dag_committed),
@@ -2495,6 +2769,7 @@ async fn main() -> Result<()> {
         coordinator_seed_rpcs,
         compute_threads,
         genesis_chain_identity,
+        cli.enable_community_rewards_v1,
     )
     .await?;
 
@@ -2505,6 +2780,45 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sha256_streaming_matches_known_vector() {
+        let test_dir =
+            std::env::temp_dir().join(format!("arc-model-hash-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&test_dir).unwrap();
+        let file = test_dir.join("model.gguf");
+        std::fs::write(&file, b"abc").unwrap();
+
+        assert_eq!(
+            sha256_of(file.to_str().unwrap()).as_deref(),
+            Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        );
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
+
+    #[test]
+    fn automatic_model_discovery_skips_same_named_wrong_bytes() {
+        let test_dir =
+            std::env::temp_dir().join(format!("arc-model-discovery-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&test_dir).unwrap();
+        let wrong = test_dir.join("llama2-7b.gguf");
+        let exact = test_dir.join("llama-2-7b-chat.Q4_K_M.gguf");
+        std::fs::write(&wrong, b"same size is not enough").unwrap();
+        std::fs::write(&exact, b"canonical test artifact").unwrap();
+        let exact_digest = sha256_of(exact.to_str().unwrap()).unwrap();
+
+        let selected = discover_matching_model(
+            vec![
+                wrong.to_string_lossy().into_owned(),
+                exact.to_string_lossy().into_owned(),
+            ],
+            &exact_digest,
+        );
+        assert_eq!(selected.as_deref(), exact.to_str());
+
+        std::fs::remove_dir_all(&test_dir).unwrap();
+    }
 
     #[test]
     fn shipped_placeholder_allows_stake_zero_community_observer_only() {
@@ -2524,6 +2838,13 @@ mod tests {
             genesis.migration_observer_network_hash().unwrap(),
             Hash256::ZERO
         );
+    }
+
+    #[test]
+    fn cli_defaults_keep_unauthenticated_rpc_local_and_eth_disabled() {
+        let cli = Cli::try_parse_from(["arc-node"]).unwrap();
+        assert_eq!(cli.rpc, "127.0.0.1:9944");
+        assert_eq!(cli.eth_rpc_port, 0);
     }
 
     #[test]

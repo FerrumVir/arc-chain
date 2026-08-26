@@ -44,17 +44,18 @@ test.describe("Projected earnings - populated", () => {
     );
   });
 
-  test("states its assumptions: rate, reward per attestation, bond", async ({
+  test("states its assumptions: rate, reward, and zero worker bond", async ({
     page,
   }) => {
     await gotoEarnings(page);
     const assumptions = page.getByTestId("projection-assumptions");
     await expect(assumptions).toBeVisible();
     // The three things a reader needs in order to judge the projection.
-    await expect(assumptions).toContainText("attestations/day");
+    await expect(assumptions).toContainText("mined reward receipts/day");
     await expect(assumptions).toContainText("measured on");
-    await expect(assumptions).toContainText("per settled attestation");
-    await expect(assumptions).toContainText("bond");
+    await expect(assumptions).toContainText("successful mined 0x25");
+    await expect(assumptions).toContainText("approval collection");
+    await expect(assumptions).toContainText("no worker bond");
     // The rate must be attributed to a host, because the seeds are separate
     // chains and a rate from one says nothing about another.
     await expect(assumptions).toContainText(/LAX|\d+\.\d+\.\d+\.\d+/);
@@ -69,46 +70,41 @@ test.describe("Projected earnings - populated", () => {
     ).toContainText("Testnet treasury transfer, not revenue");
   });
 
-  test("surfaces the finite treasury as a network-wide ceiling", async ({
+  test("surfaces the finite treasury as a selected-host ceiling", async ({
     page,
   }) => {
     await gotoEarnings(page);
     const treasury = page.getByTestId("treasury-remaining");
     await expect(treasury).toBeVisible();
     await expect(treasury).toContainText("finite");
-    await expect(treasury).toContainText("network-wide");
+    await expect(treasury).toContainText("host-scoped");
     await expect(treasury).toContainText("ARC");
     // The anti-"unlimited payout" sentence.
     await expect(treasury).toContainText("Rewards stop when it is empty");
   });
 
-  test("reports the treasury remainder as attestations, not as currency", async ({
+  test("reports the treasury remainder as fundable receipts, not currency", async ({
     page,
   }) => {
     await gotoEarnings(page);
     const treasury = page.getByTestId("treasury-remaining");
-    // `rewards_remaining` on the wire is a COUNT of attestations the treasury
+    // `rewards_remaining` on the wire is a COUNT of reward receipts the treasury
     // can still pay for, NOT an ARC amount. Rendering it as currency would be
     // wrong by nine orders of magnitude and wrong in kind, so the copy has to
     // name the unit it actually is.
     await expect(treasury).toContainText("more");
-    await expect(treasury).toContainText("settled attestations");
-    await expect(treasury).toContainText("across the whole network");
+    await expect(treasury).toContainText("successful mined");
+    await expect(treasury).toContainText("0x25");
+    await expect(treasury).toContainText("on this host");
   });
 
-  test("attributes the bond-refund claim to the host and stays conservative", async ({
+  test("does not subtract the unrelated local-attestation bond", async ({
     page,
   }) => {
     await gotoEarnings(page);
     const assumptions = page.getByTestId("projection-assumptions");
-    // The repo's own notes say the apply path locks the bond with no release,
-    // while the endpoint reports a refund. The UI must not pick a side: it
-    // attributes the claim and projects on the locked figure.
-    await expect(assumptions).toContainText("this host reports");
-    await expect(assumptions).toContainText("challenge period");
-    await expect(assumptions).toContainText(
-      "treats the bond as still locked",
-    );
+    await expect(assumptions).toContainText("no worker bond");
+    await expect(assumptions).not.toContainText("bond netted out");
   });
 
   test("shows the host's own caveat about how the rate was derived", async ({
@@ -152,7 +148,7 @@ test.describe("Projected earnings - no measured rate", () => {
     });
   });
 
-  test("shows what one attestation pays instead of a projection", async ({
+  test("shows the per-receipt amount instead of inventing a projection", async ({
     page,
   }) => {
     await gotoEarnings(page);
@@ -182,7 +178,7 @@ test.describe("Projected earnings - no measured rate", () => {
   }) => {
     await gotoEarnings(page);
     await expect(page.getByTestId("projection-assumptions")).toContainText(
-      "per settled attestation",
+      "per successful mined 0x25 community-reward receipt",
     );
     await expect(
       page.getByTestId("projection-funding-label").first(),
@@ -256,22 +252,42 @@ test.describe("Projected earnings - endpoint 404s", () => {
     await expect(treasury).toBeVisible();
     await expect(treasury).toContainText("not present in this host's state");
     await expect(page.getByTestId("treasury-remaining")).toHaveCount(0);
-    // The bond IS known here, so it must still be netted out.
+    // Certificate terms are still known even though the balance is not.
     await expect(page.getByTestId("projection-assumptions")).toContainText(
-      "bond netted out",
+      "no worker bond",
     );
   });
 
-  test("losing /economics/rewards also stops netting out a bond, and says so", async ({
+  test("losing /economics/rewards makes worker bond terms unavailable", async ({
     page,
   }) => {
     await seedMockOverrides(page, { fetch_reward_economics: ECONOMICS_404 });
     await gotoEarnings(page);
-    // The bond comes from that endpoint, so its loss must be stated rather
-    // than silently producing a gross figure labelled as net.
+    // Certificate terms come from that endpoint, so the gross-reward
+    // assumption must be explicit.
     await expect(page.getByTestId("projection-assumptions")).toContainText(
-      "the bond could not be read from this host",
+      "worker certificate bond terms could not be read",
     );
+  });
+
+  test("an inactive reward rollout never shows a forward earnings figure", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      fetch_earnings_projection: {
+        ...PROJECTION_NO_HISTORY,
+        communityRewardsEnabled: false,
+        attestationsPerDay: 43.2,
+      },
+    });
+    await gotoEarnings(page);
+    await expect(page.getByTestId("projection-rollout-inactive")).toContainText(
+      "reward settlement is inactive",
+    );
+    await expect(page.getByTestId("projection-rollout-inactive")).toContainText(
+      "approval collection",
+    );
+    await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
   });
 
   test("no identity on the device is explained, not shown as zero", async ({

@@ -1,5 +1,12 @@
 # ARC Chain — Demo Runbook
 
+> **Recovery notice (2026-08-26):** this live-network runbook records the old
+> v0.7.2/v0.7.9 fleet and is not the v0.7.12 launch walkthrough. v0.7.12 is
+> still unpublished and undeployed. Do not use the legacy v0.7.7 installer
+> path below; the gated replacement is
+> [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) after
+> [`VALIDATOR-FLEET-ROLLOUT.md`](VALIDATOR-FLEET-ROLLOUT.md) completes.
+
 **The run-of-show.** Everything here was checked read-only against the live
 network on **2026-08-17**. This supersedes `docs/SERO-DEMO.md`, which describes
 a 7-node topology that no longer exists.
@@ -90,17 +97,18 @@ ls -la ~/.arc-models/*.gguf
 If you are demoing the branch build, either match the desktop version string or
 launch the node yourself rather than through the desktop's Start button.
 
-**2. Confirm the installer resolves. 🟢**
+**2. Confirm the recovery installer contract locally. 🔵**
 
 ```bash
-ARC_NODE_VERSION= bash scripts/install-community-node.sh --help
+bash install.sh --help
+bash tests/release/run.sh
 ```
 
-The installer now walks the release list and picks the newest tag that actually
-ships an `arc-node` CLI asset — **v0.7.7** today. v0.7.10 and v0.7.11 are
-desktop-only bundles with no CLI binary, which is what used to make this
-one-liner die with a 404. If someone in the room is on ARM Linux, warn them:
-`arc-node-linux-aarch64` has never been published in any release.
+At the 2026-08-17 audit, v0.7.7 was the last public release with CLI binaries;
+it is historical, not the repaired “latest CLI.” v0.7.10 and v0.7.11 are
+desktop-only. The unreleased v0.7.12 candidate adds checksummed Linux
+x86_64/arm64 and macOS arm64/x86_64 headless assets, but no install command may
+be presented as live until that complete release is published.
 
 **3. Rehearse the exact prompts you will type.** See the prompt list below.
 
@@ -287,31 +295,27 @@ seeds, and the node appears in `/community/list` on a seed within ~60 s
 
 > **Set expectations out loud:** the local node's own **height will sit at 0**
 > for a long time, possibly the whole demo. A fresh node starts at DAG round 0,
-> fast-forwards to ~9.59 M, but its *height* only advances when a DAG block
-> carrying transactions commits locally. At ~0.2 rounds/s with no local
-> traffic, "height 0" is the expected state, not a failure. Say this before
-> someone reads it off the screen as broken.
+> and it will not fast-forward from one peer's claimed round or a far-ahead
+> signed block. A migrated validator needs the operator-approved genesis or a
+> quorum-certified checkpoint. Do not present an unauthenticated snapshot or
+> round hint as consensus catch-up.
 
 ### Why this cannot disturb consensus
 
 Say this plainly, because it is the interesting part:
 
-A peer announcing **stake below 500,000** is appended to the node's validator
-*tracker* and the handler stops there — it is never pushed into the live
-`ValidatorSet` and never queued into the consensus engine. It can serve
-inference and be counted as present; it takes no consensus role.
+A transport peer's advertised stake is never consensus authority. Only the
+operator-approved genesis/checkpoint identities and stakes enter the live and
+frozen `ValidatorSet` or the RPC validator authority list. Community inference
+registration is a separate worker path and cannot change voting membership.
 
 ### What WOULD be dangerous — do not improvise these
 
-1. **Joining with stake > 0.** A peer announcing ≥ 500,000 is merged into the
-   live validator set. At the next epoch boundary `freeze_epoch()` absorbs it,
-   normalises its stake to the maximum observed, and it owns **1/N of the leader
-   slots on every seed**. `PeerDisconnected` explicitly refuses to remove an
-   address in the frozen set, so it persists until every seed is restarted —
-   which is itself forbidden. **This has already happened once:**
-   `genesis.toml` declares 6 validators; LAX `/validators` reports **7** at full
-   stake. Admission trusts the self-declared stake in the handshake; there is no
-   on-chain stake check.
+1. **Changing membership outside the approved trust root.** The earlier
+   transport path trusted self-declared handshake stake and polluted the frozen
+   set. The recovery candidate rejects that path. Do not work around it by
+   editing one node's genesis, validator list, or stake: unequal trust roots
+   deliberately fail to reach quorum.
 
 2. **Auto-shard-join on the public net.** The trigger is
    `stake > 0 && --model is set && no explicit shard range`. It POSTs
@@ -483,92 +487,39 @@ path is what we just shipped." Do not restart a seed to demonstrate this.
 **Goal:** tell the earnings story without saying anything false. This segment
 has the most ways to go wrong, so the framing matters more than the clicks.
 
-### ⭐ THE STRONG VERSION — verified working 2026-08-17 🔵 BRANCH
+### ⛔ RETIRED INCOME DEMO — DO NOT REHEARSE OR RECORD
 
-Everything below this subsection describes the story against the **live seeds**,
-which run old code where attestations never mine and earnings read 0.00. That
-is still accurate for the seeds. But on the branch build there is now a real,
-auditable income demo, verified end to end on this hardware.
+The former “strong version” credited 2.5 ARC from the raw
+`InferenceAttestation` (`0x16`) path on an isolated local chain. That is not the
+v0.7.12 reward contract and must not be presented as evidence that community
+workers are paid. In the recovery candidate:
 
-The trick is `--shard-hosts`: it pulls the shard registry over HTTP **without
-joining anyone's P2P network or consensus**, so your node seals its own blocks
-(stake > 0, its own chain) while dispatching inference across the public
-network's shard holders. `--seeds-file` cannot do this — it dials P2P, and a
-staked node that dials P2P becomes a phantom validator (rule 2).
+- `0x16` is a computation claim and **never pays a reward**;
+- payment is a separate `CommunityInferenceReward` transaction (`0x25`);
+- the worker certificate binds the exact model artifact, assignment, output,
+  worker signature, payout, and verification evidence;
+- authorization requires unique active-validator approvals covering strict
+  greater-than-two-thirds of both validator identities and active stake (five
+  approvals for six equally staked validators);
+- genesis activation, the local issuance switch, and validator-approval
+  collection must all be ready; and
+- earnings count only a **successful mined `0x25` receipt** retained by the
+  selected host.
 
-```bash
-arc-node --rpc 127.0.0.1:19955 --p2p-port 19956 --eth-rpc-port 0 \
-  --stake 5000000 --no-community \
-  --data-dir /tmp/arc-income --validator-seed income-demo \
-  --model ~/.arc-models/llama2-7b.gguf --tokenizer-only \
-  --shard-hosts 149.28.32.76,140.82.16.112,136.244.109.1,104.238.171.11,202.182.107.41,149.28.153.31
-```
+Approval collection is intentionally unavailable in this candidate, so the RPC
+fails closed and reports the effective reward gate disabled. It neither
+synthesizes validator approvals from shard signatures nor exposes a signing
+oracle. Therefore there is no valid income recording to make before the
+approved v3 genesis, validator key rotation, peer-authenticated approval
+aggregation, and coordinated fleet cutover all complete.
 
-Confirm `GET /shards` reports `shard_count: 18, fully_covered: true` while
-`GET /health` reports **`peers: 0`** — that pair is the whole point: full
-pipeline, zero consensus involvement. Then:
-
-```bash
-A=$(curl -s 127.0.0.1:19955/node/info | jq -r .validator)
-curl -s -XPOST 127.0.0.1:19955/faucet/claim -H 'Content-Type: application/json' -d "{\"address\":\"$A\"}"
-curl -s 127.0.0.1:19955/account/$A | jq .balance      # record this
-curl -s -XPOST 127.0.0.1:19955/inference/run_sharded -H 'Content-Type: application/json' \
-  -d '{"input":"The largest planet is","max_tokens":3,"force_recompute":true,"redundancy":2}' | jq .attestation
-curl -s 127.0.0.1:19955/account/$A | jq .balance      # up by 2,499,999,000
-```
-
-**Measured, three consecutive runs:** balance rose exactly
-`+2,499,999,000` base units each time — `+2.5 ARC` reward minus the
-`1,000`-unit bond — with the nonce advancing `1 → 2 → 3 → 4`. The attestation
-mined (`/tx/<hash>` returns `block_height`, `success: true`), and
-`/worker/earnings/<addr>` reports a reconciling `onchain_balance_arc`.
-
-What you can say, and defend: *"the worker was faucet-funded, ran one
-inference across six machines, and its on-chain balance went up by the
-protocol's 2.5-ARC attestation reward. Here is the transaction in a block."*
-
-Two caveats to keep it honest:
-- The reward is a **transfer from the testnet treasury**, bounded by the
-  treasury's balance. It is not minted, and it is not revenue from a paying
-  customer. Say "protocol reward," not "revenue."
-- This runs on **your** chain. The six seeds run old code and will not do
-  this until they are upgraded. Do not imply the public testnet pays workers
-  today — it does not.
-
-**Tested against the live chain 2026-08-17, and it does not work there.** Do
-not attempt the income segment on the public seeds. The full sequence was run:
-faucet-funded a fresh attester on NYC (credit **mined in block 135,089**, so
-NYC does seal blocks when a valid transaction arrives), then relayed a signed
-attestation to NYC via `ARC_ATTEST_RELAY`. The relay was accepted (HTTP 2xx
-into the mempool) and then **never reached a block** — `/tx/<hash>` reports
-not-found and the attester's nonce stayed at 0 with its balance unchanged,
-so the transaction never applied.
-
-It is not a wire or validity problem: v0.7.2's apply path is effectively
-identical to ours (nonce check, `balance >= bond`, debit bond), our
-transaction satisfied every condition (nonce 0 against NYC's 0, balance
-10,000 against a 1,000 bond), the beneficiary field is `#[serde(skip)]` with a
-test pinning the 112-byte v0.7.2 layout, and `gas_limit: 0` means unlimited
-for backward compatibility. The same signed attestation mines correctly on a
-node running this branch — verified three times, +2.5 ARC each.
-
-The likely mechanism is that blocks are assembled from **DAG-committed**
-transactions, and a transaction injected straight into a seed's mempool over
-`/tx/submit_signed` never joins a DAG batch. That also fits the seed-wide
-stall: `run_block_producer` (`crates/arc-node/src/producer.rs:15`) is dead
-code, so blocks only come from the consensus path, which needs committed DAG
-transactions. Confirming it needs a seed's logs.
-
-**What this means for the demo:** show income on your own chain, which works.
-On the public network, show the faucet credit (real, mines) and the inference
-itself — and say plainly that worker settlement lands once the seeds run this
-build.
-
-The bond-release sweep (bond returns after `challenge_period` blocks) is
-covered by unit tests including a supply-conservation invariant; it was not
-exercised over 100 live blocks, because this chain only seals on traffic.
-The amount is 1,000 base units — a rounding error next to the reward — so
-don't build a slide on it.
+After those gates are complete, use
+[`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md). The only
+defensible payment sequence is: show the readiness fields all true; show exact
+artifact eligibility and assigned, quorum-verified work; show the returned
+`reward_tx_hash`; prove that hash is transaction type `0x25` with a successful
+receipt on the same host; then show `/worker/earnings/{address}` reconcile to
+that retained receipt. Anything less is a work demo, not an income demo.
 
 ---
 
@@ -591,19 +542,25 @@ Claim it, then read the balance back **from the same host**:
 curl -s $ARC_WALLET_SEED/account/$ADDR
 ```
 
-**2. Signed attestations, mined on the block-producing seed. 🟢**
+**2. Inference claims are not payments. 🟡**
 
 An inference produces an `InferenceAttestation` (tx `0x16`) carrying model hash,
-input hash, and output hash. On NYC — the seed that is actually sealing — it can
-reach a block. On the four stalled seeds it cannot.
+input hash, and output hash. Even if one reaches a block successfully, its
+reward is exactly zero. It is evidence of a submitted computation claim, not a
+`CommunityInferenceReward` receipt. The Aug 26 public-fleet snapshot found
+mixed v0.7.2/v0.7.9 binaries, divergent state on all six seeds, and no community
+work recorded; do not use a public `0x16` record as settlement evidence.
 
-**3. Earnings display semantics — say this out loud. 🟢**
+**3. Public and candidate earnings endpoints mean different things. 🟡**
 
 ```bash
 curl -s $ARC_WALLET_SEED/worker/earnings/$ADDR
 ```
 
-The number is **attestation count × 2.5 ARC**. Be precise about what that is:
+On the public v2 seeds, the number is legacy **display arithmetic** based on raw
+attestation count. It is not income. In the unreleased v0.7.12/v3 candidate,
+the endpoint instead counts retained successful mined `0x25` reward receipts.
+Be precise about the public response:
 
 - It is **display arithmetic**, not a balance. Nothing in that handler reads or
   writes an on-chain balance, so it **will not reconcile** against
@@ -615,16 +572,15 @@ The number is **attestation count × 2.5 ARC**. Be precise about what that is:
 - **"Today" is fabricated** as 12% of lifetime, on both the node and the
   desktop. A worker with one lifetime attestation shows identical Today and
   Lifetime figures.
-- Expect **0.0 ARC**. `/worker/earnings` returns `total_attestations: 0` for
-  every address on every seed right now, because attestations are not being
-  mined.
+- The Aug 26 read-only snapshot returned community `total_work_completed: 0`;
+  no public reward receipt was demonstrated.
 - Numbers are **per-seed**, because chain state is per-seed.
 
-The defensible framing: *"the economic plumbing is wired end to end — an
-inference produces a signed attestation, the attestation is a first-class
-transaction type, and the reward rate is a protocol constant. What you are
-looking at is the accounting view, and on this testnet it reads zero because
-attestations aren't being mined yet."* That is true. Anything stronger is not.
+The defensible framing: *“The public endpoint is legacy accounting and does not
+prove payment. The candidate has a separate 0x25 reward transaction and mined-
+receipt index, but issuance is deliberately disabled until validator approval
+collection and the coordinated v3 cutover are ready.”* Anything stronger is
+not supported by current evidence.
 
 ### ⛔ DO-NOT-SHOW LIST
 

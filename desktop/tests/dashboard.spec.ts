@@ -1,6 +1,42 @@
 import { expect, test } from "@playwright/test";
 import { seedOnboarded } from "./helpers";
 
+async function useLiveEarningsBody(
+  page: import("@playwright/test").Page,
+  earningsBody: Record<string, unknown>,
+) {
+  await page.addInitScript(() => {
+    (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+  });
+  await page.route("http://127.0.0.1:9090/**", (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const json = (body: unknown) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(body),
+      });
+    if (path === "/health") {
+      return json({
+        status: "ok",
+        version: "test",
+        peers: 1,
+        height: 10,
+        dag_round: 10,
+        dag_committed: 10,
+        uptime_secs: 60,
+        validators: 1,
+      });
+    }
+    if (path.startsWith("/worker/earnings/")) return json(earningsBody);
+    if (path === "/inference/results") return json({ count: 99, results: [] });
+    if (path === "/inference/attestations") {
+      return json({ count: 0, attestations: [] });
+    }
+    return route.fulfill({ status: 404, body: "not found" });
+  });
+}
+
 test.describe("Dashboard", () => {
   test.beforeEach(async ({ page }) => {
     await seedOnboarded(page);
@@ -17,7 +53,7 @@ test.describe("Dashboard", () => {
     await expect(page.getByTestId("dashboard")).toBeVisible();
   });
 
-  test("shows earnings card formatted as an ARC amount", async ({ page }) => {
+  test("shows only host-confirmed mined rewards as an ARC amount", async ({ page }) => {
     await page.goto("/");
     const earnings = page.getByTestId("earnings-total");
     await expect(earnings).toBeVisible();
@@ -28,7 +64,71 @@ test.describe("Dashboard", () => {
     // is the correct and expected reading for a fresh identity on the real
     // network, so the assertion would fail against live data while telling us
     // nothing about whether the card renders.
-    await expect(earnings).toHaveText(/[\d,]+\.\d{2}\s*ARC total/);
+    await expect(earnings).toHaveText(/[\d,]+\.\d{2}\s*ARC confirmed/);
+  });
+
+  test("public-v2 count-times-constant earnings fail closed even on HTTP 200", async ({
+    page,
+  }) => {
+    await useLiveEarningsBody(page, {
+      total_attestations: 7,
+      total_arc: 17.5,
+      today_arc: 2.5,
+      last_attestation_block: 9,
+    });
+    await page.goto("/");
+    const earnings = page.getByTestId("earnings-total");
+    await expect(earnings).toContainText("not confirmed");
+    await expect(earnings).not.toContainText("17.50");
+    // The old `/inference/results` fallback returned count=99 here. It must
+    // not become 247.50 ARC either.
+    await expect(earnings).not.toContainText("247.50");
+    await page.getByTestId("nav-earnings").click();
+    await expect(page.getByTestId("projection-unavailable")).toContainText(
+      "Legacy inference-count arithmetic is not projected as earnings",
+    );
+    await expect(page.getByTestId("earnings-empty")).toBeVisible();
+  });
+
+  test("candidate receipt/readiness shape can render confirmed mined rewards", async ({
+    page,
+  }) => {
+    await useLiveEarningsBody(page, {
+      total_rewards: 2,
+      estimated_total_arc: 5,
+      estimated_total_arc_note:
+        "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
+      today_arc: null,
+      community_rewards_v1_enabled: true,
+      community_rewards_v1_protocol_active: true,
+      community_rewards_v1_approval_collection_ready: true,
+      last_reward_block: 9,
+      last_reward_tx_hash: `0x${"ab".repeat(32)}`,
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toHaveText(
+      /5\.00\s*ARC confirmed/,
+    );
+  });
+
+  test("candidate-shaped negative reward totals fail closed", async ({ page }) => {
+    await useLiveEarningsBody(page, {
+      total_rewards: 2,
+      estimated_total_arc: -5,
+      estimated_total_arc_note:
+        "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
+      today_arc: null,
+      community_rewards_v1_enabled: true,
+      community_rewards_v1_protocol_active: true,
+      community_rewards_v1_approval_collection_ready: true,
+      last_reward_block: 9,
+      last_reward_tx_hash: `0x${"ab".repeat(32)}`,
+    });
+    await page.goto("/");
+    await expect(page.getByTestId("earnings-total")).toContainText(
+      "not confirmed",
+    );
+    await expect(page.getByTestId("earnings-total")).not.toContainText("-5.00");
   });
 
   test("attestations not credited to this user are not shown as earnings", async ({
@@ -38,10 +138,11 @@ test.describe("Dashboard", () => {
     const feed = page.getByTestId("attestation-feed");
     await expect(feed).toBeVisible();
     // The mock includes two rows that are not the user's: another
-    // validator's attestation, and one old-seed padding row. Both must
-    // render as "network", never as a "+2.50" credit - showing other
-    // validators' work as the user's income was the original bug.
-    await expect(feed.getByText("network", { exact: true })).toHaveCount(2);
+    // validator's attestation, and one old-seed padding row. Every raw 0x16
+    // row must render as a claim, never as a "+2.50" credit.
+    await expect(feed.getByText("network claim", { exact: true })).toHaveCount(2);
+    await expect(feed.getByText("your claim", { exact: true })).toHaveCount(2);
+    await expect(feed.getByText(/\+2\.50/)).toHaveCount(0);
   });
 
   test("unknown telemetry renders as 'recent', not fabricated zeros", async ({

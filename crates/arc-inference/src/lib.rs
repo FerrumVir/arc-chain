@@ -14,8 +14,12 @@ pub mod gas;
 pub mod gguf_integer;
 pub mod integer_engine;
 pub mod integer_lut;
+pub mod model_artifact;
 pub mod q4_engine;
 pub mod streaming;
+
+#[cfg(test)]
+mod golden_vectors;
 
 // Patent-pending integer/ASIC inference paths. The implementation files for
 // these modules (ternary_engine.rs, ternary_hybrid.rs, int8_asic.rs,

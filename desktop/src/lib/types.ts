@@ -12,7 +12,6 @@ export interface HardwareInfo {
   gpuVramGb: number | null;
   recommendedModel: string;
   recommendedRole: NodeRole;
-  estimatedDailyArc: number;
 }
 
 /**
@@ -69,7 +68,7 @@ export interface Earnings {
   lastPayoutAt: number | null;
   /** Block height of the last attestation — NOT a timestamp. */
   lastPayoutBlock: number | null;
-  /** False = synthesized locally; label it as an estimate. */
+  /** True only for the candidate's mined-0x25 receipt/readiness contract. */
   fromChain: boolean;
 }
 
@@ -81,8 +80,6 @@ export interface Attestation {
   /** null when the record carries no count — render nothing, not "0". */
   tokens: number | null;
   latencyMs: number | null;
-  /** Only set for attestations credited to this user. */
-  rewardArc: number | null;
   /** null = "recent, exact time unknown". */
   timestamp: number | null;
   blockHeight: number | null;
@@ -187,8 +184,8 @@ export interface Unavailable {
  *
  * Two wire names are easy to misread, and both were misread once:
  *
- * - **`rewards_remaining` is a COUNT of attestations, not an ARC amount** — the
- *   treasury balance divided by the per-attestation reward. Rendering it as
+   * - **`rewards_remaining` is a COUNT of fundable reward receipts, not an ARC
+   *   amount** — the treasury balance divided by the per-receipt reward. Rendering it as
  *   currency is wrong by nine orders of magnitude *and* wrong in kind. It is
  *   carried here as `attestationsRemaining` so the name cannot be confused.
  * - The treasury balance is `treasury_balance_arc` / `_base`. There is no
@@ -201,7 +198,7 @@ export interface RewardEconomics extends Unavailable {
   treasuryBalanceArc: number | null;
   treasuryBalanceUnavailableReason: string | null;
   /**
-   * How many MORE attestations the treasury can pay for. A count, not
+   * How many MORE successful reward receipts the treasury can fund. A count, not
    * currency. This is the honest form of "how much is left": it is denominated
    * in the thing a worker actually produces.
    */
@@ -209,19 +206,14 @@ export interface RewardEconomics extends Unavailable {
   attestationsRemainingUnavailableReason: string | null;
   /** The host states outright that the treasury is bounded. */
   treasuryIsFinite: boolean | null;
-  /** ARC bonded when an attestation is submitted. */
-  bondPerAttestation: number | null;
-  /** Blocks the bond stays locked before it can be released. */
-  challengePeriodBlocks: number | null;
   /**
-   * Whether THIS HOST says the bond comes back after the challenge period.
-   *
-   * Reported, never assumed, and deliberately not hardcoded either way: the
-   * repo's own notes say the apply path debits and locks the bond with no
-   * release, while this endpoint reports a refund. The UI attributes the claim
-   * to the host instead of picking a side, and projects on the conservative
-   * figure (bond still locked).
+   * ARC bonded by a community worker reward certificate. This is deliberately
+   * separate from the coordinator's local-attestation bond.
    */
+  bondPerAttestation: number | null;
+  /** Reserved for a future community-certificate challenge period. */
+  challengePeriodBlocks: number | null;
+  /** Reserved for a future community-certificate bond refund contract. */
   bondRefundedAfterChallengePeriod: boolean | null;
   /** Where the money comes from, in the host's own words. */
   fundingDetail: string | null;
@@ -238,20 +230,25 @@ export type RateSource = "chain" | "constant" | "unknown";
  * in the app that describes something that has not happened yet.
  */
 export interface EarningsProjection extends Unavailable {
-  /** ARC per settled attestation. */
+  /** ARC per successful mined community-reward receipt. */
   rewardPerAttestation: number | null;
   /** Whether the rate above is chain-reported or a local named constant. */
   rewardRateSource: RateSource;
-  /** Attestations credited to this address so far. */
+  /**
+   * Exact reward rollout gate reported by the selected coordinator. A
+   * projection is shown only when this is true.
+   */
+  communityRewardsEnabled: boolean | null;
+  /** Successful mined reward receipts retained for this address. */
   attestationsTotal: number;
-  /** Block the address's first attestation landed in. */
+  /** Block containing the first retained successful reward receipt. */
   firstAttestationBlock: number | null;
   /**
-   * Attestations per day, MEASURED over the address's own history.
+   * Reward receipts per day, MEASURED over the address's retained history.
    *
    * null with `rateUnavailableReason` set when there is no history to measure
    * — which is the common case. It is never extrapolated from zero: an
-   * account with no attestations has no rate, not a rate of zero, and
+   * account with no retained receipts has no rate, not a rate of zero, and
    * certainly not a projection.
    */
   attestationsPerDay: number | null;
@@ -521,8 +518,8 @@ export interface SavedLogs {
   lines: number;
 }
 
-// ── Tier 1 on-chain inference (VRF committee voting) ───────────────────────
-// See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
+// Historical Tier 1 read/result shapes. New request writes are disabled in the
+// recovery candidate; these remain for IPC compatibility and old-ID inspection.
 export interface Tier1Submitted {
   requestId: string; // 0x-prefixed 32-byte hex
   txHash: string;
@@ -562,8 +559,8 @@ export interface Tier1Result {
   maxReward: number;
 }
 
-/** Milestone B (#36): paid-inference receipt - includes on-chain tx
- *  hashes for the escrow-open + escrow-release, plus payer bookkeeping. */
+/** Legacy paid-inference response shape, retained only for IPC compatibility.
+ *  The v0.7.12 recovery candidate rejects new escrow writes before signing. */
 export interface PaidInferenceResult {
   input: string;
   output: string;

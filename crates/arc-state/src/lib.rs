@@ -24,7 +24,8 @@ use light_client::{HeaderProof, LightSnapshot, StateProof, TxInclusionProof};
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -299,6 +300,11 @@ pub struct StateDB {
     /// Archive mode - when true, skips all pruning (keeps full history).
     /// Used by block explorers and analytics nodes.
     pub archive_mode: bool,
+    /// Canonical genesis-committed activation height for community reward v1.
+    /// `u64::MAX` means disabled. This runtime copy is not mutable through RPC;
+    /// nodes derive it from the genesis configuration whose semantic hash is
+    /// authenticated during the P2P handshake.
+    community_rewards_v1_activation_height: AtomicU64,
     /// Index of open Tier 1 inference requests (request_id → anchor_height).
     /// Populated by `apply_inference_request`, cleared by
     /// `apply_inference_finalize`. The `inference_validator` background task
@@ -345,6 +351,7 @@ impl StateDB {
             use_jmt: false,
             gpu_cache: None,
             archive_mode: false,
+            community_rewards_v1_activation_height: AtomicU64::new(u64::MAX),
             tier1_pending: DashMap::new(),
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
         }
@@ -383,6 +390,7 @@ impl StateDB {
             use_jmt: false,
             gpu_cache: None,
             archive_mode: false,
+            community_rewards_v1_activation_height: AtomicU64::new(u64::MAX),
             tier1_pending: DashMap::new(),
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
         })
@@ -444,11 +452,17 @@ impl StateDB {
         self.gpu_cache.as_ref()
     }
 
-    /// Create state with WAL persistence + genesis accounts.
-    /// On startup: if WAL exists, replay it to recover state. Otherwise start fresh with genesis.
+    /// Create state with WAL persistence + genesis accounts, bound to one
+    /// authenticated genesis/network hash.
+    ///
+    /// A pre-existing WAL without the binding file is deliberately rejected:
+    /// replaying legacy state under a new genesis can make peers authenticate
+    /// as one network while executing different histories. Operators must use
+    /// a fresh data directory or an explicitly approved checkpoint migration.
     pub fn with_genesis_persistent(
         prefunded: &[(Address, u64)],
         wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
     ) -> Result<Self, StateError> {
         let wal_dir = wal_dir.as_ref();
 
@@ -458,6 +472,7 @@ impl StateDB {
         })?;
 
         let wal_path = wal_dir.join("state.wal");
+        Self::verify_or_create_genesis_binding(wal_dir, wal_path.exists(), expected_genesis_hash)?;
 
         if wal_path.exists() {
             // WAL exists - replay to recover state
@@ -506,6 +521,68 @@ impl StateDB {
             );
 
             Ok(state)
+        }
+    }
+
+    fn verify_or_create_genesis_binding(
+        wal_dir: &Path,
+        wal_exists: bool,
+        expected: Hash256,
+    ) -> Result<(), StateError> {
+        let binding_path = wal_dir.join("genesis.network-hash");
+        match std::fs::read_to_string(&binding_path) {
+            Ok(value) => {
+                let actual = Hash256::from_hex(value.trim()).map_err(|_| {
+                    StateError::PersistenceError(format!(
+                        "invalid genesis binding in {:?}; refusing WAL replay",
+                        binding_path
+                    ))
+                })?;
+                if actual != expected {
+                    return Err(StateError::PersistenceError(format!(
+                        "data directory genesis mismatch: {:?} is bound to {}, configured genesis is {}; use a fresh data directory or an approved checkpoint migration",
+                        wal_dir,
+                        actual.to_hex(),
+                        expected.to_hex()
+                    )));
+                }
+                Ok(())
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && wal_exists => {
+                Err(StateError::PersistenceError(format!(
+                    "legacy data directory {:?} contains a WAL but no authenticated genesis binding; refusing replay under the configured network. Back it up, then use a fresh data directory or an approved checkpoint migration",
+                    wal_dir
+                )))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&binding_path)
+                    .map_err(|e| {
+                        StateError::PersistenceError(format!(
+                            "failed to create genesis binding {:?}: {}",
+                            binding_path, e
+                        ))
+                    })?;
+                writeln!(file, "{}", expected.to_hex()).map_err(|e| {
+                    StateError::PersistenceError(format!(
+                        "failed to write genesis binding {:?}: {}",
+                        binding_path, e
+                    ))
+                })?;
+                file.sync_all().map_err(|e| {
+                    StateError::PersistenceError(format!(
+                        "failed to sync genesis binding {:?}: {}",
+                        binding_path, e
+                    ))
+                })?;
+                Ok(())
+            }
+            Err(error) => Err(StateError::PersistenceError(format!(
+                "failed to read genesis binding {:?}: {}",
+                binding_path, error
+            ))),
         }
     }
 
@@ -916,6 +993,29 @@ impl StateDB {
             .unwrap_or(false)
     }
 
+    /// Install the consensus activation schedule parsed from canonical
+    /// genesis. Call once during boot before state sync or consensus starts.
+    pub fn set_community_rewards_v1_activation_height(&self, height: Option<u64>) {
+        self.community_rewards_v1_activation_height
+            .store(height.unwrap_or(u64::MAX), Ordering::Release);
+    }
+
+    pub fn community_rewards_v1_activation_height(&self) -> Option<u64> {
+        match self
+            .community_rewards_v1_activation_height
+            .load(Ordering::Acquire)
+        {
+            u64::MAX => None,
+            height => Some(height),
+        }
+    }
+
+    /// Whether tx 0x25 is a valid state transition at the current height.
+    pub fn community_rewards_v1_active(&self) -> bool {
+        self.community_rewards_v1_activation_height()
+            .is_some_and(|activation| self.height() >= activation)
+    }
+
     /// Reset the validator set to exactly the genesis validators at startup.
     ///
     /// Two problems this solves:
@@ -949,6 +1049,109 @@ impl StateDB {
             .filter(|entry| *entry.value() >= Self::MIN_VALIDATOR_STAKE)
             .map(|entry| (Hash256(*entry.key()), *entry.value()))
             .collect()
+    }
+
+    /// Verify reward-v1's independent off-chain authorization quorum.
+    ///
+    /// Policy is deliberately stronger than either identity count or stake
+    /// alone: approvals must contain strictly more than two thirds of active
+    /// validator identities (`floor(2N/3) + 1`) AND strictly more than two
+    /// thirds of active stake (`floor(2S/3) + 1`). Every signer is unique, active at execution
+    /// time, and uses the fixed Ed25519-only approval representation. The
+    /// outer transaction signer is merely an aggregator and is not counted
+    /// unless it also supplied an explicit approval.
+    fn verify_community_reward_validator_approvals(
+        &self,
+        body: &arc_types::transaction::CommunityInferenceRewardBody,
+    ) -> Result<(), StateError> {
+        use arc_types::transaction::MAX_COMMUNITY_REWARD_APPROVALS;
+
+        if body.validator_approvals.len() > MAX_COMMUNITY_REWARD_APPROVALS {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: {} validator approvals exceeds protocol maximum {}",
+                body.validator_approvals.len(),
+                MAX_COMMUNITY_REWARD_APPROVALS
+            )));
+        }
+
+        let active = self.active_validators();
+        if active.is_empty() {
+            return Err(StateError::ExecutionError(
+                "community inference reward: active validator set is empty".to_string(),
+            ));
+        }
+        if active.len() > MAX_COMMUNITY_REWARD_APPROVALS {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: active validator set size {} exceeds reward-v1 maximum {}",
+                active.len(),
+                MAX_COMMUNITY_REWARD_APPROVALS
+            )));
+        }
+
+        let active_identity_count = u64::try_from(active.len()).map_err(|_| {
+            StateError::ExecutionError(
+                "community inference reward: active validator count exceeds u64::MAX".to_string(),
+            )
+        })?;
+        let required_identities = usize::try_from(arc_types::strict_supermajority_threshold(
+            active_identity_count,
+        ))
+        .map_err(|_| {
+            StateError::ExecutionError(
+                "community inference reward: identity threshold exceeds usize::MAX".to_string(),
+            )
+        })?;
+        if body.validator_approvals.len() < required_identities {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: insufficient validator approval identities: have {}, need {} of {} active validators",
+                body.validator_approvals.len(),
+                required_identities,
+                active.len()
+            )));
+        }
+
+        let active_stakes: HashMap<[u8; 32], u64> = active
+            .iter()
+            .map(|(address, stake)| (address.0, *stake))
+            .collect();
+        let total_active_stake: u128 = active.iter().map(|(_, stake)| u128::from(*stake)).sum();
+        let required_stake = total_active_stake * 2 / 3 + 1;
+        let commitment = body.validator_approval_commitment();
+        let mut seen = HashSet::with_capacity(body.validator_approvals.len());
+        let mut approved_stake = 0u128;
+
+        for approval in &body.validator_approvals {
+            if !seen.insert(approval.validator.0) {
+                return Err(StateError::ExecutionError(format!(
+                    "community inference reward: duplicate validator approval from {}",
+                    approval.validator.to_hex()
+                )));
+            }
+            let Some(stake) = active_stakes.get(&approval.validator.0) else {
+                return Err(StateError::ExecutionError(format!(
+                    "community inference reward: approval signer {} is not an active validator",
+                    approval.validator.to_hex()
+                )));
+            };
+            approval
+                .as_signature()
+                .verify(&commitment, &approval.validator)
+                .map_err(|_| {
+                    StateError::ExecutionError(format!(
+                        "community inference reward: invalid Ed25519 approval from {}",
+                        approval.validator.to_hex()
+                    ))
+                })?;
+            approved_stake += u128::from(*stake);
+        }
+
+        if approved_stake < required_stake {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: insufficient approved stake: have {}, need {} of {} active stake",
+                approved_stake, required_stake, total_active_stake
+            )));
+        }
+        Ok(())
     }
 
     /// Get current block height.
@@ -1219,23 +1422,42 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.execute_block_adaptive_at(transactions, producer, timestamp)
+    }
+
+    /// Execute the canonical transaction sequence using a consensus-provided
+    /// timestamp. Validators committing the same DAG block must build the same
+    /// linear block hash; sampling each machine's wall clock during local
+    /// re-execution made otherwise-identical validators expose different block
+    /// hashes and then carry different parent hashes forever.
+    pub fn execute_block_adaptive_at(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp: u64,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         let mode = crate::block_stm::choose_execution_mode(transactions);
         match mode {
             crate::block_stm::AdaptiveMode::Sequential => {
-                self.execute_block_verified(transactions, producer)
+                self.execute_block_verified_at(transactions, producer, timestamp)
             }
             crate::block_stm::AdaptiveMode::BlockSTM => {
                 // Use BlockSTM partitioned execution
-                self.execute_block_blockstm(transactions, producer)
+                self.execute_block_blockstm_at(transactions, producer, timestamp)
             }
         }
     }
 
     /// Execute a block using BlockSTM partitioned parallel execution.
-    fn execute_block_blockstm(
+    fn execute_block_blockstm_at(
         &self,
         transactions: &[Transaction],
         producer: Address,
+        timestamp: u64,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         use rayon::prelude::*;
 
@@ -1336,10 +1558,7 @@ impl StateDB {
 
         let header = BlockHeader {
             height,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            timestamp,
             parent_hash: parent,
             tx_root,
             state_root,
@@ -1381,6 +1600,20 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.execute_block_verified_at(transactions, producer, timestamp)
+    }
+
+    /// Sequential verified execution with a canonical consensus timestamp.
+    pub fn execute_block_verified_at(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp: u64,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut tx_hashes = Vec::with_capacity(transactions.len());
 
@@ -1421,6 +1654,15 @@ impl StateDB {
                     signature,
                 } = &tx.signature
                 {
+                    // Batch verification proves that `public_key` signed the
+                    // hash, but it does not bind that key to `tx.from`.
+                    // Without this check an attacker could sign a transfer
+                    // from a funded victim with the attacker's own valid key;
+                    // an all-valid batch would then skip `verify_signature`.
+                    if arc_crypto::address_from_ed25519_pubkey(public_key) != tx.from {
+                        batch_sig_valid[i] = Some(false);
+                        continue;
+                    }
                     if signature.len() == 64
                         && let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key)
                     {
@@ -1516,10 +1758,7 @@ impl StateDB {
 
         let header = BlockHeader {
             height,
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as u64,
+            timestamp,
             parent_hash: parent,
             tx_root,
             state_root,
@@ -1610,7 +1849,12 @@ impl StateDB {
                     public_key,
                     signature,
                 } => {
-                    if signature.len() == 64 {
+                    // GPU/CPU batch verifiers validate the signature against
+                    // the supplied public key; authorize the claimed sender
+                    // separately before accepting the fast-path result.
+                    if signature.len() == 64
+                        && arc_crypto::address_from_ed25519_pubkey(public_key) == tx.from
+                    {
                         let mut sig_bytes = [0u8; 64];
                         sig_bytes.copy_from_slice(signature);
                         ed_tasks.push(VerifyTask {
@@ -2333,6 +2577,16 @@ impl StateDB {
                             public_key,
                             signature,
                         } => {
+                            // The batch primitive does not check either hash
+                            // integrity or the ARC address derived from the
+                            // verifying key. Both are consensus authorization
+                            // requirements, even on the benchmark path.
+                            if tx.compute_hash() != tx.hash
+                                || arc_crypto::address_from_ed25519_pubkey(public_key) != tx.from
+                            {
+                                valid = false;
+                                break;
+                            }
                             if let (Ok(vk), Ok(sig)) = (
                                 ed25519_dalek::VerifyingKey::from_bytes(public_key),
                                 <[u8; 64]>::try_from(signature.as_slice())
@@ -2684,6 +2938,7 @@ impl StateDB {
             TxBody::ChannelDispute(_) => gas_costs::CHANNEL_DISPUTE,
             TxBody::ShardProof(_) => gas_costs::SHARD_PROOF,
             TxBody::InferenceAttestation(_) => gas_costs::INFERENCE_ATTESTATION,
+            TxBody::CommunityInferenceReward(_) => gas_costs::COMMUNITY_INFERENCE_REWARD,
             TxBody::InferenceChallenge(_) => gas_costs::INFERENCE_CHALLENGE,
             TxBody::InferenceRegister(_) => gas_costs::INFERENCE_ATTESTATION, // same gas as attestation
             TxBody::InferenceEscrowOpen(_) => gas_costs::INFERENCE_ESCROW_OPEN,
@@ -2707,6 +2962,13 @@ impl StateDB {
     /// compat / benchmark mode), an effectively unlimited gas budget is used
     /// so that no existing transaction can fail due to gas exhaustion.
     fn execute_tx(&self, tx: &Transaction) -> Result<u64, StateError> {
+        if tx.tx_type != tx.body.tx_type() {
+            return Err(StateError::ExecutionError(format!(
+                "transaction type/body mismatch: envelope {:?}, body {:?}",
+                tx.tx_type,
+                tx.body.tx_type()
+            )));
+        }
         // --- Gas metering setup ---
         let effective_limit = if tx.gas_limit > 0 {
             tx.gas_limit
@@ -4248,11 +4510,12 @@ impl StateDB {
             TxBody::InferenceAttestation(body) => {
                 // --- Tier 2 Optimistic Inference Attestation ---
                 //
-                // Net effect for the attester: +reward (a pure transfer from
-                // the treasury) − bond (into a returnable escrow released after
-                // `challenge_period` by the maturation sweep). With reward
-                // 2.5 ARC and a small/zero bond, on-chain income is visibly
-                // positive and auditable against /account/{addr}.
+                // This transaction records a provider's signed model/input/
+                // output commitment and optionally locks a challenge bond. It
+                // does NOT pay a reward by itself: a raw self-signed
+                // attestation has no coordinator-issued job or assignment and
+                // used to let anyone drain the treasury with bond=0. Verified
+                // community jobs are paid by `CommunityInferenceReward`.
 
                 // 1. Verify sender nonce.
                 let mut sender = self.get_or_create_account(&tx.from);
@@ -4264,10 +4527,6 @@ impl StateDB {
                 }
 
                 // 2. Verify sender has sufficient balance for the bond.
-                //    The reward is funded by the treasury, NOT the sender, so it
-                //    does not relax this check: an unfunded worker still gets
-                //    InsufficientBalance and must be faucet-funded before it can
-                //    post a bond — behavior unchanged from before.
                 if sender.balance < body.bond {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -4275,57 +4534,17 @@ impl StateDB {
                     });
                 }
 
-                // 3. Treasury-funded reward: a PURE TRANSFER from
-                //    faucet_pool_address (the testnet treasury sink) to the
-                //    attester, bounded by the treasury's balance. Never minted,
-                //    so total supply is conserved. If the treasury account is
-                //    absent or empty, the reward is skipped (no panic, no
-                //    negative balance, no synthetic tokens). Debit mirrors the
-                //    FaucetClaim conventions (JMT leaf update when enabled, WAL
-                //    append when active). Skipped when the attester *is* the
-                //    treasury, since a self-transfer would otherwise mint.
-                let treasury_addr = arc_types::transaction::faucet_pool_address();
-                let mut paid_reward: u64 = 0;
-                if tx.from != treasury_addr {
-                    let reward = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
-                    if let Some(mut treasury) = self.accounts.get_mut(&treasury_addr.0) {
-                        paid_reward = reward.min(treasury.balance);
-                        if paid_reward > 0 {
-                            treasury.balance -= paid_reward;
-                            if self.use_jmt {
-                                let h = hash_bytes(
-                                    &bincode::serialize(treasury.value()).unwrap_or_default(),
-                                );
-                                self.jmt.lock().update_leaf(treasury_addr.0, h);
-                            }
-                            if self.wal.is_active() {
-                                let snap = treasury.clone();
-                                drop(treasury);
-                                self.wal
-                                    .append(WalOp::SetAccount(treasury_addr, snap), self.height());
-                            }
-                        }
-                    }
-                    // Mark the treasury dirty so the debit is captured in this
-                    // block's state root (the per-tx dirty pass does not know
-                    // about the treasury for this tx type).
-                    if paid_reward > 0 {
-                        self.dirty_accounts.insert(treasury_addr.0);
-                    }
-                }
-
-                // 4. Apply both deltas to the (freshly loaded) sender together
-                //    and persist: attester ends at start + paid_reward − bond.
-                sender.balance = sender.balance - body.bond + paid_reward;
+                // 3. Lock the bond and consume the sender nonce. No treasury
+                // account is read or written on this path.
+                sender.balance -= body.bond;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                // 5. Bond handling.
+                // 4. Bond handling.
                 //    bond == 0 (community-worker path): nothing to lock, so no
-                //    escrow is created and there is nothing to release — the
-                //    attester is simply +reward. bond > 0: lock the bond in a
+                //    escrow is created. bond > 0: lock the bond in a
                 //    deterministic escrow keyed by BLAKE3("arc-inference" ||
                 //    attestation_hash) and queue it for release after
                 //    `challenge_period` blocks. See the escrow encoding at the
@@ -4354,6 +4573,161 @@ impl StateDB {
                         bucket.insert(pos, escrow_addr.0);
                     }
                 }
+
+                Ok(gas.consumed)
+            }
+            TxBody::CommunityInferenceReward(body) => {
+                if !self.community_rewards_v1_active() {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: protocol feature is not active at this height"
+                            .to_string(),
+                    ));
+                }
+                // The outer signer is an active-validator aggregator. It does
+                // not by itself certify off-chain verification; the bounded
+                // approval quorum below is the authorization boundary.
+                if !self.is_validator(&tx.from) {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: signer {} is not an active validator",
+                        tx.from.to_hex()
+                    )));
+                }
+                tx.verify_signature().map_err(|_| {
+                    StateError::ExecutionError(
+                        "community inference reward: invalid validator signature".to_string(),
+                    )
+                })?;
+                let expected_domain =
+                    arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain();
+                if body.chain_domain != expected_domain {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: wrong chain domain".to_string(),
+                    ));
+                }
+                if body.job_id == Hash256::ZERO {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: job_id cannot be zero".to_string(),
+                    ));
+                }
+                if body.max_tokens == 0 {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: max_tokens must be positive".to_string(),
+                    ));
+                }
+                if self.height() > body.expires_at_height {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: job expired at height {} (current {})",
+                        body.expires_at_height,
+                        self.height()
+                    )));
+                }
+
+                let worker_attestation = body.reconstruct_worker_attestation();
+                worker_attestation.verify_signature().map_err(|_| {
+                    StateError::ExecutionError(
+                        "community inference reward: invalid worker certificate signature"
+                            .to_string(),
+                    )
+                })?;
+
+                let treasury_addr = arc_types::transaction::faucet_pool_address();
+                if body.worker == treasury_addr {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: treasury cannot be the worker".to_string(),
+                    ));
+                }
+                let job_marker_addr =
+                    arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    );
+                if self.accounts.contains_key(&job_marker_addr.0) {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: job {} already paid",
+                        body.job_id.to_hex()
+                    )));
+                }
+                let certificate_marker_addr = arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                    &body.chain_domain,
+                    &body.worker,
+                    &body.worker_certificate.attestation_hash,
+                );
+                if self.accounts.contains_key(&certificate_marker_addr.0) {
+                    return Err(StateError::ExecutionError(format!(
+                        "community inference reward: worker certificate {} already paid",
+                        body.worker_certificate.attestation_hash.to_hex()
+                    )));
+                }
+
+                // All cheap structural, certificate, and replay checks happen
+                // before the approval quorum's Ed25519 work. No state has been
+                // mutated yet, so every failure remains atomic.
+                self.verify_community_reward_validator_approvals(body)?;
+
+                // Rewards are all-or-nothing. Partial tail payouts made worker
+                // selection depend on parallel lock order and could fork state.
+                let reward = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+                // Validate the recipient credit before mutating the treasury.
+                // State transitions are not automatically rolled back when an
+                // executor arm returns an error, so every fallible check must
+                // happen before the first write.
+                let mut worker = self.get_or_create_account(&body.worker);
+                worker.balance = worker.balance.checked_add(reward).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "community inference reward: worker balance overflow".to_string(),
+                    )
+                })?;
+                {
+                    let mut treasury =
+                        self.accounts.get_mut(&treasury_addr.0).ok_or_else(|| {
+                            StateError::ExecutionError(
+                                "community inference reward: treasury is not funded".to_string(),
+                            )
+                        })?;
+                    if treasury.balance < reward {
+                        return Err(StateError::InsufficientBalance {
+                            have: treasury.balance,
+                            need: reward,
+                        });
+                    }
+                    treasury.balance -= reward;
+                    if self.wal.is_active() {
+                        let snapshot = treasury.clone();
+                        drop(treasury);
+                        self.wal
+                            .append(WalOp::SetAccount(treasury_addr, snapshot), self.height());
+                    }
+                }
+
+                self.accounts.insert(body.worker.0, worker.clone());
+                self.wal
+                    .append(WalOp::SetAccount(body.worker, worker), self.height());
+
+                // Zero-balance receipt marker. Its metadata is auditable and
+                // makes a second reward for the same job fail even if a
+                // validator signs a transaction with a fresh nonce/hash.
+                let mut job_marker = self.get_or_create_account(&job_marker_addr);
+                job_marker.nonce = 1;
+                job_marker.code_hash = body.worker;
+                job_marker.storage_root = body.output_hash;
+                self.accounts.insert(job_marker_addr.0, job_marker.clone());
+                self.wal.append(
+                    WalOp::SetAccount(job_marker_addr, job_marker),
+                    self.height(),
+                );
+
+                // A second marker reserves the worker-signed certificate
+                // independently of the coordinator-controlled job ID.
+                let mut certificate_marker = self.get_or_create_account(&certificate_marker_addr);
+                certificate_marker.nonce = 1;
+                certificate_marker.code_hash = body.worker;
+                certificate_marker.storage_root = body.job_id;
+                self.accounts
+                    .insert(certificate_marker_addr.0, certificate_marker.clone());
+                self.wal.append(
+                    WalOp::SetAccount(certificate_marker_addr, certificate_marker),
+                    self.height(),
+                );
 
                 Ok(gas.consumed)
             }
@@ -6017,6 +6391,34 @@ impl StateDB {
                     .or_default()
                     .push(tx.hash);
             }
+            TxBody::CommunityInferenceReward(body) => {
+                let job_marker =
+                    arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    );
+                let certificate_marker = arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                    &body.chain_domain,
+                    &body.worker,
+                    &body.worker_certificate.attestation_hash,
+                );
+                self.account_txs
+                    .entry(body.worker.0)
+                    .or_default()
+                    .push(tx.hash);
+                self.account_txs
+                    .entry(job_marker.0)
+                    .or_default()
+                    .push(tx.hash);
+                self.account_txs
+                    .entry(certificate_marker.0)
+                    .or_default()
+                    .push(tx.hash);
+                self.account_txs
+                    .entry(arc_types::transaction::faucet_pool_address().0)
+                    .or_default()
+                    .push(tx.hash);
+            }
             TxBody::InferenceChallenge(body) => {
                 let escrow_addr =
                     hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
@@ -6202,6 +6604,26 @@ impl StateDB {
             TxBody::InferenceAttestation(_) => {
                 let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
+            }
+            TxBody::CommunityInferenceReward(body) => {
+                self.dirty_accounts.insert(body.worker.0);
+                self.dirty_accounts
+                    .insert(arc_types::transaction::faucet_pool_address().0);
+                self.dirty_accounts.insert(
+                    arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                        &body.chain_domain,
+                        &body.job_id,
+                    )
+                    .0,
+                );
+                self.dirty_accounts.insert(
+                    arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                        &body.chain_domain,
+                        &body.worker,
+                        &body.worker_certificate.attestation_hash,
+                    )
+                    .0,
+                );
             }
             TxBody::InferenceChallenge(body) => {
                 let escrow_addr =
@@ -7248,6 +7670,59 @@ mod tests {
         hash_bytes(&[n])
     }
 
+    fn persistent_test_dir(name: &str) -> std::path::PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("arc-state-{name}-{}-{unique}", std::process::id()))
+    }
+
+    #[test]
+    fn persistent_state_is_bound_to_the_authenticated_genesis() {
+        let dir = persistent_test_dir("genesis-binding");
+        let genesis_a = hash_bytes(b"genesis-a");
+        let genesis_b = hash_bytes(b"genesis-b");
+        let prefunded = [(addr(1), 123)];
+
+        let state = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_a).unwrap();
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 123);
+        drop(state);
+
+        let binding = std::fs::read_to_string(dir.join("genesis.network-hash")).unwrap();
+        assert_eq!(binding.trim(), genesis_a.to_hex());
+
+        let recovered = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_a).unwrap();
+        assert_eq!(recovered.get_account(&addr(1)).unwrap().balance, 123);
+        drop(recovered);
+
+        let error = StateDB::with_genesis_persistent(&prefunded, &dir, genesis_b)
+            .err()
+            .expect("mismatched genesis must fail")
+            .to_string();
+        assert!(error.contains("data directory genesis mismatch"), "{error}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_unbound_wal_fails_closed() {
+        let dir = persistent_test_dir("legacy-unbound");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("state.wal"), []).unwrap();
+
+        let error = StateDB::with_genesis_persistent(&[(addr(1), 123)], &dir, hash_bytes(b"g"))
+            .err()
+            .expect("unbound legacy WAL must fail")
+            .to_string();
+        assert!(
+            error.contains("no authenticated genesis binding"),
+            "{error}"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn test_transfer_execution() {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
@@ -7357,6 +7832,268 @@ mod tests {
         let tx2 = Transaction::new_transfer(address, addr(2), 500, 1);
         let (_, receipts2) = state.execute_block_verified(&[tx2], addr(99)).unwrap();
         assert!(!receipts2[0].success);
+    }
+
+    #[test]
+    fn batch_verified_ed25519_cannot_spend_from_a_different_address() {
+        use arc_crypto::signature::KeyPair;
+
+        let victim = KeyPair::generate_ed25519();
+        let attacker = KeyPair::generate_ed25519();
+        let recipient = addr(73);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(victim.address(), starting_balance)]);
+
+        // The transaction hash commits to the victim as `from`, while the
+        // cryptographically valid signature and public key belong to the
+        // attacker. A bare Ed25519 batch check succeeds for that supplied key;
+        // the executor must still reject the ARC-address mismatch.
+        let mut forged = Transaction::new_transfer(victim.address(), recipient, 500, 0);
+        forged.sign(&attacker).unwrap();
+        assert!(forged.verify_signature().is_err());
+
+        let (_, receipts) = state.execute_block_verified(&[forged], addr(99)).unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&victim.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn gpu_verified_rejects_ed25519_signature_from_a_different_address() {
+        use arc_crypto::signature::KeyPair;
+
+        let victim = KeyPair::generate_ed25519();
+        let attacker = KeyPair::generate_ed25519();
+        let recipient = addr(74);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(victim.address(), starting_balance)]);
+
+        let mut forged = Transaction::new_transfer(victim.address(), recipient, 500, 0);
+        forged.sign(&attacker).unwrap();
+        assert!(forged.verify_signature().is_err());
+
+        let (_, receipts) = state
+            .execute_block_gpu_verified(&[forged], addr(99))
+            .unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&victim.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn gpu_verified_rejects_stale_transaction_hash() {
+        use arc_crypto::signature::KeyPair;
+
+        let sender = KeyPair::generate_ed25519();
+        let recipient = addr(75);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(sender.address(), starting_balance)]);
+
+        let mut stale = Transaction::new_transfer(sender.address(), recipient, 500, 0);
+        stale.sign(&sender).unwrap();
+        match &mut stale.body {
+            TxBody::Transfer(body) => body.amount = 750,
+            _ => unreachable!("new_transfer must create a transfer body"),
+        }
+        assert_ne!(stale.compute_hash(), stale.hash);
+
+        let (_, receipts) = state
+            .execute_block_gpu_verified(&[stale], addr(99))
+            .unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&sender.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn signed_benchmark_rejects_ed25519_signature_from_a_different_address() {
+        use arc_crypto::signature::KeyPair;
+
+        let victim = KeyPair::generate_ed25519();
+        let attacker = KeyPair::generate_ed25519();
+        let recipient = addr(76);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(victim.address(), starting_balance)]);
+
+        let mut forged = Transaction::new_transfer(victim.address(), recipient, 500, 0);
+        forged.sign(&attacker).unwrap();
+        assert!(forged.verify_signature().is_err());
+
+        let block = state
+            .execute_block_signed_benchmark(&[forged], addr(99))
+            .unwrap();
+        let stored = state
+            .signed_block_data
+            .get(&block.header.height)
+            .expect("benchmark block must retain its success flags");
+        assert_eq!(stored.value().1.as_slice(), &[false]);
+        assert_eq!(
+            state.get_account(&victim.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn signed_benchmark_rejects_stale_transaction_hash() {
+        use arc_crypto::signature::KeyPair;
+
+        let sender = KeyPair::generate_ed25519();
+        let recipient = addr(77);
+        let starting_balance = 1_000_000;
+        let state = StateDB::with_genesis(&[(sender.address(), starting_balance)]);
+
+        let mut stale = Transaction::new_transfer(sender.address(), recipient, 500, 0);
+        stale.sign(&sender).unwrap();
+        match &mut stale.body {
+            TxBody::Transfer(body) => body.amount = 750,
+            _ => unreachable!("new_transfer must create a transfer body"),
+        }
+        assert_ne!(stale.compute_hash(), stale.hash);
+
+        let block = state
+            .execute_block_signed_benchmark(&[stale], addr(99))
+            .unwrap();
+        let stored = state
+            .signed_block_data
+            .get(&block.header.height)
+            .expect("benchmark block must retain its success flags");
+        assert_eq!(stored.value().1.as_slice(), &[false]);
+        assert_eq!(
+            state.get_account(&sender.address()).unwrap().balance,
+            starting_balance
+        );
+        assert_eq!(
+            state
+                .get_account(&recipient)
+                .map(|account| account.balance)
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn consensus_timestamp_makes_linear_block_hashes_cross_node_deterministic() {
+        use arc_crypto::signature::KeyPair;
+
+        let sender = KeyPair::generate_ed25519();
+        let producer = addr(91);
+        let genesis = [(sender.address(), 1_000_000)];
+        let first = StateDB::with_genesis(&genesis);
+        let second = StateDB::with_genesis(&genesis);
+        let mut tx = Transaction::new_transfer(sender.address(), addr(92), 500, 0);
+        tx.sign(&sender).unwrap();
+
+        let (first_block, first_receipts) = first
+            .execute_block_adaptive_at(std::slice::from_ref(&tx), producer, 1_800_000_000_123)
+            .unwrap();
+        let (second_block, second_receipts) = second
+            .execute_block_adaptive_at(&[tx], producer, 1_800_000_000_123)
+            .unwrap();
+
+        assert!(first_receipts[0].success && second_receipts[0].success);
+        assert_eq!(first_block.header.timestamp, 1_800_000_000_123);
+        assert_eq!(
+            first_block.header.state_root,
+            second_block.header.state_root
+        );
+        assert_eq!(first_block.hash, second_block.hash);
+
+        // The next block also shares the same parent hash, proving divergence
+        // is not merely deferred one height.
+        let (first_next, _) = first
+            .execute_block_adaptive_at(&[], producer, 1_800_000_000_456)
+            .unwrap();
+        let (second_next, _) = second
+            .execute_block_adaptive_at(&[], producer, 1_800_000_000_456)
+            .unwrap();
+        assert_eq!(first_next.header.parent_hash, first_block.hash);
+        assert_eq!(second_next.header.parent_hash, second_block.hash);
+        assert_eq!(first_next.hash, second_next.hash);
+    }
+
+    #[test]
+    fn consensus_timestamp_makes_blockstm_hashes_cross_node_deterministic() {
+        use arc_crypto::signature::KeyPair;
+
+        const TX_COUNT: usize = 128;
+        const TIMESTAMP: u64 = 1_800_000_000_789;
+
+        let senders: Vec<KeyPair> = (0..TX_COUNT).map(|_| KeyPair::generate_ed25519()).collect();
+        let genesis: Vec<(Address, u64)> = senders
+            .iter()
+            .map(|sender| (sender.address(), 1_000))
+            .collect();
+        let transactions: Vec<Transaction> = senders
+            .iter()
+            .enumerate()
+            .map(|(index, sender)| {
+                let recipient = hash_bytes(&[0xb1, index as u8]);
+                let mut tx = Transaction::new_transfer(sender.address(), recipient, 1, 0);
+                tx.sign(sender).unwrap();
+                tx
+            })
+            .collect();
+
+        assert_eq!(
+            crate::block_stm::choose_execution_mode(&transactions),
+            crate::block_stm::AdaptiveMode::BlockSTM,
+            "the regression must exercise execute_block_blockstm_at"
+        );
+
+        let producer = addr(93);
+        let first = StateDB::with_genesis(&genesis);
+        let second = StateDB::with_genesis(&genesis);
+        let (first_block, first_receipts) = first
+            .execute_block_adaptive_at(&transactions, producer, TIMESTAMP)
+            .unwrap();
+        let (second_block, second_receipts) = second
+            .execute_block_adaptive_at(&transactions, producer, TIMESTAMP)
+            .unwrap();
+
+        assert!(first_receipts.iter().all(|receipt| receipt.success));
+        assert!(second_receipts.iter().all(|receipt| receipt.success));
+        assert_eq!(first_block.header.timestamp, TIMESTAMP);
+        assert_eq!(second_block.header.timestamp, TIMESTAMP);
+        assert_eq!(first_block.header.tx_root, second_block.header.tx_root);
+        assert_eq!(
+            first_block.header.state_root,
+            second_block.header.state_root
+        );
+        assert_eq!(first_block.hash, second_block.hash);
     }
 
     #[test]
@@ -8968,6 +9705,11 @@ mod tests {
             .insert(signer.0, StateDB::MIN_VALIDATOR_STAKE);
     }
 
+    fn activate_community_rewards(state: &StateDB) {
+        state.set_community_rewards_v1_activation_height(Some(0));
+        assert!(state.community_rewards_v1_active());
+    }
+
     #[test]
     fn test_faucet_claim_validator_authorized_credits_recipient() {
         let pool_addr = arc_types::transaction::faucet_pool_address();
@@ -9420,15 +10162,11 @@ mod tests {
         );
     }
 
-    // ── Tier 2 attestation economics: reward credit + bond release ──────────
+    // ── Tier 2 attestation bonds + authorized community rewards ────────────
     //
-    // These exercise the "demonstrate income to users" settlement path: a
-    // treasury-funded reward is credited on attestation apply, the bond is a
-    // returnable stake released after the challenge window by the in-block
-    // maturation sweep, and total supply is conserved across every combination
-    // of {faucet, attestation, challenge, bond-release}. This is the bug class
-    // of `test_channel_close_releases_funds`, so conservation is asserted after
-    // every block.
+    // Raw attestations only commit model/input/output and lock an optional
+    // challenge bond. Treasury income is a separate validator-authorized,
+    // job-bound and replay-marked state transition.
 
     const REWARD: u64 = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
 
@@ -9464,8 +10202,97 @@ mod tests {
         )
     }
 
+    fn make_signed_community_reward(
+        validator: &arc_crypto::KeyPair,
+        worker: &arc_crypto::KeyPair,
+        reward_nonce: u64,
+        tag: &[u8],
+        expires_at_height: u64,
+    ) -> Transaction {
+        make_signed_community_reward_with_approvers(
+            validator,
+            worker,
+            reward_nonce,
+            tag,
+            expires_at_height,
+            &[validator],
+        )
+    }
+
+    fn make_signed_community_reward_with_approvers(
+        aggregator: &arc_crypto::KeyPair,
+        worker: &arc_crypto::KeyPair,
+        reward_nonce: u64,
+        tag: &[u8],
+        expires_at_height: u64,
+        approvers: &[&arc_crypto::KeyPair],
+    ) -> Transaction {
+        let mut worker_attestation = make_attestation(worker.address(), 0, 0, 100, tag);
+        worker_attestation.sign(worker).expect("worker signs");
+        let TxBody::InferenceAttestation(attestation) = &worker_attestation.body else {
+            unreachable!();
+        };
+        let mut body = arc_types::transaction::CommunityInferenceRewardBody {
+            chain_domain:
+                arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain(),
+            job_id: hash_bytes(&[b"community-job-v1", tag].concat()),
+            worker: worker.address(),
+            model_id: attestation.model_id,
+            input_hash: attestation.input_hash,
+            output_hash: attestation.output_hash,
+            max_tokens: 16,
+            expires_at_height,
+            worker_certificate: arc_types::transaction::WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: attestation.challenge_period,
+                signature: worker_attestation.signature.clone(),
+            },
+            validator_approvals: Vec::new(),
+        };
+        let commitment = body.validator_approval_commitment();
+        body.validator_approvals = approvers
+            .iter()
+            .map(|approver| {
+                let signature = approver.sign(&commitment).expect("validator approves");
+                arc_types::transaction::CommunityRewardValidatorApproval::from_ed25519_signature(
+                    approver.address(),
+                    signature,
+                )
+                .expect("reward approvals require Ed25519 validators")
+            })
+            .collect();
+        let mut tx =
+            Transaction::new_community_inference_reward(aggregator.address(), reward_nonce, body);
+        tx.sign(aggregator).expect("aggregator signs");
+        tx
+    }
+
+    fn activated_reward_state(
+        worker: Address,
+        treasury_balance: u64,
+        validators: &[(&arc_crypto::KeyPair, u64)],
+    ) -> StateDB {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let state = StateDB::with_genesis(&[(pool, treasury_balance), (worker, 0)]);
+        let validator_stakes: Vec<(Address, u64)> = validators
+            .iter()
+            .map(|(validator, stake)| (validator.address(), *stake))
+            .collect();
+        state.seed_genesis_validators(&validator_stakes);
+        activate_community_rewards(&state);
+        state
+    }
+
+    fn reward_rejection(state: &StateDB, reward: &Transaction) -> String {
+        state
+            .execute_tx(reward)
+            .expect_err("adversarial reward must be rejected")
+            .to_string()
+    }
+
     #[test]
-    fn attestation_reward_credited_from_treasury_bond_locked() {
+    fn raw_attestation_locks_bond_without_treasury_reward() {
         let pool = arc_types::transaction::faucet_pool_address();
         let worker = addr(60);
         let treasury_start = 10 * REWARD;
@@ -9479,16 +10306,13 @@ mod tests {
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Attester: start − bond + reward, nonce +1.
+        // Attester: start − bond, nonce +1. Raw attestations do not pay.
         let w = state.get_account(&worker).unwrap();
-        assert_eq!(w.balance, worker_start - bond + REWARD);
+        assert_eq!(w.balance, worker_start - bond);
         assert_eq!(w.nonce, 1);
 
-        // Treasury debited by exactly the reward.
-        assert_eq!(
-            state.get_account(&pool).unwrap().balance,
-            treasury_start - REWARD
-        );
+        // Treasury is untouched until an authorized reward transaction.
+        assert_eq!(state.get_account(&pool).unwrap().balance, treasury_start);
 
         // Bond locked in escrow, tagged OPEN, refund target = worker.
         let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
@@ -9501,7 +10325,7 @@ mod tests {
     }
 
     #[test]
-    fn attestation_bond_zero_no_escrow_just_reward() {
+    fn raw_bond_zero_attestation_creates_no_escrow_or_reward() {
         let pool = arc_types::transaction::faucet_pool_address();
         let worker = addr(61);
         let state = StateDB::with_genesis(&[(pool, 10 * REWARD), (worker, 0)]);
@@ -9514,8 +10338,8 @@ mod tests {
 
         assert_eq!(
             state.get_account(&worker).unwrap().balance,
-            REWARD,
-            "community worker (bond 0) earns exactly the reward"
+            0,
+            "an unattached self-signed attestation must never earn"
         );
         // No escrow account is created for a zero bond.
         let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
@@ -9528,6 +10352,530 @@ mod tests {
         );
         assert_eq!(state.pending_bond_release_count(), 0);
         assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn authorized_stake_zero_community_reward_pays_exactly_once() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 3 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+        let before = sum_all_balances(&state);
+
+        let reward = make_signed_community_reward(&validator, &worker, 7, b"paid-job", 100);
+        let marker = match &reward.body {
+            TxBody::CommunityInferenceReward(body) => {
+                arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                    &body.chain_domain,
+                    &body.job_id,
+                )
+            }
+            _ => unreachable!(),
+        };
+        let (_, receipts) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(receipts[0].success);
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(state.get_account(&pool).unwrap().balance, 2 * REWARD);
+        let paid = state.get_account(&marker).expect("replay marker");
+        assert_eq!(paid.nonce, 1);
+        assert_eq!(paid.code_hash, worker.address());
+        assert_eq!(sum_all_balances(&state), before, "supply conserved");
+    }
+
+    #[test]
+    fn community_reward_is_rejected_before_genesis_activation() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 2 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        state.set_community_rewards_v1_activation_height(Some(10));
+
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"too-early", 100);
+        let (_, receipts) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, 2 * REWARD);
+        assert_eq!(state.get_account(&worker.address()).unwrap().balance, 0);
+    }
+
+    #[test]
+    fn community_reward_accepts_strict_identity_and_stake_supermajority() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = activated_reward_state(
+            worker.address(),
+            2 * REWARD,
+            &validators
+                .iter()
+                .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+                .collect::<Vec<_>>(),
+        );
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"threshold-success",
+            100,
+            &[&validators[0], &validators[1], &validators[2]],
+        );
+
+        state
+            .execute_tx(&reward)
+            .expect("3 of 4 equal-stake validators");
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+    }
+
+    #[test]
+    fn community_reward_rejects_missing_approvals() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"missing-approvals",
+            100,
+            &[],
+        );
+
+        assert!(
+            reward_rejection(&state, &reward)
+                .contains("insufficient validator approval identities")
+        );
+    }
+
+    #[test]
+    fn community_reward_rejects_duplicate_approval_signer() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"duplicate-approval",
+            100,
+            &[&validators[0], &validators[1], &validators[1]],
+        );
+
+        assert!(reward_rejection(&state, &reward).contains("duplicate validator approval"));
+    }
+
+    #[test]
+    fn community_reward_rejects_inactive_approval_signer() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let outsider = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let mut stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        stakes.push((&outsider, StateDB::MIN_VALIDATOR_STAKE - 1));
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"inactive-approval",
+            100,
+            &[&validators[0], &validators[1], &outsider],
+        );
+
+        assert!(reward_rejection(&state, &reward).contains("is not an active validator"));
+    }
+
+    #[test]
+    fn community_reward_rejects_insufficient_identity_count_even_with_quorum_stake() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let unit = StateDB::MIN_VALIDATOR_STAKE;
+        let stakes = [
+            (&validators[0], 10 * unit),
+            (&validators[1], 10 * unit),
+            (&validators[2], unit),
+            (&validators[3], unit),
+        ];
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"identity-shortfall",
+            100,
+            &[&validators[0], &validators[1]],
+        );
+
+        assert!(reward_rejection(&state, &reward).contains("have 2, need 3"));
+    }
+
+    #[test]
+    fn community_reward_rejects_exactly_two_thirds_of_validator_identities() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"exact-two-thirds-identities",
+            100,
+            &[
+                &validators[0],
+                &validators[1],
+                &validators[2],
+                &validators[3],
+            ],
+        );
+
+        let error = reward_rejection(&state, &reward);
+        assert!(error.contains("have 4, need 5"), "{error}");
+    }
+
+    #[test]
+    fn community_reward_rejects_below_two_thirds_approved_stake() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let unit = StateDB::MIN_VALIDATOR_STAKE;
+        // Three identities satisfy the 3-of-4 count requirement, but the
+        // omitted validator owns most of the active stake.
+        let stakes = [
+            (&validators[0], unit),
+            (&validators[1], unit),
+            (&validators[2], unit),
+            (&validators[3], 10 * unit),
+        ];
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"stake-shortfall",
+            100,
+            &[&validators[0], &validators[1], &validators[2]],
+        );
+
+        let error = reward_rejection(&state, &reward);
+        assert!(error.contains("insufficient approved stake"), "{error}");
+    }
+
+    #[test]
+    fn community_reward_rejects_exactly_two_thirds_approved_stake() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let unit = StateDB::MIN_VALIDATOR_STAKE;
+        // Three identities meet the 3-of-4 count policy, but their stake is
+        // exactly 6/9 = 2/3. Reward authorization requires strictly >2/3.
+        let stakes = [
+            (&validators[0], unit),
+            (&validators[1], unit),
+            (&validators[2], 4 * unit),
+            (&validators[3], 3 * unit),
+        ];
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"exact-two-thirds-stake",
+            100,
+            &[&validators[0], &validators[1], &validators[2]],
+        );
+
+        let error = reward_rejection(&state, &reward);
+        assert!(error.contains("insufficient approved stake"), "{error}");
+        assert!(error.contains("need 600001"), "{error}");
+    }
+
+    #[test]
+    fn community_reward_rejects_approval_after_semantic_field_mutation() {
+        let validators: Vec<arc_crypto::KeyPair> = (0..4)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let stakes: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator, StateDB::MIN_VALIDATOR_STAKE))
+            .collect();
+        let state = activated_reward_state(worker.address(), 2 * REWARD, &stakes);
+        let mut reward = make_signed_community_reward_with_approvers(
+            &validators[0],
+            &worker,
+            1,
+            b"tampered-approval",
+            100,
+            &[&validators[0], &validators[1], &validators[2]],
+        );
+        let TxBody::CommunityInferenceReward(body) = &mut reward.body else {
+            unreachable!();
+        };
+        body.max_tokens += 1;
+        reward.sign(&validators[0]).unwrap();
+
+        assert!(reward_rejection(&state, &reward).contains("invalid Ed25519 approval"));
+    }
+
+    #[test]
+    fn community_reward_rejects_more_than_64_approvals_before_verification() {
+        use arc_types::transaction::MAX_COMMUNITY_REWARD_APPROVALS;
+
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = activated_reward_state(
+            worker.address(),
+            2 * REWARD,
+            &[(&validator, StateDB::MIN_VALIDATOR_STAKE)],
+        );
+        let mut reward =
+            make_signed_community_reward(&validator, &worker, 1, b"too-many-approvals", 100);
+        let TxBody::CommunityInferenceReward(body) = &mut reward.body else {
+            unreachable!();
+        };
+        let approval = body.validator_approvals[0].clone();
+        body.validator_approvals = vec![approval; MAX_COMMUNITY_REWARD_APPROVALS + 1];
+        reward.sign(&validator).unwrap();
+
+        let error = reward_rejection(&state, &reward);
+        assert!(error.contains("exceeds protocol maximum 64"), "{error}");
+    }
+
+    #[test]
+    fn community_reward_replay_with_fresh_nonce_cannot_pay_twice() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 3 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let first = make_signed_community_reward(&validator, &worker, 1, b"same-job", 100);
+        let second = make_signed_community_reward(&validator, &worker, 2, b"same-job", 100);
+        assert!(
+            state
+                .execute_block(&[first], validator.address())
+                .unwrap()
+                .1[0]
+                .success
+        );
+        let pool_after_first = state.get_account(&pool).unwrap().balance;
+        let (_, replay_receipt) = state.execute_block(&[second], validator.address()).unwrap();
+        assert!(!replay_receipt[0].success);
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(state.get_account(&pool).unwrap().balance, pool_after_first);
+    }
+
+    #[test]
+    fn community_reward_cannot_rewrap_one_certificate_under_a_fresh_job_id() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 3 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let first = make_signed_community_reward(&validator, &worker, 1, b"certificate", 100);
+        let mut rewrapped = first.clone();
+        rewrapped.nonce = 2;
+        let TxBody::CommunityInferenceReward(body) = &mut rewrapped.body else {
+            unreachable!();
+        };
+        body.job_id = hash_bytes(b"attacker-controlled-fresh-job-id");
+        rewrapped.sign(&validator).unwrap();
+
+        assert!(
+            state
+                .execute_block(&[first], validator.address())
+                .unwrap()
+                .1[0]
+                .success
+        );
+        let treasury_after_first = state.get_account(&pool).unwrap().balance;
+        let (_, receipts) = state
+            .execute_block(&[rewrapped], validator.address())
+            .unwrap();
+        assert!(!receipts[0].success);
+        assert_eq!(
+            state.get_account(&pool).unwrap().balance,
+            treasury_after_first
+        );
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+    }
+
+    #[test]
+    fn community_reward_rejects_unauthorized_or_mismatched_certificates() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let outsider = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let other_worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 5 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let unauthorized =
+            make_signed_community_reward(&outsider, &worker, 1, b"unauthorized", 100);
+        assert!(!state.execute_block(&[unauthorized], addr(99)).unwrap().1[0].success);
+
+        let mut mismatch = make_signed_community_reward(&validator, &worker, 2, b"mismatch", 100);
+        if let TxBody::CommunityInferenceReward(body) = &mut mismatch.body {
+            body.worker = other_worker.address();
+        }
+        mismatch.sign(&validator).unwrap();
+        assert!(!state.execute_block(&[mismatch], addr(99)).unwrap().1[0].success);
+
+        let mut wrong_domain =
+            make_signed_community_reward(&validator, &worker, 3, b"wrong-domain", 100);
+        if let TxBody::CommunityInferenceReward(body) = &mut wrong_domain.body {
+            body.chain_domain = hash_bytes(b"another-chain");
+        }
+        wrong_domain.sign(&validator).unwrap();
+        assert!(!state.execute_block(&[wrong_domain], addr(99)).unwrap().1[0].success);
+
+        assert_eq!(state.get_account(&worker.address()).unwrap().balance, 0);
+        assert_eq!(state.get_account(&pool).unwrap().balance, 5 * REWARD);
+    }
+
+    #[test]
+    fn community_reward_is_all_or_nothing_when_treasury_is_low() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let partial = REWARD - 1;
+        let state = StateDB::with_genesis(&[(pool, partial), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"low-pool", 100);
+        let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(!receipt[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, partial);
+        assert_eq!(state.get_account(&worker.address()).unwrap().balance, 0);
+    }
+
+    #[test]
+    fn community_reward_overflow_failure_does_not_debit_treasury() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 2 * REWARD), (worker.address(), u64::MAX)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"overflow", 100);
+        let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(!receipt[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, 2 * REWARD);
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn community_reward_rejects_expired_job() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis(&[(pool, 2 * REWARD), (worker.address(), 0)]);
+        seed_validator(&state, validator.address());
+        activate_community_rewards(&state);
+
+        // execute_block increments height to 1 before applying this claim.
+        let reward = make_signed_community_reward(&validator, &worker, 1, b"expired", 0);
+        let (_, receipt) = state.execute_block(&[reward], validator.address()).unwrap();
+        assert!(!receipt[0].success);
+        assert_eq!(state.get_account(&pool).unwrap().balance, 2 * REWARD);
+        assert_eq!(state.get_account(&worker.address()).unwrap().balance, 0);
+    }
+
+    #[test]
+    fn community_reward_sequential_and_blockstm_state_match_at_treasury_tail() {
+        let pool = arc_types::transaction::faucet_pool_address();
+        let validator = arc_crypto::KeyPair::generate_ed25519();
+        let worker_a = arc_crypto::KeyPair::generate_ed25519();
+        let worker_b = arc_crypto::KeyPair::generate_ed25519();
+        let treasury = REWARD + REWARD / 2;
+        let genesis = [
+            (pool, treasury),
+            (worker_a.address(), 0),
+            (worker_b.address(), 0),
+        ];
+        let sequential = StateDB::with_genesis(&genesis);
+        let parallel = StateDB::with_genesis(&genesis);
+        seed_validator(&sequential, validator.address());
+        seed_validator(&parallel, validator.address());
+        activate_community_rewards(&sequential);
+        activate_community_rewards(&parallel);
+
+        let txs = vec![
+            make_signed_community_reward(&validator, &worker_a, 1, b"ordered-a", 100),
+            make_signed_community_reward(&validator, &worker_b, 2, b"ordered-b", 100),
+        ];
+        let (seq_block, seq_receipts) =
+            sequential.execute_block(&txs, validator.address()).unwrap();
+        let (stm_block, stm_receipts) = parallel
+            .execute_block_stm(&txs, validator.address())
+            .unwrap();
+
+        assert_eq!(
+            seq_receipts.iter().map(|r| r.success).collect::<Vec<_>>(),
+            vec![true, false]
+        );
+        assert_eq!(
+            stm_receipts.iter().map(|r| r.success).collect::<Vec<_>>(),
+            vec![true, false]
+        );
+        assert_eq!(
+            sequential.get_account(&worker_a.address()).unwrap().balance,
+            parallel.get_account(&worker_a.address()).unwrap().balance
+        );
+        assert_eq!(
+            sequential.get_account(&worker_b.address()).unwrap().balance,
+            parallel.get_account(&worker_b.address()).unwrap().balance
+        );
+        assert_eq!(seq_block.header.state_root, stm_block.header.state_root);
     }
 
     #[test]
@@ -9558,7 +10906,7 @@ mod tests {
     }
 
     #[test]
-    fn attestation_treasury_dry_bounds_reward_no_mint() {
+    fn raw_attestation_never_drains_partial_treasury() {
         let pool = arc_types::transaction::faucet_pool_address();
         let worker = addr(63);
         let treasury_start = REWARD / 5; // less than a full reward
@@ -9569,10 +10917,8 @@ mod tests {
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(r[0].success);
 
-        // Reward is drained to whatever the treasury held — never more, never
-        // negative, never minted.
-        assert_eq!(state.get_account(&worker).unwrap().balance, treasury_start);
-        assert_eq!(state.get_account(&pool).unwrap().balance, 0);
+        assert_eq!(state.get_account(&worker).unwrap().balance, 0);
+        assert_eq!(state.get_account(&pool).unwrap().balance, treasury_start);
         assert_eq!(sum_all_balances(&state), before, "no tokens minted");
     }
 
@@ -9615,7 +10961,7 @@ mod tests {
         let release_h = state.get_account(&escrow_addr).unwrap().nonce;
         assert_eq!(release_h, 1 + cp, "attestation anchored at block 1");
         let worker_after_attest = state.get_account(&worker).unwrap().balance;
-        assert_eq!(worker_after_attest, 2 * REWARD - bond + REWARD);
+        assert_eq!(worker_after_attest, 2 * REWARD - bond);
 
         // Not released before the window: a sweep one block early is a no-op.
         assert_eq!(state.sweep_matured_bond_releases(release_h - 1), 0);
@@ -9735,7 +11081,7 @@ mod tests {
         assert!(state.execute_block(&[faucet], validator).unwrap().1[0].success);
         conserved!();
 
-        // Block 2: community worker attests (bond 0) → +reward only.
+        // Block 2: community worker attests (bond 0); no implicit reward.
         let a_c = make_attestation(worker_c, 0, 0, 5, b"c");
         assert!(state.execute_block(&[a_c], validator).unwrap().1[0].success);
         conserved!();

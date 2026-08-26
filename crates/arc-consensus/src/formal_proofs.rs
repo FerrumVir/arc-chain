@@ -846,11 +846,12 @@ mod formal_tests {
 
     #[test]
     fn test_bft_one_third_threshold() {
-        // Parametric test with N=4,7,10,13 validators.
+        // Parametric test including N divisible by three, where exactly 2/3
+        // must remain below the strict supermajority threshold.
         // For each N, f = floor((N-1)/3).
         // With exactly f Byzantine -> safety holds.
         // With f+1 Byzantine -> safety may not hold (demonstrate threshold).
-        for n in [4, 7, 10, 13] {
+        for n in [4, 6, 7, 10, 13] {
             let f = (n - 1) / 3; // max tolerable faults
 
             // Test 1: With f Byzantine, system is safe and live
@@ -1182,17 +1183,17 @@ mod formal_tests {
         // One Core (50M) validator = more weight than 5 Spark (500K) validators.
         //
         // Setup: 1 Core (50M) + 5 Spark (500K each = 2.5M)
-        // Total = 52.5M, quorum = ceil(2/3 * 52.5M) = 35_000_002
+        // Total = 52.5M, quorum = floor(2/3 * 52.5M) + 1 = 35_000_001
         // Core alone = 50M >= 35M quorum => Core alone forms quorum
         // All 5 Spark = 2.5M << 35M quorum => Sparks cannot form quorum
         //
         // Note: Spark validators can't produce blocks, so we use Core + Arc mix.
         // 1 Core (50M) + 5 Arc (5M each = 25M), total = 75M
-        // quorum = ceil(2/3 * 75M) = 50_000_002
-        // Core alone = 50M >= 50_000_002? Exactly at threshold!
+        // quorum = floor(2/3 * 75M) + 1 = 50_000_001
+        // Core alone = 50M < 50_000_001: exactly 2/3 is insufficient.
         //
         // Let's use: 1 Core (50M) + 2 Arc (5M each), total = 60M
-        // quorum = ceil(2/3 * 60M) = 40_000_002
+        // quorum = floor(2/3 * 60M) + 1 = 40_000_001
         // Core alone = 50M >= 40M quorum -> YES
         // 2 Arc alone = 10M < 40M -> NO
         let stakes = vec![
@@ -1203,7 +1204,7 @@ mod formal_tests {
         let (vs, addrs) = make_test_validators(&stakes);
 
         assert_eq!(vs.total_stake, STAKE_CORE + 2 * STAKE_ARC); // 60M
-        assert_eq!(vs.quorum, (2u64 * 60_000_000).div_ceil(3)); // 40_000_000
+        assert_eq!(vs.quorum, strict_supermajority_threshold(60_000_000));
 
         // Core alone reaches quorum
         assert!(
@@ -1248,14 +1249,14 @@ mod formal_tests {
     fn test_minimum_quorum_stake() {
         // Calculate exact quorum threshold for given validator set, verify
         // commit only happens when met.
-        for &total_validators in &[4, 7, 10, 13] {
+        for &total_validators in &[4, 6, 7, 10, 13] {
             let stakes: Vec<(u64, u16)> = (0..total_validators)
                 .map(|i| (STAKE_ARC, i as u16 % 4))
                 .collect();
             let (vs, addrs) = make_test_validators(&stakes);
 
             let total_stake = total_validators as u64 * STAKE_ARC;
-            let expected_quorum = (2 * total_stake).div_ceil(3);
+            let expected_quorum = strict_supermajority_threshold(total_stake);
             assert_eq!(
                 vs.quorum, expected_quorum,
                 "N={}: quorum mismatch",
@@ -1443,7 +1444,7 @@ mod formal_tests {
             } else {
                 // Use first quorum-worth of blocks from previous round as parents
                 let prev = &all_blocks[(round - 1) as usize];
-                let min_quorum_count = ((2 * n + 2) / 3) as usize;
+                let min_quorum_count = strict_supermajority_threshold(n as u64) as usize;
                 let parent_count = min_quorum_count.min(prev.len());
                 prev[..parent_count].iter().map(|b| b.hash).collect()
             };

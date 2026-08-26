@@ -782,6 +782,7 @@ impl Pipeline {
                                 | TxBody::ChannelDispute(_)
                                 | TxBody::ShardProof(_)
                                 | TxBody::InferenceAttestation(_)
+                                | TxBody::CommunityInferenceReward(_)
                                 | TxBody::InferenceChallenge(_)
                                 | TxBody::InferenceRegister(_)
                                 | TxBody::InferenceEscrowOpen(_)

@@ -180,11 +180,11 @@ export function Dashboard() {
           <p className="page-subtitle">
             {running
               ? isExternal
-                ? "Your node is live - managed by the system (launchd / systemd)."
-                : "Your node is live. Earnings update every few seconds."
+                ? "The node process is running under launchd or systemd. Peering, compatible work, and reward settlement are separate checks."
+                : "The node process is running. Peering, compatible work, and reward settlement are separate checks."
               : isStarting
                 ? "Starting node — loading model and binding RPC. This can take a few minutes on first run."
-                : "Your node is stopped. Start it to begin earning."}
+                : "Your node is stopped. Start it to sync and make configured compute available."}
           </p>
         </div>
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
@@ -268,9 +268,9 @@ export function Dashboard() {
           <div>
             <strong>Node is starting</strong>
             {startedAt ? ` (${startingElapsedSec}s elapsed)` : ""} — arc-node is
-            loading the GGUF model into memory before binding RPC. Debug builds
-            can take 2-5 minutes; release builds are 10-30 seconds. Switch to
-            Logs tab for live progress.
+            loading its configured model before binding RPC. Startup time
+            depends on the artifact, storage, memory, and CPU. Switch to Logs
+            for measured progress from this process.
           </div>
         </div>
       )}
@@ -318,7 +318,7 @@ export function Dashboard() {
             }}
           >
             <Loader2 size={13} className="spin" />
-            <strong>Connecting to network</strong>
+            <strong>Connecting to peers</strong>
             <span
               style={{
                 fontFamily: "var(--font-mono)",
@@ -356,20 +356,18 @@ export function Dashboard() {
         >
           {status?.coordinatorUrl ? (
             <>
-              <strong>Client mode</strong> — your node has 0 peers, so the app
-              is using the public network through{" "}
-              {hostLabel(status.coordinatorUrl)}. You can faucet, send,
-              and run inference, but{" "}
-              <strong>
-                you won&rsquo;t earn ARC until you have at least one peer
-              </strong>
-              .
+              <strong>Client mode</strong> — your node has 0 peers, so reads and
+              inference requests are using {hostLabel(status.coordinatorUrl)}.
+              Any balance, faucet response, or transaction is scoped to that
+              host while the public seeds remain divergent. This process cannot
+              receive peer-routed community work in its current state.
             </>
           ) : (
             <>
-              <strong>No peers yet</strong> — your node is running but
-              hasn&rsquo;t completed a handshake with any seed. You
-              won&rsquo;t earn ARC until it does.
+              <strong>No peers yet</strong> — your node is running but has not
+              completed a handshake with a configured seed. It cannot receive
+              peer-routed community work in this state. A peer connection alone
+              still does not guarantee assignment or payment.
             </>
           )}{" "}
           The most common cause is a stale peer cache from a prior session
@@ -424,7 +422,7 @@ export function Dashboard() {
 
       <Card featured style={{ marginBottom: "var(--space-6)" }}>
         <CardHeader
-          title="Earnings"
+          title="Mined rewards"
           action={
             earnings?.rank ? (
               <span
@@ -445,12 +443,20 @@ export function Dashboard() {
           }}
         >
           <div>
-            <div
-              className="big-number gradient"
-              data-testid="earnings-total"
-            >
-              <NumberTicker value={earnings?.totalArc ?? 0} digits={2} />
-              <span className="unit">ARC total</span>
+            <div className="big-number gradient" data-testid="earnings-total">
+              {earnings?.fromChain === true ? (
+                <>
+                  <NumberTicker value={earnings.totalArc} digits={2} />
+                  <span className="unit">ARC confirmed</span>
+                </>
+              ) : (
+                <span
+                  style={{ color: "var(--text-muted)" }}
+                  title="This host did not provide the mined community-reward receipt index."
+                >
+                  — <span className="unit">not confirmed</span>
+                </span>
+              )}
             </div>
             <div
               style={{
@@ -464,7 +470,7 @@ export function Dashboard() {
               {/* Rendered only when the chain actually reports it. It used
                   to fall back to `?? 0`, which showed a confident "+0.00
                   today" for a number nobody knew. */}
-              {earnings?.todayArc != null && (
+              {earnings?.fromChain === true && earnings.todayArc != null && (
                 <div>
                   <span style={{ color: "var(--success)" }}>+</span>{" "}
                   <NumberTicker
@@ -474,7 +480,9 @@ export function Dashboard() {
                   />
                 </div>
               )}
-              {earnings?.pendingArc != null && earnings.pendingArc > 0 && (
+              {earnings?.fromChain === true &&
+                earnings.pendingArc != null &&
+                earnings.pendingArc > 0 && (
                 <div>
                   <NumberTicker
                     value={earnings.pendingArc}
@@ -484,16 +492,20 @@ export function Dashboard() {
                 </div>
               )}
               {earnings && !earnings.fromChain && (
-                <div title="Synthesized from this host's recent-inference buffer, not from the chain's earnings endpoint.">
-                  estimated
+                <div title="Recent inference claims are not evidence of payment, so this fallback is not rendered as ARC.">
+                  reward receipt index unavailable
                 </div>
               )}
             </div>
           </div>
           <div>
             <div className="kv">
-              <dt>Attestations</dt>
-              <dd>{formatInt(earnings?.attestations ?? 0)}</dd>
+              <dt>Reward receipts</dt>
+              <dd>
+                {earnings?.fromChain === true
+                  ? formatInt(earnings.attestations)
+                  : "—"}
+              </dd>
               <dt>Last payout</dt>
               {/* A block height is not a timestamp. Passing
                   `last_attestation_block` (~123,462) to formatRelativeTime
@@ -554,23 +566,24 @@ export function Dashboard() {
             children: (
               <p>
                 Other nodes your node has an active QUIC connection to.
-                More peers means faster sync and better fault tolerance.
-                You need at least <code>2</code> peers to serve inference.
+                Peers can improve reachability and fault tolerance, but a peer
+                count is not proof of sync, assignment, verification, or
+                reward eligibility.
               </p>
             ),
           }}
         />
         <StatTile
           icon={Users}
-          label="Network nodes"
+          label="Host validator records"
           value={formatInt(network?.totalNodes ?? 0)}
           info={{
-            title: "Network nodes",
+            title: "Host validator records",
             children: (
               <p>
-                All validators currently participating in consensus
-                network-wide. This is the total size of the ARC testnet.
-                Your node is one of them.
+                Validator records reported by the one chain host selected for
+                this session. Because the public seeds currently diverge, this
+                is not a trustworthy network-wide node count.
               </p>
             ),
           }}
@@ -584,13 +597,13 @@ export function Dashboard() {
             children: (
               <>
                 <p>
-                  ARC uses a DAG (directed acyclic graph) consensus instead
-                  of a single chain. Every round, validators propose blocks
-                  in parallel and reach agreement in ~1&thinsp;s.
+                  This is the selected host&rsquo;s local DAG protocol round.
+                  It can advance even while that host stops sealing blocks.
                 </p>
                 <p>
-                  This number is the current round being voted on - it
-                  ticks up continuously as long as the network is live.
+                  Round progress does not prove block finality or agreement
+                  with the other public seeds. Check block age, hash, and state
+                  root before describing the chain as healthy.
                 </p>
               </>
             ),
@@ -608,9 +621,9 @@ export function Dashboard() {
             title: "Uptime",
             children: (
               <p>
-                How long this node has been connected without restart.
-                Higher uptime builds your reputation score and increases
-                your share of inference requests.
+                How long this node process has run without restart. Uptime is
+                operational evidence only; this client does not claim an
+                uptime-to-work or uptime-to-reward multiplier.
               </p>
             ),
           }}
@@ -622,32 +635,34 @@ export function Dashboard() {
           <CardHeader
             title={
               <span style={{ display: "inline-flex", alignItems: "center" }}>
-                Recent attestations
-                <InfoPopover title="How verifiable inference works">
+                Recent inference claims
+                <InfoPopover title="What this evidence proves">
                   <p>
-                    When someone sends a prompt to arc, the network <strong>executes
-                    the model end-to-end</strong> - sharded across nodes,
-                    each holding a range of transformer layers. Your
-                    node runs its slice and passes the hidden state on.
+                    In the v0.7.12 candidate, a worker is eligible only after
+                    it fully loads the exact model artifact requested. The
+                    coordinator independently recomputes every token through
+                    authenticated 2-of-3 agreement for each layer range.
                   </p>
                   <p>
-                    The final output is hashed (BLAKE3) with the model
-                    weights. A <strong>bonded attestation</strong> carrying{" "}
+                    An <code>InferenceAttestation</code> (<code>0x16</code>)
+                    carrying{" "}
                     <code>(input_hash, output_hash, model_hash)</code> is
-                    posted to the chain - this is what shows up here.
+                    a computation claim. A successful block receipt proves
+                    inclusion on this host; it does not itself prove payment.
                   </p>
                   <p>
-                    A VRF-selected committee of 7 validators re-runs the
-                    same input. If ≥5 agree on the hash, the attestation
-                    is final. If not, the bond is slashable and dispute
-                    resolution runs the inference on-chain via precompile
-                    0x0A.
+                    Payment is a separate <code>CommunityInferenceReward</code>
+                    transaction (<code>0x25</code>). It requires the signed
+                    worker certificate, active reward protocol and approval
+                    collection, strict greater-than-two-thirds validator
+                    identity and stake approval, and a successful mined
+                    receipt. With six equal validators, that means five.
                   </p>
                   <p style={{ color: "var(--text-muted)", fontSize: 11 }}>
-                    Inference is deterministic by construction: INT16
-                    fixed-point, pure integer math, bit-identical on any
-                    chip. On testnet, each settled attestation pays{" "}
-                    <code>2.5 ARC</code>.
+                    Raw <code>0x16</code> attestations pay nothing. The
+                    configured <code>2.5 ARC</code> amount applies only to a
+                    successful mined <code>0x25</code> receipt. This candidate
+                    fails closed while approval collection is unavailable.
                   </p>
                 </InfoPopover>
               </span>
@@ -662,16 +677,7 @@ export function Dashboard() {
                   color: "var(--text-muted)",
                 }}
               >
-                <span
-                  style={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: 999,
-                    background: "var(--success)",
-                    boxShadow: "0 0 6px var(--success)",
-                  }}
-                />
-                Live
+                selected host
               </span>
             }
           />
@@ -679,8 +685,8 @@ export function Dashboard() {
             {!attestations || attestations.length === 0 ? (
               <EmptyState
                 icon={FileSignature}
-                title="No attestations yet"
-                description="When your node serves inference, signed receipts appear here."
+                title="No inference claims on this host"
+                description="A raw 0x16 claim appears here after submission; payment requires a separate successful mined 0x25 reward receipt."
               />
             ) : (
               attestations.slice(0, 6).map((a) => (
@@ -729,16 +735,11 @@ export function Dashboard() {
                     }}
                     title={
                       a.mine
-                        ? "Credited to your address."
-                        : "Submitted by another validator - not your earnings."
+                        ? "Submitted by your address. A raw 0x16 claim is not payment."
+                        : "Submitted by another address. A raw 0x16 claim is not payment."
                     }
                   >
-                    {/* Every row used to read "+2.50" regardless of who
-                        submitted it, so other validators' work appeared as
-                        the user's income. */}
-                    {a.rewardArc != null
-                      ? `+${a.rewardArc.toFixed(2)}`
-                      : "network"}
+                    {a.mine ? "your claim" : "network claim"}
                   </div>
                 </div>
               ))
@@ -779,9 +780,11 @@ export function Dashboard() {
             <dt>Starts with OS</dt>
             <dd data-testid="dashboard-persistence">
               {(config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart)
-                ? loginItem === false
-                  ? "set, but no login item"
-                  : "yes"
+                ? loginItem === true
+                  ? "yes"
+                  : loginItem === false
+                    ? "set, but no login item"
+                    : "not verified"
                 : "no"}
             </dd>
           </div>
@@ -795,15 +798,30 @@ export function Dashboard() {
             }}
             data-testid="dashboard-persistence-note"
           >
-            {(config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart) ? (
+            {(config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart) &&
+            loginItem === true ? (
               <>
-                Your node starts with this computer and resumes contributing as{" "}
-                {config?.modelPath ? "a worker" : "an observer"}
+                The OS login item is registered and ARC is configured to start
+                the node when the app opens. After login it resumes as{" "}
+                {config?.modelPath ? "a worker candidate" : "an observer"}
                 {config?.modelPath
-                  ? " — it serves inference and can earn."
-                  : " — no model is configured, so it follows consensus but is never sent inference work, and earns nothing."}{" "}
-                Governed by &ldquo;Start node on app launch&rdquo; in Settings.
+                  ? " — it advertises compute only after the exact model artifact loads completely; assignment and payment remain separate."
+                  : " — no model is configured, so it cannot execute local model inference."}{" "}
+                Verify process and peer state after every restart.
               </>
+            ) : (config?.autoStart ?? DEFAULT_NODE_CONFIG.autoStart) ? (
+              loginItem === false ? (
+                <>
+                  Start-on-app-launch is enabled, but no OS login item is
+                  registered. ARC will not reopen automatically after login;
+                  open it manually or repair the login item in Settings.
+                </>
+              ) : (
+                <>
+                  Start-on-app-launch is enabled, but OS registration has not
+                  been verified. Do not assume this node resumes after login.
+                </>
+              )
             ) : (
               <>
                 Auto-start is off, so nothing resumes after a reboot until you
@@ -848,12 +866,22 @@ export function Dashboard() {
             </h2>
           </div>
           <div className="kv">
-            <dt>Total inferences</dt>
-            <dd>{formatInt(network?.totalInferences ?? 0)}</dd>
-            <dt>Average TPS</dt>
-            <dd>{formatInt(network?.avgTps ?? 0)}</dd>
-            <dt>Latest block</dt>
-            <dd>{formatInt(network?.latestBlock ?? 0)}</dd>
+            <dt>Host inference records</dt>
+            <dd>
+              {network?.totalInferences != null
+                ? formatInt(network.totalInferences)
+                : "—"}
+            </dd>
+            <dt>Host-reported TPS</dt>
+            <dd>
+              {network?.avgTps != null ? formatInt(network.avgTps) : "—"}
+            </dd>
+            <dt>Host block height</dt>
+            <dd>
+              {network?.latestBlock != null
+                ? formatInt(network.latestBlock)
+                : "—"}
+            </dd>
             {/* Block production has been stalled on most seeds for days.
                 `/health` still reports "ok" because DAG rounds keep
                 advancing, so without this the network looks healthy. */}

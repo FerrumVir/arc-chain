@@ -242,9 +242,10 @@ impl StateSyncManager {
         Ok(target_height)
     }
 
-    /// Fetch a peer's current DAG round state for consensus catch-up.
-    /// Returns (current_round, last_committed_round) so we can initialize
-    /// our consensus engine at the right round instead of starting from 0.
+    /// Fetch a peer's claimed DAG round state for diagnostics.
+    ///
+    /// The returned cursors are unauthenticated and must never initialize or
+    /// advance the consensus engine.
     pub async fn fetch_dag_state(&self, peer_rpc: &str) -> Result<(u64, u64), SyncError> {
         let url = format!("http://{}/sync/dag_state", peer_rpc);
         info!("Fetching DAG state from {}", url);
@@ -278,8 +279,11 @@ impl StateSyncManager {
         Ok((state.current_round, state.last_committed_round))
     }
 
-    /// Full sync: fetch state snapshot + DAG round from a peer.
-    /// This is the complete catch-up protocol for late-joining nodes.
+    /// Fetch an account-state snapshot plus diagnostic DAG cursors from a peer.
+    ///
+    /// This is not complete consensus catch-up: the snapshot and peer cursors
+    /// cannot advance consensus without a separately verified checkpoint and
+    /// quorum certificate.
     pub async fn full_sync_from_peer(
         &self,
         peer_rpc: &str,
@@ -289,18 +293,20 @@ impl StateSyncManager {
         // 1. Sync account state
         let height = self.sync_from_peer(peer_rpc, state).await?;
 
-        // 2. Sync DAG round state so consensus starts at the right round
+        // 2. Treat peer DAG cursors as diagnostic hints only. Account transfer
+        // does not authenticate skipped consensus history or finality.
         match self.fetch_dag_state(peer_rpc).await {
             Ok((round, committed)) => {
-                engine.set_initial_round(round, committed);
+                engine.observe_untrusted_round_hint(round, committed);
                 info!(
-                    "DAG state synced: starting at round {} (committed {})",
+                    "Observed peer DAG hint: round {} (committed {}); local consensus cursors unchanged",
                     round, committed
                 );
             }
             Err(e) => {
                 // Non-fatal: old peers may not have this endpoint yet.
-                // Node will catch up via round fast-forward on first block.
+                // Consensus remains at its locally authenticated cursor until
+                // a verified checkpoint/state-sync protocol is available.
                 warn!("Could not sync DAG state (peer may be old version): {}", e);
             }
         }

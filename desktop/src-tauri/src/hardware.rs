@@ -36,9 +36,10 @@ pub fn detect() -> HardwareInfo {
     }
     .into();
 
-    // Pick a recommended model + estimated earnings based on RAM + GPU.
-    let (recommended_model, estimated_daily_arc, recommended_role) =
-        recommend(ram_gb, gpu_vram_gb);
+    // Recommend only a hardware-fitting role/model. Hardware cannot establish
+    // demand, assignment, validator authorization, or a mined reward receipt,
+    // so this API deliberately carries no earnings estimate.
+    let (recommended_model, recommended_role) = recommend(ram_gb, gpu_vram_gb);
 
     HardwareInfo {
         platform,
@@ -50,22 +51,17 @@ pub fn detect() -> HardwareInfo {
         gpu_vram_gb,
         recommended_model: recommended_model.into(),
         recommended_role: recommended_role.into(),
-        estimated_daily_arc,
     }
 }
 
-fn recommend(ram_gb: u64, gpu_gb: Option<u64>) -> (&'static str, f64, &'static str) {
+fn recommend(ram_gb: u64, gpu_gb: Option<u64>) -> (&'static str, &'static str) {
     let vram = gpu_gb.unwrap_or(0);
     match (ram_gb, vram) {
-        (r, v) if r >= 64 && v >= 24 => {
-            ("Llama-2-70B Q4_K_M (39 GB)", 1200.0, "worker")
-        }
-        (r, v) if r >= 32 && v >= 16 => {
-            ("Llama-2-13B Q4_K_M (7.3 GB)", 420.0, "worker")
-        }
-        (r, _) if r >= 16 => ("Llama-2-7B Q4_K_M (3.8 GB)", 180.0, "worker"),
-        (r, _) if r >= 8 => ("TinyLlama-1.1B Q4 (0.6 GB)", 40.0, "worker"),
-        _ => ("Verifier only (no model)", 8.0, "verifier"),
+        (r, v) if r >= 64 && v >= 24 => ("Llama-2-70B Q4_K_M (39 GB)", "worker"),
+        (r, v) if r >= 32 && v >= 16 => ("Llama-2-13B Q4_K_M (7.3 GB)", "worker"),
+        (r, _) if r >= 16 => ("Llama-2-7B Q4_K_M (3.8 GB)", "worker"),
+        (r, _) if r >= 8 => ("TinyLlama-1.1B Q4 (0.6 GB)", "worker"),
+        _ => ("Verifier only (no model)", "verifier"),
     }
 }
 

@@ -11,7 +11,7 @@ test.describe("InfoPopover (in-context explainers)", () => {
     page,
   }) => {
     // There are multiple info-btn on the dashboard - the attestation one
-    // is inside "Recent attestations" card header.
+    // is inside "Recent inference claims" card header.
     const infoButtons = page.getByTestId("info-btn");
     await expect(infoButtons.first()).toBeVisible();
 
@@ -24,19 +24,21 @@ test.describe("InfoPopover (in-context explainers)", () => {
     await expect(popover).toHaveCount(0);
   });
 
-  test("attestation popover explains sharded inference + committee verification", async ({
+  test("claim popover separates recomputation evidence from payment", async ({
     page,
   }) => {
     const attestHeading = page
-      .locator(".card-title", { hasText: /Recent attestations/i })
+      .locator(".card-title", { hasText: /Recent inference claims/i })
       .first();
     await attestHeading.getByTestId("info-btn").click();
     const popover = page.getByTestId("info-popover");
     await expect(popover).toBeVisible();
-    await expect(popover).toContainText(/sharded/i);
-    await expect(popover).toContainText(/BLAKE3/);
-    await expect(popover).toContainText(/committee/i);
-    await expect(popover).toContainText(/bonded/i);
+    await expect(popover).toContainText(/exact model artifact/i);
+    await expect(popover).toContainText(/2-of-3/i);
+    await expect(popover).toContainText(/0x16/);
+    await expect(popover).toContainText(/pay nothing/i);
+    await expect(popover).toContainText(/0x25/);
+    await expect(popover).toContainText(/five/i);
   });
 
   test("click outside closes the popover", async ({ page }) => {

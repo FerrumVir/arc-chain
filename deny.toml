@@ -58,6 +58,14 @@ allow = [
     # files must be published. Flagged here so that is a decision and not an
     # accident.
     "MPL-2.0",
+    # Public-domain-equivalent and highly permissive licenses already present
+    # in the locked revm/wgpu/wasmer dependency graph. These are policy
+    # approvals, not advisory exceptions.
+    "CC0-1.0",
+    "0BSD",
+    # Boost Software License 1.0 (not the source-available BUSL license) is a
+    # permissive OSI-approved license used by the locked xxhash-rust crate.
+    "BSL-1.0",
     # The workspace's own crates (Cargo.toml [workspace.package] license).
     "BUSL-1.1",
 ]

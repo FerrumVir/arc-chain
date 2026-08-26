@@ -11,9 +11,10 @@
 //! All verification functions are pure (no StateDB required), so light clients
 //! can run them with only the proof data and a trusted state root.
 
-use arc_crypto::{Hash256, MerkleProof, MerkleTree, hash_bytes};
-use arc_types::{Account, Address, BlockHeader};
+use arc_crypto::{Hash256, MerkleProof, MerkleTree, Signature as CryptoSignature, hash_bytes};
+use arc_types::{Account, Address, BlockHeader, strict_supermajority_threshold};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // Proof types
@@ -45,7 +46,9 @@ pub struct StateProof {
 pub struct HeaderProof {
     /// The block header.
     pub header: BlockHeader,
-    /// Validator signature over the header (placeholder - not yet enforced).
+    /// Unverified signature metadata retained for wire compatibility. Header
+    /// verification does not consult this field; authenticity comes from a
+    /// separately verified finality proof over the computed block hash.
     pub validator_signature: Option<Vec<u8>>,
     /// Hash of the parent block header (convenience duplicate of `header.parent_hash`).
     pub parent_hash: Hash256,
@@ -64,12 +67,16 @@ pub struct TxInclusionProof {
     pub block_tx_root: Hash256,
 }
 
-/// Verify finality by checking that signing stake >= 2/3 of total stake.
+/// Check the structural voting-power condition for finality.
+///
+/// This does not verify validator identities or signatures. Call
+/// [`FinalityProof::verify_against_trusted_set`] for cryptographic finality.
 /// This is a pure function - light clients can call it with raw values
 /// obtained from a FinalityProof (defined in arc-consensus).
 pub fn verify_finality_stake(signing_stake: u64, total_stake: u64) -> bool {
-    let quorum = (2 * total_stake).div_ceil(3);
-    signing_stake >= quorum
+    total_stake > 0
+        && signing_stake <= total_stake
+        && signing_stake >= strict_supermajority_threshold(total_stake)
 }
 
 /// Compact aggregate snapshot for light client bootstrapping.
@@ -105,7 +112,9 @@ pub fn verify_state_proof(proof: &StateProof) -> bool {
         return false;
     }
     // The leaf in the proof must be the hash of the serialised account.
-    let account_bytes = bincode::serialize(&proof.account).expect("serializable account");
+    let Ok(account_bytes) = bincode::serialize(&proof.account) else {
+        return false;
+    };
     let expected_leaf = hash_bytes(&account_bytes);
     if proof.merkle_proof.leaf != expected_leaf {
         return false;
@@ -127,7 +136,8 @@ pub fn verify_account_exists(proof: &StateProof) -> bool {
     verify_state_proof(proof)
 }
 
-/// Verify that a sequence of `HeaderProof`s form a valid parent-hash chain.
+/// Verify only that a sequence of `HeaderProof`s forms a consistent parent-hash
+/// chain. This does not authenticate a producer or establish finality.
 ///
 /// Each header (except the first) must reference the previous header's computed
 /// block hash as its `parent_hash`.
@@ -176,15 +186,25 @@ pub struct ValidatorAttestation {
     pub validator_address: Address,
     /// Stake weight of this validator at the time of attestation.
     pub stake: u64,
-    /// Serialized signature bytes over the block hash.
+    /// Bincode-serialized [`arc_crypto::Signature`] over the canonical
+    /// domain-separated finality transcript.
     pub signature_bytes: Vec<u8>,
+}
+
+/// Validator identity and voting power obtained from a trusted checkpoint or
+/// genesis configuration, never from the finality proof being verified.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustedValidator {
+    pub validator_address: Address,
+    pub stake: u64,
 }
 
 /// Proof that a block was finalized by a consensus quorum.
 ///
 /// Contains the block metadata plus a set of validator attestations whose
-/// aggregate stake must meet the supermajority threshold (>= 2/3 + 1 of
-/// total stake) for the proof to be considered valid.
+/// aggregate stake must be strictly greater than two thirds of total stake.
+/// Cryptographic verification additionally requires an external trusted
+/// validator set.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalityProof {
     /// Hash of the finalized block.
@@ -207,7 +227,8 @@ pub struct FinalityProof {
 ///
 /// Combines a finality proof (consensus quorum), a state proof (Merkle
 /// inclusion of an account), and a header proof (block header chain) into
-/// a single verifiable unit.  A light client can call `verify_complete()`
+/// a single verifiable unit. A light client calls `verify_complete()` with a
+/// validator set obtained from a trusted checkpoint or genesis configuration
 /// to check all three layers plus cross-layer consistency.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LightClientBundle {
@@ -223,7 +244,47 @@ pub struct LightClientBundle {
 // FinalityProof implementation
 // ---------------------------------------------------------------------------
 
+fn checked_attestation_stake(attestations: &[ValidatorAttestation]) -> Option<u64> {
+    let mut seen = HashSet::with_capacity(attestations.len());
+    let mut total = 0u64;
+    for attestation in attestations {
+        if !seen.insert(attestation.validator_address) {
+            return None;
+        }
+        total = total.checked_add(attestation.stake)?;
+    }
+    Some(total)
+}
+
 impl FinalityProof {
+    /// Canonical transcript validators sign when attesting to finality.
+    pub fn signing_commitment(
+        block_hash: &Hash256,
+        round: u64,
+        block_height: u64,
+        state_root: &Hash256,
+        total_stake: u64,
+    ) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-light-client-finality-v1");
+        hasher.update(block_hash.as_ref());
+        hasher.update(&round.to_le_bytes());
+        hasher.update(&block_height.to_le_bytes());
+        hasher.update(state_root.as_ref());
+        hasher.update(&total_stake.to_le_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Return this proof's canonical finality-signing transcript.
+    pub fn signing_hash(&self) -> Hash256 {
+        Self::signing_commitment(
+            &self.block_hash,
+            self.round,
+            self.block_height,
+            &self.state_root,
+            self.total_stake,
+        )
+    }
+
     /// Create a new finality proof from validator attestations.
     ///
     /// `signing_stake` is computed automatically from the attestation set.
@@ -235,7 +296,8 @@ impl FinalityProof {
         attestations: Vec<ValidatorAttestation>,
         total_stake: u64,
     ) -> Self {
-        let signing_stake = attestations.iter().map(|a| a.stake).sum();
+        let signing_stake = checked_attestation_stake(&attestations)
+            .expect("finality attestations contain duplicate identities or stake overflow");
         Self {
             block_hash,
             round,
@@ -249,22 +311,17 @@ impl FinalityProof {
 
     /// Compute the supermajority threshold for a given total stake.
     ///
-    /// The threshold is `ceil(2 * total_stake / 3) + 1`, which ensures
-    /// strictly more than two-thirds of stake have attested.
+    /// The threshold is `floor(2 * total_stake / 3) + 1`.
     pub fn supermajority_threshold(total_stake: u64) -> u64 {
-        // ceil(2 * total / 3) = (2 * total + 2) / 3  (integer arithmetic)
-        let two_thirds_ceil = (2 * total_stake).div_ceil(3);
-        two_thirds_ceil + 1
+        strict_supermajority_threshold(total_stake)
     }
 
-    /// Verify that the finality proof has sufficient stake (>= supermajority).
+    /// Check internal stake accounting and the strict quorum threshold.
     ///
-    /// Returns `true` if `signing_stake >= supermajority_threshold(total_stake)`.
-    pub fn verify_quorum(&self) -> bool {
-        if self.total_stake == 0 {
-            return false;
-        }
-        self.signing_stake >= Self::supermajority_threshold(self.total_stake)
+    /// This is not cryptographic verification: attestation stakes are
+    /// self-declared until checked against a trusted validator set.
+    pub fn has_structural_quorum(&self) -> bool {
+        verify_finality_stake(self.signing_stake, self.total_stake)
     }
 
     /// Get the fraction of total stake that signed, as a percentage (0.0–100.0).
@@ -275,25 +332,74 @@ impl FinalityProof {
         (self.signing_stake as f64 / self.total_stake as f64) * 100.0
     }
 
-    /// Verify that the proof is internally consistent.
+    /// Verify that the proof is internally consistent, without trusting it as
+    /// evidence of finality.
     ///
     /// Checks:
     /// 1. At least one attestation exists.
     /// 2. The `signing_stake` field matches the sum of attestation stakes.
     /// 3. The `signing_stake` does not exceed `total_stake`.
     /// 4. The quorum threshold is met.
-    pub fn is_valid(&self) -> bool {
+    pub fn is_structurally_valid(&self) -> bool {
         if self.quorum_signatures.is_empty() {
             return false;
         }
-        let computed_stake: u64 = self.quorum_signatures.iter().map(|a| a.stake).sum();
+        let Some(computed_stake) = checked_attestation_stake(&self.quorum_signatures) else {
+            return false;
+        };
         if computed_stake != self.signing_stake {
             return false;
         }
-        if self.signing_stake > self.total_stake {
+        self.has_structural_quorum()
+    }
+
+    /// Cryptographically verify this proof against validator identities and
+    /// stakes from a trusted checkpoint or genesis configuration.
+    pub fn verify_against_trusted_set(&self, trusted_validators: &[TrustedValidator]) -> bool {
+        if !self.is_structurally_valid() || trusted_validators.is_empty() {
             return false;
         }
-        self.verify_quorum()
+
+        let mut trusted = HashMap::with_capacity(trusted_validators.len());
+        let mut trusted_total = 0u64;
+        for validator in trusted_validators {
+            if trusted
+                .insert(validator.validator_address, validator.stake)
+                .is_some()
+            {
+                return false;
+            }
+            let Some(total) = trusted_total.checked_add(validator.stake) else {
+                return false;
+            };
+            trusted_total = total;
+        }
+        if trusted_total != self.total_stake {
+            return false;
+        }
+
+        let signing_hash = self.signing_hash();
+        for attestation in &self.quorum_signatures {
+            if trusted.get(&attestation.validator_address) != Some(&attestation.stake) {
+                return false;
+            }
+            if attestation.signature_bytes.len() > 8 * 1024 {
+                return false;
+            }
+            let Ok(signature) =
+                bincode::deserialize::<CryptoSignature>(&attestation.signature_bytes)
+            else {
+                return false;
+            };
+            if signature
+                .verify(&signing_hash, &attestation.validator_address)
+                .is_err()
+            {
+                return false;
+            }
+        }
+
+        true
     }
 }
 
@@ -311,17 +417,21 @@ impl LightClientBundle {
         }
     }
 
-    /// Verify the entire bundle: finality + state + header chain consistency.
+    /// Verify the entire bundle against a validator set obtained independently
+    /// from a trusted checkpoint or genesis configuration.
     ///
     /// Checks:
-    /// 1. The finality proof has a valid quorum.
+    /// 1. The finality proof has valid signatures from a trusted quorum.
     /// 2. The state proof Merkle path is valid.
     /// 3. The finality proof's state root matches the state proof's state root.
     /// 4. The header proof's block state root matches the finality proof's state root.
-    /// 5. The finality proof's block height matches the state proof's block height.
-    pub fn verify_complete(&self) -> bool {
-        // 1. Verify finality quorum.
-        if !self.finality_proof.is_valid() {
+    /// 5. The finality proof's block hash and height match the header and state proof.
+    pub fn verify_complete(&self, trusted_validators: &[TrustedValidator]) -> bool {
+        // 1. Verify finality signatures, identities, and trusted voting power.
+        if !self
+            .finality_proof
+            .verify_against_trusted_set(trusted_validators)
+        {
             return false;
         }
 
@@ -340,8 +450,14 @@ impl LightClientBundle {
             return false;
         }
 
-        // 5. Cross-check: block heights are consistent.
-        if self.finality_proof.block_height != self.state_proof.block_height {
+        // 5. Cross-check the finality commitment against the exact header.
+        let header_hash = arc_types::Block::compute_hash(&self.header_proof.header);
+        if self.finality_proof.block_hash != header_hash
+            || self.header_proof.parent_hash != self.header_proof.header.parent_hash
+            || self.finality_proof.block_height != self.state_proof.block_height
+            || self.finality_proof.block_height != self.header_proof.header.height
+            || self.state_proof.timestamp != self.header_proof.header.timestamp
+        {
             return false;
         }
 
@@ -357,7 +473,7 @@ impl LightClientBundle {
 mod tests {
     use super::*;
     use crate::StateDB;
-    use arc_crypto::hash_bytes;
+    use arc_crypto::{KeyPair, hash_bytes};
     use arc_types::Transaction;
 
     fn addr(n: u8) -> Hash256 {
@@ -488,86 +604,101 @@ mod tests {
 
     // -- FinalityProof -------------------------------------------------------
 
-    /// Helper: build a set of validator attestations with the given stakes.
-    fn make_attestations(stakes: &[u64]) -> Vec<ValidatorAttestation> {
-        stakes
+    struct TestCommittee {
+        keys: Vec<KeyPair>,
+        trusted: Vec<TrustedValidator>,
+    }
+
+    fn make_committee(stakes: &[u64]) -> TestCommittee {
+        let keys: Vec<KeyPair> = stakes.iter().map(|_| KeyPair::generate_ed25519()).collect();
+        let trusted = keys
             .iter()
-            .enumerate()
-            .map(|(i, &stake)| ValidatorAttestation {
-                validator_address: addr(100 + i as u8),
+            .zip(stakes)
+            .map(|(key, &stake)| TrustedValidator {
+                validator_address: key.address(),
                 stake,
-                signature_bytes: vec![i as u8; 64], // placeholder signature
+            })
+            .collect();
+        TestCommittee { keys, trusted }
+    }
+
+    fn make_attestations(
+        block_hash: &Hash256,
+        round: u64,
+        block_height: u64,
+        state_root: &Hash256,
+        total_stake: u64,
+        committee: &TestCommittee,
+        signer_indices: &[usize],
+    ) -> Vec<ValidatorAttestation> {
+        let signing_hash = FinalityProof::signing_commitment(
+            block_hash,
+            round,
+            block_height,
+            state_root,
+            total_stake,
+        );
+        signer_indices
+            .iter()
+            .map(|&index| {
+                let key = &committee.keys[index];
+                let signature = key.sign(&signing_hash).unwrap();
+                ValidatorAttestation {
+                    validator_address: key.address(),
+                    stake: committee.trusted[index].stake,
+                    signature_bytes: bincode::serialize(&signature).unwrap(),
+                }
             })
             .collect()
     }
 
     #[test]
     fn test_finality_proof_quorum_sufficient() {
-        // 70% of stake signed - should be valid (threshold is ~68 for total=100).
-        let attestations = make_attestations(&[30, 20, 20]);
-        let proof = FinalityProof::new(
-            hash_bytes(b"block"),
-            1,
-            10,
-            hash_bytes(b"state"),
-            attestations,
-            100,
-        );
-        assert!(proof.verify_quorum(), "70% stake should satisfy quorum");
-        assert!(proof.is_valid());
+        let block_hash = hash_bytes(b"block");
+        let state_root = hash_bytes(b"state");
+        let committee = make_committee(&[30, 20, 20, 30]);
+        let attestations =
+            make_attestations(&block_hash, 1, 10, &state_root, 100, &committee, &[0, 1, 2]);
+        let proof = FinalityProof::new(block_hash, 1, 10, state_root, attestations, 100);
+        assert!(proof.has_structural_quorum());
+        assert!(proof.is_structurally_valid());
+        assert!(proof.verify_against_trusted_set(&committee.trusted));
     }
 
     #[test]
     fn test_finality_proof_quorum_insufficient() {
-        // 60% of stake signed - should be invalid (threshold is 68 for total=100).
-        let attestations = make_attestations(&[30, 30]);
-        let proof = FinalityProof::new(
-            hash_bytes(b"block"),
-            1,
-            10,
-            hash_bytes(b"state"),
-            attestations,
-            100,
-        );
-        assert!(
-            !proof.verify_quorum(),
-            "60% stake should NOT satisfy quorum"
-        );
-        assert!(!proof.is_valid());
+        let block_hash = hash_bytes(b"block");
+        let state_root = hash_bytes(b"state");
+        let committee = make_committee(&[30, 30, 40]);
+        let attestations =
+            make_attestations(&block_hash, 1, 10, &state_root, 100, &committee, &[0, 1]);
+        let proof = FinalityProof::new(block_hash, 1, 10, state_root, attestations, 100);
+        assert!(!proof.has_structural_quorum());
+        assert!(!proof.is_structurally_valid());
+        assert!(!proof.verify_against_trusted_set(&committee.trusted));
     }
 
     #[test]
     fn test_finality_proof_exact_threshold() {
-        // For total_stake=100: threshold = ceil(200/3) + 1 = 67 + 1 = 68.
-        // Exactly 68 should pass.
-        let attestations = make_attestations(&[34, 34]);
-        let proof = FinalityProof::new(
-            hash_bytes(b"block"),
-            1,
-            10,
-            hash_bytes(b"state"),
-            attestations,
-            100,
-        );
-        assert_eq!(proof.signing_stake, 68);
-        assert!(
-            proof.verify_quorum(),
-            "exactly 2/3+1 threshold should satisfy quorum"
-        );
-        assert!(proof.is_valid());
+        let block_hash = hash_bytes(b"block");
+        let state_root = hash_bytes(b"state");
+        let committee = make_committee(&[34, 33, 33]);
+        let attestations =
+            make_attestations(&block_hash, 1, 10, &state_root, 100, &committee, &[0, 1]);
+        let proof = FinalityProof::new(block_hash, 1, 10, state_root, attestations, 100);
+        assert_eq!(proof.signing_stake, 67);
+        assert!(proof.has_structural_quorum());
+        assert!(proof.verify_against_trusted_set(&committee.trusted));
     }
 
     #[test]
     fn test_finality_proof_stake_percentage() {
-        let attestations = make_attestations(&[25, 25, 25]);
-        let proof = FinalityProof::new(
-            hash_bytes(b"block"),
-            1,
-            10,
-            hash_bytes(b"state"),
-            attestations,
-            100,
-        );
+        let block_hash = hash_bytes(b"block");
+        let state_root = hash_bytes(b"state");
+        let committee = make_committee(&[25, 25, 25, 25]);
+        let attestations =
+            make_attestations(&block_hash, 1, 10, &state_root, 100, &committee, &[0, 1, 2]);
+        let proof = FinalityProof::new(block_hash, 1, 10, state_root, attestations, 100);
         let pct = proof.stake_percentage();
         assert!(
             (pct - 75.0).abs() < f64::EPSILON,
@@ -585,27 +716,145 @@ mod tests {
             vec![],
             100,
         );
-        assert!(!proof.is_valid(), "empty attestations should be invalid");
-        assert!(!proof.verify_quorum(), "0 signing stake should fail quorum");
+        assert!(!proof.is_structurally_valid());
+        assert!(!proof.has_structural_quorum());
     }
 
     #[test]
     fn test_supermajority_threshold_calculation() {
-        // For total_stake = 100:
-        //   ceil(200 / 3) + 1 = 67 + 1 = 68
-        assert_eq!(FinalityProof::supermajority_threshold(100), 68);
-
-        // For total_stake = 3:
-        //   ceil(6 / 3) + 1 = 2 + 1 = 3
+        assert_eq!(FinalityProof::supermajority_threshold(0), 1);
+        assert_eq!(FinalityProof::supermajority_threshold(1), 1);
         assert_eq!(FinalityProof::supermajority_threshold(3), 3);
+        assert_eq!(FinalityProof::supermajority_threshold(10), 7);
+        assert_eq!(FinalityProof::supermajority_threshold(100), 67);
+        assert_eq!(
+            FinalityProof::supermajority_threshold(u64::MAX),
+            12_297_829_382_473_034_411
+        );
+    }
 
-        // For total_stake = 10:
-        //   ceil(20 / 3) + 1 = 7 + 1 = 8
-        assert_eq!(FinalityProof::supermajority_threshold(10), 8);
+    #[test]
+    fn test_six_equal_validators_require_five_attestations() {
+        let block_hash = hash_bytes(b"six-validator-block");
+        let state_root = hash_bytes(b"state");
+        let committee = make_committee(&[5, 5, 5, 5, 5, 5]);
 
-        // For total_stake = 1:
-        //   ceil(2 / 3) + 1 = 1 + 1 = 2
-        assert_eq!(FinalityProof::supermajority_threshold(1), 2);
+        let four = FinalityProof::new(
+            block_hash,
+            1,
+            10,
+            state_root,
+            make_attestations(
+                &block_hash,
+                1,
+                10,
+                &state_root,
+                30,
+                &committee,
+                &[0, 1, 2, 3],
+            ),
+            30,
+        );
+        assert!(!four.has_structural_quorum());
+        assert!(!four.verify_against_trusted_set(&committee.trusted));
+
+        let five = FinalityProof::new(
+            block_hash,
+            1,
+            10,
+            state_root,
+            make_attestations(
+                &block_hash,
+                1,
+                10,
+                &state_root,
+                30,
+                &committee,
+                &[0, 1, 2, 3, 4],
+            ),
+            30,
+        );
+        assert!(five.verify_against_trusted_set(&committee.trusted));
+    }
+
+    #[test]
+    fn test_finality_rejects_duplicate_forged_stake_and_invalid_signature() {
+        let block_hash = hash_bytes(b"adversarial-block");
+        let state_root = hash_bytes(b"state");
+        let committee = make_committee(&[5, 5, 5, 5, 5, 5]);
+        let mut proof = FinalityProof::new(
+            block_hash,
+            1,
+            10,
+            state_root,
+            make_attestations(
+                &block_hash,
+                1,
+                10,
+                &state_root,
+                30,
+                &committee,
+                &[0, 1, 2, 3, 4],
+            ),
+            30,
+        );
+
+        let mut duplicate = proof.clone();
+        duplicate
+            .quorum_signatures
+            .push(duplicate.quorum_signatures[0].clone());
+        duplicate.signing_stake += 5;
+        assert!(!duplicate.is_structurally_valid());
+        assert!(!duplicate.verify_against_trusted_set(&committee.trusted));
+
+        let mut forged_stake = proof.clone();
+        forged_stake.quorum_signatures[0].stake = 10;
+        forged_stake.signing_stake = 30;
+        assert!(forged_stake.is_structurally_valid());
+        assert!(!forged_stake.verify_against_trusted_set(&committee.trusted));
+
+        let metadata_mutations: [fn(&mut FinalityProof); 3] = [
+            |candidate: &mut FinalityProof| candidate.round += 1,
+            |candidate: &mut FinalityProof| candidate.block_height += 1,
+            |candidate: &mut FinalityProof| candidate.state_root = hash_bytes(b"forged-root"),
+        ];
+        for mutate in metadata_mutations {
+            let mut altered_metadata = proof.clone();
+            mutate(&mut altered_metadata);
+            assert!(altered_metadata.is_structurally_valid());
+            assert!(
+                !altered_metadata.verify_against_trusted_set(&committee.trusted),
+                "signatures must bind round, height, and state root"
+            );
+        }
+
+        let last = proof.quorum_signatures[0].signature_bytes.len() - 1;
+        proof.quorum_signatures[0].signature_bytes[last] ^= 1;
+        assert!(!proof.verify_against_trusted_set(&committee.trusted));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate identities or stake overflow")]
+    fn test_finality_constructor_rejects_attestation_stake_overflow() {
+        let block_hash = hash_bytes(b"overflow-block");
+        let state_root = hash_bytes(b"state");
+        let committee = make_committee(&[u64::MAX, 1]);
+        FinalityProof::new(
+            block_hash,
+            1,
+            10,
+            state_root,
+            make_attestations(
+                &block_hash,
+                1,
+                10,
+                &state_root,
+                u64::MAX,
+                &committee,
+                &[0, 1],
+            ),
+            u64::MAX,
+        );
     }
 
     // -- LightClientBundle ---------------------------------------------------
@@ -623,7 +872,16 @@ mod tests {
         let block_hash = arc_types::Block::compute_hash(&header_proof.header);
 
         // Build a finality proof that matches the state root from the proofs.
-        let attestations = make_attestations(&[40, 40]);
+        let committee = make_committee(&[40, 40, 20]);
+        let attestations = make_attestations(
+            &block_hash,
+            1,
+            state_proof.block_height,
+            &state_proof.state_root,
+            100,
+            &committee,
+            &[0, 1],
+        );
         let finality = FinalityProof::new(
             block_hash,
             1,
@@ -635,7 +893,7 @@ mod tests {
 
         let bundle = LightClientBundle::new(finality, state_proof, header_proof);
         assert!(
-            bundle.verify_complete(),
+            bundle.verify_complete(&committee.trusted),
             "bundle with consistent hashes should verify"
         );
     }
@@ -653,7 +911,16 @@ mod tests {
 
         // Use a WRONG state root in the finality proof.
         let wrong_state_root = hash_bytes(b"wrong-state-root");
-        let attestations = make_attestations(&[40, 40]);
+        let committee = make_committee(&[40, 40, 20]);
+        let attestations = make_attestations(
+            &block_hash,
+            1,
+            state_proof.block_height,
+            &wrong_state_root,
+            100,
+            &committee,
+            &[0, 1],
+        );
         let finality = FinalityProof::new(
             block_hash,
             1,
@@ -665,7 +932,7 @@ mod tests {
 
         let bundle = LightClientBundle::new(finality, state_proof, header_proof);
         assert!(
-            !bundle.verify_complete(),
+            !bundle.verify_complete(&committee.trusted),
             "bundle with mismatched state roots should fail"
         );
     }

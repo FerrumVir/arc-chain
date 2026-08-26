@@ -5,14 +5,14 @@
 # Take an inference attestation tx_hash, fetch its recorded details
 # (input, output, model_id, output_hash), re-run the SAME input through
 # the SAME coordinator, and verify the new output_hash matches the
-# original. Independent third-party verification of any past inference run.
+# original. This is a reported-commitment comparison, not payment proof or
+# exact-artifact verification unless the selected candidate exposes those fields.
 #
-# Usage:
-#   curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \
-#     | bash -s -- --latest
+# Usage from a reviewed checkout:
+#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
 #
 #   # Or with a specific tx_hash:
-#   curl -sSL .../arc-verify.sh | bash -s -- 0x933b8616d6712baff21bc9083705f7715da4a9fd20d1815c6412426d8f071c24
+#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh 0x933b8616d6712baff21bc9083705f7715da4a9fd20d1815c6412426d8f071c24
 #
 #   # Or with a custom coordinator:
 #   ARC_COORDINATOR=http://your-node:9090 bash arc-verify.sh <tx_hash>
@@ -31,24 +31,17 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-SEED_LIST_DEFAULT="http://104.238.171.11:9090 http://136.244.109.1:9090 http://140.82.16.112:9090 http://202.182.107.41:9090 http://149.28.153.31:9090 http://149.28.32.76:9090"
-
-# ── Pick a live coordinator by probing seeds (override with ARC_COORDINATOR)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-PICK="$SCRIPT_DIR/arc-pick-coordinator.sh"
-if [ ! -f "$PICK" ]; then
-    PICK=$(mktemp)
-    curl -fsSL "https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh" -o "$PICK" 2>/dev/null || true
+if [ -z "${ARC_COORDINATOR:-}" ]; then
+    printf 'ERROR: set ARC_COORDINATOR to a reviewed candidate or local test endpoint.\n' >&2
+    printf 'Automatic public-fleet discovery is disabled during production recovery.\n' >&2
+    exit 78
 fi
-if [ -z "${ARC_COORDINATOR:-}" ] && [ -s "$PICK" ]; then
-    ARC_COORDINATOR=$(bash "$PICK" 2>/dev/null || echo "")
-fi
-COORDINATOR="${ARC_COORDINATOR:-http://104.238.171.11:9090}"
+COORDINATOR="$ARC_COORDINATOR"
 TX_HASH="${1:-}"
 
 # Seeds to sweep when the chosen coordinator has no record. The coordinator is
 # always tried first; the rest follow in order.
-ARC_SEEDS_SWEEP="${ARC_SEEDS_SWEEP:-$SEED_LIST_DEFAULT}"
+ARC_SEEDS_SWEEP="${ARC_SEEDS_SWEEP:-$COORDINATOR}"
 
 # Colors
 if [ -t 1 ]; then
@@ -67,9 +60,8 @@ USAGE:
   arc-verify.sh --latest            # verify the newest attestation on the network
   arc-verify.sh -l                  # short form
 
-  # Live against the testnet (default):
-  curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh \\
-    | bash -s -- --latest
+  # From a reviewed checkout:
+  ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
 
   # Or against your own coordinator:
   ARC_COORDINATOR=http://localhost:9944 bash arc-verify.sh --latest

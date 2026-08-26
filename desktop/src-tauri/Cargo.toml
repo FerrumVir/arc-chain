@@ -1,9 +1,10 @@
 [package]
 name = "arc-desktop"
-version = "0.7.11"
+version = "0.7.12"
 description = "ARC Node - desktop app"
 authors = ["FerrumVir"]
 edition = "2021"
+license = "BUSL-1.1"
 
 [lib]
 name = "arc_desktop_lib"
@@ -36,6 +37,7 @@ hex = "0.4"
 bip39 = "2.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 blake3 = "1.5"
+sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

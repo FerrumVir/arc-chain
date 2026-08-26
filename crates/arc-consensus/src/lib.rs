@@ -14,10 +14,11 @@
 //! This provides two-round latency for commit finality.
 
 use arc_crypto::{Hash256, KeyPair, Signature as CryptoSignature};
-use arc_types::{Transaction, TxBody};
+use arc_types::{Transaction, TxBody, strict_supermajority_threshold};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -201,6 +202,28 @@ impl Validator {
     }
 }
 
+fn checked_validator_total_stake(validators: &[Validator]) -> Result<u64, ConsensusError> {
+    let mut seen = HashSet::with_capacity(validators.len());
+    let mut total = 0u64;
+    for validator in validators {
+        if StakeTier::from_stake(validator.stake) != Some(validator.tier) {
+            return Err(ConsensusError::InvalidBlock(format!(
+                "validator {} has invalid stake/tier metadata",
+                validator.address
+            )));
+        }
+        if !seen.insert(validator.address) {
+            return Err(ConsensusError::InvalidBlock(
+                "duplicate validator address in validator set".into(),
+            ));
+        }
+        total = total.checked_add(validator.stake).ok_or_else(|| {
+            ConsensusError::InvalidBlock("total validator stake exceeds u64::MAX".into())
+        })?;
+    }
+    Ok(total)
+}
+
 // ── Validator Set ────────────────────────────────────────────────────────────
 
 /// The set of active validators for an epoch.
@@ -212,7 +235,8 @@ pub struct ValidatorSet {
     pub total_stake: u64,
     /// Current epoch number.
     pub epoch: u64,
-    /// Quorum threshold: ceil(2/3 * total_stake).
+    /// Quorum threshold: the minimum stake strictly greater than 2/3 of the
+    /// total stake.
     pub quorum: u64,
     pub slashed_total: u64,
     pub slash_history: Vec<SlashRecord>,
@@ -220,11 +244,11 @@ pub struct ValidatorSet {
 
 impl ValidatorSet {
     /// Create a new validator set for the given epoch.
-    /// Computes total_stake and quorum (ceiling of 2/3 * total_stake).
+    /// Computes total stake and the strict >2/3 quorum threshold.
     pub fn new(validators: Vec<Validator>, epoch: u64) -> Self {
-        let total_stake: u64 = validators.iter().map(|v| v.stake).sum();
-        // quorum = ceil(2 * total_stake / 3)
-        let quorum = (2 * total_stake).div_ceil(3);
+        let total_stake = checked_validator_total_stake(&validators)
+            .unwrap_or_else(|err| panic!("invalid validator set: {err}"));
+        let quorum = strict_supermajority_threshold(total_stake);
         Self {
             validators,
             total_stake,
@@ -255,19 +279,22 @@ impl ValidatorSet {
     /// Compute the fault tolerance threshold f.
     /// In BFT: n = 3f + 1, so f = (n-1)/3 in terms of validators.
     /// For stake-weighted: f = floor((total_stake - 1) / 3)
-    /// The quorum is total_stake - f = ceil(2/3 * total_stake).
+    /// The quorum is total_stake - f and is strictly greater than 2/3 stake.
     pub fn fault_tolerance_stake(&self) -> u64 {
         // f such that quorum = total_stake - f
-        self.total_stake - self.quorum
+        self.total_stake.saturating_sub(self.quorum)
     }
 
     /// Compute the total stake for a given set of validator addresses.
-    /// Unknown addresses are skipped.
+    /// Unknown and duplicate addresses are skipped.
     pub fn stake_for_addresses(&self, addresses: &[Address]) -> u64 {
+        let mut seen = HashSet::with_capacity(addresses.len());
         addresses
             .iter()
-            .filter_map(|addr| self.get_validator(addr).map(|v| v.stake))
-            .sum()
+            .filter(|address| seen.insert(**address))
+            .filter_map(|address| self.get_validator(address).map(|validator| validator.stake))
+            .try_fold(0u64, u64::checked_add)
+            .expect("unique validator stake cannot exceed checked total stake")
     }
 
     /// Check if a set of validator addresses reaches quorum.
@@ -324,7 +351,13 @@ impl ValidatorSet {
                 ConsensusError::SlashError(format!("validator {:?} not found", offender))
             })?;
         let rate = Self::slash_rate(&validator.tier);
-        let slash_amount = validator.stake * rate / 100;
+        let slash_amount = ((validator.stake as u128 * rate as u128) / 100) as u64;
+        let new_slashed_total = self
+            .slashed_total
+            .checked_add(slash_amount)
+            .ok_or_else(|| {
+                ConsensusError::SlashError("cumulative slashed stake exceeds u64::MAX".into())
+            })?;
         let record = SlashRecord {
             offense,
             offender,
@@ -333,7 +366,7 @@ impl ValidatorSet {
             timestamp,
             slash_amount,
         };
-        self.slashed_total += slash_amount;
+        self.slashed_total = new_slashed_total;
         self.slash_history.push(record.clone());
         Ok(record)
     }
@@ -367,8 +400,9 @@ impl ValidatorSet {
             self.validators.retain(|v| v.address != *offender);
         }
         // Recalculate total stake and quorum
-        self.total_stake = self.validators.iter().map(|v| v.stake).sum();
-        self.quorum = (self.total_stake * 2).div_ceil(3); // ceil(2/3 * total)
+        self.total_stake = checked_validator_total_stake(&self.validators)
+            .expect("slashing cannot overflow or duplicate validator stake");
+        self.quorum = strict_supermajority_threshold(self.total_stake);
     }
 }
 
@@ -508,9 +542,8 @@ pub struct CrossShardProof {
 
 // ── Finality Proof (A8: Light Client Finality Proofs) ────────────────────────
 
-/// Proof that a block has been finalized by a quorum of validators.
-/// Light clients can verify this without replaying the DAG - they just
-/// check that >= 2/3 stake signed the block hash.
+/// Structural container reserved for a future canonical finality-signing
+/// protocol. Stake arithmetic alone does not authenticate its signatures.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FinalityProof {
     /// Hash of the finalized block.
@@ -520,7 +553,7 @@ pub struct FinalityProof {
     /// Block height (sequential number for the committed chain).
     pub height: u64,
     /// Quorum signatures: (validator_address, signature_bytes).
-    /// Must represent >= 2/3 of total stake.
+    /// Must represent strictly more than 2/3 of total stake.
     pub quorum_signatures: Vec<(Address, Vec<u8>)>,
     /// Total stake that signed.
     pub signing_stake: u64,
@@ -529,10 +562,10 @@ pub struct FinalityProof {
 }
 
 impl FinalityProof {
-    /// Verify that the proof has sufficient stake (>= 2/3 total).
+    /// Check only the structural stake threshold (>2/3 total). This does not
+    /// verify signature identities or signed-message binding.
     pub fn has_sufficient_stake(&self) -> bool {
-        // quorum = ceil(2/3 * total_stake)
-        let quorum = (2 * self.total_stake).div_ceil(3);
+        let quorum = strict_supermajority_threshold(self.total_stake);
         self.signing_stake >= quorum
     }
 }
@@ -593,9 +626,8 @@ pub struct ConsensusEngine {
     /// This node's signing keypair for block proposals.
     /// None only in legacy test mode - production always has a keypair.
     local_keypair: Option<KeyPair>,
-    /// Testnet mode: relax validator registration, parent quorum, and slashing
-    /// checks to handle peer join races and node restarts. Production mode
-    /// enforces strict validation.
+    /// Testnet mode may suppress punitive slashing. Membership, round-jump,
+    /// and parent-quorum validation remain strict.
     testnet_mode: bool,
     /// Registered validator public keys: address -> Ed25519 verifying key bytes.
     validator_keys: DashMap<Address, [u8; 32]>,
@@ -609,18 +641,19 @@ pub struct ConsensusEngine {
     pub pending_cross_shard: DashMap<Hash256, CrossShardProof>,
     /// Completed cross-shard proofs.
     pub completed_cross_shard: DashMap<Hash256, CrossShardProof>,
-    /// Finality proofs: block_hash -> FinalityProof.
-    /// Generated when blocks are committed with quorum signatures.
-    pub finality_proofs: DashMap<Hash256, FinalityProof>,
+    /// Finality proofs: block_hash -> FinalityProof. Kept empty until a
+    /// canonical finality-signing transcript is implemented.
+    finality_proofs: DashMap<Hash256, FinalityProof>,
     /// Liveness: when the current round started (for proposer failover).
     round_start: RwLock<std::time::Instant>,
-    /// Set to `true` after `force_advance_round()`. When true, `propose_block()`
-    /// will accept whatever parents are available (even below quorum) to recover
-    /// from stalls. Cleared after a successful normal `advance_round()`.
+    /// Set to `true` after `force_advance_round()` for diagnostics. It never
+    /// relaxes parent membership or quorum checks. Cleared after a successful
+    /// normal `advance_round()`.
     force_advanced: std::sync::atomic::AtomicBool,
     /// Tracks expected vs received blocks to detect withholding attacks.
     withholding_detector: parking_lot::Mutex<WithholdingDetector>,
-    /// Stores finalized checkpoints for long-range attack prevention.
+    /// Stores only externally certified checkpoints. It remains empty until
+    /// canonical state-root checkpoint signatures are collected.
     checkpoint_registry: parking_lot::Mutex<CheckpointRegistry>,
     /// Tracks validator votes to detect double-voting (nothing-at-stake).
     stake_tracker: parking_lot::Mutex<StakeTracker>,
@@ -714,8 +747,9 @@ impl ConsensusEngine {
         }
     }
 
-    /// Create a consensus engine in testnet mode. Relaxes validator registration,
-    /// parent quorum, and slashing checks to handle peer join races and restarts.
+    /// Create a consensus engine in testnet mode. Consensus membership, round,
+    /// and parent-quorum checks remain strict; only punitive slashing behavior
+    /// may be suppressed for explicit test deployments.
     pub fn new_testnet(validator_set: ValidatorSet, local_address: Address) -> Self {
         info!(
             epoch = validator_set.epoch,
@@ -727,7 +761,9 @@ impl ConsensusEngine {
         engine
     }
 
-    /// Create a testnet-mode engine with a signing keypair.
+    /// Create a testnet-mode engine with a signing keypair. Testnet mode may
+    /// suppress slashing, but retains membership, round-jump, and parent-quorum
+    /// validation.
     pub fn new_testnet_with_keypair(
         validator_set: ValidatorSet,
         local_address: Address,
@@ -754,21 +790,43 @@ impl ConsensusEngine {
         self.last_committed_round.load(Ordering::SeqCst)
     }
 
-    /// Set the initial round state from a peer sync.
-    /// Used when a node joins late and needs to start at the network's current round
-    /// instead of round 0. This prevents permanent partition from genesis round mismatch.
-    pub fn set_initial_round(&self, round: u64, committed: u64) {
+    /// Restore round cursors from this node's authenticated local WAL.
+    ///
+    /// Network messages must never call this method. Remote round hints do not
+    /// prove skipped leader decisions or committed history.
+    pub fn restore_round_from_local_wal(&self, round: u64, committed: u64) {
+        if committed > round {
+            warn!(
+                round,
+                committed, "Ignoring inconsistent local WAL round cursors"
+            );
+            return;
+        }
         let current = self.current_round.load(Ordering::SeqCst);
         if round > current {
             self.current_round.store(round, Ordering::SeqCst);
             self.last_committed_round.store(committed, Ordering::SeqCst);
             self.reset_round_timer();
             tracing::info!(
-                "Set initial round from peer sync: round={}, committed={}",
+                "Restored round cursors from local WAL: round={}, committed={}",
                 round,
                 committed
             );
         }
+    }
+
+    /// Record an unauthenticated peer round hint without mutating consensus
+    /// state. A future state-sync protocol may use the hint to request a
+    /// checkpoint, but only verified checkpoint/quorum evidence can move the
+    /// round or commit cursors.
+    pub fn observe_untrusted_round_hint(&self, round: u64, committed: u64) {
+        debug!(
+            hinted_round = round,
+            hinted_committed = committed,
+            local_round = self.current_round(),
+            local_committed = self.last_committed_round(),
+            "Observed unauthenticated round hint; consensus cursors unchanged"
+        );
     }
 
     /// Get the frozen validator set (used for leader selection and commit decisions).
@@ -797,27 +855,21 @@ impl ConsensusEngine {
         };
         // Locks released here
 
-        // Merge without holding any locks.
-        // Normalize all stakes to the maximum observed - different nodes may
-        // see slightly different stake values due to PeerConnected race.
-        // This ensures all nodes freeze byte-identical validator sets.
+        // Merge without holding any locks. Pending membership must come from
+        // an authenticated governance path; transport discovery is never
+        // queued here.
         let mut all = validators;
         for pv in &pending {
             if let Some(existing) = all.iter_mut().find(|v| v.address == pv.address) {
-                existing.stake = existing.stake.max(pv.stake); // Take higher
+                *existing = pv.clone();
             } else {
                 all.push(pv.clone());
             }
         }
-        // Normalize: use the most common stake value for all validators
-        if !all.is_empty() {
-            let max_stake = all.iter().map(|v| v.stake).max().unwrap_or(0);
-            for v in &mut all {
-                v.stake = max_stake;
-            }
-        }
 
-        let new_epoch = old_epoch + 1;
+        let new_epoch = old_epoch
+            .checked_add(1)
+            .expect("validator epoch cannot advance beyond u64::MAX");
         let new_set = ValidatorSet::new(all, new_epoch);
         info!(
             epoch = new_epoch,
@@ -827,7 +879,9 @@ impl ConsensusEngine {
             "Epoch transition: frozen validator set updated"
         );
 
-        // Short write locks
+        // Short write locks. Active validation and deterministic leader/commit
+        // selection move to the exact same canonical epoch set.
+        *self.validator_set.write() = new_set.clone();
         *self.frozen_validator_set.write() = new_set;
         self.pending_validators.write().clear();
     }
@@ -865,9 +919,12 @@ impl ConsensusEngine {
         }
         let validator = Validator::new(address, stake, shard)
             .ok_or_else(|| ConsensusError::InvalidBlock("invalid stake".into()))?;
+        let new_total_stake = vs.total_stake.checked_add(stake).ok_or_else(|| {
+            ConsensusError::InvalidBlock("total validator stake exceeds u64::MAX".into())
+        })?;
         vs.validators.push(validator);
-        vs.total_stake += stake;
-        vs.quorum = (2 * vs.total_stake).div_ceil(3);
+        vs.total_stake = new_total_stake;
+        vs.quorum = strict_supermajority_threshold(vs.total_stake);
         drop(vs);
         self.register_validator_key(address, pubkey);
         info!(%address, stake, "Validator joined the active set");
@@ -882,12 +939,8 @@ impl ConsensusEngine {
             .map(|v| v.stake)
             .ok_or_else(|| ConsensusError::InvalidBlock("address not in validator set".into()))?;
         vs.validators.retain(|v| v.address != *address);
-        vs.total_stake = vs.validators.iter().map(|v| v.stake).sum();
-        vs.quorum = if vs.total_stake > 0 {
-            (2 * vs.total_stake).div_ceil(3)
-        } else {
-            0
-        };
+        vs.total_stake = checked_validator_total_stake(&vs.validators)?;
+        vs.quorum = strict_supermajority_threshold(vs.total_stake);
         self.validator_keys.remove(address);
         info!(%address, returned_stake = stake, "Validator left the active set");
         Ok(stake)
@@ -908,11 +961,19 @@ impl ConsensusEngine {
         let mut vs = self.validator_set.write();
         let idx = vs.validators.iter().position(|v| v.address == *address);
         if let Some(idx) = idx {
+            let old_stake = vs.validators[idx].stake;
+            let new_total_stake = vs
+                .total_stake
+                .checked_sub(old_stake)
+                .and_then(|remaining| remaining.checked_add(new_stake))
+                .ok_or_else(|| {
+                    ConsensusError::InvalidBlock("total validator stake exceeds u64::MAX".into())
+                })?;
             vs.validators[idx].stake = new_stake;
             vs.validators[idx].tier = StakeTier::from_stake(new_stake).unwrap_or(StakeTier::Spark);
             let new_tier = vs.validators[idx].tier;
-            vs.total_stake = vs.validators.iter().map(|v| v.stake).sum();
-            vs.quorum = (2 * vs.total_stake).div_ceil(3);
+            vs.total_stake = new_total_stake;
+            vs.quorum = strict_supermajority_threshold(vs.total_stake);
             info!(%address, new_stake, new_tier = ?new_tier, "Validator stake updated");
             Ok(())
         } else {
@@ -927,12 +988,9 @@ impl ConsensusEngine {
     pub fn epoch_transition(&self) -> u64 {
         let mut vs = self.validator_set.write();
         vs.epoch += 1;
-        vs.total_stake = vs.validators.iter().map(|v| v.stake).sum();
-        vs.quorum = if vs.total_stake > 0 {
-            (2 * vs.total_stake).div_ceil(3)
-        } else {
-            0
-        };
+        vs.total_stake = checked_validator_total_stake(&vs.validators)
+            .expect("epoch transition cannot overflow or duplicate validator stake");
+        vs.quorum = strict_supermajority_threshold(vs.total_stake);
         let new_epoch = vs.epoch;
         info!(
             epoch = new_epoch,
@@ -944,7 +1002,7 @@ impl ConsensusEngine {
     }
 
     /// Returns `true` if the current round was reached via `force_advance_round()`.
-    /// When true, parent quorum checks are relaxed to allow recovery from stalls.
+    /// This is diagnostic only; parent quorum checks remain strict.
     pub fn is_force_advanced(&self) -> bool {
         self.force_advanced.load(Ordering::SeqCst)
     }
@@ -1010,30 +1068,23 @@ impl ConsensusEngine {
             // was called to move us here.
             let mut selected_parents = Vec::new();
             let mut accumulated_stake = 0u64;
+            let mut seen_parent_authors = HashSet::new();
 
             for hash in &prev_hashes {
                 if let Some(block) = self.dag.get(hash)
                     && let Some(validator) = vs.get_validator(&block.author)
+                    && seen_parent_authors.insert(block.author)
                 {
                     selected_parents.push(*hash);
-                    accumulated_stake += validator.stake;
+                    accumulated_stake = accumulated_stake
+                        .checked_add(validator.stake)
+                        .expect("unique parent stake cannot exceed checked total stake");
                 }
             }
 
-            // Verify we have quorum-worth of parents.
-            // Relax: after force_advance OR when parent blocks are missing (catch-up),
-            // accept whatever parents are available. Strict quorum enforcement
-            // would prevent proposals entirely during testnet catch-up.
-            let is_force_advanced = self.force_advanced.load(Ordering::SeqCst);
-            if accumulated_stake < vs.quorum && !is_force_advanced {
-                if !self.testnet_mode {
-                    return Err(ConsensusError::InsufficientParents);
-                }
-                tracing::debug!(
-                    "Propose: sub-quorum parents ({} < {}), accepting (testnet)",
-                    accumulated_stake,
-                    vs.quorum
-                );
+            // A local timeout or testnet flag is not a quorum certificate.
+            if accumulated_stake < vs.quorum {
+                return Err(ConsensusError::InsufficientParents);
             }
 
             selected_parents
@@ -1116,18 +1167,9 @@ impl ConsensusEngine {
         let vs = self.validator_set.read();
 
         // 1. Author must be a registered validator that can produce blocks.
-        //    In testnet: accept blocks from unknown validators (they may not
-        //    have been registered via PeerConnected yet due to race conditions).
-        //    The block signature is still verified in step 3.
+        // Testnet mode cannot substitute for authenticated membership.
         if !vs.can_produce_blocks(&block.author) {
-            if !self.testnet_mode {
-                return Err(ConsensusError::NotValidator);
-            }
-            tracing::debug!(
-                "Block from unregistered validator {} at round {} (accepting for testnet)",
-                block.author,
-                block.round
-            );
+            return Err(ConsensusError::NotValidator);
         }
 
         // 2. Check for duplicates
@@ -1183,50 +1225,16 @@ impl ConsensusEngine {
         }
         // else: legacy/test mode - accept unsigned blocks
 
-        // 4. Round check: if block is ahead, fast-forward to catch up (testnet round sync).
+        // 4. A peer block may advance at most one round. Larger catch-up needs
+        // an independently authenticated checkpoint/state-sync path; even a
+        // correctly signed block does not certify skipped leaders or commits.
         let current = self.current_round.load(Ordering::SeqCst);
-        // Cap round jumps to prevent a malicious peer from sending round=u64::MAX
-        // which would stall the node (huge prune computation, stuck at max round).
-        // 1M allows ~46 hours of partition healing at 6 rounds/sec.
-        //
-        // Exception: when current == 0 we're a brand-new node booting against
-        // a long-running network. The max-jump check would reject every
-        // catch-up block from peers at round N>1M, leaving the new node
-        // permanently isolated. v0.7.0: trust the first peer's round when
-        // current == 0; subsequent blocks are bounded normally.
-        const MAX_ROUND_JUMP: u64 = 1_000_000;
-        if current > 0 && block.round > current + MAX_ROUND_JUMP {
+        let round_gap = block.round.saturating_sub(current);
+        if round_gap > 1 {
             return Err(ConsensusError::InvalidBlock(format!(
-                "round {} is too far ahead (current={}, max jump={})",
-                block.round, current, MAX_ROUND_JUMP
+                "round {} is too far ahead (current={}); authenticated state sync required",
+                block.round, current
             )));
-        }
-        if block.round > current + 1 {
-            let gap = block.round - current;
-            if gap > PRUNE_DEPTH * 2 {
-                // Large gap (>200 rounds) - likely a network partition healed.
-                // Fast-forwarding would skip thousands of empty rounds that
-                // try_commit scans. Update last_committed_round to avoid
-                // scanning the gap, which would waste CPU and never commit.
-                let new_committed = block.round.saturating_sub(PRUNE_DEPTH);
-                let old_committed = self.last_committed_round.load(Ordering::SeqCst);
-                if new_committed > old_committed {
-                    self.last_committed_round
-                        .store(new_committed, Ordering::SeqCst);
-                }
-                tracing::warn!(
-                    "Large round gap ({} rounds) - partition healed? Fast-forwarding and skipping empty gap.",
-                    gap
-                );
-            }
-            let new_round = block.round.saturating_sub(1);
-            self.current_round.store(new_round, Ordering::SeqCst);
-            tracing::info!(
-                "Round catch-up: fast-forwarded from {} to {} (peer block at round {})",
-                current,
-                new_round,
-                block.round
-            );
         }
 
         // 5. Parent validation
@@ -1238,61 +1246,44 @@ impl ConsensusEngine {
                 ));
             }
         } else {
-            // All parents must exist in our DAG and be from round - 1.
-            // Exception: if we recently fast-forwarded (round catch-up), we
-            // won't have the parent blocks in our DAG. Accept the block
-            // anyway - the signature and round are already verified.
+            // All parents must exist in our DAG and be from round - 1. A block
+            // signature proves authorship, not a parent quorum or sync state.
             let expected_parent_round = block.round - 1;
             let mut parent_stake = 0u64;
             let mut missing_parents = 0usize;
+            let mut seen_parent_authors = HashSet::new();
 
             for parent_hash in &block.parents {
                 match self.dag.get(parent_hash) {
                     Some(parent_block) => {
                         if parent_block.round != expected_parent_round {
-                            // Parent round mismatch - skip this parent but don't reject
                             missing_parents += 1;
                             continue;
                         }
-                        if let Some(validator) = vs.get_validator(&parent_block.author) {
-                            parent_stake += validator.stake;
+                        if let Some(validator) = vs.get_validator(&parent_block.author)
+                            && seen_parent_authors.insert(parent_block.author)
+                        {
+                            parent_stake = parent_stake
+                                .checked_add(validator.stake)
+                                .expect("unique parent stake cannot exceed checked total stake");
                         }
                     }
                     None => {
-                        // Parent not in our DAG - we may have missed it.
-                        // Count as missing but don't reject the block.
                         missing_parents += 1;
                     }
                 }
             }
 
             if missing_parents > 0 {
-                tracing::debug!(
-                    "Block {} from {} at round {} has {}/{} missing parents (accepted anyway)",
-                    block.hash,
-                    block.author,
-                    block.round,
-                    missing_parents,
-                    block.parents.len()
-                );
+                return Err(ConsensusError::InvalidBlock(format!(
+                    "block {} has {} missing or wrong-round parents",
+                    block.hash, missing_parents
+                )));
             }
 
-            // 6. Need quorum-worth of parent stake.
-            // Relax: always allow blocks through in testnet mode. The validator
-            // set is dynamic (peers join over time), and missing parents from
-            // catch-up means we often can't compute accurate parent stake.
-            // Signature verification (step 3) is the primary security check.
-            let is_force_advanced = self.force_advanced.load(Ordering::SeqCst);
-            if parent_stake < vs.quorum && !is_force_advanced && missing_parents == 0 {
-                if !self.testnet_mode {
-                    return Err(ConsensusError::InsufficientParents);
-                }
-                tracing::debug!(
-                    "Block {} has sub-quorum parent stake ({} < {}), accepting (testnet)",
-                    block.hash,
-                    parent_stake,
-                    vs.quorum
-                );
+            // A local timeout or testnet flag is not a parent certificate.
+            if parent_stake < vs.quorum {
+                return Err(ConsensusError::InsufficientParents);
             }
         }
 
@@ -1456,10 +1447,10 @@ impl ConsensusEngine {
         for r in scan_start..=(current.saturating_sub(2)) {
             let round_r_blocks = self.blocks_in_round(r);
             if round_r_blocks.is_empty() {
-                // No blocks in this round at all - advance scan past it.
-                // Empty rounds can't produce commits, no point rescanning.
-                self.last_committed_round.store(r + 1, Ordering::SeqCst);
-                continue;
+                // A locally empty round may still contain a delayed leader
+                // block in another honest view. Only a certified skip/view
+                // change may advance this cursor.
+                break;
             }
 
             let leader = if frozen_vals.is_empty() {
@@ -1495,15 +1486,18 @@ impl ConsensusEngine {
                         // Step 2: Check if C is referenced by >= quorum stake in round R+2
                         let round_r2_blocks = self.blocks_in_round(r + 2);
                         let mut supporting_stake = 0u64;
-                        let mut certifier_sigs: Vec<(Address, Vec<u8>)> = Vec::new();
+                        let mut seen_certifiers = HashSet::new();
 
                         for block_d_hash in &round_r2_blocks {
                             if let Some(block_d) = self.dag.get(block_d_hash)
                                 && block_d.parents.contains(block_c_hash)
                                 && let Some(validator) = vs.get_validator(&block_d.author)
+                                && seen_certifiers.insert(block_d.author)
                             {
-                                supporting_stake += validator.stake;
-                                certifier_sigs.push((block_d.author, block_d.signature.clone()));
+                                supporting_stake =
+                                    supporting_stake.checked_add(validator.stake).expect(
+                                        "unique certifier stake cannot exceed checked total stake",
+                                    );
                             }
                         }
 
@@ -1516,21 +1510,11 @@ impl ConsensusEngine {
                                     "Block committed via two-round rule"
                                 );
 
-                                // A8: Auto-generate finality proof
-                                let proof = FinalityProof {
-                                    block_hash: block_b.hash,
-                                    round: block_b.round,
-                                    height: 0, // Set by caller after state execution
-                                    quorum_signatures: certifier_sigs,
-                                    signing_stake: supporting_stake,
-                                    total_stake: vs.total_stake,
-                                };
-                                self.finality_proofs.insert(block_b.hash, proof);
                                 debug!(
                                     hash = %block_b.hash,
                                     signing_stake = supporting_stake,
                                     total_stake = vs.total_stake,
-                                    "Finality proof generated"
+                                    "Commit support observed; proof export remains disabled because D-block signatures do not sign a canonical B-finality transcript"
                                 );
 
                                 newly_committed.push(block_b.clone());
@@ -1542,55 +1526,15 @@ impl ConsensusEngine {
                 }
             }
 
-            // Advance past this round if EITHER:
-            // (a) The leader's block was committed (normal path), OR
-            // (b) The leader has no block AND the round has quorum from
-            //     other validators (leader was offline - skip round), OR
-            // (c) We're lagging >50 rounds behind current (liveness fallback -
-            //     the 2-round rule's parent reference chain broke due to
-            //     cross-continent latency; skip and move on).
             let leader_block_committed = newly_committed.iter().any(|b| b.round == r);
             if leader_block_committed {
                 // Leader's block committed - advance scan past this round
                 self.last_committed_round.store(r + 1, Ordering::SeqCst);
             } else {
-                let leader_block_exists = round_r_blocks.iter().any(|h| {
-                    self.dag
-                        .get(h)
-                        .map(|b| b.author == leader.unwrap_or(Hash256::ZERO))
-                        .unwrap_or(false)
-                });
-                // Liveness fallback: if we're lagging too far behind current,
-                // advance unconditionally. Without this, the scan gets stuck
-                // indefinitely when the 2-round commit parent-reference chain
-                // breaks due to cross-continent asynchrony (blocks in R+2
-                // don't always see C in R+1 before producing, so quorum
-                // over references is never reached).
-                const MAX_COMMIT_LAG: u64 = 50;
-                let lag = current.saturating_sub(r);
-                if lag > MAX_COMMIT_LAG {
-                    // Forcing liveness: advance the scan to release stuck round.
-                    self.last_committed_round.store(r + 1, Ordering::SeqCst);
-                } else if !leader_block_exists {
-                    // Leader has no block in this round. Check if we have quorum
-                    // from other validators (round happened, leader was offline).
-                    let mut stake = 0u64;
-                    for h in &round_r_blocks {
-                        if let Some(b) = self.dag.get(h)
-                            && let Some(v) = vs.get_validator(&b.author)
-                        {
-                            stake += v.stake;
-                        }
-                    }
-                    if stake >= vs.quorum {
-                        // Quorum without leader - skip this round
-                        self.last_committed_round.store(r + 1, Ordering::SeqCst);
-                    } else {
-                        // Not enough info yet - stop scanning, retry later
-                        break;
-                    }
-                }
-                // Leader block exists, not lagging far - retry on next call.
+                // Never skip a leader round from local absence, elapsed lag,
+                // or quorum participation alone. Those observations are not a
+                // deterministic skip certificate and can differ by node.
+                break;
             }
         }
 
@@ -1607,22 +1551,18 @@ impl ConsensusEngine {
         // Drop the read lock before security checks that may need write access
         drop(vs);
 
-        // Store checkpoint every CHECKPOINT_INTERVAL rounds
+        // A checkpoint is trusted only after a strict validator identity +
+        // stake supermajority signs its canonical state-root transcript. This
+        // engine does not yet collect those signatures or receive a canonical
+        // state root from the state layer, so checkpoint intervals deliberately
+        // remain unregistered rather than manufacturing an unsigned anchor.
         if !newly_committed.is_empty() {
             let max_round = newly_committed.iter().map(|b| b.round).max().unwrap_or(0);
             if max_round % security::CHECKPOINT_INTERVAL == 0 && max_round > 0 {
-                let mut cr = self.checkpoint_registry.lock();
-                if let Some(last_block) = newly_committed.last() {
-                    let cp = security::Checkpoint {
-                        block_hash: *last_block.hash.as_bytes(),
-                        round: max_round,
-                        height: max_round,     // height approximated by round
-                        state_root: [0u8; 32], // Would be filled by state layer
-                        timestamp: last_block.timestamp,
-                        signatures: vec![], // Would be filled with quorum sigs
-                    };
-                    cr.add_checkpoint(cp);
-                }
+                warn!(
+                    round = max_round,
+                    "Checkpoint interval reached without canonical state root and validator signature quorum; no trust anchor registered"
+                );
             }
 
             // Run withholding detection periodically (every 100 rounds)
@@ -1779,13 +1719,18 @@ impl ConsensusEngine {
                 if seen_authors.insert(block.author)
                     && let Some(validator) = vs.get_validator(&block.author)
                 {
-                    round_stake += validator.stake;
+                    round_stake = round_stake
+                        .checked_add(validator.stake)
+                        .expect("unique round stake cannot exceed checked total stake");
                 }
             }
         }
 
         if round_stake >= vs.quorum {
-            let new_round = current + 1;
+            let Some(new_round) = current.checked_add(1) else {
+                warn!(round = current, "Cannot advance beyond u64::MAX round");
+                return false;
+            };
             self.current_round.store(new_round, Ordering::SeqCst);
             // Normal quorum-based advance clears the force-advanced flag,
             // restoring strict parent validation for subsequent rounds.
@@ -1908,8 +1853,11 @@ impl ConsensusEngine {
             TxBody::ChannelDispute(_) => false, // Escrow is deterministic
             TxBody::ShardProof(_) => false,   // Shard-local proof recording
             TxBody::InferenceAttestation(_) => false, // Escrow is local to sender's shard
+            // Pays from the shared treasury to an arbitrary worker and writes
+            // a global replay marker, so it must use fully ordered consensus.
+            TxBody::CommunityInferenceReward(_) => true,
             TxBody::InferenceChallenge(_) => false, // Resolved on attestation's shard
-            TxBody::InferenceRegister(_) => false, // Local to sender's shard
+            TxBody::InferenceRegister(_) => false,  // Local to sender's shard
             // Milestone B: escrow accounts are derived from request_id via
             // a deterministic hash, so they live on the sender's shard
             // alongside the payer account. Release touches proposer +
@@ -1942,8 +1890,16 @@ impl ConsensusEngine {
         }
     }
 
-    /// Update the validator set (e.g., at epoch boundary).
-    pub fn update_validator_set(&self, new_set: ValidatorSet) {
+    /// Update the validator set from an authenticated epoch transition.
+    /// Reject forged cached totals/quorum and duplicate identities.
+    pub fn update_validator_set(&self, new_set: ValidatorSet) -> Result<(), ConsensusError> {
+        let canonical_total = checked_validator_total_stake(&new_set.validators)?;
+        let canonical_quorum = strict_supermajority_threshold(canonical_total);
+        if new_set.total_stake != canonical_total || new_set.quorum != canonical_quorum {
+            return Err(ConsensusError::InvalidBlock(
+                "validator set has non-canonical total stake or quorum".into(),
+            ));
+        }
         info!(
             epoch = new_set.epoch,
             validators = new_set.len(),
@@ -1951,6 +1907,7 @@ impl ConsensusEngine {
             "Validator set updated"
         );
         *self.validator_set.write() = new_set;
+        Ok(())
     }
 
     // ── Liveness Hardening (C3) ─────────────────────────────────────────────
@@ -1961,7 +1918,8 @@ impl ConsensusEngine {
     const PROPOSER_TIMEOUT_MS: u128 = 100;
 
     /// View-change timeout in milliseconds.
-    /// If the round is stalled for this long, force-advance to prevent halts.
+    /// If the round is stalled for this long, request collection of a quorum
+    /// view-change certificate. The timer alone cannot advance the view.
     /// 5000ms for global testnet (100-300ms cross-continent RTT needs margin).
     /// Production with optimized networking: 500-1000ms.
     const VIEW_CHANGE_TIMEOUT_MS: u128 = 5_000;
@@ -1975,11 +1933,12 @@ impl ConsensusEngine {
         self.round_start.read().elapsed().as_millis() > Self::PROPOSER_TIMEOUT_MS
     }
 
-    /// Check if a view-change (forced round advance) is needed.
+    /// Check if a certified view-change attempt is needed.
     ///
     /// Returns `true` if the round has been stalled for longer than
-    /// `VIEW_CHANGE_TIMEOUT_MS`.  The caller should force `advance_round()`
-    /// when this returns true to prevent indefinite stalls.
+    /// `VIEW_CHANGE_TIMEOUT_MS`. This is only a request to collect a quorum
+    /// view-change certificate. A caller must not advance consensus state from
+    /// this local timer alone.
     pub fn needs_view_change(&self) -> bool {
         self.round_start.read().elapsed().as_millis() > Self::VIEW_CHANGE_TIMEOUT_MS
     }
@@ -1989,31 +1948,38 @@ impl ConsensusEngine {
         *self.round_start.write() = std::time::Instant::now();
     }
 
-    /// Force-advance to the next round without quorum check.
+    /// Advance the local view after a timeout without weakening block safety.
     ///
-    /// Used by the view-change protocol when the round has been stalled
-    /// for too long (e.g. proposer crashed).  Skips the normal quorum
-    /// requirement to prevent indefinite halts.
-    ///
-    /// Sets the `force_advanced` flag so that `propose_block()` will
-    /// accept whatever parents are available (even below quorum) in the
-    /// new round. The flag is cleared on the next successful normal
-    /// `advance_round()`.
+    /// This moves only the local view and sets a diagnostic flag. Proposals and
+    /// received blocks still require complete, quorum-weighted parents. A
+    /// timeout is not a quorum view-change certificate.
     pub fn force_advance_round(&self) {
-        let old = self.current_round.fetch_add(1, Ordering::SeqCst);
+        let Ok(old) =
+            self.current_round
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    current.checked_add(1)
+                })
+        else {
+            warn!(
+                round = u64::MAX,
+                "Cannot force a view beyond u64::MAX round"
+            );
+            self.reset_round_timer();
+            return;
+        };
         self.force_advanced.store(true, Ordering::SeqCst);
         self.reset_round_timer();
         warn!(
             old_round = old,
             new_round = old + 1,
-            "View-change: force-advanced round"
+            "View-change: advanced local round; parent quorum remains required"
         );
     }
 
     /// Returns the fraction of total stake that is "online" (has proposed a
     /// block within the last N rounds).
     ///
-    /// The caller can use this to alert if online stake drops near the 2/3
+    /// The caller can use this to alert if online stake drops near the >2/3
     /// quorum threshold - a warning that the network is close to stalling.
     pub fn online_stake_fraction(&self, lookback_rounds: u64) -> f64 {
         let current = self.current_round.load(Ordering::SeqCst);
@@ -2039,7 +2005,9 @@ impl ConsensusEngine {
                 }
             }
             if seen {
-                online_stake += validator.stake;
+                online_stake = online_stake
+                    .checked_add(validator.stake)
+                    .expect("online stake cannot exceed checked total stake");
             }
         }
 
@@ -2243,61 +2211,19 @@ impl ConsensusEngine {
 
     // ── A8: Finality Proof Generation ───────────────────────────────────────
 
-    /// Generate a finality proof for a committed block.
+    /// Finality-proof export is fail-closed until validators sign a canonical,
+    /// domain-separated finality transcript for the committed block.
     ///
-    /// The proof includes the block hash, round, and the signatures from
-    /// round R+2 validators that supported the commit. Light clients verify
-    /// that the signing stake >= 2/3 of total stake.
+    /// Existing round-R+2 block signatures authorize each D block's own hash;
+    /// relabeling those bytes as signatures over B would be invalid. Commit
+    /// support remains internal to DAG consensus and this method returns
+    /// `None` until the dedicated signing protocol is implemented.
     pub fn generate_finality_proof(
         &self,
-        block_hash: &Hash256,
-        height: u64,
+        _block_hash: &Hash256,
+        _height: u64,
     ) -> Option<FinalityProof> {
-        let block = self.dag.get(block_hash)?;
-        let vs = self.validator_set.read();
-        let round = block.round;
-
-        // Collect signatures from round R+2 validators who supported the commit
-        let round_r1_blocks = self.blocks_in_round(round + 1);
-        let round_r2_blocks = self.blocks_in_round(round + 2);
-
-        let mut quorum_sigs = Vec::new();
-        let mut signing_stake = 0u64;
-
-        // Find blocks in R+1 that reference this block
-        for c_hash in &round_r1_blocks {
-            if let Some(c_block) = self.dag.get(c_hash) {
-                if !c_block.parents.contains(block_hash) {
-                    continue;
-                }
-                // Find blocks in R+2 that reference C
-                for d_hash in &round_r2_blocks {
-                    if let Some(d_block) = self.dag.get(d_hash)
-                        && d_block.parents.contains(c_hash)
-                        && let Some(validator) = vs.get_validator(&d_block.author)
-                    {
-                        // Avoid duplicates (same author counted once)
-                        if !quorum_sigs.iter().any(|(addr, _)| *addr == d_block.author) {
-                            quorum_sigs.push((d_block.author, d_block.signature.clone()));
-                            signing_stake += validator.stake;
-                        }
-                    }
-                }
-            }
-        }
-
-        let proof = FinalityProof {
-            block_hash: *block_hash,
-            round,
-            height,
-            quorum_signatures: quorum_sigs,
-            signing_stake,
-            total_stake: vs.total_stake,
-        };
-
-        // Store the proof
-        self.finality_proofs.insert(*block_hash, proof.clone());
-        Some(proof)
+        None
     }
 
     /// Get a stored finality proof by block hash.
@@ -2638,13 +2564,83 @@ mod tests {
         assert_eq!(vs.total_stake, 4 * STAKE_ARC);
         assert_eq!(vs.len(), 4);
         assert_eq!(vs.epoch, 1);
-        // quorum = ceil(2/3 * 20M) = ceil(40M/3) = 13_333_334
-        assert_eq!(vs.quorum, (2 * vs.total_stake).div_ceil(3));
+        // quorum = floor(2/3 * 20M) + 1 = 13_333_334
+        assert_eq!(vs.quorum, strict_supermajority_threshold(vs.total_stake));
         assert!(vs.quorum > vs.total_stake * 2 / 3);
         // 3 validators have 15M stake, which should exceed quorum (~13.3M)
         assert!(vs.has_quorum(&[test_addr(0), test_addr(1), test_addr(2)]));
         // 2 validators have 10M stake, which should NOT exceed quorum (~13.3M)
         assert!(!vs.has_quorum(&[test_addr(0), test_addr(1)]));
+    }
+
+    #[test]
+    fn test_strict_supermajority_threshold_edges_and_overflow() {
+        assert_eq!(strict_supermajority_threshold(0), 1);
+        assert_eq!(strict_supermajority_threshold(1), 1);
+        assert_eq!(strict_supermajority_threshold(2), 2);
+        assert_eq!(strict_supermajority_threshold(3), 3);
+        assert_eq!(strict_supermajority_threshold(6), 5);
+        assert_eq!(
+            strict_supermajority_threshold(u64::MAX),
+            12_297_829_382_473_034_411
+        );
+
+        let empty = ValidatorSet::new(Vec::new(), 1);
+        assert_eq!(empty.quorum, 1, "an empty set must fail closed");
+        assert!(!empty.has_quorum(&[]));
+        assert_eq!(empty.fault_tolerance_stake(), 0);
+
+        let max_stake =
+            ValidatorSet::new(vec![Validator::new(test_addr(0), u64::MAX, 0).unwrap()], 1);
+        assert_eq!(max_stake.total_stake, u64::MAX);
+        assert_eq!(max_stake.quorum, strict_supermajority_threshold(u64::MAX));
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate validator address in validator set")]
+    fn test_validator_set_rejects_duplicate_identities() {
+        let address = test_addr(0);
+        ValidatorSet::new(
+            vec![
+                Validator::new(address, STAKE_ARC, 0).unwrap(),
+                Validator::new(address, STAKE_ARC, 1).unwrap(),
+            ],
+            1,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "total validator stake exceeds u64::MAX")]
+    fn test_validator_set_rejects_total_stake_overflow() {
+        ValidatorSet::new(
+            vec![
+                Validator::new(test_addr(0), u64::MAX, 0).unwrap(),
+                Validator::new(test_addr(1), STAKE_SPARK, 1).unwrap(),
+            ],
+            1,
+        );
+    }
+
+    #[test]
+    fn test_six_equal_validators_require_five_for_quorum() {
+        let vs = test_validator_set(6);
+        let four = [test_addr(0), test_addr(1), test_addr(2), test_addr(3)];
+        let five = [
+            test_addr(0),
+            test_addr(1),
+            test_addr(2),
+            test_addr(3),
+            test_addr(4),
+        ];
+
+        assert_eq!(vs.total_stake, 30_000_000);
+        assert_eq!(vs.quorum, 20_000_001);
+        assert!(!vs.has_quorum(&four), "exactly 2/3 stake is insufficient");
+        assert!(vs.has_quorum(&five), "5/6 stake must reach quorum");
+        assert!(
+            !vs.has_quorum(&[test_addr(0); 5]),
+            "repeating one validator identity must not multiply its stake"
+        );
     }
 
     #[test]
@@ -2706,6 +2702,21 @@ mod tests {
     }
 
     #[test]
+    fn test_join_validator_rejects_total_stake_overflow_atomically() {
+        let validators = vec![Validator::new(test_addr(1), u64::MAX, 0).unwrap()];
+        let vs = ValidatorSet::new(validators, 1);
+        let engine = ConsensusEngine::new(vs, test_addr(1));
+
+        let result = engine.join_validator(test_addr(2), STAKE_SPARK, [2u8; 32], 1);
+        assert!(result.is_err());
+
+        let vs = engine.validator_set();
+        assert_eq!(vs.len(), 1, "a failed join must not mutate the set");
+        assert_eq!(vs.total_stake, u64::MAX);
+        assert!(!vs.is_validator(&test_addr(2)));
+    }
+
+    #[test]
     fn test_join_validator_insufficient_stake() {
         let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
@@ -2752,6 +2763,27 @@ mod tests {
         let v = vs.get_validator(&test_addr(1)).unwrap();
         assert_eq!(v.stake, STAKE_CORE);
         assert_eq!(v.tier, StakeTier::Core);
+    }
+
+    #[test]
+    fn test_update_validator_stake_rejects_overflow_atomically() {
+        let validators = vec![
+            Validator::new(test_addr(1), u64::MAX - STAKE_SPARK, 0).unwrap(),
+            Validator::new(test_addr(2), STAKE_SPARK, 1).unwrap(),
+        ];
+        let vs = ValidatorSet::new(validators, 1);
+        let engine = ConsensusEngine::new(vs, test_addr(1));
+
+        let result = engine.update_validator_stake(&test_addr(2), STAKE_SPARK + 1);
+        assert!(result.is_err());
+
+        let vs = engine.validator_set();
+        assert_eq!(vs.total_stake, u64::MAX);
+        assert_eq!(
+            vs.get_validator(&test_addr(2)).unwrap().stake,
+            STAKE_SPARK,
+            "a failed update must retain the old stake"
+        );
     }
 
     #[test]
@@ -2873,20 +2905,102 @@ mod tests {
     }
 
     #[test]
-    fn test_receive_block_future_round_catchup() {
+    fn test_duplicate_parent_references_do_not_multiply_stake() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
-        // Current round is 0, block in round 5 - should fast-forward and accept
+
+        let parent = make_block(test_addr(0), 0, vec![], vec![], 1000);
+        engine.receive_block(&parent).unwrap();
+
+        let child = make_block(
+            test_addr(1),
+            1,
+            vec![parent.hash, parent.hash, parent.hash],
+            vec![],
+            1001,
+        );
+        assert_eq!(
+            engine.receive_block(&child).unwrap_err(),
+            ConsensusError::InsufficientParents,
+            "one validator repeated three times must remain below quorum"
+        );
+    }
+
+    #[test]
+    fn test_missing_or_wrong_round_parents_fail_closed() {
+        let vs = test_validator_set(4);
+        let engine = ConsensusEngine::new(vs, test_addr(0));
+
+        let missing = make_block(
+            test_addr(1),
+            1,
+            vec![hash_bytes(b"missing-parent")],
+            vec![],
+            1001,
+        );
+        assert!(matches!(
+            engine.receive_block(&missing),
+            Err(ConsensusError::InvalidBlock(message))
+                if message.contains("missing or wrong-round parents")
+        ));
+
+        let old_parent = make_block(test_addr(0), 0, vec![], vec![], 1002);
+        engine.receive_block(&old_parent).unwrap();
+        engine.restore_round_from_local_wal(1, 0);
+        let wrong_round = make_block(test_addr(1), 2, vec![old_parent.hash], vec![], 1003);
+        assert!(matches!(
+            engine.receive_block(&wrong_round),
+            Err(ConsensusError::InvalidBlock(message))
+                if message.contains("missing or wrong-round parents")
+        ));
+        assert_eq!(
+            engine.current_round(),
+            1,
+            "invalid block must not move view"
+        );
+        assert_eq!(engine.last_committed_round(), 0);
+    }
+
+    #[test]
+    fn test_force_advance_and_testnet_never_bypass_parent_quorum() {
+        let vs = test_validator_set(4);
+        let engine = ConsensusEngine::new_testnet(vs, test_addr(0));
+        let lone_parent = make_block(test_addr(0), 0, vec![], vec![], 1000);
+        engine.receive_block(&lone_parent).unwrap();
+
+        engine.force_advance_round();
+        assert!(engine.is_force_advanced());
+        assert_eq!(engine.current_round(), 1);
+        assert_eq!(
+            engine.propose_block(vec![], 1001).unwrap_err(),
+            ConsensusError::InsufficientParents
+        );
+
+        let child = make_block(test_addr(1), 1, vec![lone_parent.hash], vec![], 1002);
+        assert_eq!(
+            engine.receive_block(&child).unwrap_err(),
+            ConsensusError::InsufficientParents
+        );
+
+        let unknown = make_block(test_addr(99), 0, vec![], vec![], 1003);
+        assert_eq!(
+            engine.receive_block(&unknown).unwrap_err(),
+            ConsensusError::NotValidator
+        );
+    }
+
+    #[test]
+    fn test_receive_block_future_round_requires_authenticated_sync() {
+        let vs = test_validator_set(4);
+        let engine = ConsensusEngine::new(vs, test_addr(0));
         let block = make_block(test_addr(1), 5, vec![], vec![], 1000);
         let result = engine.receive_block(&block);
-        // Block is accepted (round catch-up), though it may fail parent validation
-        // The key is that it does NOT return InvalidRound
-        assert_ne!(
-            result.clone().err(),
-            Some(ConsensusError::InvalidRound),
-            "Future blocks should trigger round catch-up, not InvalidRound: {:?}",
-            result
+        assert!(
+            matches!(&result, Err(ConsensusError::InvalidBlock(msg)) if msg.contains("authenticated state sync required")),
+            "single-peer future block must not move consensus state: {result:?}"
         );
+        assert_eq!(engine.current_round(), 0);
+        assert_eq!(engine.last_committed_round(), 0);
     }
 
     // ── 4. Commit Rule ───────────────────────────────────────────────────────
@@ -3050,6 +3164,34 @@ mod tests {
             !b0_committed,
             "B0 should NOT be committed with insufficient R+2 support"
         );
+    }
+
+    #[test]
+    fn test_commit_scan_never_skips_delayed_leader_round() {
+        let vs = test_validator_set(4);
+        let mut ordered: Vec<Address> = vs.validators.iter().map(|v| v.address).collect();
+        ordered.sort_by_key(|address| address.0);
+        let leader = ordered[0];
+        let engine = ConsensusEngine::new(vs, ordered[1]);
+
+        for (index, author) in ordered
+            .iter()
+            .copied()
+            .filter(|address| *address != leader)
+            .enumerate()
+        {
+            let block = make_block(author, 0, vec![], vec![], 100 + index as u64);
+            engine.receive_block(&block).unwrap();
+        }
+        engine.restore_round_from_local_wal(100, 0);
+
+        assert!(engine.try_commit().is_empty());
+        assert_eq!(engine.last_committed_round(), 0);
+
+        let delayed_leader = make_block(leader, 0, vec![], vec![], 200);
+        engine.receive_block(&delayed_leader).unwrap();
+        assert!(engine.get_block(&delayed_leader.hash).is_some());
+        assert_eq!(engine.last_committed_round(), 0);
     }
 
     // ── 5. Round Advancement ─────────────────────────────────────────────────
@@ -3382,10 +3524,27 @@ mod tests {
                 .collect(),
             2,
         );
-        engine.update_validator_set(new_vs);
+        engine.update_validator_set(new_vs).unwrap();
 
         assert_eq!(engine.validator_set().epoch, 2);
         assert_eq!(engine.validator_set().len(), 6);
+    }
+
+    #[test]
+    fn test_update_validator_set_rejects_forged_cached_quorum() {
+        let vs = test_validator_set(4);
+        let engine = ConsensusEngine::new(vs, test_addr(0));
+        let before = engine.validator_set();
+
+        let mut forged = test_validator_set(6);
+        forged.total_stake = u64::MAX;
+        forged.quorum = 1;
+        assert!(engine.update_validator_set(forged).is_err());
+
+        let after = engine.validator_set();
+        assert_eq!(after.validators.len(), before.validators.len());
+        assert_eq!(after.total_stake, before.total_stake);
+        assert_eq!(after.quorum, before.quorum);
     }
 
     // ── 12. Cross-Shard Execution Proofs ────────────────────────────────────
@@ -3765,10 +3924,39 @@ mod tests {
             !insufficient.has_sufficient_stake(),
             "50% stake should be insufficient"
         );
+
+        let exact_two_thirds = FinalityProof {
+            signing_stake: 20_000_000,
+            total_stake: 30_000_000,
+            ..proof.clone()
+        };
+        assert!(
+            !exact_two_thirds.has_sufficient_stake(),
+            "exactly 2/3 stake must not produce finality"
+        );
+
+        let five_of_six = FinalityProof {
+            signing_stake: 25_000_000,
+            ..exact_two_thirds
+        };
+        assert!(
+            five_of_six.has_sufficient_stake(),
+            "5/6 equal stake must produce finality"
+        );
+
+        let empty = FinalityProof {
+            signing_stake: 0,
+            total_stake: 0,
+            ..proof
+        };
+        assert!(
+            !empty.has_sufficient_stake(),
+            "an empty validator set must not produce finality"
+        );
     }
 
     #[test]
-    fn test_finality_proof_generation() {
+    fn test_finality_proof_export_fails_closed_without_canonical_signatures() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
@@ -3838,17 +4026,17 @@ mod tests {
         let committed = engine.try_commit();
         assert!(!committed.is_empty());
 
-        // Generate finality proof for block B
-        let proof = engine.generate_finality_proof(&block_b.hash, 1).unwrap();
-        assert_eq!(proof.block_hash, block_b.hash);
-        assert_eq!(proof.round, 0);
-        assert_eq!(proof.height, 1);
-        assert!(proof.has_sufficient_stake(), "should have quorum stake");
-        assert!(!proof.quorum_signatures.is_empty());
+        assert!(engine.generate_finality_proof(&block_b.hash, 1).is_none());
+        assert!(engine.get_finality_proof(&block_b.hash).is_none());
 
-        // Should be retrievable
-        let stored = engine.get_finality_proof(&block_b.hash).unwrap();
-        assert_eq!(stored.block_hash, proof.block_hash);
+        let validator = KeyPair::generate_ed25519();
+        let d_block_signature = validator.sign(&d0.hash).unwrap();
+        assert!(
+            d_block_signature
+                .verify(&block_b.hash, &validator.address())
+                .is_err(),
+            "a signature over D's hash must never be relabeled as B finality"
+        );
     }
 
     // ── 16. DAG Pruning / Memory Bounds (A4) ─────────────────────────────────
@@ -4145,44 +4333,35 @@ mod tests {
         assert_eq!(engine.node_role(), NodeRole::Full);
     }
 
-    // ── v0.7.0: fresh-boot catch-up tests ──────────────────────────────
-    //
-    // Pre-v0.7 a fresh node booting against a long-running network was
-    // permanently isolated by the max-jump cap (any block at round >1M
-    // got rejected when current_round=0). v0.7.0 lifts the cap when
-    // current==0 so the node can fast-forward; tests pin both halves
-    // of the contract.
+    // ── Fresh-boot catch-up safety ─────────────────────────────────────
 
     #[test]
-    fn fresh_boot_accepts_far_ahead_block_when_current_is_zero() {
-        // Engine at round 0, peer offers block at round 5_000_000 (>1M).
-        // Pre-v0.7: rejected with "too far ahead". v0.7.0: accepted, engine
-        // fast-forwards.
+    fn fresh_boot_rejects_far_ahead_signed_block() {
+        let local_key = KeyPair::generate_ed25519();
+        let peer_key = KeyPair::generate_ed25519();
         let validators = vec![
-            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
-            Validator::new(test_addr(2), STAKE_ARC, 1).unwrap(),
+            Validator::new(local_key.address(), STAKE_ARC, 0).unwrap(),
+            Validator::new(peer_key.address(), STAKE_ARC, 1).unwrap(),
         ];
         let vs = ValidatorSet::new(validators, 1);
-        // testnet mode relaxes the parent-quorum check so an empty-parents
-        // catch-up block from a peer doesn't trip InsufficientParents.
-        // Production seeds run with this enabled (cli.testnet_mode=true);
-        // tests need it for the same reason.
-        let engine = ConsensusEngine::new_testnet(vs, test_addr(1));
+        let engine = ConsensusEngine::new_with_keypair(vs, local_key.address(), local_key);
 
-        let block = make_block(test_addr(2), 5_000_000, vec![], vec![], 1_700_000_000_000);
+        let mut block = make_block(
+            peer_key.address(),
+            u64::MAX,
+            vec![],
+            vec![],
+            1_700_000_000_000,
+        );
+        block.signature = bincode::serialize(&peer_key.sign(&block.hash).unwrap()).unwrap();
         let result = engine.receive_block(&block);
         assert!(
-            result.is_ok(),
-            "fresh-boot node must accept far-ahead block; got {:?}",
+            matches!(&result, Err(ConsensusError::InvalidBlock(msg)) if msg.contains("too far ahead")),
+            "fresh node must reject attacker-controlled round movement; got {:?}",
             result
         );
-        // Engine fast-forwards to block.round - 1 (so the just-received
-        // block lands at "current+1 = block.round"). Check we got close.
-        let after = engine.current_round();
-        assert!(
-            (4_999_999..=5_000_000).contains(&after),
-            "engine should be at the peer's round (~5_000_000); got {after}"
-        );
+        assert_eq!(engine.current_round(), 0);
+        assert_eq!(engine.last_committed_round(), 0);
     }
 
     #[test]
@@ -4196,7 +4375,7 @@ mod tests {
         ];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
-        engine.set_initial_round(100, 0); // established, current=100
+        engine.restore_round_from_local_wal(100, 0); // established, current=100
 
         let block = make_block(
             test_addr(2),
@@ -4223,22 +4402,49 @@ mod tests {
     }
 
     #[test]
-    fn set_initial_round_idempotent_when_lower() {
-        // set_initial_round(N) when current >= N is a no-op. Prevents a
+    fn restore_round_from_local_wal_is_idempotent_when_lower() {
+        // Local WAL restoration when current >= N is a no-op. Prevents a
         // stale dag-wal segment from clobbering an in-memory advance.
         let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
-        engine.set_initial_round(500, 400);
+        engine.restore_round_from_local_wal(500, 400);
         assert_eq!(engine.current_round(), 500);
 
         // Try to "rewind" to 100 — should be ignored.
-        engine.set_initial_round(100, 50);
+        engine.restore_round_from_local_wal(100, 50);
         assert_eq!(
             engine.current_round(),
             500,
-            "set_initial_round must not rewind"
+            "local WAL restoration must not rewind"
         );
+    }
+
+    #[test]
+    fn untrusted_round_hint_never_mutates_consensus_cursors() {
+        let vs = test_validator_set(4);
+        let engine = ConsensusEngine::new(vs, test_addr(0));
+
+        engine.observe_untrusted_round_hint(u64::MAX, u64::MAX - 1);
+
+        assert_eq!(engine.current_round(), 0);
+        assert_eq!(engine.last_committed_round(), 0);
+    }
+
+    #[test]
+    fn round_counter_fails_closed_at_u64_max() {
+        let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
+        let vs = ValidatorSet::new(validators, 1);
+        let engine = ConsensusEngine::new(vs, test_addr(1));
+        engine.restore_round_from_local_wal(u64::MAX, 0);
+
+        engine.force_advance_round();
+        assert_eq!(engine.current_round(), u64::MAX);
+
+        let block = make_block(test_addr(1), u64::MAX, vec![], vec![], 1000);
+        engine.insert_block_into_dag(&block);
+        assert!(!engine.advance_round());
+        assert_eq!(engine.current_round(), u64::MAX);
     }
 
     #[test]

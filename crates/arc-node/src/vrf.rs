@@ -34,10 +34,16 @@
 //!   provides a deterministic tiebreaker when multiple validators pass the
 //!   threshold.
 //!
-//! # Integration
+//! # Integration status
 //!
-//! This module is self-contained and will be wired into `ConsensusManager`
-//! in a future change. It uses:
+//! These primitives are not currently end-to-end consensus authorization.
+//! `ConsensusManager` bypasses VRF gating for the multi-validator DAG path and
+//! its single-validator scheduling check does not carry or verify a VRF proof.
+//! `ValidatorInfo::public_key` is also compatibility metadata and is not used
+//! by this selector. Operators must not treat the current live proposer path
+//! as cryptographically VRF-elected until that integration is completed.
+//!
+//! This module uses:
 //! - `arc_crypto::vrf::{vrf_prove, vrf_verify}` for the core VRF operations
 //! - `arc_crypto::KeyPair` for Ed25519 signing
 //! - `arc_crypto::Hash256` as the address / hash type
@@ -46,6 +52,7 @@ use arc_crypto::hash::Hash256;
 use arc_crypto::signature::{KeyPair, SignatureError};
 use arc_crypto::vrf::{VrfProof as CryptoVrfProof, vrf_prove, vrf_verify};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -159,7 +166,8 @@ pub struct VrfProof {
 /// Information about a validator for proposer selection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValidatorInfo {
-    /// Ed25519 public key (32 bytes).
+    /// Unverified compatibility metadata. The current selector does not use
+    /// this field to authenticate the validator address.
     pub public_key: [u8; 32],
     /// Amount of ARC tokens staked.
     pub stake: u64,
@@ -188,13 +196,25 @@ impl ProposerSelector {
     /// * `validators` - The active validator set for the current epoch.
     ///
     /// # Panics
-    /// Panics if `validators` is empty (there must be at least one validator).
+    /// Panics if the set is empty, contains a duplicate validator, or if total
+    /// stake exceeds `u64::MAX`. Zero-stake observers are retained but can
+    /// never pass proposer selection.
     pub fn new(validators: Vec<ValidatorInfo>) -> Self {
         assert!(
             !validators.is_empty(),
             "ProposerSelector requires at least one validator"
         );
-        let total_stake = validators.iter().map(|v| v.stake).sum();
+        let mut addresses = HashSet::with_capacity(validators.len());
+        let mut total_stake = 0u64;
+        for validator in &validators {
+            assert!(
+                addresses.insert(validator.address),
+                "duplicate validator address in proposer selector"
+            );
+            total_stake = total_stake
+                .checked_add(validator.stake)
+                .expect("total proposer stake exceeds u64::MAX");
+        }
         Self {
             validators,
             total_stake,
@@ -808,6 +828,22 @@ mod tests {
         let selector = ProposerSelector::new(vec![v1, v2]);
         assert_eq!(selector.total_stake(), 20_000_000);
         assert_eq!(selector.validator_count(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate validator address in proposer selector")]
+    fn selector_rejects_duplicate_validator_identities() {
+        let key = test_keypair(22);
+        let validator = make_validator(&key, 5_000_000);
+        ProposerSelector::new(vec![validator.clone(), validator]);
+    }
+
+    #[test]
+    #[should_panic(expected = "total proposer stake exceeds u64::MAX")]
+    fn selector_rejects_total_stake_overflow() {
+        let first = make_validator(&test_keypair(23), u64::MAX);
+        let second = make_validator(&test_keypair(24), 1);
+        ProposerSelector::new(vec![first, second]);
     }
 
     // ── Full end-to-end test ──

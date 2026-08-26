@@ -1,5 +1,11 @@
 # Testnet Investigation — Seeds Are Independent Chains, Not One Network
 
+> **Dated incident record, still directionally confirmed.** The uniform v0.7.7
+> version table below is a June snapshot, not current state. On 2026-08-26 the
+> reachable fleet instead reported one v0.7.2 and five v0.7.9 binaries and still
+> returned six different hashes and state roots at a common height. See
+> [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
+
 **Date:** 2026-06-03
 **Investigator:** live RPC probing of the 5 public seeds + 1 retired NYC seed
 **Binary version under test:** v0.7.7 (uniform across all live seeds)

@@ -69,7 +69,7 @@ def require_address(value: object, path: str) -> str:
     return value.lower()
 
 
-def validate(path: Path) -> tuple[bool, int]:
+def validate(path: Path) -> tuple[bool, int, int | None]:
     try:
         raw = path.read_bytes()
     except OSError as error:
@@ -88,7 +88,15 @@ def validate(path: Path) -> tuple[bool, int]:
         required={"chain"},
     )
     chain = require_exact_keys(
-        root["chain"], {"name", "chain_id", "validator_set_complete"}, "genesis.chain"
+        root["chain"],
+        {
+            "name",
+            "chain_id",
+            "validator_set_complete",
+            "community_rewards_v1_activation_height",
+        },
+        "genesis.chain",
+        required={"name", "chain_id", "validator_set_complete"},
     )
     if not isinstance(chain["name"], str) or not chain["name"].strip():
         fail("genesis.chain.name must be a non-empty string")
@@ -97,6 +105,22 @@ def validate(path: Path) -> tuple[bool, int]:
     complete = chain["validator_set_complete"]
     if not isinstance(complete, bool):
         fail("genesis.chain.validator_set_complete must be explicitly true or false")
+    activation_height = chain.get("community_rewards_v1_activation_height")
+    if activation_height is not None:
+        activation_height = require_nonnegative_integer(
+            activation_height,
+            "genesis.chain.community_rewards_v1_activation_height",
+            positive=False,
+        )
+        # StateDB reserves u64::MAX as the in-memory sentinel for "absent".
+        # Shipping that value would make the semantic genesis hash say Some
+        # while runtime state treats it as None, so the release contract must
+        # reject it (and values Rust's u64 TOML field cannot represent).
+        if activation_height >= (1 << 64) - 1:
+            fail(
+                "genesis.chain.community_rewards_v1_activation_height must be "
+                "less than 18446744073709551615"
+            )
 
     accounts = root.get("accounts", [])
     if not isinstance(accounts, list):
@@ -123,7 +147,12 @@ def validate(path: Path) -> tuple[bool, int]:
                 "an incomplete community-observer genesis must not contain a partial "
                 "validator list"
             )
-        return False, 0
+        if activation_height is not None:
+            fail(
+                "an incomplete community-observer genesis must not schedule "
+                "community reward activation"
+            )
+        return False, 0, None
     if not validators:
         fail("validator_set_complete is true but no public validators are declared")
 
@@ -140,25 +169,39 @@ def validate(path: Path) -> tuple[bool, int]:
         )
         if address in seen_validators:
             fail(f"duplicate validator address at genesis.validators[{index}].address")
+        if address not in seen_accounts:
+            fail(
+                f"genesis.validators[{index}].address must also be declared in "
+                "genesis.accounts so every node materializes identical state"
+            )
         seen_validators.add(address)
 
-    return True, len(validators)
+    return True, len(validators), activation_height
 
 
 def main() -> None:
     if len(sys.argv) != 2:
         fail("usage: validate-genesis.py PATH")
     path = Path(sys.argv[1])
-    complete, validator_count = validate(path)
+    complete, validator_count, activation_height = validate(path)
     if complete:
-        print(
+        message = (
             "genesis contract: complete production validator set contains "
             f"{validator_count} public address(es) and no secret material"
         )
+        if activation_height is None:
+            message += "; community rewards v1 disabled (activation absent)"
+        else:
+            message += (
+                "; community rewards v1 activation height "
+                f"{activation_height} is explicit"
+            )
+        print(message)
     else:
         print(
             "genesis contract: explicit incomplete stake-zero community-observer "
-            "placeholder contains no validators or secret material"
+            "placeholder contains no validators or secret material; community "
+            "rewards v1 disabled (activation absent)"
         )
 
 

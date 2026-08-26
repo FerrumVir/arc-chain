@@ -5,18 +5,12 @@ set -Eeuo pipefail
 
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
 INSTALLER="$SCRIPT_DIR/../install.sh"
-TEMP_INSTALLER=""
 if [ ! -f "$INSTALLER" ]; then
-    command -v curl >/dev/null 2>&1 || {
-        printf 'Canonical installer not found and curl is unavailable.\n' >&2
-        exit 1
-    }
-    TEMP_INSTALLER="$(mktemp "${TMPDIR:-/tmp}/arc-install.XXXXXX")"
-    trap 'rm -f -- "$TEMP_INSTALLER"' EXIT HUP INT TERM
-    curl --fail --silent --show-error --location \
-        https://raw.githubusercontent.com/FerrumVir/arc-chain/main/install.sh \
-        > "$TEMP_INSTALLER"
-    INSTALLER="$TEMP_INSTALLER"
+    printf '%s\n' \
+        'sero-quickstart.sh: canonical ../install.sh was not found.' \
+        'Refusing to download or execute an installer from a mutable branch.' \
+        'After v0.7.12 is approved and published, use its exact-tag installer and release checksum.' >&2
+    exit 78
 fi
 
 case "${1:-}" in

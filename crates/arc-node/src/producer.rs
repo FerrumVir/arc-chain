@@ -34,7 +34,7 @@ pub async fn run_block_producer(state: Arc<StateDB>, mempool: Arc<Mempool>, prod
         let tx_count = transactions.len();
         let start = std::time::Instant::now();
 
-        match state.execute_block(&transactions, producer) {
+        match state.execute_block_verified(&transactions, producer) {
             Ok((block, receipts)) => {
                 let elapsed = start.elapsed();
                 let success_count = receipts.iter().filter(|r| r.success).count();

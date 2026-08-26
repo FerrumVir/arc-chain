@@ -34,7 +34,7 @@ import type {
   FaucetHealth,
   JsonRpcRequest,
   JsonRpcResponse,
-} from "./types";
+} from "./types.js";
 
 // ─── Error ──────────────────────────────────────────────────
 

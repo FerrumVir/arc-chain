@@ -121,9 +121,9 @@ complete_fixture_produces_verifiable_contract() {
     fi
 
     assert_file_contains "$sandbox/output/latest.json" '"version":[[:space:]]*"0\.8\.0"' \
-        'latest.json does not carry the immutable tag version' || return 1
+        'latest.json does not carry the exact tag version' || return 1
     assert_file_not_contains "$sandbox/output/latest.json" 'releases/latest/download' \
-        'latest.json payload URLs must point at the immutable release tag' || return 1
+        'latest.json payload URLs must point at the exact release tag' || return 1
     assert_file_contains "$sandbox/output/latest.json" '/releases/download/v0\.8\.0/' \
         'latest.json has no exact-tag artifact URL' || return 1
     assert_file_contains "$sandbox/output/genesis.toml" \
@@ -131,6 +131,41 @@ complete_fixture_produces_verifiable_contract() {
         'release did not preserve the explicit stake-zero observer placeholder' || return 1
     assert_file_not_contains "$sandbox/output/genesis.toml" '^\[\[validators\]\]' \
         'incomplete release genesis contains a partial validator set' || return 1
+    assert_file_not_contains "$sandbox/output/genesis.toml" \
+        '^community_rewards_v1_activation_height[[:space:]]*=' \
+        'observer release unexpectedly schedules community reward activation' || return 1
+}
+
+complete_scheduled_genesis_is_preserved() {
+    local sandbox genesis_file
+    new_assembly_fixture
+    sandbox="$NEW_ASSEMBLY_SANDBOX"
+    genesis_file="$sandbox/complete-scheduled-genesis.toml"
+    cat >"$genesis_file" <<'TOML'
+[chain]
+name = "arc-release-production-fixture"
+chain_id = "0x415243"
+validator_set_complete = true
+community_rewards_v1_activation_height = 10_000
+
+[[accounts]]
+address = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+balance = 0
+
+[[validators]]
+address = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+stake = 5_000_000
+TOML
+    if ! run_assembler "$sandbox" 'v0.8.0' "$genesis_file" \
+        >"$sandbox/complete-scheduled.out" 2>&1; then
+        sed -n '1,120p' "$sandbox/complete-scheduled.out"
+        return 1
+    fi
+    assert_file_contains "$sandbox/output/genesis.toml" \
+        '^community_rewards_v1_activation_height[[:space:]]*=[[:space:]]*10_000$' \
+        'release did not preserve the approved explicit activation schedule' || return 1
+    assert_file_contains "$sandbox/output/SHA256SUMS" '[[:space:]]genesis\.toml$' \
+        'scheduled production genesis is not protected by the checksum manifest' || return 1
 }
 
 unsafe_production_genesis_is_rejected_before_manifest() {
@@ -221,6 +256,7 @@ non_semver_release_tag_is_rejected() {
 }
 
 run_test 'complete fixture produces exact-tag manifest and verified SHA256SUMS' complete_fixture_produces_verifiable_contract
+run_test 'complete production genesis preserves its explicit activation schedule' complete_scheduled_genesis_is_preserved
 run_test 'unsafe production genesis is rejected before a publishable manifest exists' unsafe_production_genesis_is_rejected_before_manifest
 run_test 'each of the ten canonical headless assets is independently required' every_headless_asset_is_individually_required
 run_test 'duplicate same-named artifacts fail closed' duplicate_asset_is_rejected

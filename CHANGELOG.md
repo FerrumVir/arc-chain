@@ -18,6 +18,62 @@ All notable changes to ARC Chain are tracked here. This project follows
 >   which was merged to main only on 2026-06-16 (f6bee03).
 > - **Nothing on the live network runs v0.7.11.**
 
+## v0.7.12 - Unreleased recovery candidate
+
+- Restores one checksummed release graph for headless Linux amd64/arm64,
+  Intel/Apple-Silicon macOS, Windows CLI, and signed desktop bundles. The
+  installer resolves one exact version, works without a display, and refuses
+  downgrade or unverified replacement.
+- Adds the typed `arc health` command and makes the installer use it for
+  readiness, accepting only explicit JSON `ok` or `degraded` states. Install
+  and upgrade now share a complete rollback transaction across binaries,
+  configuration, identity, service definitions, and prior service state.
+- Adds a blocking release/security harness: Rust format/check/Clippy/test
+  coverage, Linux 24.04/26.04 headless smoke tests, deterministic desktop E2E,
+  Tauri tests on every released desktop architecture, SDK packed-consumer
+  tests, workflow/ShellCheck contracts, and staged plus working-copy secret
+  scans.
+- Replaces same-host determinism claims with hardcoded production-engine KATs
+  covering CPU I8/I16, 1-versus-4 threads, whole-versus-three-way sharding,
+  logits/KV/hidden-state hashes, and autoregressive output across ARM and x86.
+- Makes sequential and BlockSTM execution use the same canonical ordering and
+  state semantics; consensus timestamps and DAG attachments are verified and
+  peer hints can no longer mutate authoritative state.
+- Binds every persistent database to its authenticated genesis network hash,
+  rejects unmarked legacy WAL reuse, requires production validators to exist
+  in the canonical genesis accounts, binds native RPC to loopback by default,
+  and leaves Ethereum RPC disabled unless an operator explicitly enables it.
+- Replaces the abandoned bincode 1.x implementation with a bounded internal
+  v1-wire-compatible facade, and narrowly patches Wasmer's derive crate to
+  remove `proc-macro-error2` while preserving upstream provenance and valid
+  generated code. Remaining upstream advisories stay blocking in the release
+  gate; none are ignored.
+- Introduces authenticated v3 community registration/heartbeat/claim/submit,
+  exact model-ID routing, one-job worker capacity, bounded payloads/timeouts,
+  independent 2-of-3 range verification, and validator-authorized,
+  replay-protected 2.5 ARC reward transactions. Pending or rejected rewards
+  are never reported as earned.
+- Authenticates P2P session transcripts with TLS-exporter-bound Ed25519
+  identities, enforces pinned certificates in strict mode, caps frames and
+  decoders, and binds claimed identities to signed payloads.
+- Hardens validator identity and rollout: validator key files are mandatory,
+  legacy exposed keys are rejected, genesis/release contracts fail closed, and
+  the six-node v3 cutover is explicitly coordinated rather than auto-deployed.
+- Makes community reward activation an authenticated genesis schedule plus an
+  independent local issuance switch. An absent activation height disables tx
+  `0x25`; the issuance flag cannot override that absence, and the checked-in
+  migration-observer genesis deliberately has no activation schedule.
+- Reworks dashboard and explorer rendering for safe DOM insertion, honest
+  liveness/retained-history semantics, coordinator-specific compatible worker
+  capacity, visible inference/quorum/settlement evidence, and actual on-chain
+  balances. Production dashboard CSS is compiled locally instead of executing
+  the Tailwind development CDN.
+
+This candidate is not deployed or published. The public fleet remains split
+across old v0.7.2/v0.7.9 binaries until operators rotate compromised keys,
+choose a clean-genesis or checkpoint recovery policy, and complete the rollout
+gate.
+
 ## v0.7.11 - 2026-06-15 (desktop-only)
 
 - Removed the On-chain Tier 1 radio and the tier1 mutation, polling, and

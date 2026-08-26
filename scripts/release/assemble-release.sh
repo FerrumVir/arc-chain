@@ -132,7 +132,8 @@ copy_as "$(find_one "$ARTIFACTS_DIR/arc-desktop-linux-x86_64" '*.deb')" \
 copy_as "$(find_one "$ARTIFACTS_DIR/arc-desktop-linux-x86_64" '*.rpm')" \
     arc-desktop-linux-x86_64.rpm
 
-# Ship the exact installer and network configuration from the immutable tag.
+# Ship the exact installer and network configuration from the validated tag
+# commit; repository tag protection is a separate owner-controlled prerequisite.
 # Auto-update installs this checksummed copy, not a moving main-branch script.
 copy_as install.sh install.sh
 copy_as testnet-seeds.txt testnet-seeds.txt

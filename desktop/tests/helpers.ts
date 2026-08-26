@@ -96,6 +96,7 @@ export const PROJECTION_404 = {
     "http://140.82.16.112:9090 does not serve /worker/earnings/abc (HTTP 404).",
   rewardPerAttestation: null,
   rewardRateSource: "unknown",
+  communityRewardsEnabled: null,
   attestationsTotal: 0,
   firstAttestationBlock: null,
   attestationsPerDay: null,
@@ -114,6 +115,7 @@ export const PROJECTION_NO_HISTORY = {
   unavailable: null,
   rewardPerAttestation: 2.5,
   rewardRateSource: "chain",
+  communityRewardsEnabled: true,
   attestationsTotal: 0,
   firstAttestationBlock: null,
   attestationsPerDay: null,
@@ -124,10 +126,11 @@ export const PROJECTION_NO_HISTORY = {
 };
 
 /**
- * A `/economics/rewards` 404 — no treasury figures and, importantly, no bond.
+ * A `/economics/rewards` 404 — no treasury figures and, importantly, no
+ * community-certificate bond terms.
  *
- * Losing this endpoint costs the projection its ceiling AND its bond, so the
- * assumptions line has to say nothing is being netted out.
+ * Losing this endpoint costs the projection its ceiling and certificate
+ * terms, so the assumptions line must say no deduction was assumed.
  */
 export const ECONOMICS_404 = {
   sourceHost: "http://140.82.16.112:9090",
@@ -160,9 +163,9 @@ export const ECONOMICS_NO_BALANCE = {
   attestationsRemainingUnavailableReason:
     "Cannot compute a remaining count without a treasury balance.",
   treasuryIsFinite: true,
-  bondPerAttestation: 0.000001,
-  challengePeriodBlocks: 100,
-  bondRefundedAfterChallengePeriod: true,
+  bondPerAttestation: 0,
+  challengePeriodBlocks: null,
+  bondRefundedAfterChallengePeriod: null,
 };
 
 export async function clearState(page: Page) {

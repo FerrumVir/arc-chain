@@ -736,7 +736,7 @@ impl FrameworkEval for PackedDenseEval {
         // running sum of this row's products
         let mut row_sum = p[0].clone();
         for item in p.iter().take(PACK_K).skip(1) {
-            row_sum = row_sum + item.clone();
+            row_sum += item.clone();
         }
 
         // 2. accumulation chain with per-neuron reset
@@ -842,7 +842,7 @@ pub fn generate_packed_trace(
                 cols[k][row] = w;
                 cols[PACK_K + k][row] = xv;
                 cols[2 * PACK_K + k][row] = prod;
-                row_sum = row_sum + prod;
+                row_sum += prod;
             }
             acc = if r == 0 { row_sum } else { acc + row_sum };
             cols[3 * PACK_K][row] = acc;
@@ -1099,7 +1099,7 @@ pub fn try_prove_dense_stark(
         for root in &commitment_roots {
             h.update(root);
         }
-        h.update(&(log_size as u32).to_le_bytes());
+        h.update(&log_size.to_le_bytes());
         h.update(&(out_size as u32).to_le_bytes());
         h.update(&(in_size as u32).to_le_bytes());
         h.update(&hash_i64(&weights[..in_size * out_size]));
@@ -1593,9 +1593,10 @@ pub struct RecursiveVerifierInput {
 ///     `chain_valid_next * (end_state_limbs[j]_curr - start_state_limbs[j]_next) = 0`
 ///  6. (x16) Merkle structural consistency:
 ///     `active * (merkle_computed[j] - child_hash[j] - merkle_sibling[j]) = 0`
-///     (The computed Merkle node must be the "sum" of child hash and sibling in M31,
-///      representing the commitment to the hash preimage. The actual BLAKE3 is
-///      verified in the trace generator.)
+///
+///     The computed Merkle node must be the "sum" of child hash and sibling in M31,
+///     representing the commitment to the hash preimage. The actual BLAKE3 is
+///     verified in the trace generator.
 #[derive(Clone)]
 pub struct ArcRecursiveVerifierEval {
     pub log_size: u32,

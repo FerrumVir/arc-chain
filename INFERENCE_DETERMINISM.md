@@ -1,69 +1,70 @@
-# Integer Inference on ARC Chain - Determinism & Quality
+# Integer inference determinism
 
-**Version:** v0.5.2 (shipped)
-**Last verified:** 2026-04-20
+**Version:** v0.7.12 release candidate (unreleased)
 
-## Determinism (the IP)
+**Last verified locally:** 2026-08-26
 
-All integer inference paths produce **bitwise identical** output across
-ARM (Apple Silicon) and x86 (Vultr VPS), across runs, across GPU and CPU
-backends. This is the feature that lets inference pass consensus the
-same way transactions do.
+## What is now proven automatically
 
-Guarantees:
+ARC has a blocking known-answer test (KAT) for the production
+`CachedIntegerModel`. Unlike the older same-process rerun tests, it compares
+against reviewed tokens and BLAKE3 digests committed in
+`crates/arc-inference/tests/fixtures/integer_inference_kat.json`.
 
-- `forward_one_token` → same logits, same hash on ARM = x86 = NEON = scalar
-- `forward_shard_token` → same hidden-state hash across the pipeline
-- `/inference/run` and `/inference/run_sharded` return identical
-  `output_hash` on repeated calls with the same prompt (verified in
-  prod against Mac + 8 Vultr seeds at round 1,176,883)
-- Tests asserting bit-identical reruns: `test_deterministic_100_runs`,
-  `test_deterministic_1000_runs`, `test_simd_matches_scalar`,
-  `test_dot_i16_simd_matches_scalar`
+The three `golden_*` tests verify:
 
-## Quality (a known limitation)
+- the synthetic model's exact weight hash;
+- next-token IDs and every logits hash for a fixed token sequence;
+- the full KV-cache hash;
+- one-thread I8 output versus four-thread promoted-I16 output;
+- whole-model shard execution versus a three-way layer split, including every
+  intermediate hidden-state hash; and
+- a fixed autoregressive token sequence and final output hash.
 
-WikiText-2 perplexity on Llama-2-7B **Q8_0 GGUF**, 1024-token sample:
-**~107** (prior 63-token run) / **~155** (256-token run).
+Run the same gate locally with:
 
-Published FP16 baseline is 5.47. We are running ~20–30× worse.
+```bash
+cargo test -p arc-inference --lib --locked golden -- --nocapture
+```
 
-Root cause (diagnosed 2026-04-20, see `project_i16_ppl_bug.md` memory
-and `crates/arc-inference/examples/probe_i16_real_weights.rs`):
-`I8Weights::quantize_f32` truncates the f32 per-row `abs_max` with
-`abs_max as i64` before computing the scale. For 100% of Llama-2-7B's
-`output.weight` rows and 100% of `ffn_down` rows - which have
-`abs_max ∈ [0.034, 0.523]` - this collapses the scale to 1, making
-matmul output 36× smaller than f32 ground truth.
+`.github/workflows/golden-vectors.yml` runs it as a blocking matrix on Linux
+x86_64, Windows x86_64, Apple Silicon macOS, and Intel macOS. Before this branch
+is published, the fixture has also passed natively on Apple arm64 and under the
+Apple x86_64/Rosetta target. CI results must still pass on the pushed commit;
+local evidence is not a substitute for that gate.
 
-**Why the quality loss is not fixable with a one-line edit:** every
-downstream integer primitive (`attn_scale`, `integer_exp` LUT input
-range, KV cache scale conventions) was empirically tuned to the
-36×-undersized I8 output. Fixing the matmul alone detonates the softmax
-(verified: PPL explodes from 107 → 782 when I16::quantize_f32 produces
-mathematically correct magnitudes).
+## What this does not prove
 
-**Path forward (not done):**
-1. Coordinated rescale of `attn_scale`, `integer_exp` LUT, KV cache
-   scales to match the corrected matmul magnitudes. Changes every
-   chain attestation hash - requires rolling upgrade of all seeds.
-2. Or swap to proper block-wise quantization (Q8_0 / Q4_K style) with
-   per-block scales. Larger rewrite but matches llama.cpp quality.
+The KAT is intentionally scoped. It does **not** establish bit identity for:
 
-## Investigation artifacts
+- Metal, CUDA, WGSL, or any other GPU backend;
+- every quantization/storage mode (Q4, block-I8, ternary, or hybrid);
+- a production Llama-2-7B GGUF and its real weight bytes; or
+- every supported CPU architecture, such as RISC-V.
 
-Committed probes for whoever picks this up:
+Until separate hardcoded vectors run on those paths, product copy must say
+“CPU I8/I16 KAT verified on ARM and x86” rather than “identical on every chip”
+or “GPU verified.” Existing same-host tests such as
+`test_deterministic_1000_runs` and SIMD-versus-scalar comparisons remain useful
+regression tests, but they are not cross-host proof by themselves.
 
-- `crates/arc-inference/examples/probe_i16_vs_i8.rs` - forward-pass A/B
-- `crates/arc-inference/examples/probe_i16_matmul.rs` - single-row
-  synthetic matmul vs ground truth
-- `crates/arc-inference/examples/probe_i16_real_weights.rs` - real
-  Llama-2-7B tensors vs ground truth (the definitive probe)
+## Quality remains a separate question
 
-## What's unblocked on top of the current v0.5.2 baseline
+Historical Llama-2-7B Q8_0 measurements reported WikiText-2 perplexity around
+107–155 versus a published FP16 baseline of 5.47. Those April 2026 measurements
+have not been revalidated by the synthetic KAT and should not be presented as a
+current benchmark.
 
-The PPL-107 baseline is coherent enough that the chain-level features
-work: shard pipeline agrees on output hashes, attestations verify,
-cross-arch determinism holds. The inference quality limitation does
-not block consensus, economics, or demo use cases - it blocks a
-head-to-head comparison with FP16 Llama on natural-language benchmarks.
+The earlier investigation found a per-row scaling error in
+`I8Weights::quantize_f32`: converting a sub-1.0 row maximum to `i64` before
+forming the scale collapsed many values. The code now computes that scale in
+`f64`, but a correct production-quality claim still needs a fresh, pinned GGUF
+evaluation and an explicit quality threshold. Determinism only says repeated
+computation agrees; it does not say the model output is good.
+
+## Release rule
+
+A release may claim the automated CPU determinism scope only when the golden
+workflow passes on the exact tagged commit. GPU, additional quantization modes,
+and large-model quality require their own evidence and must remain labeled
+unverified until those gates exist.

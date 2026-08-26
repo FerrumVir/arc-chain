@@ -1,5 +1,14 @@
 # How ARC's pipeline-parallel sharded inference works
 
+> **Architecture history, not a current production guarantee.** The public-v2
+> model ID binds a shape label rather than exact weight bytes, and a per-hop
+> BLAKE3 digest detects changed bytes but does not prove an honest forward pass.
+> The unreleased v0.7.12 candidate adds exact-artifact binding and authenticated
+> independent recomputation; its blocking determinism evidence is currently a
+> synthetic CPU ARM/x86 known-answer test, not every model or backend. The Aug
+> 26 public fleet is forked/version-skewed. See
+> [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
+
 A walkthrough of the architecture, the wire format, and the code paths for anyone who wants to understand or reproduce sharded LLM inference on ARC. Skip to the code reference at the bottom if you just want to read the actual files.
 
 ---

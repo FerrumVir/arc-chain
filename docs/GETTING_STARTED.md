@@ -1,8 +1,17 @@
 # Getting Started with ARC Node
 
-You downloaded ARC Node. Now what?
+> **Recovery notice (2026-08-26):** v0.7.12 is an unreleased recovery
+> candidate; the public v0.7.11 release is desktop-only, and the public seeds
+> still run older split/stalled chain state. This guide predates that recovery
+> and is not proof that community work or rewards are live. For an SSH/VPS
+> node use [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md), and do not record an
+> earnings walkthrough until
+> [`VALIDATOR-FLEET-ROLLOUT.md`](VALIDATOR-FLEET-ROLLOUT.md) is complete.
 
-This guide walks you from a fresh install through your first earned ARC token. Reading time: ~5 minutes. Hands-on time: ~3 minutes.
+You downloaded a published ARC desktop package. Now what?
+
+This historical GUI tour explains the controls; it does not promise a first
+earned token. Reading time: ~5 minutes. Hands-on time: ~3 minutes.
 
 ---
 
@@ -41,23 +50,26 @@ This guide walks you from a fresh install through your first earned ARC token. R
 
 ### Linux (Ubuntu / Debian)
 
+After the complete v0.7.12 release is published, use its normalized desktop
+asset name:
+
 ```bash
-sudo apt install ./ARC.Node_0.7.11_amd64.deb
+sudo apt install ./arc-desktop-linux-x86_64.deb
 arc-node-desktop
 ```
 
 ### Linux (Fedora / RHEL)
 
 ```bash
-sudo rpm -i ARC.Node-0.7.11-1.x86_64.rpm
+sudo rpm -i ./arc-desktop-linux-x86_64.rpm
 arc-node-desktop
 ```
 
 ### Linux (any distro, AppImage)
 
 ```bash
-chmod +x ARC.Node_0.7.11_amd64.AppImage
-./ARC.Node_0.7.11_amd64.AppImage
+chmod +x ./arc-desktop-linux-x86_64.AppImage
+./arc-desktop-linux-x86_64.AppImage
 ```
 
 ---
@@ -74,31 +86,45 @@ Brief overview. Click **Continue**.
 
 ARC Node generates a fresh **BIP39 seed phrase** (12 words) and an **ARC address** (`arc1q...`).
 
-> **Save the seed phrase.** It's the only thing that proves the address is yours. Take a screenshot or copy it into a password manager. You'll need it if you ever reinstall or move to a new machine.
+> **Save the seed phrase offline or in a trusted password manager.** Do not take
+> a screenshot, paste it into chat, or store it in an unencrypted note. You'll
+> need it if you ever reinstall or move to a new machine.
 
 The seed phrase is stored locally on your machine. It is never sent to any server. ARC Node has no "forgot password" recovery — the seed phrase IS the recovery.
 
 Click **Continue**.
 
-### Screen 3: Join the network
+### Screen 3: Configure this node
 
-Pick your role:
+Choose whether to download a model:
 
-- **Worker** (default, recommended): your machine serves AI inference and earns ARC.
-- **Observer**: read-only, no earnings. For people who want to verify the chain without participating.
+- **Worker candidate**: the node can advertise compute only after the complete
+  artifact loads. It is eligible only for requests carrying that exact artifact
+  ID. This does not guarantee peers, assignment, verification, or payment.
+- **Observer/router**: no local model execution. It can still query the selected
+  coordinator and follow whatever chain services the approved rollout enables.
 
-Click **Start node**.
+Click **Set up this node**. The app downloads the chosen model and node build,
+starts the process, attempts a configured coordinator connection, and requests
+testnet faucet credit. Each result is reported separately.
 
 ---
 
 ## 3. What happens next
 
-Within ~30 seconds:
+After setup:
 
-- The bottom-left status pill turns from `connecting` → `syncing` → `live`.
-- The **Network** tab shows the 6 testnet seeds you've connected to.
-- The tray icon (🟣 dot, top-right of your menu bar / system tray) tells you the node is alive even when the window is closed.
-- ARC Node registers a launchd (macOS) / systemd user service (Linux) / startup task (Windows) so the node starts automatically next time you log in.
+- The Dashboard distinguishes a running process from peer connectivity and
+  selected-host chain health. Do not treat a `live` health string or advancing
+  DAG round as proof of block production or cross-seed agreement.
+- The **Network** tab attributes every chain number to one pinned host. The
+  public seeds are divergent, so it intentionally does not blend them.
+- The tray icon (🟣 dot, top-right of your menu bar / system tray) tells you
+  the desktop process is present when the window is closed. Use Dashboard health
+  and peer fields to check the node process and network state separately.
+- If **Start node on app launch** is enabled and the OS login item is actually
+  registered, ARC opens and starts the process after login. Settings reports
+  the config flag and registration separately.
 
 **Close the window any time.** The node keeps running in the tray. Closing the window does not stop the node. To actually stop, click the tray icon → **Quit**.
 
@@ -111,18 +137,25 @@ Within ~30 seconds:
 1. Click the **Inference** tab in the sidebar.
 2. Type a prompt. Example: `What is the capital of France?`
 3. Click **Run inference**.
-4. The network will:
-   - Route your prompt through the live shard pipeline (Llama-2-7B split into 6 layer ranges across the 6 seeds, each range replicated 3×).
-   - Run it through the pure-integer engine.
-   - Return the output, the BLAKE3 input/output hashes, and an attestation `tx_hash`.
 
-**How long this takes, honestly.** Roughly **10 seconds per token** on the
-public testnet, so the default 16-token response takes **1–3 minutes**. A first
-request against a shard that has not served recently is slower still — a
-measured cold run spent 14.5 s and 16.5 s on two individual layer ranges. The
-millisecond figures in the README are single-node local measurements, not
-network ones. Repeating the *exact* same prompt returns in microseconds because
-it is served from a result cache, not recomputed.
+The result states which host says it served the request and exactly what
+agreement evidence came back. A raw `InferenceAttestation` (`0x16`) is only a
+computation claim; even a successful mined `0x16` receipt is not a worker
+payment.
+
+4. If the selected path succeeds, the response can include output, input/output
+   commitments, route metadata, and a claim transaction hash. Each field is
+   reported independently. A missing `tx_hash`, a host-reported agreement
+   summary, or an HTTP success must not be upgraded into proof of mining,
+   independent signatures, community assignment, or payment.
+
+**How long this took in the historical public-path sample.** The old path was
+roughly **10 seconds per token**, so a 16-token response often took **1–3
+minutes**. One cold run spent 14.5 s and 16.5 s on two individual ranges. These
+are dated observations, not a latency promise for the recovery candidate.
+Millisecond figures in the README are single-node local measurements. A fast
+repeat can be a cache hit rather than recomputation; inspect the returned
+evidence instead of inferring it from timing.
 
 **About that `tx_hash`.** It is real, and the attestation genuinely enters the
 mempool — but four of the six seeds have not sealed a block in about six days,
@@ -139,9 +172,13 @@ prompts. Prompts phrased as `Explain <topic>` reliably return newline spam.
 
 1. Click the **Wallet** tab.
 2. Click **Claim from faucet** (top right).
-3. Within ~10 seconds, your balance will show **10,000 testnet ARC**.
+3. Read the returned transaction status, then verify a successful mined receipt
+   and the balance on the same selected host. A submitted or pending claim is
+   not yet a balance change.
 
-There is a **60-second cooldown** per address. Check the live figures yourself:
+The Aug 17 public endpoint reported a **60-second cooldown** and a 10,000 ARC
+testnet claim amount. Treat those as host-reported snapshot values and check the
+selected host before quoting them:
 
 ```bash
 curl http://140.82.16.112:9090/faucet/status
@@ -158,24 +195,30 @@ This is testnet ARC — no real-world value.
 ### See your earnings
 
 1. Click the **Earnings** tab.
-2. Attestations your node helped serve appear here, valued at 2.5 ARC each.
+2. Treat only a successful mined `CommunityInferenceReward` (`0x25`) receipt as
+   payment. Raw `0x16` rows are shown separately as unpaid inference claims.
 
-**What that number is.** It is display arithmetic — an attestation count
-multiplied by a 2.5 ARC constant. It does not read an on-chain balance and will
-not reconcile against your wallet balance. It is also computed from an
-in-memory transaction map that gets pruned, so the lifetime figure can go
-*down* between refreshes and resets to zero if the node restarts. Attestation
-rewards are not actually paid out on the current chain.
+The unreleased v0.7.12 candidate configures 2.5 testnet ARC per successful
+`0x25` receipt, but issuance also requires exact-artifact work assignment,
+authenticated recomputation, a signed worker certificate, active genesis
+protocol activation, validator approval collection, strict
+greater-than-two-thirds identity and active-stake approval, a funded treasury,
+and successful block inclusion. With six equally staked validators, five must
+approve. Approval collection is currently unavailable, so the candidate fails
+closed and shows no forward reward projection.
 
-Expect this tab to read **0.0 ARC** today: `/worker/earnings` returns
-`total_attestations: 0` for every address on every seed, because attestations
-are not being mined (see above).
-
-If you're a fresh worker node, you may not see earnings for the first few minutes — the network has to assign you a shard range and announce you to the coordinators. After that, attestations roll in passively.
+The deployed v2 seeds expose legacy count × constant display arithmetic. That
+does not reconcile to payment and must not be described as earnings. The Aug 26
+read-only snapshot showed community `total_work_completed: 0` across all
+workers and no successful community reward receipt.
 
 ### Check the dashboard
 
-The 6 testnet seeds publish a live network dashboard at <http://140.82.16.112:3200>. You can paste your ARC address into it to see your node's view of the world from outside.
+The public dashboard at <http://140.82.16.112:3200> is a diagnostic view, not a
+proof that the fleet is one healthy chain. On Aug 26, all six reachable seeds
+returned different block hashes and state roots at the same audited height.
+Pin one source, show its version and block age, and stop any reward demo if the
+common-height fork warning appears.
 
 ---
 
@@ -183,19 +226,32 @@ The 6 testnet seeds publish a live network dashboard at <http://140.82.16.112:32
 
 **Does ARC Node use GPU?**
 
-If you have a Metal-capable Mac (M1/M2/M3/M4) or a CUDA GPU on Linux/Windows, yes. Otherwise CPU. The integer-fixed-point engine is deterministic across both — same prompt → identical output hash regardless of hardware.
+A GPU is optional. The candidate's blocking cross-architecture known-answer
+test covers the CPU I8/I16 whole-model and three-way-shard paths on ARM and x86.
+It does not yet prove a GPU backend or production 7B GGUF, so do not claim
+cross-GPU bit identity from the current test gate.
 
 **How much will I earn?**
 
-On testnet: nothing real. Testnet ARC is a placeholder for measuring throughput and proving the economic model. Mainnet earnings depend on demand, your hardware, and your chosen shard range. The Earnings tab shows you the testnet-equivalent rate.
+No amount is guaranteed. Testnet ARC has no monetary value. The Earnings tab
+shows a forward figure only when the selected coordinator confirms reward
+protocol and approval readiness and has enough successful mined `0x25` history
+to measure an address-specific rate. Hardware size is not a reward multiplier.
 
 **Will it slow down my computer?**
 
-The node runs at ~5-15% CPU when idle, spiking briefly during inference. RAM usage is ~3-4 GB (model weights). Storage: ~5 GB total. If you want to throttle, **Settings → Resource limits**.
+Measure this on your own machine; the app does not promise a universal CPU or
+RAM figure. An observer needs no model. The current full-model worker target is
+about 4 GB on disk; use at least 8 GB RAM, with 12 GB or more providing safer
+OS and chain headroom. **Settings → Compute contribution** controls the worker
+thread ceiling, not a reward multiplier.
 
 **How do I update?**
 
-The macOS, Windows NSIS, and Linux AppImage builds consume the signed Tauri
+When **Check for app updates automatically** is enabled, the candidate checks
+shortly after startup and every 24 hours. Background checks do not download or
+install anything; the user must confirm installation. The macOS, Windows NSIS,
+and Linux AppImage builds consume the signed Tauri
 `latest.json` manifest. The updater refuses an artifact whose signature does
 not match the public key pinned in `desktop/src-tauri/tauri.conf.json`. Linux
 `.deb` and `.rpm` installs remain owned by their package managers, so update
@@ -209,7 +265,9 @@ package-managed files. Headless/server updates are separate and documented in
 - **Windows**: Settings → Apps → ARC Node → Uninstall.
 - **Linux**: `sudo apt remove arc-node-desktop` (or rpm equivalent), then `~/.config/network.arc.desktop/`.
 
-The seed phrase lives in your config dir, so deleting it without backup means losing the address.
+Keep the recovery phrase you saved during setup. The desktop does not retain the
+displayed phrase for later recovery, so do not reset or uninstall until you have
+verified your backup.
 
 **Where do I report bugs?**
 
@@ -220,7 +278,7 @@ GitHub Issues: <https://github.com/FerrumVir/arc-chain/issues>
 ## 6. Want to go deeper?
 
 - **Run from CLI instead of the desktop app?** See [README.md](../README.md) "Or run from the command line".
-- **Verify a past attestation from scratch?** `curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh | bash -s -- --latest`
+- **Inspect a past attestation from a reviewed checkout?** Run `ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest` from the repository root against a controlled candidate. Its hash comparison is not payment proof or exact-artifact recomputation unless that coordinator supplies those fields.
 - **Read the paper:** *On the Foundations of Trustworthy Artificial Intelligence* (in the repo root).
 - **Architecture deep-dive:** [ARCHITECTURE.md](../ARCHITECTURE.md).
 

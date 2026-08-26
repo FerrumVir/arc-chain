@@ -1,0 +1,14 @@
+[package]
+name = "tauri-updater-verifier"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[dependencies]
+base64 = "=0.22.1"
+minisign-verify = "=0.2.5"
+
+# Keep this small release tool independent of the application workspace. Its
+# lockfile is reviewed and used with --locked by the publication gate.
+[workspace]

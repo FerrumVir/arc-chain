@@ -20,6 +20,13 @@ pub struct TxAccessSet {
     pub accounts: HashSet<[u8; 32]>,
 }
 
+/// Synthetic conflict key for the validator registry, which lives outside the
+/// account map. Transactions that read validator authorization or mutate
+/// membership/stake must share this key so BlockSTM preserves canonical order.
+fn validator_set_access_key() -> [u8; 32] {
+    arc_crypto::hash_bytes(b"arc-block-stm-validator-set-v1").0
+}
+
 /// Compute the access set for a single transaction.
 ///
 /// This is a *static* prediction based on the transaction body - no execution
@@ -42,6 +49,7 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
         }
         TxBody::Stake(body) => {
             accounts.insert(body.validator.0);
+            accounts.insert(validator_set_access_key());
         }
         TxBody::WasmCall(body) => {
             accounts.insert(body.contract.0);
@@ -50,10 +58,10 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             accounts.insert(body.beneficiary.0);
         }
         TxBody::DeployContract(_) | TxBody::RegisterAgent(_) | TxBody::MultiSig(_) => {}
-        TxBody::JoinValidator(_)
-        | TxBody::LeaveValidator
-        | TxBody::ClaimRewards
-        | TxBody::UpdateStake(_) => {}
+        TxBody::JoinValidator(_) | TxBody::LeaveValidator | TxBody::UpdateStake(_) => {
+            accounts.insert(validator_set_access_key());
+        }
+        TxBody::ClaimRewards => {}
         TxBody::Governance(_) => {}
         TxBody::BridgeLock(_) | TxBody::BridgeMint(_) => {}
         TxBody::BatchSettle(body) => {
@@ -75,14 +83,23 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             accounts.insert(escrow_addr.0);
         }
         TxBody::CommunityInferenceReward(body) => {
-            // Rewards share the treasury and each touches a worker plus an
-            // exactly-once marker derived from the coordinator job id.
+            // Rewards share the treasury and each touches a worker plus
+            // independent exactly-once job and worker-certificate markers.
             accounts.insert(arc_types::transaction::faucet_pool_address().0);
+            accounts.insert(validator_set_access_key());
             accounts.insert(body.worker.0);
             accounts.insert(
                 arc_types::transaction::CommunityInferenceRewardBody::marker_address(
                     &body.chain_domain,
                     &body.job_id,
+                )
+                .0,
+            );
+            accounts.insert(
+                arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                    &body.chain_domain,
+                    &body.worker,
+                    &body.worker_certificate.attestation_hash,
                 )
                 .0,
             );
@@ -155,6 +172,7 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             // doesn't race on the pool's balance.
             accounts.insert(body.recipient.0);
             accounts.insert(arc_types::transaction::faucet_pool_address().0);
+            accounts.insert(validator_set_access_key());
         }
         TxBody::InferenceRequest(body) => {
             // Touches the request escrow account derived from request_id.
@@ -240,6 +258,7 @@ mod tests {
         Address, TxType,
         transaction::{
             CommunityInferenceRewardBody, InferenceAttestationBody, InferenceChallengeBody,
+            UpdateStakeBody, WorkerInferenceCertificate,
         },
     };
 
@@ -295,6 +314,7 @@ mod tests {
     }
 
     fn make_community_reward(validator: Address, worker: Address, tag: u8) -> Transaction {
+        let worker_attestation = make_attestation(worker, 0, tag);
         Transaction::new_community_inference_reward(
             validator,
             u64::from(tag),
@@ -307,7 +327,13 @@ mod tests {
                 output_hash: hash_bytes(&[tag, 2]),
                 max_tokens: 8,
                 expires_at_height: 100,
-                worker_attestation: Box::new(make_attestation(worker, 0, tag)),
+                worker_certificate: WorkerInferenceCertificate {
+                    attestation_hash: worker_attestation.hash,
+                    nonce: worker_attestation.nonce,
+                    challenge_period: 100,
+                    signature: worker_attestation.signature,
+                },
+                validator_approvals: Vec::new(),
             },
         )
     }
@@ -384,6 +410,36 @@ mod tests {
             partition_batches(&[first, second]).len(),
             2,
             "shared treasury debits must execute in transaction order"
+        );
+    }
+
+    #[test]
+    fn community_rewards_conflict_with_validator_set_mutations() {
+        let reward = make_community_reward(addr(9), addr(10), 1);
+        let mut update_stake = Transaction {
+            tx_type: TxType::UpdateStake,
+            from: addr(50),
+            nonce: 0,
+            body: TxBody::UpdateStake(UpdateStakeBody { new_stake: 123_456 }),
+            fee: 0,
+            gas_limit: 0,
+            hash: arc_crypto::Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        update_stake.hash = update_stake.compute_hash();
+
+        let validator_set = validator_set_access_key();
+        assert!(tx_access_set(&reward).accounts.contains(&validator_set));
+        assert!(
+            tx_access_set(&update_stake)
+                .accounts
+                .contains(&validator_set)
+        );
+        assert_eq!(
+            partition_batches(&[update_stake, reward]).len(),
+            2,
+            "reward quorum must observe the preceding canonical validator-set mutation"
         );
     }
 

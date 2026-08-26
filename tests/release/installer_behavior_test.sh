@@ -85,7 +85,16 @@ invoke_installer() {
         MOCK_TARGET_GROUP="${MOCK_TARGET_GROUP_UNDER_TEST:-arc-community-test}" \
         MOCK_TARGET_HOME="$sandbox/home" \
         MOCK_HEALTH_PORT="${MOCK_HEALTH_PORT_UNDER_TEST:-}" \
+        MOCK_HEALTH_STATUS="${MOCK_HEALTH_STATUS_UNDER_TEST:-ok}" \
         MOCK_TAMPER_BINARY="${MOCK_TAMPER_BINARY_UNDER_TEST:-0}" \
+        MOCK_SYSTEMD_NODE_ACTIVE="${MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST:-false}" \
+        MOCK_SYSTEMD_NODE_ENABLED="${MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST:-false}" \
+        MOCK_SYSTEMD_UPDATER_ACTIVE="${MOCK_SYSTEMD_UPDATER_ACTIVE_UNDER_TEST:-false}" \
+        MOCK_SYSTEMD_UPDATER_ENABLED="${MOCK_SYSTEMD_UPDATER_ENABLED_UNDER_TEST:-false}" \
+        MOCK_SERVICE_FAIL_MATCH="${MOCK_SERVICE_FAIL_MATCH_UNDER_TEST:-}" \
+        MOCK_SERVICE_FAIL_ONCE_FILE="$sandbox/service-fail-once" \
+        ARC_INSTALL_TEST_FAIL_AFTER_COPY="${ARC_INSTALL_TEST_FAIL_AFTER_COPY_UNDER_TEST:-}" \
+        ARC_HEALTH_TIMEOUT="${ARC_HEALTH_TIMEOUT_UNDER_TEST:-180}" \
         ARC_TEST_NODE_ARGS_LOG="$sandbox/node-args.log" \
         TMPDIR="$sandbox/tmp" \
         NO_COLOR=1 \
@@ -260,8 +269,10 @@ no_service_no_updater_really_is_install_only() {
         'empty model choice was not persisted unambiguously' || return 1
     assert_file_contains "$sandbox/arc/install.conf" '^service_scope=none$' \
         'install-only mode was not persisted as service_scope=none' || return 1
-    assert_file_contains "$sandbox/arc/bin/run-arc-node" '--rpc 0\.0\.0\.0:18444' \
-        'generated runner does not use the custom RPC port' || return 1
+    assert_file_contains "$sandbox/arc/bin/run-arc-node" '--rpc 127\.0\.0\.1:18444' \
+        'generated runner does not bind the custom RPC port to loopback' || return 1
+    assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--rpc 0\.0\.0\.0:' \
+        'managed stake-zero runner exposes unauthenticated RPC on every interface' || return 1
     assert_file_contains "$sandbox/arc/bin/run-arc-node" '--p2p-port 18445' \
         'generated runner does not use RPC+1 for P2P' || return 1
     assert_file_contains "$sandbox/arc/bin/run-arc-node" '--community-mode' \
@@ -428,6 +439,36 @@ update_only_preserves_custom_port_and_empty_model() {
     fi
 }
 
+degraded_service_health_is_reported_truthfully() {
+    local sandbox output
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    output="$sandbox/degraded-health.out"
+    ARC_NODE_VERSION_UNDER_TEST='v0.8.0'
+    MOCK_HEALTH_PORT_UNDER_TEST=9944
+    MOCK_HEALTH_STATUS_UNDER_TEST=degraded
+
+    if ! invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.0.json" '0.8.0' \
+        --user-service --no-auto-update >"$output" 2>&1; then
+        sed -n '1,160p' "$output"
+        MOCK_HEALTH_PORT_UNDER_TEST=''
+        MOCK_HEALTH_STATUS_UNDER_TEST=''
+        ARC_NODE_VERSION_UNDER_TEST=''
+        return 1
+    fi
+
+    MOCK_HEALTH_PORT_UNDER_TEST=''
+    MOCK_HEALTH_STATUS_UNDER_TEST=''
+    ARC_NODE_VERSION_UNDER_TEST=''
+    assert_file_contains "$output" 'reports status=degraded' \
+        'installer hid a degraded node behind a generic healthy message' || return 1
+    assert_file_not_contains "$output" 'is healthy' \
+        'installer still labels a degraded migration observer as healthy' || return 1
+    assert_file_not_contains "$output" 'restoring the previous arc-node binary' \
+        'a truthful degraded migration observer should remain installed for diagnosis' || return 1
+}
+
 legacy_installer_delegates_without_generating_validator_material() {
     local sandbox output expected_args actual_args
     new_sandbox
@@ -462,6 +503,229 @@ SH
     fi
 }
 
+transaction_state() {
+    local sandbox="$1"
+    local label path
+    while IFS='|' read -r label path; do
+        [ -n "$label" ] || continue
+        if [ -f "$path" ]; then
+            printf '%s|file|%s|%s\n' "$label" "$(file_sha256 "$path")" "$(file_mode "$path")"
+        else
+            printf '%s|absent\n' "$label"
+        fi
+    done <<EOF
+arc-node|$sandbox/arc/bin/arc-node
+arc-cli|$sandbox/arc/bin/arc-cli
+arc-installer|$sandbox/arc/bin/arc-installer
+seeds|$sandbox/arc/testnet-seeds.txt
+genesis|$sandbox/arc/genesis.toml
+identity|$sandbox/arc/identity/validator-seed
+node-env|$sandbox/arc/node.env
+runner|$sandbox/arc/bin/run-arc-node
+install-config|$sandbox/arc/install.conf
+node-unit|$sandbox/home/.config/systemd/user/arc-node.service
+updater-unit|$sandbox/home/.config/systemd/user/arc-node-update.service
+updater-timer|$sandbox/home/.config/systemd/user/arc-node-update.timer
+model|$sandbox/model.gguf
+data-sentinel|$sandbox/arc/data/existing-user-data
+EOF
+}
+
+reset_transaction_test_environment() {
+    ARC_NODE_VERSION_UNDER_TEST=''
+    MOCK_HEALTH_PORT_UNDER_TEST=''
+    MOCK_HEALTH_STATUS_UNDER_TEST=''
+    ARC_HEALTH_TIMEOUT_UNDER_TEST=''
+    ARC_INSTALL_TEST_FAIL_AFTER_COPY_UNDER_TEST=''
+    MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=false
+    MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=false
+    MOCK_SYSTEMD_UPDATER_ACTIVE_UNDER_TEST=false
+    MOCK_SYSTEMD_UPDATER_ENABLED_UNDER_TEST=false
+    MOCK_SERVICE_FAIL_MATCH_UNDER_TEST=''
+}
+
+prepare_transactional_user_install() {
+    local sandbox="$1" output="$2"
+    mkdir -p "$sandbox/arc/data"
+    printf 'existing user chain bytes\n' >"$sandbox/arc/data/existing-user-data"
+    printf 'existing local model bytes\n' >"$sandbox/model.gguf"
+    ARC_NODE_VERSION_UNDER_TEST=v0.8.0
+    MOCK_HEALTH_PORT_UNDER_TEST=18444
+    MOCK_HEALTH_STATUS_UNDER_TEST=ok
+    ARC_HEALTH_TIMEOUT_UNDER_TEST=4
+    if ! invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.0.json" 0.8.0 \
+        --user-service --port 18444 --model "$sandbox/model.gguf" >"$output" 2>&1; then
+        sed -n '1,180p' "$output"
+        reset_transaction_test_environment
+        return 1
+    fi
+    ARC_NODE_VERSION_UNDER_TEST=''
+    MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
+    MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=true
+    MOCK_SYSTEMD_UPDATER_ACTIVE_UNDER_TEST=true
+    MOCK_SYSTEMD_UPDATER_ENABLED_UNDER_TEST=true
+}
+
+assert_failed_update_restored_everything() {
+    local sandbox="$1" before_state="$2" output="$3" failure_name="$4"
+    local after_state
+    after_state="$(transaction_state "$sandbox")"
+    assert_equals "$before_state" "$after_state" \
+        "$failure_name left a mixed binary/config/service/identity installation" || return 1
+    assert_file_contains "$output" 'restoring every previously managed file and service state' \
+        "$failure_name did not run the full install transaction rollback" || return 1
+    assert_file_contains "$output" 'Previous ARC installation and service state restored' \
+        "$failure_name did not report a successful full rollback" || return 1
+    assert_log_contains_literal "$sandbox/service.log" 'systemctl --user restart arc-node.service' \
+        "$failure_name did not restart the previously active node service" || return 1
+    if find "$sandbox/arc" "$sandbox/home/.config/systemd/user" \
+        -type f \( -name '*.new.*' -o -name '*.rollback.*' \) | grep -q .; then
+        printf '%s left staged transaction files behind:\n' "$failure_name"
+        find "$sandbox/arc" "$sandbox/home/.config/systemd/user" \
+            -type f \( -name '*.new.*' -o -name '*.rollback.*' \) -print
+        return 1
+    fi
+    if [ -e "$sandbox/arc/.install.lock" ]; then
+        printf '%s left the installer lock behind\n' "$failure_name"
+        return 1
+    fi
+}
+
+fresh_mid_copy_failure_removes_new_managed_files() {
+    local sandbox output status
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    output="$sandbox/fresh-mid-copy.out"
+    ARC_NODE_VERSION_UNDER_TEST=v0.8.0
+    ARC_INSTALL_TEST_FAIL_AFTER_COPY_UNDER_TEST=3
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.0.json" 0.8.0 \
+        --no-service --no-auto-update >"$output" 2>&1
+    status=$?
+    reset_transaction_test_environment
+    if [ "$status" -eq 0 ]; then
+        printf 'injected fresh-install copy failure unexpectedly succeeded\n'
+        return 1
+    fi
+    if find "$sandbox/arc" -type f | grep -q .; then
+        printf 'fresh-install rollback retained newly introduced managed files:\n'
+        find "$sandbox/arc" -type f -print
+        return 1
+    fi
+    assert_file_contains "$output" 'Previous ARC installation and service state restored' \
+        'fresh-install copy failure did not complete rollback' || return 1
+}
+
+mid_copy_update_failure_restores_full_install() {
+    local sandbox output before_state status
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    output="$sandbox/base-transaction-install.out"
+    prepare_transactional_user_install "$sandbox" "$output" || return 1
+    before_state="$(transaction_state "$sandbox")"
+    : >"$sandbox/service.log"
+    output="$sandbox/mid-copy-update.out"
+    ARC_INSTALL_TEST_FAIL_AFTER_COPY_UNDER_TEST=4
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.1.json" 0.8.1 \
+        --update-only >"$output" 2>&1
+    status=$?
+    ARC_INSTALL_TEST_FAIL_AFTER_COPY_UNDER_TEST=''
+    if [ "$status" -eq 0 ]; then
+        printf 'injected mid-copy update failure unexpectedly succeeded\n'
+        reset_transaction_test_environment
+        return 1
+    fi
+    assert_failed_update_restored_everything "$sandbox" "$before_state" "$output" \
+        'mid-copy update failure' || {
+            reset_transaction_test_environment
+            return 1
+        }
+    reset_transaction_test_environment
+}
+
+service_failure_restores_full_install() {
+    local sandbox output before_state status
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    output="$sandbox/base-transaction-install.out"
+    prepare_transactional_user_install "$sandbox" "$output" || return 1
+    before_state="$(transaction_state "$sandbox")"
+    : >"$sandbox/service.log"
+    rm -f "$sandbox/service-fail-once"
+    output="$sandbox/service-failure-update.out"
+    MOCK_SERVICE_FAIL_MATCH_UNDER_TEST='restart arc-node.service'
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.1.json" 0.8.1 \
+        --update-only >"$output" 2>&1
+    status=$?
+    MOCK_SERVICE_FAIL_MATCH_UNDER_TEST=''
+    if [ "$status" -eq 0 ]; then
+        printf 'injected node-service restart failure unexpectedly succeeded\n'
+        reset_transaction_test_environment
+        return 1
+    fi
+    assert_failed_update_restored_everything "$sandbox" "$before_state" "$output" \
+        'service restart failure' || {
+            reset_transaction_test_environment
+            return 1
+        }
+    reset_transaction_test_environment
+}
+
+health_failure_restores_full_install() {
+    local sandbox output before_state status
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    output="$sandbox/base-transaction-install.out"
+    prepare_transactional_user_install "$sandbox" "$output" || return 1
+    before_state="$(transaction_state "$sandbox")"
+    : >"$sandbox/service.log"
+    output="$sandbox/health-failure-update.out"
+    MOCK_HEALTH_STATUS_UNDER_TEST=starting
+    ARC_HEALTH_TIMEOUT_UNDER_TEST=2
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.1.json" 0.8.1 \
+        --update-only >"$output" 2>&1
+    status=$?
+    MOCK_HEALTH_STATUS_UNDER_TEST=ok
+    if [ "$status" -eq 0 ]; then
+        printf 'non-ready health response unexpectedly committed an update\n'
+        reset_transaction_test_environment
+        return 1
+    fi
+    assert_failed_update_restored_everything "$sandbox" "$before_state" "$output" \
+        'health classification failure' || {
+            reset_transaction_test_environment
+            return 1
+        }
+    reset_transaction_test_environment
+}
+
+transaction_contract_covers_every_service_scope() {
+    local required_literal
+    for required_literal in \
+        'snapshot_transaction_path /etc/systemd/system/arc-node.service' \
+        'snapshot_transaction_path /etc/systemd/system/arc-node-update.service' \
+        'snapshot_transaction_path /etc/systemd/system/arc-node-update.timer' \
+        'snapshot_transaction_path "$USER_UNIT_DIR/arc-node.service"' \
+        'snapshot_transaction_path "$USER_UNIT_DIR/arc-node-update.service"' \
+        'snapshot_transaction_path "$USER_UNIT_DIR/arc-node-update.timer"' \
+        'snapshot_transaction_path "$NODE_PLIST"' \
+        'snapshot_transaction_path "$UPDATE_PLIST"'
+    do
+        assert_log_contains_literal "$REPO_ROOT/install.sh" "$required_literal" \
+            "installer transaction omits service-managed path: $required_literal" || return 1
+    done
+    assert_file_not_contains "$REPO_ROOT/install.sh" \
+        'as_root cp -- "\$TMP_DIR/arc-node[^ ]*" /etc/systemd/system/' \
+        'system service files bypass transactional_copy' || return 1
+    assert_file_contains "$REPO_ROOT/install.sh" \
+        '^commit_install_transaction$' \
+        'installer never commits the full transaction after health succeeds' || return 1
+}
+
 run_test 'offline platform aliases install exact-tag node + CLI assets without starting' install_only_platform_matrix
 run_test 'checksum mismatch rejects and removes staged executables' tampered_binary_is_rejected
 run_test 'ARC_NODE_VERSION requires strict X.Y.Z before network-shaped requests' invalid_version_pin_fails_before_asset_download
@@ -470,6 +734,12 @@ run_test 'sudo/root execution normalizes ownership to the invoking community use
 run_test 'Windows remains a documented manual-binary path, not a shell install path' windows_is_manual_only
 run_test 'update-only refuses downgrade before downloading artifacts' update_only_refuses_downgrade
 run_test 'update-only preserves custom ports and an intentionally empty model' update_only_preserves_custom_port_and_empty_model
+run_test 'degraded service health remains installed but is never labeled healthy' degraded_service_health_is_reported_truthfully
 run_test 'legacy installer delegates to stake-zero root installer without key generation' legacy_installer_delegates_without_generating_validator_material
+run_test 'fresh mid-copy failure removes every newly introduced managed file' fresh_mid_copy_failure_removes_new_managed_files
+run_test 'mid-copy update failure restores the complete prior install transaction' mid_copy_update_failure_restores_full_install
+run_test 'service restart failure restores files and prior service state' service_failure_restores_full_install
+run_test 'non-ready health failure restores files and prior service state' health_failure_restores_full_install
+run_test 'systemd system/user and launchd files share the full transaction boundary' transaction_contract_covers_every_service_scope
 
 finish_tests

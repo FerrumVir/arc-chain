@@ -63,8 +63,10 @@ export function Wallet() {
                 <p>
                   Your balance is fetched from the chain via{" "}
                   <code>GET /account/&lt;address&gt;</code>. It reflects every
-                  confirmed transaction: faucet drops, earnings from verified
-                  inference, and transfers in or out.
+                  successful transaction retained by this selected host:
+                  faucet credits, transfers, and mined community-reward
+                  transactions (<code>0x25</code>). A raw inference attestation
+                  (<code>0x16</code>) is not payment.
                 </p>
                 <p style={{ color: "var(--text-muted)", fontSize: 11 }}>
                   Updates every 4 seconds.

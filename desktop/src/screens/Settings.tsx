@@ -488,9 +488,9 @@ function ComputeContribution() {
       <span className="field-hint">
         Cores your node may use for inference and verification. More cores
         serve each hop faster, at the cost of responsiveness elsewhere on this
-        machine. Earnings follow the attestations you actually serve, not the
-        cores you own — there is no multiplier from cores to ARC, and a faster
-        node earns nothing if the network sends it no work.
+        machine. Cores do not multiply ARC: payment requires compatible assigned
+        work, independent verification, validator authorization, and a
+        successful mined <code>0x25</code> reward receipt.
       </span>
 
       <ActualContribution />
@@ -672,14 +672,13 @@ function ActualContribution() {
 }
 
 /**
- * Persistence, stated plainly — the owner's first question was whether mining
- * survives a restart without the user doing anything.
+ * Startup state, stated plainly — whether the app is configured to start the
+ * node and whether the OS login item that can reopen the app is registered.
  *
  * It has to be truthful about what resumes, not just that something does.
- * Auto-start brings the node back, but the ROLE it comes back in depends on
- * whether a model is configured: with one it serves inference and can earn,
- * without one it follows consensus and is never sent inference work. Saying
- * "mining resumes" to an observer-mode install would be a lie by omission.
+ * Auto-start brings the process back, but the role depends on whether a model
+ * path is configured. Neither process state nor role proves exact-artifact
+ * eligibility, assignment, authorization, or payment.
  */
 function PersistenceCard() {
   const config = useAppStore((s) => s.config);
@@ -702,7 +701,7 @@ function PersistenceCard() {
   return (
     <Card style={{ marginBottom: "var(--space-6)" }} data-testid="persistence-card">
       <CardHeader
-        title="Runs with your computer"
+        title="Startup readiness"
         action={
           <StatusPill
             level={running ? "live" : "offline"}
@@ -721,21 +720,22 @@ function PersistenceCard() {
           {autoStart ? (
             <>
               <strong>
-                Your node starts with this computer and keeps contributing.
+                ARC is configured to start the node when the app opens.
               </strong>{" "}
-              You do not need to switch it back on after a reboot, and turning
-              it off and on again does not reset anything. The only thing that
-              changes this is the{" "}
-              <strong>&ldquo;Start node on app launch&rdquo;</strong> setting
-              below — while it is on, the behaviour persists.
+              {loginItem === true
+                ? "The OS login item is registered, so ARC can reopen after login. Check “Right now” after a reboot; process startup does not prove peers, work, or payment."
+                : loginItem === false
+                  ? "No OS login item is registered, so this setting alone cannot reopen ARC after login. Open ARC manually or repair the login item."
+                  : "OS login-item registration has not been verified yet. Until it is, do not assume ARC will reopen after login."}
             </>
           ) : (
             <>
               <strong>Your node does not start on its own.</strong>{" "}
               &ldquo;Start node on app launch&rdquo; is off, so after a reboot
-              you have to start it yourself from the Dashboard, and it earns
-              nothing until you do. Turn the setting on to have it resume
-              automatically.
+              you have to start it yourself from the Dashboard. A stopped node
+              cannot serve local inference; starting it still does not
+              guarantee peers, assignment, or payment. Turn the setting on to
+              have the process resume automatically.
             </>
           )}
         </p>
@@ -744,15 +744,17 @@ function PersistenceCard() {
           When it does resume, it comes back as{" "}
           {hasModel ? (
             <>
-              a <strong>worker</strong>: a model is configured, so it serves
-              slices of inference requests and can earn attestations.
+              a <strong>worker candidate</strong>: a model path is configured.
+              The artifact must load completely and exactly match a requested
+              model ID before the node advertises capacity. Assignment and a
+              successful mined <code>0x25</code> reward remain separate gates.
             </>
           ) : (
             <>
-              an <strong>observer</strong>: no model is configured, so it
-              follows consensus but is never sent inference work — and{" "}
-              <strong>an observer earns nothing</strong>. Download a model to
-              be sent work.
+              an <strong>observer/router</strong>: no model is configured, so it
+              cannot execute local model inference. Downloading a complete
+              compatible artifact can enable worker mode, but does not promise
+              work or payment.
             </>
           )}
         </p>
@@ -805,8 +807,10 @@ function InferenceModeToggle() {
         <div>
           <div style={{ fontWeight: 500 }}>Coordinator</div>
           <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
-            Routes inference through the seed coordinator network. Results are
-            verified by k-of-n consensus across validator replicas.
+            Tries your local node, then the selected coordinator path. The
+            v0.7.12 candidate accepts community work only after authenticated
+            2-of-3 recomputation for every layer range and token. Older public
+            seeds may return less evidence, which the result screen labels.
           </div>
         </div>
       </label>

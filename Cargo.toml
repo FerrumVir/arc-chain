@@ -2,6 +2,8 @@
 resolver = "2"
 exclude = ["desktop/src-tauri", "vendor/stwo"]
 members = [
+    "vendor/wasmer-derive",
+    "crates/arc-bincode",
     "crates/arc-crypto",
     "crates/arc-types",
     "crates/arc-state",
@@ -21,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.11"
+version = "0.7.12"
 edition = "2024"
 license = "BUSL-1.1"
 authors = ["FerrumVir"]
@@ -57,7 +59,10 @@ rand_core = "0.6"
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-bincode = "1.3"
+# Maintained, bincode-v1-wire-compatible serde adapter. The dependency key
+# intentionally remains `bincode` so protocol call sites cannot accidentally
+# mix codecs while the package itself is the ARC compatibility facade.
+bincode = { package = "arc-bincode", path = "crates/arc-bincode" }
 
 # Async / networking
 tokio = { version = "1.0", features = ["full"] }
@@ -116,6 +121,13 @@ uuid = { version = "1.0", features = ["v4"] }
 parking_lot = "0.12"
 bytes = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
+
+# Wasmer 6.1.0 still depends on the abandoned `proc-macro-error2` crate even
+# though wasmer-derive only uses it for diagnostics. Keep the runtime and its
+# generated valid-code behavior pinned to 6.1.0, while replacing that helper
+# in a narrowly vendored derive crate. See vendor/wasmer-derive/README.md.
+[patch.crates-io]
+wasmer-derive = { path = "vendor/wasmer-derive" }
 
 [profile.release]
 opt-level = 3

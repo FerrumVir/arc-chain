@@ -68,6 +68,13 @@ render_fake_binary() {
         printf "    printf '%%s\\n' '%s %s'\n" "$program" "$version"
         printf '    exit 0\n'
         printf 'fi\n'
+        if [ "$program" = arc-cli ]; then
+            # shellcheck disable=SC2016 # Expansion belongs to the generated executable.
+            printf 'if [ "${3:-}" = "health" ]; then\n'
+            # shellcheck disable=SC2016 # Expansion belongs to the generated executable.
+            printf '    case "${MOCK_HEALTH_STATUS:-ok}" in ok|degraded) printf "%%s\\n" "$MOCK_HEALTH_STATUS"; exit 0 ;; *) exit 1 ;; esac\n'
+            printf 'fi\n'
+        fi
         # shellcheck disable=SC2016 # Expansion belongs to the generated executable.
         printf 'printf "%%s\\n" "$*" >>"${ARC_TEST_NODE_ARGS_LOG:?}"\n'
         printf 'exit 0\n'
@@ -79,17 +86,17 @@ render_asset() {
     local version="$1" asset="$2" destination="$3"
     case "$asset" in
         testnet-seeds.txt)
-            printf '127.0.0.1:19091\n' >"$destination"
+            printf '# release v%s\n127.0.0.1:19091\n' "$version" >"$destination"
             ;;
         genesis.toml)
             printf '%s\n' \
                 '[chain]' \
-                'name = "arc-release-observer-fixture"' \
+                "name = \"arc-release-observer-fixture-v$version\"" \
                 'chain_id = "0x415243"' \
                 'validator_set_complete = false' >"$destination"
             ;;
         install.sh)
-            printf '#!/usr/bin/env bash\nexit 0\n' >"$destination"
+            printf '#!/usr/bin/env bash\n# release v%s\nexit 0\n' "$version" >"$destination"
             chmod +x "$destination"
             ;;
         *)
@@ -142,7 +149,7 @@ case "$url" in
         if [ "$requested_port" != "${MOCK_HEALTH_PORT:-}" ]; then
             exit 22
         fi
-        emit_text '{"status":"ok","peers":1}'
+        printf '{"status":"%s","peers":1}\n' "${MOCK_HEALTH_STATUS:-ok}"
         ;;
     https://github.com/FerrumVir/arc-chain/releases/download/v*/*)
         release_tail="${url#*'/releases/download/v'}"

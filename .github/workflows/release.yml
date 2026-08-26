@@ -1,9 +1,9 @@
 name: Release ARC
 
-# One tag, one workflow, one publisher. v0.7.10 and v0.7.11 were broken by
+# One tag, one workflow, one create-only publisher. v0.7.10 and v0.7.11 were broken by
 # two sibling workflows: the desktop workflow created a release with its
 # GITHUB_TOKEN, and that event could not trigger the headless workflow. This
-# graph builds every supported asset first and calls the release API once.
+# graph builds every supported asset first and invokes one create-only publisher.
 on:
   push:
     tags:
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing immutable tag to release (for example v0.8.0)
+        description: Existing strict tag to release (for example v0.7.12); repository rules must separately protect it from moves
         required: true
         type: string
 
@@ -27,18 +27,20 @@ env:
 
 jobs:
   validate:
-    name: Validate immutable release ref
+    name: Validate release tag and pin commit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       date: ${{ steps.release.outputs.date }}
+      sha: ${{ steps.release.outputs.sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
           ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
       - id: release
         name: Match tag, source, and application versions
@@ -61,7 +63,7 @@ jobs:
           TAG_COMMIT="$(git rev-list -n 1 "$TAG")"
           HEAD_COMMIT="$(git rev-parse HEAD)"
           if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
-            echo "::error::Checkout $HEAD_COMMIT does not match immutable tag $TAG ($TAG_COMMIT)."
+            echo "::error::Checkout $HEAD_COMMIT does not match tag $TAG ($TAG_COMMIT)."
             exit 1
           fi
 
@@ -102,7 +104,155 @@ jobs:
             echo "tag=$TAG"
             echo "version=$VERSION"
             echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "sha=$TAG_COMMIT"
           } >> "$GITHUB_OUTPUT"
+
+  # A tag is independently releasable only if its validated commit passes
+  # the aggregate quality harness. Do not rely on a prior branch CI run: a tag
+  # or workflow_dispatch can otherwise publish a commit whose required gates
+  # were never executed. This intentionally duplicates build work in exchange
+  # for making the publish authorization self-contained.
+  release-quality:
+    name: Full quality gate on validated release commit
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            dashboard/package-lock.json
+            desktop/package-lock.json
+            sdk/typescript/package-lock.json
+
+      # The workspace is pinned to nightly; the out-of-workspace Tauri crate
+      # is deliberately tested on stable by scripts/ci_check.sh.
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+          components: clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: release-quality
+          workspaces: |
+            . -> target
+            desktop/src-tauri -> desktop/src-tauri/target
+
+      - name: Audit every JavaScript lockfile used by release builds
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          for package in dashboard desktop sdk/typescript; do
+            npm --prefix "$package" audit --package-lock-only --audit-level=low
+          done
+
+      - name: Install pinned Actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -Eeuo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            > "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          printf '%s\n' "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Install Linux desktop and browser prerequisites
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libfuse2
+          cd desktop
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Run every blocking local release gate
+        run: ./scripts/ci_check.sh --full
+
+  # Release publication fails closed on the reviewed Cargo.lock and deny.toml.
+  # The branch CI audit is intentionally only a canary; this exact-commit gate
+  # is the release authorization for advisories, bans, sources, and licenses.
+  release-supply-chain:
+    name: Cargo dependency policy (${{ matrix.graph }})
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - graph: workspace
+            manifest: Cargo.toml
+          - graph: desktop
+            manifest: desktop/src-tauri/Cargo.toml
+          - graph: updater-verifier
+            manifest: tests/release/tauri-updater-verifier/Cargo.toml
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: ${{ matrix.manifest }}
+          arguments: --locked
+          command: check advisories bans sources licenses
+
+  # The release graph repeats the inference known-answer vectors on every
+  # supported CPU/OS architecture. A green Linux x86_64 quality run alone does
+  # not prove that integer promotion, threading, or shard assembly agrees on
+  # ARM, Intel macOS, or Windows.
+  cross-arch-golden-vectors:
+    name: Golden vectors (${{ matrix.platform }})
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
+          - platform: macos-arm64
+            runner: macos-14
+          - platform: macos-x86_64
+            runner: macos-15-intel
+          - platform: windows-x86_64
+            runner: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-03-16
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: release-golden-${{ matrix.platform }}
+
+      - name: Run blocking inference known-answer vectors
+        run: cargo test -p arc-inference --lib --locked golden -- --nocapture
 
   headless:
     name: Headless ${{ matrix.platform }}
@@ -145,15 +295,17 @@ jobs:
             extension: .exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: nightly-2026-03-16
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: release-headless-${{ matrix.target }}
           workspaces: . -> target
@@ -179,7 +331,7 @@ jobs:
           "./$NODE_ASSET" --version | grep -F " $VERSION"
           "./$CLI_ASSET" --version | grep -F " $VERSION"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: headless-${{ matrix.platform }}
           path: |
@@ -202,7 +354,12 @@ jobs:
           - platform: linux-arm64
             runner: ubuntu-22.04-arm
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: headless-${{ matrix.platform }}
           path: release-smoke
@@ -223,13 +380,65 @@ jobs:
                 "ubuntu:$ubuntu" "/release/$binary" --version \
                 | grep -F " $VERSION"
             done
+
+            # Boot the real headless node, not just clap's `--version` path.
+            # The shipped incomplete genesis deliberately enters the
+            # stake-zero migration-observer mode, so this exercises config,
+            # data-dir creation and Axum health serving without joining or
+            # mutating any network. Bash `/dev/tcp` avoids installing curl in
+            # the otherwise-clean server image.
+            docker run --rm \
+              --env DISPLAY= \
+              --volume "$PWD/release-smoke:/release:ro" \
+              --volume "$PWD/genesis.toml:/config/genesis.toml:ro" \
+              "ubuntu:$ubuntu" bash -ceu '
+                log=/tmp/arc-node-smoke.log
+                /release/arc-node-${{ matrix.platform }} \
+                  --rpc 127.0.0.1:19944 \
+                  --p2p-port 19945 \
+                  --eth-rpc-port 0 \
+                  --data-dir /tmp/arc-data \
+                  --genesis /config/genesis.toml \
+                  --no-community >"$log" 2>&1 &
+                node_pid=$!
+                trap '\''kill "$node_pid" 2>/dev/null || true; wait "$node_pid" 2>/dev/null || true'\'' EXIT
+                for _ in $(seq 1 40); do
+                  if ! kill -0 "$node_pid" 2>/dev/null; then
+                    cat "$log"
+                    exit 1
+                  fi
+                  if response=$(timeout 2 bash -ceu '\''
+                    exec 3<>/dev/tcp/127.0.0.1/19944
+                    printf "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3
+                    cat <&3
+                  '\'' 2>/dev/null) && printf "%s" "$response" | grep -q "HTTP/1.1 200"; then
+                    # An isolated migration observer has no advancing chain,
+                    # so truthful health is normally `degraded`; the smoke
+                    # requires a valid liveness classification, not a false
+                    # green chain claim.
+                    printf "%s\n" "$response" | grep -Eq '"status":"(ok|degraded)"'
+                    exit 0
+                  fi
+                  sleep 0.25
+                done
+                cat "$log"
+                exit 1
+              '
           done
 
   desktop:
     name: Desktop ${{ matrix.platform }}
-    needs: validate
+    # Do not expose the environment-scoped signing key to repository build
+    # code until the exact commit has passed every platform-independent
+    # quality, dependency-policy, and known-answer gate.
+    needs: [validate, release-quality, release-supply-chain, cross-arch-golden-vectors]
     runs-on: ${{ matrix.runner }}
+    environment: release
     timeout-minutes: 120
+    env:
+      # The desktop crate is intentionally built and tested independently of
+      # the workspace's pinned nightly toolchain.
+      RUSTUP_TOOLCHAIN: stable
     strategy:
       fail-fast: false
       matrix:
@@ -273,11 +482,12 @@ jobs:
         working-directory: desktop
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
         with:
           targets: ${{ matrix.rust-target }}
 
@@ -291,15 +501,15 @@ jobs:
             libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
             patchelf libfuse2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: desktop/package-lock.json
 
       - run: npm ci
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: release-desktop-${{ matrix.rust-target }}
           workspaces: desktop/src-tauri -> target
@@ -315,9 +525,9 @@ jobs:
             echo "::error::TAURI_SIGNING_PRIVATE_KEY is required. Unsigned updater artifacts are never published."
             exit 1
           fi
-          npx tauri build ${{ matrix.tauri-args }}
+          npx tauri build --ci ${{ matrix.tauri-args }} -- --locked
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: arc-desktop-${{ matrix.platform }}
           path: ${{ matrix.artifact-glob }}
@@ -326,19 +536,26 @@ jobs:
 
   publish:
     name: Validate and publish complete release
-    needs: [validate, headless, linux-server-compat, desktop]
+    needs: [validate, release-quality, release-supply-chain, cross-arch-golden-vectors, headless, linux-server-compat, desktop]
     runs-on: ubuntu-latest
+    environment: release
     timeout-minutes: 30
+    env:
+      # The isolated updater verifier is a stable-toolchain release utility.
+      RUSTUP_TOOLCHAIN: stable
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ needs.validate.outputs.tag }}
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
 
       - name: Assemble assets, updater manifest, and checksums
         env:
@@ -347,28 +564,36 @@ jobs:
           REPOSITORY: ${{ github.repository }}
         run: ./scripts/release/assemble-release.sh
 
+      - name: Cryptographically verify every updater payload against the embedded key
+        run: |
+          tests/release/verify_tauri_updater_signatures.sh \
+            desktop/src-tauri/tauri.conf.json release-files
+
       - name: Show final release contract
         run: |
           set -Eeuo pipefail
           ls -lh release-files
           cat release-files/SHA256SUMS
 
-      # This is intentionally the only release-publishing action in the repo.
-      # Every build/signature/checksum gate above must pass before it runs.
-      - name: Publish all assets after validation
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.validate.outputs.tag }}
-          name: ARC Chain ${{ needs.validate.outputs.tag }}
-          body: |
+      # This is intentionally the only release-publishing command in the repo.
+      # It refuses an existing release, re-resolves the remote tag immediately
+      # before creation, and lets `gh release create` stage every asset on a
+      # draft before publishing it. Repository tag rules and immutable-release
+      # settings remain an owner-controlled prerequisite outside this workflow.
+      - name: Re-verify tag and create a new complete release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.validate.outputs.sha }}
+          RELEASE_NOTES: |
             ## Headless / server node
 
             Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel), and
             Windows x86_64 command-line binaries are attached. Linux and macOS:
 
             ```bash
-            curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/latest/download/install.sh
-            bash install.sh
+            curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${{ needs.validate.outputs.tag }}/install.sh
+            bash install.sh --version ${{ needs.validate.outputs.version }}
             ```
 
             Windows Server users can download the `arc-node-windows-x86_64.exe`
@@ -376,12 +601,50 @@ jobs:
 
             ## Desktop GUI
 
-            Signed Tauri updater artifacts and desktop installers are attached
-            for macOS Apple Silicon/Intel, Windows x86_64, and Linux x86_64.
-            Linux ARM64 is headless-only in this release.
+            Tauri updater payloads carry application-update signatures. The
+            macOS and Windows installer packages in this recovery candidate are
+            not Apple Developer ID/notarized or Windows Authenticode signed, so
+            operating-system trust approval may be required. Linux x86_64
+            packages are attached; Linux ARM64 is headless-only in this release.
 
             Verify any asset with the attached `SHA256SUMS` file.
-          files: release-files/*
-          fail_on_unmatched_files: true
-          generate_release_notes: false
-          make_latest: true
+        run: |
+          set -Eeuo pipefail
+
+          LOCAL_SHA="$(git rev-parse HEAD)"
+          if [ "$LOCAL_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Publish checkout $LOCAL_SHA does not match validated commit $EXPECTED_SHA."
+            exit 1
+          fi
+
+          REMOTE_TAG_ROWS="$(git ls-remote --exit-code --tags origin \
+            "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")" || {
+            echo "::error::Remote tag $RELEASE_TAG no longer exists."
+            exit 1
+          }
+          REMOTE_SHA="$(printf '%s\n' "$REMOTE_TAG_ROWS" \
+            | awk '$2 ~ /\^\{\}$/ { print $1; exit }')"
+          if [ -z "$REMOTE_SHA" ]; then
+            REMOTE_SHA="$(printf '%s\n' "$REMOTE_TAG_ROWS" \
+              | awk -v tag="refs/tags/$RELEASE_TAG" '$2 == tag { print $1; exit }')"
+          fi
+          if [ "$REMOTE_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Remote tag $RELEASE_TAG moved to ${REMOTE_SHA:-missing}; validated commit was $EXPECTED_SHA."
+            exit 1
+          fi
+
+          EXISTING_TAGS="$RUNNER_TEMP/existing-release-tags.txt"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[].tag_name' > "$EXISTING_TAGS"
+          if grep -Fxq "$RELEASE_TAG" "$EXISTING_TAGS"; then
+            echo "::error::A GitHub release already exists for $RELEASE_TAG. Releases are create-only; use a new version/tag instead of replacing assets."
+            exit 1
+          fi
+
+          gh release create "$RELEASE_TAG" release-files/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --target "$EXPECTED_SHA" \
+            --title "ARC Chain $RELEASE_TAG" \
+            --notes "$RELEASE_NOTES" \
+            --latest

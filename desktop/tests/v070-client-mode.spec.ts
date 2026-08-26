@@ -3,7 +3,7 @@
 // Pre-v0.7 the banner was titled "Lite mode" and pointed users at firewall
 // + Hyper-V config that no longer applies (v0.5.7 ephemeral UDP fallback
 // resolves bind issues automatically). v0.7.0 rewrites the banner as
-// "Client mode" — honest about not earning until peers ≥ 1 — and adds
+// "Client mode" — honest about host scope and lack of peer-routed work — and adds
 // a one-click "Reset peer state & rebootstrap" button that wipes
 // known_peers.json and restarts the node. Most common cause of
 // "stuck after restart" is a stale dial cache; this fixes it.
@@ -19,7 +19,7 @@ import { expect, test } from "@playwright/test";
 import { seedOnboarded } from "./helpers";
 
 test.describe("v0.7.0 Client-mode banner (replaces 'Lite mode')", () => {
-  test("renders honest 'won't earn ARC until peers' banner when health=lite", async ({
+  test("renders honest host-scoped zero-peer banner when health=lite", async ({
     page,
   }) => {
     await seedOnboarded(page);
@@ -68,10 +68,11 @@ test.describe("v0.7.0 Client-mode banner (replaces 'Lite mode')", () => {
     const banner = page.getByTestId("lite-mode-banner");
     await expect(banner).toBeVisible({ timeout: 15_000 });
 
-    // v0.7.0 copy: "Client mode", explicit no-earnings warning, NYC label.
+    // Client mode names the host and does not turn a peer threshold into an
+    // earnings promise.
     await expect(banner).toContainText("Client mode");
-    await expect(banner).toContainText("won");
-    await expect(banner).toContainText("earn ARC");
+    await expect(banner).toContainText("scoped to that host");
+    await expect(banner).toContainText("cannot receive peer-routed community work");
     await expect(banner).toContainText("0 peers");
     await expect(banner).toContainText("NYC");
 

@@ -41,7 +41,7 @@ test.describe("Onboarding wizard", () => {
 
     // Launch
     await expect(page.getByTestId("step-launch")).toBeVisible();
-    await expect(page.getByRole("button", { name: /join the network/i })).toBeVisible();
+    await expect(page.getByRole("button", { name: /set up this node/i })).toBeVisible();
     await page.getByTestId("btn-launch").click();
 
     // Lands on dashboard (mock mode resolves startNode + faucetClaim fast)
@@ -85,5 +85,22 @@ test.describe("Onboarding wizard", () => {
     await page.getByTestId("btn-continue-welcome").click();
     await expect(page.getByTestId("step-hardware")).toHaveCount(0);
     await expect(page.getByTestId("step-role")).toHaveCount(0);
+  });
+
+  test("does not promise model size, setup, or automatic updates will earn rewards", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await expect(page.getByText(/confirm every download and install/i)).toBeVisible();
+    await expect(page.getByText(/you start earning/i)).toHaveCount(0);
+    await page.getByTestId("btn-continue-welcome").click();
+    await page.getByTestId("btn-reveal-seed").click();
+    await page.getByTestId("btn-continue-identity").click();
+    await expect(page.getByTestId("step-model")).toContainText(
+      /exact artifact ID/i,
+    );
+    await expect(page.getByTestId("step-model")).toContainText(
+      /do not multiply rewards or guarantee demand/i,
+    );
   });
 });

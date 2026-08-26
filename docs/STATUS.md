@@ -1,17 +1,25 @@
-# ARC Chain - Status (2026-04-22, partially refreshed 2026-08-17)
+# ARC Chain - Status (archived 2026-04-22 snapshot)
 
 > ## ⚠ This document is largely stale. Read this box first.
 >
 > The body below is a **2026-04-22 snapshot** and much of it describes a v0.4.6
 > world: the release table stops at v0.4.6, it refers to a Mac joining as a
 > "9th node", and it says the community installer pulls v0.4.6. The workspace
-> is now at **v0.7.11**.
+> is now the **unreleased v0.7.12 recovery candidate**; public v0.7.11 is
+> desktop-only, while the seeds still run v0.7.2/v0.7.9.
 >
 > Two sections have been corrected in place because they were actively
 > misleading — the precision claim (see "On precision" below) and the pointers
-> in "What to look at first". Everything else is a historical record.
+> in "What to look at first". Everything else is a historical record. In
+> particular, do **not** rely on the live, one-command join, daily auto-update,
+> universal model-ID, or reward claims below and do not run its legacy
+> installer command.
 >
 > **For current state, use these instead:**
+> - [`README.md`](../README.md) — honest release/public-network status
+> - [`docs/HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) — post-publication v0.7.12 server install
+> - [`docs/COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) — gated recording script
+> - [`docs/VALIDATOR-FLEET-ROLLOUT.md`](VALIDATOR-FLEET-ROLLOUT.md) — blocking cutover checklist
 > - [`ALERTS.md`](../ALERTS.md) — what is broken on the live network right now
 > - [`docs/DEMO-RUNBOOK.md`](DEMO-RUNBOOK.md) — the current run-of-show
 > - [`CLAUDE.md`](../CLAUDE.md) — live network table and safety rules
@@ -36,10 +44,9 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc
 curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh | bash -s -- --latest
 ```
 
-**One-command join the network**:
-```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
-```
+**Historical one-command join:** retired; do not run it. The replacement is
+documented in [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md) and is not usable
+until the complete v0.7.12 release is published.
 
 ---
 
@@ -199,9 +206,9 @@ is not yet accurate.
    copy still carries pre-April topology copy and references retired hosts. The
    repo copy in `dashboard/index.html` has been corrected; the live one has not
    been redeployed.
-5. **Check the installer** before sending it to anyone:
-   `curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash`
-   It was broken from v0.7.10 until 2026-08-17.
+5. **Do not send the historical installer in this archive to anyone.** Use the
+   exact-version, checksummed post-publication flow in
+   [`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md).
 
 ## Live endpoints
 

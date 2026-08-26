@@ -9,6 +9,7 @@
 //! This is the Tier 1 on-chain inference path. Every validator loads the
 //! same GGUF model and produces bitwise identical output.
 
+use crate::model_artifact::ModelArtifactCommitment;
 use crate::{InferenceError, InferenceResult};
 use arc_crypto::Hash256;
 // Only the `candle` feature has code paths that log here; without it this
@@ -30,7 +31,7 @@ pub struct GgufEngine {
 struct LoadedGgufModel {
     /// Path to the GGUF file (for reference).
     path: String,
-    /// Model ID = BLAKE3(first 1MB of file || file_size).
+    /// Model ID = streaming BLAKE3 of every source-artifact byte.
     model_id: Hash256,
     /// Quantized model weights loaded via candle.
     model: candle_transformers::models::quantized_llama::ModelWeights,
@@ -57,55 +58,38 @@ impl GgufEngine {
 
     /// Load a GGUF quantized model from a file path.
     ///
-    /// The model_id is computed as BLAKE3(first_1MB || file_size), ensuring all
-    /// validators loading the same file get the same model_id. Hashing only the
-    /// header + size avoids reading entire multi-GB GGUF files at load time.
+    /// The model_id is the streaming BLAKE3 commitment of the complete source
+    /// artifact. Shape metadata and byte sampling are not identities: two GGUF
+    /// files can share them while containing different weights.
     #[cfg(feature = "candle")]
     pub fn load_gguf_file(&self, path: &str) -> Result<Hash256, InferenceError> {
+        let artifact = ModelArtifactCommitment::from_path(path)?;
+        self.load_gguf_artifact(&artifact)
+    }
+
+    /// Load a model using an identity already computed during node startup.
+    /// The artifact is rechecked before Candle parses it so a file changed
+    /// between commitment and loading cannot be advertised under the old ID.
+    #[cfg(feature = "candle")]
+    pub fn load_gguf_artifact(
+        &self,
+        artifact: &ModelArtifactCommitment,
+    ) -> Result<Hash256, InferenceError> {
         use candle_core::Device;
         use candle_transformers::models::quantized_llama::ModelWeights;
-        use std::io::Read;
 
-        info!(path = path, "Loading GGUF model...");
+        artifact.verify_unchanged()?;
+        let path = artifact.path();
+        let path_display = path.display().to_string();
+        let model_id = artifact.model_id();
+        let file_size = artifact.size_bytes();
 
-        // Read file and compute model_id
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| InferenceError::Runtime(format!("Failed to open {path}: {e}")))?;
-
-        // For model_id: hash first 1MB + last 1MB + file size.
-        // Hashing the full multi-GB file is too slow for startup, but sampling
-        // both ends catches corrupted/tampered weight data that a header-only
-        // hash would miss.
-        let file_size = file
-            .metadata()
-            .map_err(|e| InferenceError::Runtime(format!("Failed to stat {path}: {e}")))?
-            .len();
-
-        let head_size = (1024 * 1024).min(file_size as usize);
-        let mut header_buf = vec![0u8; head_size];
-        file.read_exact(&mut header_buf)
-            .map_err(|e| InferenceError::Runtime(format!("Failed to read {path}: {e}")))?;
-
-        // Also read the last 1MB (or less for small files)
-        let tail_size = (1024 * 1024).min(file_size as usize);
-        let tail_offset = (file_size as usize).saturating_sub(tail_size);
-        if tail_offset > head_size {
-            use std::io::Seek;
-            file.seek(std::io::SeekFrom::Start(tail_offset as u64))
-                .map_err(|e| InferenceError::Runtime(format!("Failed to seek {path}: {e}")))?;
-            let mut tail_buf = vec![0u8; tail_size];
-            file.read_exact(&mut tail_buf).map_err(|e| {
-                InferenceError::Runtime(format!("Failed to read tail of {path}: {e}"))
-            })?;
-            header_buf.extend_from_slice(&tail_buf);
-        }
-
-        header_buf.extend_from_slice(&file_size.to_le_bytes());
-        let model_id = arc_crypto::hash_bytes(&header_buf);
+        info!(path = %path.display(), "Loading GGUF model...");
 
         // Open GGUF via candle's quantized loader
-        let mut gguf_file = std::fs::File::open(path)
-            .map_err(|e| InferenceError::Runtime(format!("Failed to reopen {path}: {e}")))?;
+        let mut gguf_file = std::fs::File::open(path).map_err(|e| {
+            InferenceError::Runtime(format!("Failed to reopen {path_display}: {e}"))
+        })?;
 
         let gguf_content = candle_core::quantized::gguf_file::Content::read(&mut gguf_file)
             .map_err(|e| InferenceError::Runtime(format!("GGUF parse error: {e}")))?;
@@ -127,7 +111,7 @@ impl GgufEngine {
         self.models.insert(
             model_id.0,
             LoadedGgufModel {
-                path: path.to_string(),
+                path: path_display,
                 model_id,
                 model,
                 vocab_size,
@@ -139,6 +123,16 @@ impl GgufEngine {
 
     #[cfg(not(feature = "candle"))]
     pub fn load_gguf_file(&self, _path: &str) -> Result<Hash256, InferenceError> {
+        Err(InferenceError::Runtime(
+            "candle feature not enabled - build with: cargo build --features candle".into(),
+        ))
+    }
+
+    #[cfg(not(feature = "candle"))]
+    pub fn load_gguf_artifact(
+        &self,
+        _artifact: &ModelArtifactCommitment,
+    ) -> Result<Hash256, InferenceError> {
         Err(InferenceError::Runtime(
             "candle feature not enabled - build with: cargo build --features candle".into(),
         ))

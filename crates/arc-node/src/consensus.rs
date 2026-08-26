@@ -7,7 +7,7 @@ use crate::SharedValidators;
 use crate::pipeline::{Pipeline, PipelineBatch};
 use crate::vrf::ProposerSelector;
 use arc_consensus::{ConsensusEngine, StakeTier, Validator, ValidatorSet};
-use arc_crypto::{Hash256, KeyPair, hash_bytes};
+use arc_crypto::{Hash256, KeyPair};
 use arc_mempool::{EncryptedMempool, Mempool};
 use arc_net::transport::{InboundMessage, OutboundMessage};
 use arc_state::StateDB;
@@ -15,6 +15,12 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerDagTransactionError {
+    AttachmentMismatch,
+    InvalidTransaction(Hash256),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerStateDiffError {
@@ -160,6 +166,47 @@ fn verify_peer_state_diff(
     Ok(())
 }
 
+/// Verify that peer-supplied transaction bodies are the exact preimages for a
+/// DAG block's canonical hash list. The returned copies carry a process-local
+/// verification cache bit; that bit is never accepted from the wire.
+fn verify_peer_dag_transactions(
+    committed_hashes: &[Hash256],
+    transactions: &[arc_types::Transaction],
+) -> Result<Vec<arc_types::Transaction>, PeerDagTransactionError> {
+    let mut attached_hashes: Vec<Hash256> = transactions.iter().map(|tx| tx.hash).collect();
+    attached_hashes.sort_by_key(|hash| hash.0);
+    let has_duplicates = attached_hashes.windows(2).any(|pair| pair[0] == pair[1]);
+    if has_duplicates || attached_hashes != committed_hashes {
+        return Err(PeerDagTransactionError::AttachmentMismatch);
+    }
+
+    transactions
+        .iter()
+        .map(|tx| {
+            let mut verified = tx.clone();
+            verified.sig_verified = false;
+            verified
+                .verify_signature()
+                .map_err(|_| PeerDagTransactionError::InvalidTransaction(verified.hash))?;
+            verified.sig_verified = true;
+            Ok(verified)
+        })
+        .collect()
+}
+
+/// The direct benchmark executor mutates canonical `StateDB` without a DAG
+/// commit. That is valid only for a one-validator development chain. A
+/// multi-validator benchmark must feed its signed transactions through the
+/// mempool and normal DAG proposal/commit path so every validator executes the
+/// same ordered block with the same consensus timestamp.
+fn should_execute_local_benchmark(
+    benchmark: bool,
+    can_produce: bool,
+    validator_count: usize,
+) -> bool {
+    benchmark && can_produce && validator_count == 1
+}
+
 /// Orchestrates DAG consensus for a single validator node.
 pub struct ConsensusManager {
     /// The underlying DAG consensus engine.
@@ -185,7 +232,8 @@ pub struct ConsensusManager {
     /// Encrypted mempool for MEV-protected commit-reveal transactions.
     /// Runs alongside the regular mempool when `Some`.
     encrypted_mempool: Option<Arc<EncryptedMempool>>,
-    /// Shared validator list for RPC - updated on PeerConnected/Disconnected.
+    /// Shared operator-approved validator authority list for RPC. Transport
+    /// connection events must never add, remove, or reweight entries.
     pub dag_validators: Option<SharedValidators>,
     /// Shared DAG round counter for health endpoint.
     pub dag_round: Option<Arc<std::sync::atomic::AtomicU64>>,
@@ -193,7 +241,8 @@ pub struct ConsensusManager {
     pub dag_committed: Option<Arc<std::sync::atomic::AtomicU64>>,
     /// WAL writer for DAG persistence - enables consensus recovery after restart.
     pub dag_wal: Option<Arc<arc_state::WalWriter>>,
-    /// Long-range attack prevention: checkpoint registry (every 1000 rounds).
+    /// Registry for externally certified long-range checkpoints. It remains
+    /// empty until canonical state-root signatures are actually collected.
     /// Behind Mutex for interior mutability in the consensus loop (takes &self).
     pub checkpoint_registry: std::sync::Mutex<arc_consensus::security::CheckpointRegistry>,
     /// Nothing-at-stake mitigation: double-vote tracker with graduated slashing.
@@ -220,17 +269,14 @@ impl ConsensusManager {
     ) -> Self {
         let (validator_set, tier) =
             Self::build_validator_set(validator_address, stake, peer_validators);
-        let engine = Arc::new(ConsensusEngine::new_testnet(
-            validator_set,
-            validator_address,
-        ));
+        let engine = Arc::new(ConsensusEngine::new(validator_set, validator_address));
 
         info!(
             address = %validator_address,
             stake = stake,
             tier = ?tier,
             shards = num_shards,
-            "ConsensusManager initialized (testnet mode, no keypair)"
+            "ConsensusManager initialized (strict legacy mode, no keypair)"
         );
 
         let vrf_selector = Self::build_vrf_selector(validator_address, stake, peer_validators);
@@ -270,20 +316,11 @@ impl ConsensusManager {
     ) -> Self {
         let (validator_set, tier) =
             Self::build_validator_set(validator_address, stake, peer_validators);
-        let engine = Arc::new(ConsensusEngine::new_testnet_with_keypair(
+        let engine = Arc::new(ConsensusEngine::new_with_keypair(
             validator_set,
             validator_address,
             keypair,
         ));
-
-        // Freeze the genesis validator set immediately at epoch 1.
-        // This ensures ALL nodes have the EXACT same frozen set from round 0,
-        // which is critical for deterministic leader selection. Without this,
-        // nodes that receive PeerConnected events before the freeze would add
-        // extra validators, causing different frozen sets → different leaders.
-        if !peer_validators.is_empty() {
-            engine.freeze_epoch();
-        }
 
         info!(
             address = %validator_address,
@@ -349,7 +386,9 @@ impl ConsensusManager {
                 validators.push(v);
             }
         }
-        let validator_set = ValidatorSet::new(validators, 0);
+        // This fixed, operator-approved set is active from epoch 1. Transport
+        // peer metadata never changes its identities or voting power.
+        let validator_set = ValidatorSet::new(validators, 1);
         (validator_set, tier)
     }
 
@@ -483,86 +522,35 @@ impl ConsensusManager {
                                 );
                                 continue;
                             }
-                            // Check if this peer is already in our validator set.
-                            // If so, this is a reconnect - do NOT reset the DAG,
-                            // which would destroy all round progress and cause
-                            // perpetual 0 TPS in soak tests with network jitter.
-                            let already_known = self.engine.validator_set().is_validator(&address);
-                            if already_known {
+                            // Transport authentication proves the peer identity,
+                            // but its advertised stake is still self-asserted.
+                            // Only the operator-approved genesis/checkpoint set
+                            // grants voting membership and voting power.
+                            let configured_stake = self
+                                .engine
+                                .validator_set()
+                                .get_validator(&address)
+                                .map(|validator| validator.stake);
+                            if let Some(configured_stake) = configured_stake {
+                                if stake != configured_stake {
+                                    warn!(
+                                        peer = %address,
+                                        advertised_stake = stake,
+                                        configured_stake,
+                                        "Ignored validator's self-reported stake; using configured voting power"
+                                    );
+                                }
                                 info!(
                                     peer = %address,
-                                    "Peer reconnected - already in validator set, keeping DAG state"
+                                    configured_stake,
+                                    "Configured validator connected; fixed membership unchanged"
                                 );
                             } else {
-                                // New peer: only add if it's a known genesis
-                                // validator. Unknown peers (e.g., old systemd
-                                // Accept new validators if they have sufficient stake.
-                                // Genesis validators are always accepted. New validators
-                                // join the live set immediately and the frozen set at the
-                                // next epoch boundary (round 1000, 2000, etc.).
-                                if stake < 500_000 {
-                                    // Low-stake peer: can't vote in consensus, but
-                                    // track in dag_validators so /community/list
-                                    // auto-discovers them as community workers.
-                                    // The P2P connection IS the registration.
-                                    if let Some(ref dv) = self.dag_validators {
-                                        let mut vals = dv.write();
-                                        if !vals.iter().any(|(a, _)| *a == address) {
-                                            vals.push((address, stake));
-                                            info!(
-                                                peer = %address,
-                                                stake = stake,
-                                                "Observer peer added to tracker (auto community worker)"
-                                            );
-                                        }
-                                    }
-                                    continue;
-                                }
-                                let current_vs = self.engine.validator_set();
-                                let mut validators: Vec<Validator> = current_vs.validators.clone();
-                                if let Some(v) = Validator::new(address, stake, 0) {
-                                    validators.push(v.clone());
-                                    // Queue for next epoch freeze
-                                    self.engine.queue_validator(v);
-                                }
-                                if !validators
-                                    .iter()
-                                    .any(|v| v.address == self.validator_address)
-                                    && let Some(v) =
-                                        Validator::new(self.validator_address, self.stake, 0)
-                                {
-                                    validators.push(v);
-                                }
-                                let was_single = current_vs.len() <= 1;
-                                let new_set = ValidatorSet::new(validators, current_vs.epoch);
-                                self.engine.update_validator_set(new_set);
-
-                                // On first peer connection, reset DAG but DON'T freeze
-                                // the epoch yet - more peers will connect in the next
-                                // 30-60s. The periodic freeze (every 100 rounds) will
-                                // capture the full validator set once peers stabilize.
-                                if was_single {
-                                    self.engine.reset_dag();
-                                    pending_txs.clear();
-                                    last_proposed_round = None;
-                                }
-                                info!(
+                                warn!(
                                     peer = %address,
-                                    validators = self.engine.validator_set().len(),
-                                    was_single = was_single,
-                                    "Peer connected - ValidatorSet updated"
+                                    advertised_stake = stake,
+                                    "Unknown peer connected without consensus voting authority; fixed membership unchanged"
                                 );
-
-                                // Update shared validator list for RPC
-                                if let Some(ref dv) = self.dag_validators {
-                                    let vs = self.engine.validator_set();
-                                    let mut list = dv.write();
-                                    *list = vs
-                                        .validators
-                                        .iter()
-                                        .map(|v| (v.address, v.stake))
-                                        .collect();
-                                }
                             }
                         }
                         InboundMessage::PeerDisconnected {
@@ -581,77 +569,60 @@ impl ConsensusManager {
                                 );
                                 continue;
                             }
-                            // CRITICAL: genesis validators (those in the frozen set)
-                            // must NEVER be removed from the active validator set.
-                            // The transport layer emits PeerDisconnected for the OLD
-                            // connection during stale-connection replacement (epoch-guarded
-                            // swap), which fires microseconds after PeerConnected for the
-                            // NEW connection. Removing the validator in that case breaks
-                            // consensus quorum even though the peer is actually connected.
-                            //
-                            // For genesis validators, we keep them in the active set
-                            // regardless of connection churn. The block-level quorum check
-                            // will naturally handle the "can't get blocks from offline peer"
-                            // case by failing to commit until enough blocks are received.
-                            let is_genesis =
-                                self.engine.frozen_validator_set().is_validator(&address);
-                            if is_genesis {
+                            // Connectivity is liveness metadata, never a
+                            // membership transaction. Keep the fixed voting set
+                            // unchanged for both configured and unknown peers.
+                            if self.engine.validator_set().is_validator(&address) {
                                 info!(
                                     peer = %address,
-                                    "Peer transport disconnected (genesis validator - keeping in set)"
+                                    "Configured validator disconnected; fixed membership unchanged"
                                 );
-                                continue;
+                            } else {
+                                debug!(peer = %address, "Unknown non-voting peer disconnected");
                             }
-
-                            // Non-genesis peer: remove from active set as before.
-                            let current_vs = self.engine.validator_set();
-                            let remaining: Vec<Validator> = current_vs
-                                .validators
-                                .iter()
-                                .filter(|v| v.address != address)
-                                .cloned()
-                                .collect();
-                            // Ensure local validator is present
-                            let mut validators = remaining;
-                            if !validators
-                                .iter()
-                                .any(|v| v.address == self.validator_address)
-                                && let Some(v) =
-                                    Validator::new(self.validator_address, self.stake, 0)
-                            {
-                                validators.push(v);
-                            }
-                            let now_single = validators.len() <= 1;
-                            let new_set = ValidatorSet::new(validators, current_vs.epoch);
-                            self.engine.update_validator_set(new_set);
-
-                            // Only reset DAG when reverting to single-validator mode.
-                            // The pending DAG blocks are no longer useful since the
-                            // peer that produced them is gone and we can't reach quorum.
-                            if now_single {
-                                self.engine.reset_dag();
-                                pending_txs.clear();
-                                last_proposed_round = None;
-                            }
-                            info!(
-                                peer = %address,
-                                now_single = now_single,
-                                "Peer disconnected - non-genesis validator removed"
-                            );
                         }
                         InboundMessage::DagBlockWithTxs {
                             block,
                             transactions,
                         } => {
-                            // Insert the full transactions into pending_txs
-                            // so we can resolve them when this block commits.
-                            // Mark as sig_verified - the proposing node validated
-                            // them at the RPC layer, and sig_verified doesn't
-                            // survive serde roundtrip (defaults to false).
-                            for tx in &transactions {
-                                let mut tx_copy = tx.clone();
-                                tx_copy.sig_verified = true;
-                                pending_txs.insert(tx_copy.hash.0, tx_copy);
+                            // Verify peer-supplied envelopes locally before
+                            // they can reach committed execution. The
+                            // `sig_verified` bit is a process-local cache and
+                            // is deliberately forced false across serde; a peer
+                            // cannot confer trust by setting it.
+                            // The attachment must be an exact preimage set of
+                            // the transaction hashes committed by the DAG
+                            // block. Accepting a partial or unrelated
+                            // vector can finalize a block whose transactions
+                            // are unavailable (or populate pending state with
+                            // transactions the author never committed to).
+                            let verified = match verify_peer_dag_transactions(
+                                &block.transactions,
+                                &transactions,
+                            ) {
+                                Ok(verified) => verified,
+                                Err(PeerDagTransactionError::AttachmentMismatch) => {
+                                    warn!(
+                                        author = %block.author,
+                                        round = block.round,
+                                        committed = block.transactions.len(),
+                                        attached = transactions.len(),
+                                        "Rejected DAG block with mismatched transaction attachment"
+                                    );
+                                    continue;
+                                }
+                                Err(PeerDagTransactionError::InvalidTransaction(tx_hash)) => {
+                                    warn!(
+                                        %tx_hash,
+                                        author = %block.author,
+                                        round = block.round,
+                                        "Rejected entire DAG block containing an invalid transaction"
+                                    );
+                                    continue;
+                                }
+                            };
+                            for tx in verified {
+                                pending_txs.insert(tx.hash.0, tx);
                             }
                             // Feed block into consensus engine
                             match self.engine.receive_block(&block) {
@@ -737,7 +708,16 @@ impl ConsensusManager {
                         InboundMessage::Transactions(txs) => {
                             let mut inserted = 0usize;
                             for tx_bytes in txs {
-                                if let Ok(tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                                if let Ok(mut tx) = bincode::deserialize::<Transaction>(&tx_bytes) {
+                                    // Gossip is an untrusted ingress boundary.
+                                    // Verify before consuming bounded mempool
+                                    // capacity and cache the result only in
+                                    // this process.
+                                    tx.sig_verified = false;
+                                    if tx.verify_signature().is_err() {
+                                        continue;
+                                    }
+                                    tx.sig_verified = true;
                                     // Skip if already proposed (prevents gossip loop:
                                     // drain removes from mempool.seen, so without this
                                     // check the same tx bounces between peers forever)
@@ -799,20 +779,17 @@ impl ConsensusManager {
                             committed_round,
                         } => {
                             let my_round = self.engine.current_round();
-                            if dag_round > my_round + 10_000 {
+                            if dag_round.saturating_sub(my_round) > 10_000 {
                                 warn!(
-                                    "PARTITION DETECTED: peer {} at round {} but we are at {} (gap: {}). Triggering catch-up.",
+                                    "PARTITION DETECTED: peer {} at round {} but we are at {} (gap: {}). Authenticated checkpoint sync is required.",
                                     peer,
                                     dag_round,
                                     my_round,
                                     dag_round - my_round
                                 );
-                                // Fast-forward our round to peer's round minus a small buffer
-                                let target_round = dag_round.saturating_sub(10);
-                                let target_committed = committed_round;
                                 self.engine
-                                    .set_initial_round(target_round, target_committed);
-                            } else if my_round > dag_round + 10_000 {
+                                    .observe_untrusted_round_hint(dag_round, committed_round);
+                            } else if my_round.saturating_sub(dag_round) > 10_000 {
                                 debug!(
                                     "Peer {} is behind us by {} rounds (them: {}, us: {})",
                                     peer,
@@ -844,18 +821,15 @@ impl ConsensusManager {
                                     },
                                 );
                             }
-                            if their_round > my_round + 10_000 {
+                            if their_round.saturating_sub(my_round) > 10_000 {
                                 warn!(
-                                    "Peer {} ahead by {} rounds. Catching up from {} to ~{}",
+                                    "Peer {} ahead by {} rounds. Recording hint; authenticated checkpoint sync is required (local {}).",
                                     peer,
                                     their_round - my_round,
                                     my_round,
-                                    their_round
                                 );
-                                self.engine.set_initial_round(
-                                    their_round.saturating_sub(10),
-                                    their_committed,
-                                );
+                                self.engine
+                                    .observe_untrusted_round_hint(their_round, their_committed);
                             }
                         }
                         // ── Round sync response - update our round if behind ───
@@ -864,13 +838,13 @@ impl ConsensusManager {
                             last_committed_round,
                         } => {
                             let my_round = self.engine.current_round();
-                            if current_round > my_round + 1000 {
+                            if current_round.saturating_sub(my_round) > 1000 {
                                 info!(
-                                    "Round sync: peer at round {}, we are at {} - catching up",
+                                    "Round sync hint: peer at round {}, we are at {}; authenticated checkpoint sync required",
                                     current_round, my_round
                                 );
-                                self.engine.set_initial_round(
-                                    current_round.saturating_sub(10),
+                                self.engine.observe_untrusted_round_hint(
+                                    current_round,
                                     last_committed_round,
                                 );
                             }
@@ -933,18 +907,23 @@ impl ConsensusManager {
             let already_proposed = last_proposed_round == Some(current_round);
             let has_connected_quorum = if multi_validator {
                 let vs = self.engine.validator_set();
-                let local_stake = vs
-                    .get_validator(&self.validator_address)
-                    .map(|validator| validator.stake)
-                    .unwrap_or(0);
-                let peer_stake: u64 = connected_validators
-                    .iter()
-                    .filter(|(_, generation)| generation.connected)
-                    .filter_map(|(address, _)| {
-                        vs.get_validator(address).map(|validator| validator.stake)
-                    })
-                    .sum();
-                local_stake.saturating_add(peer_stake) >= vs.quorum
+                let mut connected_stake = 0u64;
+                let mut seen_validators = std::collections::HashSet::new();
+                seen_validators.insert(self.validator_address);
+                if let Some(validator) = vs.get_validator(&self.validator_address) {
+                    connected_stake = validator.stake;
+                }
+                for (address, generation) in connected_validators.iter() {
+                    if generation.connected
+                        && seen_validators.insert(*address)
+                        && let Some(validator) = vs.get_validator(address)
+                    {
+                        connected_stake = connected_stake
+                            .checked_add(validator.stake)
+                            .expect("unique connected stake cannot exceed validator-set total");
+                    }
+                }
+                connected_stake >= vs.quorum
             } else {
                 true
             };
@@ -980,23 +959,21 @@ impl ConsensusManager {
             // IMPORTANT: Check parent readiness BEFORE draining the mempool.
             // If the peer's block from the previous round hasn't arrived yet,
             // we would fail to propose and lose the drained transactions.
-            let _has_quorum_parents = if current_round == 0 {
+            let has_quorum_parents = if current_round == 0 {
                 true // Round 0 has no parent requirement
-            } else if self.engine.is_force_advanced() {
-                // After a view-change (force_advance_round), relax the parent
-                // check. The force advance already decided to skip quorum for
-                // the stalled round, so requiring quorum parents here would
-                // re-deadlock immediately. Accept whatever parents exist.
-                true
             } else {
                 let vs = self.engine.validator_set();
                 let prev_blocks = self.engine.blocks_in_round(current_round - 1);
                 let mut parent_stake = 0u64;
+                let mut seen_authors = std::collections::HashSet::new();
                 for hash in &prev_blocks {
                     if let Some(block) = self.engine.get_block(hash)
                         && let Some(validator) = vs.get_validator(&block.author)
+                        && seen_authors.insert(block.author)
                     {
-                        parent_stake += validator.stake;
+                        parent_stake = parent_stake
+                            .checked_add(validator.stake)
+                            .expect("unique parent stake cannot exceed validator-set total");
                     }
                 }
                 parent_stake >= vs.quorum
@@ -1023,27 +1000,25 @@ impl ConsensusManager {
                 true // No VRF = always allowed (backward compat)
             };
 
-            // In multi-validator DAG mode, always allow proposals - the DAG
-            // needs blocks from ALL validators to build quorum. Strict parent
-            // checks would cause deadlock: no proposals → no blocks → no quorum.
-            // In single-validator mode, use VRF to gate proposals. The 2-round
-            // commit rule handles safety regardless (won't commit without quorum).
+            // Multi-validator proposals require both connected stake and a
+            // unique-author parent quorum. A timeout is not a parent
+            // certificate. Single-validator mode uses VRF scheduling.
             let allow_propose = if multi_validator {
                 has_connected_quorum // DAG: wait until peers can receive round 0
             } else {
                 vrf_approved // Single-validator: VRF gates block production
             };
-            // ── Benchmark: execute pre-signed txs EVERY TICK ─────────────
-            // Runs independently of proposals. In multi-validator, DAG consensus
-            // runs in parallel. The benchmark_tx_count reflects actual execution
-            // throughput (20K+ TPS sustained). Batch size is tuned so each
-            // execution takes <40ms, leaving time for peer messages.
-            if self.benchmark
-                && can_produce
-                && let Some(ref pool) = benchmark_pool
+            // ── Single-validator benchmark fast path ─────────────────────
+            // Direct StateDB execution is intentionally forbidden once the
+            // configured set has multiple validators. Multi-validator benchmark
+            // traffic was pre-fed into the mempool above and must be DAG-committed.
+            if should_execute_local_benchmark(
+                self.benchmark,
+                can_produce,
+                self.engine.validator_set().len(),
+            ) && let Some(ref pool) = benchmark_pool
             {
-                let batch_size = if multi_validator { 1_500 } else { 1_000_000 };
-                let signed_txs = pool.drain(batch_size);
+                let signed_txs = pool.drain(1_000_000);
                 if !signed_txs.is_empty() {
                     let tx_count = signed_txs.len() as u64;
                     let start = std::time::Instant::now();
@@ -1071,7 +1046,12 @@ impl ConsensusManager {
                 }
             }
 
-            if can_produce && !already_proposed && allow_propose && vrf_approved {
+            if can_produce
+                && !already_proposed
+                && allow_propose
+                && vrf_approved
+                && has_quorum_parents
+            {
                 if !multi_validator && self.benchmark {
                     // Single-validator: just advance DAG round for tracking
                     let timestamp = SystemTime::now()
@@ -1103,18 +1083,18 @@ impl ConsensusManager {
                             transactions.len()
                         );
                         for tx in &transactions {
-                            eprintln!(
-                                "[DRAIN] hash=0x{} type={:?} from=0x{} nonce={}",
-                                hex::encode(&tx.hash.0[..8]),
-                                tx.tx_type,
-                                hex::encode(&tx.from.0[..6]),
-                                tx.nonce
+                            debug!(
+                                tx_hash = %tx.hash,
+                                tx_type = ?tx.tx_type,
+                                from = %tx.from,
+                                nonce = tx.nonce,
+                                "Drained transaction for DAG proposal"
                             );
                         }
                     } else if mempool_len_pre > 0 {
-                        eprintln!(
-                            "[DRAIN-MISMATCH] mempool.len()={} but drain returned 0",
-                            mempool_len_pre
+                        warn!(
+                            mempool_len = mempool_len_pre,
+                            "Mempool reported entries but drain returned none"
                         );
                     }
 
@@ -1223,9 +1203,10 @@ impl ConsensusManager {
                         // blocks take 100-300ms to arrive across continents. The 2-round
                         // commit rule then can't fire because parent references are stale.
                         //
-                        // In single-validator or benchmark mode, advance immediately
-                        // (no peers to wait for).
-                        if !multi_validator || self.benchmark {
+                        // A single-validator chain can advance immediately. A
+                        // multi-validator benchmark uses the same quorum-paced
+                        // round transition as every other production DAG.
+                        if !multi_validator {
                             let _ = self.engine.advance_round();
                         }
                         // Multi-validator: round advancement happens below when
@@ -1438,8 +1419,11 @@ impl ConsensusManager {
 
                             {
                                 // ── CANONICAL PATH: local adaptive execution ──
-                                match state.execute_block_adaptive(&committed_txs, dag_block.author)
-                                {
+                                match state.execute_block_adaptive_at(
+                                    &committed_txs,
+                                    dag_block.author,
+                                    dag_block.timestamp,
+                                ) {
                                     Ok((block, receipts)) => {
                                         let elapsed = start.elapsed();
                                         let success = receipts.iter().filter(|r| r.success).count();
@@ -1546,12 +1530,6 @@ impl ConsensusManager {
                                             },
                                             "Block produced (DAG commit)"
                                         );
-
-                                        if let Some(mut proof) =
-                                            self.engine.finality_proofs.get_mut(&dag_block.hash)
-                                        {
-                                            proof.height = block.header.height;
-                                        }
                                     }
                                     Err(e) => {
                                         warn!("DAG commit block execution failed: {}", e);
@@ -1610,48 +1588,36 @@ impl ConsensusManager {
                     }
                 }
 
-                // Create checkpoint every 1000 rounds for long-range attack prevention
-                if let Ok(mut cp_registry) = self.checkpoint_registry.lock() {
-                    for dag_block in &committed {
-                        if dag_block.round > 0
-                            && dag_block.round % arc_consensus::security::CHECKPOINT_INTERVAL == 0
-                        {
-                            let checkpoint = arc_consensus::security::Checkpoint {
-                                block_hash: dag_block.hash.0,
-                                round: dag_block.round,
-                                height: state.height(),
-                                state_root: hash_bytes(&state.height().to_le_bytes()).0,
-                                timestamp: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs())
-                                    .unwrap_or(0),
-                                signatures: Vec::new(), // TODO: collect quorum signatures
-                            };
-                            if cp_registry.add_checkpoint(checkpoint) {
-                                info!(
-                                    round = dag_block.round,
-                                    height = state.height(),
-                                    "Checkpoint created for long-range attack prevention"
-                                );
-                            }
-                        }
+                // Do not turn a local wall-clock timestamp and a hash of the
+                // height into a fake long-range trust anchor. The trusted
+                // checkpoint registry accepts only a canonical state-root
+                // transcript carrying strict validator identity + stake
+                // supermajorities. This loop does not yet collect that
+                // evidence, so checkpoint intervals remain explicitly dark.
+                for dag_block in &committed {
+                    if dag_block.round > 0
+                        && dag_block.round % arc_consensus::security::CHECKPOINT_INTERVAL == 0
+                    {
+                        warn!(
+                            round = dag_block.round,
+                            height = state.height(),
+                            "Checkpoint interval reached without canonical state root and validator signature quorum; no trust anchor registered"
+                        );
                     }
                 }
             }
 
-            // ── 3. Liveness: view-change check ────────────────────────────────
-            // If the round has been stalled too long, force-advance to prevent
-            // indefinite halts (e.g. from a crashed proposer).
-            // force_advance_round() sets the force_advanced flag, which relaxes
-            // parent quorum checks in propose_block() and receive_block(),
-            // allowing the DAG to recover from stalls.
+            // ── 3. Liveness: certified view-change check ──────────────────────
+            // A local wall-clock timeout is not a quorum view-change
+            // certificate. Until the network collects and verifies such a
+            // certificate, preserve the current view and fail closed instead
+            // of letting each node advance on a different timer.
             if multi_validator && self.engine.needs_view_change() {
                 warn!(
                     round = current_round,
-                    "Round stalled - forcing view-change (advancing round)"
+                    "Round stalled, but no authenticated quorum view-change certificate is available; consensus view unchanged"
                 );
-                self.engine.force_advance_round();
-                last_proposed_round = None;
+                self.engine.reset_round_timer();
             }
 
             // ── 3b. Broadcast round-info heartbeat every ~30 seconds ─────
@@ -1673,19 +1639,9 @@ impl ConsensusManager {
                 );
             }
 
-            // ── 4. Epoch management: freeze validator set when stable ─────
-            // Freeze when: multi-validator AND we have 3+ validators AND
-            // epoch is still 0 (first freeze) OR every 1000 rounds after.
-            // The "3+ validators" check ensures we don't freeze too early
-            // with only 1-2 peers.
-            // Epoch management: the genesis set is frozen at construction
-            // (epoch 1). Re-freeze only at round 1000, 2000, etc. to
-            // absorb new validators that joined via staking.
-            // CRITICAL: do NOT freeze at round 0 - that would overwrite the
-            // genesis freeze with whatever PeerConnected events arrived.
-            if multi_validator && current_round >= 1000 && current_round.is_multiple_of(1000) {
-                self.engine.freeze_epoch();
-            }
+            // Membership remains the fixed, operator-approved epoch-1 set.
+            // A future epoch transition must be driven by an authenticated
+            // on-chain governance certificate, never transport discovery.
 
             // ── 4. Periodic memory eviction ──────────────────────────────────
             // Cap in-memory data to prevent OOM in long-running nodes.
@@ -1736,8 +1692,85 @@ impl ConsensusManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arc_crypto::hash_bytes;
-    use arc_types::{Account, AccountChange, StateDiff};
+    use arc_crypto::{KeyPair, Signature, hash_bytes};
+    use arc_types::{Account, AccountChange, StateDiff, Transaction, TxType};
+
+    fn signed_transfer(key: &KeyPair, recipient: u8, nonce: u64) -> Transaction {
+        let mut tx =
+            Transaction::new_transfer(key.address(), hash_bytes(&[recipient]), nonce + 1, nonce);
+        tx.sign(key).unwrap();
+        tx
+    }
+
+    #[test]
+    fn direct_benchmark_execution_is_single_validator_only() {
+        assert!(should_execute_local_benchmark(true, true, 1));
+        assert!(!should_execute_local_benchmark(false, true, 1));
+        assert!(!should_execute_local_benchmark(true, false, 1));
+        assert!(!should_execute_local_benchmark(true, true, 0));
+        assert!(!should_execute_local_benchmark(true, true, 2));
+        assert!(!should_execute_local_benchmark(true, true, 8));
+    }
+
+    #[test]
+    fn peer_dag_attachment_accepts_exact_set_in_noncanonical_body_order() {
+        let key = KeyPair::generate_ed25519();
+        let first = signed_transfer(&key, 1, 0);
+        let second = signed_transfer(&key, 2, 1);
+        let mut committed = vec![first.hash, second.hash];
+        committed.sort_by_key(|hash| hash.0);
+
+        let verified = verify_peer_dag_transactions(&committed, &[second, first]).unwrap();
+        assert_eq!(verified.len(), 2);
+        assert!(verified.iter().all(|tx| tx.sig_verified));
+    }
+
+    #[test]
+    fn peer_dag_attachment_rejects_partial_duplicate_and_invalid_transactions() {
+        let key = KeyPair::generate_ed25519();
+        let first = signed_transfer(&key, 1, 0);
+        let second = signed_transfer(&key, 2, 1);
+        let mut committed = vec![first.hash, second.hash];
+        committed.sort_by_key(|hash| hash.0);
+
+        assert!(matches!(
+            verify_peer_dag_transactions(&committed, std::slice::from_ref(&first)),
+            Err(PeerDagTransactionError::AttachmentMismatch)
+        ));
+        assert!(matches!(
+            verify_peer_dag_transactions(
+                &[first.hash, first.hash],
+                &[first.clone(), first.clone()]
+            ),
+            Err(PeerDagTransactionError::AttachmentMismatch)
+        ));
+
+        let mut invalid = second;
+        invalid.signature = Signature::null();
+        assert!(matches!(
+            verify_peer_dag_transactions(&committed, &[first, invalid.clone()]),
+            Err(PeerDagTransactionError::InvalidTransaction(hash)) if hash == invalid.hash
+        ));
+    }
+
+    #[test]
+    fn peer_dag_attachment_ignores_forged_trust_bit_and_rejects_type_mismatch() {
+        let key = KeyPair::generate_ed25519();
+        let mut unsigned = Transaction::new_transfer(key.address(), hash_bytes(b"recipient"), 1, 0);
+        unsigned.sig_verified = true;
+        assert!(matches!(
+            verify_peer_dag_transactions(&[unsigned.hash], &[unsigned.clone()]),
+            Err(PeerDagTransactionError::InvalidTransaction(hash)) if hash == unsigned.hash
+        ));
+
+        let mut mismatch = signed_transfer(&key, 3, 0);
+        mismatch.tx_type = TxType::InferenceAttestation;
+        mismatch.sign(&key).unwrap();
+        assert!(matches!(
+            verify_peer_dag_transactions(&[mismatch.hash], &[mismatch.clone()]),
+            Err(PeerDagTransactionError::InvalidTransaction(hash)) if hash == mismatch.hash
+        ));
+    }
 
     #[test]
     fn peer_state_diff_requires_authenticated_block_author_and_exact_height() {
@@ -1840,5 +1873,60 @@ mod tests {
         let observer = ConsensusManager::new(observer_addr, 0, 4, false, &[]);
         assert_eq!(observer.tier, StakeTier::Spark);
         assert!(!observer.tier.can_produce_blocks());
+    }
+
+    #[tokio::test]
+    async fn forged_transport_stake_cannot_join_fixed_validator_set() {
+        let local_key = KeyPair::generate_ed25519();
+        let configured_peer = hash_bytes(b"configured-peer");
+        let forged_peer = hash_bytes(b"forged-peer");
+        let configured_stake = 5_000_000;
+        let mut manager = ConsensusManager::new_with_keypair(
+            local_key.address(),
+            configured_stake,
+            4,
+            false,
+            &[(configured_peer, configured_stake)],
+            local_key,
+        );
+        let shared_validators = Arc::new(parking_lot::RwLock::new(vec![
+            (manager.validator_address, configured_stake),
+            (configured_peer, configured_stake),
+        ]));
+        manager.dag_validators = Some(shared_validators.clone());
+
+        let before = manager.engine.validator_set();
+        let (inbound_tx, inbound_rx) = mpsc::channel(4);
+        inbound_tx
+            .send(InboundMessage::PeerConnected {
+                address: forged_peer,
+                stake: u64::MAX,
+                connection_id: 1,
+            })
+            .await
+            .unwrap();
+
+        let state = Arc::new(StateDB::with_genesis(&[]));
+        let mempool = Arc::new(Mempool::new(16));
+        let result = tokio::time::timeout(
+            tokio::time::Duration::from_millis(120),
+            manager.run_consensus_loop(state, mempool, Some(inbound_rx), None, None),
+        )
+        .await;
+        assert!(result.is_err(), "consensus loop should still be running");
+
+        let after = manager.engine.validator_set();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.total_stake, before.total_stake);
+        assert_eq!(after.quorum, before.quorum);
+        assert!(!after.is_validator(&forged_peer));
+        assert_eq!(
+            *shared_validators.read(),
+            vec![
+                (manager.validator_address, configured_stake),
+                (configured_peer, configured_stake)
+            ],
+            "transport discovery must not enter the RPC validator authority list"
+        );
     }
 }

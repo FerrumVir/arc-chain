@@ -1,14 +1,33 @@
 ![Rust](https://img.shields.io/badge/Rust-121K%2B_LOC-orange)
 ![Tests](https://img.shields.io/badge/tests-1%2C363_defined-brightgreen)
 ![License](https://img.shields.io/badge/license-BUSL--1.1-blue)
-![Inference](https://img.shields.io/badge/inference-consensus--verified-purple)
-![Testnet](https://img.shields.io/badge/testnet-live-green)
+![Inference](https://img.shields.io/badge/inference-CPU_KAT--verified-purple)
+![Testnet](https://img.shields.io/badge/public_fleet-forked-red)
 
 # ARC Chain - Trustworthy AI
 
-**A high-performance Layer 1 blockchain built from scratch in Rust. Purpose-built so AI inference can pass network consensus - the same way transactions do.**
+**A Rust Layer 1 recovery candidate designed to make AI inference
+reproducible, independently recomputed, and explicitly authorized before a
+community reward can settle.**
 
 **Not a fork. Not a copy. Every line is original.**
+
+## Downloads
+
+- **Current desktop v0.7.11:** use the asset list on the
+  [GitHub release page](https://github.com/FerrumVir/arc-chain/releases/latest);
+  the normalized direct links below begin with v0.7.12.
+- **SSH / EC2 / VPS / no GUI:** use [Headless / server node](#headless--server-node-no-gui-or-display-required).
+- **All artifacts and checksums:** [latest GitHub release](https://github.com/FerrumVir/arc-chain/releases/latest).
+
+The current public v0.7.11 release is desktop-only. The unified v0.7.12/v3
+recovery candidate in this repository restores headless Linux amd64/arm64,
+Intel and Apple Silicon macOS, Windows CLI assets, checksums, and one installer,
+but it has **not** been published or deployed yet. Do not paste the server
+install command into a production machine until the complete v0.7.12 release
+is visible on GitHub. See
+[the recovery/cutover gate](docs/VALIDATOR-FLEET-ROLLOUT.md).
+In short: v0.7.12 is not published or deployed.
 
 📄 Paper: *On the Foundations of Trustworthy Artificial Intelligence*
 
@@ -18,9 +37,19 @@
 
 Every AI response from a cloud provider is a claim you can't check. You don't know which model ran. You don't know whether the output was truncated, cached, routed, or silently modified. You trust the logo.
 
-ARC makes inference **verifiable by a blockchain the same way transactions are verifiable**. The engine runs in pure integer arithmetic, no floating point. The output hash is bit-identical on ARM, x86, GPU - every chip on earth. Validators can re-run any inference and vote on it the same way they vote on blocks. Invalid outputs are slashed. Honest ones are attested on-chain with cryptographic proof of which model produced them.
+ARC's release candidate makes inference reproducible enough for validators to
+recompute and compare a 32-byte commitment. The production CPU engine uses
+integer arithmetic, and a hardcoded synthetic-model KAT now proves its I8/I16
+whole-model and three-way-shard paths on ARM and x86. That test does **not** yet
+cover GPU backends or a production 7B GGUF. The new community path rejects a
+worker result unless the coordinator obtains a 2-of-3 authenticated quorum for
+every range and token position; automatic slashing is not wired. The current
+public seeds do not run this release candidate yet.
 
-**This is AI that passes consensus.** Inference becomes a first-class on-chain primitive. An oracle you don't need to trust. A model output you can replay, verify, and settle against - at any scale, on any hardware.
+The design goal is AI that can pass consensus. The current candidate proves a
+bounded CPU path and fails closed when exact-model, recomputation, validator
+authorization, or chain-readiness evidence is missing. It is not yet a claim of
+trustless inference at arbitrary scale or on every hardware backend.
 
 ---
 
@@ -32,10 +61,10 @@ Five things, in one runtime. Every row is checkable, and the commands are in
 | | Everywhere else | Here |
 |---|---|---|
 | **Verifying an AI answer** | Trust the API, or pay orders of magnitude more to prove it in zero-knowledge | Re-run it and compare one 32-byte hash — the cost of a single forward pass |
-| **Same answer on different chips** | Floating-point drifts; no one claims bit-identity | Bit-identical on ARM, x86 and GPU — with the float backend run alongside as a control that *does* diverge |
-| **Inference inside consensus** | Oracles, trusted hardware, optimistic challenge windows | Validators re-execute the inference and vote on it, exactly like a transaction. Disagree and you get slashed |
-| **Post-quantum signatures** | Ethereum: nothing live, roadmap ~2029. Algorand: PQ accounts Q3 2026 | ML-DSA-65 and Falcon-512 as first-class transaction types, running today |
-| **Post-quantum verify inside a contract** | Ethereum's EIP-8052 is still a proposal | `falcon512_verify` precompile at address `0x08`, live |
+| **Same answer on different chips** | Floating-point execution can drift | Blocking CPU I8/I16 KAT on ARM and x86; GPU and full-GGUF vectors still required |
+| **Inference verification before community reward** | Trust a worker or external oracle | Coordinator recomputes through authenticated 2-of-3 range quorums; mismatches are rejected, not auto-slashed |
+| **Post-quantum signatures** | Common chains still center classical signatures | Current source includes ML-DSA-65 and Falcon-512 transaction verification; public-fleet deployment is not claimed |
+| **Post-quantum verify inside a contract** | Common contract runtimes do not expose Falcon verification | Current source defines `falcon512_verify` precompile `0x08`; public-fleet deployment is not claimed |
 
 **I don't know of another chain that has all five.** If you know one, open an
 issue and I'll put it in this table myself.
@@ -75,41 +104,47 @@ trade, not a better prover.
 
 ---
 
-## What's live right now
+## Public fleet snapshot
 
-| | |
-|---|---|
-| **6 seed validators** | NYC · LAX · AMS · LHR · NRT · SGP |
-| **Cluster round** | 9.5 M+ and advancing (~0.2 rounds/s) - `curl $SEED/health` for the live figure |
-| **DAG finality** | ~24 ms (2-round commit) measured in-lab; see the note below for what the public seeds are doing today |
-| **Self-healing** | each seed runs `arc-self-heal` - drift or RPC silence auto-restarts the node with shard flags preserved |
-| **Deterministic inference** | INT16 engine, ARM Mac = x86 Linux = identical output hash, verified |
-| **Sharded inference** | 32-layer Llama-2-7B in 6 layer ranges, each replicated on 3 of the 6 seeds (18 shards), BLAKE3 over every hop |
-| **Attestations** | Every sharded inference produces an `InferenceAttestation` (0x16) with model hash + input hash + output hash |
-| **Live dashboard** | http://140.82.16.112:3200 |
-| **Web wallet** | http://140.82.16.112:3100 |
+**Read-only public-fleet snapshot, 2026-08-26 around 15:06 CDT.** These are
+observations, not a standing uptime promise:
 
-**Honest status of the public testnet, checked 2026-08-17.** This is a testnet
-and it is currently limping in two specific ways. Neither is hidden behind a
-green `status: ok`, so read them before you draw conclusions from a `/health`
-response:
+| Seed | Version | State height at snapshot | Latest-block observation |
+|---|---:|---:|---|
+| NYC | 0.7.2 | ~136,969 | ~157 seconds old |
+| LAX | 0.7.9 | ~127,188 | ~1,050 seconds old |
+| AMS | 0.7.9 | ~88,452 | ~125 seconds old |
+| LHR | 0.7.9 | ~51,422 | ~4.2 days old |
+| NRT | 0.7.9 | ~96,770 | ~4.2 days old |
+| SGP | 0.7.9 | ~97,591 | ~4.2 days old |
 
-- **Block production is stalled on four of the six seeds.** AMS, LHR, NRT and
-  SGP last sealed a block ~6.3 days ago (LHR ~6.7). Only NYC and LAX are
-  committing. DAG rounds still advance on all six, which is why `/health`
-  keeps saying `ok` — round progress and block commit are separate.
-  Consequence: an attestation submitted today lands in the mempool and is
-  **not** mined, so it reads `block_height: null`.
-- **The seeds are not yet a single replicated chain.** They share a DAG round
-  but not state: `/block/43000` returns a different hash on each seed, and
-  heights range from ~51 K to ~135 K. A faucet credit or transaction on one
-  seed will not be found on another. Pin one seed for anything involving
-  balances. The repair plan is `docs/superpowers/plans/2026-06-04-replicated-chain-model-1.md`
-  and it has not been started.
+At common height 50,000, all six reachable seeds returned **six different
+block hashes and six different state roots**. The dashboard independently
+repeated the comparison at the then-highest common height, 51,422, with the
+same 6/6 divergence. Therefore the public fleet is not one replicated chain.
+Stop reward issuance, pin one source for diagnosis, and choose an approved
+canonical recovery state before any rollout. An advancing DAG round or
+`status: ok` does not override this result.
+
+The same snapshot found community `total_work_completed: 0` across the worker
+list. No public inference job, validator-authorized `0x25` reward, or mined
+community payment was demonstrated. A raw `InferenceAttestation` (`0x16`) is a
+computation claim and pays nothing.
 
 Version skew is real too: NYC runs v0.7.2, the other five run v0.7.9, and
 **nothing on the network runs v0.7.11** — that version exists only as a desktop
 bundle. See [`ALERTS.md`](ALERTS.md) for the current alert list.
+
+The concise evidence record is
+[`docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](docs/PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
+
+There is also a trust-root incident: legacy production validator seed material
+was published in repository history. Those six identities must be replaced;
+deleting the strings from the current tree does not make them safe. The v3
+candidate requires mode-`0600` Ed25519 keyfiles and a complete public-address
+genesis, and intentionally refuses staked production startup until operators
+approve a new genesis/checkpoint and coordinated quorum cutover. Rewards remain
+off during that migration.
 
 ---
 
@@ -117,23 +152,30 @@ bundle. See [`ALERTS.md`](ALERTS.md) for the current alert list.
 
 ### Desktop GUI (requires a screen)
 
-| Supported desktop | Stable latest download |
+| Supported desktop | Normalized v0.7.12 asset (valid after publication) |
 |---|---|
 | **macOS 11+ — Apple Silicon** | [DMG](https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-desktop-macos-arm64.dmg) |
 | **macOS 11+ — Intel** | [DMG](https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-desktop-macos-x86_64.dmg) |
 | **Windows 10/11 — x86_64** | [Installer](https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-desktop-windows-x86_64-setup.exe) |
 | **Linux desktop — x86_64** | [AppImage](https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-desktop-linux-x86_64.AppImage) · [.deb](https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-desktop-linux-x86_64.deb) · [.rpm](https://github.com/FerrumVir/arc-chain/releases/latest/download/arc-desktop-linux-x86_64.rpm) |
 
-These version-independent links are generated by the unified release pipeline,
-so the README does not point forever at an old release. The GUI is not a server
-binary: it needs a graphical session. An EC2/VPS/SSH-only machine should use the
-headless installer below. Linux ARM64 is also headless-only.
+These version-independent names are generated by the unified v0.7.12 release
+pipeline; until that release is published, use the release page rather than
+assuming these direct links exist. The GUI is not a server binary: it needs a
+graphical session. An EC2/VPS/SSH-only machine should use the headless installer
+below. Linux ARM64 is also headless-only.
 
-The desktop updater remains signature-verified. It can update macOS, Windows,
-and the Linux AppImage in place. `.deb` and `.rpm` installations remain owned by
-their package managers and must be upgraded by installing the new package.
+The public v0.7.11 desktop bundled updater configuration but did not invoke the
+update lifecycle, so it must not be described as auto-updating. The v0.7.12
+candidate now checks the signed manifest shortly after startup and every 24
+hours when the setting is enabled. Background checks do not download or install
+anything; the user confirms installation. macOS, Windows, and Linux AppImage
+can then update in place. `.deb` and `.rpm` remain owned by their package
+managers and must be upgraded by installing the new package.
 
-**📖 Full walkthrough:** [Getting Started with ARC Node](docs/GETTING_STARTED.md) - install, identity, first inference, faucet, earnings, and FAQ.
+**📖 Desktop controls:** [Getting Started with ARC Node](docs/GETTING_STARTED.md)
+— release gates, identity, inference evidence, faucet, mined reward receipts,
+and FAQ.
 
 ---
 
@@ -144,9 +186,13 @@ Silicon and Intel, and Windows x86_64. The installer supports Linux and macOS;
 Windows Server operators download the two `.exe` assets and `SHA256SUMS`
 manually from the [latest release](https://github.com/FerrumVir/arc-chain/releases/latest).
 
+The following recovery command is intentionally pinned and becomes valid only
+after GitHub shows the complete `v0.7.12` release. Until then, `latest` remains
+the desktop-only v0.7.11 release and is not a headless install source.
+
 ```bash
-curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/latest/download/install.sh
-bash install.sh
+curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/download/v0.7.12/install.sh
+bash install.sh --version 0.7.12
 ```
 
 The installer uses an exact release tag after resolution, verifies `arc-node`,
@@ -154,30 +200,57 @@ The installer uses an exact release tag after resolution, verifies `arc-node`,
 missing assets, unknown versions, and downgrades. On Linux it installs a systemd
 system service when run as root and a systemd user service otherwise; on macOS
 it installs a LaunchAgent. It preserves the private node identity across
-upgrades and never places it in the process command line.
+upgrades and never places it in the process command line. Managed stake-zero
+nodes bind RPC to `127.0.0.1` only; `--port` changes the local port, not the
+interface, so a permissive EC2 security group cannot expose RPC accidentally.
+
+v0.7.12 writes `genesis.network-hash` into fresh persisted state and fails
+closed when an existing WAL has no marker or its hash differs from the selected
+genesis. Do not reuse a v0.7.11-or-earlier data directory. Back up an observer's
+identity and old data for forensics, then select a fresh `--data-dir`; validators
+require the approved canonical checkpoint migration. On a failed install or
+update, the installer restores every managed binary, network file, runner,
+config, identity file, service unit, and the prior service/timer state. That
+rollback is not a migration and never rewrites the model or chain data.
 
 Useful server options:
 
 ```bash
 # SSH-only Ubuntu server, custom RPC/P2P ports and data volume
-bash install.sh --port 19090 --p2p-port 19091 --data-dir /srv/arc-data
+bash install.sh --version 0.7.12 \
+  --port 19090 --p2p-port 19091 --data-dir /srv/arc-data
 
 # Install binaries/config only; print the command but do not start anything
-bash install.sh --no-service --no-auto-update
+bash install.sh --version 0.7.12 --no-service --no-auto-update
 
 # Serve local inference (a model is optional and never passed as an empty arg)
-bash install.sh --model /absolute/path/to/model.gguf
+bash install.sh --version 0.7.12 --model /absolute/path/to/model.gguf
 
 # Reproducible pin; an older version is rejected if a newer one is installed
-bash install.sh --version X.Y.Z
+bash install.sh --version 0.7.12
 ```
+
+For an install that kept the scheduled updater, the manual commands are:
+
+```bash
+# Linux user service or macOS LaunchAgent
+"$HOME/.arc/bin/arc-installer" --update-only --install-dir "$HOME/.arc"
+
+# Linux system service
+sudo /var/lib/arc-chain/bin/arc-installer --update-only --install-dir /var/lib/arc-chain --system-service
+```
+
+Update mode intentionally resolves the newest complete release, verifies it,
+and refuses equality or downgrade; do not add `--version 0.7.12` when the goal
+is to discover a later safe update.
 
 Without `--model`, the node is an observer/router and will not execute local
 model inference. It still joins with `--stake 0 --community-mode`; stake-zero
 is the safe community posture, but rewards and work assignment are determined
 by the network and are not guaranteed by the installer. See
 [`docs/HEADLESS_INSTALL.md`](docs/HEADLESS_INSTALL.md) for service commands,
-firewall notes, upgrade behavior, and Windows verification.
+firewall notes, upgrade behavior, and Windows verification. The short operator
+demo is [`docs/COMMUNITY-NODE-WALKTHROUGH.md`](docs/COMMUNITY-NODE-WALKTHROUGH.md).
 
 **📖 Desktop walkthrough:** [Getting Started with ARC Node](docs/GETTING_STARTED.md).
 
@@ -185,39 +258,75 @@ firewall notes, upgrade behavior, and Windows verification.
 
 ### Command-line network demos
 
-**Run a real inference on the live network, see the BLAKE3 hash, watch it verify:**
+**Inspect a public inference response, its trace, and the evidence the selected
+coordinator actually returns:**
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash
+ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-demo.sh
 ```
 
-Discovers the live shard pipeline, dispatches a Llama-2-7B prompt, prints the per-hop trace, then re-runs the prompt asking for a genuine recomputation.
+Run this only against a controlled local or reviewed recovery-candidate
+coordinator. Automatic public-fleet discovery is disabled because the public v2
+seeds have mixed versions and divergent state. The script inspects the selected
+pipeline, dispatches a prompt, prints its trace, and asks for recomputation.
 
-A word on that re-run, because it is the point of the demo. The coordinator caches by (model, prompt, max_tokens), so simply POSTing the same prompt twice is answered out of cache in microseconds and proves nothing. The script sends `force_recompute`. Against a coordinator that honours it you get `✓ DETERMINISTIC` — two independent pipeline walks, same 32 bytes. Against the live v0.7.9 seeds, which do not have the flag yet, you get `● SERVED FROM CACHE (hash match)` instead. That is the honest label, and it is what you should expect today.
+A word on that re-run, because it is the point of the demo. The coordinator
+caches by (model, prompt, max_tokens), so simply POSTing the same prompt twice
+is answered out of cache and proves nothing. The script sends
+`force_recompute`: a supporting candidate reports `✓ DETERMINISTIC` after two
+pipeline walks; a cache response is labeled `● SERVED FROM CACHE (hash match)`.
 
-**Re-verify any past attestation from scratch on your own machine:**
+**Attempt to recompute a past public inference claim on your own machine:**
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-verify.sh | bash -s -- --latest
+ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-verify.sh --latest
 ```
 
-Sweeps every seed for a real attestation record, re-executes the same prompt against the same model, compares `output_hash` and `model_hash`. Prints `VERIFIED (recomputed)` or `VERIFIED (from cache)` depending on which it actually got. Today only LHR holds a meaningful attestation history, and the script finds it for you.
+The historical script sweeps seeds for an inference record, replays its prompt,
+and compares reported commitments. Its `VERIFIED` label means only that those
+reported hashes matched. A cache response is not recomputation, and the public
+v2 model ID below does not bind the weight bytes, so this is not exact-artifact
+proof.
 
-Note what `model_hash` commits to: it is a BLAKE3 of the model's shape label (`arc-32L-4096d-32h-32000v`), not of the weight bytes. It proves the same declared model, not the same tensors. Binding attestations to a hash over the actual weights is on the roadmap below.
+On today's public v2 seeds, `model_hash` is still a BLAKE3 of the model's
+shape label (`arc-32L-4096d-32h-32000v`), not of the weight bytes. It proves
+the same declared shape, not the same tensors. The unpublished v0.7.12/v3
+candidate instead streams the complete `--model` artifact through BLAKE3 and
+uses that exact byte commitment for shard routing, worker eligibility, caches,
+attestations, and verification. Do not read that candidate behavior as already
+deployed on the public fleet.
 
 ---
 
 ## The improvements that made this real
 
-The core thesis - "inference that passes consensus" - only works if the arithmetic is perfectly reproducible. Getting there took a sequence of concrete breakthroughs, each one verified on the live network:
+The core thesis - "inference that passes consensus" - only works if the
+arithmetic is perfectly reproducible. The list below separates mechanisms from
+their evidence; it is not a claim that every item is deployed on today's
+version-skewed public fleet:
 
-1. **Pure-integer transformer inference.** Every matmul, softmax, layer norm, and activation in i64 fixed-point. No floating point anywhere on the hot path. Eliminates the only source of hardware drift.
+1. **Integer transformer path.** The candidate's production CPU I8/I16 path
+   uses fixed-point kernels for its covered transformer operations. The
+   blocking KAT is the evidence boundary; it does not establish that every
+   optional backend or production model is float-free.
 
-2. **Cross-architecture bit identity, proven.** Same prompt → same output hash on Apple M2 Ultra and x86_64 Vultr VPS. No approximations, no tolerance thresholds. Byte-for-byte equal.
+2. **Cross-architecture CPU KAT.** A committed synthetic model now produces the
+   same reviewed token, logits, KV-cache, hidden-state, and output hashes on
+   Apple arm64 and x86_64. The blocking workflow covers Linux, Windows, Apple
+   Silicon, and Intel macOS. This is not yet a GPU or full-Llama-2-7B proof; see
+   [`INFERENCE_DETERMINISM.md`](INFERENCE_DETERMINISM.md).
 
-3. **BLAKE3 verification in O(1).** Consensus participants re-run an inference and compare one 32-byte hash. That costs the same as one forward pass — where proving the same inference in zero-knowledge costs orders of magnitude more. This is the whole trade: reproducibility instead of proof.
+3. **Constant-size commitment comparison.** Comparing two BLAKE3 commitments is
+   constant size, but obtaining independent evidence still requires another
+   forward pass. A matching hash is useful only when the verifier really
+   recomputed the exact artifact and input.
 
-4. **Sharded inference with hop-level integrity.** 32-layer model split into 6 layer ranges across 6 VPS, each range replicated 3×. Each shard verifies the previous shard's BLAKE3 hash before computing its own layers. A single corrupted hop invalidates the whole chain - the network notices immediately.
+4. **Sharded inference with transit integrity.** The historical public layout
+   splits 32 layers into six ranges with three replicas each. Each request binds
+   the received hidden-state bytes to a BLAKE3 digest, which detects accidental
+   or in-transit modification. A malicious shard can hash its own wrong output;
+   authenticated independent recomputation—not the transit hash—is what rejects
+   a bad result in the candidate.
 
 5. **Pipelined prefill across shards.** Prompt prefill runs one task per shard joined by channels, so the node holding layers 6–12 works on position *p* while the node holding 0–6 is already on *p+1*. The per-token decode loop that follows is necessarily sequential — each token depends on the previous token's logits — so a long prompt pipelines well and a long generation does not.
 
@@ -225,15 +334,31 @@ The core thesis - "inference that passes consensus" - only works if the arithmet
 
 7. **Deterministic result cache, content-addressed.** Integer-only means identical inputs produce identical outputs, so results are addressable by (model, prompt, length) and a repeat serves in microseconds. Worth being precise about what that does and does not show: a cache hit is not evidence that the pipeline recomputed. `force_recompute` exists to get a real second walk.
 
-8. **VRF committee selection.** For inference gas lane transactions, a committee is pseudo-randomly selected per request, seeded by the output hash, and recorded with the result for auditability. The selection is live and deterministic; the vote-collection and slashing half is **not yet wired** — members are chosen but never polled. Treat the `committee` field in an inference response as provenance, not as a verification that happened.
+8. **Legacy VRF committee metadata.** The source can select and record a
+   deterministic committee for the older inference gas lane, but that path
+   does not collect votes or auto-slash. Treat a `committee` field as metadata,
+   not verification. Community reward `0x25` uses a separate strict active-set
+   authorization contract and currently fails closed because approval
+   collection is unavailable.
 
-9. **Post-quantum signatures in production.** Falcon-512 and ML-DSA live alongside Ed25519, BLS12-381, secp256k1. Most chains still list this on a roadmap.
+9. **Post-quantum signature code paths.** Falcon-512 and ML-DSA exist alongside
+   Ed25519, BLS12-381, and secp256k1 in the current source tree. This is not a
+   claim that the divergent public fleet runs one coordinated release of them.
 
-10. **DashMap lock-inversion fix in `index_account_tx`** (this week). Consensus thread was holding one shard's write lock while acquiring another → classic deadlock. Found via `gdb -p` on a stuck node with a debuginfo build, fixed in a few lines. Stability debt paid; cluster holds tight round spread now.
+10. **DashMap lock-inversion repair in `index_account_tx`.** The source no
+    longer holds one shard write lock while acquiring another. That removes one
+    identified deadlock; it is not evidence that today's forked public fleet is
+    healthy.
 
 ---
 
 ## Measured performance
+
+The values below are historical lab or public-path observations, not the
+v0.7.12 release gate and not an earnings promise. Re-run the linked harness on
+the exact commit, model artifact, backend, and hardware before quoting one.
+The blocking candidate evidence currently covers CPU ARM/x86 KATs; it does not
+validate GPU determinism or a production 7B GGUF.
 
 **Read this row first, because it is the one people get wrong.** There are two
 very different latency stories here and the millisecond numbers below are the
@@ -242,21 +367,18 @@ very different latency stories here and the millisecond numbers below are the
 | Where | Latency | What it is |
 |---|---|---|
 | **One node, whole model in memory, M2 Ultra** | **76–139 ms/token** | the numbers in the table below |
-| **Sharded across the 6 public seeds** | **~2–10 s/token** | what `arc-demo.sh` actually produces today |
+| **Sharded across 6 public v2 seeds (historical snapshot)** | **~2–10 s/token** | dated observation; not current recovery-candidate evidence |
 
-A 16-token response on the public testnet takes roughly **1–3 minutes**, not
-milliseconds. The seeds are CPU-only VPS — `/info` reports `gpu.available:true`
-but names `llvmpipe`, which is a software rasterizer, not a GPU. A cold shard
-that has not served recently pays a large first-hit penalty on top: a measured
-cold run spent 14.5 s and 16.5 s on two layer ranges that a warm node serves in
-~200 ms. Warm your prompts before demoing.
+In that historical public-v2 snapshot, a 16-token response took roughly **1–3
+minutes**, not milliseconds. Those measurements do not establish current fleet
+health or candidate performance and should not be used as a live demo promise.
 
 All numbers below on Apple M2 Ultra (24 cores, 64 GB) unless noted, single node.
 
 | Metric | Value | Conditions |
 |---|---|---|
-| **Inference (GPU)** | **76 ms/token** | Deterministic INT16, single node, model fully local |
-| **Inference (CPU)** | **139 ms/token** | Deterministic INT16, single node, model fully local |
+| Historical integer GPU path | 76 ms/token | single-node lab measurement; outside current determinism gate |
+| Historical integer CPU path | 139 ms/token | single-node lab measurement; rerun required on candidate |
 | Standard float (Candle Q4) | 175 ms/token | Not deterministic |
 | Single-node peak TPS | 183,000 | CPU verify + sequential exec |
 | Multi-node sustained TPS | 33,230 | 2 validators, real QUIC, real DAG |
@@ -267,7 +389,9 @@ All numbers below on Apple M2 Ultra (24 cores, 64 GB) unless noted, single node.
 | Ed25519 signing | 82,800 / sec | Single-core |
 | DAG finality | ~24 ms | 2-round commit rule |
 
-The deterministic integer engine is **2.3× faster than floating-point** on GPU. Integer ops associate; floating-point ops don't; that removes a class of barriers that force the GPU to serialize.
+The historical lab run measured the integer path faster than its float control.
+That result is workload- and backend-specific and does not establish universal
+GPU speed or cross-GPU bit identity.
 
 ---
 
@@ -348,8 +472,24 @@ Users / AI Agents
 ## Codebase
 
 ~121,900 lines of Rust across 16 workspace members (14 under `crates/`, plus
-`agents/` and `relayer/`). 1,363 `#[test]` / `#[tokio::test]` functions defined
-— run `cargo test --workspace` for the pass count on your machine.
+`agents/` and `relayer/`). More than 1,300 Rust tests are defined. Run the
+complete release gate from the repository root:
+
+```bash
+./scripts/ci_check.sh             # full release/security/integration/UI suite
+./scripts/ci_check.sh --quick     # shorter edit loop
+```
+
+The full command covers release and installer contracts, a releasable-worktree
+secret scan, ShellCheck, workflow syntax, rustfmt, Clippy, every workspace
+target, unit/integration/doc tests, multi-node scenarios, dashboard/explorer
+contracts (including reproducible compiled dashboard CSS), deterministic
+desktop TypeScript/Playwright/Tauri tests, and a clean build plus packed-install
+smoke of the supported TypeScript SDK. CI scans the
+exact checked-out commit. Node.js 24 LTS (see `.node-version`) is required locally.
+Failures retain complete logs under `target/ci-check/`.
+The local shell harness targets macOS/Linux POSIX hosts; Windows-specific SDK,
+desktop, and packaging behavior is enforced by the blocking Windows CI legs.
 
 | Crate | LOC | What it does |
 |---|---|---|
@@ -366,29 +506,33 @@ Users / AI Agents
 | `arc-mempool` | 876 | Lock-free queue, deduplication, BLS threshold encrypted mempool |
 | `arc-cli`, `arc-channel`, `arc-bench`, `arc-relayer`, `arc-agents` | misc | CLI, payment channels, benchmarks, bridge, example agents |
 
-Plus: Python SDK (2,688 LOC), TypeScript SDK (2,011 LOC), Solidity contracts (1,944 LOC), Next.js block explorer.
+Plus: Python SDK (2,688 LOC), TypeScript SDK (2,011 LOC), Solidity contracts
+(1,944 LOC), and a dependency-free static block explorer.
 
 ---
 
-## What's shipping on-chain
+## What exists in the current release candidate
 
-Every line below is live on the testnet right now:
+This table describes the current source tree. The public testnet is still on
+v0.7.2/v0.7.9 and must pass the coordinated rollout gate before these rows can
+be described as deployed together.
 
 | | |
 |---|---|
-| DAG consensus, 2-round commit | ✅ 6 nodes, 3 continents |
-| Self-heal daemon per seed (drift or RPC-silence auto-restart) | ✅ `arc-self-heal.service` |
-| Deterministic INT16 inference, bit-identical cross-arch | ✅ ARM = x86 proof |
-| Sharded inference across 6 seeds, 3× replication, hop-level BLAKE3 | ✅ `/inference/run_sharded` |
-| k-of-n consensus inference with divergence detection | ✅ `/inference/run_consensus` |
+| DAG consensus, 2-round commit | implemented in source; v3 trusted-set cutover not performed |
+| Self-heal daemon | scripts and service units exist; does not repair a forked trust root |
+| Deterministic CPU I8/I16 inference | ✅ hardcoded ARM/x86 KAT; GPU/full-GGUF unverified |
+| Sharded inference, 3× range replication, transit BLAKE3 | candidate endpoints implemented; not deployed to the public fleet |
+| Authenticated range recomputation | candidate requires 2-of-3 for every range/token; not deployed |
 | Latency-aware replica selection per layer range | ✅ rolling EWMA |
 | Auto-shard node onboarding | ✅ `--auto-shard` flag |
-| Inference attestations as a transaction type | ✅ tx type `0x16` |
+| Inference computation claims | tx `0x16`; never a payment |
+| Community reward settlement | tx `0x25`, strict active-set identity + stake approvals; issuance currently fails closed because approval collection is unavailable |
 | EVM (Solidity) + WASM (Rust / C / Go) both | ✅ revm 19, Wasmer 6.0 |
 | 5 signature algorithms incl. 2 post-quantum | ✅ Ed25519 · Falcon-512 · BLS · ML-DSA · secp256k1 |
 | BLS threshold encrypted mempool (MEV protection) | ✅ commit-reveal |
 | Zero-fee agent settlements | ✅ `Settle` (0x06) · `RegisterAgent` (0x07) |
-| Web wallet, live dashboard | ✅ |
+| Wallet and dashboard UIs | public diagnostics exist; corrected candidate UI not yet deployed |
 
 ### Built but not yet doing its job
 
@@ -399,8 +543,8 @@ thing you would assume from the name is not happening yet:
 |---|---|
 | Validator slashing (equivocation, liveness) | implemented in `arc-consensus`; no slash has been triggered on the live net |
 | VRF committee re-execution | committee is selected and recorded; votes are never collected |
-| Attestations reaching a block | submitted to the mempool, but 4 of 6 seeds are not sealing, so they read `block_height: null` |
-| Model identity in attestations | `model_hash` commits to the shape label, not the weight bytes |
+| Public inference claims reaching blocks | host-dependent on the forked fleet; a mined `0x16` still pays nothing |
+| Exact model identity | public v2 `model_hash` is shape-derived; the unpublished v0.7.12/v3 candidate commits to every byte of the source model artifact |
 
 ### Roadmap — designed, not shipped
 
@@ -412,14 +556,17 @@ endpoints return 404 on the current binary.
 | Content-addressed model chunks (no GGUF download) | `/chunks/get/{hash}` — planned |
 | Heterogeneous hardware scheduler, race-top-K | `/inference/plan` — planned |
 | Peer-to-peer weight distribution | planned |
-| Replicated chain across the seeds (one shared state) | plan written, not started |
-| Block explorer | offline |
+| Replicated chain across the seeds (one shared state) | v3 repair candidate built; public cutover blocked on validator key rotation and an approved genesis/checkpoint |
+| Block explorer | source-pinned static candidate built; not yet publicly deployed |
 
 ---
 
 ## Network endpoints
 
-All 6 seeds serve the same API on port 9090. Auto-pick a healthy one:
+All six legacy seed addresses answer selected HTTP routes on port 9090, but
+they do not serve one chain and their v0.7.2/v0.7.9 schemas differ from the
+candidate. This helper is for read-only endpoint diagnosis, not for blending
+state or choosing a canonical chain:
 
 ```bash
 COORDINATOR=$(bash scripts/arc-pick-coordinator.sh)
@@ -442,29 +589,23 @@ Key endpoints:
 | `/health`, `/stats`, `/info` | node + chain health |
 | `/block/latest`, `/block/{n}` | blocks (per-seed — see the state note above) |
 | `/inference/run`, `/inference/run_sharded` | single-node + sharded inference |
-| `/inference/attestations` | attestation records |
+| `/inference/attestations` | raw inference claim records (`0x16`; not payment) |
 | `/inference/results` | node-local inference results (in-memory, lost on restart) |
 | `/tx/submit`, `/tx/{hash}` | transactions |
 | `/validators`, `/shards` | network state |
 | `/account/{addr}` | balances |
 | `/faucet/claim`, `/faucet/status` | free testnet tokens (10,000 ARC, 60 s cooldown) |
-| `/worker/earnings/{addr}` | attestation count × 2.5 ARC (display arithmetic — see below) |
+| `/worker/earnings/{addr}` | candidate: successful mined `0x25` reward receipts and observed-rate projection; public v2 semantics differ |
 | `/workers/scoreboard` | registered community workers |
 | `/eth` | Ethereum JSON-RPC (MetaMask compatible) |
 
-Two endpoints deserve a warning label:
-
-- **`/models`** reports `fully_covered: false` with `covered_layers: 96` against
-  `total_layers: 32`. That is a counting bug — it sums the layer spans of all 18
-  shards instead of taking their union, so any replication factor above 1 makes
-  it report a false negative. `/shards` on the same node computes coverage
-  correctly and says `true`. Trust `/shards`.
-- **`/worker/earnings/{addr}`** multiplies an attestation count by a 2.5 ARC
-  constant. It is display arithmetic, not a balance: nothing reads or writes an
-  on-chain balance in that handler, so it will not reconcile against
-  `/account/{addr}`. It also counts from an in-memory transaction map that is
-  pruned, so the figure can go *down* between two polls and resets to zero when
-  a node restarts.
+The public v2 seeds still exhibit two known API bugs: `/models` double-counts
+replicated layer coverage, and `/worker/earnings/{addr}` reports display
+arithmetic rather than mined income. The v3 candidate fixes both: coverage is a
+range union, while earnings count only successful retained
+`CommunityInferenceReward` receipts and expose observed projections as null
+when the node lacks enough evidence. Those fixes are not live until the fleet
+cutover completes.
 
 See `docs/HOW-SHARDING-WORKS.md` for the wire protocol.
 

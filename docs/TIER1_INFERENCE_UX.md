@@ -4,6 +4,15 @@
 **Status:** Draft v1 — 2026-05-16
 **Audience:** Anyone evaluating what users will actually see when Tier 1 ships.
 
+> **Not shipped.** This is a proposed experience, not the public v0.7.11 UI or
+> the unreleased v0.7.12 recovery contract. Reward amounts and validator-vote
+> examples below are design assumptions, not evidence of current work or
+> payment. The recovery candidate treats only a successful mined `0x25`
+> community-reward receipt as payment and currently fails closed while approval
+> collection is unavailable. Its paid-escrow and Tier 1 request commands
+> return before signing or network I/O; VRF selection and server-derived
+> replica labels are not validator payment authorization.
+
 This document walks through the inference experience after Tier 1 lands. It complements the implementation plan by focusing on what the user perceives — UI states, timing, edge cases, and how it differs from today's coordinator-based flow.
 
 ---

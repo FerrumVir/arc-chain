@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
-# Scan exactly the checked-out commit tree, never the already-compromised Git
-# history. The pinned archive checksum prevents a replaced release asset from
-# silently changing this blocking CI gate.
+# Scan either the exact checked-out commit (the CI default) or every releasable
+# tracked/untracked file in the local working tree. Never scan the already-
+# compromised Git history. The pinned archive checksum prevents a replaced
+# release asset from silently changing this blocking gate.
 set -Eeuo pipefail
 
 TEST_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 GITLEAKS_VERSION=8.30.1
 CONFIG_FILE="$TEST_DIR/gitleaks-current-tree.toml"
+MATERIALIZER="$TEST_DIR/materialize_releasable_tree.py"
 TEMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/arc-current-tree-secrets.XXXXXX")"
 cleanup() { rm -rf -- "$TEMP_ROOT"; }
 trap cleanup EXIT HUP INT TERM
+
+SOURCE_MODE="${1:---commit}"
+case "$SOURCE_MODE" in
+    --commit|--worktree) ;;
+    *)
+        printf 'usage: %s [--commit|--worktree]\n' "$0" >&2
+        exit 2
+        ;;
+esac
 
 case "$(uname -s):$(uname -m)" in
     Linux:x86_64|Linux:amd64)
@@ -57,12 +68,28 @@ else
 fi
 tar -xzf "$ARCHIVE" -C "$TEMP_ROOT" gitleaks
 
-SCAN_ROOT="$TEMP_ROOT/current-tree"
-mkdir -p "$SCAN_ROOT"
-git -C "$REPO_ROOT" archive --format=tar HEAD | tar -xf - -C "$SCAN_ROOT"
-
-"$GITLEAKS_BIN" dir \
-    --no-banner \
-    --redact \
-    --config "$CONFIG_FILE" \
-    "$SCAN_ROOT"
+if [ "$SOURCE_MODE" = --commit ]; then
+    SCAN_ROOT="$TEMP_ROOT/commit-tree"
+    mkdir -p "$SCAN_ROOT"
+    git -C "$REPO_ROOT" archive --format=tar HEAD | tar -xf - -C "$SCAN_ROOT"
+    "$GITLEAKS_BIN" dir \
+        --no-banner \
+        --redact \
+        --config "$CONFIG_FILE" \
+        "$SCAN_ROOT"
+else
+    # Scan both views. The index catches bytes already staged for commit even
+    # when the working copy was subsequently cleaned; the worktree catches
+    # tracked edits and untracked, non-ignored files not staged yet.
+    for tree_mode in index worktree; do
+        SCAN_ROOT="$TEMP_ROOT/$tree_mode-tree"
+        mkdir -p "$SCAN_ROOT"
+        python3 "$MATERIALIZER" "--$tree_mode" "$REPO_ROOT" "$SCAN_ROOT"
+        printf 'secret scan: checking releasable %s bytes\n' "$tree_mode"
+        "$GITLEAKS_BIN" dir \
+            --no-banner \
+            --redact \
+            --config "$CONFIG_FILE" \
+            "$SCAN_ROOT"
+    done
+fi

@@ -7,14 +7,14 @@ help:
 	@echo "ARC Chain make targets"
 	@echo ""
 	@echo "  Verification (mirror CI):"
-	@echo "    make ci               Run the full local gate (fmt-check, lint, test, audit)"
+	@echo "    make ci               Run the full blocking local/CI gate"
 	@echo "    make fmt              Format the workspace in place"
 	@echo "    make fmt-check        Fail if anything is unformatted (what CI runs)"
 	@echo "    make lint             clippy --all-targets -D warnings"
 	@echo "    make test             Unit tests (the blocking CI gate)"
 	@echo "    make test-integration Integration + doc tests (not run by --lib)"
 	@echo "    make audit            cargo deny check (advisories/licenses/bans/sources)"
-	@echo "    make desktop-test     Desktop typecheck + Playwright suite"
+	@echo "    make desktop-test     Desktop typecheck + stable Playwright/Tauri tests"
 	@echo ""
 	@echo "  Build / run:"
 	@echo "    make build node join inference inference-node explorer faucet bench"
@@ -66,16 +66,15 @@ test-integration:
 audit:
 	cargo deny check
 
-# Desktop typecheck + the 15-spec Playwright suite (runs against the mock
-# Tauri backend, so no arc-node binary is needed).
+# Desktop typecheck + deterministic Playwright gate + stable Tauri tests. The
+# screenshot gallery and ambient live-node suite remain manual-only.
 desktop-test:
-	cd desktop && npm ci && npx tsc --noEmit && npx playwright install --with-deps chromium && npx playwright test
+	cd desktop && npm ci && npx tsc --noEmit && npx playwright install chromium && CI=true npx playwright test --config playwright.gate.config.ts
+	cargo +stable test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked
 
-# The local aggregate. Deliberately ordered cheapest-first so it fails fast.
-# Does not include test-integration or desktop-test: both are slow, and both
-# are non-blocking in CI today. Run them explicitly.
-ci: fmt-check lint test audit
-	@echo "ALL LOCAL CHECKS PASSED"
+# The single source of truth for every required local gate.
+ci:
+	./scripts/ci_check.sh --full
 
 # ---------------------------------------------------------------------------
 # Existing targets, unchanged.
@@ -89,13 +88,15 @@ node:
 join:
 	./scripts/join-testnet.sh
 
-# Join testnet with inference enabled (downloads model)
+# Join as a stake-zero inference worker with an operator-verified local model.
 inference:
-	./scripts/join-testnet.sh --with-inference
+	@test -n "$$ARC_MODEL_PATH" || { echo "Set ARC_MODEL_PATH=/absolute/path/to/model.gguf" >&2; exit 2; }
+	./scripts/join-inference.sh --model "$$ARC_MODEL_PATH"
 
-# Join as an inference node (GPU recommended, earn ARC)
+# Alias for the same stake-zero worker flow. Work/rewards are not guaranteed.
 inference-node:
-	./scripts/join-inference.sh
+	@test -n "$$ARC_MODEL_PATH" || { echo "Set ARC_MODEL_PATH=/absolute/path/to/model.gguf" >&2; exit 2; }
+	./scripts/join-inference.sh --model "$$ARC_MODEL_PATH"
 
 # Run the block explorer
 explorer:

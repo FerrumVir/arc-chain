@@ -4,6 +4,23 @@ use serde::{Deserialize, Serialize};
 
 use crate::account::Address;
 
+fn serialize_unverified<S>(_: &bool, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_bool(false)
+}
+
+fn deserialize_unverified<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Consume the legacy wire field to preserve the bincode layout, but never
+    // trust a process-local verification-cache bit received from JSON/P2P.
+    let _ = bool::deserialize(deserializer)?;
+    Ok(false)
+}
+
 // ---------------------------------------------------------------------------
 // Gas constants & metering
 // ---------------------------------------------------------------------------
@@ -68,6 +85,8 @@ pub mod gas_costs {
     pub const SHARD_PROOF: u64 = 60_000;
     /// Gas for submitting an optimistic inference attestation (Tier 2).
     pub const INFERENCE_ATTESTATION: u64 = 50_000;
+    /// Gas for a validator-authorized community inference reward.
+    pub const COMMUNITY_INFERENCE_REWARD: u64 = 50_000;
     /// Gas for challenging an inference attestation (Tier 2).
     pub const INFERENCE_CHALLENGE: u64 = 100_000;
     /// Gas for opening a per-request inference escrow (Milestone B).
@@ -287,6 +306,9 @@ pub enum TxType {
     /// elapsed. Distributes payout (or refunds), zeroes the escrow, and
     /// commits the final `output_hash` to the receipt log.
     InferenceFinalize = 0x24,
+    /// Validator-authorized payment for one coordinator-issued community
+    /// inference job. Appended to preserve every existing wire discriminant.
+    CommunityInferenceReward = 0x25,
 }
 
 /// A transaction on the ARC chain.
@@ -316,7 +338,11 @@ pub struct Transaction {
     pub signature: Signature,
     /// Whether the signature has already been verified (e.g. at mempool insertion).
     /// When true, block execution can skip re-verification for a ~2x speedup.
-    #[serde(default)]
+    #[serde(
+        default,
+        serialize_with = "serialize_unverified",
+        deserialize_with = "deserialize_unverified"
+    )]
     pub sig_verified: bool,
 }
 
@@ -386,6 +412,57 @@ pub enum TxBody {
     InferenceVote(InferenceVoteBody),
     /// Tier 1 system-deterministic finalize (payout or refund, zeroes escrow).
     InferenceFinalize(InferenceFinalizeBody),
+    /// Validator-authorized, replay-protected community inference payment.
+    CommunityInferenceReward(CommunityInferenceRewardBody),
+}
+
+impl TxBody {
+    /// Canonical envelope discriminant for this body variant.
+    ///
+    /// Consensus and ingress must reject a transaction whose public `tx_type`
+    /// disagrees with this value; otherwise a restricted body can masquerade
+    /// as a harmless transfer while state executes the body variant.
+    pub const fn tx_type(&self) -> TxType {
+        match self {
+            Self::Transfer(_) => TxType::Transfer,
+            Self::Settle(_) => TxType::Settle,
+            Self::Swap(_) => TxType::Swap,
+            Self::Escrow(_) => TxType::Escrow,
+            Self::Stake(_) => TxType::Stake,
+            Self::WasmCall(_) => TxType::WasmCall,
+            Self::MultiSig(_) => TxType::MultiSig,
+            Self::DeployContract(_) => TxType::DeployContract,
+            Self::RegisterAgent(_) => TxType::RegisterAgent,
+            Self::JoinValidator(_) => TxType::JoinValidator,
+            Self::LeaveValidator => TxType::LeaveValidator,
+            Self::ClaimRewards => TxType::ClaimRewards,
+            Self::UpdateStake(_) => TxType::UpdateStake,
+            Self::Governance(_) => TxType::Governance,
+            Self::BridgeLock(_) => TxType::BridgeLock,
+            Self::BridgeMint(_) => TxType::BridgeMint,
+            Self::BatchSettle(_) => TxType::BatchSettle,
+            Self::ChannelOpen(_) => TxType::ChannelOpen,
+            Self::ChannelClose(_) => TxType::ChannelClose,
+            Self::ChannelDispute(_) => TxType::ChannelDispute,
+            Self::ShardProof(_) => TxType::ShardProof,
+            Self::InferenceAttestation(_) => TxType::InferenceAttestation,
+            Self::InferenceChallenge(_) => TxType::InferenceChallenge,
+            Self::InferenceRegister(_) => TxType::InferenceRegister,
+            Self::InferenceEscrowOpen(_) => TxType::InferenceEscrowOpen,
+            Self::InferenceEscrowRelease(_) => TxType::InferenceEscrowRelease,
+            Self::InferenceEscrowRefund(_) => TxType::InferenceEscrowRefund,
+            Self::ModelRegistration(_) => TxType::ModelRegistration,
+            Self::ModelRequest(_) => TxType::ModelRequest,
+            Self::ShardCoverageClaim(_) => TxType::ShardCoverageClaim,
+            Self::CapacityAdvertisement(_) => TxType::CapacityAdvertisement,
+            Self::ShardAssignmentProposal(_) => TxType::ShardAssignmentProposal,
+            Self::FaucetClaim(_) => TxType::FaucetClaim,
+            Self::InferenceRequest(_) => TxType::InferenceRequest,
+            Self::InferenceVote(_) => TxType::InferenceVote,
+            Self::InferenceFinalize(_) => TxType::InferenceFinalize,
+            Self::CommunityInferenceReward(_) => TxType::CommunityInferenceReward,
+        }
+    }
 }
 
 /// Simple value transfer.
@@ -668,12 +745,193 @@ pub struct InferenceAttestationBody {
     /// Marking the field `skip` makes the serialized form (and the tx hash)
     /// byte-identical to v0.7.2, restoring rolling-upgrade compatibility.
     ///
-    /// The "credit the original requester, not the working validator"
-    /// behavior (Option C) is reconstructed at query time in
-    /// `worker_earnings` by matching this attestation's `input_hash` to the
-    /// sender of the original InferenceRequest — no wire field required.
+    /// This deprecated local hint is not used for payment. Community income
+    /// is attributed explicitly by `CommunityInferenceRewardBody::worker`.
     #[serde(skip)]
     pub beneficiary: Option<Address>,
+}
+
+/// Validator-authorized payment for one completed community inference job.
+///
+/// The worker's signed `InferenceAttestation` proves the result to independent
+/// validators. A bounded Ed25519 approval quorum authorizes this compact
+/// on-chain receipt; its outer signature only authenticates the aggregator.
+/// Consensus derives one-shot markers from both `job_id` and the worker
+/// certificate so neither can be paid twice under a different transaction.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CommunityInferenceRewardBody {
+    /// Domain separator for ARC chain `0x415243` reward-v1 signatures.
+    pub chain_domain: Hash256,
+    /// Coordinator-generated, globally unique job commitment.
+    pub job_id: Hash256,
+    /// Stake-zero or staked worker that completed the assigned job.
+    pub worker: Address,
+    /// Model and I/O commitments copied from the verified worker attestation.
+    pub model_id: Hash256,
+    pub input_hash: Hash256,
+    pub output_hash: Hash256,
+    /// Token ceiling authorized by the coordinator for this job.
+    pub max_tokens: u32,
+    /// Last block height at which this reward authorization is valid.
+    pub expires_at_height: u64,
+    /// Flat worker-signed certificate. A full `Transaction` here made the
+    /// wire type recursively nestable because a reward transaction could
+    /// contain another reward transaction indefinitely. Validators rebuild
+    /// the one permitted InferenceAttestation shape from these bounded fields.
+    pub worker_certificate: WorkerInferenceCertificate,
+    /// Independent active-validator approvals over
+    /// [`Self::validator_approval_commitment`]. The outer transaction
+    /// signature authenticates the aggregator only; consensus does not treat
+    /// it as proof that the off-chain result was independently verified.
+    /// State caps this list at [`MAX_COMMUNITY_REWARD_APPROVALS`].
+    pub validator_approvals: Vec<CommunityRewardValidatorApproval>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkerInferenceCertificate {
+    /// Hash assigned by `Transaction::sign` to the original worker
+    /// InferenceAttestation.
+    pub attestation_hash: Hash256,
+    pub nonce: u64,
+    pub challenge_period: u64,
+    pub signature: Signature,
+}
+
+/// Hard wire bound for reward-v1 quorum evidence.
+///
+/// V1 deliberately fails closed when the active validator set exceeds this
+/// bound. Each entry is exactly an address, Ed25519 public key, and 64-byte
+/// signature, so a reward cannot recursively embed transactions or unbounded
+/// post-quantum signature payloads.
+pub const MAX_COMMUNITY_REWARD_APPROVALS: usize = 64;
+
+/// One validator's approval of a community reward's complete semantic
+/// commitment. The split 64-byte signature keeps the wire representation
+/// fixed-size while using serde's portable 32-byte array support.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityRewardValidatorApproval {
+    pub validator: Address,
+    pub public_key: [u8; 32],
+    pub signature_halves: [[u8; 32]; 2],
+}
+
+impl CommunityRewardValidatorApproval {
+    /// Convert only a canonical 64-byte Ed25519 signature. Other ARC
+    /// signature schemes are intentionally not representable in reward-v1
+    /// quorum evidence.
+    pub fn from_ed25519_signature(validator: Address, signature: Signature) -> Option<Self> {
+        let Signature::Ed25519 {
+            public_key,
+            signature,
+        } = signature
+        else {
+            return None;
+        };
+        let bytes: [u8; 64] = signature.try_into().ok()?;
+        let mut first = [0u8; 32];
+        let mut second = [0u8; 32];
+        first.copy_from_slice(&bytes[..32]);
+        second.copy_from_slice(&bytes[32..]);
+        Some(Self {
+            validator,
+            public_key,
+            signature_halves: [first, second],
+        })
+    }
+
+    /// Reconstruct the ARC signature enum only for cryptographic verification.
+    pub fn as_signature(&self) -> Signature {
+        let mut signature = Vec::with_capacity(64);
+        signature.extend_from_slice(&self.signature_halves[0]);
+        signature.extend_from_slice(&self.signature_halves[1]);
+        Signature::Ed25519 {
+            public_key: self.public_key,
+            signature,
+        }
+    }
+}
+
+impl CommunityInferenceRewardBody {
+    pub fn expected_chain_domain() -> Hash256 {
+        arc_crypto::hash_bytes(b"arc-chain:0x415243:community-inference-reward:v1")
+    }
+
+    /// Zero-balance state marker used for consensus-level replay protection.
+    pub fn marker_address(chain_domain: &Hash256, job_id: &Hash256) -> Address {
+        let mut bytes = Vec::with_capacity(23 + 64);
+        bytes.extend_from_slice(b"arc-community-reward-v1");
+        bytes.extend_from_slice(chain_domain.as_ref());
+        bytes.extend_from_slice(job_id.as_ref());
+        arc_crypto::hash_bytes(&bytes)
+    }
+
+    /// Independent one-shot marker for the worker-signed certificate. A
+    /// validator must not be able to wrap one valid certificate in fresh job
+    /// IDs and collect the flat treasury reward repeatedly.
+    pub fn certificate_marker_address(
+        chain_domain: &Hash256,
+        worker: &Address,
+        attestation_hash: &Hash256,
+    ) -> Address {
+        let mut bytes = Vec::with_capacity(34 + 96);
+        bytes.extend_from_slice(b"arc-community-certificate-v1");
+        bytes.extend_from_slice(chain_domain.as_ref());
+        bytes.extend_from_slice(worker.as_ref());
+        bytes.extend_from_slice(attestation_hash.as_ref());
+        arc_crypto::hash_bytes(&bytes)
+    }
+
+    /// Common transcript independently signed by every reward approver.
+    ///
+    /// This binds all payout semantics, the exact worker-signed certificate,
+    /// and the reward-v1 amount. It intentionally excludes
+    /// `validator_approvals` and the outer transaction envelope so validators
+    /// can sign the same bounded message before an aggregator packages it.
+    pub fn validator_approval_commitment(&self) -> Hash256 {
+        let mut hasher =
+            blake3::Hasher::new_derive_key("ARC-community-inference-reward-validator-approval-v1");
+        hasher.update(self.chain_domain.as_ref());
+        hasher.update(self.job_id.as_ref());
+        hasher.update(self.worker.as_ref());
+        hasher.update(self.model_id.as_ref());
+        hasher.update(self.input_hash.as_ref());
+        hasher.update(self.output_hash.as_ref());
+        hasher.update(&self.max_tokens.to_le_bytes());
+        hasher.update(&self.expires_at_height.to_le_bytes());
+        hasher.update(self.worker_certificate.attestation_hash.as_ref());
+        hasher.update(&self.worker_certificate.nonce.to_le_bytes());
+        hasher.update(&self.worker_certificate.challenge_period.to_le_bytes());
+        let certificate_signature = bincode::serialize(&self.worker_certificate.signature)
+            .expect("worker certificate signature is serializable");
+        hasher.update(&(certificate_signature.len() as u64).to_le_bytes());
+        hasher.update(&certificate_signature);
+        hasher.update(&crate::economics::INFERENCE_ATTESTATION_REWARD.to_le_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Rebuild the only worker transaction shape accepted by a community
+    /// reward. Fixed fee/gas/bond values keep the certificate compact and
+    /// remove all recursive deserialization paths.
+    pub fn reconstruct_worker_attestation(&self) -> Transaction {
+        Transaction {
+            tx_type: TxType::InferenceAttestation,
+            from: self.worker,
+            nonce: self.worker_certificate.nonce,
+            body: TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id: self.model_id,
+                input_hash: self.input_hash,
+                output_hash: self.output_hash,
+                challenge_period: self.worker_certificate.challenge_period,
+                bond: 0,
+                beneficiary: None,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: self.worker_certificate.attestation_hash,
+            signature: self.worker_certificate.signature.clone(),
+            sig_verified: false,
+        }
+    }
 }
 
 /// Challenge an inference attestation (Tier 2 fraud proof).
@@ -1194,6 +1452,28 @@ impl CompactTransfer {
 }
 
 impl Transaction {
+    /// Construct a validator-authorized payment for a completed community
+    /// inference job. The caller must sign with an active validator key.
+    pub fn new_community_inference_reward(
+        validator: Address,
+        nonce: u64,
+        body: CommunityInferenceRewardBody,
+    ) -> Self {
+        let mut tx = Self {
+            tx_type: TxType::CommunityInferenceReward,
+            from: validator,
+            nonce,
+            body: TxBody::CommunityInferenceReward(body),
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: false,
+        };
+        tx.hash = tx.compute_hash();
+        tx
+    }
+
     /// Construct a validator-authorized faucet claim (unsigned — caller
     /// must `tx.sign(&validator_keypair)` before submitting). The executor
     /// will reject the tx unless `validator` is an active validator at
@@ -1408,6 +1688,9 @@ impl Transaction {
     ///
     /// Null signatures (benchmark mode) always fail verification.
     pub fn verify_signature(&self) -> Result<(), SignatureError> {
+        if self.tx_type != self.body.tx_type() {
+            return Err(SignatureError::HashMismatch);
+        }
         // Integrity: recompute hash and compare
         let expected = self.compute_hash();
         if expected != self.hash {
@@ -1445,6 +1728,22 @@ mod tests {
         assert_eq!(tx.tx_type, TxType::Transfer);
         assert_ne!(tx.hash, Hash256::ZERO);
         assert!(tx.is_unsigned());
+    }
+
+    #[test]
+    fn unsigned_transfer_wire_format_stays_bincode_v1_compatible() {
+        const LEGACY_WIRE_HEX: &str = "0000000048fc721fbbc172e0925fa27af1671de225ba927134802998b10a1568a188652b000000000000000000000000ab13bedf42e84bae0f7c62c7dd6a8ada571e8829bed6ea558217f0361b5e25d0e80300000000000000000000000000000000000000000000003296b0b8498403c1255885e25dbc016407ad8b83498b8233bd006c59a4ba892e00000000000000000000000000000000000000000000000000000000000000000000000040000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
+        let tx = Transaction::new_transfer(test_addr(1), test_addr(2), 1000, 0);
+        assert_eq!(
+            hex::encode(bincode::serialize(&tx).unwrap()),
+            LEGACY_WIRE_HEX
+        );
+
+        let historical = hex::decode(LEGACY_WIRE_HEX).unwrap();
+        let decoded: Transaction = bincode::deserialize(&historical).unwrap();
+        assert_eq!(bincode::serialize(&decoded).unwrap(), historical);
+        assert_eq!(decoded.hash, tx.hash);
+        assert_eq!(decoded.tx_type, tx.tx_type);
     }
 
     #[test]
@@ -1548,6 +1847,36 @@ mod tests {
         });
 
         // Verification must fail (hash mismatch)
+        assert!(tx.verify_signature().is_err());
+    }
+
+    #[test]
+    fn sig_verified_wire_field_is_always_reset_to_false() {
+        let kp = KeyPair::generate_ed25519();
+        let mut tx = Transaction::new_transfer(kp.address(), test_addr(2), 1, 0);
+        tx.sign(&kp).unwrap();
+        tx.sig_verified = true;
+
+        let json = serde_json::to_value(&tx).unwrap();
+        assert_eq!(json["sig_verified"], false);
+        let mut malicious_json = json;
+        malicious_json["sig_verified"] = serde_json::Value::Bool(true);
+        let decoded_json: Transaction = serde_json::from_value(malicious_json).unwrap();
+        assert!(!decoded_json.sig_verified);
+
+        let wire = bincode::serialize(&tx).unwrap();
+        let decoded_wire: Transaction = bincode::deserialize(&wire).unwrap();
+        assert!(!decoded_wire.sig_verified);
+        decoded_wire.verify_signature().unwrap();
+    }
+
+    #[test]
+    fn signed_type_body_mismatch_is_rejected() {
+        let kp = KeyPair::generate_ed25519();
+        let mut tx = Transaction::new_transfer(kp.address(), test_addr(2), 1, 0);
+        tx.tx_type = TxType::InferenceAttestation;
+        tx.sign(&kp).unwrap();
+        assert_ne!(tx.tx_type, tx.body.tx_type());
         assert!(tx.verify_signature().is_err());
     }
 
@@ -1710,6 +2039,199 @@ mod tests {
         assert_eq!(TxType::InferenceRequest as u8, 0x22);
         assert_eq!(TxType::InferenceVote as u8, 0x23);
         assert_eq!(TxType::InferenceFinalize as u8, 0x24);
+        assert_eq!(TxType::CommunityInferenceReward as u8, 0x25);
+    }
+
+    #[test]
+    fn community_inference_reward_roundtrip_and_marker_are_stable() {
+        let job_id = hash_bytes(b"job-1");
+        let worker_key = KeyPair::generate_ed25519();
+        let validator_key = KeyPair::generate_ed25519();
+        let mut worker_attestation = Transaction {
+            tx_type: TxType::InferenceAttestation,
+            from: worker_key.address(),
+            nonce: 0,
+            body: TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id: hash_bytes(b"model"),
+                input_hash: hash_bytes(b"input"),
+                output_hash: hash_bytes(b"output"),
+                challenge_period: 100,
+                bond: 0,
+                beneficiary: None,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: false,
+        };
+        worker_attestation.sign(&worker_key).unwrap();
+        let chain_domain = CommunityInferenceRewardBody::expected_chain_domain();
+        let mut body = CommunityInferenceRewardBody {
+            chain_domain,
+            job_id,
+            worker: worker_key.address(),
+            model_id: hash_bytes(b"model"),
+            input_hash: hash_bytes(b"input"),
+            output_hash: hash_bytes(b"output"),
+            max_tokens: 32,
+            expires_at_height: 123,
+            worker_certificate: WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: 100,
+                signature: worker_attestation.signature.clone(),
+            },
+            validator_approvals: Vec::new(),
+        };
+        let approval_commitment = body.validator_approval_commitment();
+        body.validator_approvals.push(
+            CommunityRewardValidatorApproval::from_ed25519_signature(
+                validator_key.address(),
+                validator_key.sign(&approval_commitment).unwrap(),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            approval_commitment,
+            body.validator_approval_commitment(),
+            "approval evidence itself is excluded from the common transcript"
+        );
+        let marker = CommunityInferenceRewardBody::marker_address(&chain_domain, &job_id);
+        assert_eq!(
+            marker,
+            CommunityInferenceRewardBody::marker_address(&chain_domain, &job_id)
+        );
+
+        let encoded = bincode::serialize(&TxBody::CommunityInferenceReward(body.clone()))
+            .expect("serialize reward");
+        assert!(
+            encoded.len() < 1024,
+            "flat reward certificate must remain bounded; got {} bytes",
+            encoded.len()
+        );
+        let decoded: TxBody = bincode::deserialize(&encoded).expect("deserialize reward");
+        match decoded {
+            TxBody::CommunityInferenceReward(got) => {
+                assert_eq!(got.job_id, body.job_id);
+                assert_eq!(got.worker, body.worker);
+                assert_eq!(got.output_hash, body.output_hash);
+                assert_eq!(got.max_tokens, 32);
+                assert_eq!(got.expires_at_height, 123);
+                assert_eq!(got.validator_approvals.len(), 1);
+                got.validator_approvals[0]
+                    .as_signature()
+                    .verify(
+                        &got.validator_approval_commitment(),
+                        &validator_key.address(),
+                    )
+                    .unwrap();
+                let rebuilt = got.reconstruct_worker_attestation();
+                assert_eq!(rebuilt.hash, got.worker_certificate.attestation_hash);
+                rebuilt.verify_signature().unwrap();
+            }
+            other => panic!("wrong variant after roundtrip: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn community_reward_approval_commitment_binds_every_semantic_and_certificate_field() {
+        let worker_key = KeyPair::generate_ed25519();
+        let mut worker_attestation = Transaction {
+            tx_type: TxType::InferenceAttestation,
+            from: worker_key.address(),
+            nonce: 4,
+            body: TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id: hash_bytes(b"model"),
+                input_hash: hash_bytes(b"input"),
+                output_hash: hash_bytes(b"output"),
+                challenge_period: 100,
+                bond: 0,
+                beneficiary: None,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: Hash256::ZERO,
+            signature: Signature::null(),
+            sig_verified: false,
+        };
+        worker_attestation.sign(&worker_key).unwrap();
+        let body = CommunityInferenceRewardBody {
+            chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
+            job_id: hash_bytes(b"job"),
+            worker: worker_key.address(),
+            model_id: hash_bytes(b"model"),
+            input_hash: hash_bytes(b"input"),
+            output_hash: hash_bytes(b"output"),
+            max_tokens: 32,
+            expires_at_height: 123,
+            worker_certificate: WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: 100,
+                signature: worker_attestation.signature,
+            },
+            validator_approvals: Vec::new(),
+        };
+        let expected = body.validator_approval_commitment();
+
+        macro_rules! assert_mutation_bound {
+            ($label:literal, $mutation:expr) => {{
+                let mut changed = body.clone();
+                $mutation(&mut changed);
+                assert_ne!(
+                    changed.validator_approval_commitment(),
+                    expected,
+                    "{} was not bound by approval commitment",
+                    $label
+                );
+            }};
+        }
+        assert_mutation_bound!("chain_domain", |b: &mut CommunityInferenceRewardBody| {
+            b.chain_domain = hash_bytes(b"other-domain")
+        });
+        assert_mutation_bound!("job_id", |b: &mut CommunityInferenceRewardBody| {
+            b.job_id = hash_bytes(b"other-job")
+        });
+        assert_mutation_bound!("worker", |b: &mut CommunityInferenceRewardBody| {
+            b.worker = hash_bytes(b"other-worker")
+        });
+        assert_mutation_bound!("model_id", |b: &mut CommunityInferenceRewardBody| {
+            b.model_id = hash_bytes(b"other-model")
+        });
+        assert_mutation_bound!("input_hash", |b: &mut CommunityInferenceRewardBody| {
+            b.input_hash = hash_bytes(b"other-input")
+        });
+        assert_mutation_bound!("output_hash", |b: &mut CommunityInferenceRewardBody| {
+            b.output_hash = hash_bytes(b"other-output")
+        });
+        assert_mutation_bound!("max_tokens", |b: &mut CommunityInferenceRewardBody| {
+            b.max_tokens += 1
+        });
+        assert_mutation_bound!(
+            "expires_at_height",
+            |b: &mut CommunityInferenceRewardBody| { b.expires_at_height += 1 }
+        );
+        assert_mutation_bound!(
+            "worker_certificate.attestation_hash",
+            |b: &mut CommunityInferenceRewardBody| {
+                b.worker_certificate.attestation_hash = hash_bytes(b"other-attestation")
+            }
+        );
+        assert_mutation_bound!(
+            "worker_certificate.nonce",
+            |b: &mut CommunityInferenceRewardBody| { b.worker_certificate.nonce += 1 }
+        );
+        assert_mutation_bound!(
+            "worker_certificate.challenge_period",
+            |b: &mut CommunityInferenceRewardBody| { b.worker_certificate.challenge_period += 1 }
+        );
+        assert_mutation_bound!(
+            "worker_certificate.signature",
+            |b: &mut CommunityInferenceRewardBody| {
+                b.worker_certificate.signature = Signature::null()
+            }
+        );
     }
 
     #[test]

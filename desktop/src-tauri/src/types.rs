@@ -12,7 +12,6 @@ pub struct HardwareInfo {
     pub gpu_vram_gb: Option<u64>,
     pub recommended_model: String,
     pub recommended_role: String,
-    pub estimated_daily_arc: f64,
 }
 
 /// On-disk identity. Carries the BIP-39 phrase because the phrase is what
@@ -186,10 +185,6 @@ pub struct Attestation {
     /// the meta line instead of printing a confident "0 tokens".
     pub tokens: Option<u32>,
     pub latency_ms: Option<u32>,
-    /// Only set for attestations credited to THIS user. Showing another
-    /// validator's work as "+2.50" in the user's own earnings feed is the
-    /// single most misleading thing this screen could do.
-    pub reward_arc: Option<f64>,
     /// Real epoch millis when the record carries one. `None` means "recent,
     /// exact time unknown" — previously this was a fabricated
     /// `now - i * 30s` series that looked like real telemetry.
@@ -378,9 +373,8 @@ pub struct ResetPeerStateResult {
     pub message: String,
 }
 
-/// Milestone B (#36): paid-inference response - carries the InferenceResult
-/// fields plus the on-chain receipts (open tx hash, release tx hash, the
-/// payer's address, the max_fee that was escrowed).
+/// Legacy paid-inference response shape, retained for IPC compatibility.
+/// The v0.7.12 recovery candidate rejects new escrow writes before signing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PaidInferenceResult {
@@ -420,9 +414,10 @@ pub struct PaidInferenceResult {
 ///
 /// Two field names on the wire are easy to misread, and both were misread once:
 ///
-/// - **`rewards_remaining` is a COUNT of attestations, not an ARC amount.** It
-///   is the treasury balance divided by the per-attestation reward. Rendering
-///   it as currency is wrong by nine orders of magnitude *and* wrong in kind.
+/// - **`rewards_remaining` is a COUNT of fundable reward receipts, not an ARC
+///   amount.** It is the treasury balance divided by the per-receipt reward.
+///   Rendering it as currency is wrong by nine orders of magnitude *and* wrong
+///   in kind.
 ///   It is carried here as [`Self::attestations_remaining`] so the name cannot
 ///   be confused at the call site.
 /// - The treasury balance is `treasury_balance_arc` / `treasury_balance_base`.
@@ -432,13 +427,13 @@ pub struct PaidInferenceResult {
 pub struct RewardEconomics {
     pub source_host: String,
     pub unavailable: Option<String>,
-    /// ARC paid for one settled attestation.
+    /// ARC paid for one successful mined community-reward receipt.
     pub reward_per_attestation: Option<f64>,
     /// ARC left in the reward treasury.
     pub treasury_balance_arc: Option<f64>,
     /// Why the treasury balance is absent, in the host's own words.
     pub treasury_balance_unavailable_reason: Option<String>,
-    /// How many MORE attestations the treasury can still pay for.
+    /// How many MORE successful reward receipts the treasury can still fund.
     ///
     /// A count, not currency — see the type docs. This is the honest form of
     /// "how much is left": it is denominated in the thing a worker actually
@@ -447,17 +442,13 @@ pub struct RewardEconomics {
     pub attestations_remaining_unavailable_reason: Option<String>,
     /// The host states outright that the treasury is bounded.
     pub treasury_is_finite: Option<bool>,
-    /// ARC bonded when an attestation is submitted.
+    /// ARC bonded by a community worker reward certificate. The v1
+    /// certificate contract reports zero; this deliberately does not expose
+    /// the unrelated bond used by the coordinator's local attestation path.
     pub bond_per_attestation: Option<f64>,
-    /// Blocks the bond stays locked before it can be released.
+    /// Reserved for a future community-certificate challenge period.
     pub challenge_period_blocks: Option<u64>,
-    /// Whether THIS HOST says the bond comes back after the challenge period.
-    ///
-    /// Reported, never assumed. It is deliberately not hardcoded either way:
-    /// the repo's own notes say the apply path debits and locks the bond with no
-    /// release, while this endpoint reports a refund — so the UI attributes the
-    /// claim to the host rather than picking a side, and projects on the
-    /// conservative figure (bond still locked).
+    /// Reserved for a future community-certificate bond refund contract.
     pub bond_refunded_after_challenge_period: Option<bool>,
     /// Where the money comes from, in the host's own words. Used to label the
     /// funding rather than inventing a description of it.
@@ -474,18 +465,21 @@ pub struct RewardEconomics {
 pub struct EarningsProjection {
     pub source_host: String,
     pub unavailable: Option<String>,
-    /// ARC per settled attestation.
+    /// ARC per successful mined community-reward receipt.
     pub reward_per_attestation: Option<f64>,
     /// `"chain"` = the host reported the rate; `"constant"` = the named local
     /// constant; `"unknown"` = neither. Never `"assumed"`.
     pub reward_rate_source: String,
+    /// Exact rollout gate reported by the selected coordinator. Only `Some(true)`
+    /// permits the UI to show a forward-looking community reward projection.
+    pub community_rewards_enabled: Option<bool>,
     pub attestations_total: u64,
     pub first_attestation_block: Option<u64>,
-    /// Attestations per day, MEASURED over this address's own history.
+    /// Reward receipts per day, MEASURED over this address's retained history.
     ///
     /// `None` with `rate_unavailable_reason` set whenever there is no history
     /// to measure — the common case. Never extrapolated from zero: an account
-    /// with no attestations has no rate, not a rate of zero.
+    /// with no retained receipts has no rate, not a rate of zero.
     pub attestations_per_day: Option<f64>,
     pub rate_unavailable_reason: Option<String>,
     /// Blocks the rate was observed across (`blocks_observed` on the wire).

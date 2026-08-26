@@ -62,8 +62,53 @@ case "$command_name" in
         printf 'chown %s\n' "$*" >>"${MOCK_OWNER_LOG:?MOCK_OWNER_LOG is required}"
         exit 0
         ;;
-    sudo|systemctl|launchctl)
+    sudo)
         printf '%s %s\n' "$command_name" "$*" >>"${MOCK_SERVICE_LOG:?MOCK_SERVICE_LOG is required}"
+        exit 0
+        ;;
+    systemctl)
+        printf '%s %s\n' "$command_name" "$*" >>"${MOCK_SERVICE_LOG:?MOCK_SERVICE_LOG is required}"
+        arguments=" $* "
+        case "$arguments" in
+            *' show-environment '*) exit 0 ;;
+            *' is-active '*arc-node-update.timer*)
+                [ "${MOCK_SYSTEMD_UPDATER_ACTIVE:-false}" = true ] ;;
+            *' is-enabled '*arc-node-update.timer*)
+                [ "${MOCK_SYSTEMD_UPDATER_ENABLED:-false}" = true ] ;;
+            *' is-active '*arc-node.service*)
+                [ "${MOCK_SYSTEMD_NODE_ACTIVE:-false}" = true ] ;;
+            *' is-enabled '*arc-node.service*)
+                [ "${MOCK_SYSTEMD_NODE_ENABLED:-false}" = true ] ;;
+        esac
+        if [ -n "${MOCK_SERVICE_FAIL_MATCH:-}" ]; then
+            case "$arguments" in
+                *"${MOCK_SERVICE_FAIL_MATCH}"*)
+                    marker="${MOCK_SERVICE_FAIL_ONCE_FILE:?MOCK_SERVICE_FAIL_ONCE_FILE is required when failure injection is active}"
+                    if [ ! -e "$marker" ]; then
+                        : >"$marker"
+                        exit 1
+                    fi
+                    ;;
+            esac
+        fi
+        exit 0
+        ;;
+    launchctl)
+        printf '%s %s\n' "$command_name" "$*" >>"${MOCK_SERVICE_LOG:?MOCK_SERVICE_LOG is required}"
+        case " $* " in
+            *' print-disabled '*)
+                printf 'disabled services = {\n'
+                [ "${MOCK_LAUNCHD_NODE_DISABLED:-false}" = true ] \
+                    && printf '    "network.arc.node" => true\n'
+                [ "${MOCK_LAUNCHD_UPDATER_DISABLED:-false}" = true ] \
+                    && printf '    "network.arc.update" => true\n'
+                printf '}\n'
+                exit 0
+                ;;
+            *' print gui/'*) [ "${MOCK_LAUNCHD_GUI_AVAILABLE:-true}" = true ] ;;
+            *' print '*'/network.arc.node '*) [ "${MOCK_LAUNCHD_NODE_LOADED:-false}" = true ] ;;
+            *' print '*'/network.arc.update '*) [ "${MOCK_LAUNCHD_UPDATER_LOADED:-false}" = true ] ;;
+        esac
         exit 0
         ;;
     *)

@@ -2,37 +2,29 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # ARC Chain - Sharded Inference Demo (one command)
 #
-# This is what to run after watching the dashboard. It hits the live
-# coordinator, walks through the demo, and prints colored output proving
-# every claim:
+# This inspects one explicitly selected coordinator and labels the evidence it
+# actually returns. It does not establish that the public fleet shares one
+# canonical chain.
 #
 #   1. Discover the shard pipeline from /shards
 #   2. Run a real sharded inference and show every per-hop trace entry
 #   3. Re-run the same prompt and verify the hash is identical (determinism)
 #   4. Run a different prompt and verify the hash is different (isolation)
 #
-# Usage:
-#   curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash
+# Usage from a reviewed checkout:
+#   ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-demo.sh
 #
 #   # Or against a different coordinator:
 #   ARC_COORDINATOR=http://your-node:9090 bash arc-demo.sh
 # ─────────────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-# ── Pick a live coordinator by probing all seeds (override with ARC_COORDINATOR)
-# arc-pick-coordinator.sh ranks seeds by: full pipeline > healthy w/ peers > alive.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-PICK="$SCRIPT_DIR/arc-pick-coordinator.sh"
-# When the script is curl'd into bash it won't be on disk. Fall back to
-# fetching the picker from GitHub main so the curl-pipe install still works.
-if [ ! -f "$PICK" ]; then
-    PICK=$(mktemp)
-    curl -fsSL "https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-pick-coordinator.sh" -o "$PICK" 2>/dev/null || true
+if [ -z "${ARC_COORDINATOR:-}" ]; then
+    printf 'ERROR: set ARC_COORDINATOR to a reviewed candidate or local test endpoint.\n' >&2
+    printf 'Automatic public-fleet discovery is disabled during production recovery.\n' >&2
+    exit 78
 fi
-if [ -z "${ARC_COORDINATOR:-}" ] && [ -s "$PICK" ]; then
-    ARC_COORDINATOR=$(bash "$PICK" 2>/dev/null || echo "")
-fi
-COORDINATOR="${ARC_COORDINATOR:-http://136.244.109.1:9090}"
+COORDINATOR="$ARC_COORDINATOR"
 # 2026-04-27: the prior B prompt "The capital of France is" reliably
 # triggered a model-side collision with PROMPT_A on the testnet build -
 # both prompts produced identical output tokens for medium-length
@@ -61,8 +53,8 @@ cat <<BANNER
 ${BOLD}${MAGENTA}
   ╔════════════════════════════════════════════════════════════╗
   ║   ARC Chain - Sharded Inference Demo                       ║
-  ║   A real LLM split across 6 nodes in 6 cities              ║
-  ║   Cryptographically verifiable. Pure integer arithmetic.   ║
+  ║   Inspect one selected coordinator and its returned trace  ║
+  ║   Cache, recomputation, and commitment labels kept distinct║
   ╚════════════════════════════════════════════════════════════╝${RESET}
 BANNER
 
@@ -139,6 +131,8 @@ if [ -z "$RESP_A" ]; then
     printf "%s[FAIL]%s Sharded inference request failed.\n" "$RED" "$RESET" >&2
     exit 1
 fi
+
+printf "  completed in %ss\n" "$WALL_S"
 
 HASH_A=$(echo "$RESP_A" | python3 -c "import json,sys;print(json.load(sys.stdin).get('output_hash',''))" 2>/dev/null || echo "")
 
@@ -269,18 +263,14 @@ fi
 section "5. Summary"
 cat <<SUMMARY
 
-  You just ran a real Llama-2-7B inference across ${BOLD}6 separate machines${RESET}
-  in 6 different cities. The 32 transformer layers are split into
-  ${BOLD}6 layer ranges, each replicated on 3 of the 6 nodes${RESET} - so each machine
-  holds roughly ${BOLD}15-17 layers (~3 GB)${RESET} and no single one has the whole model.
+  This run exercised ${BOLD}${COORDINATOR}${RESET} and displayed the shard trace and
+  commitments that endpoint returned. Those fields are useful evidence for
+  this response; by themselves they do not prove a canonical chain, exact
+  model bytes, independent recomputation, finality, or payment.
 
-  Every hop was BLAKE3-verified. The output is bit-identical regardless
-  of which replica served a given range. Pure i64 arithmetic - no floating point.
+  ${BOLD}Run from a reviewed checkout:${RESET}
+    ARC_COORDINATOR=http://127.0.0.1:9944 bash scripts/arc-demo.sh
 
-  ${BOLD}Try it yourself:${RESET}
-    curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
-
-  ${BOLD}Live dashboard:${RESET} http://140.82.16.112:3200
   ${BOLD}Run-of-show:${RESET} https://github.com/FerrumVir/arc-chain/blob/main/docs/DEMO-RUNBOOK.md
   ${BOLD}Source:${RESET} https://github.com/FerrumVir/arc-chain
 

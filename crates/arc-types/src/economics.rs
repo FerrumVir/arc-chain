@@ -17,8 +17,10 @@ pub const DECIMALS: u8 = 9;
 /// base units per claim — both are counts of *this* unit.
 pub const ARC_BASE_UNITS: u64 = 10u64.pow(DECIMALS as u32); // 1_000_000_000
 
-/// Reward paid to the attester of each accepted `InferenceAttestation`, in
-/// base units. Demo default: **2.5 ARC** (`2.5 * 10^9` base units).
+/// Reward paid to the worker for each accepted, validator-authorized
+/// `CommunityInferenceReward`, in base units. Demo default: **2.5 ARC**
+/// (`2.5 * 10^9` base units). Raw `InferenceAttestation` transactions never
+/// pay this reward by themselves.
 ///
 /// This is the single on-chain source of truth for the attestation reward.
 /// `arc-node`'s `/worker/earnings` derives its human-facing
@@ -28,8 +30,8 @@ pub const ARC_BASE_UNITS: u64 = 10u64.pow(DECIMALS as u32); // 1_000_000_000
 ///
 /// Testnet monetary policy: this reward is a **pure transfer** FROM the
 /// treasury (`arc_types::transaction::faucet_pool_address()`) TO the
-/// attester, bounded by the treasury's current balance. It is NEVER minted —
-/// total supply is conserved. Tune this single constant to change the rate;
+/// explicitly certified worker, and is paid only in full when funds exist.
+/// It is NEVER minted — total supply is conserved. Tune this single constant;
 /// production will replace the flat rate with a halving-curve emission.
 pub const INFERENCE_ATTESTATION_REWARD: u64 = 2_500_000_000; // 2.5 ARC
 

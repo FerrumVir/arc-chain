@@ -1,6 +1,6 @@
 // End-to-end flow tests exercising the six fixes that unblocked testnet
 // release (arc-node CLI spawn args, bundled seeds/genesis, BIP-39 validator
-// seed, auto-download binary, real attestation-backed earnings, Gatekeeper
+// seed, auto-download binary, mined-reward versus raw-claim semantics, Gatekeeper
 // docs). These tests run against the mock IPC layer - exhaustive live
 // behaviour is covered by tests/live.spec.ts.
 import { expect, test } from "@playwright/test";
@@ -22,7 +22,7 @@ test.describe("Onboarding → launch end-to-end", () => {
     await clearState(page);
   });
 
-  test("four-step launch: welcome → identity → model → join", async ({
+  test("four-step setup: welcome → identity → model → launch", async ({
     page,
   }) => {
     await page.goto("/");
@@ -36,7 +36,7 @@ test.describe("Onboarding → launch end-to-end", () => {
     await page.getByTestId("tier-skip").click();
     await page.getByTestId("btn-continue-model").click();
     await expect(page.getByTestId("step-launch")).toBeVisible();
-    await expect(page.getByText(/ready to join/i)).toBeVisible();
+    await expect(page.getByText(/ready to set up/i)).toBeVisible();
 
     await page.getByTestId("btn-launch").click();
 
@@ -45,14 +45,14 @@ test.describe("Onboarding → launch end-to-end", () => {
     await expect(page.getByTestId("dashboard")).toBeVisible({ timeout: 15_000 });
   });
 
-  test("launch button says 'Join the network', not 'Launch node'", async ({
+  test("launch button promises setup, not a successful network join", async ({
     page,
   }) => {
     await page.goto("/");
     await walkToLaunch(page);
     await expect(page.getByTestId("btn-launch")).toBeVisible();
     await expect(page.getByTestId("btn-launch")).toContainText(
-      /join the network/i,
+      /set up this node/i,
     );
   });
 
@@ -91,42 +91,24 @@ test.describe("Onboarding → launch end-to-end", () => {
   });
 });
 
-test.describe("Earnings chart uses real attestation data", () => {
+test.describe("Raw inference claims never become earnings", () => {
   test.beforeEach(async ({ page }) => {
     await seedOnboarded(page);
   });
 
-  test("seven-day bars count only the user's own dated attestations", async ({
+  test("does not build an income chart from dated 0x16 claims", async ({
     page,
   }) => {
     await page.goto("/");
     await page.getByTestId("nav-earnings").click();
     await expect(page.getByTestId("earnings-screen")).toBeVisible();
 
-    // The mock has three attestations: two credited to this user at
-    // 2.5 ARC each with real timestamps, and one from another validator
-    // with no timestamp and no reward. Only the first two are bucketable,
-    // so today's bar is 5 ARC and the other six are 0.
-    //
-    // The previous version of this test expected 114.5 across bars, from
-    // per-attestation rewards of 12.5/34.8/67.2 - figures the chain never
-    // produced. The real testnet rate is a flat 2.5 per attestation.
-    const chart = page.getByTestId("weekly-chart");
-    await expect(chart).toBeVisible();
-
-    const labels = await chart
-      .locator("div")
-      .filter({ hasText: /^(\d+)$/ })
-      .allTextContents();
-
-    const zeroCount = labels.filter((l) => l === "0").length;
-    expect(zeroCount).toBeGreaterThanOrEqual(6);
-
-    // Today's bar: 2 × 2.5 = 5, rendered with toFixed(0).
-    expect(labels).toContain("5");
-
-    // The other validator's attestation must not have been counted.
-    expect(labels.some((l) => Number(l) > 5)).toBe(false);
+    // The mock carries dated raw inference claims. Those timestamps are not
+    // mined 0x25 reward receipts, so no seven-day income chart may be built.
+    await expect(page.getByTestId("weekly-chart")).toHaveCount(0);
+    const feed = page.getByTestId("all-attestations");
+    await expect(feed.getByText("your claim", { exact: true })).toHaveCount(2);
+    await expect(feed.getByText(/\+2\.50 ARC/)).toHaveCount(0);
   });
 
   test("another validator's attestation is not shown as the user's income", async ({
@@ -139,7 +121,31 @@ test.describe("Earnings chart uses real attestation data", () => {
     // Two of four mock attestations are the user's; the other two (another
     // validator's row and an old-seed padding row) must not be counted.
     await expect(page.getByText(/2 yours · 4 shown/)).toBeVisible();
-    await expect(feed.getByText("network", { exact: true })).toHaveCount(2);
+    await expect(feed.getByText("network claim", { exact: true })).toHaveCount(2);
+  });
+});
+
+test.describe("Paid settlement recovery gate", () => {
+  test("browser-live and preview adapters reject both write commands before fetch", () => {
+    const src = fs.readFileSync(
+      path.resolve(REPO_DESKTOP, "src", "lib", "tauri.ts"),
+      "utf8",
+    );
+    const caseBodies = (command: string) =>
+      [...src.matchAll(new RegExp(`case "${command}": \\{([\\s\\S]*?)\\n    \\}`, "g"))]
+        .map((match) => match[1]);
+
+    for (const command of ["run_paid_inference", "tier1_submit"]) {
+      const bodies = caseBodies(command);
+      // One browser-live adapter and one browser-preview adapter.
+      expect(bodies).toHaveLength(2);
+      for (const body of bodies) {
+        expect(body).toContain("throw settlementWriteUnavailable");
+        expect(body).not.toContain("fetch(");
+        expect(body).not.toContain("return {");
+        expect(body).not.toContain("submit_signed");
+      }
+    }
   });
 });
 
@@ -393,14 +399,24 @@ test.describe("Keep-running lifecycle (auto-start + tray + auto-update)", () => 
   });
 });
 
-test.describe("Release CI publishes signed update manifest", () => {
+test.describe("Unified release publishes a signed update manifest", () => {
   const wf = fs.readFileSync(
     path.resolve(
       REPO_DESKTOP,
       "..",
       ".github",
       "workflows",
-      "release-desktop.yml",
+      "release.yml",
+    ),
+    "utf8",
+  );
+  const assembler = fs.readFileSync(
+    path.resolve(
+      REPO_DESKTOP,
+      "..",
+      "scripts",
+      "release",
+      "assemble-release.sh",
     ),
     "utf8",
   );
@@ -410,11 +426,13 @@ test.describe("Release CI publishes signed update manifest", () => {
     expect(wf).toContain("TAURI_SIGNING_PRIVATE_KEY_PASSWORD");
   });
 
-  test("workflow emits latest.json with per-target url + signature", () => {
-    expect(wf).toMatch(/darwin-aarch64/);
-    expect(wf).toMatch(/linux-x86_64/);
-    expect(wf).toMatch(/\.app\.tar\.gz\.sig/);
-    expect(wf).toMatch(/latest\.json/);
+  test("assembler emits latest.json with per-target url + signature", () => {
+    expect(assembler).toMatch(/darwin-aarch64/);
+    expect(assembler).toMatch(/darwin-x86_64/);
+    expect(assembler).toMatch(/linux-x86_64/);
+    expect(assembler).toMatch(/\.app\.tar\.gz\.sig/);
+    expect(assembler).toMatch(/latest\.json/);
+    expect(wf).toContain("./scripts/release/assemble-release.sh");
   });
 
   test("tag trigger matches v*.*.*", () => {

@@ -223,7 +223,25 @@ impl CachedLayer {
 
     /// True if this slot was populated by the loader (vs a placeholder).
     pub fn is_loaded(&self) -> bool {
-        self.wq.n_rows > 0
+        let matrix_is_complete = |weights: &I8Weights| {
+            weights.n_rows > 0
+                && weights.n_cols > 0
+                && weights.data.len() == weights.n_rows.saturating_mul(weights.n_cols)
+                && weights.scales.len() == weights.n_rows
+        };
+        [
+            &self.wq,
+            &self.wk,
+            &self.wv,
+            &self.wo,
+            &self.w_gate,
+            &self.w_up,
+            &self.w_down,
+        ]
+        .into_iter()
+        .all(matrix_is_complete)
+            && !self.attn_norm.is_empty()
+            && !self.ffn_norm.is_empty()
     }
 }
 
@@ -406,6 +424,17 @@ pub struct CachedIntegerModel {
 }
 
 impl CachedIntegerModel {
+    /// True only when every configured transformer layer has real weights.
+    ///
+    /// Tokenizer-only and range-sharded loaders intentionally leave
+    /// placeholder layers in this vector. They are valid relay/coordinator
+    /// models, but must never advertise or execute the full-worker loop.
+    pub fn has_all_transformer_layers(&self) -> bool {
+        self.config.n_layers > 0
+            && self.layers.len() == self.config.n_layers
+            && self.layers.iter().all(CachedLayer::is_loaded)
+    }
+
     /// Convert all weights to Q4 (4-bit). Halves memory bandwidth.
     /// Call once after loading model. Original I8 weights kept for fallback.
     pub fn enable_q4(&mut self) {
@@ -2756,22 +2785,7 @@ impl CachedIntegerModel {
                 .copied()
                 .unwrap_or(*prompt.last().unwrap_or(&0));
             let mut logits = self.forward_one_token(last_token, &mut cache);
-
-            // Repetition penalty: penalize recently generated tokens deterministically.
-            // This prevents INT8 quantized models from getting stuck in loops.
-            // Penalty factor: divide logit by 1.2 (multiply by ONE*5/6) for repeated tokens.
-            for &prev_tok in generated.iter().rev().take(64) {
-                let idx = prev_tok as usize;
-                if idx < logits.len() {
-                    if logits[idx] > 0 {
-                        logits[idx] = logits[idx] * 5 / 6; // reduce positive logit
-                    } else {
-                        logits[idx] = logits[idx] * 6 / 5; // increase negative logit (make more negative)
-                    }
-                }
-            }
-
-            let next = argmax_i64(&logits) as u32;
+            let next = select_next_token_with_repetition_penalty(&mut logits, &generated);
             generated.push(next);
             if eos_tokens.contains(&next) {
                 break;
@@ -2881,6 +2895,22 @@ impl CachedIntegerModel {
         start_layer: usize,
         end_layer: usize,
         position: usize,
+    ) -> Result<ShardOutput, ShardForwardError> {
+        self.forward_shard_token_with_history(input, cache, start_layer, end_layer, position, &[])
+    }
+
+    /// Sharded forward pass with the same generated-token selection semantics
+    /// as [`Self::generate`].  Only the terminal shard consumes
+    /// `generated_tokens`; earlier shards carry the field in the authenticated
+    /// request transcript but do not use it for tensor execution.
+    pub fn forward_shard_token_with_history(
+        &self,
+        input: ShardInput,
+        cache: &mut KVCache,
+        start_layer: usize,
+        end_layer: usize,
+        position: usize,
+        generated_tokens: &[u32],
     ) -> Result<ShardOutput, ShardForwardError> {
         let cfg = &self.config;
         let d = cfg.d_model;
@@ -3093,14 +3123,14 @@ impl CachedIntegerModel {
         if is_last {
             cache.seq_len = position + 1;
             let normed = layernorm(&hidden, &self.final_norm);
-            let logits = if let Some(ref i16w) = self.i16_output {
+            let mut logits = if let Some(ref i16w) = self.i16_output {
                 let mut logits = vec![0i64; cfg.vocab_size];
                 matmul_i16_into(i16w, &normed, d, &mut logits);
                 logits
             } else {
                 matmul_fast(&self.output_weight, &normed, d, cfg.vocab_size)
             };
-            let token_id = argmax_i64(&logits) as u32;
+            let token_id = select_next_token_with_repetition_penalty(&mut logits, generated_tokens);
             let logits_bytes: Vec<u8> = logits.iter().flat_map(|v| v.to_le_bytes()).collect();
             let logits_hash = arc_crypto::hash_bytes(&logits_bytes);
             Ok(ShardOutput::Token {
@@ -3112,6 +3142,30 @@ impl CachedIntegerModel {
             Ok(ShardOutput::Hidden(hidden))
         }
     }
+}
+
+/// Apply ARC's deterministic repetition penalty and choose the next token.
+///
+/// This is the single token-selection semantic shared by whole-model workers
+/// and terminal pipeline shards.  Keeping it here prevents community
+/// verification from comparing a penalized worker result with an unpenalized
+/// distributed argmax.  Repeated appearances are intentionally applied more
+/// than once, matching the historical generation behavior exactly.
+pub fn select_next_token_with_repetition_penalty(
+    logits: &mut [i64],
+    generated_tokens: &[u32],
+) -> u32 {
+    for &previous_token in generated_tokens.iter().rev().take(64) {
+        let index = previous_token as usize;
+        if let Some(logit) = logits.get_mut(index) {
+            if *logit > 0 {
+                *logit = *logit * 5 / 6;
+            } else {
+                *logit = *logit * 6 / 5;
+            }
+        }
+    }
+    argmax_i64(logits) as u32
 }
 
 /// Input to a shard's forward pass.
@@ -4596,6 +4650,26 @@ pub fn load_cached_model_binary(path: &str) -> Result<CachedIntegerModel, crate:
 mod tests {
     use super::*;
 
+    #[test]
+    fn shared_repetition_penalty_changes_a_repeated_raw_argmax() {
+        // Token 1 is the raw winner. Once it appears in generated history, the
+        // shared ARC penalty lowers it from 120 to 100 and token 2 must win.
+        // Whole-model generation and terminal pipeline shards both call this
+        // exact helper, so this vector guards their common selection semantic.
+        let raw_logits = vec![0, 120, 110];
+        assert_eq!(argmax_i64(&raw_logits), 1);
+
+        let mut worker_logits = raw_logits.clone();
+        let mut distributed_verifier_logits = raw_logits;
+        let worker = select_next_token_with_repetition_penalty(&mut worker_logits, &[1]);
+        let distributed_verifier =
+            select_next_token_with_repetition_penalty(&mut distributed_verifier_logits, &[1]);
+
+        assert_eq!(worker, 2);
+        assert_eq!(distributed_verifier, worker);
+        assert_eq!(worker_logits, distributed_verifier_logits);
+    }
+
     fn build_test_model(
         vs: usize,
         d: usize,
@@ -4691,6 +4765,28 @@ mod tests {
             ternary_layers: None,
             ternary_output: None,
         }
+    }
+
+    #[test]
+    fn full_worker_requires_every_configured_transformer_layer() {
+        let full = build_test_model(32, 16, 2, 32, 3);
+        assert!(full.has_all_transformer_layers());
+
+        let mut partial = build_test_model(32, 16, 2, 32, 3);
+        partial.layers[1] = CachedLayer::placeholder();
+        assert!(!partial.has_all_transformer_layers());
+
+        let mut incomplete_layer = build_test_model(32, 16, 2, 32, 1);
+        incomplete_layer.layers[0].w_down = I8Weights::empty();
+        assert!(!incomplete_layer.has_all_transformer_layers());
+
+        let mut tokenizer_only = build_test_model(32, 16, 2, 32, 1);
+        tokenizer_only.layers[0] = CachedLayer::placeholder();
+        assert!(!tokenizer_only.has_all_transformer_layers());
+
+        let mut inconsistent = build_test_model(32, 16, 2, 32, 1);
+        inconsistent.config.n_layers = 2;
+        assert!(!inconsistent.has_all_transformer_layers());
     }
 
     #[test]

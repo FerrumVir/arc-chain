@@ -2,13 +2,16 @@
 
 TypeScript SDK for the **ARC Chain** RPC API -- the agent-native L1 blockchain.
 
-Zero dependencies. Uses the built-in Fetch API (Node 18+, all modern browsers).
+Zero dependencies. Uses the built-in Fetch API (Node.js 24 LTS+, all modern browsers).
 
 ## Installation
 
 ```bash
 npm install @arc-chain/sdk
 ```
+
+The package is native ESM. Use `import` (or dynamic `import()` from a CommonJS
+application); it does not advertise a `require()` entrypoint.
 
 ## Quick Start
 
@@ -282,6 +285,22 @@ ARC Chain supports 21 transaction types. The `TransactionBody` type is a discrim
 | `ChannelClose` | Close state channel (L1 scaling) |
 | `ChannelDispute` | Dispute state channel (L1 scaling) |
 | `ShardProof` | Shard STARK proof (L1 scaling) |
+| `InferenceAttestation` | Optimistic inference result attestation |
+| `InferenceChallenge` | Challenge an inference attestation |
+| `InferenceRegister` | Register an inference provider |
+| `InferenceEscrowOpen` | Open an inference payment escrow |
+| `InferenceEscrowRelease` | Release an inference payment escrow |
+| `InferenceEscrowRefund` | Refund an expired inference escrow |
+| `ModelRegistration` | Register inference model metadata |
+| `ModelRequest` | Request replicated model coverage |
+| `ShardCoverageClaim` | Claim a model layer range |
+| `CapacityAdvertisement` | Advertise worker hardware capacity |
+| `ShardAssignmentProposal` | Publish deterministic shard assignments |
+| `FaucetClaim` | Validator-authorized faucet claim |
+| `InferenceRequest` | Request Tier 1 on-chain inference |
+| `InferenceVote` | Submit a Tier 1 committee result |
+| `InferenceFinalize` | Finalize a Tier 1 inference request |
+| `CommunityInferenceReward` | Reward a verified community inference job |
 
 ## Requirements
 
@@ -290,4 +309,4 @@ ARC Chain supports 21 transaction types. The `TransactionBody` type is a discrim
 
 ## License
 
-MIT
+[Business Source License 1.1](./LICENSE). The change license is Apache-2.0 on March 25, 2030.

@@ -4,11 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>ARC Chain - Sharded AI Inference Across the Network</title>
-<meta name="description" content="Run a Llama-2-7B model split across 6 separate VPS in 6 cities, with every layer range replicated 3x. Per-row INT16 weights, BLAKE3-verified hidden states, bit-identical output on every chip. Pipeline-parallel sharded inference, cryptographically verifiable.">
+<meta name="description" content="Inspect ARC Chain's host-pinned testnet metrics and pipeline-parallel inference traces, including model registry agreement, BLAKE3 transit commitments, measured latency, community routing, and mined reward receipts.">
 
 <!-- Open Graph -->
 <meta property="og:title" content="ARC Chain - Sharded AI Inference Across the Network">
-<meta property="og:description" content="A real Llama-2-7B model split across 6 separate machines, 3x replicated. Type a prompt, watch the activation hop through every shard. BLAKE3-verified, bit-identical, deterministic.">
+<meta property="og:description" content="Inspect host-pinned ARC testnet metrics and a replicated, pipeline-parallel inference trace with honest routing, verification, and settlement states.">
 <meta property="og:type" content="website">
 <meta property="og:url" content="http://140.82.16.112:3200">
 <meta property="og:site_name" content="ARC Chain Testnet">
@@ -16,16 +16,10 @@
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="ARC Chain - Sharded AI Inference">
-<meta name="twitter:description" content="Run a Llama-2-7B model split across 6 cheap VPS, 3x replicated. Cryptographically verifiable. Type a prompt, watch the trace.">
+<meta name="twitter:description" content="Inspect ARC's replicated sharded-inference trace, community routing, and mined settlement status without hiding unavailable evidence.">
 
 <link rel="icon" href="data:image/svg+xml,&lt;svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22&gt;&lt;rect width=%2232%22 height=%2232%22 rx=%228%22 fill=%22%236366f1%22/&gt;&lt;text x=%2216%22 y=%2222%22 font-family=%22Arial%22 font-size=%2218%22 font-weight=%22bold%22 fill=%22white%22 text-anchor=%22middle%22&gt;A&lt;/text&gt;&lt;/svg&gt;">
-<script src="https://cdn.tailwindcss.com"></script>
-<script>
-tailwind.config={darkMode:'class',theme:{extend:{colors:{
-  arc:{400:'#818cf8',500:'#6366f1',600:'#4f46e5'},
-  surface:{1:'#09090f',2:'#0f0f19',3:'#141420',4:'#1a1a2e',5:'#22223a'}
-}}}}
-</script>
+<link href="./tailwind.css" rel="stylesheet">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace}
@@ -63,8 +57,8 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
 <main class="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
   <!-- Hero Stats -->
   <div class="grid grid-cols-2 lg:grid-cols-5 gap-3">
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Block</p><p class="text-2xl font-extrabold text-arc-400 mono mt-1" id="dagRound">-</p></div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Finalized</p><p class="text-2xl font-extrabold text-white mono mt-1" id="committed">-</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">State height</p><p class="text-2xl font-extrabold text-arc-400 mono mt-1" id="stateHeight">-</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">DAG commits (process)</p><p class="text-2xl font-extrabold text-white mono mt-1" id="committed">-</p></div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Validators</p><p class="text-2xl font-extrabold text-emerald-400 mono mt-1" id="validatorCount">-</p></div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">DAG rounds/sec</p><p class="text-2xl font-extrabold text-white mono mt-1" id="rps">-</p></div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Measured benchmark TPS</p><p class="text-2xl font-extrabold text-yellow-400 mono mt-1" id="tps">-</p></div>
@@ -87,6 +81,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
       <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Seed Hosts - 6 Cities</h2>
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-2" id="nodeGrid"></div>
+      <div id="fleetConsistency" class="mt-3 rounded-lg border border-yellow-500/30 bg-yellow-950/20 p-2 text-[10px] text-yellow-300">Comparing reachable seed heights and versions…</div>
     </div>
   </div>
 
@@ -102,10 +97,11 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
           <span class="text-[10px] font-bold text-arc-300 ml-1 px-2 py-0.5 rounded-full bg-arc-500/10 border border-arc-500/30">PIPELINE-PARALLEL</span>
         </h2>
         <p class="text-xs text-gray-300 mt-1.5 leading-relaxed">
-          A model that <span class="text-arc-300 font-semibold">cannot fit on any single node</span> is split at transformer layer boundaries.
+          A model can be <span class="text-arc-300 font-semibold">split across smaller nodes</span> at transformer layer boundaries.
           Each request flows through the pipeline of shard-holders via HTTP, with
-          <span class="text-emerald-300 font-semibold">BLAKE3 hashes verifying every hidden state</span> in transit.
-          Pure i64 arithmetic. Output hashes and measured latency are shown from the coordinator response below.
+          <span class="text-emerald-300 font-semibold">BLAKE3 commitments detecting hidden-state corruption</span> in transit.
+          Pure i64 arithmetic. Output hashes and measured latency are shown from the coordinator response below;
+          a matching hash does not by itself prove that a shard computed the right function.
         </p>
       </div>
       <div class="flex gap-3 text-right flex-wrap">
@@ -132,13 +128,14 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       </div>
     </div>
 
-    <!-- Model identity verification: every shard reports the same model_id hash -->
+    <!-- Registry agreement: equality is necessary, but legacy IDs may describe
+         model shape rather than commit to exact artifact bytes. -->
     <div id="modelIdVerifyPanel" class="hidden mb-3 p-3 bg-surface-3 border-2 border-arc-500/40 rounded-xl">
       <div class="flex items-center gap-2">
         <span id="modelIdVerifyIcon" class="text-lg">🔐</span>
         <div class="flex-1 min-w-0">
-          <div class="text-[11px] font-bold text-white" id="modelIdVerifyHeadline">Model identity verified</div>
-          <div class="text-[10px] text-gray-400 mt-0.5">All shards must report the same BLAKE3 model_id, otherwise the pipeline cannot produce trustworthy output.</div>
+          <div class="text-[11px] font-bold text-white" id="modelIdVerifyHeadline">Registry model ID agreement</div>
+          <div class="text-[10px] text-gray-400 mt-0.5">All shards must report the same model_id. Legacy nodes may use a shape-derived ID, so agreement is not proof of identical weight bytes; protocol-v3 nodes commit to the exact artifact.</div>
           <div class="text-[10px] mono text-arc-300 truncate mt-1" id="modelIdVerifyHash">-</div>
         </div>
       </div>
@@ -149,18 +146,18 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       <div class="bg-red-950/30 border border-red-500/30 rounded-xl p-4">
         <div class="flex items-center justify-between mb-1">
           <span class="text-[10px] uppercase tracking-wider text-red-300 font-bold">If you tried this on 1 node</span>
-          <span class="text-[10px] text-red-400">✗ OOM</span>
+          <span class="text-[10px] text-yellow-400">⚠ HIGH RAM</span>
         </div>
         <div class="text-2xl font-extrabold text-red-300 mono" id="shardSingleMb">- GB</div>
-        <div class="text-[10px] text-gray-500 mt-1">Full model RAM. Most consumer/cloud nodes have 8 GB max. <span class="text-red-300">Won't load.</span></div>
+        <div class="text-[10px] text-gray-500 mt-1">Estimated full weight memory before runtime and KV-cache overhead. A small node may exhaust memory.</div>
       </div>
       <div class="bg-emerald-950/30 border border-emerald-500/30 rounded-xl p-4">
         <div class="flex items-center justify-between mb-1">
           <span class="text-[10px] uppercase tracking-wider text-emerald-300 font-bold">Sharded across the network</span>
-          <span class="text-[10px] text-emerald-400">✓ FITS</span>
+          <span class="text-[10px] text-emerald-400">↓ LOWER / NODE</span>
         </div>
         <div class="text-2xl font-extrabold text-emerald-300 mono" id="shardPerNodeMb">- GB / node</div>
-        <div class="text-[10px] text-gray-500 mt-1">Each node holds ~<span id="shardLayersPerNode">-</span> layers. Together = full model. <span class="text-emerald-300">Loads everywhere.</span></div>
+        <div class="text-[10px] text-gray-500 mt-1">Each registry entry holds ~<span id="shardLayersPerNode">-</span> layers. Together they cover the model; actual fit still depends on runtime overhead and host capacity.</div>
       </div>
     </div>
 
@@ -200,7 +197,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
         <button data-preset="The speed of light in a vacuum is" onclick="presetPrompt('The speed of light in a vacuum is')" class="preset-btn px-2 py-1 rounded-md bg-surface-2 border border-arc-500/20 text-arc-300 hover:bg-arc-500/10 hover:border-arc-400 text-[10px] transition">The speed of light is</button>
       </div>
       <div id="cacheStatsLine" class="text-[9px] text-emerald-300/70 mt-1.5 font-mono"></div>
-      <div id="shardedStatus" class="text-[10px] text-gray-500 mt-2">Sends one token through all shards. Each hop verifies the previous shard's BLAKE3 hash. Last shard runs the LM head + argmax. <span class="text-emerald-300">Cached prompts return in ~100 ms (~200 tok/s).</span></div>
+      <div id="shardedStatus" class="text-[10px] text-gray-500 mt-2">Sends one token through all shards. Each hop checks the previous shard's BLAKE3 commitment. Last shard runs the LM head + argmax. <span class="text-emerald-300">Cache hits are labeled separately with measured latency.</span></div>
       <!-- Sharded result panel -->
       <div id="shardedResult" class="hidden mt-3"></div>
       <!-- Run history (persisted in localStorage) -->
@@ -220,22 +217,43 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
         </div>
         <span id="communityJobs" class="text-[10px] text-violet-300 font-mono">0 jobs completed</span>
       </div>
+      <div class="bg-surface-2/80 border border-violet-400/30 rounded-xl p-3 mb-3">
+        <div class="flex flex-wrap items-start justify-between gap-2 mb-2">
+          <div>
+            <div class="text-[10px] uppercase tracking-wider text-violet-300 font-bold">Send a real community inference job</div>
+            <div class="text-[9px] text-gray-500 mt-0.5">One click calls <code class="text-violet-300 mono">POST /inference/run</code> on the selected coordinator. Online community workers get first chance to claim it.</div>
+          </div>
+          <div class="text-[9px] text-gray-500 mono">Coordinator: <span id="communityCoordinator" class="text-violet-300">loading…</span></div>
+        </div>
+        <div class="flex flex-col sm:flex-row gap-2">
+          <input id="communityPrompt" type="text" value="The largest planet is" maxlength="32768"
+                 aria-label="Community inference prompt"
+                 class="flex-1 px-3 py-2 bg-surface-3 border border-violet-500/30 rounded-lg text-white text-sm placeholder-gray-600 focus:border-violet-400 focus:outline-none mono">
+          <button id="communityInferenceBtn" type="button"
+                  class="px-4 py-2 rounded-lg bg-violet-500 hover:bg-violet-400 text-white font-bold text-xs whitespace-nowrap transition shadow-lg shadow-violet-500/20">
+            ▶ Send to Community
+          </button>
+        </div>
+        <div id="communityInferenceStatus" class="text-[10px] text-gray-500 mt-2">Ready. A local fallback is reported honestly if no community worker claims the job.</div>
+        <div id="communityEligibility" class="text-[9px] text-yellow-300 mt-1">Checking model-ready worker capacity…</div>
+        <div id="communityInferenceResult" class="hidden mt-3"></div>
+      </div>
       <div id="communityWorkerList" class="space-y-1 mb-3"></div>
-      <div class="text-[9px] text-gray-500">Registered community workers. Completed jobs come from each seed's worker scoreboard.</div>
+      <div class="text-[9px] text-gray-500">Registered community workers. Completed jobs come from each seed's worker scoreboard; balances and mined rewards come from that same seed's on-chain earnings view.</div>
     </div>
 
     <!-- "Join the network" - the conversion event for visitors -->
     <div class="bg-gradient-to-br from-emerald-900/40 to-arc-900/30 border-2 border-emerald-500/40 rounded-xl p-4 mb-2">
       <div class="flex items-center gap-2 mb-2">
         <span class="text-base">🚀</span>
-        <span class="text-sm font-bold text-white">Join the network as a shard holder in one command</span>
+        <span class="text-sm font-bold text-white">Install a headless node from the unified recovery release</span>
       </div>
-      <div class="text-[11px] text-gray-300 mb-3">Persistent service. Daily auto-update. Auto-detects your platform. macOS arm64/x86, Linux x86_64/aarch64. ~3 minutes from curl to running node.</div>
+      <div class="text-[11px] text-gray-300 mb-3">Checksummed CLI assets for macOS arm64/x86 and Linux x86_64/aarch64; no GUI or display required. The installer can configure a persistent service and identity-preserving updates. Pre-stage a compatible model separately.</div>
       <div class="bg-surface-2 border border-emerald-500/40 rounded-lg p-3 flex items-center justify-between gap-3">
-        <code class="text-[11px] text-emerald-300 mono break-all flex-1" id="installCmd">curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash</code>
+        <code class="text-[11px] text-emerald-300 mono break-all flex-1" id="installCmd">curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/download/v0.7.12/install.sh &amp;&amp; bash install.sh --version 0.7.12 --model /absolute/path/to/model.gguf</code>
         <button onclick="copyInstallCmd(this)" class="px-3 py-1.5 rounded-md bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-[10px] whitespace-nowrap transition shadow-lg shadow-emerald-500/30" id="copyBtn">📋 Copy</button>
       </div>
-      <div class="text-[9px] text-gray-500 mt-2">Or run the demo end-to-end without installing: <code class="text-arc-300 mono">curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-demo.sh | bash</code></div>
+      <div class="text-[9px] text-yellow-300 mt-2">Recovery candidate: use this command only after the complete v0.7.12 release is published. Follow the repository's community-node walkthrough and verify the checksum before recording a demo.</div>
     </div>
 
     <!-- Pure parallel demo (kept below sharded for comparison) -->
@@ -329,9 +347,10 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
   <!-- Inference Feed + Transactions -->
   <div class="grid lg:grid-cols-2 gap-4">
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
-      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">
-        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1.5"></span>Live Inference Feed
+      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-1">
+        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400 mr-1.5"></span>Selected-Host Inference Activity
       </h2>
+      <p class="text-[10px] text-gray-600 mb-4">Receipt-backed attestations and node-local observations are labelled separately. This is not a merged canonical-chain feed.</p>
       <div class="space-y-1 max-h-[400px] overflow-y-auto" id="inferenceList"><p class="text-gray-600 text-sm">Loading...</p></div>
     </div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
@@ -373,8 +392,8 @@ const RPC_FALLBACKS=NODES.map(n=>`http://${n.ip}:9090`).filter(url=>url!==RPC);
 // Inference is coordinated by one explicitly selected seed. A response from
 // this endpoint is never presented as proof that all configured hosts ran it.
 const SHARDED_COORDINATOR='http://104.238.171.11:9090';
-// Write to an element only if it exists. Two ids in this block (`height`,
-// `mempool`) have no matching element, and a null deref there was throwing
+// Write to an element only if it exists. The legacy `mempool` id has no
+// matching element, and a null deref there used to throw
 // inside the stats try/catch - which silently killed every field after it.
 function setText(id, value){
   const el = document.getElementById(id);
@@ -404,6 +423,36 @@ async function findRPC(){
   }
 }
 let lastRound=0,lastTime=Date.now(),lastTxCount=0;
+let fleetRootAudit={height:null,checkedAt:0,available:0,hashCount:0,rootCount:0};
+let fleetRootAuditPromise=null;
+
+async function auditFleetAtCommonHeight(reachable,commonHeight){
+  const now=Date.now();
+  if(fleetRootAudit.height===commonHeight&&now-fleetRootAudit.checkedAt<60000)return fleetRootAudit;
+  if(fleetRootAuditPromise)return fleetRootAuditPromise;
+  fleetRootAuditPromise=(async()=>{
+    const samples=await Promise.allSettled(reachable.map(async value=>{
+      const response=await fetch(`http://${value.n.ip}:9090/block/${commonHeight}`,{signal:AbortSignal.timeout(3000)});
+      if(!response.ok)throw new Error(`HTTP ${response.status}`);
+      const payload=await response.json();
+      const block=payload?.block??payload;
+      const hash=String(block?.hash??'').replace(/^0x/i,'').toLowerCase();
+      const root=String(block?.header?.state_root??block?.state_root??'').replace(/^0x/i,'').toLowerCase();
+      if(!/^[0-9a-f]{64}$/.test(hash)||!/^[0-9a-f]{64}$/.test(root))throw new Error('missing canonical block commitments');
+      return{hash,root};
+    }));
+    const valid=samples.filter(sample=>sample.status==='fulfilled').map(sample=>sample.value);
+    fleetRootAudit={
+      height:commonHeight,
+      checkedAt:Date.now(),
+      available:valid.length,
+      hashCount:new Set(valid.map(sample=>sample.hash)).size,
+      rootCount:new Set(valid.map(sample=>sample.root)).size,
+    };
+    return fleetRootAudit;
+  })();
+  try{return await fleetRootAuditPromise}finally{fleetRootAuditPromise=null}
+}
 
 // Fetch all configured hosts in parallel (no sequential blocking).
 async function renderNodes(){
@@ -411,6 +460,7 @@ async function renderNodes(){
   const results=await Promise.allSettled(NODES.map(async n=>{
     try{
       const r=await fetch(`http://${n.ip}:9090/health`,{signal:AbortSignal.timeout(3000)});
+      if(!r.ok)throw new Error(`HTTP ${r.status}`);
       return{n,d:await r.json(),ok:true};
     }catch(e){return{n,ok:false}}
   }));
@@ -420,18 +470,22 @@ async function renderNodes(){
     if(v.ok){
       const d=v.d,n=v.n;
       el.className='bg-surface-3 border border-surface-4 rounded-lg p-2.5 text-center hover:border-arc-500/30 transition cursor-pointer';
+      const height=Number.isFinite(Number(d.height))?Number(d.height):'-';
       const round=Number.isFinite(Number(d.dag_round))?Number(d.dag_round):'-';
       const committed=Number.isFinite(Number(d.dag_committed))?Number(d.dag_committed):'-';
-      el.addEventListener('click',()=>showModal(n.name+' - '+n.loc,[['Status','🟢 Online'],['Block',round],['Finalized',committed],['Peers',d.peers],['Validators',d.validators],['Uptime',Math.floor((Number(d.uptime_secs)||0)/60)+'m'],['RPC','http://'+n.ip+':9090','http://'+n.ip+':9090/health']]));
+      const version=typeof d.version==='string'?d.version:'unknown';
+      const liveness=d.chain_advancing===true?'advancing':d.chain_advancing===false?'stalled':'unknown';
+      el.addEventListener('click',()=>showModal(n.name+' - '+n.loc,[['Reachability','reachable'],['Chain liveness',liveness],['Version',version],['State height',height],['DAG round',round],['DAG commits (process)',committed],['Peers',d.peers],['Validators',d.validators],['Uptime',Math.floor((Number(d.uptime_secs)||0)/60)+'m'],['RPC','http://'+n.ip+':9090','http://'+n.ip+':9090/health']]));
       const header=makeElement('div','flex items-center justify-center gap-1');
       header.append(
-        makeElement('span','w-1.5 h-1.5 rounded-full bg-emerald-400'),
+        makeElement('span',`w-1.5 h-1.5 rounded-full ${liveness==='advancing'?'bg-emerald-400':liveness==='stalled'?'bg-red-400':'bg-yellow-400'}`),
         makeElement('span','text-white font-semibold text-xs',n.name),
       );
       el.append(
         header,
         makeElement('div','text-[10px] text-gray-500',`${n.flag} ${n.loc}`),
-        makeElement('div','mono text-arc-400 text-[11px] mt-1',`#${round==='-'?'-':round.toLocaleString()}`),
+        makeElement('div','mono text-arc-400 text-[11px] mt-1',`height #${height==='-'?'-':height.toLocaleString()}`),
+        makeElement('div','text-[9px] text-gray-500',`v${version} · liveness ${liveness}`),
       );
     }else{
       const n=v.n;
@@ -448,6 +502,41 @@ async function renderNodes(){
       );
     }
     grid.appendChild(el);
+  }
+
+  const fleet=document.getElementById('fleetConsistency');
+  const reachable=results
+    .map(result=>result.status==='fulfilled'?result.value:null)
+    .filter(value=>value?.ok);
+  const heights=reachable
+    .map(value=>Number(value.d.height))
+    .filter(Number.isFinite);
+  const versions=[...new Set(reachable.map(value=>String(value.d.version??'unknown')))].sort();
+  const commonHeight=heights.length>1?Math.min(...heights):null;
+  const rootAudit=commonHeight===null?null:await auditFleetAtCommonHeight(reachable,commonHeight);
+  fleet.className='mt-3 rounded-lg border p-2 text-[10px]';
+  if(heights.length===0){
+    fleet.classList.add('border-red-500/40','bg-red-950/30','text-red-300');
+    fleet.textContent='No reachable seed exposes a numeric state height. Fleet consistency is unavailable.';
+  }else if(heights.length===1){
+    fleet.classList.add('border-yellow-500/30','bg-yellow-950/20','text-yellow-300');
+    fleet.textContent=`Only one seed height is available (#${heights[0].toLocaleString()}); no cross-seed consistency claim can be made. Version: ${versions.join(', ')}.`;
+  }else{
+    const min=Math.min(...heights),max=Math.max(...heights),spread=max-min;
+    const forkConfirmed=rootAudit?.available===heights.length&&(rootAudit.hashCount>1||rootAudit.rootCount>1);
+    if(forkConfirmed){
+      fleet.classList.add('border-red-500/40','bg-red-950/30','text-red-300');
+      fleet.textContent=`COMMON-HEIGHT FORK CONFIRMED: at #${rootAudit.height.toLocaleString()}, ${rootAudit.available}/${heights.length} reachable seeds report ${rootAudit.hashCount} block hashes and ${rootAudit.rootCount} state roots. Latest heights span #${min.toLocaleString()} to #${max.toLocaleString()}; versions ${versions.join(', ')}. Stop reward issuance and choose one canonical recovery state.`;
+    }else if(spread>10){
+      fleet.classList.add('border-red-500/40','bg-red-950/30','text-red-300');
+      fleet.textContent=`LARGE FLEET DIVERGENCE: ${heights.length} reachable seeds span state heights #${min.toLocaleString()} to #${max.toLocaleString()} (${spread.toLocaleString()} apart); versions ${versions.join(', ')}. Do not treat them as one canonical chain. Common-height commitments were available from ${rootAudit?.available??0}/${heights.length} seeds.`;
+    }else{
+      fleet.classList.add('border-yellow-500/30','bg-yellow-950/20','text-yellow-300');
+      const commitmentNote=rootAudit?.available===heights.length&&rootAudit.hashCount===1&&rootAudit.rootCount===1
+        ?`All ${heights.length} seeds agree on the block hash and state root at common height #${rootAudit.height.toLocaleString()}, but this sample alone is not a finality proof.`
+        :`Common-height commitment comparison is incomplete (${rootAudit?.available??0}/${heights.length} available).`;
+      fleet.textContent=`Reachable seed heights span #${min.toLocaleString()} to #${max.toLocaleString()} (${spread.toLocaleString()} apart); versions ${versions.join(', ')}. ${commitmentNote}`;
+    }
   }
 }
 
@@ -573,7 +662,8 @@ async function refreshShardRegistry(){
     document.getElementById('shardPerNodeMb').textContent = perNodeMb > 0 ? `~${(perNodeMb/1024).toFixed(1)} GB / node` : '-';
     document.getElementById('shardLayersPerNode').textContent = layersPerNode || '-';
 
-    // Model identity verification: every shard must report the same BLAKE3 model_id
+    // Registry agreement is required, but a legacy shape-derived ID is not
+    // evidence that every node loaded the same artifact bytes.
     if(currentPipeline.length > 0){
       const ids = new Set(currentPipeline.map(s => s.model_id).filter(x => x));
       const panel = document.getElementById('modelIdVerifyPanel');
@@ -588,14 +678,14 @@ async function refreshShardRegistry(){
           panel.classList.add('border-emerald-500/60');
           icon.textContent = '✓';
           icon.className = 'text-lg text-emerald-400';
-          headline.innerHTML = `<span class="text-emerald-300">Model identity verified</span> - all <span class="font-bold">${currentPipeline.length}</span> shards report the same BLAKE3 model_id`;
+          headline.textContent = `Registry model ID agreement - all ${currentPipeline.length} shards report the same model_id (exact-byte identity requires protocol v3)`;
           hashLine.textContent = h;
         }else if(ids.size > 1){
           panel.classList.remove('border-emerald-500/60');
           panel.classList.add('border-red-500');
           icon.textContent = '✗';
           icon.className = 'text-lg text-red-400';
-          headline.innerHTML = `<span class="text-red-300">MODEL MISMATCH</span> - ${ids.size} different model_ids across ${currentPipeline.length} shards. Pipeline cannot produce trustworthy output.`;
+          headline.textContent = `MODEL MISMATCH - ${ids.size} different model_ids across ${currentPipeline.length} shards. Pipeline cannot produce trustworthy output.`;
           hashLine.textContent = [...ids].join(' / ');
         }
       }
@@ -1167,15 +1257,81 @@ function showTxDetail(hash){
   });
 }
 
+function normalizeInferenceActivity(row,sourceHostName,sourceRpc){
+  const candidate=row&&typeof row==='object'?row:{};
+  const receiptStatus=String(candidate.receipt_status||'absent');
+  const receiptBacked=candidate.schema==='arc.inference.activity.v1'
+    &&candidate.record_kind==='mined_inference_attestation'
+    &&candidate.source==='chain_receipt'
+    &&candidate.mined===true
+    &&(receiptStatus==='success'||receiptStatus==='failed');
+  if(receiptBacked){
+    return {...candidate,
+      mined:true,
+      success:candidate.success===true,
+      receipt_status:receiptStatus,
+      tx_type:'InferenceAttestation',
+      source_host_name:sourceHostName,
+      source_rpc:sourceRpc,
+    };
+  }
+
+  // Old nodes returned local process memory as success=true Inference rows.
+  // Treat every legacy or malformed row as unmined until v1 receipt evidence
+  // says otherwise; never preserve its success/transaction claim.
+  const observation={...candidate,
+    schema:candidate.schema==='arc.inference.activity.v1'
+      ?candidate.schema
+      :'legacy.inference.unproven',
+    record_kind:'inference_observation',
+    record_id:String(candidate.record_id||candidate.tx_hash||candidate.from||'unidentified observation'),
+    source:candidate.schema==='arc.inference.activity.v1'
+      ?String(candidate.source||'node_local_memory')
+      :'legacy_rpc_unproven',
+    mined:false,
+    receipt_status:'absent',
+    tx_type:'InferenceObservation',
+    source_host_name:sourceHostName,
+    source_rpc:sourceRpc,
+  };
+  delete observation.success;
+  return observation;
+}
+
 function showInferenceDetail(a){
-  showModal('Inference Attestation',[
-    ['TX Hash',(a.tx_hash||a.from||'').slice(0,40)+'...',a.tx_hash?`${RPC}/tx/${a.tx_hash}`:null],
-    ['Amount',`${(a.amount||0).toLocaleString()} ARC`],
-    ['Block Height',a.block_height||'-'],
-    ['From',(a.from||'-').slice(0,40)+'...'],
-    ['Model',a.model||'TinyLlama 1.1B'],
-    ['Type','InferenceAttestation'],
-  ]);
+  const inf=a.inference&&typeof a.inference==='object'?a.inference:{};
+  const mined=a.mined===true;
+  const minedSuccess=mined&&a.receipt_status==='success'&&a.success===true;
+  const hash=String(a.tx_hash||'');
+  const hashBare=hash.replace(/^0x/i,'');
+  const txLink=mined&&/^[0-9a-f]{64}$/i.test(hashBare)
+    ?`${a.source_rpc||RPC}/tx/${hashBare}`
+    :null;
+  const title=minedSuccess
+    ?'Mined Inference Attestation'
+    :mined
+      ?'Mined Failed Inference Transaction'
+      :'Local Inference Observation';
+  const rows=[
+    ['Record kind',String(a.record_kind||'inference_observation')],
+    ['Source',`${String(a.source||'unavailable')} · ${String(a.source_host_name||'selected host')}`],
+    ['Mined',mined?'yes':'no'],
+    ['Receipt status',String(a.receipt_status||'absent')],
+    ['Type',String(a.tx_type||'InferenceObservation')],
+    ['Model',String(inf.model||inf.model_hash||'unavailable')],
+    ['Displayed content source',String(inf.display_content_source||a.source||'unavailable')],
+    ['Displayed text stored on chain',inf.display_text_on_chain===true?'yes':'no'],
+  ];
+  if(mined){
+    rows.push(['TX Hash',hash||'unavailable',txLink]);
+    rows.push(['Block Height',a.block_height??'unavailable']);
+    rows.push(['Execution',minedSuccess?'successful receipt':'failed receipt']);
+    rows.push(['From',String(a.from||'unavailable')]);
+  }else{
+    rows.push(['Observation ID',String(a.record_id||'unavailable')]);
+    rows.push(['Chain evidence','No transaction receipt is present']);
+  }
+  showModal(title,rows);
 }
 
 // These counters are process-local and reset when a coordinator restarts.
@@ -1214,9 +1370,8 @@ async function refresh(){
     const tps=lastTxCount>0&&(now-lastTime)>0?(txDiff/((now-lastTime)/1000)).toFixed(1):'0';
     lastRound=d.dag_round;lastTime=now;lastTxCount=d.total_transactions;
 
-    setText('dagRound', d.dag_round.toLocaleString());
+    setText('stateHeight', Number(d.block_height).toLocaleString());
     setText('committed', d.dag_committed.toLocaleString());
-    setText('height', d.block_height);
     setText('totalTx', (d.total_transactions ?? 0).toLocaleString());
     setText('accounts', (d.total_accounts ?? 0).toLocaleString());
     setText('mempool', d.mempool_size);
@@ -1231,69 +1386,61 @@ async function refresh(){
     setText('uptime', hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`);
     const subtitle=document.getElementById('subtitle');
     const liveDot=makeElement('span','inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot');
-    subtitle.replaceChildren(liveDot,document.createTextNode(`Live - block ${Number(d.dag_round).toLocaleString()} · ${Number(d.dag_committed).toLocaleString()} finalized · ${Number(d.total_transactions)||0} txs`));
+    subtitle.replaceChildren(liveDot,document.createTextNode(`Selected host live - height ${Number(d.block_height).toLocaleString()} · DAG round ${Number(d.dag_round).toLocaleString()} · ${Number(d.total_transactions)||0} indexed txs`));
     // Coordinator-local counters; these are not durable network totals.
     refreshCoordinatorCounters().catch(()=>{});
   }catch(e){ console.error('stats refresh failed:', e); }
 
   // Nodes - fetched by renderNodes() above (runs in parallel, no blocking)
 
-  // Cross-host inference aggregation: fetch from all configured seeds in parallel,
-  // dedupe by tx_hash, group by model, and show which device(s) saw each.
+  // Inference provenance is deliberately pinned to the selected RPC host.
+  // The configured seeds can be on different forks, and a node-local
+  // observation is process memory, so cross-host unioning would fabricate a
+  // canonical network feed that no individual chain view supports.
   try{
-    const results=await Promise.allSettled(NODES.map(async n=>{
-      try{
-        const r=await fetch(`http://${n.ip}:9090/inference/attestations?limit=50`,{signal:AbortSignal.timeout(3000)});
-        const d=await r.json();
-        return {node:n,attestations:d.attestations||[]};
-      }catch(e){return {node:n,attestations:[]}}
-    }));
+    const selectedNode=NODES.find(node=>RPC.includes(node.ip));
+    const selectedSourceName=selectedNode?.name||'selected RPC host';
+    const activityResponse=await fetch(`${RPC}/inference/attestations?limit=50`,{signal:AbortSignal.timeout(3000)});
+    const activityPayload=await activityResponse.json();
+    const legacyInferenceRows=Array.isArray(activityPayload.attestations)
+      ?activityPayload.attestations.filter(row=>{
+        const inf=row?.inference&&typeof row.inference==='object'?row.inference:{};
+        return row?.tx_type==='Inference'
+          ||row?.tx_type==='InferenceAttestation'
+          ||Boolean(inf.output_hash||inf.model_hash||inf.input||inf.output);
+      })
+      :[];
+    const rawActivities=Array.isArray(activityPayload.activities)
+      ?activityPayload.activities
+      :legacyInferenceRows;
+    const allActivities=rawActivities
+      .map(row=>normalizeInferenceActivity(row,selectedSourceName,RPC))
+      .sort((a,b)=>{
+        if(a.mined!==b.mined)return a.mined?-1:1;
+        if(a.mined)return Number(b.block_height||0)-Number(a.block_height||0);
+        return Number(b.observed_at_unix_ms||0)-Number(a.observed_at_unix_ms||0);
+      });
 
-    // Dedupe by tx_hash, track which nodes saw each
-    const byHash={};
     const modelStats={}; // model_hash → {count, name, workers:Set, latestMs}
-    const nodesWithInference=new Set();
 
-    for(const{value:v}of results){
-      if(!v||!v.attestations)continue;
-      for(const a of v.attestations){
-        const inf=a.inference||{};
-        // Older nodes pad this endpoint with unrelated tx_type="Other" rows.
-        // Do not turn those records into inference activity.
-        const isInference=a.tx_type==='InferenceAttestation'||Boolean(
-          inf.output_hash||inf.model_hash||inf.input||inf.output
-        );
-        if(!isInference)continue;
-        const hash=a.tx_hash||a.from||'';
-        if(!hash)continue;
-        if(!byHash[hash]){
-          byHash[hash]={...a,seen_on:new Set()};
-        }
-        byHash[hash].seen_on.add(v.node.name);
-        // Track which nodes do inference (have attestations)
-        nodesWithInference.add(v.node.name);
-        // Track models
-        const modelHash=inf.model_hash||'unknown';
-        const modelName=inf.model||'unknown';
-        if(!modelStats[modelHash]){
-          modelStats[modelHash]={count:0,name:modelName,workers:new Set(),latestMs:0,modelHash};
-        }
-        modelStats[modelHash].count++;
-        modelStats[modelHash].workers.add(v.node.name);
-        if(inf.ms_per_token>modelStats[modelHash].latestMs){
-          modelStats[modelHash].latestMs=inf.ms_per_token;
-        }
+    for(const activity of allActivities){
+      const inf=activity.inference||{};
+      const modelHash=inf.model_hash||'unknown';
+      const modelName=inf.model||'unknown';
+      if(!modelStats[modelHash]){
+        modelStats[modelHash]={count:0,name:modelName,workers:new Set(),latestMs:null,modelHash};
+      }
+      modelStats[modelHash].count++;
+      modelStats[modelHash].workers.add(selectedSourceName);
+      const msPerToken=finiteNumberOrNull(inf.ms_per_token);
+      if(msPerToken!==null&&(modelStats[modelHash].latestMs===null||msPerToken>modelStats[modelHash].latestMs)){
+        modelStats[modelHash].latestMs=msPerToken;
       }
     }
 
-    const allAttestations=Object.values(byHash).sort((a,b)=>{
-      // Sort by tx_hash for now (newer attestations naturally near top)
-      return 0;
-    });
-
     // Update summary stats
     const infCountEl=document.getElementById('infCount');
-    if(infCountEl)infCountEl.textContent=allAttestations.length.toLocaleString();
+    if(infCountEl)infCountEl.textContent=allActivities.length.toLocaleString();
     const modelCountEl=document.getElementById('modelCount');
     if(modelCountEl)modelCountEl.textContent=Object.keys(modelStats).length;
     const infNodes=NODES.filter(n=>n.inference);
@@ -1327,12 +1474,12 @@ async function refresh(){
         const header=makeElement('div','flex items-center justify-between mb-1');
         header.append(
           makeElement('span','text-white font-semibold text-xs truncate max-w-[180px]',m.name),
-          makeElement('span','px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20',`${m.count} runs`),
+          makeElement('span','px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20',`${m.count} selected-host records`),
         );
         const footer=makeElement('div','flex items-center justify-between mt-2 text-[10px]');
         footer.append(
           makeElement('span','text-gray-500',[...m.workers].join(', ')),
-          makeElement('span','text-arc-400 mono',`${m.latestMs} ms/tok`),
+          makeElement('span','text-arc-400 mono',m.latestMs===null?'latency unavailable':`${m.latestMs} ms/tok`),
         );
         card.append(
           header,
@@ -1345,16 +1492,27 @@ async function refresh(){
       breakdown.innerHTML='<div class="col-span-full text-gray-600 text-sm text-center py-4">No inference activity yet. Start a node with <code class="mono text-arc-400">./scripts/join-inference.sh --model path.gguf</code></div>';
     }
 
-    // Render inference feed (recent attestations with cross-device badge)
+    // Render selected-host activity with receipt provenance on every row.
     const list=document.getElementById('inferenceList');
-    if(allAttestations.length>0){
+    if(allActivities.length>0){
       list.replaceChildren();
-      allAttestations.slice(0,15).forEach(a=>{
+      allActivities.slice(0,15).forEach(a=>{
         const inf=a.inference||{};
-        const seenCount=a.seen_on.size;
         const input=(inf.input||'-').slice(0,50);
         const output=(inf.output||'-').slice(0,80);
         const isSharded = inf.sharded === true || inf.engine?.includes('sharded');
+        const minedSuccess=a.mined===true&&a.receipt_status==='success'&&a.success===true;
+        const minedFailed=a.mined===true&&!minedSuccess;
+        const provenanceLabel=minedSuccess
+          ?'MINED · successful receipt'
+          :minedFailed
+            ?'MINED · failed receipt'
+            :'OBSERVED · not mined';
+        const provenanceClass=minedSuccess
+          ?'px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+          :minedFailed
+            ?'px-1.5 py-0.5 rounded text-[9px] font-bold bg-red-500/20 text-red-300 border border-red-500/40'
+            :'px-1.5 py-0.5 rounded text-[9px] font-bold bg-yellow-500/20 text-yellow-300 border border-yellow-500/40';
         const row=makeElement('div','py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition');
         row.tabIndex=0;
         row.setAttribute('role','button');
@@ -1363,16 +1521,18 @@ async function refresh(){
         if(isSharded){
           badges.appendChild(makeElement('span','px-1.5 py-0.5 rounded text-[9px] font-bold bg-arc-500/20 text-arc-300 border border-arc-500/40',`SHARDED · ${inf.pipeline_length||'?'} shards`));
         }
-        badges.appendChild(makeElement('span',seenCount>1
-          ? 'px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-          : 'px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surface-4 text-gray-400',
-          seenCount>1?`seen on ${seenCount} hosts`:'seen on 1 host'));
-        badges.appendChild(makeElement('span','text-[10px] text-gray-500 mono',`${inf.ms_per_token||'?'}ms/tok`));
+        const activityLatency=finiteNumberOrNull(inf.ms_per_token);
+        badges.appendChild(makeElement('span',provenanceClass,provenanceLabel));
+        badges.appendChild(makeElement('span','px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surface-4 text-gray-400',`source: ${a.source_host_name}`));
+        badges.appendChild(makeElement('span','text-[10px] text-gray-500 mono',activityLatency===null?'latency unavailable':`${activityLatency}ms/tok`));
+        const recordReference=minedSuccess||minedFailed
+          ?String(a.tx_hash||'transaction hash unavailable')
+          :String(a.record_id||'observation id unavailable');
         row.append(
           badges,
           makeElement('div','text-[11px] text-gray-400 truncate',`→ ${input}`),
           makeElement('div','text-[11px] text-white truncate',`← ${output}`),
-          makeElement('div','text-[9px] text-gray-600 mono mt-1',`${String(a.tx_hash||'').slice(0,40)}...`),
+          makeElement('div','text-[9px] text-gray-600 mono mt-1',recordReference.slice(0,60)),
         );
         const open=()=>showInferenceDetail(a);
         row.addEventListener('click',open);
@@ -1382,7 +1542,7 @@ async function refresh(){
         list.appendChild(row);
       });
     }else{
-      list.innerHTML='<p class="text-gray-600 text-sm">No attestations yet. <a href="https://github.com/FerrumVir/arc-chain" class="text-arc-400 hover:underline">Run a node with inference →</a></p>';
+      list.innerHTML='<p class="text-gray-600 text-sm">The selected host reports no mined inference attestations or local inference observations.</p>';
     }
   }catch(e){
     console.error('inference fetch failed',e);
@@ -1413,11 +1573,20 @@ async function refresh(){
       list.appendChild(row);
       hasRows=true;
     }
-    // Show any faucet/transfer attestations
+    // Only receipt-backed successful v1 rows belong in a transaction list.
+    // Legacy endpoints and node-local observations fail closed here.
     try{
       const ar=await fetch(RPC+'/inference/attestations',{signal:AbortSignal.timeout(3000)});
       const ad=await ar.json();
-      (ad.attestations||[]).filter(tx=>tx.tx_type!=='Other').slice(0,8).forEach(tx=>{
+      (Array.isArray(ad.attestations)?ad.attestations:[]).filter(tx=>
+        tx.schema==='arc.inference.activity.v1'
+        &&tx.record_kind==='mined_inference_attestation'
+        &&tx.source==='chain_receipt'
+        &&tx.mined===true
+        &&tx.receipt_status==='success'
+        &&tx.success===true
+        &&tx.tx_type==='InferenceAttestation'
+      ).slice(0,8).forEach(tx=>{
         const hash=String(tx.tx_hash||tx.from||'');
         if(!hash)return;
         const row=makeElement('div','flex items-center justify-between py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition');
@@ -1428,7 +1597,7 @@ async function refresh(){
           makeElement('span','px-1.5 py-0.5 rounded text-[10px] font-semibold bg-arc-500/10 text-arc-400 border border-arc-500/20','TX'),
           makeElement('span','mono text-[11px] text-gray-400',`${hash.slice(0,20)}...`),
         );
-        row.append(label,makeElement('span','mono text-xs text-white font-medium',`${Number(tx.amount)||0} ARC`));
+        row.append(label,makeElement('span','mono text-xs text-emerald-300 font-medium',`mined · block ${tx.block_height??'unavailable'}`));
         const open=()=>showTxDetail(hash);
         row.addEventListener('click',open);
         row.addEventListener('keydown',event=>{
@@ -1472,7 +1641,7 @@ async function probePresetCache(){
       const s = await sR.json();
       const line = document.getElementById('cacheStatsLine');
       if(line){
-        line.textContent = `↯ cache: ${s.size}/${s.capacity} entries · ${s.total_hits} cumulative hits · O(1) lookup (~20 μs)`;
+        line.textContent = `↯ cache: ${s.size}/${s.capacity} entries · ${s.total_hits} cumulative hits · in-memory key lookup`;
       }
     }
     // 2) cache_check - per-preset warm status (same coordinator as cache_stats)
@@ -1505,86 +1674,312 @@ async function probePresetCache(){
   }catch(e){/* silent - /inference/cache_check only exists on v0.5.1+ coordinators */}
 }
 
+// ── One-click community inference ──────────────────────────────────────────
+// This deliberately uses /inference/run. The main sharded demo remains on
+// /inference/run_consensus, which does not assign work to community workers.
+function appendCommunityDetail(container,label,value,valueClass='text-white'){
+  const row=makeElement('div','flex flex-col gap-0.5');
+  row.append(
+    makeElement('span','text-[8px] uppercase tracking-wider text-gray-500',label),
+    makeElement('span',`text-[10px] mono break-all ${valueClass}`,value),
+  );
+  container.appendChild(row);
+}
+
+function renderCommunityInferenceResult(data){
+  const resultEl=document.getElementById('communityInferenceResult');
+  if(!resultEl)return;
+  resultEl.replaceChildren();
+  resultEl.classList.remove('hidden');
+
+  const payload=data&&typeof data==='object'?data:{};
+  const inference=payload.inference&&typeof payload.inference==='object'?payload.inference:{};
+  const verification=payload.verification&&typeof payload.verification==='object'?payload.verification:null;
+  const settlement=payload.settlement&&typeof payload.settlement==='object'?payload.settlement:null;
+  const routedVia=typeof payload.routed_via==='string'?payload.routed_via:'unavailable';
+  const communityRoute=routedVia.startsWith('community:');
+  const succeeded=payload.success===true;
+
+  const panel=makeElement('div',`rounded-lg border p-3 ${succeeded?'bg-violet-950/30 border-violet-400/30':'bg-red-950/20 border-red-500/30'}`);
+  const headline=makeElement('div','flex flex-wrap items-center justify-between gap-2 mb-3');
+  headline.append(
+    makeElement('span',`text-xs font-bold ${succeeded?'text-violet-200':'text-red-300'}`,succeeded?'Inference response received':'Inference request failed'),
+    makeElement('span',`text-[9px] font-bold px-2 py-0.5 rounded-full border ${communityRoute?'text-emerald-300 border-emerald-500/30 bg-emerald-500/10':'text-yellow-300 border-yellow-500/30 bg-yellow-500/10'}`,communityRoute?'COMMUNITY WORKER':'LOCAL / NO WORKER'),
+  );
+  panel.appendChild(headline);
+
+  const summary=makeElement('div','grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3');
+  appendCommunityDetail(summary,'Routed via',routedVia,communityRoute?'text-emerald-300':'text-yellow-300');
+  appendCommunityDetail(summary,'Output hash',inference.output_hash??'unavailable','text-arc-300');
+  appendCommunityDetail(summary,'Engine',inference.engine??'unavailable');
+  appendCommunityDetail(summary,'Inference time',inference.inference_ms==null?'unavailable':`${inference.inference_ms} ms`);
+  panel.appendChild(summary);
+
+  const outputBox=makeElement('div','rounded-md bg-surface-3 border border-surface-4 p-2 mb-3');
+  outputBox.append(
+    makeElement('div','text-[8px] uppercase tracking-wider text-gray-500 mb-1','Output'),
+    makeElement('div','text-[11px] text-white whitespace-pre-wrap break-words max-h-32 overflow-y-auto',inference.output??payload.error??'Unavailable'),
+  );
+  panel.appendChild(outputBox);
+
+  const evidenceGrid=makeElement('div','grid grid-cols-1 md:grid-cols-2 gap-2');
+  const verificationCard=makeElement('div','rounded-md bg-surface-3 border border-emerald-500/20 p-2');
+  verificationCard.appendChild(makeElement('div','text-[9px] uppercase tracking-wider text-emerald-300 font-bold mb-1','Coordinator quorum summary'));
+  if(verification){
+    const verificationRows=makeElement('div','grid grid-cols-2 gap-2');
+    appendCommunityDetail(verificationRows,'Method',verification.method??'unavailable');
+    appendCommunityDetail(verificationRows,'Verified hash',verification.output_hash??'unavailable','text-emerald-300');
+    appendCommunityDetail(verificationRows,'Verified tokens',verification.tokens_generated??'unavailable');
+    appendCommunityDetail(verificationRows,'Range-position quorums',verification.range_position_quorums??'unavailable');
+    appendCommunityDetail(verificationRows,'Signatures required',verification.signatures_required_per_quorum??'unavailable');
+    appendCommunityDetail(verificationRows,'Replicas contacted',verification.replicas_contacted_per_quorum??'unavailable');
+    appendCommunityDetail(verificationRows,'Model ranges',verification.ranges??'unavailable');
+    verificationCard.appendChild(verificationRows);
+  }else{
+    verificationCard.appendChild(makeElement('div','text-[10px] text-yellow-300','Unavailable — this response does not include independent verifier evidence.'));
+  }
+
+  const settlementCard=makeElement('div','rounded-md bg-surface-3 border border-yellow-500/20 p-2');
+  settlementCard.appendChild(makeElement('div','text-[9px] uppercase tracking-wider text-yellow-300 font-bold mb-1','Settlement status'));
+  if(settlement){
+    const settlementStatus=String(settlement.status??'unavailable');
+    const negativeStatus=/(?:submitted|pending|rejected|failed|unavailable|not_activated|missing)/i.test(settlementStatus);
+    const minedReported=settlement.included===true&&!negativeStatus;
+    const settlementRows=makeElement('div','grid grid-cols-1 gap-2');
+    appendCommunityDetail(settlementRows,'Status',settlementStatus,minedReported?'text-emerald-300':'text-yellow-300');
+    appendCommunityDetail(settlementRows,'Reward transaction',settlement.reward_tx_hash??'unavailable','text-arc-300');
+    appendCommunityDetail(
+      settlementRows,
+      'Earned?',
+      minedReported?'Inclusion reported; confirm in successful mined rewards below':'No — pending, rejected, disabled, or not mined',
+      minedReported?'text-emerald-300':'text-yellow-300',
+    );
+    if(settlement.reason??settlement.error){
+      appendCommunityDetail(settlementRows,'Detail',settlement.reason??settlement.error,'text-gray-400');
+    }
+    settlementCard.appendChild(settlementRows);
+  }else{
+    settlementCard.appendChild(makeElement('div','text-[10px] text-gray-500','Unavailable. No reward is counted as earned without a successful mined receipt.'));
+  }
+  evidenceGrid.append(verificationCard,settlementCard);
+  panel.appendChild(evidenceGrid);
+  resultEl.appendChild(panel);
+}
+
+async function runCommunityInference(){
+  const button=document.getElementById('communityInferenceBtn');
+  const input=document.getElementById('communityPrompt');
+  const status=document.getElementById('communityInferenceStatus');
+  const resultEl=document.getElementById('communityInferenceResult');
+  if(!button||!input||!status||!resultEl)return;
+  const prompt=input.value.trim();
+  if(!prompt){
+    status.textContent='Enter a prompt before sending community work.';
+    return;
+  }
+
+  button.disabled=true;
+  button.textContent='Dispatching…';
+  status.textContent='Waiting for the selected coordinator to assign and independently verify a community worker…';
+  resultEl.replaceChildren();
+  resultEl.classList.add('hidden');
+  try{
+    const response=await fetch(SHARDED_COORDINATOR+'/inference/run',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({input:prompt,max_tokens:8}),
+      signal:AbortSignal.timeout(90000),
+    });
+    let payload={};
+    try{payload=await response.json()}catch(error){payload={success:false,error:'Coordinator returned a non-JSON response'}}
+    if(!response.ok){
+      throw new Error(String(payload.error||`Coordinator returned HTTP ${response.status}`));
+    }
+    renderCommunityInferenceResult(payload);
+    const routedVia=typeof payload.routed_via==='string'?payload.routed_via:'unavailable';
+    status.textContent=payload.success!==true
+      ?`Coordinator did not complete inference via ${routedVia}: ${String(payload.error||'unsuccessful response')}`
+      :routedVia.startsWith('community:')
+      ?`Completed through ${routedVia}. Verification and settlement evidence are shown below.`
+      :`Completed via ${routedVia}. No community worker received credit for this fallback.`;
+    refreshCommunityWorkers();
+  }catch(error){
+    const message=String(error?.message||error||'Unknown coordinator error');
+    renderCommunityInferenceResult({success:false,routed_via:'unavailable',error:message});
+    status.textContent=`Community inference failed: ${message}`;
+  }finally{
+    button.disabled=false;
+    button.textContent='▶ Send to Community';
+  }
+}
+
 // ── Community workers - poll the seeds and display the live worker list ──
-// Merge unique workers by worker_id, render in the Community Network section.
-// Updates every 10 seconds.
-//
-// Worker registrations are node-local, not replicated, so merge unique worker
-// records from the active seed inventory. The scoreboard's canonical completed
-// work field is success_count; work_completed is retained only for older nodes.
+// Worker registrations are seed-local. Keep the source seed attached to the
+// selected scoreboard record, then ask that exact seed for its chain earnings
+// view so the worker row never splices together two independent seed states.
 const GATEWAY_SEEDS=NODES.map(n=>n.ip);
 const completedJobsOf=worker=>Number(worker.success_count??worker.work_completed??0)||0;
+function finiteNumberOrNull(value){
+  if(value===null||value===undefined||value==='')return null;
+  const number=Number(value);
+  return Number.isFinite(number)?number:null;
+}
+function formatArcOrUnavailable(value){
+  const amount=finiteNumberOrNull(value);
+  return amount===null||amount<0?'Unavailable':`${amount.toLocaleString(undefined,{maximumFractionDigits:6})} ARC`;
+}
 
 async function refreshCommunityWorkers(){
-  const seen = new Map(); // worker_id -> worker
-  let totalJobs = 0;
-  // Query all seeds in parallel, merge results
-  const results = await Promise.allSettled(GATEWAY_SEEDS.map(ip =>
-    fetch(`http://${ip}:9090/workers/scoreboard`, {signal: AbortSignal.timeout(3000)})
-      .then(r => r.json())
-  ));
-  for(const r of results){
-    if(r.status !== 'fulfilled') continue;
-    const d = r.value;
-    for(const w of (d.workers || [])){
-      if(!seen.has(w.worker_id)){
-        seen.set(w.worker_id, w);
-      } else {
-        // Keep the record with the most completed work. The scoreboard reports
-        // success_count; an older response shape used work_completed.
-        if(completedJobsOf(w)>completedJobsOf(seen.get(w.worker_id))){
-          seen.set(w.worker_id, w);
+  const seen=new Map(); // worker_id -> {worker, sourceSeed, sourceName}
+  const selectedEligibleWorkerIds=new Set();
+  let selectedCoordinatorEligibility=null;
+  const results=await Promise.allSettled(GATEWAY_SEEDS.map(async ip=>{
+    const sourceSeed=`http://${ip}:9090`;
+    const response=await fetch(`${sourceSeed}/workers/scoreboard`,{signal:AbortSignal.timeout(3000)});
+    if(!response.ok)throw new Error(`scoreboard HTTP ${response.status}`);
+    return{
+      sourceSeed,
+      sourceName:NODES.find(node=>node.ip===ip)?.name||ip,
+      data:await response.json(),
+    };
+  }));
+  for(const result of results){
+    if(result.status!=='fulfilled')continue;
+    const {data,sourceSeed,sourceName}=result.value;
+    const rows=Array.isArray(data?.workers)?data.workers:[];
+    if(sourceSeed===SHARDED_COORDINATOR){
+      const rawEligible=finiteNumberOrNull(data?.eligible_inference_workers);
+      const coordinatorModelId=typeof data?.coordinator_model_id==='string'?data.coordinator_model_id.trim().replace(/^0x/i,'').toLowerCase():null;
+      if(rawEligible!==null&&Number.isInteger(rawEligible)&&rawEligible>=0&&coordinatorModelId){
+        selectedCoordinatorEligibility={
+          eligibleCount:rawEligible,
+          modelId:coordinatorModelId,
+          modelName:typeof data?.coordinator_model==='string'?data.coordinator_model:null,
+        };
+        for(const worker of rows){
+          const workerModelId=typeof worker?.model_id==='string'?worker.model_id.trim().replace(/^0x/i,'').toLowerCase():null;
+          const capabilities=Array.isArray(worker?.capabilities)?worker.capabilities:[];
+          const workerId=String(worker?.worker_id??'').trim();
+          if(workerId&&capabilities.includes('inference')&&workerModelId===coordinatorModelId){
+            selectedEligibleWorkerIds.add(workerId);
+          }
         }
       }
     }
+    for(const worker of rows){
+      const workerId=String(worker?.worker_id??'').trim();
+      if(!workerId)continue;
+      const existing=seen.get(workerId);
+      if(!existing||completedJobsOf(worker)>completedJobsOf(existing.worker)){
+        seen.set(workerId,{worker,sourceSeed,sourceName});
+      }
+    }
   }
-  const workers = Array.from(seen.values());
-  // /workers/scoreboard has no total_work_completed field, so sum per-worker
-  // successes. Expect 0 today: no worker on the live net has a nonzero
-  // success_count, because the sharded pipeline dispatches to shard nodes
-  // rather than to scoreboard workers.
-  totalJobs=workers.reduce((count,worker)=>count+completedJobsOf(worker),0);
-  // Update count badge
-  const countEl = document.getElementById('communityCount');
-  if(countEl) countEl.textContent = `${workers.length} worker${workers.length !== 1 ? 's' : ''}`;
-  // Update jobs
-  const jobsEl = document.getElementById('communityJobs');
-  if(jobsEl) jobsEl.textContent = `${totalJobs} jobs completed`;
-  // Render worker list
-  const listEl = document.getElementById('communityWorkerList');
-  if(!listEl) return;
+
+  const workers=await Promise.all(Array.from(seen.values()).map(async record=>{
+    const workerId=String(record.worker.worker_id);
+    try{
+      const response=await fetch(`${record.sourceSeed}/worker/earnings/${encodeURIComponent(workerId)}`,{signal:AbortSignal.timeout(3000)});
+      if(!response.ok)throw new Error(`earnings HTTP ${response.status}`);
+      const earnings=await response.json();
+      return{...record,earnings:earnings&&typeof earnings==='object'?earnings:null};
+    }catch(error){
+      return{...record,earnings:null};
+    }
+  }));
+
+  const totalJobs=workers.reduce((count,record)=>count+completedJobsOf(record.worker),0);
+  const modelReady=selectedCoordinatorEligibility?.eligibleCount??null;
+  const countEl=document.getElementById('communityCount');
+  if(countEl)countEl.textContent=modelReady===null
+    ?`eligibility unavailable · ${workers.length} network-visible`
+    :`${modelReady} compatible · ${workers.length} network-visible`;
+  const jobsEl=document.getElementById('communityJobs');
+  if(jobsEl)jobsEl.textContent=`${totalJobs} jobs completed`;
+  const eligibilityEl=document.getElementById('communityEligibility');
+  if(eligibilityEl){
+    eligibilityEl.textContent=modelReady===null
+      ?'The selected coordinator does not expose exact model eligibility. Network-visible registrations are not proof that this action can assign work.'
+      :modelReady>0
+      ?`${modelReady} worker${modelReady===1?' is':'s are'} registered on the selected coordinator with its exact model identity and can claim this action’s jobs.`
+      :workers.length>0
+      ?'No compatible worker is registered on the selected coordinator. Other network-visible nodes may be observers, registered elsewhere, or serving a different model; this action will fall back locally.'
+      :'No compatible community capacity is visible. This action will fall back locally.';
+    eligibilityEl.className=`text-[9px] mt-1 ${modelReady!==null&&modelReady>0?'text-emerald-300':'text-yellow-300'}`;
+  }
+
+  const listEl=document.getElementById('communityWorkerList');
+  if(!listEl)return;
   listEl.replaceChildren();
-  if(workers.length === 0){
+  if(workers.length===0){
     listEl.appendChild(makeElement('div','text-[10px] text-gray-600 italic','No community workers are registered on the responding seeds.'));
     return;
   }
-  workers.forEach(w=>{
-    const workerId=String(w.worker_id||'unknown-worker');
-    const name=String(w.name||workerId.slice(0,12)).slice(0,25);
-    const plat=String(w.platform||'?').slice(0,30);
-    const work=completedJobsOf(w);
-    const ago = w.registered_at ? Math.floor((Date.now()/1000 - w.registered_at)/60) : 0;
-    const timeStr = ago < 60 ? `${ago}m ago` : ago < 1440 ? `${Math.floor(ago/60)}h ago` : `${Math.floor(ago/1440)}d ago`;
-    const row=makeElement('div','flex items-center justify-between bg-surface-2 border border-violet-500/20 rounded-lg px-3 py-1.5');
-    const identity=makeElement('div','flex items-center gap-2');
+
+  workers.forEach(({worker,sourceName,earnings})=>{
+    const workerId=String(worker.worker_id);
+    const name=String(worker.name||workerId.slice(0,12)).slice(0,25);
+    const platform=String(worker.platform||'?').slice(0,30);
+    const model=typeof worker.model==='string'&&worker.model.trim()!==''?worker.model.trim().slice(0,40):null;
+    const compatible=selectedEligibleWorkerIds.has(workerId);
+    const work=completedJobsOf(worker);
+    const registeredAt=finiteNumberOrNull(worker.registered_at);
+    const agoMinutes=registeredAt===null?null:Math.max(0,Math.floor((Date.now()/1000-registeredAt)/60));
+    const timeStr=agoMinutes===null?'time unavailable':agoMinutes<60?`${agoMinutes}m ago`:agoMinutes<1440?`${Math.floor(agoMinutes/60)}h ago`:`${Math.floor(agoMinutes/1440)}d ago`;
+
+    const balance=finiteNumberOrNull(earnings?.onchain_balance_arc);
+    const rawRewards=finiteNumberOrNull(earnings?.total_rewards);
+    const minedRewards=rawRewards!==null&&Number.isInteger(rawRewards)&&rawRewards>=0?rawRewards:null;
+    const rawRate=finiteNumberOrNull(earnings?.attestations_per_day_observed);
+    const observedRate=rawRate!==null&&rawRate>=0?rawRate:null;
+    const rewardEnabled=typeof earnings?.community_rewards_v1_enabled==='boolean'?earnings.community_rewards_v1_enabled:null;
+    const rewardProtocolActive=typeof earnings?.community_rewards_v1_protocol_active==='boolean'?earnings.community_rewards_v1_protocol_active:null;
+    const approvalCollectionReady=typeof earnings?.community_rewards_v1_approval_collection_ready==='boolean'?earnings.community_rewards_v1_approval_collection_ready:null;
+    const rewardReadiness=rewardEnabled===true&&approvalCollectionReady===true
+      ?'Ready'
+      :rewardProtocolActive===true&&approvalCollectionReady===false
+        ?'Blocked: validator approval collection unavailable'
+        :rewardEnabled===true&&approvalCollectionReady===null
+          ?'Unavailable: seed does not report approval readiness'
+          :rewardEnabled===false?'Inactive':'Unavailable';
+
+    const row=makeElement('div','bg-surface-2 border border-violet-500/20 rounded-lg px-3 py-2');
+    const header=makeElement('div','flex flex-wrap items-center justify-between gap-2 mb-2');
+    const identity=makeElement('div','flex flex-wrap items-center gap-2');
     identity.append(
       makeElement('span','inline-block w-1.5 h-1.5 rounded-full bg-violet-400'),
       makeElement('span','text-[11px] text-white font-medium',name),
-      makeElement('span','text-[9px] text-gray-500',plat),
+      makeElement('span','text-[9px] text-gray-500',platform),
+      makeElement('span',`text-[8px] px-1.5 py-0.5 rounded border ${compatible?'text-emerald-300 border-emerald-500/30 bg-emerald-500/10':'text-yellow-300 border-yellow-500/30 bg-yellow-500/10'}`,compatible?`compatible · ${model}`:model?`network-visible · compatibility unconfirmed · ${model}`:'observer · no model'),
+      makeElement('span','text-[8px] text-gray-600 mono',`via ${sourceName}`),
     );
     const activity=makeElement('div','flex items-center gap-3');
     activity.append(
-      makeElement('span','text-[9px] text-violet-300 font-mono',`${work} jobs`),
+      makeElement('span','text-[9px] text-violet-300 font-mono',`${work} completed jobs`),
       makeElement('span','text-[9px] text-gray-600',`joined ${timeStr}`),
     );
-    row.append(identity,activity);
+    header.append(identity,activity);
+
+    const metrics=makeElement('div','grid grid-cols-2 lg:grid-cols-4 gap-2');
+    appendCommunityDetail(metrics,'On-chain balance',formatArcOrUnavailable(balance),'text-white');
+    appendCommunityDetail(metrics,'Mined rewards visible here',minedRewards===null?'Unavailable':String(minedRewards),'text-emerald-300');
+    appendCommunityDetail(metrics,'Reward issuance',rewardReadiness,rewardReadiness==='Ready'?'text-emerald-300':rewardReadiness==='Unavailable'?'text-gray-500':'text-yellow-300');
+    appendCommunityDetail(metrics,'Mined rewards/day observed',observedRate===null?'Unavailable':`${observedRate.toLocaleString(undefined,{maximumFractionDigits:2})} / day`,'text-violet-300');
+
+    const caveat=makeElement('div','text-[8px] text-gray-600 mt-1.5','Mined totals and observed rate are backward-looking over this seed’s retained in-memory window and may undercount after pruning or restart; they are not guaranteed future work or earnings. Null data remains unavailable. Pending or rejected rewards are never counted as earned.');
+    row.append(header,metrics,caveat);
     listEl.appendChild(row);
   });
 }
 
-// Start community worker polling
+// Start community actions and worker polling.
+setText('communityCoordinator',SHARDED_COORDINATOR);
+document.getElementById('communityInferenceBtn')?.addEventListener('click',runCommunityInference);
+document.getElementById('communityPrompt')?.addEventListener('keydown',event=>{
+  if(event.key==='Enter')runCommunityInference();
+});
 refreshCommunityWorkers();
-setInterval(refreshCommunityWorkers, 10000);
+setInterval(refreshCommunityWorkers,10000);
 </script>
 </body>
 </html>

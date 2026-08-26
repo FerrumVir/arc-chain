@@ -158,10 +158,9 @@ export function Onboarding() {
       }
 
       // 2. Build the config now that we know whether we have a model. Worker
-      //    role + modelPath set ⇒ node_manager passes --community-mode and the
-      //    coordinator dispatches inference jobs. No model = observer
-      //    (validates consensus, doesn't earn — only path for users who
-      //    explicitly opt out).
+      //    role + modelPath set makes the node eligible to advertise an exact,
+      //    fully loaded artifact. It does not promise assignment or payment.
+      //    No model means observer/router mode with no local model execution.
       const config: NodeConfig = {
         ...DEFAULT_NODE_CONFIG,
         role: modelPath ? "worker" : "observer",
@@ -254,7 +253,8 @@ export function Onboarding() {
                 </div>
                 <h1 className="onboarding-title">welcome to arc</h1>
                 <p className="onboarding-subtitle">
-                  Run a node on your machine. Serve inference. Earn ARC.
+                  Run a node on your machine. Offer compatible compute. Verify
+                  every result and reward from the selected chain host.
                 </p>
 
                 <div
@@ -268,7 +268,7 @@ export function Onboarding() {
                     {
                       icon: Sparkles,
                       title: "One click setup",
-                      desc: "Pick the model tier matching your hardware. We download it, configure your node, you start earning.",
+                      desc: "Pick a model that fits your hardware. We download and configure it; exact-artifact eligibility, assignment, and rewards remain visible gates.",
                     },
                     {
                       icon: ShieldCheck,
@@ -277,8 +277,8 @@ export function Onboarding() {
                     },
                     {
                       icon: Network,
-                      title: "Always on",
-                      desc: "Lives in the menu bar, starts on login, auto-updates. Inference jobs land while you sleep.",
+                      title: "Ready when you are",
+                      desc: "It can start on app launch. Automatic update checks are read-only; you confirm every download and install. Work arrives only when assigned.",
                     },
                   ].map(({ icon: Icon, title, desc }) => (
                     <div
@@ -546,9 +546,10 @@ export function Onboarding() {
               <div data-testid="step-model">
                 <h1 className="onboarding-title">Pick your model</h1>
                 <p className="onboarding-subtitle">
-                  Your node serves inference for the network and earns ARC per
-                  attestation. We pre-selected the tier that fits your machine.
-                  Bigger model = more demand = more earnings.
+                  A fully loaded model makes your node eligible only for work
+                  requesting that exact artifact ID. We pre-selected the tier
+                  that fits your machine. Larger files use more disk and RAM;
+                  they do not multiply rewards or guarantee demand.
                 </p>
 
                 <div
@@ -682,7 +683,7 @@ export function Onboarding() {
                       selectedTier === "skip" ? "underline" : "none",
                   }}
                 >
-                  Skip — run as a verifier only (no inference earnings)
+                  Skip — observer/router mode (no local model execution)
                 </button>
 
                 <div className="onboarding-actions">
@@ -731,7 +732,7 @@ export function Onboarding() {
                 </div>
                 <h1 className="onboarding-title">
                   {!launching
-                    ? "Ready to join"
+                    ? "Ready to set up"
                     : launchStage === "model"
                       ? "Downloading model"
                       : launchStage === "downloading"
@@ -739,14 +740,14 @@ export function Onboarding() {
                         : launchStage === "starting"
                           ? "Starting your node"
                           : launchStage === "connecting"
-                            ? "Joining the network"
+                            ? "Connecting to a coordinator"
                             : launchStage === "claiming"
                               ? "Claiming welcome tokens"
                               : "Finishing up"}
                 </h1>
                 <p className="onboarding-subtitle">
                   {!launching &&
-                    "We'll fetch the model, download the node binary, start it, and drop testnet ARC into your wallet."}
+                    "We'll fetch the selected model, download the node binary, start the process, and request testnet faucet credit. Setup does not guarantee peers, work, or rewards."}
                   {launching && launchStage === "model" && modelProgress && (
                     <>
                       {formatBytes(modelProgress.downloadedBytes)} of{" "}
@@ -767,7 +768,7 @@ export function Onboarding() {
                     "Connecting to Hugging Face mirror..."}
                   {launching &&
                     launchStage === "downloading" &&
-                    "Fetching the latest arc-node for your platform. ~45 MB."}
+                    "Fetching the signed arc-node build selected by this desktop release."}
                   {launching &&
                     launchStage === "starting" &&
                     "Launching your local node."}
@@ -845,7 +846,7 @@ export function Onboarding() {
                       onClick={finish}
                       data-testid="btn-launch"
                     >
-                      {launchError ? "Retry" : "Join the network"}{" "}
+                      {launchError ? "Retry" : "Set up this node"}{" "}
                       <Sparkles size={16} />
                     </button>
                   </div>

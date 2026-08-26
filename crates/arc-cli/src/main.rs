@@ -56,6 +56,8 @@ enum Commands {
     },
     /// Query chain info
     Info,
+    /// Validate node health JSON and print `ok` or `degraded`
+    Health,
     /// Get block details
     Block {
         /// Block height
@@ -93,6 +95,7 @@ async fn main() {
             commands::transfer::run(&rpc_client, &from, &to, amount).await
         }
         Commands::Info => commands::info::run(&rpc_client).await,
+        Commands::Health => commands::health::run(&rpc_client).await,
         Commands::Block { height } => commands::block::run(&rpc_client, height).await,
         Commands::Tx { hash } => commands::tx::run(&rpc_client, &hash).await,
         Commands::Faucet {

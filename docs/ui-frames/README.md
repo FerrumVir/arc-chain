@@ -1,5 +1,12 @@
 # UI frames — video / design handoff
 
+> **Historical visual snapshot only.** These populated frames and URLs do not
+> prove current inference, shared chain state, community assignment, or payment.
+> The 2026-08-26 read-only audit found the public fleet forked and
+> version-skewed with community completed work at zero; v0.7.12 is not deployed.
+> Do not use these images as a current product walkthrough. See
+> [`../PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](../PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
+
 Captured 2026-08-21 against the live testnet (height ~124,989, DAG round ~9.67M,
 10 validators, 8 peers). Chromium, 1920×1080 viewport, `deviceScaleFactor: 2`,
 so every PNG is 3840×2160 retina.

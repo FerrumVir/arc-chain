@@ -1,6 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Calendar, FileSignature, Search } from "lucide-react";
-import { useMemo } from "react";
+import { FileSignature, Search } from "lucide-react";
 import { Card, CardHeader } from "../components/Card";
 import { EmptyState } from "../components/EmptyState";
 import { NumberTicker } from "../components/NumberTicker";
@@ -8,9 +7,6 @@ import { ProjectedEarnings } from "../components/ProjectedEarnings";
 import { api } from "../lib/tauri";
 import { formatHash, formatInt, formatRelativeTime } from "../lib/format";
 import { useAppStore } from "../lib/store";
-
-/** Testnet flat rate per settled attestation. Mirrors rpc_client.rs. */
-const REWARD_PER_ATTESTATION = 2.5;
 
 export function Earnings() {
   const lookupHash = useAppStore((s) => s.lookupHash);
@@ -25,55 +21,13 @@ export function Earnings() {
     refetchInterval: 5000,
   });
 
-  // 7-day bucketed earnings from real attestation timestamps.
-  //
-  // Only attestations that are BOTH the user's own AND carry a genuine
-  // timestamp can be bucketed. That is frequently none of them: the live
-  // seeds return flat tx records with no timestamp, and the previous
-  // synthetic `now - i * 30s` series made every attestation land in today's
-  // bucket, producing a chart that looked like a week of activity from a
-  // single afternoon's data. When nothing is bucketable the chart is not
-  // rendered at all — see `chartIsMeaningful`.
-  const { weekly, datedCount } = useMemo(() => {
-    const WEEK_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const now = new Date();
-    const todayStart = new Date(
-      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
-    ).getTime();
-    const DAY_MS = 86_400_000;
-    const buckets: Array<{ label: string; value: number; dayStart: number }> =
-      [];
-    for (let i = 6; i >= 0; i--) {
-      const start = todayStart - i * DAY_MS;
-      const date = new Date(start);
-      buckets.push({
-        label: WEEK_LABELS[date.getUTCDay()],
-        value: 0,
-        dayStart: start,
-      });
-    }
-    let dated = 0;
-    for (const a of attestations ?? []) {
-      if (a.timestamp == null || a.rewardArc == null) continue;
-      const ts = a.timestamp;
-      const bucketIdx = buckets.findIndex(
-        (b) => ts >= b.dayStart && ts < b.dayStart + DAY_MS,
-      );
-      if (bucketIdx !== -1) {
-        buckets[bucketIdx].value += a.rewardArc;
-        dated++;
-      }
-    }
-    return { weekly: buckets, datedCount: dated };
-  }, [attestations]);
-
-  const chartIsMeaningful = datedCount > 0;
   const mineCount = (attestations ?? []).filter((a) => a.mine).length;
-  const hasEarned = (earnings?.totalArc ?? 0) > 0 || mineCount > 0;
-
-  // Floor at 1 so all-zero weeks still render visible (flat) bars instead
-  // of dividing by zero.
-  const max = Math.max(1, ...weekly.map((d) => d.value));
+  // The legacy attestation feed is 0x16 computation claims. It must never
+  // make the reward screen look funded. Only the selected host's mined reward
+  // receipt index can establish that a receipt exists; a zero-valued receipt
+  // must not be relabelled as "no receipt."
+  const hasConfirmedRewards =
+    earnings?.fromChain === true && earnings.attestations > 0;
 
   return (
     <div className="main-inner" data-testid="earnings-screen">
@@ -81,7 +35,8 @@ export function Earnings() {
         <div>
           <h1 className="page-title">Earnings</h1>
           <p className="page-subtitle">
-            Your share of network rewards, paid in ARC.
+            Successful mined community-reward receipts reported by the selected
+            chain host. Testnet ARC has no monetary value.
           </p>
         </div>
       </div>
@@ -96,9 +51,9 @@ export function Earnings() {
       {/* When nothing has been earned, three cards reading "0.00 ARC" next
           to a "Last 7 days" chart of empty bars told the user nothing and
           implied something had gone wrong. Explain the mechanism instead. */}
-      {!hasEarned ? (
+      {!hasConfirmedRewards ? (
         <Card style={{ marginBottom: "var(--space-6)" }} data-testid="earnings-empty">
-          <CardHeader title="No earnings yet" />
+          <CardHeader title="No mined reward receipts yet" />
           <div
             style={{
               color: "var(--text-secondary)",
@@ -107,30 +62,41 @@ export function Earnings() {
             }}
           >
             <p style={{ marginTop: 0 }}>
-              You earn <strong>{REWARD_PER_ATTESTATION.toFixed(2)} ARC</strong>{" "}
-              each time your node serves a slice of an inference request and
-              the resulting attestation settles on-chain.
+              A raw <code>InferenceAttestation</code> (<code>0x16</code>) is a
+              computation claim and pays nothing. The candidate&rsquo;s
+              configured <strong>2.50 ARC</strong> amount applies only when a
+              separate <code>CommunityInferenceReward</code> (<code>0x25</code>)
+              transaction succeeds in a mined block.
             </p>
-            <p>Three things have to be true before that can happen:</p>
+            <p>All of these gates have to pass first:</p>
             <ol style={{ paddingLeft: "1.2em" }}>
               <li>
-                Your node is <strong>running</strong> and has at least one
-                peer — check the Dashboard.
+                The node fully loaded the <strong>exact model artifact</strong>{" "}
+                requested; a matching filename or model shape is not enough.
               </li>
               <li>
-                You downloaded a <strong>model</strong> during setup. Without
-                one your node validates consensus but is never sent inference
-                work.
+                A coordinator actually <strong>assigned work</strong> to this
+                worker and independently verified every token through its
+                authenticated range quorum.
               </li>
               <li>
-                The network <strong>routed a request to you</strong>. Requests
-                are distributed across all workers, so a quiet network means
-                quiet earnings.
+                Reward activation and validator approval collection are ready,
+                and the signed worker certificate receives strict
+                greater-than-two-thirds validator identity and active-stake
+                approval. Six equal validators require five approvals.
+              </li>
+              <li>
+                The resulting <code>0x25</code> transaction is included with a
+                <strong>successful mined receipt</strong> on this same chain
+                host. Pending, failed, pruned, or raw <code>0x16</code> records
+                are not counted.
               </li>
             </ol>
             <p style={{ marginBottom: 0, color: "var(--text-muted)" }}>
-              Run a prompt yourself from the Inference tab to put work through
-              the network.
+              The current recovery candidate fails closed while approval
+              collection is unavailable. Running a prompt from the Inference
+              tab tests the selected inference path; it does not guarantee that
+              your worker receives the job or a reward.
             </p>
           </div>
         </Card>
@@ -174,10 +140,10 @@ export function Earnings() {
             </div>
           </Card>
           <Card>
-            <div className="stat-label">Last attestation</div>
-            {/* Replaces the "Pending" card. Pending was invented client-side
-                (min(results,5) × 2.5 / 2) — the chain exposes no such
-                figure. The last attestation's block height is real. */}
+            <div className="stat-label">Last reward receipt</div>
+            {/* Replaces the old invented "Pending" card. The candidate
+                endpoint reports the block of the last successful mined 0x25
+                reward receipt; absent remains absent. */}
             <div className="big-number" style={{ marginTop: "var(--space-2)" }}>
               {earnings?.lastPayoutBlock != null ? (
                 <span style={{ fontSize: "0.7em" }}>
@@ -195,94 +161,9 @@ export function Earnings() {
         </div>
       )}
 
-      {/* Rendered only when at least one of the user's own attestations
-          carries a real timestamp. Otherwise there is nothing to plot, and a
-          row of empty bars under a "Last 7 days" heading reads as "you
-          earned nothing all week" rather than "this data doesn't exist". */}
-      {chartIsMeaningful && (
-      <Card style={{ marginBottom: "var(--space-6)" }} data-testid="weekly-chart">
-        <CardHeader
-          title="Last 7 days"
-          action={
-            <span
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: 6,
-                fontSize: "var(--text-xs)",
-                color: "var(--text-muted)",
-              }}
-              title={`Built from ${datedCount} timestamped attestation${datedCount === 1 ? "" : "s"} credited to you.`}
-            >
-              <Calendar size={12} /> {datedCount} dated
-            </span>
-          }
-        />
-        <div
-          style={{
-            display: "flex",
-            alignItems: "stretch",
-            gap: "var(--space-3)",
-            height: 200,
-            padding: "var(--space-2) 0",
-          }}
-        >
-          {weekly.map((d, i) => {
-            const barHeight = Math.max(6, (d.value / max) * 140);
-            return (
-              <div
-                key={i}
-                style={{
-                  flex: 1,
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "center",
-                  justifyContent: "flex-end",
-                  gap: "var(--space-2)",
-                }}
-              >
-                <div
-                  style={{
-                    fontSize: 10,
-                    color: "var(--text-muted)",
-                    fontVariantNumeric: "tabular-nums",
-                    marginBottom: 4,
-                  }}
-                >
-                  {d.value.toFixed(0)}
-                </div>
-                <div
-                  style={{
-                    width: "100%",
-                    maxWidth: 40,
-                    height: barHeight,
-                    background: "var(--gradient-earnings)",
-                    borderRadius: "var(--radius-sm)",
-                    transition: "height 0.6s var(--ease-out)",
-                    boxShadow: "0 4px 14px rgba(232, 93, 47, 0.22)",
-                  }}
-                />
-                <div
-                  style={{
-                    fontSize: 11,
-                    color: "var(--text-muted)",
-                    letterSpacing: "var(--tracking-wide)",
-                    textTransform: "uppercase",
-                    fontWeight: 500,
-                  }}
-                >
-                  {d.label}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </Card>
-      )}
-
       <Card>
         <CardHeader
-          title="All attestations"
+          title="Inference claims (not payments)"
           action={
             <span
               style={{
@@ -290,8 +171,8 @@ export function Earnings() {
                 color: "var(--text-muted)",
               }}
             >
-              {/* The feed is network-wide; only some rows are the user's.
-                  Saying "N total shown" alone implied all of them were. */}
+              {/* Only address attribution is claimed. These 0x16 records are
+                  never converted into income. */}
               {formatInt(mineCount)} yours ·{" "}
               {formatInt(attestations?.length ?? 0)} shown
             </span>
@@ -301,8 +182,8 @@ export function Earnings() {
           {!attestations || attestations.length === 0 ? (
             <EmptyState
               icon={FileSignature}
-              title="No attestations yet"
-              description="Run inference to start earning."
+              title="No inference claims on this host"
+              description="Running a prompt can test the selected inference path, but it does not guarantee worker assignment or payment."
             />
           ) : (
             attestations.map((a) => (
@@ -343,13 +224,11 @@ export function Earnings() {
                   }}
                   title={
                     a.mine
-                      ? "Credited to your address."
-                      : "Submitted by another validator - not your earnings."
+                      ? "Submitted by your address. A raw 0x16 claim is not payment."
+                      : "Submitted by another address. A raw 0x16 claim is not payment."
                   }
                 >
-                  {a.rewardArc != null
-                    ? `+${a.rewardArc.toFixed(2)} ARC`
-                    : "network"}
+                  {a.mine ? "your claim" : "network claim"}
                 </div>
                 {/* Was openExternal to a hardcoded LAX :3200 URL — the wrong
                     host for this session and not a block explorer. Resolves

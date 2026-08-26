@@ -7,9 +7,9 @@ license.workspace = true
 
 [features]
 default = []
-# Declared so the `#[cfg(feature = "strict-tls")]` branches in transport.rs are
-# real, checkable configuration rather than dead code the compiler cannot see.
-# Off by default, so the built configuration is unchanged.
+# Fail-closed production guard. Certificate pinning is not implemented yet, so
+# enabling this feature deliberately stops transport startup instead of silently
+# retaining the accept-all testnet verifier.
 strict-tls = []
 
 [dependencies]

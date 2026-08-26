@@ -10,9 +10,7 @@
 #   3. How many peers is your node actually connected to?
 #   4. Is your dag_round advancing or stuck proposing blocks alone?
 #
-# Usage:
-#   curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc-diagnose.sh | bash
-#   # or:
+# Usage from a reviewed checkout:
 #   bash scripts/arc-diagnose.sh [--port 9944]
 #
 # After running, paste the output in Discord / GitHub issue if you need help.

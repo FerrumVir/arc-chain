@@ -46,13 +46,13 @@ REM=$(( N_LAYERS - BASE * RANGES ))
 STARTS=(); ENDS=()
 cursor=0
 for r in $(seq 0 $((RANGES - 1))); do
-    STARTS+=($cursor)
+    STARTS+=("$cursor")
     width=$BASE
     if [ "$r" -lt "$REM" ]; then
         width=$((width + 1))
     fi
     cursor=$((cursor + width))
-    ENDS+=($cursor)
+    ENDS+=("$cursor")
 done
 if [ "$cursor" -ne "$N_LAYERS" ]; then
     echo "ERROR: range layout mismatch ($cursor != $N_LAYERS)" >&2

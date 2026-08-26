@@ -38,6 +38,81 @@ const COORD_PAYLOAD = {
 };
 
 test.describe("Inference - coordinator fallback (Milestone A, #35)", () => {
+  test("paid settlement is visibly unavailable and free inference cannot trigger an escrow write", async ({
+    page,
+  }) => {
+    await seedOnboarded(page);
+    await page.addInitScript(() => {
+      (window as unknown as { __ARC_LIVE__: number }).__ARC_LIVE__ = 9090;
+    });
+
+    const postUrls: string[] = [];
+    page.on("request", (request) => {
+      if (request.method() === "POST") postUrls.push(request.url());
+    });
+    await page.route("**/inference/run", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          inference: {
+            input: "Free path",
+            output: "Still available.",
+            output_hash: "0xaaaa",
+            model_hash: "0xbbbb",
+            tokens_generated: 2,
+            inference_ms: 10,
+            deterministic: true,
+            engine: "local-int16",
+          },
+          attestation: { tx_hash: "" },
+        }),
+      }),
+    );
+    await page.route("**/health", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          peers: 1,
+          uptime_secs: 60,
+          version: "test",
+          dag_round: 1,
+          dag_committed: 1,
+          height: 1,
+          validators: 1,
+        }),
+      }),
+    );
+
+    await page.goto("/");
+    await page.getByTestId("nav-inference").click();
+    const unavailable = page.getByTestId("paid-mode-unavailable");
+    await expect(unavailable).toContainText("Testnet escrow is unavailable");
+    await expect(unavailable).toContainText("will not sign or submit");
+    await expect(unavailable).toContainText("Free/community inference remains available");
+    await expect(unavailable).toContainText(
+      "VRF or replica selection is not validator payment approval",
+    );
+    await expect(page.getByTestId("paid-mode-toggle")).toHaveCount(0);
+    await expect(page.getByTestId("inference-max-fee")).toHaveCount(0);
+    await expect(page.getByTestId("btn-run-inference")).toContainText(
+      "Run inference",
+    );
+
+    await page.getByTestId("inference-prompt").fill("Free path");
+    await page.getByTestId("btn-run-inference").click();
+    await expect(page.getByTestId("inference-output")).toContainText(
+      "Still available",
+    );
+    expect(postUrls).toHaveLength(1);
+    expect(new URL(postUrls[0]).pathname).toBe("/inference/run");
+    expect(postUrls.some((url) => url.includes("submit_signed"))).toBe(false);
+    expect(postUrls.some((url) => url.includes("/inference/onchain/"))).toBe(
+      false,
+    );
+  });
+
   test("observer node (local 503) falls back to coordinator and renders consensus panel", async ({
     page,
   }) => {
@@ -104,6 +179,12 @@ test.describe("Inference - coordinator fallback (Milestone A, #35)", () => {
     await expect(banner).toContainText("48/48");
     await expect(banner).toContainText("unanimous");
     await expect(banner).toContainText("k=3");
+    await expect(banner).toContainText("coordinator reports");
+    // This payload has no claim transaction. Coordinator agreement is
+    // recomputation evidence; the UI must not invent a claim or payment.
+    await expect(page.getByTestId("inference-result")).not.toContainText(
+      /reward|paid|ARC/,
+    );
 
     // Output text is the coordinator's real answer, not the mock stub.
     await expect(page.getByTestId("inference-output")).toContainText(
@@ -185,6 +266,12 @@ test.describe("Inference - coordinator fallback (Milestone A, #35)", () => {
     await expect(banner).toBeVisible();
     await expect(banner).toContainText("your node");
     await expect(banner).not.toContainText("k=");
+    await expect(banner).toContainText(
+      "no independent replica-agreement evidence returned",
+    );
+    await expect(page.getByTestId("inference-result")).toContainText(
+      "serving host reports deterministic",
+    );
     expect(hitConsensus).toBe(false);
   });
 });

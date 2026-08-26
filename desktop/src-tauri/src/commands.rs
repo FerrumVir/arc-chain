@@ -1,7 +1,8 @@
 use crate::node_manager::{managed_binary_path, TestnetResources};
 use crate::types::*;
 use crate::{hardware, identity, paths, rpc_client, AppState};
-use std::io::Write as _;
+use sha2::{Digest as _, Sha256};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt as AutostartManagerExt;
@@ -871,19 +872,20 @@ pub async fn run_inference_via_coordinator_direct(
     ))
 }
 
-/// Tier 1 on-chain inference: submit an InferenceRequest to one of the live
-/// testnet seed VPSes via its `/inference/onchain/submit` convenience endpoint.
-/// The seed signs with its validator keypair and forwards to its mempool.
+const SETTLEMENT_WRITE_UNAVAILABLE: &str =
+    "is unavailable in the v0.7.12 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
+
+fn settlement_write_unavailable<T>(flow: &str) -> CmdResult<T> {
+    Err(format!("{} {}", flow, SETTLEMENT_WRITE_UNAVAILABLE))
+}
+
+/// Tier 1 settlement is intentionally unavailable in this recovery candidate.
 ///
-/// Picks a random host from `TIER1_HOSTS` (shuffled, then tried in order) so
-/// load spreads across the 6 seeds. The picked host is pinned to the returned
-/// request_id in `state.tier1_routes`, because each seed runs its own chain
-/// with a different `anchor_height` — polling a different seed for the result
-/// would 404.
-///
-/// `ARC_TIER1_RPC` env var, if set, overrides the host list (used for local
-/// dev: `ARC_TIER1_RPC=http://127.0.0.1:9090`). See
-/// `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
+/// This command used to derive a model ID from a static shape label, use VRF
+/// selection as though it authorized spend, and submit an
+/// `InferenceRequest` before the validator-approval protocol was complete.
+/// Its body now returns a typed error without probing a host, reading a nonce,
+/// signing a transaction, or performing any network write.
 #[tauri::command]
 pub async fn tier1_submit(
     state: State<'_, AppState>,
@@ -893,159 +895,20 @@ pub async fn tier1_submit(
     deadline_blocks: Option<u64>,
     committee_size: Option<u8>,
 ) -> CmdResult<rpc_client::Tier1Submitted> {
-    use ed25519_dalek::Signer;
-
-    // Pull the user's keypair so the InferenceRequest tx is signed by
-    // the user — not the seed validator's convenience endpoint. The
-    // resulting tx.from = user, which arc-state's apply path stores as
-    // `tier1.requester`. When the seed votes, it reads that back and
-    // sets it as the `beneficiary` on the InferenceAttestation, so
-    // /worker/earnings credits the user (Option C).
-    let phrase = {
-        let store = state.store.lock().await;
-        store
-            .identity
-            .as_ref()
-            .map(|i| i.seed_phrase.clone())
-            .ok_or_else(|| "no identity - run onboarding first".to_string())?
-    };
-    let signing_key = keypair_from_phrase(&phrase);
-    let public_key = signing_key.verifying_key().to_bytes();
-    let payer_addr = arc_crypto::Hash256(*blake3::hash(&public_key).as_bytes());
-
-    let candidates = tier1_candidate_hosts();
-    let mut last_err = String::from("no tier1 hosts configured");
-
-    let max_tokens = max_tokens.unwrap_or(32);
-    let max_reward = max_reward.unwrap_or(10);
-    let deadline_blocks = deadline_blocks.unwrap_or(20);
-    // Alpha is a solo chain with 1 validator — committee_size > 1 stalls
-    // forever waiting for votes that will never come. Default to 1 so
-    // requests finalize on alpha. Users can still override via the
-    // Inference UI's committee_size input when targeting multi-validator
-    // chains in the future.
-    let committee_size = committee_size.unwrap_or(1);
-
-    for host in &candidates {
-        // Fetch the user's current nonce and the chain's current height
-        // (used in the deterministic request_id derivation).
-        // No `0x` prefix — the /account handler requires bare 64-hex.
-        // With the prefix it returns 400 "Invalid address", fallback in
-        // the match below uses nonce=0 and every submit after the first
-        // gets rejected at apply with InvalidNonce.
-        let account_url = format!(
-            "{}/account/{}",
-            host,
-            hex::encode(&payer_addr.0)
-        );
-        let nonce: u64 = match state.http.get(&account_url).send().await {
-            Ok(r) if r.status().is_success() => r
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("nonce").and_then(|n| n.as_u64()))
-                .unwrap_or(0),
-            _ => 0,
-        };
-        let height_url = format!("{}/health", host);
-        let height: u64 = match state.http.get(&height_url).send().await {
-            Ok(r) if r.status().is_success() => r
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v.get("height").and_then(|n| n.as_u64()))
-                .unwrap_or(0),
-            _ => 0,
-        };
-
-        // request_id mirrors the chain's derivation in
-        // arc-node/src/rpc.rs:inference_onchain_submit, so the
-        // generated id is the same one apply uses to key the escrow.
-        let input_blob = prompt.as_bytes().to_vec();
-        let input_hash = arc_crypto::hash_bytes(&input_blob);
-        let mut id_input = Vec::with_capacity(72);
-        id_input.extend_from_slice(&payer_addr.0);
-        id_input.extend_from_slice(&input_hash.0);
-        id_input.extend_from_slice(&height.to_le_bytes());
-        let request_id_hash = arc_crypto::hash_bytes(&id_input);
-        let request_id = request_id_hash.0;
-
-        let model_id = arc_crypto::hash_bytes(b"arc-32L-test");
-        let body = arc_types::transaction::InferenceRequestBody {
-            request_id,
-            model_id,
-            input_hash,
-            input_blob,
-            max_tokens,
-            tier: 1,
-            max_reward,
-            deadline_blocks,
-            committee_size,
-        };
-        let mut tx = arc_types::Transaction {
-            tx_type: arc_types::TxType::InferenceRequest,
-            from: payer_addr,
-            nonce,
-            body: arc_types::TxBody::InferenceRequest(body),
-            fee: 0,
-            gas_limit: 0,
-            hash: arc_crypto::Hash256::ZERO,
-            signature: arc_crypto::Signature::null(),
-            sig_verified: false,
-        };
-        tx.hash = tx.compute_hash();
-        let sig = signing_key.sign(tx.hash.as_bytes());
-        tx.signature = arc_crypto::Signature::Ed25519 {
-            public_key,
-            signature: sig.to_bytes().to_vec(),
-        };
-        let tx_hash = tx.hash;
-
-        let resp = state
-            .http
-            .post(format!("{}/tx/submit_signed", host))
-            .json(&tx)
-            .send()
-            .await;
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let request_id_hex = format!("0x{}", hex::encode(&request_id));
-                state
-                    .tier1_routes
-                    .lock()
-                    .await
-                    .insert(request_id_hex.clone(), host.clone());
-                return Ok(rpc_client::Tier1Submitted {
-                    request_id: request_id_hex,
-                    tx_hash: tx_hash.to_hex(),
-                    anchor_height: height,
-                    committee_size,
-                    deadline_blocks,
-                    max_reward,
-                });
-            }
-            Ok(r) => {
-                let status = r.status();
-                let body = r.text().await.unwrap_or_default();
-                last_err = format!("{}: HTTP {} - {}", host, status, body);
-                tracing::warn!("tier1_submit fallback: {}", last_err);
-            }
-            Err(e) => {
-                last_err = format!("{}: {}", host, e);
-                tracing::warn!("tier1_submit fallback: {}", last_err);
-            }
-        }
-    }
-    Err(format!(
-        "all {} tier1 hosts failed; last: {}",
-        candidates.len(),
-        last_err
-    ))
+    let _ = (
+        state,
+        prompt,
+        max_tokens,
+        max_reward,
+        deadline_blocks,
+        committee_size,
+    );
+    settlement_write_unavailable("Tier 1 on-chain inference")
 }
 
-/// Poll the chain for the on-chain state of a Tier 1 request. Called every
-/// 500 ms from the desktop UI until status transitions to a terminal value.
-/// Looks up the host that accepted the original submit from
+/// Read the on-chain state of a Tier 1 request created by an older build.
+/// The current desktop does not submit or poll new requests. This read-only
+/// compatibility path looks up the host that accepted the original submit from
 /// `state.tier1_routes`; if missing (e.g. app restart between submit and
 /// poll), falls back to scanning every host.
 #[tauri::command]
@@ -1093,16 +956,8 @@ fn tier1_candidate_hosts() -> Vec<String> {
     hosts
 }
 
-/// Tier 1 inference hosts — same 5 testnet seeds the wallet reads
-/// from. Requires the v0.7.6 BlockSTM fix to be deployed on the seeds
-/// for InferenceRequest tx to actually land. Before v0.7.6 the
-/// speculative executor silently dropped the tx; the alpha solo host
-/// was the temporary stopgap. With v0.7.6 rolled out, alpha retires
-/// and tier 1 lives on the public testnet alongside everything else.
-///
-/// NYC was missing from this list. It is a live seed and, for long stretches,
-/// the healthiest one — so both the coordinator fallback and the chain-host
-/// election were choosing among five hosts while ignoring the sixth.
+/// Candidate hosts for free coordinator inference and read-only compatibility
+/// queries. New paid/Tier 1 request writes are disabled above.
 const COORDINATOR_HOSTS: [&str; 6] = [
     "http://149.28.32.76:9090",   // NYC
     "http://140.82.16.112:9090",  // LAX
@@ -1126,39 +981,14 @@ const WALLET_HOSTS: [&str; 6] = [
     "http://149.28.153.31:9090",  // SGP
 ];
 
-/// Milestone B (#36): testnet model commitment. Both ends - the
-/// InferenceEscrowOpen tx and the InferenceEscrowRelease tx the
-/// coordinator will auto-submit - must use the same value or the
-/// state-layer metadata-hash check rejects the release.
-fn testnet_model_id() -> arc_crypto::Hash256 {
-    arc_crypto::hash_bytes(b"arc-testnet-llama-2-7b-chat-q4")
-}
-
-/// Milestone B default escrow timeout (in blocks). Conservative enough
-/// that a slow 50s/token run_consensus pass can't auto-refund out from
-/// under the coordinator before it submits the release.
-const DEFAULT_ESCROW_TIMEOUT_BLOCKS: u64 = 10_000;
-
-/// Default "Pay N ARC" max_fee for the UI. Matches the PLAN.md example
-/// (Alice pays 10 ARC × 10 inferences = 100 ARC debited).
-const DEFAULT_MAX_FEE: u64 = 10_000;
-
-/// Derive the signing keypair from a BIP-39 phrase the same way
-/// `identity::derive` does. Duplicated (not factored) because
-/// `identity::derive` returns an opaque `Identity` struct meant for the
-/// UI; here we need the raw `SigningKey` so we can put the public key
-/// into the Transaction's signature slot.
-fn keypair_from_phrase(phrase: &str) -> ed25519_dalek::SigningKey {
-    const DOMAIN_TAG: &str = "ARC-chain-validator-keypair-v1";
-    let seed_bytes = blake3::derive_key(DOMAIN_TAG, phrase.trim().as_bytes());
-    ed25519_dalek::SigningKey::from_bytes(&seed_bytes)
-}
-
-/// Milestone B (#36): open an inference-escrow on a coordinator, then
-/// call `/inference/run_consensus` against it. The coordinator validates
-/// the escrow is present before running model work, and on success
-/// auto-submits the release tx that pays out 40/25/15/20 to
-/// proposer / replicas / observer pool / treasury.
+/// Paid inference escrow is intentionally unavailable in this recovery
+/// candidate.
+///
+/// The removed implementation opened escrow using a label-derived model ID
+/// before asking the coordinator to run the exact artifact. A candidate
+/// coordinator then rejected the mismatch, leaving funds locked until timeout.
+/// This command now returns an error before identity access, host probing,
+/// signing, nonce reads, transaction submission, or any other network write.
 #[tauri::command]
 pub async fn run_paid_inference(
     state: State<'_, AppState>,
@@ -1167,214 +997,8 @@ pub async fn run_paid_inference(
     max_fee: Option<u64>,
     k: Option<u32>,
 ) -> CmdResult<PaidInferenceResult> {
-    use ed25519_dalek::Signer;
-
-    let phrase = {
-        let store = state.store.lock().await;
-        store
-            .identity
-            .as_ref()
-            .map(|i| i.seed_phrase.clone())
-            .ok_or_else(|| "no identity - run onboarding first".to_string())?
-    };
-    let signing_key = keypair_from_phrase(&phrase);
-    let public_key = signing_key.verifying_key().to_bytes();
-    // ARC address = BLAKE3(public_key) - matches chain derivation.
-    let payer_addr = arc_crypto::Hash256(*blake3::hash(&public_key).as_bytes());
-
-    // Pick the best reachable coordinator (parallel probe, local first).
-    // The escrow is opened against whichever host is chosen, so this must
-    // resolve before any transaction is signed.
-    let probe = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(6))
-        .build()
-        .map_err(map_err)?;
-    let coord_url = coordinator_candidates(&state)
-        .await
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            "no coordinator reachable - every testnet seed timed out on /health".to_string()
-        })?;
-
-    // Pull the payer's current on-chain nonce so the open tx lands.
-    let account_url = format!(
-        "{}/account/0x{}",
-        coord_url,
-        hex::encode(&payer_addr.0)
-    );
-    let nonce: u64 = match probe.get(&account_url).send().await {
-        Ok(r) if r.status().is_success() => r
-            .json::<serde_json::Value>()
-            .await
-            .ok()
-            .and_then(|v| v.get("nonce").and_then(|n| n.as_u64()))
-            .unwrap_or(0),
-        _ => 0,
-    };
-
-    let mut request_id = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut request_id);
-    let model_id = testnet_model_id();
-    let max_tokens = max_tokens.unwrap_or(32);
-    let max_fee = max_fee.unwrap_or(DEFAULT_MAX_FEE);
-    let timeout_blocks = DEFAULT_ESCROW_TIMEOUT_BLOCKS;
-
-    // Build + sign the InferenceEscrowOpen tx.
-    let body = arc_types::transaction::InferenceEscrowOpenBody {
-        request_id,
-        model_id,
-        max_fee,
-        max_tokens,
-        timeout_blocks,
-    };
-    let mut tx = arc_types::Transaction {
-        tx_type: arc_types::TxType::InferenceEscrowOpen,
-        from: payer_addr,
-        nonce,
-        body: arc_types::TxBody::InferenceEscrowOpen(body),
-        fee: 0,
-        gas_limit: 0,
-        hash: arc_crypto::Hash256::ZERO,
-        signature: arc_crypto::Signature::null(),
-        sig_verified: false,
-    };
-    tx.hash = tx.compute_hash();
-    let sig = signing_key.sign(tx.hash.as_bytes());
-    tx.signature = arc_crypto::Signature::Ed25519 {
-        public_key,
-        signature: sig.to_bytes().to_vec(),
-    };
-    let open_tx_hash = tx.hash;
-
-    let submit_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(map_err)?;
-    let open_resp = submit_client
-        .post(format!("{}/tx/submit_signed", coord_url))
-        .json(&tx)
-        .send()
-        .await
-        .map_err(map_err)?;
-    if !open_resp.status().is_success() {
-        return Err(format!(
-            "escrow open failed: {} - payer=0x{} nonce={}",
-            open_resp.status(),
-            hex::encode(&payer_addr.0),
-            nonce
-        ));
-    }
-
-    // Wait for the open tx to commit (mempool → block). ≤ 15s × 200ms.
-    let open_hash_hex = hex::encode(&open_tx_hash.0);
-    let mut committed = false;
-    for _ in 0..75 {
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Ok(r) = submit_client
-            .get(format!("{}/tx/0x{}", coord_url, open_hash_hex))
-            .send()
-            .await
-        {
-            if r.status().is_success() {
-                committed = true;
-                break;
-            }
-        }
-    }
-    if !committed {
-        return Err(format!(
-            "escrow open tx did not commit within 15s (hash=0x{})",
-            open_hash_hex
-        ));
-    }
-
-    // Run inference with the escrow-gated flags.
-    //
-    // The prompt is sent raw with `chat_template: true` rather than wrapped
-    // client-side in `[INST] ... [/INST]`. The node applies the model's own
-    // template from GGUF metadata, which is correct for whatever model is
-    // actually loaded; hardcoding Llama-2's tags corrupted the prompt for
-    // every other architecture and double-wrapped when the node templated
-    // too.
-    let k = k.unwrap_or(3);
-    let infer_client = inference_client()?;
-    let infer_resp = infer_client
-        .post(format!("{}/inference/run_consensus", coord_url))
-        .json(&serde_json::json!({
-            "input": prompt,
-            "chat_template": true,
-            "max_tokens": max_tokens,
-            "k": k,
-            "payer": format!("0x{}", hex::encode(&payer_addr.0)),
-            "request_id": format!("0x{}", hex::encode(&request_id)),
-            "max_fee": max_fee,
-            "model_id": format!("0x{}", hex::encode(&model_id.0)),
-            "timeout_blocks": timeout_blocks,
-        }))
-        .send()
-        .await
-        .map_err(map_err)?;
-    if !infer_resp.status().is_success() {
-        return Err(format!(
-            "run_consensus failed: {} (escrow will refund after {} blocks)",
-            infer_resp.status(),
-            timeout_blocks
-        ));
-    }
-    let v: serde_json::Value = infer_resp.json().await.map_err(map_err)?;
-    let c = v.get("consensus").cloned().unwrap_or(serde_json::Value::Null);
-    let escrow_block = v.get("escrow").cloned().unwrap_or(serde_json::Value::Null);
-
-    Ok(PaidInferenceResult {
-        input: v
-            .get("input")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        output: v
-            .get("output")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        output_hash: v
-            .get("output_hash")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        tokens_generated: v
-            .get("tokens_generated")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-        inference_ms: v
-            .get("total_ms")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u32,
-        coordinator: coord_url,
-        consensus: InferenceConsensus {
-            k: c.get("k").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-            votes_total: c
-                .get("votes_total")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0) as u32,
-            unanimous: c.get("unanimous").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-            majority: c.get("majority").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-            split: c.get("split").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
-            divergent_replica_count: c
-                .get("divergent_replicas")
-                .and_then(|x| x.as_object())
-                .map(|m| m.len() as u32)
-                .unwrap_or(0),
-        },
-        payer_address: format!("0x{}", hex::encode(&payer_addr.0)),
-        max_fee,
-        open_tx_hash: format!("0x{}", open_hash_hex),
-        release_tx_hash: escrow_block
-            .get("release_tx_hash")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-    })
+    let _ = (state, prompt, max_tokens, max_fee, k);
+    settlement_write_unavailable("Paid inference escrow")
 }
 
 // `check_for_update` (GitHub releases API) was deleted here deliberately.
@@ -1542,12 +1166,59 @@ pub async fn set_worker_threads(
 /// a previous release sitting in ~/.arc/bin and must redownload, otherwise
 /// chain bug fixes never reach existing users on auto-update.
 const EXPECTED_NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
+const ARC_RELEASE_DOWNLOAD_ROOT: &str =
+    "https://github.com/FerrumVir/arc-chain/releases/download";
+const MAX_NODE_BINARY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CHECKSUM_MANIFEST_BYTES: usize = 1024 * 1024;
+
+fn exact_release_asset_url(asset: &str) -> String {
+    format!(
+        "{}/v{}/{}",
+        ARC_RELEASE_DOWNLOAD_ROOT, EXPECTED_NODE_VERSION, asset
+    )
+}
+
+/// Read one GNU/BSD-style SHA256SUMS entry without accepting an ambiguous or
+/// path-substituted match. The release assembler emits exactly this shape.
+fn expected_release_sha256(manifest: &str, asset: &str) -> Result<[u8; 32], String> {
+    let mut matches = manifest.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let digest = fields.next()?;
+        let filename = fields.next()?;
+        if fields.next().is_some() || filename.trim_start_matches('*') != asset {
+            return None;
+        }
+        Some(digest)
+    });
+
+    let digest = matches
+        .next()
+        .ok_or_else(|| format!("SHA256SUMS has no entry for {}", asset))?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "SHA256SUMS has more than one entry for {}",
+            asset
+        ));
+    }
+    let decoded = hex::decode(digest)
+        .map_err(|_| format!("SHA256SUMS has invalid hex for {}", asset))?;
+    decoded
+        .try_into()
+        .map_err(|_| format!("SHA256SUMS has a non-SHA-256 digest for {}", asset))
+}
+
+fn binary_download_sidecar(target: &Path) -> PathBuf {
+    match target.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) => target.with_extension(format!("download.{}", extension)),
+        None => target.with_extension("download"),
+    }
+}
 
 /// First-launch readiness check. Confirms the bundled testnet resources are
 /// resolvable AND the arc-node binary is present at the version this desktop
 /// was built against. If the binary is missing OR its `--version` doesn't
 /// match this desktop's `CARGO_PKG_VERSION`, downloads the matching arc-node
-/// binary from the latest GitHub release for this platform. The onboarding
+/// binary from that exact immutable release for this platform. The onboarding
 /// screen calls this before launching the node, and `start_node` also calls
 /// it on every start so existing users picked up by the desktop auto-updater
 /// always get the matching arc-node binary instead of running a stale one.
@@ -1565,16 +1236,15 @@ fn installed(path: &Path) -> BinaryStatus {
     }
 }
 
-/// Make sure *some* runnable arc-node exists, and prefer a current one.
+/// Make sure a runnable arc-node exists at the exact desktop version.
 ///
-/// The governing rule, learned the hard way: **a usable binary that is
-/// present must never be blocked by a failed refresh.** The previous version
-/// returned `Err` on any non-200 from GitHub, and `start_node` propagated it
-/// with `?`. Because v0.7.10 and v0.7.11 were both published desktop-only via
-/// `workflow_dispatch`, the release carries no `arc-node-*` assets at all, so
-/// that download 404s on every platform — and every Start click, on every
-/// machine, failed before arc-node was ever spawned. A stale arc-node beats
-/// no arc-node; no arc-node beats nothing.
+/// v0.7.10 and v0.7.11 were published without `arc-node-*` assets, which made
+/// every refresh return 404. Continuing with an older managed binary looked
+/// friendlier but silently paired incompatible protocols after upgrades. The
+/// unified release now makes a missing exact asset/checksum a publication
+/// failure; the desktop therefore fails closed instead of pretending a stale
+/// node is current. Operators who intentionally maintain a custom binary can
+/// select it explicitly with `ARC_NODE_BIN`.
 ///
 /// Resolution order mirrors `node_manager::resolve_binary` so the thing this
 /// function blesses is the thing that actually gets spawned.
@@ -1594,12 +1264,9 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
 
     let target = managed_binary_path();
 
-    // 2. A binary already in the managed location. Compare versions and
-    //    *warn* — do not force a redownload. A hand-built or locally patched
-    //    arc-node is a deliberate act; clobbering it because its version
-    //    string differs from the desktop's is user-hostile, and with the
-    //    release assets missing it replaces something that works with
-    //    nothing at all. Only a genuinely OLDER binary is worth refreshing.
+    // 2. A binary already in the managed location. Exact matches are reused;
+    //    older copies are replaced, and newer/unparseable copies stop with a
+    //    clear mismatch instead of silently coupling incompatible versions.
     if target.exists() {
         match read_arc_node_version(&target) {
             Some(ref v) if v == EXPECTED_NODE_VERSION => return Ok(installed(&target)),
@@ -1610,13 +1277,16 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
                         v, target.display(), EXPECTED_NODE_VERSION
                     );
                     // Fall through to the download attempt below.
+                } else if semver_gt(&v, EXPECTED_NODE_VERSION) {
+                    return Err(format!(
+                        "managed arc-node v{} is newer than desktop v{}. Upgrade the desktop, or set ARC_NODE_BIN explicitly if this pairing is intentional",
+                        v, EXPECTED_NODE_VERSION
+                    ));
                 } else {
-                    tracing::warn!(
-                        "arc-node {} at {} does not match this desktop's {} - keeping it \
-                         (newer or unrecognized versions are left alone)",
-                        v, target.display(), EXPECTED_NODE_VERSION
-                    );
-                    return Ok(installed(&target));
+                    return Err(format!(
+                        "managed arc-node at {} reports unrecognized version '{}'; expected v{}",
+                        target.display(), v, EXPECTED_NODE_VERSION
+                    ));
                 }
             }
             None => {
@@ -1634,9 +1304,8 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
         return Ok(installed(&dev));
     }
 
-    // 4. Download. Any failure past this point is non-fatal when we already
-    //    have something to run.
-    let have_fallback = target.exists();
+    // 4. Download the exact release. An older or corrupt managed binary is not
+    //    a valid fallback across a protocol-version boundary.
     match download_arc_node(&target).await {
         Ok(total_bytes) => {
             let _ = app; // reserved for progress events via app.emit(...)
@@ -1646,13 +1315,6 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
                 total_bytes,
                 already_installed: false,
             })
-        }
-        Err(e) if have_fallback => {
-            tracing::warn!(
-                "arc-node refresh failed ({}) - continuing with the existing binary at {}",
-                e, target.display()
-            );
-            Ok(installed(&target))
         }
         Err(e) => {
             // Last chance: a dev build we skipped earlier because the
@@ -1682,22 +1344,42 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
             std::env::consts::ARCH
         )
     })?;
-    let url = format!(
-        "https://github.com/FerrumVir/arc-chain/releases/latest/download/{}",
-        asset
-    );
+    let url = exact_release_asset_url(asset);
+    let checksum_url = exact_release_asset_url("SHA256SUMS");
 
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent).map_err(map_err)?;
     }
 
     let client = reqwest::Client::builder()
-        .user_agent("arc-desktop/0.1")
+        .user_agent(format!("arc-desktop/{}", EXPECTED_NODE_VERSION))
         .timeout(std::time::Duration::from_secs(600))
         .build()
         .map_err(map_err)?;
 
-    let resp = client.get(&url).send().await.map_err(map_err)?;
+    let checksum_resp = client.get(&checksum_url).send().await.map_err(map_err)?;
+    if !checksum_resp.status().is_success() {
+        return Err(format!(
+            "release checksum manifest returned HTTP {} for v{}",
+            checksum_resp.status(),
+            EXPECTED_NODE_VERSION
+        ));
+    }
+    if checksum_resp
+        .content_length()
+        .is_some_and(|length| length > MAX_CHECKSUM_MANIFEST_BYTES as u64)
+    {
+        return Err("release checksum manifest exceeds the 1 MiB safety limit".to_string());
+    }
+    let checksum_bytes = checksum_resp.bytes().await.map_err(map_err)?;
+    if checksum_bytes.len() > MAX_CHECKSUM_MANIFEST_BYTES {
+        return Err("release checksum manifest exceeds the 1 MiB safety limit".to_string());
+    }
+    let checksum_manifest = std::str::from_utf8(&checksum_bytes)
+        .map_err(|_| "release checksum manifest is not UTF-8".to_string())?;
+    let expected_sha256 = expected_release_sha256(checksum_manifest, asset)?;
+
+    let mut resp = client.get(&url).send().await.map_err(map_err)?;
     if !resp.status().is_success() {
         return Err(format!(
             "release asset {} returned HTTP {}",
@@ -1705,13 +1387,79 @@ async fn download_arc_node(target: &Path) -> Result<u64, String> {
             resp.status()
         ));
     }
-    let total_bytes = resp.content_length().unwrap_or(0);
-    let tmp = target.with_extension("download");
+    if resp
+        .content_length()
+        .is_some_and(|length| length > MAX_NODE_BINARY_BYTES)
     {
-        let mut file = std::fs::File::create(&tmp).map_err(map_err)?;
-        let bytes = resp.bytes().await.map_err(map_err)?;
-        file.write_all(&bytes).map_err(map_err)?;
-        file.sync_all().ok();
+        return Err(format!(
+            "release asset {} exceeds the 512 MiB safety limit",
+            asset
+        ));
+    }
+    let tmp = binary_download_sidecar(target);
+    let mut file = tokio::fs::File::create(&tmp).await.map_err(map_err)?;
+    let mut hasher = Sha256::new();
+    let mut total_bytes = 0u64;
+    loop {
+        let chunk = match resp.chunk().await {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => break,
+            Err(error) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(format!(
+                    "release asset {} failed after {} bytes: {}",
+                    asset, total_bytes, error
+                ));
+            }
+        };
+        total_bytes = total_bytes.saturating_add(chunk.len() as u64);
+        if total_bytes > MAX_NODE_BINARY_BYTES {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(format!(
+                "release asset {} exceeds the 512 MiB safety limit",
+                asset
+            ));
+        }
+        hasher.update(&chunk);
+        if let Err(error) = file.write_all(&chunk).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(format!("write {}: {}", tmp.display(), error));
+        }
+    }
+    file.flush().await.map_err(map_err)?;
+    file.sync_all().await.map_err(map_err)?;
+    drop(file);
+
+    let actual_sha256: [u8; 32] = hasher.finalize().into();
+    if actual_sha256 != expected_sha256 {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!(
+            "checksum verification failed for {} (expected {}, got {})",
+            asset,
+            hex::encode(expected_sha256),
+            hex::encode(actual_sha256)
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(&tmp, perms).map_err(map_err)?;
+    }
+    let downloaded_version = read_arc_node_version(&tmp).ok_or_else(|| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("downloaded {} did not report a parseable version", asset)
+    })?;
+    if downloaded_version != EXPECTED_NODE_VERSION {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "downloaded {} reports v{}, expected v{}",
+            asset, downloaded_version, EXPECTED_NODE_VERSION
+        ));
     }
 
     install_over(&tmp, target)?;
@@ -1771,10 +1519,13 @@ fn install_over(tmp: &Path, target: &Path) -> Result<(), String> {
 /// Compares major.minor.patch numerically. Falls back to false on parse error.
 fn semver_gt(a: &str, b: &str) -> bool {
     let parse = |s: &str| -> Option<(u64, u64, u64)> {
-        let mut parts = s.trim().splitn(3, '.');
+        let mut parts = s.trim().split('.');
         let maj = parts.next()?.parse().ok()?;
         let min = parts.next()?.parse().ok()?;
-        let pat = parts.next().and_then(|p| p.split('-').next()).and_then(|p| p.parse().ok()).unwrap_or(0);
+        let pat = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
         Some((maj, min, pat))
     };
     match (parse(a), parse(b)) {
@@ -1853,7 +1604,7 @@ fn resolve_testnet_resources(app: &AppHandle) -> TestnetResources {
 // from TheBloke's GGUF mirrors:
 //   tiny     ~669 MB   TinyLlama-1.1B-Chat   - laptops without GPU, mobile-class
 //   standard ~4.08 GB  Llama-2-7B-Chat       - 16GB+ RAM, the network's primary tier
-//   big      ~7.87 GB  Llama-2-13B-Chat      - workstations w/ GPU, top earner
+//   big      ~7.87 GB  Llama-2-13B-Chat      - workstations w/ GPU
 //
 // Llama-2-70B (~39 GB) intentionally not in the auto-download set: too large
 // to push through a one-click onboarding without scaring users. Operators
@@ -1864,6 +1615,9 @@ struct ModelTierSpec {
     display_name: &'static str,
     url: &'static str,
     size_bytes: u64,
+    /// SHA-256 from the repository's immutable LFS object ID. URLs may move,
+    /// but a desktop-selected tier must always resolve to these exact bytes.
+    sha256: &'static str,
 }
 
 const MODEL_TIERS: &[ModelTierSpec] = &[
@@ -1871,21 +1625,59 @@ const MODEL_TIERS: &[ModelTierSpec] = &[
         id: "tiny",
         display_name: "TinyLlama 1.1B (Q4_K_M)",
         url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        size_bytes: 669_262_336,
+        size_bytes: 668_788_096,
+        sha256: "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0",
     },
     ModelTierSpec {
         id: "standard",
         display_name: "Llama-2 7B Chat (Q4_K_M)",
         url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
-        size_bytes: 4_081_004_544,
+        size_bytes: 4_081_004_224,
+        sha256: "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa",
     },
     ModelTierSpec {
         id: "big",
         display_name: "Llama-2 13B Chat (Q4_K_M)",
         url: "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_K_M.gguf",
-        size_bytes: 7_866_070_016,
+        size_bytes: 7_865_956_224,
+        sha256: "7ddfe27f61bf994542c22aca213c46ecbd8a624cca74abff02a7b5a8c18f787f",
     },
 ];
+
+fn model_digest(spec: &ModelTierSpec) -> Result<[u8; 32], String> {
+    let decoded = hex::decode(spec.sha256)
+        .map_err(|_| format!("invalid built-in SHA-256 for model tier {}", spec.id))?;
+    decoded
+        .try_into()
+        .map_err(|_| format!("invalid built-in SHA-256 length for model tier {}", spec.id))
+}
+
+fn verify_model_file(path: &Path, spec: &ModelTierSpec) -> Result<bool, String> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("inspect {}: {}", path.display(), error)),
+    };
+    if !metadata.is_file() || metadata.len() != spec.size_bytes {
+        return Ok(false);
+    }
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| format!("open {}: {}", path.display(), error))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| format!("read {}: {}", path.display(), error))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual: [u8; 32] = hasher.finalize().into();
+    Ok(actual == model_digest(spec)?)
+}
 
 fn tier_spec(id: &str) -> Option<&'static ModelTierSpec> {
     MODEL_TIERS.iter().find(|t| t.id == id)
@@ -1937,64 +1729,50 @@ pub async fn recommended_tier() -> CmdResult<String> {
     Ok(tier.into())
 }
 
-/// Returns `Some(path)` if the matching tier's GGUF is already on disk and
-/// looks at least mostly downloaded (size within 1% of expected). Frontend
-/// uses this to skip the download step on a re-install or after the upgrade
-/// flow ran successfully.
+/// Returns `Some(path)` only when the matching tier's GGUF is byte-for-byte
+/// the pinned artifact. Hashing runs off the async worker because these files
+/// are multi-gigabyte. A same-size mutation must never be treated as ready.
 #[tauri::command]
 pub async fn existing_model_for_tier(tier: String) -> CmdResult<Option<String>> {
     let Some(spec) = tier_spec(&tier) else { return Ok(None) };
     let p = model_path_for(&tier);
-    if !p.exists() {
-        return Ok(None);
-    }
-    let metadata = match std::fs::metadata(&p) {
-        Ok(m) => m,
-        Err(_) => return Ok(None),
-    };
-    let actual = metadata.len();
-    let expected = spec.size_bytes;
-    // Within 1% tolerance — accommodates HF re-uploads with tiny size deltas
-    // without false-positiving on a half-downloaded file.
-    let tolerance = expected / 100;
-    if actual + tolerance < expected || actual > expected + tolerance {
-        return Ok(None);
-    }
-    Ok(Some(p.to_string_lossy().into_owned()))
+    let verify_path = p.clone();
+    let valid = tokio::task::spawn_blocking(move || verify_model_file(&verify_path, spec))
+        .await
+        .map_err(map_err)??;
+    Ok(valid.then(|| p.to_string_lossy().into_owned()))
 }
 
 /// Download the GGUF for `tier` to ~/.arc/models/<tier>.gguf, streaming
 /// progress events on the `model-download-progress` channel so the UI can
 /// render a real progress bar.
 ///
-/// Idempotent — if the target file already exists at the expected size,
-/// returns immediately without re-downloading. Atomically renames into place
-/// from a `.download` sidecar so a crashed mid-download leaves the previous
-/// good copy intact.
+/// Idempotent only for an exact pinned artifact. The stream is checked against
+/// both its exact LFS size and SHA-256 before an atomic rename from the
+/// `.download` sidecar, so a crash or mirror mutation cannot replace a known
+/// good model.
 #[tauri::command]
 pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     let spec = tier_spec(&tier)
         .ok_or_else(|| format!("unknown model tier: {}", tier))?;
     let target = model_path_for(&tier);
 
-    // Already downloaded at expected size → done.
-    if let Ok(meta) = std::fs::metadata(&target) {
-        let actual = meta.len();
-        let tolerance = spec.size_bytes / 100;
-        if actual + tolerance >= spec.size_bytes && actual <= spec.size_bytes + tolerance {
-            // Emit a final 100% progress so the UI doesn't hang on a stale
-            // "downloading" state when the model was already there.
-            let _ = app.emit(
-                "model-download-progress",
-                ModelDownloadProgress {
-                    tier: tier.clone(),
-                    downloaded_bytes: actual,
-                    total_bytes: spec.size_bytes,
-                    done: true,
-                },
-            );
-            return Ok(target.to_string_lossy().into_owned());
-        }
+    // Already downloaded and hash-verified → done.
+    let verify_path = target.clone();
+    if tokio::task::spawn_blocking(move || verify_model_file(&verify_path, spec))
+        .await
+        .map_err(map_err)??
+    {
+        let _ = app.emit(
+            "model-download-progress",
+            ModelDownloadProgress {
+                tier: tier.clone(),
+                downloaded_bytes: spec.size_bytes,
+                total_bytes: spec.size_bytes,
+                done: true,
+            },
+        );
+        return Ok(target.to_string_lossy().into_owned());
     }
 
     if let Some(parent) = target.parent() {
@@ -2020,7 +1798,15 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
             tier
         ));
     }
-    let total_bytes = resp.content_length().unwrap_or(spec.size_bytes);
+    if let Some(length) = resp.content_length() {
+        if length != spec.size_bytes {
+            return Err(format!(
+                "GGUF mirror reported {} bytes for tier {}, expected {}",
+                length, tier, spec.size_bytes
+            ));
+        }
+    }
+    let total_bytes = spec.size_bytes;
 
     let tmp = target.with_extension("download");
     let mut file = tokio::fs::File::create(&tmp)
@@ -2029,6 +1815,7 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
 
     let mut stream = resp;
     let mut downloaded: u64 = 0;
+    let mut hasher = Sha256::new();
     let mut last_emit = std::time::Instant::now();
     // Emit progress at most every 250ms. HF chunks tend to land in 8-64 KB
     // units; emitting on every chunk would flood the IPC channel and pin
@@ -2039,12 +1826,30 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
         let chunk = match stream.chunk().await {
             Ok(Some(c)) => c,
             Ok(None) => break,
-            Err(e) => return Err(format!("chunk read failed at {} bytes: {}", downloaded, e)),
+            Err(error) => {
+                drop(file);
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return Err(format!(
+                    "chunk read failed at {} bytes: {}",
+                    downloaded, error
+                ));
+            }
         };
-        downloaded += chunk.len() as u64;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("write to temp file: {}", e))?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        if downloaded > spec.size_bytes {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(format!(
+                "model tier {} exceeded its pinned size of {} bytes",
+                tier, spec.size_bytes
+            ));
+        }
+        hasher.update(&chunk);
+        if let Err(error) = file.write_all(&chunk).await {
+            drop(file);
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(format!("write to temp file: {}", error));
+        }
 
         if last_emit.elapsed() >= emit_every {
             let _ = app.emit(
@@ -2061,7 +1866,25 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
     }
 
     file.flush().await.map_err(map_err)?;
+    file.sync_all().await.map_err(map_err)?;
     drop(file);
+
+    if downloaded != spec.size_bytes {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!(
+            "model tier {} ended at {} bytes, expected {}",
+            tier, downloaded, spec.size_bytes
+        ));
+    }
+    let actual_sha256: [u8; 32] = hasher.finalize().into();
+    let expected_sha256 = model_digest(spec)?;
+    if actual_sha256 != expected_sha256 {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(format!(
+            "SHA-256 verification failed for model tier {}",
+            tier
+        ));
+    }
 
     // Atomic rename over any existing target. std::fs::rename uses
     // MoveFileEx(REPLACE_EXISTING) on Windows since Rust 1.62, so this
@@ -2105,3 +1928,139 @@ pub async fn remove_model(tier: String) -> CmdResult<()> {
 
 #[allow(dead_code)]
 fn _path_helper(_: &Path) {} // keep `Path` import used if `model_path_for` returns inline
+
+#[cfg(test)]
+mod release_binary_tests {
+    use super::*;
+
+    fn source_between<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start_at = source.find(start).expect("command start marker");
+        let tail = &source[start_at..];
+        let end_at = tail.find(end).expect("command end marker");
+        &tail[..end_at]
+    }
+
+    #[test]
+    fn settlement_write_gate_explains_why_it_is_closed() {
+        let error = settlement_write_unavailable::<()>("Paid inference escrow")
+            .expect_err("recovery candidate must reject settlement writes");
+        assert!(error.contains("before any transaction is signed or submitted"));
+        assert!(error.contains("exact model-artifact binding"));
+        assert!(error.contains("validator-authenticated authorization"));
+        assert!(error.contains("Free/community inference remains available"));
+    }
+
+    #[test]
+    fn paid_and_tier1_commands_have_no_network_write_body() {
+        let source = include_str!("commands.rs");
+        let tier1 = source_between(
+            source,
+            "pub async fn tier1_submit(",
+            "/// Read the on-chain state",
+        );
+        let paid = source_between(
+            source,
+            "pub async fn run_paid_inference(",
+            "// `check_for_update`",
+        );
+
+        for (name, body) in [("tier1_submit", tier1), ("run_paid_inference", paid)] {
+            assert!(body.contains("settlement_write_unavailable"), "{name}");
+            for forbidden in [
+                ".post(",
+                ".send()",
+                "submit_signed",
+                "Transaction {",
+                "hash_bytes(",
+                ".sign(",
+            ] {
+                assert!(!body.contains(forbidden), "{name} contains {forbidden}");
+            }
+        }
+        let legacy_shape_label = ["arc", "32L", "test"].join("-");
+        let legacy_model_label = ["arc", "testnet", "llama", "2", "7b", "chat", "q4"].join("-");
+        assert!(!source.contains(&legacy_shape_label));
+        assert!(!source.contains(&legacy_model_label));
+    }
+
+    #[test]
+    fn node_asset_urls_are_version_pinned() {
+        let url = exact_release_asset_url("arc-node-linux-x86_64");
+        assert!(url.contains(&format!("/v{}/", EXPECTED_NODE_VERSION)));
+        assert!(!url.contains("/latest/"));
+    }
+
+    #[test]
+    fn checksum_manifest_requires_one_exact_asset() {
+        let digest = "11".repeat(32);
+        let manifest = format!(
+            "{}  arc-node-linux-x86_64\n{} *arc-node-macos-arm64\n",
+            digest, digest
+        );
+        assert_eq!(
+            expected_release_sha256(&manifest, "arc-node-linux-x86_64").unwrap(),
+            [0x11; 32]
+        );
+        assert!(expected_release_sha256(&manifest, "arc-node-linux-arm64").is_err());
+
+        let duplicate = format!(
+            "{}  arc-node-linux-x86_64\n{} *arc-node-linux-x86_64\n",
+            digest, digest
+        );
+        assert!(expected_release_sha256(&duplicate, "arc-node-linux-x86_64").is_err());
+    }
+
+    #[test]
+    fn checksum_manifest_rejects_wrong_digest_shape() {
+        let manifest = "abcd  arc-node-linux-x86_64\n";
+        assert!(expected_release_sha256(manifest, "arc-node-linux-x86_64").is_err());
+    }
+
+    #[test]
+    fn download_sidecar_preserves_windows_executable_suffix() {
+        assert_eq!(
+            binary_download_sidecar(Path::new("arc-node.exe")),
+            PathBuf::from("arc-node.download.exe")
+        );
+        assert_eq!(
+            binary_download_sidecar(Path::new("arc-node")),
+            PathBuf::from("arc-node.download")
+        );
+    }
+
+    #[test]
+    fn version_comparison_rejects_non_strict_values() {
+        assert!(semver_gt("0.7.12", "0.7.11"));
+        assert!(!semver_gt("0.7.12-beta", "0.7.11"));
+        assert!(!semver_gt("0.7", "0.6.99"));
+        assert!(!semver_gt("0.7.12.1", "0.7.12"));
+    }
+
+    #[test]
+    fn every_builtin_model_has_a_fixed_sha256() {
+        for spec in MODEL_TIERS {
+            assert_eq!(model_digest(spec).unwrap().len(), 32, "{}", spec.id);
+            assert_eq!(spec.sha256.len(), 64, "{}", spec.id);
+        }
+    }
+
+    #[test]
+    fn same_size_model_mutation_is_rejected() {
+        let good = b"good";
+        let digest = Box::leak(hex::encode(Sha256::digest(good)).into_boxed_str());
+        let spec = ModelTierSpec {
+            id: "test",
+            display_name: "test",
+            url: "https://example.invalid/model.gguf",
+            size_bytes: good.len() as u64,
+            sha256: digest,
+        };
+        let path = std::env::temp_dir()
+            .join(format!("arc-model-check-{}-same-size", std::process::id()));
+        std::fs::write(&path, good).unwrap();
+        assert!(verify_model_file(&path, &spec).unwrap());
+        std::fs::write(&path, b"evil").unwrap();
+        assert!(!verify_model_file(&path, &spec).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+}

@@ -27,6 +27,12 @@ pub struct ChainInfo {
     /// booting a partial or legacy seed-derived validator set.
     #[serde(default)]
     pub validator_set_complete: bool,
+    /// Consensus activation height for `CommunityInferenceReward` (tx 0x25).
+    /// Absent means disabled. Because this value is committed by
+    /// `network_hash`, validators with different schedules cannot handshake
+    /// as though they were on the same chain.
+    #[serde(default)]
+    pub community_rewards_v1_activation_height: Option<u64>,
 }
 
 /// A prefunded account in the genesis state.
@@ -55,6 +61,27 @@ pub struct GenesisValidator {
 }
 
 impl GenesisConfig {
+    /// Parse the exact account set that will be materialized into state.
+    /// Network authentication and state initialization must share this input;
+    /// neither may add an account derived from the local signing identity.
+    fn validated_accounts(&self) -> Result<Vec<(Hash256, u64)>> {
+        let mut seen = HashSet::new();
+        let mut accounts = Vec::with_capacity(self.accounts.len());
+        for (index, account) in self.accounts.iter().enumerate() {
+            let address =
+                crate::validator_identity::parse_address(&account.address).with_context(|| {
+                    format!("genesis account #{} has an invalid address", index + 1)
+                })?;
+            ensure!(
+                seen.insert(address),
+                "genesis contains duplicate account address {}",
+                address
+            );
+            accounts.push((address, account.balance));
+        }
+        Ok(accounts)
+    }
+
     /// Validate and materialize the validator set without ever reading a
     /// production secret from genesis. Incomplete sets are usable only for an
     /// explicitly insecure disposable development network.
@@ -69,6 +96,15 @@ impl GenesisConfig {
                 "genesis declares validator_set_complete = true but contains no [[validators]] public addresses"
             );
         }
+
+        let production_accounts: HashSet<Hash256> = if self.chain.validator_set_complete {
+            self.validated_accounts()?
+                .into_iter()
+                .map(|(address, _)| address)
+                .collect()
+        } else {
+            HashSet::new()
+        };
 
         let mut seen = HashSet::new();
         let mut validators = Vec::with_capacity(self.validators.len());
@@ -112,6 +148,14 @@ impl GenesisConfig {
                 "genesis contains duplicate validator address {}",
                 address
             );
+            if self.chain.validator_set_complete {
+                ensure!(
+                    production_accounts.contains(&address),
+                    "genesis validator #{} address {} is missing from [[accounts]]; every production validator must be declared in the shared genesis state",
+                    index + 1,
+                    address
+                );
+            }
             validators.push((address, validator.stake));
         }
 
@@ -146,20 +190,7 @@ impl GenesisConfig {
     fn canonical_network_hash(&self, mut validators: Vec<(Hash256, u64)>) -> Result<Hash256> {
         validators.sort_unstable_by_key(|(address, _)| address.0);
 
-        let mut seen_accounts = HashSet::new();
-        let mut accounts = Vec::with_capacity(self.accounts.len());
-        for (index, account) in self.accounts.iter().enumerate() {
-            let address =
-                crate::validator_identity::parse_address(&account.address).with_context(|| {
-                    format!("genesis account #{} has an invalid address", index + 1)
-                })?;
-            ensure!(
-                seen_accounts.insert(address),
-                "genesis contains duplicate account address {}",
-                address
-            );
-            accounts.push((address, account.balance));
-        }
+        let mut accounts = self.validated_accounts()?;
         accounts.sort_unstable_by_key(|(address, _)| address.0);
 
         let mut canonical = Vec::with_capacity(
@@ -168,10 +199,17 @@ impl GenesisConfig {
                 + accounts.len() * 40
                 + validators.len() * 40,
         );
-        canonical.extend_from_slice(b"ARC-genesis-config-v2\0");
+        canonical.extend_from_slice(b"ARC-genesis-config-v3\0");
         append_bytes(&mut canonical, self.chain.name.as_bytes());
         append_bytes(&mut canonical, self.chain.chain_id.as_bytes());
         canonical.push(u8::from(self.chain.validator_set_complete));
+        match self.chain.community_rewards_v1_activation_height {
+            Some(height) => {
+                canonical.push(1);
+                append_u64(&mut canonical, height);
+            }
+            None => canonical.push(0),
+        }
         append_u64(&mut canonical, accounts.len() as u64);
         for (address, balance) in accounts {
             canonical.extend_from_slice(&address.0);
@@ -274,10 +312,10 @@ pub struct InferenceConfig {
 /// RPC server configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RpcConfig {
-    /// Listen address for the native ARC RPC (default: "0.0.0.0:9090").
+    /// Listen address for the native ARC RPC (default: "127.0.0.1:9944").
     #[serde(default = "default_rpc_listen")]
     pub listen: String,
-    /// Port for the ETH-compatible JSON-RPC server (default: 8545, 0 = disabled).
+    /// Port for the ETH-compatible JSON-RPC server (default: 0 = disabled).
     #[serde(default = "default_eth_port")]
     pub eth_port: u16,
 }
@@ -355,11 +393,11 @@ fn default_chain_id() -> String {
 }
 
 fn default_rpc_listen() -> String {
-    "0.0.0.0:9944".to_string()
+    "127.0.0.1:9944".to_string()
 }
 
 fn default_eth_port() -> u16 {
-    8545
+    0
 }
 
 fn default_p2p_port() -> u16 {
@@ -492,8 +530,8 @@ mod tests {
         // Ports moved from 9090/9091 -> 9944/9945 to avoid collisions with
         // Prometheus (9090) and Transmission/BitTorrent (9091). These tests
         // assert the current defaults; update both together when rebinding.
-        assert_eq!(cfg.rpc.listen, "0.0.0.0:9944");
-        assert_eq!(cfg.rpc.eth_port, 8545);
+        assert_eq!(cfg.rpc.listen, "127.0.0.1:9944");
+        assert_eq!(cfg.rpc.eth_port, 0);
         assert_eq!(cfg.p2p.port, 9945);
         assert!(cfg.p2p.peers.is_empty());
         assert!(cfg.validator.key_file.is_none());
@@ -537,7 +575,7 @@ mod tests {
         let cfg: NodeConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.rpc.listen, "127.0.0.1:9999");
         // All other fields should use defaults
-        assert_eq!(cfg.rpc.eth_port, 8545);
+        assert_eq!(cfg.rpc.eth_port, 0);
         assert_eq!(cfg.p2p.port, 9945);
         assert!(cfg.validator.key_file.is_none());
         assert!(cfg.validator.seed.is_none());
@@ -662,10 +700,15 @@ mod tests {
                 name = "public-address-test"
                 validator_set_complete = true
 
+                [[accounts]]
+                address = "{}"
+                balance = 0
+
                 [[validators]]
                 address = "{}"
                 stake = 7000000
             "#,
+            address.to_hex(),
             address.to_hex()
         ))
         .unwrap();
@@ -720,10 +763,15 @@ mod tests {
                     chain_id = "0x415243"
                     validator_set_complete = true
 
+                    [[accounts]]
+                    address = "{}"
+                    balance = 0
+
                     [[validators]]
                     address = "{}"
                     stake = 5000000
                 "#,
+                address.to_hex(),
                 address.to_hex()
             ))
             .unwrap()
@@ -740,6 +788,14 @@ mod tests {
             chain_a.network_hash(false).unwrap(),
             different_chain.network_hash(false).unwrap()
         );
+
+        let mut scheduled = chain_a.clone();
+        scheduled.chain.community_rewards_v1_activation_height = Some(10_000);
+        assert_ne!(
+            chain_a.network_hash(false).unwrap(),
+            scheduled.network_hash(false).unwrap(),
+            "consensus reward activation must be part of network identity"
+        );
     }
 
     #[test]
@@ -748,16 +804,18 @@ mod tests {
             crate::validator_identity::derive_insecure_seed_keypair("order-test-a").address();
         let address_b =
             crate::validator_identity::derive_insecure_seed_keypair("order-test-b").address();
-        let account_a = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
-        let account_b = "2d3adedff11b61f14c886e35afa036736dcd87a74d27b5c1510225d0f592e213";
         let parse = |reverse: bool| {
             let account_entries = if reverse {
                 format!(
-                    "[[accounts]]\naddress = \"{account_b}\"\nbalance = 20\n[[accounts]]\naddress = \"{account_a}\"\nbalance = 10"
+                    "[[accounts]]\naddress = \"{}\"\nbalance = 20\n[[accounts]]\naddress = \"{}\"\nbalance = 10",
+                    address_b.to_hex(),
+                    address_a.to_hex()
                 )
             } else {
                 format!(
-                    "[[accounts]]\naddress = \"{account_a}\"\nbalance = 10\n[[accounts]]\naddress = \"{account_b}\"\nbalance = 20"
+                    "[[accounts]]\naddress = \"{}\"\nbalance = 10\n[[accounts]]\naddress = \"{}\"\nbalance = 20",
+                    address_a.to_hex(),
+                    address_b.to_hex()
                 )
             };
             let validator_entries = if reverse {
@@ -791,6 +849,33 @@ mod tests {
             parse(false).network_hash(false).unwrap(),
             parse(true).network_hash(false).unwrap()
         );
+    }
+
+    #[test]
+    fn complete_genesis_rejects_validator_missing_from_accounts() {
+        let address =
+            crate::validator_identity::derive_insecure_seed_keypair("missing-account").address();
+        let cfg: GenesisConfig = toml::from_str(&format!(
+            r#"
+                [chain]
+                name = "missing-validator-account"
+                validator_set_complete = true
+
+                [[accounts]]
+                address = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+                balance = 100
+
+                [[validators]]
+                address = "{}"
+                stake = 5000000
+            "#,
+            address.to_hex()
+        ))
+        .unwrap();
+
+        let error = cfg.validated_validator_set(false).unwrap_err().to_string();
+        assert!(error.contains("missing from [[accounts]]"), "{error}");
+        assert!(cfg.network_hash(false).is_err());
     }
 
     #[test]

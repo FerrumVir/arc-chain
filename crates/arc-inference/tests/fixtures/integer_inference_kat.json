@@ -1,0 +1,45 @@
+{
+  "schema": 1,
+  "name": "cached-integer-i8-i16-v1",
+  "model_seed": "0x5eedc0de1234abcd",
+  "vocab_size": 23,
+  "d_model": 32,
+  "n_heads": 4,
+  "n_kv_heads": 2,
+  "d_ff": 64,
+  "n_layers": 4,
+  "max_seq": 16,
+  "sequence_tokens": [1, 3, 7, 11, 5, 13],
+  "generation_prompt": [3, 7, 11, 5],
+  "generation_max_tokens": 6,
+  "shard_boundaries": [1, 3],
+  "expected": {
+    "model_weight_hash": "341bfe46788636f41737a89124276e306427668d998a427858fc8bbb83335190",
+    "next_tokens": [11, 10, 6, 6, 10, 7],
+    "logits_hashes": [
+      "809f54846f49c45686b8919f7648e0f2b7dbc43d5a89a121781d5b77b3ab7bb1",
+      "4901adf145179e2f0197273148fbab3e434ad0291c986e52b88af6f9db7410ba",
+      "e97f652276673a7683efbd602a7e5631a86d1a98f9cfeef2b9da67cc57d6f859",
+      "1277450aaa716bd2d8e75d42dd64ebcd1e48eeb04bae0d26524fb05d74b6897e",
+      "9002cb218196f6f999f972ed10afae78ef059dc3166ea217f8b8e7e6a4604b4e",
+      "569c1a3364260931182d97d9320ec21249cac6d8b4fc7d4d02f9898f5fa4372d"
+    ],
+    "kv_cache_hash": "ba4bbbc77b651983ee663b9f978173a69f2467bf4324867862163d80046ab414",
+    "shard_hidden_hashes": [
+      "bf5ca7ea46cc7ddba3a990446e7d181af38cb937605109de0023681ce3862a3e",
+      "7596b9a4d211e61da8e0023415e2d7c4506c88957efa9f2b2e429807cd57b01a",
+      "c64daf4bccbafe4a267edd987a4c46979a079481356f499508bdc713c7510895",
+      "7e4fc188297d3c1fe41973e542aad82aa6c0e5e817fe8ca44789ba9509b3d0cb",
+      "ffaabfbb604257b6540e84d3df2bde46d6436d68da98981ddbcf9861cf61eb93",
+      "dc71eaa80b6a688128066622ab411b6a055f5932022357b0ea82fcaaa6550f96",
+      "affef5cf4d774bf1a5545d535b9bae6cf541bf966c24bfbe0b7691e3080eb401",
+      "d2ea0856cf66543840f6a2242aded8a471e36056964f50f6471b8fa309de4daa",
+      "d54633cdd5f47393382626a5eb50ddd58e4ffcfb89b443bf34ea1c738ce40673",
+      "6e8b62636edbcb3e73e1110e6edfea04fddbef4bd460aabf0b9713b2e7fedd99",
+      "c1a1ea7bd6a2389fd2884e5e64cd228cfab1cf3bdbbf433c2659c870a733a12b",
+      "0a79ed30c42d7aeb428f4e04936e902db52350d9b929e323099fde71d575790d"
+    ],
+    "generated_tokens": [11, 6, 11, 18, 10, 20],
+    "generated_output_hash": "9cdefa17ab6286529e5973b989f9bc3b9a83c4d8f092c675b5a77bcd2954d17b"
+  }
+}

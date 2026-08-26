@@ -1,6 +1,6 @@
 // ─── @arc-chain/sdk - Type Definitions ────────────────────────
 // Complete TypeScript types for the ARC Chain RPC API.
-// Covers all endpoints, all 21 transaction body variants,
+// Covers all endpoints, all 37 transaction body variants,
 // block structures, account state, validators, contracts,
 // light client, faucet, and ETH JSON-RPC compatibility.
 
@@ -11,6 +11,12 @@ export type Hash256 = string;
 
 /** 64-character hex-encoded account/validator address. */
 export type Address = string;
+
+/** Hex-encoded bytes without a required prefix. */
+export type HexString = string;
+
+/** Hex-encoded bytes with the `0x` prefix used by selected RPC projections. */
+export type PrefixedHexString = `0x${string}`;
 
 // ─── Health & Info ───────────────────────────────────────────
 
@@ -198,7 +204,7 @@ export interface TxSubmitBatchResponse {
   tx_hashes: Hash256[];
 }
 
-// ─── Transaction Body Variants (all 21 types) ──────────────
+// ─── Transaction Body Variants (0x01 through 0x25) ─────────
 
 export interface TransferBody {
   type: "Transfer";
@@ -271,7 +277,7 @@ export interface RegisterAgentBody {
 
 export interface JoinValidatorBody {
   type: "JoinValidator";
-  pubkey: number[];
+  pubkey: HexString;
   initial_stake: number;
 }
 
@@ -297,7 +303,7 @@ export interface GovernanceBody {
 export interface BridgeLockBody {
   type: "BridgeLock";
   destination_chain: number;
-  destination_address: number[];
+  destination_address: HexString;
   amount: number;
 }
 
@@ -307,41 +313,36 @@ export interface BridgeMintBody {
   source_tx_hash: Hash256;
   recipient: Address;
   amount: number;
-  merkle_proof: number[];
+  merkle_proof_size: number;
 }
 
 export interface BatchSettleBody {
   type: "BatchSettle";
-  entries: Array<{
-    agent_id: Address;
-    service_hash: Hash256;
-    amount: number;
-  }>;
+  entries: number;
+  total_amount: number;
 }
 
 export interface ChannelOpenBody {
   type: "ChannelOpen";
-  channel_id: Hash256;
-  counterparty: Address;
+  channel_id: PrefixedHexString;
+  counterparty: PrefixedHexString;
   deposit: number;
   timeout_blocks: number;
 }
 
 export interface ChannelCloseBody {
   type: "ChannelClose";
-  channel_id: Hash256;
+  channel_id: PrefixedHexString;
   opener_balance: number;
   counterparty_balance: number;
-  counterparty_sig: number[];
   state_nonce: number;
 }
 
 export interface ChannelDisputeBody {
   type: "ChannelDispute";
-  channel_id: Hash256;
+  channel_id: PrefixedHexString;
   opener_balance: number;
   counterparty_balance: number;
-  other_party_sig: number[];
   state_nonce: number;
   challenge_period: number;
 }
@@ -350,14 +351,166 @@ export interface ShardProofBody {
   type: "ShardProof";
   shard_id: number;
   block_height: number;
-  block_hash: Hash256;
-  prev_state_root: Hash256;
-  post_state_root: Hash256;
   tx_count: number;
-  proof_data: number[];
+  proof_size: number;
+  prev_state_root: PrefixedHexString;
+  post_state_root: PrefixedHexString;
 }
 
-/** Discriminated union of all 21 ARC Chain transaction body types. */
+export interface InferenceAttestationBody {
+  type: "InferenceAttestation";
+  model_id: PrefixedHexString;
+  input_hash: PrefixedHexString;
+  output_hash: PrefixedHexString;
+  challenge_period: number;
+  bond: number;
+}
+
+export interface InferenceChallengeBody {
+  type: "InferenceChallenge";
+  attestation_hash: PrefixedHexString;
+  challenger_output_hash: PrefixedHexString;
+  challenger_bond: number;
+}
+
+export interface InferenceRegisterBody {
+  type: "InferenceRegister";
+  tier: number;
+  stake_bond: number;
+}
+
+export interface InferenceEscrowOpenBody {
+  type: "InferenceEscrowOpen";
+  request_id: PrefixedHexString;
+  model_id: PrefixedHexString;
+  max_fee: number;
+  max_tokens: number;
+  timeout_blocks: number;
+}
+
+export interface InferenceEscrowReleaseBody {
+  type: "InferenceEscrowRelease";
+  request_id: PrefixedHexString;
+  payer: PrefixedHexString;
+  model_id: PrefixedHexString;
+  max_tokens: number;
+  timeout_blocks: number;
+  output_hash: PrefixedHexString;
+  proposer: PrefixedHexString;
+  replicas: PrefixedHexString[];
+  observer_pool: PrefixedHexString;
+  treasury: PrefixedHexString;
+}
+
+export interface InferenceEscrowRefundBody {
+  type: "InferenceEscrowRefund";
+  request_id: PrefixedHexString;
+  model_id: PrefixedHexString;
+  max_tokens: number;
+  timeout_blocks: number;
+}
+
+export interface ModelRegistrationBody {
+  type: "ModelRegistration";
+  model_id: PrefixedHexString;
+  metadata_hash: PrefixedHexString;
+  chunk_tree_root: PrefixedHexString;
+  n_layers: number;
+  d_model: number;
+  quantization: string;
+  registration_fee: number;
+  royalty_recipient: PrefixedHexString;
+}
+
+export interface ModelRequestBody {
+  type: "ModelRequest";
+  request_id: PrefixedHexString;
+  model_id: PrefixedHexString;
+  target_k_replication: number;
+  bond_per_layer_epoch: number;
+  max_wait_secs: number;
+}
+
+/** Inclusive start/end layer range serialized by the RPC as a JSON tuple. */
+export type LayerRange = [number, number];
+
+export interface ShardCoverageClaimBody {
+  type: "ShardCoverageClaim";
+  model_id: PrefixedHexString;
+  node_pubkey: PrefixedHexString;
+  ranges: LayerRange[];
+  bond: number;
+  epoch_blocks: number;
+}
+
+export interface CapacityAdvertisementBody {
+  type: "CapacityAdvertisement";
+  node_pubkey: PrefixedHexString;
+  ram_bytes: number;
+  vram_bytes: number;
+  bandwidth_mbps: number;
+  uptime_hint_mins: number;
+  stake: number;
+  region: string;
+}
+
+export interface ShardAssignmentEntry {
+  node_pubkey: PrefixedHexString;
+  model_id: PrefixedHexString;
+  ranges: LayerRange[];
+}
+
+export interface ShardAssignmentProposalBody {
+  type: "ShardAssignmentProposal";
+  epoch_blocks: number;
+  input_snapshot_hash: PrefixedHexString;
+  assignments: ShardAssignmentEntry[];
+}
+
+export interface FaucetClaimBody {
+  type: "FaucetClaim";
+  recipient: Address;
+  amount: number;
+}
+
+export interface InferenceRequestBody {
+  type: "InferenceRequest";
+  request_id: PrefixedHexString;
+  model_id: Hash256;
+  input_hash: Hash256;
+  max_tokens: number;
+  tier: number;
+  max_reward: number;
+  deadline_blocks: number;
+  committee_size: number;
+}
+
+export interface InferenceVoteBody {
+  type: "InferenceVote";
+  request_id: PrefixedHexString;
+  output_hash: Hash256;
+  output_blob_attached: boolean;
+}
+
+export interface InferenceFinalizeBody {
+  type: "InferenceFinalize";
+  request_id: PrefixedHexString;
+}
+
+export interface CommunityInferenceRewardBody {
+  type: "CommunityInferenceReward";
+  chain_domain: Hash256;
+  job_id: Hash256;
+  worker: Address;
+  model_id: Hash256;
+  input_hash: Hash256;
+  output_hash: Hash256;
+  max_tokens: number;
+  expires_at_height: number;
+  worker_attestation_hash: Hash256;
+}
+
+/** Discriminated union of all 37 ARC Chain transaction body projections. */
 export type TransactionBody =
   | TransferBody
   | SettleBody
@@ -379,7 +532,23 @@ export type TransactionBody =
   | ChannelOpenBody
   | ChannelCloseBody
   | ChannelDisputeBody
-  | ShardProofBody;
+  | ShardProofBody
+  | InferenceAttestationBody
+  | InferenceChallengeBody
+  | InferenceRegisterBody
+  | InferenceEscrowOpenBody
+  | InferenceEscrowReleaseBody
+  | InferenceEscrowRefundBody
+  | ModelRegistrationBody
+  | ModelRequestBody
+  | ShardCoverageClaimBody
+  | CapacityAdvertisementBody
+  | ShardAssignmentProposalBody
+  | FaucetClaimBody
+  | InferenceRequestBody
+  | InferenceVoteBody
+  | InferenceFinalizeBody
+  | CommunityInferenceRewardBody;
 
 /** String literal union of all transaction type discriminators. */
 export type TransactionType = TransactionBody["type"];

@@ -31,6 +31,18 @@ impl RpcClient {
         self.handle_response(resp).await
     }
 
+    /// `GET /health` - machine-validated node readiness status.
+    pub async fn get_health(&self) -> Result<Value> {
+        let url = format!("{}/health", self.base_url);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("failed to connect to {}", url))?;
+        self.handle_response(resp).await
+    }
+
     /// `GET /account/{addr}` - account balance and nonce.
     pub async fn get_account(&self, addr: &str) -> Result<Value> {
         let url = format!("{}/account/{}", self.base_url, addr);

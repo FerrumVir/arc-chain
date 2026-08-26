@@ -124,7 +124,9 @@ test.describe("Network screen - stalled block production", () => {
     // The reason `/health` cannot be trusted here has to be stated, or the
     // user will believe the green pill over this banner.
     await expect(banner).toContainText("DAG round keeps advancing");
-    await expect(banner).toContainText("cannot settle");
+    await expect(banner).toContainText(
+      "cannot mine a new claim or reward receipt",
+    );
   });
 
   test("warns more mildly when blocks lag but the host still claims to produce", async ({
@@ -291,6 +293,10 @@ test.describe("Network screen - transaction lookup", () => {
     const result = page.getByTestId("tx-lookup-result");
     await expect(result).toContainText("In a block");
     await expect(result).toContainText("Position in block");
+    await expect(result).toContainText("does not expose transaction type");
+    await expect(result).toContainText("0x25");
+    await expect(result).toContainText("0x16");
+    await expect(result).toContainText("pays nothing");
   });
 
   test("an unknown but well-formed hash is 'not in a block yet', never invalid", async ({
@@ -372,6 +378,9 @@ test.describe("Network screen - blocks and attestations", () => {
     await expect(
       page.getByTestId("recent-inference").locator(".feed-item"),
     ).toHaveCount(3);
+    await expect(page.getByTestId("recent-inference")).toContainText(
+      "not payments",
+    );
   });
 });
 

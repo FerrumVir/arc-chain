@@ -34,11 +34,11 @@ test.describe("Compute contribution", () => {
     await gotoSettings(page);
     const hint = page.getByTestId("compute-contribution");
     await expect(hint).toContainText("serve each hop faster");
-    // The honest causal chain: attestations pay, cores do not.
-    await expect(hint).toContainText(
-      "Earnings follow the attestations you actually serve, not the cores you own",
-    );
-    await expect(hint).toContainText("no multiplier from cores to ARC");
+    // The honest causal chain: a successful mined 0x25 receipt pays; cores and
+    // raw attestations do not.
+    await expect(hint).toContainText("Cores do not multiply ARC");
+    await expect(hint).toContainText("successful mined");
+    await expect(hint).toContainText("0x25");
     // The previous copy promised "more cores means more work served - and more
     // earnings". That claim must not come back.
     await expect(hint).not.toContainText("more cores means more work served");
@@ -134,21 +134,15 @@ test.describe("Persistence - auto-start on", () => {
     await seedOnboarded(page);
   });
 
-  test("states plainly that the node starts with the computer", async ({
+  test("separates app-launch configuration from verified OS registration", async ({
     page,
   }) => {
     await gotoSettings(page);
     const summary = page.getByTestId("persistence-summary");
     await expect(summary).toBeVisible();
-    await expect(summary).toContainText(
-      "starts with this computer and keeps contributing",
-    );
-    // The owner's actual question: off and on again must not reset it.
-    await expect(summary).toContainText(
-      "turning it off and on again does not reset anything",
-    );
-    // And what governs it.
-    await expect(summary).toContainText("Start node on app launch");
+    await expect(summary).toContainText("when the app opens");
+    await expect(summary).toContainText("OS login item is registered");
+    await expect(summary).toContainText("does not prove peers, work, or payment");
   });
 
   test("reports the config flag and the OS login item separately", async ({
@@ -162,18 +156,18 @@ test.describe("Persistence - auto-start on", () => {
     );
   });
 
-  test("is truthful that a model-less node resumes as an earning-nothing observer", async ({
+  test("is truthful that a model-less node resumes without local inference", async ({
     page,
   }) => {
     // seedOnboarded writes modelPath: null.
     await gotoSettings(page);
     const role = page.getByTestId("persistence-role");
     await expect(role).toContainText("observer");
-    await expect(role).toContainText("never sent inference work");
-    await expect(role).toContainText("an observer earns nothing");
+    await expect(role).toContainText("cannot execute local model inference");
+    await expect(role).toContainText("does not promise work or payment");
   });
 
-  test("says worker, and that it can earn, once a model is configured", async ({
+  test("says worker candidate without promising work or payment", async ({
     page,
   }) => {
     await page.addInitScript(() => {
@@ -185,8 +179,10 @@ test.describe("Persistence - auto-start on", () => {
     });
     await gotoSettings(page);
     const role = page.getByTestId("persistence-role");
-    await expect(role).toContainText("worker");
-    await expect(role).toContainText("can earn attestations");
+    await expect(role).toContainText("worker candidate");
+    await expect(role).toContainText("artifact must load completely");
+    await expect(role).toContainText("successful mined");
+    await expect(role).toContainText("0x25");
   });
 
   test("the Dashboard also answers whether it starts with the OS", async ({
@@ -194,10 +190,10 @@ test.describe("Persistence - auto-start on", () => {
   }) => {
     await page.goto("/");
     await expect(page.getByTestId("dashboard-persistence")).toHaveText(
-      /^(yes|no|set, but no login item)$/,
+      /^(yes|no|set, but no login item|not verified)$/,
     );
     await expect(page.getByTestId("dashboard-persistence-note")).toContainText(
-      "starts with this computer",
+      "OS login item is registered",
     );
   });
 });
@@ -215,7 +211,8 @@ test.describe("Persistence - auto-start off", () => {
     await gotoSettings(page);
     const summary = page.getByTestId("persistence-summary");
     await expect(summary).toContainText("does not start on its own");
-    await expect(summary).toContainText("earns nothing until you do");
+    await expect(summary).toContainText("cannot serve local inference");
+    await expect(summary).toContainText("does not guarantee peers, assignment, or payment");
     await expect(page.getByTestId("persistence-autostart")).toHaveText("off");
   });
 });

@@ -77,20 +77,54 @@ jobs:
           fetch-depth: 1
       - run: bash tests/release/current_tree_secret_scan.sh
 
-  # ----------------------------------------------- static web contracts ----
-  # These sites intentionally have no package manifest or build step. Their
-  # dependency-free Node contracts validate JavaScript syntax, supported RPC
-  # sources, CSP boundaries, safe rendering, and honest liveness semantics.
-  dashboard-contract:
-    name: dashboard contract
+  # ------------------------------------------------ workflow syntax -------
+  # Release and deployment behavior is encoded in Actions YAML, so malformed
+  # expressions or runner syntax must fail before merge rather than at tag
+  # time. The binary and checksum are pinned to the upstream release.
+  workflow-syntax:
+    name: workflow syntax (actionlint)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - name: Install pinned Actionlint
+        env:
+          ACTIONLINT_VERSION: 1.7.12
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint.tar.gz"
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            > "$archive"
+          printf '%s  %s\n' "$ACTIONLINT_SHA256" "$archive" | sha256sum -c -
+          tar -xzf "$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" -version
+      - name: Check every workflow
+        run: |
+          "$RUNNER_TEMP/actionlint" -color
+
+  # ----------------------------------------------- static web contracts ----
+  # Dashboard CSS is compiled and committed so production never executes the
+  # Tailwind development CDN. Its verifier regenerates CSS and rejects drift;
+  # the contract validates JavaScript syntax, sources, safe rendering, and
+  # honest liveness semantics. Explorer remains dependency-free static HTML.
+  dashboard-contract:
+    name: dashboard build + contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-      - run: node dashboard/test-contract.mjs
+          node-version: 24
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm test
 
   explorer-contract:
     name: explorer contract
@@ -100,7 +134,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
       - run: node explorer/test-contract.mjs
 
   # ---------------------------------------------------------------- fmt ----
@@ -220,11 +254,41 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: desktop/package-lock.json
       - run: npm ci
       - run: npx tsc --noEmit
+
+  # ---------------------------------------------------- desktop Tauri Rust --
+  # desktop/src-tauri is intentionally outside the root Cargo workspace. Build
+  # every release OS on stable, matching release.yml and exercising each
+  # platform-specific supervisor/updater branch before a tag is created.
+  desktop-tauri-test:
+    name: desktop Tauri Rust tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-14 is Apple Silicon; macos-15-intel covers the Intel package
+        # that regressed for community users and is still released.
+        os: [ubuntu-latest, macos-14, macos-15-intel, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libfuse2
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+          shared-key: desktop-tauri-${{ matrix.os }}
+      - run: cargo test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked
 
   # -------------------------------------------------------- desktop e2e ----
   # playwright.config.ts drives the mock Tauri backend, so no arc-node binary
@@ -241,14 +305,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: desktop/package-lock.json
       - run: npm ci
       - run: npx playwright install --with-deps chromium
-      # webServer in playwright.config.ts runs `npm run build && npm run
+      # webServer in playwright.gate.config.ts runs `npm run build && npm run
       # preview` on :4173 and CI=true turns on forbidOnly/retries/1 worker.
-      - run: npx playwright test
+      - run: npx playwright test --config playwright.gate.config.ts
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -293,21 +357,14 @@ jobs:
           exit "$fail"
 
   # --------------------------------------------------------- shellcheck ----
-  # 33 shell scripts, several of which are curl|bash'd onto third-party
-  # machines straight off main (scripts/install-community-node.sh,
-  # scripts/install-node.sh), plus the per-seed self-heal daemon that decides
-  # when to restart production nodes. None have ever been linted.
+  # Shell scripts include curl|bash installers, deployment tooling, and the
+  # per-seed self-heal daemon. Warning-level findings are kept at zero so
+  # quoting, masked exit codes, broken traps, and positional parsing regressions
+  # cannot merge.
   shellcheck:
     name: shellcheck
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # TODO(OPTIONAL-SHELLCHECK): ratchet, don't flip in one step. Sequence:
-    #   a) fix findings at -S error, make the job blocking at -S error
-    #   b) fix findings at -S warning, change the flag below to match
-    #   c) only then consider -S style
-    # Prioritise fixes by blast radius: install-community-node.sh and
-    # arc-self-heal.sh before anything else.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       # shellcheck is preinstalled on ubuntu-latest runners; no third-party
@@ -316,8 +373,11 @@ jobs:
         run: |
           set -euo pipefail
           shellcheck --version
-          find scripts deploy -type f -name '*.sh' -print0 \
-            | xargs -0 shellcheck -S warning
+          files=(install.sh)
+          while IFS= read -r -d '' file; do
+            files+=("$file")
+          done < <(find scripts deploy tests/release -type f -name '*.sh' -print0)
+          shellcheck -S warning "${files[@]}"
 
   # ------------------------------------------------------------- forge ----
   # 8 Solidity files including a bridge, a staking contract, a state-root
@@ -362,9 +422,13 @@ jobs:
   # `cd sdk/typescript && npm install` and commit the lockfile; do not weaken
   # this gate by reverting to `npm install`.
   sdk-check:
-    name: sdk typecheck
-    runs-on: ubuntu-latest
+    name: SDK clean build + packed consumer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     defaults:
       run:
         working-directory: sdk/typescript
@@ -372,11 +436,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
           cache-dependency-path: sdk/typescript/package-lock.json
       - run: npm ci
-      - run: npx tsc --noEmit
+      # Builds from an isolated copy, installs the tarball into an empty
+      # consumer, imports its ESM API, and compiles its declarations. The gate
+      # never rewrites the checkout's tracked dist directory.
+      - run: npm test
 
 # REMOVED: the old `explorer-build` job. It probed for explorer/package.json,
 # emitted a ::notice:: and exited. Explorer is intentionally dependency-free
@@ -384,12 +451,9 @@ jobs:
 # the blocking `explorer-contract` job above. Add a build job only if a real
 # package/build pipeline lands in explorer/.
 #
-# NOT ADDED (deliberate, tracked as follow-up): jobs for sdks/typescript
-# (a complete jest + ts-jest suite that has never run), sdks/python
-# (tests/test_client.py, no pytest/ruff/mypy anywhere), and
-# desktop/src-tauri (excluded from the workspace at Cargo.toml:3, so every
-# `--workspace` command here skips the code that supervises the arc-node
-# child process and downloads its binary). All three are real gaps; none are
-# in scope for this change. Note that three separate package.json files
-# declare the name "@arc-chain/sdk" — that collision should be resolved
-# before writing CI against them.
+# NOT ADDED (deliberate, tracked as follow-up): jobs for the two duplicate
+# legacy SDK trees at sdk/ and sdks/typescript, or sdks/python. The legacy Jest
+# suite cannot currently load its ESM-only noble dependency and its test-only
+# dependency tree has known advisories; Python has no tracked pytest/ruff/mypy
+# tooling. Resolve which of the three packages named "@arc-chain/sdk" is
+# canonical before publishing or making those trees release gates.

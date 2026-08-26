@@ -88,7 +88,7 @@ Until Phase B coordinated upgrade lands, Tier 1 mode in the desktop will only wo
 
 - Xcode Command Line Tools (`xcode-select --install`)
 - Rust via rustup (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- Node.js 20+ via nvm or fnm
+- Node.js 24 LTS via nvm or fnm
 - Tauri prerequisites (`brew install pkg-config`)
 
 ### Setup

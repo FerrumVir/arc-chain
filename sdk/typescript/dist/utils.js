@@ -1,4 +1,4 @@
-// ─── @arc-chain/sdk — Utility Functions ───────────────────────
+// ─── @arc-chain/sdk - Utility Functions ───────────────────────
 // Address validation, hash formatting, hex encoding/decoding.
 // Pure functions with zero dependencies.
 /**
@@ -40,7 +40,7 @@ export function isValidAddress(addr) {
 /**
  * Check whether a string is a valid ARC Chain transaction hash.
  *
- * Same format as addresses — 64 hex characters (32-byte BLAKE3).
+ * Same format as addresses - 64 hex characters (32-byte BLAKE3).
  *
  * @example
  * ```ts

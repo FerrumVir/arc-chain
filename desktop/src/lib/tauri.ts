@@ -54,7 +54,96 @@ function liveBase(): string | null {
   return `http://127.0.0.1:${port}`;
 }
 
-const REWARD_PER_ATTESTATION = 2.5;
+/** Browser-preview fixture amount for a successful mined 0x25 receipt. */
+const MOCK_REWARD_PER_RECEIPT = 2.5;
+
+const SETTLEMENT_WRITE_UNAVAILABLE =
+  "is unavailable in the v0.7.12 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
+
+function settlementWriteUnavailable(flow: string): Error {
+  return new Error(`${flow} ${SETTLEMENT_WRITE_UNAVAILABLE}`);
+}
+
+function emptyEarnings(): Earnings {
+  return {
+    totalArc: 0,
+    todayArc: null,
+    pendingArc: null,
+    rank: null,
+    attestations: 0,
+    lastPayoutAt: null,
+    lastPayoutBlock: null,
+    fromChain: false,
+  };
+}
+
+/**
+ * Parse only the candidate's mined-0x25 receipt/readiness contract.
+ * Public v2 returns HTTP 200 for this path too, but its body is raw-0x16
+ * count × constant display arithmetic. HTTP status is not a semantics gate.
+ */
+function confirmedEarningsFromBody(body: unknown): Earnings | null {
+  if (!body || typeof body !== "object") return null;
+  const o = body as Record<string, unknown>;
+  const totalRewards = o.total_rewards;
+  const totalArc = o.estimated_total_arc;
+  const note = o.estimated_total_arc_note;
+  const effective = o.community_rewards_v1_enabled;
+  const protocolActive = o.community_rewards_v1_protocol_active;
+  const approvalReady = o.community_rewards_v1_approval_collection_ready;
+  if (
+    typeof totalRewards !== "number" ||
+    !Number.isSafeInteger(totalRewards) ||
+    totalRewards < 0 ||
+    typeof totalArc !== "number" ||
+    !Number.isFinite(totalArc) ||
+    totalArc < 0 ||
+    typeof note !== "string" ||
+    !note.includes("CommunityInferenceReward") ||
+    typeof effective !== "boolean" ||
+    typeof protocolActive !== "boolean" ||
+    typeof approvalReady !== "boolean"
+  ) {
+    return null;
+  }
+  if (effective && (!protocolActive || !approvalReady)) return null;
+  if (
+    !Object.prototype.hasOwnProperty.call(o, "last_reward_block") ||
+    !Object.prototype.hasOwnProperty.call(o, "last_reward_tx_hash")
+  ) {
+    return null;
+  }
+  const lastBlock =
+    typeof o.last_reward_block === "number" &&
+    Number.isSafeInteger(o.last_reward_block) &&
+    o.last_reward_block >= 0
+      ? o.last_reward_block
+      : null;
+  const lastHash =
+    typeof o.last_reward_tx_hash === "string" &&
+    o.last_reward_tx_hash.trim().length > 0
+      ? o.last_reward_tx_hash
+      : null;
+  if (totalRewards > 0 && (lastBlock === null || lastHash === null)) return null;
+
+  return {
+    totalArc,
+    todayArc:
+      typeof o.today_arc === "number" && Number.isFinite(o.today_arc)
+        ? o.today_arc
+        : null,
+    pendingArc: null,
+    rank: null,
+    attestations: totalRewards,
+    lastPayoutAt:
+      typeof o.last_reward_at === "number" &&
+      Number.isFinite(o.last_reward_at)
+        ? o.last_reward_at
+        : null,
+    lastPayoutBlock: lastBlock,
+    fromChain: true,
+  };
+}
 
 /** Mirrors commands.rs::COORDINATOR_HOSTS, NYC included. */
 const COORDINATOR_HOSTS = [
@@ -202,7 +291,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         gpuVramGb: 16,
         recommendedModel: "Llama-2-7B Q4_K_M (3.8 GB)",
         recommendedRole: "worker",
-        estimatedDailyArc: 180,
       } as T;
     case "generate_identity":
       return {
@@ -312,34 +400,15 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       }
     }
     case "fetch_earnings": {
-      // No synthesized "today" (was total × 12%) and no invented "pending"
-      // (was a flat 2.5). This path genuinely does not know either, and
-      // null renders as "—" rather than a confident number.
-      try {
-        const r = await fetchJson("/inference/results?limit=1");
-        const count = r.count ?? 0;
-        return {
-          totalArc: count * REWARD_PER_ATTESTATION,
-          todayArc: null,
-          pendingArc: null,
-          rank: null,
-          attestations: count,
-          lastPayoutAt: null,
-          lastPayoutBlock: null,
-          fromChain: false,
-        } as T;
-      } catch {
-        return {
-          totalArc: 0,
-          todayArc: null,
-          pendingArc: null,
-          rank: null,
-          attestations: 0,
-          lastPayoutAt: null,
-          lastPayoutBlock: null,
-          fromChain: false,
-        } as T;
-      }
+      const stored = localStorage.getItem("arc-desktop-state-v1");
+      const addr = stored
+        ? (JSON.parse(stored).identity?.address as string | undefined)
+        : undefined;
+      if (!addr) return emptyEarnings() as T;
+      const path = `/worker/earnings/${strip0x(addr)}`;
+      const response = await getDetailed(path);
+      if (response.kind !== "ok") return emptyEarnings() as T;
+      return (confirmedEarningsFromBody(response.body) ?? emptyEarnings()) as T;
     }
     case "fetch_attestations": {
       // Shape-tolerant, matching rpc_client.rs::fetch_attestations. The live
@@ -387,7 +456,6 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
                 tokens !== null && msPerTok !== null
                   ? tokens * msPerTok
                   : num(inf, "inference_ms"),
-              rewardArc: mine ? REWARD_PER_ATTESTATION : null,
               timestamp: num(v, "timestamp"),
               blockHeight: num(v, "block_height"),
               txType: (v.tx_type as string) ?? null,
@@ -625,44 +693,10 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       throw new Error(`all coordinators failed (direct path); last: ${lastErr}`);
     }
     case "run_paid_inference": {
-      // Paid-inference signs and submits an on-chain tx; the live browser
-      // mode doesn't carry the payer's private key and can't represent
-      // that flow honestly. Surface a clear error rather than synthesize
-      // fake tx hashes the user might take as real.
-      throw new Error(
-        "run_paid_inference requires the Tauri native app (signing + tx submission)",
-      );
+      throw settlementWriteUnavailable("Paid inference escrow");
     }
     case "tier1_submit": {
-      const { prompt, maxTokens, maxReward, deadlineBlocks, committeeSize } =
-        args as {
-          prompt: string;
-          maxTokens?: number;
-          maxReward?: number;
-          deadlineBlocks?: number;
-          committeeSize?: number;
-        };
-      const r = await fetch(`${base}/inference/onchain/submit`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          input: prompt,
-          max_tokens: maxTokens ?? 32,
-          max_reward: maxReward ?? 10,
-          deadline_blocks: deadlineBlocks ?? 20,
-          committee_size: committeeSize ?? 5,
-        }),
-      });
-      if (!r.ok) throw new Error(`tier1_submit → HTTP ${r.status}`);
-      const v = await r.json();
-      return {
-        requestId: v.request_id,
-        txHash: v.tx_hash,
-        anchorHeight: v.anchor_height,
-        committeeSize: v.committee_size,
-        deadlineBlocks: v.deadline_blocks,
-        maxReward: v.max_reward,
-      } as T;
+      throw settlementWriteUnavailable("Tier 1 on-chain inference");
     }
     case "tier1_result": {
       const { requestId } = args as { requestId: string };
@@ -733,22 +767,20 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         treasuryBalanceUnavailableReason: strOf(d.body, [
           "treasury_balance_unavailable_reason",
         ]),
-        // `rewards_remaining` is a COUNT of attestations, NOT an ARC amount.
-        // Renamed on ingest so no call site can mistake it for currency.
+        // `rewards_remaining` is a COUNT of fundable reward receipts, NOT an
+        // ARC amount. Renamed on ingest so no call site can mistake it for
+        // currency.
         attestationsRemaining: numOf(d.body, ["rewards_remaining"]),
         attestationsRemainingUnavailableReason: strOf(d.body, [
           "rewards_remaining_unavailable_reason",
         ]),
         treasuryIsFinite: nBool(d.body, "treasury_is_finite"),
         bondPerAttestation: baseOrArc(
-          "bond_per_attestation_base",
-          "bond_per_attestation_arc",
+          "community_worker_certificate_bond_base",
+          "community_worker_certificate_bond_arc",
         ),
-        challengePeriodBlocks: numOf(d.body, ["challenge_period_blocks"]),
-        bondRefundedAfterChallengePeriod: nBool(
-          d.body,
-          "bond_refunded_after_challenge_period",
-        ),
+        challengePeriodBlocks: null,
+        bondRefundedAfterChallengePeriod: null,
         fundingDetail: strOf(d.body, ["funding_detail", "funding"]),
       } as T;
     }
@@ -761,6 +793,7 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         sourceHost: base,
         rewardPerAttestation: null,
         rewardRateSource: "unknown" as const,
+        communityRewardsEnabled: null,
         attestationsTotal: 0,
         firstAttestationBlock: null,
         attestationsPerDay: null,
@@ -780,21 +813,36 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (d.kind !== "ok") {
         return { ...empty, unavailable: reason(path, d) } as T;
       }
+      if (!confirmedEarningsFromBody(d.body)) {
+        return {
+          ...empty,
+          unavailable: `${base} answered ${path}, but did not provide the candidate mined-0x25 receipt and reward-readiness contract. Legacy inference-count arithmetic is not projected as earnings.`,
+        } as T;
+      }
       const rateBase = numOf(d.body, ["reward_per_attestation_base"]);
       const chainRate =
         rateBase !== null
           ? rateBase / ARC_BASE_UNITS
           : numOf(d.body, ["reward_per_attestation_arc"]);
-      const attestationsTotal =
-        numOf(d.body, ["total_attestations", "attestations"]) ?? 0;
-      const perDay = numOf(d.body, ["attestations_per_day_observed"]);
+      const attestationsTotal = numOf(d.body, ["total_rewards"]) ?? 0;
+      const payableRate =
+        chainRate !== null && chainRate >= 0 ? chainRate : null;
+      const observedPerDay = numOf(d.body, ["attestations_per_day_observed"]);
+      const perDay =
+        observedPerDay !== null && observedPerDay >= 0
+          ? observedPerDay
+          : null;
       return {
         sourceHost: base,
         unavailable: null,
-        // Falls back to the named constant, and says so via rewardRateSource
-        // rather than passing a constant off as a measurement.
-        rewardPerAttestation: chainRate ?? REWARD_PER_ATTESTATION,
-        rewardRateSource: chainRate !== null ? "chain" : "constant",
+        // The selected coordinator must report the payable amount. A local
+        // constant cannot prove remote rollout alignment.
+        rewardPerAttestation: payableRate,
+        rewardRateSource: payableRate !== null ? "chain" : "unknown",
+        communityRewardsEnabled: nBool(
+          d.body,
+          "community_rewards_v1_enabled",
+        ),
         attestationsTotal,
         firstAttestationBlock: numOf(d.body, ["first_attestation_block"]),
         attestationsPerDay: perDay,
@@ -803,8 +851,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
             ? null
             : (strOf(d.body, ["attestations_per_day_unavailable_reason"]) ??
               (attestationsTotal === 0
-                ? "No attestations credited to this address yet, so there is no history to measure a rate from."
-                : `${base} reports ${attestationsTotal} attestation(s) for this address but no observed rate, so a per-day figure cannot be measured here.`)),
+                ? "No successful mined reward receipts are retained for this address, so there is no history to measure a rate from."
+                : `${base} reports ${attestationsTotal} successful mined reward receipt(s) for this address but no observed rate, so a per-day figure cannot be measured here.`)),
         // `blocks_observed` on the wire.
         observedOverBlocks: numOf(d.body, ["blocks_observed"]),
         // Shown verbatim: the host knows its own method, this build does not.
@@ -1194,21 +1242,23 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
 let mockStartedAt: number | null = null;
 let mockWorkerThreads: number | null = null;
 const mockLogs: LogEntry[] = [];
-let mockEarnings: Earnings = {
+// Explicit browser-preview fixture for a hypothetical host whose candidate
+// receipt contract is ready. These are static layout values, never a claim
+// about the public fleet and never increased merely because a process runs.
+const mockEarnings: Earnings = {
   totalArc: 12_847.5,
-  todayArc: 247.12,
-  pendingArc: 18.4,
-  rank: 147,
+  todayArc: null,
+  pendingArc: null,
+  rank: null,
   attestations: 1283,
-  lastPayoutAt: Date.now() - 1000 * 60 * 12,
+  lastPayoutAt: null,
   lastPayoutBlock: 123_462,
   fromChain: true,
 };
 
 // The mock deliberately exercises BOTH attestation shapes the UI must
-// survive: rows that are the user's own (with a reward, tokens and a real
-// timestamp) and a row from another validator with no telemetry — which is
-// what the live seeds actually return today.
+// survive: raw 0x16 rows submitted by the user's address (with tokens and a
+// timestamp, but no reward) and a row from another address with no telemetry.
 const MOCK_ADDRESS = "arc1qxywa87m9v3kz8n2p5nc4z8y7dv4q3lns8z3p";
 
 const mockAttestations: Attestation[] = [
@@ -1219,7 +1269,6 @@ const mockAttestations: Attestation[] = [
     modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
     tokens: 42,
     latencyMs: 147,
-    rewardArc: REWARD_PER_ATTESTATION,
     timestamp: Date.now() - 1000 * 34,
     blockHeight: 123_462,
     txType: "Inference",
@@ -1234,7 +1283,6 @@ const mockAttestations: Attestation[] = [
     modelHash: "0xabec2d582beb97a876c21d7ccc5e8e48",
     tokens: 128,
     latencyMs: 412,
-    rewardArc: REWARD_PER_ATTESTATION,
     timestamp: Date.now() - 1000 * 89,
     blockHeight: 123_455,
     txType: "Inference",
@@ -1252,7 +1300,6 @@ const mockAttestations: Attestation[] = [
     modelHash: "",
     tokens: null,
     latencyMs: null,
-    rewardArc: null,
     timestamp: null,
     blockHeight: 123_401,
     txType: "Inference",
@@ -1272,7 +1319,6 @@ const mockAttestations: Attestation[] = [
     modelHash: "",
     tokens: null,
     latencyMs: null,
-    rewardArc: null,
     timestamp: null,
     blockHeight: 123_390,
     txType: "Other",
@@ -1288,10 +1334,9 @@ const MOCK_CHAIN_HOST = "http://140.82.16.112:9090";
 /**
  * Fourteen validators, four of them at stake 0.
  *
- * That ratio is not decorative — it is what the live network actually reports,
- * and it is why the Network screen separates active from registered. `/health`
- * and `/validators` both count the zero-stake entries, so the set looks four
- * larger than the number of nodes that can actually lead a round.
+ * This fixture preserves an older host response in which four registered
+ * entries had zero stake. It exists to keep the Network screen's active versus
+ * registered distinction testable; it is not a current fleet claim.
  */
 const MOCK_VALIDATORS = Array.from({ length: 14 }, (_, i) => ({
   address: `${(i + 1).toString(16).padStart(2, "0")}cda729e004c87fd15efc6b859ab567bbaba82ba95bdcf5f026082e0865e93${(i + 16).toString(16)}`,
@@ -1365,7 +1410,6 @@ const DEFAULT_HARDWARE: HardwareInfo = {
   gpuVramGb: 64,
   recommendedModel: "Llama-2-13B Q4_K_M (7.3 GB)",
   recommendedRole: "worker",
-  estimatedDailyArc: 420,
 };
 
 async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
@@ -1412,7 +1456,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         running,
         pid: running ? 42_731 : null,
         health: running ? (uptime < 8 ? "syncing" : "live") : "offline",
-        version: "0.7.11",
+        version: "0.7.12",
         peers: running ? 8 : 0,
         round: running ? 43_821 + Math.floor(uptime / 4) : 0,
         committed: running ? 43_820 + Math.floor(uptime / 4) : 0,
@@ -1449,14 +1493,6 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         message: "Cleared cached peer list. Rebootstrapping from testnet seeds.",
       } as T;
     case "fetch_earnings": {
-      if (mockStartedAt) {
-        const elapsed = (Date.now() - mockStartedAt) / 1000;
-        mockEarnings = {
-          ...mockEarnings,
-          todayArc: 247.12 + elapsed * 0.05,
-          totalArc: 12_847.5 + elapsed * 0.05,
-        };
-      }
       return mockEarnings as T;
     }
     case "fetch_attestations":
@@ -1478,18 +1514,18 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return {
         sourceHost: MOCK_CHAIN_HOST,
         unavailable: null,
-        rewardPerAttestation: REWARD_PER_ATTESTATION,
+        rewardPerAttestation: MOCK_REWARD_PER_RECEIPT,
         treasuryBalanceArc: 4_182_500,
         treasuryBalanceUnavailableReason: null,
-        // A COUNT of attestations the treasury can still pay for:
+        // A COUNT of successful reward receipts the treasury can still fund:
         // 4,182,500 ARC / 2.5 ARC = 1,673,000.
         attestationsRemaining: 1_673_000,
         attestationsRemainingUnavailableReason: null,
         treasuryIsFinite: true,
-        // DEFAULT_ATTESTATION_BOND is 1_000 base units = 0.000001 ARC.
-        bondPerAttestation: 1_000 / ARC_BASE_UNITS,
-        challengePeriodBlocks: 100,
-        bondRefundedAfterChallengePeriod: true,
+        // Verified community reward certificates carry no worker bond.
+        bondPerAttestation: 0,
+        challengePeriodBlocks: null,
+        bondRefundedAfterChallengePeriod: null,
         fundingDetail:
           "Transferred from a pre-funded testnet treasury account. Not an emission and not revenue share.",
       } as T;
@@ -1497,8 +1533,9 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return {
         sourceHost: MOCK_CHAIN_HOST,
         unavailable: null,
-        rewardPerAttestation: REWARD_PER_ATTESTATION,
+        rewardPerAttestation: MOCK_REWARD_PER_RECEIPT,
         rewardRateSource: "chain",
+        communityRewardsEnabled: true,
         attestationsTotal: 1_283,
         firstAttestationBlock: 118_011,
         attestationsPerDay: 43.2,
@@ -1658,7 +1695,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return {
         input: prompt,
         output:
-          "  Mock coordinator response - browser preview. In Tauri + live testnet, this is served by one of the 6 seed nodes via /inference/run_consensus with k=3 majority verification.",
+          "  Mock coordinator response — browser preview only. An installed build asks the selected coordinator for its agreement evidence; a host-reported quorum is not proof of payment or a healthy shared public chain.",
         outputHash:
           "0xd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
         modelHash: "",
@@ -1686,7 +1723,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       return {
         input: prompt,
         output:
-          "  Mock direct-coordinator response - browser preview. In Tauri + live testnet, this hits a single coordinator's /inference/run as a fallback when the sharded /inference/run_consensus path is degraded.",
+          "  Mock direct-coordinator response — browser preview only. An installed build may ask one coordinator directly, but that response alone does not prove independent recomputation, community assignment, mining, or payment.",
         outputHash:
           "0xe5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5",
         modelHash:
@@ -1703,24 +1740,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     }
     case "tier1_submit": {
-      await new Promise((r) => setTimeout(r, 300));
-      const requestId =
-        "0x" +
-        [...crypto.getRandomValues(new Uint8Array(32))]
-          .map((b) => b.toString(16).padStart(2, "0"))
-          .join("");
-      return {
-        requestId,
-        txHash:
-          "0x" +
-          [...crypto.getRandomValues(new Uint8Array(32))]
-            .map((b) => b.toString(16).padStart(2, "0"))
-            .join(""),
-        anchorHeight: 12345,
-        committeeSize: 5,
-        deadlineBlocks: 20,
-        maxReward: 10,
-      } as T;
+      throw settlementWriteUnavailable("Tier 1 on-chain inference");
     }
     case "tier1_result": {
       const { requestId } = args as { requestId: string };
@@ -1758,37 +1778,7 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     }
     case "run_paid_inference": {
-      const { prompt, maxFee } = args as {
-        prompt: string;
-        maxTokens?: number;
-        maxFee?: number;
-      };
-      await new Promise((r) => setTimeout(r, 1500));
-      return {
-        input: prompt,
-        output:
-          "  Mock paid-inference response - browser preview. In the native app, this flow: signs an InferenceEscrowOpen tx locally, POSTs it to a coordinator, waits for commit, then runs /inference/run_consensus which auto-submits the release.",
-        outputHash:
-          "0xd3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3",
-        tokensGenerated: 28,
-        inferenceMs: 22_100,
-        coordinator: "http://149.28.32.76:9090",
-        consensus: {
-          k: 3,
-          votesTotal: 48,
-          unanimous: 48,
-          majority: 0,
-          split: 0,
-          divergentReplicaCount: 0,
-        },
-        payerAddress:
-          "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
-        maxFee: maxFee ?? 10_000,
-        openTxHash:
-          "0x0open111111111111111111111111111111111111111111111111111111111111",
-        releaseTxHash:
-          "0x0release1111111111111111111111111111111111111111111111111111111",
-      } as T;
+      throw settlementWriteUnavailable("Paid inference escrow");
     }
     case "clear_crash":
       return undefined as T;
@@ -1949,7 +1939,9 @@ export const api = {
       maxTokens,
       chatTemplate,
     }),
-  // ── Tier 1 on-chain inference ────────────────────────────────────────────
+  // Write commands remain in the IPC surface for compatibility, but every
+  // native/browser implementation rejects them before signing or network I/O.
+  // `tier1Result` is read-only inspection for IDs created by older builds.
   tier1Submit: (
     prompt: string,
     maxTokens = 32,

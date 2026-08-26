@@ -200,8 +200,8 @@ export function Network() {
                 It still reports healthy — its DAG round keeps advancing after
                 block production stops, so the health check cannot see this.{" "}
                 <strong>
-                  Attestations cannot settle and earnings cannot be paid while
-                  a chain is stopped.
+                  This host cannot mine a new claim or reward receipt while it
+                  is not sealing blocks.
                 </strong>
                 {overview?.isBlockProducingBasis && (
                   <>
@@ -473,6 +473,20 @@ function TxLookupCard({
                   {result.blockHash ? formatHash(result.blockHash, 16) : "—"}
                 </dd>
               </div>
+              <p
+                style={{
+                  margin: "var(--space-3) 0 0",
+                  color: "var(--text-muted)",
+                  fontSize: "var(--text-xs)",
+                  lineHeight: 1.6,
+                }}
+              >
+                This receipt proves inclusion and execution status on this
+                host, but this endpoint does not expose transaction type. A
+                community payment must separately be identified as a
+                successful <code>0x25</code> reward transaction; a mined raw
+                <code>0x16</code> inference claim pays nothing.
+              </p>
             </>
           )}
 
@@ -819,7 +833,7 @@ function RecentInferenceCard({
   return (
     <Card data-testid="recent-inference">
       <CardHeader
-        title="Recent inference attestations"
+        title="Recent 0x16 inference claims (not payments)"
         action={
           <span style={{ fontSize: "var(--text-xs)", color: "var(--text-muted)" }}>
             {formatInt(real.length)} shown
@@ -847,8 +861,8 @@ function RecentInferenceCard({
         {real.length === 0 ? (
           <EmptyState
             icon={FileSignature}
-            title="No inference attestations on this host"
-            description="Attestations appear here once this chain has sealed one."
+            title="No inference claims on this host"
+            description="Raw 0x16 computation claims appear after submission. Payment requires a separate successful mined 0x25 reward receipt."
           />
         ) : (
           real.slice(0, 12).map((a) => (

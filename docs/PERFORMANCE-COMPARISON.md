@@ -1,5 +1,16 @@
 # Performance comparison - what ARC trades for what
 
+> **Historical comparison — do not quote as current capability or performance.**
+> The tables below mix an April-era seven-node topology, external estimates,
+> and design claims. They do not describe the forked/version-skewed public fleet
+> observed on 2026-08-26 or the unreleased v0.7.12 candidate. Public-v2 hashes do
+> not bind exact model bytes; transit hashes alone are not recomputation proof;
+> and current evidence does not establish RISC-V, GPU, full-GGUF, permissionless
+> work assignment, or one-command production participation. Re-benchmark the
+> exact commit, model, backend, topology, and hardware before publishing a
+> comparison. See
+> [`PRODUCTION-RECOVERY-AUDIT-2026-08-26.md`](PRODUCTION-RECOVERY-AUDIT-2026-08-26.md).
+
 If you're evaluating ARC's sharded inference against a centralized API or a single-machine local LLM, the latency difference is real and the answer is not "ARC is faster." Here is the honest comparison and what you actually get for the slower number.
 
 ## Latency

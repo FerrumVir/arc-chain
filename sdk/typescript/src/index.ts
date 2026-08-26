@@ -11,7 +11,7 @@
 
 // ─── Client ─────────────────────────────────────────────────
 
-export { ArcClient, ArcRpcError } from "./client";
+export { ArcClient, ArcRpcError } from "./client.js";
 
 // ─── Utilities ──────────────────────────────────────────────
 
@@ -24,7 +24,7 @@ export {
   bytesToHex,
   stripHexPrefix,
   addHexPrefix,
-} from "./utils";
+} from "./utils.js";
 
 // ─── Types ──────────────────────────────────────────────────
 
@@ -32,6 +32,8 @@ export type {
   // Primitives
   Hash256,
   Address,
+  HexString,
+  PrefixedHexString,
 
   // Health & Info
   HealthResponse,
@@ -61,7 +63,7 @@ export type {
   TxSubmitResponse,
   TxSubmitBatchResponse,
 
-  // Transaction Body Variants (all 21)
+  // Transaction Body Variants (0x01 through 0x25)
   TransactionBody,
   TransactionType,
   TransferBody,
@@ -85,6 +87,24 @@ export type {
   ChannelCloseBody,
   ChannelDisputeBody,
   ShardProofBody,
+  InferenceAttestationBody,
+  InferenceChallengeBody,
+  InferenceRegisterBody,
+  InferenceEscrowOpenBody,
+  InferenceEscrowReleaseBody,
+  InferenceEscrowRefundBody,
+  ModelRegistrationBody,
+  ModelRequestBody,
+  LayerRange,
+  ShardCoverageClaimBody,
+  CapacityAdvertisementBody,
+  ShardAssignmentEntry,
+  ShardAssignmentProposalBody,
+  FaucetClaimBody,
+  InferenceRequestBody,
+  InferenceVoteBody,
+  InferenceFinalizeBody,
+  CommunityInferenceRewardBody,
 
   // Accounts
   Account,
@@ -118,4 +138,4 @@ export type {
   BlockTxsQueryOptions,
   ContractCallOptions,
   TxSubmitPayload,
-} from "./types";
+} from "./types.js";

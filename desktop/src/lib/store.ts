@@ -10,11 +10,9 @@ export type Route =
   | "settings"
   | "logs";
 
-/// Selects which inference flow the user gets when they submit a prompt.
-/// `coordinator` = legacy off-chain coordinator path (run_consensus +
-/// direct fallback). `onchain` = Tier 1 VRF committee voting on-chain.
-/// See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
-export type InferenceMode = "coordinator" | "onchain";
+/** The only inference mode the recovery candidate exposes. Older persisted
+ * `"onchain"` values are untyped input and are coerced below. */
+export type InferenceMode = "coordinator";
 
 interface AppState {
   onboarded: boolean;

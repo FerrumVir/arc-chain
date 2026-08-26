@@ -12,27 +12,33 @@ import type { EarningsProjection, RewardEconomics } from "../lib/types";
  *
  * The rules it follows, in order of how badly breaking each one would hurt:
  *
- * 1. **A projection needs a measured rate.** `attestationsPerDay` comes from
- *    the chain host or it is absent. This component never derives a rate
+ * 1. **A projection needs a measured rate.** `attestationsPerDay` is the
+ *    backward-compatible field name for successful mined 0x25 receipts/day.
+ *    It comes from the chain host or it is absent. This component never derives a rate
  *    itself: deriving one means assuming a block time, and block production is
  *    stalled on four of six seeds, so any assumed block time is wrong by an
- *    unknown factor. With no rate, it shows what one attestation pays and says
+ *    unknown factor. With no rate, it shows the configured amount for one
+ *    successful mined reward receipt and says
  *    a rate needs history. It does not extrapolate from zero.
  * 2. **The treasury is finite.** The remaining balance and the number of
- *    attestations it can still pay for are shown whenever known. A per-day
+ *    reward receipts it can still fund are shown whenever known. A per-day
  *    figure with no stated ceiling implies an unlimited payout, and that is the
  *    dishonest version of this feature.
- * 3. **The bond is netted out, conservatively.** A bond is locked when an
- *    attestation is submitted. The host may report that it is refunded after a
- *    challenge period; the projection still nets it out and says so, because a
- *    refund this app cannot verify is not something to build a projection on.
- * 4. **This is a testnet treasury transfer, not revenue.** Stated on every
+ * 3. **Settlement must be active.** The selected coordinator must explicitly
+ *    report that community reward v1 is enabled. Jobs can execute while reward
+ *    settlement is paused, so a protocol constant alone is not permission to
+ *    display projected earnings.
+ * 4. **Worker bond terms are exact.** Community certificates currently carry
+ *    a zero bond. The unrelated local-attestation bond is never subtracted
+ *    from a worker reward.
+ * 5. **This is a testnet treasury transfer, not revenue.** Stated on every
  *    variant. No fiat figure and no currency symbol appears anywhere.
- * 5. **Every number is attributable.** The host each figure came from is named
+ * 6. **Every number is attributable.** The host each figure came from is named
  *    inline, because the seeds are separate chains.
  *
  * Two reads are joined here: `/worker/earnings/{addr}` supplies the rate and
- * the reward, `/economics/rewards` supplies the bond and the treasury ceiling.
+ * the reward and rollout gate, `/economics/rewards` supplies worker certificate
+ * terms and the treasury ceiling.
  * Either can 404 independently, and losing one must not take down the other.
  */
 
@@ -40,11 +46,11 @@ import type { EarningsProjection, RewardEconomics } from "../lib/types";
  *  daily rate can be extended over without the stalls dominating it. */
 const PROJECTION_DAYS = 7;
 
-/** Decimals for the bond, which is ~1e-6 ARC and vanishes at 2dp. */
+/** Precision if a future community-certificate contract reports a small bond. */
 const BOND_DIGITS = 6;
 
 interface Derived {
-  /** Net ARC per settled attestation, bond removed when known. */
+  /** Net ARC per mined community-reward receipt, worker bond removed when known. */
   netPerAttestation: number | null;
   perDay: number | null;
   perWeek: number | null;
@@ -53,9 +59,9 @@ interface Derived {
 /**
  * Combine the two reads into the figures shown.
  *
- * The bond arrives from `/economics/rewards`, NOT from the earnings endpoint —
- * worth stating because reading it from the wrong place silently yields null
- * and quietly stops netting anything out.
+ * Worker certificate terms arrive from `/economics/rewards`, not from the
+ * earnings endpoint. They must never be confused with the coordinator's local
+ * attestation bond.
  */
 function derive(
   p: EarningsProjection | undefined,
@@ -96,8 +102,8 @@ function rateSourceLabel(p: EarningsProjection): string {
  * instead of rendering "over null blocks".
  *
  * `compact` shortens each clause for the Dashboard tile without dropping any of
- * the three facts a reader needs — the rate and where it was measured, the
- * reward per attestation, and whether a bond was netted out.
+ * the facts a reader needs — the successful mined reward-receipt rate and
+ * where it was measured, the 0x25 reward amount, and certificate terms.
  */
 function assumptionClauses(
   p: EarningsProjection,
@@ -110,7 +116,7 @@ function assumptionClauses(
     : hostLabelVerbose(p.sourceHost);
 
   if (p.attestationsPerDay !== null) {
-    let rate = `${formatArc(p.attestationsPerDay, 1)} attestations/day, measured on ${host}`;
+    let rate = `${formatArc(p.attestationsPerDay, 1)} mined reward receipts/day, measured on ${host}`;
     if (p.observedOverBlocks !== null) {
       rate += ` over ${formatInt(p.observedOverBlocks)} blocks`;
     }
@@ -123,41 +129,45 @@ function assumptionClauses(
   if (p.rewardPerAttestation !== null) {
     out.push(
       compact
-        ? `${formatArc(p.rewardPerAttestation)} ARC per settled attestation`
-        : `${formatArc(p.rewardPerAttestation)} ARC per settled attestation (${rateSourceLabel(p)})`,
+        ? `${formatArc(p.rewardPerAttestation)} ARC per successful mined 0x25 receipt`
+        : `${formatArc(p.rewardPerAttestation)} ARC per successful mined 0x25 community-reward receipt (${rateSourceLabel(p)})`,
     );
   }
 
-  // The bond, netted out on the conservative assumption that it stays locked —
-  // even when the host says it comes back.
+  out.push(
+    compact
+      ? "reward protocol and approval collection reported ready"
+      : "the selected coordinator reports both reward-protocol activation and validator-approval collection ready",
+  );
+
+  // Community reward certificate bond only. A zero here is meaningful: the
+  // worker signs a certificate but posts no collateral.
   const bond = econ?.bondPerAttestation ?? null;
   if (bond !== null) {
-    if (compact) {
-      out.push(`${formatArc(bond, BOND_DIGITS)} ARC bond netted out`);
-    } else if (econ?.bondRefundedAfterChallengePeriod === true) {
-      const period =
-        econ.challengePeriodBlocks !== null
-          ? `${formatInt(econ.challengePeriodBlocks)}-block `
-          : "";
+    if (bond === 0) {
       out.push(
-        `${formatArc(bond, BOND_DIGITS)} ARC bond netted out — this host reports it is refunded after the ${period}challenge period, so the figure above is the conservative one that treats the bond as still locked`,
+        compact
+          ? "no worker bond required"
+          : "no worker bond is required for a verified community reward certificate",
       );
+    } else if (compact) {
+      out.push(`${formatArc(bond, BOND_DIGITS)} ARC bond netted out`);
     } else {
       out.push(
-        `${formatArc(bond, BOND_DIGITS)} ARC bond netted out; this host does not report whether it is ever released`,
+        `${formatArc(bond, BOND_DIGITS)} ARC worker certificate bond netted out`,
       );
     }
   } else if (econ?.unavailable) {
     out.push(
       compact
-        ? `bond unknown, so none is netted out`
-        : `the bond could not be read from this host, so nothing is netted out of the reward above`,
+        ? `worker bond terms unavailable; no deduction assumed`
+        : `worker certificate bond terms could not be read from this host, so the projection uses the gross reward and assumes no deduction`,
     );
   } else {
     out.push(
       compact
-        ? `no bond figure from this host, so none is netted out`
-        : `no bond figure reported by this host, so nothing is netted out of the reward above`,
+        ? `worker bond terms unreported; no deduction assumed`
+        : `no worker certificate bond figure was reported by this host, so the projection uses the gross reward and assumes no deduction`,
     );
   }
 
@@ -167,10 +177,10 @@ function assumptionClauses(
 /**
  * The finite-treasury line.
  *
- * Shows the remaining balance AND how many attestations it can still pay for.
- * That count comes from the host, not from arithmetic here — dividing a
- * network-wide pot by one node's rate would produce a "days remaining" figure
- * describing nothing, so this deliberately does no such division.
+ * Shows the remaining balance AND how many reward receipts it can still fund.
+ * That count comes from the selected host, not from arithmetic here. Dividing
+ * a host-scoped treasury by one worker's rate would produce a "days remaining"
+ * figure describing nothing, so this deliberately does no such division.
  */
 function TreasuryLine({
   econ,
@@ -218,11 +228,11 @@ function TreasuryLine({
       <p style={unavailableStyle} data-testid="treasury-remaining">
         Finite reward treasury:{" "}
         {balance !== null && <>{formatArc(balance)} ARC remains </>}
-        network-wide
+        on this chain host
         {remaining !== null && (
-          <> — about {formatInt(remaining)} more settled attestations</>
+          <> — about {formatInt(remaining)} more successful 0x25 receipts</>
         )}
-        , shared by every worker. Rewards stop when it is empty.
+        . Do not aggregate it across the currently divergent public seeds.
       </p>
     );
   }
@@ -242,17 +252,18 @@ function TreasuryLine({
             <strong>{formatArc(balance)} ARC</strong> remains{" "}
           </>
         )}
-        network-wide
+        on this selected chain host
         {/* A COUNT the host computed — not currency, and not our arithmetic. */}
         {remaining !== null && (
           <>
             {" "}
             — enough for about <strong>{formatInt(remaining)}</strong> more
-            settled attestations across the whole network
+            successful mined <code>0x25</code> reward receipts on this host
           </>
         )}
-        . Rewards stop when it is empty. This is a network-wide pot shared by
-        every worker, not a balance reserved for you.
+        . Rewards stop when it is empty. This is a finite host-scoped treasury,
+        not a balance reserved for you; do not combine it with another seed
+        while the public fleet is divergent.
       </div>
       {econ.fundingDetail && (
         <div
@@ -278,7 +289,7 @@ function FundingLabel() {
       className="status-pill info"
       data-testid="projection-funding-label"
       style={{ fontSize: "var(--text-xs)", fontWeight: 500 }}
-      title="Rewards are moved from a testnet treasury. They are not income, and this app never shows a fiat value for them."
+      title="Only successful mined 0x25 receipts move testnet treasury ARC. Raw 0x16 attestations are not payment, and no fiat value is shown."
     >
       Testnet treasury transfer, not revenue
     </span>
@@ -326,7 +337,7 @@ export function ProjectedEarnings({
   if (!projection) {
     return (
       <Card data-testid="projection-loading">
-        <CardHeader title="Projected rewards" />
+        <CardHeader title="Observed-rate reward projection" />
         <p
           style={{
             color: "var(--text-muted)",
@@ -344,10 +355,31 @@ export function ProjectedEarnings({
   if (projection.unavailable) {
     return (
       <Card data-testid="projection-card">
-        <CardHeader title="Projected rewards" action={<FundingLabel />} />
+        <CardHeader title="Observed-rate reward projection" action={<FundingLabel />} />
         <NotAvailable
           reason={projection.unavailable}
           testId="projection-unavailable"
+        />
+        <TreasuryLine econ={econ} compact={compact} />
+      </Card>
+    );
+  }
+
+  // Jobs and rewards have separate rollout gates. Never turn a configured
+  // protocol amount into projected earnings unless this coordinator confirms
+  // that it can actually settle community reward transactions.
+  if (projection.communityRewardsEnabled !== true) {
+    const inactive = projection.communityRewardsEnabled === false;
+    return (
+      <Card data-testid="projection-card">
+        <CardHeader title="Observed-rate reward projection" action={<FundingLabel />} />
+        <NotAvailable
+          reason={
+            inactive
+              ? `Community reward settlement is inactive on ${hostLabelVerbose(projection.sourceHost)}. Work may still run, but this coordinator reports that protocol activation and/or validator-approval collection is not ready, so it cannot create a payable 0x25 transaction.`
+              : `This host did not confirm both community-reward protocol activation and validator-approval collection. No future reward figure is shown.`
+          }
+          testId="projection-rollout-inactive"
         />
         <TreasuryLine econ={econ} compact={compact} />
       </Card>
@@ -358,7 +390,7 @@ export function ProjectedEarnings({
   if (d.perDay === null) {
     return (
       <Card data-testid="projection-card">
-        <CardHeader title="Projected rewards" action={<FundingLabel />} />
+        <CardHeader title="Observed-rate reward projection" action={<FundingLabel />} />
         <div data-testid="projection-no-rate">
           <div
             className="big-number"
@@ -369,7 +401,7 @@ export function ProjectedEarnings({
                 ? formatArc(projection.rewardPerAttestation)
                 : "—"}
             </span>
-            <span className="unit">ARC per settled attestation</span>
+            <span className="unit">ARC per successful mined 0x25 receipt</span>
           </div>
           <p
             style={{
@@ -380,7 +412,7 @@ export function ProjectedEarnings({
             }}
           >
             {projection.rateUnavailableReason ??
-              "This host reports no observed attestation rate."}{" "}
+              "This host reports no observed mined-reward-receipt rate."}{" "}
             <strong>
               No per-day figure is shown: a rate has to be measured, and there
               is nothing yet to measure.
@@ -408,7 +440,7 @@ export function ProjectedEarnings({
   // ── Full projection: every input is real ───────────────────────────────
   return (
     <Card data-testid="projection-card" featured={!compact}>
-      <CardHeader title="Projected rewards" action={<FundingLabel />} />
+      <CardHeader title="Observed-rate reward projection" action={<FundingLabel />} />
       <div data-testid="projection-figures">
         <div
           style={{

@@ -10,8 +10,8 @@
 //   GET  /inference/results?limit=N      { results: [{input, output, output_hash,
 //                                          ms_per_token, tokens_generated,
 //                                          tx_hash}], count }
-//   GET  /worker/earnings                (not implemented on this node - empty body;
-//                                          we synthesize from attestations)
+//   GET  /worker/earnings/:address       (candidate: successful mined 0x25
+//                                          receipt index + readiness fields)
 
 use crate::types::{
     AccountBalance, Attestation, BlockSummary, Earnings, EarningsProjection, FaucetResult,
@@ -20,8 +20,6 @@ use crate::types::{
 };
 use serde_json::Value;
 use tracing::{debug, info, warn};
-
-const REWARD_PER_ATTESTATION: f64 = 2.5; // ARC; matches testnet flat rate
 
 /// Public seed coordinators that mirror `commands.rs::COORDINATOR_HOSTS`.
 /// Probed when local P2P can't get peers, so the UI can flip to "lite mode"
@@ -185,13 +183,65 @@ pub async fn fetch_status(
     }
 }
 
-/// Fetch this worker's earnings. v0.7.0+: hits the chain-side
-/// `/worker/earnings/:address` endpoint, which counts on-chain
-/// InferenceAttestation events (tx 0x16) attributed to this address.
-/// Falls back to the pre-v0.7 `/inference/results` synthesis when:
-///   - we don't have an address yet (onboarding not finished), or
-///   - the node hasn't been upgraded to v0.7.0 (returns 404 on the
-///     new route).
+/// Parse only the v0.7.12 mined-community-reward receipt contract.
+///
+/// Public v2 also answers `/worker/earnings/:address` with HTTP 200, but that
+/// older body is raw-0x16 count × constant display arithmetic. HTTP success is
+/// therefore not a semantics/version signal. The candidate contract is
+/// identified by its explicit receipt count, retained-window note, last-reward
+/// evidence fields, and all three rollout/readiness booleans. Any missing,
+/// ambiguous, or internally inconsistent field fails closed.
+fn confirmed_earnings_from_value(v: &Value) -> Option<Earnings> {
+    let total_rewards = v.get("total_rewards")?.as_u64()?;
+    let total_arc = v.get("estimated_total_arc")?.as_f64()?;
+    if total_arc < 0.0 {
+        return None;
+    }
+    let note = v.get("estimated_total_arc_note")?.as_str()?;
+    if !note.contains("CommunityInferenceReward") {
+        return None;
+    }
+
+    let effective = v.get("community_rewards_v1_enabled")?.as_bool()?;
+    let protocol_active = v.get("community_rewards_v1_protocol_active")?.as_bool()?;
+    let approval_ready = v
+        .get("community_rewards_v1_approval_collection_ready")?
+        .as_bool()?;
+    if effective && !(protocol_active && approval_ready) {
+        return None;
+    }
+
+    // Both keys are part of the candidate contract even when their value is
+    // null because no successful receipt exists yet.
+    let last_reward_block_value = v.get("last_reward_block")?;
+    let last_reward_hash_value = v.get("last_reward_tx_hash")?;
+    let last_reward_block = last_reward_block_value.as_u64();
+    let last_reward_hash = last_reward_hash_value
+        .as_str()
+        .filter(|hash| !hash.trim().is_empty());
+    if total_rewards > 0 && (last_reward_block.is_none() || last_reward_hash.is_none()) {
+        return None;
+    }
+
+    Some(Earnings {
+        total_arc,
+        // Null means unavailable, not zero. The candidate intentionally does
+        // not invent a daily split from a lifetime receipt count.
+        today_arc: v.get("today_arc").and_then(Value::as_f64),
+        pending_arc: None,
+        rank: None,
+        attestations: total_rewards,
+        last_payout_at: v.get("last_reward_at").and_then(Value::as_i64),
+        last_payout_block: last_reward_block,
+        from_chain: true,
+    })
+}
+
+/// Fetch this worker's confirmed community rewards.
+///
+/// Only the v0.7.12 receipt/readiness response above can produce numeric
+/// earnings. Older endpoints and inference caches are deliberately unavailable
+/// rather than converted into ARC.
 ///
 /// `address` is the user's hex address (with or without `0x` prefix).
 pub async fn fetch_earnings(
@@ -204,87 +254,13 @@ pub async fn fetch_earnings(
         if let Ok(resp) = http.get(&url).send().await {
             if resp.status().is_success() {
                 if let Ok(v) = resp.json::<Value>().await {
-                    let total_arc = v
-                        .get("total_arc")
-                        .and_then(|x| x.as_f64())
-                        .unwrap_or(0.0);
-                    let today_arc = v
-                        .get("today_arc")
-                        .and_then(|x| x.as_f64())
-                        .unwrap_or(0.0);
-                    let attestations = v
-                        .get("total_attestations")
-                        .and_then(|x| x.as_u64())
-                        .unwrap_or(0);
-                    let last_block = v
-                        .get("last_attestation_block")
-                        .and_then(|x| x.as_u64());
-                    return Earnings {
-                        total_arc,
-                        // `today_arc` is a real chain-reported field, so it
-                        // is passed through as-is - but only because the
-                        // chain sent it. It is never synthesized.
-                        today_arc: Some(today_arc),
-                        // Pending = submitted but not yet
-                        // unchallenged-released. The chain doesn't expose
-                        // that distinction yet, so report None ("not
-                        // available") rather than a made-up figure.
-                        pending_arc: None,
-                        rank: None,
-                        attestations,
-                        // A block height is NOT a timestamp. Feeding
-                        // `last_attestation_block` (~123,462) to the UI's
-                        // relative-time formatter rendered "20770d ago" -
-                        // masked today only because the field is null until
-                        // the account actually earns something. Keep the two
-                        // concepts in separate fields; emit a timestamp only
-                        // if the chain ever sends a real one.
-                        last_payout_at: v
-                            .get("last_attestation_at")
-                            .and_then(|x| x.as_i64()),
-                        last_payout_block: last_block,
-                        from_chain: true,
-                    };
+                    return confirmed_earnings_from_value(&v).unwrap_or_else(empty_earnings);
                 }
             }
-            // 404 from v0.6.x seeds → fall through to synthesis
         }
     }
 
-    // Pre-v0.7 fallback: synthesize from /inference/results (the host's
-    // ring buffer of recent inferences). Misleading for workers behind
-    // NAT (they earn on remote seeds, but their local cache doesn't see
-    // those attestations) — keeping it only as a safety net for old
-    // binaries.
-    let resp = http
-        .get(format!("{}/inference/results?limit=10000", base_url))
-        .send()
-        .await;
-    let v: Value = match resp {
-        Ok(r) => r.json().await.unwrap_or(Value::Null),
-        Err(_) => return empty_earnings(),
-    };
-    let total = v.get("count").and_then(|x| x.as_u64()).unwrap_or(0);
-
-    // Everything below is an estimate from the host's ring buffer of recent
-    // inferences, flagged as such via `from_chain: false`.
-    //
-    // The invented numbers are gone. "Today" used to be `total * 0.12`
-    // rounded — a made-up 12% of lifetime earnings presented in the same
-    // typeface as a real balance. "Pending" was
-    // `min(results, 5) * 2.5 / 2`, which is not an approximation of anything.
-    // Both are None now: the fallback genuinely does not know them, and
-    // saying so is better than filling the gap with arithmetic.
-    Earnings {
-        total_arc: total as f64 * REWARD_PER_ATTESTATION,
-        today_arc: None,
-        pending_arc: None,
-        rank: None,
-        attestations: total,
-        last_payout_at: None,
-        last_payout_block: None,
-        from_chain: false,
-    }
+    empty_earnings()
 }
 
 /// Recent attestations, parsed shape-tolerantly and attributed honestly.
@@ -294,15 +270,14 @@ pub async fn fetch_earnings(
 /// **Shape.** Every field was read out of a nested `inference` object. The
 /// deployed seeds return a flat transaction record —
 /// `{block_height, from, gas_used, success, tx_hash, tx_type}` — with no such
-/// key, so every field collapsed to `""` or `0` while `reward_arc` stayed
-/// hardcoded at 2.5. The Dashboard rendered rows with a blank prompt,
+/// key, so every field collapsed to `""` or `0` while the old adapter still
+/// attached a hardcoded +2.5. The Dashboard rendered rows with a blank prompt,
 /// "0 tokens", "0ms" and a confident "+2.50". Both shapes are accepted now,
 /// and absent values stay absent instead of becoming zero.
 ///
-/// **Attribution.** `reward_arc` was 2.5 for every row regardless of who
-/// submitted it, so the user's own earnings feed showed other validators'
-/// work as their income. A reward is now attached only when `from` matches
-/// the user's address.
+/// **Payment.** Every row here is a raw inference claim (`0x16`). Address
+/// matching says who submitted the claim; it never adds a reward field or
+/// turns the claim into a payment.
 ///
 /// **Time.** Timestamps were fabricated as `now - i * 30s`, producing a
 /// plausible-looking "34s ago / 1m ago / 2m ago" ladder that was pure
@@ -397,7 +372,6 @@ pub async fn fetch_attestations(
                     .to_string(),
                 tokens,
                 latency_ms,
-                reward_arc: mine.then_some(REWARD_PER_ATTESTATION),
                 timestamp: v
                     .get("timestamp")
                     .or_else(|| inf.get("timestamp"))
@@ -905,70 +879,12 @@ pub async fn run_inference_remote(
     })
 }
 
-// ── Tier 1 on-chain inference (VRF committee voting) ───────────────────────
-// See `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
-//
-// The caller picks which seed VPS to talk to (see commands.rs::pick_tier1_host).
-// Each seed runs its own chain instance with a different anchor_height, so the
-// submit/result pair MUST stick to the same host or the poll will 404. The
-// command layer stores request_id → host in `AppState::tier1_routes` to enforce
-// this.
-
-/// Submit an `InferenceRequest` tx via the chosen seed's convenience endpoint
-/// (`/inference/onchain/submit`). The seed signs with its validator keypair on
-/// the user's behalf. Returns the request_id which the UI then polls via
-/// `tier1_result` against the SAME `base_url`.
-/// Currently unused: `commands::tier1_submit` builds and signs the
-/// `InferenceRequest` locally so the tx is attributed to the user rather than
-/// to the seed's validator key, and posts it to `/tx/submit_signed` instead.
-/// Kept because the seed-signed convenience route is still the fallback if
-/// local signing has to be dropped.
-#[allow(dead_code)]
-pub async fn tier1_submit(
-    http: &reqwest::Client,
-    base_url: &str,
-    prompt: &str,
-    max_tokens: u32,
-    max_reward: u64,
-    deadline_blocks: u64,
-    committee_size: u8,
-) -> Result<Tier1Submitted, String> {
-    let resp = http
-        .post(format!("{}/inference/onchain/submit", base_url))
-        .json(&serde_json::json!({
-            "input": prompt,
-            "max_tokens": max_tokens,
-            "max_reward": max_reward,
-            "deadline_blocks": deadline_blocks,
-            "committee_size": committee_size,
-        }))
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {} from /inference/onchain/submit", resp.status()));
-    }
-    let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(Tier1Submitted {
-        request_id: v
-            .get("request_id")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        tx_hash: v
-            .get("tx_hash")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        anchor_height: v.get("anchor_height").and_then(|x| x.as_u64()).unwrap_or(0),
-        committee_size: v
-            .get("committee_size")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0) as u8,
-        deadline_blocks: v.get("deadline_blocks").and_then(|x| x.as_u64()).unwrap_or(0),
-        max_reward: v.get("max_reward").and_then(|x| x.as_u64()).unwrap_or(0),
-    })
-}
+// ── Historical Tier 1 reads ───────────────────────────────────────────────
+// New Tier 1 request writes are disabled by commands.rs. The former
+// seed-signed convenience submitter was removed as well: server-selected
+// replica names and VRF membership are not validator authorization. Keep only
+// the read path so an operator can inspect a request ID created by an older
+// build without creating a new request.
 
 /// Poll the on-chain state of a Tier 1 request. Returns the current
 /// status, the votes seen so far, and (once finalized) the agreed
@@ -1238,23 +1154,24 @@ pub async fn fetch_reward_economics(
             v,
             &["treasury_balance_unavailable_reason"],
         ),
-        // `rewards_remaining` is a COUNT of attestations the treasury can
-        // still pay for — NOT an ARC amount. Renamed on the way in so no call
-        // site can mistake it for currency.
+        // `rewards_remaining` is a COUNT of fundable reward receipts — NOT an
+        // ARC amount. Renamed on the way in so no call site can mistake it for
+        // currency.
         attestations_remaining: pick_u64(v, &["rewards_remaining"]),
         attestations_remaining_unavailable_reason: pick_str(
             v,
             &["rewards_remaining_unavailable_reason"],
         ),
         treasury_is_finite: v.get("treasury_is_finite").and_then(|x| x.as_bool()),
+        // Community reward certificates are a separate transaction shape
+        // from the local coordinator attestation. Never subtract the latter's
+        // bond from a worker's projected reward.
         bond_per_attestation: base_or_arc(
-            "bond_per_attestation_base",
-            "bond_per_attestation_arc",
+            "community_worker_certificate_bond_base",
+            "community_worker_certificate_bond_arc",
         ),
-        challenge_period_blocks: pick_u64(v, &["challenge_period_blocks"]),
-        bond_refunded_after_challenge_period: v
-            .get("bond_refunded_after_challenge_period")
-            .and_then(|x| x.as_bool()),
+        challenge_period_blocks: None,
+        bond_refunded_after_challenge_period: None,
         funding_detail: pick_str(v, &["funding_detail", "funding"]),
     }
 }
@@ -1282,6 +1199,7 @@ pub async fn fetch_earnings_projection(
                 ),
                 reward_per_attestation: None,
                 reward_rate_source: "unknown".to_string(),
+                community_rewards_enabled: None,
                 attestations_total: 0,
                 first_attestation_block: None,
                 attestations_per_day: None,
@@ -1302,6 +1220,7 @@ pub async fn fetch_earnings_projection(
                 unavailable: Some(unavailable_reason(base_url, &path, other)),
                 reward_per_attestation: None,
                 reward_rate_source: "unknown".to_string(),
+                community_rewards_enabled: None,
                 attestations_total: 0,
                 first_attestation_block: None,
                 attestations_per_day: None,
@@ -1312,22 +1231,45 @@ pub async fn fetch_earnings_projection(
         }
     };
 
+    if confirmed_earnings_from_value(v).is_none() {
+        return EarningsProjection {
+            source_host: base_url.to_string(),
+            unavailable: Some(format!(
+                "{} answered {}, but did not provide the candidate mined-0x25 receipt and reward-readiness contract. Legacy inference-count arithmetic is not projected as earnings.",
+                base_url, path
+            )),
+            reward_per_attestation: None,
+            reward_rate_source: "unknown".to_string(),
+            community_rewards_enabled: None,
+            attestations_total: 0,
+            first_attestation_block: None,
+            attestations_per_day: None,
+            rate_unavailable_reason: None,
+            observed_over_blocks: None,
+            rate_caveat: None,
+        };
+    }
+
     let chain_rate = pick_u64(v, &["reward_per_attestation_base"])
         .map(|b| b as f64 / ARC_BASE_UNITS)
-        .or_else(|| pick_f64(v, &["reward_per_attestation_arc"]));
+        .or_else(|| pick_f64(v, &["reward_per_attestation_arc"]))
+        .filter(|rate| *rate >= 0.0);
     let (reward_per_attestation, reward_rate_source) = match chain_rate {
         Some(r) => (Some(r), "chain"),
-        // The flat testnet rate is a named constant in this build and in the
-        // node. Labelling its origin is what keeps it from reading as a
-        // measurement.
-        None => (Some(REWARD_PER_ATTESTATION), "constant"),
+        // A payable amount must come from the selected coordinator. A local
+        // constant cannot prove that the remote rollout is active or aligned.
+        None => (None, "unknown"),
     };
+    let community_rewards_enabled = v
+        .get("community_rewards_v1_enabled")
+        .and_then(|value| value.as_bool());
 
-    let attestations_total = pick_u64(v, &["total_attestations", "attestations"]).unwrap_or(0);
+    let attestations_total = pick_u64(v, &["total_rewards"]).unwrap_or(0);
     let first_attestation_block = pick_u64(v, &["first_attestation_block"]);
     // `blocks_observed` on the wire — the inclusive span the rate covers.
     let observed_over_blocks = pick_u64(v, &["blocks_observed"]);
-    let attestations_per_day = pick_f64(v, &["attestations_per_day_observed"]);
+    let attestations_per_day = pick_f64(v, &["attestations_per_day_observed"])
+        .filter(|rate| *rate >= 0.0);
 
     // A rate the host explicitly declined to give carries its own reason;
     // otherwise say precisely which input is missing.
@@ -1345,10 +1287,10 @@ pub async fn fetch_earnings_projection(
             )
             .unwrap_or_else(|| {
                 if attestations_total == 0 {
-                    "No attestations credited to this address yet, so there is no history to measure a rate from.".to_string()
+                    "No successful mined reward receipts are retained for this address, so there is no history to measure a rate from.".to_string()
                 } else {
                     format!(
-                        "{} reports {} attestation(s) for this address but no observed rate, so a per-day figure cannot be measured here.",
+                        "{} reports {} successful mined reward receipt(s) for this address but no observed rate, so a per-day figure cannot be measured here.",
                         base_url, attestations_total
                     )
                 }
@@ -1365,6 +1307,7 @@ pub async fn fetch_earnings_projection(
         unavailable: None,
         reward_per_attestation,
         reward_rate_source: reward_rate_source.to_string(),
+        community_rewards_enabled,
         attestations_total,
         first_attestation_block,
         attestations_per_day,
@@ -2006,6 +1949,88 @@ mod chain_read_tests {
     }
 
     // ── Recent-block window ─────────────────────────────────────────────
+
+    fn candidate_earnings_value() -> Value {
+        json!({
+            "total_rewards": 2,
+            "estimated_total_arc": 5.0,
+            "estimated_total_arc_note":
+                "retained-window gross rewards = successful CommunityInferenceReward receipts × reward_per_attestation_arc",
+            "today_arc": Value::Null,
+            "community_rewards_v1_enabled": true,
+            "community_rewards_v1_protocol_active": true,
+            "community_rewards_v1_approval_collection_ready": true,
+            "last_reward_block": 123_462,
+            "last_reward_tx_hash": format!("0x{}", "ab".repeat(32)),
+        })
+    }
+
+    #[test]
+    fn candidate_reward_receipt_contract_is_confirmed_without_inventing_today() {
+        let earnings = confirmed_earnings_from_value(&candidate_earnings_value())
+            .expect("candidate receipt contract should parse");
+        assert!(earnings.from_chain);
+        assert_eq!(earnings.attestations, 2);
+        assert_eq!(earnings.total_arc, 5.0);
+        assert_eq!(earnings.today_arc, None);
+        assert_eq!(earnings.last_payout_block, Some(123_462));
+    }
+
+    #[test]
+    fn public_v2_count_times_constant_body_is_not_confirmed_earnings() {
+        let legacy = json!({
+            "total_attestations": 7,
+            "total_arc": 17.5,
+            "today_arc": 2.5,
+            "last_attestation_block": 123_462,
+        });
+        assert!(confirmed_earnings_from_value(&legacy).is_none());
+    }
+
+    #[test]
+    fn candidate_shape_without_all_readiness_fields_fails_closed() {
+        let mut value = candidate_earnings_value();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("community_rewards_v1_approval_collection_ready");
+        assert!(confirmed_earnings_from_value(&value).is_none());
+    }
+
+    #[test]
+    fn candidate_shape_with_negative_reward_total_fails_closed() {
+        let mut value = candidate_earnings_value();
+        value["estimated_total_arc"] = json!(-5.0);
+        assert!(confirmed_earnings_from_value(&value).is_none());
+    }
+
+    #[test]
+    fn internally_inconsistent_effective_reward_gate_fails_closed() {
+        let mut value = candidate_earnings_value();
+        value["community_rewards_v1_approval_collection_ready"] = json!(false);
+        assert!(confirmed_earnings_from_value(&value).is_none());
+    }
+
+    #[test]
+    fn positive_reward_count_requires_last_successful_receipt_evidence() {
+        let mut value = candidate_earnings_value();
+        value["last_reward_tx_hash"] = Value::Null;
+        assert!(confirmed_earnings_from_value(&value).is_none());
+    }
+
+    #[test]
+    fn zero_candidate_receipts_allow_null_last_receipt_but_remain_confirmed_zero() {
+        let mut value = candidate_earnings_value();
+        value["total_rewards"] = json!(0);
+        value["estimated_total_arc"] = json!(0.0);
+        value["last_reward_block"] = Value::Null;
+        value["last_reward_tx_hash"] = Value::Null;
+        let earnings = confirmed_earnings_from_value(&value)
+            .expect("explicit candidate zero is distinct from legacy ambiguity");
+        assert!(earnings.from_chain);
+        assert_eq!(earnings.total_arc, 0.0);
+        assert_eq!(earnings.today_arc, None);
+    }
 
     #[test]
     fn recent_block_range_anchors_to_the_tip_not_to_genesis() {
