@@ -156,6 +156,40 @@ installer_normalizes_service_identity_and_secret_permissions() {
     fi
 }
 
+linux_compat_smoke_has_one_docker_run() {
+    local smoke_block docker_run_count
+    smoke_block="$(awk '
+        /^  linux-server-compat:/ { capture=1 }
+        capture { print }
+        capture && /^  desktop:/ { exit }
+    ' "$RELEASE_WORKFLOW")"
+
+    docker_run_count="$(printf '%s\n' "$smoke_block" | grep -Ec '^[[:space:]]+docker run --rm[[:space:]]*\\$' || true)"
+    if [ "$docker_run_count" -ne 1 ]; then
+        printf 'Ubuntu compatibility loop must contain exactly one docker run command; found %s\n' "$docker_run_count"
+        return 1
+    fi
+    if printf '%s\n' "$smoke_block" | awk '
+        /^[[:space:]]+docker run --rm[[:space:]]*\\$/ {
+            if (previous) duplicate=1
+            previous=1
+            next
+        }
+        { previous=0 }
+        END { exit duplicate ? 0 : 1 }
+    '; then
+        printf 'Ubuntu compatibility loop contains consecutive duplicate docker run commands\n'
+        return 1
+    fi
+    # shellcheck disable=SC2016 # GitHub expression literals are the contract.
+    for required in 'for ubuntu in 24.04 26.04' 'arc-node-${{ matrix.platform }}' 'arc-cli-${{ matrix.platform }}' '--env DISPLAY='; do
+        printf '%s\n' "$smoke_block" | grep -Fq -- "$required" || {
+            printf 'Ubuntu compatibility smoke is missing: %s\n' "$required"
+            return 1
+        }
+    done
+}
+
 relevant_shell_is_syntax_valid() {
     local file
     for file in "$INSTALLER" "$ASSEMBLER" "$TEST_DIR"/*.sh "$TEST_DIR"/helpers/*.sh; do
@@ -170,6 +204,7 @@ run_test 'installer and update-only path verify SHA-256 before replacement' inst
 run_test 'raw node consumers use exact versioned release URLs' raw_node_downloads_are_version_pinned
 run_test 'update-only path refuses equal and older semantic versions' updater_has_semver_downgrade_guard
 run_test 'installer normalizes service identity and protects its seed' installer_normalizes_service_identity_and_secret_permissions
+run_test 'Ubuntu compatibility loop has one non-duplicated docker invocation' linux_compat_smoke_has_one_docker_run
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
 
 finish_tests
