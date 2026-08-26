@@ -1239,26 +1239,12 @@ impl StateDB {
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         use rayon::prelude::*;
 
-        // ── Pre-sort by (sender, nonce) to reduce BlockSTM conflicts ──────
-        // Build a sorted index so same-sender TXs are adjacent in nonce order.
-        // This makes the partition algorithm place them in sequential batches
-        // naturally, reducing cross-batch conflicts.
-        let mut sorted_indices: Vec<usize> = (0..transactions.len()).collect();
-        sorted_indices.sort_by(|&a, &b| {
-            transactions[a]
-                .from
-                .0
-                .cmp(&transactions[b].from.0)
-                .then(transactions[a].nonce.cmp(&transactions[b].nonce))
-        });
-
-        // Build a re-ordered transaction slice for partitioning.
-        let sorted_txs: Vec<Transaction> = sorted_indices
-            .iter()
-            .map(|&i| transactions[i].clone())
-            .collect();
-        // Map from sorted position back to original index.
-        let batches = crate::block_stm::partition_batches(&sorted_txs);
+        // The transaction slice is already in canonical block/DAG order.
+        // Re-sorting by sender used to reverse cross-sender conflicts (shared
+        // treasury, reward marker, challenge escrow, etc.) while merely moving
+        // receipts back to their original slots. Partition that canonical
+        // sequence directly; partition_batches preserves every conflict edge.
+        let batches = crate::block_stm::partition_batches(transactions);
         let mut receipts = vec![None; transactions.len()];
         let mut tx_hashes = vec![Hash256::ZERO; transactions.len()];
 
@@ -1276,14 +1262,12 @@ impl StateDB {
 
         // Execute batches: within each batch, TXs run in parallel.
         // Batches run sequentially (they may have cross-batch dependencies).
-        // Note: batch indices refer to positions in sorted_txs; we map back
-        // to original positions via sorted_indices for receipt/hash placement.
+        // Batch indices are the original canonical transaction indices.
         for batch in &batches {
             let batch_results: Vec<(usize, bool, u64)> = batch
                 .par_iter()
-                .map(|&sorted_idx| {
-                    let orig_idx = sorted_indices[sorted_idx];
-                    let tx = &transactions[orig_idx];
+                .map(|&idx| {
+                    let tx = &transactions[idx];
                     self.mark_tx_accounts_dirty(tx);
                     let result = if tx.sig_verified {
                         self.execute_tx(tx) // Pre-verified (faucet/RPC) - skip sig check
@@ -1298,17 +1282,17 @@ impl StateDB {
                         Ok(gas) => (true, gas),
                         Err(_) => (false, Self::gas_cost_for_tx(tx)),
                     };
-                    (orig_idx, success, gas_used)
+                    (idx, success, gas_used)
                 })
                 .collect();
 
-            for (orig_idx, success, gas_used) in batch_results {
-                tx_hashes[orig_idx] = transactions[orig_idx].hash;
-                receipts[orig_idx] = Some(TxReceipt {
-                    tx_hash: transactions[orig_idx].hash,
+            for (idx, success, gas_used) in batch_results {
+                tx_hashes[idx] = transactions[idx].hash;
+                receipts[idx] = Some(TxReceipt {
+                    tx_hash: transactions[idx].hash,
                     block_height: height,
                     block_hash: Hash256::ZERO,
-                    index: orig_idx as u32,
+                    index: idx as u32,
                     success,
                     gas_used,
                     value_commitment: None,

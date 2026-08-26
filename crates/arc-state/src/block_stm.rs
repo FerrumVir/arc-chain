@@ -67,12 +67,32 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
         TxBody::ChannelClose(_) | TxBody::ChannelDispute(_) => {}
         TxBody::ShardProof(_) => {}
         TxBody::InferenceAttestation(_) => {
-            // Escrow address is derived from tx hash (not known statically);
-            // sender account is already included.
+            // A bonded attestation writes an escrow derived from its tx hash.
+            // Raw attestations no longer debit the treasury; settlement uses
+            // the validator-authorized reward variant below.
+            let escrow_addr =
+                arc_crypto::hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
+            accounts.insert(escrow_addr.0);
         }
-        TxBody::InferenceChallenge(_) => {
-            // Escrow address depends on attestation hash (not known statically);
-            // sender account is already included.
+        TxBody::CommunityInferenceReward(body) => {
+            // Rewards share the treasury and each touches a worker plus an
+            // exactly-once marker derived from the coordinator job id.
+            accounts.insert(arc_types::transaction::faucet_pool_address().0);
+            accounts.insert(body.worker.0);
+            accounts.insert(
+                arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+                    &body.chain_domain,
+                    &body.job_id,
+                )
+                .0,
+            );
+        }
+        TxBody::InferenceChallenge(body) => {
+            // Competing challenges for one attestation mutate the same escrow.
+            let escrow_addr = arc_crypto::hash_bytes(
+                &[b"arc-inference", body.attestation_hash.as_ref()].concat(),
+            );
+            accounts.insert(escrow_addr.0);
         }
         TxBody::InferenceRegister(_) => {
             // Sender account is already included; inference registry is global state.
@@ -180,31 +200,30 @@ pub fn partition_batches(transactions: &[Transaction]) -> Vec<Vec<usize>> {
 
     let access_sets: Vec<TxAccessSet> = transactions.iter().map(tx_access_set).collect();
 
-    // Greedy batch assignment: for each tx, find the first batch where it
-    // doesn't conflict with any already-assigned tx in that batch.
+    // Assign each transaction to the first wave *after* every earlier
+    // transaction that touches one of the same accounts. This is deliberately
+    // not ordinary first-fit graph coloring: first-fit can place a later tx in
+    // an earlier batch than a conflicting predecessor, reversing canonical
+    // block/DAG order and changing success, nonces, balances, or rewards.
     let mut batches: Vec<Vec<usize>> = Vec::new();
-    // Track which accounts are "claimed" in each batch.
-    let mut batch_accounts: Vec<HashSet<[u8; 32]>> = Vec::new();
+    let mut last_batch_by_account: HashMap<[u8; 32], usize> = HashMap::new();
 
     for (i, access) in access_sets.iter().enumerate() {
-        let mut placed = false;
-        for (b, batch_accts) in batch_accounts.iter_mut().enumerate() {
-            // Check if any account in this tx's access set is already in the batch
-            let conflicts = access.accounts.iter().any(|a| batch_accts.contains(a));
-            if !conflicts {
-                // No conflict - add to this batch
-                batch_accts.extend(&access.accounts);
-                batches[b].push(i);
-                placed = true;
-                break;
-            }
+        let batch_index = access
+            .accounts
+            .iter()
+            .filter_map(|account| last_batch_by_account.get(account))
+            .map(|last_batch| last_batch + 1)
+            .max()
+            .unwrap_or(0);
+
+        if batches.len() <= batch_index {
+            batches.resize_with(batch_index + 1, Vec::new);
         }
-        if !placed {
-            // Create a new batch
-            let mut new_accts = HashSet::new();
-            new_accts.extend(&access.accounts);
-            batch_accounts.push(new_accts);
-            batches.push(vec![i]);
+        batches[batch_index].push(i);
+
+        for account in &access.accounts {
+            last_batch_by_account.insert(*account, batch_index);
         }
     }
 
@@ -217,7 +236,12 @@ mod tests {
     // `Address` is used only by these tests, so it is imported here rather
     // than at module scope where the lib target would see it as unused.
     use arc_crypto::hash_bytes;
-    use arc_types::Address;
+    use arc_types::{
+        Address, TxType,
+        transaction::{
+            CommunityInferenceRewardBody, InferenceAttestationBody, InferenceChallengeBody,
+        },
+    };
 
     fn addr(n: u8) -> Address {
         hash_bytes(&[n])
@@ -225,6 +249,67 @@ mod tests {
 
     fn make_transfer(from: Address, to: Address, nonce: u64) -> Transaction {
         Transaction::new_transfer(from, to, 100, nonce)
+    }
+
+    fn make_attestation(from: Address, nonce: u64, tag: u8) -> Transaction {
+        let mut tx = Transaction {
+            tx_type: TxType::InferenceAttestation,
+            from,
+            nonce,
+            body: TxBody::InferenceAttestation(InferenceAttestationBody {
+                model_id: hash_bytes(b"model"),
+                input_hash: hash_bytes(&[tag, 1]),
+                output_hash: hash_bytes(&[tag, 2]),
+                challenge_period: 100,
+                bond: 1,
+                beneficiary: None,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: arc_crypto::Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        tx.hash = tx.compute_hash();
+        tx
+    }
+
+    fn make_challenge(from: Address, attestation_hash: arc_crypto::Hash256) -> Transaction {
+        let mut tx = Transaction {
+            tx_type: TxType::InferenceChallenge,
+            from,
+            nonce: 0,
+            body: TxBody::InferenceChallenge(InferenceChallengeBody {
+                attestation_hash,
+                challenger_output_hash: hash_bytes(b"different-output"),
+                challenger_bond: 1,
+            }),
+            fee: 0,
+            gas_limit: 0,
+            hash: arc_crypto::Hash256::ZERO,
+            signature: arc_crypto::Signature::null(),
+            sig_verified: false,
+        };
+        tx.hash = tx.compute_hash();
+        tx
+    }
+
+    fn make_community_reward(validator: Address, worker: Address, tag: u8) -> Transaction {
+        Transaction::new_community_inference_reward(
+            validator,
+            u64::from(tag),
+            CommunityInferenceRewardBody {
+                chain_domain: CommunityInferenceRewardBody::expected_chain_domain(),
+                job_id: hash_bytes(&[tag, 3]),
+                worker,
+                model_id: hash_bytes(b"model"),
+                input_hash: hash_bytes(&[tag, 1]),
+                output_hash: hash_bytes(&[tag, 2]),
+                max_tokens: 8,
+                expires_at_height: 100,
+                worker_attestation: Box::new(make_attestation(worker, 0, tag)),
+            },
+        )
     }
 
     #[test]
@@ -285,6 +370,44 @@ mod tests {
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), 2);
         assert_eq!(batches[1].len(), 2);
+    }
+
+    #[test]
+    fn community_rewards_conflict_on_shared_treasury() {
+        let first = make_community_reward(addr(9), addr(10), 1);
+        let second = make_community_reward(addr(9), addr(11), 2);
+        let treasury = arc_types::transaction::faucet_pool_address().0;
+
+        assert!(tx_access_set(&first).accounts.contains(&treasury));
+        assert!(tx_access_set(&second).accounts.contains(&treasury));
+        assert_eq!(
+            partition_batches(&[first, second]).len(),
+            2,
+            "shared treasury debits must execute in transaction order"
+        );
+    }
+
+    #[test]
+    fn raw_attestations_do_not_claim_treasury_access() {
+        let first = make_attestation(addr(10), 0, 1);
+        let second = make_attestation(addr(11), 0, 2);
+        let treasury = arc_types::transaction::faucet_pool_address().0;
+
+        assert!(!tx_access_set(&first).accounts.contains(&treasury));
+        assert!(!tx_access_set(&second).accounts.contains(&treasury));
+        assert_eq!(partition_batches(&[first, second]).len(), 1);
+    }
+
+    #[test]
+    fn challenges_for_same_attestation_conflict_on_escrow() {
+        let attestation_hash = hash_bytes(b"attestation");
+        let first = make_challenge(addr(20), attestation_hash);
+        let second = make_challenge(addr(21), attestation_hash);
+        let escrow = hash_bytes(&[b"arc-inference", attestation_hash.as_ref()].concat()).0;
+
+        assert!(tx_access_set(&first).accounts.contains(&escrow));
+        assert!(tx_access_set(&second).accounts.contains(&escrow));
+        assert_eq!(partition_batches(&[first, second]).len(), 2);
     }
 }
 
