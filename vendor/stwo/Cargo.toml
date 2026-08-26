@@ -1,0 +1,48 @@
+# Vendored from StarkWare's Stwo prover, Apache-2.0.
+#
+#   upstream: https://github.com/starkware-libs/stwo
+#   commit:   76dd75715ce87e2fe2258083480b6228c23bb70b
+#
+# Vendored rather than tracked as a git dependency so that ARC's proving path
+# cannot be broken by an upstream change, and so the prover internals are ours
+# to modify. See vendor/stwo/NOTICE for the modification record.
+#
+# This is a separate workspace; the root workspace excludes it.
+
+[workspace]
+members = [
+    "stwo",
+    "air-utils",
+    "air-utils-derive",
+    "constraint-framework",
+    "std-shims",
+]
+exclude = ["ensure-verifier-no_std"]
+resolver = "2"
+
+[workspace.package]
+version = "2.2.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+itertools = { version = "0.12", default-features = false, features = [
+    "use_alloc",
+] }
+blake2 = { version = "0.10.6", default-features = false }
+blake3 = { version = "1.5.0", default-features = false }
+educe = "0.5.0"
+hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
+num-traits = { version = "0.2.19", default-features = false }
+thiserror = { version = "2.0.12", default-features = false }
+bytemuck = { version = "1.14.3", default-features = false }
+tracing = { version = "0.1.40", default-features = false }
+tracing-subscriber = { version = "0.3.18", default-features = false }
+rayon = { version = "1.10.0", optional = false }
+rand = { version = "0.8.5", default-features = false, features = ["small_rng"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+hashbrown = { version = ">=0.15.2", features = ["serde"] }
+
+[profile.bench]
+codegen-units = 1
+lto = true

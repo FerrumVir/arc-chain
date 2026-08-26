@@ -77,6 +77,11 @@ pub struct DenseLayerProof {
     pub proving_time_ms: u64,
     /// Number of trace rows.
     pub trace_rows: usize,
+    /// What actually produced `proof_data`: `"stwo-circle-stark"` for a real
+    /// Circle STARK, `"blake3-commitment"` for the hash-only fallback that is
+    /// compiled when the `stwo-prover` feature is off. Never report a
+    /// commitment as a proof - check this field.
+    pub proof_kind: String,
 }
 
 /// Result of a folded multi-layer proof.
@@ -289,13 +294,31 @@ pub fn prove_dense_layer(layer: &DenseLayerInput) -> Result<DenseLayerProof, Str
         .collect();
     let output_hash = hash_bytes(&output_bytes);
 
-    // Serialize proof (binding hash + trace dimensions)
-    let mut proof_data = Vec::new();
-    proof_data.extend_from_slice(&(trace_rows as u64).to_le_bytes());
-    proof_data.extend_from_slice(&(DENSE_TRACE_COLS as u64).to_le_bytes());
-    proof_data.extend_from_slice(&binding_hash.0);
-    proof_data.extend_from_slice(&input_hash.0);
-    proof_data.extend_from_slice(&output_hash.0);
+    // Proof data: a real Circle STARK receipt when the prover is compiled in,
+    // otherwise a clearly-labelled BLAKE3 commitment.
+    #[cfg(feature = "stwo-prover")]
+    let (proof_data, proof_kind) = {
+        let (receipt, _size, _ms) = crate::stwo_air::try_prove_dense_stark(
+            &layer.weights,
+            &layer.input,
+            &layer.output,
+            &layer.bias,
+            layer.in_size,
+            layer.out_size,
+        )?;
+        (receipt, "stwo-circle-stark".to_string())
+    };
+
+    #[cfg(not(feature = "stwo-prover"))]
+    let (proof_data, proof_kind) = {
+        let mut d = Vec::new();
+        d.extend_from_slice(&(trace_rows as u64).to_le_bytes());
+        d.extend_from_slice(&(DENSE_TRACE_COLS as u64).to_le_bytes());
+        d.extend_from_slice(&binding_hash.0);
+        d.extend_from_slice(&input_hash.0);
+        d.extend_from_slice(&output_hash.0);
+        (d, "blake3-commitment".to_string())
+    };
 
     let proving_time_ms = start.elapsed().as_millis() as u64;
 
@@ -306,6 +329,7 @@ pub fn prove_dense_layer(layer: &DenseLayerInput) -> Result<DenseLayerProof, Str
         output_hash,
         proving_time_ms,
         trace_rows,
+        proof_kind,
     })
 }
 

@@ -51,6 +51,8 @@ fn main() {
 
     let mut total_proofs = 0usize;
     let mut total_bytes = 0usize;
+    let mut stark_proofs = 0usize;
+    let mut other_proofs = 0usize;
     let overall_start = Instant::now();
 
     for (label, out_size, in_size) in &direct_layers {
@@ -74,6 +76,7 @@ fn main() {
             );
             total_bytes += proof_size;
             total_proofs += 1;
+            stark_proofs += 1;
             receipts.push(proof_data);
         }
 
@@ -131,10 +134,18 @@ fn main() {
                     let out_hash = hex::encode(&sharded_proof.output_hash.0[..16]);
                     let n_shards = sharded_proof.shard_proofs.len();
                     let total_size = sharded_proof.total_proof_size;
+                    let n_stark = sharded_proof
+                        .shard_proofs
+                        .iter()
+                        .filter(|sp| sp.proof.proof_kind == "stwo-circle-stark")
+                        .count();
+                    stark_proofs += n_stark;
+                    other_proofs += n_shards - n_stark;
                     println!(
-                        "   Run {}: {} shards, {} bytes total, {}ms, output=0x{}",
+                        "   Run {}: {} shards ({} STARK), {} bytes total, {}ms, output=0x{}",
                         rep + 1,
                         n_shards,
+                        n_stark,
                         total_size,
                         elapsed,
                         &out_hash
@@ -171,6 +182,16 @@ fn main() {
         total_bytes as f64 / 1024.0
     );
     println!("Total time: {:.1}s", total_time.as_secs_f64());
-    println!("All proofs are real Circle STARKs (Stwo) verified inline");
+    println!(
+        "Real Circle STARKs (Stwo, verified inline): {} of {}",
+        stark_proofs,
+        stark_proofs + other_proofs
+    );
+    if other_proofs > 0 {
+        println!(
+            "NOT proofs - BLAKE3 commitments only: {} (build with --features stwo-prover)",
+            other_proofs
+        );
+    }
     println!("Reproducibility: same inputs → identical proof commitments");
 }

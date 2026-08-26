@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["desktop/src-tauri"]
+exclude = ["desktop/src-tauri", "vendor/stwo"]
 members = [
     "crates/arc-crypto",
     "crates/arc-types",
@@ -40,35 +40,11 @@ sha2 = "0.10"
 sha3 = "0.10"
 blst = { version = "0.3", features = ["portable"] }
 # STARK prover (Stwo - StarkWare's Circle STARK)
-# PINNED. These were unpinned git deps tracking starkware-libs/stwo's default
-# branch, so every fresh checkout - including every CI run and every release
-# build of the arc-node binaries distributed to third-party operators -
-# resolved whatever HEAD happened to be at that moment. Consequences that were
-# live until this pin: a release could not be reproduced from its tag, an
-# upstream force-push turned every build red with zero commits here, and no
-# lockfile-based advisory scanning was meaningful.
-#
-# The rev below is the exact commit already resolved in the tracked
-# Cargo.lock, so this pin is behaviour-preserving - it records what was
-# already being built, it does not change it. Bump deliberately, never
-# implicitly. (The icicle deps below were already correctly pinned to a tag.)
-#
-# !! INTEGRATOR, READ BEFORE FIRST CI RUN !!
-# Adding `rev =` CHANGES HOW THE SOURCE IS SPELLED IN Cargo.lock:
-#   before:  source = "git+https://github.com/starkware-libs/stwo.git#826591c6..."
-#   after:   source = "git+https://github.com/starkware-libs/stwo.git?rev=826591c6...#826591c6..."
-# So the lockfile on disk does NOT satisfy `--locked` against this manifest
-# until it is regenerated, and every `--locked` command in CI (which is all of
-# them) will fail with "the lock file needs to be updated". One-time fix,
-# before committing:
-#   1. cargo check --workspace          # refreshes Cargo.lock in place
-#   2. git diff Cargo.lock              # EXPECT: only the two stwo source
-#                                       #   lines change. If any other package
-#                                       #   version moved, stop - the pin was
-#                                       #   supposed to be behaviour-preserving.
-#   3. git add -f Cargo.lock            # it was gitignored until now
-stwo = { git = "https://github.com/starkware-libs/stwo.git", rev = "826591c6c371376810ca8213b5812d5daf6d5092", default-features = false, features = ["prover"] }
-stwo-constraint-framework = { git = "https://github.com/starkware-libs/stwo.git", rev = "826591c6c371376810ca8213b5812d5daf6d5092", default-features = false, features = ["prover"] }
+# Vendored from the audited upstream revision so tagged builds remain
+# reproducible even if upstream moves or becomes unavailable. Bump the vendor
+# tree and Cargo.lock together in a dedicated dependency update.
+stwo = { path = "vendor/stwo/stwo", default-features = false, features = ["prover"] }
+stwo-constraint-framework = { path = "vendor/stwo/constraint-framework", default-features = false, features = ["prover"] }
 # GPU acceleration (ICICLE - Ingonyama's GPU library for M31 field ops)
 icicle-runtime = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }
 icicle-core = { git = "https://github.com/ingonyama-zk/icicle.git", tag = "v3.4.0" }

@@ -356,7 +356,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
 <script>
 // Try multiple nodes - use first one that responds
 let RPC='http://140.82.16.112:9090';
-const RPC_FALLBACKS=['http://136.244.109.1:9090','http://104.238.171.11:9090','http://149.28.32.76:9090','http://202.182.107.41:9090'];
+const RPC_FALLBACKS=['http://136.244.109.1:9090','http://104.238.171.11:9090','http://149.28.32.76:9090','http://202.182.107.41:9090','http://149.28.153.31:9090'];
 // Sharded inference goes to a seed coordinator on port 9090.
 // 2026-08-17: this used to point at http://149.28.32.76:10000, an SSH reverse
 // tunnel to a Mac M2 Ultra that is no longer reachable (connect fails, code
@@ -364,6 +364,13 @@ const RPC_FALLBACKS=['http://136.244.109.1:9090','http://104.238.171.11:9090','h
 // [0,2), LAX [2,5) - has not been the topology since April. The live layout is
 // 6 layer ranges replicated 3x across the 6 seeds; any seed can coordinate.
 const SHARDED_COORDINATOR = 'http://104.238.171.11:9090';
+// Write to an element only if it exists. Two ids in this block (`height`,
+// `mempool`) have no matching element, and a null deref there was throwing
+// inside the stats try/catch - which silently killed every field after it.
+function setText(id, value){
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
 async function findRPC(){
   try{const r=await fetch(RPC+'/health',{signal:AbortSignal.timeout(3000)});if(r.ok)return}catch(e){}
   for(const fb of RPC_FALLBACKS){
@@ -1205,28 +1212,28 @@ async function refresh(){
     const tps=lastTxCount>0&&(now-lastTime)>0?(txDiff/((now-lastTime)/1000)).toFixed(1):'0';
     lastRound=d.dag_round;lastTime=now;lastTxCount=d.total_transactions;
 
-    document.getElementById('dagRound').textContent=d.dag_round.toLocaleString();
-    document.getElementById('committed').textContent=d.dag_committed.toLocaleString();
-    document.getElementById('height').textContent=d.block_height;
-    document.getElementById('totalTx').textContent=d.total_transactions;
-    document.getElementById('accounts').textContent=d.total_accounts;
-    document.getElementById('mempool').textContent=d.mempool_size;
-    document.getElementById('validatorCount').textContent=d.validators;
-    document.getElementById('peers').textContent=d.connected_peers;
-    document.getElementById('rps').textContent=rps;
+    setText('dagRound', d.dag_round.toLocaleString());
+    setText('committed', d.dag_committed.toLocaleString());
+    setText('height', d.block_height);
+    setText('totalTx', (d.total_transactions ?? 0).toLocaleString());
+    setText('accounts', (d.total_accounts ?? 0).toLocaleString());
+    setText('mempool', d.mempool_size);
+    setText('validatorCount', d.validators);
+    setText('peers', d.connected_peers);
+    setText('rps', rps);
     // Show total transaction count (more meaningful than instantaneous TPS)
     // Show benchmark TPS if running, otherwise total transactions
     const benchTps = d.benchmark_tps || 0;
-    document.getElementById('tps').textContent = benchTps > 0
+    setText('tps', benchTps > 0
       ? benchTps.toLocaleString()
-      : d.total_transactions.toLocaleString();
+      : (d.total_transactions ?? 0).toLocaleString());
     const mins=Math.floor(d.uptime_secs/60);const hrs=Math.floor(mins/60);
-    document.getElementById('uptime').textContent=hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`;
+    setText('uptime', hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`);
     document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live - block ${d.dag_round.toLocaleString()} · ${d.dag_committed.toLocaleString()} finalized · ${d.total_transactions} txs`;
     // Sharded inference network counters - aggregate across ALL nodes
     // (resilient to single-coordinator restart resetting its in-memory counter)
     aggregateShardedCounters();
-  }catch(e){}
+  }catch(e){ console.error('stats refresh failed:', e); }
 
   // Nodes - fetched by renderNodes() above (runs in parallel, no blocking)
 

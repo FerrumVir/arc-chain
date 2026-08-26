@@ -1,0 +1,14 @@
+# Stwo needs the nightly-only `portable_simd`, `slice_ptr_get` and
+# `iter_array_chunks` features, so a nightly toolchain is required for the real
+# STARK proving path (`--features stwo-prover`). Without a pin, `cargo build`
+# on an unsupported toolchain fails to compile the prover and — because the
+# feature is optional — silently falls back to the BLAKE3 mock instead of
+# erroring. Hence the pin.
+#
+# Previously stuck on nightly-2025-06-01 because upstream Stwo used the slice
+# method `array_chunks`, which was later removed. Stwo is now vendored
+# (vendor/stwo) and migrated to `as_chunks`, verified byte-identical against
+# upstream via examples/receipt_probe.rs, so the pin tracks a current toolchain.
+[toolchain]
+channel = "nightly-2026-03-16"
+components = ["rustfmt", "clippy"]
