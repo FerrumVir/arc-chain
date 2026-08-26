@@ -21,19 +21,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use arc_crypto::{hash_bytes, Hash256, KeyPair};
-use arc_inference::candle_backend::GgufEngine;
+use arc_crypto::{Hash256, KeyPair, hash_bytes};
 use arc_inference::cached_integer_model::CachedIntegerModel;
+use arc_inference::candle_backend::GgufEngine;
 use arc_mempool::Mempool;
 use arc_state::{StateDB, Tier1RequestSnapshot};
 use arc_state::{
-    TIER1_STATUS_OPEN, TIER1_STATUS_REFUNDED, TIER1_STATUS_FINALIZED, TIER1_STATUS_VOTING,
-};
-use arc_types::transaction::{
-    InferenceAttestationBody, InferenceFinalizeBody, InferenceVoteBody, Transaction, TxBody,
-    TxType,
+    TIER1_STATUS_FINALIZED, TIER1_STATUS_OPEN, TIER1_STATUS_REFUNDED, TIER1_STATUS_VOTING,
 };
 use arc_types::Address;
+use arc_types::transaction::{
+    InferenceAttestationBody, InferenceFinalizeBody, InferenceVoteBody, Transaction, TxBody, TxType,
+};
 use dashmap::DashMap;
 use tokio::time;
 use tracing::{debug, info, warn};
@@ -160,9 +159,7 @@ impl InferenceValidatorTask {
             };
             // Skip terminal states. The pending index should already be
             // pruned but double-check (we may race with apply).
-            if snap.status == TIER1_STATUS_FINALIZED
-                || snap.status == TIER1_STATUS_REFUNDED
-            {
+            if snap.status == TIER1_STATUS_FINALIZED || snap.status == TIER1_STATUS_REFUNDED {
                 continue;
             }
 
@@ -177,9 +174,7 @@ impl InferenceValidatorTask {
                     snap.anchor_height,
                     snap.committee_size,
                 );
-                let in_committee = committee
-                    .iter()
-                    .any(|a| a.0 == self.validator_address.0);
+                let in_committee = committee.iter().any(|a| a.0 == self.validator_address.0);
                 if in_committee {
                     // Mark optimistically; clear on submission failure.
                     self.voted.insert(request_id, ());
@@ -203,14 +198,14 @@ impl InferenceValidatorTask {
             //   (a) Vote count reached committee_size  → ready
             //   (b) Height has passed deadline         → timeout
             let votes_done = snap.votes.len() >= snap.committee_size as usize;
-            let deadline_reached =
-                now >= snap.anchor_height.saturating_add(snap.deadline_blocks);
+            let deadline_reached = now >= snap.anchor_height.saturating_add(snap.deadline_blocks);
             let retry_ok = self
                 .finalize_submitted
                 .get(&request_id)
                 .map(|e| e.value().elapsed() >= FINALIZE_RETRY_AFTER)
                 .unwrap_or(true);
-            let can_finalize = (snap.status == TIER1_STATUS_VOTING || snap.status == TIER1_STATUS_OPEN)
+            let can_finalize = (snap.status == TIER1_STATUS_VOTING
+                || snap.status == TIER1_STATUS_OPEN)
                 && (votes_done || deadline_reached)
                 && retry_ok;
             if can_finalize {
@@ -273,7 +268,7 @@ impl InferenceValidatorTask {
             } else {
                 None
             },
-            vrf_proof: Vec::new(), // VRF proof not enforced in Phase A.
+            vrf_proof: Vec::new(),         // VRF proof not enforced in Phase A.
             committee_seed: Hash256::ZERO, // advisory only; apply re-derives.
         });
         let mut tx = Transaction {
@@ -372,9 +367,7 @@ impl InferenceValidatorTask {
         snap: &Tier1RequestSnapshot,
     ) -> anyhow::Result<(Hash256, Vec<u8>)> {
         // Candle path (real inference, coherent output).
-        if let (Some(engine), Some(tok), Some(model_id)) =
-            (engine, tokenizer, model_id)
-        {
+        if let (Some(engine), Some(tok), Some(model_id)) = (engine, tokenizer, model_id) {
             let text = String::from_utf8_lossy(&snap.input_blob).to_string();
             let templated = tok.apply_chat_template(&text);
             let tokens = tok.encode(&templated);

@@ -1,10 +1,13 @@
 //! `arc faucet <address>` - request testnet tokens from the faucet.
 
-use anyhow::Result;
 use crate::rpc::RpcClient;
+use anyhow::Result;
 
 pub async fn run(rpc: &RpcClient, address: &str, faucet_url: &str) -> Result<()> {
-    println!("Requesting tokens from faucet for {}...", &address[..address.len().min(16)]);
+    println!(
+        "Requesting tokens from faucet for {}...",
+        &address[..address.len().min(16)]
+    );
 
     let data = rpc.claim_faucet(faucet_url, address).await?;
 

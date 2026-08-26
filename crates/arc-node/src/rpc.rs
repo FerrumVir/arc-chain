@@ -1,21 +1,21 @@
-use arc_consensus::StakeTier;
 use crate::SharedValidators;
+use arc_consensus::StakeTier;
 use arc_crypto::{Hash256, MerkleProof};
 use arc_gpu::probe_gpu;
 use arc_mempool::Mempool;
 use arc_state::StateDB;
-use arc_types::*;
 use arc_types::economics::RoleRevenueConfig;
+use arc_types::*;
 use axum::{
+    Json, Router,
     extract::{ConnectInfo, DefaultBodyLimit, Query, State as AxumState},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
-use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -134,7 +134,12 @@ pub struct NodeState {
     /// Per-request KV cache for sharded inference. Key: request_id (Hash256 hex).
     /// Each entry is an Arc<Mutex<KVCache>> so handlers can clone the Arc and
     /// release the DashMap shard lock immediately.
-    pub shard_kv_caches: Arc<dashmap::DashMap<String, Arc<std::sync::Mutex<arc_inference::cached_integer_model::KVCache>>>>,
+    pub shard_kv_caches: Arc<
+        dashmap::DashMap<
+            String,
+            Arc<std::sync::Mutex<arc_inference::cached_integer_model::KVCache>>,
+        >,
+    >,
     /// Network-wide shard registry (gossiped via /shards/announce).
     /// Maps node socket addr → (ShardInfo, last-seen Instant). Entries older
     /// than SHARD_REGISTRY_TTL_SECS (60s) are considered stale and dropped
@@ -195,13 +200,15 @@ pub struct NodeState {
     /// Community work dispatch: receiver side. Wrapped in a tokio::Mutex so
     /// multiple claim_work handlers can await concurrently (only one wins
     /// each item). The long-poll handler calls `recv()` with a timeout.
-    pub community_work_queue: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WorkItem>>>>,
+    pub community_work_queue:
+        Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<WorkItem>>>>,
     /// Community work results: keyed by request_id. The coordinator inserts
     /// a oneshot::Sender before dispatching a WorkItem. When a community
     /// worker POSTs to /community/submit_work, the handler removes the
     /// sender and delivers the WorkResult. The coordinator awaits the
     /// oneshot::Receiver to resume the pipeline walk.
-    pub community_work_results: Option<Arc<dashmap::DashMap<String, tokio::sync::oneshot::Sender<WorkResult>>>>,
+    pub community_work_results:
+        Option<Arc<dashmap::DashMap<String, tokio::sync::oneshot::Sender<WorkResult>>>>,
     /// Shared outbound HTTP client for ALL coordinator→shard traffic.
     /// Built once at boot so the keep-alive connection pool survives across
     /// requests. Previously every /inference/run_sharded and
@@ -400,11 +407,7 @@ pub const LATENCY_POISON_FLOOR_MS: f64 = 5_000.0;
 pub const LATENCY_POISON_RATIO: f64 = 20.0;
 
 /// Fold a real forward_shard hop observation into the EWMA for `socket`.
-pub fn record_latency(
-    stats: &dashmap::DashMap<String, LatencyEWMA>,
-    socket: &str,
-    hop_ms: u64,
-) {
+pub fn record_latency(stats: &dashmap::DashMap<String, LatencyEWMA>, socket: &str, hop_ms: u64) {
     let hop = hop_ms as f64;
     let now = std::time::Instant::now();
     stats
@@ -476,8 +479,12 @@ pub fn sort_replicas_by_latency(
     stats: &dashmap::DashMap<String, LatencyEWMA>,
 ) {
     replicas.sort_by(|a, b| {
-        let a_ms = stats.get(&a.socket_addr).and_then(|v| effective_latency_ms(&v));
-        let b_ms = stats.get(&b.socket_addr).and_then(|v| effective_latency_ms(&v));
+        let a_ms = stats
+            .get(&a.socket_addr)
+            .and_then(|v| effective_latency_ms(&v));
+        let b_ms = stats
+            .get(&b.socket_addr)
+            .and_then(|v| effective_latency_ms(&v));
         match (a_ms, b_ms) {
             (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
             (Some(_), None) => std::cmp::Ordering::Less,
@@ -541,7 +548,8 @@ pub fn set_compute_threads(node: &NodeState, threads: usize) -> Result<usize, St
         .build()
         .map_err(|e| format!("building rayon pool with {} threads: {}", threads, e))?;
     *node.compute_pool.write() = Some(Arc::new(pool));
-    node.compute_threads.store(threads as u32, Ordering::Relaxed);
+    node.compute_threads
+        .store(threads as u32, Ordering::Relaxed);
     Ok(threads)
 }
 
@@ -571,7 +579,12 @@ pub enum PipelineError {
     /// Registry is empty (or every entry was a stub).
     NoShards,
     /// Coverage stops before the model does.
-    Gap { expected: usize, got: (usize, usize), node: String, addr: String },
+    Gap {
+        expected: usize,
+        got: (usize, usize),
+        node: String,
+        addr: String,
+    },
     /// Coverage ran out before reaching n_layers.
     Incomplete { covered: usize, total: usize },
 }
@@ -580,14 +593,22 @@ impl std::fmt::Display for PipelineError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PipelineError::NoShards => write!(
-                f, "No shards announced. Need shard registry to be populated."
+                f,
+                "No shards announced. Need shard registry to be populated."
             ),
-            PipelineError::Gap { expected, got, node, addr } => write!(
-                f, "Pipeline gap: expected layer {} next, got shard [{}, {}) (node {}, addr {})",
+            PipelineError::Gap {
+                expected,
+                got,
+                node,
+                addr,
+            } => write!(
+                f,
+                "Pipeline gap: expected layer {} next, got shard [{}, {}) (node {}, addr {})",
                 expected, got.0, got.1, node, addr
             ),
             PipelineError::Incomplete { covered, total } => write!(
-                f, "Pipeline incomplete: covered layers 0..{} but model has {} layers",
+                f,
+                "Pipeline incomplete: covered layers 0..{} but model has {} layers",
                 covered, total
             ),
         }
@@ -645,10 +666,15 @@ pub fn assemble_pipeline(
     for s in announced {
         let key = (s.start_layer, s.end_layer);
         let bucket = by_range.entry(key).or_default();
-        match bucket.iter().position(|existing| existing.node_name == s.node_name) {
+        match bucket
+            .iter()
+            .position(|existing| existing.node_name == s.node_name)
+        {
             None => bucket.push(s),
             Some(i) => {
-                if is_stub_socket_addr(&bucket[i].socket_addr) && !is_stub_socket_addr(&s.socket_addr) {
+                if is_stub_socket_addr(&bucket[i].socket_addr)
+                    && !is_stub_socket_addr(&s.socket_addr)
+                {
                     bucket[i] = s;
                 }
             }
@@ -694,7 +720,10 @@ pub fn assemble_pipeline(
         chosen.push(((start, end), replicas));
     }
     if covered_to != n_layers {
-        return Err(PipelineError::Incomplete { covered: covered_to, total: n_layers });
+        return Err(PipelineError::Incomplete {
+            covered: covered_to,
+            total: n_layers,
+        });
     }
     Ok(chosen)
 }
@@ -753,7 +782,9 @@ pub fn build_node_state(
         // LRU eviction by hit_count when full.
         inference_cache: Arc::new(arc_inference::distributed::DistributedCache::new(10_000)),
         multi_model_registry: Arc::new(arc_inference::distributed::ShardRegistry::new()),
-        verification_manager: Arc::new(std::sync::Mutex::new(arc_vm::inference_verify::VerificationManager::new())),
+        verification_manager: Arc::new(std::sync::Mutex::new(
+            arc_vm::inference_verify::VerificationManager::new(),
+        )),
         revenue_config: RoleRevenueConfig::default(),
         community_workers: Arc::new(dashmap::DashMap::new()),
         // Community work dispatch — bounded mpsc with 256-slot buffer. New
@@ -919,15 +950,19 @@ pub fn attestations_per_day_observed(
         return Err("a single attestation defines no interval; a rate needs at least two");
     }
     let (Some(first), Some(last)) = (first_ts_ms, last_ts_ms) else {
-        return Err("block timestamps for the observed window are not retained by this node \
-                    (non-archive nodes prune old blocks)");
+        return Err(
+            "block timestamps for the observed window are not retained by this node \
+                    (non-archive nodes prune old blocks)",
+        );
     };
     if first == 0 || last == 0 {
         return Err("a block in the observed window carries a zero timestamp");
     }
     if last <= first {
-        return Err("first and last attestation fall in the same instant; no elapsed time to \
-                    divide by");
+        return Err(
+            "first and last attestation fall in the same instant; no elapsed time to \
+                    divide by",
+        );
     }
     let elapsed_ms = (last - first) as f64;
     Ok((count - 1) as f64 * 86_400_000.0 / elapsed_ms)
@@ -1083,7 +1118,18 @@ pub async fn serve(
     //   the desktop never has to guess which chain it is talking to.
     chain_identity: Option<ChainIdentity>,
 ) -> anyhow::Result<()> {
-    let mut node = build_node_state(state, mempool, validator_address, validator_keypair, stake, boot_time, peer_count, inference_model, candle_engine, candle_model_id);
+    let mut node = build_node_state(
+        state,
+        mempool,
+        validator_address,
+        validator_keypair,
+        stake,
+        boot_time,
+        peer_count,
+        inference_model,
+        candle_engine,
+        candle_model_id,
+    );
     node.chain_identity = chain_identity;
     if let Some(dv) = dag_validators {
         node.dag_validators = dv;
@@ -1117,14 +1163,19 @@ pub async fn serve(
     // different ranges coexist.
     for si in &shard_infos {
         let key = format!("{}#{}-{}", si.socket_addr, si.start_layer, si.end_layer);
-        node.shard_registry.insert(key, (si.clone(), std::time::Instant::now()));
+        node.shard_registry
+            .insert(key, (si.clone(), std::time::Instant::now()));
     }
 
     // ── Dedicated inference compute pool ────────────────────────────────
     if compute_threads > 0 {
         match set_compute_threads(&node, compute_threads) {
             Ok(n) => tracing::info!("Inference compute pool: {} threads (--threads)", n),
-            Err(e) => tracing::warn!("could not build {}-thread compute pool: {}", compute_threads, e),
+            Err(e) => tracing::warn!(
+                "could not build {}-thread compute pool: {}",
+                compute_threads,
+                e
+            ),
         }
     } else {
         tracing::info!(
@@ -1183,10 +1234,8 @@ pub async fn serve(
                 }
             };
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(
-                    LATENCY_PROBE_INTERVAL_SECS,
-                ))
-                .await;
+                tokio::time::sleep(std::time::Duration::from_secs(LATENCY_PROBE_INTERVAL_SECS))
+                    .await;
 
                 let mut sockets: Vec<String> = fresh_shards(&probe_node.shard_registry)
                     .into_iter()
@@ -1219,11 +1268,7 @@ pub async fn serve(
                     match recorded {
                         Some((ms, false)) if probe_supersedes_recorded(ms, probe_ms) => {
                             probe_node.latency_stats.remove(&socket);
-                            record_probe_latency(
-                                &probe_node.latency_stats,
-                                &socket,
-                                probe_ms,
-                            );
+                            record_probe_latency(&probe_node.latency_stats, &socket, probe_ms);
                             tracing::info!(
                                 socket = %socket,
                                 stale_ewma_ms = ms,
@@ -1248,7 +1293,10 @@ pub async fn serve(
         // Runtime inference width. GET reports the current pool; POST
         // rebuilds it live, which is how an operator "adds two cores"
         // mid-demo without restarting the node.
-        .route("/node/threads", get(get_node_threads).post(set_node_threads))
+        .route(
+            "/node/threads",
+            get(get_node_threads).post(set_node_threads),
+        )
         // Additive honest-projection routes (v0.7.11+). Absent on every live
         // seed (v0.7.2 / v0.7.9) — clients must treat 404 as "unknown".
         .route("/network/info", get(network_info))
@@ -1308,7 +1356,10 @@ pub async fn serve(
         // and the result is committed on-chain. See
         // `arc-chain-docs/TIER1_ONCHAIN_INFERENCE_PLAN.md`.
         .route("/inference/onchain/submit", post(inference_onchain_submit))
-        .route("/inference/onchain/result/{request_id}", get(inference_onchain_result))
+        .route(
+            "/inference/onchain/result/{request_id}",
+            get(inference_onchain_result),
+        )
         // Deterministic inference cache introspection
         .route("/inference/cache_stats", get(inference_cache_stats))
         .route("/inference/latency_stats", get(inference_latency_stats))
@@ -1328,7 +1379,10 @@ pub async fn serve(
         // Inference verification - commit-challenge system
         .route("/inference/commit", post(inference_commit))
         .route("/inference/challenge", post(inference_challenge))
-        .route("/inference/verification_status", get(inference_verification_status))
+        .route(
+            "/inference/verification_status",
+            get(inference_verification_status),
+        )
         // Revenue split info
         .route("/economics/revenue_split", get(get_revenue_split))
         .route("/economics/rewards", get(economics_rewards))
@@ -1341,7 +1395,10 @@ pub async fn serve(
         .route("/models/open_requests", get(list_open_model_requests))
         // Milestone D: capacity advertisement discovery + per-node
         // assignment long-poll. Also read-only from the state.
-        .route("/capacity/advertisements", get(list_capacity_advertisements))
+        .route(
+            "/capacity/advertisements",
+            get(list_capacity_advertisements),
+        )
         .route("/assignments/for_me", get(get_assignment_for_me))
         // Community worker registration (HTTP-only, works behind NAT)
         .route("/community/register", post(community_register))
@@ -1373,7 +1430,11 @@ pub async fn serve(
     // `0.0.0.0:*` socket_addrs in shard announcements with the peer's real
     // source IP - otherwise the coordinator can't route /inference/forward_shard
     // calls to shards held by remote nodes.
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1399,7 +1460,10 @@ pub async fn serve_eth(addr: &str, node: NodeState) -> anyhow::Result<()> {
 }
 
 async fn index() -> &'static str {
-    concat!("ARC Chain - Agent Runtime Chain - Testnet v", env!("CARGO_PKG_VERSION"))
+    concat!(
+        "ARC Chain - Agent Runtime Chain - Testnet v",
+        env!("CARGO_PKG_VERSION")
+    )
 }
 
 /// JSON error response body returned by endpoints that fail with 4xx/5xx.
@@ -1597,22 +1661,30 @@ async fn get_block(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
 ) -> Result<Json<Block>, (StatusCode, Json<ApiError>)> {
-    node.state
-        .get_block(height)
-        .map(Json)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Block at height {} not found", height)))
+    node.state.get_block(height).map(Json).ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("Block at height {} not found", height),
+        )
+    })
 }
 
 async fn get_account(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(address): axum::extract::Path<String>,
 ) -> Result<Json<Account>, (StatusCode, Json<ApiError>)> {
-    let addr = Hash256::from_hex(&address)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid address. Must be 64 hex characters."))?;
-    node.state
-        .get_account(&addr)
-        .map(Json)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Account {} not found", address)))
+    let addr = Hash256::from_hex(&address).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid address. Must be 64 hex characters.",
+        )
+    })?;
+    node.state.get_account(&addr).map(Json).ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("Account {} not found", address),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1647,51 +1719,74 @@ async fn submit_tx(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<SubmitTxRequest>,
 ) -> Result<Json<SubmitTxResponse>, (StatusCode, String)> {
-    let from = Hash256::from_hex(&req.from).map_err(|_| (StatusCode::BAD_REQUEST, "invalid from address".to_string()))?;
-    let to = Hash256::from_hex(&req.to).map_err(|_| (StatusCode::BAD_REQUEST, "invalid to address".to_string()))?;
+    let from = Hash256::from_hex(&req.from)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid from address".to_string()))?;
+    let to = Hash256::from_hex(&req.to)
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid to address".to_string()))?;
 
     // Per-sender rate limit: 10 tx/sec (100ms cooldown)
     if let Some(last) = node.tx_rate_limit.get(&from.0)
-        && last.elapsed().as_millis() < 100 {
-            return Err((StatusCode::TOO_MANY_REQUESTS, "rate limited: max 10 tx/sec per sender".to_string()));
-        }
+        && last.elapsed().as_millis() < 100
+    {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate limited: max 10 tx/sec per sender".to_string(),
+        ));
+    }
     node.tx_rate_limit.insert(from.0, Instant::now());
 
     // Check if a signature was provided
     if let Some(ref sig_hex) = req.signature
-        && let Some(ref pubkey_hex) = req.public_key {
-            // Build signed transaction
-            let mut tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
+        && let Some(ref pubkey_hex) = req.public_key
+    {
+        // Build signed transaction
+        let mut tx = Transaction::new_transfer(from, to, req.amount, req.nonce);
 
-            // Parse signature and public key
-            let sig_bytes = hex::decode(sig_hex).map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature hex".to_string()))?;
-            let pk_bytes = hex::decode(pubkey_hex).map_err(|_| (StatusCode::BAD_REQUEST, "invalid public_key hex".to_string()))?;
+        // Parse signature and public key
+        let sig_bytes = hex::decode(sig_hex)
+            .map_err(|_| (StatusCode::BAD_REQUEST, "invalid signature hex".to_string()))?;
+        let pk_bytes = hex::decode(pubkey_hex).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid public_key hex".to_string(),
+            )
+        })?;
 
-            if sig_bytes.len() != 64 || pk_bytes.len() != 32 {
-                return Err((StatusCode::BAD_REQUEST, "signature must be 64 bytes, public_key must be 32 bytes".to_string()));
-            }
-
-            let mut pk_arr = [0u8; 32];
-            pk_arr.copy_from_slice(&pk_bytes);
-
-            tx.signature = arc_crypto::signature::Signature::Ed25519 {
-                public_key: pk_arr,
-                signature: sig_bytes,
-            };
-
-            // Verify signature before accepting
-            tx.verify_signature().map_err(|_| (StatusCode::BAD_REQUEST, "signature verification failed".to_string()))?;
-            // Mark as pre-verified so block execution can skip re-verification.
-            tx.sig_verified = true;
-
-            let hash = tx.hash.to_hex();
-            node.mempool.insert(tx).map_err(|_| (StatusCode::CONFLICT, "duplicate transaction".to_string()))?;
-
-            return Ok(Json(SubmitTxResponse {
-                tx_hash: hash,
-                status: "pending".to_string(),
-            }));
+        if sig_bytes.len() != 64 || pk_bytes.len() != 32 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "signature must be 64 bytes, public_key must be 32 bytes".to_string(),
+            ));
         }
+
+        let mut pk_arr = [0u8; 32];
+        pk_arr.copy_from_slice(&pk_bytes);
+
+        tx.signature = arc_crypto::signature::Signature::Ed25519 {
+            public_key: pk_arr,
+            signature: sig_bytes,
+        };
+
+        // Verify signature before accepting
+        tx.verify_signature().map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "signature verification failed".to_string(),
+            )
+        })?;
+        // Mark as pre-verified so block execution can skip re-verification.
+        tx.sig_verified = true;
+
+        let hash = tx.hash.to_hex();
+        node.mempool
+            .insert(tx)
+            .map_err(|_| (StatusCode::CONFLICT, "duplicate transaction".to_string()))?;
+
+        return Ok(Json(SubmitTxResponse {
+            tx_hash: hash,
+            status: "pending".to_string(),
+        }));
+    }
 
     // No signature provided - reject. Unsigned transfers are a security hole
     // (anyone could drain any account). Require a signature for all transfers.
@@ -1721,11 +1816,17 @@ async fn submit_batch(
     for tx_req in req.transactions {
         let from = match Hash256::from_hex(&tx_req.from) {
             Ok(h) => h,
-            Err(_) => { rejected += 1; continue; }
+            Err(_) => {
+                rejected += 1;
+                continue;
+            }
         };
         let to = match Hash256::from_hex(&tx_req.to) {
             Ok(h) => h,
-            Err(_) => { rejected += 1; continue; }
+            Err(_) => {
+                rejected += 1;
+                continue;
+            }
         };
 
         let tx = Transaction::new_transfer(from, to, tx_req.amount, tx_req.nonce);
@@ -1764,12 +1865,21 @@ async fn submit_signed_tx(
     let sig_ok = tx.verify_signature().is_ok();
     eprintln!(
         "[SUBMIT] hash=0x{} type={} from={} nonce={} sig_ok={} sig_verified={}",
-        &hash[..16], tx_type, from_short, nonce, sig_ok, tx.sig_verified
+        &hash[..16],
+        tx_type,
+        from_short,
+        nonce,
+        sig_ok,
+        tx.sig_verified
     );
 
     match node.mempool.insert(tx) {
         Ok(()) => {
-            eprintln!("[SUBMIT] hash=0x{} insert=OK pool_len={}", &hash[..16], node.mempool.len());
+            eprintln!(
+                "[SUBMIT] hash=0x{} insert=OK pool_len={}",
+                &hash[..16],
+                node.mempool.len()
+            );
             Ok(Json(SubmitTxResponse {
                 tx_hash: hash,
                 status: "pending".to_string(),
@@ -1800,9 +1910,7 @@ struct ValidatorsResponse {
     count: usize,
 }
 
-async fn get_validators(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<ValidatorsResponse> {
+async fn get_validators(AxumState(node): AxumState<NodeState>) -> Json<ValidatorsResponse> {
     // Show live DAG validator set (updated by consensus loop via PeerConnected).
     // Falls back to staked accounts from state if DAG set is single-validator.
     let dag_vals = node.dag_validators.read().clone();
@@ -1856,9 +1964,7 @@ struct AgentsListResponse {
     count: usize,
 }
 
-async fn get_agents(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<AgentsListResponse> {
+async fn get_agents(AxumState(node): AxumState<NodeState>) -> Json<AgentsListResponse> {
     // Scan full_transactions for RegisterAgent transactions and build agent list.
     let mut agents: Vec<AgentInfoResponse> = Vec::new();
     let mut seen_names = std::collections::HashSet::new();
@@ -1937,9 +2043,12 @@ async fn faucet_claim(
 ) -> Result<Json<FaucetClaimResponse>, (StatusCode, Json<FaucetErrorResponse>)> {
     // Parse recipient address
     let to = Hash256::from_hex(&req.address).map_err(|_| {
-        (StatusCode::BAD_REQUEST, Json(FaucetErrorResponse {
-            error: "Invalid address. Must be 64 hex characters.".to_string(),
-        }))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(FaucetErrorResponse {
+                error: "Invalid address. Must be 64 hex characters.".to_string(),
+            }),
+        )
     })?;
 
     // Rate limiting: check if this address claimed recently
@@ -1948,11 +2057,19 @@ async fn faucet_claim(
     {
         let total = node.faucet_claims_total.load(Ordering::Relaxed);
         if total > FAUCET_GLOBAL_RATE_LIMIT as u32 {
-            let recent = node.faucet_claims.iter().filter(|e| e.value().elapsed().as_secs() < 60).count();
+            let recent = node
+                .faucet_claims
+                .iter()
+                .filter(|e| e.value().elapsed().as_secs() < 60)
+                .count();
             if recent > FAUCET_GLOBAL_RATE_LIMIT {
-                return Err((StatusCode::TOO_MANY_REQUESTS, Json(FaucetErrorResponse {
-                    error: "Faucet busy. Too many claims globally. Try again in a minute.".to_string(),
-                })));
+                return Err((
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(FaucetErrorResponse {
+                        error: "Faucet busy. Too many claims globally. Try again in a minute."
+                            .to_string(),
+                    }),
+                ));
             }
         }
     }
@@ -1962,12 +2079,15 @@ async fn faucet_claim(
         let elapsed = entry.value().elapsed().as_secs();
         if elapsed < FAUCET_RATE_LIMIT_SECS {
             let remaining = FAUCET_RATE_LIMIT_SECS - elapsed;
-            return Err((StatusCode::TOO_MANY_REQUESTS, Json(FaucetErrorResponse {
-                error: format!(
-                    "Rate limited. Try again in {} minutes.",
-                    remaining.div_ceil(60)
-                ),
-            })));
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(FaucetErrorResponse {
+                    error: format!(
+                        "Rate limited. Try again in {} minutes.",
+                        remaining.div_ceil(60)
+                    ),
+                }),
+            ));
         }
     }
 
@@ -1990,24 +2110,31 @@ async fn faucet_claim(
         // `sig_verified` flag) so the funded balance only existed on
         // the seed that received the /faucet/claim call.
         let keypair = node.validator_keypair.as_ref().ok_or_else(|| {
-            (StatusCode::SERVICE_UNAVAILABLE, Json(FaucetErrorResponse {
-                error: "Validator keypair not configured on this node.".to_string(),
-            }))
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(FaucetErrorResponse {
+                    error: "Validator keypair not configured on this node.".to_string(),
+                }),
+            )
         })?;
         let validator_addr = node.validator_address;
 
         let pool_addr = arc_types::transaction::faucet_pool_address();
-        let pool_account = node.state
-            .get_account(&pool_addr)
-            .ok_or_else(|| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
+        let pool_account = node.state.get_account(&pool_addr).ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(FaucetErrorResponse {
                     error: "Faucet pool account not funded. Node misconfiguration.".to_string(),
-                }))
-            })?;
+                }),
+            )
+        })?;
         if pool_account.balance < FAUCET_CLAIM_AMOUNT {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(FaucetErrorResponse {
-                error: "Faucet balance too low. Please try another node.".to_string(),
-            })));
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(FaucetErrorResponse {
+                    error: "Faucet balance too low. Please try another node.".to_string(),
+                }),
+            ));
         }
 
         // Read validator's current state nonce per-call. An in-memory
@@ -2017,16 +2144,14 @@ async fn faucet_claim(
         let validator_account = node.state.get_or_create_account(&validator_addr);
         let nonce = validator_account.nonce;
 
-        let mut tx = Transaction::new_faucet_claim(
-            validator_addr,
-            to,
-            FAUCET_CLAIM_AMOUNT,
-            nonce,
-        );
+        let mut tx = Transaction::new_faucet_claim(validator_addr, to, FAUCET_CLAIM_AMOUNT, nonce);
         tx.sign(keypair).map_err(|e| {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
-                error: format!("Faucet sign failed: {:?}", e),
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(FaucetErrorResponse {
+                    error: format!("Faucet sign failed: {:?}", e),
+                }),
+            )
         })?;
         tx.sig_verified = true;
         let hash = tx.hash.to_hex();
@@ -2037,7 +2162,9 @@ async fn faucet_claim(
         let receipt = TxReceipt {
             tx_hash: tx.hash,
             block_height: node.state.height(),
-            block_hash: node.state.get_block(node.state.height())
+            block_hash: node
+                .state
+                .get_block(node.state.height())
                 .map(|b| b.hash)
                 .unwrap_or(Hash256::ZERO),
             index: 0,
@@ -2065,9 +2192,21 @@ async fn faucet_claim(
             node.state.update_account(&to, recipient);
         }
         node.state.full_transactions.insert(tx.hash.0, tx.clone());
-        node.state.account_txs.entry(validator_addr.0).or_default().push(tx.hash);
-        node.state.account_txs.entry(pool_addr.0).or_default().push(tx.hash);
-        node.state.account_txs.entry(to.0).or_default().push(tx.hash);
+        node.state
+            .account_txs
+            .entry(validator_addr.0)
+            .or_default()
+            .push(tx.hash);
+        node.state
+            .account_txs
+            .entry(pool_addr.0)
+            .or_default()
+            .push(tx.hash);
+        node.state
+            .account_txs
+            .entry(to.0)
+            .or_default()
+            .push(tx.hash);
 
         let _ = node.mempool.insert(tx);
         hash
@@ -2078,18 +2217,22 @@ async fn faucet_claim(
         // because no FaucetClaim variant is emitted that v0.7.0 peers
         // can't deserialize.
         let faucet_addr = arc_crypto::hash_bytes(&[0u8]);
-        let faucet_account = node.state
-            .get_account(&faucet_addr)
-            .ok_or_else(|| {
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(FaucetErrorResponse {
+        let faucet_account = node.state.get_account(&faucet_addr).ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(FaucetErrorResponse {
                     error: "Faucet account not funded. Node misconfiguration.".to_string(),
-                }))
-            })?;
+                }),
+            )
+        })?;
 
         if faucet_account.balance < FAUCET_CLAIM_AMOUNT {
-            return Err((StatusCode::SERVICE_UNAVAILABLE, Json(FaucetErrorResponse {
-                error: "Faucet balance too low. Please try another node.".to_string(),
-            })));
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(FaucetErrorResponse {
+                    error: "Faucet balance too low. Please try another node.".to_string(),
+                }),
+            ));
         }
 
         static FAUCET_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2097,7 +2240,11 @@ async fn faucet_claim(
         if nonce == 0 {
             FAUCET_NONCE.store(faucet_account.nonce + 1, Ordering::SeqCst);
         }
-        let actual_nonce = if nonce == 0 { faucet_account.nonce } else { nonce };
+        let actual_nonce = if nonce == 0 {
+            faucet_account.nonce
+        } else {
+            nonce
+        };
 
         let mut tx = Transaction::new_transfer(faucet_addr, to, FAUCET_CLAIM_AMOUNT, actual_nonce);
         tx.sig_verified = true;
@@ -2106,7 +2253,9 @@ async fn faucet_claim(
         let receipt = TxReceipt {
             tx_hash: tx.hash,
             block_height: node.state.height(),
-            block_hash: node.state.get_block(node.state.height())
+            block_hash: node
+                .state
+                .get_block(node.state.height())
                 .map(|b| b.hash)
                 .unwrap_or(Hash256::ZERO),
             index: 0,
@@ -2129,8 +2278,16 @@ async fn faucet_claim(
             node.state.update_account(&to, recipient);
         }
         node.state.full_transactions.insert(tx.hash.0, tx.clone());
-        node.state.account_txs.entry(faucet_addr.0).or_default().push(tx.hash);
-        node.state.account_txs.entry(to.0).or_default().push(tx.hash);
+        node.state
+            .account_txs
+            .entry(faucet_addr.0)
+            .or_default()
+            .push(tx.hash);
+        node.state
+            .account_txs
+            .entry(to.0)
+            .or_default()
+            .push(tx.hash);
 
         let _ = node.mempool.insert(tx);
         hash
@@ -2139,26 +2296,23 @@ async fn faucet_claim(
     // Record claim time + evict stale entries to prevent unbounded growth
     node.faucet_claims.insert(to.0, Instant::now());
     if node.faucet_claims.len() > 10_000 {
-        node.faucet_claims.retain(|_, v| v.elapsed().as_secs() < 7200);
+        node.faucet_claims
+            .retain(|_, v| v.elapsed().as_secs() < 7200);
     }
     node.faucet_claims_total.fetch_add(1, Ordering::Relaxed);
 
     Ok(Json(FaucetClaimResponse {
         tx_hash: hash,
         amount: FAUCET_CLAIM_AMOUNT,
-        message: format!(
-            "Sent {} ARC to {}",
-            FAUCET_CLAIM_AMOUNT,
-            req.address
-        ),
+        message: format!("Sent {} ARC to {}", FAUCET_CLAIM_AMOUNT, req.address),
     }))
 }
 
-async fn faucet_status(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<FaucetStatusResponse> {
+async fn faucet_status(AxumState(node): AxumState<NodeState>) -> Json<FaucetStatusResponse> {
     let faucet_addr = arc_crypto::hash_bytes(&[0u8]);
-    let balance = node.state.get_account(&faucet_addr)
+    let balance = node
+        .state
+        .get_account(&faucet_addr)
         .map(|a| a.balance)
         .unwrap_or(0);
     Json(FaucetStatusResponse {
@@ -2179,9 +2333,12 @@ async fn faucet_status(
 fn parse_hash(hex_str: &str) -> Result<[u8; 32], (StatusCode, Json<ApiError>)> {
     // Accept both forms: with or without "0x" prefix.
     let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-    Hash256::from_hex(stripped)
-        .map(|h| h.0)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid hash. Must be 64 hex characters (0x prefix optional)."))
+    Hash256::from_hex(stripped).map(|h| h.0).map_err(|_| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "Invalid hash. Must be 64 hex characters (0x prefix optional).",
+        )
+    })
 }
 
 /// GET /tx/{hash} - Look up a transaction receipt by its hash.
@@ -2199,7 +2356,12 @@ async fn get_transaction(
     node.state
         .get_benchmark_receipt_by_hash(&tx_hash)
         .map(Json)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Transaction {} not found", hash)))
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                format!("Transaction {} not found", hash),
+            )
+        })
 }
 
 /// GET /tx/{hash}/proof - Return a full verification bundle for a transaction.
@@ -2213,42 +2375,50 @@ async fn get_tx_proof(
     // Try indexed receipt with stored proof first
     if let Some(receipt) = node.state.get_receipt(&tx_hash)
         && let Some(ref proof_bytes) = receipt.inclusion_proof
-            && let Ok(merkle_proof) = bincode::deserialize::<MerkleProof>(proof_bytes) {
-                let siblings: Vec<Value> = merkle_proof
-                    .siblings
-                    .iter()
-                    .map(|(h, is_left)| {
-                        json!({
-                            "hash": h.to_hex(),
-                            "is_left": is_left,
-                        })
-                    })
-                    .collect();
+        && let Ok(merkle_proof) = bincode::deserialize::<MerkleProof>(proof_bytes)
+    {
+        let siblings: Vec<Value> = merkle_proof
+            .siblings
+            .iter()
+            .map(|(h, is_left)| {
+                json!({
+                    "hash": h.to_hex(),
+                    "is_left": is_left,
+                })
+            })
+            .collect();
 
-                return Ok(Json(json!({
-                    "tx_hash": Hash256(tx_hash).to_hex(),
-                    "blake3_domain": "ARC-chain-tx-v1",
-                    "merkle_proof": {
-                        "leaf": merkle_proof.leaf.to_hex(),
-                        "index": merkle_proof.index,
-                        "siblings": siblings,
-                        "root": merkle_proof.root.to_hex(),
-                    },
-                    "block_height": receipt.block_height,
-                    "pedersen_commitment": receipt.value_commitment.map(hex::encode),
-                })));
-            }
+        return Ok(Json(json!({
+            "tx_hash": Hash256(tx_hash).to_hex(),
+            "blake3_domain": "ARC-chain-tx-v1",
+            "merkle_proof": {
+                "leaf": merkle_proof.leaf.to_hex(),
+                "index": merkle_proof.index,
+                "siblings": siblings,
+                "root": merkle_proof.root.to_hex(),
+            },
+            "block_height": receipt.block_height,
+            "pedersen_commitment": receipt.value_commitment.map(hex::encode),
+        })));
+    }
 
     // Fall back to on-demand proof reconstruction for benchmark txs
-    let (height, idx) = node
-        .state
-        .get_tx_location(&tx_hash)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Transaction {} not found", hash)))?;
+    let (height, idx) = node.state.get_tx_location(&tx_hash).ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("Transaction {} not found", hash),
+        )
+    })?;
 
     let merkle_proof = node
         .state
         .reconstruct_benchmark_proof(height, idx)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, "Could not reconstruct proof for transaction"))?;
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "Could not reconstruct proof for transaction",
+            )
+        })?;
 
     let siblings: Vec<Value> = merkle_proof
         .siblings
@@ -2261,11 +2431,10 @@ async fn get_tx_proof(
         })
         .collect();
 
-    let block_tx_root = node
-        .state
-        .get_block(height)
-        .map(|b| b.header.tx_root);
-    let verified = block_tx_root.map(|r| r == merkle_proof.root).unwrap_or(false);
+    let block_tx_root = node.state.get_block(height).map(|b| b.header.tx_root);
+    let verified = block_tx_root
+        .map(|r| r == merkle_proof.root)
+        .unwrap_or(false);
 
     Ok(Json(json!({
         "tx_hash": Hash256(tx_hash).to_hex(),
@@ -2287,32 +2456,33 @@ async fn get_block_proofs(
     AxumState(node): AxumState<NodeState>,
     axum::extract::Path(height): axum::extract::Path<u64>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let block = node
-        .state
-        .get_block(height)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Block at height {} not found", height)))?;
+    let block = node.state.get_block(height).ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("Block at height {} not found", height),
+        )
+    })?;
 
     let mut proofs = Vec::new();
     for tx_hash in &block.tx_hashes {
         if let Some(receipt) = node.state.get_receipt(&tx_hash.0)
             && let Some(ref proof_bytes) = receipt.inclusion_proof
-                && let Ok(proof) = bincode::deserialize::<MerkleProof>(proof_bytes) {
-                    let siblings: Vec<Value> = proof
-                        .siblings
-                        .iter()
-                        .map(|(h, is_left)| {
-                            json!({ "hash": h.to_hex(), "is_left": is_left })
-                        })
-                        .collect();
+            && let Ok(proof) = bincode::deserialize::<MerkleProof>(proof_bytes)
+        {
+            let siblings: Vec<Value> = proof
+                .siblings
+                .iter()
+                .map(|(h, is_left)| json!({ "hash": h.to_hex(), "is_left": is_left }))
+                .collect();
 
-                    proofs.push(json!({
-                        "tx_hash": tx_hash.to_hex(),
-                        "leaf": proof.leaf.to_hex(),
-                        "index": proof.index,
-                        "siblings": siblings,
-                        "root": proof.root.to_hex(),
-                    }));
-                }
+            proofs.push(json!({
+                "tx_hash": tx_hash.to_hex(),
+                "leaf": proof.leaf.to_hex(),
+                "index": proof.index,
+                "siblings": siblings,
+                "root": proof.root.to_hex(),
+            }));
+        }
     }
 
     Ok(Json(json!({
@@ -2381,10 +2551,12 @@ async fn get_block_txs(
     axum::extract::Path(height): axum::extract::Path<u64>,
     Query(params): Query<BlockTxsQuery>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let block = node
-        .state
-        .get_block(height)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Block at height {} not found", height)))?;
+    let block = node.state.get_block(height).ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("Block at height {} not found", height),
+        )
+    })?;
 
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(100).min(1000);
@@ -2467,9 +2639,14 @@ async fn get_account_txs(
 async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let indexed_receipts = node.state.receipts.len();
     let indexed_hashes = node.state.tx_index.len();
-    let executed = node.state.benchmark_tx_count.load(std::sync::atomic::Ordering::Relaxed) as usize;
+    let executed = node
+        .state
+        .benchmark_tx_count
+        .load(std::sync::atomic::Ordering::Relaxed) as usize;
     let dag_round = node.dag_round.load(std::sync::atomic::Ordering::Relaxed);
-    let dag_committed = node.dag_committed.load(std::sync::atomic::Ordering::Relaxed);
+    let dag_committed = node
+        .dag_committed
+        .load(std::sync::atomic::Ordering::Relaxed);
     let validators = node.dag_validators.read().len();
     let peers = node.peer_count.load(Ordering::Relaxed);
     let uptime = node.boot_time.elapsed().as_secs();
@@ -2506,9 +2683,7 @@ async fn get_stats(AxumState(node): AxumState<NodeState>) -> Json<Value> {
 // ---------------------------------------------------------------------------
 
 /// Returns metadata about the latest snapshot available for sync.
-async fn sync_snapshot_info(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn sync_snapshot_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let height = node.state.height();
     let state_root = node.state.get_state_root();
     let account_count = node.state.account_count();
@@ -2525,21 +2700,24 @@ async fn sync_snapshot_info(
 async fn sync_snapshot(
     AxumState(node): AxumState<NodeState>,
 ) -> Result<axum::response::Response, StatusCode> {
-    use axum::response::IntoResponse;
     use axum::http::header;
+    use axum::response::IntoResponse;
 
     let snapshot = node.state.export_snapshot();
-    let data = bincode::serialize(&snapshot)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let data = bincode::serialize(&snapshot).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let compressed = lz4_flex::compress_prepend_size(&data);
 
     Ok((
         [
             (header::CONTENT_TYPE, "application/octet-stream"),
-            (header::CONTENT_DISPOSITION, "attachment; filename=\"snapshot.lz4\""),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"snapshot.lz4\"",
+            ),
         ],
         compressed,
-    ).into_response())
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -2548,9 +2726,7 @@ async fn sync_snapshot(
 
 /// GET /light/snapshot - Returns a lightweight snapshot for light client bootstrapping:
 /// current height, state root, account count, total supply, latest block hash.
-async fn light_snapshot(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn light_snapshot(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let snap = node.state.generate_light_snapshot();
     Json(json!({
         "height": snap.height,
@@ -2567,9 +2743,7 @@ async fn light_snapshot(
 
 /// GET /sync/manifest - Returns the snapshot manifest (height, chunk count,
 /// state root, accounts) so a syncing node can plan parallel chunk downloads.
-async fn sync_manifest(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn sync_manifest(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let manifest = node.state.export_snapshot_manifest();
     Json(json!({
         "version": manifest.version,
@@ -2596,16 +2770,16 @@ async fn sync_chunk(
     axum::extract::Path(index): axum::extract::Path<u32>,
 ) -> Result<Json<arc_state::StateSnapshot>, StatusCode> {
     let manifest = node.state.export_snapshot_manifest();
-    let chunk = node.state.export_snapshot_chunk(index, manifest.chunk_size)
+    let chunk = node
+        .state
+        .export_snapshot_chunk(index, manifest.chunk_size)
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(chunk))
 }
 
 /// GET /sync/status - Returns whether this node can serve snapshots and
 /// information about the latest available snapshot.
-async fn sync_status(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn sync_status(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let manifest = node.state.export_snapshot_manifest();
     Json(json!({
         "available": true,
@@ -2622,11 +2796,11 @@ async fn sync_status(
 /// GET /sync/dag_state - Returns the current DAG consensus round state.
 /// Used by new nodes to start at the right round instead of round 0.
 /// This prevents permanent partition from genesis round mismatch.
-async fn sync_dag_state(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn sync_dag_state(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let current_round = node.dag_round.load(std::sync::atomic::Ordering::Relaxed);
-    let last_committed_round = node.dag_committed.load(std::sync::atomic::Ordering::Relaxed);
+    let last_committed_round = node
+        .dag_committed
+        .load(std::sync::atomic::Ordering::Relaxed);
     let validator_count = node.dag_validators.read().len();
 
     Json(json!({
@@ -2653,7 +2827,12 @@ async fn get_full_transaction(
         .state
         .get_transaction(&tx_hash)
         .or_else(|| node.state.get_benchmark_tx_by_hash(&tx_hash))
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Transaction {} not found", hash)))?;
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                format!("Transaction {} not found", hash),
+            )
+        })?;
 
     let receipt = node
         .state
@@ -2920,7 +3099,10 @@ async fn get_full_transaction(
     };
 
     let sig_json = match &tx.signature {
-        arc_crypto::Signature::Ed25519 { public_key, signature } => json!({
+        arc_crypto::Signature::Ed25519 {
+            public_key,
+            signature,
+        } => json!({
             "Ed25519": {
                 "public_key": hex::encode(public_key),
                 "signature": hex::encode(signature),
@@ -2931,7 +3113,10 @@ async fn get_full_transaction(
                 "signature": hex::encode(signature),
             }
         }),
-        arc_crypto::Signature::MlDsa65 { public_key, signature } => json!({
+        arc_crypto::Signature::MlDsa65 {
+            public_key,
+            signature,
+        } => json!({
             "MlDsa65": {
                 "public_key_size": public_key.len(),
                 "signature_size": signature.len(),
@@ -2970,10 +3155,12 @@ async fn get_contract_info(
     let addr = Hash256::from_hex(&address)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid contract address."))?;
 
-    let bytecode = node
-        .state
-        .get_contract(&addr)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Contract {} not found", address)))?;
+    let bytecode = node.state.get_contract(&addr).ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("Contract {} not found", address),
+        )
+    })?;
 
     let code_hash = hex::encode(arc_crypto::hash_bytes(&bytecode).0);
 
@@ -3002,10 +3189,12 @@ async fn call_contract(
     let contract_addr = Hash256::from_hex(&address)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "Invalid contract address."))?;
 
-    let bytecode = node
-        .state
-        .get_contract(&contract_addr)
-        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, format!("Contract {} not found", address)))?;
+    let bytecode = node.state.get_contract(&contract_addr).ok_or_else(|| {
+        api_error(
+            StatusCode::NOT_FOUND,
+            format!("Contract {} not found", address),
+        )
+    })?;
 
     let caller = req
         .from
@@ -3114,7 +3303,10 @@ async fn eth_json_rpc(
         "eth_chainId" => eth_rpc_result(&req.id, json!(format!("0x{:x}", ARC_CHAIN_ID))),
         "eth_blockNumber" => eth_rpc_result(&req.id, json!(format!("0x{:x}", node.state.height()))),
         "net_version" => eth_rpc_result(&req.id, json!(ARC_CHAIN_ID.to_string())),
-        "web3_clientVersion" => eth_rpc_result(&req.id, json!(format!("ARC/v{}", env!("CARGO_PKG_VERSION")))),
+        "web3_clientVersion" => eth_rpc_result(
+            &req.id,
+            json!(format!("ARC/v{}", env!("CARGO_PKG_VERSION"))),
+        ),
         "eth_gasPrice" => eth_rpc_result(&req.id, json!("0x0")), // Zero-fee chain
         "net_listening" => eth_rpc_result(&req.id, json!(true)),
         "net_peerCount" => {
@@ -3141,19 +3333,28 @@ async fn eth_json_rpc(
             };
             match node.state.get_block_by_hash(&hash.0) {
                 Some(block) => {
-                    let txs = json!(block.tx_hashes.iter().map(|h| format!("0x{}", h.to_hex())).collect::<Vec<_>>());
-                    eth_rpc_result(&req.id, json!({
-                        "number": format!("0x{:x}", block.header.height),
-                        "hash": format!("0x{}", block.hash.to_hex()),
-                        "parentHash": format!("0x{}", block.header.parent_hash.to_hex()),
-                        "stateRoot": format!("0x{}", block.header.state_root.to_hex()),
-                        "transactionsRoot": format!("0x{}", block.header.tx_root.to_hex()),
-                        "miner": format!("0x{}", hex::encode(&block.header.producer.0[..20])),
-                        "timestamp": format!("0x{:x}", block.header.timestamp / 1000),
-                        "transactions": txs,
-                        "gasUsed": "0x0",
-                        "gasLimit": "0xffffffffffffffff",
-                    }))
+                    let txs = json!(
+                        block
+                            .tx_hashes
+                            .iter()
+                            .map(|h| format!("0x{}", h.to_hex()))
+                            .collect::<Vec<_>>()
+                    );
+                    eth_rpc_result(
+                        &req.id,
+                        json!({
+                            "number": format!("0x{:x}", block.header.height),
+                            "hash": format!("0x{}", block.hash.to_hex()),
+                            "parentHash": format!("0x{}", block.header.parent_hash.to_hex()),
+                            "stateRoot": format!("0x{}", block.header.state_root.to_hex()),
+                            "transactionsRoot": format!("0x{}", block.header.tx_root.to_hex()),
+                            "miner": format!("0x{}", hex::encode(&block.header.producer.0[..20])),
+                            "timestamp": format!("0x{:x}", block.header.timestamp / 1000),
+                            "transactions": txs,
+                            "gasUsed": "0x0",
+                            "gasLimit": "0xffffffffffffffff",
+                        }),
+                    )
                 }
                 None => eth_rpc_result(&req.id, json!(null)),
             }
@@ -3171,7 +3372,11 @@ async fn eth_json_rpc(
                 None => eth_rpc_result(&req.id, json!(null)),
             }
         }
-        _ => eth_rpc_error(&req.id, -32601, &format!("Method not found: {}", req.method)),
+        _ => eth_rpc_error(
+            &req.id,
+            -32601,
+            &format!("Method not found: {}", req.method),
+        ),
     }
 }
 
@@ -3231,11 +3436,7 @@ fn eth_get_tx_count(node: &NodeState, params: &Value, id: &Value) -> Json<Value>
         Ok(a) => a,
         Err(_) => return eth_rpc_error(id, -32602, "Invalid address"),
     };
-    let nonce = node
-        .state
-        .get_account(&addr)
-        .map(|a| a.nonce)
-        .unwrap_or(0);
+    let nonce = node.state.get_account(&addr).map(|a| a.nonce).unwrap_or(0);
     eth_rpc_result(id, json!(format!("0x{:x}", nonce)))
 }
 
@@ -3286,7 +3487,10 @@ fn eth_get_storage_at(node: &NodeState, params: &Value, id: &Value) -> Json<Valu
             padded[s..s + c].copy_from_slice(&value[..c]);
             eth_rpc_result(id, json!(format!("0x{}", hex::encode(&padded))))
         }
-        None => eth_rpc_result(id, json!("0x0000000000000000000000000000000000000000000000000000000000000000")),
+        None => eth_rpc_result(
+            id,
+            json!("0x0000000000000000000000000000000000000000000000000000000000000000"),
+        ),
     }
 }
 
@@ -3298,33 +3502,48 @@ fn eth_get_block_by_number(node: &NodeState, params: &Value, id: &Value) -> Json
         Some(block) => {
             let txs: Value = if full_txs {
                 // Full tx objects would go here; for now return hashes with 0x prefix
-                json!(block.tx_hashes.iter().map(|h| format!("0x{}", h.to_hex())).collect::<Vec<_>>())
+                json!(
+                    block
+                        .tx_hashes
+                        .iter()
+                        .map(|h| format!("0x{}", h.to_hex()))
+                        .collect::<Vec<_>>()
+                )
             } else {
-                json!(block.tx_hashes.iter().map(|h| format!("0x{}", h.to_hex())).collect::<Vec<_>>())
+                json!(
+                    block
+                        .tx_hashes
+                        .iter()
+                        .map(|h| format!("0x{}", h.to_hex()))
+                        .collect::<Vec<_>>()
+                )
             };
 
-            eth_rpc_result(id, json!({
-                "number": format!("0x{:x}", block.header.height),
-                "hash": format!("0x{}", block.hash.to_hex()),
-                "parentHash": format!("0x{}", block.header.parent_hash.to_hex()),
-                "nonce": "0x0000000000000000",
-                "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
-                "logsBloom": format!("0x{}", "00".repeat(256)),
-                "transactionsRoot": format!("0x{}", block.header.tx_root.to_hex()),
-                "stateRoot": format!("0x{}", block.header.state_root.to_hex()),
-                "receiptsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "miner": format!("0x{}", hex::encode(&block.header.producer.0[..20])),
-                "difficulty": "0x0",
-                "totalDifficulty": "0x0",
-                "extraData": "0x",
-                "size": "0x0",
-                "gasLimit": "0xffffffffffffffff",
-                "gasUsed": "0x0",
-                "timestamp": format!("0x{:x}", block.header.timestamp / 1000),
-                "transactions": txs,
-                "uncles": [],
-                "baseFeePerGas": "0x0",
-            }))
+            eth_rpc_result(
+                id,
+                json!({
+                    "number": format!("0x{:x}", block.header.height),
+                    "hash": format!("0x{}", block.hash.to_hex()),
+                    "parentHash": format!("0x{}", block.header.parent_hash.to_hex()),
+                    "nonce": "0x0000000000000000",
+                    "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+                    "logsBloom": format!("0x{}", "00".repeat(256)),
+                    "transactionsRoot": format!("0x{}", block.header.tx_root.to_hex()),
+                    "stateRoot": format!("0x{}", block.header.state_root.to_hex()),
+                    "receiptsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "miner": format!("0x{}", hex::encode(&block.header.producer.0[..20])),
+                    "difficulty": "0x0",
+                    "totalDifficulty": "0x0",
+                    "extraData": "0x",
+                    "size": "0x0",
+                    "gasLimit": "0xffffffffffffffff",
+                    "gasUsed": "0x0",
+                    "timestamp": format!("0x{:x}", block.header.timestamp / 1000),
+                    "transactions": txs,
+                    "uncles": [],
+                    "baseFeePerGas": "0x0",
+                }),
+            )
         }
         None => eth_rpc_result(id, json!(null)),
     }
@@ -3341,35 +3560,46 @@ fn eth_get_tx_by_hash(node: &NodeState, params: &Value, id: &Value) -> Json<Valu
         Err(_) => return eth_rpc_error(id, -32602, "Invalid hash"),
     };
 
-    let tx = node.state.get_transaction(&tx_hash.0)
+    let tx = node
+        .state
+        .get_transaction(&tx_hash.0)
         .or_else(|| node.state.get_benchmark_tx_by_hash(&tx_hash.0));
 
     match tx {
         Some(tx) => {
             let (to, value) = match &tx.body {
-                TxBody::Transfer(b) => (Some(format!("0x{}", hex::encode(&b.to.0[..20]))), format!("0x{:x}", b.amount)),
-                TxBody::WasmCall(b) => (Some(format!("0x{}", hex::encode(&b.contract.0[..20]))), format!("0x{:x}", b.value)),
+                TxBody::Transfer(b) => (
+                    Some(format!("0x{}", hex::encode(&b.to.0[..20]))),
+                    format!("0x{:x}", b.amount),
+                ),
+                TxBody::WasmCall(b) => (
+                    Some(format!("0x{}", hex::encode(&b.contract.0[..20]))),
+                    format!("0x{:x}", b.value),
+                ),
                 _ => (None, "0x0".to_string()),
             };
 
-            eth_rpc_result(id, json!({
-                "hash": format!("0x{}", tx_hash.to_hex()),
-                "nonce": format!("0x{:x}", tx.nonce),
-                "from": format!("0x{}", hex::encode(&tx.from.0[..20])),
-                "to": to,
-                "value": value,
-                "gas": format!("0x{:x}", tx.gas_limit),
-                "gasPrice": "0x0",
-                "input": "0x",
-                "blockNumber": null,
-                "blockHash": null,
-                "transactionIndex": null,
-                "type": "0x0",
-                "chainId": format!("0x{:x}", ARC_CHAIN_ID),
-                "v": "0x0",
-                "r": "0x0",
-                "s": "0x0",
-            }))
+            eth_rpc_result(
+                id,
+                json!({
+                    "hash": format!("0x{}", tx_hash.to_hex()),
+                    "nonce": format!("0x{:x}", tx.nonce),
+                    "from": format!("0x{}", hex::encode(&tx.from.0[..20])),
+                    "to": to,
+                    "value": value,
+                    "gas": format!("0x{:x}", tx.gas_limit),
+                    "gasPrice": "0x0",
+                    "input": "0x",
+                    "blockNumber": null,
+                    "blockHash": null,
+                    "transactionIndex": null,
+                    "type": "0x0",
+                    "chainId": format!("0x{:x}", ARC_CHAIN_ID),
+                    "v": "0x0",
+                    "r": "0x0",
+                    "s": "0x0",
+                }),
+            )
         }
         None => eth_rpc_result(id, json!(null)),
     }
@@ -3386,54 +3616,71 @@ fn eth_get_tx_receipt(node: &NodeState, params: &Value, id: &Value) -> Json<Valu
         Err(_) => return eth_rpc_error(id, -32602, "Invalid hash"),
     };
 
-    let receipt = node.state.get_receipt(&tx_hash.0)
+    let receipt = node
+        .state
+        .get_receipt(&tx_hash.0)
         .or_else(|| node.state.get_benchmark_receipt_by_hash(&tx_hash.0));
 
     match receipt {
         Some(r) => {
-            let tx = node.state.get_transaction(&tx_hash.0)
+            let tx = node
+                .state
+                .get_transaction(&tx_hash.0)
                 .or_else(|| node.state.get_benchmark_tx_by_hash(&tx_hash.0));
 
-            let from = tx.as_ref().map(|t| format!("0x{}", hex::encode(&t.from.0[..20]))).unwrap_or_default();
+            let from = tx
+                .as_ref()
+                .map(|t| format!("0x{}", hex::encode(&t.from.0[..20])))
+                .unwrap_or_default();
             let to = tx.as_ref().and_then(|t| match &t.body {
                 TxBody::Transfer(b) => Some(format!("0x{}", hex::encode(&b.to.0[..20]))),
                 TxBody::WasmCall(b) => Some(format!("0x{}", hex::encode(&b.contract.0[..20]))),
                 _ => None,
             });
 
-            let logs_json: Vec<Value> = r.logs.iter().enumerate().map(|(i, log)| {
-                let topics: Vec<String> = log.topics.iter()
-                    .map(|t| format!("0x{}", t.to_hex()))
-                    .collect();
+            let logs_json: Vec<Value> = r
+                .logs
+                .iter()
+                .enumerate()
+                .map(|(i, log)| {
+                    let topics: Vec<String> = log
+                        .topics
+                        .iter()
+                        .map(|t| format!("0x{}", t.to_hex()))
+                        .collect();
+                    json!({
+                        "address": format!("0x{}", hex::encode(&log.address.0[..20])),
+                        "topics": topics,
+                        "data": format!("0x{}", hex::encode(&log.data)),
+                        "blockNumber": format!("0x{:x}", log.block_height),
+                        "transactionHash": format!("0x{}", tx_hash.to_hex()),
+                        "transactionIndex": format!("0x{:x}", r.index),
+                        "blockHash": format!("0x{}", r.block_hash.to_hex()),
+                        "logIndex": format!("0x{:x}", i),
+                        "removed": false,
+                    })
+                })
+                .collect();
+
+            eth_rpc_result(
+                id,
                 json!({
-                    "address": format!("0x{}", hex::encode(&log.address.0[..20])),
-                    "topics": topics,
-                    "data": format!("0x{}", hex::encode(&log.data)),
-                    "blockNumber": format!("0x{:x}", log.block_height),
                     "transactionHash": format!("0x{}", tx_hash.to_hex()),
                     "transactionIndex": format!("0x{:x}", r.index),
+                    "blockNumber": format!("0x{:x}", r.block_height),
                     "blockHash": format!("0x{}", r.block_hash.to_hex()),
-                    "logIndex": format!("0x{:x}", i),
-                    "removed": false,
-                })
-            }).collect();
-
-            eth_rpc_result(id, json!({
-                "transactionHash": format!("0x{}", tx_hash.to_hex()),
-                "transactionIndex": format!("0x{:x}", r.index),
-                "blockNumber": format!("0x{:x}", r.block_height),
-                "blockHash": format!("0x{}", r.block_hash.to_hex()),
-                "from": from,
-                "to": to,
-                "cumulativeGasUsed": format!("0x{:x}", r.gas_used),
-                "gasUsed": format!("0x{:x}", r.gas_used),
-                "contractAddress": null,
-                "logs": logs_json,
-                "logsBloom": format!("0x{}", "00".repeat(256)),
-                "status": if r.success { "0x1" } else { "0x0" },
-                "effectiveGasPrice": "0x0",
-                "type": "0x0",
-            }))
+                    "from": from,
+                    "to": to,
+                    "cumulativeGasUsed": format!("0x{:x}", r.gas_used),
+                    "gasUsed": format!("0x{:x}", r.gas_used),
+                    "contractAddress": null,
+                    "logs": logs_json,
+                    "logsBloom": format!("0x{}", "00".repeat(256)),
+                    "status": if r.success { "0x1" } else { "0x0" },
+                    "effectiveGasPrice": "0x0",
+                    "type": "0x0",
+                }),
+            )
         }
         None => eth_rpc_result(id, json!(null)),
     }
@@ -3446,41 +3693,45 @@ fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
         None => return eth_rpc_error(id, -32602, "Missing filter object"),
     };
 
-    let from_block = filter.get("fromBlock")
+    let from_block = filter
+        .get("fromBlock")
         .and_then(|v| v.as_str())
         .map(|s| parse_block_number(node, Some(&json!(s))))
         .unwrap_or(0);
 
-    let to_block = filter.get("toBlock")
+    let to_block = filter
+        .get("toBlock")
         .and_then(|v| v.as_str())
         .map(|s| parse_block_number(node, Some(&json!(s))))
         .unwrap_or_else(|| node.state.height());
 
-    let address_filter: Option<Vec<Hash256>> = filter.get("address")
-        .and_then(|v| {
-            if let Some(s) = v.as_str() {
-                parse_eth_address(s).ok().map(|a| vec![a])
-            } else if let Some(arr) = v.as_array() {
-                let addrs: Vec<Hash256> = arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter_map(|s| parse_eth_address(s).ok())
-                    .collect();
-                if addrs.is_empty() { None } else { Some(addrs) }
-            } else {
-                None
-            }
-        });
+    let address_filter: Option<Vec<Hash256>> = filter.get("address").and_then(|v| {
+        if let Some(s) = v.as_str() {
+            parse_eth_address(s).ok().map(|a| vec![a])
+        } else if let Some(arr) = v.as_array() {
+            let addrs: Vec<Hash256> = arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .filter_map(|s| parse_eth_address(s).ok())
+                .collect();
+            if addrs.is_empty() { None } else { Some(addrs) }
+        } else {
+            None
+        }
+    });
 
-    let topic_filters: Vec<Option<Hash256>> = filter.get("topics")
+    let topic_filters: Vec<Option<Hash256>> = filter
+        .get("topics")
         .and_then(|v| v.as_array())
         .map(|arr| {
-            arr.iter().map(|t| {
-                t.as_str()
-                    .and_then(|s| {
+            arr.iter()
+                .map(|t| {
+                    t.as_str().and_then(|s| {
                         let s = s.strip_prefix("0x").unwrap_or(s);
                         Hash256::from_hex(s).ok()
                     })
-            }).collect()
+                })
+                .collect()
         })
         .unwrap_or_default();
 
@@ -3492,25 +3743,32 @@ fn eth_get_logs(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
             for log in logs.iter() {
                 // Address filter
                 if let Some(ref addrs) = address_filter
-                    && !addrs.iter().any(|a| a.0 == log.address.0) {
-                        continue;
-                    }
+                    && !addrs.iter().any(|a| a.0 == log.address.0)
+                {
+                    continue;
+                }
                 // Topic filter
                 let mut topic_match = true;
                 for (i, filter_topic) in topic_filters.iter().enumerate() {
                     if let Some(expected) = filter_topic
-                        && log.topics.get(i).map(|t| t.0) != Some(expected.0) {
-                            topic_match = false;
-                            break;
-                        }
+                        && log.topics.get(i).map(|t| t.0) != Some(expected.0)
+                    {
+                        topic_match = false;
+                        break;
+                    }
                 }
-                if !topic_match { continue; }
+                if !topic_match {
+                    continue;
+                }
 
                 let block = node.state.get_block(height);
-                let block_hash = block.map(|b| format!("0x{}", b.hash.to_hex()))
+                let block_hash = block
+                    .map(|b| format!("0x{}", b.hash.to_hex()))
                     .unwrap_or_else(|| "0x".to_string() + &"00".repeat(32));
 
-                let topics: Vec<String> = log.topics.iter()
+                let topics: Vec<String> = log
+                    .topics
+                    .iter()
                     .map(|t| format!("0x{}", t.to_hex()))
                     .collect();
 
@@ -3537,7 +3795,8 @@ fn eth_call(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
         None => return eth_rpc_error(id, -32602, "Missing call object"),
     };
 
-    let from = call_obj.get("from")
+    let from = call_obj
+        .get("from")
         .and_then(|v| v.as_str())
         .and_then(|s| parse_eth_address(s).ok())
         .unwrap_or(Hash256::ZERO);
@@ -3550,20 +3809,23 @@ fn eth_call(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
         None => return eth_rpc_error(id, -32602, "Missing to address"),
     };
 
-    let data = call_obj.get("data")
+    let data = call_obj
+        .get("data")
         .or_else(|| call_obj.get("input"))
         .and_then(|v| v.as_str())
         .map(|s| s.strip_prefix("0x").unwrap_or(s))
         .and_then(|s| hex::decode(s).ok())
         .unwrap_or_default();
 
-    let value = call_obj.get("value")
+    let value = call_obj
+        .get("value")
         .and_then(|v| v.as_str())
         .map(|s| s.strip_prefix("0x").unwrap_or(s))
         .and_then(|s| u64::from_str_radix(s, 16).ok())
         .unwrap_or(0);
 
-    let gas = call_obj.get("gas")
+    let gas = call_obj
+        .get("gas")
         .and_then(|v| v.as_str())
         .map(|s| s.strip_prefix("0x").unwrap_or(s))
         .and_then(|s| u64::from_str_radix(s, 16).ok())
@@ -3573,7 +3835,14 @@ fn eth_call(node: &NodeState, params: &Value, id: &Value) -> Json<Value> {
     if result.success {
         eth_rpc_result(id, json!(format!("0x{}", hex::encode(&result.return_data))))
     } else {
-        eth_rpc_error(id, 3, result.revert_reason.as_deref().unwrap_or("execution reverted"))
+        eth_rpc_error(
+            id,
+            3,
+            result
+                .revert_reason
+                .as_deref()
+                .unwrap_or("execution reverted"),
+        )
     }
 }
 
@@ -3718,7 +3987,10 @@ mod rlp {
 
     /// Encode a list of already-encoded items as an RLP list.
     pub fn encode_list(encoded_items: &[Vec<u8>]) -> Vec<u8> {
-        let payload: Vec<u8> = encoded_items.iter().flat_map(|i| i.iter().copied()).collect();
+        let payload: Vec<u8> = encoded_items
+            .iter()
+            .flat_map(|i| i.iter().copied())
+            .collect();
         if payload.len() <= 55 {
             let mut out = vec![0xc0 + payload.len() as u8];
             out.extend_from_slice(&payload);
@@ -3738,7 +4010,10 @@ mod rlp {
             return vec![0];
         }
         let bytes = val.to_be_bytes();
-        let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+        let first_nonzero = bytes
+            .iter()
+            .position(|&b| b != 0)
+            .unwrap_or(bytes.len() - 1);
         bytes[first_nonzero..].to_vec()
     }
 
@@ -3749,7 +4024,10 @@ mod rlp {
             encode_bytes(&[])
         } else {
             let bytes = val.to_be_bytes();
-            let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
+            let first_nonzero = bytes
+                .iter()
+                .position(|&b| b != 0)
+                .unwrap_or(bytes.len() - 1);
             encode_bytes(&bytes[first_nonzero..])
         }
     }
@@ -3851,7 +4129,13 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         ($idx:expr, $name:expr) => {
             match fields[$idx].as_bytes() {
                 Ok(b) => b,
-                Err(_) => return eth_rpc_error(id, -32602, &format!("RLP field {} must be bytes, not list", $name)),
+                Err(_) => {
+                    return eth_rpc_error(
+                        id,
+                        -32602,
+                        &format!("RLP field {} must be bytes, not list", $name),
+                    )
+                }
             }
         };
     }
@@ -3972,7 +4256,11 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         addr[..20].copy_from_slice(to_bytes);
         Hash256(addr)
     } else {
-        return eth_rpc_error(id, -32602, &format!("Invalid to address length: {}", to_bytes.len()));
+        return eth_rpc_error(
+            id,
+            -32602,
+            &format!("Invalid to address length: {}", to_bytes.len()),
+        );
     };
 
     // --- 7. Build the ARC Transaction ---
@@ -3991,10 +4279,14 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
             gas_limit,
         );
         if !result.success {
-            return eth_rpc_error(id, -32000, &format!(
-                "Contract deployment failed: {}",
-                result.revert_reason.unwrap_or_default()
-            ));
+            return eth_rpc_error(
+                id,
+                -32000,
+                &format!(
+                    "Contract deployment failed: {}",
+                    result.revert_reason.unwrap_or_default()
+                ),
+            );
         }
 
         // Store event logs from deployment
@@ -4049,31 +4341,39 @@ fn eth_estimate_gas(node: &NodeState, params: &Value, id: &Value) -> Json<Value>
         None => return eth_rpc_error(id, -32602, "Missing call object"),
     };
 
-    let from = call_obj.get("from")
+    let from = call_obj
+        .get("from")
         .and_then(|v| v.as_str())
         .and_then(|s| parse_eth_address(s).ok())
         .unwrap_or(Hash256::ZERO);
 
-    let to = call_obj.get("to")
+    let to = call_obj
+        .get("to")
         .and_then(|v| v.as_str())
         .and_then(|s| parse_eth_address(s).ok())
         .unwrap_or(Hash256::ZERO);
 
-    let data = call_obj.get("data")
+    let data = call_obj
+        .get("data")
         .or_else(|| call_obj.get("input"))
         .and_then(|v| v.as_str())
         .map(|s| s.strip_prefix("0x").unwrap_or(s))
         .and_then(|s| hex::decode(s).ok())
         .unwrap_or_default();
 
-    let value = call_obj.get("value")
+    let value = call_obj
+        .get("value")
         .and_then(|v| v.as_str())
         .map(|s| s.strip_prefix("0x").unwrap_or(s))
         .and_then(|s| u64::from_str_radix(s, 16).ok())
         .unwrap_or(0);
 
     let result = arc_vm::evm::evm_call(&node.state, from, to, data, value, 30_000_000);
-    let gas_estimate = if result.gas_used == 0 { 21000 } else { result.gas_used };
+    let gas_estimate = if result.gas_used == 0 {
+        21000
+    } else {
+        result.gas_used
+    };
     eth_rpc_result(id, json!(format!("0x{:x}", gas_estimate)))
 }
 
@@ -4113,29 +4413,29 @@ async fn channel_state(
     axum::extract::Path(channel_id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, StatusCode> {
     // Look up channel escrow on-chain
-    let escrow_input = [b"arc-channel".as_slice(), &hex::decode(&channel_id).unwrap_or_default()].concat();
+    let escrow_input = [
+        b"arc-channel".as_slice(),
+        &hex::decode(&channel_id).unwrap_or_default(),
+    ]
+    .concat();
     let escrow_addr = arc_crypto::hash_bytes(&escrow_input);
     let escrow = node.state.get_account(&escrow_addr);
 
     match escrow {
-        Some(account) => {
-            Ok(Json(json!({
-                "channel_id": channel_id,
-                "locked_balance": account.balance,
-                "state_nonce": account.nonce,
-                "challenge_expiry": account.staked_balance,
-                "opener": format!("0x{}", hex::encode(account.code_hash.0)),
-                "counterparty": format!("0x{}", hex::encode(account.storage_root.0)),
-                "active": account.balance > 0,
-            })))
-        }
-        None => {
-            Ok(Json(json!({
-                "channel_id": channel_id,
-                "active": false,
-                "error": "channel not found",
-            })))
-        }
+        Some(account) => Ok(Json(json!({
+            "channel_id": channel_id,
+            "locked_balance": account.balance,
+            "state_nonce": account.nonce,
+            "challenge_expiry": account.staked_balance,
+            "opener": format!("0x{}", hex::encode(account.code_hash.0)),
+            "counterparty": format!("0x{}", hex::encode(account.storage_root.0)),
+            "active": account.balance > 0,
+        }))),
+        None => Ok(Json(json!({
+            "channel_id": channel_id,
+            "active": false,
+            "error": "channel not found",
+        }))),
     }
 }
 
@@ -4181,8 +4481,7 @@ fn live_inference_worker_count(node: &NodeState) -> usize {
         .iter()
         .filter(|e| {
             let (w, ts) = e.value();
-            now.duration_since(*ts) <= ttl
-                && w.capabilities.iter().any(|c| c == "inference")
+            now.duration_since(*ts) <= ttl && w.capabilities.iter().any(|c| c == "inference")
         })
         .count()
 }
@@ -4302,8 +4601,8 @@ async fn inference_onchain_submit(
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     use arc_types::transaction::{
-        InferenceRequestBody, Transaction, TxBody, TxType, TIER1_INPUT_BLOB_MAX,
-        TIER1_MAX_TOKENS, TIER1_MIN_DEADLINE_BLOCKS, TIER1_MAX_DEADLINE_BLOCKS,
+        InferenceRequestBody, TIER1_INPUT_BLOB_MAX, TIER1_MAX_DEADLINE_BLOCKS, TIER1_MAX_TOKENS,
+        TIER1_MIN_DEADLINE_BLOCKS, Transaction, TxBody, TxType,
     };
 
     let req = match body {
@@ -4312,7 +4611,7 @@ async fn inference_onchain_submit(
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "Request body required (input, max_tokens, max_reward, ...)",
-            ))
+            ));
         }
     };
 
@@ -4342,21 +4641,21 @@ async fn inference_onchain_submit(
         if tx.tx_type != TxType::InferenceRequest {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
-                format!(
-                    "signed_tx must be InferenceRequest, got {:?}",
-                    tx.tx_type
-                ),
+                format!("signed_tx must be InferenceRequest, got {:?}", tx.tx_type),
             ));
         }
         let (req_id_arr, mreward, dblocks, csize) = match &tx.body {
-            TxBody::InferenceRequest(b) => {
-                (b.request_id, b.max_reward, b.deadline_blocks, b.committee_size)
-            }
+            TxBody::InferenceRequest(b) => (
+                b.request_id,
+                b.max_reward,
+                b.deadline_blocks,
+                b.committee_size,
+            ),
             _ => {
                 return Err(api_error(
                     StatusCode::BAD_REQUEST,
                     "signed_tx body is not an InferenceRequest variant",
-                ))
+                ));
             }
         };
         let tx_hash = tx.hash;
@@ -4494,7 +4793,11 @@ async fn inference_onchain_submit(
     // debuggable. If the self-signed path is wedging, operators can see at a
     // glance whether they're hitting the validator-self-submit path (and the
     // submitter's balance/nonce) and pivot to the `signed_tx` field above.
-    let signer_balance = node.state.get_account(&sender_addr).map(|a| a.balance).unwrap_or(0);
+    let signer_balance = node
+        .state
+        .get_account(&sender_addr)
+        .map(|a| a.balance)
+        .unwrap_or(0);
     Ok(Json(json!({
         "request_id": format!("0x{}", hex::encode(request_id)),
         "tx_hash": tx_hash.to_hex(),
@@ -4546,12 +4849,15 @@ async fn inference_onchain_result(
     let mut request_id = [0u8; 32];
     request_id.copy_from_slice(&bytes);
 
-    let snap = node.state.tier1_request_snapshot(&request_id).ok_or_else(|| {
-        api_error(
-            StatusCode::NOT_FOUND,
-            format!("no such request: {}", request_id_str),
-        )
-    })?;
+    let snap = node
+        .state
+        .tier1_request_snapshot(&request_id)
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                format!("no such request: {}", request_id_str),
+            )
+        })?;
 
     let status_str = match snap.status {
         arc_state::TIER1_STATUS_OPEN => "Open",
@@ -4577,12 +4883,10 @@ async fn inference_onchain_result(
                 None
             }
         });
-    let output_blob = node
-        .state
-        .get_storage(
-            &snap.escrow_addr,
-            &arc_crypto::hash_bytes(b"tier1.output_blob"),
-        );
+    let output_blob = node.state.get_storage(
+        &snap.escrow_addr,
+        &arc_crypto::hash_bytes(b"tier1.output_blob"),
+    );
 
     // Decode token-id bytes (little-endian u32) back to text via the
     // local tokenizer. The blob is the same bytes the candle backend
@@ -4646,32 +4950,48 @@ async fn inference_run(
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let req = match body {
         Some(Json(v)) => v,
-        None => return Err(api_error(StatusCode::BAD_REQUEST, "Request body required. Send JSON with 'input' and 'max_tokens' fields.")),
+        None => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "Request body required. Send JSON with 'input' and 'max_tokens' fields.",
+            ));
+        }
     };
 
-    let input_text = req.get("input")
+    let input_text = req
+        .get("input")
         .and_then(|v| v.as_str())
         .unwrap_or("Hello, world!");
 
     // Validate input: reject null bytes, enforce max length
     if input_text.len() > 32_768 {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Input exceeds 32KB limit",
+        ));
     }
     if input_text.contains('\0') {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Input contains null bytes"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Input contains null bytes",
+        ));
     }
 
-    let max_tokens = req.get("max_tokens")
+    let max_tokens = req
+        .get("max_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(64)
         .min(4096) as u32; // Cap at 4K tokens to prevent resource exhaustion
-    let bond = req.get("bond")
+    let bond = req
+        .get("bond")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_ATTESTATION_BOND);
-    let challenge_period = req.get("challenge_period")
+    let challenge_period = req
+        .get("challenge_period")
         .and_then(|v| v.as_u64())
         .unwrap_or(DEFAULT_ATTESTATION_CHALLENGE_PERIOD_BLOCKS);
-    let force_local = req.get("force_local")
+    let force_local = req
+        .get("force_local")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
@@ -4797,8 +5117,8 @@ async fn inference_run(
     // pure-integer path runs against `model.layers` which is what
     // load_cached_model_ranges populates with `.is_loaded()=false`
     // sentinels for non-held layers.
-    let local_is_complete = node.candle_engine.is_some()
-        || model.layers.iter().all(|l| l.is_loaded());
+    let local_is_complete =
+        node.candle_engine.is_some() || model.layers.iter().all(|l| l.is_loaded());
     if !local_is_complete && !force_local {
         tracing::info!(
             "local model is partial ({}/{} layers loaded); routing /inference/run \
@@ -4849,45 +5169,63 @@ async fn inference_run(
     // calls occupied every runtime thread and stalled DAG gossip, consensus
     // and all other RPC on the node. Both paths now go through
     // spawn_blocking, and inside it through the configurable compute pool.
-    let (generated_tokens, output_hash, engine_name) = if let (Some(engine), Some(mid)) = (&node.candle_engine, &node.candle_model_id) {
-        // Candle Q4 float backend - coherent output, deterministic on same arch
-        let engine_c = engine.clone();
-        let mid_c = *mid;
-        let toks = tokens_with_bos.clone();
-        let pool_node = node.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            install_on_compute_pool(&pool_node, move || {
-                engine_c.generate(&mid_c, &toks, max_tokens)
+    let (generated_tokens, output_hash, engine_name) =
+        if let (Some(engine), Some(mid)) = (&node.candle_engine, &node.candle_model_id) {
+            // Candle Q4 float backend - coherent output, deterministic on same arch
+            let engine_c = engine.clone();
+            let mid_c = *mid;
+            let toks = tokens_with_bos.clone();
+            let pool_node = node.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                install_on_compute_pool(&pool_node, move || {
+                    engine_c.generate(&mid_c, &toks, max_tokens)
+                })
             })
-        })
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Inference failed: {}", e)))?;
-        let gen_tokens: Vec<u32> = result.output.chunks(4)
-            .map(|c| u32::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0),
-                c.get(2).copied().unwrap_or(0), c.get(3).copied().unwrap_or(0)]))
-            .collect();
-        (gen_tokens, result.output_hash, "candle Q4 (float, deterministic per-arch)")
-    } else {
-        // Integer engine — bit-identical across architectures. Precision
-        // label comes from the model itself so it tracks the dispatch
-        // chain (I16 / block-I8 / Q4 / per-row I8 / ternary / hybrid)
-        // instead of hardcoding "INT8 integer". When the loader populates
-        // I16 (default 2026-06-04+) this reports "INT16 integer …";
-        // before that it reported "INT8" even when block-I8 was actually
-        // running. Honest labels matter for "is INT16 working" debugging.
-        let model_c = model.clone();
-        let toks = tokens_with_bos.clone();
-        let pool_node = node.clone();
-        let (generated, hash) = tokio::task::spawn_blocking(move || {
-            install_on_compute_pool(&pool_node, move || {
-                model_c.generate(&toks, max_tokens, &model_c.config.eos_tokens)
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?
+            .map_err(|e| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Inference failed: {}", e),
+                )
+            })?;
+            let gen_tokens: Vec<u32> = result
+                .output
+                .chunks(4)
+                .map(|c| {
+                    u32::from_le_bytes([
+                        c[0],
+                        c.get(1).copied().unwrap_or(0),
+                        c.get(2).copied().unwrap_or(0),
+                        c.get(3).copied().unwrap_or(0),
+                    ])
+                })
+                .collect();
+            (
+                gen_tokens,
+                result.output_hash,
+                "candle Q4 (float, deterministic per-arch)",
+            )
+        } else {
+            // Integer engine — bit-identical across architectures. Precision
+            // label comes from the model itself so it tracks the dispatch
+            // chain (I16 / block-I8 / Q4 / per-row I8 / ternary / hybrid)
+            // instead of hardcoding "INT8 integer". When the loader populates
+            // I16 (default 2026-06-04+) this reports "INT16 integer …";
+            // before that it reported "INT8" even when block-I8 was actually
+            // running. Honest labels matter for "is INT16 working" debugging.
+            let model_c = model.clone();
+            let toks = tokens_with_bos.clone();
+            let pool_node = node.clone();
+            let (generated, hash) = tokio::task::spawn_blocking(move || {
+                install_on_compute_pool(&pool_node, move || {
+                    model_c.generate(&toks, max_tokens, &model_c.config.eos_tokens)
+                })
             })
-        })
-        .await
-        .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?;
-        (generated, hash, model.effective_precision_label())
-    };
+            .await
+            .map_err(|e| api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("Join: {}", e)))?;
+            (generated, hash, model.effective_precision_label())
+        };
 
     let inference_ms = start.elapsed().as_millis() as u64;
     let tokens_generated = generated_tokens.len() as u64;
@@ -4899,8 +5237,7 @@ async fn inference_run(
     // Compute model ID
     let model_id_data = format!(
         "arc-{}L-{}d-{}h-{}v",
-        model.config.n_layers, model.config.d_model,
-        model.config.n_heads, model.config.vocab_size
+        model.config.n_layers, model.config.d_model, model.config.n_heads, model.config.vocab_size
     );
     let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
     let input_hash = arc_crypto::hash_bytes(input_text.as_bytes());
@@ -4927,17 +5264,20 @@ async fn inference_run(
     let tx_hash_hex = format!("0x{}", hex::encode(tx_hash.0));
     let (explorer_url, explorer_url_unavailable_reason) =
         explorer_url_for(&node, &tx_hash, &attestation_status);
-    node.inference_results.insert(tx_hash_hex.clone(), json!({
-        "input": input_text,
-        "output": &output_text,
-        "output_hash": format!("0x{}", hex::encode(output_hash.0)),
-        "model": &model_id_data,
-        "model_hash": format!("0x{}", hex::encode(model_id_hash.0)),
-        "ms_per_token": ms_per_token,
-        "tokens_generated": tokens_generated,
-        "engine": &engine_name,
-        "deterministic": true,
-    }));
+    node.inference_results.insert(
+        tx_hash_hex.clone(),
+        json!({
+            "input": input_text,
+            "output": &output_text,
+            "output_hash": format!("0x{}", hex::encode(output_hash.0)),
+            "model": &model_id_data,
+            "model_hash": format!("0x{}", hex::encode(model_id_hash.0)),
+            "ms_per_token": ms_per_token,
+            "tokens_generated": tokens_generated,
+            "engine": &engine_name,
+            "deterministic": true,
+        }),
+    );
 
     Ok(Json(json!({
         "success": true,
@@ -4990,8 +5330,12 @@ async fn worker_earnings(
     axum::extract::Path(address_hex): axum::extract::Path<String>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let trimmed = address_hex.trim_start_matches("0x");
-    let raw = hex::decode(trimmed)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid hex address: {}", e)))?;
+    let raw = hex::decode(trimmed).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid hex address: {}", e),
+        )
+    })?;
     if raw.len() != 32 {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -5068,8 +5412,7 @@ async fn worker_earnings(
         .get_account(&want)
         .map(|a| a.balance)
         .unwrap_or(0);
-    let onchain_balance_arc =
-        onchain_balance as f64 / arc_types::economics::ARC_BASE_UNITS as f64;
+    let onchain_balance_arc = onchain_balance as f64 / arc_types::economics::ARC_BASE_UNITS as f64;
 
     // ── Observed rate, measured from real block timestamps ────────────────
     //
@@ -5251,7 +5594,11 @@ async fn workers_scoreboard(
         });
     }
 
-    rows.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    rows.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     rows.truncate(limit);
 
     Json(json!({
@@ -5268,7 +5615,8 @@ async fn inference_list_attestations(
     AxumState(node): AxumState<NodeState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, StatusCode> {
-    let limit = params.get("limit")
+    let limit = params
+        .get("limit")
         .and_then(|l| l.parse::<usize>().ok())
         .unwrap_or(10);
 
@@ -5290,15 +5638,16 @@ async fn inference_list_attestations(
         // Enrich with receipt data if available
         let mut block_height: Option<u64> = None;
         if let Ok(hash_bytes) = hex::decode(hash_clean)
-            && hash_bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&hash_bytes);
-                if let Some(receipt) = node.state.get_receipt(&key) {
-                    att["block_height"] = json!(receipt.block_height);
-                    att["gas_used"] = json!(receipt.gas_used);
-                    block_height = Some(receipt.block_height);
-                }
+            && hash_bytes.len() == 32
+        {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&hash_bytes);
+            if let Some(receipt) = node.state.get_receipt(&key) {
+                att["block_height"] = json!(receipt.block_height);
+                att["gas_used"] = json!(receipt.gas_used);
+                block_height = Some(receipt.block_height);
             }
+        }
         attestations.push((block_height, att));
     }
 
@@ -5317,9 +5666,13 @@ async fn inference_list_attestations(
         let tx = entry.value();
         let tx_hex = format!("0x{}", hex::encode(hash));
         // Skip if already added from local inference_results cache
-        if node.inference_results.contains_key(&tx_hex) { continue; }
+        if node.inference_results.contains_key(&tx_hex) {
+            continue;
+        }
 
-        let TxBody::InferenceAttestation(body) = &tx.body else { continue };
+        let TxBody::InferenceAttestation(body) = &tx.body else {
+            continue;
+        };
         let block_height = node.state.get_receipt(hash).map(|r| r.block_height);
         let att = json!({
             "tx_hash": tx_hex,
@@ -5367,10 +5720,10 @@ async fn inference_list_attestations(
 }
 
 /// GET /inference/results - list stored inference results (input, output, hash, model).
-async fn inference_list_results(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
-    let results: Vec<Value> = node.inference_results.iter()
+async fn inference_list_results(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let results: Vec<Value> = node
+        .inference_results
+        .iter()
         .map(|entry| {
             let mut r = entry.value().clone();
             r["tx_hash"] = json!(entry.key().clone());
@@ -5442,9 +5795,7 @@ struct ForwardShardResponse {
 /// Report live stats about the deterministic inference cache: how many
 /// entries are warm, what the capacity is, and total cumulative hits.
 /// Dashboards call this to show a "N prompts cached" counter.
-async fn inference_cache_stats(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<serde_json::Value> {
+async fn inference_cache_stats(AxumState(node): AxumState<NodeState>) -> Json<serde_json::Value> {
     Json(json!({
         "size": node.inference_cache.len(),
         "capacity": node.inference_cache.capacity(),
@@ -5462,9 +5813,7 @@ async fn inference_cache_stats(
 /// Returns the rolling EWMA hop latency (ms) per replica socket, plus sample
 /// count and age. Coordinators use this map to sort per-range replica lists
 /// before picking primary (run_sharded) or top-k (run_consensus). Closes #29.
-async fn inference_latency_stats(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<serde_json::Value> {
+async fn inference_latency_stats(AxumState(node): AxumState<NodeState>) -> Json<serde_json::Value> {
     let mut entries: Vec<serde_json::Value> = Vec::with_capacity(node.latency_stats.len());
     for kv in node.latency_stats.iter() {
         let (socket, stat) = (kv.key().clone(), kv.value().clone());
@@ -5486,8 +5835,14 @@ async fn inference_latency_stats(
         }));
     }
     entries.sort_by(|a, b| {
-        let ae = a.get("ewma_ms").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
-        let be = b.get("ewma_ms").and_then(|v| v.as_f64()).unwrap_or(f64::MAX);
+        let ae = a
+            .get("ewma_ms")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::MAX);
+        let be = b
+            .get("ewma_ms")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(f64::MAX);
         ae.partial_cmp(&be).unwrap_or(std::cmp::Ordering::Equal)
     });
     Json(json!({
@@ -5514,7 +5869,9 @@ struct CacheCheckPrompt {
     max_tokens: u32,
 }
 
-fn default_cache_check_max_tokens() -> u32 { 20 }
+fn default_cache_check_max_tokens() -> u32 {
+    20
+}
 
 #[derive(Serialize)]
 struct CacheCheckResult {
@@ -5527,17 +5884,16 @@ async fn inference_cache_check(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<CacheCheckRequest>,
 ) -> Result<Json<Vec<CacheCheckResult>>, (StatusCode, String)> {
-    let model = node
-        .inference_model
-        .as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no model loaded".to_string()))?;
+    let model = node.inference_model.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no model loaded".to_string(),
+    ))?;
 
     // Replicate the cache-key derivation used by inference_run_sharded so
     // a check here matches what a real call would look up.
     let model_id_data = format!(
         "arc-{}L-{}d-{}h-{}v",
-        model.config.n_layers, model.config.d_model,
-        model.config.n_heads, model.config.vocab_size
+        model.config.n_layers, model.config.d_model, model.config.n_heads, model.config.vocab_size
     );
     let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
 
@@ -5571,29 +5927,48 @@ async fn inference_forward_shard(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<ForwardShardRequest>,
 ) -> Result<Json<ForwardShardResponse>, (StatusCode, String)> {
-    let model = node.inference_model.as_ref()
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "No model loaded".to_string()))?;
+    let model = node.inference_model.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "No model loaded".to_string(),
+    ))?;
     if node.shard_infos.is_empty() {
-        return Err((StatusCode::SERVICE_UNAVAILABLE, "Node is not a shard holder".to_string()));
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Node is not a shard holder".to_string(),
+        ));
     }
     // Verify this node holds the requested layer range. A node holding
     // multiple disjoint ranges accepts requests for any of them - each range
     // was independently announced and is an independent replica slot.
-    let shard = node.shard_infos.iter()
+    let shard = node
+        .shard_infos
+        .iter()
         .find(|s| s.start_layer == req.start_layer && s.end_layer == req.end_layer)
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, format!(
-            "Shard mismatch: requested [{}, {}) but this node holds {:?}",
-            req.start_layer, req.end_layer,
-            node.shard_infos.iter().map(|s| (s.start_layer, s.end_layer)).collect::<Vec<_>>()
-        )))?;
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Shard mismatch: requested [{}, {}) but this node holds {:?}",
+                    req.start_layer,
+                    req.end_layer,
+                    node.shard_infos
+                        .iter()
+                        .map(|s| (s.start_layer, s.end_layer))
+                        .collect::<Vec<_>>()
+                ),
+            )
+        })?;
 
     // Decode input
-    use arc_inference::cached_integer_model::{ShardInput, ShardOutput, KVCache};
+    use arc_inference::cached_integer_model::{KVCache, ShardInput, ShardOutput};
 
     let input = if let Some(token) = req.token {
         // Verify this is the first shard (only first shard accepts a raw token)
         if shard.start_layer != 0 {
-            return Err((StatusCode::BAD_REQUEST, "Only the first shard accepts a raw token".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Only the first shard accepts a raw token".to_string(),
+            ));
         }
         ShardInput::Token(token)
     } else if let Some(hidden) = req.hidden {
@@ -5603,19 +5978,27 @@ async fn inference_forward_shard(
             let actual = arc_crypto::hash_bytes(&bytes);
             let actual_hex = format!("0x{}", hex::encode(actual.0));
             if &actual_hex != expected_hex {
-                return Err((StatusCode::BAD_REQUEST, format!(
-                    "Hidden state integrity check failed: expected {}, got {}", expected_hex, actual_hex
-                )));
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "Hidden state integrity check failed: expected {}, got {}",
+                        expected_hex, actual_hex
+                    ),
+                ));
             }
         }
         ShardInput::Hidden(hidden)
     } else {
-        return Err((StatusCode::BAD_REQUEST, "Need either 'token' or 'hidden' field".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Need either 'token' or 'hidden' field".to_string(),
+        ));
     };
 
     // Get-or-create per-request KV cache
     let n_layers = model.config.n_layers;
-    let cache_arc = node.shard_kv_caches
+    let cache_arc = node
+        .shard_kv_caches
         .entry(req.request_id.clone())
         .or_insert_with(|| Arc::new(std::sync::Mutex::new(KVCache::new(n_layers))))
         .value()
@@ -5705,18 +6088,16 @@ async fn inference_forward_shard(
                 node_name,
             }
         }
-        ShardOutput::Token { id, logits_hash } => {
-            ForwardShardResponse {
-                is_terminal: true,
-                hidden: None,
-                hidden_hash: None,
-                token_id: Some(id),
-                logits_hash: Some(format!("0x{}", hex::encode(logits_hash.0))),
-                layers_processed,
-                compute_ms,
-                node_name,
-            }
-        }
+        ShardOutput::Token { id, logits_hash } => ForwardShardResponse {
+            is_terminal: true,
+            hidden: None,
+            hidden_hash: None,
+            token_id: Some(id),
+            logits_hash: Some(format!("0x{}", hex::encode(logits_hash.0))),
+            layers_processed,
+            compute_ms,
+            node_name,
+        },
     };
     Ok(Json(response))
 }
@@ -5775,8 +6156,11 @@ pub struct RangeVote {
 
 /// In-flight fan-out calls for one hop: `(replica, wall_ms, response)`, where
 /// the error side carries `(message, is_cold_cache)`.
-type FanoutJoinSet =
-    tokio::task::JoinSet<(ShardInfo, u64, Result<(ForwardShardResponse, usize), (String, bool)>)>;
+type FanoutJoinSet = tokio::task::JoinSet<(
+    ShardInfo,
+    u64,
+    Result<(ForwardShardResponse, usize), (String, bool)>,
+)>;
 
 /// What one hop produced.
 struct HopOutcome {
@@ -5855,9 +6239,12 @@ async fn forward_shard_once(
     // `total_bytes_transferred` previously counted only REQUEST bodies, which
     // undercounted the true wire cost by roughly half — the hidden state comes
     // back the same size it went out.
-    let raw = resp.bytes().await.map_err(|e| (format!("body: {}", e), false))?;
-    let parsed: ForwardShardResponse = serde_json::from_slice(&raw)
-        .map_err(|e| (format!("parse: {}", e), false))?;
+    let raw = resp
+        .bytes()
+        .await
+        .map_err(|e| (format!("body: {}", e), false))?;
+    let parsed: ForwardShardResponse =
+        serde_json::from_slice(&raw).map_err(|e| (format!("parse: {}", e), false))?;
     Ok((parsed, raw.len()))
 }
 
@@ -6010,7 +6397,10 @@ async fn pipeline_hop(
                         if is_cold {
                             cold.push(shard.socket_addr.clone());
                         }
-                        errors.push(format!("{} ({}): {}", shard.node_name, shard.socket_addr, e));
+                        errors.push(format!(
+                            "{} ({}): {}",
+                            shard.node_name, shard.socket_addr, e
+                        ));
                     }
                 }
             }
@@ -6072,7 +6462,10 @@ async fn pipeline_hop(
                     position: req.position,
                     range: (req.start_layer, req.end_layer),
                     replicas_contacted: selected.iter().map(|s| s.node_name.clone()).collect(),
-                    replicas_returned: returned.iter().map(|(s, _, _, _)| s.node_name.clone()).collect(),
+                    replicas_returned: returned
+                        .iter()
+                        .map(|(s, _, _, _)| s.node_name.clone())
+                        .collect(),
                     majority_hash: majority_hash.clone(),
                     divergent: divergent.clone(),
                     agreement: if returned.is_empty() {
@@ -6176,8 +6569,7 @@ async fn run_pipeline(
 
     // Replica lists carried across the whole request so a working replica
     // stays primary and cold replicas stay evicted.
-    let mut live_replicas: Vec<Vec<ShardInfo>> =
-        pipeline.iter().map(|(_, r)| r.clone()).collect();
+    let mut live_replicas: Vec<Vec<ShardInfo>> = pipeline.iter().map(|(_, r)| r.clone()).collect();
     let mut hop_stats: Vec<HopStats> = vec![HopStats::default(); num_hops];
 
     // ─── Pipelined prefill ──────────────────────────────────────────────
@@ -6322,17 +6714,19 @@ async fn run_pipeline(
         }
 
         if let Some(tok) = first_generated
-            && !model.config.eos_tokens.contains(&tok) {
-                generated.push(tok);
-            }
+            && !model.config.eos_tokens.contains(&tok)
+        {
+            generated.push(tok);
+        }
     }
 
     // ─── Sequential decode ──────────────────────────────────────────────
     for gen_idx in 1..(max_tokens as usize) {
         if let Some(last) = generated.last()
-            && model.config.eos_tokens.contains(last) {
-                break;
-            }
+            && model.config.eos_tokens.contains(last)
+        {
+            break;
+        }
         let position = prompt_len + gen_idx - 1;
         let input_token = *generated.last().unwrap_or(&all_tokens[prompt_len - 1]);
 
@@ -6380,7 +6774,12 @@ async fn run_pipeline(
         }
     }
 
-    Ok(PipelineRun { generated, hop_stats, total_bytes, votes })
+    Ok(PipelineRun {
+        generated,
+        hop_stats,
+        total_bytes,
+        votes,
+    })
 }
 
 /// Render the accumulated per-hop statistics as the response's `shard_trace`.
@@ -6491,9 +6890,10 @@ async fn bootstrap_shard_registry_from_seeds(node: &NodeState) -> usize {
             Err(p) => p.into_inner(),
         };
         if let Some(t) = *last
-            && t.elapsed().as_secs() < REGISTRY_BOOTSTRAP_MIN_INTERVAL_SECS {
-                return 0;
-            }
+            && t.elapsed().as_secs() < REGISTRY_BOOTSTRAP_MIN_INTERVAL_SECS
+        {
+            return 0;
+        }
         *last = Some(std::time::Instant::now());
     }
 
@@ -6512,7 +6912,10 @@ async fn bootstrap_shard_registry_from_seeds(node: &NodeState) -> usize {
     let mut merged = 0usize;
     let now = std::time::Instant::now();
     for seed in seeds.iter() {
-        let seed_host = seed.rsplit_once(':').map(|(h, _)| h).unwrap_or(seed.as_str());
+        let seed_host = seed
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(seed.as_str());
         let resp = match client.get(format!("http://{}/shards", seed)).send().await {
             Ok(r) if r.status().is_success() => r,
             _ => continue,
@@ -6546,9 +6949,10 @@ async fn bootstrap_shard_registry_from_seeds(node: &NodeState) -> usize {
         if let Some(arr) = body.get("shards").and_then(|v| v.as_array()) {
             for v in arr {
                 if let Ok(si) = serde_json::from_value::<ShardInfo>(v.clone())
-                    && !is_stub_socket_addr(&si.socket_addr) {
-                        candidates.push(si);
-                    }
+                    && !is_stub_socket_addr(&si.socket_addr)
+                {
+                    candidates.push(si);
+                }
             }
         }
 
@@ -6699,14 +7103,24 @@ async fn submit_or_relay_attestation(
         Ok(v) if !v.trim().is_empty() => v.trim().trim_end_matches('/').to_string(),
         _ => {
             let (h, s) = submit_inference_attestation(
-                node, model_id, input_hash, output_hash, bond, challenge_period,
+                node,
+                model_id,
+                input_hash,
+                output_hash,
+                bond,
+                challenge_period,
             );
             return (h, s.to_string());
         }
     };
     let Some(kp) = node.validator_keypair.as_ref() else {
         let (h, s) = submit_inference_attestation(
-            node, model_id, input_hash, output_hash, bond, challenge_period,
+            node,
+            model_id,
+            input_hash,
+            output_hash,
+            bond,
+            challenge_period,
         );
         return (h, s.to_string());
     };
@@ -6753,7 +7167,12 @@ async fn submit_or_relay_attestation(
     };
     if tx.sign(kp).is_err() {
         let (h, s) = submit_inference_attestation(
-            node, model_id, input_hash, output_hash, bond, challenge_period,
+            node,
+            model_id,
+            input_hash,
+            output_hash,
+            bond,
+            challenge_period,
         );
         return (h, s.to_string());
     }
@@ -6772,14 +7191,24 @@ async fn submit_or_relay_attestation(
         Ok(r) => {
             tracing::warn!("attestation relay to {} rejected: {}", relay, r.status());
             let (h2, s) = submit_inference_attestation(
-                node, model_id, input_hash, output_hash, bond, challenge_period,
+                node,
+                model_id,
+                input_hash,
+                output_hash,
+                bond,
+                challenge_period,
             );
             (h2, format!("{} (relay_rejected {})", s, r.status()))
         }
         Err(e) => {
             tracing::warn!("attestation relay to {} failed: {}", relay, e);
             let (h2, s) = submit_inference_attestation(
-                node, model_id, input_hash, output_hash, bond, challenge_period,
+                node,
+                model_id,
+                input_hash,
+                output_hash,
+                bond,
+                challenge_period,
             );
             (h2, format!("{} (relay_unreachable)", s))
         }
@@ -6823,7 +7252,10 @@ async fn inference_run_sharded(
         .ok_or(api_error(StatusCode::BAD_REQUEST, "'input' field required"))?;
 
     if input_text.len() > 32_768 {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Input exceeds 32KB limit",
+        ));
     }
 
     // Sharded-pipeline output cap. Was 256, which combined with the model's
@@ -6930,90 +7362,94 @@ async fn inference_run_sharded(
     );
     let cache_key_hex = format!("0x{}", hex::encode(cache_key.0));
 
-    if !force_recompute
-        && let Some(cached_tokens) = node.inference_cache.get(&cache_key) {
-            let output_text = model.decode(&cached_tokens);
-            let output_bytes: Vec<u8> =
-                cached_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
-            let output_hash = arc_crypto::hash_bytes(&output_bytes);
-            let elapsed_us = overall_start.elapsed().as_micros() as u64;
+    if !force_recompute && let Some(cached_tokens) = node.inference_cache.get(&cache_key) {
+        let output_text = model.decode(&cached_tokens);
+        let output_bytes: Vec<u8> = cached_tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+        let output_hash = arc_crypto::hash_bytes(&output_bytes);
+        let elapsed_us = overall_start.elapsed().as_micros() as u64;
 
-            // A cache hit is NOT a sharded run: no pipeline was walked, no
-            // activations moved, no shard did any work. Counting it in
-            // sharded_runs_total inflated every "distributed inference
-            // served" figure on the dashboard.
-            node.sharded_cache_hits.fetch_add(1, Ordering::Relaxed);
+        // A cache hit is NOT a sharded run: no pipeline was walked, no
+        // activations moved, no shard did any work. Counting it in
+        // sharded_runs_total inflated every "distributed inference
+        // served" figure on the dashboard.
+        node.sharded_cache_hits.fetch_add(1, Ordering::Relaxed);
 
-            // Return the ORIGINAL run's provenance rather than zeros: the
-            // attestation tx that recorded it, the trace of the hops that
-            // actually produced it, and how long that real run took. A hit
-            // that reports `shard_trace: []`, `total_ms: 0` and no
-            // attestation looks like the pipeline did the work in 800 µs,
-            // which is what made the "determinism check" demo hollow.
-            let meta = node.sharded_run_meta.get(&cache_key_hex).map(|m| m.clone());
-            let mut resp = json!({
-                "success": true,
-                "request_id": request_id,
-                "input": input_text,
-                "output": output_text,
-                "output_tokens": cached_tokens,
-                "output_hash": format!("0x{}", hex::encode(output_hash.0)),
-                "input_hash": format!("0x{}", hex::encode(input_hash.0)),
-                "model_hash": format!("0x{}", hex::encode(model_id_hash.0)),
-                "tokens_generated": cached_tokens.len(),
-                "total_ms": elapsed_us / 1000,
-                "total_us": elapsed_us,
-                "ms_per_token": 0,
-                "pipeline_length": pipeline.len(),
-                "model": model_id_data,
-                "shard_trace": [],
-                "total_bytes_transferred": 0,
-                "deterministic": true,
-                "engine": "deterministic cache hit (bit-identical to the original sharded run)",
-                "cache": {
-                    "hit": true,
-                    "key": cache_key_hex,
-                    "served_in_us": elapsed_us,
-                    "size": node.inference_cache.len(),
-                },
-            });
-            if let Some(m) = meta {
-                for key in [
-                    "attestation",
-                    "shard_trace",
-                    "total_bytes_transferred",
-                    "committee",
-                    "fee_split",
-                    "explorer_url",
-                    // Carry the reason with the link. Copying `explorer_url`
-                    // alone would let a cache hit serve a null link with no
-                    // explanation — or, once the tx does get mined, a stale
-                    // reason alongside a now-valid link.
-                    "explorer_url_unavailable_reason",
-                    "pipeline_length",
-                ] {
-                    if let Some(v) = m.get(key) {
-                        resp[key] = v.clone();
-                    }
-                }
-                if let Some(v) = m.get("total_ms") {
-                    resp["original_total_ms"] = v.clone();
-                }
-                if let Some(v) = m.get("ms_per_token") {
-                    resp["original_ms_per_token"] = v.clone();
-                }
-                resp["cached_total_ms"] = json!(elapsed_us / 1000);
-                resp["cached_total_us"] = json!(elapsed_us);
-                if let Some(obj) = resp["cache"].as_object_mut() {
-                    obj.insert("original_request_id".into(), m.get("request_id").cloned().unwrap_or(Value::Null));
+        // Return the ORIGINAL run's provenance rather than zeros: the
+        // attestation tx that recorded it, the trace of the hops that
+        // actually produced it, and how long that real run took. A hit
+        // that reports `shard_trace: []`, `total_ms: 0` and no
+        // attestation looks like the pipeline did the work in 800 µs,
+        // which is what made the "determinism check" demo hollow.
+        let meta = node.sharded_run_meta.get(&cache_key_hex).map(|m| m.clone());
+        let mut resp = json!({
+            "success": true,
+            "request_id": request_id,
+            "input": input_text,
+            "output": output_text,
+            "output_tokens": cached_tokens,
+            "output_hash": format!("0x{}", hex::encode(output_hash.0)),
+            "input_hash": format!("0x{}", hex::encode(input_hash.0)),
+            "model_hash": format!("0x{}", hex::encode(model_id_hash.0)),
+            "tokens_generated": cached_tokens.len(),
+            "total_ms": elapsed_us / 1000,
+            "total_us": elapsed_us,
+            "ms_per_token": 0,
+            "pipeline_length": pipeline.len(),
+            "model": model_id_data,
+            "shard_trace": [],
+            "total_bytes_transferred": 0,
+            "deterministic": true,
+            "engine": "deterministic cache hit (bit-identical to the original sharded run)",
+            "cache": {
+                "hit": true,
+                "key": cache_key_hex,
+                "served_in_us": elapsed_us,
+                "size": node.inference_cache.len(),
+            },
+        });
+        if let Some(m) = meta {
+            for key in [
+                "attestation",
+                "shard_trace",
+                "total_bytes_transferred",
+                "committee",
+                "fee_split",
+                "explorer_url",
+                // Carry the reason with the link. Copying `explorer_url`
+                // alone would let a cache hit serve a null link with no
+                // explanation — or, once the tx does get mined, a stale
+                // reason alongside a now-valid link.
+                "explorer_url_unavailable_reason",
+                "pipeline_length",
+            ] {
+                if let Some(v) = m.get(key) {
+                    resp[key] = v.clone();
                 }
             }
-            return Ok(Json(resp));
+            if let Some(v) = m.get("total_ms") {
+                resp["original_total_ms"] = v.clone();
+            }
+            if let Some(v) = m.get("ms_per_token") {
+                resp["original_ms_per_token"] = v.clone();
+            }
+            resp["cached_total_ms"] = json!(elapsed_us / 1000);
+            resp["cached_total_us"] = json!(elapsed_us);
+            if let Some(obj) = resp["cache"].as_object_mut() {
+                obj.insert(
+                    "original_request_id".into(),
+                    m.get("request_id").cloned().unwrap_or(Value::Null),
+                );
+            }
         }
+        return Ok(Json(resp));
+    }
 
     // ─── Real pipeline walk ─────────────────────────────────────────────
     let strategy = if redundancy > 1 {
-        HopStrategy::Fanout { fanout: redundancy, needed: 1 }
+        HopStrategy::Fanout {
+            fanout: redundancy,
+            needed: 1,
+        }
     } else {
         HopStrategy::Failover
     };
@@ -7099,11 +7535,13 @@ async fn inference_run_sharded(
         let validators = node.dag_validators.read();
         let eligible: Vec<arc_inference::committee::InferenceValidator> = validators
             .iter()
-            .map(|(addr, stake)| arc_inference::committee::InferenceValidator {
-                address: *addr,
-                max_tier: 2,
-                stake: *stake,
-            })
+            .map(
+                |(addr, stake)| arc_inference::committee::InferenceValidator {
+                    address: *addr,
+                    max_tier: 2,
+                    stake: *stake,
+                },
+            )
             .collect();
 
         if eligible.len() >= 3 {
@@ -7111,7 +7549,9 @@ async fn inference_run_sharded(
                 &output_hash,
                 &eligible,
                 2,
-                eligible.len().min(arc_inference::committee::DEFAULT_COMMITTEE_SIZE),
+                eligible
+                    .len()
+                    .min(arc_inference::committee::DEFAULT_COMMITTEE_SIZE),
             );
             let member_hexes: Vec<String> = committee
                 .members
@@ -7151,9 +7591,10 @@ async fn inference_run_sharded(
         }
     }
 
-    let fee_split = node
-        .revenue_config
-        .split_fee(1000, node.dag_validators.read().len().saturating_sub(1) as u32);
+    let fee_split = node.revenue_config.split_fee(
+        1000,
+        node.dag_validators.read().len().saturating_sub(1) as u32,
+    );
 
     let (explorer_url, explorer_url_unavailable_reason) =
         explorer_url_for(&node, &tx_hash, &attestation_status);
@@ -7284,7 +7725,10 @@ async fn inference_run_consensus(
         .and_then(|v| v.as_str())
         .ok_or(api_error(StatusCode::BAD_REQUEST, "'input' field required"))?;
     if input_text.len() > 32_768 {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Input exceeds 32KB limit",
+        ));
     }
     let max_tokens = req
         .get("max_tokens")
@@ -7451,7 +7895,10 @@ async fn inference_run_consensus(
             _ => {}
         }
         for (replica, hash) in &v.divergent {
-            divergent_all.entry(replica.clone()).or_default().push(hash.clone());
+            divergent_all
+                .entry(replica.clone())
+                .or_default()
+                .push(hash.clone());
         }
     }
 
@@ -7503,7 +7950,9 @@ async fn inference_run_consensus(
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "auto-challenge create failed for {}: {}", replica_name, e
+                                "auto-challenge create failed for {}: {}",
+                                replica_name,
+                                e
                             );
                         }
                     }
@@ -7511,7 +7960,8 @@ async fn inference_run_consensus(
             }
             Err(e) => {
                 tracing::warn!(
-                    "verification manager lock poisoned; skipping auto-challenges: {}", e
+                    "verification manager lock poisoned; skipping auto-challenges: {}",
+                    e
                 );
             }
         }
@@ -7613,9 +8063,7 @@ async fn inference_run_consensus(
 /// returns the resulting per-model metadata. For MVP this is O(N) over
 /// the full-tx DashMap; a later patch can maintain a sidecar index if
 /// the registry grows past a few thousand models.
-async fn list_model_registry(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn list_model_registry(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut rows: Vec<Value> = Vec::new();
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
@@ -7640,9 +8088,7 @@ async fn list_model_registry(
 /// Milestone C (#37): GET /models/open_requests
 /// Returns every ModelRequest tx body. Workers poll this to find open
 /// demand and decide which ranges to claim.
-async fn list_open_model_requests(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn list_open_model_requests(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut rows: Vec<Value> = Vec::new();
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
@@ -7664,9 +8110,7 @@ async fn list_open_model_requests(
 /// Milestone D (#38): GET /capacity/advertisements
 /// Returns every CapacityAdvertisement. The planner reads this set
 /// plus open requests + current shard_registry to compute assignments.
-async fn list_capacity_advertisements(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn list_capacity_advertisements(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut rows: Vec<Value> = Vec::new();
     for entry in node.state.full_transactions.iter() {
         let tx = entry.value();
@@ -7694,16 +8138,13 @@ async fn list_capacity_advertisements(
 /// listed `--shard-range` flags and announce the assignment.
 async fn get_assignment_for_me(
     AxumState(node): AxumState<NodeState>,
-    axum::extract::Query(params): axum::extract::Query<
-        std::collections::HashMap<String, String>,
-    >,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     let pk_hex = params
         .get("pubkey")
         .ok_or(api_error(StatusCode::BAD_REQUEST, "missing ?pubkey= param"))?;
-    let pk = decode_hash_hex(pk_hex).map_err(|e| {
-        api_error(StatusCode::BAD_REQUEST, format!("pubkey: {}", e))
-    })?;
+    let pk = decode_hash_hex(pk_hex)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, format!("pubkey: {}", e)))?;
 
     let mut assignments: Vec<Value> = Vec::new();
     for entry in node.state.full_transactions.iter() {
@@ -7870,24 +8311,30 @@ const AUTO_CHALLENGE_BOND: u64 = 100_000;
 /// GET /shards
 /// Returns the local shard registry - every node this coordinator knows about
 /// and which layer range it holds.
-async fn get_shards(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn get_shards(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut shards: Vec<ShardInfo> = fresh_shards(&node.shard_registry);
     shards.sort_by_key(|s| s.start_layer);
 
     let total_layers = shards.first().map(|s| s.total_layers).unwrap_or(0);
     let total_full_mb = shards.first().map(|s| s.full_model_mb).unwrap_or(0);
     let total_held_mb: usize = shards.iter().map(|s| s.memory_mb).sum();
-    let model_id = shards.first().map(|s| s.model_id.clone()).unwrap_or_default();
-    let model_name = shards.first().map(|s| s.model_name.clone()).unwrap_or_default();
+    let model_id = shards
+        .first()
+        .map(|s| s.model_id.clone())
+        .unwrap_or_default();
+    let model_name = shards
+        .first()
+        .map(|s| s.model_name.clone())
+        .unwrap_or_default();
 
     // Dedup ranges across replicas. With 3× replication each range appears
     // three times in `shards`; walking the raw list sees the second replica's
     // start_layer == 0 as a backward step and flips contiguous=false. BTreeSet
     // collapses duplicates and iterates in sorted (start, end) order.
-    let unique_ranges: std::collections::BTreeSet<(usize, usize)> =
-        shards.iter().map(|s| (s.start_layer, s.end_layer)).collect();
+    let unique_ranges: std::collections::BTreeSet<(usize, usize)> = shards
+        .iter()
+        .map(|s| (s.start_layer, s.end_layer))
+        .collect();
     let mut covered_to = 0usize;
     let mut contiguous = true;
     for (start, end) in &unique_ranges {
@@ -7937,10 +8384,7 @@ fn is_stub_socket_addr(addr: &str) -> bool {
 /// the original when no rewrite is needed.
 ///
 /// Pure function - no I/O, no state. Cheap to unit test.
-fn rewrite_stub_shard_addr(
-    announced_addr: &str,
-    peer_addr: SocketAddr,
-) -> String {
+fn rewrite_stub_shard_addr(announced_addr: &str, peer_addr: SocketAddr) -> String {
     if !is_stub_socket_addr(announced_addr) || peer_addr.ip().is_loopback() {
         return announced_addr.to_string();
     }
@@ -7990,7 +8434,9 @@ async fn announce_shard(
                 && !s.socket_addr.is_empty()
         });
         if has_better {
-            return Json(json!({"ok": true, "registry_size": node.shard_registry.len(), "note": "stub addr ignored - routable addr already registered"}));
+            return Json(
+                json!({"ok": true, "registry_size": node.shard_registry.len(), "note": "stub addr ignored - routable addr already registered"}),
+            );
         }
     }
     // Key by (socket_addr, range) so one node announcing multiple held ranges
@@ -7998,7 +8444,10 @@ async fn announce_shard(
     // prior announces and only the most recent range survives. The
     // coordinator's BTreeMap grouping already keys on (start, end) so a
     // per-range entry is exactly what we need.
-    let key = format!("{}#{}-{}", req.shard.socket_addr, req.shard.start_layer, req.shard.end_layer);
+    let key = format!(
+        "{}#{}-{}",
+        req.shard.socket_addr, req.shard.start_layer, req.shard.end_layer
+    );
     // Also register in multi-model ShardRegistry for multi-model routing
     if let Ok(model_hash_bytes) = parse_hash(&req.shard.model_id) {
         let model_hash = Hash256(model_hash_bytes);
@@ -8011,9 +8460,11 @@ async fn announce_shard(
             gpu_tier: 0,
             available_memory: (req.shard.memory_mb as u64) * 1024 * 1024,
         };
-        node.multi_model_registry.register_shard(model_hash, assignment);
+        node.multi_model_registry
+            .register_shard(model_hash, assignment);
     }
-    node.shard_registry.insert(key, (req.shard, std::time::Instant::now()));
+    node.shard_registry
+        .insert(key, (req.shard, std::time::Instant::now()));
     Json(json!({"ok": true, "registry_size": node.shard_registry.len()}))
 }
 
@@ -8055,7 +8506,10 @@ async fn community_register(
     Json(req): Json<CommunityRegisterRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if req.worker_id.is_empty() || req.worker_id.len() > 128 {
-        return Err((StatusCode::BAD_REQUEST, "worker_id required (1-128 chars)".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "worker_id required (1-128 chars)".to_string(),
+        ));
     }
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -8106,9 +8560,11 @@ async fn community_register(
     // because no other shard starts at the stub's end_layer. Real
     // workers run on routable IPs; a stub here means a misconfigured
     // dev binary calling production seeds.
-    let shard_assignment = if let (Some(model_id), Some(total_layers), Some(rpc_addr)) =
-        (req.model_id.as_ref(), req.total_layers, req.rpc_addr.as_ref())
-    {
+    let shard_assignment = if let (Some(model_id), Some(total_layers), Some(rpc_addr)) = (
+        req.model_id.as_ref(),
+        req.total_layers,
+        req.rpc_addr.as_ref(),
+    ) {
         if is_stub_socket_addr(rpc_addr) {
             tracing::debug!(
                 worker_id = %req.worker_id,
@@ -8141,9 +8597,15 @@ async fn community_register(
             let mut in_run = false;
             for (i, &is_covered) in covered.iter().enumerate() {
                 if !is_covered {
-                    if !in_run { run_start = i; in_run = true; }
+                    if !in_run {
+                        run_start = i;
+                        in_run = true;
+                    }
                     let run_len = i - run_start + 1;
-                    if run_len > best_len { best_start = run_start; best_len = run_len; }
+                    if run_len > best_len {
+                        best_start = run_start;
+                        best_len = run_len;
+                    }
                 } else {
                     in_run = false;
                 }
@@ -8183,20 +8645,24 @@ async fn community_register(
                 node_name: worker_name.clone(),
             };
             let reg_key = format!("{}#{}-{}", rpc_addr, best_start, end);
-            node.shard_registry.insert(reg_key, (shard_info, std::time::Instant::now()));
+            node.shard_registry
+                .insert(reg_key, (shard_info, std::time::Instant::now()));
 
             // Register in multi-model registry
             if let Ok(mhb) = parse_hash(model_id) {
                 let mh = Hash256(mhb);
-                node.multi_model_registry.register_shard(mh, arc_inference::distributed::ShardAssignment {
-                    node_address: mh,
-                    start_layer: best_start as u32,
-                    end_layer: end as u32,
-                    expert_indices: Vec::new(),
-                    socket_addr: rpc_addr.clone(),
-                    gpu_tier: 0,
-                    available_memory: req.available_memory_mb.unwrap_or(8192) * 1024 * 1024,
-                });
+                node.multi_model_registry.register_shard(
+                    mh,
+                    arc_inference::distributed::ShardAssignment {
+                        node_address: mh,
+                        start_layer: best_start as u32,
+                        end_layer: end as u32,
+                        expert_indices: Vec::new(),
+                        socket_addr: rpc_addr.clone(),
+                        gpu_tier: 0,
+                        available_memory: req.available_memory_mb.unwrap_or(8192) * 1024 * 1024,
+                    },
+                );
             }
 
             Some(json!({
@@ -8243,7 +8709,10 @@ async fn community_heartbeat(
         }
         Ok(Json(json!({"ok": true})))
     } else {
-        Err((StatusCode::NOT_FOUND, "worker_id not registered - call /community/register first".to_string()))
+        Err((
+            StatusCode::NOT_FOUND,
+            "worker_id not registered - call /community/register first".to_string(),
+        ))
     }
 }
 
@@ -8251,9 +8720,7 @@ async fn community_heartbeat(
 /// Returns all fresh community workers. Entries older than
 /// COMMUNITY_WORKER_TTL_SECS are pruned at read time. The dashboard
 /// polls this to show the community node count + geographic spread.
-async fn community_list(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<serde_json::Value> {
+async fn community_list(AxumState(node): AxumState<NodeState>) -> Json<serde_json::Value> {
     let now = std::time::Instant::now();
     let ttl = std::time::Duration::from_secs(COMMUNITY_WORKER_TTL_SECS);
     let mut live: Vec<CommunityWorker> = Vec::new();
@@ -8402,7 +8869,9 @@ pub struct WorkResult {
     pub signed_attestation_hex: Option<String>,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 /// POST body for /community/claim_work.
 #[derive(Deserialize)]
@@ -8478,18 +8947,19 @@ pub async fn community_claim_work(
             // and the work item has a model_id, they must agree. If the
             // worker doesn't filter by model, accept any work.
             if let (Some(worker_model), Some(item_model)) = (&req.model, &item.model_id)
-                && worker_model != item_model {
-                    // Model mismatch - put the item back on the queue so
-                    // another worker can pick it up, then tell this worker
-                    // there's no matching work.
-                    if let Some(ref tx) = node.community_work_tx {
-                        let _ = tx.send(item).await;
-                    }
-                    return Ok(Json(json!({
-                        "status": "no_work",
-                        "reason": "model_mismatch",
-                    })));
+                && worker_model != item_model
+            {
+                // Model mismatch - put the item back on the queue so
+                // another worker can pick it up, then tell this worker
+                // there's no matching work.
+                if let Some(ref tx) = node.community_work_tx {
+                    let _ = tx.send(item).await;
                 }
+                return Ok(Json(json!({
+                    "status": "no_work",
+                    "reason": "model_mismatch",
+                })));
+            }
 
             // Flat response shape — the worker (arc-node main.rs) reads
             // `job_id`, `input`, `max_tokens` directly off the top-level
@@ -8538,10 +9008,7 @@ pub async fn community_submit_work(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     // ── Validate required fields ────────────────────────────────────────
     if result.job_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "job_id is required".to_string(),
-        ));
+        return Err((StatusCode::BAD_REQUEST, "job_id is required".to_string()));
     }
     if result.worker_id.is_empty() || result.worker_id.len() > 128 {
         return Err((
@@ -8586,9 +9053,8 @@ pub async fn community_submit_work(
         if result.success {
             worker.work_completed += 1;
             worker.success_count += 1;
-            worker.sum_total_ms_success = worker
-                .sum_total_ms_success
-                .saturating_add(result.total_ms);
+            worker.sum_total_ms_success =
+                worker.sum_total_ms_success.saturating_add(result.total_ms);
             worker.last_total_ms = result.total_ms;
         } else {
             worker.failure_count += 1;
@@ -8686,10 +9152,7 @@ pub async fn community_submit_work(
                     // Receiver dropped - dispatcher timed out
                     Err((
                         StatusCode::GONE,
-                        format!(
-                            "dispatcher already timed out for job_id {}",
-                            job_id
-                        ),
+                        format!("dispatcher already timed out for job_id {}", job_id),
                     ))
                 }
             }
@@ -8717,10 +9180,9 @@ fn decode_and_verify_worker_attestation(
 ) -> Result<arc_types::Transaction, String> {
     // Strip optional "0x" prefix so workers can encode either way.
     let trimmed = hex_bytes.trim_start_matches("0x");
-    let raw = hex::decode(trimmed)
-        .map_err(|e| format!("hex decode failed: {}", e))?;
-    let tx: arc_types::Transaction = bincode::deserialize(&raw)
-        .map_err(|e| format!("bincode deserialize failed: {}", e))?;
+    let raw = hex::decode(trimmed).map_err(|e| format!("hex decode failed: {}", e))?;
+    let tx: arc_types::Transaction =
+        bincode::deserialize(&raw).map_err(|e| format!("bincode deserialize failed: {}", e))?;
 
     if tx.tx_type != arc_types::TxType::InferenceAttestation {
         return Err(format!(
@@ -8732,9 +9194,7 @@ fn decode_and_verify_worker_attestation(
     // The worker signs as `from = their validator_address`. The claim
     // submission's worker_id is the hex of that address. Reject mismatches
     // outright so a worker can't submit on someone else's behalf.
-    let claim_address = expected_worker_id
-        .trim_start_matches("0x")
-        .to_string();
+    let claim_address = expected_worker_id.trim_start_matches("0x").to_string();
     let tx_from_hex = hex::encode(tx.from.0);
     if claim_address != tx_from_hex {
         return Err(format!(
@@ -8753,9 +9213,7 @@ fn decode_and_verify_worker_attestation(
 
 /// GET /models
 /// List all models known to the multi-model registry with pipeline coverage info.
-async fn get_models(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn get_models(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let covered = node.multi_model_registry.fully_covered_models();
     let total_nodes = node.multi_model_registry.total_shard_nodes();
 
@@ -8766,7 +9224,8 @@ async fn get_models(
 
     for s in &flat_shards {
         if model_set.insert(s.model_id.clone()) {
-            let shards_for_model: Vec<&ShardInfo> = flat_shards.iter()
+            let shards_for_model: Vec<&ShardInfo> = flat_shards
+                .iter()
                 .filter(|ss| ss.model_id == s.model_id)
                 .collect();
             // Coverage is the UNION of the announced layer intervals, not the
@@ -8818,8 +9277,10 @@ async fn get_model_shards(
     AxumState(node): AxumState<NodeState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let model_id_hex = params.get("model_id")
-        .ok_or(api_error(StatusCode::BAD_REQUEST, "model_id query parameter required"))?;
+    let model_id_hex = params.get("model_id").ok_or(api_error(
+        StatusCode::BAD_REQUEST,
+        "model_id query parameter required",
+    ))?;
 
     let model_hash_bytes = parse_hash(model_id_hex)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid model_id hex"))?;
@@ -8827,13 +9288,18 @@ async fn get_model_shards(
 
     match node.multi_model_registry.get_pipeline(&model_hash) {
         Some(pipeline) => {
-            let shards: Vec<Value> = pipeline.iter().map(|s| json!({
-                "start_layer": s.start_layer,
-                "end_layer": s.end_layer,
-                "socket_addr": s.socket_addr,
-                "gpu_tier": s.gpu_tier,
-                "available_memory_mb": s.available_memory / (1024 * 1024),
-            })).collect();
+            let shards: Vec<Value> = pipeline
+                .iter()
+                .map(|s| {
+                    json!({
+                        "start_layer": s.start_layer,
+                        "end_layer": s.end_layer,
+                        "socket_addr": s.socket_addr,
+                        "gpu_tier": s.gpu_tier,
+                        "available_memory_mb": s.available_memory / (1024 * 1024),
+                    })
+                })
+                .collect();
             let total_layers = pipeline.last().map(|s| s.end_layer).unwrap_or(0);
             Ok(Json(json!({
                 "model_id": model_id_hex,
@@ -8843,7 +9309,10 @@ async fn get_model_shards(
                 "fully_covered": node.multi_model_registry.is_model_fully_covered(&model_hash, total_layers),
             })))
         }
-        None => Err(api_error(StatusCode::NOT_FOUND, "model not found in registry")),
+        None => Err(api_error(
+            StatusCode::NOT_FOUND,
+            "model not found in registry",
+        )),
     }
 }
 
@@ -8878,8 +9347,15 @@ async fn inference_commit(
         bond_amount: req.bond_amount,
     };
 
-    let commitment_id = node.verification_manager.lock()
-        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "verification manager lock poisoned"))?
+    let commitment_id = node
+        .verification_manager
+        .lock()
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "verification manager lock poisoned",
+            )
+        })?
         .submit_commitment(commitment);
 
     Ok(Json(json!({
@@ -8911,12 +9387,29 @@ async fn inference_challenge(
         "spot_check" => arc_vm::inference_verify::ChallengeType::SpotCheck,
         "statistical_audit" => arc_vm::inference_verify::ChallengeType::StatisticalAudit,
         "consensus" => arc_vm::inference_verify::ChallengeType::ConsensusVerification,
-        _ => return Err(api_error(StatusCode::BAD_REQUEST, "invalid challenge_type: use re_execution, spot_check, statistical_audit, or consensus")),
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid challenge_type: use re_execution, spot_check, statistical_audit, or consensus",
+            ));
+        }
     };
 
-    let challenge_id = node.verification_manager.lock()
-        .map_err(|_| api_error(StatusCode::INTERNAL_SERVER_ERROR, "verification manager lock poisoned"))?
-        .create_challenge(commitment_hash, node.validator_address.0, challenge_type, req.bond_amount)
+    let challenge_id = node
+        .verification_manager
+        .lock()
+        .map_err(|_| {
+            api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "verification manager lock poisoned",
+            )
+        })?
+        .create_challenge(
+            commitment_hash,
+            node.validator_address.0,
+            challenge_type,
+            req.bond_amount,
+        )
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, e))?;
 
     Ok(Json(json!({
@@ -8929,10 +9422,10 @@ async fn inference_challenge(
 
 /// GET /inference/verification_status
 /// Show overall verification system stats.
-async fn inference_verification_status(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
-    let reputation = node.verification_manager.lock()
+async fn inference_verification_status(AxumState(node): AxumState<NodeState>) -> Json<Value> {
+    let reputation = node
+        .verification_manager
+        .lock()
         .map(|mgr| mgr.get_provider_reputation(node.validator_address.0))
         .unwrap_or(1.0);
 
@@ -8949,9 +9442,7 @@ async fn inference_verification_status(
 
 /// GET /economics/revenue_split
 /// Show the fee distribution configuration.
-async fn get_revenue_split(
-    AxumState(node): AxumState<NodeState>,
-) -> Json<Value> {
+async fn get_revenue_split(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let config = &node.revenue_config;
     let num_validators = node.dag_validators.read().len();
     let example_split = config.split_fee(10_000, num_validators.saturating_sub(1) as u32);
@@ -9019,18 +9510,22 @@ async fn compute_auto_shard_plan(
     for entry in node.community_workers.iter() {
         let (worker, ts) = entry.value();
         if now.duration_since(*ts).as_secs() < COMMUNITY_WORKER_TTL_SECS
-            && seen_nodes.insert(worker.name.clone()) {
-                capabilities.push(arc_inference::distributed::NodeCapability {
-                    address: Hash256(parse_hash(&worker.worker_id).unwrap_or([0u8; 32])),
-                    socket_addr: worker.name.clone(),
-                    gpu_tier: 0,
-                    available_memory: 8 * 1024 * 1024 * 1024, // default 8GB estimate
-                });
-            }
+            && seen_nodes.insert(worker.name.clone())
+        {
+            capabilities.push(arc_inference::distributed::NodeCapability {
+                address: Hash256(parse_hash(&worker.worker_id).unwrap_or([0u8; 32])),
+                socket_addr: worker.name.clone(),
+                gpu_tier: 0,
+                available_memory: 8 * 1024 * 1024 * 1024, // default 8GB estimate
+            });
+        }
     }
 
     if capabilities.is_empty() {
-        return Err(api_error(StatusCode::SERVICE_UNAVAILABLE, "no nodes available for sharding"));
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no nodes available for sharding",
+        ));
     }
 
     let plan = arc_inference::distributed::compute_shard_plan(
@@ -9042,17 +9537,23 @@ async fn compute_auto_shard_plan(
 
     // Register the computed plan in the multi-model registry
     for assignment in &plan {
-        node.multi_model_registry.register_shard(model_hash, assignment.clone());
+        node.multi_model_registry
+            .register_shard(model_hash, assignment.clone());
     }
 
-    let plan_json: Vec<Value> = plan.iter().map(|a| json!({
-        "node_address": format!("0x{}", hex::encode(a.node_address.0)),
-        "socket_addr": a.socket_addr,
-        "start_layer": a.start_layer,
-        "end_layer": a.end_layer,
-        "gpu_tier": a.gpu_tier,
-        "available_memory_mb": a.available_memory / (1024 * 1024),
-    })).collect();
+    let plan_json: Vec<Value> = plan
+        .iter()
+        .map(|a| {
+            json!({
+                "node_address": format!("0x{}", hex::encode(a.node_address.0)),
+                "socket_addr": a.socket_addr,
+                "start_layer": a.start_layer,
+                "end_layer": a.end_layer,
+                "gpu_tier": a.gpu_tier,
+                "available_memory_mb": a.available_memory / (1024 * 1024),
+            })
+        })
+        .collect();
 
     Ok(Json(json!({
         "model_id": req.model_id,
@@ -9101,7 +9602,10 @@ async fn shard_join(
     Json(req): Json<ShardJoinRequest>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
     if req.total_layers == 0 {
-        return Err(api_error(StatusCode::BAD_REQUEST, "total_layers must be > 0"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "total_layers must be > 0",
+        ));
     }
 
     let model_hash_bytes = parse_hash(&req.model_id)
@@ -9163,7 +9667,10 @@ async fn shard_join(
         }
         // Find the layer with minimum coverage
         let min_coverage = *coverage_count.iter().min().unwrap_or(&0);
-        let thin_start = coverage_count.iter().position(|&c| c == min_coverage).unwrap_or(0);
+        let thin_start = coverage_count
+            .iter()
+            .position(|&c| c == min_coverage)
+            .unwrap_or(0);
         // Assign a range around the thinnest spot
         let range_size = (req.total_layers as usize / 4).max(1);
         best_start = thin_start;
@@ -9186,7 +9693,8 @@ async fn shard_join(
         node_name: req.node_name.clone(),
     };
     let reg_key = format!("{}#{}-{}", req.socket_addr, assigned_start, assigned_end);
-    node.shard_registry.insert(reg_key, (shard_info, std::time::Instant::now()));
+    node.shard_registry
+        .insert(reg_key, (shard_info, std::time::Instant::now()));
 
     // Also register in multi-model registry
     let model_hash = Hash256(model_hash_bytes);
@@ -9199,11 +9707,15 @@ async fn shard_join(
         gpu_tier: req.gpu_tier,
         available_memory: req.available_memory_mb * 1024 * 1024,
     };
-    node.multi_model_registry.register_shard(model_hash, assignment);
+    node.multi_model_registry
+        .register_shard(model_hash, assignment);
 
     // Check if pipeline is now fully covered
     let mut new_covered: Vec<bool> = vec![false; req.total_layers as usize];
-    for s in fresh_shards(&node.shard_registry).iter().filter(|s| s.model_id == req.model_id) {
+    for s in fresh_shards(&node.shard_registry)
+        .iter()
+        .filter(|s| s.model_id == req.model_id)
+    {
         for c in new_covered
             .iter_mut()
             .take(s.end_layer.min(req.total_layers as usize))
@@ -9243,16 +9755,21 @@ async fn inference_auto(
     AxumState(node): AxumState<NodeState>,
     Json(req): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<ApiError>)> {
-    let input = req.get("input")
+    let input = req
+        .get("input")
         .and_then(|v| v.as_str())
         .ok_or(api_error(StatusCode::BAD_REQUEST, "'input' field required"))?
         .to_string();
 
     if input.len() > 32_768 {
-        return Err(api_error(StatusCode::BAD_REQUEST, "Input exceeds 32KB limit"));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "Input exceeds 32KB limit",
+        ));
     }
 
-    let max_tokens = req.get("max_tokens")
+    let max_tokens = req
+        .get("max_tokens")
         .and_then(|v| v.as_u64())
         .unwrap_or(20)
         .min(256) as u32;
@@ -9279,7 +9796,9 @@ async fn inference_auto(
 
     // Strategy 3: Check if community workers are available
     let now = std::time::Instant::now();
-    let community_worker_count = node.community_workers.iter()
+    let community_worker_count = node
+        .community_workers
+        .iter()
         .filter(|e| now.duration_since(e.value().1).as_secs() < COMMUNITY_WORKER_TTL_SECS)
         .count();
 
@@ -9291,10 +9810,7 @@ async fn inference_auto(
             "max_tokens": max_tokens,
             "chat_template": req.get("chat_template").and_then(|v| v.as_bool()).unwrap_or(false),
         });
-        let result = inference_run_sharded(
-            AxumState(node.clone()),
-            Json(sharded_req),
-        ).await;
+        let result = inference_run_sharded(AxumState(node.clone()), Json(sharded_req)).await;
         match result {
             Ok(mut resp) => {
                 if let Some(obj) = resp.0.as_object_mut() {
@@ -9310,10 +9826,7 @@ async fn inference_auto(
             "input": input,
             "max_tokens": max_tokens,
         });
-        let result = inference_run(
-            AxumState(node.clone()),
-            Some(Json(local_req)),
-        ).await;
+        let result = inference_run(AxumState(node.clone()), Some(Json(local_req))).await;
         match result {
             Ok(mut resp) => {
                 if let Some(obj) = resp.0.as_object_mut() {
@@ -9325,10 +9838,13 @@ async fn inference_auto(
         }
     } else if community_worker_count > 0 {
         // Route to community workers (via work dispatch)
-        Err(api_error(StatusCode::SERVICE_UNAVAILABLE, format!(
-            "{} community workers available but direct dispatch not yet implemented. Use /inference/community on the gateway (port 3001).",
-            community_worker_count
-        )))
+        Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!(
+                "{} community workers available but direct dispatch not yet implemented. Use /inference/community on the gateway (port 3001).",
+                community_worker_count
+            ),
+        ))
     } else {
         Err(api_error(StatusCode::SERVICE_UNAVAILABLE, json!({
             "error": "No inference path available",
@@ -9543,10 +10059,11 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let mut h = height;
     while h > floor {
         if let Some(b) = node.state.get_block(h)
-            && b.header.producer == node.validator_address {
-                self_produced = Some((b.header.height, b.header.timestamp));
-                break;
-            }
+            && b.header.producer == node.validator_address
+        {
+            self_produced = Some((b.header.height, b.header.timestamp));
+            break;
+        }
         h -= 1;
     }
     let self_produced_age = self_produced.and_then(|(_, ts)| age_secs_from_ms(ts));
@@ -9560,13 +10077,10 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
     let vals = node.dag_validators.read().clone();
     let split = split_validators(&vals, arc_consensus::STAKE_SPARK);
 
-    let protocol_version = latest
-        .as_ref()
-        .or(genesis.as_ref())
-        .map(|b| {
-            let pv = &b.header.protocol_version;
-            format!("{}.{}.{}", pv.major, pv.minor, pv.patch)
-        });
+    let protocol_version = latest.as_ref().or(genesis.as_ref()).map(|b| {
+        let pv = &b.header.protocol_version;
+        format!("{}.{}.{}", pv.major, pv.minor, pv.patch)
+    });
 
     Json(json!({
         // ── Identity ──────────────────────────────────────────────────────
@@ -10011,7 +10525,10 @@ mod tests {
         assert_eq!(v["submitted_at_unix_ms"], 1_700_000_000_000i64);
         // Old layer-shard fields must NOT appear — they belong to the
         // seed-to-seed forward_shard path now.
-        assert!(v.get("request_id").is_none(), "request_id is the v0.6 layer-shard field, must not leak into community jobs");
+        assert!(
+            v.get("request_id").is_none(),
+            "request_id is the v0.6 layer-shard field, must not leak into community jobs"
+        );
         assert!(v.get("hidden").is_none());
         assert!(v.get("start_layer").is_none());
         assert!(v.get("end_layer").is_none());
@@ -10047,7 +10564,8 @@ mod tests {
             "ms_per_token": 250u64,
             "engine": "INT8 integer (community worker)",
         });
-        let r: WorkResult = serde_json::from_value(body).expect("worker payload should deserialize");
+        let r: WorkResult =
+            serde_json::from_value(body).expect("worker payload should deserialize");
         assert_eq!(r.job_id, "abc");
         assert_eq!(r.worker_id, "0x12ab");
         assert!(r.success);
@@ -10090,7 +10608,9 @@ mod tests {
             max_tokens: 4,
             model_id: None,
             submitted_at_unix_ms: 1,
-        }).await.unwrap();
+        })
+        .await
+        .unwrap();
 
         // Drain
         let got = rx.lock().await.recv().await.expect("a job");
@@ -10154,7 +10674,9 @@ mod tests {
             sharded_bytes_total: Arc::new(AtomicU64::new(0)),
             inference_cache: Arc::new(arc_inference::distributed::DistributedCache::new(16)),
             multi_model_registry: Arc::new(arc_inference::distributed::ShardRegistry::new()),
-            verification_manager: Arc::new(std::sync::Mutex::new(arc_vm::inference_verify::VerificationManager::new())),
+            verification_manager: Arc::new(std::sync::Mutex::new(
+                arc_vm::inference_verify::VerificationManager::new(),
+            )),
             revenue_config: RoleRevenueConfig::default(),
             inference_http: reqwest::Client::new(),
             sharded_cache_hits: Arc::new(AtomicU64::new(0)),
@@ -10164,9 +10686,7 @@ mod tests {
             seed_rpc_addrs: Arc::new(Vec::new()),
             last_registry_bootstrap: Arc::new(Mutex::new(None)),
             chain_identity: None,
-            own_compute_ms: Arc::new(parking_lot::Mutex::new(
-                std::collections::VecDeque::new(),
-            )),
+            own_compute_ms: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),
         }
     }
 
@@ -10214,10 +10734,7 @@ mod tests {
         // through the same channels submit_work uses, then assert the
         // dispatcher returns the right WorkResult.
         let now = std::time::Instant::now();
-        let node = fake_node_with_workers(vec![(
-            worker("w1", &["inference"]),
-            now,
-        )]);
+        let node = fake_node_with_workers(vec![(worker("w1", &["inference"]), now)]);
 
         let queue = node.community_work_queue.as_ref().unwrap().clone();
         let results = node.community_work_results.as_ref().unwrap().clone();
@@ -10339,8 +10856,7 @@ mod tests {
         let kp = KeyPair::generate_ed25519();
         let (orig, hex_s) = sign_attestation_for(&kp, 0, 0);
         let worker_id = format!("0x{}", hex::encode(kp.address().0));
-        let got = decode_and_verify_worker_attestation(&hex_s, &worker_id)
-            .expect("verify ok");
+        let got = decode_and_verify_worker_attestation(&hex_s, &worker_id).expect("verify ok");
         assert_eq!(got.hash, orig.hash, "hash should round-trip exactly");
         assert_eq!(got.tx_type, TxType::InferenceAttestation);
     }
@@ -10438,11 +10954,7 @@ mod tests {
             (worker_with_stats("fresh", 0, 0, 0, 0), now),
         ]);
 
-        let resp = workers_scoreboard(
-            AxumState(node),
-            Query(HashMap::new()),
-        )
-        .await;
+        let resp = workers_scoreboard(AxumState(node), Query(HashMap::new())).await;
         let v: Value = resp.0;
         let workers = v.get("workers").and_then(|x| x.as_array()).unwrap();
         let ids: Vec<&str> = workers
@@ -10467,7 +10979,9 @@ mod tests {
             (worker_with_stats("stale", 999, 0, 999_999, 999_999), stale),
         ]);
 
-        let v: Value = workers_scoreboard(AxumState(node), Query(HashMap::new())).await.0;
+        let v: Value = workers_scoreboard(AxumState(node), Query(HashMap::new()))
+            .await
+            .0;
         let workers = v.get("workers").and_then(|x| x.as_array()).unwrap();
         assert_eq!(workers.len(), 1, "stale worker must be hidden");
         assert_eq!(
@@ -10498,8 +11012,7 @@ mod tests {
         let score = if w.success_count == 0 {
             0.0
         } else {
-            success_rate * 1000.0
-                - (w.sum_total_ms_success as f64 / w.success_count as f64)
+            success_rate * 1000.0 - (w.sum_total_ms_success as f64 / w.success_count as f64)
         };
         assert_eq!(score, 0.0);
     }
@@ -10556,14 +11069,24 @@ mod tests {
         // [0, 6) replica has start_layer 0 != covered_to 6 — so it declared
         // has_full_pipeline false on a network with complete coverage and
         // never took the sharded path once.
-        let hops = assemble_pipeline(live_topology(), &no_stats()).expect("live topology covers 0..32");
-        assert_eq!(hops.len(), 6, "one hop per layer range, not per announcement");
+        let hops =
+            assemble_pipeline(live_topology(), &no_stats()).expect("live topology covers 0..32");
+        assert_eq!(
+            hops.len(),
+            6,
+            "one hop per layer range, not per announcement"
+        );
         assert_eq!(
             hops.iter().map(|(r, _)| *r).collect::<Vec<_>>(),
             vec![(0, 6), (6, 12), (12, 17), (17, 22), (22, 27), (27, 32)]
         );
         for (range, replicas) in &hops {
-            assert_eq!(replicas.len(), 3, "range {:?} should keep all 3 replicas", range);
+            assert_eq!(
+                replicas.len(),
+                3,
+                "range {:?} should keep all 3 replicas",
+                range
+            );
         }
     }
 
@@ -10599,7 +11122,11 @@ mod tests {
         shards.push(shard("NYC", "0.0.0.0:9090", 0, 6));
         let hops = assemble_pipeline(shards, &no_stats()).expect("still fully covered");
         let (_, first) = &hops[0];
-        assert_eq!(first.len(), 3, "the stub duplicate must collapse into the routable entry");
+        assert_eq!(
+            first.len(),
+            3,
+            "the stub duplicate must collapse into the routable entry"
+        );
         assert!(
             first.iter().all(|r| !is_stub_socket_addr(&r.socket_addr)),
             "no stub survived: {:?}",
@@ -10646,7 +11173,13 @@ mod tests {
             .filter(|s| s.end_layer <= 27)
             .collect();
         let err = assemble_pipeline(shards, &no_stats()).expect_err("nothing covers 27..32");
-        assert_eq!(err, PipelineError::Incomplete { covered: 27, total: 32 });
+        assert_eq!(
+            err,
+            PipelineError::Incomplete {
+                covered: 27,
+                total: 32
+            }
+        );
     }
 
     #[test]
@@ -10661,13 +11194,21 @@ mod tests {
         ] {
             stats.insert(
                 addr.to_string(),
-                LatencyEWMA { ms, count: 10, last_updated: now, probe_only: false },
+                LatencyEWMA {
+                    ms,
+                    count: 10,
+                    last_updated: now,
+                    probe_only: false,
+                },
             );
         }
         let hops = assemble_pipeline(live_topology(), &stats).unwrap();
         let (_, first) = &hops[0];
         assert_eq!(
-            first.iter().map(|r| r.node_name.as_str()).collect::<Vec<_>>(),
+            first
+                .iter()
+                .map(|r| r.node_name.as_str())
+                .collect::<Vec<_>>(),
             vec!["AMS", "NYC", "LAX"],
             "primary must be the fastest measured replica"
         );
@@ -10681,14 +11222,23 @@ mod tests {
         // is UNKNOWN, and unknown replicas keep their announcement order
         // rather than being sorted to the bottom by a fossil.
         let stats = no_stats();
-        let stale = std::time::Instant::now()
-            - std::time::Duration::from_secs(LATENCY_STALE_SECS + 60);
+        let stale =
+            std::time::Instant::now() - std::time::Duration::from_secs(LATENCY_STALE_SECS + 60);
         stats.insert(
             "104.238.171.11:9090".into(),
-            LatencyEWMA { ms: 37_276.0, count: 1370, last_updated: stale, probe_only: false },
+            LatencyEWMA {
+                ms: 37_276.0,
+                count: 1370,
+                last_updated: stale,
+                probe_only: false,
+            },
         );
         let fresh_stat = stats.get("104.238.171.11:9090").unwrap();
-        assert_eq!(effective_latency_ms(&fresh_stat), None, "a 6-minute-old sample is not evidence");
+        assert_eq!(
+            effective_latency_ms(&fresh_stat),
+            None,
+            "a 6-minute-old sample is not evidence"
+        );
         drop(fresh_stat);
 
         // And a fresh one still counts.
@@ -10737,7 +11287,10 @@ mod tests {
         let (status, reason) = health_status_from(Some(false), Some(670_501));
         assert_eq!(status, "degraded");
         let reason = reason.expect("a degraded node must explain itself");
-        assert!(reason.contains("670501"), "reason must cite the real age: {reason}");
+        assert!(
+            reason.contains("670501"),
+            "reason must cite the real age: {reason}"
+        );
         assert!(
             reason.contains("round progress is not block production"),
             "reason must name the DAG/commit distinction that hid this: {reason}"
@@ -10753,7 +11306,10 @@ mod tests {
     /// window edge is not flapped to degraded.
     #[test]
     fn block_age_at_the_freshness_boundary_is_still_ok() {
-        assert_eq!(health_status_from(Some(true), Some(HEALTH_STALL_SECS)).0, "ok");
+        assert_eq!(
+            health_status_from(Some(true), Some(HEALTH_STALL_SECS)).0,
+            "ok"
+        );
         let advancing = |age: u64| age <= HEALTH_STALL_SECS;
         assert!(advancing(HEALTH_STALL_SECS));
         assert!(!advancing(HEALTH_STALL_SECS + 1));
@@ -10777,7 +11333,10 @@ mod tests {
 
         // Real observed inter-block times on the two sealing seeds.
         assert!(advancing(744), "NYC cadence ~12 min must read as advancing");
-        assert!(advancing(344), "LAX cadence ~5.7 min must read as advancing");
+        assert!(
+            advancing(344),
+            "LAX cadence ~5.7 min must read as advancing"
+        );
         // And the ages actually observed while probing them.
         assert!(advancing(677));
         assert!(advancing(460));
@@ -10841,7 +11400,10 @@ mod tests {
         record_latency(&stats, "1.2.3.4:9090", 4_000);
         record_probe_latency(&stats, "1.2.3.4:9090", 12);
         let s = stats.get("1.2.3.4:9090").unwrap();
-        assert_eq!(s.ms, 4_000.0, "a 12 ms /health RTT is not a forward_shard latency");
+        assert_eq!(
+            s.ms, 4_000.0,
+            "a 12 ms /health RTT is not a forward_shard latency"
+        );
         assert!(!s.probe_only);
     }
 
@@ -10859,7 +11421,10 @@ mod tests {
         }
         record_latency(&stats, "1.2.3.4:9090", 3_000);
         let s = stats.get("1.2.3.4:9090").unwrap();
-        assert_eq!(s.ms, 3_000.0, "blending would have understated the hop cost");
+        assert_eq!(
+            s.ms, 3_000.0,
+            "blending would have understated the hop cost"
+        );
         assert!(!s.probe_only);
         assert_eq!(s.count, 1);
     }
@@ -10897,7 +11462,10 @@ mod tests {
         // Hop cost is now the 2nd response.
         let got = tally_until_majority(&[Some("0xaa"), Some("0xaa"), Some("0xaa")], 2)
             .expect("two agreed");
-        assert_eq!(got.0, 1, "returned at arrival index 1 — the third never blocks us");
+        assert_eq!(
+            got.0, 1,
+            "returned at arrival index 1 — the third never blocks us"
+        );
         assert_eq!(got.1, "0xaa");
         assert_eq!(got.2, vec![0, 1]);
     }
@@ -10911,7 +11479,11 @@ mod tests {
             .expect("the honest pair agreed");
         assert_eq!(got.0, 2, "had to wait for the second honest answer");
         assert_eq!(got.1, "0xok");
-        assert_eq!(got.2, vec![1, 2], "the divergent first responder is not in the winning group");
+        assert_eq!(
+            got.2,
+            vec![1, 2],
+            "the divergent first responder is not in the winning group"
+        );
     }
 
     #[test]
@@ -10943,7 +11515,11 @@ mod tests {
             ((k / 2) + 1).max(1).min(use_n)
         };
         assert_eq!(needed_for(3, 3), 2, "k=3 over 3 replicas: strict majority");
-        assert_eq!(needed_for(3, 2), 2, "one replica lost: both survivors must agree");
+        assert_eq!(
+            needed_for(3, 2),
+            2,
+            "one replica lost: both survivors must agree"
+        );
         assert_eq!(needed_for(3, 1), 1, "degraded to a single replica");
         assert_eq!(needed_for(5, 5), 3);
         assert_eq!(needed_for(1, 3), 1, "k=1 asks one replica and trusts it");
@@ -10963,10 +11539,16 @@ mod tests {
         assert!(node.compute_pool.read().is_some());
         // Nested rayon work sees the installed pool.
         let width = install_on_compute_pool(&node, rayon::current_num_threads);
-        assert_eq!(width, 3, "par_iter inside the job must see the resized pool");
+        assert_eq!(
+            width, 3,
+            "par_iter inside the job must see the resized pool"
+        );
 
         set_compute_threads(&node, 5).expect("resize live");
-        assert_eq!(install_on_compute_pool(&node, rayon::current_num_threads), 5);
+        assert_eq!(
+            install_on_compute_pool(&node, rayon::current_num_threads),
+            5
+        );
 
         set_compute_threads(&node, 0).expect("back to global");
         assert_eq!(node.compute_threads.load(Ordering::Relaxed), 0);
@@ -11102,9 +11684,9 @@ mod projection_tests {
     #[test]
     fn validator_split_respects_the_min_stake_boundary() {
         let vals = vec![
-            (addr(1), arc_consensus::STAKE_SPARK),     // exactly at min → active
+            (addr(1), arc_consensus::STAKE_SPARK), // exactly at min → active
             (addr(2), arc_consensus::STAKE_SPARK - 1), // one under → not active
-            (addr(3), arc_consensus::STAKE_CORE),      // well over → active
+            (addr(3), arc_consensus::STAKE_CORE),  // well over → active
         ];
         let split = split_validators(&vals, arc_consensus::STAKE_SPARK);
         assert_eq!(split.registered, 3);
@@ -11115,7 +11697,10 @@ mod projection_tests {
             arc_consensus::STAKE_SPARK + arc_consensus::STAKE_CORE
         );
         // Stake below the threshold still counts toward total_stake.
-        assert_eq!(split.total_stake, split.active_stake + arc_consensus::STAKE_SPARK - 1);
+        assert_eq!(
+            split.total_stake,
+            split.active_stake + arc_consensus::STAKE_SPARK - 1
+        );
     }
 
     #[test]
@@ -11242,6 +11827,10 @@ mod projection_tests {
         assert_eq!(*ring.front().unwrap(), extra, "oldest evicted first");
         // p50 over a full ring is still a real sample from it.
         let samples: Vec<u64> = ring.iter().copied().collect();
-        assert!(p50_u64(&samples).map(|v| samples.contains(&v)).unwrap_or(false));
+        assert!(
+            p50_u64(&samples)
+                .map(|v| samples.contains(&v))
+                .unwrap_or(false)
+        );
     }
 }

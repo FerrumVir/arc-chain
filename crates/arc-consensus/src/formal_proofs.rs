@@ -181,7 +181,13 @@ mod formal_tests {
         // Round 0: All 4 validators propose blocks
         let mut r0_blocks = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            let block = make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64);
+            let block = make_block(
+                *addr,
+                0,
+                vec![],
+                vec![hash_bytes(&[0, i as u8])],
+                100 + i as u64,
+            );
             r0_blocks.push(block);
         }
 
@@ -410,7 +416,13 @@ mod formal_tests {
         // Round 0
         let mut r0 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            let block = make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64);
+            let block = make_block(
+                *addr,
+                0,
+                vec![],
+                vec![hash_bytes(&[0, i as u8])],
+                100 + i as u64,
+            );
             r0.push(block);
         }
 
@@ -588,7 +600,11 @@ mod formal_tests {
         // Continue for 3 more rounds with all 4 validators
         // Current round should be 3 (after 3 rounds: 0, 1, 2 + advances)
         let current = engine.current_round();
-        assert!(current >= 3, "Should be at round 3 or later, got {}", current);
+        assert!(
+            current >= 3,
+            "Should be at round 3 or later, got {}",
+            current
+        );
 
         // Build rounds manually for the recovered validator set
         for round_offset in 0..15 {
@@ -786,9 +802,7 @@ mod formal_tests {
         let r2_blocks: Vec<DagBlock> = honest
             .iter()
             .enumerate()
-            .map(|(i, addr)| {
-                make_block(*addr, 2, r1_parents.clone(), vec![], 300 + i as u64)
-            })
+            .map(|(i, addr)| make_block(*addr, 2, r1_parents.clone(), vec![], 300 + i as u64))
             .collect();
 
         for engine in [&engine_without_byz, &engine_with_byz] {
@@ -859,7 +873,11 @@ mod formal_tests {
                     assert!(
                         !committed.is_empty(),
                         "N={}, f={}: System should make progress with {} honest validators (stake {} >= quorum {})",
-                        n, f, honest_count, honest_stake, required_quorum
+                        n,
+                        f,
+                        honest_count,
+                        honest_stake,
+                        required_quorum
                     );
                 }
             }
@@ -922,7 +940,13 @@ mod formal_tests {
         // Round 0
         let mut r0 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            r0.push(make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64));
+            r0.push(make_block(
+                *addr,
+                0,
+                vec![],
+                vec![hash_bytes(&[0, i as u8])],
+                100 + i as u64,
+            ));
         }
 
         // Forward order
@@ -941,7 +965,13 @@ mod formal_tests {
         let r0_parents: Vec<Hash256> = r0[0..3].iter().map(|b| b.hash).collect();
         let mut r1 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            r1.push(make_block(*addr, 1, r0_parents.clone(), vec![], 200 + i as u64));
+            r1.push(make_block(
+                *addr,
+                1,
+                r0_parents.clone(),
+                vec![],
+                200 + i as u64,
+            ));
         }
 
         for block in &r1 {
@@ -958,7 +988,13 @@ mod formal_tests {
         let r1_parents: Vec<Hash256> = r1[0..3].iter().map(|b| b.hash).collect();
         let mut r2 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            r2.push(make_block(*addr, 2, r1_parents.clone(), vec![], 300 + i as u64));
+            r2.push(make_block(
+                *addr,
+                2,
+                r1_parents.clone(),
+                vec![],
+                300 + i as u64,
+            ));
         }
 
         for block in &r2 {
@@ -998,7 +1034,13 @@ mod formal_tests {
         // Round 0: all validators propose
         let mut r0 = Vec::new();
         for (i, addr) in addrs.iter().enumerate() {
-            let block = make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64);
+            let block = make_block(
+                *addr,
+                0,
+                vec![],
+                vec![hash_bytes(&[0, i as u8])],
+                100 + i as u64,
+            );
             engine.receive_block(&block).unwrap();
             r0.push(block);
         }
@@ -1312,8 +1354,7 @@ mod formal_tests {
             // Now add the quorum-reaching validator
             let idx = min_validators_for_quorum as usize - 1;
             if idx < addrs.len() && idx >= max_validators_below_quorum as usize {
-                let block =
-                    make_block(addrs[idx], 2, r1_parents.clone(), vec![], 300 + idx as u64);
+                let block = make_block(addrs[idx], 2, r1_parents.clone(), vec![], 300 + idx as u64);
                 let _ = engine.receive_block(&block);
             }
 
@@ -1468,7 +1509,15 @@ mod formal_tests {
         let h_blocks: Vec<DagBlock> = honest
             .iter()
             .enumerate()
-            .map(|(i, addr)| make_block(*addr, 0, vec![], vec![hash_bytes(&[0, i as u8])], 100 + i as u64))
+            .map(|(i, addr)| {
+                make_block(
+                    *addr,
+                    0,
+                    vec![],
+                    vec![hash_bytes(&[0, i as u8])],
+                    100 + i as u64,
+                )
+            })
             .collect();
 
         // Byzantine equivocation

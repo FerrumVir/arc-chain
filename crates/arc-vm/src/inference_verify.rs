@@ -391,7 +391,8 @@ mod tests {
             .unwrap();
 
         // Proof > 32 bytes: provider wins
-        mgr.respond_to_challenge(challenge_id, vec![0xAA; 64]).unwrap();
+        mgr.respond_to_challenge(challenge_id, vec![0xAA; 64])
+            .unwrap();
         let resolution = mgr.resolve_challenge(challenge_id).unwrap();
 
         assert_eq!(resolution.winner, provider_addr(1));
@@ -409,7 +410,8 @@ mod tests {
             .unwrap();
 
         // Proof <= 32 bytes: challenger wins
-        mgr.respond_to_challenge(challenge_id, vec![0xBB; 16]).unwrap();
+        mgr.respond_to_challenge(challenge_id, vec![0xBB; 16])
+            .unwrap();
         let resolution = mgr.resolve_challenge(challenge_id).unwrap();
 
         assert_eq!(resolution.winner, provider_addr(2));

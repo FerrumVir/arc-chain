@@ -480,7 +480,10 @@ mod tests {
         state.execute_block(&[tx], addr(99)).unwrap();
 
         let root_after = state.get_state_root();
-        assert_ne!(root_before, root_after, "state root must change after executing transactions");
+        assert_ne!(
+            root_before, root_after,
+            "state root must change after executing transactions"
+        );
     }
 
     // -- FinalityProof -------------------------------------------------------
@@ -526,7 +529,10 @@ mod tests {
             attestations,
             100,
         );
-        assert!(!proof.verify_quorum(), "60% stake should NOT satisfy quorum");
+        assert!(
+            !proof.verify_quorum(),
+            "60% stake should NOT satisfy quorum"
+        );
         assert!(!proof.is_valid());
     }
 

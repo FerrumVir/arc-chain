@@ -9,24 +9,39 @@
 
 use arc_inference::block_i8;
 use arc_inference::cached_integer_model::{
-    load_cached_model, KVCache, apply_rope, layernorm, matmul_fast, silu_i64,
+    KVCache, apply_rope, layernorm, load_cached_model, matmul_fast, silu_i64,
 };
-use arc_inference::integer_lut::{integer_exp, FRAC_BITS, ONE};
+use arc_inference::integer_lut::{FRAC_BITS, ONE, integer_exp};
 
 const MODEL_PATH: &str = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
 
 fn stats(label: &str, v: &[i64]) {
     let abs: Vec<i64> = v.iter().map(|x| x.abs()).collect();
     let max = *abs.iter().max().unwrap_or(&0);
-    let mean: i64 = if abs.is_empty() { 0 } else { abs.iter().sum::<i64>() / abs.len() as i64 };
+    let mean: i64 = if abs.is_empty() {
+        0
+    } else {
+        abs.iter().sum::<i64>() / abs.len() as i64
+    };
     let mut sorted = abs.clone();
     sorted.sort();
-    let p50 = if sorted.is_empty() { 0 } else { sorted[sorted.len() / 2] };
-    let p99 = if sorted.is_empty() { 0 } else { sorted[sorted.len() * 99 / 100] };
+    let p50 = if sorted.is_empty() {
+        0
+    } else {
+        sorted[sorted.len() / 2]
+    };
+    let p99 = if sorted.is_empty() {
+        0
+    } else {
+        sorted[sorted.len() * 99 / 100]
+    };
     println!(
         "  {:40} max={:>15} mean={:>12} p50={:>10} p99={:>12}  (real: max={:>9.3} mean={:>7.3})",
         label,
-        max, mean, p50, p99,
+        max,
+        mean,
+        p50,
+        p99,
         max as f64 / ONE as f64,
         mean as f64 / ONE as f64,
     );
@@ -37,9 +52,15 @@ fn main() {
     let model = load_cached_model(MODEL_PATH).expect("load");
     let cfg = &model.config;
     let d = cfg.d_model;
-    println!("Loaded. d_model={} n_layers={} d_ff={}\n", d, cfg.n_layers, cfg.d_ff);
+    println!(
+        "Loaded. d_model={} n_layers={} d_ff={}\n",
+        d, cfg.n_layers, cfg.d_ff
+    );
 
-    let block_layers = model.block_i8_layers.as_ref().expect("need block_i8_layers");
+    let block_layers = model
+        .block_i8_layers
+        .as_ref()
+        .expect("need block_i8_layers");
     println!("Using block-i8 for Q/K/V/O/gate/up/down.\n");
 
     // Token: BOS (1), then a known content token.
@@ -80,12 +101,22 @@ fn main() {
 
             // RoPE
             for h in 0..cfg.n_heads {
-                apply_rope(&mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
-                    pos, cfg.d_head, &cfg.rope_cos, &cfg.rope_sin);
+                apply_rope(
+                    &mut q[h * cfg.d_head..(h + 1) * cfg.d_head],
+                    pos,
+                    cfg.d_head,
+                    &cfg.rope_cos,
+                    &cfg.rope_sin,
+                );
             }
             for h in 0..cfg.n_kv_heads {
-                apply_rope(&mut k_buf[h * cfg.d_head..(h + 1) * cfg.d_head],
-                    pos, cfg.d_head, &cfg.rope_cos, &cfg.rope_sin);
+                apply_rope(
+                    &mut k_buf[h * cfg.d_head..(h + 1) * cfg.d_head],
+                    pos,
+                    cfg.d_head,
+                    &cfg.rope_cos,
+                    &cfg.rope_sin,
+                );
             }
             if li == 0 || li == cfg.n_layers - 1 {
                 stats(&format!("L{:02} Q (post-RoPE)", li), &q);
@@ -143,7 +174,10 @@ fn main() {
                 }
 
                 if li == 0 && h == 0 {
-                    stats(&format!("L{:02} attn running_max/sum→ head0", li), &[running_max, running_sum]);
+                    stats(
+                        &format!("L{:02} attn running_max/sum→ head0", li),
+                        &[running_max, running_sum],
+                    );
                     stats(&format!("L{:02} attn head0 out", li), &out_head);
                 }
 
@@ -156,7 +190,9 @@ fn main() {
             if li <= 2 || li == cfg.n_layers - 1 {
                 stats(&format!("L{:02} Wo out", li), &projected);
             }
-            for i in 0..d { hidden[i] += projected[i]; }
+            for i in 0..d {
+                hidden[i] += projected[i];
+            }
             if li <= 2 {
                 stats(&format!("L{:02} hidden after Wo residual", li), &hidden);
             }
@@ -186,7 +222,9 @@ fn main() {
                 stats(&format!("L{:02} w_down out", li), &ff_out);
             }
 
-            for i in 0..d { hidden[i] += ff_out[i]; }
+            for i in 0..d {
+                hidden[i] += ff_out[i];
+            }
 
             // Print every layer's end-of-layer hidden max so we can see exactly
             // where the residual stream diverges from the expected bounded range.
@@ -208,7 +246,11 @@ fn main() {
         stats("LOGITS", &logits);
 
         let amax = logits.iter().enumerate().max_by_key(|(_, v)| **v).unwrap();
-        println!("  argmax = {} (logit = {}, real = {:.3})\n",
-            amax.0, amax.1, *amax.1 as f64 / ONE as f64);
+        println!(
+            "  argmax = {} (logit = {}, real = {:.3})\n",
+            amax.0,
+            amax.1,
+            *amax.1 as f64 / ONE as f64
+        );
     }
 }

@@ -1,7 +1,7 @@
 //! `arc balance <address>` - query an account's balance and nonce.
 
-use anyhow::Result;
 use crate::rpc::RpcClient;
+use anyhow::Result;
 
 pub async fn run(rpc: &RpcClient, address: &str) -> Result<()> {
     if let Err(e) = super::validate_address(address) {
@@ -14,7 +14,7 @@ pub async fn run(rpc: &RpcClient, address: &str) -> Result<()> {
             let msg = format!("{:#}", e);
             if msg.contains("404") {
                 let short_addr = if address.len() > 16 {
-                    format!("{}...{}", &address[..8], &address[address.len()-8..])
+                    format!("{}...{}", &address[..8], &address[address.len() - 8..])
                 } else {
                     address.to_string()
                 };
@@ -28,15 +28,11 @@ pub async fn run(rpc: &RpcClient, address: &str) -> Result<()> {
         }
     };
 
-    let balance = data.get("balance")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let nonce = data.get("nonce")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let balance = data.get("balance").and_then(|v| v.as_u64()).unwrap_or(0);
+    let nonce = data.get("nonce").and_then(|v| v.as_u64()).unwrap_or(0);
 
     let short_addr = if address.len() > 16 {
-        format!("{}...{}", &address[..8], &address[address.len()-8..])
+        format!("{}...{}", &address[..8], &address[address.len() - 8..])
     } else {
         address.to_string()
     };

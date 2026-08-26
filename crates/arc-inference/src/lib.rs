@@ -5,16 +5,16 @@
 //! - `committee`: VRF-based committee selection for tiered inference
 //! - `gas`: EIP-1559-style inference gas lane with separate base fee
 
-pub mod committee;
-pub mod gas;
-pub mod candle_backend;
-pub mod integer_lut;
-pub mod integer_engine;
-pub mod gguf_integer;
-pub mod cached_integer_model;
 pub mod block_i8;
-pub mod q4_engine;
+pub mod cached_integer_model;
+pub mod candle_backend;
+pub mod committee;
 pub mod distributed;
+pub mod gas;
+pub mod gguf_integer;
+pub mod integer_engine;
+pub mod integer_lut;
+pub mod q4_engine;
 pub mod streaming;
 
 // Patent-pending integer/ASIC inference paths. The implementation files for
@@ -31,24 +31,34 @@ pub mod streaming;
 // is only reachable when the `experimental-ip` feature is on, which requires
 // the real implementation files to be present at the canonical paths.
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod ternary_engine;
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod ternary_hybrid;
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod int8_asic;
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod int16_asic;
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod sha256_isa;
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod asic_families;
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod asic_parallel;
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod asic_batched;
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod mining_asic_node;
 #[cfg(feature = "experimental-ip")]
+#[rustfmt::skip]
 pub mod economics;
 
 #[cfg(not(feature = "experimental-ip"))]
@@ -71,15 +81,8 @@ pub mod ternary_engine {
         }
     }
 
-    pub fn matmul_ternary_into(
-        _: &TernaryWeights,
-        _: &[i64],
-        _: usize,
-        _: &mut [i64],
-    ) {
-        unreachable!(
-            "matmul_ternary_into called without the experimental-ip feature"
-        )
+    pub fn matmul_ternary_into(_: &TernaryWeights, _: &[i64], _: usize, _: &mut [i64]) {
+        unreachable!("matmul_ternary_into called without the experimental-ip feature")
     }
 }
 

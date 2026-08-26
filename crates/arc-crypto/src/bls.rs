@@ -199,8 +199,7 @@ pub fn bls_keygen(seed: &[u8]) -> BlsKeypair {
 /// # Returns
 /// A `BlsSignature` (96 bytes, compressed G2 point).
 pub fn bls_sign(sk: &BlsSecretKey, message: &[u8]) -> BlsSignature {
-    let blst_sk = blst::min_pk::SecretKey::deserialize(&sk.0)
-        .expect("invalid secret key bytes");
+    let blst_sk = blst::min_pk::SecretKey::deserialize(&sk.0).expect("invalid secret key bytes");
     let sig = blst_sk.sign(message, DST, &[]);
     BlsSignature(sig.compress())
 }
@@ -275,7 +274,9 @@ pub fn aggregate_public_keys(pks: &[BlsPublicKey]) -> Result<AggregatePublicKey,
 
     let blst_pks: Vec<blst::min_pk::PublicKey> = pks
         .iter()
-        .map(|pk| blst::min_pk::PublicKey::uncompress(&pk.0).map_err(|_| BlsError::InvalidPublicKey))
+        .map(|pk| {
+            blst::min_pk::PublicKey::uncompress(&pk.0).map_err(|_| BlsError::InvalidPublicKey)
+        })
         .collect::<Result<Vec<_>, _>>()?;
 
     let pk_refs: Vec<&blst::min_pk::PublicKey> = blst_pks.iter().collect();
@@ -578,8 +579,7 @@ mod tests {
             .map(|kp| bls_sign(&kp.secret, message))
             .collect();
 
-        let indexed_sigs: Vec<(usize, BlsSignature)> =
-            sigs.into_iter().enumerate().collect();
+        let indexed_sigs: Vec<(usize, BlsSignature)> = sigs.into_iter().enumerate().collect();
         let agg = create_aggregate(&indexed_sigs).unwrap();
 
         assert!(meets_threshold(&agg, &config));

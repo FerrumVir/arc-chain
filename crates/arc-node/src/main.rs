@@ -1,16 +1,16 @@
 mod config;
 
 use anyhow::Result;
-use arc_crypto::{hash_bytes, Hash256, KeyPair};
+use arc_crypto::{Hash256, KeyPair, hash_bytes};
 use arc_mempool::Mempool;
-use arc_net::transport::{run_transport, InboundMessage, OutboundMessage};
+use arc_net::transport::{InboundMessage, OutboundMessage, run_transport};
 use arc_node::{benchmark::BenchmarkPool, consensus::ConsensusManager, rpc};
 use arc_state::StateDB;
 use arc_types::Block;
 use clap::{CommandFactory, Parser};
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
@@ -346,16 +346,18 @@ fn sha256_of(path: &str) -> Option<String> {
             .and_then(|s| s.split_whitespace().next().map(|x| x.to_string()))
     };
     if let Ok(out) = std::process::Command::new("sha256sum").arg(path).output()
-        && out.status.success() {
-            return parse(out.stdout);
-        }
+        && out.status.success()
+    {
+        return parse(out.stdout);
+    }
     if let Ok(out) = std::process::Command::new("shasum")
         .args(["-a", "256"])
         .arg(path)
         .output()
-        && out.status.success() {
-            return parse(out.stdout);
-        }
+        && out.status.success()
+    {
+        return parse(out.stdout);
+    }
     None
 }
 
@@ -378,9 +380,8 @@ const TESTNET_MODEL_SHA256: &str =
 /// git-lfs for 4-GB+ files, and works behind any NAT (HTTPS only). Add
 /// mirrors by appending URLs here, no recompile needed for ad-hoc mirrors
 /// via the env var.
-const DEFAULT_MODEL_SOURCES: &[&str] = &[
-    "https://huggingface.co/FerrumVir/llama-2-7b-arc/resolve/main/llama2-7b.gguf",
-];
+const DEFAULT_MODEL_SOURCES: &[&str] =
+    &["https://huggingface.co/FerrumVir/llama-2-7b-arc/resolve/main/llama2-7b.gguf"];
 
 /// Resolve a HuggingFace `/resolve/main/` URL to its `/raw/main/` form,
 /// which returns the git-lfs pointer text (~200 bytes) for large files.
@@ -417,10 +418,14 @@ fn download_and_verify(url: &str, tmp: &str, expected_sha: &str) -> bool {
     let status = std::process::Command::new("curl")
         .args([
             "-fL",
-            "--retry", "5",
-            "--retry-delay", "5",
-            "-C", "-",
-            "-o", tmp,
+            "--retry",
+            "5",
+            "--retry-delay",
+            "5",
+            "-C",
+            "-",
+            "-o",
+            tmp,
             url,
         ])
         .status()
@@ -431,7 +436,11 @@ fn download_and_verify(url: &str, tmp: &str, expected_sha: &str) -> bool {
     }
     let got = sha256_of(tmp).unwrap_or_default();
     if got != expected_sha {
-        tracing::warn!("  sha mismatch from {} (got {}); discarding partial", url, got);
+        tracing::warn!(
+            "  sha mismatch from {} (got {}); discarding partial",
+            url,
+            got
+        );
         let _ = std::fs::remove_file(tmp);
         return false;
     }
@@ -474,7 +483,10 @@ fn auto_download_model() -> Option<String> {
         })
         .filter(|v: &Vec<String>| !v.is_empty())
         .unwrap_or_else(|| {
-            DEFAULT_MODEL_SOURCES.iter().map(|s| s.to_string()).collect()
+            DEFAULT_MODEL_SOURCES
+                .iter()
+                .map(|s| s.to_string())
+                .collect()
         });
 
     tracing::info!(
@@ -494,7 +506,8 @@ fn auto_download_model() -> Option<String> {
             if remote_sha != TESTNET_MODEL_SHA256 {
                 tracing::warn!(
                     "  LFS sha {} != expected {} — skipping this source",
-                    remote_sha, TESTNET_MODEL_SHA256
+                    remote_sha,
+                    TESTNET_MODEL_SHA256
                 );
                 continue;
             }
@@ -509,7 +522,8 @@ fn auto_download_model() -> Option<String> {
             }
             tracing::info!(
                 "--community: downloaded + sha-verified model at {} (sha256 {})",
-                target, TESTNET_MODEL_SHA256
+                target,
+                TESTNET_MODEL_SHA256
             );
             return Some(target);
         }
@@ -536,9 +550,9 @@ fn detect_ram_mb() -> u64 {
                     .split_whitespace()
                     .nth(1)
                     .and_then(|s| s.parse::<u64>().ok())
-                {
-                    return kb / 1024;
-                }
+            {
+                return kb / 1024;
+            }
         }
     }
     8192
@@ -550,23 +564,26 @@ fn detect_ram_mb() -> u64 {
 fn pick_seed_rpc(cli: &Cli) -> Option<String> {
     for p in &cli.peers {
         if let Some(host) = p.split(':').next()
-            && !host.is_empty() {
-                return Some(format!("{}:9090", host));
-            }
+            && !host.is_empty()
+        {
+            return Some(format!("{}:9090", host));
+        }
     }
     if let Some(path) = &cli.seeds_file
-        && let Ok(content) = std::fs::read_to_string(path) {
-            for raw in content.lines() {
-                let line = raw.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some(host) = line.split(':').next()
-                    && !host.is_empty() {
-                        return Some(format!("{}:9090", host));
-                    }
+        && let Ok(content) = std::fs::read_to_string(path)
+    {
+        for raw in content.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(host) = line.split(':').next()
+                && !host.is_empty()
+            {
+                return Some(format!("{}:9090", host));
             }
         }
+    }
     None
 }
 
@@ -608,9 +625,7 @@ async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
     // the tier-1 identifier here would register us in an empty parallel
     // pipeline and the seed would return 0:32 (the full model) for every
     // joiner. TODO(v0.8): unify these two model_id derivations.
-    let model_id_hex = hex::encode(
-        arc_crypto::hash_bytes(b"arc-32L-4096d-32h-32000v").0,
-    );
+    let model_id_hex = hex::encode(arc_crypto::hash_bytes(b"arc-32L-4096d-32h-32000v").0);
 
     let body = serde_json::json!({
         "socket_addr": cli.rpc,
@@ -682,15 +697,25 @@ async fn main() -> Result<()> {
         match &cli.model {
             Some(p) => tracing::info!("community mode: model at {}", p),
             None => {
-                tracing::warn!("community mode: no GGUF model found and auto-download did not succeed.");
+                tracing::warn!(
+                    "community mode: no GGUF model found and auto-download did not succeed."
+                );
                 tracing::warn!("  Place a Llama-2-7B Q4_K_M GGUF (~4.08 GB) at one of:");
                 tracing::warn!("    ./llama2-7b.gguf");
                 tracing::warn!("    $HOME/.arc-models/llama2-7b.gguf");
                 tracing::warn!("    /opt/arc/llama2-7b.gguf");
-                tracing::warn!("  Expected sha256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa");
-                tracing::warn!("  Manual download: huggingface-cli download TheBloke/Llama-2-7B-GGUF llama-2-7b.Q4_K_M.gguf --local-dir $HOME/.arc-models");
-                tracing::warn!("  Then: mv $HOME/.arc-models/llama-2-7b.Q4_K_M.gguf $HOME/.arc-models/llama2-7b.gguf");
-                tracing::warn!("  Continuing in community routing mode (registered with seeds, no local inference).");
+                tracing::warn!(
+                    "  Expected sha256: 08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
+                );
+                tracing::warn!(
+                    "  Manual download: huggingface-cli download TheBloke/Llama-2-7B-GGUF llama-2-7b.Q4_K_M.gguf --local-dir $HOME/.arc-models"
+                );
+                tracing::warn!(
+                    "  Then: mv $HOME/.arc-models/llama-2-7b.Q4_K_M.gguf $HOME/.arc-models/llama2-7b.gguf"
+                );
+                tracing::warn!(
+                    "  Continuing in community routing mode (registered with seeds, no local inference)."
+                );
             }
         }
     }
@@ -714,7 +739,8 @@ async fn main() -> Result<()> {
             Some((start, end)) => {
                 tracing::info!(
                     "auto-shard: seed assigned this validator layers [{}, {}) — loading shard",
-                    start, end
+                    start,
+                    end
                 );
                 cli.shard_ranges.push(format!("{}:{}", start, end));
             }
@@ -733,8 +759,7 @@ async fn main() -> Result<()> {
     let matches = Cli::command().get_matches_from(std::env::args_os());
 
     let node_cfg = if let Some(config_path) = &cli.config {
-        let cfg = config::load_config(config_path)
-            .expect("Failed to load node config");
+        let cfg = config::load_config(config_path).expect("Failed to load node config");
         tracing::info!("Loaded node config from {}", config_path);
         cfg
     } else {
@@ -748,11 +773,12 @@ async fn main() -> Result<()> {
         node_cfg.rpc.listen.clone()
     };
 
-    let p2p_port = if matches.value_source("p2p_port") == Some(clap::parser::ValueSource::CommandLine) {
-        cli.p2p_port
-    } else {
-        node_cfg.p2p.port
-    };
+    let p2p_port =
+        if matches.value_source("p2p_port") == Some(clap::parser::ValueSource::CommandLine) {
+            cli.p2p_port
+        } else {
+            node_cfg.p2p.port
+        };
 
     // --community is treated as an explicit CLI override of stake (the post-
     // parse block forces cli.stake = 0 for that flag). Without this short-
@@ -769,17 +795,19 @@ async fn main() -> Result<()> {
         node_cfg.validator.stake
     };
 
-    let data_dir = if matches.value_source("data_dir") == Some(clap::parser::ValueSource::CommandLine) {
-        cli.data_dir.clone()
-    } else {
-        node_cfg.storage.data_dir.clone()
-    };
+    let data_dir =
+        if matches.value_source("data_dir") == Some(clap::parser::ValueSource::CommandLine) {
+            cli.data_dir.clone()
+        } else {
+            node_cfg.storage.data_dir.clone()
+        };
 
-    let min_stake = if matches.value_source("min_stake") == Some(clap::parser::ValueSource::CommandLine) {
-        cli.min_stake
-    } else {
-        node_cfg.validator.min_stake
-    };
+    let min_stake =
+        if matches.value_source("min_stake") == Some(clap::parser::ValueSource::CommandLine) {
+            cli.min_stake
+        } else {
+            node_cfg.validator.min_stake
+        };
 
     // Precedence: --validator-seed, then ARC_VALIDATOR_SEED, then the config
     // file. EnvVariable must be honoured alongside CommandLine — the desktop
@@ -793,11 +821,12 @@ async fn main() -> Result<()> {
         _ => node_cfg.validator.seed.clone(),
     };
 
-    let eth_rpc_port = if matches.value_source("eth_rpc_port") == Some(clap::parser::ValueSource::CommandLine) {
-        cli.eth_rpc_port
-    } else {
-        node_cfg.rpc.eth_port
-    };
+    let eth_rpc_port =
+        if matches.value_source("eth_rpc_port") == Some(clap::parser::ValueSource::CommandLine) {
+            cli.eth_rpc_port
+        } else {
+            node_cfg.rpc.eth_port
+        };
 
     // Peers: merge CLI peers + config peers + seeds file
     let mut peers = if !cli.peers.is_empty() {
@@ -832,37 +861,47 @@ async fn main() -> Result<()> {
     peers.dedup();
 
     // Benchmark settings: CLI > config > default
-    let _bench_batch = if matches.value_source("bench_batch") == Some(clap::parser::ValueSource::CommandLine) {
-        cli.bench_batch
-    } else {
-        node_cfg.benchmark.batch_size
-    };
+    let _bench_batch =
+        if matches.value_source("bench_batch") == Some(clap::parser::ValueSource::CommandLine) {
+            cli.bench_batch
+        } else {
+            node_cfg.benchmark.batch_size
+        };
 
-    let _bench_interval = if matches.value_source("bench_interval") == Some(clap::parser::ValueSource::CommandLine) {
-        cli.bench_interval
-    } else {
-        node_cfg.benchmark.interval_ms
-    };
+    let _bench_interval =
+        if matches.value_source("bench_interval") == Some(clap::parser::ValueSource::CommandLine) {
+            cli.bench_interval
+        } else {
+            node_cfg.benchmark.interval_ms
+        };
 
-    let bench_sender_start = if matches.value_source("bench_sender_start") == Some(clap::parser::ValueSource::CommandLine) {
+    let bench_sender_start = if matches.value_source("bench_sender_start")
+        == Some(clap::parser::ValueSource::CommandLine)
+    {
         cli.bench_sender_start
     } else {
         node_cfg.benchmark.sender_start
     };
 
-    let bench_sender_count = if matches.value_source("bench_sender_count") == Some(clap::parser::ValueSource::CommandLine) {
+    let bench_sender_count = if matches.value_source("bench_sender_count")
+        == Some(clap::parser::ValueSource::CommandLine)
+    {
         cli.bench_sender_count
     } else {
         node_cfg.benchmark.sender_count
     };
 
-    let bench_sign_threads = if matches.value_source("bench_sign_threads") == Some(clap::parser::ValueSource::CommandLine) {
+    let bench_sign_threads = if matches.value_source("bench_sign_threads")
+        == Some(clap::parser::ValueSource::CommandLine)
+    {
         cli.bench_sign_threads
     } else {
         node_cfg.benchmark.sign_threads
     };
 
-    let bench_rayon_threads = if matches.value_source("bench_rayon_threads") == Some(clap::parser::ValueSource::CommandLine) {
+    let bench_rayon_threads = if matches.value_source("bench_rayon_threads")
+        == Some(clap::parser::ValueSource::CommandLine)
+    {
         cli.bench_rayon_threads
     } else {
         node_cfg.benchmark.rayon_threads
@@ -918,7 +957,11 @@ async fn main() -> Result<()> {
             tracing::warn!("╔══════════════════════════════════════════════════════════════╗");
             tracing::warn!("║  JOINING A PUBLIC NETWORK AS A VOTING VALIDATOR              ║");
             tracing::warn!("╚══════════════════════════════════════════════════════════════╝");
-            tracing::warn!("  --stake {} against {} non-local peer(s).", stake, public_peers.len());
+            tracing::warn!(
+                "  --stake {} against {} non-local peer(s).",
+                stake,
+                public_peers.len()
+            );
             tracing::warn!("  This node will be merged into every seed's validator set and");
             tracing::warn!("  absorbed by the next epoch freeze. Frozen sets do NOT release a");
             tracing::warn!("  validator on disconnect, so it will keep drawing leader slots on");
@@ -931,7 +974,8 @@ async fn main() -> Result<()> {
 
     // ── Derive validator keypair and address from seed ─────────────────
     // Deterministic: same seed → same keypair → same address across restarts.
-    let validator_seed_bytes = blake3::derive_key("ARC-chain-validator-keypair-v1", validator_seed.as_bytes());
+    let validator_seed_bytes =
+        blake3::derive_key("ARC-chain-validator-keypair-v1", validator_seed.as_bytes());
     let signing_key = ed25519_dalek::SigningKey::from_bytes(&validator_seed_bytes);
     let validator_keypair = KeyPair::Ed25519(signing_key);
     let validator_address = validator_keypair.address();
@@ -968,14 +1012,19 @@ async fn main() -> Result<()> {
     // Extract genesis validators (for consensus) if --genesis is provided.
     // All nodes MUST use the same genesis → same validator set from round 0.
     let genesis_validators: Vec<(Hash256, u64)> = if let Some(genesis_path) = &cli.genesis {
-        let genesis_cfg = config::load_genesis(genesis_path)
-            .expect("Failed to load genesis config");
-        genesis_cfg.validators.iter().map(|v| {
-            let seed_bytes = blake3::derive_key("ARC-chain-validator-keypair-v1", v.seed.as_bytes());
-            let sk = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
-            let kp = KeyPair::Ed25519(sk);
-            (kp.address(), v.stake)
-        }).collect()
+        let genesis_cfg =
+            config::load_genesis(genesis_path).expect("Failed to load genesis config");
+        genesis_cfg
+            .validators
+            .iter()
+            .map(|v| {
+                let seed_bytes =
+                    blake3::derive_key("ARC-chain-validator-keypair-v1", v.seed.as_bytes());
+                let sk = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
+                let kp = KeyPair::Ed25519(sk);
+                (kp.address(), v.stake)
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -994,23 +1043,26 @@ async fn main() -> Result<()> {
         });
 
     let genesis_accounts: Vec<(Hash256, u64)> = if let Some(genesis_path) = &cli.genesis {
-        let genesis_cfg = config::load_genesis(genesis_path)
-            .expect("Failed to load genesis config");
+        let genesis_cfg =
+            config::load_genesis(genesis_path).expect("Failed to load genesis config");
         tracing::info!(
             "Genesis: {} ({} accounts, {} validators)",
             genesis_cfg.chain.name,
             genesis_cfg.accounts.len(),
             genesis_cfg.validators.len(),
         );
-        genesis_cfg.accounts.iter().map(|a| {
-            let mut bytes = [0u8; 32];
-            hex::decode_to_slice(&a.address, &mut bytes)
-                .unwrap_or_else(|e| {
+        genesis_cfg
+            .accounts
+            .iter()
+            .map(|a| {
+                let mut bytes = [0u8; 32];
+                hex::decode_to_slice(&a.address, &mut bytes).unwrap_or_else(|e| {
                     eprintln!("Invalid genesis account address '{}': {}", a.address, e);
                     std::process::exit(1);
                 });
-            (Hash256(bytes), a.balance)
-        }).collect()
+                (Hash256(bytes), a.balance)
+            })
+            .collect()
     } else if cli.benchmark {
         // Benchmark mode: deterministic ed25519 keypair-derived addresses
         (0..100u8)
@@ -1029,7 +1081,10 @@ async fn main() -> Result<()> {
     let genesis_accounts = {
         let mut accounts = genesis_accounts;
         if !accounts.iter().any(|(addr, _)| *addr == validator_address) {
-            tracing::info!("Adding validator {} to genesis with faucet balance", validator_address);
+            tracing::info!(
+                "Adding validator {} to genesis with faucet balance",
+                validator_address
+            );
             accounts.push((validator_address, 1_000_000_000_000));
         }
         accounts
@@ -1070,7 +1125,10 @@ async fn main() -> Result<()> {
     {
         let rebuilt = state.rebuild_tier1_pending();
         if rebuilt > 0 {
-            tracing::info!("Rebuilt {} Tier 1 pending requests from on-disk state", rebuilt);
+            tracing::info!(
+                "Rebuilt {} Tier 1 pending requests from on-disk state",
+                rebuilt
+            );
         }
     }
 
@@ -1088,7 +1146,12 @@ async fn main() -> Result<()> {
         for peer_addr in peers.iter().take(3) {
             let peer_rpc = peer_addr.replace(":9091", ":9090");
             let url = format!("http://{}/health", peer_rpc);
-            match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(1)).send().await {
+            match reqwest::Client::new()
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(1))
+                .send()
+                .await
+            {
                 Ok(resp) if resp.status().is_success() => {
                     tracing::info!("Auto-sync: peer {} reachable", peer_rpc);
                     found = Some(peer_rpc);
@@ -1111,7 +1174,10 @@ async fn main() -> Result<()> {
                 tracing::info!("State sync complete, height = {}", height);
             }
             Err(e) => {
-                tracing::warn!("Sync from peer failed ({}), continuing from genesis state", e);
+                tracing::warn!(
+                    "Sync from peer failed ({}), continuing from genesis state",
+                    e
+                );
                 // Don't crash - the node will start from genesis and catch
                 // up via DAG consensus. This is fine for testnet.
             }
@@ -1136,15 +1202,15 @@ async fn main() -> Result<()> {
     // existing launch scripts keep working through the rolling upgrade.
     let mut held_ranges: Vec<(usize, usize)> = Vec::new();
     for raw in &cli.shard_ranges {
-        let (s, e) = raw.split_once(':').ok_or_else(|| anyhow::anyhow!(
-            "--shard-range must be START:END, got {raw:?}"
-        ))?;
-        let start: usize = s.trim().parse().map_err(|_| anyhow::anyhow!(
-            "--shard-range START must be a non-negative integer, got {s:?}"
-        ))?;
-        let end: usize = e.trim().parse().map_err(|_| anyhow::anyhow!(
-            "--shard-range END must be a non-negative integer, got {e:?}"
-        ))?;
+        let (s, e) = raw
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("--shard-range must be START:END, got {raw:?}"))?;
+        let start: usize = s.trim().parse().map_err(|_| {
+            anyhow::anyhow!("--shard-range START must be a non-negative integer, got {s:?}")
+        })?;
+        let end: usize = e.trim().parse().map_err(|_| {
+            anyhow::anyhow!("--shard-range END must be a non-negative integer, got {e:?}")
+        })?;
         if start >= end {
             return Err(anyhow::anyhow!(
                 "--shard-range START ({start}) must be strictly less than END ({end})"
@@ -1153,44 +1219,49 @@ async fn main() -> Result<()> {
         held_ranges.push((start, end));
     }
     if held_ranges.is_empty()
-        && let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end) {
-            held_ranges.push((start, end));
-        }
+        && let (Some(start), Some(end)) = (cli.shard_start, cli.shard_end)
+    {
+        held_ranges.push((start, end));
+    }
     held_ranges.sort();
     for i in 1..held_ranges.len() {
         if held_ranges[i].0 < held_ranges[i - 1].1 {
             return Err(anyhow::anyhow!(
                 "--shard-range entries overlap: [{}, {}) and [{}, {})",
-                held_ranges[i - 1].0, held_ranges[i - 1].1,
-                held_ranges[i].0, held_ranges[i].1
+                held_ranges[i - 1].0,
+                held_ranges[i - 1].1,
+                held_ranges[i].0,
+                held_ranges[i].1
             ));
         }
     }
 
     let is_shard_holder = !held_ranges.is_empty();
-    let (candle_engine, candle_model_id): (Option<Arc<arc_inference::candle_backend::GgufEngine>>, Option<arc_crypto::Hash256>) =
-        if is_shard_holder {
-            tracing::info!("Shard holder mode - candle backend SKIPPED to save ~4 GB RAM");
-            (None, None)
-        } else if let Some(model_path) = &cli.model {
-            if !model_path.ends_with(".arc-int8") {
-                let engine = Arc::new(arc_inference::candle_backend::GgufEngine::new(120_000));
-                match engine.load_gguf_file(model_path) {
-                    Ok(mid) => {
-                        tracing::info!("Candle float inference ENABLED (Q4 GGUF)");
-                        (Some(engine), Some(mid))
-                    }
-                    Err(e) => {
-                        tracing::warn!("Candle backend failed: {} - falling back to INT8", e);
-                        (None, None)
-                    }
+    let (candle_engine, candle_model_id): (
+        Option<Arc<arc_inference::candle_backend::GgufEngine>>,
+        Option<arc_crypto::Hash256>,
+    ) = if is_shard_holder {
+        tracing::info!("Shard holder mode - candle backend SKIPPED to save ~4 GB RAM");
+        (None, None)
+    } else if let Some(model_path) = &cli.model {
+        if !model_path.ends_with(".arc-int8") {
+            let engine = Arc::new(arc_inference::candle_backend::GgufEngine::new(120_000));
+            match engine.load_gguf_file(model_path) {
+                Ok(mid) => {
+                    tracing::info!("Candle float inference ENABLED (Q4 GGUF)");
+                    (Some(engine), Some(mid))
                 }
-            } else {
-                (None, None) // .arc-int8 files use integer engine only
+                Err(e) => {
+                    tracing::warn!("Candle backend failed: {} - falling back to INT8", e);
+                    (None, None)
+                }
             }
         } else {
-            (None, None)
-        };
+            (None, None) // .arc-int8 files use integer engine only
+        }
+    } else {
+        (None, None)
+    };
 
     // ── Load tokenizer model (lightweight: vocab-only from TinyLlama if available, else from GGUF) ──
     let inference_model: Option<Arc<arc_inference::cached_integer_model::CachedIntegerModel>> =
@@ -1199,7 +1270,9 @@ async fn main() -> Result<()> {
             // Try loading a small tokenizer model first (tinyllama), fall back to full GGUF.
             let tokenizer_path = if candle_engine.is_some() {
                 // Check for a small tokenizer model alongside the main model
-                let dir = std::path::Path::new(model_path).parent().unwrap_or(std::path::Path::new("."));
+                let dir = std::path::Path::new(model_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."));
                 let tiny = dir.join("tinyllama-1.1b.arc-int8");
                 if tiny.exists() {
                     tracing::info!("Using TinyLlama tokenizer (lightweight)");
@@ -1219,23 +1292,36 @@ async fn main() -> Result<()> {
             } else if tokenizer_path.ends_with(".arc-int8") {
                 arc_inference::cached_integer_model::load_cached_model_binary(&tokenizer_path)
             } else if !held_ranges.is_empty() {
-                let summary: Vec<String> = held_ranges.iter()
+                let summary: Vec<String> = held_ranges
+                    .iter()
                     .map(|(s, e)| format!("[{s}, {e})"))
                     .collect();
                 tracing::info!("SHARD MODE: loading ranges {}", summary.join(", "));
-                arc_inference::cached_integer_model::load_cached_model_ranges(&tokenizer_path, &held_ranges)
+                arc_inference::cached_integer_model::load_cached_model_ranges(
+                    &tokenizer_path,
+                    &held_ranges,
+                )
             } else {
                 arc_inference::cached_integer_model::load_cached_model(&tokenizer_path)
             };
             match load_result {
                 Ok(mut model) => {
                     let elapsed = load_start.elapsed();
-                    let mb_held: usize = model.layers.iter()
+                    let mb_held: usize = model
+                        .layers
+                        .iter()
                         .filter(|l| l.is_loaded())
-                        .map(|l| l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
-                            + l.wo.memory_bytes() + l.w_gate.memory_bytes() + l.w_up.memory_bytes()
-                            + l.w_down.memory_bytes())
-                        .sum::<usize>() / (1024 * 1024);
+                        .map(|l| {
+                            l.wq.memory_bytes()
+                                + l.wk.memory_bytes()
+                                + l.wv.memory_bytes()
+                                + l.wo.memory_bytes()
+                                + l.w_gate.memory_bytes()
+                                + l.w_up.memory_bytes()
+                                + l.w_down.memory_bytes()
+                        })
+                        .sum::<usize>()
+                        / (1024 * 1024);
                     let layers_held = model.layers.iter().filter(|l| l.is_loaded()).count();
                     // Multi-range / sharded loaders explicitly drop the I16
                     // quantization at the merge step (cached_integer_model.rs
@@ -1282,7 +1368,10 @@ async fn main() -> Result<()> {
                     }
                     tracing::info!(
                         "Model loaded in {:.1}s - {} layers held / {} total, {} MB shard weights, vocab {}",
-                        elapsed.as_secs_f64(), layers_held, model.config.n_layers, mb_held,
+                        elapsed.as_secs_f64(),
+                        layers_held,
+                        model.config.n_layers,
+                        mb_held,
                         model.config.vocab_size
                     );
                     Some(Arc::new(model))
@@ -1308,10 +1397,7 @@ async fn main() -> Result<()> {
     let genesis_hash = Block::genesis().hash;
 
     // Parse bootstrap peers
-    let bootstrap_peers: Vec<SocketAddr> = peers
-        .iter()
-        .filter_map(|p| p.parse().ok())
-        .collect();
+    let bootstrap_peers: Vec<SocketAddr> = peers.iter().filter_map(|p| p.parse().ok()).collect();
 
     let listen_addr: SocketAddr = format!("0.0.0.0:{}", p2p_port).parse()?;
 
@@ -1360,7 +1446,8 @@ async fn main() -> Result<()> {
     // have the SAME validator set from round 0 - the key to consensus.
     // Without this, nodes discover peers at different times → different
     // validator counts → different epoch freezes → different leaders.
-    let peer_vals: Vec<(Hash256, u64)> = genesis_validators.iter()
+    let peer_vals: Vec<(Hash256, u64)> = genesis_validators
+        .iter()
         .filter(|(addr, _)| *addr != validator_address)
         .cloned()
         .collect();
@@ -1372,8 +1459,14 @@ async fn main() -> Result<()> {
     let dag_validators = Arc::new(parking_lot::RwLock::new(all_vals));
     let dag_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut consensus =
-        ConsensusManager::new_with_keypair(validator_address, stake, 4 /* num_shards */, cli.benchmark, &peer_vals, validator_keypair.clone());
+    let mut consensus = ConsensusManager::new_with_keypair(
+        validator_address,
+        stake,
+        4, /* num_shards */
+        cli.benchmark,
+        &peer_vals,
+        validator_keypair.clone(),
+    );
     consensus.dag_validators = Some(dag_validators.clone());
     consensus.dag_round = Some(dag_round.clone());
     consensus.dag_committed = Some(dag_committed.clone());
@@ -1553,8 +1646,9 @@ async fn main() -> Result<()> {
     {
         let shutdown_state = state.clone();
         tokio::spawn(async move {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("SIGTERM handler");
             sigterm.recv().await;
             tracing::info!("SIGTERM received - initiating graceful shutdown...");
             shutdown_state.sync_wal();
@@ -1571,36 +1665,55 @@ async fn main() -> Result<()> {
         (ranges, Some(model)) if !ranges.is_empty() => {
             let total_layers = model.config.n_layers;
             let layers_held_total: usize = ranges.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-            let memory_mb_total: usize = model.layers.iter()
+            let memory_mb_total: usize = model
+                .layers
+                .iter()
                 .filter(|l| l.is_loaded())
-                .map(|l| l.wq.memory_bytes() + l.wk.memory_bytes() + l.wv.memory_bytes()
-                    + l.wo.memory_bytes() + l.w_gate.memory_bytes() + l.w_up.memory_bytes()
-                    + l.w_down.memory_bytes())
-                .sum::<usize>() / (1024 * 1024);
+                .map(|l| {
+                    l.wq.memory_bytes()
+                        + l.wk.memory_bytes()
+                        + l.wv.memory_bytes()
+                        + l.wo.memory_bytes()
+                        + l.w_gate.memory_bytes()
+                        + l.w_up.memory_bytes()
+                        + l.w_down.memory_bytes()
+                })
+                .sum::<usize>()
+                / (1024 * 1024);
             let per_layer_mb = memory_mb_total / layers_held_total.max(1);
             let full_model_mb = per_layer_mb * total_layers;
             let model_id_data = format!(
                 "arc-{}L-{}d-{}h-{}v",
-                model.config.n_layers, model.config.d_model,
-                model.config.n_heads, model.config.vocab_size
+                model.config.n_layers,
+                model.config.d_model,
+                model.config.n_heads,
+                model.config.vocab_size
             );
             let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
-            let socket_addr = std::env::var("ARC_PUBLIC_SOCKET")
-                .unwrap_or_else(|_| format!("{}:{}", rpc_addr.split(':').next().unwrap_or("127.0.0.1"), rpc_addr.split(':').nth(1).unwrap_or("9090")));
-            ranges.iter().map(|&(start, end)| rpc::ShardInfo {
-                start_layer: start,
-                end_layer: end,
-                total_layers,
-                model_id: format!("0x{}", hex::encode(model_id_hash.0)),
-                model_name: model_id_data.clone(),
-                memory_mb: per_layer_mb * (end - start),
-                full_model_mb,
-                socket_addr: socket_addr.clone(),
-                // NOT validator_seed: this ShardInfo is POSTed to every seed
-                // every 15s and served publicly by GET /shards, and the
-                // desktop's seed is the wallet's BIP-39 phrase.
-                node_name: public_node_name(&cli),
-            }).collect()
+            let socket_addr = std::env::var("ARC_PUBLIC_SOCKET").unwrap_or_else(|_| {
+                format!(
+                    "{}:{}",
+                    rpc_addr.split(':').next().unwrap_or("127.0.0.1"),
+                    rpc_addr.split(':').nth(1).unwrap_or("9090")
+                )
+            });
+            ranges
+                .iter()
+                .map(|&(start, end)| rpc::ShardInfo {
+                    start_layer: start,
+                    end_layer: end,
+                    total_layers,
+                    model_id: format!("0x{}", hex::encode(model_id_hash.0)),
+                    model_name: model_id_data.clone(),
+                    memory_mb: per_layer_mb * (end - start),
+                    full_model_mb,
+                    socket_addr: socket_addr.clone(),
+                    // NOT validator_seed: this ShardInfo is POSTed to every seed
+                    // every 15s and served publicly by GET /shards, and the
+                    // desktop's seed is the wallet's BIP-39 phrase.
+                    node_name: public_node_name(&cli),
+                })
+                .collect()
         }
         _ => Vec::new(),
     };
@@ -1622,9 +1735,11 @@ async fn main() -> Result<()> {
                 seed_addrs.push(format!("{}:9090", host));
                 if let Some(port_str) = p.split(':').nth(1)
                     && let Ok(port) = port_str.parse::<u16>()
-                        && port > 1 && port - 1 != 9090 {
-                            seed_addrs.push(format!("{}:{}", host, port - 1));
-                        }
+                    && port > 1
+                    && port - 1 != 9090
+                {
+                    seed_addrs.push(format!("{}:{}", host, port - 1));
+                }
             }
         }
         seed_addrs.sort();
@@ -1636,14 +1751,18 @@ async fn main() -> Result<()> {
         // timestamp refreshed every tick. Without the localhost post, the
         // 60s TTL on the registry would prune the self entry even while
         // the node is still live.
-        let local_announce_broadcast = format!("http://127.0.0.1:{}/shards/announce", rpc_addr.split(':').nth(1).unwrap_or("9090"));
+        let local_announce_broadcast = format!(
+            "http://127.0.0.1:{}/shards/announce",
+            rpc_addr.split(':').nth(1).unwrap_or("9090")
+        );
         tokio::spawn(async move {
             // Brief settle so the local /shards endpoint is up before we ask
             // peers to fetch from us
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
-                .build() {
+                .build()
+            {
                 Ok(c) => c,
                 Err(_) => return,
             };
@@ -1651,7 +1770,11 @@ async fn main() -> Result<()> {
                 for si in &sis {
                     let payload = serde_json::json!({"shard": si});
                     // Refresh our own entry first
-                    let _ = client.post(&local_announce_broadcast).json(&payload).send().await;
+                    let _ = client
+                        .post(&local_announce_broadcast)
+                        .json(&payload)
+                        .send()
+                        .await;
                     // Then announce to remote seeds
                     for addr in &seed_addrs {
                         let url = format!("http://{}/shards/announce", addr);
@@ -1665,12 +1788,16 @@ async fn main() -> Result<()> {
         // Background puller: fetch each seed's /shards and re-announce them locally.
         // This converges the registry even when a peer was offline when we first
         // announced. Anyone we reach contributes their full registry to ours.
-        let local_announce = format!("http://127.0.0.1:{}/shards/announce", rpc_addr.split(':').nth(1).unwrap_or("9090"));
+        let local_announce = format!(
+            "http://127.0.0.1:{}/shards/announce",
+            rpc_addr.split(':').nth(1).unwrap_or("9090")
+        );
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
-                .build() {
+                .build()
+            {
                 Ok(c) => c,
                 Err(_) => return,
             };
@@ -1696,29 +1823,33 @@ async fn main() -> Result<()> {
                 // /shards/announce broadcasts produces too.
                 for addr in &seed_addrs_pull {
                     if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await
-                        && let Ok(mut json) = resp.json::<serde_json::Value>().await {
-                            // New peers emit `self_shards: [ShardInfo, ...]`; legacy
-                            // peers still emit `self_shard: ShardInfo` - accept both
-                            // so a rolling upgrade never loses shard visibility.
-                            let mut to_announce: Vec<serde_json::Value> = Vec::new();
-                            if let Some(arr) = json.get_mut("self_shards").and_then(|v| v.as_array_mut()) {
-                                for entry in arr.iter_mut() {
-                                    if !entry.is_null() {
-                                        rewrite_pulled_self_shard(entry, addr);
-                                        to_announce.push(entry.clone());
-                                    }
+                        && let Ok(mut json) = resp.json::<serde_json::Value>().await
+                    {
+                        // New peers emit `self_shards: [ShardInfo, ...]`; legacy
+                        // peers still emit `self_shard: ShardInfo` - accept both
+                        // so a rolling upgrade never loses shard visibility.
+                        let mut to_announce: Vec<serde_json::Value> = Vec::new();
+                        if let Some(arr) =
+                            json.get_mut("self_shards").and_then(|v| v.as_array_mut())
+                        {
+                            for entry in arr.iter_mut() {
+                                if !entry.is_null() {
+                                    rewrite_pulled_self_shard(entry, addr);
+                                    to_announce.push(entry.clone());
                                 }
-                            }
-                            if let Some(self_shard) = json.get_mut("self_shard")
-                                && !self_shard.is_null() {
-                                    rewrite_pulled_self_shard(self_shard, addr);
-                                    to_announce.push(self_shard.clone());
-                                }
-                            for shard_val in to_announce {
-                                let payload = serde_json::json!({"shard": shard_val});
-                                let _ = client.post(&local_announce).json(&payload).send().await;
                             }
                         }
+                        if let Some(self_shard) = json.get_mut("self_shard")
+                            && !self_shard.is_null()
+                        {
+                            rewrite_pulled_self_shard(self_shard, addr);
+                            to_announce.push(self_shard.clone());
+                        }
+                        for shard_val in to_announce {
+                            let payload = serde_json::json!({"shard": shard_val});
+                            let _ = client.post(&local_announce).json(&payload).send().await;
+                        }
+                    }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             }
@@ -1766,10 +1897,12 @@ async fn main() -> Result<()> {
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let platform = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
-        let model_name = inference_model
-            .as_ref()
-            .map(|m| format!("arc-{}L-{}d-{}h-{}v",
-                m.config.n_layers, m.config.d_model, m.config.n_heads, m.config.vocab_size));
+        let model_name = inference_model.as_ref().map(|m| {
+            format!(
+                "arc-{}L-{}d-{}h-{}v",
+                m.config.n_layers, m.config.d_model, m.config.n_heads, m.config.vocab_size
+            )
+        });
 
         // Derive seed RPC endpoints from the peers list (P2P port - 1, usually 9090)
         let mut seed_rpc_addrs: Vec<String> = Vec::new();
@@ -1789,12 +1922,18 @@ async fn main() -> Result<()> {
         let rpc_addr_c = rpc_addr.clone();
         // Pre-compute model info for auto-shard registration
         let model_id_hex = inference_model.as_ref().map(|m| {
-            let id_data = format!("arc-{}L-{}d-{}h-{}v",
-                m.config.n_layers, m.config.d_model, m.config.n_heads, m.config.vocab_size);
-            format!("0x{}", hex::encode(arc_crypto::hash_bytes(id_data.as_bytes()).0))
+            let id_data = format!(
+                "arc-{}L-{}d-{}h-{}v",
+                m.config.n_layers, m.config.d_model, m.config.n_heads, m.config.vocab_size
+            );
+            format!(
+                "0x{}",
+                hex::encode(arc_crypto::hash_bytes(id_data.as_bytes()).0)
+            )
         });
         let total_layers = inference_model.as_ref().map(|m| m.config.n_layers as u32);
-        let avail_mem_mb: u64 = inference_model.as_ref()
+        let avail_mem_mb: u64 = inference_model
+            .as_ref()
             .map(|m| (m.config.d_model * m.config.n_layers * 4 / 1024 / 1024) as u64 * 2)
             .unwrap_or(8192)
             .max(4096);
@@ -1804,7 +1943,8 @@ async fn main() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
-                .build() {
+                .build()
+            {
                 Ok(c) => c,
                 Err(_) => return,
             };
@@ -1868,7 +2008,11 @@ async fn main() -> Result<()> {
                     } else {
                         heartbeat_payload.clone()
                     };
-                    let path = if register_tick { "register" } else { "heartbeat" };
+                    let path = if register_tick {
+                        "register"
+                    } else {
+                        "heartbeat"
+                    };
                     set.spawn(async move {
                         let host = addr.split(':').next().unwrap_or(&addr).to_string();
                         let gateway_addr = format!("{}:3001", host);
@@ -1879,7 +2023,9 @@ async fn main() -> Result<()> {
                             .send()
                             .await;
                         let resp = match primary {
-                            Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+                            Ok(r) if r.status().is_success() => {
+                                r.json::<serde_json::Value>().await.ok()
+                            }
                             // …legacy gateway only if arc-node didn't answer.
                             _ => match client
                                 .post(format!("http://{}/community/{}", gateway_addr, path))
@@ -1897,21 +2043,25 @@ async fn main() -> Result<()> {
                 while let Some(Ok((addr, resp))) = set.join_next().await {
                     if let Some(resp) = resp
                         && let Some(sa) = resp.get("shard_assignment")
-                            && !sa.is_null() {
-                                tracing::info!(
-                                    start = sa.get("start_layer").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    end = sa.get("end_layer").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    total = sa.get("total_layers").and_then(|v| v.as_u64()).unwrap_or(0),
-                                    seed = %addr,
-                                    "Auto-shard assignment received from coordinator"
-                                );
-                            }
+                        && !sa.is_null()
+                    {
+                        tracing::info!(
+                            start = sa.get("start_layer").and_then(|v| v.as_u64()).unwrap_or(0),
+                            end = sa.get("end_layer").and_then(|v| v.as_u64()).unwrap_or(0),
+                            total = sa.get("total_layers").and_then(|v| v.as_u64()).unwrap_or(0),
+                            seed = %addr,
+                            "Auto-shard assignment received from coordinator"
+                        );
+                    }
                 }
                 ticks += 1;
                 tokio::time::sleep(std::time::Duration::from_secs(15)).await;
             }
         });
-        tracing::info!("Community-mode HTTP registration started (worker_id={})", worker_id);
+        tracing::info!(
+            "Community-mode HTTP registration started (worker_id={})",
+            worker_id
+        );
 
         // ── Community inference worker loop ──────────────────────────────
         // Continuously long-poll /community/claim_work on all seeds. When
@@ -1932,8 +2082,7 @@ async fn main() -> Result<()> {
             // nonce (see init-from-chain block inside the loop), then
             // incremented locally per attestation. If a future submit
             // is rejected with InvalidNonce we re-query and reset.
-            let attestation_nonce =
-                std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let attestation_nonce = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
             let attestation_nonce_initialized =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -1941,7 +2090,8 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 let client = match reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(35)) // 30s claim + 5s overhead
-                    .build() {
+                    .build()
+                {
                     Ok(c) => c,
                     Err(_) => return,
                 };
@@ -2019,16 +2169,30 @@ async fn main() -> Result<()> {
                             continue;
                         };
 
-                        let job_id = job.get("job_id").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                        let input = job.get("input").and_then(|s| s.as_str()).unwrap_or("").to_string();
-                        let max_tokens = job.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
+                        let job_id = job
+                            .get("job_id")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let input = job
+                            .get("input")
+                            .and_then(|s| s.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let max_tokens =
+                            job.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(20) as u32;
                         if input.is_empty() || job_id.is_empty() {
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                             continue;
                         }
 
-                        tracing::info!("Claimed job {} from {}: {:?} (max_tokens={})",
-                            job_id, winner, &input[..input.len().min(40)], max_tokens);
+                        tracing::info!(
+                            "Claimed job {} from {}: {:?} (max_tokens={})",
+                            job_id,
+                            winner,
+                            &input[..input.len().min(40)],
+                            max_tokens
+                        );
 
                         // Run inference locally
                         let start = std::time::Instant::now();
@@ -2046,37 +2210,53 @@ async fn main() -> Result<()> {
                         let tokens_gen = generated.len() as u64;
                         let ms_per_tok = elapsed_ms.checked_div(tokens_gen).unwrap_or(0);
 
-                        tracing::info!("Job {} done: {} tokens in {}ms = {} ms/tok",
-                            job_id, tokens_gen, elapsed_ms, ms_per_tok);
+                        tracing::info!(
+                            "Job {} done: {} tokens in {}ms = {} ms/tok",
+                            job_id,
+                            tokens_gen,
+                            elapsed_ms,
+                            ms_per_tok
+                        );
 
                         // ── Build + sign the InferenceAttestation tx ──
                         // First time only: query the chain for the worker's
                         // current nonce and seed our local counter from
                         // there. Subsequent attestations increment locally.
-                        if !attestation_nonce_initialized.load(std::sync::atomic::Ordering::Relaxed) {
-                            let q_url = format!("http://{}/account/0x{}",
-                                winner, hex::encode(worker_address.0));
+                        if !attestation_nonce_initialized.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            let q_url = format!(
+                                "http://{}/account/0x{}",
+                                winner,
+                                hex::encode(worker_address.0)
+                            );
                             if let Ok(resp) = client.get(&q_url).send().await
-                                && let Ok(v) = resp.json::<serde_json::Value>().await {
-                                    let n = v.get("nonce").and_then(|x| x.as_u64()).unwrap_or(0);
-                                    attestation_nonce.store(n, std::sync::atomic::Ordering::Relaxed);
-                                    tracing::info!(starting_nonce = n, "worker attestation nonce initialized from chain");
-                                }
-                            attestation_nonce_initialized.store(true, std::sync::atomic::Ordering::Relaxed);
+                                && let Ok(v) = resp.json::<serde_json::Value>().await
+                            {
+                                let n = v.get("nonce").and_then(|x| x.as_u64()).unwrap_or(0);
+                                attestation_nonce.store(n, std::sync::atomic::Ordering::Relaxed);
+                                tracing::info!(
+                                    starting_nonce = n,
+                                    "worker attestation nonce initialized from chain"
+                                );
+                            }
+                            attestation_nonce_initialized
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
                         }
 
                         // Build the InferenceAttestation body. Mirrors what
                         // /inference/run does on the local-served path.
                         let model_id_data = format!(
                             "arc-{}L-{}d-{}h-{}v",
-                            model.config.n_layers, model.config.d_model,
-                            model.config.n_heads, model.config.vocab_size
+                            model.config.n_layers,
+                            model.config.d_model,
+                            model.config.n_heads,
+                            model.config.vocab_size
                         );
                         let model_id_hash = arc_crypto::hash_bytes(model_id_data.as_bytes());
                         let input_hash = arc_crypto::hash_bytes(input.as_bytes());
 
-                        let nonce = attestation_nonce
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let nonce =
+                            attestation_nonce.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let mut tx = arc_types::Transaction {
                             tx_type: arc_types::TxType::InferenceAttestation,
                             from: worker_address,
@@ -2103,11 +2283,9 @@ async fn main() -> Result<()> {
                         };
 
                         let signed_attestation_hex = match tx.sign(&worker_keypair) {
-                            Ok(()) => {
-                                bincode::serialize(&tx)
-                                    .ok()
-                                    .map(|b| format!("0x{}", hex::encode(b)))
-                            }
+                            Ok(()) => bincode::serialize(&tx)
+                                .ok()
+                                .map(|b| format!("0x{}", hex::encode(b))),
                             Err(e) => {
                                 tracing::warn!("attestation sign failed: {:?}", e);
                                 None
@@ -2126,7 +2304,8 @@ async fn main() -> Result<()> {
                             "engine": "INT8 integer (community worker)",
                         });
                         if let Some(hex_str) = signed_attestation_hex {
-                            result_body["signed_attestation_hex"] = serde_json::Value::String(hex_str);
+                            result_body["signed_attestation_hex"] =
+                                serde_json::Value::String(hex_str);
                         }
 
                         let submit_resp = client
@@ -2139,19 +2318,21 @@ async fn main() -> Result<()> {
                         // If submit reports invalid_nonce, force a re-query
                         // of the chain on the next loop iteration.
                         if let Ok(resp) = submit_resp
-                            && let Ok(body) = resp.json::<serde_json::Value>().await {
-                                let attestation = body.get("attestation");
-                                if let Some(a) = attestation {
-                                    let status = a.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                                    let err = a.get("error").and_then(|s| s.as_str()).unwrap_or("");
-                                    if status == "rejected" && err.contains("InvalidNonce") {
-                                        tracing::warn!("attestation nonce drifted; will re-query chain on next submit");
-                                        attestation_nonce_initialized
-                                            .store(false, std::sync::atomic::Ordering::Relaxed);
-                                    }
+                            && let Ok(body) = resp.json::<serde_json::Value>().await
+                        {
+                            let attestation = body.get("attestation");
+                            if let Some(a) = attestation {
+                                let status = a.get("status").and_then(|s| s.as_str()).unwrap_or("");
+                                let err = a.get("error").and_then(|s| s.as_str()).unwrap_or("");
+                                if status == "rejected" && err.contains("InvalidNonce") {
+                                    tracing::warn!(
+                                        "attestation nonce drifted; will re-query chain on next submit"
+                                    );
+                                    attestation_nonce_initialized
+                                        .store(false, std::sync::atomic::Ordering::Relaxed);
                                 }
                             }
-
+                        }
                     }
                     // Brief sleep between poll rounds to avoid hammering
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -2193,13 +2374,12 @@ async fn main() -> Result<()> {
     // Inference pool width: explicit --threads wins, then [inference] threads
     // from the config file, else 0 = rayon's global pool (which honours
     // RAYON_NUM_THREADS; see config::InferenceConfig).
-    let compute_threads = if matches.value_source("threads")
-        == Some(clap::parser::ValueSource::CommandLine)
-    {
-        cli.threads
-    } else {
-        node_cfg.inference.threads
-    };
+    let compute_threads =
+        if matches.value_source("threads") == Some(clap::parser::ValueSource::CommandLine) {
+            cli.threads
+        } else {
+            node_cfg.inference.threads
+        };
 
     rpc::serve(
         &rpc_addr,

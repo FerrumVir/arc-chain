@@ -12,15 +12,14 @@
 //
 // Default ARC_SEED is the local node at 127.0.0.1:9090.
 
-use arc_crypto::{hash_bytes, Hash256, KeyPair, Signature};
-use arc_types::{transaction::InferenceAttestationBody, Transaction, TxBody, TxType};
+use arc_crypto::{Hash256, KeyPair, Signature, hash_bytes};
+use arc_types::{Transaction, TxBody, TxType, transaction::InferenceAttestationBody};
 use serde_json::Value;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let seed = std::env::var("ARC_SEED")
-        .unwrap_or_else(|_| "http://127.0.0.1:9090".to_string());
+    let seed = std::env::var("ARC_SEED").unwrap_or_else(|_| "http://127.0.0.1:9090".to_string());
 
     println!("=== v0.7.0 end-to-end attestation test ===");
     println!("Seed: {}", seed);
@@ -55,7 +54,11 @@ async fn main() -> anyhow::Result<()> {
     // 3. Verify starting earnings = 0
     println!("\n[2/7] Initial /worker/earnings ...");
     let initial: Value = client
-        .get(format!("{}/worker/earnings/{}", seed, address_hex.trim_start_matches("0x")))
+        .get(format!(
+            "{}/worker/earnings/{}",
+            seed,
+            address_hex.trim_start_matches("0x")
+        ))
         .send()
         .await?
         .json()
@@ -143,7 +146,11 @@ async fn main() -> anyhow::Result<()> {
 
     // Worker nonce: query the chain
     let acct: Value = client
-        .get(format!("{}/account/{}", seed, address_hex.trim_start_matches("0x")))
+        .get(format!(
+            "{}/account/{}",
+            seed,
+            address_hex.trim_start_matches("0x")
+        ))
         .send()
         .await?
         .json()
@@ -221,7 +228,11 @@ async fn main() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_secs(10)).await;
 
     let final_earnings: Value = client
-        .get(format!("{}/worker/earnings/{}", seed, address_hex.trim_start_matches("0x")))
+        .get(format!(
+            "{}/worker/earnings/{}",
+            seed,
+            address_hex.trim_start_matches("0x")
+        ))
         .send()
         .await?
         .json()

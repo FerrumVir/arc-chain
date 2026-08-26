@@ -246,8 +246,7 @@ impl Signature {
                 signature,
             } => {
                 use pqcrypto_traits::sign::{
-                    PublicKey as PqPublicKey,
-                    DetachedSignature as PqDetachedSignature,
+                    DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey,
                 };
 
                 // Length checks
@@ -276,8 +275,12 @@ impl Signature {
                 let sig = pqcrypto_falcon::falcon512::DetachedSignature::from_bytes(signature)
                     .map_err(|_| SignatureError::InvalidSignature)?;
 
-                pqcrypto_falcon::falcon512::verify_detached_signature(&sig, message_hash.as_bytes(), &pk)
-                    .map_err(|_| SignatureError::InvalidSignature)
+                pqcrypto_falcon::falcon512::verify_detached_signature(
+                    &sig,
+                    message_hash.as_bytes(),
+                    &pk,
+                )
+                .map_err(|_| SignatureError::InvalidSignature)
             }
         }
     }
@@ -348,10 +351,16 @@ impl Drop for KeyPair {
             KeyPair::Secp256k1(_) => {
                 // k256 SigningKey implements ZeroizeOnDrop
             }
-            KeyPair::MlDsa65 { sk_bytes, pk_bytes: _ } => {
+            KeyPair::MlDsa65 {
+                sk_bytes,
+                pk_bytes: _,
+            } => {
                 sk_bytes.zeroize();
             }
-            KeyPair::Falcon512 { sk_bytes, pk_bytes: _ } => {
+            KeyPair::Falcon512 {
+                sk_bytes,
+                pk_bytes: _,
+            } => {
                 sk_bytes.zeroize();
             }
         }
@@ -374,8 +383,8 @@ impl KeyPair {
     /// Generate a new random ML-DSA-65 key pair (post-quantum).
     pub fn generate_ml_dsa() -> Self {
         use fips204::traits::SerDes;
-        let (pk, sk) = fips204::ml_dsa_65::try_keygen()
-            .expect("ML-DSA-65 keygen failed (RNG error)");
+        let (pk, sk) =
+            fips204::ml_dsa_65::try_keygen().expect("ML-DSA-65 keygen failed (RNG error)");
         KeyPair::MlDsa65 {
             sk_bytes: sk.into_bytes().to_vec(),
             pk_bytes: pk.into_bytes().to_vec(),
@@ -408,15 +417,14 @@ impl KeyPair {
                 let uncompressed = vk.to_encoded_point(false);
                 let point_bytes = uncompressed.as_bytes();
                 // Uncompressed secp256k1 point: 0x04 || x (32 bytes) || y (32 bytes) = 65 bytes
-                debug_assert!(point_bytes.len() >= 65, "secp256k1 uncompressed point too short");
+                debug_assert!(
+                    point_bytes.len() >= 65,
+                    "secp256k1 uncompressed point too short"
+                );
                 address_from_secp256k1_pubkey(&point_bytes[1..65])
             }
-            KeyPair::MlDsa65 { pk_bytes, .. } => {
-                address_from_ml_dsa_pubkey(pk_bytes)
-            }
-            KeyPair::Falcon512 { pk_bytes, .. } => {
-                address_from_falcon_pubkey(pk_bytes)
-            }
+            KeyPair::MlDsa65 { pk_bytes, .. } => address_from_ml_dsa_pubkey(pk_bytes),
+            KeyPair::Falcon512 { pk_bytes, .. } => address_from_falcon_pubkey(pk_bytes),
         }
     }
 
@@ -448,12 +456,9 @@ impl KeyPair {
             KeyPair::MlDsa65 { sk_bytes, pk_bytes } => {
                 use fips204::traits::{SerDes, Signer};
 
-                let sk_arr: [u8; ML_DSA_SK_LEN] = sk_bytes
-                    .as_slice()
-                    .try_into()
-                    .map_err(|_| SignatureError::SigningFailed(
-                        "invalid ML-DSA secret key length".into(),
-                    ))?;
+                let sk_arr: [u8; ML_DSA_SK_LEN] = sk_bytes.as_slice().try_into().map_err(|_| {
+                    SignatureError::SigningFailed("invalid ML-DSA secret key length".into())
+                })?;
                 let sk = fips204::ml_dsa_65::PrivateKey::try_from_bytes(sk_arr)
                     .map_err(|e| SignatureError::SigningFailed(e.to_string()))?;
                 let sig = sk
@@ -467,18 +472,17 @@ impl KeyPair {
             }
             KeyPair::Falcon512 { sk_bytes, pk_bytes } => {
                 use pqcrypto_traits::sign::{
-                    SecretKey as PqSk,
-                    DetachedSignature as PqDetachedSig,
+                    DetachedSignature as PqDetachedSig, SecretKey as PqSk,
                 };
 
-                let sk = pqcrypto_falcon::falcon512::SecretKey::from_bytes(sk_bytes)
-                    .map_err(|e| SignatureError::SigningFailed(format!(
-                        "invalid Falcon-512 secret key: {}", e
-                    )))?;
-                let sig = pqcrypto_falcon::falcon512::detached_sign(
-                    message_hash.as_bytes(),
-                    &sk,
-                );
+                let sk =
+                    pqcrypto_falcon::falcon512::SecretKey::from_bytes(sk_bytes).map_err(|e| {
+                        SignatureError::SigningFailed(format!(
+                            "invalid Falcon-512 secret key: {}",
+                            e
+                        ))
+                    })?;
+                let sig = pqcrypto_falcon::falcon512::detached_sign(message_hash.as_bytes(), &sk);
 
                 Ok(Signature::Falcon512 {
                     public_key: pk_bytes.clone(),
@@ -621,8 +625,7 @@ pub fn batch_verify_falcon512(
     public_keys: &[&[u8]],
 ) -> Result<(), SignatureError> {
     use pqcrypto_traits::sign::{
-        PublicKey as PqPublicKey,
-        DetachedSignature as PqDetachedSignature,
+        DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey,
     };
     use rayon::prelude::*;
 
@@ -676,7 +679,7 @@ pub fn falcon_keygen() -> (Vec<u8>, Vec<u8>) {
 
 /// Sign a message with a Falcon-512 secret key, returning the detached signature bytes.
 pub fn falcon_sign(secret_key: &[u8], message: &[u8]) -> Result<Vec<u8>, SignatureError> {
-    use pqcrypto_traits::sign::{SecretKey as PqSk, DetachedSignature as PqDetachedSig};
+    use pqcrypto_traits::sign::{DetachedSignature as PqDetachedSig, SecretKey as PqSk};
     let sk = pqcrypto_falcon::falcon512::SecretKey::from_bytes(secret_key)
         .map_err(|e| SignatureError::SigningFailed(format!("invalid Falcon secret key: {}", e)))?;
     let sig = pqcrypto_falcon::falcon512::detached_sign(message, &sk);
@@ -686,8 +689,7 @@ pub fn falcon_sign(secret_key: &[u8], message: &[u8]) -> Result<Vec<u8>, Signatu
 /// Verify a Falcon-512 detached signature against a message and public key.
 pub fn falcon_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> bool {
     use pqcrypto_traits::sign::{
-        PublicKey as PqPublicKey,
-        DetachedSignature as PqDetachedSignature,
+        DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey,
     };
     let pk = match pqcrypto_falcon::falcon512::PublicKey::from_bytes(public_key) {
         Ok(pk) => pk,
@@ -704,16 +706,11 @@ pub fn falcon_verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> boo
 ///
 /// Unlike `batch_verify_falcon512` which returns a single pass/fail,
 /// this returns a `Vec<bool>` indicating which individual signatures are valid.
-pub fn falcon_batch_verify(
-    keys: &[&[u8]],
-    messages: &[&[u8]],
-    signatures: &[&[u8]],
-) -> Vec<bool> {
-    use rayon::prelude::*;
+pub fn falcon_batch_verify(keys: &[&[u8]], messages: &[&[u8]], signatures: &[&[u8]]) -> Vec<bool> {
     use pqcrypto_traits::sign::{
-        PublicKey as PqPublicKey,
-        DetachedSignature as PqDetachedSignature,
+        DetachedSignature as PqDetachedSignature, PublicKey as PqPublicKey,
     };
+    use rayon::prelude::*;
 
     keys.par_iter()
         .zip(messages.par_iter())
@@ -861,7 +858,10 @@ mod tests {
         let msg = hash_bytes(b"test");
         let sig = kp.sign(&msg).expect("sign ok");
         match sig {
-            Signature::MlDsa65 { signature, public_key } => {
+            Signature::MlDsa65 {
+                signature,
+                public_key,
+            } => {
                 assert_eq!(signature.len(), ML_DSA_SIG_LEN);
                 assert_eq!(public_key.len(), ML_DSA_PK_LEN);
             }
@@ -1041,7 +1041,10 @@ mod tests {
         let msg = hash_bytes(b"test");
         let sig = kp.sign(&msg).expect("sign ok");
         match sig {
-            Signature::Falcon512 { signature, public_key } => {
+            Signature::Falcon512 {
+                signature,
+                public_key,
+            } => {
                 assert!(signature.len() <= FALCON_SIG_MAX_LEN);
                 assert!(!signature.is_empty());
                 assert_eq!(public_key.len(), FALCON_PK_LEN);
@@ -1159,7 +1162,10 @@ mod tests {
             let sig = kp.sign(&msg_hash).expect("sign ok");
 
             match sig {
-                Signature::Falcon512 { public_key, signature } => {
+                Signature::Falcon512 {
+                    public_key,
+                    signature,
+                } => {
                     messages.push(msg_hash.as_bytes().to_vec());
                     signatures.push(signature);
                     public_keys.push(public_key);
@@ -1189,7 +1195,10 @@ mod tests {
             let sig = kp.sign(&msg_hash).expect("sign ok");
 
             match sig {
-                Signature::Falcon512 { public_key, signature } => {
+                Signature::Falcon512 {
+                    public_key,
+                    signature,
+                } => {
                     messages.push(msg_hash.as_bytes().to_vec());
                     signatures.push(signature);
                     public_keys.push(public_key);

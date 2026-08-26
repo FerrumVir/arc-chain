@@ -30,7 +30,9 @@ impl fmt::Display for ProofMarketError {
             Self::RequestExpired => write!(f, "proof request has expired"),
             Self::InvalidProof => write!(f, "submitted proof failed verification"),
             Self::ProverNotFound => write!(f, "prover not found in registry"),
-            Self::OfferAlreadyAccepted => write!(f, "an offer has already been accepted for this request"),
+            Self::OfferAlreadyAccepted => {
+                write!(f, "an offer has already been accepted for this request")
+            }
             Self::RequestAlreadyFulfilled => write!(f, "request has already been fulfilled"),
             Self::InsufficientPayment => write!(f, "offered price is below the minimum"),
             Self::DeadlinePassed => write!(f, "deadline for this request has passed"),
@@ -212,8 +214,7 @@ impl ProverStats {
         self.total_proofs += 1;
 
         // Rolling average for success rate.
-        let successes = (self.success_rate * was_total as f64)
-            + if success { 1.0 } else { 0.0 };
+        let successes = (self.success_rate * was_total as f64) + if success { 1.0 } else { 0.0 };
         self.success_rate = successes / self.total_proofs as f64;
 
         // Rolling average for time.
@@ -278,20 +279,25 @@ impl ProofMarketplace {
             return Err(ProofMarketError::DeadlinePassed);
         }
         let id = request.id;
-        self.requests.insert(id, RequestEntry {
-            request,
-            status: RequestStatus::Open,
-            offers: Vec::new(),
-            accepted_prover: None,
-            submission: None,
-            verification: None,
-        });
+        self.requests.insert(
+            id,
+            RequestEntry {
+                request,
+                status: RequestStatus::Open,
+                offers: Vec::new(),
+                accepted_prover: None,
+                submission: None,
+                verification: None,
+            },
+        );
         Ok(())
     }
 
     /// A prover makes an offer on an open request.
     pub fn make_offer(&mut self, offer: ProofOffer) -> Result<(), ProofMarketError> {
-        let entry = self.requests.get_mut(&offer.request_id)
+        let entry = self
+            .requests
+            .get_mut(&offer.request_id)
             .ok_or(ProofMarketError::RequestNotFound)?;
 
         if entry.status != RequestStatus::Open {
@@ -309,7 +315,9 @@ impl ProofMarketplace {
         }
 
         // Ensure the prover exists in the stats registry (auto-register).
-        self.prover_stats.entry(offer.prover).or_insert_with(|| ProverStats::new(offer.prover));
+        self.prover_stats
+            .entry(offer.prover)
+            .or_insert_with(|| ProverStats::new(offer.prover));
 
         entry.offers.push(offer);
         Ok(())
@@ -321,7 +329,9 @@ impl ProofMarketplace {
         request_id: &[u8; 32],
         prover: &[u8; 32],
     ) -> Result<(), ProofMarketError> {
-        let entry = self.requests.get_mut(request_id)
+        let entry = self
+            .requests
+            .get_mut(request_id)
             .ok_or(ProofMarketError::RequestNotFound)?;
 
         if entry.status != RequestStatus::Open {
@@ -339,11 +349,10 @@ impl ProofMarketplace {
     }
 
     /// The assigned prover submits a completed proof.
-    pub fn submit_proof(
-        &mut self,
-        submission: ProofSubmission,
-    ) -> Result<(), ProofMarketError> {
-        let entry = self.requests.get_mut(&submission.request_id)
+    pub fn submit_proof(&mut self, submission: ProofSubmission) -> Result<(), ProofMarketError> {
+        let entry = self
+            .requests
+            .get_mut(&submission.request_id)
             .ok_or(ProofMarketError::RequestNotFound)?;
 
         if entry.status == RequestStatus::Fulfilled {
@@ -370,10 +379,14 @@ impl ProofMarketplace {
         verifier: [u8; 32],
         verified: bool,
     ) -> Result<ProofVerificationResult, ProofMarketError> {
-        let entry = self.requests.get_mut(request_id)
+        let entry = self
+            .requests
+            .get_mut(request_id)
             .ok_or(ProofMarketError::RequestNotFound)?;
 
-        let submission = entry.submission.as_ref()
+        let submission = entry
+            .submission
+            .as_ref()
             .ok_or(ProofMarketError::InvalidProof)?;
 
         let result = ProofVerificationResult {
@@ -387,7 +400,9 @@ impl ProofMarketplace {
         let prover = submission.prover;
         let compute_time = submission.compute_time_ms;
         let earned = if verified {
-            entry.offers.iter()
+            entry
+                .offers
+                .iter()
                 .find(|o| o.prover == prover)
                 .map(|o| o.price)
                 .unwrap_or(0)
@@ -409,17 +424,25 @@ impl ProofMarketplace {
 
     /// Get aggregated stats for a prover.
     pub fn get_stats(&self, prover: &[u8; 32]) -> Result<&ProverStats, ProofMarketError> {
-        self.prover_stats.get(prover).ok_or(ProofMarketError::ProverNotFound)
+        self.prover_stats
+            .get(prover)
+            .ok_or(ProofMarketError::ProverNotFound)
     }
 
     /// Number of open (unfulfilled) requests in the marketplace.
     pub fn open_request_count(&self) -> usize {
-        self.requests.values().filter(|e| e.status == RequestStatus::Open).count()
+        self.requests
+            .values()
+            .filter(|e| e.status == RequestStatus::Open)
+            .count()
     }
 
     /// Number of fulfilled requests.
     pub fn fulfilled_count(&self) -> usize {
-        self.requests.values().filter(|e| e.status == RequestStatus::Fulfilled).count()
+        self.requests
+            .values()
+            .filter(|e| e.status == RequestStatus::Fulfilled)
+            .count()
     }
 
     /// Total number of registered provers.
@@ -453,13 +476,7 @@ mod tests {
     }
 
     fn sample_offer(prover: u8, request_id: u8, price: u64) -> ProofOffer {
-        ProofOffer::new(
-            test_hash(prover),
-            test_hash(request_id),
-            500,
-            price,
-            0.95,
-        )
+        ProofOffer::new(test_hash(prover), test_hash(request_id), 500, price, 0.95)
     }
 
     // 1. Submit a request and verify it is open.
@@ -511,7 +528,10 @@ mod tests {
         mp.submit_request(sample_request(1)).unwrap();
 
         let offer = sample_offer(0x10, 1, 5_000); // max_cost = 1_000
-        assert_eq!(mp.make_offer(offer), Err(ProofMarketError::InsufficientPayment));
+        assert_eq!(
+            mp.make_offer(offer),
+            Err(ProofMarketError::InsufficientPayment)
+        );
     }
 
     // 6. Accept an offer and assign prover.
@@ -550,7 +570,9 @@ mod tests {
         assert!(mp.submit_proof(submission).is_ok());
 
         // Verify proof.
-        let result = mp.verify_proof(&test_hash(1), test_hash(0xFF), true).unwrap();
+        let result = mp
+            .verify_proof(&test_hash(1), test_hash(0xFF), true)
+            .unwrap();
         assert!(result.verified);
         assert_eq!(result.verifier, test_hash(0xFF));
         assert_eq!(mp.fulfilled_count(), 1);
@@ -570,16 +592,13 @@ mod tests {
         mp.make_offer(sample_offer(0x10, 1, 500)).unwrap();
         mp.accept_offer(&test_hash(1), &test_hash(0x10)).unwrap();
 
-        let submission = ProofSubmission::new(
-            test_hash(1),
-            test_hash(0x10),
-            vec![0x00],
-            vec![],
-            200,
-        );
+        let submission =
+            ProofSubmission::new(test_hash(1), test_hash(0x10), vec![0x00], vec![], 200);
         mp.submit_proof(submission).unwrap();
 
-        let result = mp.verify_proof(&test_hash(1), test_hash(0xFF), false).unwrap();
+        let result = mp
+            .verify_proof(&test_hash(1), test_hash(0xFF), false)
+            .unwrap();
         assert!(!result.verified);
 
         let stats = mp.get_stats(&test_hash(0x10)).unwrap();
@@ -625,14 +644,12 @@ mod tests {
     #[test]
     fn test_submit_proof_unknown_request() {
         let mut mp = ProofMarketplace::new(100);
-        let submission = ProofSubmission::new(
-            test_hash(99),
-            test_hash(0x10),
-            vec![0x00],
-            vec![],
-            100,
+        let submission =
+            ProofSubmission::new(test_hash(99), test_hash(0x10), vec![0x00], vec![], 100);
+        assert_eq!(
+            mp.submit_proof(submission),
+            Err(ProofMarketError::RequestNotFound)
         );
-        assert_eq!(mp.submit_proof(submission), Err(ProofMarketError::RequestNotFound));
     }
 
     // 12. Cannot accept offer from prover who didn't bid.

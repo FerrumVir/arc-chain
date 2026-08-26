@@ -98,10 +98,7 @@ impl ModelRegistry {
 
     /// List all models owned by a given address.
     pub fn list_by_owner(&self, owner: &[u8; 32]) -> Vec<&ModelMetadata> {
-        self.models
-            .values()
-            .filter(|m| &m.owner == owner)
-            .collect()
+        self.models.values().filter(|m| &m.owner == owner).collect()
     }
 
     /// List all models of a given type.
@@ -226,7 +223,7 @@ pub struct InferenceResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InferenceRequestStatus {
     Open,
-    Claimed([u8; 32]),   // provider who claimed it
+    Claimed([u8; 32]), // provider who claimed it
     Completed,
     Disputed,
 }
@@ -281,10 +278,7 @@ impl InferenceMarketplace {
         let request_id = &result.request_id;
         match self.statuses.get(request_id) {
             Some(InferenceRequestStatus::Claimed(provider)) if *provider == result.provider => {
-                let req = self
-                    .requests
-                    .get(request_id)
-                    .ok_or("Request not found")?;
+                let req = self.requests.get(request_id).ok_or("Request not found")?;
                 if result.cost > req.max_cost {
                     return Err("Result cost exceeds max_cost".to_string());
                 }
@@ -1244,9 +1238,11 @@ mod tests {
         assert_eq!(account.available(), 600);
 
         // Withdraw should respect locked balance
-        assert!(ledger
-            .withdraw(owner, 700, CreditReason::InferencePurchase, 200)
-            .is_err());
+        assert!(
+            ledger
+                .withdraw(owner, 700, CreditReason::InferencePurchase, 200)
+                .is_err()
+        );
 
         ledger.unlock(owner, 400).unwrap();
         let account = ledger.balance(&owner).unwrap();

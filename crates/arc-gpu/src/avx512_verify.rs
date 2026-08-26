@@ -27,13 +27,21 @@ impl Default for Avx512Verifier {
 
 impl Avx512Verifier {
     pub fn new() -> Self {
-        Self { min_batch: 64, total_verified: 0, total_batches: 0 }
+        Self {
+            min_batch: 64,
+            total_verified: 0,
+            total_batches: 0,
+        }
     }
 
     pub fn batch_verify(&mut self, tasks: &[VerifyTask]) -> GpuVerifyResult {
         if tasks.is_empty() {
             return GpuVerifyResult {
-                total: 0, valid: 0, invalid_indices: vec![], elapsed_us: 0, used_gpu: false,
+                total: 0,
+                valid: 0,
+                invalid_indices: vec![],
+                elapsed_us: 0,
+                used_gpu: false,
             };
         }
 
@@ -44,16 +52,29 @@ impl Avx512Verifier {
         let mut invalid_indices = Vec::new();
         let mut valid_count = 0usize;
         for (i, &v) in results.iter().enumerate() {
-            if v { valid_count += 1; } else { invalid_indices.push(i); }
+            if v {
+                valid_count += 1;
+            } else {
+                invalid_indices.push(i);
+            }
         }
 
         self.total_verified += tasks.len() as u64;
         self.total_batches += 1;
 
-        debug!(batch = tasks.len(), valid = valid_count, us = elapsed_us, "AVX-512 batch verify");
+        debug!(
+            batch = tasks.len(),
+            valid = valid_count,
+            us = elapsed_us,
+            "AVX-512 batch verify"
+        );
 
         GpuVerifyResult {
-            total: tasks.len(), valid: valid_count, invalid_indices, elapsed_us, used_gpu: false,
+            total: tasks.len(),
+            valid: valid_count,
+            invalid_indices,
+            elapsed_us,
+            used_gpu: false,
         }
     }
 }
@@ -77,9 +98,10 @@ fn avx512_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
     if tasks.len() < 64 {
         tasks.iter().map(verify_custom).collect()
     } else {
-        tasks.par_chunks(8).flat_map(|chunk| {
-            chunk.iter().map(verify_custom).collect::<Vec<_>>()
-        }).collect()
+        tasks
+            .par_chunks(8)
+            .flat_map(|chunk| chunk.iter().map(verify_custom).collect::<Vec<_>>())
+            .collect()
     }
 }
 
@@ -95,10 +117,10 @@ fn avx512_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
 /// 2. Compute k = SHA-512(R || A || msg) mod l
 /// 3. Check: [s]B - [k]A == R
 fn verify_custom(task: &VerifyTask) -> bool {
+    use curve25519_dalek::EdwardsPoint;
     use curve25519_dalek::edwards::CompressedEdwardsY;
     use curve25519_dalek::scalar::Scalar;
-    use curve25519_dalek::EdwardsPoint;
-    use sha2::{Sha512, Digest};
+    use sha2::{Digest, Sha512};
 
     let r_bytes: [u8; 32] = task.signature[..32].try_into().unwrap_or([0u8; 32]);
     let s_bytes: [u8; 32] = task.signature[32..64].try_into().unwrap_or([0u8; 32]);
@@ -180,9 +202,13 @@ mod tests {
     fn test_avx512_mixed_batch() {
         let mut v = Avx512Verifier::new();
         let mut tasks = Vec::new();
-        for _ in 0..50 { tasks.push(make_valid_task()); }
+        for _ in 0..50 {
+            tasks.push(make_valid_task());
+        }
         tasks.push(make_invalid_task());
-        for _ in 0..49 { tasks.push(make_valid_task()); }
+        for _ in 0..49 {
+            tasks.push(make_valid_task());
+        }
         let result = v.batch_verify(&tasks);
         assert_eq!(result.total, 100);
         assert_eq!(result.valid, 99);

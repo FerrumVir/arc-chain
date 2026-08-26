@@ -1,6 +1,6 @@
+use crate::account::Address;
 use arc_crypto::Hash256;
 use serde::{Deserialize, Serialize};
-use crate::account::Address;
 
 /// Identity attestation level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,9 +41,7 @@ impl Identity {
 
     pub fn is_sanctioned_country(&self) -> bool {
         // OFAC sanctioned country codes
-        let sanctioned = [
-            *b"KP", *b"IR", *b"SY", *b"CU", *b"RU",
-        ];
+        let sanctioned = [*b"KP", *b"IR", *b"SY", *b"CU", *b"RU"];
         sanctioned.contains(&self.country_code)
     }
 }

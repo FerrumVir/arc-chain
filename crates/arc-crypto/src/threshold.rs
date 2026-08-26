@@ -196,11 +196,7 @@ impl KeyGeneration {
     ///
     /// Uses a random degree-(threshold-1) polynomial f(x) where f(0) = secret.
     /// Each share i (1..=total) is (i, f(i) mod p).
-    pub fn generate_shares(
-        secret: &[u8; 32],
-        threshold: u32,
-        total: u32,
-    ) -> Vec<SecretShare> {
+    pub fn generate_shares(secret: &[u8; 32], threshold: u32, total: u32) -> Vec<SecretShare> {
         assert!(threshold >= 1, "threshold must be >= 1");
         assert!(total >= threshold, "total must be >= threshold");
 
@@ -438,11 +434,7 @@ impl ThresholdSigner {
     /// Verify a combined threshold signature against a message and public key.
     ///
     /// The public key is BLAKE3(secret) - the commitment to the original secret.
-    pub fn verify_combined(
-        message: &[u8],
-        combined_sig: &[u8; 32],
-        public_key: &[u8; 32],
-    ) -> bool {
+    pub fn verify_combined(message: &[u8], combined_sig: &[u8; 32], public_key: &[u8; 32]) -> bool {
         // Reconstruct the expected binding tag.
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"arc-threshold-verify");
@@ -507,7 +499,10 @@ impl ThresholdEncryption {
     /// # Returns
     /// A 32-byte symmetric key deterministically derived from the aggregated signature.
     pub fn derive_slot_key(slot: u64, sig_shares: &[crate::bls::BlsSignature]) -> [u8; 32] {
-        assert!(!sig_shares.is_empty(), "need at least one BLS signature share");
+        assert!(
+            !sig_shares.is_empty(),
+            "need at least one BLS signature share"
+        );
 
         // Aggregate all provided BLS signatures (real G2 point addition via blst).
         let agg_sig = crate::bls::aggregate_signatures(sig_shares)
@@ -565,7 +560,8 @@ impl ThresholdEncryption {
 
         // Generate keystream and XOR-encrypt.
         let keystream = Self::derive_keystream(&enc_key, nonce, plaintext.len());
-        let ciphertext: Vec<u8> = plaintext.iter()
+        let ciphertext: Vec<u8> = plaintext
+            .iter()
             .zip(keystream.iter())
             .map(|(p, k)| p ^ k)
             .collect();
@@ -615,7 +611,8 @@ impl ThresholdEncryption {
 
         // Decrypt.
         let keystream = Self::derive_keystream(&enc_key, &nonce, ciphertext.len());
-        let plaintext: Vec<u8> = ciphertext.iter()
+        let plaintext: Vec<u8> = ciphertext
+            .iter()
             .zip(keystream.iter())
             .map(|(c, k)| c ^ k)
             .collect();
@@ -741,8 +738,10 @@ mod tests {
         // Compare field elements (the secret is reduced mod p during sharing).
         let secret_field = bytes_to_field(&secret);
         let recovered_field = bytes_to_field(&recovered);
-        assert_eq!(recovered_field, secret_field,
-            "recovered secret field element does not match original");
+        assert_eq!(
+            recovered_field, secret_field,
+            "recovered secret field element does not match original"
+        );
     }
 
     #[test]
@@ -771,7 +770,10 @@ mod tests {
         let shares = KeyGeneration::generate_shares(&secret, 3, 5);
         let subset = vec![shares[0].clone()];
         let err = KeyGeneration::recover_secret(&subset, 3).unwrap_err();
-        assert!(matches!(err, ThresholdError::InsufficientShares { needed: 3, got: 1 }));
+        assert!(matches!(
+            err,
+            ThresholdError::InsufficientShares { needed: 3, got: 1 }
+        ));
     }
 
     #[test]
@@ -813,7 +815,10 @@ mod tests {
 
         let sig1 = signer.partial_sign(msg);
         let sig2 = signer.partial_sign(msg);
-        assert_eq!(sig1.signature, sig2.signature, "partial signing must be deterministic");
+        assert_eq!(
+            sig1.signature, sig2.signature,
+            "partial signing must be deterministic"
+        );
         assert_eq!(sig1.signer_index, 1);
     }
 
@@ -854,7 +859,10 @@ mod tests {
         let p0 = signer.partial_sign(msg);
 
         let err = signer.combine_partials(&[p0]).unwrap_err();
-        assert!(matches!(err, ThresholdError::InsufficientShares { needed: 3, got: 1 }));
+        assert!(matches!(
+            err,
+            ThresholdError::InsufficientShares { needed: 3, got: 1 }
+        ));
     }
 
     #[test]
@@ -1002,7 +1010,10 @@ mod tests {
 
         let ct1 = ThresholdEncryption::encrypt_with_nonce(&key, plaintext, &nonce);
         let ct2 = ThresholdEncryption::encrypt_with_nonce(&key, plaintext, &nonce);
-        assert_eq!(ct1, ct2, "same key+nonce+plaintext must produce identical ciphertext");
+        assert_eq!(
+            ct1, ct2,
+            "same key+nonce+plaintext must produce identical ciphertext"
+        );
     }
 
     #[test]
@@ -1016,7 +1027,8 @@ mod tests {
         let keypairs: Vec<_> = (0..3)
             .map(|i| bls_keygen(format!("committee-{i}").as_bytes()))
             .collect();
-        let sigs: Vec<_> = keypairs.iter()
+        let sigs: Vec<_> = keypairs
+            .iter()
             .map(|kp| bls_sign(&kp.secret, &msg))
             .collect();
 
@@ -1044,7 +1056,8 @@ mod tests {
         let keypairs: Vec<_> = (0..5)
             .map(|i| bls_keygen(format!("val-enc-{i}").as_bytes()))
             .collect();
-        let sigs: Vec<_> = keypairs.iter()
+        let sigs: Vec<_> = keypairs
+            .iter()
             .map(|kp| bls_sign(&kp.secret, &msg))
             .collect();
 
@@ -1061,7 +1074,10 @@ mod tests {
 
         // Subset of 3 sigs derives a DIFFERENT key (intentional: all-or-threshold)
         let partial_key = ThresholdEncryption::derive_slot_key(slot, &sigs[..3]);
-        assert_ne!(key, partial_key, "different sig subsets must produce different keys");
+        assert_ne!(
+            key, partial_key,
+            "different sig subsets must produce different keys"
+        );
         assert!(ThresholdEncryption::decrypt(&partial_key, &ciphertext).is_none());
     }
 

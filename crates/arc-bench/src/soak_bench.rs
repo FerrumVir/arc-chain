@@ -12,8 +12,8 @@
 //! Usage:
 //!   cargo run --release --bin arc-bench-soak -- --duration 300 --batch-size 10000
 
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_crypto::Hash256;
+use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_node::pipeline::{ExecutionMode, Pipeline, PipelineBatch, PipelineConfig, VerifyMode};
 use arc_state::StateDB;
 use arc_types::Transaction;
@@ -60,7 +60,12 @@ fn format_tps(tps: f64) -> String {
 
 fn format_count(n: u64) -> String {
     if n >= 1_000_000 {
-        format!("{},{:03},{:03}", n / 1_000_000, (n / 1_000) % 1_000, n % 1_000)
+        format!(
+            "{},{:03},{:03}",
+            n / 1_000_000,
+            (n / 1_000) % 1_000,
+            n % 1_000
+        )
     } else if n >= 1_000 {
         format!("{},{:03}", n / 1_000, n % 1_000)
     } else {
@@ -81,14 +86,15 @@ fn progress_bar(fraction: f64, width: usize) -> String {
 
 /// Resident set size in bytes (macOS / Linux).
 fn rss_bytes() -> u64 {
-#[allow(deprecated)]
+    #[allow(deprecated)]
     #[cfg(target_os = "macos")]
     {
         use std::mem::MaybeUninit;
         unsafe {
             let mut info = MaybeUninit::<libc::mach_task_basic_info_data_t>::zeroed().assume_init();
             let mut count = (std::mem::size_of::<libc::mach_task_basic_info_data_t>()
-                / std::mem::size_of::<libc::natural_t>()) as libc::mach_msg_type_number_t;
+                / std::mem::size_of::<libc::natural_t>())
+                as libc::mach_msg_type_number_t;
             let kr = libc::task_info(
                 libc::mach_task_self(),
                 libc::MACH_TASK_BASIC_INFO,
@@ -236,9 +242,8 @@ impl SoakMetrics {
         if self.interval_snapshots.len() < 2 {
             return 0.0;
         }
-        let mean: f64 =
-            self.interval_snapshots.iter().map(|s| s.tps).sum::<f64>()
-                / self.interval_snapshots.len() as f64;
+        let mean: f64 = self.interval_snapshots.iter().map(|s| s.tps).sum::<f64>()
+            / self.interval_snapshots.len() as f64;
         let variance: f64 = self
             .interval_snapshots
             .iter()
@@ -254,8 +259,7 @@ impl SoakMetrics {
 
 // ── Dashboard printing ───────────────────────────────────────────────────────
 
-const SEPARATOR: &str =
-    "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}";
+const SEPARATOR: &str = "\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}\u{2501}";
 
 fn print_dashboard(
     elapsed: Duration,
@@ -290,10 +294,7 @@ fn print_dashboard(
         format_tps(metrics.min_tps)
     };
     println!("  Min TPS:        {}", min_tps_display);
-    println!(
-        "  Total Txs:      {}",
-        format_count(metrics.total_txs)
-    );
+    println!("  Total Txs:      {}", format_count(metrics.total_txs));
     println!("  Success Rate:   {:.1}%", metrics.success_rate());
     println!("  Memory (RSS):   {}", format_bytes(rss_bytes()));
     println!("  Progress:       {}", progress_bar(fraction, 20));
@@ -313,10 +314,7 @@ fn print_final_report(total_duration: Duration, metrics: &SoakMetrics) {
     println!(" SOAK TEST COMPLETE");
     println!("{}", SEPARATOR);
     println!("  Duration:       {:.1}s", elapsed_secs);
-    println!(
-        "  Total Txs:      {}",
-        format_count(metrics.total_txs)
-    );
+    println!("  Total Txs:      {}", format_count(metrics.total_txs));
     println!("  Average TPS:    {}", format_tps(avg_tps));
     println!("  Peak TPS:       {}", format_tps(metrics.peak_tps));
     // `min_tps` is initialised to the sentinel f64::MAX and only ever replaced
@@ -367,7 +365,10 @@ fn main() {
 
     // ── Pre-sign one batch worth of transactions (reused every iteration) ────
     println!();
-    print!("  Pre-signing {} transactions with Ed25519... ", args.batch_size);
+    print!(
+        "  Pre-signing {} transactions with Ed25519... ",
+        args.batch_size
+    );
     let sign_start = Instant::now();
     let (transactions, genesis) = presign_transactions(args.senders, args.batch_size);
     let sign_elapsed = sign_start.elapsed();

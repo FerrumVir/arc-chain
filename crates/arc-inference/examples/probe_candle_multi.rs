@@ -2,7 +2,7 @@
 // matches candle at position 0 but diverges at position k, the KV cache path
 // (storage, attention read, online softmax, or RoPE position handling) is the
 // bug site.
-use arc_inference::cached_integer_model::{load_cached_model, KVCache};
+use arc_inference::cached_integer_model::{KVCache, load_cached_model};
 use candle_core::{Device, Tensor};
 use candle_transformers::models::quantized_llama::ModelWeights;
 
@@ -11,25 +11,37 @@ const MODEL_PATH: &str = "/Users/tjdunham/.arc-models/llama-2-7b.gguf";
 fn argmax_f32(v: &[f32]) -> (usize, f32) {
     let mut ai = 0;
     let mut av = f32::NEG_INFINITY;
-    for (i, &x) in v.iter().enumerate() { if x > av { av = x; ai = i; } }
+    for (i, &x) in v.iter().enumerate() {
+        if x > av {
+            av = x;
+            ai = i;
+        }
+    }
     (ai, av)
 }
 fn argmax_i64(v: &[i64]) -> (usize, i64) {
     let mut ai = 0;
     let mut av = i64::MIN;
-    for (i, &x) in v.iter().enumerate() { if x > av { av = x; ai = i; } }
+    for (i, &x) in v.iter().enumerate() {
+        if x > av {
+            av = x;
+            ai = i;
+        }
+    }
     (ai, av)
 }
 
 fn topk_f32(v: &[f32], k: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..v.len()).collect();
     idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap());
-    idx.truncate(k); idx
+    idx.truncate(k);
+    idx
 }
 fn topk_i64(v: &[i64], k: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..v.len()).collect();
     idx.sort_by(|&a, &b| v[b].cmp(&v[a]));
-    idx.truncate(k); idx
+    idx.truncate(k);
+    idx
 }
 
 fn main() {
@@ -49,7 +61,10 @@ fn main() {
     // (1=BOS, 450="The", 7483=" capital", 310=" of", 3444=" France", 338=" is")
     let tokens: Vec<u32> = vec![1, 450, 7483, 310, 3444, 338];
 
-    eprintln!("\n{:^3}  {:^6}  {:^5}  {:>10}  {:>10}  {:^5}  top10-overlap", "pos", "tok_in", "c_amx", "c_logit", "our_logit", "o_amx");
+    eprintln!(
+        "\n{:^3}  {:^6}  {:^5}  {:>10}  {:>10}  {:^5}  top10-overlap",
+        "pos", "tok_in", "c_amx", "c_logit", "our_logit", "o_amx"
+    );
     eprintln!("{}", "-".repeat(80));
 
     for (pos, &tok) in tokens.iter().enumerate() {
@@ -59,7 +74,9 @@ fn main() {
         let cl = cl.squeeze(0).unwrap();
         let cl = if cl.dims().len() == 2 {
             cl.get(cl.dim(0).unwrap() - 1).unwrap()
-        } else { cl };
+        } else {
+            cl
+        };
         let c_vec: Vec<f32> = cl.to_vec1().unwrap();
         let (c_ai, c_av) = argmax_f32(&c_vec);
 
@@ -71,7 +88,15 @@ fn main() {
         let otop100: std::collections::HashSet<usize> = topk_i64(&ol, 100).into_iter().collect();
         let overlap = ctop.iter().filter(|i| otop100.contains(i)).count();
 
-        eprintln!("{:3}  {:>6}  {:>5}  {:>10.3}  {:>10.3}  {:>5}  {}/10",
-            pos, tok, c_ai, c_av, o_av as f64 / 65536.0, o_ai, overlap);
+        eprintln!(
+            "{:3}  {:>6}  {:>5}  {:>10.3}  {:>10.3}  {:>5}  {}/10",
+            pos,
+            tok,
+            c_ai,
+            c_av,
+            o_av as f64 / 65536.0,
+            o_ai,
+            overlap
+        );
     }
 }

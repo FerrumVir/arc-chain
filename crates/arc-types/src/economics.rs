@@ -109,7 +109,12 @@ impl RoleRevenueConfig {
         };
         let observer_pool = (total as u128 * self.observer_pool_bps as u128 / 10_000) as u64;
         let treasury = (total as u128 * self.treasury_share_bps as u128 / 10_000) as u64;
-        FeeSplit { proposer, per_verifier, observer_pool, treasury }
+        FeeSplit {
+            proposer,
+            per_verifier,
+            observer_pool,
+            treasury,
+        }
     }
 }
 
@@ -152,7 +157,7 @@ impl BootstrapFund {
             distributed: 0,
             vesting_start_block: start_block,
             vesting_duration_blocks: BLOCKS_PER_YEAR * 2, // 2 years
-            cliff_blocks: 1_512_000,                       // ~7 days
+            cliff_blocks: 1_512_000,                      // ~7 days
         }
     }
 
@@ -170,7 +175,8 @@ impl BootstrapFund {
 
     /// Amount claimable (vested minus already distributed).
     pub fn claimable(&self, current_block: u64) -> u128 {
-        self.vested_amount(current_block).saturating_sub(self.distributed)
+        self.vested_amount(current_block)
+            .saturating_sub(self.distributed)
     }
 
     /// Per-block distribution amount for active validators.
@@ -416,8 +422,12 @@ pub struct FeeConfig {
     pub role_revenue: RoleRevenueConfig,
 }
 
-fn default_circulating_supply() -> u128 { TOTAL_SUPPLY }
-fn default_target_burn_bps() -> u16 { 0 }
+fn default_circulating_supply() -> u128 {
+    TOTAL_SUPPLY
+}
+fn default_target_burn_bps() -> u16 {
+    0
+}
 
 /// Breakdown of fees for a single transaction.
 /// No tokens are burned - 100% distributed to validators + treasury.
@@ -451,7 +461,7 @@ impl FeeConfig {
             max_base_fee: 1_000_000_000,
             target_block_utilization: 0.5,
             adjustment_speed: 8,
-            burn_percentage: 0,       // No burn
+            burn_percentage: 0,         // No burn
             proposer_percentage: 10000, // 100% to validators (split by role_revenue)
             smoothed_tps: 0.0,
             circulating_supply: TOTAL_SUPPLY,
@@ -628,11 +638,11 @@ pub struct StateRentConfig {
 impl Default for StateRentConfig {
     fn default() -> Self {
         Self {
-            cost_per_byte_per_epoch: 1,        // 1 nanoARC per byte per epoch
-            epoch_length_blocks: 216_000,      // ~1 day at 400ms blocks
-            dust_threshold: 1_000_000,         // 0.001 ARC
-            grace_epochs: 30,                  // ~30 days
-            account_size_bytes: 128,           // bytes per standard account
+            cost_per_byte_per_epoch: 1,   // 1 nanoARC per byte per epoch
+            epoch_length_blocks: 216_000, // ~1 day at 400ms blocks
+            dust_threshold: 1_000_000,    // 0.001 ARC
+            grace_epochs: 30,             // ~30 days
+            account_size_bytes: 128,      // bytes per standard account
         }
     }
 }
@@ -640,7 +650,8 @@ impl Default for StateRentConfig {
 impl StateRentConfig {
     /// Cost per account per epoch: `cost_per_byte_per_epoch * account_size_bytes`.
     pub fn rent_per_epoch(&self) -> u64 {
-        self.cost_per_byte_per_epoch.saturating_mul(self.account_size_bytes)
+        self.cost_per_byte_per_epoch
+            .saturating_mul(self.account_size_bytes)
     }
 
     /// Returns `true` if the balance is below the dust threshold (dormant).
@@ -766,7 +777,9 @@ impl SupplyTracker {
 
     /// Staking ratio as percentage.
     pub fn staking_ratio(&self) -> f64 {
-        if self.total_supply == 0 { return 0.0; }
+        if self.total_supply == 0 {
+            return 0.0;
+        }
         self.total_staked as f64 / self.total_supply as f64 * 100.0
     }
 }
@@ -794,10 +807,7 @@ mod tests {
         assert_eq!(StakeTier::from_amount(MIN_STAKE_ARC), StakeTier::Arc);
         assert_eq!(StakeTier::from_amount(MIN_STAKE_CORE), StakeTier::Core);
         // In between: 200K should be Lite (below Spark threshold)
-        assert_eq!(
-            StakeTier::from_amount(200_000_000_000_000),
-            StakeTier::Lite
-        );
+        assert_eq!(StakeTier::from_amount(200_000_000_000_000), StakeTier::Lite);
         // 1M should be Spark
         assert_eq!(
             StakeTier::from_amount(1_000_000_000_000_000),
@@ -810,18 +820,9 @@ mod tests {
     fn test_stake_tier_boundaries() {
         // One unit below each threshold → lower tier
         assert_eq!(StakeTier::from_amount(MIN_STAKE_LITE - 1), StakeTier::None);
-        assert_eq!(
-            StakeTier::from_amount(MIN_STAKE_SPARK - 1),
-            StakeTier::Lite
-        );
-        assert_eq!(
-            StakeTier::from_amount(MIN_STAKE_ARC - 1),
-            StakeTier::Spark
-        );
-        assert_eq!(
-            StakeTier::from_amount(MIN_STAKE_CORE - 1),
-            StakeTier::Arc
-        );
+        assert_eq!(StakeTier::from_amount(MIN_STAKE_SPARK - 1), StakeTier::Lite);
+        assert_eq!(StakeTier::from_amount(MIN_STAKE_ARC - 1), StakeTier::Spark);
+        assert_eq!(StakeTier::from_amount(MIN_STAKE_CORE - 1), StakeTier::Arc);
 
         // Exactly at threshold → that tier
         assert_eq!(StakeTier::from_amount(MIN_STAKE_LITE), StakeTier::Lite);
@@ -962,11 +963,14 @@ mod tests {
         assert_eq!(fee.total_fee, fee.base_fee + fee.priority_fee);
 
         // No burn - all fees distributed
-        let total_distributed = fee.to_proposer + fee.to_verifiers + fee.to_observer_pool + fee.to_treasury;
+        let total_distributed =
+            fee.to_proposer + fee.to_verifiers + fee.to_observer_pool + fee.to_treasury;
         // Allow ±4 for integer rounding across 4 splits
         assert!(
             (total_distributed as i64 - fee.total_fee as i64).abs() <= 4,
-            "distributed {} should ≈ total_fee {}", total_distributed, fee.total_fee
+            "distributed {} should ≈ total_fee {}",
+            total_distributed,
+            fee.total_fee
         );
 
         // Proposer gets 40%

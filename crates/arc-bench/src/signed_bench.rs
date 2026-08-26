@@ -12,8 +12,8 @@
 //!   ml-dsa         - Generate ML-DSA-65 (post-quantum) signed txs + batch verify
 //!   all            - Run all modes including quantum comparison (default)
 
-use arc_crypto::{hash_bytes, batch_verify_ed25519, batch_verify_ml_dsa, Hash256, KeyPair};
 use arc_crypto::signature::{ML_DSA_PK_LEN, ML_DSA_SIG_LEN};
+use arc_crypto::{Hash256, KeyPair, batch_verify_ed25519, batch_verify_ml_dsa, hash_bytes};
 use arc_state::StateDB;
 use arc_types::Transaction;
 use clap::Parser;
@@ -71,7 +71,12 @@ fn format_rate(rate: f64) -> String {
 /// Returns (transactions, keypairs, keygen_time, signing_time).
 fn generate_signed_transactions(
     count: usize,
-) -> (Vec<Transaction>, Vec<KeyPair>, std::time::Duration, std::time::Duration) {
+) -> (
+    Vec<Transaction>,
+    Vec<KeyPair>,
+    std::time::Duration,
+    std::time::Duration,
+) {
     // Step 1: Generate keypairs (parallel)
     let keygen_start = Instant::now();
     let keypairs: Vec<KeyPair> = (0..count)
@@ -104,7 +109,12 @@ fn generate_signed_transactions(
 /// Returns (transactions, keypairs, keygen_time, signing_time).
 fn generate_ml_dsa_transactions(
     count: usize,
-) -> (Vec<Transaction>, Vec<KeyPair>, std::time::Duration, std::time::Duration) {
+) -> (
+    Vec<Transaction>,
+    Vec<KeyPair>,
+    std::time::Duration,
+    std::time::Duration,
+) {
     // Step 1: Generate ML-DSA keypairs (parallel - heavier than Ed25519)
     let keygen_start = Instant::now();
     let keypairs: Vec<KeyPair> = (0..count)
@@ -163,10 +173,7 @@ fn bench_ml_dsa_batch_verify(transactions: &[Transaction]) -> f64 {
 }
 
 /// Benchmark: ML-DSA batch-verified block execution.
-fn bench_ml_dsa_batch_execution(
-    transactions: &[Transaction],
-    keypairs: &[KeyPair],
-) -> f64 {
+fn bench_ml_dsa_batch_execution(transactions: &[Transaction], keypairs: &[KeyPair]) -> f64 {
     let state = state_for_signed(keypairs);
     let validator = keypairs[0].address();
 
@@ -192,8 +199,7 @@ fn bench_ml_dsa_batch_execution(
     }
 
     let msg_refs: Vec<&[u8]> = messages.iter().map(|m| m.as_slice()).collect();
-    batch_verify_ml_dsa(&msg_refs, &sigs, &pks)
-        .expect("ML-DSA batch verify must succeed");
+    batch_verify_ml_dsa(&msg_refs, &sigs, &pks).expect("ML-DSA batch verify must succeed");
 
     // Step 2: Execute block (sigs already verified)
     let (_, receipts) = state.execute_block(transactions, validator).unwrap();
@@ -201,7 +207,10 @@ fn bench_ml_dsa_batch_execution(
     let elapsed = start.elapsed();
 
     let success = receipts.iter().filter(|r| r.success).count();
-    assert!(success > 0, "at least some ML-DSA transactions must succeed");
+    assert!(
+        success > 0,
+        "at least some ML-DSA transactions must succeed"
+    );
 
     transactions.len() as f64 / elapsed.as_secs_f64()
 }
@@ -215,9 +224,8 @@ fn generate_unsigned_transactions(count: usize) -> Vec<Transaction> {
         .flat_map(|agent_id| {
             let from = hash_bytes(&agent_id.to_le_bytes());
             let to = hash_bytes(&((agent_id + 1) % num_agents).to_le_bytes());
-            (0..txs_per_agent as u64).map(move |nonce| {
-                Transaction::new_transfer(from, to, 1, nonce)
-            })
+            (0..txs_per_agent as u64)
+                .map(move |nonce| Transaction::new_transfer(from, to, 1, nonce))
         })
         .collect()
 }
@@ -281,11 +289,7 @@ fn bench_individual_verify(transactions: &[Transaction]) -> f64 {
         .filter(|tx| tx.verify_signature().is_ok())
         .count();
     let elapsed = start.elapsed();
-    assert_eq!(
-        verified,
-        transactions.len(),
-        "all signatures must verify"
-    );
+    assert_eq!(verified, transactions.len(), "all signatures must verify");
     transactions.len() as f64 / elapsed.as_secs_f64()
 }
 
@@ -305,8 +309,8 @@ fn bench_batch_verify(transactions: &[Transaction]) -> f64 {
                 public_key,
                 signature,
             } => {
-                let vk = ed25519_dalek::VerifyingKey::from_bytes(public_key)
-                    .expect("valid public key");
+                let vk =
+                    ed25519_dalek::VerifyingKey::from_bytes(public_key).expect("valid public key");
                 let sig_bytes: [u8; 64] = signature.as_slice().try_into().expect("64-byte sig");
                 let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
                 verifying_keys.push(vk);
@@ -337,12 +341,8 @@ fn bench_batch_verify(transactions: &[Transaction]) -> f64 {
         .collect();
 
     chunks.par_iter().for_each(|&(s, e)| {
-        batch_verify_ed25519(
-            &msg_refs[s..e],
-            &signatures[s..e],
-            &verifying_keys[s..e],
-        )
-        .expect("batch verify must succeed");
+        batch_verify_ed25519(&msg_refs[s..e], &signatures[s..e], &verifying_keys[s..e])
+            .expect("batch verify must succeed");
     });
 
     let elapsed = start.elapsed();
@@ -392,10 +392,7 @@ fn bench_signed_execution(transactions: &[Transaction], keypairs: &[KeyPair]) ->
 
 /// Benchmark: batch-verified block execution.
 /// First batch-verify all signatures, then execute without per-tx sig checks.
-fn bench_batch_verified_execution(
-    transactions: &[Transaction],
-    keypairs: &[KeyPair],
-) -> f64 {
+fn bench_batch_verified_execution(transactions: &[Transaction], keypairs: &[KeyPair]) -> f64 {
     let state = state_for_signed(keypairs);
     let validator = keypairs[0].address();
 
@@ -413,8 +410,8 @@ fn bench_batch_verified_execution(
                 public_key,
                 signature,
             } => {
-                let vk = ed25519_dalek::VerifyingKey::from_bytes(public_key)
-                    .expect("valid public key");
+                let vk =
+                    ed25519_dalek::VerifyingKey::from_bytes(public_key).expect("valid public key");
                 let sig_bytes: [u8; 64] = signature.as_slice().try_into().expect("64-byte sig");
                 let sig = ed25519_dalek::Signature::from_bytes(&sig_bytes);
                 vks.push(vk);
@@ -438,12 +435,8 @@ fn bench_batch_verified_execution(
         .collect();
 
     chunks.par_iter().for_each(|&(s, e)| {
-        batch_verify_ed25519(
-            &msg_refs[s..e],
-            &sigs[s..e],
-            &vks[s..e],
-        )
-        .expect("batch verify must succeed");
+        batch_verify_ed25519(&msg_refs[s..e], &sigs[s..e], &vks[s..e])
+            .expect("batch verify must succeed");
     });
 
     // Step 2: Execute block WITHOUT per-tx signature verification
@@ -474,10 +467,7 @@ fn print_results(results: &BenchResults) {
     println!("{}", line);
     println!(" ARC Chain Benchmark - Classical vs Quantum-Proof Signatures");
     println!("{}", line);
-    println!(
-        " Transactions     : {}",
-        format_number(results.tx_count)
-    );
+    println!(" Transactions     : {}", format_number(results.tx_count));
     println!(" Threads          : {} (Rayon)", results.num_threads);
     println!("{}", dash);
     println!(" ED25519 (CLASSICAL)");
@@ -550,7 +540,8 @@ fn print_results(results: &BenchResults) {
     println!(
         " Quantum security cost        : {:.1}%  overhead vs Ed25519 batch",
         if results.batch_verified_tps > 0.0 {
-            ((results.batch_verified_tps - results.ml_dsa_batch_tps) / results.batch_verified_tps) * 100.0
+            ((results.batch_verified_tps - results.ml_dsa_batch_tps) / results.batch_verified_tps)
+                * 100.0
         } else {
             0.0
         }
@@ -603,7 +594,11 @@ fn main() {
     println!();
     println!("================================================================");
     println!(" ARC Chain - Signature Benchmark (Classical + Quantum-Proof)");
-    println!(" {} transactions, {} threads", format_number(n), num_threads);
+    println!(
+        " {} transactions, {} threads",
+        format_number(n),
+        num_threads
+    );
     println!("================================================================");
     println!();
 
@@ -616,7 +611,10 @@ fn main() {
         }
 
         "signed" => {
-            println!("[1/3] Generating {} signed transactions...", format_number(n));
+            println!(
+                "[1/3] Generating {} signed transactions...",
+                format_number(n)
+            );
             let (txs, keypairs, keygen_time, sign_time) = generate_signed_transactions(n);
             println!(
                 "  Key generation:  {:.2}s ({} keys/sec)",
@@ -637,12 +635,18 @@ fn main() {
 
             println!("[3/3] Signed block execution (per-tx verification)...");
             let tps = bench_signed_execution(&txs, &keypairs);
-            println!("  => {} TPS (with per-tx sig verification)", format_rate(tps));
+            println!(
+                "  => {} TPS (with per-tx sig verification)",
+                format_rate(tps)
+            );
             println!();
         }
 
         "batch-verified" => {
-            println!("[1/3] Generating {} signed transactions...", format_number(n));
+            println!(
+                "[1/3] Generating {} signed transactions...",
+                format_number(n)
+            );
             let (txs, keypairs, keygen_time, sign_time) = generate_signed_transactions(n);
             println!(
                 "  Key generation:  {:.2}s ({} keys/sec)",
@@ -668,8 +672,12 @@ fn main() {
         }
 
         "ml-dsa" => {
-            println!("[1/3] Generating {} ML-DSA-65 keypairs + signed transactions...", format_number(n));
-            let (ml_txs, ml_keypairs, ml_keygen_time, ml_sign_time) = generate_ml_dsa_transactions(n);
+            println!(
+                "[1/3] Generating {} ML-DSA-65 keypairs + signed transactions...",
+                format_number(n)
+            );
+            let (ml_txs, ml_keypairs, ml_keygen_time, ml_sign_time) =
+                generate_ml_dsa_transactions(n);
             println!(
                 "  Key generation:  {:.2}s ({} keys/sec)",
                 ml_keygen_time.as_secs_f64(),
@@ -695,7 +703,10 @@ fn main() {
 
         _ => {
             // ── Ed25519: Generate signed transactions ────────────────
-            println!("[1/9] Generating {} Ed25519 keypairs + signed transactions...", format_number(n));
+            println!(
+                "[1/9] Generating {} Ed25519 keypairs + signed transactions...",
+                format_number(n)
+            );
             let (txs, keypairs, keygen_time, sign_time) = generate_signed_transactions(n);
             let keygen_rate = n as f64 / keygen_time.as_secs_f64();
             let signing_rate = n as f64 / sign_time.as_secs_f64();
@@ -714,10 +725,7 @@ fn main() {
             // ── Ed25519: Individual verification ─────────────────────
             println!("[2/9] Ed25519 individual signature verification...");
             let individual_verify_rate = bench_individual_verify(&txs);
-            println!(
-                "  => {} verifies/sec",
-                format_rate(individual_verify_rate)
-            );
+            println!("  => {} verifies/sec", format_rate(individual_verify_rate));
             println!();
 
             // ── Ed25519: Batch verification ──────────────────────────
@@ -750,8 +758,12 @@ fn main() {
             println!();
 
             // ── ML-DSA-65: Generate quantum-proof transactions ───────
-            println!("[7/9] Generating {} ML-DSA-65 keypairs + signed transactions...", format_number(n));
-            let (ml_txs, ml_keypairs, ml_keygen_time, ml_sign_time) = generate_ml_dsa_transactions(n);
+            println!(
+                "[7/9] Generating {} ML-DSA-65 keypairs + signed transactions...",
+                format_number(n)
+            );
+            let (ml_txs, ml_keypairs, ml_keygen_time, ml_sign_time) =
+                generate_ml_dsa_transactions(n);
             let ml_dsa_keygen_rate = n as f64 / ml_keygen_time.as_secs_f64();
             let ml_dsa_signing_rate = n as f64 / ml_sign_time.as_secs_f64();
             println!(
@@ -769,7 +781,10 @@ fn main() {
             // ── ML-DSA-65: Batch verification ────────────────────────
             println!("[8/9] ML-DSA-65 batch verification (Rayon parallel)...");
             let ml_dsa_batch_verify_rate = bench_ml_dsa_batch_verify(&ml_txs);
-            println!("  => {} verifies/sec", format_rate(ml_dsa_batch_verify_rate));
+            println!(
+                "  => {} verifies/sec",
+                format_rate(ml_dsa_batch_verify_rate)
+            );
             println!();
 
             // ── ML-DSA-65: Batch-verified block execution ────────────

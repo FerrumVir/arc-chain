@@ -350,7 +350,8 @@ pub async fn read_message<R: AsyncRead + Unpin>(
                 reader.read_exact(&mut discard).await?;
                 tracing::debug!(
                     "Skipped unknown message type 0x{:02x} ({} bytes) - peer may be newer version",
-                    type_byte, len
+                    type_byte,
+                    len
                 );
             }
         }

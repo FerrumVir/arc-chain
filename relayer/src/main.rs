@@ -76,8 +76,7 @@ async fn main() -> Result<()> {
     info!("ARC Chain Bridge Relayer starting");
     info!(config_path = %cli.config.display(), "loading configuration");
 
-    let config = RelayerConfig::from_file(&cli.config)
-        .context("failed to load config")?;
+    let config = RelayerConfig::from_file(&cli.config).context("failed to load config")?;
     config.validate()?;
 
     info!(

@@ -168,7 +168,10 @@ impl SessionKeyManager {
         *hasher.finalize().as_bytes()
     }
 
-    fn find_key_mut(&mut self, key_id: &[u8; 32]) -> Result<&mut ManagedSessionKey, SessionKeyError> {
+    fn find_key_mut(
+        &mut self,
+        key_id: &[u8; 32],
+    ) -> Result<&mut ManagedSessionKey, SessionKeyError> {
         self.active_keys
             .iter_mut()
             .find(|k| k.key_id == *key_id)
@@ -283,7 +286,10 @@ impl SessionKeyManager {
 
         // Check function selector whitelist.
         if !key.permissions.allowed_functions.is_empty()
-            && !key.permissions.allowed_functions.contains(&function_selector)
+            && !key
+                .permissions
+                .allowed_functions
+                .contains(&function_selector)
         {
             return Err(SessionKeyError::FunctionNotAllowed);
         }
@@ -390,7 +396,9 @@ impl SessionKeyManager {
             if k.status == SessionKeyStatus::Active && now >= k.expires_at {
                 // This key expired; don't retain.
                 false
-            } else { k.status != SessionKeyStatus::Expired }
+            } else {
+                k.status != SessionKeyStatus::Expired
+            }
         });
         before - self.active_keys.len()
     }
@@ -588,9 +596,7 @@ mod tests {
             max_gas_per_tx: 500_000,
             rate_limit: None,
         };
-        let kid = mgr
-            .create_key(addr(20), perms, 86400, "k1".into())
-            .unwrap();
+        let kid = mgr.create_key(addr(20), perms, 86400, "k1".into()).unwrap();
 
         mgr.record_usage(kid, 1000, 21_000, 10).unwrap();
         assert_eq!(mgr.active_keys[0].usage.tx_count, 1);

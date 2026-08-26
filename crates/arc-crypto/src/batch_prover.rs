@@ -240,7 +240,8 @@ impl BatchProver {
         // Compute a verification tag and verify.
         let verify_start = Instant::now();
         let verify_tag = compute_verify_tag(&task.circuit_id, &task.public_inputs, &proof);
-        let verified = verify_mock_proof(&task.circuit_id, &task.public_inputs, &proof, &verify_tag);
+        let verified =
+            verify_mock_proof(&task.circuit_id, &task.public_inputs, &proof, &verify_tag);
         let verify_elapsed = verify_start.elapsed().as_millis() as u64;
 
         let status = if verified {
@@ -460,7 +461,10 @@ mod tests {
 
         let proof1 = generate_mock_proof(&t1);
         let proof2 = generate_mock_proof(&t2);
-        assert_ne!(proof1, proof2, "different inputs must produce different proofs");
+        assert_ne!(
+            proof1, proof2,
+            "different inputs must produce different proofs"
+        );
     }
 
     #[test]

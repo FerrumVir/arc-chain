@@ -318,11 +318,7 @@ impl RpcRequest {
     /// `arc_getBalance` for the given address.
     pub fn get_balance(address: [u8; 32]) -> Self {
         let addr_hex = serde_json::Value::String(hex::encode(address));
-        Self::new(
-            "arc_getBalance",
-            RpcParams::Array(vec![addr_hex]),
-            1,
-        )
+        Self::new("arc_getBalance", RpcParams::Array(vec![addr_hex]), 1)
     }
 
     /// `arc_getBlock` by height.
@@ -334,11 +330,7 @@ impl RpcRequest {
     /// `arc_sendTransaction` with a raw signed transaction.
     pub fn send_transaction(raw_tx: Vec<u8>) -> Self {
         let tx_hex = serde_json::Value::String(hex::encode(raw_tx));
-        Self::new(
-            "arc_sendTransaction",
-            RpcParams::Array(vec![tx_hex]),
-            1,
-        )
+        Self::new("arc_sendTransaction", RpcParams::Array(vec![tx_hex]), 1)
     }
 }
 

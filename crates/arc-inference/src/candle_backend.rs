@@ -76,7 +76,8 @@ impl GgufEngine {
         // Hashing the full multi-GB file is too slow for startup, but sampling
         // both ends catches corrupted/tampered weight data that a header-only
         // hash would miss.
-        let file_size = file.metadata()
+        let file_size = file
+            .metadata()
             .map_err(|e| InferenceError::Runtime(format!("Failed to stat {path}: {e}")))?
             .len();
 
@@ -93,8 +94,9 @@ impl GgufEngine {
             file.seek(std::io::SeekFrom::Start(tail_offset as u64))
                 .map_err(|e| InferenceError::Runtime(format!("Failed to seek {path}: {e}")))?;
             let mut tail_buf = vec![0u8; tail_size];
-            file.read_exact(&mut tail_buf)
-                .map_err(|e| InferenceError::Runtime(format!("Failed to read tail of {path}: {e}")))?;
+            file.read_exact(&mut tail_buf).map_err(|e| {
+                InferenceError::Runtime(format!("Failed to read tail of {path}: {e}"))
+            })?;
             header_buf.extend_from_slice(&tail_buf);
         }
 
@@ -122,12 +124,15 @@ impl GgufEngine {
             "GGUF model loaded successfully"
         );
 
-        self.models.insert(model_id.0, LoadedGgufModel {
-            path: path.to_string(),
-            model_id,
-            model,
-            vocab_size,
-        });
+        self.models.insert(
+            model_id.0,
+            LoadedGgufModel {
+                path: path.to_string(),
+                model_id,
+                model,
+                vocab_size,
+            },
+        );
 
         Ok(model_id)
     }
@@ -157,7 +162,9 @@ impl GgufEngine {
 
         let start = std::time::Instant::now();
 
-        let mut model_ref = self.models.get_mut(&model_id.0)
+        let mut model_ref = self
+            .models
+            .get_mut(&model_id.0)
             .ok_or_else(|| InferenceError::ModelNotFound(hex::encode(&model_id.0[..8])))?;
 
         let device = Device::Cpu;
@@ -185,25 +192,31 @@ impl GgufEngine {
                     .map_err(|e| InferenceError::Runtime(format!("Unsqueeze: {e}")))?
             };
 
-            let _seq_len = context.dim(1)
+            let _seq_len = context
+                .dim(1)
                 .map_err(|e| InferenceError::Runtime(format!("Dim: {e}")))?;
 
             // Forward pass through quantized transformer
-            let logits = model_ref.model.forward(&context, i as usize)
+            let logits = model_ref
+                .model
+                .forward(&context, i as usize)
                 .map_err(|e| InferenceError::Runtime(format!("Forward: {e}")))?;
 
             // Get logits for last position
-            let logits = logits.squeeze(0)
+            let logits = logits
+                .squeeze(0)
                 .map_err(|e| InferenceError::Runtime(format!("Squeeze: {e}")))?;
             let last_logits = if logits.dims().len() == 2 {
-                logits.get(logits.dim(0).unwrap() - 1)
+                logits
+                    .get(logits.dim(0).unwrap() - 1)
                     .map_err(|e| InferenceError::Runtime(format!("Get: {e}")))?
             } else {
                 logits
             };
 
             // Argmax (deterministic: lowest index wins on tie)
-            let next_token = last_logits.argmax(0)
+            let next_token = last_logits
+                .argmax(0)
                 .map_err(|e| InferenceError::Runtime(format!("Argmax: {e}")))?
                 .to_scalar::<u32>()
                 .map_err(|e| InferenceError::Runtime(format!("Scalar: {e}")))?;
@@ -227,7 +240,8 @@ impl GgufEngine {
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         // Serialize output as bytes for hashing
-        let output_bytes: Vec<u8> = generated_tokens.iter()
+        let output_bytes: Vec<u8> = generated_tokens
+            .iter()
             .flat_map(|t| t.to_le_bytes())
             .collect();
         let output_hash = arc_crypto::hash_bytes(&output_bytes);
@@ -267,7 +281,8 @@ impl GgufEngine {
     /// List loaded models.
     #[cfg(feature = "candle")]
     pub fn loaded_models(&self) -> Vec<(Hash256, String)> {
-        self.models.iter()
+        self.models
+            .iter()
             .map(|entry| {
                 let model = entry.value();
                 (model.model_id, model.path.clone())

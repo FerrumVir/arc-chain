@@ -33,8 +33,7 @@ pub enum MemoryModel {
 /// NVIDIA (128B L1 cache line). All fields are fixed-size for direct memcpy
 /// into GPU storage buffers.
 #[repr(C)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub struct GpuAccountRepr {
     pub address: [u8; 32],      // 32
     pub balance: u64,           // 8
@@ -42,13 +41,12 @@ pub struct GpuAccountRepr {
     pub code_hash: [u8; 32],    // 32
     pub storage_root: [u8; 32], // 32
     pub staked_balance: u64,    // 8
-    pub _padding: [u8; 8],     // 8  → total = 128
+    pub _padding: [u8; 8],      // 8  → total = 128
 }
 
 // Safety: GpuAccountRepr is #[repr(C)], all fields are plain data, no padding gaps.
 unsafe impl bytemuck::Pod for GpuAccountRepr {}
 unsafe impl bytemuck::Zeroable for GpuAccountRepr {}
-
 
 /// Size of one account slot in bytes.
 pub const ACCOUNT_SLOT_SIZE: usize = std::mem::size_of::<GpuAccountRepr>(); // 128
@@ -97,17 +95,18 @@ impl GpuAccountBuffer {
             ..Default::default()
         });
 
-        let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        })) {
-            Ok(a) => a,
-            Err(_) => {
-                info!("No GPU adapter found, using CPU-only backing for state cache");
-                return Ok(Self::cpu_only(max_accounts));
-            }
-        };
+        let adapter =
+            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                force_fallback_adapter: false,
+                compatible_surface: None,
+            })) {
+                Ok(a) => a,
+                Err(_) => {
+                    info!("No GPU adapter found, using CPU-only backing for state cache");
+                    return Ok(Self::cpu_only(max_accounts));
+                }
+            };
 
         let gpu_info = adapter.get_info();
         let max_buf = adapter.limits().max_buffer_size;
@@ -121,30 +120,26 @@ impl GpuAccountBuffer {
             return Ok(Self::cpu_only(max_accounts));
         }
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("ARC GPU State"),
+            required_features: wgpu::Features::MAPPABLE_PRIMARY_BUFFERS,
+            required_limits: wgpu::Limits {
+                max_buffer_size: buf_size.max(wgpu::Limits::default().max_buffer_size),
+                ..wgpu::Limits::default()
+            },
+            ..Default::default()
+        }))
+        .or_else(|_| {
+            // Retry without MAPPABLE_PRIMARY_BUFFERS - discrete GPUs may not support it.
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                 label: Some("ARC GPU State"),
-                required_features: wgpu::Features::MAPPABLE_PRIMARY_BUFFERS,
+                required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits {
                     max_buffer_size: buf_size.max(wgpu::Limits::default().max_buffer_size),
                     ..wgpu::Limits::default()
                 },
                 ..Default::default()
-            },
-        ))
-        .or_else(|_| {
-            // Retry without MAPPABLE_PRIMARY_BUFFERS - discrete GPUs may not support it.
-            pollster::block_on(adapter.request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("ARC GPU State"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits {
-                        max_buffer_size: buf_size.max(wgpu::Limits::default().max_buffer_size),
-                        ..wgpu::Limits::default()
-                    },
-                    ..Default::default()
-                },
-            ))
+            }))
         })
         .map_err(|e| crate::GpuError::DeviceError(e.to_string()))?;
 
@@ -296,7 +291,12 @@ impl GpuAccountBuffer {
     /// On discrete: writes to the staging buffer (call `sync_to_gpu()` to flush).
     /// On CPU-only: writes to the backing Vec.
     pub fn write_account(&self, slot: usize, account: &GpuAccountRepr) {
-        assert!(slot < self.capacity, "slot {} out of range (capacity {})", slot, self.capacity);
+        assert!(
+            slot < self.capacity,
+            "slot {} out of range (capacity {})",
+            slot,
+            self.capacity
+        );
         let offset = slot * ACCOUNT_SLOT_SIZE;
         let bytes = bytemuck::bytes_of(account);
 
@@ -320,7 +320,11 @@ impl GpuAccountBuffer {
                     // Vec is behind a shared ref, but we guarantee non-overlapping slot writes.
                     let ptr = backing.as_ptr() as *mut u8;
                     unsafe {
-                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), ACCOUNT_SLOT_SIZE);
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            ptr.add(offset),
+                            ACCOUNT_SLOT_SIZE,
+                        );
                     }
                 }
             }
@@ -337,7 +341,12 @@ impl GpuAccountBuffer {
     /// On discrete: reads from staging buffer (call `sync_from_gpu()` first if GPU modified data).
     /// On CPU-only: reads from the backing Vec.
     pub fn read_account(&self, slot: usize) -> GpuAccountRepr {
-        assert!(slot < self.capacity, "slot {} out of range (capacity {})", slot, self.capacity);
+        assert!(
+            slot < self.capacity,
+            "slot {} out of range (capacity {})",
+            slot,
+            self.capacity
+        );
         let offset = slot * ACCOUNT_SLOT_SIZE;
         let byte_len = ACCOUNT_SLOT_SIZE as u64;
 
@@ -475,9 +484,12 @@ impl GpuAccountBuffer {
         if self.memory_model != MemoryModel::ManagedDiscrete {
             return;
         }
-        if let (Some(device), Some(queue), Some(staging), Some(storage)) =
-            (&self.device, &self.queue, &self.staging_buffer, &self.gpu_buffer)
-        {
+        if let (Some(device), Some(queue), Some(staging), Some(storage)) = (
+            &self.device,
+            &self.queue,
+            &self.staging_buffer,
+            &self.gpu_buffer,
+        ) {
             let buf_size = (self.capacity * ACCOUNT_SLOT_SIZE) as u64;
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("GPU state sync → device"),
@@ -495,9 +507,12 @@ impl GpuAccountBuffer {
         if self.memory_model != MemoryModel::ManagedDiscrete {
             return;
         }
-        if let (Some(device), Some(queue), Some(storage), Some(staging)) =
-            (&self.device, &self.queue, &self.gpu_buffer, &self.staging_buffer)
-        {
+        if let (Some(device), Some(queue), Some(storage), Some(staging)) = (
+            &self.device,
+            &self.queue,
+            &self.gpu_buffer,
+            &self.staging_buffer,
+        ) {
             let buf_size = (self.capacity * ACCOUNT_SLOT_SIZE) as u64;
             let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("GPU state sync → host"),
@@ -561,9 +576,10 @@ impl Drop for GpuAccountBuffer {
         // Best-effort zeroing on drop (secure_shutdown is preferred).
         // We can't do async map here, but queue.write_buffer is synchronous-enough.
         if self.memory_model == MemoryModel::CpuOnly
-            && let Some(ref mut backing) = self.cpu_backing {
-                backing.fill(0);
-            }
+            && let Some(ref mut backing) = self.cpu_backing
+        {
+            backing.fill(0);
+        }
     }
 }
 

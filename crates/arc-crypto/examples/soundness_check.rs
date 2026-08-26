@@ -34,7 +34,10 @@ fn main() {
     let output = dense_forward_i64(&weights, &bias, &input, in_size, out_size);
 
     println!("=== Dense layer AIR soundness check ===");
-    println!("Layer: {out_size}x{in_size} = {} MACs\n", in_size * out_size);
+    println!(
+        "Layer: {out_size}x{in_size} = {} MACs\n",
+        in_size * out_size
+    );
 
     // ── 1. Honest proof ─────────────────────────────────────────────────
     print!("1. Honest output                    ... ");

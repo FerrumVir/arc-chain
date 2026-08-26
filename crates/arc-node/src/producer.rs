@@ -12,12 +12,11 @@ const BLOCK_INTERVAL_MS: u64 = 100; // 10 blocks/sec
 
 /// Run the block producer loop.
 /// Drains the mempool every BLOCK_INTERVAL_MS and produces a block.
-pub async fn run_block_producer(
-    state: Arc<StateDB>,
-    mempool: Arc<Mempool>,
-    producer: Hash256,
-) {
-    info!("Block producer started (interval={}ms, max_txs={})", BLOCK_INTERVAL_MS, MAX_TXS_PER_BLOCK);
+pub async fn run_block_producer(state: Arc<StateDB>, mempool: Arc<Mempool>, producer: Hash256) {
+    info!(
+        "Block producer started (interval={}ms, max_txs={})",
+        BLOCK_INTERVAL_MS, MAX_TXS_PER_BLOCK
+    );
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_millis(BLOCK_INTERVAL_MS)).await;

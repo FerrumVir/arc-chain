@@ -26,8 +26,8 @@
 //! Usage:
 //!   arc-bench-mixed [--txs 100000] [--batch-size 10000] [--threads 0]
 
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_crypto::Hash256;
+use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_node::pipeline::{Pipeline, PipelineBatch};
 use arc_state::StateDB;
 use arc_types::Transaction;
@@ -80,30 +80,30 @@ impl SimTxType {
     /// ETH-equivalent gas cost weight relative to a simple transfer (1.0×).
     fn weight(self) -> f64 {
         match self {
-            Self::SimpleTransfer   =>  1.0,
-            Self::Erc20Transfer    =>  2.7,
-            Self::DexSwap          =>  6.0,
-            Self::NftOperation     =>  7.1,
+            Self::SimpleTransfer => 1.0,
+            Self::Erc20Transfer => 2.7,
+            Self::DexSwap => 6.0,
+            Self::NftOperation => 7.1,
             Self::LendingBorrowing => 13.1,
-            Self::MevBot           =>  4.8,
-            Self::Bridge           =>  3.8,
-            Self::ContractDeploy   => 61.9,
-            Self::Other            =>  3.8,
+            Self::MevBot => 4.8,
+            Self::Bridge => 3.8,
+            Self::ContractDeploy => 61.9,
+            Self::Other => 3.8,
         }
     }
 
     /// Gas equivalent.
     fn gas(self) -> u64 {
         match self {
-            Self::SimpleTransfer   =>    21_000,
-            Self::Erc20Transfer    =>    57_500,
-            Self::DexSwap          =>   125_000,
-            Self::NftOperation     =>   150_000,
-            Self::LendingBorrowing =>   275_000,
-            Self::MevBot           =>   100_000,
-            Self::Bridge           =>    80_000,
-            Self::ContractDeploy   => 1_300_000,
-            Self::Other            =>    80_000,
+            Self::SimpleTransfer => 21_000,
+            Self::Erc20Transfer => 57_500,
+            Self::DexSwap => 125_000,
+            Self::NftOperation => 150_000,
+            Self::LendingBorrowing => 275_000,
+            Self::MevBot => 100_000,
+            Self::Bridge => 80_000,
+            Self::ContractDeploy => 1_300_000,
+            Self::Other => 80_000,
         }
     }
 
@@ -112,30 +112,30 @@ impl SimTxType {
     /// so these are the ADDITIONAL ops on top of that baseline.
     fn extra_reads(self) -> usize {
         match self {
-            Self::SimpleTransfer   =>  0,  // baseline: 2 reads already
-            Self::Erc20Transfer    =>  2,  // 4 total - 2 baseline = 2 extra
-            Self::DexSwap          =>  6,  // 8 total - 2 baseline
-            Self::NftOperation     =>  4,  // 6 total - 2 baseline
-            Self::LendingBorrowing => 10,  // 12 total - 2 baseline
-            Self::MevBot           =>  4,  // ~6 reads total
-            Self::Bridge           =>  3,  // ~5 reads total
-            Self::ContractDeploy   => 48,  // 50 total - 2 baseline
-            Self::Other            =>  3,  // ~5 reads total
+            Self::SimpleTransfer => 0,    // baseline: 2 reads already
+            Self::Erc20Transfer => 2,     // 4 total - 2 baseline = 2 extra
+            Self::DexSwap => 6,           // 8 total - 2 baseline
+            Self::NftOperation => 4,      // 6 total - 2 baseline
+            Self::LendingBorrowing => 10, // 12 total - 2 baseline
+            Self::MevBot => 4,            // ~6 reads total
+            Self::Bridge => 3,            // ~5 reads total
+            Self::ContractDeploy => 48,   // 50 total - 2 baseline
+            Self::Other => 3,             // ~5 reads total
         }
     }
 
     /// Extra state writes to simulate this tx type's computational cost.
     fn extra_writes(self) -> usize {
         match self {
-            Self::SimpleTransfer   =>  0,  // baseline: 2 writes already
-            Self::Erc20Transfer    =>  1,  // 3 total - 2 baseline = 1 extra
-            Self::DexSwap          =>  4,  // 6 total - 2 baseline
-            Self::NftOperation     =>  3,  // 5 total - 2 baseline
-            Self::LendingBorrowing =>  6,  // 8 total - 2 baseline
-            Self::MevBot           =>  2,  // ~4 writes total
-            Self::Bridge           =>  1,  // ~3 writes total
-            Self::ContractDeploy   => 28,  // 30 total - 2 baseline
-            Self::Other            =>  1,  // ~3 writes total
+            Self::SimpleTransfer => 0,   // baseline: 2 writes already
+            Self::Erc20Transfer => 1,    // 3 total - 2 baseline = 1 extra
+            Self::DexSwap => 4,          // 6 total - 2 baseline
+            Self::NftOperation => 3,     // 5 total - 2 baseline
+            Self::LendingBorrowing => 6, // 8 total - 2 baseline
+            Self::MevBot => 2,           // ~4 writes total
+            Self::Bridge => 1,           // ~3 writes total
+            Self::ContractDeploy => 28,  // 30 total - 2 baseline
+            Self::Other => 1,            // ~3 writes total
         }
     }
 }
@@ -165,7 +165,7 @@ const ETH_WEIGHT_FACTOR: f64 = 3.93;
 fn assign_tx_type(index: usize) -> SimTxType {
     let bucket = (index % 1000) as u16;
     match bucket {
-        0..=379   => SimTxType::SimpleTransfer,
+        0..=379 => SimTxType::SimpleTransfer,
         380..=589 => SimTxType::Erc20Transfer,
         590..=739 => SimTxType::DexSwap,
         740..=819 => SimTxType::NftOperation,
@@ -173,7 +173,7 @@ fn assign_tx_type(index: usize) -> SimTxType {
         870..=909 => SimTxType::MevBot,
         910..=939 => SimTxType::Bridge,
         940..=944 => SimTxType::ContractDeploy,
-        _         => SimTxType::Other,
+        _ => SimTxType::Other,
     }
 }
 
@@ -211,18 +211,14 @@ fn format_gas(gas: f64) -> String {
 
 /// Pre-sign a batch of transfer transactions.
 /// Returns the signed transactions and genesis accounts to prefund.
-fn presign_transactions(
-    total_txs: usize,
-) -> (Vec<Transaction>, Vec<(Hash256, u64)>) {
+fn presign_transactions(total_txs: usize) -> (Vec<Transaction>, Vec<(Hash256, u64)>) {
     let sender_count = 10u8;
     let keypairs: Vec<_> = (0..sender_count)
         .map(|i| (benchmark_keypair(i), benchmark_address(i)))
         .collect();
 
     // Receiver addresses (don't overlap with senders)
-    let receivers: Vec<Hash256> = (200u8..=255)
-        .map(benchmark_address)
-        .collect();
+    let receivers: Vec<Hash256> = (200u8..=255).map(benchmark_address).collect();
 
     // Genesis: fund all senders generously, receivers start at 0
     let mut genesis: Vec<(Hash256, u64)> = keypairs
@@ -276,13 +272,8 @@ fn presign_transactions(
 ///
 /// Uses auxiliary accounts (addresses 100..199) so we do not interfere
 /// with the pipeline's own balance accounting.
-fn simulate_extra_state_ops(
-    state: &StateDB,
-    tx_types: &[SimTxType],
-) {
-    let aux_addrs: Vec<Hash256> = (100u8..200)
-        .map(benchmark_address)
-        .collect();
+fn simulate_extra_state_ops(state: &StateDB, tx_types: &[SimTxType]) {
+    let aux_addrs: Vec<Hash256> = (100u8..200).map(benchmark_address).collect();
     let storage_contract = benchmark_address(100);
 
     for (i, &sim_type) in tx_types.iter().enumerate() {
@@ -323,15 +314,15 @@ fn compute_mix_stats(tx_types: &[SimTxType]) -> MixStats {
 
     for &t in tx_types {
         let idx = match t {
-            SimTxType::SimpleTransfer   => 0,
-            SimTxType::Erc20Transfer    => 1,
-            SimTxType::DexSwap          => 2,
-            SimTxType::NftOperation     => 3,
+            SimTxType::SimpleTransfer => 0,
+            SimTxType::Erc20Transfer => 1,
+            SimTxType::DexSwap => 2,
+            SimTxType::NftOperation => 3,
             SimTxType::LendingBorrowing => 4,
-            SimTxType::MevBot           => 5,
-            SimTxType::Bridge           => 6,
-            SimTxType::ContractDeploy   => 7,
-            SimTxType::Other            => 8,
+            SimTxType::MevBot => 5,
+            SimTxType::Bridge => 6,
+            SimTxType::ContractDeploy => 7,
+            SimTxType::Other => 8,
         };
         counts[idx] += 1;
         total_gas += t.gas();
@@ -362,15 +353,15 @@ fn compute_mix_stats(tx_types: &[SimTxType]) -> MixStats {
 
 fn type_name(t: SimTxType) -> &'static str {
     match t {
-        SimTxType::SimpleTransfer   => "Simple transfer",
-        SimTxType::Erc20Transfer    => "ERC-20 transfer",
-        SimTxType::DexSwap          => "DEX swap",
-        SimTxType::NftOperation     => "NFT operation",
+        SimTxType::SimpleTransfer => "Simple transfer",
+        SimTxType::Erc20Transfer => "ERC-20 transfer",
+        SimTxType::DexSwap => "DEX swap",
+        SimTxType::NftOperation => "NFT operation",
         SimTxType::LendingBorrowing => "Lending/borrowing",
-        SimTxType::MevBot           => "MEV bot",
-        SimTxType::Bridge           => "Bridge",
-        SimTxType::ContractDeploy   => "Contract deploy",
-        SimTxType::Other            => "Other",
+        SimTxType::MevBot => "MEV bot",
+        SimTxType::Bridge => "Bridge",
+        SimTxType::ContractDeploy => "Contract deploy",
+        SimTxType::Other => "Other",
     }
 }
 
@@ -378,10 +369,7 @@ fn type_name(t: SimTxType) -> &'static str {
 // Run transfer-only baseline
 // ---------------------------------------------------------------------------
 
-fn run_transfer_only(
-    total_txs: usize,
-    batch_size: usize,
-) -> (usize, usize, Duration) {
+fn run_transfer_only(total_txs: usize, batch_size: usize) -> (usize, usize, Duration) {
     let (transactions, genesis) = presign_transactions(total_txs);
     let state = Arc::new(StateDB::with_genesis(&genesis));
     let pipeline = Pipeline::new(Arc::clone(&state));
@@ -531,7 +519,10 @@ fn main() {
     println!("  WHY ETH-WEIGHTED TPS:");
     println!("    Raw TPS counts every tx equally, but a DEX swap is 6x");
     println!("    heavier than a simple transfer.  ETH-weighted TPS divides");
-    println!("    by the composite weight factor ({:.2}x) to give a fair", ETH_WEIGHT_FACTOR);
+    println!(
+        "    by the composite weight factor ({:.2}x) to give a fair",
+        ETH_WEIGHT_FACTOR
+    );
     println!("    comparison to Ethereum's gas-based throughput.");
     println!();
     println!("  System:");
@@ -552,12 +543,17 @@ fn main() {
     let _sign_time = sign_start.elapsed();
     let tf_tps = tf_processed as f64 / tf_elapsed.as_secs_f64();
 
-    println!("    Processed:         {} / {} submitted", tf_processed, args.txs);
+    println!(
+        "    Processed:         {} / {} submitted",
+        tf_processed, args.txs
+    );
     println!("    Successful:        {}", tf_success);
     println!("    Pipeline time:     {:.2}s", tf_elapsed.as_secs_f64());
     println!("    Raw TPS:           {}", format_tps(tf_tps));
-    println!("    Gas throughput:    {} gas/sec (at 21,000 gas each)",
-        format_gas(tf_tps * 21_000.0));
+    println!(
+        "    Gas throughput:    {} gas/sec (at 21,000 gas each)",
+        format_gas(tf_tps * 21_000.0)
+    );
     println!();
 
     // ── Phase 2: Mixed workload ──────────────────────────────────────────
@@ -575,20 +571,23 @@ fn main() {
     let stats = compute_mix_stats(&tx_types);
 
     println!("  Transaction Mix:");
-    println!("    {:<20} {:>7} {:>7}  {:>6}  {:>6}  {:>8}",
-        "Type", "Count", "Pct", "Weight", "Reads", "Writes");
+    println!(
+        "    {:<20} {:>7} {:>7}  {:>6}  {:>6}  {:>8}",
+        "Type", "Count", "Pct", "Weight", "Reads", "Writes"
+    );
     println!("    {}", "-".repeat(62));
     for (sim_type, count) in &stats.counts {
         let pct = (*count as f64 / stats.total as f64) * 100.0;
-        println!("    {:<20} {:>7} {:>6.1}%  {:>5.1}x  {:>3}+{:<3}  {:>3}+{:<3}",
+        println!(
+            "    {:<20} {:>7} {:>6.1}%  {:>5.1}x  {:>3}+{:<3}  {:>3}+{:<3}",
             type_name(*sim_type),
             count,
             pct,
             sim_type.weight(),
-            2 + sim_type.extra_reads(),   // total reads
-            2 + sim_type.extra_writes(),  // total writes
-            sim_type.extra_reads(),       // extra reads
-            sim_type.extra_writes(),      // extra writes
+            2 + sim_type.extra_reads(),  // total reads
+            2 + sim_type.extra_writes(), // total writes
+            sim_type.extra_reads(),      // extra reads
+            sim_type.extra_writes(),     // extra writes
         );
     }
     println!();
@@ -600,15 +599,27 @@ fn main() {
     println!("  Extra state operations (beyond baseline transfers):");
     println!("    Additional reads:  {}", total_extra_reads);
     println!("    Additional writes: {}", total_extra_writes);
-    println!("    Actual weight:     {:.2}x (expected {:.2}x)", actual_weight, ETH_WEIGHT_FACTOR);
+    println!(
+        "    Actual weight:     {:.2}x (expected {:.2}x)",
+        actual_weight, ETH_WEIGHT_FACTOR
+    );
     println!();
 
     println!("  Results:");
-    println!("    Processed:         {} / {} submitted", mx_processed, args.txs);
+    println!(
+        "    Processed:         {} / {} submitted",
+        mx_processed, args.txs
+    );
     println!("    Successful:        {}", mx_success);
     println!("    Pipeline time:     {:.2}s", mx_elapsed.as_secs_f64());
-    println!("    Total gas:         {}", format_gas(stats.total_gas as f64));
-    println!("    Gas throughput:    {} gas/sec", format_gas(stats.total_gas as f64 / mx_elapsed.as_secs_f64()));
+    println!(
+        "    Total gas:         {}",
+        format_gas(stats.total_gas as f64)
+    );
+    println!(
+        "    Gas throughput:    {} gas/sec",
+        format_gas(stats.total_gas as f64 / mx_elapsed.as_secs_f64())
+    );
     println!();
 
     // ── Phase 3: Comparison ──────────────────────────────────────────────
@@ -616,19 +627,41 @@ fn main() {
     println!("  RESULTS COMPARISON");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
-    println!("                        {:>12}  {:>12}", "Transfer-only", "Mixed");
+    println!(
+        "                        {:>12}  {:>12}",
+        "Transfer-only", "Mixed"
+    );
     println!("    {}", "-".repeat(42));
-    println!("    Raw TPS:            {:>12}  {:>12}", format_tps(tf_tps), format_tps(mx_raw_tps));
-    println!("    ETH-weighted TPS:   {:>12}  {:>12}",
-        format_tps(tf_tps),  // transfers are 1.0x weight, so same
-        format_tps(mx_weighted_tps));
-    println!("    Pipeline time:      {:>11.2}s  {:>11.2}s",
-        tf_elapsed.as_secs_f64(), mx_elapsed.as_secs_f64());
+    println!(
+        "    Raw TPS:            {:>12}  {:>12}",
+        format_tps(tf_tps),
+        format_tps(mx_raw_tps)
+    );
+    println!(
+        "    ETH-weighted TPS:   {:>12}  {:>12}",
+        format_tps(tf_tps), // transfers are 1.0x weight, so same
+        format_tps(mx_weighted_tps)
+    );
+    println!(
+        "    Pipeline time:      {:>11.2}s  {:>11.2}s",
+        tf_elapsed.as_secs_f64(),
+        mx_elapsed.as_secs_f64()
+    );
     println!();
 
-    let slowdown = if mx_raw_tps > 0.0 { tf_tps / mx_raw_tps } else { f64::INFINITY };
-    println!("    Mixed workload overhead: {:.1}x slowdown vs transfer-only", slowdown);
-    println!("    ETH weight factor:       {:.2}x (gas-weighted tx complexity)", ETH_WEIGHT_FACTOR);
+    let slowdown = if mx_raw_tps > 0.0 {
+        tf_tps / mx_raw_tps
+    } else {
+        f64::INFINITY
+    };
+    println!(
+        "    Mixed workload overhead: {:.1}x slowdown vs transfer-only",
+        slowdown
+    );
+    println!(
+        "    ETH weight factor:       {:.2}x (gas-weighted tx complexity)",
+        ETH_WEIGHT_FACTOR
+    );
     println!();
 
     // ── Ethereum comparison ──────────────────────────────────────────────
@@ -640,15 +673,30 @@ fn main() {
     println!("  ETHEREUM COMPARISON");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
-    println!("    Ethereum L1:            ~{} TPS / ~{}  gas/sec",
-        format_tps(eth_tps), format_gas(eth_gas_per_sec));
-    println!("    ARC (transfer-only):     {} TPS / {} gas/sec",
-        format_tps(tf_tps), format_gas(tf_tps * 21_000.0));
-    println!("    ARC (mixed workload):    {} TPS / {} gas/sec",
-        format_tps(mx_weighted_tps), format_gas(arc_gas_per_sec));
+    println!(
+        "    Ethereum L1:            ~{} TPS / ~{}  gas/sec",
+        format_tps(eth_tps),
+        format_gas(eth_gas_per_sec)
+    );
+    println!(
+        "    ARC (transfer-only):     {} TPS / {} gas/sec",
+        format_tps(tf_tps),
+        format_gas(tf_tps * 21_000.0)
+    );
+    println!(
+        "    ARC (mixed workload):    {} TPS / {} gas/sec",
+        format_tps(mx_weighted_tps),
+        format_gas(arc_gas_per_sec)
+    );
     println!();
-    println!("    ARC vs ETH (weighted):   {:.0}x faster", mx_weighted_tps / eth_tps);
-    println!("    ARC vs ETH (gas/sec):    {:.0}x faster", arc_gas_per_sec / eth_gas_per_sec);
+    println!(
+        "    ARC vs ETH (weighted):   {:.0}x faster",
+        mx_weighted_tps / eth_tps
+    );
+    println!(
+        "    ARC vs ETH (gas/sec):    {:.0}x faster",
+        arc_gas_per_sec / eth_gas_per_sec
+    );
     println!();
 
     // ── Honesty report ───────────────────────────────────────────────────

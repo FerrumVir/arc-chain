@@ -10,10 +10,10 @@
 //!
 //! Parallel via Rayon: each beam element expanded independently.
 
+use super::enumerate::*;
+use crate::Grid;
 use rayon::prelude::*;
 use std::collections::HashSet;
-use crate::Grid;
-use super::enumerate::*;
 
 /// Result of a successful search.
 #[derive(Clone, Debug)]
@@ -26,9 +26,9 @@ pub struct SearchResult {
 
 /// Beam search parameters.
 pub struct BeamConfig {
-    pub beam_width: usize,      // how many partial programs to keep per depth
-    pub max_depth: usize,       // maximum program depth
-    pub timeout_ms: u64,        // wall-clock timeout
+    pub beam_width: usize, // how many partial programs to keep per depth
+    pub max_depth: usize,  // maximum program depth
+    pub timeout_ms: u64,   // wall-clock timeout
 }
 
 impl Default for BeamConfig {
@@ -62,15 +62,29 @@ pub fn beam_search_steered(
     config: &BeamConfig,
     steering: Option<&super::steering::SteeringModel>,
 ) -> Option<SearchResult> {
-    if train_pairs.is_empty() { return None; }
+    if train_pairs.is_empty() {
+        return None;
+    }
 
     let start = std::time::Instant::now();
 
     // Collect colors from all training grids
     let mut colors: Vec<u8> = Vec::new();
     for (inp, out) in train_pairs {
-        for row in inp { for &c in row { if !colors.contains(&c) { colors.push(c); } } }
-        for row in out { for &c in row { if !colors.contains(&c) { colors.push(c); } } }
+        for row in inp {
+            for &c in row {
+                if !colors.contains(&c) {
+                    colors.push(c);
+                }
+            }
+        }
+        for row in out {
+            for &c in row {
+                if !colors.contains(&c) {
+                    colors.push(c);
+                }
+            }
+        }
     }
     colors.sort();
 
@@ -100,7 +114,8 @@ pub fn beam_search_steered(
         }
 
         // Expand all beam elements in parallel
-        let new_candidates: Vec<PartialProgram> = beam.par_iter()
+        let new_candidates: Vec<PartialProgram> = beam
+            .par_iter()
             .flat_map(|partial| {
                 let mut expansions = Vec::new();
 
@@ -120,9 +135,11 @@ pub fn beam_search_steered(
                     let mut ordered: Vec<usize> = Vec::new();
                     for (name, _score) in &scores {
                         for (idx, prim) in catalog.iter().enumerate() {
-                            if ordered.contains(&idx) { continue; }
-                            let matches = prim.name == name.as_str()
-                                || matches_hodel_name(prim.name, name);
+                            if ordered.contains(&idx) {
+                                continue;
+                            }
+                            let matches =
+                                prim.name == name.as_str() || matches_hodel_name(prim.name, name);
                             if matches {
                                 ordered.push(idx);
                             }
@@ -144,9 +161,10 @@ pub fn beam_search_steered(
                     // Type check: does this primitive accept the current type?
                     if prim.input_types.len() == 1 && prim.input_types[0] == partial.current_type {
                         let args = vec![partial.current_value.clone()];
-                        let apply_result = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| (prim.apply)(&args))
-                        );
+                        let apply_result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                (prim.apply)(&args)
+                            }));
                         if let Ok(Some(result)) = apply_result {
                             let fitness = if let DagValue::Grid(ref g) = result {
                                 compute_fitness(g, target_output)
@@ -182,13 +200,16 @@ pub fn beam_search_steered(
                             partial.current_value.clone(),
                             DagValue::Grid(train_pairs[0].0.clone()),
                         ];
-                        let apply_result = std::panic::catch_unwind(
-                            std::panic::AssertUnwindSafe(|| (prim.apply)(&args))
-                        );
+                        let apply_result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                (prim.apply)(&args)
+                            }));
                         if let Ok(Some(result)) = apply_result {
                             let fitness = if let DagValue::Grid(ref g) = result {
                                 compute_fitness(g, target_output)
-                            } else { 0.0 };
+                            } else {
+                                0.0
+                            };
 
                             let hash = match &result {
                                 DagValue::Grid(g) => quick_hash(g),
@@ -228,36 +249,38 @@ pub fn beam_search_steered(
         // Check for exact match (fitness = 1.0)
         for candidate in &deduped {
             if candidate.fitness >= 0.9999
-                && let DagValue::Grid(ref result_grid) = candidate.current_value {
-                    // Verify on ALL training pairs
-                    let all_match = verify_on_all_pairs(
-                        &candidate.steps, &catalog, train_pairs,
-                    );
-                    if all_match {
-                        // Apply to test inputs
-                        let test_output = apply_program(
-                            &candidate.steps, &catalog,
-                            &test_inputs[0],
-                        );
-                        if let Some(output) = test_output {
-                            return Some(SearchResult {
-                                program: candidate.steps.clone(),
-                                output,
-                                depth: depth + 1,
-                                fitness: 1.0,
-                            });
-                        }
+                && let DagValue::Grid(ref result_grid) = candidate.current_value
+            {
+                // Verify on ALL training pairs
+                let all_match = verify_on_all_pairs(&candidate.steps, &catalog, train_pairs);
+                if all_match {
+                    // Apply to test inputs
+                    let test_output = apply_program(&candidate.steps, &catalog, &test_inputs[0]);
+                    if let Some(output) = test_output {
+                        return Some(SearchResult {
+                            program: candidate.steps.clone(),
+                            output,
+                            depth: depth + 1,
+                            fitness: 1.0,
+                        });
                     }
                 }
+            }
         }
 
         // Sort by fitness, keep top beam_width
-        deduped.sort_by(|a, b| b.fitness.partial_cmp(&a.fitness).unwrap_or(std::cmp::Ordering::Equal));
+        deduped.sort_by(|a, b| {
+            b.fitness
+                .partial_cmp(&a.fitness)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         deduped.truncate(config.beam_width);
 
         beam = deduped;
 
-        if beam.is_empty() { break; }
+        if beam.is_empty() {
+            break;
+        }
     }
 
     None
@@ -279,11 +302,7 @@ fn verify_on_all_pairs(
 }
 
 /// Apply a program (sequence of primitive names) to an input grid.
-fn apply_program(
-    steps: &[&'static str],
-    catalog: &[TypedPrimitive],
-    input: &Grid,
-) -> Option<Grid> {
+fn apply_program(steps: &[&'static str], catalog: &[TypedPrimitive], input: &Grid) -> Option<Grid> {
     let mut current = DagValue::Grid(input.clone());
 
     for &step_name in steps {
@@ -315,7 +334,9 @@ fn matches_hodel_name(catalog_name: &str, hodel_name: &str) -> bool {
         "objects" => catalog_name.starts_with("obj_"),
         "replace" => catalog_name.starts_with("replace_"),
         "switch" => catalog_name.starts_with("switch_"),
-        "fill" => catalog_name.starts_with("fill_idx_") || catalog_name.starts_with("underfill_idx_"),
+        "fill" => {
+            catalog_name.starts_with("fill_idx_") || catalog_name.starts_with("underfill_idx_")
+        }
         "ofcolor" => catalog_name.starts_with("ofcolor_"),
         "paint" => catalog_name.starts_with("paint_all_") || catalog_name == "cover",
         "upscale" => catalog_name.starts_with("upscale_"),
@@ -450,10 +471,12 @@ fn exhaustive_dfs(
     for prim in catalog {
         // Amortized timeout check: every 5,000 iterations
         let count = EXHAUST_ITER_COUNT.fetch_add(1, Ordering::Relaxed);
-        if count.is_multiple_of(5_000) && count > 0
-            && start.elapsed().as_millis() as u64 > timeout_ms {
-                return None;
-            }
+        if count.is_multiple_of(5_000)
+            && count > 0
+            && start.elapsed().as_millis() as u64 > timeout_ms
+        {
+            return None;
+        }
 
         // Type check: unary or binary
         let accepts = (prim.input_types.len() == 1 && prim.input_types[0] == *current_type)
@@ -473,9 +496,7 @@ fn exhaustive_dfs(
         };
 
         // Apply with panic safety
-        let result = std::panic::catch_unwind(
-            std::panic::AssertUnwindSafe(|| (prim.apply)(&args)),
-        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (prim.apply)(&args)));
 
         let new_value = match result {
             Ok(Some(v)) => v,
@@ -564,7 +585,11 @@ mod tests {
         let result = beam_search(
             &[(input.clone(), output.clone())],
             &[input],
-            &BeamConfig { beam_width: 50, max_depth: 3, timeout_ms: 5000 },
+            &BeamConfig {
+                beam_width: 50,
+                max_depth: 3,
+                timeout_ms: 5000,
+            },
         );
 
         assert!(result.is_some());
@@ -581,7 +606,11 @@ mod tests {
         let result = beam_search(
             &[(input.clone(), output.clone())],
             &[input],
-            &BeamConfig { beam_width: 50, max_depth: 3, timeout_ms: 5000 },
+            &BeamConfig {
+                beam_width: 50,
+                max_depth: 3,
+                timeout_ms: 5000,
+            },
         );
 
         assert!(result.is_some());
@@ -598,12 +627,7 @@ mod tests {
         let input = vec![vec![1, 0], vec![0, 0]];
         let output = vec![vec![0, 1], vec![0, 0]];
 
-        let result = exhaustive_search(
-            &[(input.clone(), output.clone())],
-            &[input],
-            3,
-            5000,
-        );
+        let result = exhaustive_search(&[(input.clone(), output.clone())], &[input], 3, 5000);
 
         assert!(result.is_some());
         let r = result.unwrap();
@@ -616,12 +640,7 @@ mod tests {
         let input = vec![vec![1, 0, 2], vec![2, 1, 0]];
         let output = vec![vec![3, 0, 2], vec![2, 3, 0]];
 
-        let result = exhaustive_search(
-            &[(input.clone(), output.clone())],
-            &[input],
-            3,
-            5000,
-        );
+        let result = exhaustive_search(&[(input.clone(), output.clone())], &[input], 3, 5000);
 
         assert!(result.is_some());
         assert_eq!(result.unwrap().output, output);

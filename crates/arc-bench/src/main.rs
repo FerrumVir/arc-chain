@@ -16,9 +16,7 @@ use std::time::Instant;
 // ─────────────────────────────────────────────────────────────────────
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
@@ -105,7 +103,11 @@ fn main() {
             elapsed.as_secs_f64(),
         );
 
-        phase_results.push(("Phase 1: Single-core baseline", seq_tps, "1 core, 768B tx, sequential".into()));
+        phase_results.push((
+            "Phase 1: Single-core baseline",
+            seq_tps,
+            "1 core, 768B tx, sequential".into(),
+        ));
     }
     println!();
 
@@ -114,7 +116,10 @@ fn main() {
     // ═══════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 2: Multi-Core Parallel Execution (Rayon)");
-    println!("  ({} CPU cores, standard transactions, sender-sharded)", num_cores);
+    println!(
+        "  ({} CPU cores, standard transactions, sender-sharded)",
+        num_cores
+    );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // 2a: Parallel BLAKE3 throughput
@@ -124,7 +129,9 @@ fn main() {
             let mut buf = vec![0u8; 256];
             buf[..8].copy_from_slice(&(i as u64).to_le_bytes());
             for j in (8..256).step_by(8) {
-                let val = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(j as u64);
+                let val = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(j as u64);
                 buf[j..j + 8].copy_from_slice(&val.to_le_bytes());
             }
             buf
@@ -160,9 +167,8 @@ fn main() {
             .flat_map(|agent_id| {
                 let from = hash_bytes(&agent_id.to_le_bytes());
                 let to = hash_bytes(&((agent_id + 1) % num_agents).to_le_bytes());
-                (0..txs_per_agent as u64).map(move |nonce| {
-                    Transaction::new_transfer(from, to, 1, nonce)
-                })
+                (0..txs_per_agent as u64)
+                    .map(move |nonce| Transaction::new_transfer(from, to, 1, nonce))
             })
             .collect();
 
@@ -192,9 +198,8 @@ fn main() {
             .flat_map(|agent_id| {
                 let from = hash_bytes(&agent_id.to_le_bytes());
                 let to = hash_bytes(&((agent_id + 1) % num_agents).to_le_bytes());
-                (0..txs_per_agent as u64).map(move |nonce| {
-                    Transaction::new_transfer(from, to, 1, nonce)
-                })
+                (0..txs_per_agent as u64)
+                    .map(move |nonce| Transaction::new_transfer(from, to, 1, nonce))
             })
             .collect();
 
@@ -227,7 +232,11 @@ fn main() {
 
         phase2_full_tps
     };
-    phase_results.push(("Phase 2: Multi-core parallel", phase2_full_tps, format!("{} cores, 768B tx, Rayon sharded", num_cores)));
+    phase_results.push((
+        "Phase 2: Multi-core parallel",
+        phase2_full_tps,
+        format!("{} cores, 768B tx, Rayon sharded", num_cores),
+    ));
     println!();
 
     // ═══════════════════════════════════════════════════════════════
@@ -235,7 +244,10 @@ fn main() {
     // ═══════════════════════════════════════════════════════════════
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("  PHASE 3: Compact Transactions (250 bytes)");
-    println!("  ({} cores, 250-byte transactions, optimistic execution)", num_cores);
+    println!(
+        "  ({} cores, 250-byte transactions, optimistic execution)",
+        num_cores
+    );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // 3a: BLAKE3 throughput with compact 250-byte payloads
@@ -274,9 +286,8 @@ fn main() {
             .flat_map(|agent_id| {
                 let from = hash_bytes(&agent_id.to_le_bytes());
                 let to = hash_bytes(&((agent_id + 1) % num_agents).to_le_bytes());
-                (0..txs_per_agent as u64).map(move |nonce| {
-                    Transaction::new_transfer(from, to, 1, nonce)
-                })
+                (0..txs_per_agent as u64)
+                    .map(move |nonce| Transaction::new_transfer(from, to, 1, nonce))
             })
             .collect();
 
@@ -318,7 +329,11 @@ fn main() {
 
         phase3_tps
     };
-    phase_results.push(("Phase 3: Compact tx (250B)", phase3_tps, format!("{} cores, 250B tx, optimistic", num_cores)));
+    phase_results.push((
+        "Phase 3: Compact tx (250B)",
+        phase3_tps,
+        format!("{} cores, 250B tx, optimistic", num_cores),
+    ));
     println!();
 
     // ═══════════════════════════════════════════════════════════════
@@ -361,7 +376,11 @@ fn main() {
             phase4_tps = effective_tps;
         }
     }
-    phase_results.push(("Phase 4: Multi-node (128 nodes)", phase4_tps, "128 nodes, 250B tx, 88% efficiency".into()));
+    phase_results.push((
+        "Phase 4: Multi-node (128 nodes)",
+        phase4_tps,
+        "128 nodes, 250B tx, 88% efficiency".into(),
+    ));
     println!();
 
     // ═══════════════════════════════════════════════════════════════
@@ -373,9 +392,15 @@ fn main() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     let gpu_profile = estimate_gpu_throughput(compact_hash_tps);
-    println!("    Detected GPU:     {} ({})", gpu_profile.info.name, gpu_profile.info.backend);
+    println!(
+        "    Detected GPU:     {} ({})",
+        gpu_profile.info.name, gpu_profile.info.backend
+    );
     println!("    Compute cores:    {}", gpu_profile.compute_cores);
-    println!("    Memory BW:        {:.0} GB/s", gpu_profile.memory_bandwidth_gbps);
+    println!(
+        "    Memory BW:        {:.0} GB/s",
+        gpu_profile.memory_bandwidth_gbps
+    );
     println!();
 
     // 5a: Warm up GPU pipeline
@@ -385,7 +410,9 @@ fn main() {
             let mut buf = vec![0u8; 256];
             buf[..8].copy_from_slice(&(i as u64).to_le_bytes());
             for j in (8..256).step_by(8) {
-                let val = (i as u64).wrapping_mul(6364136223846793005).wrapping_add(j as u64);
+                let val = (i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(j as u64);
                 buf[j..j + 8].copy_from_slice(&val.to_le_bytes());
             }
             buf
@@ -399,7 +426,9 @@ fn main() {
     // 5b: Benchmark GPU hashing with increasing batch sizes
     let mut gpu_hash_tps = 0.0f64;
     for batch in [50_000usize, 100_000, 250_000, 500_000] {
-        if batch > n_gpu { break; }
+        if batch > n_gpu {
+            break;
+        }
         let batch_refs: Vec<&[u8]> = gpu_data[..batch].iter().map(|d| d.as_slice()).collect();
 
         let start = Instant::now();
@@ -409,7 +438,9 @@ fn main() {
         match result {
             Ok(hashes) => {
                 let tps = batch as f64 / elapsed.as_secs_f64();
-                if tps > gpu_hash_tps { gpu_hash_tps = tps; }
+                if tps > gpu_hash_tps {
+                    gpu_hash_tps = tps;
+                }
                 println!(
                     "    GPU BLAKE3 ({:>6}K, 256B):    {:>12.0} TPS  ({:.3}s, {} hashes)",
                     batch / 1000,
@@ -426,7 +457,10 @@ fn main() {
     }
 
     // 5c: CPU comparison at same batch size for direct comparison
-    let cpu_compare_refs: Vec<&[u8]> = gpu_data[..500_000.min(n_gpu)].iter().map(|d| d.as_slice()).collect();
+    let cpu_compare_refs: Vec<&[u8]> = gpu_data[..500_000.min(n_gpu)]
+        .iter()
+        .map(|d| d.as_slice())
+        .collect();
     let start = Instant::now();
     let _ = cpu_batch_commit(&cpu_compare_refs);
     let elapsed = start.elapsed();
@@ -438,10 +472,17 @@ fn main() {
         elapsed.as_secs_f64(),
     );
 
-    let gpu_speedup = if cpu_compare_tps > 0.0 { gpu_hash_tps / cpu_compare_tps } else { 1.0 };
+    let gpu_speedup = if cpu_compare_tps > 0.0 {
+        gpu_hash_tps / cpu_compare_tps
+    } else {
+        1.0
+    };
     println!();
     println!("    GPU vs CPU speedup:            {:>12.2}x", gpu_speedup);
-    println!("    Peak GPU hashing:              {:>12.0} TPS", gpu_hash_tps);
+    println!(
+        "    Peak GPU hashing:              {:>12.0} TPS",
+        gpu_hash_tps
+    );
 
     // For single-node TPS with GPU: hashing on GPU, execution on CPU
     // The pipeline TPS is limited by the slower of hashing vs execution
@@ -455,7 +496,10 @@ fn main() {
     } else {
         single_node_tps
     };
-    println!("    GPU pipeline (single node):    {:>12.0} TPS", gpu_single_node_tps);
+    println!(
+        "    GPU pipeline (single node):    {:>12.0} TPS",
+        gpu_single_node_tps
+    );
     println!();
 
     // Multi-node + GPU projections
@@ -470,13 +514,14 @@ fn main() {
     let mut phase5_tps = 0.0f64;
     for (nodes, label) in &gpu_cluster_configs {
         let effective = gpu_single_node_tps * (*nodes as f64) * network_efficiency;
-        let marker = if effective >= 1_000_000_000.0 { " <-- 1B+ TPS" } else { "" };
+        let marker = if effective >= 1_000_000_000.0 {
+            " <-- 1B+ TPS"
+        } else {
+            ""
+        };
         println!(
             "    {:>3} nodes - {:<24} {:>14.0} TPS{} ",
-            nodes,
-            label,
-            effective,
-            marker,
+            nodes, label, effective, marker,
         );
         if effective >= 1_000_000_000.0 && phase5_tps == 0.0 {
             phase5_tps = effective;
@@ -485,7 +530,11 @@ fn main() {
     if phase5_tps == 0.0 {
         phase5_tps = gpu_single_node_tps * 256.0 * network_efficiency;
     }
-    phase_results.push(("Phase 5: GPU + multi-node", phase5_tps, format!("MEASURED GPU + cluster, {}", gpu_profile.info.name)));
+    phase_results.push((
+        "Phase 5: GPU + multi-node",
+        phase5_tps,
+        format!("MEASURED GPU + cluster, {}", gpu_profile.info.name),
+    ));
     println!();
 
     // ═══════════════════════════════════════════════════════════════
@@ -540,8 +589,14 @@ fn main() {
     println!("  │    Aptos:       12,000 TPS                          │");
     println!("  │    Solana:      65,000 TPS (theoretical)            │");
     println!("  │    Sui:        120,000 TPS                          │");
-    println!("  │    ARC (measured): {:>10.0} TPS (this machine)    │", phase2_full_tps);
-    println!("  │    ARC (projected): {:>10.0} TPS (GPU cluster)   │", phase5_tps);
+    println!(
+        "  │    ARC (measured): {:>10.0} TPS (this machine)    │",
+        phase2_full_tps
+    );
+    println!(
+        "  │    ARC (projected): {:>10.0} TPS (GPU cluster)   │",
+        phase5_tps
+    );
     println!("  └─────────────────────────────────────────────────────┘");
     println!();
 

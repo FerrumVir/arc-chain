@@ -40,9 +40,9 @@
 use curve25519_dalek::scalar::Scalar;
 use dashmap::DashMap;
 use ed25519_dalek::VerifyingKey;
-use rayon::prelude::*;
-use sha2::{Sha512, Digest};
 use parking_lot::Mutex;
+use rayon::prelude::*;
+use sha2::{Digest, Sha512};
 use std::borrow::Cow;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -168,10 +168,7 @@ impl MetalVerifier {
     pub fn batch_verify_cpu(&mut self, tasks: &[VerifyTask]) -> GpuVerifyResult {
         let start = Instant::now();
 
-        let results: Vec<bool> = tasks
-            .iter()
-            .map(verify_single)
-            .collect();
+        let results: Vec<bool> = tasks.iter().map(verify_single).collect();
 
         let elapsed_us = start.elapsed().as_micros() as u64;
         let (valid, invalid_indices) = tally_results(&results);
@@ -382,8 +379,8 @@ fn verify_single(task: &VerifyTask) -> bool {
 fn compute_k_scalar(signature: &[u8; 64], public_key: &[u8; 32], message: &[u8]) -> [u8; 32] {
     let mut hasher = Sha512::new();
     hasher.update(&signature[0..32]); // R
-    hasher.update(public_key);         // A
-    hasher.update(message);            // M
+    hasher.update(public_key); // A
+    hasher.update(message); // M
     let hash: [u8; 64] = hasher.finalize().into();
     Scalar::from_bytes_mod_order_wide(&hash).to_bytes()
 }
@@ -411,7 +408,7 @@ fn create_buffer_pool(
     capacity: usize,
 ) -> BufferPool {
     let input_size = (capacity * 128) as u64; // 32 u32s × 4 bytes per sig
-    let output_size = (capacity * 4) as u64;  // 1 u32 per sig
+    let output_size = (capacity * 4) as u64; // 1 u32 per sig
 
     let input_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Ed25519 Input Pool"),
@@ -445,14 +442,33 @@ fn create_buffer_pool(
         label: Some("Ed25519 Pool Bind Group"),
         layout,
         entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: input_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: output_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 2, resource: params_buffer.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 3, resource: base_table_buffer.as_entire_binding() },
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: input_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: output_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: params_buffer.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: base_table_buffer.as_entire_binding(),
+            },
         ],
     });
 
-    BufferPool { input_buffer, output_buffer, staging_buffer, params_buffer, bind_group, capacity }
+    BufferPool {
+        input_buffer,
+        output_buffer,
+        staging_buffer,
+        params_buffer,
+        bind_group,
+        capacity,
+    }
 }
 
 /// Cached wgpu device, queue, pipeline, and bind group layout.
@@ -476,69 +492,70 @@ struct GpuContext {
 fn base_point_table_data() -> [u32; 480] {
     [
         // 0*B (identity)
-        0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000,
-        0x0000001, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000,
-        0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000,
-        // 1*B
-        0x325D51A, 0x18B5823, 0x0F6592A, 0x104A92D, 0x1A4B31D, 0x1D6DC5C, 0x27118FE, 0x07FD814, 0x13CD6E5, 0x085A4DB,
-        0x2666658, 0x1999999, 0x0CCCCCC, 0x1333333, 0x1999999, 0x0666666, 0x3333333, 0x0CCCCCC, 0x2666666, 0x1999999,
-        0x1B7DDA3, 0x1A2ACE9, 0x25EADBB, 0x003BA8A, 0x083C27E, 0x0ABE37D, 0x1274732, 0x0CCACDD, 0x0FD78B7, 0x19E1D7C,
-        // 2*B
-        0x043CE0E, 0x168538A, 0x08BF078, 0x028AEBD, 0x0203639, 0x033E7AC, 0x21DBE8C, 0x08D87A0, 0x0C9F5A0, 0x0DAACE1,
-        0x2F8A3C9, 0x1D1AB9A, 0x22AC1CB, 0x08B21C2, 0x25CE43D, 0x1A21F56, 0x12F7464, 0x13843B4, 0x3309232, 0x0898337,
-        0x169B401, 0x08FD55B, 0x08056E3, 0x04E0FB9, 0x175E6B3, 0x103B413, 0x2AF8439, 0x11B83BC, 0x050B2F6, 0x092629E,
-        // 3*B
-        0x3F8E25C, 0x09217F4, 0x110D58C, 0x0CC0B12, 0x18D0E60, 0x0DAC83A, 0x2573A1F, 0x1E923FE, 0x0A22928, 0x19EBA71,
-        0x0F5B4D4, 0x0DA121E, 0x0608058, 0x0BB3920, 0x27C5BB0, 0x0269EF7, 0x350C730, 0x1357424, 0x1177EE6, 0x0499EC7,
-        0x0B3A41A, 0x0423E9E, 0x38959BF, 0x05FD8B7, 0x1709CD6, 0x1B91527, 0x39BC1D6, 0x0A21D7D, 0x1CB1DD9, 0x0A93409,
-        // 4*B
-        0x0C9F870, 0x0A995F1, 0x2A8E927, 0x00C9E70, 0x069CE7B, 0x03520F9, 0x2EA5C3D, 0x028D064, 0x1B56CFF, 0x080F6A3,
-        0x232112F, 0x02AD872, 0x1FE1BE7, 0x1975178, 0x133C8A0, 0x0D5716C, 0x35C42C0, 0x0BC28E1, 0x27CB159, 0x11F43A0,
-        0x28A1358, 0x1C8BD9C, 0x0F94BF1, 0x0F5B6E8, 0x1C6578C, 0x07C2960, 0x25D3563, 0x0C18E42, 0x18D8732, 0x089E0F3,
-        // 5*B
-        0x22EF233, 0x027300C, 0x034B228, 0x1C9F0DF, 0x170A067, 0x12DA5DE, 0x3BE7BE8, 0x10F7F9D, 0x3EADE35, 0x127F69C,
-        0x276C8ED, 0x087E0F5, 0x16BA21A, 0x0544A18, 0x0C4A0BB, 0x1924666, 0x2370A44, 0x1CDFC05, 0x3298FEA, 0x17D2096,
-        0x3E801D0, 0x0542F3C, 0x0D7EC83, 0x0280049, 0x2BEE53A, 0x136C7F9, 0x0752843, 0x1A9862C, 0x2C9C593, 0x1D17158,
-        // 6*B
-        0x1CBF23D, 0x09D069F, 0x084EF07, 0x01363DA, 0x2879666, 0x10A29BE, 0x356606E, 0x0038C55, 0x3A7A456, 0x1325E5E,
-        0x1497EF4, 0x09EB43E, 0x16C183A, 0x034A26B, 0x3E505F0, 0x14F7D77, 0x384D3FE, 0x11423B6, 0x3C2886D, 0x015378F,
-        0x04EF1D2, 0x1B5B22D, 0x11378F9, 0x0A3E3EE, 0x02EBE48, 0x1E7DCC4, 0x2AD4CA7, 0x009F050, 0x1109AA6, 0x0F0CBBF,
-        // 7*B
-        0x10E4107, 0x16606BD, 0x1D2AB0A, 0x19DDF8E, 0x20FA027, 0x11D8107, 0x1F70CA5, 0x1A9DD3C, 0x05FCF4B, 0x0515A1A,
-        0x34062B8, 0x1312D67, 0x247A258, 0x037BD5F, 0x3C220AD, 0x136AD41, 0x332346E, 0x0A5F0F9, 0x232B47D, 0x0C7158F,
-        0x187ED1B, 0x1515595, 0x09C8217, 0x150F4D5, 0x14A518C, 0x1D5BAB4, 0x016E2C4, 0x1C3737D, 0x311D165, 0x04679DE,
-        // 8*B
-        0x0A584C8, 0x1FF6F02, 0x1732770, 0x1DC034C, 0x3ACEB19, 0x04ECF93, 0x316AE7C, 0x036C850, 0x1F97D77, 0x19D0B85,
-        0x037B9B4, 0x1D6EA7F, 0x09263C5, 0x1E310F7, 0x205E0F3, 0x08AF38F, 0x2B784B3, 0x06F2DD5, 0x00C9E57, 0x0874C18,
-        0x01A51BF, 0x1BD06B5, 0x17EADF7, 0x169A261, 0x117C339, 0x0B3D993, 0x0614D9C, 0x15C22C1, 0x2CEDF7E, 0x0B13D67,
-        // 9*B
-        0x185715C, 0x008C194, 0x0529A7C, 0x0E17270, 0x21B6039, 0x19422B8, 0x19B7037, 0x02CA37E, 0x30C8007, 0x0D5F325,
-        0x122F1C0, 0x1912115, 0x08618E9, 0x0991B72, 0x07DE240, 0x0F2D2FD, 0x37E74AB, 0x1BE9657, 0x02C2DD0, 0x1FCF48F,
-        0x0B2F465, 0x0CE1BE2, 0x24FCB87, 0x107BB81, 0x05ECF52, 0x147CD74, 0x33B56FB, 0x17F3B6C, 0x08EA87C, 0x171C3F1,
-        // 10*B
-        0x077F94F, 0x147C892, 0x3028892, 0x076C1B7, 0x081FA39, 0x0BC8677, 0x05B0769, 0x1AEA88E, 0x3E30CA6, 0x180B1E5,
-        0x2E87B2C, 0x01D2C1A, 0x1087751, 0x029EF07, 0x095DA9A, 0x098BFCF, 0x226AA64, 0x08EF91C, 0x2A7A1B2, 0x18DFFF2,
-        0x35BC63E, 0x1D32540, 0x0A4A87C, 0x1A59DC9, 0x1D3D6A7, 0x1B4577F, 0x3E88184, 0x0525117, 0x3266735, 0x0DB817C,
-        // 11*B
-        0x07CF3CB, 0x1F4B048, 0x2AA5FE5, 0x1962C9E, 0x34E0696, 0x0712438, 0x383C6EB, 0x082F6D9, 0x31154BE, 0x05394A2,
-        0x2033713, 0x1CB70DA, 0x31A8611, 0x0E1E4E2, 0x0496164, 0x0FF0FCE, 0x3BE71A0, 0x172EB4D, 0x313F21A, 0x0B64208,
-        0x35BEED4, 0x173CBB6, 0x106FD70, 0x0EF0C7E, 0x1640007, 0x016ADBF, 0x1535F79, 0x1144739, 0x25800F2, 0x16B9A95,
-        // 12*B
-        0x0F0902D, 0x0BF999E, 0x36855CC, 0x11C2E09, 0x0CA56FC, 0x0A249DB, 0x3B87006, 0x1A6ABD9, 0x3E016E5, 0x11C6785,
-        0x22DE4F9, 0x0A0770B, 0x2CCE67A, 0x1A2939C, 0x15921FA, 0x17825B8, 0x2B62731, 0x0045CE3, 0x208BCE8, 0x101C339,
-        0x24B1CCB, 0x130C4A3, 0x2757ABD, 0x02462D8, 0x03C7BC3, 0x1CD006F, 0x3E9D418, 0x114240C, 0x203A485, 0x0ACD138,
-        // 13*B
-        0x3C05FED, 0x0381CED, 0x2F706F0, 0x1446915, 0x2210F8F, 0x02D304F, 0x1D6F814, 0x0D99B66, 0x20D5F36, 0x041D09F,
-        0x2401F80, 0x1F86BBA, 0x0E470FD, 0x19144D1, 0x0DD033E, 0x0DA89B8, 0x3301169, 0x16E8F08, 0x0DED538, 0x04B6EC0,
-        0x0DE2F53, 0x137337A, 0x1DF8A45, 0x08F5974, 0x16C52A9, 0x1562338, 0x06EB0E6, 0x08C18B8, 0x3917BE6, 0x104A01A,
-        // 14*B
-        0x18515B9, 0x19CD4ED, 0x0655471, 0x0C1F1CC, 0x3637B9B, 0x0CABB15, 0x23D44AE, 0x155E091, 0x02F5884, 0x0817CED,
-        0x19C2839, 0x07F6622, 0x0CB906D, 0x140CDB1, 0x29D2263, 0x1B702BF, 0x168BD65, 0x17022B7, 0x2F50C4C, 0x1394095,
-        0x271C2E0, 0x0CF4B28, 0x0BC1122, 0x1FF3322, 0x1C79D0D, 0x0BFE479, 0x3055F9E, 0x1C1F1D4, 0x1463A87, 0x1990CB4,
-        // 15*B
-        0x2A18DC1, 0x05FCF99, 0x139720C, 0x1A3B80C, 0x3658C4D, 0x120419E, 0x1637CAE, 0x086BB8B, 0x2AEC2EC, 0x13C58B7,
-        0x12E5CDF, 0x153312B, 0x354328D, 0x0C50CD4, 0x2B396BC, 0x0D29331, 0x17B80B2, 0x05EAA2C, 0x2D04FF2, 0x04B2FEC,
-        0x092BF29, 0x15FCCD7, 0x0BEA281, 0x07F2057, 0x3E98EDA, 0x1760DE2, 0x27E9120, 0x0923564, 0x0E36B77, 0x178CFC0,
+        0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000,
+        0x0000000, 0x0000000, 0x0000001, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000,
+        0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000,
+        0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, 0x0000000, // 1*B
+        0x325D51A, 0x18B5823, 0x0F6592A, 0x104A92D, 0x1A4B31D, 0x1D6DC5C, 0x27118FE, 0x07FD814,
+        0x13CD6E5, 0x085A4DB, 0x2666658, 0x1999999, 0x0CCCCCC, 0x1333333, 0x1999999, 0x0666666,
+        0x3333333, 0x0CCCCCC, 0x2666666, 0x1999999, 0x1B7DDA3, 0x1A2ACE9, 0x25EADBB, 0x003BA8A,
+        0x083C27E, 0x0ABE37D, 0x1274732, 0x0CCACDD, 0x0FD78B7, 0x19E1D7C, // 2*B
+        0x043CE0E, 0x168538A, 0x08BF078, 0x028AEBD, 0x0203639, 0x033E7AC, 0x21DBE8C, 0x08D87A0,
+        0x0C9F5A0, 0x0DAACE1, 0x2F8A3C9, 0x1D1AB9A, 0x22AC1CB, 0x08B21C2, 0x25CE43D, 0x1A21F56,
+        0x12F7464, 0x13843B4, 0x3309232, 0x0898337, 0x169B401, 0x08FD55B, 0x08056E3, 0x04E0FB9,
+        0x175E6B3, 0x103B413, 0x2AF8439, 0x11B83BC, 0x050B2F6, 0x092629E, // 3*B
+        0x3F8E25C, 0x09217F4, 0x110D58C, 0x0CC0B12, 0x18D0E60, 0x0DAC83A, 0x2573A1F, 0x1E923FE,
+        0x0A22928, 0x19EBA71, 0x0F5B4D4, 0x0DA121E, 0x0608058, 0x0BB3920, 0x27C5BB0, 0x0269EF7,
+        0x350C730, 0x1357424, 0x1177EE6, 0x0499EC7, 0x0B3A41A, 0x0423E9E, 0x38959BF, 0x05FD8B7,
+        0x1709CD6, 0x1B91527, 0x39BC1D6, 0x0A21D7D, 0x1CB1DD9, 0x0A93409, // 4*B
+        0x0C9F870, 0x0A995F1, 0x2A8E927, 0x00C9E70, 0x069CE7B, 0x03520F9, 0x2EA5C3D, 0x028D064,
+        0x1B56CFF, 0x080F6A3, 0x232112F, 0x02AD872, 0x1FE1BE7, 0x1975178, 0x133C8A0, 0x0D5716C,
+        0x35C42C0, 0x0BC28E1, 0x27CB159, 0x11F43A0, 0x28A1358, 0x1C8BD9C, 0x0F94BF1, 0x0F5B6E8,
+        0x1C6578C, 0x07C2960, 0x25D3563, 0x0C18E42, 0x18D8732, 0x089E0F3, // 5*B
+        0x22EF233, 0x027300C, 0x034B228, 0x1C9F0DF, 0x170A067, 0x12DA5DE, 0x3BE7BE8, 0x10F7F9D,
+        0x3EADE35, 0x127F69C, 0x276C8ED, 0x087E0F5, 0x16BA21A, 0x0544A18, 0x0C4A0BB, 0x1924666,
+        0x2370A44, 0x1CDFC05, 0x3298FEA, 0x17D2096, 0x3E801D0, 0x0542F3C, 0x0D7EC83, 0x0280049,
+        0x2BEE53A, 0x136C7F9, 0x0752843, 0x1A9862C, 0x2C9C593, 0x1D17158, // 6*B
+        0x1CBF23D, 0x09D069F, 0x084EF07, 0x01363DA, 0x2879666, 0x10A29BE, 0x356606E, 0x0038C55,
+        0x3A7A456, 0x1325E5E, 0x1497EF4, 0x09EB43E, 0x16C183A, 0x034A26B, 0x3E505F0, 0x14F7D77,
+        0x384D3FE, 0x11423B6, 0x3C2886D, 0x015378F, 0x04EF1D2, 0x1B5B22D, 0x11378F9, 0x0A3E3EE,
+        0x02EBE48, 0x1E7DCC4, 0x2AD4CA7, 0x009F050, 0x1109AA6, 0x0F0CBBF, // 7*B
+        0x10E4107, 0x16606BD, 0x1D2AB0A, 0x19DDF8E, 0x20FA027, 0x11D8107, 0x1F70CA5, 0x1A9DD3C,
+        0x05FCF4B, 0x0515A1A, 0x34062B8, 0x1312D67, 0x247A258, 0x037BD5F, 0x3C220AD, 0x136AD41,
+        0x332346E, 0x0A5F0F9, 0x232B47D, 0x0C7158F, 0x187ED1B, 0x1515595, 0x09C8217, 0x150F4D5,
+        0x14A518C, 0x1D5BAB4, 0x016E2C4, 0x1C3737D, 0x311D165, 0x04679DE, // 8*B
+        0x0A584C8, 0x1FF6F02, 0x1732770, 0x1DC034C, 0x3ACEB19, 0x04ECF93, 0x316AE7C, 0x036C850,
+        0x1F97D77, 0x19D0B85, 0x037B9B4, 0x1D6EA7F, 0x09263C5, 0x1E310F7, 0x205E0F3, 0x08AF38F,
+        0x2B784B3, 0x06F2DD5, 0x00C9E57, 0x0874C18, 0x01A51BF, 0x1BD06B5, 0x17EADF7, 0x169A261,
+        0x117C339, 0x0B3D993, 0x0614D9C, 0x15C22C1, 0x2CEDF7E, 0x0B13D67, // 9*B
+        0x185715C, 0x008C194, 0x0529A7C, 0x0E17270, 0x21B6039, 0x19422B8, 0x19B7037, 0x02CA37E,
+        0x30C8007, 0x0D5F325, 0x122F1C0, 0x1912115, 0x08618E9, 0x0991B72, 0x07DE240, 0x0F2D2FD,
+        0x37E74AB, 0x1BE9657, 0x02C2DD0, 0x1FCF48F, 0x0B2F465, 0x0CE1BE2, 0x24FCB87, 0x107BB81,
+        0x05ECF52, 0x147CD74, 0x33B56FB, 0x17F3B6C, 0x08EA87C, 0x171C3F1, // 10*B
+        0x077F94F, 0x147C892, 0x3028892, 0x076C1B7, 0x081FA39, 0x0BC8677, 0x05B0769, 0x1AEA88E,
+        0x3E30CA6, 0x180B1E5, 0x2E87B2C, 0x01D2C1A, 0x1087751, 0x029EF07, 0x095DA9A, 0x098BFCF,
+        0x226AA64, 0x08EF91C, 0x2A7A1B2, 0x18DFFF2, 0x35BC63E, 0x1D32540, 0x0A4A87C, 0x1A59DC9,
+        0x1D3D6A7, 0x1B4577F, 0x3E88184, 0x0525117, 0x3266735, 0x0DB817C, // 11*B
+        0x07CF3CB, 0x1F4B048, 0x2AA5FE5, 0x1962C9E, 0x34E0696, 0x0712438, 0x383C6EB, 0x082F6D9,
+        0x31154BE, 0x05394A2, 0x2033713, 0x1CB70DA, 0x31A8611, 0x0E1E4E2, 0x0496164, 0x0FF0FCE,
+        0x3BE71A0, 0x172EB4D, 0x313F21A, 0x0B64208, 0x35BEED4, 0x173CBB6, 0x106FD70, 0x0EF0C7E,
+        0x1640007, 0x016ADBF, 0x1535F79, 0x1144739, 0x25800F2, 0x16B9A95, // 12*B
+        0x0F0902D, 0x0BF999E, 0x36855CC, 0x11C2E09, 0x0CA56FC, 0x0A249DB, 0x3B87006, 0x1A6ABD9,
+        0x3E016E5, 0x11C6785, 0x22DE4F9, 0x0A0770B, 0x2CCE67A, 0x1A2939C, 0x15921FA, 0x17825B8,
+        0x2B62731, 0x0045CE3, 0x208BCE8, 0x101C339, 0x24B1CCB, 0x130C4A3, 0x2757ABD, 0x02462D8,
+        0x03C7BC3, 0x1CD006F, 0x3E9D418, 0x114240C, 0x203A485, 0x0ACD138, // 13*B
+        0x3C05FED, 0x0381CED, 0x2F706F0, 0x1446915, 0x2210F8F, 0x02D304F, 0x1D6F814, 0x0D99B66,
+        0x20D5F36, 0x041D09F, 0x2401F80, 0x1F86BBA, 0x0E470FD, 0x19144D1, 0x0DD033E, 0x0DA89B8,
+        0x3301169, 0x16E8F08, 0x0DED538, 0x04B6EC0, 0x0DE2F53, 0x137337A, 0x1DF8A45, 0x08F5974,
+        0x16C52A9, 0x1562338, 0x06EB0E6, 0x08C18B8, 0x3917BE6, 0x104A01A, // 14*B
+        0x18515B9, 0x19CD4ED, 0x0655471, 0x0C1F1CC, 0x3637B9B, 0x0CABB15, 0x23D44AE, 0x155E091,
+        0x02F5884, 0x0817CED, 0x19C2839, 0x07F6622, 0x0CB906D, 0x140CDB1, 0x29D2263, 0x1B702BF,
+        0x168BD65, 0x17022B7, 0x2F50C4C, 0x1394095, 0x271C2E0, 0x0CF4B28, 0x0BC1122, 0x1FF3322,
+        0x1C79D0D, 0x0BFE479, 0x3055F9E, 0x1C1F1D4, 0x1463A87, 0x1990CB4, // 15*B
+        0x2A18DC1, 0x05FCF99, 0x139720C, 0x1A3B80C, 0x3658C4D, 0x120419E, 0x1637CAE, 0x086BB8B,
+        0x2AEC2EC, 0x13C58B7, 0x12E5CDF, 0x153312B, 0x354328D, 0x0C50CD4, 0x2B396BC, 0x0D29331,
+        0x17B80B2, 0x05EAA2C, 0x2D04FF2, 0x04B2FEC, 0x092BF29, 0x15FCCD7, 0x0BEA281, 0x07F2057,
+        0x3E98EDA, 0x1760DE2, 0x27E9120, 0x0923564, 0x0E36B77, 0x178CFC0,
     ]
 }
 
@@ -546,164 +563,188 @@ fn base_point_table_data() -> [u32; 480] {
 static GPU_CONTEXT: OnceLock<Option<GpuContext>> = OnceLock::new();
 
 fn get_or_init_gpu() -> Option<&'static GpuContext> {
-    GPU_CONTEXT.get_or_init(|| {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..Default::default()
-        });
-
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        })).ok()?;
-
-        let gpu_info = adapter.get_info();
-        let has_msl = adapter.features().contains(wgpu::Features::MSL_SHADER_PASSTHROUGH);
-        tracing::info!(
-            gpu_name = %gpu_info.name,
-            gpu_backend = ?gpu_info.backend,
-            msl_passthrough = has_msl,
-            "GPU Ed25519 context initialized"
-        );
-
-        // Request MSL_SHADER_PASSTHROUGH if available (enables native Metal shader)
-        let required_features = if has_msl {
-            wgpu::Features::MSL_SHADER_PASSTHROUGH
-        } else {
-            wgpu::Features::empty()
-        };
-
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("ARC Ed25519 Verifier"),
-                required_features,
-                required_limits: wgpu::Limits::default(),
+    GPU_CONTEXT
+        .get_or_init(|| {
+            let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::all(),
                 ..Default::default()
-            },
-        ))
-        .ok()?;
+            });
 
-        // WGSL pipeline (always available, fallback)
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Ed25519 Verify WGSL"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!("ed25519_verify.wgsl"))),
-        });
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    force_fallback_adapter: false,
+                    compatible_surface: None,
+                }))
+                .ok()?;
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Ed25519 BGL"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
+            let gpu_info = adapter.get_info();
+            let has_msl = adapter
+                .features()
+                .contains(wgpu::Features::MSL_SHADER_PASSTHROUGH);
+            tracing::info!(
+                gpu_name = %gpu_info.name,
+                gpu_backend = ?gpu_info.backend,
+                msl_passthrough = has_msl,
+                "GPU Ed25519 context initialized"
+            );
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Ed25519 Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Ed25519 WGSL Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        // Native MSL pipeline (Metal only - uses hardware u64 arithmetic)
-        let msl_pipeline = if has_msl {
-            let msl_source = include_str!("ed25519_verify.metal");
-            let msl_shader = unsafe {
-                device.create_shader_module_passthrough(
-                    wgpu::ShaderModuleDescriptorPassthrough::Msl(
-                        wgpu::ShaderModuleDescriptorMsl {
-                            entry_point: "ed25519_verify_main".to_string(),
-                            label: Some("Ed25519 Verify MSL"),
-                            num_workgroups: (64, 1, 1), // workgroup size, not dispatch count
-                            source: Cow::Borrowed(msl_source),
-                        },
-                    ),
-                )
+            // Request MSL_SHADER_PASSTHROUGH if available (enables native Metal shader)
+            let required_features = if has_msl {
+                wgpu::Features::MSL_SHADER_PASSTHROUGH
+            } else {
+                wgpu::Features::empty()
             };
-            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                    label: Some("Ed25519 MSL Pipeline"),
-                    layout: Some(&pipeline_layout),
-                    module: &msl_shader,
-                    entry_point: Some("ed25519_verify_main"),
-                    compilation_options: Default::default(),
-                    cache: None,
-                })
-            })) {
-                Ok(p) => {
-                    tracing::info!("Native MSL Ed25519 pipeline created (hardware u64)");
-                    Some(p)
+
+            let (device, queue) =
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    label: Some("ARC Ed25519 Verifier"),
+                    required_features,
+                    required_limits: wgpu::Limits::default(),
+                    ..Default::default()
+                }))
+                .ok()?;
+
+            // WGSL pipeline (always available, fallback)
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Ed25519 Verify WGSL"),
+                source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(include_str!(
+                    "ed25519_verify.wgsl"
+                ))),
+            });
+
+            let bind_group_layout =
+                device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Ed25519 BGL"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+            let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Ed25519 Pipeline Layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+
+            let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Ed25519 WGSL Pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+
+            // Native MSL pipeline (Metal only - uses hardware u64 arithmetic)
+            let msl_pipeline = if has_msl {
+                let msl_source = include_str!("ed25519_verify.metal");
+                let msl_shader = unsafe {
+                    device.create_shader_module_passthrough(
+                        wgpu::ShaderModuleDescriptorPassthrough::Msl(
+                            wgpu::ShaderModuleDescriptorMsl {
+                                entry_point: "ed25519_verify_main".to_string(),
+                                label: Some("Ed25519 Verify MSL"),
+                                num_workgroups: (64, 1, 1), // workgroup size, not dispatch count
+                                source: Cow::Borrowed(msl_source),
+                            },
+                        ),
+                    )
+                };
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                        label: Some("Ed25519 MSL Pipeline"),
+                        layout: Some(&pipeline_layout),
+                        module: &msl_shader,
+                        entry_point: Some("ed25519_verify_main"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    })
+                })) {
+                    Ok(p) => {
+                        tracing::info!("Native MSL Ed25519 pipeline created (hardware u64)");
+                        Some(p)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "MSL pipeline creation failed, using WGSL fallback: {:?}",
+                            e
+                        );
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("MSL pipeline creation failed, using WGSL fallback: {:?}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
 
-        let table_data = base_point_table_data();
-        let base_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Ed25519 Base Table"),
-            contents: bytemuck::cast_slice(&table_data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+            let table_data = base_point_table_data();
+            let base_table_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Ed25519 Base Table"),
+                contents: bytemuck::cast_slice(&table_data),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
 
-        let pool = create_buffer_pool(&device, &bind_group_layout, &base_table_buffer, DEFAULT_POOL_CAPACITY);
-        tracing::info!(capacity = DEFAULT_POOL_CAPACITY, "Buffer pool pre-allocated");
+            let pool = create_buffer_pool(
+                &device,
+                &bind_group_layout,
+                &base_table_buffer,
+                DEFAULT_POOL_CAPACITY,
+            );
+            tracing::info!(
+                capacity = DEFAULT_POOL_CAPACITY,
+                "Buffer pool pre-allocated"
+            );
 
-        Some(GpuContext {
-            device, queue, pipeline, msl_pipeline, bind_group_layout, base_table_buffer,
-            pool: Mutex::new(pool),
+            Some(GpuContext {
+                device,
+                queue,
+                pipeline,
+                msl_pipeline,
+                bind_group_layout,
+                base_table_buffer,
+                pool: Mutex::new(pool),
+            })
         })
-    }).as_ref()
+        .as_ref()
 }
 
 /// Per-phase timing breakdown from a GPU dispatch.
@@ -740,8 +781,7 @@ fn dispatch_ed25519_verify_timed(
         return Ok(vec![]);
     }
 
-    let ctx = get_or_init_gpu()
-        .ok_or_else(|| "GPU context initialization failed".to_string())?;
+    let ctx = get_or_init_gpu().ok_or_else(|| "GPU context initialization failed".to_string())?;
 
     // Phase A: Pack + write to GPU buffers
     let t_write = Instant::now();
@@ -763,13 +803,19 @@ fn dispatch_ed25519_verify_timed(
     if n > pool.capacity {
         let new_cap = n.next_power_of_two();
         tracing::info!(old = pool.capacity, new = new_cap, "Growing buffer pool");
-        *pool = create_buffer_pool(&ctx.device, &ctx.bind_group_layout, &ctx.base_table_buffer, new_cap);
+        *pool = create_buffer_pool(
+            &ctx.device,
+            &ctx.bind_group_layout,
+            &ctx.base_table_buffer,
+            new_cap,
+        );
     }
 
     // Write data into pre-allocated buffers (zero Metal allocations)
     ctx.queue.write_buffer(&pool.input_buffer, 0, input_bytes);
     let params = [n as u32];
-    ctx.queue.write_buffer(&pool.params_buffer, 0, bytemuck::cast_slice(&params));
+    ctx.queue
+        .write_buffer(&pool.params_buffer, 0, bytemuck::cast_slice(&params));
 
     let write_elapsed = t_write.elapsed();
 
@@ -779,9 +825,11 @@ fn dispatch_ed25519_verify_timed(
     let workgroup_size = 64u32;
     let num_workgroups = (n as u32).div_ceil(workgroup_size);
 
-    let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("Ed25519 Encoder"),
-    });
+    let mut encoder = ctx
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Ed25519 Encoder"),
+        });
 
     {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -796,7 +844,9 @@ fn dispatch_ed25519_verify_timed(
 
     encoder.copy_buffer_to_buffer(&pool.output_buffer, 0, &pool.staging_buffer, 0, output_size);
     ctx.queue.submit(Some(encoder.finish()));
-    ctx.device.poll(wgpu::PollType::wait()).map_err(|e| format!("GPU poll error: {e:?}"))?;
+    ctx.device
+        .poll(wgpu::PollType::wait())
+        .map_err(|e| format!("GPU poll error: {e:?}"))?;
 
     let compute_elapsed = t_compute.elapsed();
 
@@ -808,7 +858,9 @@ fn dispatch_ed25519_verify_timed(
     buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = sender.send(result);
     });
-    ctx.device.poll(wgpu::PollType::wait()).map_err(|e| format!("GPU poll error: {e:?}"))?;
+    ctx.device
+        .poll(wgpu::PollType::wait())
+        .map_err(|e| format!("GPU poll error: {e:?}"))?;
     receiver
         .recv()
         .map_err(|e| format!("Channel error: {e}"))?
@@ -848,8 +900,7 @@ pub struct GpuVerifyFuture {
 impl GpuVerifyFuture {
     /// Block until GPU results are ready and return verification results.
     pub fn wait(self) -> Result<GpuVerifyResult, String> {
-        let ctx = get_or_init_gpu()
-            .ok_or_else(|| "GPU context lost".to_string())?;
+        let ctx = get_or_init_gpu().ok_or_else(|| "GPU context lost".to_string())?;
 
         let output_size = (self.count * 4) as u64;
         let buffer_slice = self.staging_buffer.slice(..output_size);
@@ -857,7 +908,9 @@ impl GpuVerifyFuture {
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = sender.send(result);
         });
-        ctx.device.poll(wgpu::PollType::wait()).map_err(|e| format!("GPU poll error: {e:?}"))?;
+        ctx.device
+            .poll(wgpu::PollType::wait())
+            .map_err(|e| format!("GPU poll error: {e:?}"))?;
         receiver
             .recv()
             .map_err(|e| format!("Channel error: {e}"))?
@@ -899,8 +952,7 @@ fn dispatch_ed25519_verify_async(packed: &[[u8; 128]]) -> Result<GpuVerifyFuture
         return Err("Empty batch for async dispatch".to_string());
     }
 
-    let ctx = get_or_init_gpu()
-        .ok_or_else(|| "GPU context initialization failed".to_string())?;
+    let ctx = get_or_init_gpu().ok_or_else(|| "GPU context initialization failed".to_string())?;
 
     let start = Instant::now();
 
@@ -928,19 +980,27 @@ fn dispatch_ed25519_verify_async(packed: &[[u8; 128]]) -> Result<GpuVerifyFuture
 
         if n > pool.capacity {
             let new_cap = n.next_power_of_two();
-            *pool = create_buffer_pool(&ctx.device, &ctx.bind_group_layout, &ctx.base_table_buffer, new_cap);
+            *pool = create_buffer_pool(
+                &ctx.device,
+                &ctx.bind_group_layout,
+                &ctx.base_table_buffer,
+                new_cap,
+            );
         }
 
         ctx.queue.write_buffer(&pool.input_buffer, 0, input_bytes);
         let params = [n as u32];
-        ctx.queue.write_buffer(&pool.params_buffer, 0, bytemuck::cast_slice(&params));
+        ctx.queue
+            .write_buffer(&pool.params_buffer, 0, bytemuck::cast_slice(&params));
 
         let workgroup_size = 64u32;
         let num_workgroups = (n as u32).div_ceil(workgroup_size);
 
-        let mut encoder = ctx.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Ed25519 Async Encoder"),
-        });
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Ed25519 Async Encoder"),
+            });
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -960,7 +1020,11 @@ fn dispatch_ed25519_verify_async(packed: &[[u8; 128]]) -> Result<GpuVerifyFuture
         // Pool unlocked here - GPU has captured all commands
     }
 
-    Ok(GpuVerifyFuture { staging_buffer, count: n, start })
+    Ok(GpuVerifyFuture {
+        staging_buffer,
+        count: n,
+        start,
+    })
 }
 
 // ── Pre-verification Cache ──────────────────────────────────────────────────
@@ -981,7 +1045,9 @@ pub struct SigVerifyCache {
 
 impl SigVerifyCache {
     pub fn new() -> Self {
-        Self { results: DashMap::new() }
+        Self {
+            results: DashMap::new(),
+        }
     }
 
     /// Pre-verify a batch of transactions using GPU (or CPU fallback).
@@ -989,7 +1055,9 @@ impl SigVerifyCache {
     /// Results are cached immediately and available via `lookup()`.
     /// Call this from a background thread after mempool insertion.
     pub fn pre_verify(&self, tasks: &[VerifyTask], tx_hashes: &[[u8; 32]]) {
-        if tasks.is_empty() { return; }
+        if tasks.is_empty() {
+            return;
+        }
         assert_eq!(tasks.len(), tx_hashes.len());
 
         let results = gpu_parallel_verify(tasks);
@@ -1003,20 +1071,13 @@ impl SigVerifyCache {
     ///
     /// Returns a `GpuVerifyFuture` that must be waited on to cache results.
     /// Use `cache_from_future()` to store results after `wait()`.
-    pub fn pre_verify_async(
-        &self,
-        tasks: &[VerifyTask],
-    ) -> Result<GpuVerifyFuture, String> {
+    pub fn pre_verify_async(&self, tasks: &[VerifyTask]) -> Result<GpuVerifyFuture, String> {
         let verifier = MetalVerifier::new();
         verifier.batch_verify_gpu_async(tasks)
     }
 
     /// Store results from a completed `GpuVerifyFuture` into the cache.
-    pub fn cache_from_result(
-        &self,
-        result: &GpuVerifyResult,
-        tx_hashes: &[[u8; 32]],
-    ) {
+    pub fn cache_from_result(&self, result: &GpuVerifyResult, tx_hashes: &[[u8; 32]]) {
         assert_eq!(result.total, tx_hashes.len());
         let invalid_set: std::collections::HashSet<usize> =
             result.invalid_indices.iter().copied().collect();
@@ -1071,10 +1132,10 @@ fn gpu_parallel_verify(tasks: &[VerifyTask]) -> Vec<bool> {
         .map(|task| {
             let k = compute_k_scalar(&task.signature, &task.public_key, &task.message);
             let mut buf = [0u8; 128];
-            buf[0..32].copy_from_slice(&task.signature[0..32]);   // R
+            buf[0..32].copy_from_slice(&task.signature[0..32]); // R
             buf[32..64].copy_from_slice(&task.signature[32..64]); // S
-            buf[64..96].copy_from_slice(&k);                       // k (reduced mod l)
-            buf[96..128].copy_from_slice(&task.public_key);        // A
+            buf[64..96].copy_from_slice(&k); // k (reduced mod l)
+            buf[96..128].copy_from_slice(&task.public_key); // A
             buf
         })
         .collect();
@@ -1151,10 +1212,16 @@ mod tests {
         println!("Metal GPU available: {}", verifier.is_gpu_available());
 
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        assert!(verifier.is_gpu_available(), "Apple Silicon should detect Metal");
+        assert!(
+            verifier.is_gpu_available(),
+            "Apple Silicon should detect Metal"
+        );
 
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        assert!(!verifier.is_gpu_available(), "Non-Apple-Silicon should not detect Metal");
+        assert!(
+            !verifier.is_gpu_available(),
+            "Non-Apple-Silicon should not detect Metal"
+        );
     }
 
     #[test]
@@ -1231,7 +1298,10 @@ mod tests {
         let sig2 = sk2.sign(msg2.as_slice());
 
         let messages: Vec<&[u8]> = vec![msg1.as_slice(), msg2.as_slice()];
-        let public_keys = [sk1.verifying_key().to_bytes(), sk2.verifying_key().to_bytes()];
+        let public_keys = [
+            sk1.verifying_key().to_bytes(),
+            sk2.verifying_key().to_bytes(),
+        ];
         let signatures = [sig1.to_bytes(), sig2.to_bytes()];
 
         let tasks = MetalVerifier::prepare_batch(&messages, &public_keys, &signatures);
@@ -1333,7 +1403,10 @@ mod tests {
         if verifier.is_gpu_available() {
             assert!(result.used_gpu, "large batch should use GPU when available");
         } else {
-            assert!(!result.used_gpu, "large batch uses CPU when GPU unavailable");
+            assert!(
+                !result.used_gpu,
+                "large batch uses CPU when GPU unavailable"
+            );
         }
 
         // Change threshold and verify behavior changes
@@ -1357,7 +1430,9 @@ mod tests {
 
         // GPU path (if available) should produce the same results
         if verifier.is_gpu_available() {
-            let gpu_result = verifier.batch_verify_gpu(&tasks).expect("GPU should succeed");
+            let gpu_result = verifier
+                .batch_verify_gpu(&tasks)
+                .expect("GPU should succeed");
             assert_eq!(cpu_result.total, gpu_result.total);
             assert_eq!(cpu_result.valid, gpu_result.valid);
             assert_eq!(cpu_result.invalid_indices, gpu_result.invalid_indices);
@@ -1377,7 +1452,8 @@ mod tests {
         tasks[999] = generate_invalid_task();
 
         // Submit async GPU verification
-        let future = verifier.batch_verify_gpu_async(&tasks)
+        let future = verifier
+            .batch_verify_gpu_async(&tasks)
             .expect("async dispatch should succeed");
 
         assert_eq!(future.count(), 2000);
@@ -1396,8 +1472,12 @@ mod tests {
         assert!(result.invalid_indices.contains(&999));
         assert!(result.used_gpu);
 
-        println!("Async GPU verify: {} sigs in {}us, CPU work overlap: {}us",
-            result.total, result.elapsed_us, cpu_work_time.as_micros());
+        println!(
+            "Async GPU verify: {} sigs in {}us, CPU work overlap: {}us",
+            result.total,
+            result.elapsed_us,
+            cpu_work_time.as_micros()
+        );
     }
 
     #[test]
@@ -1408,7 +1488,9 @@ mod tests {
         }
 
         let mut tasks = generate_valid_tasks(5000);
-        for i in (0..50).map(|x| x * 100) { tasks[i] = generate_invalid_task(); }
+        for i in (0..50).map(|x| x * 100) {
+            tasks[i] = generate_invalid_task();
+        }
 
         // Sync path
         let sync_results = gpu_parallel_verify(&tasks);
@@ -1421,13 +1503,19 @@ mod tests {
             .collect();
 
         // Compare
-        let mismatches: Vec<usize> = sync_results.iter().zip(async_bools.iter())
+        let mismatches: Vec<usize> = sync_results
+            .iter()
+            .zip(async_bools.iter())
             .enumerate()
             .filter(|(_, (s, a))| s != a)
             .map(|(i, _)| i)
             .collect();
 
-        assert!(mismatches.is_empty(), "Async and sync must match. Mismatches at: {:?}", mismatches);
+        assert!(
+            mismatches.is_empty(),
+            "Async and sync must match. Mismatches at: {:?}",
+            mismatches
+        );
     }
 
     #[test]
@@ -1439,7 +1527,9 @@ mod tests {
         tasks[10] = generate_invalid_task();
         tasks[50] = generate_invalid_task();
 
-        let hashes: Vec<[u8; 32]> = tasks.iter().enumerate()
+        let hashes: Vec<[u8; 32]> = tasks
+            .iter()
+            .enumerate()
             .map(|(i, _)| {
                 let mut h = [0u8; 32];
                 h[0..8].copy_from_slice(&(i as u64).to_le_bytes());
@@ -1486,7 +1576,9 @@ mod tests {
         let mut tasks = generate_valid_tasks(2000);
         tasks[100] = generate_invalid_task();
 
-        let hashes: Vec<[u8; 32]> = tasks.iter().enumerate()
+        let hashes: Vec<[u8; 32]> = tasks
+            .iter()
+            .enumerate()
             .map(|(i, _)| {
                 let mut h = [0u8; 32];
                 h[0..8].copy_from_slice(&(i as u64).to_le_bytes());
@@ -1541,7 +1633,10 @@ mod tests {
         let mut y_u32s = [0u32; 8];
         for i in 0..8 {
             y_u32s[i] = u32::from_le_bytes([
-                r_bytes[i*4], r_bytes[i*4+1], r_bytes[i*4+2], r_bytes[i*4+3]
+                r_bytes[i * 4],
+                r_bytes[i * 4 + 1],
+                r_bytes[i * 4 + 2],
+                r_bytes[i * 4 + 3],
             ]);
         }
         y_u32s[7] &= 0x7FFFFFFF;
@@ -1560,14 +1655,14 @@ mod tests {
 
         // CPU decompression intermediates
         let y2 = cpu_fe_mul(&y, &y);
-        let u = cpu_fe_sub(&y2, &[1,0,0,0,0,0,0,0,0,0]);
+        let u = cpu_fe_sub(&y2, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         // d constant (from the shader)
         let d_const: [u32; 10] = [
-            0x35978A3, 0x0D37284, 0x3156EBD, 0x06A0A0E, 0x001C029,
-            0x179E898, 0x3A03CBB, 0x1CE7198, 0x2E2B6FF, 0x1480DB3
+            0x35978A3, 0x0D37284, 0x3156EBD, 0x06A0A0E, 0x001C029, 0x179E898, 0x3A03CBB, 0x1CE7198,
+            0x2E2B6FF, 0x1480DB3,
         ];
         let dy2 = cpu_fe_mul(&d_const, &y2);
-        let v = cpu_fe_add(&dy2, &[1,0,0,0,0,0,0,0,0,0]);
+        let v = cpu_fe_add(&dy2, &[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
         let v2 = cpu_fe_mul(&v, &v);
         let v3 = cpu_fe_mul(&v2, &v);
         let v6 = cpu_fe_mul(&v3, &v3);
@@ -1582,9 +1677,14 @@ mod tests {
         let vx2_cpu = cpu_fe_mul(&v, &x2_cpu);
 
         println!("CPU intermediates [limb 0]:");
-        println!("  y^2[0]={} u[0]={} dy2[0]={} v[0]={} uv7[0]={}",
-            y2[0], u[0], dy2[0], v[0], uv7[0]);
-        println!("  pow[0]={} x[0]={} vx2[0]={}", pow_cpu[0], x_cpu[0], vx2_cpu[0]);
+        println!(
+            "  y^2[0]={} u[0]={} dy2[0]={} v[0]={} uv7[0]={}",
+            y2[0], u[0], dy2[0], v[0], uv7[0]
+        );
+        println!(
+            "  pow[0]={} x[0]={} vx2[0]={}",
+            pow_cpu[0], x_cpu[0], vx2_cpu[0]
+        );
 
         let packed: Vec<[u8; 128]> = tasks
             .iter()
@@ -1605,20 +1705,55 @@ mod tests {
                 println!("  [0] fe_sq(1)[0]  = {} (expect 1)", raw[0]);
                 println!("  [1] fe_sq(e1)[2] = {} (expect 2)", raw[1]);
                 println!("  [2] R decomp     = {} (0=identity, 99=valid)", raw[2]);
-                println!("  [3] y^2[0]  GPU={} CPU={} {}", raw[3], y2[0],
-                    if raw[3] == y2[0] { "MATCH" } else { "MISMATCH!" });
-                println!("  [4] u[0]    GPU={} CPU={} {}", raw[4], u[0],
-                    if raw[4] == u[0] { "MATCH" } else { "MISMATCH!" });
-                println!("  [5] dy2[0]  GPU={} CPU={} {}", raw[5], dy2[0],
-                    if raw[5] == dy2[0] { "MATCH" } else { "MISMATCH!" });
-                println!("  [6] v[0]    GPU={} CPU={} {}", raw[6], v[0],
-                    if raw[6] == v[0] { "MATCH" } else { "MISMATCH!" });
-                println!("  [7] uv7[0]  GPU={} CPU={} {}", raw[7], uv7[0],
-                    if raw[7] == uv7[0] { "MATCH" } else { "MISMATCH!" });
+                println!(
+                    "  [3] y^2[0]  GPU={} CPU={} {}",
+                    raw[3],
+                    y2[0],
+                    if raw[3] == y2[0] {
+                        "MATCH"
+                    } else {
+                        "MISMATCH!"
+                    }
+                );
+                println!(
+                    "  [4] u[0]    GPU={} CPU={} {}",
+                    raw[4],
+                    u[0],
+                    if raw[4] == u[0] { "MATCH" } else { "MISMATCH!" }
+                );
+                println!(
+                    "  [5] dy2[0]  GPU={} CPU={} {}",
+                    raw[5],
+                    dy2[0],
+                    if raw[5] == dy2[0] {
+                        "MATCH"
+                    } else {
+                        "MISMATCH!"
+                    }
+                );
+                println!(
+                    "  [6] v[0]    GPU={} CPU={} {}",
+                    raw[6],
+                    v[0],
+                    if raw[6] == v[0] { "MATCH" } else { "MISMATCH!" }
+                );
+                println!(
+                    "  [7] uv7[0]  GPU={} CPU={} {}",
+                    raw[7],
+                    uv7[0],
+                    if raw[7] == uv7[0] {
+                        "MATCH"
+                    } else {
+                        "MISMATCH!"
+                    }
+                );
                 println!("  [8] pow[0]  GPU={}", raw[8]);
                 println!("  [9] x[0]    GPU={}", raw[9]);
                 println!("  [10] vx2[0] GPU={}", raw[10]);
-                println!("  [11] check  GPU={} (100=pass, 200=sqrtm1, 300=fail)", raw[11]);
+                println!(
+                    "  [11] check  GPU={} (100=pass, 200=sqrtm1, 300=fail)",
+                    raw[11]
+                );
             }
             Err(e) => {
                 println!("GPU dispatch failed: {}", e);
@@ -1628,14 +1763,24 @@ mod tests {
 
     fn cpu_fe_add(a: &[u32; 10], b: &[u32; 10]) -> [u32; 10] {
         let mut r = [0u32; 10];
-        for i in 0..10 { r[i] = a[i] + b[i]; }
+        for i in 0..10 {
+            r[i] = a[i] + b[i];
+        }
         r
     }
 
     fn cpu_fe_sub(a: &[u32; 10], b: &[u32; 10]) -> [u32; 10] {
         let bias: [u32; 10] = [
-            0x7FFFFDAu32, 0x3FFFFFEu32, 0x7FFFFFEu32, 0x3FFFFFEu32, 0x7FFFFFEu32,
-            0x3FFFFFEu32, 0x7FFFFFEu32, 0x3FFFFFEu32, 0x7FFFFFEu32, 0x3FFFFFEu32
+            0x7FFFFDAu32,
+            0x3FFFFFEu32,
+            0x7FFFFFEu32,
+            0x3FFFFFEu32,
+            0x7FFFFFEu32,
+            0x3FFFFFEu32,
+            0x7FFFFFEu32,
+            0x3FFFFFEu32,
+            0x7FFFFFEu32,
+            0x3FFFFFEu32,
         ];
         let mut r = [0u32; 10];
         for i in 0..10 {
@@ -1651,11 +1796,11 @@ mod tests {
                 if i % 2 == 0 {
                     let carry = r[i] >> 26;
                     r[i] &= 0x3FFFFFF;
-                    r[i+1] += carry;
+                    r[i + 1] += carry;
                 } else {
                     let carry = r[i] >> 25;
                     r[i] &= 0x1FFFFFF;
-                    r[i+1] += carry;
+                    r[i + 1] += carry;
                 }
             }
             let carry9 = r[9] >> 25;
@@ -1732,11 +1877,11 @@ mod tests {
             if i % 2 == 0 {
                 let c = r64[i] >> 26;
                 r64[i] &= 0x3FFFFFF;
-                r64[i+1] += c;
+                r64[i + 1] += c;
             } else {
                 let c = r64[i] >> 25;
                 r64[i] &= 0x1FFFFFF;
-                r64[i+1] += c;
+                r64[i + 1] += c;
             }
         }
         let c = r64[9] >> 25;
@@ -1745,7 +1890,9 @@ mod tests {
 
         // Convert to u32 (all values now fit in their limb widths)
         let mut r = [0u32; 10];
-        for i in 0..10 { r[i] = r64[i] as u32; }
+        for i in 0..10 {
+            r[i] = r64[i] as u32;
+        }
         r
     }
 
@@ -1778,7 +1925,7 @@ mod tests {
         let mut bytes = [0u8; 32];
         for i in 0..8 {
             let b = out[i].to_le_bytes();
-            bytes[i*4..i*4+4].copy_from_slice(&b);
+            bytes[i * 4..i * 4 + 4].copy_from_slice(&b);
         }
         bytes
     }
@@ -1791,8 +1938,11 @@ mod tests {
         let product = cpu_fe_mul(&two, &two_inv);
         let canonical = cpu_fe_freeze(&product);
         println!("2 * 2^(p-2) = {:?}", canonical);
-        assert_eq!(canonical, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            "2 * inverse(2) should be 1");
+        assert_eq!(
+            canonical,
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "2 * inverse(2) should be 1"
+        );
 
         // Also test with a larger value: 42
         let val = [42u32, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -1800,20 +1950,25 @@ mod tests {
         let product2 = cpu_fe_mul(&val, &val_inv);
         let canonical2 = cpu_fe_freeze(&product2);
         println!("42 * 42^(p-2) = {:?}", canonical2);
-        assert_eq!(canonical2, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            "42 * inverse(42) should be 1");
+        assert_eq!(
+            canonical2,
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "42 * inverse(42) should be 1"
+        );
 
         // Test fe_tobytes round-trip
         let y_bytes: [u8; 32] = [
-            0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66,
         ];
         let mut y_u32s = [0u32; 8];
         for i in 0..8 {
             y_u32s[i] = u32::from_le_bytes([
-                y_bytes[i*4], y_bytes[i*4+1], y_bytes[i*4+2], y_bytes[i*4+3]
+                y_bytes[i * 4],
+                y_bytes[i * 4 + 1],
+                y_bytes[i * 4 + 2],
+                y_bytes[i * 4 + 3],
             ]);
         }
         y_u32s[7] &= 0x7FFFFFFF;
@@ -1831,7 +1986,10 @@ mod tests {
 
         let roundtrip = cpu_fe_tobytes(&y);
         println!("y round-trip: {:?}", roundtrip);
-        assert_eq!(roundtrip, y_bytes, "fe_tobytes should round-trip to original bytes");
+        assert_eq!(
+            roundtrip, y_bytes,
+            "fe_tobytes should round-trip to original bytes"
+        );
     }
 
     #[test]
@@ -1840,16 +1998,18 @@ mod tests {
         // Known: y = 4/5 mod p, x = 15112221...
         // Compressed base point: y bytes with sign bit
         let by_bytes: [u8; 32] = [
-            0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66,
         ];
 
         let mut y_u32s = [0u32; 8];
         for i in 0..8 {
             y_u32s[i] = u32::from_le_bytes([
-                by_bytes[i*4], by_bytes[i*4+1], by_bytes[i*4+2], by_bytes[i*4+3]
+                by_bytes[i * 4],
+                by_bytes[i * 4 + 1],
+                by_bytes[i * 4 + 2],
+                by_bytes[i * 4 + 3],
             ]);
         }
         let _x_sign = (y_u32s[7] >> 31) & 1;
@@ -1870,12 +2030,12 @@ mod tests {
         println!("Base point y limbs: {:?}", y);
 
         let d_const: [u32; 10] = [
-            0x35978A3, 0x0D37284, 0x3156EBD, 0x06A0A0E, 0x001C029,
-            0x179E898, 0x3A03CBB, 0x1CE7198, 0x2E2B6FF, 0x1480DB3
+            0x35978A3, 0x0D37284, 0x3156EBD, 0x06A0A0E, 0x001C029, 0x179E898, 0x3A03CBB, 0x1CE7198,
+            0x2E2B6FF, 0x1480DB3,
         ];
 
         let y2 = cpu_fe_mul(&y, &y);
-        let one = [1u32,0,0,0,0,0,0,0,0,0];
+        let one = [1u32, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let u = cpu_fe_sub(&y2, &one);
         let dy2 = cpu_fe_mul(&d_const, &y2);
         let v = cpu_fe_add(&dy2, &one);
@@ -1917,7 +2077,7 @@ mod tests {
     }
 
     fn cpu_fe_neg(a: &[u32; 10]) -> [u32; 10] {
-        cpu_fe_sub(&[0u32;10], a)
+        cpu_fe_sub(&[0u32; 10], a)
     }
 
     fn cpu_fe_is_zero(a: &[u32; 10]) -> bool {
@@ -1943,15 +2103,33 @@ mod tests {
         h[0] = h[0].wrapping_add(19 * q);
 
         let mut carry;
-        carry = h[0] >> 26; h[0] &= 0x3FFFFFF; h[1] += carry;
-        carry = h[1] >> 25; h[1] &= 0x1FFFFFF; h[2] += carry;
-        carry = h[2] >> 26; h[2] &= 0x3FFFFFF; h[3] += carry;
-        carry = h[3] >> 25; h[3] &= 0x1FFFFFF; h[4] += carry;
-        carry = h[4] >> 26; h[4] &= 0x3FFFFFF; h[5] += carry;
-        carry = h[5] >> 25; h[5] &= 0x1FFFFFF; h[6] += carry;
-        carry = h[6] >> 26; h[6] &= 0x3FFFFFF; h[7] += carry;
-        carry = h[7] >> 25; h[7] &= 0x1FFFFFF; h[8] += carry;
-        carry = h[8] >> 26; h[8] &= 0x3FFFFFF; h[9] += carry;
+        carry = h[0] >> 26;
+        h[0] &= 0x3FFFFFF;
+        h[1] += carry;
+        carry = h[1] >> 25;
+        h[1] &= 0x1FFFFFF;
+        h[2] += carry;
+        carry = h[2] >> 26;
+        h[2] &= 0x3FFFFFF;
+        h[3] += carry;
+        carry = h[3] >> 25;
+        h[3] &= 0x1FFFFFF;
+        h[4] += carry;
+        carry = h[4] >> 26;
+        h[4] &= 0x3FFFFFF;
+        h[5] += carry;
+        carry = h[5] >> 25;
+        h[5] &= 0x1FFFFFF;
+        h[6] += carry;
+        carry = h[6] >> 26;
+        h[6] &= 0x3FFFFFF;
+        h[7] += carry;
+        carry = h[7] >> 25;
+        h[7] &= 0x1FFFFFF;
+        h[8] += carry;
+        carry = h[8] >> 26;
+        h[8] &= 0x3FFFFFF;
+        h[9] += carry;
         h[9] &= 0x1FFFFFF;
 
         h
@@ -1965,7 +2143,12 @@ mod tests {
         fn bytes_to_10limb(bytes: &[u8]) -> [u32; 10] {
             let mut b = [0u32; 8];
             for i in 0..8 {
-                b[i] = u32::from_le_bytes([bytes[i*4], bytes[i*4+1], bytes[i*4+2], bytes[i*4+3]]);
+                b[i] = u32::from_le_bytes([
+                    bytes[i * 4],
+                    bytes[i * 4 + 1],
+                    bytes[i * 4 + 2],
+                    bytes[i * 4 + 3],
+                ]);
             }
             let mut f = [0u32; 10];
             f[0] = b[0] & 0x3FFFFFF;
@@ -1983,20 +2166,23 @@ mod tests {
 
         fn print_limbs(name: &str, limbs: &[u32; 10]) {
             println!("let {} = array<u32, 10>(", name);
-            println!("    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u,",
-                limbs[0], limbs[1], limbs[2], limbs[3], limbs[4]);
-            println!("    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u",
-                limbs[5], limbs[6], limbs[7], limbs[8], limbs[9]);
+            println!(
+                "    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u,",
+                limbs[0], limbs[1], limbs[2], limbs[3], limbs[4]
+            );
+            println!(
+                "    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u",
+                limbs[5], limbs[6], limbs[7], limbs[8], limbs[9]
+            );
             println!(");");
         }
 
         // Base point y = 4/5 mod p
         // Compressed: 5866666666666666666666666666666666666666666666666666666666666666
         let by_bytes: [u8; 32] = [
-            0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
-            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x58, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+            0x66, 0x66, 0x66, 0x66,
         ];
         let by = bytes_to_10limb(&by_bytes);
         print_limbs("by", &by);
@@ -2005,10 +2191,9 @@ mod tests {
         // x = 15112221349535807912866137220509078750507884956996801397042474682556759602985
         // hex (big-endian): 216936D3CD6E53FEC0A4E231FDD6DC5C692CC7609525A7B2C9562D608F25D51A
         let bx_bytes: [u8; 32] = [
-            0x1A, 0xD5, 0x25, 0x8F, 0x60, 0x2D, 0x56, 0xC9,
-            0xB2, 0xA7, 0x25, 0x95, 0x60, 0xC7, 0x2C, 0x69,
-            0x5C, 0xDC, 0xD6, 0xFD, 0x31, 0xE2, 0xA4, 0xC0,
-            0xFE, 0x53, 0x6E, 0xCD, 0xD3, 0x36, 0x69, 0x21,
+            0x1A, 0xD5, 0x25, 0x8F, 0x60, 0x2D, 0x56, 0xC9, 0xB2, 0xA7, 0x25, 0x95, 0x60, 0xC7,
+            0x2C, 0x69, 0x5C, 0xDC, 0xD6, 0xFD, 0x31, 0xE2, 0xA4, 0xC0, 0xFE, 0x53, 0x6E, 0xCD,
+            0xD3, 0x36, 0x69, 0x21,
         ];
         let bx = bytes_to_10limb(&bx_bytes);
         print_limbs("bx", &bx);
@@ -2016,10 +2201,9 @@ mod tests {
         // d = -121665/121666 mod p
         // hex (big-endian): 52036cee2b6ffe738cc740797779e89800700a4d4141d8ab75eb4dca135978a3
         let d_bytes: [u8; 32] = [
-            0xa3, 0x78, 0x59, 0x13, 0xca, 0x4d, 0xeb, 0x75,
-            0xab, 0xd8, 0x41, 0x41, 0x4d, 0x0a, 0x70, 0x00,
-            0x98, 0xe8, 0x79, 0x77, 0x79, 0x40, 0xc7, 0x8c,
-            0x73, 0xfe, 0x6f, 0x2b, 0xee, 0x6c, 0x03, 0x52,
+            0xa3, 0x78, 0x59, 0x13, 0xca, 0x4d, 0xeb, 0x75, 0xab, 0xd8, 0x41, 0x41, 0x4d, 0x0a,
+            0x70, 0x00, 0x98, 0xe8, 0x79, 0x77, 0x79, 0x40, 0xc7, 0x8c, 0x73, 0xfe, 0x6f, 0x2b,
+            0xee, 0x6c, 0x03, 0x52,
         ];
         let d = bytes_to_10limb(&d_bytes);
         print_limbs("d", &d);
@@ -2036,11 +2220,11 @@ mod tests {
                 if i % 2 == 0 {
                     let carry = d2[i] >> 26;
                     d2[i] &= 0x3FFFFFF;
-                    d2[i+1] += carry;
+                    d2[i + 1] += carry;
                 } else {
                     let carry = d2[i] >> 25;
                     d2[i] &= 0x1FFFFFF;
-                    d2[i+1] += carry;
+                    d2[i + 1] += carry;
                 }
             }
             let carry9 = d2[9] >> 25;
@@ -2052,10 +2236,9 @@ mod tests {
         // sqrt(-1) mod p = 2^((p-1)/4) mod p
         // hex (big-endian): 2b8324804fc1df0b2b4d00993dfbd7a72f431806ad2fe478c4ee1b274a0ea0b0
         let sqrtm1_bytes: [u8; 32] = [
-            0xb0, 0xa0, 0x0e, 0x4a, 0x27, 0x1b, 0xee, 0xc4,
-            0x78, 0xe4, 0x2f, 0xad, 0x06, 0x18, 0x43, 0x2f,
-            0xa7, 0xd7, 0xfb, 0x3d, 0x99, 0x00, 0x4d, 0x2b,
-            0x0b, 0xdf, 0xc1, 0x4f, 0x80, 0x24, 0x83, 0x2b,
+            0xb0, 0xa0, 0x0e, 0x4a, 0x27, 0x1b, 0xee, 0xc4, 0x78, 0xe4, 0x2f, 0xad, 0x06, 0x18,
+            0x43, 0x2f, 0xa7, 0xd7, 0xfb, 0x3d, 0x99, 0x00, 0x4d, 0x2b, 0x0b, 0xdf, 0xc1, 0x4f,
+            0x80, 0x24, 0x83, 0x2b,
         ];
         let sqrtm1 = bytes_to_10limb(&sqrtm1_bytes);
         print_limbs("sqrtm1", &sqrtm1);
@@ -2065,12 +2248,19 @@ mod tests {
     type CpuGePoint = ([u32; 10], [u32; 10], [u32; 10], [u32; 10]); // (x, y, z, t)
 
     fn cpu_ge_zero() -> CpuGePoint {
-        ([0;10], [1,0,0,0,0,0,0,0,0,0], [1,0,0,0,0,0,0,0,0,0], [0;10])
+        (
+            [0; 10],
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [0; 10],
+        )
     }
 
     fn cpu_fe_2d() -> [u32; 10] {
-        [0x2B2F159, 0x1A6E509, 0x22ADD7A, 0x0D4141D, 0x0038052,
-         0x0F3D130, 0x3407977, 0x19CE331, 0x1C56DFF, 0x0901B67]
+        [
+            0x2B2F159, 0x1A6E509, 0x22ADD7A, 0x0D4141D, 0x0038052, 0x0F3D130, 0x3407977, 0x19CE331,
+            0x1C56DFF, 0x0901B67,
+        ]
     }
 
     fn cpu_ge_add(p: &CpuGePoint, q: &CpuGePoint) -> CpuGePoint {
@@ -2084,8 +2274,12 @@ mod tests {
         let g = cpu_fe_add(&d, &c);
         let h = cpu_fe_add(&b, &a);
 
-        (cpu_fe_mul(&e, &f), cpu_fe_mul(&g, &h),
-         cpu_fe_mul(&f, &g), cpu_fe_mul(&e, &h))
+        (
+            cpu_fe_mul(&e, &f),
+            cpu_fe_mul(&g, &h),
+            cpu_fe_mul(&f, &g),
+            cpu_fe_mul(&e, &h),
+        )
     }
 
     // CPU mirror of the shader's `ge_double`, kept beside `cpu_ge_add` as the
@@ -2100,13 +2294,20 @@ mod tests {
         let c = cpu_fe_add(&c_inner, &c_inner);
         let d = cpu_fe_neg(&a);
 
-        let e = cpu_fe_sub(&cpu_fe_mul(&cpu_fe_add(&p.0, &p.1), &cpu_fe_add(&p.0, &p.1)), &cpu_fe_add(&a, &b));
+        let e = cpu_fe_sub(
+            &cpu_fe_mul(&cpu_fe_add(&p.0, &p.1), &cpu_fe_add(&p.0, &p.1)),
+            &cpu_fe_add(&a, &b),
+        );
         let g = cpu_fe_add(&d, &b);
         let f = cpu_fe_sub(&g, &c);
         let h = cpu_fe_sub(&d, &b);
 
-        (cpu_fe_mul(&e, &f), cpu_fe_mul(&g, &h),
-         cpu_fe_mul(&f, &g), cpu_fe_mul(&e, &h))
+        (
+            cpu_fe_mul(&e, &f),
+            cpu_fe_mul(&g, &h),
+            cpu_fe_mul(&f, &g),
+            cpu_fe_mul(&e, &h),
+        )
     }
 
     fn cpu_ge_to_affine(p: &CpuGePoint) -> CpuGePoint {
@@ -2114,19 +2315,19 @@ mod tests {
         let x = cpu_fe_mul(&p.0, &z_inv);
         let y = cpu_fe_mul(&p.1, &z_inv);
         let t = cpu_fe_mul(&x, &y);
-        (x, y, [1,0,0,0,0,0,0,0,0,0], t)
+        (x, y, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0], t)
     }
 
     fn cpu_ge_basepoint() -> CpuGePoint {
         let bx: [u32; 10] = [
-            0x325D51A, 0x18B5823, 0x0F6592A, 0x104A92D, 0x1A4B31D,
-            0x1D6DC5C, 0x27118FE, 0x07FD814, 0x13CD6E5, 0x085A4DB
+            0x325D51A, 0x18B5823, 0x0F6592A, 0x104A92D, 0x1A4B31D, 0x1D6DC5C, 0x27118FE, 0x07FD814,
+            0x13CD6E5, 0x085A4DB,
         ];
         let by: [u32; 10] = [
-            0x2666658, 0x1999999, 0x0CCCCCC, 0x1333333, 0x1999999,
-            0x0666666, 0x3333333, 0x0CCCCCC, 0x2666666, 0x1999999
+            0x2666658, 0x1999999, 0x0CCCCCC, 0x1333333, 0x1999999, 0x0666666, 0x3333333, 0x0CCCCCC,
+            0x2666666, 0x1999999,
         ];
-        let bz: [u32; 10] = [1,0,0,0,0,0,0,0,0,0];
+        let bz: [u32; 10] = [1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let bt = cpu_fe_mul(&bx, &by);
         (bx, by, bz, bt)
     }
@@ -2139,12 +2340,15 @@ mod tests {
         let bp = cpu_ge_basepoint();
 
         // Verify basepoint is on curve using curve25519-dalek
-        use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
         use curve25519_dalek::Scalar;
+        use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
         let dalek_bp_compressed = ED25519_BASEPOINT_POINT.compress();
         let our_by_bytes = cpu_fe_tobytes(&bp.1);
-        assert_eq!(our_by_bytes, dalek_bp_compressed.as_bytes()[..32],
-            "Base point y should match curve25519-dalek");
+        assert_eq!(
+            our_by_bytes,
+            dalek_bp_compressed.as_bytes()[..32],
+            "Base point y should match curve25519-dalek"
+        );
 
         let mut table: Vec<CpuGePoint> = Vec::with_capacity(16);
         // 0 * B = identity
@@ -2161,7 +2365,11 @@ mod tests {
         // Convert all to affine and verify against curve25519-dalek
         let mut affine_table: Vec<CpuGePoint> = Vec::with_capacity(16);
         for (i, entry) in table.iter().enumerate() {
-            let aff = if i == 0 { cpu_ge_zero() } else { cpu_ge_to_affine(entry) };
+            let aff = if i == 0 {
+                cpu_ge_zero()
+            } else {
+                cpu_ge_to_affine(entry)
+            };
             // Verify against dalek for non-zero points
             if i > 0 {
                 let dalek_point = Scalar::from(i as u64) * ED25519_BASEPOINT_POINT;
@@ -2172,8 +2380,12 @@ mod tests {
                 let x_sign = our_x_bytes[0] & 1;
                 let mut expected_compressed = our_y_bytes;
                 expected_compressed[31] |= x_sign << 7;
-                assert_eq!(expected_compressed, dalek_compressed.as_bytes()[..32],
-                    "{}*B should match curve25519-dalek", i);
+                assert_eq!(
+                    expected_compressed,
+                    dalek_compressed.as_bytes()[..32],
+                    "{}*B should match curve25519-dalek",
+                    i
+                );
             }
             affine_table.push(aff);
         }
@@ -2186,12 +2398,18 @@ mod tests {
             let yf = cpu_fe_freeze(y);
             let tf = cpu_fe_freeze(t);
             println!("\n// {}*B", i);
-            println!("const B_TABLE_{}_X = array<u32, 10>(\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u,\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u\n);",
-                i, xf[0], xf[1], xf[2], xf[3], xf[4], xf[5], xf[6], xf[7], xf[8], xf[9]);
-            println!("const B_TABLE_{}_Y = array<u32, 10>(\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u,\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u\n);",
-                i, yf[0], yf[1], yf[2], yf[3], yf[4], yf[5], yf[6], yf[7], yf[8], yf[9]);
-            println!("const B_TABLE_{}_T = array<u32, 10>(\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u,\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u\n);",
-                i, tf[0], tf[1], tf[2], tf[3], tf[4], tf[5], tf[6], tf[7], tf[8], tf[9]);
+            println!(
+                "const B_TABLE_{}_X = array<u32, 10>(\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u,\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u\n);",
+                i, xf[0], xf[1], xf[2], xf[3], xf[4], xf[5], xf[6], xf[7], xf[8], xf[9]
+            );
+            println!(
+                "const B_TABLE_{}_Y = array<u32, 10>(\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u,\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u\n);",
+                i, yf[0], yf[1], yf[2], yf[3], yf[4], yf[5], yf[6], yf[7], yf[8], yf[9]
+            );
+            println!(
+                "const B_TABLE_{}_T = array<u32, 10>(\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u,\n    0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u, 0x{:07X}u\n);",
+                i, tf[0], tf[1], tf[2], tf[3], tf[4], tf[5], tf[6], tf[7], tf[8], tf[9]
+            );
         }
     }
 
@@ -2211,8 +2429,10 @@ mod tests {
 
         println!("\nEd25519 Verification Throughput Comparison (buffer pool + wg=256):");
         println!("{:-<100}", "");
-        println!("{:>7}  {:>14}  {:>14}  {:>14}  {:>10}  {:>10}  {:>12}",
-            "batch", "CPU-seq", "CPU-par(rayon)", gpu_label, "GPU/seq", "GPU/par", "GPU time");
+        println!(
+            "{:>7}  {:>14}  {:>14}  {:>14}  {:>10}  {:>10}  {:>12}",
+            "batch", "CPU-seq", "CPU-par(rayon)", gpu_label, "GPU/seq", "GPU/par", "GPU time"
+        );
         println!("{:-<100}", "");
 
         for &n in &batch_sizes {
@@ -2271,32 +2491,56 @@ mod tests {
             let gpu_vps = n as f64 / gpu_elapsed.as_secs_f64();
 
             // Verify results match
-            let mismatch_gpu_par = par_results.iter().zip(gpu_results.iter())
-                .filter(|(c, g)| c != g).count();
+            let mismatch_gpu_par = par_results
+                .iter()
+                .zip(gpu_results.iter())
+                .filter(|(c, g)| c != g)
+                .count();
             if let Some(ref cpu_res) = cpu_results {
-                let mismatch = cpu_res.iter().zip(gpu_results.iter())
-                    .filter(|(c, g)| c != g).count();
+                let mismatch = cpu_res
+                    .iter()
+                    .zip(gpu_results.iter())
+                    .filter(|(c, g)| c != g)
+                    .count();
                 assert_eq!(mismatch, 0, "GPU and CPU-seq must match for batch {}", n);
             }
 
             if cpu_vps > 0.0 {
-                println!("{:>7}  {:>10.0} v/s  {:>10.0} v/s  {:>10.0} v/s  {:>9.2}x  {:>9.2}x  {:>8.1}ms",
-                    n, cpu_vps, par_vps, gpu_vps,
-                    gpu_vps / cpu_vps, gpu_vps / par_vps,
-                    gpu_elapsed.as_secs_f64() * 1000.0);
+                println!(
+                    "{:>7}  {:>10.0} v/s  {:>10.0} v/s  {:>10.0} v/s  {:>9.2}x  {:>9.2}x  {:>8.1}ms",
+                    n,
+                    cpu_vps,
+                    par_vps,
+                    gpu_vps,
+                    gpu_vps / cpu_vps,
+                    gpu_vps / par_vps,
+                    gpu_elapsed.as_secs_f64() * 1000.0
+                );
             } else {
-                println!("{:>7}  {:>14}  {:>10.0} v/s  {:>10.0} v/s  {:>10}  {:>9.2}x  {:>8.1}ms",
-                    n, "-", par_vps, gpu_vps,
-                    "-", gpu_vps / par_vps,
-                    gpu_elapsed.as_secs_f64() * 1000.0);
+                println!(
+                    "{:>7}  {:>14}  {:>10.0} v/s  {:>10.0} v/s  {:>10}  {:>9.2}x  {:>8.1}ms",
+                    n,
+                    "-",
+                    par_vps,
+                    gpu_vps,
+                    "-",
+                    gpu_vps / par_vps,
+                    gpu_elapsed.as_secs_f64() * 1000.0
+                );
             }
-            println!("         precompute={:.1}ms  write={:.1}ms  compute={:.1}ms  readback={:.1}ms",
+            println!(
+                "         precompute={:.1}ms  write={:.1}ms  compute={:.1}ms  readback={:.1}ms",
                 t_precompute.as_secs_f64() * 1000.0,
                 timing.write_us as f64 / 1000.0,
                 timing.compute_us as f64 / 1000.0,
-                timing.readback_us as f64 / 1000.0);
+                timing.readback_us as f64 / 1000.0
+            );
 
-            assert_eq!(mismatch_gpu_par, 0, "GPU and rayon must match for batch {}", n);
+            assert_eq!(
+                mismatch_gpu_par, 0,
+                "GPU and rayon must match for batch {}",
+                n
+            );
         }
         println!("{:-<100}", "");
         println!("Note: GPU = SHA-512 precompute (rayon) + dispatch (buffer pool, zero alloc).");

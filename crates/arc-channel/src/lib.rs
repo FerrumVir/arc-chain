@@ -203,7 +203,10 @@ impl ChannelStateMachine {
                         need: amount,
                     });
                 }
-                (self.opener_balance - amount, self.counterparty_balance + amount)
+                (
+                    self.opener_balance - amount,
+                    self.counterparty_balance + amount,
+                )
             }
             Role::Counterparty => {
                 if self.counterparty_balance < amount {
@@ -212,7 +215,10 @@ impl ChannelStateMachine {
                         need: amount,
                     });
                 }
-                (self.opener_balance + amount, self.counterparty_balance - amount)
+                (
+                    self.opener_balance + amount,
+                    self.counterparty_balance - amount,
+                )
             }
         };
 
@@ -278,9 +284,7 @@ impl ChannelStateMachine {
 
         // Validate channel_id
         if commitment.channel_id != self.channel_id {
-            return Err(ChannelError::NotAuthorized(
-                "channel_id mismatch".into(),
-            ));
+            return Err(ChannelError::NotAuthorized("channel_id mismatch".into()));
         }
 
         // Validate nonce is strictly increasing
@@ -329,10 +333,7 @@ impl ChannelStateMachine {
     /// Finalize a proposed state after receiving the counterparty's co-signature.
     ///
     /// Call this on the proposer side after getting back the fully-signed commitment.
-    pub fn finalize_state(
-        &mut self,
-        commitment: &StateCommitment,
-    ) -> Result<(), ChannelError> {
+    pub fn finalize_state(&mut self, commitment: &StateCommitment) -> Result<(), ChannelError> {
         if !commitment.is_fully_signed() {
             return Err(ChannelError::InvalidSignature);
         }
@@ -398,11 +399,9 @@ impl ChannelStateMachine {
             .iter()
             .rev()
             .find(|c| c.is_fully_signed())
-            .ok_or_else(|| {
-                ChannelError::WrongState {
-                    expected: "state with both signatures".into(),
-                    actual: "no fully-signed states".into(),
-                }
+            .ok_or_else(|| ChannelError::WrongState {
+                expected: "state with both signatures".into(),
+                actual: "no fully-signed states".into(),
             })?;
 
         Ok(latest.clone())
@@ -443,13 +442,8 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-1");
         let deposit = 1_000_000;
 
-        let opener = ChannelStateMachine::new(
-            channel_id,
-            Role::Opener,
-            deposit,
-            opener_sk,
-            counter_vk,
-        );
+        let opener =
+            ChannelStateMachine::new(channel_id, Role::Opener, deposit, opener_sk, counter_vk);
         let counter = ChannelStateMachine::new(
             channel_id,
             Role::Counterparty,

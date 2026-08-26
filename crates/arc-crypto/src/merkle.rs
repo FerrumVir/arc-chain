@@ -92,7 +92,11 @@ impl MerkleTree {
         let mut idx = index;
 
         for level in &self.levels[..self.levels.len() - 1] {
-            let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) {
+                idx + 1
+            } else {
+                idx - 1
+            };
             let sibling = if sibling_idx < level.len() {
                 level[sibling_idx]
             } else {
@@ -311,10 +315,12 @@ impl IncrementalMerkle {
 
             // Prepare dirty set for next level.
             dirty_at_level = dirty_parents;
-            if next_real > 0 && self.levels[next_lv].len() > next_real
-                && dirty_at_level.contains(&(next_real - 1)) {
-                    dirty_at_level.insert(next_real);
-                }
+            if next_real > 0
+                && self.levels[next_lv].len() > next_real
+                && dirty_at_level.contains(&(next_real - 1))
+            {
+                dirty_at_level.insert(next_real);
+            }
         }
     }
 
@@ -343,10 +349,7 @@ impl IncrementalMerkle {
 
     /// Generate a Merkle inclusion proof for the leaf at `index`.
     pub fn proof(&self, index: usize) -> Option<MerkleProof> {
-        if self.levels.is_empty()
-            || self.real_lengths.is_empty()
-            || index >= self.real_lengths[0]
-        {
+        if self.levels.is_empty() || self.real_lengths.is_empty() || index >= self.real_lengths[0] {
             return None;
         }
 
@@ -355,7 +358,11 @@ impl IncrementalMerkle {
         let mut idx = index;
 
         for level in &self.levels[..self.levels.len() - 1] {
-            let sibling_idx = if idx.is_multiple_of(2) { idx + 1 } else { idx - 1 };
+            let sibling_idx = if idx.is_multiple_of(2) {
+                idx + 1
+            } else {
+                idx - 1
+            };
             let sibling = if sibling_idx < level.len() {
                 level[sibling_idx]
             } else {
@@ -398,9 +405,7 @@ mod tests {
 
     #[test]
     fn test_proof_verify() {
-        let leaves: Vec<Hash256> = (0..1000u32)
-            .map(|i| hash_bytes(&i.to_le_bytes()))
-            .collect();
+        let leaves: Vec<Hash256> = (0..1000u32).map(|i| hash_bytes(&i.to_le_bytes())).collect();
         let tree = MerkleTree::from_leaves(leaves);
 
         // Prove leaf 42
@@ -410,9 +415,7 @@ mod tests {
 
     #[test]
     fn test_proof_fails_with_wrong_leaf() {
-        let leaves: Vec<Hash256> = (0..100u32)
-            .map(|i| hash_bytes(&i.to_le_bytes()))
-            .collect();
+        let leaves: Vec<Hash256> = (0..100u32).map(|i| hash_bytes(&i.to_le_bytes())).collect();
         let tree = MerkleTree::from_leaves(leaves);
 
         let mut proof = tree.proof(42).unwrap();
@@ -562,7 +565,10 @@ mod tests {
         // Generate and verify proofs at various positions.
         for idx in [0, 1, 50, 98, 99] {
             let proof = im.proof(idx).unwrap();
-            assert!(MerkleTree::verify_proof(&proof), "proof failed at index {idx}");
+            assert!(
+                MerkleTree::verify_proof(&proof),
+                "proof failed at index {idx}"
+            );
         }
     }
 }

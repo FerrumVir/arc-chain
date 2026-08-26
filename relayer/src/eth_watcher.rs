@@ -72,7 +72,8 @@ impl EthWatcher {
             "id": 1
         });
 
-        let resp: serde_json::Value = self.client
+        let resp: serde_json::Value = self
+            .client
             .post(&self.eth_rpc_url)
             .json(&body)
             .send()
@@ -131,7 +132,8 @@ impl EthWatcher {
             "id": 1
         });
 
-        let resp: serde_json::Value = self.client
+        let resp: serde_json::Value = self
+            .client
             .post(&self.eth_rpc_url)
             .json(&body)
             .send()
@@ -169,18 +171,14 @@ impl EthWatcher {
 /// - topics[2]: nonce (indexed, left-padded to 32 bytes)
 /// - data: amount (uint256, 32 bytes)
 fn parse_lock_event(log: &serde_json::Value) -> Result<LockEvent> {
-    let topics = log["topics"]
-        .as_array()
-        .context("missing topics")?;
+    let topics = log["topics"].as_array().context("missing topics")?;
 
     if topics.len() < 3 {
         anyhow::bail!("expected at least 3 topics, got {}", topics.len());
     }
 
     // topics[1] = sender address (last 20 bytes of 32-byte word)
-    let sender_hex = topics[1]
-        .as_str()
-        .context("missing sender topic")?;
+    let sender_hex = topics[1].as_str().context("missing sender topic")?;
     let sender_bytes = decode_hex_bytes(sender_hex)?;
     let mut sender = [0u8; 20];
     if sender_bytes.len() >= 20 {
@@ -188,22 +186,16 @@ fn parse_lock_event(log: &serde_json::Value) -> Result<LockEvent> {
     }
 
     // topics[2] = nonce
-    let nonce_hex = topics[2]
-        .as_str()
-        .context("missing nonce topic")?;
+    let nonce_hex = topics[2].as_str().context("missing nonce topic")?;
     let nonce = parse_hex_u64(nonce_hex)?;
 
     // data = amount (uint256)
-    let data_hex = log["data"]
-        .as_str()
-        .context("missing data field")?;
+    let data_hex = log["data"].as_str().context("missing data field")?;
     let data_bytes = decode_hex_bytes(data_hex)?;
     let amount = parse_uint256_as_u128(&data_bytes)?;
 
     // Block number
-    let block_hex = log["blockNumber"]
-        .as_str()
-        .context("missing blockNumber")?;
+    let block_hex = log["blockNumber"].as_str().context("missing blockNumber")?;
     let block_number = parse_hex_u64(block_hex)?;
 
     // Transaction hash
@@ -217,9 +209,7 @@ fn parse_lock_event(log: &serde_json::Value) -> Result<LockEvent> {
     }
 
     // Log index
-    let log_index_hex = log["logIndex"]
-        .as_str()
-        .unwrap_or("0x0");
+    let log_index_hex = log["logIndex"].as_str().unwrap_or("0x0");
     let log_index = parse_hex_u64(log_index_hex)?;
 
     Ok(LockEvent {

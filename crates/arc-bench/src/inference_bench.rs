@@ -13,7 +13,7 @@
 //!   cargo run --release --bin arc-bench-inference
 //!   cargo run --release --bin arc-bench-inference -- --model /tmp/arc-models/mlp-1024x6.arc
 
-use arc_crypto::{hash_bytes, Hash256};
+use arc_crypto::{Hash256, hash_bytes};
 use arc_state::StateDB;
 use arc_types::*;
 use arc_vm::inference::{
@@ -27,7 +27,10 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let model_path = args.iter().position(|a| a == "--model").map(|i| args[i + 1].clone());
+    let model_path = args
+        .iter()
+        .position(|a| a == "--model")
+        .map(|i| args[i + 1].clone());
 
     eprintln!("═══════════════════════════════════════════════════════════");
     eprintln!("ARC Chain - Inference Benchmark");
@@ -124,20 +127,23 @@ fn main() {
             all_deterministic
         );
 
-        results["models"].as_array_mut().unwrap().push(serde_json::json!({
-            "name": name,
-            "params": param_count,
-            "input_dim": input_dim,
-            "hidden_dim": hidden,
-            "depth": depth,
-            "runs": 100,
-            "avg_us": avg_us,
-            "p50_us": p50_us,
-            "p99_us": p99_us,
-            "forward_ms": avg_us as f64 / 1000.0,
-            "deterministic": all_deterministic,
-            "model_id": hex_encode(&model_id.0[..8]),
-        }));
+        results["models"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "name": name,
+                "params": param_count,
+                "input_dim": input_dim,
+                "hidden_dim": hidden,
+                "depth": depth,
+                "runs": 100,
+                "avg_us": avg_us,
+                "p50_us": p50_us,
+                "p99_us": p99_us,
+                "forward_ms": avg_us as f64 / 1000.0,
+                "deterministic": all_deterministic,
+                "model_id": hex_encode(&model_id.0[..8]),
+            }));
 
         if !all_deterministic {
             results["determinism_verified"] = serde_json::json!(false);
@@ -173,7 +179,11 @@ fn main() {
                         match engine.run_inference(&request) {
                             Ok(result) => {
                                 let elapsed_ms = start.elapsed().as_millis();
-                                eprintln!("  External model: {}ms, output_len={}", elapsed_ms, format!("{:?}", result.output).len());
+                                eprintln!(
+                                    "  External model: {}ms, output_len={}",
+                                    elapsed_ms,
+                                    format!("{:?}", result.output).len()
+                                );
                                 results["external_model"] = serde_json::json!({
                                     "path": path,
                                     "model_id": hex_encode(&model_id.0[..8]),
@@ -195,9 +205,7 @@ fn main() {
 
     eprintln!("\n  Benchmarking InferenceAttestation TX throughput...");
     {
-        let state = StateDB::with_genesis(&[
-            (hash_bytes(b"attester"), 10_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(hash_bytes(b"attester"), 10_000_000)]);
         let attester = hash_bytes(b"attester");
 
         let mut attestation_txs = Vec::new();
@@ -233,7 +241,9 @@ fn main() {
         }
 
         let start = Instant::now();
-        let (block, receipts) = state.execute_block(&attestation_txs, hash_bytes(b"producer")).unwrap();
+        let (block, receipts) = state
+            .execute_block(&attestation_txs, hash_bytes(b"producer"))
+            .unwrap();
         let elapsed_ms = start.elapsed().as_millis() as u64;
 
         let success_count = receipts.iter().filter(|r| r.success).count();
@@ -268,7 +278,9 @@ fn build_model(hidden: usize, input_dim: usize, depth: usize) -> arc_vm::inferen
 
     // Simple LCG for deterministic "random" weights
     let mut next_f32 = || -> f32 {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((rng_state >> 33) as f32 / u32::MAX as f32 - 0.5) * 0.1
     };
 
@@ -308,22 +320,28 @@ fn build_model(hidden: usize, input_dim: usize, depth: usize) -> arc_vm::inferen
 
 fn count_params(model: &arc_vm::inference::NeuralNet) -> usize {
     use arc_vm::inference::Layer;
-    model.layers.iter().map(|l| match l {
-        Layer::Dense { weights, bias } => {
-            weights.len() * weights.first().map(|r| r.len()).unwrap_or(0) + bias.len()
-        }
-        Layer::LayerNorm { gamma, beta, .. } => gamma.len() + beta.len(),
-        Layer::Embedding { table } => table.len() * table.first().map(|r| r.len()).unwrap_or(0),
-        _ => 0,
-    }).sum()
+    model
+        .layers
+        .iter()
+        .map(|l| match l {
+            Layer::Dense { weights, bias } => {
+                weights.len() * weights.first().map(|r| r.len()).unwrap_or(0) + bias.len()
+            }
+            Layer::LayerNorm { gamma, beta, .. } => gamma.len() + beta.len(),
+            Layer::Embedding { table } => table.len() * table.first().map(|r| r.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
 }
 
 fn random_input(dim: usize) -> Vec<f32> {
     let mut rng_state: u64 = 123;
-    (0..dim).map(|_| {
-        rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        (rng_state >> 33) as f32 / u32::MAX as f32
-    }).collect()
+    (0..dim)
+        .map(|_| {
+            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            (rng_state >> 33) as f32 / u32::MAX as f32
+        })
+        .collect()
 }
 
 fn make_request(model_id: [u8; 32], input: &[f32]) -> InferenceRequest {

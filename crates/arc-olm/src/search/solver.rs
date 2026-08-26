@@ -13,13 +13,13 @@
 //! - **5.** **LLM-guided** (remaining time) - Ollama LLM picks operations step by step
 
 use crate::Grid;
-use crate::search::beam::{beam_search, beam_search_steered, exhaustive_search, BeamConfig};
-use crate::search::diff_synth;
-use crate::search::synthesizer;
-use crate::search::steering;
 use crate::search::augmentation;
+use crate::search::beam::{BeamConfig, beam_search, beam_search_steered, exhaustive_search};
+use crate::search::diff_synth;
 use crate::search::evolution::{self, EvolutionConfig};
 use crate::search::llm_engine::{self, LlmConfig};
+use crate::search::steering;
+use crate::search::synthesizer;
 use std::time::Instant;
 
 // ============================================================
@@ -27,12 +27,12 @@ use std::time::Instant;
 // ============================================================
 
 pub struct SolverConfig {
-    pub timeout_ms: u64,         // total wall-clock timeout per task (default 30_000)
-    pub use_augmentation: bool,  // enable D4 + color perm + PoE (default true)
-    pub use_evolution: bool,     // enable evolutionary refinement (default true)
-    pub use_llm: bool,           // enable LLM-guided search via Ollama (default false)
-    pub beam_width: usize,       // beam search width (default 200)
-    pub max_depth: usize,        // beam search max depth (default 6)
+    pub timeout_ms: u64,        // total wall-clock timeout per task (default 30_000)
+    pub use_augmentation: bool, // enable D4 + color perm + PoE (default true)
+    pub use_evolution: bool,    // enable evolutionary refinement (default true)
+    pub use_llm: bool,          // enable LLM-guided search via Ollama (default false)
+    pub beam_width: usize,      // beam search width (default 200)
+    pub max_depth: usize,       // beam search max depth (default 6)
     pub verbose: bool,
     pub steering_model: Option<std::sync::Arc<steering::SteeringModel>>,
 }
@@ -58,7 +58,7 @@ impl Default for SolverConfig {
 
 pub struct SolveResult {
     pub test_outputs: Vec<Grid>,
-    pub engine: &'static str,  // which engine solved it
+    pub engine: &'static str, // which engine solved it
     pub program: Vec<String>,
     pub time_ms: u64,
 }
@@ -102,12 +102,18 @@ pub fn solve(
         // This catches overfitting (programs that pass training but fail on new data).
         let cv_ok = if train_pairs.len() >= 3 {
             (0..train_pairs.len()).all(|hold_out| {
-                let sub_pairs: Vec<_> = train_pairs.iter().enumerate()
+                let sub_pairs: Vec<_> = train_pairs
+                    .iter()
+                    .enumerate()
                     .filter(|&(i, _)| i != hold_out)
                     .map(|(_, p)| p.clone())
                     .collect();
                 let held = &train_pairs[hold_out];
-                match synthesizer::synthesize(&sub_pairs, std::slice::from_ref(&held.0), synth_budget / 2) {
+                match synthesizer::synthesize(
+                    &sub_pairs,
+                    std::slice::from_ref(&held.0),
+                    synth_budget / 2,
+                ) {
                     Some(cv_result) => {
                         !cv_result.test_outputs.is_empty() && cv_result.test_outputs[0] == held.1
                     }
@@ -122,7 +128,9 @@ pub fn solve(
             if config.verbose {
                 eprintln!(
                     "[solver] synthesizer solved in {}ms (level {}): {}",
-                    elapsed(), sr.level, sr.program_desc
+                    elapsed(),
+                    sr.level,
+                    sr.program_desc
                 );
             }
             return Some(SolveResult {
@@ -155,12 +163,18 @@ pub fn solve(
         // Cross-validate diff_synth results too
         let cv_ok = if train_pairs.len() >= 2 {
             (0..train_pairs.len()).all(|hold_out| {
-                let sub_pairs: Vec<_> = train_pairs.iter().enumerate()
+                let sub_pairs: Vec<_> = train_pairs
+                    .iter()
+                    .enumerate()
                     .filter(|&(i, _)| i != hold_out)
                     .map(|(_, p)| p.clone())
                     .collect();
                 let held = &train_pairs[hold_out];
-                match diff_synth::diff_synthesize(&sub_pairs, std::slice::from_ref(&held.0), diff_budget / 2) {
+                match diff_synth::diff_synthesize(
+                    &sub_pairs,
+                    std::slice::from_ref(&held.0),
+                    diff_budget / 2,
+                ) {
                     Some(cv_result) => {
                         !cv_result.test_outputs.is_empty() && cv_result.test_outputs[0] == held.1
                     }
@@ -175,7 +189,8 @@ pub fn solve(
             if config.verbose {
                 eprintln!(
                     "[solver] diff_synth solved in {}ms: {}",
-                    elapsed(), dr.program_desc
+                    elapsed(),
+                    dr.program_desc
                 );
             }
             return Some(SolveResult {
@@ -201,13 +216,20 @@ pub fn solve(
     // ----------------------------------------------------------
     let exhaust_budget = config.timeout_ms * 5 / 100; // only 5% - fast depth-3 search
     if config.verbose {
-        eprintln!("[solver] engine 1.8: exhaustive search (budget={}ms, depth=3)", exhaust_budget);
+        eprintln!(
+            "[solver] engine 1.8: exhaustive search (budget={}ms, depth=3)",
+            exhaust_budget
+        );
     }
 
     if let Some(sr) = exhaustive_search(train_pairs, test_inputs, 3, exhaust_budget) {
         let program: Vec<String> = sr.program.iter().map(|s| s.to_string()).collect();
         if config.verbose {
-            eprintln!("[solver] exhaustive search solved in {}ms: {:?}", elapsed(), program);
+            eprintln!(
+                "[solver] exhaustive search solved in {}ms: {:?}",
+                elapsed(),
+                program
+            );
         }
         // Apply program to all test inputs
         if let Some(test_outputs) = apply_to_all_tests(&program, train_pairs, test_inputs) {
@@ -245,7 +267,11 @@ pub fn solve(
     if let Some(sr) = beam_search_steered(train_pairs, test_inputs, &beam_config, steer_ref) {
         let program: Vec<String> = sr.program.iter().map(|s| s.to_string()).collect();
         if config.verbose {
-            eprintln!("[solver] beam search solved in {}ms: {:?}", elapsed(), program);
+            eprintln!(
+                "[solver] beam search solved in {}ms: {:?}",
+                elapsed(),
+                program
+            );
         }
         // beam_search returns output for the first test input only.
         // Apply the program to all test inputs.
@@ -269,7 +295,10 @@ pub fn solve(
     if config.use_augmentation {
         let aug_budget = config.timeout_ms * 30 / 100;
         if config.verbose {
-            eprintln!("[solver] engine 3: augmented beam search (budget={}ms)", aug_budget);
+            eprintln!(
+                "[solver] engine 3: augmented beam search (budget={}ms)",
+                aug_budget
+            );
         }
 
         let aug_beam_config = BeamConfig {
@@ -285,7 +314,11 @@ pub fn solve(
                 // Wrap beam search as a multi-test solver
                 let mut outputs: Vec<Option<Grid>> = Vec::new();
                 for test_input in aug_tests {
-                    match beam_search(aug_train, std::slice::from_ref(test_input), &aug_beam_config) {
+                    match beam_search(
+                        aug_train,
+                        std::slice::from_ref(test_input),
+                        &aug_beam_config,
+                    ) {
                         Some(sr) => outputs.push(Some(sr.output)),
                         None => outputs.push(None),
                     }
@@ -296,8 +329,7 @@ pub fn solve(
 
         // Check if augmentation produced valid outputs for all test inputs
         if !aug_results.is_empty() && aug_results.iter().all(|r| r.is_some()) {
-            let test_outputs: Vec<Grid> =
-                aug_results.into_iter().map(|r| r.unwrap()).collect();
+            let test_outputs: Vec<Grid> = aug_results.into_iter().map(|r| r.unwrap()).collect();
             if config.verbose {
                 eprintln!("[solver] augmented beam search solved in {}ms", elapsed());
             }
@@ -359,7 +391,10 @@ pub fn solve(
     if config.use_llm {
         let llm_budget = remaining();
         if config.verbose {
-            eprintln!("[solver] engine 5: LLM-guided search (budget={}ms)", llm_budget);
+            eprintln!(
+                "[solver] engine 5: LLM-guided search (budget={}ms)",
+                llm_budget
+            );
         }
 
         let llm_config = LlmConfig {
@@ -367,11 +402,15 @@ pub fn solve(
             ..LlmConfig::default()
         };
 
-        if let Some(lr) = llm_engine::llm_guided_search(train_pairs, test_inputs, &llm_config, config.verbose) {
+        if let Some(lr) =
+            llm_engine::llm_guided_search(train_pairs, test_inputs, &llm_config, config.verbose)
+        {
             if config.verbose {
                 eprintln!(
                     "[solver] LLM solved in {}ms (attempt {}): {:?}",
-                    elapsed(), lr.attempt, lr.program
+                    elapsed(),
+                    lr.attempt,
+                    lr.program
                 );
             }
             return Some(SolveResult {
@@ -393,7 +432,7 @@ pub fn solve(
 pub fn solve_and_score(
     train_pairs: &[(Grid, Grid)],
     test_inputs: &[Grid],
-    test_outputs: &[Grid],  // ground truth
+    test_outputs: &[Grid], // ground truth
     config: &SolverConfig,
 ) -> (bool, Option<SolveResult>) {
     match solve(train_pairs, test_inputs, config) {
@@ -476,9 +515,7 @@ fn apply_program_local(
             return None;
         };
 
-        let result = std::panic::catch_unwind(
-            std::panic::AssertUnwindSafe(|| (prim.apply)(&args))
-        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (prim.apply)(&args)));
         current = match result {
             Ok(Some(v)) => v,
             _ => return None,
@@ -584,12 +621,7 @@ mod tests {
             ..Default::default()
         };
 
-        let (correct, result) = solve_and_score(
-            &train_pairs,
-            &test_inputs,
-            &test_outputs,
-            &config,
-        );
+        let (correct, result) = solve_and_score(&train_pairs, &test_inputs, &test_outputs, &config);
         assert!(correct);
         assert!(result.is_some());
     }
@@ -610,12 +642,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (correct, _result) = solve_and_score(
-            &train_pairs,
-            &test_inputs,
-            &test_outputs,
-            &config,
-        );
+        let (correct, _result) =
+            solve_and_score(&train_pairs, &test_inputs, &test_outputs, &config);
         assert!(!correct);
     }
 
@@ -647,11 +675,7 @@ mod tests {
     fn test_solver_empty_input() {
         let config = SolverConfig::default();
         assert!(solve(&[], &[], &config).is_none());
-        assert!(solve(
-            &[(vec![vec![1]], vec![vec![2]])],
-            &[],
-            &config,
-        ).is_none());
+        assert!(solve(&[(vec![vec![1]], vec![vec![2]])], &[], &config,).is_none());
     }
 
     /// The engine field correctly identifies which engine solved it.

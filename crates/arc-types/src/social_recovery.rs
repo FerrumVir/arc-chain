@@ -458,7 +458,7 @@ mod tests {
                 guardian(12, 1, GuardianType::Hardware),
             ],
             threshold: 2,
-            recovery_delay: 86400, // 1 day
+            recovery_delay: 86400,           // 1 day
             cooldown_after_recovery: 604800, // 1 week
         }
     }

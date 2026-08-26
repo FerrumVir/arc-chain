@@ -186,9 +186,7 @@ fn build_op_vocabulary(colors: &[u8]) -> String {
 // ============================================================
 
 fn build_program_prompt(train_pairs: &[(Grid, Grid)], colors: &[u8]) -> String {
-    let mut prompt = String::from(
-        "You are solving an ARC-AGI puzzle. Study the examples:\n\n",
-    );
+    let mut prompt = String::from("You are solving an ARC-AGI puzzle. Study the examples:\n\n");
 
     for (i, (inp, out)) in train_pairs.iter().enumerate() {
         prompt.push_str(&format!(
@@ -239,8 +237,7 @@ fn build_python_prompt(train_pairs: &[(Grid, Grid)]) -> String {
 // ============================================================
 
 fn parse_program(response: &str, catalog: &[TypedPrimitive]) -> Vec<String> {
-    let catalog_names: std::collections::HashSet<&str> =
-        catalog.iter().map(|p| p.name).collect();
+    let catalog_names: std::collections::HashSet<&str> = catalog.iter().map(|p| p.name).collect();
 
     // Clean up the response: remove quotes, backticks, newlines, commas
     let cleaned = response
@@ -276,11 +273,28 @@ fn parse_python_to_ops(code: &str) -> Vec<String> {
     let mappings: &[(&[&str], &str)] = &[
         (&["rot90", "rotate.*90", "np.rot90"], "rot90"),
         (&["rot180", "rotate.*180"], "rot180"),
-        (&["rot270", "rotate.*270", "np.rot90.*k=3", "np.rot90.*3"], "rot270"),
-        (&["flipud", "flip.*up.*down", "[::-1]", "vertical.*flip"], "hmirror"),
-        (&["fliplr", "flip.*left.*right", "horizontal.*flip", "[:, ::-1]"], "vmirror"),
+        (
+            &["rot270", "rotate.*270", "np.rot90.*k=3", "np.rot90.*3"],
+            "rot270",
+        ),
+        (
+            &["flipud", "flip.*up.*down", "[::-1]", "vertical.*flip"],
+            "hmirror",
+        ),
+        (
+            &[
+                "fliplr",
+                "flip.*left.*right",
+                "horizontal.*flip",
+                "[:, ::-1]",
+            ],
+            "vmirror",
+        ),
         (&["transpose", ".T", "np.transpose", "diagonal"], "dmirror"),
-        (&["trim", "crop", "remove.*border", "strip.*background"], "trim"),
+        (
+            &["trim", "crop", "remove.*border", "strip.*background"],
+            "trim",
+        ),
         (&["compress", "remove.*duplicate"], "compress"),
         (&["top.*half", "[:h//2]"], "tophalf"),
         (&["bottom.*half", "[h//2:]"], "bottomhalf"),
@@ -391,8 +405,7 @@ fn apply_program(steps: &[String], catalog: &[TypedPrimitive], input: &Grid) -> 
             return None;
         };
 
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (prim.apply)(&args)));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (prim.apply)(&args)));
         current = match result {
             Ok(Some(v)) => v,
             _ => return None,
@@ -418,12 +431,12 @@ fn verify_program(
     if program.is_empty() {
         return false;
     }
-    train_pairs.iter().all(|(inp, out)| {
-        match apply_program(program, catalog, inp) {
+    train_pairs
+        .iter()
+        .all(|(inp, out)| match apply_program(program, catalog, inp) {
             Some(ref result) => result == out,
             None => false,
-        }
-    })
+        })
 }
 
 // ============================================================
@@ -523,7 +536,10 @@ fn python_attempt(
     let response = call_ollama_python(&prompt, config, temperature)?;
 
     if verbose {
-        eprintln!("[llm] python response: {:?}", &response[..response.len().min(200)]);
+        eprintln!(
+            "[llm] python response: {:?}",
+            &response[..response.len().min(200)]
+        );
     }
 
     let ops = parse_python_to_ops(&response);
@@ -536,8 +552,7 @@ fn python_attempt(
     }
 
     // Filter to only operations that exist in the catalog
-    let catalog_names: std::collections::HashSet<&str> =
-        catalog.iter().map(|p| p.name).collect();
+    let catalog_names: std::collections::HashSet<&str> = catalog.iter().map(|p| p.name).collect();
     let valid_ops: Vec<String> = ops
         .into_iter()
         .filter(|o| catalog_names.contains(o.as_str()))

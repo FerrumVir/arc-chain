@@ -1,6 +1,6 @@
 //! Submit an InferenceEscrowRelease for the open already on-chain.
 
-use arc_crypto::{hash_bytes, Hash256, Signature};
+use arc_crypto::{Hash256, Signature, hash_bytes};
 use arc_types::transaction::{InferenceEscrowReleaseBody, TxBody};
 use arc_types::{Transaction, TxType};
 use ed25519_dalek::{Signer, SigningKey};
@@ -10,10 +10,8 @@ use std::time::Duration;
 
 const COORD: &str = "http://140.82.16.112:9090";
 const PAYER_PHRASE: &str = "milestone-b-live-test";
-const REQUEST_ID_HEX: &str =
-    "f404a52ae155907183b428fdac2601a08dbf003416dc16ef7c073e93c2c94d56";
-const MODEL_ID_HEX: &str =
-    "2c66ccd2ebaa35b1031efb18e1af8b946339a6b31a3c718cbd3beb3f4281156d";
+const REQUEST_ID_HEX: &str = "f404a52ae155907183b428fdac2601a08dbf003416dc16ef7c073e93c2c94d56";
+const MODEL_ID_HEX: &str = "2c66ccd2ebaa35b1031efb18e1af8b946339a6b31a3c718cbd3beb3f4281156d";
 
 async fn balance(c: &Client, hex_addr: &str) -> u64 {
     let url = format!("{}/account/{}", COORD, hex_addr);
@@ -130,10 +128,11 @@ async fn main() {
             .get(format!("{}/tx/0x{}", COORD, release_hash))
             .send()
             .await
-            && r.status().is_success() {
-                committed = true;
-                break;
-            }
+            && r.status().is_success()
+        {
+            committed = true;
+            break;
+        }
     }
     if !committed {
         eprintln!("release tx did not commit in 60s");
@@ -153,15 +152,21 @@ async fn main() {
     println!("=== BALANCE DELTAS (release) ===");
     println!(
         "payer/proposer: {} → {}  (Δ {:+})",
-        payer_pre, payer_post, payer_post as i64 - payer_pre as i64
+        payer_pre,
+        payer_post,
+        payer_post as i64 - payer_pre as i64
     );
     println!(
         "treasury:       {} → {}  (Δ {:+})",
-        tre_pre, tre_post, tre_post as i64 - tre_pre as i64
+        tre_pre,
+        tre_post,
+        tre_post as i64 - tre_pre as i64
     );
     println!(
         "observer pool:  {} → {}  (Δ {:+})",
-        obs_pre, obs_post, obs_post as i64 - obs_pre as i64
+        obs_pre,
+        obs_post,
+        obs_post as i64 - obs_pre as i64
     );
     let names = ["NYC", "LAX", "AMS", "LHR", "NRT", "SGP"];
     let mut sum_replica: i64 = 0;
@@ -178,7 +183,10 @@ async fn main() {
         + sum_replica
         + (payer_post as i64 - payer_pre as i64);
     println!();
-    println!("Total credited (treasury+observer+replicas+proposer-self): {}", credited);
+    println!(
+        "Total credited (treasury+observer+replicas+proposer-self): {}",
+        credited
+    );
     println!("Expected: 10000 ARC released from escrow");
     if credited == 10000 {
         println!("✓ TOTAL CONSERVED");

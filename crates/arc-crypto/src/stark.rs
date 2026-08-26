@@ -552,11 +552,8 @@ impl RecursiveProof {
         let child_proofs: Vec<[u8; 32]> = proofs.iter().map(|p| p.proof_hash()).collect();
 
         // Build structured proof_data with Merkle commitment
-        let (proof_data, merkle_root) = build_recursive_proof_data(
-            &child_proofs,
-            &start_state_root,
-            &end_state_root,
-        );
+        let (proof_data, merkle_root) =
+            build_recursive_proof_data(&child_proofs, &start_state_root, &end_state_root);
 
         Ok(Self {
             start_height,
@@ -615,11 +612,8 @@ impl RecursiveProof {
 
         let child_proofs: Vec<[u8; 32]> = proofs.iter().map(|p| p.proof_hash()).collect();
 
-        let (proof_data, merkle_root) = build_recursive_proof_data(
-            &child_proofs,
-            &start_state_root,
-            &end_state_root,
-        );
+        let (proof_data, merkle_root) =
+            build_recursive_proof_data(&child_proofs, &start_state_root, &end_state_root);
 
         Ok(Self {
             start_height,
@@ -673,11 +667,8 @@ impl RecursiveProof {
         let child_proofs: Vec<[u8; 32]> = proofs.iter().map(|p| p.proof_hash()).collect();
 
         // Build structured proof_data with Merkle commitment
-        let (proof_data, merkle_root) = build_recursive_proof_data(
-            &child_proofs,
-            &start_state_root,
-            &end_state_root,
-        );
+        let (proof_data, merkle_root) =
+            build_recursive_proof_data(&child_proofs, &start_state_root, &end_state_root);
 
         Ok(Self {
             start_height,
@@ -733,18 +724,17 @@ impl RecursiveProof {
 
             // Reconstruct Merkle root from child_proofs and compare against both
             // the top-level `merkle_root` field and the root embedded in proof_data
-            let leaves: Vec<Hash256> = self
-                .child_proofs
-                .iter()
-                .map(|h| Hash256(*h))
-                .collect();
+            let leaves: Vec<Hash256> = self.child_proofs.iter().map(|h| Hash256(*h)).collect();
             let tree = MerkleTree::from_leaves(leaves);
             let reconstructed_root = tree.root();
             let reconstructed_bytes: [u8; 32] = *reconstructed_root.as_bytes();
 
             // Check merkle_root field matches recomputed root
             if reconstructed_bytes != self.merkle_root {
-                errors.push("merkle_root field mismatch: child_proofs do not match struct merkle_root".to_string());
+                errors.push(
+                    "merkle_root field mismatch: child_proofs do not match struct merkle_root"
+                        .to_string(),
+                );
             }
 
             // Check proof_data committed root matches recomputed root
@@ -754,7 +744,9 @@ impl RecursiveProof {
                 }
                 // Also verify the field and embedded root are consistent
                 if self.merkle_root != committed_root {
-                    errors.push("merkle_root field does not match committed root in proof_data".to_string());
+                    errors.push(
+                        "merkle_root field does not match committed root in proof_data".to_string(),
+                    );
                 }
             } else {
                 errors.push("could not extract Merkle root from proof_data".to_string());
@@ -768,7 +760,10 @@ impl RecursiveProof {
 
             if let Some(committed_state_hash) = extract_state_hash(&self.proof_data) {
                 if expected_state_hash != committed_state_hash {
-                    errors.push("state hash mismatch: start/end state roots do not match committed hash".to_string());
+                    errors.push(
+                        "state hash mismatch: start/end state roots do not match committed hash"
+                            .to_string(),
+                    );
                 }
             } else {
                 errors.push("could not extract state hash from proof_data".to_string());
@@ -874,10 +869,8 @@ impl RecursiveProof {
         let total_tx_count = proofs.iter().map(|p| p.tx_count as u64).sum();
 
         let child_proof_hashes: Vec<[u8; 32]> = proofs.iter().map(|p| p.proof_hash()).collect();
-        let child_start_states: Vec<[u8; 32]> =
-            proofs.iter().map(|p| p.prev_state_root).collect();
-        let child_end_states: Vec<[u8; 32]> =
-            proofs.iter().map(|p| p.post_state_root).collect();
+        let child_start_states: Vec<[u8; 32]> = proofs.iter().map(|p| p.prev_state_root).collect();
+        let child_end_states: Vec<[u8; 32]> = proofs.iter().map(|p| p.post_state_root).collect();
 
         // Build Merkle tree over child proof hashes
         let leaves: Vec<Hash256> = child_proof_hashes.iter().map(|h| Hash256(*h)).collect();
@@ -924,7 +917,6 @@ impl RecursiveProof {
         })
     }
 
-
     pub fn spans_range(&self, height: u64) -> bool {
         height >= self.start_height && height <= self.end_height
     }
@@ -943,14 +935,14 @@ impl ProverConfig {
         Self {
             max_constraints: 1 << 20, // ~1M constraints
             #[cfg(feature = "stwo-prover")]
-            field_size_bits: 31,      // Mersenne-31 field (Stwo)
+            field_size_bits: 31, // Mersenne-31 field (Stwo)
             #[cfg(not(feature = "stwo-prover"))]
-            field_size_bits: 64,      // Goldilocks field (placeholder)
+            field_size_bits: 64, // Goldilocks field (placeholder)
             hash_function: ProofHashType::Poseidon,
             recursion_threshold: 8,
             target_proof_size: 512,
             #[cfg(feature = "stwo-icicle")]
-            gpu_acceleration: true,   // ICICLE GPU backend
+            gpu_acceleration: true, // ICICLE GPU backend
             #[cfg(not(feature = "stwo-icicle"))]
             gpu_acceleration: false,
         }
@@ -1018,8 +1010,8 @@ impl ProvingPipeline {
             self.stats.total_proof_bytes += proof.proof_size_bytes as u64;
 
             // Running average
-            self.stats.avg_block_proof_time_ms = self.stats.total_proving_time_ms as f64
-                / self.stats.blocks_proven as f64;
+            self.stats.avg_block_proof_time_ms =
+                self.stats.total_proving_time_ms as f64 / self.stats.blocks_proven as f64;
 
             new_proofs.push(proof);
         }
@@ -1034,10 +1026,7 @@ impl ProvingPipeline {
             .sum::<usize>() as f64;
 
         if raw_input_bytes > 0.0 {
-            let proof_bytes = new_proofs
-                .iter()
-                .map(|p| p.proof_size_bytes)
-                .sum::<usize>() as f64;
+            let proof_bytes = new_proofs.iter().map(|p| p.proof_size_bytes).sum::<usize>() as f64;
             self.stats.compression_ratio = proof_bytes / raw_input_bytes;
         }
 
@@ -1183,7 +1172,9 @@ mod tests {
     // 3. Aggregate 5 block proofs
     #[test]
     fn test_recursive_from_blocks() {
-        let proofs: Vec<BlockProof> = (10..15).map(|h| BlockProof::mock_prove(&make_input(h))).collect();
+        let proofs: Vec<BlockProof> = (10..15)
+            .map(|h| BlockProof::mock_prove(&make_input(h)))
+            .collect();
 
         let recursive = RecursiveProof::from_block_proofs(&proofs).unwrap();
 
@@ -1204,8 +1195,12 @@ mod tests {
     // 4. Recurse over 2 recursive proofs
     #[test]
     fn test_recursive_from_recursive() {
-        let proofs_a: Vec<BlockProof> = (0..5).map(|h| BlockProof::mock_prove(&make_input(h))).collect();
-        let proofs_b: Vec<BlockProof> = (5..10).map(|h| BlockProof::mock_prove(&make_input(h))).collect();
+        let proofs_a: Vec<BlockProof> = (0..5)
+            .map(|h| BlockProof::mock_prove(&make_input(h)))
+            .collect();
+        let proofs_b: Vec<BlockProof> = (5..10)
+            .map(|h| BlockProof::mock_prove(&make_input(h)))
+            .collect();
 
         let rec_a = RecursiveProof::from_block_proofs(&proofs_a).unwrap();
         let rec_b = RecursiveProof::from_block_proofs(&proofs_b).unwrap();
@@ -1230,7 +1225,9 @@ mod tests {
     // 5. Range check
     #[test]
     fn test_recursive_spans_range() {
-        let proofs: Vec<BlockProof> = (100..110).map(|h| BlockProof::mock_prove(&make_input(h))).collect();
+        let proofs: Vec<BlockProof> = (100..110)
+            .map(|h| BlockProof::mock_prove(&make_input(h)))
+            .collect();
         let recursive = RecursiveProof::from_block_proofs(&proofs).unwrap();
 
         assert!(recursive.spans_range(100));
@@ -1440,11 +1437,7 @@ mod tests {
         assert_eq!(child_count, 8);
 
         // Reconstruct the Merkle root independently and verify it matches
-        let leaves: Vec<Hash256> = recursive
-            .child_proofs
-            .iter()
-            .map(|h| Hash256(*h))
-            .collect();
+        let leaves: Vec<Hash256> = recursive.child_proofs.iter().map(|h| Hash256(*h)).collect();
         let tree = MerkleTree::from_leaves(leaves);
         let expected_root = tree.root();
         let committed_root = extract_merkle_root(&recursive.proof_data).unwrap();
@@ -1474,7 +1467,11 @@ mod tests {
         let result = tampered.verify();
         assert!(!result.is_valid);
         assert!(
-            result.error.as_ref().unwrap().contains("Merkle root mismatch"),
+            result
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Merkle root mismatch"),
             "should detect Merkle root tampering: {:?}",
             result.error
         );
@@ -1485,7 +1482,11 @@ mod tests {
         let result2 = tampered2.verify();
         assert!(!result2.is_valid);
         assert!(
-            result2.error.as_ref().unwrap().contains("Merkle root mismatch"),
+            result2
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("Merkle root mismatch"),
             "should detect child proof hash tampering: {:?}",
             result2.error
         );
@@ -1496,7 +1497,11 @@ mod tests {
         let result3 = tampered3.verify();
         assert!(!result3.is_valid);
         assert!(
-            result3.error.as_ref().unwrap().contains("state hash mismatch"),
+            result3
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("state hash mismatch"),
             "should detect state root tampering: {:?}",
             result3.error
         );
@@ -1547,11 +1552,7 @@ mod tests {
 
         // Verify the aggregate has a valid Merkle commitment
         let committed_root = extract_merkle_root(&aggregate.proof_data).unwrap();
-        let leaves: Vec<Hash256> = aggregate
-            .child_proofs
-            .iter()
-            .map(|h| Hash256(*h))
-            .collect();
+        let leaves: Vec<Hash256> = aggregate.child_proofs.iter().map(|h| Hash256(*h)).collect();
         let tree = MerkleTree::from_leaves(leaves);
         assert_eq!(*tree.root().as_bytes(), committed_root);
 
@@ -1597,10 +1598,17 @@ mod tests {
 
         // The recursive proof should be valid
         let result = recursive.verify();
-        assert!(result.is_valid, "recursive proof should verify: {:?}", result.error);
+        assert!(
+            result.is_valid,
+            "recursive proof should verify: {:?}",
+            result.error
+        );
 
         // merkle_root field should be populated (non-zero)
-        assert_ne!(recursive.merkle_root, [0u8; 32], "merkle_root should not be zero");
+        assert_ne!(
+            recursive.merkle_root, [0u8; 32],
+            "merkle_root should not be zero"
+        );
 
         // merkle_root should match the root embedded in proof_data
         let committed_root = extract_merkle_root(&recursive.proof_data).unwrap();
@@ -1610,11 +1618,7 @@ mod tests {
         );
 
         // Verify the Merkle root is computed correctly from child proof hashes
-        let leaves: Vec<Hash256> = recursive
-            .child_proofs
-            .iter()
-            .map(|h| Hash256(*h))
-            .collect();
+        let leaves: Vec<Hash256> = recursive.child_proofs.iter().map(|h| Hash256(*h)).collect();
         let tree = MerkleTree::from_leaves(leaves);
         assert_eq!(
             *tree.root().as_bytes(),
@@ -1697,7 +1701,10 @@ mod tests {
         let mut tampered_field = recursive.clone();
         tampered_field.merkle_root[15] ^= 0x42;
         let result = tampered_field.verify();
-        assert!(!result.is_valid, "tampered merkle_root field should be detected");
+        assert!(
+            !result.is_valid,
+            "tampered merkle_root field should be detected"
+        );
         let err = result.error.unwrap();
         assert!(
             err.contains("merkle_root"),
@@ -1709,7 +1716,10 @@ mod tests {
         let mut tampered_data = recursive.clone();
         tampered_data.proof_data[PROOF_DATA_MERKLE_OFF + 10] ^= 0x01;
         let result2 = tampered_data.verify();
-        assert!(!result2.is_valid, "tampered proof_data root should be detected");
+        assert!(
+            !result2.is_valid,
+            "tampered proof_data root should be detected"
+        );
 
         // Tampering with a child proof hash should cause Merkle root mismatch
         let mut tampered_child = recursive.clone();
@@ -1748,7 +1758,10 @@ mod tests {
 
         for r in [&rec_1, &rec_2, &rec_3, &rec_4] {
             assert!(r.verify().is_valid, "layer 2 proof should verify");
-            assert_ne!(r.merkle_root, [0u8; 32], "layer 2 should have non-zero merkle_root");
+            assert_ne!(
+                r.merkle_root, [0u8; 32],
+                "layer 2 should have non-zero merkle_root"
+            );
         }
 
         // Layer 3: aggregate pairs of recursive proofs (depth 2)
@@ -1777,7 +1790,11 @@ mod tests {
         assert_eq!(final_proof.total_tx_count, 60); // 5 tx * 12 blocks
 
         let result = final_proof.verify();
-        assert!(result.is_valid, "final aggregate should verify: {:?}", result.error);
+        assert!(
+            result.is_valid,
+            "final aggregate should verify: {:?}",
+            result.error
+        );
         assert_eq!(result.proof_type, ProofType::Aggregate);
 
         // The final proof's merkle_root should match its child proofs
@@ -1864,19 +1881,15 @@ mod tests {
             child_end_states: proofs.iter().map(|p| p.post_state_root).collect(),
             merkle_siblings: (0..proofs.len())
                 .map(|_| {
-                    let sibling = super::blake3_domain_hash(
-                        "ARC-merkle-sibling-v1",
-                        &recursive.merkle_root,
-                    );
+                    let sibling =
+                        super::blake3_domain_hash("ARC-merkle-sibling-v1", &recursive.merkle_root);
                     vec![sibling]
                 })
                 .collect(),
             expected_merkle_root: recursive.merkle_root,
         };
-        let valid = crate::stwo_air::verify_recursive_proof(
-            &recursive_input,
-            &recursive.proof_data,
-        );
+        let valid =
+            crate::stwo_air::verify_recursive_proof(&recursive_input, &recursive.proof_data);
         assert!(valid, "inner-circuit recursive proof receipt should verify");
 
         eprintln!(
@@ -1885,5 +1898,4 @@ mod tests {
             recursive.proof_data.len()
         );
     }
-
 }

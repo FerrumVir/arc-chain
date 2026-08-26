@@ -50,7 +50,10 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             accounts.insert(body.beneficiary.0);
         }
         TxBody::DeployContract(_) | TxBody::RegisterAgent(_) | TxBody::MultiSig(_) => {}
-        TxBody::JoinValidator(_) | TxBody::LeaveValidator | TxBody::ClaimRewards | TxBody::UpdateStake(_) => {}
+        TxBody::JoinValidator(_)
+        | TxBody::LeaveValidator
+        | TxBody::ClaimRewards
+        | TxBody::UpdateStake(_) => {}
         TxBody::Governance(_) => {}
         TxBody::BridgeLock(_) | TxBody::BridgeMint(_) => {}
         TxBody::BatchSettle(body) => {
@@ -78,16 +81,12 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
             // Escrow address is deterministic from request_id - include it
             // so two opens on the same request_id don't run in parallel.
             accounts.insert(
-                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(
-                    &body.request_id,
-                ),
+                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(&body.request_id),
             );
         }
         TxBody::InferenceEscrowRelease(body) => {
             accounts.insert(
-                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(
-                    &body.request_id,
-                ),
+                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(&body.request_id),
             );
             accounts.insert(body.proposer.0);
             for r in &body.replicas {
@@ -98,24 +97,18 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
         }
         TxBody::InferenceEscrowRefund(body) => {
             accounts.insert(
-                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(
-                    &body.request_id,
-                ),
+                arc_types::transaction::InferenceEscrowOpenBody::escrow_address(&body.request_id),
             );
         }
         TxBody::ModelRegistration(body) => {
             accounts.insert(
-                arc_types::transaction::ModelRegistrationBody::registry_account(
-                    &body.model_id,
-                ),
+                arc_types::transaction::ModelRegistrationBody::registry_account(&body.model_id),
             );
         }
         TxBody::ModelRequest(body) => {
-            accounts.insert(
-                arc_types::transaction::ModelRequestBody::request_account(
-                    &body.request_id,
-                ),
-            );
+            accounts.insert(arc_types::transaction::ModelRequestBody::request_account(
+                &body.request_id,
+            ));
         }
         TxBody::ShardCoverageClaim(body) => {
             accounts.insert(
@@ -145,24 +138,21 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
         }
         TxBody::InferenceRequest(body) => {
             // Touches the request escrow account derived from request_id.
-            let escrow_addr = arc_crypto::hash_bytes(
-                &[b"arc-infreq", body.request_id.as_ref()].concat(),
-            );
+            let escrow_addr =
+                arc_crypto::hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
             accounts.insert(escrow_addr.0);
         }
         TxBody::InferenceVote(body) => {
-            let escrow_addr = arc_crypto::hash_bytes(
-                &[b"arc-infreq", body.request_id.as_ref()].concat(),
-            );
+            let escrow_addr =
+                arc_crypto::hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
             accounts.insert(escrow_addr.0);
         }
         TxBody::InferenceFinalize(body) => {
             // Finalize touches escrow + treasury + (committee voters, which
             // we cannot enumerate statically without reading state — leave to
             // the executor to detect conflicts).
-            let escrow_addr = arc_crypto::hash_bytes(
-                &[b"arc-infreq", body.request_id.as_ref()].concat(),
-            );
+            let escrow_addr =
+                arc_crypto::hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
             accounts.insert(escrow_addr.0);
             accounts.insert(arc_types::transaction::faucet_pool_address().0);
         }
@@ -402,7 +392,9 @@ impl Default for MVHashMap {
 impl MVHashMap {
     /// Create a new empty multi-version hash map.
     pub fn new() -> Self {
-        Self { data: DashMap::new() }
+        Self {
+            data: DashMap::new(),
+        }
     }
 
     /// Write a value for an account at a specific transaction index.
@@ -826,12 +818,8 @@ pub fn execute_speculative(
 
         // Re-execute conflicting transactions
         for idx in &conflicts {
-            let result = speculative_execute_tx(
-                *idx,
-                &transactions[*idx],
-                accounts,
-                scheduler.mv_hashmap(),
-            );
+            let result =
+                speculative_execute_tx(*idx, &transactions[*idx], accounts, scheduler.mv_hashmap());
             scheduler.record_result(result);
         }
     }
@@ -848,8 +836,8 @@ pub fn execute_speculative(
 #[cfg(test)]
 mod speculative_tests {
     use super::*;
-    use arc_types::Address;
     use arc_crypto::hash_bytes;
+    use arc_types::Address;
 
     fn addr(n: u8) -> Address {
         hash_bytes(&[n])
@@ -969,14 +957,8 @@ mod speculative_tests {
         let recv1 = addr(3);
         let recv2 = addr(4);
 
-        accounts.insert(
-            sender1.0,
-            Account::new(sender1, 10_000),
-        );
-        accounts.insert(
-            sender2.0,
-            Account::new(sender2, 10_000),
-        );
+        accounts.insert(sender1.0, Account::new(sender1, 10_000));
+        accounts.insert(sender2.0, Account::new(sender2, 10_000));
         accounts.insert(recv1.0, Account::new(recv1, 0));
         accounts.insert(recv2.0, Account::new(recv2, 0));
 
@@ -999,14 +981,8 @@ mod speculative_tests {
         let sender2 = addr(2);
         let receiver = addr(3);
 
-        accounts.insert(
-            sender1.0,
-            Account::new(sender1, 10_000),
-        );
-        accounts.insert(
-            sender2.0,
-            Account::new(sender2, 10_000),
-        );
+        accounts.insert(sender1.0, Account::new(sender1, 10_000));
+        accounts.insert(sender2.0, Account::new(sender2, 10_000));
         accounts.insert(receiver.0, Account::new(receiver, 0));
 
         let txs = vec![

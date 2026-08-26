@@ -41,13 +41,11 @@ pub fn matmul_i64(
 ///
 /// Computes: output[i] = (input[i] - mean) * isqrt(var + eps) * gamma[i] + beta[i]
 /// All in Q16 fixed-point with integer-only arithmetic.
-pub fn layernorm_i64(
-    input: &[i64],
-    gamma: &[i64],
-    beta: &[i64],
-) -> Vec<i64> {
+pub fn layernorm_i64(input: &[i64], gamma: &[i64], beta: &[i64]) -> Vec<i64> {
     let n = input.len() as i64;
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
 
     // Mean = sum(input) / n
     let sum: i64 = input.iter().sum();
@@ -138,12 +136,12 @@ pub fn attention_i64(
 
 /// Simple integer transformer block: norm → attention → residual → norm → FFN → residual
 pub struct IntTransformerBlock {
-    pub wq: Vec<i64>,      // [d_model × d_model]
+    pub wq: Vec<i64>, // [d_model × d_model]
     pub wk: Vec<i64>,
     pub wv: Vec<i64>,
     pub wo: Vec<i64>,
-    pub w_ff1: Vec<i64>,   // [d_ff × d_model]
-    pub w_ff2: Vec<i64>,   // [d_model × d_ff]
+    pub w_ff1: Vec<i64>, // [d_ff × d_model]
+    pub w_ff2: Vec<i64>, // [d_model × d_ff]
     pub norm1_gamma: Vec<i64>,
     pub norm1_beta: Vec<i64>,
     pub norm2_gamma: Vec<i64>,
@@ -192,7 +190,8 @@ impl IntTransformerBlock {
                 }
             }
 
-            let head_out = attention_i64(&hq, &hk, &hv, seq_len, self.d_head, self.attn_scale, true);
+            let head_out =
+                attention_i64(&hq, &hk, &hv, seq_len, self.d_head, self.attn_scale, true);
 
             // Scatter back
             for pos in 0..seq_len {
@@ -238,11 +237,11 @@ impl IntTransformerBlock {
 
 /// Simple integer transformer model for testing.
 pub struct IntTransformerModel {
-    pub embedding: Vec<i64>,   // [vocab_size × d_model]
+    pub embedding: Vec<i64>, // [vocab_size × d_model]
     pub blocks: Vec<IntTransformerBlock>,
     pub final_norm_gamma: Vec<i64>,
     pub final_norm_beta: Vec<i64>,
-    pub lm_head: Vec<i64>,    // [vocab_size × d_model]
+    pub lm_head: Vec<i64>, // [vocab_size × d_model]
     pub vocab_size: usize,
     pub d_model: usize,
 }
@@ -287,18 +286,23 @@ impl IntTransformerModel {
             let next = argmax_i64(&logits) as u32;
             generated.push(next);
             tokens.push(next);
-            if next == eos { break; }
+            if next == eos {
+                break;
+            }
         }
 
         generated
     }
 
     /// Compute output hash for consensus verification.
-    pub fn generate_with_hash(&self, prompt: &[u32], max_tokens: u32, eos: u32) -> (Vec<u32>, arc_crypto::Hash256) {
+    pub fn generate_with_hash(
+        &self,
+        prompt: &[u32],
+        max_tokens: u32,
+        eos: u32,
+    ) -> (Vec<u32>, arc_crypto::Hash256) {
         let generated = self.generate(prompt, max_tokens, eos);
-        let output_bytes: Vec<u8> = generated.iter()
-            .flat_map(|t| t.to_le_bytes())
-            .collect();
+        let output_bytes: Vec<u8> = generated.iter().flat_map(|t| t.to_le_bytes()).collect();
         let hash = arc_crypto::hash_bytes(&output_bytes);
         (generated, hash)
     }
@@ -318,15 +322,15 @@ pub fn build_test_model(
     // Deterministic "random" weight generation using LCG
     let mut rng: u64 = 42;
     let mut next_weight = || -> i64 {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // Map to small Q16 values in [-0.1, 0.1] range
         // = [-6553, 6553] in Q16
         ((rng >> 33) as i64 % 13107) - 6553
     };
 
-    let mut gen_vec = |size: usize| -> Vec<i64> {
-        (0..size).map(|_| next_weight()).collect()
-    };
+    let mut gen_vec = |size: usize| -> Vec<i64> { (0..size).map(|_| next_weight()).collect() };
 
     let embedding = gen_vec(vocab_size * d_model);
     let lm_head = gen_vec(vocab_size * d_model);
@@ -338,9 +342,9 @@ pub fn build_test_model(
     // For d_head=64: sqrt(64)=8, ONE/8 = 8192
     // Just hardcode common values for 1/sqrt(d_head) in Q16
     let attn_scale = match d_head {
-        32 => 11585,  // 1/sqrt(32) * 65536
-        64 => 8192,   // 1/sqrt(64) * 65536
-        128 => 5793,  // 1/sqrt(128) * 65536
+        32 => 11585,                                    // 1/sqrt(32) * 65536
+        64 => 8192,                                     // 1/sqrt(64) * 65536
+        128 => 5793,                                    // 1/sqrt(128) * 65536
         _ => ONE / ((d_head as f64).sqrt() as i64 + 1), // fallback (uses float but only at init)
     };
 
@@ -384,8 +388,12 @@ mod tests {
     fn test_matmul_small() {
         // 2x3 weight matrix × 3-element input
         let weights = vec![
-            ONE, 2 * ONE, 3 * ONE,  // row 0
-            4 * ONE, 5 * ONE, 6 * ONE,  // row 1
+            ONE,
+            2 * ONE,
+            3 * ONE, // row 0
+            4 * ONE,
+            5 * ONE,
+            6 * ONE, // row 1
         ];
         let bias = vec![ONE, -ONE];
         let input = vec![ONE, ONE, ONE];
@@ -422,7 +430,11 @@ mod tests {
         assert_eq!(output.len(), seq_len * d_head);
         // All V values are ONE, so weighted average should be ~ONE regardless of attention weights
         for &val in &output {
-            assert!((val - ONE).abs() < ONE / 5, "attention output {} not close to ONE", val);
+            assert!(
+                (val - ONE).abs() < ONE / 5,
+                "attention output {} not close to ONE",
+                val
+            );
         }
     }
 

@@ -58,18 +58,12 @@ impl WithholdingDetector {
 
     /// Mark that a validator was expected to produce a block in the given round.
     pub fn report_expected(&mut self, validator: Hash256, round: u64) {
-        self.expected
-            .entry(validator)
-            .or_default()
-            .insert(round);
+        self.expected.entry(validator).or_default().insert(round);
     }
 
     /// Mark that a validator actually published a block in the given round.
     pub fn report_received(&mut self, validator: Hash256, round: u64) {
-        self.received
-            .entry(validator)
-            .or_default()
-            .insert(round);
+        self.received.entry(validator).or_default().insert(round);
     }
 
     /// Scan the last `window` rounds for validators with high withholding scores.
@@ -107,11 +101,7 @@ impl WithholdingDetector {
             let missing: Vec<u64> = expected_in_window
                 .iter()
                 .copied()
-                .filter(|r| {
-                    received_rounds
-                        .map(|set| !set.contains(r))
-                        .unwrap_or(true)
-                })
+                .filter(|r| received_rounds.map(|set| !set.contains(r)).unwrap_or(true))
                 .collect();
 
             let withholding_score = missing.len() as f64 / total_expected as f64;
@@ -252,10 +242,8 @@ impl CheckpointRegistry {
         }
 
         // Build a quick lookup: round -> block hash.
-        let round_to_hash: HashMap<u64, [u8; 32]> = chain
-            .iter()
-            .map(|b| (b.round, b.hash))
-            .collect();
+        let round_to_hash: HashMap<u64, [u8; 32]> =
+            chain.iter().map(|b| (b.round, b.hash)).collect();
 
         let chain_min = chain.iter().map(|b| b.round).min().unwrap_or(0);
         let chain_max = chain.iter().map(|b| b.round).max().unwrap_or(0);
@@ -267,20 +255,14 @@ impl CheckpointRegistry {
                         // Consistent - continue checking.
                     }
                     Some(_) => {
-                        warn!(
-                            round = round,
-                            "Chain diverges from checkpoint"
-                        );
+                        warn!(round = round, "Chain diverges from checkpoint");
                         return false;
                     }
                     None => {
                         // Chain doesn't include this round at all - suspicious but
                         // may happen with sparse block refs. We treat missing as
                         // invalid since the chain should cover checkpoint rounds.
-                        warn!(
-                            round = round,
-                            "Chain missing block at checkpoint round"
-                        );
+                        warn!(round = round, "Chain missing block at checkpoint round");
                         return false;
                     }
                 }
@@ -387,10 +369,10 @@ pub struct PenaltyRecord {
 /// - `WithholdingBlock`: 10% of stake (liveness degradation)
 pub fn calculate_slash_amount(offense: &SlashableOffense, stake: u64) -> u64 {
     match offense {
-        SlashableOffense::DoubleVote => stake,                  // 100%
-        SlashableOffense::Equivocation => stake,                // 100%
-        SlashableOffense::InvalidBlock => stake / 2,            // 50%
-        SlashableOffense::WithholdingBlock => stake / 10,       // 10%
+        SlashableOffense::DoubleVote => stake,            // 100%
+        SlashableOffense::Equivocation => stake,          // 100%
+        SlashableOffense::InvalidBlock => stake / 2,      // 50%
+        SlashableOffense::WithholdingBlock => stake / 10, // 10%
     }
 }
 
@@ -579,7 +561,10 @@ mod tests {
 
         // Window of 50 covers rounds 51-100 - all present, no withholding.
         let reports = detector.detect_withholding(50);
-        assert!(reports.is_empty(), "Recent window should show no withholding");
+        assert!(
+            reports.is_empty(),
+            "Recent window should show no withholding"
+        );
 
         // Window of 100 covers everything - 50 missing out of 100 = 0.5, not > 0.5.
         let reports_full = detector.detect_withholding(100);
@@ -658,7 +643,10 @@ mod tests {
         let cp_old = make_checkpoint(1000, test_block_hash(2));
 
         assert!(registry.add_checkpoint(cp1));
-        assert!(!registry.add_checkpoint(cp_old), "Should reject older checkpoint");
+        assert!(
+            !registry.add_checkpoint(cp_old),
+            "Should reject older checkpoint"
+        );
         assert_eq!(registry.len(), 1);
     }
 
@@ -669,9 +657,21 @@ mod tests {
         registry.add_checkpoint(make_checkpoint(1000, bh));
 
         let chain = vec![
-            BlockRef { hash: test_block_hash(0), round: 500, height: 500 },
-            BlockRef { hash: bh, round: 1000, height: 1000 },
-            BlockRef { hash: test_block_hash(1), round: 1500, height: 1500 },
+            BlockRef {
+                hash: test_block_hash(0),
+                round: 500,
+                height: 500,
+            },
+            BlockRef {
+                hash: bh,
+                round: 1000,
+                height: 1000,
+            },
+            BlockRef {
+                hash: test_block_hash(1),
+                round: 1500,
+                height: 1500,
+            },
         ];
 
         assert!(registry.verify_chain_against_checkpoints(&chain));
@@ -683,9 +683,11 @@ mod tests {
         registry.add_checkpoint(make_checkpoint(1000, test_block_hash(42)));
 
         // Chain has a different hash at round 1000.
-        let chain = vec![
-            BlockRef { hash: test_block_hash(99), round: 1000, height: 1000 },
-        ];
+        let chain = vec![BlockRef {
+            hash: test_block_hash(99),
+            round: 1000,
+            height: 1000,
+        }];
 
         assert!(!registry.verify_chain_against_checkpoints(&chain));
     }
@@ -697,8 +699,16 @@ mod tests {
 
         // Chain spans the checkpoint round but has no block at round 1000.
         let chain = vec![
-            BlockRef { hash: test_block_hash(0), round: 999, height: 999 },
-            BlockRef { hash: test_block_hash(1), round: 1001, height: 1001 },
+            BlockRef {
+                hash: test_block_hash(0),
+                round: 999,
+                height: 999,
+            },
+            BlockRef {
+                hash: test_block_hash(1),
+                round: 1001,
+                height: 1001,
+            },
         ];
 
         assert!(!registry.verify_chain_against_checkpoints(&chain));
@@ -774,10 +784,22 @@ mod tests {
     fn stake_slash_amounts_graduated() {
         let stake = 1_000_000u64;
 
-        assert_eq!(calculate_slash_amount(&SlashableOffense::DoubleVote, stake), 1_000_000);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::Equivocation, stake), 1_000_000);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::InvalidBlock, stake), 500_000);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::WithholdingBlock, stake), 100_000);
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::DoubleVote, stake),
+            1_000_000
+        );
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::Equivocation, stake),
+            1_000_000
+        );
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::InvalidBlock, stake),
+            500_000
+        );
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::WithholdingBlock, stake),
+            100_000
+        );
     }
 
     #[test]
@@ -828,7 +850,10 @@ mod tests {
     #[test]
     fn stake_offense_labels() {
         assert_eq!(SlashableOffense::DoubleVote.label(), "double_vote");
-        assert_eq!(SlashableOffense::WithholdingBlock.label(), "withholding_block");
+        assert_eq!(
+            SlashableOffense::WithholdingBlock.label(),
+            "withholding_block"
+        );
         assert_eq!(SlashableOffense::InvalidBlock.label(), "invalid_block");
         assert_eq!(SlashableOffense::Equivocation.label(), "equivocation");
     }
@@ -837,7 +862,13 @@ mod tests {
     fn stake_slash_zero_stake() {
         // Edge case: slashing zero stake should produce zero penalty.
         assert_eq!(calculate_slash_amount(&SlashableOffense::DoubleVote, 0), 0);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::InvalidBlock, 0), 0);
-        assert_eq!(calculate_slash_amount(&SlashableOffense::WithholdingBlock, 0), 0);
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::InvalidBlock, 0),
+            0
+        );
+        assert_eq!(
+            calculate_slash_amount(&SlashableOffense::WithholdingBlock, 0),
+            0
+        );
     }
 }

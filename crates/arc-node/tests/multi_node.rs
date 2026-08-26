@@ -19,17 +19,17 @@
 
 #![allow(dead_code)]
 
-use arc_crypto::{hash_bytes, Hash256, KeyPair};
+use arc_crypto::{Hash256, KeyPair, hash_bytes};
 use arc_mempool::Mempool;
-use arc_net::transport::{run_transport, InboundMessage, OutboundMessage};
+use arc_net::transport::{InboundMessage, OutboundMessage, run_transport};
 use arc_node::consensus::ConsensusManager;
 use arc_state::StateDB;
 use arc_types::{Block, Transaction};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -97,12 +97,7 @@ impl TestNode {
     /// * `stake` - ARC stake amount (must be >= 5M for block production).
     /// * `port` - port to listen on (use `find_free_port()` to get one).
     /// * `bootstrap_peers` - addresses of peers to connect to on startup.
-    async fn start(
-        seed: &str,
-        stake: u64,
-        port: u16,
-        bootstrap_peers: Vec<SocketAddr>,
-    ) -> Self {
+    async fn start(seed: &str, stake: u64, port: u16, bootstrap_peers: Vec<SocketAddr>) -> Self {
         let keypair = make_validator_keypair(seed);
         let address = keypair.address();
 
@@ -816,10 +811,7 @@ async fn test_transaction_gossip() {
             assert_eq!(received_txs[1], b"raw-tx-beta-002".to_vec());
             assert_eq!(received_txs[2], b"raw-tx-gamma-003".to_vec());
         }
-        other => panic!(
-            "Expected InboundMessage::Transactions, got: {:?}",
-            other
-        ),
+        other => panic!("Expected InboundMessage::Transactions, got: {:?}", other),
     }
 
     // Suppress unused variable warnings.

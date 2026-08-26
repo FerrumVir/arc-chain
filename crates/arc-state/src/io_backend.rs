@@ -43,10 +43,7 @@ pub struct StdBackend {
 
 impl StdBackend {
     pub fn new(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             writer: BufWriter::with_capacity(256 * 1024, file),
             total_bytes: 0,
@@ -88,10 +85,7 @@ pub struct DirectBackend {
 
 impl DirectBackend {
     pub fn new(path: &Path) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
+        let file = OpenOptions::new().create(true).append(true).open(path)?;
 
         // Platform-specific cache bypass hints
         #[cfg(target_os = "macos")]
@@ -109,12 +103,7 @@ impl DirectBackend {
             // On Linux, we'd ideally use O_DIRECT, but that requires page-aligned
             // buffers. Instead, use posix_fadvise DONTNEED to hint the kernel.
             unsafe {
-                libc::posix_fadvise(
-                    file.as_raw_fd(),
-                    0,
-                    0,
-                    libc::POSIX_FADV_DONTNEED,
-                );
+                libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
             }
         }
 
@@ -261,9 +250,7 @@ impl PreallocBackend {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::io::AsRawFd;
-            let ret = unsafe {
-                libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t)
-            };
+            let ret = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) };
             if ret != 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -391,11 +378,7 @@ impl<B: IoBackend> BatchWriter<B> {
     }
 
     /// Create a BatchWriter with custom capacity and flush threshold.
-    pub fn with_capacity(
-        inner: B,
-        batch_capacity: usize,
-        auto_flush_threshold: usize,
-    ) -> Self {
+    pub fn with_capacity(inner: B, batch_capacity: usize, auto_flush_threshold: usize) -> Self {
         Self {
             inner,
             batch: Vec::with_capacity(batch_capacity),
@@ -813,8 +796,7 @@ mod tests {
         let buf_cap: usize = 256;
 
         {
-            let mut backend =
-                PreallocBackend::with_capacity(&path, buf_cap, chunk).unwrap();
+            let mut backend = PreallocBackend::with_capacity(&path, buf_cap, chunk).unwrap();
 
             let initial_prealloc = backend.preallocated_size();
             assert_eq!(initial_prealloc, chunk);

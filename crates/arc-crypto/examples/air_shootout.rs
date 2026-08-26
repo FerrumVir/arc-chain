@@ -4,8 +4,8 @@
 
 use arc_crypto::inference_proof::dense_forward_i64;
 use arc_crypto::stwo_air::{
-    packed_log_size, try_prove_dense_packed, try_prove_dense_stark, compute_log_size,
-    PACK_K, PACKED_STARK_COLS, DENSE_STARK_COLS,
+    DENSE_STARK_COLS, PACK_K, PACKED_STARK_COLS, compute_log_size, packed_log_size,
+    try_prove_dense_packed, try_prove_dense_stark,
 };
 use std::io::Write;
 
@@ -36,7 +36,12 @@ fn main() {
     println!("{}", "-".repeat(74));
     let _ = std::io::stdout().flush();
 
-    for (out_size, in_size) in [(256usize, 1024usize), (512, 2048), (1024, 4096), (4096, 4096)] {
+    for (out_size, in_size) in [
+        (256usize, 1024usize),
+        (512, 2048),
+        (1024, 4096),
+        (4096, 4096),
+    ] {
         let n = out_size * in_size;
         let weights = make_data("w", n);
         let bias = vec![0i64; out_size];
@@ -82,7 +87,11 @@ fn main() {
     let honest = try_prove_dense_packed(&weights, &input, &output, &bias, in_size, out_size);
     println!(
         "1. honest output            ... {}",
-        if honest.is_ok() { "PROVED" } else { "FAILED (bug)" }
+        if honest.is_ok() {
+            "PROVED"
+        } else {
+            "FAILED (bug)"
+        }
     );
 
     let checks: Vec<(&str, Vec<i64>, Vec<i64>, Vec<i64>)> = vec![
@@ -96,16 +105,26 @@ fn main() {
             o.swap(3, 7);
             o
         }),
-        ("bias tampered", weights.clone(), {
-            let mut b = bias.clone();
-            b[1] += 1000;
-            b
-        }, output.clone()),
-        ("one weight changed", {
-            let mut w = weights.clone();
-            w[0] += 1;
-            w
-        }, bias.clone(), output.clone()),
+        (
+            "bias tampered",
+            weights.clone(),
+            {
+                let mut b = bias.clone();
+                b[1] += 1000;
+                b
+            },
+            output.clone(),
+        ),
+        (
+            "one weight changed",
+            {
+                let mut w = weights.clone();
+                w[0] += 1;
+                w
+            },
+            bias.clone(),
+            output.clone(),
+        ),
     ];
 
     let mut all_rejected = true;
@@ -117,7 +136,11 @@ fn main() {
             "{}. {:<26} ... {}",
             i + 2,
             name,
-            if rejected { "REJECTED" } else { "PROVED  <-- UNSOUND" }
+            if rejected {
+                "REJECTED"
+            } else {
+                "PROVED  <-- UNSOUND"
+            }
         );
     }
 

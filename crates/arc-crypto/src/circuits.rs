@@ -305,7 +305,9 @@ impl CircuitEvaluator {
                     }
                     let va = values[*a].ok_or(CircuitError::MissingInput(*a))?;
                     let vb = values[*b].ok_or(CircuitError::MissingInput(*b))?;
-                    let sum = va.checked_add(vb).ok_or(CircuitError::ArithmeticOverflow(gate_idx))?;
+                    let sum = va
+                        .checked_add(vb)
+                        .ok_or(CircuitError::ArithmeticOverflow(gate_idx))?;
                     values[*out] = Some(sum);
                 }
                 Gate::Mul(a, b, out) => {
@@ -320,7 +322,9 @@ impl CircuitEvaluator {
                     }
                     let va = values[*a].ok_or(CircuitError::MissingInput(*a))?;
                     let vb = values[*b].ok_or(CircuitError::MissingInput(*b))?;
-                    let product = va.checked_mul(vb).ok_or(CircuitError::ArithmeticOverflow(gate_idx))?;
+                    let product = va
+                        .checked_mul(vb)
+                        .ok_or(CircuitError::ArithmeticOverflow(gate_idx))?;
                     values[*out] = Some(product);
                 }
                 Gate::Assert(idx, expected) => {
@@ -412,14 +416,14 @@ impl TransferCircuit {
         let mut builder = CircuitBuilder::new("transfer-verification");
 
         // Public inputs.
-        let _sender_bal = builder.add_public_input();     // wire 0
-        let receiver_bal = builder.add_public_input();   // wire 1
-        let amount = builder.add_public_input();         // wire 2
+        let _sender_bal = builder.add_public_input(); // wire 0
+        let receiver_bal = builder.add_public_input(); // wire 1
+        let amount = builder.add_public_input(); // wire 2
 
         // new_sender = sender_balance - amount.
         // We represent subtraction as: new_sender + amount = sender_balance.
         // new_sender is a private witness input.
-        let new_sender = builder.add_private_input();    // wire 3
+        let new_sender = builder.add_private_input(); // wire 3
 
         // Constraint: new_sender + amount == sender_balance.
         let _sum_check = builder.add(new_sender, amount); // wire 4 = new_sender + amount
@@ -792,7 +796,10 @@ mod tests {
     fn test_circuit_id_differs_by_name() {
         let c1 = CircuitBuilder::new("circuit-a").build();
         let c2 = CircuitBuilder::new("circuit-b").build();
-        assert_ne!(c1.id, c2.id, "differently-named circuits must have different IDs");
+        assert_ne!(
+            c1.id, c2.id,
+            "differently-named circuits must have different IDs"
+        );
     }
 
     #[test]
@@ -835,7 +842,7 @@ mod tests {
         let result = CircuitEvaluator::evaluate(&circuit, &[10, 20, 5]);
         assert!(result.is_ok());
         let witness = result.unwrap();
-        assert_eq!(witness[3], 30);   // sum
-        assert_eq!(witness[4], 150);  // product
+        assert_eq!(witness[3], 30); // sum
+        assert_eq!(witness[4], 150); // product
     }
 }

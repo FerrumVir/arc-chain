@@ -10,7 +10,7 @@
 //! }
 //! ```
 
-use anyhow::{Result, bail, Context};
+use anyhow::{Context, Result, bail};
 use arc_crypto::signature::KeyPair;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -44,11 +44,9 @@ pub fn generate_keypair(scheme: &str) -> Result<KeyPair> {
 /// Save a keypair to a JSON keyfile with restricted permissions (0600).
 pub fn save_keyfile(keypair: &KeyPair, path: &str) -> Result<()> {
     let keyfile = keypair_to_keyfile(keypair);
-    let json = serde_json::to_string_pretty(&keyfile)
-        .context("failed to serialize keyfile")?;
+    let json = serde_json::to_string_pretty(&keyfile).context("failed to serialize keyfile")?;
 
-    fs::write(path, &json)
-        .with_context(|| format!("failed to write keyfile to {}", path))?;
+    fs::write(path, &json).with_context(|| format!("failed to write keyfile to {}", path))?;
 
     // Set file permissions to owner-only read/write on Unix.
     #[cfg(unix)]
@@ -65,8 +63,8 @@ pub fn save_keyfile(keypair: &KeyPair, path: &str) -> Result<()> {
 pub fn load_keyfile(path: &str) -> Result<KeyPair> {
     let json = fs::read_to_string(path)
         .with_context(|| format!("failed to read keyfile from {}", path))?;
-    let keyfile: Keyfile = serde_json::from_str(&json)
-        .with_context(|| format!("failed to parse keyfile {}", path))?;
+    let keyfile: Keyfile =
+        serde_json::from_str(&json).with_context(|| format!("failed to parse keyfile {}", path))?;
     keyfile_to_keypair(&keyfile)
 }
 
@@ -76,20 +74,32 @@ fn keypair_to_keyfile(keypair: &KeyPair) -> Keyfile {
         KeyPair::Ed25519(sk) => {
             let sk_bytes = sk.to_bytes();
             let pk_bytes = sk.verifying_key().as_bytes().to_vec();
-            ("ed25519".to_string(), hex::encode(sk_bytes), hex::encode(pk_bytes))
+            (
+                "ed25519".to_string(),
+                hex::encode(sk_bytes),
+                hex::encode(pk_bytes),
+            )
         }
         KeyPair::Secp256k1(sk) => {
             let sk_bytes = sk.to_bytes();
             let vk = sk.verifying_key();
             let pk_bytes = vk.to_encoded_point(true).as_bytes().to_vec();
-            ("secp256k1".to_string(), hex::encode(sk_bytes), hex::encode(pk_bytes))
+            (
+                "secp256k1".to_string(),
+                hex::encode(sk_bytes),
+                hex::encode(pk_bytes),
+            )
         }
-        KeyPair::MlDsa65 { sk_bytes, pk_bytes } => {
-            ("ml-dsa-65".to_string(), hex::encode(sk_bytes), hex::encode(pk_bytes))
-        }
-        KeyPair::Falcon512 { sk_bytes, pk_bytes } => {
-            ("falcon-512".to_string(), hex::encode(sk_bytes), hex::encode(pk_bytes))
-        }
+        KeyPair::MlDsa65 { sk_bytes, pk_bytes } => (
+            "ml-dsa-65".to_string(),
+            hex::encode(sk_bytes),
+            hex::encode(pk_bytes),
+        ),
+        KeyPair::Falcon512 { sk_bytes, pk_bytes } => (
+            "falcon-512".to_string(),
+            hex::encode(sk_bytes),
+            hex::encode(pk_bytes),
+        ),
     };
 
     Keyfile {
@@ -102,13 +112,15 @@ fn keypair_to_keyfile(keypair: &KeyPair) -> Keyfile {
 
 /// Reconstruct a `KeyPair` from a `Keyfile`.
 fn keyfile_to_keypair(keyfile: &Keyfile) -> Result<KeyPair> {
-    let sk_bytes = hex::decode(&keyfile.secret_key)
-        .context("invalid hex in secret_key")?;
+    let sk_bytes = hex::decode(&keyfile.secret_key).context("invalid hex in secret_key")?;
 
     match keyfile.scheme.as_str() {
         "ed25519" => {
             if sk_bytes.len() != 32 {
-                bail!("ed25519 secret key must be 32 bytes, got {}", sk_bytes.len());
+                bail!(
+                    "ed25519 secret key must be 32 bytes, got {}",
+                    sk_bytes.len()
+                );
             }
             let sk_arr: [u8; 32] = sk_bytes.try_into().unwrap();
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&sk_arr);
@@ -116,7 +128,10 @@ fn keyfile_to_keypair(keyfile: &Keyfile) -> Result<KeyPair> {
         }
         "secp256k1" => {
             if sk_bytes.len() != 32 {
-                bail!("secp256k1 secret key must be 32 bytes, got {}", sk_bytes.len());
+                bail!(
+                    "secp256k1 secret key must be 32 bytes, got {}",
+                    sk_bytes.len()
+                );
             }
             let sk_arr: &[u8; 32] = sk_bytes.as_slice().try_into().unwrap();
             let signing_key = k256::ecdsa::SigningKey::from_bytes(sk_arr.into())
@@ -124,13 +139,11 @@ fn keyfile_to_keypair(keyfile: &Keyfile) -> Result<KeyPair> {
             Ok(KeyPair::Secp256k1(signing_key))
         }
         "ml-dsa-65" | "ml_dsa_65" | "mldsa65" => {
-            let pk_bytes = hex::decode(&keyfile.public_key)
-                .context("invalid hex in public_key")?;
+            let pk_bytes = hex::decode(&keyfile.public_key).context("invalid hex in public_key")?;
             Ok(KeyPair::MlDsa65 { sk_bytes, pk_bytes })
         }
         "falcon-512" | "falcon512" => {
-            let pk_bytes = hex::decode(&keyfile.public_key)
-                .context("invalid hex in public_key")?;
+            let pk_bytes = hex::decode(&keyfile.public_key).context("invalid hex in public_key")?;
             Ok(KeyPair::Falcon512 { sk_bytes, pk_bytes })
         }
         _ => bail!("unknown scheme '{}' in keyfile", keyfile.scheme),

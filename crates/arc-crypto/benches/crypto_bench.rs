@@ -1,5 +1,5 @@
-use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
 use arc_crypto::*;
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 
 fn bench_blake3_commit(c: &mut Criterion) {
     let mut group = c.benchmark_group("blake3_commit");
@@ -31,5 +31,10 @@ fn bench_merkle_tree(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_blake3_commit, bench_pedersen_commit, bench_merkle_tree);
+criterion_group!(
+    benches,
+    bench_blake3_commit,
+    bench_pedersen_commit,
+    bench_merkle_tree
+);
 criterion_main!(benches);

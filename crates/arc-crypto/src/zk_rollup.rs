@@ -198,10 +198,7 @@ impl RollupState {
     }
 
     /// Verify that a batch produces the claimed state transition.
-    pub fn verify_batch(
-        &self,
-        batch: &RollupBatch,
-    ) -> Result<bool, String> {
+    pub fn verify_batch(&self, batch: &RollupBatch) -> Result<bool, String> {
         // Pre-state root must match.
         let current_root = self.compute_state_root();
         if current_root != batch.pre_state_root {
@@ -267,10 +264,7 @@ impl RollupVerifier {
     }
 
     /// Verify a full state transition: proof + state roots.
-    pub fn verify_state_transition(
-        &self,
-        batch: &RollupBatch,
-    ) -> bool {
+    pub fn verify_state_transition(&self, batch: &RollupBatch) -> bool {
         // Must have a proof.
         let proof = match &batch.proof {
             Some(p) => p,

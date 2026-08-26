@@ -23,12 +23,12 @@
 //!   9. Asserts: payer down 10_000, treasury/observer/proposer up by
 //!      their share, total conserved (±rounding).
 
-use arc_crypto::{hash_bytes, Hash256, Signature};
+use arc_crypto::{Hash256, Signature, hash_bytes};
 use arc_types::transaction::{InferenceEscrowOpenBody, TxBody};
 use arc_types::{Transaction, TxType};
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const DOMAIN_TAG: &str = "ARC-chain-validator-keypair-v1";
@@ -140,7 +140,9 @@ async fn main() {
         let mut b = 0u64;
         for _ in 0..40 {
             b = balance(&quick, &url, &payer_hex).await;
-            if b > 0 { break; }
+            if b > 0 {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         println!("  payer_balance[{}]: {} ARC", name, b);
@@ -224,10 +226,11 @@ async fn main() {
             .get(format!("{}/tx/0x{}", coord, open_hash_hex))
             .send()
             .await
-            && r.status().is_success() {
-                committed = true;
-                break;
-            }
+            && r.status().is_success()
+        {
+            committed = true;
+            break;
+        }
     }
     if !committed {
         eprintln!("open tx did not commit in 30s");
@@ -277,9 +280,10 @@ async fn main() {
             .get(format!("{}/tx/0x{}", coord, release_hex))
             .send()
             .await
-            && r.status().is_success() {
-                break;
-            }
+            && r.status().is_success()
+        {
+            break;
+        }
     }
 
     // Step 8: record post-balances.
@@ -294,9 +298,24 @@ async fn main() {
 
     println!();
     println!("=== BALANCE DELTAS ===");
-    println!("payer:    {} → {}  (Δ {:+})", bal_pre, bal_post, bal_post as i64 - bal_pre as i64);
-    println!("treasury: {} → {}  (Δ {:+})", tre_pre, tre_post, tre_post as i64 - tre_pre as i64);
-    println!("observer: {} → {}  (Δ {:+})", obs_pre, obs_post, obs_post as i64 - obs_pre as i64);
+    println!(
+        "payer:    {} → {}  (Δ {:+})",
+        bal_pre,
+        bal_post,
+        bal_post as i64 - bal_pre as i64
+    );
+    println!(
+        "treasury: {} → {}  (Δ {:+})",
+        tre_pre,
+        tre_post,
+        tre_post as i64 - tre_pre as i64
+    );
+    println!(
+        "observer: {} → {}  (Δ {:+})",
+        obs_pre,
+        obs_post,
+        obs_post as i64 - obs_pre as i64
+    );
     let mut sum_replica_delta: i64 = 0;
     for (i, (name, b_post)) in replica_post.iter().enumerate() {
         let b_pre = replica_pre[i].2;
@@ -306,11 +325,16 @@ async fn main() {
     }
 
     let payer_out = bal_pre as i64 - bal_post as i64;
-    let total_in = (tre_post as i64 - tre_pre as i64)
-        + (obs_post as i64 - obs_pre as i64)
-        + sum_replica_delta;
+    let total_in =
+        (tre_post as i64 - tre_pre as i64) + (obs_post as i64 - obs_pre as i64) + sum_replica_delta;
     println!();
     println!("payer sent: {}", payer_out);
-    println!("beneficiaries received (treasury+observer+replicas): {}", total_in);
-    println!("conservation residual: {} (positive = still in escrow or proposer)", payer_out - total_in);
+    println!(
+        "beneficiaries received (treasury+observer+replicas): {}",
+        total_in
+    );
+    println!(
+        "conservation residual: {} (positive = still in escrow or proposer)",
+        payer_out - total_in
+    );
 }

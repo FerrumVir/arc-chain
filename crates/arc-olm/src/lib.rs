@@ -19,9 +19,9 @@
 //! on it, so we allow it crate-wide.
 #![allow(dead_code, unused_imports, unused_variables, clippy::never_loop)]
 
+pub mod ontology;
 pub mod primitives;
 pub mod search;
-pub mod ontology;
 
 /// ARC-AGI grid: 2D array of colors (0-9), max 30x30.
 pub type Grid = Vec<Vec<u8>>;
@@ -51,7 +51,12 @@ impl Object {
         for (c, _) in &self.cells {
             counts[*c as usize] += 1;
         }
-        counts.iter().enumerate().max_by_key(|&(_, c)| *c).map(|(i, _)| i as u8).unwrap_or(0)
+        counts
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, c)| *c)
+            .map(|(i, _)| i as u8)
+            .unwrap_or(0)
     }
 
     pub fn size(&self) -> usize {

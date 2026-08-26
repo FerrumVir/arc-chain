@@ -14,16 +14,12 @@
 
 use std::sync::Arc;
 
-use arc_crypto::{hash_bytes, Hash256, KeyPair};
+use arc_crypto::{Hash256, KeyPair, hash_bytes};
 use arc_mempool::Mempool;
 use arc_node::inference_validator::InferenceValidatorTask;
-use arc_state::{
-    StateDB, TIER1_STATUS_FINALIZED, TIER1_STATUS_OPEN, TIER1_STATUS_VOTING,
-};
-use arc_types::transaction::{
-    InferenceRequestBody, Transaction, TxBody, TxType,
-};
+use arc_state::{StateDB, TIER1_STATUS_FINALIZED, TIER1_STATUS_OPEN, TIER1_STATUS_VOTING};
 use arc_types::Address;
+use arc_types::transaction::{InferenceRequestBody, Transaction, TxBody, TxType};
 
 fn build_request_tx(
     from: Address,
@@ -96,9 +92,7 @@ async fn tier1_full_flow_single_validator() {
     // First tick: should detect the request, run stub inference, submit vote.
     // We can't call private tick(), so use the public run() in a brief spawn.
     let tick_task = task.clone();
-    let handle = tokio::spawn(async move {
-        InferenceValidatorTask::run_arc(tick_task).await
-    });
+    let handle = tokio::spawn(async move { InferenceValidatorTask::run_arc(tick_task).await });
 
     // Wait until the mempool sees the vote tx (with a generous timeout to
     // tolerate runtime scheduler variance). 500ms tick + spawn detached vote
@@ -129,8 +123,7 @@ async fn tier1_full_flow_single_validator() {
     handle.abort();
 
     // ── 6. Apply finalize and verify payout + state ──
-    let (_, final_receipts) =
-        state.execute_block(&[finalize_tx], validator).unwrap();
+    let (_, final_receipts) = state.execute_block(&[finalize_tx], validator).unwrap();
     assert!(
         final_receipts[0].success,
         "finalize must apply successfully"
@@ -148,8 +141,9 @@ async fn tier1_full_flow_single_validator() {
     let final_acct = state.get_account(&validator).unwrap();
     assert_eq!(final_acct.balance, 999_990);
 
-    let treasury =
-        state.get_account(&arc_types::transaction::faucet_pool_address()).unwrap();
+    let treasury = state
+        .get_account(&arc_types::transaction::faucet_pool_address())
+        .unwrap();
     assert_eq!(treasury.balance, 10, "treasury must receive 10% cut");
 
     // Pending index must be cleared.

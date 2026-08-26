@@ -14,7 +14,7 @@
 //! This provides two-round latency for commit finality.
 
 use arc_crypto::{Hash256, KeyPair, Signature as CryptoSignature};
-use arc_types::{TxBody, Transaction};
+use arc_types::{Transaction, TxBody};
 use dashmap::DashMap;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -24,10 +24,10 @@ use tracing::{debug, info, warn};
 
 pub mod beacon;
 pub mod data_availability;
-pub mod subnet;
 pub mod security;
-pub use security::*;
+pub mod subnet;
 pub use data_availability::*;
+pub use security::*;
 
 // ── Type Aliases ─────────────────────────────────────────────────────────────
 
@@ -316,8 +316,13 @@ impl ValidatorSet {
         round: u64,
         timestamp: u64,
     ) -> Result<SlashRecord, ConsensusError> {
-        let validator = self.validators.iter().find(|v| v.address == offender)
-            .ok_or_else(|| ConsensusError::SlashError(format!("validator {:?} not found", offender)))?;
+        let validator = self
+            .validators
+            .iter()
+            .find(|v| v.address == offender)
+            .ok_or_else(|| {
+                ConsensusError::SlashError(format!("validator {:?} not found", offender))
+            })?;
         let rate = Self::slash_rate(&validator.tier);
         let slash_amount = validator.stake * rate / 100;
         let record = SlashRecord {
@@ -349,8 +354,7 @@ impl ValidatorSet {
                 removed = true;
             } else {
                 // Recalculate tier
-                validator.tier = StakeTier::from_stake(validator.stake)
-                    .unwrap_or(StakeTier::Spark);
+                validator.tier = StakeTier::from_stake(validator.stake).unwrap_or(StakeTier::Spark);
                 info!(
                     address = %offender,
                     new_stake = validator.stake,
@@ -761,7 +765,8 @@ impl ConsensusEngine {
             self.reset_round_timer();
             tracing::info!(
                 "Set initial round from peer sync: round={}, committed={}",
-                round, committed
+                round,
+                committed
             );
         }
     }
@@ -872,11 +877,10 @@ impl ConsensusEngine {
     /// Remove a validator from the active set.
     pub fn leave_validator(&self, address: &Address) -> Result<u64, ConsensusError> {
         let mut vs = self.validator_set.write();
-        let stake = vs.get_validator(address)
+        let stake = vs
+            .get_validator(address)
             .map(|v| v.stake)
-            .ok_or_else(|| ConsensusError::InvalidBlock(
-                "address not in validator set".into(),
-            ))?;
+            .ok_or_else(|| ConsensusError::InvalidBlock("address not in validator set".into()))?;
         vs.validators.retain(|v| v.address != *address);
         vs.total_stake = vs.validators.iter().map(|v| v.stake).sum();
         vs.quorum = if vs.total_stake > 0 {
@@ -905,8 +909,7 @@ impl ConsensusEngine {
         let idx = vs.validators.iter().position(|v| v.address == *address);
         if let Some(idx) = idx {
             vs.validators[idx].stake = new_stake;
-            vs.validators[idx].tier = StakeTier::from_stake(new_stake)
-                .unwrap_or(StakeTier::Spark);
+            vs.validators[idx].tier = StakeTier::from_stake(new_stake).unwrap_or(StakeTier::Spark);
             let new_tier = vs.validators[idx].tier;
             vs.total_stake = vs.validators.iter().map(|v| v.stake).sum();
             vs.quorum = (2 * vs.total_stake).div_ceil(3);
@@ -931,7 +934,12 @@ impl ConsensusEngine {
             0
         };
         let new_epoch = vs.epoch;
-        info!(epoch = new_epoch, validators = vs.len(), total_stake = vs.total_stake, "Epoch transition");
+        info!(
+            epoch = new_epoch,
+            validators = vs.len(),
+            total_stake = vs.total_stake,
+            "Epoch transition"
+        );
         new_epoch
     }
 
@@ -1005,10 +1013,11 @@ impl ConsensusEngine {
 
             for hash in &prev_hashes {
                 if let Some(block) = self.dag.get(hash)
-                    && let Some(validator) = vs.get_validator(&block.author) {
-                        selected_parents.push(*hash);
-                        accumulated_stake += validator.stake;
-                    }
+                    && let Some(validator) = vs.get_validator(&block.author)
+                {
+                    selected_parents.push(*hash);
+                    accumulated_stake += validator.stake;
+                }
             }
 
             // Verify we have quorum-worth of parents.
@@ -1022,7 +1031,8 @@ impl ConsensusEngine {
                 }
                 tracing::debug!(
                     "Propose: sub-quorum parents ({} < {}), accepting (testnet)",
-                    accumulated_stake, vs.quorum
+                    accumulated_stake,
+                    vs.quorum
                 );
             }
 
@@ -1115,7 +1125,8 @@ impl ConsensusEngine {
             }
             tracing::debug!(
                 "Block from unregistered validator {} at round {} (accepting for testnet)",
-                block.author, block.round
+                block.author,
+                block.round
             );
         }
 
@@ -1135,13 +1146,11 @@ impl ConsensusEngine {
         //     order and that the ordering commitment matches this sorted sequence.
         //     This prevents proposers from reordering transactions for MEV.
         if !block.verify_ordering() {
-            return Err(ConsensusError::MevOrderingViolation(
-                format!(
-                    "block {} by {} has transactions not in canonical lexicographic order \
+            return Err(ConsensusError::MevOrderingViolation(format!(
+                "block {} by {} has transactions not in canonical lexicographic order \
                      or ordering commitment does not match sorted tx hashes",
-                    block.hash, block.author
-                ),
-            ));
+                block.hash, block.author
+            )));
         }
 
         // 3c. Verify block signature - author must have signed the block hash
@@ -1149,25 +1158,25 @@ impl ConsensusEngine {
             let sig: CryptoSignature = bincode::deserialize(&block.signature)
                 .map_err(|_| ConsensusError::InvalidSignature)?;
             // verify() checks: (a) pubkey in sig derives to block.author, (b) sig is valid
-            sig.verify(&block.hash, &block.author)
-                .map_err(|_| {
-                    warn!(
-                        author = %block.author,
-                        hash = %block.hash,
-                        "Block signature verification failed"
-                    );
-                    ConsensusError::InvalidSignature
-                })?;
+            sig.verify(&block.hash, &block.author).map_err(|_| {
+                warn!(
+                    author = %block.author,
+                    hash = %block.hash,
+                    "Block signature verification failed"
+                );
+                ConsensusError::InvalidSignature
+            })?;
             // If we have a registered key, cross-check it matches the signature's pubkey
             if let Some(registered_key) = self.validator_keys.get(&block.author)
                 && let CryptoSignature::Ed25519 { public_key, .. } = &sig
-                    && public_key != registered_key.value() {
-                        warn!(
-                            author = %block.author,
-                            "Block signed with key that doesn't match registered key"
-                        );
-                        return Err(ConsensusError::InvalidSignature);
-                    }
+                && public_key != registered_key.value()
+            {
+                warn!(
+                    author = %block.author,
+                    "Block signed with key that doesn't match registered key"
+                );
+                return Err(ConsensusError::InvalidSignature);
+            }
         } else if self.local_keypair.is_some() {
             // Production mode: reject unsigned blocks
             return Err(ConsensusError::InvalidSignature);
@@ -1187,9 +1196,10 @@ impl ConsensusEngine {
         // current == 0; subsequent blocks are bounded normally.
         const MAX_ROUND_JUMP: u64 = 1_000_000;
         if current > 0 && block.round > current + MAX_ROUND_JUMP {
-            return Err(ConsensusError::InvalidBlock(
-                format!("round {} is too far ahead (current={}, max jump={})", block.round, current, MAX_ROUND_JUMP)
-            ));
+            return Err(ConsensusError::InvalidBlock(format!(
+                "round {} is too far ahead (current={}, max jump={})",
+                block.round, current, MAX_ROUND_JUMP
+            )));
         }
         if block.round > current + 1 {
             let gap = block.round - current;
@@ -1201,7 +1211,8 @@ impl ConsensusEngine {
                 let new_committed = block.round.saturating_sub(PRUNE_DEPTH);
                 let old_committed = self.last_committed_round.load(Ordering::SeqCst);
                 if new_committed > old_committed {
-                    self.last_committed_round.store(new_committed, Ordering::SeqCst);
+                    self.last_committed_round
+                        .store(new_committed, Ordering::SeqCst);
                 }
                 tracing::warn!(
                     "Large round gap ({} rounds) - partition healed? Fast-forwarding and skipping empty gap.",
@@ -1212,7 +1223,9 @@ impl ConsensusEngine {
             self.current_round.store(new_round, Ordering::SeqCst);
             tracing::info!(
                 "Round catch-up: fast-forwarded from {} to {} (peer block at round {})",
-                current, new_round, block.round
+                current,
+                new_round,
+                block.round
             );
         }
 
@@ -1256,8 +1269,11 @@ impl ConsensusEngine {
             if missing_parents > 0 {
                 tracing::debug!(
                     "Block {} from {} at round {} has {}/{} missing parents (accepted anyway)",
-                    block.hash, block.author, block.round,
-                    missing_parents, block.parents.len()
+                    block.hash,
+                    block.author,
+                    block.round,
+                    missing_parents,
+                    block.parents.len()
                 );
             }
 
@@ -1273,7 +1289,9 @@ impl ConsensusEngine {
                 }
                 tracing::debug!(
                     "Block {} has sub-quorum parent stake ({} < {}), accepting (testnet)",
-                    block.hash, parent_stake, vs.quorum
+                    block.hash,
+                    parent_stake,
+                    vs.quorum
                 );
             }
         }
@@ -1284,7 +1302,8 @@ impl ConsensusEngine {
         let key = (block.author, block.round);
         if let Some(equivocation) = self.detect_equivocation(block) {
             // Equivocation detected! Slash the offender.
-            let evidence = arc_crypto::hash_pair(&equivocation.block1_hash, &equivocation.block2_hash);
+            let evidence =
+                arc_crypto::hash_pair(&equivocation.block1_hash, &equivocation.block2_hash);
             warn!(
                 author = %block.author,
                 round = block.round,
@@ -1317,7 +1336,9 @@ impl ConsensusEngine {
             // and insert different blocks for the same (author, round).
             use dashmap::mapref::entry::Entry;
             match self.author_round_blocks.entry(key) {
-                Entry::Vacant(e) => { e.insert(block.hash); }
+                Entry::Vacant(e) => {
+                    e.insert(block.hash);
+                }
                 Entry::Occupied(e) => {
                     if *e.get() != block.hash {
                         // Late-detected equivocation (lost the TOCTOU race)
@@ -1345,7 +1366,8 @@ impl ConsensusEngine {
         // Skip if this author already has a different block in this round
         // (equivocation), since that case is already handled above by
         // detect_equivocation() and we don't want to double-slash.
-        let is_equivocation = self.author_round_blocks
+        let is_equivocation = self
+            .author_round_blocks
             .get(&(block.author, block.round))
             .map(|existing| *existing.value() != block.hash)
             .unwrap_or(false);
@@ -1457,9 +1479,10 @@ impl ConsensusEngine {
                 // but only the leader's block carries transactions to the chain.
                 if let Some(leader_addr) = leader
                     && let Some(block_b) = self.dag.get(block_b_hash)
-                        && block_b.author != leader_addr {
-                            continue; // Not the leader - skip
-                        }
+                    && block_b.author != leader_addr
+                {
+                    continue; // Not the leader - skip
+                }
 
                 // Step 1: Find a block C in round R+1 that references B
                 let round_r1_blocks = self.blocks_in_round(r + 1);
@@ -1477,15 +1500,11 @@ impl ConsensusEngine {
                         for block_d_hash in &round_r2_blocks {
                             if let Some(block_d) = self.dag.get(block_d_hash)
                                 && block_d.parents.contains(block_c_hash)
-                                    && let Some(validator) =
-                                        vs.get_validator(&block_d.author)
-                                    {
-                                        supporting_stake += validator.stake;
-                                        certifier_sigs.push((
-                                            block_d.author,
-                                            block_d.signature.clone(),
-                                        ));
-                                    }
+                                && let Some(validator) = vs.get_validator(&block_d.author)
+                            {
+                                supporting_stake += validator.stake;
+                                certifier_sigs.push((block_d.author, block_d.signature.clone()));
+                            }
                         }
 
                         if supporting_stake >= vs.quorum {
@@ -1536,7 +1555,10 @@ impl ConsensusEngine {
                 self.last_committed_round.store(r + 1, Ordering::SeqCst);
             } else {
                 let leader_block_exists = round_r_blocks.iter().any(|h| {
-                    self.dag.get(h).map(|b| b.author == leader.unwrap_or(Hash256::ZERO)).unwrap_or(false)
+                    self.dag
+                        .get(h)
+                        .map(|b| b.author == leader.unwrap_or(Hash256::ZERO))
+                        .unwrap_or(false)
                 });
                 // Liveness fallback: if we're lagging too far behind current,
                 // advance unconditionally. Without this, the scan gets stuck
@@ -1555,9 +1577,10 @@ impl ConsensusEngine {
                     let mut stake = 0u64;
                     for h in &round_r_blocks {
                         if let Some(b) = self.dag.get(h)
-                            && let Some(v) = vs.get_validator(&b.author) {
-                                stake += v.stake;
-                            }
+                            && let Some(v) = vs.get_validator(&b.author)
+                        {
+                            stake += v.stake;
+                        }
                     }
                     if stake >= vs.quorum {
                         // Quorum without leader - skip this round
@@ -1593,10 +1616,10 @@ impl ConsensusEngine {
                     let cp = security::Checkpoint {
                         block_hash: *last_block.hash.as_bytes(),
                         round: max_round,
-                        height: max_round,  // height approximated by round
-                        state_root: [0u8; 32],  // Would be filled by state layer
+                        height: max_round,     // height approximated by round
+                        state_root: [0u8; 32], // Would be filled by state layer
                         timestamp: last_block.timestamp,
-                        signatures: vec![],  // Would be filled with quorum sigs
+                        signatures: vec![], // Would be filled with quorum sigs
                     };
                     cr.add_checkpoint(cp);
                 }
@@ -1694,7 +1717,8 @@ impl ConsensusEngine {
 
         // Prune finality proofs for blocks no longer in DAG
         if pruned_blocks > 0 {
-            let stale_proofs: Vec<Hash256> = self.finality_proofs
+            let stale_proofs: Vec<Hash256> = self
+                .finality_proofs
                 .iter()
                 .filter(|e| !self.dag.contains_key(e.key()))
                 .map(|e| *e.key())
@@ -1703,18 +1727,24 @@ impl ConsensusEngine {
                 self.finality_proofs.remove(h);
             }
             // Prune DA commitments and cross-shard proofs for pruned blocks
-            let stale_da: Vec<Hash256> = self.da_commitments
+            let stale_da: Vec<Hash256> = self
+                .da_commitments
                 .iter()
                 .filter(|e| !self.dag.contains_key(e.key()))
                 .map(|e| *e.key())
                 .collect();
-            for h in &stale_da { self.da_commitments.remove(h); }
-            let stale_cs: Vec<Hash256> = self.completed_cross_shard
+            for h in &stale_da {
+                self.da_commitments.remove(h);
+            }
+            let stale_cs: Vec<Hash256> = self
+                .completed_cross_shard
                 .iter()
                 .filter(|e| !self.dag.contains_key(e.key()))
                 .map(|e| *e.key())
                 .collect();
-            for h in &stale_cs { self.completed_cross_shard.remove(h); }
+            for h in &stale_cs {
+                self.completed_cross_shard.remove(h);
+            }
         }
 
         if pruned_rounds > 0 {
@@ -1747,9 +1777,10 @@ impl ConsensusEngine {
             if let Some(block) = self.dag.get(hash) {
                 // Only count each author once per round
                 if seen_authors.insert(block.author)
-                    && let Some(validator) = vs.get_validator(&block.author) {
-                        round_stake += validator.stake;
-                    }
+                    && let Some(validator) = vs.get_validator(&block.author)
+                {
+                    round_stake += validator.stake;
+                }
             }
         }
 
@@ -1853,7 +1884,10 @@ impl ConsensusEngine {
                 // Agent registration is local
                 false
             }
-            TxBody::JoinValidator(_) | TxBody::LeaveValidator | TxBody::ClaimRewards | TxBody::UpdateStake(_) => {
+            TxBody::JoinValidator(_)
+            | TxBody::LeaveValidator
+            | TxBody::ClaimRewards
+            | TxBody::UpdateStake(_) => {
                 // Validator management transactions are global (affect consensus state)
                 false
             }
@@ -1865,17 +1899,17 @@ impl ConsensusEngine {
                 // Bridge transactions are global (cross-chain)
                 false
             }
-            TxBody::BatchSettle(_) => false,  // Local to sender's shard
+            TxBody::BatchSettle(_) => false, // Local to sender's shard
             TxBody::ChannelOpen(body) => {
                 let cp_shard = Self::shard_of(&body.counterparty, num_shards);
                 sender_shard != cp_shard
             }
-            TxBody::ChannelClose(_) => false,  // Escrow is deterministic
-            TxBody::ChannelDispute(_) => false,  // Escrow is deterministic
-            TxBody::ShardProof(_) => false,  // Shard-local proof recording
-            TxBody::InferenceAttestation(_) => false,  // Escrow is local to sender's shard
-            TxBody::InferenceChallenge(_) => false,  // Resolved on attestation's shard
-            TxBody::InferenceRegister(_) => false,  // Local to sender's shard
+            TxBody::ChannelClose(_) => false, // Escrow is deterministic
+            TxBody::ChannelDispute(_) => false, // Escrow is deterministic
+            TxBody::ShardProof(_) => false,   // Shard-local proof recording
+            TxBody::InferenceAttestation(_) => false, // Escrow is local to sender's shard
+            TxBody::InferenceChallenge(_) => false, // Resolved on attestation's shard
+            TxBody::InferenceRegister(_) => false, // Local to sender's shard
             // Milestone B: escrow accounts are derived from request_id via
             // a deterministic hash, so they live on the sender's shard
             // alongside the payer account. Release touches proposer +
@@ -1993,13 +2027,16 @@ impl ConsensusEngine {
                 if let Some(blocks) = self.rounds.get(&r) {
                     for hash in blocks.value() {
                         if let Some(block) = self.dag.get(hash)
-                            && block.author == validator.address {
-                                seen = true;
-                                break;
-                            }
+                            && block.author == validator.address
+                        {
+                            seen = true;
+                            break;
+                        }
                     }
                 }
-                if seen { break; }
+                if seen {
+                    break;
+                }
             }
             if seen {
                 online_stake += validator.stake;
@@ -2039,20 +2076,23 @@ impl ConsensusEngine {
     /// Insert a block into the DAG and the round index.
     fn insert_block_into_dag(&self, block: &DagBlock) {
         self.dag.insert(block.hash, block.clone());
-        self.rounds
-            .entry(block.round)
-            .or_default()
-            .push(block.hash);
+        self.rounds.entry(block.round).or_default().push(block.hash);
     }
 
     /// Store a DA commitment.
     pub fn store_da_commitment(&self, commitment: data_availability::DACommitment) {
-        self.da_commitments.insert(commitment.block_hash, commitment);
+        self.da_commitments
+            .insert(commitment.block_hash, commitment);
     }
 
     /// Get a DA commitment by block hash.
-    pub fn get_da_commitment(&self, block_hash: &Hash256) -> Option<data_availability::DACommitment> {
-        self.da_commitments.get(block_hash).map(|r| r.value().clone())
+    pub fn get_da_commitment(
+        &self,
+        block_hash: &Hash256,
+    ) -> Option<data_availability::DACommitment> {
+        self.da_commitments
+            .get(block_hash)
+            .map(|r| r.value().clone())
     }
 
     /// Lock a cross-shard transaction.
@@ -2065,15 +2105,18 @@ impl ConsensusEngine {
         source_round: u64,
     ) -> Result<CrossShardProof, ConsensusError> {
         if self.pending_cross_shard.contains_key(&tx_hash) {
-            return Err(ConsensusError::CrossShardLockAlreadyExists(
-                format!("tx {} already locked", tx_hash),
-            ));
+            return Err(ConsensusError::CrossShardLockAlreadyExists(format!(
+                "tx {} already locked",
+                tx_hash
+            )));
         }
         let lock_hash = arc_crypto::hash_bytes(
-            &bincode::serialize(&(&tx_hash, source_shard, target_shard))
-                .map_err(|e| ConsensusError::CrossShardLockFailed(format!("serialize lock: {e}")))?
+            &bincode::serialize(&(&tx_hash, source_shard, target_shard)).map_err(|e| {
+                ConsensusError::CrossShardLockFailed(format!("serialize lock: {e}"))
+            })?,
         );
-        let inclusion_proof = bincode::serialize(&(&tx_hash, &source_block_hash)).unwrap_or_default();
+        let inclusion_proof =
+            bincode::serialize(&(&tx_hash, &source_block_hash)).unwrap_or_default();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -2096,10 +2139,9 @@ impl ConsensusEngine {
 
     /// Commit a locked cross-shard transaction.
     pub fn commit_cross_shard(&self, tx_hash: Hash256) -> Result<CrossShardProof, ConsensusError> {
-        let (_, mut proof) = self.pending_cross_shard.remove(&tx_hash)
-            .ok_or_else(|| ConsensusError::CrossShardLockNotFound(
-                format!("tx {} not found in pending", tx_hash),
-            ))?;
+        let (_, mut proof) = self.pending_cross_shard.remove(&tx_hash).ok_or_else(|| {
+            ConsensusError::CrossShardLockNotFound(format!("tx {} not found in pending", tx_hash))
+        })?;
         proof.status = CrossShardStatus::Committed;
         self.completed_cross_shard.insert(tx_hash, proof.clone());
         Ok(proof)
@@ -2107,10 +2149,9 @@ impl ConsensusEngine {
 
     /// Abort a locked cross-shard transaction.
     pub fn abort_cross_shard(&self, tx_hash: Hash256) -> Result<CrossShardProof, ConsensusError> {
-        let (_, mut proof) = self.pending_cross_shard.remove(&tx_hash)
-            .ok_or_else(|| ConsensusError::CrossShardLockNotFound(
-                format!("tx {} not found in pending", tx_hash),
-            ))?;
+        let (_, mut proof) = self.pending_cross_shard.remove(&tx_hash).ok_or_else(|| {
+            ConsensusError::CrossShardLockNotFound(format!("tx {} not found in pending", tx_hash))
+        })?;
         proof.status = CrossShardStatus::Aborted;
         self.completed_cross_shard.insert(tx_hash, proof.clone());
         Ok(proof)
@@ -2134,9 +2175,10 @@ impl ConsensusEngine {
                     for prev_proof in &proofs {
                         let _ = self.abort_cross_shard(prev_proof.tx_hash);
                     }
-                    return Err(ConsensusError::CrossShardLockFailed(
-                        format!("batch failed at tx {}: {}", tx_hash, e),
-                    ));
+                    return Err(ConsensusError::CrossShardLockFailed(format!(
+                        "batch failed at tx {}: {}",
+                        tx_hash, e
+                    )));
                 }
             }
         }
@@ -2145,7 +2187,10 @@ impl ConsensusEngine {
 
     /// Get counts of (pending, completed) cross-shard transactions.
     pub fn cross_shard_stats(&self) -> (usize, usize) {
-        (self.pending_cross_shard.len(), self.completed_cross_shard.len())
+        (
+            self.pending_cross_shard.len(),
+            self.completed_cross_shard.len(),
+        )
     }
 
     // ── A6: Cross-Shard Deadlock Prevention ─────────────────────────────────
@@ -2163,12 +2208,15 @@ impl ConsensusEngine {
         let current_round = self.current_round.load(Ordering::SeqCst);
         const MAX_LOCK_ROUNDS: u64 = 100; // locks expire after 100 rounds regardless of wall time
 
-        let expired: Vec<Hash256> = self.pending_cross_shard
+        let expired: Vec<Hash256> = self
+            .pending_cross_shard
             .iter()
             .filter(|entry| {
                 let proof = entry.value();
-                let time_expired = now_ms.saturating_sub(proof.locked_at_ms) > CROSS_SHARD_LOCK_TIMEOUT_MS;
-                let round_expired = current_round.saturating_sub(proof.locked_at_round) > MAX_LOCK_ROUNDS;
+                let time_expired =
+                    now_ms.saturating_sub(proof.locked_at_ms) > CROSS_SHARD_LOCK_TIMEOUT_MS;
+                let round_expired =
+                    current_round.saturating_sub(proof.locked_at_round) > MAX_LOCK_ROUNDS;
                 time_expired || round_expired
             })
             .map(|entry| *entry.key())
@@ -2226,16 +2274,14 @@ impl ConsensusEngine {
                 for d_hash in &round_r2_blocks {
                     if let Some(d_block) = self.dag.get(d_hash)
                         && d_block.parents.contains(c_hash)
-                            && let Some(validator) = vs.get_validator(&d_block.author) {
-                                // Avoid duplicates (same author counted once)
-                                if !quorum_sigs.iter().any(|(addr, _)| *addr == d_block.author) {
-                                    quorum_sigs.push((
-                                        d_block.author,
-                                        d_block.signature.clone(),
-                                    ));
-                                    signing_stake += validator.stake;
-                                }
-                            }
+                        && let Some(validator) = vs.get_validator(&d_block.author)
+                    {
+                        // Avoid duplicates (same author counted once)
+                        if !quorum_sigs.iter().any(|(addr, _)| *addr == d_block.author) {
+                            quorum_sigs.push((d_block.author, d_block.signature.clone()));
+                            signing_stake += validator.stake;
+                        }
+                    }
                 }
             }
         }
@@ -2256,7 +2302,9 @@ impl ConsensusEngine {
 
     /// Get a stored finality proof by block hash.
     pub fn get_finality_proof(&self, block_hash: &Hash256) -> Option<FinalityProof> {
-        self.finality_proofs.get(block_hash).map(|r| r.value().clone())
+        self.finality_proofs
+            .get(block_hash)
+            .map(|r| r.value().clone())
     }
 
     // ── A4: DAG Pruning / Memory Bounds ──────────────────────────────────────
@@ -2328,14 +2376,15 @@ impl ConsensusEngine {
     pub fn detect_equivocation(&self, block: &DagBlock) -> Option<EquivocationProof> {
         let key = (block.author, block.round);
         if let Some(existing_hash) = self.author_round_blocks.get(&key)
-            && *existing_hash.value() != block.hash {
-                return Some(EquivocationProof {
-                    author: block.author,
-                    round: block.round,
-                    block1_hash: *existing_hash.value(),
-                    block2_hash: block.hash,
-                });
-            }
+            && *existing_hash.value() != block.hash
+        {
+            return Some(EquivocationProof {
+                author: block.author,
+                round: block.round,
+                block1_hash: *existing_hash.value(),
+                block2_hash: block.hash,
+            });
+        }
         None
     }
 
@@ -2399,12 +2448,14 @@ impl ConsensusEngine {
 
         let timeout_ms = timeout_secs * 1000;
 
-        let expired: Vec<Hash256> = self.pending_cross_shard
+        let expired: Vec<Hash256> = self
+            .pending_cross_shard
             .iter()
             .filter(|entry| {
                 let proof = entry.value();
                 let time_expired = now_ms.saturating_sub(proof.locked_at_ms) > timeout_ms;
-                let round_expired = current_round.saturating_sub(proof.locked_at_round) > MAX_LOCK_ROUNDS;
+                let round_expired =
+                    current_round.saturating_sub(proof.locked_at_round) > MAX_LOCK_ROUNDS;
                 time_expired || round_expired
             })
             .map(|entry| *entry.key())
@@ -2425,7 +2476,10 @@ impl ConsensusEngine {
         }
 
         if count > 0 {
-            info!(expired = count, timeout_secs, "Expired stale cross-shard locks (parameterized)");
+            info!(
+                expired = count,
+                timeout_secs, "Expired stale cross-shard locks (parameterized)"
+            );
         }
         count
     }
@@ -2531,8 +2585,7 @@ mod tests {
     fn test_validator_set(n: usize) -> ValidatorSet {
         let validators: Vec<Validator> = (0..n)
             .map(|i| {
-                Validator::new(test_addr(i as u8), STAKE_ARC, i as u16)
-                    .expect("valid validator")
+                Validator::new(test_addr(i as u8), STAKE_ARC, i as u16).expect("valid validator")
             })
             .collect();
         ValidatorSet::new(validators, 1)
@@ -2541,9 +2594,9 @@ mod tests {
     /// Create a test validator set with mixed tiers.
     fn mixed_validator_set() -> ValidatorSet {
         let validators = vec![
-            Validator::new(test_addr(0), STAKE_CORE, 0).unwrap(),  // Core: 50M
-            Validator::new(test_addr(1), STAKE_ARC, 1).unwrap(),   // Arc: 5M
-            Validator::new(test_addr(2), STAKE_ARC, 0).unwrap(),   // Arc: 5M
+            Validator::new(test_addr(0), STAKE_CORE, 0).unwrap(), // Core: 50M
+            Validator::new(test_addr(1), STAKE_ARC, 1).unwrap(),  // Arc: 5M
+            Validator::new(test_addr(2), STAKE_ARC, 0).unwrap(),  // Arc: 5M
             Validator::new(test_addr(3), STAKE_SPARK, 1).unwrap(), // Spark: 500K
         ];
         ValidatorSet::new(validators, 1)
@@ -2603,10 +2656,7 @@ mod tests {
         assert_eq!(StakeTier::from_stake(STAKE_ARC), Some(StakeTier::Arc));
         assert_eq!(StakeTier::from_stake(49_999_999), Some(StakeTier::Arc));
         assert_eq!(StakeTier::from_stake(STAKE_CORE), Some(StakeTier::Core));
-        assert_eq!(
-            StakeTier::from_stake(100_000_000),
-            Some(StakeTier::Core)
-        );
+        assert_eq!(StakeTier::from_stake(100_000_000), Some(StakeTier::Core));
 
         assert!(!StakeTier::Spark.can_produce_blocks());
         assert!(StakeTier::Arc.can_produce_blocks());
@@ -2642,19 +2692,12 @@ mod tests {
 
     #[test]
     fn test_join_validator() {
-        let validators = vec![
-            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
-        ];
+        let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
 
         // Join a new validator
-        let result = engine.join_validator(
-            test_addr(2),
-            STAKE_ARC,
-            [2u8; 32],
-            1,
-        );
+        let result = engine.join_validator(test_addr(2), STAKE_ARC, [2u8; 32], 1);
         assert!(result.is_ok());
 
         let vs = engine.validator_set();
@@ -2664,9 +2707,7 @@ mod tests {
 
     #[test]
     fn test_join_validator_insufficient_stake() {
-        let validators = vec![
-            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
-        ];
+        let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
 
@@ -2699,13 +2740,13 @@ mod tests {
 
     #[test]
     fn test_update_validator_stake() {
-        let validators = vec![
-            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
-        ];
+        let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
 
-        engine.update_validator_stake(&test_addr(1), STAKE_CORE).unwrap();
+        engine
+            .update_validator_stake(&test_addr(1), STAKE_CORE)
+            .unwrap();
 
         let vs = engine.validator_set();
         let v = vs.get_validator(&test_addr(1)).unwrap();
@@ -2715,9 +2756,7 @@ mod tests {
 
     #[test]
     fn test_epoch_transition() {
-        let validators = vec![
-            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
-        ];
+        let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
 
@@ -2730,9 +2769,7 @@ mod tests {
 
     #[test]
     fn test_join_validator_duplicate() {
-        let validators = vec![
-            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
-        ];
+        let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
 
@@ -2844,8 +2881,12 @@ mod tests {
         let result = engine.receive_block(&block);
         // Block is accepted (round catch-up), though it may fail parent validation
         // The key is that it does NOT return InvalidRound
-        assert_ne!(result.clone().err(), Some(ConsensusError::InvalidRound),
-            "Future blocks should trigger round catch-up, not InvalidRound: {:?}", result);
+        assert_ne!(
+            result.clone().err(),
+            Some(ConsensusError::InvalidRound),
+            "Future blocks should trigger round catch-up, not InvalidRound: {:?}",
+            result
+        );
     }
 
     // ── 4. Commit Rule ───────────────────────────────────────────────────────
@@ -3337,9 +3378,7 @@ mod tests {
         // Update to a new epoch with 6 validators
         let new_vs = ValidatorSet::new(
             (0..6)
-                .map(|i| {
-                    Validator::new(test_addr(i as u8), STAKE_ARC, i as u16).unwrap()
-                })
+                .map(|i| Validator::new(test_addr(i as u8), STAKE_ARC, i as u16).unwrap())
                 .collect(),
             2,
         );
@@ -3442,9 +3481,7 @@ mod tests {
             .expect("lock should succeed");
         assert_eq!(proof.status, CrossShardStatus::Locked);
 
-        let aborted = engine
-            .abort_cross_shard(tx)
-            .expect("abort should succeed");
+        let aborted = engine.abort_cross_shard(tx).expect("abort should succeed");
         assert_eq!(aborted.status, CrossShardStatus::Aborted);
         assert_eq!(aborted.source_shard, 2);
         assert_eq!(aborted.target_shard, 3);
@@ -3497,11 +3534,12 @@ mod tests {
             .expect("pre-lock should succeed");
         assert_eq!(engine.cross_shard_stats(), (1, 0));
 
-        let result = engine.atomic_cross_shard_batch(
-            vec![tx1, tx2, tx3],
-            vec![(0, 1), (0, 2), (1, 3)],
+        let result =
+            engine.atomic_cross_shard_batch(vec![tx1, tx2, tx3], vec![(0, 1), (0, 2), (1, 3)]);
+        assert!(
+            result.is_err(),
+            "batch should fail because tx2 is already locked"
         );
-        assert!(result.is_err(), "batch should fail because tx2 is already locked");
 
         assert!(engine.completed_cross_shard.get(&tx1).is_some());
         let tx1_proof = engine.completed_cross_shard.get(&tx1).unwrap();
@@ -3531,17 +3569,25 @@ mod tests {
         let txs_b = vec![hash_bytes(b"tx2"), hash_bytes(b"tx1")];
         let ca = DagBlock::compute_ordering_commitment(&txs_a);
         let cb = DagBlock::compute_ordering_commitment(&txs_b);
-        assert_ne!(ca, cb, "different tx order must produce different commitment");
+        assert_ne!(
+            ca, cb,
+            "different tx order must produce different commitment"
+        );
     }
 
     #[test]
     fn test_block_verifies_correct_ordering() {
         let block = make_block(
-            test_addr(0), 0, vec![],
+            test_addr(0),
+            0,
+            vec![],
             vec![hash_bytes(b"tx1"), hash_bytes(b"tx2")],
             1000,
         );
-        assert!(block.verify_ordering(), "block with correct ordering should verify");
+        assert!(
+            block.verify_ordering(),
+            "block with correct ordering should verify"
+        );
     }
 
     #[test]
@@ -3553,9 +3599,8 @@ mod tests {
         let mut block = make_block(test_addr(1), 0, vec![], txs, 1000);
 
         // Tamper with the ordering commitment (simulate reordering)
-        block.ordering_commitment = DagBlock::compute_ordering_commitment(
-            &[hash_bytes(b"tx2"), hash_bytes(b"tx1")]
-        );
+        block.ordering_commitment =
+            DagBlock::compute_ordering_commitment(&[hash_bytes(b"tx2"), hash_bytes(b"tx1")]);
         // Recompute hash with tampered commitment
         block.hash = block.compute_hash();
 
@@ -3645,7 +3690,10 @@ mod tests {
         let proof = engine
             .lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0)
             .unwrap();
-        assert!(proof.locked_at_ms > 0, "lock should have a non-zero timestamp");
+        assert!(
+            proof.locked_at_ms > 0,
+            "lock should have a non-zero timestamp"
+        );
     }
 
     #[test]
@@ -3654,7 +3702,9 @@ mod tests {
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
         let tx = hash_bytes(b"fresh_lock");
-        engine.lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0).unwrap();
+        engine
+            .lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0)
+            .unwrap();
 
         // Just locked - should not be expired
         let expired = engine.expire_stale_locks();
@@ -3668,7 +3718,9 @@ mod tests {
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
         let tx = hash_bytes(b"old_lock");
-        engine.lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0).unwrap();
+        engine
+            .lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0)
+            .unwrap();
 
         // Manually set the lock timestamp to 60 seconds ago
         if let Some(mut entry) = engine.pending_cross_shard.get_mut(&tx) {
@@ -3700,13 +3752,19 @@ mod tests {
             signing_stake: 15_000_000,
             total_stake: 20_000_000,
         };
-        assert!(proof.has_sufficient_stake(), "75% stake should be sufficient");
+        assert!(
+            proof.has_sufficient_stake(),
+            "75% stake should be sufficient"
+        );
 
         let insufficient = FinalityProof {
             signing_stake: 10_000_000,
             ..proof.clone()
         };
-        assert!(!insufficient.has_sufficient_stake(), "50% stake should be insufficient");
+        assert!(
+            !insufficient.has_sufficient_stake(),
+            "50% stake should be insufficient"
+        );
     }
 
     #[test]
@@ -3726,20 +3784,52 @@ mod tests {
         engine.advance_round();
 
         let block_c = make_block(
-            test_addr(1), 1,
+            test_addr(1),
+            1,
             vec![block_b.hash, b1.hash, b2.hash],
-            vec![], 200,
+            vec![],
+            200,
         );
-        let c2 = make_block(test_addr(2), 1, vec![block_b.hash, b1.hash, b2.hash], vec![], 201);
-        let c3 = make_block(test_addr(3), 1, vec![block_b.hash, b1.hash, b3.hash], vec![], 202);
+        let c2 = make_block(
+            test_addr(2),
+            1,
+            vec![block_b.hash, b1.hash, b2.hash],
+            vec![],
+            201,
+        );
+        let c3 = make_block(
+            test_addr(3),
+            1,
+            vec![block_b.hash, b1.hash, b3.hash],
+            vec![],
+            202,
+        );
         engine.receive_block(&block_c).unwrap();
         engine.receive_block(&c2).unwrap();
         engine.receive_block(&c3).unwrap();
         engine.advance_round();
 
-        let d0 = make_block(test_addr(0), 2, vec![block_c.hash, c2.hash, c3.hash], vec![], 300);
-        let d2 = make_block(test_addr(2), 2, vec![block_c.hash, c2.hash, c3.hash], vec![], 301);
-        let d3 = make_block(test_addr(3), 2, vec![block_c.hash, c2.hash, c3.hash], vec![], 302);
+        let d0 = make_block(
+            test_addr(0),
+            2,
+            vec![block_c.hash, c2.hash, c3.hash],
+            vec![],
+            300,
+        );
+        let d2 = make_block(
+            test_addr(2),
+            2,
+            vec![block_c.hash, c2.hash, c3.hash],
+            vec![],
+            301,
+        );
+        let d3 = make_block(
+            test_addr(3),
+            2,
+            vec![block_c.hash, c2.hash, c3.hash],
+            vec![],
+            302,
+        );
         engine.receive_block(&d0).unwrap();
         engine.receive_block(&d2).unwrap();
         engine.receive_block(&d3).unwrap();
@@ -3777,17 +3867,14 @@ mod tests {
                     // Use at least one parent from the previous round
                     engine.blocks_in_round(round - 1)
                 };
-                let block = make_block(
-                    test_addr(v),
-                    round,
-                    parents,
-                    vec![],
-                    round * 100 + v as u64,
-                );
+                let block =
+                    make_block(test_addr(v), round, parents, vec![], round * 100 + v as u64);
                 // Insert directly into DAG (bypass validation for test scaffolding)
                 engine.dag.insert(block.hash, block.clone());
                 engine.rounds.entry(round).or_default().push(block.hash);
-                engine.author_round_blocks.insert((block.author, round), block.hash);
+                engine
+                    .author_round_blocks
+                    .insert((block.author, round), block.hash);
             }
         }
 
@@ -3826,7 +3913,11 @@ mod tests {
             let block = make_block(
                 test_addr(0),
                 round,
-                if round == 0 { vec![] } else { engine.blocks_in_round(round - 1) },
+                if round == 0 {
+                    vec![]
+                } else {
+                    engine.blocks_in_round(round - 1)
+                },
                 vec![],
                 round * 100,
             );
@@ -3838,7 +3929,10 @@ mod tests {
 
         // committed_round = 50, which is < PRUNE_DEPTH (100), so nothing should be pruned
         let pruned = engine.prune_below_round(50);
-        assert_eq!(pruned, 0, "no rounds should be pruned when committed_round < PRUNE_DEPTH");
+        assert_eq!(
+            pruned, 0,
+            "no rounds should be pruned when committed_round < PRUNE_DEPTH"
+        );
         assert_eq!(engine.dag_size(), initial_size);
 
         // All rounds should still exist
@@ -3867,7 +3961,10 @@ mod tests {
 
         // detect_equivocation should find it
         let proof = engine.detect_equivocation(&block2);
-        assert!(proof.is_some(), "should detect equivocation for same author, same round");
+        assert!(
+            proof.is_some(),
+            "should detect equivocation for same author, same round"
+        );
 
         let proof = proof.unwrap();
         assert_eq!(proof.author, test_addr(1));
@@ -3887,12 +3984,21 @@ mod tests {
 
         // Block from validator 1 in round 1 - different round, NOT equivocation
         // Need to set up parent references properly
-        let block2 = make_block(test_addr(1), 1, vec![block1.hash], vec![hash_bytes(b"tx_b")], 1001);
+        let block2 = make_block(
+            test_addr(1),
+            1,
+            vec![block1.hash],
+            vec![hash_bytes(b"tx_b")],
+            1001,
+        );
 
         // Insert block2's author+round into author_round_blocks for detection
         // (normally receive_block would do this, but we test detect_equivocation directly)
         let proof = engine.detect_equivocation(&block2);
-        assert!(proof.is_none(), "different rounds should not trigger equivocation");
+        assert!(
+            proof.is_none(),
+            "different rounds should not trigger equivocation"
+        );
     }
 
     #[test]
@@ -3906,7 +4012,10 @@ mod tests {
 
         // Slash 1,000,000 ARC - should reduce stake but not remove
         let removed = engine.enforce_slash(&target, 1_000_000);
-        assert!(!removed, "validator should not be removed with 4M remaining");
+        assert!(
+            !removed,
+            "validator should not be removed with 4M remaining"
+        );
 
         let new_stake = engine.validator_set().get_validator(&target).unwrap().stake;
         assert_eq!(new_stake, STAKE_ARC - 1_000_000);
@@ -3922,7 +4031,10 @@ mod tests {
 
         // Slash the entire stake - should remove the validator
         let removed = engine.enforce_slash(&target, STAKE_ARC);
-        assert!(removed, "validator should be removed when stake falls below STAKE_SPARK");
+        assert!(
+            removed,
+            "validator should be removed when stake falls below STAKE_SPARK"
+        );
 
         // Validator should no longer be in the set
         assert!(
@@ -3944,7 +4056,9 @@ mod tests {
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
         let tx = hash_bytes(b"expiry_test_lock");
-        engine.lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0).unwrap();
+        engine
+            .lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0)
+            .unwrap();
 
         // Manually set the lock timestamp to 60 seconds ago (well past 30s timeout)
         if let Some(mut entry) = engine.pending_cross_shard.get_mut(&tx) {
@@ -3971,7 +4085,9 @@ mod tests {
         let engine = ConsensusEngine::new(vs, test_addr(0));
 
         let tx = hash_bytes(b"fresh_lock_test");
-        engine.lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0).unwrap();
+        engine
+            .lock_cross_shard(tx, 0, 1, hash_bytes(b"block"), 0)
+            .unwrap();
 
         // Lock was just created - should NOT be expired even with a short timeout
         let expired = engine.expire_stale_locks_with_timeout(30);
@@ -4007,9 +4123,7 @@ mod tests {
 
     #[test]
     fn test_node_role_default() {
-        let validators = vec![
-            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
-        ];
+        let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
         assert_eq!(engine.node_role(), NodeRole::Full);
@@ -4017,9 +4131,7 @@ mod tests {
 
     #[test]
     fn test_node_role_setter() {
-        let validators = vec![
-            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
-        ];
+        let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let mut engine = ConsensusEngine::new(vs, test_addr(1));
 
@@ -4057,13 +4169,7 @@ mod tests {
         // tests need it for the same reason.
         let engine = ConsensusEngine::new_testnet(vs, test_addr(1));
 
-        let block = make_block(
-            test_addr(2),
-            5_000_000,
-            vec![],
-            vec![],
-            1_700_000_000_000,
-        );
+        let block = make_block(test_addr(2), 5_000_000, vec![], vec![], 1_700_000_000_000);
         let result = engine.receive_block(&block);
         assert!(
             result.is_ok(),
@@ -4120,9 +4226,7 @@ mod tests {
     fn set_initial_round_idempotent_when_lower() {
         // set_initial_round(N) when current >= N is a no-op. Prevents a
         // stale dag-wal segment from clobbering an in-memory advance.
-        let validators = vec![
-            Validator::new(test_addr(1), STAKE_ARC, 0).unwrap(),
-        ];
+        let validators = vec![Validator::new(test_addr(1), STAKE_ARC, 0).unwrap()];
         let vs = ValidatorSet::new(validators, 1);
         let engine = ConsensusEngine::new(vs, test_addr(1));
         engine.set_initial_round(500, 400);
@@ -4130,7 +4234,11 @@ mod tests {
 
         // Try to "rewind" to 100 — should be ignored.
         engine.set_initial_round(100, 50);
-        assert_eq!(engine.current_round(), 500, "set_initial_round must not rewind");
+        assert_eq!(
+            engine.current_round(),
+            500,
+            "set_initial_round must not rewind"
+        );
     }
 
     #[test]

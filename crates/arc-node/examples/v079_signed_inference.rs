@@ -15,12 +15,12 @@
 //! wall-clock-derived string so reruns produce a fresh address with
 //! no carry-over nonce state.
 
-use arc_crypto::{hash_bytes, Hash256, Signature};
+use arc_crypto::{Hash256, Signature, hash_bytes};
 use arc_types::transaction::{InferenceRequestBody, TxBody};
 use arc_types::{Transaction, TxType};
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const DOMAIN_TAG: &str = "ARC-chain-validator-keypair-v1";
@@ -38,9 +38,10 @@ async fn balance(c: &Client, coord: &str, addr_hex: &str) -> u64 {
     let url = format!("{}/account/{}", coord, addr_hex);
     if let Ok(r) = c.get(&url).send().await
         && r.status().is_success()
-            && let Ok(v) = r.json::<Value>().await {
-                return v.get("balance").and_then(|b| b.as_u64()).unwrap_or(0);
-            }
+        && let Ok(v) = r.json::<Value>().await
+    {
+        return v.get("balance").and_then(|b| b.as_u64()).unwrap_or(0);
+    }
     0
 }
 
@@ -48,9 +49,10 @@ async fn nonce_of(c: &Client, coord: &str, addr_hex: &str) -> u64 {
     let url = format!("{}/account/{}", coord, addr_hex);
     if let Ok(r) = c.get(&url).send().await
         && r.status().is_success()
-            && let Ok(v) = r.json::<Value>().await {
-                return v.get("nonce").and_then(|n| n.as_u64()).unwrap_or(0);
-            }
+        && let Ok(v) = r.json::<Value>().await
+    {
+        return v.get("nonce").and_then(|n| n.as_u64()).unwrap_or(0);
+    }
     0
 }
 
@@ -162,7 +164,11 @@ async fn main() {
     println!("--- step 3: POST /inference/onchain/submit (signed_tx) ---");
     let bin = bincode::serialize(&tx).expect("bincode serialize tx");
     let signed_hex = format!("0x{}", hex::encode(&bin));
-    println!("signed_tx_len: {} bytes ({} hex chars)", bin.len(), signed_hex.len());
+    println!(
+        "signed_tx_len: {} bytes ({} hex chars)",
+        bin.len(),
+        signed_hex.len()
+    );
     let submit_resp = c
         .post(format!("{}/inference/onchain/submit", coord))
         .json(&json!({ "signed_tx": signed_hex }))
@@ -191,7 +197,11 @@ async fn main() {
                 let s = r.status();
                 let txt = r.text().await.unwrap_or_default();
                 if let Ok(v) = serde_json::from_str::<Value>(&txt) {
-                    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("?").to_string();
+                    let status = v
+                        .get("status")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("?")
+                        .to_string();
                     if status != last_status {
                         println!("[{:>2}s] status={} HTTP {}", (i + 1) * 5, status, s);
                         println!("       full: {}", txt);
@@ -215,7 +225,10 @@ async fn main() {
     // 6. Recheck nonce.
     let final_nonce = nonce_of(&c, &coord, &addr_hex).await;
     println!();
-    println!("--- final nonce of signer: {} (was {} pre-submit) ---", final_nonce, nonce);
+    println!(
+        "--- final nonce of signer: {} (was {} pre-submit) ---",
+        final_nonce, nonce
+    );
 
     if !finalized {
         eprintln!("\nFAIL: never reached Finalized after 180s");

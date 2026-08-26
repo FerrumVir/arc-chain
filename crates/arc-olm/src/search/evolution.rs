@@ -5,9 +5,9 @@
 //! programs. Each candidate is scored by fitness (exact match rate) and
 //! cell accuracy (fraction of cells correct across all training pairs).
 
-use crate::{Grid, Color};
-use crate::search::enumerate::*;
 use crate::search::beam::{BeamConfig, beam_search};
+use crate::search::enumerate::*;
+use crate::{Color, Grid};
 use std::time::Instant;
 
 // ============================================================
@@ -18,18 +18,18 @@ use std::time::Instant;
 #[derive(Clone, Debug)]
 pub struct Candidate {
     pub steps: Vec<String>,
-    pub fitness: f64,        // examples_solved / total (0.0-1.0)
-    pub cell_accuracy: f64,  // cells_correct / total_cells (0.0-1.0)
+    pub fitness: f64,       // examples_solved / total (0.0-1.0)
+    pub cell_accuracy: f64, // cells_correct / total_cells (0.0-1.0)
     pub generation: u8,
 }
 
 /// Configuration for the evolutionary search.
 pub struct EvolutionConfig {
-    pub n_initial: usize,        // initial candidates per generation (default 16)
-    pub n_parents: usize,        // top parents to select (default 4)
-    pub n_offspring: usize,      // offspring per parent (default 4)
-    pub n_generations: usize,    // total generations (default 4)
-    pub timeout_ms: u64,         // wall-clock timeout (default 60_000)
+    pub n_initial: usize,     // initial candidates per generation (default 16)
+    pub n_parents: usize,     // top parents to select (default 4)
+    pub n_offspring: usize,   // offspring per parent (default 4)
+    pub n_generations: usize, // total generations (default 4)
+    pub timeout_ms: u64,      // wall-clock timeout (default 60_000)
 }
 
 impl Default for EvolutionConfig {
@@ -78,9 +78,7 @@ fn apply_program_by_name(
             return None;
         };
 
-        let result = std::panic::catch_unwind(
-            std::panic::AssertUnwindSafe(|| (prim.apply)(&args))
-        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (prim.apply)(&args)));
         current = match result {
             Ok(Some(v)) => v,
             _ => return None,
@@ -140,15 +138,13 @@ pub fn score_candidate(
                     }
                 } else {
                     // Wrong dimensions: count expected cells as total, 0 correct
-                    let cells = expected.len()
-                        * expected.first().map_or(0, |r| r.len());
+                    let cells = expected.len() * expected.first().map_or(0, |r| r.len());
                     total_cells += cells;
                 }
             }
             None => {
                 // Program failed to produce output
-                let cells = expected.len()
-                    * expected.first().map_or(0, |r| r.len());
+                let cells = expected.len() * expected.first().map_or(0, |r| r.len());
                 total_cells += cells;
             }
         }
@@ -192,7 +188,10 @@ fn collect_colors(train_pairs: &[(Grid, Grid)]) -> Vec<Color> {
 }
 
 /// Find all primitives whose input type matches the given type.
-fn type_valid_ops<'a>(catalog: &'a [TypedPrimitive], input_type: &DagType) -> Vec<&'a TypedPrimitive> {
+fn type_valid_ops<'a>(
+    catalog: &'a [TypedPrimitive],
+    input_type: &DagType,
+) -> Vec<&'a TypedPrimitive> {
     catalog
         .iter()
         .filter(|p| {
@@ -211,9 +210,10 @@ fn output_type_of(steps: &[String], catalog: &[TypedPrimitive]) -> DagType {
         return DagType::Grid;
     }
     if let Some(last) = steps.last()
-        && let Some(prim) = catalog.iter().find(|p| p.name == last.as_str()) {
-            return prim.output_type.clone();
-        }
+        && let Some(prim) = catalog.iter().find(|p| p.name == last.as_str())
+    {
+        return prim.output_type.clone();
+    }
     DagType::Grid
 }
 
@@ -245,9 +245,10 @@ fn mutate_swap(parent: &Candidate, catalog: &[TypedPrimitive]) -> Vec<Candidate>
             if pos + 1 < parent.steps.len() {
                 let next_name = &parent.steps[pos + 1];
                 if let Some(next_prim) = catalog.iter().find(|p| p.name == next_name.as_str())
-                    && next_prim.input_types[0] != op.output_type {
-                        continue; // type mismatch with next step
-                    }
+                    && next_prim.input_types[0] != op.output_type
+                {
+                    continue; // type mismatch with next step
+                }
             }
 
             let mut new_steps = parent.steps.clone();
@@ -373,9 +374,21 @@ pub fn evolve(
 
     // Try beam search with a few small configurations to get diverse seeds
     let beam_configs = [
-        BeamConfig { beam_width: 50, max_depth: 3, timeout_ms: config.timeout_ms / 8 },
-        BeamConfig { beam_width: 30, max_depth: 4, timeout_ms: config.timeout_ms / 8 },
-        BeamConfig { beam_width: 80, max_depth: 2, timeout_ms: config.timeout_ms / 8 },
+        BeamConfig {
+            beam_width: 50,
+            max_depth: 3,
+            timeout_ms: config.timeout_ms / 8,
+        },
+        BeamConfig {
+            beam_width: 30,
+            max_depth: 4,
+            timeout_ms: config.timeout_ms / 8,
+        },
+        BeamConfig {
+            beam_width: 80,
+            max_depth: 2,
+            timeout_ms: config.timeout_ms / 8,
+        },
     ];
 
     for bc in &beam_configs {
@@ -396,11 +409,11 @@ pub fn evolve(
 
             // If we already have a perfect solution, verify and return
             if fitness >= 1.0 - f64::EPSILON
-                && let Some(result) = try_produce_result(
-                    &candidate, train_pairs, test_inputs, &catalog,
-                ) {
-                    return Some(result);
-                }
+                && let Some(result) =
+                    try_produce_result(&candidate, train_pairs, test_inputs, &catalog)
+            {
+                return Some(result);
+            }
 
             population.push(candidate);
         }
@@ -429,7 +442,9 @@ pub fn evolve(
     {
         let mut singles = population.clone();
         singles.sort_by(|a, b| {
-            b.cell_accuracy.partial_cmp(&a.cell_accuracy).unwrap_or(std::cmp::Ordering::Equal)
+            b.cell_accuracy
+                .partial_cmp(&a.cell_accuracy)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         let top_singles: Vec<_> = singles.into_iter().take(config.n_parents).collect();
         for parent in &top_singles {
@@ -452,9 +467,10 @@ pub fn evolve(
     // Check for perfect candidate in generation 1
     if let Some(best) = population.first()
         && best.fitness >= 1.0 - f64::EPSILON
-            && let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog) {
-                return Some(result);
-            }
+        && let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog)
+    {
+        return Some(result);
+    }
 
     // ----------------------------------------------------------
     // Generations 2..N: evolve
@@ -465,11 +481,7 @@ pub fn evolve(
         }
 
         // Select top parents
-        let parents: Vec<Candidate> = population
-            .iter()
-            .take(config.n_parents)
-            .cloned()
-            .collect();
+        let parents: Vec<Candidate> = population.iter().take(config.n_parents).cloned().collect();
 
         let mut offspring: Vec<Candidate> = Vec::new();
 
@@ -518,9 +530,10 @@ pub fn evolve(
         // Check for perfect candidate
         if let Some(best) = population.first()
             && best.fitness >= 1.0 - f64::EPSILON
-                && let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog) {
-                    return Some(result);
-                }
+            && let Some(result) = try_produce_result(best, train_pairs, test_inputs, &catalog)
+        {
+            return Some(result);
+        }
     }
 
     // No perfect solution found

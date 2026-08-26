@@ -17,14 +17,14 @@ use arc_gpu::{cpu_batch_commit, gpu_batch_commit, probe_gpu};
 use arc_state::StateDB;
 use arc_types::*;
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::HeaderMap,
     response::{Html, IntoResponse},
     routing::{get, post},
-    Json, Router,
 };
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -202,7 +202,8 @@ fn run_benchmark(n: usize, node_id: Option<String>) -> NodeResult {
         .flat_map(|agent_id| {
             let from = hash_bytes(&agent_id.to_le_bytes());
             let to = hash_bytes(&((agent_id + 1) % num_agents).to_le_bytes());
-            (0..txs_per_agent as u64).map(move |nonce| Transaction::new_transfer(from, to, 1, nonce))
+            (0..txs_per_agent as u64)
+                .map(move |nonce| Transaction::new_transfer(from, to, 1, nonce))
         })
         .collect();
 
@@ -304,10 +305,7 @@ async fn live_report(
     "ok"
 }
 
-async fn live_ws(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<LiveState>>,
-) -> impl IntoResponse {
+async fn live_ws(ws: WebSocketUpgrade, State(state): State<Arc<LiveState>>) -> impl IntoResponse {
     ws.on_upgrade(|socket| dashboard_loop(socket, state))
 }
 
@@ -467,10 +465,7 @@ async fn run_worker(port: u16, coord_url: Option<String>) {
     let addr = format!("0.0.0.0:{port}");
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  ARC Chain - Benchmark Worker Node                         ║");
-    println!(
-        "║  Listening on {:<46}║",
-        &addr
-    );
+    println!("║  Listening on {:<46}║", &addr);
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -485,10 +480,7 @@ async fn run_worker_reporting(coord_url: &str) {
 
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║  ARC Chain - Benchmark Worker (Reporting Mode)             ║");
-    println!(
-        "║  Coordinator: {:<46}║",
-        coord_url
-    );
+    println!("║  Coordinator: {:<46}║", coord_url);
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
 
@@ -627,28 +619,13 @@ async fn run_coordinator(node_urls: Vec<String>, n: usize) {
                 "no GPU"
             }
         );
-        println!(
-            "║    CPU hash:     {:>12.0} TPS",
-            node.cpu_hash_tps
-        );
+        println!("║    CPU hash:     {:>12.0} TPS", node.cpu_hash_tps);
         if node.gpu_hash_tps > 0.0 {
-            println!(
-                "║    GPU hash:     {:>12.0} TPS",
-                node.gpu_hash_tps
-            );
+            println!("║    GPU hash:     {:>12.0} TPS", node.gpu_hash_tps);
         }
-        println!(
-            "║    State exec:   {:>12.0} TPS",
-            node.state_exec_tps
-        );
-        println!(
-            "║    Pipeline:     {:>12.0} TPS",
-            node.compact_pipeline_tps
-        );
-        println!(
-            "║    Best:         {:>12.0} TPS",
-            node.best_single_node_tps
-        );
+        println!("║    State exec:   {:>12.0} TPS", node.state_exec_tps);
+        println!("║    Pipeline:     {:>12.0} TPS", node.compact_pipeline_tps);
+        println!("║    Best:         {:>12.0} TPS", node.best_single_node_tps);
     }
 
     println!("║                                                            ║");
@@ -659,10 +636,7 @@ async fn run_coordinator(node_urls: Vec<String>, n: usize) {
         results.len(),
         combined_tps
     );
-    println!(
-        "║  Avg per node:                {:>12.0} TPS",
-        avg_node_tps
-    );
+    println!("║  Avg per node:                {:>12.0} TPS", avg_node_tps);
     println!(
         "║  Elapsed:                     {:>12.2}s",
         total_elapsed.as_secs_f64()
@@ -695,9 +669,7 @@ fn get_arg(args: &[String], flag: &str) -> Option<String> {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter("info")
-        .init();
+    tracing_subscriber::fmt().with_env_filter("info").init();
 
     let args: Vec<String> = std::env::args().collect();
 
@@ -734,10 +706,18 @@ async fn main() {
             eprintln!("ARC Chain - Multi-Node Benchmark");
             eprintln!();
             eprintln!("Usage:");
-            eprintln!("  arc-bench-node live     [--port 8080]                             Live dashboard coordinator");
-            eprintln!("  arc-bench-node worker   [--port 9944] [--coord http://host:8080]  Benchmark worker");
-            eprintln!("  arc-bench-node coord    --nodes url1,url2 [--n 1000000]           One-shot aggregation");
-            eprintln!("  arc-bench-node local    [--n 1000000]                             Local benchmark");
+            eprintln!(
+                "  arc-bench-node live     [--port 8080]                             Live dashboard coordinator"
+            );
+            eprintln!(
+                "  arc-bench-node worker   [--port 9944] [--coord http://host:8080]  Benchmark worker"
+            );
+            eprintln!(
+                "  arc-bench-node coord    --nodes url1,url2 [--n 1000000]           One-shot aggregation"
+            );
+            eprintln!(
+                "  arc-bench-node local    [--n 1000000]                             Local benchmark"
+            );
         }
     }
 }

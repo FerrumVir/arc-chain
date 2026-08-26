@@ -4,7 +4,7 @@
 //! Every function operates on integer grids (u8 values).
 //! Zero floating point. Fully deterministic.
 
-use crate::{Grid, Color, Pos, PosSet};
+use crate::{Color, Grid, Pos, PosSet};
 
 // ============================================================
 // Spatial transforms (Grid → Grid)
@@ -13,7 +13,9 @@ use crate::{Grid, Color, Pos, PosSet};
 /// Rotate 90 degrees clockwise.
 pub fn rot90(grid: &Grid) -> Grid {
     let h = grid.len();
-    if h == 0 { return grid.clone(); }
+    if h == 0 {
+        return grid.clone();
+    }
     let w = grid[0].len();
     let mut out = vec![vec![0u8; h]; w];
     for r in 0..h {
@@ -27,7 +29,9 @@ pub fn rot90(grid: &Grid) -> Grid {
 /// Rotate 180 degrees.
 pub fn rot180(grid: &Grid) -> Grid {
     let h = grid.len();
-    if h == 0 { return grid.clone(); }
+    if h == 0 {
+        return grid.clone();
+    }
     let w = grid[0].len();
     let mut out = vec![vec![0u8; w]; h];
     for r in 0..h {
@@ -41,7 +45,9 @@ pub fn rot180(grid: &Grid) -> Grid {
 /// Rotate 270 degrees clockwise (= 90 degrees counter-clockwise).
 pub fn rot270(grid: &Grid) -> Grid {
     let h = grid.len();
-    if h == 0 { return grid.clone(); }
+    if h == 0 {
+        return grid.clone();
+    }
     let w = grid[0].len();
     let mut out = vec![vec![0u8; h]; w];
     for r in 0..h {
@@ -61,17 +67,21 @@ pub fn hmirror(grid: &Grid) -> Grid {
 
 /// Flip left-to-right (vertical mirror).
 pub fn vmirror(grid: &Grid) -> Grid {
-    grid.iter().map(|row| {
-        let mut r = row.clone();
-        r.reverse();
-        r
-    }).collect()
+    grid.iter()
+        .map(|row| {
+            let mut r = row.clone();
+            r.reverse();
+            r
+        })
+        .collect()
 }
 
 /// Transpose (mirror along main diagonal).
 pub fn dmirror(grid: &Grid) -> Grid {
     let h = grid.len();
-    if h == 0 { return grid.clone(); }
+    if h == 0 {
+        return grid.clone();
+    }
     let w = grid[0].len();
     let mut out = vec![vec![0u8; h]; w];
     for r in 0..h {
@@ -120,18 +130,32 @@ pub fn righthalf(grid: &Grid) -> Grid {
 
 /// Replace all occurrences of one color with another.
 pub fn replace_color(grid: &Grid, old: Color, new: Color) -> Grid {
-    grid.iter().map(|row| {
-        row.iter().map(|&c| if c == old { new } else { c }).collect()
-    }).collect()
+    grid.iter()
+        .map(|row| {
+            row.iter()
+                .map(|&c| if c == old { new } else { c })
+                .collect()
+        })
+        .collect()
 }
 
 /// Swap two colors.
 pub fn switch_colors(grid: &Grid, a: Color, b: Color) -> Grid {
-    grid.iter().map(|row| {
-        row.iter().map(|&c| {
-            if c == a { b } else if c == b { a } else { c }
-        }).collect()
-    }).collect()
+    grid.iter()
+        .map(|row| {
+            row.iter()
+                .map(|&c| {
+                    if c == a {
+                        b
+                    } else if c == b {
+                        a
+                    } else {
+                        c
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Most common color in the grid.
@@ -142,7 +166,12 @@ pub fn mostcolor(grid: &Grid) -> Color {
             counts[c as usize] += 1;
         }
     }
-    counts.iter().enumerate().max_by_key(|&(_, c)| *c).map(|(i, _)| i as u8).unwrap_or(0)
+    counts
+        .iter()
+        .enumerate()
+        .max_by_key(|&(_, c)| *c)
+        .map(|(i, _)| i as u8)
+        .unwrap_or(0)
 }
 
 /// Least common color in the grid (among colors that appear).
@@ -153,7 +182,9 @@ pub fn leastcolor(grid: &Grid) -> Color {
             counts[c as usize] += 1;
         }
     }
-    counts.iter().enumerate()
+    counts
+        .iter()
+        .enumerate()
         .filter(|&(_, c)| *c > 0)
         .min_by_key(|&(_, c)| *c)
         .map(|(i, _)| i as u8)
@@ -168,7 +199,8 @@ pub fn leastcolor(grid: &Grid) -> Color {
 pub fn upscale(grid: &Grid, factor: usize) -> Grid {
     let mut out = Vec::new();
     for row in grid {
-        let expanded_row: Vec<u8> = row.iter()
+        let expanded_row: Vec<u8> = row
+            .iter()
             .flat_map(|&c| std::iter::repeat_n(c, factor))
             .collect();
         for _ in 0..factor {
@@ -181,7 +213,9 @@ pub fn upscale(grid: &Grid, factor: usize) -> Grid {
 /// Downscale grid by integer factor (majority vote per block).
 pub fn downscale(grid: &Grid, factor: usize) -> Grid {
     let h = grid.len();
-    if h == 0 || factor == 0 { return grid.clone(); }
+    if h == 0 || factor == 0 {
+        return grid.clone();
+    }
     let w = grid[0].len();
     let nh = h / factor;
     let nw = w / factor;
@@ -202,11 +236,13 @@ pub fn downscale(grid: &Grid, factor: usize) -> Grid {
 /// Concatenate horizontally (side by side).
 pub fn hconcat(a: &Grid, b: &Grid) -> Grid {
     let h = a.len().min(b.len());
-    (0..h).map(|r| {
-        let mut row = a[r].clone();
-        row.extend_from_slice(&b[r]);
-        row
-    }).collect()
+    (0..h)
+        .map(|r| {
+            let mut row = a[r].clone();
+            row.extend_from_slice(&b[r]);
+            row
+        })
+        .collect()
 }
 
 /// Concatenate vertically (top to bottom).
@@ -223,9 +259,13 @@ pub fn vconcat(a: &Grid, b: &Grid) -> Grid {
 /// Crop a subgrid starting at (sr, sc) with dimensions (h, w).
 pub fn crop(grid: &Grid, sr: usize, sc: usize, h: usize, w: usize) -> Grid {
     let gh = grid.len();
-    if gh == 0 { return vec![]; }
+    if gh == 0 {
+        return vec![];
+    }
     let gw = grid[0].len();
-    if sr >= gh || sc >= gw { return vec![]; }
+    if sr >= gh || sc >= gw {
+        return vec![];
+    }
     let eh = (sr + h).min(gh);
     let ew = (sc + w).min(gw);
     (sr..eh).map(|r| grid[r][sc..ew].to_vec()).collect()
@@ -234,10 +274,14 @@ pub fn crop(grid: &Grid, sr: usize, sc: usize, h: usize, w: usize) -> Grid {
 /// Trim 1-cell border.
 pub fn trim(grid: &Grid) -> Grid {
     let h = grid.len();
-    if h <= 2 { return vec![]; }
+    if h <= 2 {
+        return vec![];
+    }
     let w = grid[0].len();
-    if w <= 2 { return vec![]; }
-    (1..h-1).map(|r| grid[r][1..w-1].to_vec()).collect()
+    if w <= 2 {
+        return vec![];
+    }
+    (1..h - 1).map(|r| grid[r][1..w - 1].to_vec()).collect()
 }
 
 // ============================================================
@@ -283,11 +327,14 @@ pub fn underfill(grid: &Grid, color: Color, positions: &PosSet) -> Grid {
 /// Compress: remove uniform rows and columns.
 pub fn compress(grid: &Grid) -> Grid {
     let h = grid.len();
-    if h == 0 { return grid.clone(); }
+    if h == 0 {
+        return grid.clone();
+    }
     let w = grid[0].len();
 
     // Find uniform rows
-    let keep_rows: Vec<bool> = grid.iter()
+    let keep_rows: Vec<bool> = grid
+        .iter()
         .map(|row| row.iter().collect::<std::collections::HashSet<_>>().len() > 1)
         .collect();
 
@@ -299,10 +346,12 @@ pub fn compress(grid: &Grid) -> Grid {
         })
         .collect();
 
-    grid.iter().enumerate()
+    grid.iter()
+        .enumerate()
         .filter(|(r, _)| keep_rows[*r])
         .map(|(_, row)| {
-            row.iter().enumerate()
+            row.iter()
+                .enumerate()
                 .filter(|(c, _)| keep_cols[*c])
                 .map(|(_, &v)| v)
                 .collect()
@@ -322,18 +371,30 @@ pub fn canvas(color: Color, h: usize, w: usize) -> Grid {
 /// Cellwise comparison: keep matching values, use fallback for mismatches.
 pub fn cellwise(a: &Grid, b: &Grid, fallback: Color) -> Grid {
     let h = a.len().min(b.len());
-    if h == 0 { return vec![]; }
+    if h == 0 {
+        return vec![];
+    }
     let w = a[0].len().min(b[0].len());
-    (0..h).map(|r| {
-        (0..w).map(|c| {
-            if a[r][c] == b[r][c] { a[r][c] } else { fallback }
-        }).collect()
-    }).collect()
+    (0..h)
+        .map(|r| {
+            (0..w)
+                .map(|c| {
+                    if a[r][c] == b[r][c] {
+                        a[r][c]
+                    } else {
+                        fallback
+                    }
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// Split grid horizontally into n parts.
 pub fn hsplit(grid: &Grid, n: usize) -> Vec<Grid> {
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
     let h = grid.len();
     let w = grid[0].len();
     let pw = w / n;
@@ -342,7 +403,9 @@ pub fn hsplit(grid: &Grid, n: usize) -> Vec<Grid> {
 
 /// Split grid vertically into n parts.
 pub fn vsplit(grid: &Grid, n: usize) -> Vec<Grid> {
-    if n == 0 { return vec![]; }
+    if n == 0 {
+        return vec![];
+    }
     let h = grid.len();
     let w = grid[0].len();
     let ph = h / n;

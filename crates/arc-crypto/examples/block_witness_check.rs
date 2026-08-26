@@ -49,7 +49,9 @@ fn main() {
 
     print!("1. Three honest transfers          ... ");
     match try_prove_block(&input(good.clone())) {
-        Ok((data, size, ms)) => println!("PROVED   {size} B in {ms}ms  0x{}", hex::encode(&data[..8])),
+        Ok((data, size, ms)) => {
+            println!("PROVED   {size} B in {ms}ms  0x{}", hex::encode(&data[..8]))
+        }
         Err(e) => {
             println!("FAILED (bug): {e}");
             std::process::exit(1);

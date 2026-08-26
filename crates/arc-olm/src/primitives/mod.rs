@@ -1,3 +1,3 @@
+pub mod compose;
 pub mod grid;
 pub mod object;
-pub mod compose;

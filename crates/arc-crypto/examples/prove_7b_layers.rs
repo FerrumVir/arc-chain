@@ -119,14 +119,8 @@ fn main() {
         let mut root_hashes: Vec<String> = Vec::new();
         for rep in 0..REPS {
             let start = Instant::now();
-            let result = prove_sharded_dense(
-                &weights,
-                &bias,
-                &input,
-                *in_size,
-                *out_size,
-                *shard_cols,
-            );
+            let result =
+                prove_sharded_dense(&weights, &bias, &input, *in_size, *out_size, *shard_cols);
             let elapsed = start.elapsed().as_millis();
 
             match result {
@@ -161,7 +155,9 @@ fn main() {
             }
         }
 
-        let all_match = root_hashes.windows(2).all(|w| w[0] == w[1] && !w[0].is_empty());
+        let all_match = root_hashes
+            .windows(2)
+            .all(|w| w[0] == w[1] && !w[0].is_empty());
         if all_match {
             println!(
                 "   REPRODUCIBLE: all {} runs produce identical root hash",

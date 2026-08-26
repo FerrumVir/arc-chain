@@ -1,7 +1,7 @@
 //! Object extraction and manipulation primitives.
 
-use crate::{Grid, Color, Pos, PosSet, Object};
 use crate::primitives::grid::mostcolor;
+use crate::{Color, Grid, Object, Pos, PosSet};
 use std::collections::{BTreeSet, VecDeque};
 
 /// Extract connected-component objects from a grid.
@@ -12,16 +12,24 @@ use std::collections::{BTreeSet, VecDeque};
 /// - `without_bg`: if true, ignore background (most common) color.
 pub fn objects(grid: &Grid, univalued: bool, diagonal: bool, without_bg: bool) -> Vec<Object> {
     let h = grid.len();
-    if h == 0 { return vec![]; }
+    if h == 0 {
+        return vec![];
+    }
     let w = grid[0].len();
 
-    let bg = if without_bg { Some(mostcolor(grid)) } else { None };
+    let bg = if without_bg {
+        Some(mostcolor(grid))
+    } else {
+        None
+    };
     let mut visited = vec![vec![false; w]; h];
     let mut result = Vec::new();
 
     for r in 0..h {
         for c in 0..w {
-            if visited[r][c] { continue; }
+            if visited[r][c] {
+                continue;
+            }
             let color = grid[r][c];
             if bg == Some(color) {
                 visited[r][c] = true;
@@ -40,8 +48,10 @@ pub fn objects(grid: &Grid, univalued: bool, diagonal: bool, without_bg: bool) -
                 // Neighbors
                 let neighbors: Vec<(usize, usize)> = if diagonal {
                     vec![
-                        (cr.wrapping_sub(1), cc), (cr + 1, cc),
-                        (cr, cc.wrapping_sub(1)), (cr, cc + 1),
+                        (cr.wrapping_sub(1), cc),
+                        (cr + 1, cc),
+                        (cr, cc.wrapping_sub(1)),
+                        (cr, cc + 1),
                         (cr.wrapping_sub(1), cc.wrapping_sub(1)),
                         (cr.wrapping_sub(1), cc + 1),
                         (cr + 1, cc.wrapping_sub(1)),
@@ -49,16 +59,22 @@ pub fn objects(grid: &Grid, univalued: bool, diagonal: bool, without_bg: bool) -
                     ]
                 } else {
                     vec![
-                        (cr.wrapping_sub(1), cc), (cr + 1, cc),
-                        (cr, cc.wrapping_sub(1)), (cr, cc + 1),
+                        (cr.wrapping_sub(1), cc),
+                        (cr + 1, cc),
+                        (cr, cc.wrapping_sub(1)),
+                        (cr, cc + 1),
                     ]
                 };
 
                 for (nr, nc) in neighbors {
                     if nr < h && nc < w && !visited[nr][nc] {
                         let nc_color = grid[nr][nc];
-                        if bg == Some(nc_color) { continue; }
-                        if univalued && nc_color != color { continue; }
+                        if bg == Some(nc_color) {
+                            continue;
+                        }
+                        if univalued && nc_color != color {
+                            continue;
+                        }
                         visited[nr][nc] = true;
                         queue.push_back((nr, nc));
                     }
@@ -76,7 +92,10 @@ pub fn objects(grid: &Grid, univalued: bool, diagonal: bool, without_bg: bool) -
 
 /// Filter objects by color.
 pub fn colorfilter(objs: &[Object], color: Color) -> Vec<Object> {
-    objs.iter().filter(|o| o.primary_color() == color).cloned().collect()
+    objs.iter()
+        .filter(|o| o.primary_color() == color)
+        .cloned()
+        .collect()
 }
 
 /// Filter objects by size.
@@ -97,7 +116,9 @@ pub fn argmin_size(objs: &[Object]) -> Option<&Object> {
 /// Bounding box of an object's positions.
 pub fn bbox(obj: &Object) -> (usize, usize, usize, usize) {
     let positions = obj.positions();
-    if positions.is_empty() { return (0, 0, 0, 0); }
+    if positions.is_empty() {
+        return (0, 0, 0, 0);
+    }
     let min_r = positions.iter().map(|p| p.0).min().unwrap();
     let max_r = positions.iter().map(|p| p.0).max().unwrap();
     let min_c = positions.iter().map(|p| p.1).min().unwrap();
@@ -187,14 +208,22 @@ pub fn corners(obj: &Object) -> PosSet {
 /// Inbox: inner border of bounding box.
 pub fn inbox(obj: &Object) -> PosSet {
     let (min_r, min_c, max_r, max_c) = bbox(obj);
-    if max_r <= min_r + 1 || max_c <= min_c + 1 { return PosSet::new(); }
+    if max_r <= min_r + 1 || max_c <= min_c + 1 {
+        return PosSet::new();
+    }
     let ir = min_r + 1;
     let ic = min_c + 1;
     let er = max_r - 1;
     let ec = max_c - 1;
     let mut result = PosSet::new();
-    for r in ir..=er { result.insert((r, ic)); result.insert((r, ec)); }
-    for c in ic..=ec { result.insert((ir, c)); result.insert((er, c)); }
+    for r in ir..=er {
+        result.insert((r, ic));
+        result.insert((r, ec));
+    }
+    for c in ic..=ec {
+        result.insert((ir, c));
+        result.insert((er, c));
+    }
     result
 }
 
@@ -206,22 +235,32 @@ pub fn outbox(obj: &Object) -> PosSet {
     let er = max_r + 1;
     let ec = max_c + 1;
     let mut result = PosSet::new();
-    for r in or..=er { result.insert((r, oc)); result.insert((r, ec)); }
-    for c in oc..=ec { result.insert((or, c)); result.insert((er, c)); }
+    for r in or..=er {
+        result.insert((r, oc));
+        result.insert((r, ec));
+    }
+    for c in oc..=ec {
+        result.insert((or, c));
+        result.insert((er, c));
+    }
     result
 }
 
 /// Shift an object by (dr, dc).
 pub fn shift(obj: &Object, dr: isize, dc: isize) -> Object {
-    let cells = obj.cells.iter().filter_map(|&(color, (r, c))| {
-        let nr = r as isize + dr;
-        let nc = c as isize + dc;
-        if nr >= 0 && nc >= 0 {
-            Some((color, (nr as usize, nc as usize)))
-        } else {
-            None
-        }
-    }).collect();
+    let cells = obj
+        .cells
+        .iter()
+        .filter_map(|&(color, (r, c))| {
+            let nr = r as isize + dr;
+            let nc = c as isize + dc;
+            if nr >= 0 && nc >= 0 {
+                Some((color, (nr as usize, nc as usize)))
+            } else {
+                None
+            }
+        })
+        .collect();
     Object { cells }
 }
 
@@ -259,23 +298,30 @@ pub fn connect(a: (usize, usize), b: (usize, usize)) -> PosSet {
     if a.0 == b.0 {
         // Horizontal line
         let (start, end) = if a.1 <= b.1 { (a.1, b.1) } else { (b.1, a.1) };
-        for c in start..=end { result.insert((a.0, c)); }
+        for c in start..=end {
+            result.insert((a.0, c));
+        }
     } else if a.1 == b.1 {
         // Vertical line
         let (start, end) = if a.0 <= b.0 { (a.0, b.0) } else { (b.0, a.0) };
-        for r in start..=end { result.insert((r, a.1)); }
+        for r in start..=end {
+            result.insert((r, a.1));
+        }
     } else {
         // Diagonal
         let dr: isize = if b.0 > a.0 { 1 } else { -1 };
         let dc: isize = if b.1 > a.1 { 1 } else { -1 };
         let mut r = a.0 as isize;
         let mut c = a.1 as isize;
-        let steps = (b.0 as isize - a.0 as isize).unsigned_abs().max(
-            (b.1 as isize - a.1 as isize).unsigned_abs()
-        );
+        let steps = (b.0 as isize - a.0 as isize)
+            .unsigned_abs()
+            .max((b.1 as isize - a.1 as isize).unsigned_abs());
         for _ in 0..=steps {
-            if r >= 0 && c >= 0 { result.insert((r as usize, c as usize)); }
-            r += dr; c += dc;
+            if r >= 0 && c >= 0 {
+                result.insert((r as usize, c as usize));
+            }
+            r += dr;
+            c += dc;
         }
     }
     result
@@ -287,8 +333,11 @@ pub fn shoot(start: (usize, usize), dr: isize, dc: isize) -> PosSet {
     let mut r = start.0 as isize;
     let mut c = start.1 as isize;
     for _ in 0..30 {
-        if r >= 0 && c >= 0 { result.insert((r as usize, c as usize)); }
-        r += dr; c += dc;
+        if r >= 0 && c >= 0 {
+            result.insert((r as usize, c as usize));
+        }
+        r += dr;
+        c += dc;
     }
     result
 }
@@ -297,9 +346,13 @@ pub fn shoot(start: (usize, usize), dr: isize, dc: isize) -> PosSet {
 pub fn dneighbors(pos: (usize, usize)) -> PosSet {
     let mut result = PosSet::new();
     let (r, c) = pos;
-    if r > 0 { result.insert((r - 1, c)); }
+    if r > 0 {
+        result.insert((r - 1, c));
+    }
     result.insert((r + 1, c));
-    if c > 0 { result.insert((r, c - 1)); }
+    if c > 0 {
+        result.insert((r, c - 1));
+    }
     result.insert((r, c + 1));
     result
 }
@@ -308,9 +361,15 @@ pub fn dneighbors(pos: (usize, usize)) -> PosSet {
 pub fn neighbors(pos: (usize, usize)) -> PosSet {
     let mut result = dneighbors(pos);
     let (r, c) = pos;
-    if r > 0 && c > 0 { result.insert((r - 1, c - 1)); }
-    if r > 0 { result.insert((r - 1, c + 1)); }
-    if c > 0 { result.insert((r + 1, c - 1)); }
+    if r > 0 && c > 0 {
+        result.insert((r - 1, c - 1));
+    }
+    if r > 0 {
+        result.insert((r - 1, c + 1));
+    }
+    if c > 0 {
+        result.insert((r + 1, c - 1));
+    }
     result.insert((r + 1, c + 1));
     result
 }
@@ -339,11 +398,7 @@ mod tests {
 
     #[test]
     fn test_objects_extraction() {
-        let grid = vec![
-            vec![0, 1, 0],
-            vec![0, 1, 0],
-            vec![0, 0, 2],
-        ];
+        let grid = vec![vec![0, 1, 0], vec![0, 1, 0], vec![0, 0, 2]];
         let objs = objects(&grid, true, false, true);
         assert_eq!(objs.len(), 2); // object of color 1 and object of color 2
     }

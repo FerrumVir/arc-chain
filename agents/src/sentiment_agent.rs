@@ -20,17 +20,13 @@
 //! └─────────────┘                           └──────────────┘
 //! ```
 
-use arc_crypto::{hash_bytes, Hash256};
 use arc_crypto::signature::Signature;
-use arc_types::transaction::{
-    RegisterBody, SettleBody, Transaction, TxBody, TxType,
-};
+use arc_crypto::{Hash256, hash_bytes};
+use arc_types::transaction::{RegisterBody, SettleBody, Transaction, TxBody, TxType};
 use arc_vm::agent::{
-    Agent, AgentConfig, AgentId, AgentRegistry, AgentState, ActionResult, ActionType, AgentAction,
+    ActionResult, ActionType, Agent, AgentAction, AgentConfig, AgentId, AgentRegistry, AgentState,
 };
-use arc_vm::inference::{
-    InferenceConfig, InferenceEngine, Layer, ModelInfo, NeuralNet,
-};
+use arc_vm::inference::{InferenceConfig, InferenceEngine, Layer, ModelInfo, NeuralNet};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -91,9 +87,15 @@ fn build_sentiment_model() -> NeuralNet {
 
     NeuralNet {
         layers: vec![
-            Layer::Dense { weights: weights_1, bias: bias_1 },
+            Layer::Dense {
+                weights: weights_1,
+                bias: bias_1,
+            },
             Layer::ReLU,
-            Layer::Dense { weights: weights_2, bias: bias_2 },
+            Layer::Dense {
+                weights: weights_2,
+                bias: bias_2,
+            },
             Layer::Softmax,
         ],
         input_size: INPUT_DIM,
@@ -137,7 +139,8 @@ fn build_register_tx(owner: Hash256, nonce: u64) -> Transaction {
             "output_dim": OUTPUT_DIM,
             "activation": "relu+softmax",
             "task": "binary-sentiment"
-        })).unwrap_or_default(),
+        }))
+        .unwrap_or_default(),
     });
 
     let hash = hash_bytes(&serde_json::to_vec(&body).unwrap_or_default());
@@ -218,11 +221,17 @@ fn main() {
     println!("=== ARC Chain Sentiment Agent ===\n");
 
     // 1. Build the neural network model.
-    println!("[1/5] Building 3-layer sentiment model (Dense {}->{}->{})",
-        INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM);
+    println!(
+        "[1/5] Building 3-layer sentiment model (Dense {}->{}->{})",
+        INPUT_DIM, HIDDEN_DIM, OUTPUT_DIM
+    );
     let model = build_sentiment_model();
-    println!("      Model built: {} layers, input_size={}, output_size={}",
-        model.layers.len(), model.input_size, model.output_size);
+    println!(
+        "      Model built: {} layers, input_size={}, output_size={}",
+        model.layers.len(),
+        model.input_size,
+        model.output_size
+    );
 
     // 2. Serialize model weights.
     println!("[2/5] Serializing model weights to NeuralNet binary format");
@@ -230,8 +239,8 @@ fn main() {
     println!("      Serialized model size: {} bytes", model_bytes.len());
 
     // Verify round-trip deserialization.
-    let model_restored = NeuralNet::from_bytes(&model_bytes)
-        .expect("model round-trip deserialization failed");
+    let model_restored =
+        NeuralNet::from_bytes(&model_bytes).expect("model round-trip deserialization failed");
     assert_eq!(model.layers.len(), model_restored.layers.len());
     println!("      Round-trip deserialization verified");
 
@@ -239,7 +248,10 @@ fn main() {
     println!("[3/5] Constructing RegisterAgent transaction");
     let owner = hash_bytes(b"sentiment-agent-owner");
     let register_tx = build_register_tx(owner, 0);
-    println!("      TX type: {:?}, hash: {}", register_tx.tx_type, register_tx.hash);
+    println!(
+        "      TX type: {:?}, hash: {}",
+        register_tx.tx_type, register_tx.hash
+    );
 
     // Register in the agent registry.
     let mut registry = AgentRegistry::new();
@@ -267,7 +279,9 @@ fn main() {
     };
 
     registry.register(agent).expect("agent registration failed");
-    registry.update_state(&agent_id, AgentState::Active).expect("activation failed");
+    registry
+        .update_state(&agent_id, AgentState::Active)
+        .expect("activation failed");
     println!("      Agent registered and activated: {:?}", agent_id);
 
     // 4. Deploy model into inference engine.
@@ -282,13 +296,20 @@ fn main() {
     let model_info = ModelInfo {
         name: "sentiment-3layer".to_string(),
         model_type: "classifier".to_string(),
-        parameter_count: (INPUT_DIM * HIDDEN_DIM + HIDDEN_DIM + HIDDEN_DIM * OUTPUT_DIM + OUTPUT_DIM) as u64,
+        parameter_count: (INPUT_DIM * HIDDEN_DIM
+            + HIDDEN_DIM
+            + HIDDEN_DIM * OUTPUT_DIM
+            + OUTPUT_DIM) as u64,
         quantization: "f32".to_string(),
         max_context: INPUT_DIM as u32,
     };
-    engine.load_model_with_weights(model_id, model_info, &model_bytes)
+    engine
+        .load_model_with_weights(model_id, model_info, &model_bytes)
         .expect("model loading failed");
-    println!("      Model loaded into engine (id: {})", hex::encode(&model_id[..8]));
+    println!(
+        "      Model loaded into engine (id: {})",
+        hex::encode(&model_id[..8])
+    );
 
     // 5. Process sample inference requests.
     println!("[5/5] Processing inference requests\n");
@@ -337,11 +358,14 @@ fn main() {
             timestamp: i as u64,
             result: ActionResult::Success(output.iter().flat_map(|f| f.to_le_bytes()).collect()),
         };
-        registry.execute_action(&agent_id, action).expect("action execution failed");
+        registry
+            .execute_action(&agent_id, action)
+            .expect("action execution failed");
 
         // Build a Settle TX for the completed inference.
         let service_hash = hash_bytes(text.as_bytes());
-        let settle_tx = build_settle_tx(owner, Hash256(agent_id_bytes), service_hash, (i + 1) as u64);
+        let settle_tx =
+            build_settle_tx(owner, Hash256(agent_id_bytes), service_hash, (i + 1) as u64);
         println!("    Settle TX: hash={}", settle_tx.hash);
         println!();
     }

@@ -109,7 +109,10 @@ impl AbiFunction {
     // ── internal ──
 
     fn build_signature(name: &str, inputs: &[AbiParam]) -> String {
-        let param_types: Vec<String> = inputs.iter().map(|p| abi_type_string(&p.param_type)).collect();
+        let param_types: Vec<String> = inputs
+            .iter()
+            .map(|p| abi_type_string(&p.param_type))
+            .collect();
         format!("{}({})", name, param_types.join(","))
     }
 }
@@ -430,12 +433,7 @@ mod tests {
     #[test]
     fn test_contract_manifest_creation() {
         let hash = test_hash(0xAB);
-        let manifest = ContractManifest::new(
-            "token".to_string(),
-            VmTarget::Wasm,
-            hash,
-            4096,
-        );
+        let manifest = ContractManifest::new("token".to_string(), VmTarget::Wasm, hash, 4096);
 
         assert_eq!(manifest.name, "token");
         assert_eq!(manifest.version, "0.1.0");
@@ -457,12 +455,19 @@ mod tests {
         let transfer = AbiFunction::new(
             "transfer",
             vec![
-                AbiParam { name: "to".to_string(), param_type: AbiType::Address },
-                AbiParam { name: "amount".to_string(), param_type: AbiType::Uint256 },
+                AbiParam {
+                    name: "to".to_string(),
+                    param_type: AbiType::Address,
+                },
+                AbiParam {
+                    name: "amount".to_string(),
+                    param_type: AbiType::Uint256,
+                },
             ],
-            vec![
-                AbiParam { name: "success".to_string(), param_type: AbiType::Bool },
-            ],
+            vec![AbiParam {
+                name: "success".to_string(),
+                param_type: AbiType::Bool,
+            }],
             StateMutability::NonPayable,
         );
 
@@ -499,8 +504,14 @@ mod tests {
         let transfer = AbiFunction::new(
             "transfer",
             vec![
-                AbiParam { name: "to".to_string(), param_type: AbiType::Address },
-                AbiParam { name: "amount".to_string(), param_type: AbiType::Uint256 },
+                AbiParam {
+                    name: "to".to_string(),
+                    param_type: AbiType::Address,
+                },
+                AbiParam {
+                    name: "amount".to_string(),
+                    param_type: AbiType::Uint256,
+                },
             ],
             vec![],
             StateMutability::NonPayable,
@@ -510,12 +521,14 @@ mod tests {
 
         let balance_of = AbiFunction::new(
             "balanceOf",
-            vec![
-                AbiParam { name: "owner".to_string(), param_type: AbiType::Address },
-            ],
-            vec![
-                AbiParam { name: "balance".to_string(), param_type: AbiType::Uint256 },
-            ],
+            vec![AbiParam {
+                name: "owner".to_string(),
+                param_type: AbiType::Address,
+            }],
+            vec![AbiParam {
+                name: "balance".to_string(),
+                param_type: AbiType::Uint256,
+            }],
             StateMutability::View,
         );
         abi.add_function(balance_of);
@@ -535,8 +548,14 @@ mod tests {
         let func = AbiFunction::new(
             "transfer",
             vec![
-                AbiParam { name: "to".to_string(), param_type: AbiType::Address },
-                AbiParam { name: "amount".to_string(), param_type: AbiType::Uint256 },
+                AbiParam {
+                    name: "to".to_string(),
+                    param_type: AbiType::Address,
+                },
+                AbiParam {
+                    name: "amount".to_string(),
+                    param_type: AbiType::Uint256,
+                },
             ],
             vec![],
             StateMutability::NonPayable,
@@ -563,7 +582,10 @@ mod tests {
             vec![],
             StateMutability::NonPayable,
         );
-        assert_eq!(complex.signature(), "batchTransfer(address[],(uint256,bool))");
+        assert_eq!(
+            complex.signature(),
+            "batchTransfer(address[],(uint256,bool))"
+        );
     }
 
     // 6. Test case creation - create with actions and assertions.

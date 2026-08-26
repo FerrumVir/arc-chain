@@ -37,7 +37,11 @@ impl NeonVerifier {
     pub fn batch_verify(&mut self, tasks: &[VerifyTask]) -> GpuVerifyResult {
         if tasks.is_empty() {
             return GpuVerifyResult {
-                total: 0, valid: 0, invalid_indices: vec![], elapsed_us: 0, used_gpu: false,
+                total: 0,
+                valid: 0,
+                invalid_indices: vec![],
+                elapsed_us: 0,
+                used_gpu: false,
             };
         }
 
@@ -48,25 +52,43 @@ impl NeonVerifier {
         let mut invalid_indices = Vec::new();
         let mut valid_count = 0usize;
         for (i, &v) in results.iter().enumerate() {
-            if v { valid_count += 1; } else { invalid_indices.push(i); }
+            if v {
+                valid_count += 1;
+            } else {
+                invalid_indices.push(i);
+            }
         }
 
         self.total_verified += tasks.len() as u64;
         self.total_batches += 1;
         if elapsed_us > 0 {
             let tp = (tasks.len() as f64) / (elapsed_us as f64 / 1_000_000.0);
-            self.avg_throughput = if self.total_batches == 1 { tp }
-                else { self.avg_throughput * 0.7 + tp * 0.3 };
+            self.avg_throughput = if self.total_batches == 1 {
+                tp
+            } else {
+                self.avg_throughput * 0.7 + tp * 0.3
+            };
         }
 
-        debug!(batch = tasks.len(), valid = valid_count, us = elapsed_us, "NEON batch verify");
+        debug!(
+            batch = tasks.len(),
+            valid = valid_count,
+            us = elapsed_us,
+            "NEON batch verify"
+        );
 
         GpuVerifyResult {
-            total: tasks.len(), valid: valid_count, invalid_indices, elapsed_us, used_gpu: false,
+            total: tasks.len(),
+            valid: valid_count,
+            invalid_indices,
+            elapsed_us,
+            used_gpu: false,
         }
     }
 
-    pub fn throughput(&self) -> f64 { self.avg_throughput }
+    pub fn throughput(&self) -> f64 {
+        self.avg_throughput
+    }
 }
 
 /// Core batch verification using curve25519-dalek internals.
@@ -77,10 +99,7 @@ impl NeonVerifier {
 /// 3. Verify each: [s]B == R + [k]A  via vartime_double_scalar_mul_basepoint
 #[cfg(target_arch = "aarch64")]
 fn neon_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
-    
-    
     use rayon::prelude::*;
-    
 
     if tasks.len() < 64 {
         // Small batch: sequential with custom verification path
@@ -89,11 +108,14 @@ fn neon_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
         // Large batch: parallel custom verification.
         // Pre-compute k-scalars in pairs (NEON 2-wide SHA-512 via hardware).
         // Then verify in parallel via rayon.
-        tasks.par_chunks(2).flat_map(|pair| {
-            // Compute k-scalars for this pair
-            let results: Vec<bool> = pair.iter().map(verify_custom).collect();
-            results
-        }).collect()
+        tasks
+            .par_chunks(2)
+            .flat_map(|pair| {
+                // Compute k-scalars for this pair
+                let results: Vec<bool> = pair.iter().map(verify_custom).collect();
+                results
+            })
+            .collect()
     }
 }
 
@@ -116,10 +138,10 @@ fn neon_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
 /// 3. Extract s from signature
 /// 4. Check: [s]B == R + [k]A  via  [s]B - [k]A == R
 fn verify_custom(task: &VerifyTask) -> bool {
+    use curve25519_dalek::EdwardsPoint;
     use curve25519_dalek::edwards::CompressedEdwardsY;
     use curve25519_dalek::scalar::Scalar;
-    use curve25519_dalek::EdwardsPoint;
-    use sha2::{Sha512, Digest};
+    use sha2::{Digest, Sha512};
 
     // Extract R (first 32 bytes of signature) and s (last 32 bytes)
     let r_bytes: [u8; 32] = task.signature[..32].try_into().unwrap_or([0u8; 32]);

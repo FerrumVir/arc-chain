@@ -106,7 +106,10 @@ impl ShardRegistry {
         after_layer: u32,
     ) -> Option<ShardAssignment> {
         self.models.get(model_id).and_then(|shards| {
-            shards.iter().find(|s| s.start_layer >= after_layer).cloned()
+            shards
+                .iter()
+                .find(|s| s.start_layer >= after_layer)
+                .cloned()
         })
     }
 
@@ -194,8 +197,7 @@ pub fn compute_shard_plan(
     let mut current_layer = 0u32;
 
     for (i, node) in nodes.iter().enumerate() {
-        let weight =
-            node.available_memory as f64 * if node.gpu_tier > 0 { 1.5 } else { 1.0 };
+        let weight = node.available_memory as f64 * if node.gpu_tier > 0 { 1.5 } else { 1.0 };
         let fraction = weight / total_weight;
 
         let layer_count = if i == nodes.len() - 1 {
@@ -287,10 +289,7 @@ pub struct NodeCapability {
 /// Serialize i64 activations to bytes (little-endian) with BLAKE3 integrity hash.
 /// This is the wire format for passing hidden states between shard holders.
 pub fn serialize_activations(activations: &[i64]) -> (Vec<u8>, Hash256) {
-    let bytes: Vec<u8> = activations
-        .iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
+    let bytes: Vec<u8> = activations.iter().flat_map(|v| v.to_le_bytes()).collect();
     let hash = arc_crypto::hash_bytes(&bytes);
     (bytes, hash)
 }
@@ -311,9 +310,7 @@ pub fn deserialize_activations(
 
     // Deserialize
     if !bytes.len().is_multiple_of(8) {
-        return Err(InferenceShardError::InvalidActivationSize {
-            size: bytes.len(),
-        });
+        return Err(InferenceShardError::InvalidActivationSize { size: bytes.len() });
     }
 
     let activations: Vec<i64> = bytes
@@ -402,11 +399,7 @@ impl PipelineCoordinator {
 
     /// Record that a shard has completed and produced a token.
     /// Returns the next action: either forward to next shard or inference complete.
-    pub fn on_shard_result(
-        &self,
-        request_id: &Hash256,
-        token_id: u32,
-    ) -> PipelineAction {
+    pub fn on_shard_result(&self, request_id: &Hash256, token_id: u32) -> PipelineAction {
         let mut state = match self.active_requests.get_mut(request_id) {
             Some(s) => s,
             None => return PipelineAction::RequestNotFound,
@@ -431,11 +424,9 @@ impl PipelineCoordinator {
         drop(state);
 
         match self.registry.get_pipeline(&model_id) {
-            Some(pipeline) if !pipeline.is_empty() => {
-                PipelineAction::NextToken {
-                    first_shard: pipeline[0].clone(),
-                }
-            }
+            Some(pipeline) if !pipeline.is_empty() => PipelineAction::NextToken {
+                first_shard: pipeline[0].clone(),
+            },
             _ => PipelineAction::PipelineBroken,
         }
     }
@@ -481,8 +472,7 @@ pub enum PipelineAction {
 // ─── Shard Forward Pass (Layer-Level Execution) ─────────────────────────────
 
 use super::cached_integer_model::{
-    CachedIntegerModel, KVCache, QuantizedInput,
-    layernorm, matmul_fast_preq, silu_i64, apply_rope,
+    CachedIntegerModel, KVCache, QuantizedInput, apply_rope, layernorm, matmul_fast_preq, silu_i64,
 };
 use super::integer_lut::{FRAC_BITS, ONE, argmax_i64, integer_exp};
 
@@ -537,9 +527,30 @@ pub fn forward_shard_layers(
         let normed_q = QuantizedInput::from_i64(&normed);
 
         // Q/K/V projections
-        dispatch_matmul!(q4_layer.map(|l| &l.wq), &layer.wq, &normed_q, &normed, d, &mut q);
-        dispatch_matmul!(q4_layer.map(|l| &l.wk), &layer.wk, &normed_q, &normed, d, &mut k_buf);
-        dispatch_matmul!(q4_layer.map(|l| &l.wv), &layer.wv, &normed_q, &normed, d, &mut v_buf);
+        dispatch_matmul!(
+            q4_layer.map(|l| &l.wq),
+            &layer.wq,
+            &normed_q,
+            &normed,
+            d,
+            &mut q
+        );
+        dispatch_matmul!(
+            q4_layer.map(|l| &l.wk),
+            &layer.wk,
+            &normed_q,
+            &normed,
+            d,
+            &mut k_buf
+        );
+        dispatch_matmul!(
+            q4_layer.map(|l| &l.wv),
+            &layer.wv,
+            &normed_q,
+            &normed,
+            d,
+            &mut v_buf
+        );
 
         // RoPE
         for h in 0..cfg.n_heads {
@@ -601,8 +612,7 @@ pub fn forward_shard_layers(
 
                     let v_off = j * cfg.d_kv + kv_h * dh;
                     for (dd, o) in out.iter_mut().enumerate() {
-                        *o += (w * cache.v_data[layer_idx][v_off + dd])
-                            >> FRAC_BITS;
+                        *o += (w * cache.v_data[layer_idx][v_off + dd]) >> FRAC_BITS;
                     }
                 }
 
@@ -624,7 +634,14 @@ pub fn forward_shard_layers(
 
         // Wo projection + residual
         let attn_out_q = QuantizedInput::from_i64(&attn_out);
-        dispatch_matmul!(q4_layer.map(|l| &l.wo), &layer.wo, &attn_out_q, &attn_out, d, &mut projected);
+        dispatch_matmul!(
+            q4_layer.map(|l| &l.wo),
+            &layer.wo,
+            &attn_out_q,
+            &attn_out,
+            d,
+            &mut projected
+        );
         for i in 0..d {
             hidden[i] += projected[i];
         }
@@ -633,8 +650,22 @@ pub fn forward_shard_layers(
         let normed_ff = layernorm(&hidden, &layer.ffn_norm);
         let normed_ff_q = QuantizedInput::from_i64(&normed_ff);
 
-        dispatch_matmul!(q4_layer.map(|l| &l.w_gate), &layer.w_gate, &normed_ff_q, &normed_ff, d, &mut gate);
-        dispatch_matmul!(q4_layer.map(|l| &l.w_up), &layer.w_up, &normed_ff_q, &normed_ff, d, &mut up);
+        dispatch_matmul!(
+            q4_layer.map(|l| &l.w_gate),
+            &layer.w_gate,
+            &normed_ff_q,
+            &normed_ff,
+            d,
+            &mut gate
+        );
+        dispatch_matmul!(
+            q4_layer.map(|l| &l.w_up),
+            &layer.w_up,
+            &normed_ff_q,
+            &normed_ff,
+            d,
+            &mut up
+        );
 
         // SiLU gate * up
         for j in 0..cfg.d_ff {
@@ -643,7 +674,14 @@ pub fn forward_shard_layers(
 
         // W_down + residual
         let gate_q = QuantizedInput::from_i64(&gate);
-        dispatch_matmul!(q4_layer.map(|l| &l.w_down), &layer.w_down, &gate_q, &gate, cfg.d_ff, &mut ff_out);
+        dispatch_matmul!(
+            q4_layer.map(|l| &l.w_down),
+            &layer.w_down,
+            &gate_q,
+            &gate,
+            cfg.d_ff,
+            &mut ff_out
+        );
         for i in 0..d {
             hidden[i] += ff_out[i];
         }
@@ -654,10 +692,7 @@ pub fn forward_shard_layers(
 
 /// Execute the final layers: final LayerNorm + LM head → logits → argmax.
 /// Called by the last shard in the pipeline.
-pub fn forward_final(
-    model: &CachedIntegerModel,
-    hidden: &[i64],
-) -> (u32, Hash256) {
+pub fn forward_final(model: &CachedIntegerModel, hidden: &[i64]) -> (u32, Hash256) {
     let cfg = &model.config;
     let normed = layernorm(hidden, &model.final_norm);
 
@@ -666,7 +701,12 @@ pub fn forward_final(
         super::cached_integer_model::matmul_q4_full(q4_out, &normed, &mut logits);
         logits
     } else {
-        super::cached_integer_model::matmul_fast(&model.output_weight, &normed, cfg.d_model, cfg.vocab_size)
+        super::cached_integer_model::matmul_fast(
+            &model.output_weight,
+            &normed,
+            cfg.d_model,
+            cfg.vocab_size,
+        )
     };
 
     let token_id = argmax_i64(&logits) as u32;
@@ -734,11 +774,7 @@ impl DistributedCache {
 
     /// Evict the least-recently-used entry (lowest hit count).
     fn evict_lru(&self) {
-        if let Some(min_entry) = self
-            .entries
-            .iter()
-            .min_by_key(|e| e.value().hit_count)
-        {
+        if let Some(min_entry) = self.entries.iter().min_by_key(|e| e.value().hit_count) {
             let key = *min_entry.key();
             drop(min_entry);
             self.entries.remove(&key);
@@ -782,10 +818,7 @@ pub enum InferenceShardError {
     NoPipeline { model_id: Hash256 },
 
     #[error("activation integrity check failed: expected {expected}, got {actual}")]
-    ActivationIntegrityFailed {
-        expected: Hash256,
-        actual: Hash256,
-    },
+    ActivationIntegrityFailed { expected: Hash256, actual: Hash256 },
 
     #[error("invalid activation size: {size} bytes (must be multiple of 8)")]
     InvalidActivationSize { size: usize },
@@ -814,25 +847,31 @@ mod tests {
         let node_a = test_address(b"node-a");
         let node_b = test_address(b"node-b");
 
-        registry.register_shard(model_id, ShardAssignment {
-            node_address: node_a,
-            start_layer: 0,
-            end_layer: 16,
-            expert_indices: vec![],
-            socket_addr: "1.2.3.4:9091".into(),
-            gpu_tier: 1,
-            available_memory: 16_000_000_000,
-        });
+        registry.register_shard(
+            model_id,
+            ShardAssignment {
+                node_address: node_a,
+                start_layer: 0,
+                end_layer: 16,
+                expert_indices: vec![],
+                socket_addr: "1.2.3.4:9091".into(),
+                gpu_tier: 1,
+                available_memory: 16_000_000_000,
+            },
+        );
 
-        registry.register_shard(model_id, ShardAssignment {
-            node_address: node_b,
-            start_layer: 16,
-            end_layer: 32,
-            expert_indices: vec![],
-            socket_addr: "5.6.7.8:9091".into(),
-            gpu_tier: 2,
-            available_memory: 64_000_000_000,
-        });
+        registry.register_shard(
+            model_id,
+            ShardAssignment {
+                node_address: node_b,
+                start_layer: 16,
+                end_layer: 32,
+                expert_indices: vec![],
+                socket_addr: "5.6.7.8:9091".into(),
+                gpu_tier: 2,
+                available_memory: 64_000_000_000,
+            },
+        );
 
         assert!(registry.is_model_fully_covered(&model_id, 32));
         assert!(!registry.is_model_fully_covered(&model_id, 64));
@@ -849,15 +888,18 @@ mod tests {
         let model_id = test_address(b"model-1");
         let node_a = test_address(b"node-a");
 
-        registry.register_shard(model_id, ShardAssignment {
-            node_address: node_a,
-            start_layer: 0,
-            end_layer: 32,
-            expert_indices: vec![],
-            socket_addr: "1.2.3.4:9091".into(),
-            gpu_tier: 1,
-            available_memory: 16_000_000_000,
-        });
+        registry.register_shard(
+            model_id,
+            ShardAssignment {
+                node_address: node_a,
+                start_layer: 0,
+                end_layer: 32,
+                expert_indices: vec![],
+                socket_addr: "1.2.3.4:9091".into(),
+                gpu_tier: 1,
+                available_memory: 16_000_000_000,
+            },
+        );
 
         assert_eq!(registry.total_shard_nodes(), 1);
         registry.remove_node(&node_a);
@@ -972,15 +1014,18 @@ mod tests {
         let model_id = test_address(b"model-1");
         let node_a = test_address(b"node-a");
 
-        registry.register_shard(model_id, ShardAssignment {
-            node_address: node_a,
-            start_layer: 0,
-            end_layer: 32,
-            expert_indices: vec![],
-            socket_addr: "1.2.3.4:9091".into(),
-            gpu_tier: 1,
-            available_memory: 16_000_000_000,
-        });
+        registry.register_shard(
+            model_id,
+            ShardAssignment {
+                node_address: node_a,
+                start_layer: 0,
+                end_layer: 32,
+                expert_indices: vec![],
+                socket_addr: "1.2.3.4:9091".into(),
+                gpu_tier: 1,
+                available_memory: 16_000_000_000,
+            },
+        );
 
         let coord = PipelineCoordinator::new(registry);
         let req_id = test_address(b"req-1");

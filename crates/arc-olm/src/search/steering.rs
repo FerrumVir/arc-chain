@@ -260,17 +260,25 @@ impl SteeringModel {
         let mut heads = Vec::new();
         for (_, head_dim) in &head_configs {
             let w = read_weight_matrix(&data, &mut cursor, *head_dim, h2)?;
-            heads.push(TypeHead { weights: w, prim_names: Vec::new() });
+            heads.push(TypeHead {
+                weights: w,
+                prim_names: Vec::new(),
+            });
         }
 
         // Read vocab section (newline-separated strings per head)
         for head in &mut heads {
-            if cursor + 4 > data.len() { break; }
+            if cursor + 4 > data.len() {
+                break;
+            }
             let vocab_len = read_u32(&data, &mut cursor) as usize;
-            if cursor + vocab_len > data.len() { break; }
+            if cursor + vocab_len > data.len() {
+                break;
+            }
             let vocab_str = String::from_utf8(data[cursor..cursor + vocab_len].to_vec()).ok()?;
             cursor += vocab_len;
-            head.prim_names = vocab_str.split('\n')
+            head.prim_names = vocab_str
+                .split('\n')
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string())
                 .collect();
@@ -291,11 +299,7 @@ impl SteeringModel {
 impl SteeringModel {
     /// Score operations for the given state and type.
     /// Returns `(primitive_name, score)` pairs sorted by descending score.
-    pub fn score_operations(
-        &self,
-        features: &[f32],
-        current_type: &DagType,
-    ) -> Vec<(String, f32)> {
+    pub fn score_operations(&self, features: &[f32], current_type: &DagType) -> Vec<(String, f32)> {
         // Layer 1: matmul + ReLU
         let h1 = matmul(&self.layer1, features);
         let h1: Vec<f32> = h1.into_iter().map(|x| x.max(0.0)).collect();

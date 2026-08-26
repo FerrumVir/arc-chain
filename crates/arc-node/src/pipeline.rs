@@ -21,14 +21,14 @@
 
 use crate::block_stm::BlockSTM;
 use crate::coalesce::CoalescedBatch;
-use arc_state::block_stm::execute_speculative;
+use arc_consensus::encode_block_data;
 use arc_state::StateDB;
+use arc_state::block_stm::execute_speculative;
 use arc_types::{Address, Transaction, TxBody};
 use crossbeam::channel::{self, Receiver, Sender};
 use rayon::prelude::*;
 use std::sync::Arc;
 use std::thread;
-use arc_consensus::encode_block_data;
 use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -269,7 +269,10 @@ impl Pipeline {
                             continue; // hash mismatch → invalid
                         }
                         match &tx.signature {
-                            arc_crypto::Signature::Ed25519 { public_key, signature } => {
+                            arc_crypto::Signature::Ed25519 {
+                                public_key,
+                                signature,
+                            } => {
                                 // Check address derivation.
                                 let derived = arc_crypto::address_from_ed25519_pubkey(public_key);
                                 if derived != tx.from {
@@ -315,46 +318,50 @@ impl Pipeline {
                         }
 
                         if cached_count > 0 {
-                            debug!(cached = cached_count, uncached = uncached_task_indices.len(),
-                                "Pipeline: pre-verified cache hits");
+                            debug!(
+                                cached = cached_count,
+                                uncached = uncached_task_indices.len(),
+                                "Pipeline: pre-verified cache hits"
+                            );
                         }
 
                         // Verify remaining uncached signatures via the selected backend.
                         if !uncached_task_indices.is_empty() {
                             // Helper: CPU rayon fallback path (used by CPU mode and
                             // as fallback for not-yet-implemented kernel modes).
-                            let cpu_verify = |indices: &[usize],
-                                              msgs: &[Vec<u8>],
-                                              sigs: &[ed25519_dalek::Signature],
-                                              vks: &[ed25519_dalek::VerifyingKey],
-                                              ed_idx: &[usize],
-                                              out: &mut [bool]| {
-                                let msg_refs: Vec<&[u8]> = indices.iter()
-                                    .map(|&j| msgs[j].as_slice()).collect();
-                                let s: Vec<ed25519_dalek::Signature> = indices.iter()
-                                    .map(|&j| sigs[j]).collect();
-                                let v: Vec<ed25519_dalek::VerifyingKey> = indices.iter()
-                                    .map(|&j| vks[j]).collect();
-                                let results = arc_gpu::cpu_batch_verify_ed25519(
-                                    &msg_refs, &s, &v,
-                                );
-                                for (k, &valid) in results.iter().enumerate() {
-                                    out[ed_idx[indices[k]]] = valid;
-                                }
-                            };
+                            let cpu_verify =
+                                |indices: &[usize],
+                                 msgs: &[Vec<u8>],
+                                 sigs: &[ed25519_dalek::Signature],
+                                 vks: &[ed25519_dalek::VerifyingKey],
+                                 ed_idx: &[usize],
+                                 out: &mut [bool]| {
+                                    let msg_refs: Vec<&[u8]> =
+                                        indices.iter().map(|&j| msgs[j].as_slice()).collect();
+                                    let s: Vec<ed25519_dalek::Signature> =
+                                        indices.iter().map(|&j| sigs[j]).collect();
+                                    let v: Vec<ed25519_dalek::VerifyingKey> =
+                                        indices.iter().map(|&j| vks[j]).collect();
+                                    let results =
+                                        arc_gpu::cpu_batch_verify_ed25519(&msg_refs, &s, &v);
+                                    for (k, &valid) in results.iter().enumerate() {
+                                        out[ed_idx[indices[k]]] = valid;
+                                    }
+                                };
 
                             match verify_mode {
                                 VerifyMode::GpuMetal if metal_verifier.is_some() => {
                                     // GPU Metal path
                                     let verifier = metal_verifier.as_mut().unwrap();
-                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
-                                        .iter()
-                                        .map(|&j| arc_gpu::metal_verify::VerifyTask {
-                                            message: ed_msgs[j].clone(),
-                                            public_key: *ed_vks[j].as_bytes(),
-                                            signature: ed_sigs[j].to_bytes(),
-                                        })
-                                        .collect();
+                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> =
+                                        uncached_task_indices
+                                            .iter()
+                                            .map(|&j| arc_gpu::metal_verify::VerifyTask {
+                                                message: ed_msgs[j].clone(),
+                                                public_key: *ed_vks[j].as_bytes(),
+                                                signature: ed_sigs[j].to_bytes(),
+                                            })
+                                            .collect();
                                     let result = verifier.batch_verify(&tasks);
                                     let invalid_set: std::collections::HashSet<usize> =
                                         result.invalid_indices.iter().copied().collect();
@@ -365,14 +372,15 @@ impl Pipeline {
                                 VerifyMode::GpuCuda if cuda_verifier.is_some() => {
                                     // CUDA kernel dispatch
                                     let verifier = cuda_verifier.as_mut().unwrap();
-                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
-                                        .iter()
-                                        .map(|&j| arc_gpu::metal_verify::VerifyTask {
-                                            message: ed_msgs[j].clone(),
-                                            public_key: *ed_vks[j].as_bytes(),
-                                            signature: ed_sigs[j].to_bytes(),
-                                        })
-                                        .collect();
+                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> =
+                                        uncached_task_indices
+                                            .iter()
+                                            .map(|&j| arc_gpu::metal_verify::VerifyTask {
+                                                message: ed_msgs[j].clone(),
+                                                public_key: *ed_vks[j].as_bytes(),
+                                                signature: ed_sigs[j].to_bytes(),
+                                            })
+                                            .collect();
                                     let result = verifier.batch_verify(&tasks);
                                     let invalid_set: std::collections::HashSet<usize> =
                                         result.invalid_indices.iter().copied().collect();
@@ -383,14 +391,15 @@ impl Pipeline {
                                 VerifyMode::CpuAvx512 if avx512_verifier.is_some() => {
                                     // AVX-512 kernel dispatch
                                     let verifier = avx512_verifier.as_mut().unwrap();
-                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
-                                        .iter()
-                                        .map(|&j| arc_gpu::metal_verify::VerifyTask {
-                                            message: ed_msgs[j].clone(),
-                                            public_key: *ed_vks[j].as_bytes(),
-                                            signature: ed_sigs[j].to_bytes(),
-                                        })
-                                        .collect();
+                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> =
+                                        uncached_task_indices
+                                            .iter()
+                                            .map(|&j| arc_gpu::metal_verify::VerifyTask {
+                                                message: ed_msgs[j].clone(),
+                                                public_key: *ed_vks[j].as_bytes(),
+                                                signature: ed_sigs[j].to_bytes(),
+                                            })
+                                            .collect();
                                     let result = verifier.batch_verify(&tasks);
                                     let invalid_set: std::collections::HashSet<usize> =
                                         result.invalid_indices.iter().copied().collect();
@@ -401,14 +410,15 @@ impl Pipeline {
                                 VerifyMode::CpuNeon if neon_verifier.is_some() => {
                                     // NEON kernel dispatch
                                     let verifier = neon_verifier.as_mut().unwrap();
-                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> = uncached_task_indices
-                                        .iter()
-                                        .map(|&j| arc_gpu::metal_verify::VerifyTask {
-                                            message: ed_msgs[j].clone(),
-                                            public_key: *ed_vks[j].as_bytes(),
-                                            signature: ed_sigs[j].to_bytes(),
-                                        })
-                                        .collect();
+                                    let tasks: Vec<arc_gpu::metal_verify::VerifyTask> =
+                                        uncached_task_indices
+                                            .iter()
+                                            .map(|&j| arc_gpu::metal_verify::VerifyTask {
+                                                message: ed_msgs[j].clone(),
+                                                public_key: *ed_vks[j].as_bytes(),
+                                                signature: ed_sigs[j].to_bytes(),
+                                            })
+                                            .collect();
                                     let result = verifier.batch_verify(&tasks);
                                     let invalid_set: std::collections::HashSet<usize> =
                                         result.invalid_indices.iter().copied().collect();
@@ -419,8 +429,12 @@ impl Pipeline {
                                 _ => {
                                     // CPU scalar path (default)
                                     cpu_verify(
-                                        &uncached_task_indices, &ed_msgs, &ed_sigs, &ed_vks,
-                                        &ed_indices, &mut sig_valid,
+                                        &uncached_task_indices,
+                                        &ed_msgs,
+                                        &ed_sigs,
+                                        &ed_vks,
+                                        &ed_indices,
+                                        &mut sig_valid,
                                     );
                                 }
                             }
@@ -569,23 +583,24 @@ impl Pipeline {
                                     let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
                                     for (j, tx) in valid_txs.iter().enumerate() {
                                         if let TxBody::WasmCall(ref body) = tx.body
-                                            && exec_state.is_evm_contract(&body.contract) {
-                                                let result = arc_vm::evm::evm_execute(
-                                                    &exec_state,
-                                                    tx.from,
-                                                    body.contract,
-                                                    body.calldata.clone(),
-                                                    body.value,
-                                                    body.gas_limit.max(1_000_000),
-                                                );
-                                                if !result.success {
-                                                    receipt_success[orig_indices[j]] = false;
-                                                }
-                                                for mut log in result.logs {
-                                                    log.tx_hash = tx.hash;
-                                                    block_logs.push(log);
-                                                }
+                                            && exec_state.is_evm_contract(&body.contract)
+                                        {
+                                            let result = arc_vm::evm::evm_execute(
+                                                &exec_state,
+                                                tx.from,
+                                                body.contract,
+                                                body.calldata.clone(),
+                                                body.value,
+                                                body.gas_limit.max(1_000_000),
+                                            );
+                                            if !result.success {
+                                                receipt_success[orig_indices[j]] = false;
                                             }
+                                            for mut log in result.logs {
+                                                log.tx_hash = tx.hash;
+                                                block_logs.push(log);
+                                            }
+                                        }
                                     }
                                     if !block_logs.is_empty() {
                                         let height = exec_state.height();
@@ -648,23 +663,24 @@ impl Pipeline {
                             for (j, tx) in valid_txs.iter().enumerate() {
                                 if receipt_success[orig_indices[j]]
                                     && let TxBody::WasmCall(ref body) = tx.body
-                                        && exec_state.is_evm_contract(&body.contract) {
-                                            let result = arc_vm::evm::evm_execute(
-                                                &exec_state,
-                                                tx.from,
-                                                body.contract,
-                                                body.calldata.clone(),
-                                                body.value,
-                                                body.gas_limit.max(1_000_000),
-                                            );
-                                            if !result.success {
-                                                receipt_success[orig_indices[j]] = false;
-                                            }
-                                            for mut log in result.logs {
-                                                log.tx_hash = tx.hash;
-                                                block_logs.push(log);
-                                            }
-                                        }
+                                    && exec_state.is_evm_contract(&body.contract)
+                                {
+                                    let result = arc_vm::evm::evm_execute(
+                                        &exec_state,
+                                        tx.from,
+                                        body.contract,
+                                        body.calldata.clone(),
+                                        body.value,
+                                        body.gas_limit.max(1_000_000),
+                                    );
+                                    if !result.success {
+                                        receipt_success[orig_indices[j]] = false;
+                                    }
+                                    for mut log in result.logs {
+                                        log.tx_hash = tx.hash;
+                                        block_logs.push(log);
+                                    }
+                                }
                             }
                             if !block_logs.is_empty() {
                                 let height = exec_state.height();
@@ -736,9 +752,10 @@ impl Pipeline {
                                 TxBody::Stake(body) => {
                                     // Pre-load the validator address account if different from sender
                                     if body.validator != sender_addr
-                                        && let Some(acct) = exec_state.get_account(&body.validator) {
-                                            account_snapshot.insert(body.validator.0, acct);
-                                        }
+                                        && let Some(acct) = exec_state.get_account(&body.validator)
+                                    {
+                                        account_snapshot.insert(body.validator.0, acct);
+                                    }
                                 }
                                 TxBody::FaucetClaim(body) => {
                                     let pool_addr = arc_types::transaction::faucet_pool_address();
@@ -749,13 +766,20 @@ impl Pipeline {
                                         account_snapshot.insert(body.recipient.0, acct);
                                     }
                                 }
-                                TxBody::DeployContract(_) | TxBody::RegisterAgent(_)
-                                | TxBody::MultiSig(_) | TxBody::JoinValidator(_)
-                                | TxBody::LeaveValidator | TxBody::ClaimRewards
-                                | TxBody::UpdateStake(_) | TxBody::Governance(_)
-                                | TxBody::BridgeLock(_) | TxBody::BridgeMint(_)
-                                | TxBody::BatchSettle(_) | TxBody::ChannelOpen(_)
-                                | TxBody::ChannelClose(_) | TxBody::ChannelDispute(_)
+                                TxBody::DeployContract(_)
+                                | TxBody::RegisterAgent(_)
+                                | TxBody::MultiSig(_)
+                                | TxBody::JoinValidator(_)
+                                | TxBody::LeaveValidator
+                                | TxBody::ClaimRewards
+                                | TxBody::UpdateStake(_)
+                                | TxBody::Governance(_)
+                                | TxBody::BridgeLock(_)
+                                | TxBody::BridgeMint(_)
+                                | TxBody::BatchSettle(_)
+                                | TxBody::ChannelOpen(_)
+                                | TxBody::ChannelClose(_)
+                                | TxBody::ChannelDispute(_)
                                 | TxBody::ShardProof(_)
                                 | TxBody::InferenceAttestation(_)
                                 | TxBody::InferenceChallenge(_)
@@ -809,23 +833,24 @@ impl Pipeline {
                         for (j, tx) in valid_txs.iter().enumerate() {
                             if receipt_success[orig_indices[j]]
                                 && let TxBody::WasmCall(ref body) = tx.body
-                                    && exec_state.is_evm_contract(&body.contract) {
-                                        let result = arc_vm::evm::evm_execute(
-                                            &exec_state,
-                                            tx.from,
-                                            body.contract,
-                                            body.calldata.clone(),
-                                            body.value,
-                                            body.gas_limit.max(1_000_000),
-                                        );
-                                        if !result.success {
-                                            receipt_success[orig_indices[j]] = false;
-                                        }
-                                        for mut log in result.logs {
-                                            log.tx_hash = tx.hash;
-                                            block_logs.push(log);
-                                        }
-                                    }
+                                && exec_state.is_evm_contract(&body.contract)
+                            {
+                                let result = arc_vm::evm::evm_execute(
+                                    &exec_state,
+                                    tx.from,
+                                    body.contract,
+                                    body.calldata.clone(),
+                                    body.value,
+                                    body.gas_limit.max(1_000_000),
+                                );
+                                if !result.success {
+                                    receipt_success[orig_indices[j]] = false;
+                                }
+                                for mut log in result.logs {
+                                    log.tx_hash = tx.hash;
+                                    block_logs.push(log);
+                                }
+                            }
                         }
                         if !block_logs.is_empty() {
                             let height = exec_state.height();
@@ -936,23 +961,24 @@ impl Pipeline {
                             // to handle storage writes, internal transfers, and event logs.
                             if tx_ok
                                 && let TxBody::WasmCall(ref body) = tx.body
-                                    && exec_state.is_evm_contract(&body.contract) {
-                                        let result = arc_vm::evm::evm_execute(
-                                            &exec_state,
-                                            tx.from,
-                                            body.contract,
-                                            body.calldata.clone(),
-                                            body.value,
-                                            body.gas_limit.max(1_000_000),
-                                        );
-                                        if !result.success {
-                                            receipt_success[i] = false;
-                                        }
-                                        for mut log in result.logs {
-                                            log.tx_hash = tx.hash;
-                                            block_logs.push(log);
-                                        }
-                                    }
+                                && exec_state.is_evm_contract(&body.contract)
+                            {
+                                let result = arc_vm::evm::evm_execute(
+                                    &exec_state,
+                                    tx.from,
+                                    body.contract,
+                                    body.calldata.clone(),
+                                    body.value,
+                                    body.gas_limit.max(1_000_000),
+                                );
+                                if !result.success {
+                                    receipt_success[i] = false;
+                                }
+                                for mut log in result.logs {
+                                    log.tx_hash = tx.hash;
+                                    block_logs.push(log);
+                                }
+                            }
                         }
                     }
 
@@ -1004,11 +1030,8 @@ impl Pipeline {
 
                     match result {
                         Ok((block, _receipts)) => {
-                            let success_count = ebatch
-                                .receipt_success
-                                .iter()
-                                .filter(|&&v| v)
-                                .count();
+                            let success_count =
+                                ebatch.receipt_success.iter().filter(|&&v| v).count();
 
                             // ── Block witness ───────────────────────────
                             // Pair each eligible transfer's pre-state with the
@@ -1045,10 +1068,9 @@ impl Pipeline {
                                     .get_account(&body.to)
                                     .map(|a| a.balance)
                                     .unwrap_or(0);
-                                let (Ok(nonce_before), Ok(nonce_after)) = (
-                                    u32::try_from(snb),
-                                    u32::try_from(sender_post.nonce),
-                                ) else {
+                                let (Ok(nonce_before), Ok(nonce_after)) =
+                                    (u32::try_from(snb), u32::try_from(sender_post.nonce))
+                                else {
                                     continue;
                                 };
                                 let witness = arc_crypto::stark::TransferWitness {
@@ -1087,9 +1109,11 @@ impl Pipeline {
                             let vr = proof.verify();
 
                             // Compress the proof for storage / transmission
-                            let compressed = arc_crypto::proof_compress::compress_proof(&proof.proof_data);
+                            let compressed =
+                                arc_crypto::proof_compress::compress_proof(&proof.proof_data);
                             let ratio = if compressed.original_size > 0 {
-                                compressed.compressed_data.len() as f64 / compressed.original_size as f64
+                                compressed.compressed_data.len() as f64
+                                    / compressed.original_size as f64
                             } else {
                                 1.0
                             };
@@ -1100,17 +1124,18 @@ impl Pipeline {
                                 ratio = format!("{:.2}", ratio),
                                 proving_ms = proof.proving_time_ms,
                                 valid = vr.is_valid,
-                                prover = if cfg!(feature = "stwo-prover") { "stwo-circle-stark" } else { "mock-blake3" },
+                                prover = if cfg!(feature = "stwo-prover") {
+                                    "stwo-circle-stark"
+                                } else {
+                                    "mock-blake3"
+                                },
                                 witness_rows,
                                 "Pipeline: STARK proof generated"
                             );
 
                             // ── DA erasure encoding ──────────────────
-                            let da_input: Vec<u8> = block
-                                .tx_hashes
-                                .iter()
-                                .flat_map(|h| h.0.to_vec())
-                                .collect();
+                            let da_input: Vec<u8> =
+                                block.tx_hashes.iter().flat_map(|h| h.0.to_vec()).collect();
                             let da_encoding = encode_block_data(&da_input, 4, 2);
                             debug!(
                                 height = block.header.height,
@@ -1146,7 +1171,12 @@ impl Pipeline {
             })
             .expect("spawn commit thread");
 
-        Self { tx_in, rx_out, config, sig_cache }
+        Self {
+            tx_in,
+            rx_out,
+            config,
+            sig_cache,
+        }
     }
 
     /// Returns the config this pipeline was created with.
@@ -1182,7 +1212,7 @@ impl Pipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arc_crypto::{hash_bytes, KeyPair};
+    use arc_crypto::{KeyPair, hash_bytes};
 
     fn addr(n: u8) -> Address {
         hash_bytes(&[n])
@@ -1196,10 +1226,7 @@ mod tests {
         let kp = KeyPair::generate_ed25519();
         let sender = kp.address();
 
-        let state = Arc::new(StateDB::with_genesis(&[
-            (sender, 1_000_000),
-            (addr(2), 0),
-        ]));
+        let state = Arc::new(StateDB::with_genesis(&[(sender, 1_000_000), (addr(2), 0)]));
 
         let pipeline = Pipeline::new(Arc::clone(&state));
 
@@ -1216,7 +1243,9 @@ mod tests {
             .unwrap();
 
         // Wait for result (with timeout)
-        let result = pipeline.rx_out.recv_timeout(std::time::Duration::from_secs(5));
+        let result = pipeline
+            .rx_out
+            .recv_timeout(std::time::Duration::from_secs(5));
         assert!(result.is_ok(), "pipeline should produce a result");
         let result = result.unwrap();
         assert_eq!(result.tx_count, 1);
@@ -1228,10 +1257,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_rejects_unsigned_tx() {
-        let state = Arc::new(StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 0),
-        ]));
+        let state = Arc::new(StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]));
 
         let pipeline = Pipeline::new(Arc::clone(&state));
 
@@ -1244,7 +1270,9 @@ mod tests {
             })
             .unwrap();
 
-        let result = pipeline.rx_out.recv_timeout(std::time::Duration::from_secs(5));
+        let result = pipeline
+            .rx_out
+            .recv_timeout(std::time::Duration::from_secs(5));
         assert!(result.is_ok(), "pipeline should produce a result");
         let result = result.unwrap();
         assert_eq!(result.tx_count, 1);
@@ -1266,10 +1294,7 @@ mod tests {
         let kp = KeyPair::generate_ed25519();
         let sender = kp.address();
 
-        let state = Arc::new(StateDB::with_genesis(&[
-            (sender, 1_000_000),
-            (addr(2), 0),
-        ]));
+        let state = Arc::new(StateDB::with_genesis(&[(sender, 1_000_000), (addr(2), 0)]));
 
         let config = PipelineConfig {
             execution_mode: ExecutionMode::BlockSTM,
@@ -1294,7 +1319,9 @@ mod tests {
             })
             .unwrap();
 
-        let result = pipeline.rx_out.recv_timeout(std::time::Duration::from_secs(5));
+        let result = pipeline
+            .rx_out
+            .recv_timeout(std::time::Duration::from_secs(5));
         assert!(result.is_ok(), "pipeline should produce a result");
         let result = result.unwrap();
         assert_eq!(result.tx_count, 1);
@@ -1342,7 +1369,9 @@ mod tests {
             })
             .unwrap();
 
-        let result = pipeline.rx_out.recv_timeout(std::time::Duration::from_secs(5));
+        let result = pipeline
+            .rx_out
+            .recv_timeout(std::time::Duration::from_secs(5));
         assert!(result.is_ok(), "pipeline should produce a result");
         let result = result.unwrap();
         assert_eq!(result.tx_count, 3);

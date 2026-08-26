@@ -285,8 +285,7 @@ impl PoseidonSponge {
             let remaining = self.absorb_buf.split_off(rate);
             let block = std::mem::replace(&mut self.absorb_buf, remaining);
             for (i, &v) in block.iter().enumerate() {
-                self.state.elements[1 + i] =
-                    mod_add(self.state.elements[1 + i], v % MODULUS);
+                self.state.elements[1 + i] = mod_add(self.state.elements[1 + i], v % MODULUS);
             }
             self.state.permute(&self.config);
         }

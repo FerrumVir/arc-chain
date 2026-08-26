@@ -81,20 +81,20 @@ impl StateSyncManager {
         let url = format!("http://{}/sync/manifest", peer_rpc);
         info!("Fetching snapshot manifest from {}", url);
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| SyncError::ManifestFetchFailed {
-                url: url.clone(),
-                source: e,
-            })?;
-
-        let manifest: SnapshotManifest =
-            resp.json()
+        let resp =
+            self.client
+                .get(&url)
+                .send()
                 .await
-                .map_err(|e| SyncError::ManifestFetchFailed { url, source: e })?;
+                .map_err(|e| SyncError::ManifestFetchFailed {
+                    url: url.clone(),
+                    source: e,
+                })?;
+
+        let manifest: SnapshotManifest = resp
+            .json()
+            .await
+            .map_err(|e| SyncError::ManifestFetchFailed { url, source: e })?;
 
         info!(
             "Manifest received: height={}, accounts={}, chunks={}",
@@ -111,25 +111,22 @@ impl StateSyncManager {
     ) -> Result<StateSnapshot, SyncError> {
         let url = format!("http://{}/sync/chunk/{}", peer_rpc, chunk_index);
 
-        let resp =
-            self.client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| SyncError::ChunkFetchFailed {
-                    url: url.clone(),
-                    index: chunk_index,
-                    source: e,
-                })?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| SyncError::ChunkFetchFailed {
+                url: url.clone(),
+                index: chunk_index,
+                source: e,
+            })?;
 
-        let chunk: StateSnapshot =
-            resp.json()
-                .await
-                .map_err(|e| SyncError::ChunkFetchFailed {
-                    url,
-                    index: chunk_index,
-                    source: e,
-                })?;
+        let chunk: StateSnapshot = resp.json().await.map_err(|e| SyncError::ChunkFetchFailed {
+            url,
+            index: chunk_index,
+            source: e,
+        })?;
 
         Ok(chunk)
     }
@@ -252,7 +249,8 @@ impl StateSyncManager {
         let url = format!("http://{}/sync/dag_state", peer_rpc);
         info!("Fetching DAG state from {}", url);
 
-        let resp = self.client
+        let resp = self
+            .client
             .get(&url)
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -268,7 +266,9 @@ impl StateSyncManager {
             last_committed_round: u64,
         }
 
-        let state: DagState = resp.json().await
+        let state: DagState = resp
+            .json()
+            .await
             .map_err(|e| SyncError::ManifestFetchFailed { url, source: e })?;
 
         info!(
@@ -293,7 +293,10 @@ impl StateSyncManager {
         match self.fetch_dag_state(peer_rpc).await {
             Ok((round, committed)) => {
                 engine.set_initial_round(round, committed);
-                info!("DAG state synced: starting at round {} (committed {})", round, committed);
+                info!(
+                    "DAG state synced: starting at round {} (committed {})",
+                    round, committed
+                );
             }
             Err(e) => {
                 // Non-fatal: old peers may not have this endpoint yet.

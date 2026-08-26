@@ -9,9 +9,9 @@
 //!   arc tx <hash>
 //!   arc faucet <address>
 
+mod commands;
 mod keygen;
 mod rpc;
-mod commands;
 
 use clap::{Parser, Subcommand};
 
@@ -80,31 +80,25 @@ enum Commands {
 async fn main() {
     let cli = Cli::parse();
 
-    let rpc_url = cli.rpc
+    let rpc_url = cli
+        .rpc
         .or_else(|| std::env::var("ARC_RPC_URL").ok())
         .unwrap_or_else(|| "http://localhost:9944".to_string());
     let rpc_client = rpc::RpcClient::new(&rpc_url);
 
     let result = match cli.command {
-        Commands::Keygen { scheme, output } => {
-            keygen::run(&scheme, &output)
-        }
-        Commands::Balance { address } => {
-            commands::balance::run(&rpc_client, &address).await
-        }
+        Commands::Keygen { scheme, output } => keygen::run(&scheme, &output),
+        Commands::Balance { address } => commands::balance::run(&rpc_client, &address).await,
         Commands::Transfer { from, to, amount } => {
             commands::transfer::run(&rpc_client, &from, &to, amount).await
         }
-        Commands::Info => {
-            commands::info::run(&rpc_client).await
-        }
-        Commands::Block { height } => {
-            commands::block::run(&rpc_client, height).await
-        }
-        Commands::Tx { hash } => {
-            commands::tx::run(&rpc_client, &hash).await
-        }
-        Commands::Faucet { address, faucet_url } => {
+        Commands::Info => commands::info::run(&rpc_client).await,
+        Commands::Block { height } => commands::block::run(&rpc_client, height).await,
+        Commands::Tx { hash } => commands::tx::run(&rpc_client, &hash).await,
+        Commands::Faucet {
+            address,
+            faucet_url,
+        } => {
             let url = faucet_url
                 .or_else(|| std::env::var("ARC_FAUCET_URL").ok())
                 .unwrap_or_else(|| format!("{}/faucet", rpc_url));

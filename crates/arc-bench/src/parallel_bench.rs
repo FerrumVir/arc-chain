@@ -7,9 +7,9 @@
 //!
 //! Also benchmarks GPU Ed25519 verification vs CPU.
 
-use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_crypto::Hash256;
-use arc_node::pipeline::{Pipeline, PipelineBatch, PipelineConfig, ExecutionMode, VerifyMode};
+use arc_crypto::signature::{benchmark_address, benchmark_keypair};
+use arc_node::pipeline::{ExecutionMode, Pipeline, PipelineBatch, PipelineConfig, VerifyMode};
 use arc_state::StateDB;
 use arc_types::Transaction;
 use clap::Parser;
@@ -54,9 +54,7 @@ fn presign_transactions(
         .map(|i| (benchmark_keypair(i), benchmark_address(i)))
         .collect();
 
-    let receivers: Vec<Hash256> = (200u8..=255)
-        .map(benchmark_address)
-        .collect();
+    let receivers: Vec<Hash256> = (200u8..=255).map(benchmark_address).collect();
 
     let mut genesis: Vec<(Hash256, u64)> = keypairs
         .iter()
@@ -127,7 +125,10 @@ fn run_mode(
     while results_received < batches_submitted {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            eprintln!("  {}: TIMEOUT - got {}/{} results", mode_name, results_received, batches_submitted);
+            eprintln!(
+                "  {}: TIMEOUT - got {}/{} results",
+                mode_name, results_received, batches_submitted
+            );
             break;
         }
 
@@ -150,7 +151,10 @@ fn bench_gpu_verify(count: usize) {
     use ed25519_dalek::Signer;
 
     println!("\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-    println!("  GPU vs CPU Ed25519 Batch Verification ({} signatures)", count);
+    println!(
+        "  GPU vs CPU Ed25519 Batch Verification ({} signatures)",
+        count
+    );
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
     // Generate signed messages as VerifyTasks
@@ -170,31 +174,63 @@ fn bench_gpu_verify(count: usize) {
     }
 
     let mut verifier = MetalVerifier::new();
-    println!("    Metal GPU:    {}", if verifier.is_gpu_available() { "DETECTED" } else { "not available (CPU fallback)" });
+    println!(
+        "    Metal GPU:    {}",
+        if verifier.is_gpu_available() {
+            "DETECTED"
+        } else {
+            "not available (CPU fallback)"
+        }
+    );
 
     // CPU-only path
     let cpu_result = verifier.batch_verify_cpu(&tasks);
     let cpu_rate = count as f64 / (cpu_result.elapsed_us as f64 / 1_000_000.0);
-    println!("    CPU (rayon):  {} sigs in {:.3}s = {} verif/sec  ({} valid)",
-        count, cpu_result.elapsed_us as f64 / 1_000_000.0,
-        format_tps(cpu_rate), cpu_result.valid);
+    println!(
+        "    CPU (rayon):  {} sigs in {:.3}s = {} verif/sec  ({} valid)",
+        count,
+        cpu_result.elapsed_us as f64 / 1_000_000.0,
+        format_tps(cpu_rate),
+        cpu_result.valid
+    );
 
     // GPU path (Metal on Apple Silicon, CPU fallback otherwise)
     verifier.reset_stats();
     let gpu_result = verifier.batch_verify(&tasks);
     let gpu_rate = count as f64 / (gpu_result.elapsed_us as f64 / 1_000_000.0);
-    println!("    GPU (Metal):  {} sigs in {:.3}s = {} verif/sec  ({} valid, gpu_used={})",
-        count, gpu_result.elapsed_us as f64 / 1_000_000.0,
-        format_tps(gpu_rate), gpu_result.valid, gpu_result.used_gpu);
+    println!(
+        "    GPU (Metal):  {} sigs in {:.3}s = {} verif/sec  ({} valid, gpu_used={})",
+        count,
+        gpu_result.elapsed_us as f64 / 1_000_000.0,
+        format_tps(gpu_rate),
+        gpu_result.valid,
+        gpu_result.used_gpu
+    );
 
     let speedup = gpu_rate / cpu_rate;
-    println!("    Speedup:      {:.2}x {}", speedup,
-        if speedup > 1.0 { "(GPU faster)" } else { "(CPU faster)" }
+    println!(
+        "    Speedup:      {:.2}x {}",
+        speedup,
+        if speedup > 1.0 {
+            "(GPU faster)"
+        } else {
+            "(CPU faster)"
+        }
     );
-    println!("    All valid:    {}", if cpu_result.valid == count && gpu_result.valid == count { "YES" } else { "MISMATCH" });
+    println!(
+        "    All valid:    {}",
+        if cpu_result.valid == count && gpu_result.valid == count {
+            "YES"
+        } else {
+            "MISMATCH"
+        }
+    );
 
     let stats = verifier.stats();
-    println!("    Stats:        GPU batches={}, CPU batches={}", stats.gpu_batches, stats.cpu_batches);
+    println!(
+        "    Stats:        GPU batches={}, CPU batches={}",
+        stats.gpu_batches, stats.cpu_batches
+    );
 }
 
 fn main() {
@@ -213,7 +249,10 @@ fn main() {
     println!("  Config:");
     println!("    Transactions:   {}", args.txs);
     println!("    Batch size:     {}", args.batch);
-    println!("    Senders:        {} (less = more contention)", args.senders);
+    println!(
+        "    Senders:        {} (less = more contention)",
+        args.senders
+    );
     println!("    CPU cores:      {}", rayon::current_num_threads());
 
     // Pre-sign transactions once
@@ -222,9 +261,11 @@ fn main() {
     let sign_start = Instant::now();
     let (transactions, genesis) = presign_transactions(args.senders, args.txs);
     let sign_elapsed = sign_start.elapsed();
-    println!("done in {:.2}s ({} sigs/sec)",
+    println!(
+        "done in {:.2}s ({} sigs/sec)",
         sign_elapsed.as_secs_f64(),
-        format_tps(args.txs as f64 / sign_elapsed.as_secs_f64()));
+        format_tps(args.txs as f64 / sign_elapsed.as_secs_f64())
+    );
 
     // Define all 6 mode combinations
     struct BenchMode {
@@ -235,12 +276,42 @@ fn main() {
     }
 
     let modes = [
-        BenchMode { name: "CPU verify + Sequential exec",          verify: VerifyMode::Cpu,      exec: ExecutionMode::Sequential, coalesce: false },
-        BenchMode { name: "CPU verify + Block-STM exec",           verify: VerifyMode::Cpu,      exec: ExecutionMode::BlockSTM,   coalesce: false },
-        BenchMode { name: "CPU verify + Block-STM + Coalesce",     verify: VerifyMode::Cpu,      exec: ExecutionMode::BlockSTM,   coalesce: true },
-        BenchMode { name: "GPU verify + Sequential exec",          verify: VerifyMode::GpuMetal, exec: ExecutionMode::Sequential, coalesce: false },
-        BenchMode { name: "GPU verify + Block-STM exec",           verify: VerifyMode::GpuMetal, exec: ExecutionMode::BlockSTM,   coalesce: false },
-        BenchMode { name: "GPU verify + Block-STM + Coalesce",     verify: VerifyMode::GpuMetal, exec: ExecutionMode::BlockSTM,   coalesce: true },
+        BenchMode {
+            name: "CPU verify + Sequential exec",
+            verify: VerifyMode::Cpu,
+            exec: ExecutionMode::Sequential,
+            coalesce: false,
+        },
+        BenchMode {
+            name: "CPU verify + Block-STM exec",
+            verify: VerifyMode::Cpu,
+            exec: ExecutionMode::BlockSTM,
+            coalesce: false,
+        },
+        BenchMode {
+            name: "CPU verify + Block-STM + Coalesce",
+            verify: VerifyMode::Cpu,
+            exec: ExecutionMode::BlockSTM,
+            coalesce: true,
+        },
+        BenchMode {
+            name: "GPU verify + Sequential exec",
+            verify: VerifyMode::GpuMetal,
+            exec: ExecutionMode::Sequential,
+            coalesce: false,
+        },
+        BenchMode {
+            name: "GPU verify + Block-STM exec",
+            verify: VerifyMode::GpuMetal,
+            exec: ExecutionMode::BlockSTM,
+            coalesce: false,
+        },
+        BenchMode {
+            name: "GPU verify + Block-STM + Coalesce",
+            verify: VerifyMode::GpuMetal,
+            exec: ExecutionMode::BlockSTM,
+            coalesce: true,
+        },
     ];
 
     let mut results: Vec<(&str, usize, f64)> = Vec::new();
@@ -284,24 +355,50 @@ fn main() {
     for (name, _success, tps) in &results {
         let speedup = tps / baseline_tps;
         let weighted = tps / 3.93;
-        println!("    {:<42} {:>8}  {:.2}x      {:>8}",
-            name, format_tps(*tps), speedup, format_tps(weighted));
+        println!(
+            "    {:<42} {:>8}  {:.2}x      {:>8}",
+            name,
+            format_tps(*tps),
+            speedup,
+            format_tps(weighted)
+        );
     }
     println!();
 
     let best_tps = results.iter().map(|r| r.2).fold(0.0f64, f64::max);
     let best_weighted = best_tps / 3.93;
-    println!("    Best single-node (raw):       {} TPS", format_tps(best_tps));
-    println!("    Best single-node (weighted):  {} TPS", format_tps(best_weighted));
-    println!("    vs Ethereum (~15 TPS):        {:.0}x faster", best_weighted / 15.0);
+    println!(
+        "    Best single-node (raw):       {} TPS",
+        format_tps(best_tps)
+    );
+    println!(
+        "    Best single-node (weighted):  {} TPS",
+        format_tps(best_weighted)
+    );
+    println!(
+        "    vs Ethereum (~15 TPS):        {:.0}x faster",
+        best_weighted / 15.0
+    );
     println!();
 
     // Projections using best mode
     println!("    MULTI-NODE PROJECTIONS (propose-verify, ETH-weighted):");
-    println!("      10 nodes:   {} TPS", format_tps(best_tps * 10.0 * 0.9 / 3.93));
-    println!("      50 nodes:   {} TPS", format_tps(best_tps * 50.0 * 0.85 / 3.93));
-    println!("      100 nodes:  {} TPS", format_tps(best_tps * 100.0 * 0.8 / 3.93));
-    println!("      500 nodes:  {} TPS", format_tps(best_tps * 500.0 * 0.7 / 3.93));
+    println!(
+        "      10 nodes:   {} TPS",
+        format_tps(best_tps * 10.0 * 0.9 / 3.93)
+    );
+    println!(
+        "      50 nodes:   {} TPS",
+        format_tps(best_tps * 50.0 * 0.85 / 3.93)
+    );
+    println!(
+        "      100 nodes:  {} TPS",
+        format_tps(best_tps * 100.0 * 0.8 / 3.93)
+    );
+    println!(
+        "      500 nodes:  {} TPS",
+        format_tps(best_tps * 500.0 * 0.7 / 3.93)
+    );
 
     println!();
     println!("================================================================");

@@ -159,10 +159,9 @@ mod tests {
 
     #[test]
     fn test_aggregate_fails_wrong_hashes() {
-        let tx_hashes: Vec<Hash256> = (0..100u32)
-            .map(|i| hash_bytes(&i.to_le_bytes()))
-            .collect();
-        let commitments: Vec<PedersenCommitment> = (0..100).map(|i| commit_value(i as u64)).collect();
+        let tx_hashes: Vec<Hash256> = (0..100u32).map(|i| hash_bytes(&i.to_le_bytes())).collect();
+        let commitments: Vec<PedersenCommitment> =
+            (0..100).map(|i| commit_value(i as u64)).collect();
 
         let proof = aggregate_proofs(&tx_hashes, &commitments);
 

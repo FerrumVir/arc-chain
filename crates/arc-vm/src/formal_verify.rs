@@ -112,20 +112,22 @@ impl ModelState {
                     }
                     // Uint comparison.
                     if let StateValue::Uint(v) = val
-                        && let Ok(lit) = literal.parse::<u64>() {
-                            return Some(cmp_fn(*v, lit));
-                        }
+                        && let Ok(lit) = literal.parse::<u64>()
+                    {
+                        return Some(cmp_fn(*v, lit));
+                    }
                     // Int comparison.
                     if let StateValue::Int(v) = val
-                        && let Ok(lit) = literal.parse::<i64>() {
-                            return Some(match op {
-                                ">=" => *v >= lit,
-                                "==" => *v == lit,
-                                ">" => *v > lit,
-                                "<" => *v < lit,
-                                _ => return None,
-                            });
-                        }
+                        && let Ok(lit) = literal.parse::<i64>()
+                    {
+                        return Some(match op {
+                            ">=" => *v >= lit,
+                            "==" => *v == lit,
+                            ">" => *v > lit,
+                            "<" => *v < lit,
+                            _ => return None,
+                        });
+                    }
                 }
             }
         }
@@ -243,7 +245,10 @@ impl ModelChecker {
                     Some(CounterExample {
                         states: vec![state.clone()],
                         transitions: vec![],
-                        description: format!("Invariant '{}' violated: {}", inv.name, inv.expression),
+                        description: format!(
+                            "Invariant '{}' violated: {}",
+                            inv.name, inv.expression
+                        ),
                     })
                 },
             });
@@ -349,11 +354,7 @@ impl ModelChecker {
 
         // Also check all invariants hold in the new state.
         let inv_results = self.check_state(to);
-        results.extend(
-            inv_results
-                .into_iter()
-                .filter(|r| !r.satisfied)
-        );
+        results.extend(inv_results.into_iter().filter(|r| !r.satisfied));
 
         results
     }
@@ -363,16 +364,17 @@ impl ModelChecker {
         // Search invariants.
         for inv in &self.invariants {
             if inv.name == property
-                && let Some(false) = inv.holds {
-                    return Some(CounterExample {
-                        states: vec![],
-                        transitions: vec![],
-                        description: format!(
-                            "Invariant '{}' was violated. Expression: {}",
-                            inv.name, inv.expression
-                        ),
-                    });
-                }
+                && let Some(false) = inv.holds
+            {
+                return Some(CounterExample {
+                    states: vec![],
+                    transitions: vec![],
+                    description: format!(
+                        "Invariant '{}' was violated. Expression: {}",
+                        inv.name, inv.expression
+                    ),
+                });
+            }
         }
 
         // Search safety properties.
@@ -696,10 +698,7 @@ mod tests {
 
     #[test]
     fn test_state_value_array() {
-        let arr = StateValue::Array(vec![
-            StateValue::Uint(1),
-            StateValue::Bool(true),
-        ]);
+        let arr = StateValue::Array(vec![StateValue::Uint(1), StateValue::Bool(true)]);
         if let StateValue::Array(items) = arr {
             assert_eq!(items.len(), 2);
         } else {

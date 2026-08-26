@@ -4,9 +4,9 @@
 //! This catches the massive "identity + localized changes" category
 //! (146/400 near-misses from identity alone).
 
-use crate::{Grid, Color, Object};
 use crate::primitives::{grid, object};
-use std::collections::{HashMap, BTreeSet};
+use crate::{Color, Grid, Object};
+use std::collections::{BTreeSet, HashMap};
 use std::time::Instant;
 
 pub struct DiffResult {
@@ -28,57 +28,61 @@ pub fn diff_synthesize(
 
     // Only operate on same-size pairs for most strategies
     let same_size = train_pairs.iter().all(|(inp, out)| {
-        inp.len() == out.len()
-            && !inp.is_empty()
-            && !out.is_empty()
-            && inp[0].len() == out[0].len()
+        inp.len() == out.len() && !inp.is_empty() && !out.is_empty() && inp[0].len() == out[0].len()
     });
 
     // Strategy 1: Consistent color mapping
-    if same_size
-        && let Some(r) = strategy_color_mapping(train_pairs, test_inputs) {
-            return Some(r);
-        }
-    if elapsed() > timeout_ms { return None; }
+    if same_size && let Some(r) = strategy_color_mapping(train_pairs, test_inputs) {
+        return Some(r);
+    }
+    if elapsed() > timeout_ms {
+        return None;
+    }
 
     // Strategy 2: Positional diff - cells that change share a spatial pattern
-    if same_size
-        && let Some(r) = strategy_positional_diff(train_pairs, test_inputs) {
-            return Some(r);
-        }
-    if elapsed() > timeout_ms { return None; }
+    if same_size && let Some(r) = strategy_positional_diff(train_pairs, test_inputs) {
+        return Some(r);
+    }
+    if elapsed() > timeout_ms {
+        return None;
+    }
 
     // Strategy 3: Object diff - detect what happened to objects
     if let Some(r) = strategy_object_diff(train_pairs, test_inputs) {
         return Some(r);
     }
-    if elapsed() > timeout_ms { return None; }
+    if elapsed() > timeout_ms {
+        return None;
+    }
 
     // Strategy 4: Conditional color replace
-    if same_size
-        && let Some(r) = strategy_conditional_replace(train_pairs, test_inputs) {
-            return Some(r);
-        }
-    if elapsed() > timeout_ms { return None; }
+    if same_size && let Some(r) = strategy_conditional_replace(train_pairs, test_inputs) {
+        return Some(r);
+    }
+    if elapsed() > timeout_ms {
+        return None;
+    }
 
     // Strategy 5: Pattern stamp / copy
     if let Some(r) = strategy_pattern_stamp(train_pairs, test_inputs) {
         return Some(r);
     }
-    if elapsed() > timeout_ms { return None; }
+    if elapsed() > timeout_ms {
+        return None;
+    }
 
     // Strategy 6: Remove or keep specific objects
-    if same_size
-        && let Some(r) = strategy_remove_objects(train_pairs, test_inputs) {
-            return Some(r);
-        }
-    if elapsed() > timeout_ms { return None; }
+    if same_size && let Some(r) = strategy_remove_objects(train_pairs, test_inputs) {
+        return Some(r);
+    }
+    if elapsed() > timeout_ms {
+        return None;
+    }
 
     // Strategy 7: Fill between objects
-    if same_size
-        && let Some(r) = strategy_fill_between(train_pairs, test_inputs) {
-            return Some(r);
-        }
+    if same_size && let Some(r) = strategy_fill_between(train_pairs, test_inputs) {
+        return Some(r);
+    }
 
     None
 }
@@ -136,10 +140,14 @@ fn is_isolated(g: &Grid, r: usize, c: usize) -> bool {
     for (dr, dc) in &neighbors {
         let nr = r as isize + dr;
         let nc = c as isize + dc;
-        if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize
-            && g[nr as usize][nc as usize] == color {
-                return false;
-            }
+        if nr >= 0
+            && nr < h as isize
+            && nc >= 0
+            && nc < w as isize
+            && g[nr as usize][nc as usize] == color
+        {
+            return false;
+        }
     }
     true
 }
@@ -338,11 +346,7 @@ fn strategy_color_mapping(
 
 fn apply_color_map(g: &Grid, map: &HashMap<u8, u8>) -> Grid {
     g.iter()
-        .map(|row| {
-            row.iter()
-                .map(|&c| *map.get(&c).unwrap_or(&c))
-                .collect()
-        })
+        .map(|row| row.iter().map(|&c| *map.get(&c).unwrap_or(&c)).collect())
         .collect()
 }
 
@@ -401,14 +405,22 @@ fn positional_adjacent_fill_any(
     for &trigger_color in &all_colors {
         for &from_color in &all_colors {
             for &to_color in &all_colors {
-                if from_color == to_color { continue; }
-                if from_color == trigger_color { continue; }
+                if from_color == to_color {
+                    continue;
+                }
+                if from_color == trigger_color {
+                    continue;
+                }
 
                 let consistent = train_pairs.iter().all(|(inp, out)| {
                     let h = inp.len();
-                    if h == 0 || inp[0].len() != out.first().map_or(0, |r| r.len()) { return false; }
+                    if h == 0 || inp[0].len() != out.first().map_or(0, |r| r.len()) {
+                        return false;
+                    }
                     let w = inp[0].len();
-                    if inp.len() != out.len() { return false; }
+                    if inp.len() != out.len() {
+                        return false;
+                    }
 
                     // Check: every cell where inp==from_color AND adjacent to trigger_color
                     //   must become to_color in output
@@ -416,43 +428,72 @@ fn positional_adjacent_fill_any(
                     let mut ok = true;
                     for r in 0..h {
                         for c in 0..w {
-                            let is_adj = [(r.wrapping_sub(1),c),(r+1,c),(r,c.wrapping_sub(1)),(r,c+1)]
-                                .iter()
-                                .any(|&(nr,nc)| nr < h && nc < w && inp[nr][nc] == trigger_color);
+                            let is_adj = [
+                                (r.wrapping_sub(1), c),
+                                (r + 1, c),
+                                (r, c.wrapping_sub(1)),
+                                (r, c + 1),
+                            ]
+                            .iter()
+                            .any(|&(nr, nc)| nr < h && nc < w && inp[nr][nc] == trigger_color);
 
                             if inp[r][c] == from_color && is_adj {
-                                if out[r][c] != to_color { ok = false; break; }
+                                if out[r][c] != to_color {
+                                    ok = false;
+                                    break;
+                                }
                             } else {
-                                if inp[r][c] != out[r][c] { ok = false; break; }
+                                if inp[r][c] != out[r][c] {
+                                    ok = false;
+                                    break;
+                                }
                             }
                         }
-                        if !ok { break; }
+                        if !ok {
+                            break;
+                        }
                     }
                     ok
                 });
 
                 if consistent {
-                    let test_outputs: Vec<Grid> = test_inputs.iter().map(|inp| {
-                        let h = inp.len();
-                        if h == 0 { return inp.clone(); }
-                        let w = inp[0].len();
-                        let mut out = inp.clone();
-                        for r in 0..h {
-                            for c in 0..w {
-                                if inp[r][c] == from_color {
-                                    let is_adj = [(r.wrapping_sub(1),c),(r+1,c),(r,c.wrapping_sub(1)),(r,c+1)]
-                                        .iter()
-                                        .any(|&(nr,nc)| nr < h && nc < w && inp[nr][nc] == trigger_color);
-                                    if is_adj { out[r][c] = to_color; }
+                    let test_outputs: Vec<Grid> =
+                        test_inputs
+                            .iter()
+                            .map(|inp| {
+                                let h = inp.len();
+                                if h == 0 {
+                                    return inp.clone();
                                 }
-                            }
-                        }
-                        out
-                    }).collect();
+                                let w = inp[0].len();
+                                let mut out = inp.clone();
+                                for r in 0..h {
+                                    for c in 0..w {
+                                        if inp[r][c] == from_color {
+                                            let is_adj = [
+                                                (r.wrapping_sub(1), c),
+                                                (r + 1, c),
+                                                (r, c.wrapping_sub(1)),
+                                                (r, c + 1),
+                                            ]
+                                            .iter()
+                                            .any(|&(nr, nc)| {
+                                                nr < h && nc < w && inp[nr][nc] == trigger_color
+                                            });
+                                            if is_adj {
+                                                out[r][c] = to_color;
+                                            }
+                                        }
+                                    }
+                                }
+                                out
+                            })
+                            .collect();
 
                     return Some(DiffResult {
                         program_desc: format!(
-                            "adj_fill({}->{},near={})", from_color, to_color, trigger_color
+                            "adj_fill({}->{},near={})",
+                            from_color, to_color, trigger_color
                         ),
                         test_outputs,
                     });
@@ -474,46 +515,65 @@ fn positional_replace_from_color(
 
     for &from_c in &all_colors {
         for &to_c in &all_colors {
-            if from_c == to_c { continue; }
+            if from_c == to_c {
+                continue;
+            }
 
             // Non-border variant: cells of from_c that are NOT on the grid border
             let consistent = train_pairs.iter().all(|(inp, out)| {
                 let h = inp.len();
-                if h == 0 { return false; }
+                if h == 0 {
+                    return false;
+                }
                 let w = inp[0].len();
-                if inp.len() != out.len() { return false; }
+                if inp.len() != out.len() {
+                    return false;
+                }
 
                 let mut ok = true;
                 for r in 0..h {
                     for c in 0..w {
-                        let is_border = r == 0 || r == h-1 || c == 0 || c == w-1;
+                        let is_border = r == 0 || r == h - 1 || c == 0 || c == w - 1;
                         if inp[r][c] == from_c && !is_border {
-                            if out[r][c] != to_c { ok = false; break; }
+                            if out[r][c] != to_c {
+                                ok = false;
+                                break;
+                            }
                         } else {
-                            if inp[r][c] != out[r][c] { ok = false; break; }
+                            if inp[r][c] != out[r][c] {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    if !ok { break; }
+                    if !ok {
+                        break;
+                    }
                 }
                 ok
             });
 
             if consistent {
-                let test_outputs: Vec<Grid> = test_inputs.iter().map(|inp| {
-                    let h = inp.len();
-                    if h == 0 { return inp.clone(); }
-                    let w = inp[0].len();
-                    let mut out = inp.clone();
-                    for r in 0..h {
-                        for c in 0..w {
-                            let is_border = r == 0 || r == h-1 || c == 0 || c == w-1;
-                            if inp[r][c] == from_c && !is_border {
-                                out[r][c] = to_c;
+                let test_outputs: Vec<Grid> = test_inputs
+                    .iter()
+                    .map(|inp| {
+                        let h = inp.len();
+                        if h == 0 {
+                            return inp.clone();
+                        }
+                        let w = inp[0].len();
+                        let mut out = inp.clone();
+                        for r in 0..h {
+                            for c in 0..w {
+                                let is_border = r == 0 || r == h - 1 || c == 0 || c == w - 1;
+                                if inp[r][c] == from_c && !is_border {
+                                    out[r][c] = to_c;
+                                }
                             }
                         }
-                    }
-                    out
-                }).collect();
+                        out
+                    })
+                    .collect();
                 return Some(DiffResult {
                     program_desc: format!("replace_nonborder({}->{}", from_c, to_c),
                     test_outputs,
@@ -523,47 +583,74 @@ fn positional_replace_from_color(
             // Isolated variant: cells of from_c with NO same-color 4-neighbors
             let consistent = train_pairs.iter().all(|(inp, out)| {
                 let h = inp.len();
-                if h == 0 { return false; }
+                if h == 0 {
+                    return false;
+                }
                 let w = inp[0].len();
-                if inp.len() != out.len() { return false; }
+                if inp.len() != out.len() {
+                    return false;
+                }
 
                 let mut ok = true;
                 for r in 0..h {
                     for c in 0..w {
-                        let has_same_neighbor = [(r.wrapping_sub(1),c),(r+1,c),(r,c.wrapping_sub(1)),(r,c+1)]
-                            .iter()
-                            .any(|&(nr,nc)| nr < h && nc < w && inp[nr][nc] == from_c);
+                        let has_same_neighbor = [
+                            (r.wrapping_sub(1), c),
+                            (r + 1, c),
+                            (r, c.wrapping_sub(1)),
+                            (r, c + 1),
+                        ]
+                        .iter()
+                        .any(|&(nr, nc)| nr < h && nc < w && inp[nr][nc] == from_c);
 
                         if inp[r][c] == from_c && !has_same_neighbor {
                             // Isolated cell of from_c → should become to_c
-                            if out[r][c] != to_c { ok = false; break; }
+                            if out[r][c] != to_c {
+                                ok = false;
+                                break;
+                            }
                         } else {
-                            if inp[r][c] != out[r][c] { ok = false; break; }
+                            if inp[r][c] != out[r][c] {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    if !ok { break; }
+                    if !ok {
+                        break;
+                    }
                 }
                 ok
             });
 
             if consistent {
-                let test_outputs: Vec<Grid> = test_inputs.iter().map(|inp| {
-                    let h = inp.len();
-                    if h == 0 { return inp.clone(); }
-                    let w = inp[0].len();
-                    let mut out = inp.clone();
-                    for r in 0..h {
-                        for c in 0..w {
-                            let has_same_neighbor = [(r.wrapping_sub(1),c),(r+1,c),(r,c.wrapping_sub(1)),(r,c+1)]
+                let test_outputs: Vec<Grid> = test_inputs
+                    .iter()
+                    .map(|inp| {
+                        let h = inp.len();
+                        if h == 0 {
+                            return inp.clone();
+                        }
+                        let w = inp[0].len();
+                        let mut out = inp.clone();
+                        for r in 0..h {
+                            for c in 0..w {
+                                let has_same_neighbor = [
+                                    (r.wrapping_sub(1), c),
+                                    (r + 1, c),
+                                    (r, c.wrapping_sub(1)),
+                                    (r, c + 1),
+                                ]
                                 .iter()
-                                .any(|&(nr,nc)| nr < h && nc < w && inp[nr][nc] == from_c);
-                            if inp[r][c] == from_c && !has_same_neighbor {
-                                out[r][c] = to_c;
+                                .any(|&(nr, nc)| nr < h && nc < w && inp[nr][nc] == from_c);
+                                if inp[r][c] == from_c && !has_same_neighbor {
+                                    out[r][c] = to_c;
+                                }
                             }
                         }
-                    }
-                    out
-                }).collect();
+                        out
+                    })
+                    .collect();
                 return Some(DiffResult {
                     program_desc: format!("replace_isolated({}->{}", from_c, to_c),
                     test_outputs,
@@ -592,56 +679,85 @@ fn positional_intersection_fill(
 
                 let consistent = train_pairs.iter().all(|(inp, out)| {
                     let (h, w) = grid_dims(inp);
-                    if h == 0 || inp.len() != out.len() { return false; }
+                    if h == 0 || inp.len() != out.len() {
+                        return false;
+                    }
                     let bg = grid::mostcolor(inp);
-                    if fill_color == bg { return false; }
+                    if fill_color == bg {
+                        return false;
+                    }
 
                     let mut rows_with = BTreeSet::new();
                     let mut cols_with = BTreeSet::new();
                     for (r, row) in inp.iter().enumerate() {
                         for (c, &cell) in row.iter().enumerate() {
-                            if cell == row_marker { rows_with.insert(r); }
-                            if cell == col_marker { cols_with.insert(c); }
+                            if cell == row_marker {
+                                rows_with.insert(r);
+                            }
+                            if cell == col_marker {
+                                cols_with.insert(c);
+                            }
                         }
                     }
-                    if rows_with.is_empty() || cols_with.is_empty() { return false; }
+                    if rows_with.is_empty() || cols_with.is_empty() {
+                        return false;
+                    }
 
                     let mut ok = true;
                     for r in 0..h {
                         for c in 0..w {
-                            let is_intersect = rows_with.contains(&r) && cols_with.contains(&c) && inp[r][c] == bg;
+                            let is_intersect =
+                                rows_with.contains(&r) && cols_with.contains(&c) && inp[r][c] == bg;
                             if is_intersect {
-                                if out[r][c] != fill_color { ok = false; break; }
+                                if out[r][c] != fill_color {
+                                    ok = false;
+                                    break;
+                                }
                             } else {
-                                if inp[r][c] != out[r][c] { ok = false; break; }
+                                if inp[r][c] != out[r][c] {
+                                    ok = false;
+                                    break;
+                                }
                             }
                         }
-                        if !ok { break; }
+                        if !ok {
+                            break;
+                        }
                     }
                     ok
                 });
 
                 if consistent {
-                    let test_outputs: Vec<Grid> = test_inputs.iter().map(|inp| {
-                        let bg = grid::mostcolor(inp);
-                        let mut rows_with = BTreeSet::new();
-                        let mut cols_with = BTreeSet::new();
-                        for (r, row) in inp.iter().enumerate() {
-                            for (c, &cell) in row.iter().enumerate() {
-                                if cell == row_marker { rows_with.insert(r); }
-                                if cell == col_marker { cols_with.insert(c); }
-                            }
-                        }
-                        let mut out = inp.clone();
-                        for (r, row) in out.iter_mut().enumerate() {
-                            for (c, cell) in row.iter_mut().enumerate() {
-                                if rows_with.contains(&r) && cols_with.contains(&c) && *cell == bg {
-                                    *cell = fill_color;
+                    let test_outputs: Vec<Grid> = test_inputs
+                        .iter()
+                        .map(|inp| {
+                            let bg = grid::mostcolor(inp);
+                            let mut rows_with = BTreeSet::new();
+                            let mut cols_with = BTreeSet::new();
+                            for (r, row) in inp.iter().enumerate() {
+                                for (c, &cell) in row.iter().enumerate() {
+                                    if cell == row_marker {
+                                        rows_with.insert(r);
+                                    }
+                                    if cell == col_marker {
+                                        cols_with.insert(c);
+                                    }
                                 }
                             }
-                        }
-                        out
-                    }).collect();
+                            let mut out = inp.clone();
+                            for (r, row) in out.iter_mut().enumerate() {
+                                for (c, cell) in row.iter_mut().enumerate() {
+                                    if rows_with.contains(&r)
+                                        && cols_with.contains(&c)
+                                        && *cell == bg
+                                    {
+                                        *cell = fill_color;
+                                    }
+                                }
+                            }
+                            out
+                        })
+                        .collect();
 
                     return Some(DiffResult {
                         program_desc: format!(
@@ -668,37 +784,54 @@ fn positional_enclosed_flexible(
     for &fill_color in &all_colors {
         let consistent = train_pairs.iter().all(|(inp, out)| {
             let (h, w) = grid_dims(inp);
-            if h == 0 || inp.len() != out.len() { return false; }
+            if h == 0 || inp.len() != out.len() {
+                return false;
+            }
             let bg = grid::mostcolor(inp);
-            if fill_color == bg { return false; }
+            if fill_color == bg {
+                return false;
+            }
 
             let enclosed = find_enclosed_bg(inp, bg);
-            if enclosed.is_empty() { return false; }
+            if enclosed.is_empty() {
+                return false;
+            }
 
             let mut ok = true;
             for r in 0..h {
                 for c in 0..w {
                     if enclosed.contains(&(r, c)) {
-                        if out[r][c] != fill_color { ok = false; break; }
+                        if out[r][c] != fill_color {
+                            ok = false;
+                            break;
+                        }
                     } else {
-                        if inp[r][c] != out[r][c] { ok = false; break; }
+                        if inp[r][c] != out[r][c] {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
-                if !ok { break; }
+                if !ok {
+                    break;
+                }
             }
             ok
         });
 
         if consistent {
-            let test_outputs: Vec<Grid> = test_inputs.iter().map(|inp| {
-                let bg = grid::mostcolor(inp);
-                let enclosed = find_enclosed_bg(inp, bg);
-                let mut out = inp.clone();
-                for (r, c) in enclosed {
-                    out[r][c] = fill_color;
-                }
-                out
-            }).collect();
+            let test_outputs: Vec<Grid> = test_inputs
+                .iter()
+                .map(|inp| {
+                    let bg = grid::mostcolor(inp);
+                    let enclosed = find_enclosed_bg(inp, bg);
+                    let mut out = inp.clone();
+                    for (r, c) in enclosed {
+                        out[r][c] = fill_color;
+                    }
+                    out
+                })
+                .collect();
 
             return Some(DiffResult {
                 program_desc: format!("enclosed_flexible_fill(fill={})", fill_color),
@@ -762,11 +895,15 @@ fn positional_enclosed_recolor(
 
     for &from_c in &all_colors {
         for &to_c in &all_colors {
-            if from_c == to_c { continue; }
+            if from_c == to_c {
+                continue;
+            }
 
             let consistent = train_pairs.iter().all(|(inp, out)| {
                 let (h, w) = grid_dims(inp);
-                if h == 0 || inp.len() != out.len() { return false; }
+                if h == 0 || inp.len() != out.len() {
+                    return false;
+                }
                 let bg = grid::mostcolor(inp);
 
                 // Enclosed bg cells define the interior region.
@@ -777,7 +914,9 @@ fn positional_enclosed_recolor(
                 // Actually, simplest correct approach: a cell of from_c is "enclosed"
                 // if BFS from border through bg cannot reach it.
                 let enclosed_bg = find_enclosed_bg(inp, bg);
-                if enclosed_bg.is_empty() { return false; }
+                if enclosed_bg.is_empty() {
+                    return false;
+                }
 
                 // A cell of from_c is enclosed if ALL its 4-neighbors are either
                 // enclosed-bg, non-bg (barrier), or another enclosed from_c cell.
@@ -815,56 +954,69 @@ fn positional_enclosed_recolor(
                     for c in 0..w {
                         if inp[r][c] == from_c && !reachable[r][c] {
                             any_enclosed = true;
-                            if out[r][c] != to_c { ok = false; break; }
+                            if out[r][c] != to_c {
+                                ok = false;
+                                break;
+                            }
                         } else {
-                            if inp[r][c] != out[r][c] { ok = false; break; }
+                            if inp[r][c] != out[r][c] {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    if !ok { break; }
+                    if !ok {
+                        break;
+                    }
                 }
                 ok && any_enclosed
             });
 
             if consistent {
-                let test_outputs: Vec<Grid> = test_inputs.iter().map(|inp| {
-                    let (h, w) = grid_dims(inp);
-                    let bg = grid::mostcolor(inp);
-                    let mut reachable = vec![vec![false; w]; h];
-                    let mut queue = std::collections::VecDeque::new();
-                    for r in 0..h {
-                        for c in 0..w {
-                            if (r == 0 || r == h - 1 || c == 0 || c == w - 1)
-                                && (inp[r][c] == bg || inp[r][c] == from_c)
-                            {
-                                reachable[r][c] = true;
-                                queue.push_back((r, c));
-                            }
-                        }
-                    }
-                    while let Some((r, c)) = queue.pop_front() {
-                        let neighbors: [(isize, isize); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
-                        for (dr, dc) in &neighbors {
-                            let nr = r as isize + dr;
-                            let nc = c as isize + dc;
-                            if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
-                                let (nr, nc) = (nr as usize, nc as usize);
-                                if !reachable[nr][nc] && (inp[nr][nc] == bg || inp[nr][nc] == from_c) {
-                                    reachable[nr][nc] = true;
-                                    queue.push_back((nr, nc));
+                let test_outputs: Vec<Grid> = test_inputs
+                    .iter()
+                    .map(|inp| {
+                        let (h, w) = grid_dims(inp);
+                        let bg = grid::mostcolor(inp);
+                        let mut reachable = vec![vec![false; w]; h];
+                        let mut queue = std::collections::VecDeque::new();
+                        for r in 0..h {
+                            for c in 0..w {
+                                if (r == 0 || r == h - 1 || c == 0 || c == w - 1)
+                                    && (inp[r][c] == bg || inp[r][c] == from_c)
+                                {
+                                    reachable[r][c] = true;
+                                    queue.push_back((r, c));
                                 }
                             }
                         }
-                    }
-                    let mut out = inp.clone();
-                    for r in 0..h {
-                        for c in 0..w {
-                            if inp[r][c] == from_c && !reachable[r][c] {
-                                out[r][c] = to_c;
+                        while let Some((r, c)) = queue.pop_front() {
+                            let neighbors: [(isize, isize); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
+                            for (dr, dc) in &neighbors {
+                                let nr = r as isize + dr;
+                                let nc = c as isize + dc;
+                                if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize {
+                                    let (nr, nc) = (nr as usize, nc as usize);
+                                    if !reachable[nr][nc]
+                                        && (inp[nr][nc] == bg || inp[nr][nc] == from_c)
+                                    {
+                                        reachable[nr][nc] = true;
+                                        queue.push_back((nr, nc));
+                                    }
+                                }
                             }
                         }
-                    }
-                    out
-                }).collect();
+                        let mut out = inp.clone();
+                        for r in 0..h {
+                            for c in 0..w {
+                                if inp[r][c] == from_c && !reachable[r][c] {
+                                    out[r][c] = to_c;
+                                }
+                            }
+                        }
+                        out
+                    })
+                    .collect();
 
                 return Some(DiffResult {
                     program_desc: format!("enclosed_recolor({}->{}", from_c, to_c),
@@ -885,13 +1037,19 @@ fn positional_diagonal_fill(
 
     for &trigger_color in &all_colors {
         for &fill_color in &all_colors {
-            if trigger_color == fill_color { continue; }
+            if trigger_color == fill_color {
+                continue;
+            }
 
             let consistent = train_pairs.iter().all(|(inp, out)| {
                 let (h, w) = grid_dims(inp);
-                if h == 0 || inp.len() != out.len() { return false; }
+                if h == 0 || inp.len() != out.len() {
+                    return false;
+                }
                 let bg = grid::mostcolor(inp);
-                if fill_color == bg { return false; }
+                if fill_color == bg {
+                    return false;
+                }
 
                 let adj8 = adjacent_8_to_color(inp, trigger_color);
 
@@ -899,28 +1057,39 @@ fn positional_diagonal_fill(
                 for r in 0..h {
                     for c in 0..w {
                         if adj8.contains(&(r, c)) && inp[r][c] == bg {
-                            if out[r][c] != fill_color { ok = false; break; }
+                            if out[r][c] != fill_color {
+                                ok = false;
+                                break;
+                            }
                         } else {
-                            if inp[r][c] != out[r][c] { ok = false; break; }
+                            if inp[r][c] != out[r][c] {
+                                ok = false;
+                                break;
+                            }
                         }
                     }
-                    if !ok { break; }
+                    if !ok {
+                        break;
+                    }
                 }
                 ok
             });
 
             if consistent {
-                let test_outputs: Vec<Grid> = test_inputs.iter().map(|inp| {
-                    let bg = grid::mostcolor(inp);
-                    let adj8 = adjacent_8_to_color(inp, trigger_color);
-                    let mut out = inp.clone();
-                    for (r, c) in adj8 {
-                        if out[r][c] == bg {
-                            out[r][c] = fill_color;
+                let test_outputs: Vec<Grid> = test_inputs
+                    .iter()
+                    .map(|inp| {
+                        let bg = grid::mostcolor(inp);
+                        let adj8 = adjacent_8_to_color(inp, trigger_color);
+                        let mut out = inp.clone();
+                        for (r, c) in adj8 {
+                            if out[r][c] == bg {
+                                out[r][c] = fill_color;
+                            }
                         }
-                    }
-                    out
-                }).collect();
+                        out
+                    })
+                    .collect();
 
                 return Some(DiffResult {
                     program_desc: format!(
@@ -945,9 +1114,14 @@ fn adjacent_8_to_color(g: &Grid, color: Color) -> BTreeSet<(usize, usize)> {
                 continue;
             }
             let neighbors: [(isize, isize); 8] = [
-                (-1, -1), (-1, 0), (-1, 1),
-                (0, -1),           (0, 1),
-                (1, -1),  (1, 0),  (1, 1),
+                (-1, -1),
+                (-1, 0),
+                (-1, 1),
+                (0, -1),
+                (0, 1),
+                (1, -1),
+                (1, 0),
+                (1, 1),
             ];
             for (dr, dc) in &neighbors {
                 let nr = r as isize + dr;
@@ -995,8 +1169,7 @@ fn positional_adjacent_fill(
                         .filter(|&&(r, c)| inp[r][c] == bg)
                         .cloned()
                         .collect();
-                    let changed: BTreeSet<_> =
-                        diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
+                    let changed: BTreeSet<_> = diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
                     expected == changed
                 }
             });
@@ -1052,8 +1225,7 @@ fn positional_enclosed_fill(
                 if enclosed.is_empty() {
                     return false;
                 }
-                let changed: BTreeSet<_> =
-                    diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
+                let changed: BTreeSet<_> = diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
                 // All changed cells enclosed, all changed to fill_color
                 diffs.iter().all(|&(_, _, _, to)| to == fill_color)
                     && changed.is_subset(&enclosed)
@@ -1061,7 +1233,9 @@ fn positional_enclosed_fill(
                         // All enclosed cells that weren't boundary must have changed
                         let expected: BTreeSet<_> = enclosed
                             .iter()
-                            .filter(|&&(r, c)| inp[r][c] != boundary_color && inp[r][c] != fill_color)
+                            .filter(|&&(r, c)| {
+                                inp[r][c] != boundary_color && inp[r][c] != fill_color
+                            })
                             .cloned()
                             .collect();
                         expected == changed
@@ -1097,10 +1271,7 @@ fn positional_enclosed_fill(
 }
 
 /// 2c: Changed cells are in same row/col as a specific color.
-fn positional_line_fill(
-    train_pairs: &[(Grid, Grid)],
-    test_inputs: &[Grid],
-) -> Option<DiffResult> {
+fn positional_line_fill(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     let all_colors = collect_all_colors(train_pairs);
 
     for &trigger_color in &all_colors {
@@ -1116,9 +1287,10 @@ fn positional_line_fill(
                 }
                 let line_cells = line_from_color(inp, trigger_color);
                 let bg = grid::mostcolor(inp);
-                let changed: BTreeSet<_> =
-                    diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
-                diffs.iter().all(|&(_, _, from, to)| from == bg && to == fill_color)
+                let changed: BTreeSet<_> = diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
+                diffs
+                    .iter()
+                    .all(|&(_, _, from, to)| from == bg && to == fill_color)
                     && {
                         let expected: BTreeSet<_> = line_cells
                             .iter()
@@ -1170,19 +1342,19 @@ fn positional_noise_removal(
             return false;
         }
         let bg = grid::mostcolor(inp);
-        diffs.iter().all(|&(r, c, _from, to)| {
-            to == bg && is_isolated(inp, r, c)
-        }) && {
-            // Verify all isolated non-bg cells were removed
-            let (h, w) = grid_dims(inp);
-            let changed: BTreeSet<_> =
-                diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
-            let expected: BTreeSet<_> = (0..h)
-                .flat_map(|r| (0..w).map(move |c| (r, c)))
-                .filter(|&(r, c)| inp[r][c] != bg && is_isolated(inp, r, c))
-                .collect();
-            expected == changed
-        }
+        diffs
+            .iter()
+            .all(|&(r, c, _from, to)| to == bg && is_isolated(inp, r, c))
+            && {
+                // Verify all isolated non-bg cells were removed
+                let (h, w) = grid_dims(inp);
+                let changed: BTreeSet<_> = diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
+                let expected: BTreeSet<_> = (0..h)
+                    .flat_map(|r| (0..w).map(move |c| (r, c)))
+                    .filter(|&(r, c)| inp[r][c] != bg && is_isolated(inp, r, c))
+                    .collect();
+                expected == changed
+            }
     });
 
     if !consistent {
@@ -1212,10 +1384,7 @@ fn positional_noise_removal(
 }
 
 /// 2e: Gap fill - fill between two same-color cells.
-fn positional_gap_fill(
-    train_pairs: &[(Grid, Grid)],
-    test_inputs: &[Grid],
-) -> Option<DiffResult> {
+fn positional_gap_fill(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     let all_colors = collect_all_colors(train_pairs);
 
     for &gap_color in &all_colors {
@@ -1228,8 +1397,7 @@ fn positional_gap_fill(
             if gaps.is_empty() {
                 return false;
             }
-            let changed: BTreeSet<_> =
-                diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
+            let changed: BTreeSet<_> = diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
             diffs.iter().all(|&(_, _, _, to)| to == gap_color) && changed == gaps
         });
 
@@ -1259,10 +1427,7 @@ fn positional_gap_fill(
 // Strategy 3: Object diff
 // ============================================================
 
-fn strategy_object_diff(
-    train_pairs: &[(Grid, Grid)],
-    test_inputs: &[Grid],
-) -> Option<DiffResult> {
+fn strategy_object_diff(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     // Try object recoloring
     if let Some(r) = object_recolor(train_pairs, test_inputs) {
         return Some(r);
@@ -1275,10 +1440,7 @@ fn strategy_object_diff(
 }
 
 /// Detect consistent object recoloring across training pairs.
-fn object_recolor(
-    train_pairs: &[(Grid, Grid)],
-    test_inputs: &[Grid],
-) -> Option<DiffResult> {
+fn object_recolor(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     // For each pair, extract objects and see if some are recolored
     let mut recolor_map: Option<HashMap<u8, u8>> = None;
 
@@ -1328,9 +1490,10 @@ fn object_recolor(
                 // Must be consistent across pairs
                 for (k, v) in &pair_map {
                     if let Some(&ev) = existing.get(k)
-                        && ev != *v {
-                            return None;
-                        }
+                        && ev != *v
+                    {
+                        return None;
+                    }
                 }
                 let mut merged = existing.clone();
                 merged.extend(pair_map);
@@ -1364,16 +1527,10 @@ fn object_recolor(
 }
 
 /// Detect consistent object movement across training pairs.
-fn object_move(
-    train_pairs: &[(Grid, Grid)],
-    test_inputs: &[Grid],
-) -> Option<DiffResult> {
+fn object_move(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     // Check if the same-size grids have objects that moved consistently
     let same_size = train_pairs.iter().all(|(inp, out)| {
-        inp.len() == out.len()
-            && !inp.is_empty()
-            && !out.is_empty()
-            && inp[0].len() == out[0].len()
+        inp.len() == out.len() && !inp.is_empty() && !out.is_empty() && inp[0].len() == out[0].len()
     });
     if !same_size {
         return None;
@@ -1525,9 +1682,7 @@ fn strategy_conditional_replace(
                             let mut out = inp.clone();
                             for (r, row) in out.iter_mut().enumerate() {
                                 for (c, cell) in row.iter_mut().enumerate() {
-                                    if *cell == from_color
-                                        && has_neighbor(inp, r, c, adj_color)
-                                    {
+                                    if *cell == from_color && has_neighbor(inp, r, c, adj_color) {
                                         *cell = to_color;
                                     }
                                 }
@@ -1560,9 +1715,7 @@ fn strategy_conditional_replace(
                 let mut expected = BTreeSet::new();
                 for (r, row) in inp.iter().enumerate() {
                     for (c, &cell) in row.iter().enumerate() {
-                        if cell == from_color
-                            && (r == 0 || r == h - 1 || c == 0 || c == w - 1)
-                        {
+                        if cell == from_color && (r == 0 || r == h - 1 || c == 0 || c == w - 1) {
                             expected.insert((r, c));
                         }
                     }
@@ -1572,7 +1725,9 @@ fn strategy_conditional_replace(
                 }
                 let diffs = compute_diff(inp, out);
                 let actual: BTreeSet<_> = diffs.iter().map(|&(r, c, _, _)| (r, c)).collect();
-                diffs.iter().all(|&(_, _, f, t)| f == from_color && t == to_color)
+                diffs
+                    .iter()
+                    .all(|&(_, _, f, t)| f == from_color && t == to_color)
                     && expected == actual
             });
 
@@ -1615,10 +1770,14 @@ fn has_neighbor(g: &Grid, r: usize, c: usize, color: Color) -> bool {
     for (dr, dc) in &neighbors {
         let nr = r as isize + dr;
         let nc = c as isize + dc;
-        if nr >= 0 && nr < h as isize && nc >= 0 && nc < w as isize
-            && g[nr as usize][nc as usize] == color {
-                return true;
-            }
+        if nr >= 0
+            && nr < h as isize
+            && nc >= 0
+            && nc < w as isize
+            && g[nr as usize][nc as usize] == color
+        {
+            return true;
+        }
     }
     false
 }
@@ -1643,10 +1802,7 @@ fn strategy_pattern_stamp(
 }
 
 /// Extract: the output is the bounding box of the non-background region.
-fn pattern_extract(
-    train_pairs: &[(Grid, Grid)],
-    test_inputs: &[Grid],
-) -> Option<DiffResult> {
+fn pattern_extract(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     let consistent = train_pairs.iter().all(|(inp, out)| {
         let bg = grid::mostcolor(inp);
         let (h, w) = grid_dims(inp);
@@ -1709,10 +1865,7 @@ fn pattern_extract(
 }
 
 /// Tile: the output is the input repeated/tiled.
-fn pattern_tile(
-    train_pairs: &[(Grid, Grid)],
-    test_inputs: &[Grid],
-) -> Option<DiffResult> {
+fn pattern_tile(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     // Check if output dimensions are exact multiples of input dimensions
     let mut tile_r: Option<usize> = None;
     let mut tile_c: Option<usize> = None;
@@ -1879,10 +2032,7 @@ fn remove_by_criterion(
 // Strategy 7: Fill between objects
 // ============================================================
 
-fn strategy_fill_between(
-    train_pairs: &[(Grid, Grid)],
-    test_inputs: &[Grid],
-) -> Option<DiffResult> {
+fn strategy_fill_between(train_pairs: &[(Grid, Grid)], test_inputs: &[Grid]) -> Option<DiffResult> {
     let all_colors = collect_all_colors(train_pairs);
 
     // For each color, try filling between same-color objects

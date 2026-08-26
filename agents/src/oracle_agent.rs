@@ -18,13 +18,11 @@
 //! └───────────────┘                         └──────────────┘
 //! ```
 
-use arc_crypto::{hash_bytes, Hash256};
 use arc_crypto::signature::Signature;
-use arc_types::transaction::{
-    InferenceAttestationBody, RegisterBody, Transaction, TxBody, TxType,
-};
+use arc_crypto::{Hash256, hash_bytes};
+use arc_types::transaction::{InferenceAttestationBody, RegisterBody, Transaction, TxBody, TxType};
 use arc_vm::agent::{
-    Agent, AgentAction, AgentConfig, AgentId, AgentRegistry, AgentState, ActionResult, ActionType,
+    ActionResult, ActionType, Agent, AgentAction, AgentConfig, AgentId, AgentRegistry, AgentState,
 };
 use arc_vm::precompiles::{OracleRegistry, PriceFeed};
 
@@ -37,11 +35,11 @@ const AGENT_NAME: &str = "price-oracle-v1";
 /// Simulated token addresses for price feeds.
 fn token_addresses() -> Vec<([u8; 32], &'static str, u128)> {
     vec![
-        (hash_bytes(b"ARC").0,  "ARC",  2_500_000_000_000_000_000),    // $2.50
-        (hash_bytes(b"ETH").0,  "ETH",  3_200_000_000_000_000_000_000), // $3,200
-        (hash_bytes(b"BTC").0,  "BTC",  67_500_000_000_000_000_000_000), // $67,500
-        (hash_bytes(b"USDC").0, "USDC", 1_000_000_000_000_000_000),    // $1.00
-        (hash_bytes(b"SOL").0,  "SOL",  145_000_000_000_000_000_000),  // $145
+        (hash_bytes(b"ARC").0, "ARC", 2_500_000_000_000_000_000), // $2.50
+        (hash_bytes(b"ETH").0, "ETH", 3_200_000_000_000_000_000_000), // $3,200
+        (hash_bytes(b"BTC").0, "BTC", 67_500_000_000_000_000_000_000), // $67,500
+        (hash_bytes(b"USDC").0, "USDC", 1_000_000_000_000_000_000), // $1.00
+        (hash_bytes(b"SOL").0, "SOL", 145_000_000_000_000_000_000), // $145
     ]
 }
 
@@ -62,7 +60,8 @@ fn build_register_tx(owner: Hash256, nonce: u64) -> Transaction {
             "update_interval_blocks": 10,
             "tier": 2,
             "attestation_bond": 1000
-        })).unwrap_or_default(),
+        }))
+        .unwrap_or_default(),
     });
 
     let hash = hash_bytes(&serde_json::to_vec(&body).unwrap_or_default());
@@ -158,7 +157,9 @@ fn main() {
     };
 
     registry.register(agent).expect("agent registration failed");
-    registry.update_state(&agent_id, AgentState::Active).expect("activation failed");
+    registry
+        .update_state(&agent_id, AgentState::Active)
+        .expect("activation failed");
     println!("      Agent registered and activated: {:?}", agent_id);
 
     // 2. Initialize oracle registry with price feeds.
@@ -175,10 +176,16 @@ fn main() {
             source: format!("{}-oracle-agent", symbol),
         };
         oracle.update_price(feed);
-        println!("      Initialized {}/USD feed: ${:.2}",
-            symbol, *base_price as f64 / 1e18);
+        println!(
+            "      Initialized {}/USD feed: ${:.2}",
+            symbol,
+            *base_price as f64 / 1e18
+        );
     }
-    println!("      Oracle registry: {} feeds active", oracle.price_count());
+    println!(
+        "      Oracle registry: {} feeds active",
+        oracle.price_count()
+    );
 
     // 3. Simulate price update rounds.
     println!("[3/4] Simulating price update rounds\n");
@@ -213,7 +220,8 @@ fn main() {
                 round * tokens.len() as u64,
             );
 
-            println!("    {}/USD: ${:.2} (attestation: {})",
+            println!(
+                "    {}/USD: ${:.2} (attestation: {})",
                 symbol,
                 new_price as f64 / 1e18,
                 &hex::encode(attestation_tx.hash.0)[..16],
@@ -229,7 +237,9 @@ fn main() {
                 timestamp: round,
                 result: ActionResult::Success(new_price.to_le_bytes().to_vec()),
             };
-            registry.execute_action(&agent_id, action).expect("action execution failed");
+            registry
+                .execute_action(&agent_id, action)
+                .expect("action execution failed");
         }
 
         // Verify prices are readable from oracle.
@@ -255,7 +265,8 @@ fn main() {
     println!("\n  Latest prices:");
     for (token_addr, symbol, _) in &tokens {
         let feed = oracle.get_price(token_addr).unwrap();
-        println!("    {}/USD: ${:.2} (round {}, source: {})",
+        println!(
+            "    {}/USD: ${:.2} (round {}, source: {})",
             symbol,
             feed.price_usd as f64 / 1e18,
             feed.round_id,

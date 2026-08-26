@@ -44,7 +44,7 @@
 
 use arc_crypto::hash::Hash256;
 use arc_crypto::signature::{KeyPair, SignatureError};
-use arc_crypto::vrf::{vrf_prove, vrf_verify, VrfProof as CryptoVrfProof};
+use arc_crypto::vrf::{VrfProof as CryptoVrfProof, vrf_prove, vrf_verify};
 use serde::{Deserialize, Serialize};
 
 // ── Constants ────────────────────────────────────────────────────────────────

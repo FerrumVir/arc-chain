@@ -32,15 +32,15 @@
 //! Usage:
 //!     cargo run --release --example live_milestones_cde -p arc-node -- [coord_url]
 
-use arc_crypto::{hash_bytes, Hash256, Signature};
+use arc_crypto::{Hash256, Signature, hash_bytes};
 use arc_types::transaction::{
-    AssignmentEntry, CapacityAdvertisementBody, ModelRegistrationBody, ModelRequestBody,
-    ShardAssignmentProposalBody, ShardCoverageClaimBody, TxBody, MIN_MODEL_REGISTRATION_FEE,
+    AssignmentEntry, CapacityAdvertisementBody, MIN_MODEL_REGISTRATION_FEE, ModelRegistrationBody,
+    ModelRequestBody, ShardAssignmentProposalBody, ShardCoverageClaimBody, TxBody,
 };
 use arc_types::{Transaction, TxType};
 use ed25519_dalek::{Signer, SigningKey};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::time::Duration;
 
 const DOMAIN_TAG: &str = "ARC-chain-validator-keypair-v1";
@@ -162,13 +162,11 @@ async fn wait_committed(c: &Client, coord: &str, hash_hex: &str) -> bool {
     // before giving up - generous but well below the operator's patience.
     for _ in 0..480 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Ok(r) = c
-            .get(format!("{}/tx/0x{}", coord, hash_hex))
-            .send()
-            .await
-            && r.status().is_success() {
-                return true;
-            }
+        if let Ok(r) = c.get(format!("{}/tx/0x{}", coord, hash_hex)).send().await
+            && r.status().is_success()
+        {
+            return true;
+        }
     }
     false
 }
@@ -295,10 +293,7 @@ async fn main() {
     );
     let registry = fetch_json(&c, &format!("{}/models/registry", coord)).await;
     let registry_count = registry.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-    println!(
-        "registry visible? count={} (expect ≥ 1)",
-        registry_count
-    );
+    println!("registry visible? count={} (expect ≥ 1)", registry_count);
 
     // Step 3: ModelRequest from querier.
     println!();
@@ -393,10 +388,7 @@ async fn main() {
     }
     let caps = fetch_json(&c, &format!("{}/capacity/advertisements", coord)).await;
     let cap_count = caps.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
-    println!(
-        "advertisements visible? count={} (expect ≥ 3)",
-        cap_count
-    );
+    println!("advertisements visible? count={} (expect ≥ 3)", cap_count);
 
     // Step 6: ShardAssignmentProposal mirroring the 3 claims (Milestone D).
     println!();
@@ -446,10 +438,7 @@ async fn main() {
     let mut all_assigned = true;
     for (name, _, pk, _) in &workers {
         let pk_hex = hex::encode(pk);
-        let url = format!(
-            "{}/assignments/for_me?pubkey=0x{}",
-            coord, pk_hex
-        );
+        let url = format!("{}/assignments/for_me?pubkey=0x{}", coord, pk_hex);
         let resp = fetch_json(&c, &url).await;
         let count = resp.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
         println!("  {} assignments visible: count={}", name, count);

@@ -46,13 +46,20 @@ fn main() {
     let f32_input: Vec<f32> = vec![1.2, -0.8, 0.5, 2.1, -1.0, 0.7, 1.5, -0.3];
 
     // Ground truth
-    let truth: f32 = f32_weights.iter().zip(f32_input.iter()).map(|(w, x)| w * x).sum();
+    let truth: f32 = f32_weights
+        .iter()
+        .zip(f32_input.iter())
+        .map(|(w, x)| w * x)
+        .sum();
     println!("Ground truth dot: {:.6}", truth);
     println!("Expected Q16:    {}", (truth * ONE as f32).round() as i64);
     println!();
 
     // Q16 input (i64)
-    let input_q16: Vec<i64> = f32_input.iter().map(|&x| (x * ONE as f32).round() as i64).collect();
+    let input_q16: Vec<i64> = f32_input
+        .iter()
+        .map(|&x| (x * ONE as f32).round() as i64)
+        .collect();
     println!("Input Q16: {:?}", input_q16);
     println!();
 
@@ -62,7 +69,11 @@ fn main() {
     println!("  data   = {:?}", w_a.data);
     println!("  scales = {:?}", w_a.scales);
     let out_a = matmul_i16_scalar(&w_a, &input_q16);
-    println!("  output = {} (real = {:.6})", out_a[0], out_a[0] as f32 / ONE as f32);
+    println!(
+        "  output = {} (real = {:.6})",
+        out_a[0],
+        out_a[0] as f32 / ONE as f32
+    );
     println!();
 
     // Path B: I8::quantize_f32 → I16::from_i8 → matmul
@@ -74,20 +85,40 @@ fn main() {
     println!("  i16 data  = {:?}", w_b.data);
     println!("  i16 scales= {:?}", w_b.scales);
     let out_b = matmul_i16_scalar(&w_b, &input_q16);
-    println!("  output = {} (real = {:.6})", out_b[0], out_b[0] as f32 / ONE as f32);
+    println!(
+        "  output = {} (real = {:.6})",
+        out_b[0],
+        out_b[0] as f32 / ONE as f32
+    );
     println!();
 
     // Path C: I8::quantize_f32 + i8 matmul (baseline, known to work)
     let out_c = matmul_i8_scalar(&w_i8, &input_q16);
     println!("I8 matmul baseline (works in production):");
-    println!("  output = {} (real = {:.6})", out_c[0], out_c[0] as f32 / ONE as f32);
+    println!(
+        "  output = {} (real = {:.6})",
+        out_c[0],
+        out_c[0] as f32 / ONE as f32
+    );
     println!();
 
     // Error analysis
     println!("=== Comparison ===");
     let truth_q16 = (truth * ONE as f32).round() as i64;
     println!("truth_q16:           {}", truth_q16);
-    println!("I16 quantize_f32:    {} (ratio to truth: {:.3})", out_a[0], out_a[0] as f64 / truth_q16 as f64);
-    println!("I16 from_i8:         {} (ratio to truth: {:.3})", out_b[0], out_b[0] as f64 / truth_q16 as f64);
-    println!("I8 baseline:         {} (ratio to truth: {:.3})", out_c[0], out_c[0] as f64 / truth_q16 as f64);
+    println!(
+        "I16 quantize_f32:    {} (ratio to truth: {:.3})",
+        out_a[0],
+        out_a[0] as f64 / truth_q16 as f64
+    );
+    println!(
+        "I16 from_i8:         {} (ratio to truth: {:.3})",
+        out_b[0],
+        out_b[0] as f64 / truth_q16 as f64
+    );
+    println!(
+        "I8 baseline:         {} (ratio to truth: {:.3})",
+        out_c[0],
+        out_c[0] as f64 / truth_q16 as f64
+    );
 }

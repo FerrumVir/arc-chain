@@ -257,16 +257,16 @@ impl SubnetRegistry {
 
         // Enforce monotonically increasing subnet heights.
         if let Some(latest) = self.latest_anchor.get(&anchor.subnet_id)
-            && anchor.subnet_height <= latest.subnet_height {
-                return Err(SubnetError::InvalidAnchorHeight {
-                    new: anchor.subnet_height,
-                    latest: latest.subnet_height,
-                });
-            }
+            && anchor.subnet_height <= latest.subnet_height
+        {
+            return Err(SubnetError::InvalidAnchorHeight {
+                new: anchor.subnet_height,
+                latest: latest.subnet_height,
+            });
+        }
 
         // Store the anchor.
-        self.latest_anchor
-            .insert(anchor.subnet_id, anchor.clone());
+        self.latest_anchor.insert(anchor.subnet_id, anchor.clone());
 
         self.anchors
             .entry(anchor.subnet_id)
@@ -297,10 +297,7 @@ impl SubnetRegistry {
 
     /// Total number of anchors recorded for a subnet.
     pub fn anchor_count(&self, subnet_id: &SubnetId) -> usize {
-        self.anchors
-            .get(subnet_id)
-            .map(|a| a.len())
-            .unwrap_or(0)
+        self.anchors.get(subnet_id).map(|a| a.len()).unwrap_or(0)
     }
 
     // ── Validators ──────────────────────────────────────────────────────
@@ -344,19 +341,17 @@ impl SubnetRegistry {
 
         // Auto-activate subnet when minimum validators reached.
         if let Some(mut subnet) = self.subnets.get_mut(subnet_id)
-            && subnet.status == SubnetStatus::Pending && active_count >= subnet.min_validators {
-                subnet.status = SubnetStatus::Active;
-            }
+            && subnet.status == SubnetStatus::Pending
+            && active_count >= subnet.min_validators
+        {
+            subnet.status = SubnetStatus::Active;
+        }
 
         Ok(())
     }
 
     /// A validator leaves a subnet. Marks them as inactive and removes them.
-    pub fn leave_subnet(
-        &self,
-        subnet_id: &SubnetId,
-        address: &Address,
-    ) -> Result<(), SubnetError> {
+    pub fn leave_subnet(&self, subnet_id: &SubnetId, address: &Address) -> Result<(), SubnetError> {
         if !self.subnets.contains_key(subnet_id) {
             return Err(SubnetError::NotFound(*subnet_id));
         }
@@ -412,7 +407,9 @@ impl SubnetRegistry {
             None => return true, // No anchors yet is trivially valid.
         };
 
-        anchors.windows(2).all(|w| w[0].subnet_height < w[1].subnet_height)
+        anchors
+            .windows(2)
+            .all(|w| w[0].subnet_height < w[1].subnet_height)
     }
 }
 
@@ -479,11 +476,7 @@ mod tests {
     }
 
     /// Helper: create a state anchor.
-    fn make_anchor(
-        subnet_id: SubnetId,
-        subnet_height: u64,
-        anchor_height: u64,
-    ) -> StateAnchor {
+    fn make_anchor(subnet_id: SubnetId, subnet_height: u64, anchor_height: u64) -> StateAnchor {
         StateAnchor {
             subnet_id,
             subnet_height,
@@ -690,26 +683,17 @@ mod tests {
         reg.register_subnet(config).unwrap();
 
         // Status should be Pending before enough validators join.
-        assert_eq!(
-            reg.get_subnet(&id).unwrap().status,
-            SubnetStatus::Pending,
-        );
+        assert_eq!(reg.get_subnet(&id).unwrap().status, SubnetStatus::Pending,);
 
         // First validator - still pending.
         reg.join_subnet(&id, make_validator(addr(0x10), id, 5_000))
             .unwrap();
-        assert_eq!(
-            reg.get_subnet(&id).unwrap().status,
-            SubnetStatus::Pending,
-        );
+        assert_eq!(reg.get_subnet(&id).unwrap().status, SubnetStatus::Pending,);
 
         // Second validator - should now be Active.
         reg.join_subnet(&id, make_validator(addr(0x11), id, 5_000))
             .unwrap();
-        assert_eq!(
-            reg.get_subnet(&id).unwrap().status,
-            SubnetStatus::Active,
-        );
+        assert_eq!(reg.get_subnet(&id).unwrap().status, SubnetStatus::Active,);
     }
 
     // ── 12. Liveness check ──────────────────────────────────────────────
@@ -781,7 +765,9 @@ mod tests {
         reg.submit_anchor(make_anchor(id, 300, 3)).unwrap();
 
         // Find exact height.
-        let a = reg.get_anchor_at_height(&id, 200).expect("should find height 200");
+        let a = reg
+            .get_anchor_at_height(&id, 200)
+            .expect("should find height 200");
         assert_eq!(a.subnet_height, 200);
         assert_eq!(a.anchor_height, 2);
 

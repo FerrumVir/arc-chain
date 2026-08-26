@@ -22,15 +22,15 @@
 use arc_crypto::signature::{benchmark_address, benchmark_keypair};
 use arc_crypto::{Hash256, KeyPair};
 use arc_mempool::Mempool;
-use arc_net::transport::{run_transport, InboundMessage, OutboundMessage};
+use arc_net::transport::{InboundMessage, OutboundMessage, run_transport};
 use arc_node::consensus::ConsensusManager;
 use arc_state::StateDB;
 use arc_types::{Block, Transaction};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -356,9 +356,7 @@ fn main() {
 
 async fn run_benchmark(args: Args, cpu_cores: usize) {
     // Suppress noisy tracing from transport/consensus internals
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter("warn")
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
 
     let config = BenchmarkConfig {
         num_nodes: args.nodes,
@@ -444,10 +442,7 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
     if all_connected {
         println!("OK ({} nodes, full mesh)", args.nodes);
     } else {
-        println!(
-            "PARTIAL ({} nodes, some peers missing)",
-            args.nodes
-        );
+        println!("PARTIAL ({} nodes, some peers missing)", args.nodes);
     }
 
     // ── Phase 3: Pre-sign Transactions ──────────────────────────────────
@@ -558,7 +553,9 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
                 let committed_now = args.txs.saturating_sub(mp.iter().sum::<usize>());
                 let live_tps = if elapsed.as_secs_f64() > 0.0 {
                     committed_now as f64 / elapsed.as_secs_f64()
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 println!(
                     "    Height {}: {:.1}s elapsed, {} committed, {:.0} TPS, mempools: {:?}",
                     current_height,

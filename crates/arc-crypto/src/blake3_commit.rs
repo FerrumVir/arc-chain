@@ -84,8 +84,14 @@ mod tests {
         let commits = batch_commit_parallel(&txns);
         assert_eq!(commits.len(), 3);
         // Each should match individual commit
-        assert_eq!(commits[0].hash, commit_transaction(domains::TRANSFER, b"tx1").hash);
-        assert_eq!(commits[1].hash, commit_transaction(domains::SETTLE, b"tx2").hash);
+        assert_eq!(
+            commits[0].hash,
+            commit_transaction(domains::TRANSFER, b"tx1").hash
+        );
+        assert_eq!(
+            commits[1].hash,
+            commit_transaction(domains::SETTLE, b"tx2").hash
+        );
     }
 
     #[test]
@@ -97,7 +103,10 @@ mod tests {
                 buf
             })
             .collect();
-        let txns: Vec<(u8, &[u8])> = data.iter().map(|d| (domains::TRANSFER, d.as_slice())).collect();
+        let txns: Vec<(u8, &[u8])> = data
+            .iter()
+            .map(|d| (domains::TRANSFER, d.as_slice()))
+            .collect();
         let commits = batch_commit_parallel(&txns);
         assert_eq!(commits.len(), 1_000_000);
     }

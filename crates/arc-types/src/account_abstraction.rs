@@ -455,7 +455,10 @@ mod tests {
         let acct = SmartAccount::new(owner, 0);
 
         assert_eq!(acct.owner, owner);
-        assert_ne!(acct.address, [0u8; 32], "address should be derived, not zero");
+        assert_ne!(
+            acct.address, [0u8; 32],
+            "address should be derived, not zero"
+        );
         assert_eq!(acct.nonce, 0);
         assert!(acct.guardians.is_empty());
         assert!(acct.session_keys.is_empty());
@@ -651,7 +654,11 @@ mod tests {
         // Changing any field should change the hash
         let mut op2 = op.clone();
         op2.nonce = 43;
-        assert_ne!(op.hash(), op2.hash(), "different nonce must produce different hash");
+        assert_ne!(
+            op.hash(),
+            op2.hash(),
+            "different nonce must produce different hash"
+        );
     }
 
     // 10. User operation paymaster detection
@@ -691,8 +698,9 @@ mod tests {
 
         acct.modules
             .push(AccountModule::SocialRecovery { threshold: 3 });
-        acct.modules
-            .push(AccountModule::PaymasterSponsored { paymaster: test_key(50) });
+        acct.modules.push(AccountModule::PaymasterSponsored {
+            paymaster: test_key(50),
+        });
 
         assert!(acct.has_module("SocialRecovery"));
         assert!(!acct.has_module("MultiSig"));
@@ -712,8 +720,8 @@ mod tests {
     fn test_active_session_keys() {
         let mut acct = SmartAccount::new(test_key(1), 0);
 
-        acct.add_session_key(make_session_key(10, 100, 500));  // active 100..500
-        acct.add_session_key(make_session_key(11, 200, 600));  // active 200..600
+        acct.add_session_key(make_session_key(10, 100, 500)); // active 100..500
+        acct.add_session_key(make_session_key(11, 200, 600)); // active 200..600
         acct.add_session_key(make_session_key(12, 800, 1000)); // active 800..1000
 
         // At block 50: none active

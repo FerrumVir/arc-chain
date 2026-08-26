@@ -282,12 +282,12 @@ pub fn serialize_batch(txs: &[ParsedTx]) -> Vec<u8> {
         let tx_len = MIN_TX_BODY as u32;
         buf.extend_from_slice(&tx_len.to_le_bytes()); // 4-byte length prefix
 
-        buf.extend_from_slice(&tx.sender);            // 32
-        buf.extend_from_slice(&tx.receiver);           // 32
-        buf.extend_from_slice(&tx.amount.to_le_bytes());  // 8
-        buf.extend_from_slice(&tx.nonce.to_le_bytes());   // 8
+        buf.extend_from_slice(&tx.sender); // 32
+        buf.extend_from_slice(&tx.receiver); // 32
+        buf.extend_from_slice(&tx.amount.to_le_bytes()); // 8
+        buf.extend_from_slice(&tx.nonce.to_le_bytes()); // 8
         buf.extend_from_slice(&tx.signature_offset.to_le_bytes()); // 4
-        buf.extend_from_slice(&tx.hash);               // 32
+        buf.extend_from_slice(&tx.hash); // 32
     }
 
     buf
@@ -546,10 +546,10 @@ mod tests {
         let short_len = short_body.len() as u32;
 
         let mut buf = Vec::new();
-        buf.extend_from_slice(&valid_batch);                    // valid
-        buf.extend_from_slice(&short_len.to_le_bytes());         // len prefix
-        buf.extend_from_slice(&short_body);                      // short body
-        buf.extend_from_slice(&valid_batch);                    // valid again
+        buf.extend_from_slice(&valid_batch); // valid
+        buf.extend_from_slice(&short_len.to_le_bytes()); // len prefix
+        buf.extend_from_slice(&short_body); // short body
+        buf.extend_from_slice(&valid_batch); // valid again
 
         let parser = SimdParser::new();
         let result = parser.parse_batch(&buf);

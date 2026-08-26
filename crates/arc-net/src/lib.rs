@@ -15,13 +15,12 @@ pub mod transport;
 
 pub use protocol::{
     DagBlockWithTxsMessage, HandshakeMessage, MessageType, PeerExchangeMessage, PexPeerInfo,
-    SnapshotChunkRequestMessage, SnapshotChunkResponseMessage,
-    SnapshotManifestRequestMessage, SnapshotManifestResponseMessage,
-    TxGossipMessage as GossipMessage,
+    SnapshotChunkRequestMessage, SnapshotChunkResponseMessage, SnapshotManifestRequestMessage,
+    SnapshotManifestResponseMessage, TxGossipMessage as GossipMessage,
 };
-pub use transport::{run_transport, InboundMessage, OutboundMessage};
+pub use transport::{InboundMessage, OutboundMessage, run_transport};
 
-use arc_crypto::{hash_bytes, Hash256};
+use arc_crypto::{Hash256, hash_bytes};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -647,7 +646,11 @@ mod tests {
         let shreds = ShredEncoder::encode(data, hash, 42, 0);
 
         // 1 data shred + 1 parity shred = 2 total
-        assert_eq!(shreds.len(), 2, "small block should produce 1 data + 1 parity shred");
+        assert_eq!(
+            shreds.len(),
+            2,
+            "small block should produce 1 data + 1 parity shred"
+        );
         assert_eq!(shreds[0].block_hash, hash);
         assert_eq!(shreds[0].block_height, 42);
         assert_eq!(shreds[0].shard_id, 0);
@@ -757,9 +760,7 @@ mod tests {
     #[test]
     fn test_shred_roundtrip_large_block() {
         // 100 KB block => 79 data shreds + 40 parity shreds = 119 total
-        let data: Vec<u8> = (0..100_000u32)
-            .map(|i| (i % 256) as u8)
-            .collect();
+        let data: Vec<u8> = (0..100_000u32).map(|i| (i % 256) as u8).collect();
         let hash = hash_bytes(&data);
         let shreds = ShredEncoder::encode(&data, hash, 999, 7);
 
@@ -1065,7 +1066,8 @@ mod tests {
         assert_eq!(shreds.len(), 3);
 
         // Supply only data shred 1 and parity shred 0 (index=2).
-        let partial: Vec<ShredMessage> = shreds.iter()
+        let partial: Vec<ShredMessage> = shreds
+            .iter()
             .filter(|s| s.shred_index != 0)
             .cloned()
             .collect();
@@ -1084,7 +1086,8 @@ mod tests {
         assert_eq!(shreds.len(), 3);
 
         // Supply only data shred 0 and parity shred (index=2).
-        let partial: Vec<ShredMessage> = shreds.iter()
+        let partial: Vec<ShredMessage> = shreds
+            .iter()
             .filter(|s| s.shred_index != 1)
             .cloned()
             .collect();
@@ -1102,7 +1105,8 @@ mod tests {
         let shreds = ShredEncoder::encode(&data, hash, 3, 0);
 
         // Supply only parity shred (index=2).
-        let partial: Vec<ShredMessage> = shreds.iter()
+        let partial: Vec<ShredMessage> = shreds
+            .iter()
             .filter(|s| s.shred_index >= 2)
             .cloned()
             .collect();
@@ -1123,7 +1127,8 @@ mod tests {
 
         // Drop data shred 0 (recovered from shred 1 + parity 0)
         // Drop data shred 3 (recovered from shred 2 + parity 1)
-        let partial: Vec<ShredMessage> = shreds.iter()
+        let partial: Vec<ShredMessage> = shreds
+            .iter()
             .filter(|s| s.shred_index != 0 && s.shred_index != 3)
             .cloned()
             .collect();

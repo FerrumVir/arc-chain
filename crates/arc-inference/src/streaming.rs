@@ -30,7 +30,7 @@
 //! node with a 2TB NVMe SSD can serve a 400B model. No $240K H100 required.
 
 use crate::cached_integer_model::{
-    CachedIntegerModel, CachedLayer, KVCache, I8Weights, ModelConfig,
+    CachedIntegerModel, CachedLayer, I8Weights, KVCache, ModelConfig,
 };
 use crate::integer_lut::*;
 use std::collections::HashMap;
@@ -116,9 +116,10 @@ impl MemoryTierConfig {
                 .ok();
             if let Some(out) = output
                 && let Ok(s) = String::from_utf8(out.stdout)
-                    && let Ok(bytes) = s.trim().parse::<u64>() {
-                        return bytes;
-                    }
+                && let Ok(bytes) = s.trim().parse::<u64>()
+            {
+                return bytes;
+            }
             16 * 1024 * 1024 * 1024 // default 16GB
         }
         #[cfg(target_os = "linux")]
@@ -278,12 +279,19 @@ impl StreamingLayerCache {
         let d = self.config.d_model;
         let prefix = format!("blk.{layer_idx}");
 
-        let extract_i8 = |reader: &mut std::fs::File, name: &str, rows: usize, cols: usize| -> Result<I8Weights, crate::InferenceError> {
-            let qt = content.tensor(reader, name, &device)
+        let extract_i8 = |reader: &mut std::fs::File,
+                          name: &str,
+                          rows: usize,
+                          cols: usize|
+         -> Result<I8Weights, crate::InferenceError> {
+            let qt = content
+                .tensor(reader, name, &device)
                 .map_err(|e| crate::InferenceError::Runtime(format!("{name}: {e}")))?;
-            let deq = qt.dequantize(&device)
+            let deq = qt
+                .dequantize(&device)
                 .map_err(|e| crate::InferenceError::Runtime(format!("dequant {name}: {e}")))?;
-            let f = deq.flatten_all()
+            let f = deq
+                .flatten_all()
                 .map_err(|e| crate::InferenceError::Runtime(format!("flatten: {e}")))?
                 .to_vec1::<f32>()
                 .map_err(|e| crate::InferenceError::Runtime(format!("tovec: {e}")))?;
@@ -301,12 +309,37 @@ impl StreamingLayerCache {
 
         let layer = CachedLayer {
             wq: extract_i8(&mut reader, &format!("{prefix}.attn_q.weight"), d, d)?,
-            wk: extract_i8(&mut reader, &format!("{prefix}.attn_k.weight"), self.config.d_kv, d)?,
-            wv: extract_i8(&mut reader, &format!("{prefix}.attn_v.weight"), self.config.d_kv, d)?,
+            wk: extract_i8(
+                &mut reader,
+                &format!("{prefix}.attn_k.weight"),
+                self.config.d_kv,
+                d,
+            )?,
+            wv: extract_i8(
+                &mut reader,
+                &format!("{prefix}.attn_v.weight"),
+                self.config.d_kv,
+                d,
+            )?,
             wo: extract_i8(&mut reader, &format!("{prefix}.attn_output.weight"), d, d)?,
-            w_gate: extract_i8(&mut reader, &format!("{prefix}.ffn_gate.weight"), self.config.d_ff, d)?,
-            w_up: extract_i8(&mut reader, &format!("{prefix}.ffn_up.weight"), self.config.d_ff, d)?,
-            w_down: extract_i8(&mut reader, &format!("{prefix}.ffn_down.weight"), d, self.config.d_ff)?,
+            w_gate: extract_i8(
+                &mut reader,
+                &format!("{prefix}.ffn_gate.weight"),
+                self.config.d_ff,
+                d,
+            )?,
+            w_up: extract_i8(
+                &mut reader,
+                &format!("{prefix}.ffn_up.weight"),
+                self.config.d_ff,
+                d,
+            )?,
+            w_down: extract_i8(
+                &mut reader,
+                &format!("{prefix}.ffn_down.weight"),
+                d,
+                self.config.d_ff,
+            )?,
             attn_norm: extract_norm(&mut reader, &format!("{prefix}.attn_norm.weight"), d),
             ffn_norm: extract_norm(&mut reader, &format!("{prefix}.ffn_norm.weight"), d),
         };
@@ -314,14 +347,20 @@ impl StreamingLayerCache {
         self.cache.insert(layer_idx, layer);
         self.lru_order.push(layer_idx);
         self.disk_loads += 1;
-        debug!(layer = layer_idx, cached = self.cache.len(), "StreamingLayerCache: loaded layer from disk");
+        debug!(
+            layer = layer_idx,
+            cached = self.cache.len(),
+            "StreamingLayerCache: loaded layer from disk"
+        );
 
         Ok(())
     }
 
     #[cfg(not(feature = "candle"))]
     pub fn get_layer(&mut self, _layer_idx: usize) -> Result<&CachedLayer, crate::InferenceError> {
-        Err(crate::InferenceError::Runtime("candle feature required for streaming".into()))
+        Err(crate::InferenceError::Runtime(
+            "candle feature required for streaming".into(),
+        ))
     }
 
     /// Number of layers currently in cache.
@@ -417,15 +456,21 @@ pub fn speculative_decode(
 
         for _ in 0..speculation_depth {
             let logits = draft.forward_one_token(draft_input, &mut draft_cache);
-            if logits.is_empty() { break; }
+            if logits.is_empty() {
+                break;
+            }
             let tok = crate::integer_lut::argmax_i64(&logits) as u32;
             draft_tokens.push(tok);
             draft_input = tok;
-            if draft.config.eos_tokens.contains(&tok) { break; }
+            if draft.config.eos_tokens.contains(&tok) {
+                break;
+            }
         }
         draft_ms += t0.elapsed().as_millis() as u64;
 
-        if draft_tokens.is_empty() { break; }
+        if draft_tokens.is_empty() {
+            break;
+        }
         total_proposed += draft_tokens.len();
 
         // Phase 2: Target model verifies each drafted token.
@@ -439,7 +484,9 @@ pub fn speculative_decode(
             let verify_input = *all_tokens.last().unwrap_or(&1);
             let target_logits = target.forward_one_token(verify_input, &mut target_cache);
 
-            if target_logits.is_empty() { break; }
+            if target_logits.is_empty() {
+                break;
+            }
             let target_tok = crate::integer_lut::argmax_i64(&target_logits) as u32;
 
             if target_tok == draft_tok {
@@ -448,8 +495,12 @@ pub fn speculative_decode(
                 all_tokens.push(target_tok);
                 accepted_this_round += 1;
 
-                if target.config.eos_tokens.contains(&target_tok) { break; }
-                if accepted_tokens.len() >= max_tokens as usize { break; }
+                if target.config.eos_tokens.contains(&target_tok) {
+                    break;
+                }
+                if accepted_tokens.len() >= max_tokens as usize {
+                    break;
+                }
             } else {
                 // Draft diverged - accept target's token (it's correct),
                 // discard remaining draft tokens
@@ -482,7 +533,11 @@ pub fn speculative_decode(
             }
         }
 
-        if accepted_tokens.last().map(|t| target.config.eos_tokens.contains(t)).unwrap_or(false) {
+        if accepted_tokens
+            .last()
+            .map(|t| target.config.eos_tokens.contains(t))
+            .unwrap_or(false)
+        {
             break;
         }
     }
@@ -520,11 +575,7 @@ pub struct ExpertSelection {
 /// gate_weights: [num_experts × d_model] I8 weights for the gating network.
 /// hidden: [d_model] i64 Q16 hidden state at the MoE layer.
 /// top_k: how many experts to select (typically 2 for Mixtral, 8 for R1).
-pub fn select_experts(
-    gate_weights: &I8Weights,
-    hidden: &[i64],
-    top_k: usize,
-) -> ExpertSelection {
+pub fn select_experts(gate_weights: &I8Weights, hidden: &[i64], top_k: usize) -> ExpertSelection {
     let num_experts = gate_weights.n_rows;
     let d = gate_weights.n_cols;
 
@@ -566,11 +617,20 @@ mod tests {
         let n_heads = d_model / d_head;
         let (rope_cos, rope_sin) = compute_rope_tables(d_head, 256, 10000.0);
         ModelConfig {
-            n_layers, d_model, n_heads, n_kv_heads: n_heads,
-            d_head, d_kv: d_model, d_ff: d_model * 4, vocab_size: 64,
+            n_layers,
+            d_model,
+            n_heads,
+            n_kv_heads: n_heads,
+            d_head,
+            d_kv: d_model,
+            d_ff: d_model * 4,
+            vocab_size: 64,
             attn_scale: (ONE as f64 / (d_head as f64).sqrt()).round() as i64,
-            rope_cos, rope_sin,
-            max_seq: 256, eos_tokens: vec![2], bos_token: 1,
+            rope_cos,
+            rope_sin,
+            max_seq: 256,
+            eos_tokens: vec![2],
+            bos_token: 1,
             chat_template: String::new(),
         }
     }
@@ -579,12 +639,19 @@ mod tests {
         let mut data = vec![0i8; rows * cols];
         let mut rng = seed;
         for v in data.iter_mut() {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *v = ((rng >> 56) as i8).clamp(-5, 5); // small values to avoid overflow through layers
         }
         // Small scales to keep activations bounded through multiple layers
         let scales = vec![ONE / 10; rows];
-        I8Weights { data, scales, n_rows: rows, n_cols: cols }
+        I8Weights {
+            data,
+            scales,
+            n_rows: rows,
+            n_cols: cols,
+        }
     }
 
     fn make_random_layer(d_model: usize, d_ff: usize, seed: u64) -> CachedLayer {
@@ -664,9 +731,12 @@ mod tests {
     #[test]
     fn test_ssd_latency_estimate() {
         let config = MemoryTierConfig {
-            vram_bytes: 0, ram_bytes: 16 * 1024 * 1024 * 1024,
-            ssd_bytes: 500 * 1024 * 1024 * 1024, ssd_bandwidth: 3_500_000_000,
-            vram_layer_capacity: 0, ram_layer_capacity: 8,
+            vram_bytes: 0,
+            ram_bytes: 16 * 1024 * 1024 * 1024,
+            ssd_bytes: 500 * 1024 * 1024 * 1024,
+            ssd_bandwidth: 3_500_000_000,
+            vram_layer_capacity: 0,
+            ram_layer_capacity: 8,
         };
         let latency = config.estimate_ssd_latency_ms(10, 500_000_000);
         assert!(latency > 1400.0 && latency < 1500.0, "latency={}", latency);
@@ -717,7 +787,10 @@ mod tests {
         // Should evict layer 1 (now LRU), not layer 0
         cache.insert_layer(0, make_random_layer(d, d_ff, 100)); // re-touch layer 0
         cache.insert_layer(3, make_random_layer(d, d_ff, 400));
-        assert!(cache.is_cached(0), "layer 0 was recently accessed, should survive");
+        assert!(
+            cache.is_cached(0),
+            "layer 0 was recently accessed, should survive"
+        );
         assert!(!cache.is_cached(1), "layer 1 should be evicted (LRU)");
         assert!(cache.is_cached(2));
         assert!(cache.is_cached(3));
@@ -746,12 +819,7 @@ mod tests {
     #[test]
     fn test_expert_selection_basic() {
         let gate = I8Weights {
-            data: vec![
-                10, 0, 0, 0,
-                0, 10, 0, 0,
-                0, 0, 10, 0,
-                0, 0, 0, 10,
-            ],
+            data: vec![10, 0, 0, 0, 0, 10, 0, 0, 0, 0, 10, 0, 0, 0, 0, 10],
             scales: vec![ONE; 4],
             n_rows: 4,
             n_cols: 4,
@@ -797,8 +865,10 @@ mod tests {
         let sel2 = select_experts(&gate, &h2, 2);
         // Different inputs should (usually) select different experts
         // Not guaranteed for random weights, but very likely with orthogonal inputs
-        assert!(sel1.expert_indices != sel2.expert_indices || sel1.weights != sel2.weights,
-            "Different inputs should produce different expert selections");
+        assert!(
+            sel1.expert_indices != sel2.expert_indices || sel1.weights != sel2.weights,
+            "Different inputs should produce different expert selections"
+        );
     }
 
     // ── Speculative Decoding Tests ─────────────────────────────────────
@@ -823,10 +893,12 @@ mod tests {
         // Random embeddings
         // Small embeddings to avoid i64 overflow in layernorm (x*x >> 16)
         let mut rng = 42u64;
-        let embedding_q16: Vec<i64> = (0..config.vocab_size * d).map(|_| {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((rng >> 48) as i64) * 16 // small values, ~O(1000)
-        }).collect();
+        let embedding_q16: Vec<i64> = (0..config.vocab_size * d)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 48) as i64) * 16 // small values, ~O(1000)
+            })
+            .collect();
 
         let model = CachedIntegerModel {
             config: config.clone(),
@@ -835,7 +907,9 @@ mod tests {
             layers,
             final_norm: vec![ONE; d],
             output_weight: make_random_i8_weights(config.vocab_size, d, 9999),
-            vocab: (0..config.vocab_size).map(|i| format!("tok_{}", i)).collect(),
+            vocab: (0..config.vocab_size)
+                .map(|i| format!("tok_{}", i))
+                .collect(),
             q4_layers: None,
             q4_output: None,
             i16_layers: None,
@@ -850,11 +924,20 @@ mod tests {
 
         // Use the same model as both draft and target
         let result = speculative_decode(&model, &model, &[1, 5, 10], 8, 4);
-        assert!(!result.accepted_tokens.is_empty(), "Should produce at least 1 token");
-        assert!(result.accepted_tokens.len() <= 8, "Should respect max_tokens");
+        assert!(
+            !result.accepted_tokens.is_empty(),
+            "Should produce at least 1 token"
+        );
+        assert!(
+            result.accepted_tokens.len() <= 8,
+            "Should respect max_tokens"
+        );
         // With identical models, every draft token should be accepted
-        assert_eq!(result.acceptance_rate, 1.0,
-            "Identical models should have 100% acceptance rate, got {}", result.acceptance_rate);
+        assert_eq!(
+            result.acceptance_rate, 1.0,
+            "Identical models should have 100% acceptance rate, got {}",
+            result.acceptance_rate
+        );
     }
 
     #[test]
@@ -866,10 +949,12 @@ mod tests {
 
         // Small embeddings to avoid i64 overflow in layernorm (x*x >> 16)
         let mut rng = 42u64;
-        let embedding_q16: Vec<i64> = (0..config.vocab_size * d).map(|_| {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((rng >> 48) as i64) * 16 // small values, ~O(1000)
-        }).collect();
+        let embedding_q16: Vec<i64> = (0..config.vocab_size * d)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 48) as i64) * 16 // small values, ~O(1000)
+            })
+            .collect();
 
         let make_model = |seed: u64| -> CachedIntegerModel {
             let mut layers = Vec::new();
@@ -883,11 +968,19 @@ mod tests {
                 layers,
                 final_norm: vec![ONE; d],
                 output_weight: make_random_i8_weights(config.vocab_size, d, seed + 100),
-                vocab: (0..config.vocab_size).map(|i| format!("tok_{}", i)).collect(),
-                q4_layers: None, q4_output: None, i16_layers: None, i16_output: None,
-                block_i8_layers: None, block_i8_output: None,
-                ternary_layers: None, ternary_output: None,
-                ternary_hybrid_layers: None, ternary_hybrid_output: None,
+                vocab: (0..config.vocab_size)
+                    .map(|i| format!("tok_{}", i))
+                    .collect(),
+                q4_layers: None,
+                q4_output: None,
+                i16_layers: None,
+                i16_output: None,
+                block_i8_layers: None,
+                block_i8_output: None,
+                ternary_layers: None,
+                ternary_output: None,
+                ternary_hybrid_layers: None,
+                ternary_hybrid_output: None,
             }
         };
 
@@ -895,8 +988,14 @@ mod tests {
         let target = make_model(2000);
 
         let result = speculative_decode(&draft, &target, &[1, 5], 6, 3);
-        assert!(!result.accepted_tokens.is_empty(), "Should produce at least 1 token");
-        assert!(result.accepted_tokens.len() <= 6, "Should respect max_tokens");
+        assert!(
+            !result.accepted_tokens.is_empty(),
+            "Should produce at least 1 token"
+        );
+        assert!(
+            result.accepted_tokens.len() <= 6,
+            "Should respect max_tokens"
+        );
         assert!(result.proposed > 0, "Draft should propose tokens");
         // Acceptance rate with different models should be < 1.0 (probably 0.3-0.7)
         // but at least some tokens should be accepted (target always produces 1 per round)
@@ -911,10 +1010,12 @@ mod tests {
 
         // Small embeddings to avoid i64 overflow in layernorm (x*x >> 16)
         let mut rng = 42u64;
-        let embedding_q16: Vec<i64> = (0..config.vocab_size * d).map(|_| {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-            ((rng >> 48) as i64) * 16 // small values, ~O(1000)
-        }).collect();
+        let embedding_q16: Vec<i64> = (0..config.vocab_size * d)
+            .map(|_| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng >> 48) as i64) * 16 // small values, ~O(1000)
+            })
+            .collect();
 
         let make_model = |seed: u64| -> CachedIntegerModel {
             let mut layers = Vec::new();
@@ -928,11 +1029,19 @@ mod tests {
                 layers,
                 final_norm: vec![ONE; d],
                 output_weight: make_random_i8_weights(config.vocab_size, d, seed + 100),
-                vocab: (0..config.vocab_size).map(|i| format!("tok_{}", i)).collect(),
-                q4_layers: None, q4_output: None, i16_layers: None, i16_output: None,
-                block_i8_layers: None, block_i8_output: None,
-                ternary_layers: None, ternary_output: None,
-                ternary_hybrid_layers: None, ternary_hybrid_output: None,
+                vocab: (0..config.vocab_size)
+                    .map(|i| format!("tok_{}", i))
+                    .collect(),
+                q4_layers: None,
+                q4_output: None,
+                i16_layers: None,
+                i16_output: None,
+                block_i8_layers: None,
+                block_i8_output: None,
+                ternary_layers: None,
+                ternary_output: None,
+                ternary_hybrid_layers: None,
+                ternary_hybrid_output: None,
             }
         };
 
@@ -943,8 +1052,10 @@ mod tests {
         let r2 = speculative_decode(&draft, &target, &[1, 3], 5, 3);
 
         // Deterministic: same input → same output every time
-        assert_eq!(r1.accepted_tokens, r2.accepted_tokens,
-            "Speculative decode must be deterministic");
+        assert_eq!(
+            r1.accepted_tokens, r2.accepted_tokens,
+            "Speculative decode must be deterministic"
+        );
         assert_eq!(r1.proposed, r2.proposed);
         assert_eq!(r1.accepted, r2.accepted);
     }

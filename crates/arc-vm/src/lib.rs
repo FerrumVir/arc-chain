@@ -3,16 +3,16 @@
 //! Executes smart contracts compiled to WebAssembly with full host imports
 //! wired to the StateDB for storage, balance queries, and event emission.
 
+pub mod agent;
 pub mod evm;
-pub mod precompiles;
+pub mod formal_verify;
 pub mod inference;
 pub mod inference_verify;
 pub mod oracle;
-pub mod zk_precompile;
-pub mod agent;
-pub mod test_framework;
+pub mod precompiles;
 pub mod security_tests;
-pub mod formal_verify;
+pub mod test_framework;
+pub mod zk_precompile;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -23,7 +23,7 @@ use arc_state::StateDB;
 use arc_types::Address;
 use thiserror::Error;
 use wasmer::{
-    imports, Function, FunctionEnv, FunctionEnvMut, Instance, Memory, Module, Store, Value,
+    Function, FunctionEnv, FunctionEnvMut, Instance, Memory, Module, Store, Value, imports,
 };
 
 // ---------------------------------------------------------------------------
@@ -497,7 +497,6 @@ fn host_emit_event(
     });
 }
 
-
 /// `ai_inference(model_ptr: i32, model_len: i32, input_ptr: i32, input_len: i32, output_ptr: i32) -> i32`
 ///
 /// Calls an AI model. The model_id and input are read from WASM memory.
@@ -597,8 +596,7 @@ impl ArcVM {
 
     /// Compile a WASM module from bytecode.
     pub fn compile(&self, bytecode: &[u8]) -> Result<Module, VmError> {
-        Module::new(&self.store, bytecode)
-            .map_err(|e| VmError::CompilationError(e.to_string()))
+        Module::new(&self.store, bytecode).map_err(|e| VmError::CompilationError(e.to_string()))
     }
 
     /// Execute a function with full state access - the main execution path
@@ -649,10 +647,8 @@ impl ArcVM {
         let func_env = FunctionEnv::new(&mut self.store, host_env);
 
         // Build host import functions
-        let use_gas_fn =
-            Function::new_typed_with_env(&mut self.store, &func_env, host_use_gas);
-        let log_fn =
-            Function::new_typed_with_env(&mut self.store, &func_env, host_log);
+        let use_gas_fn = Function::new_typed_with_env(&mut self.store, &func_env, host_use_gas);
+        let log_fn = Function::new_typed_with_env(&mut self.store, &func_env, host_log);
         let storage_get_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_storage_get);
         let storage_set_fn =
@@ -661,16 +657,14 @@ impl ArcVM {
             Function::new_typed_with_env(&mut self.store, &func_env, host_balance_of);
         let self_balance_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_self_balance);
-        let caller_fn =
-            Function::new_typed_with_env(&mut self.store, &func_env, host_caller);
+        let caller_fn = Function::new_typed_with_env(&mut self.store, &func_env, host_caller);
         let self_address_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_self_address);
         let block_height_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_block_height);
         let block_timestamp_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_block_timestamp);
-        let tx_value_fn =
-            Function::new_typed_with_env(&mut self.store, &func_env, host_tx_value);
+        let tx_value_fn = Function::new_typed_with_env(&mut self.store, &func_env, host_tx_value);
         let gas_remaining_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_gas_remaining);
         let emit_event_fn =
@@ -733,11 +727,7 @@ impl ArcVM {
                 // Flush storage writes to StateDB
                 let writes = std::mem::take(&mut *storage_writes_handle.lock().unwrap());
                 for (key, value) in writes {
-                    state.set_storage(
-                        &context.self_address,
-                        Hash256(key),
-                        value,
-                    );
+                    state.set_storage(&context.self_address, Hash256(key), value);
                 }
 
                 let return_data = result
@@ -793,10 +783,8 @@ impl ArcVM {
         let func_env = FunctionEnv::new(&mut self.store, host_env);
 
         // Build the minimal set of host imports
-        let use_gas_fn =
-            Function::new_typed_with_env(&mut self.store, &func_env, host_use_gas);
-        let log_fn =
-            Function::new_typed_with_env(&mut self.store, &func_env, host_log);
+        let use_gas_fn = Function::new_typed_with_env(&mut self.store, &func_env, host_use_gas);
+        let log_fn = Function::new_typed_with_env(&mut self.store, &func_env, host_log);
         let storage_get_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_storage_get);
         let storage_set_fn =
@@ -805,16 +793,14 @@ impl ArcVM {
             Function::new_typed_with_env(&mut self.store, &func_env, host_balance_of);
         let self_balance_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_self_balance);
-        let caller_fn =
-            Function::new_typed_with_env(&mut self.store, &func_env, host_caller);
+        let caller_fn = Function::new_typed_with_env(&mut self.store, &func_env, host_caller);
         let self_address_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_self_address);
         let block_height_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_block_height);
         let block_timestamp_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_block_timestamp);
-        let tx_value_fn =
-            Function::new_typed_with_env(&mut self.store, &func_env, host_tx_value);
+        let tx_value_fn = Function::new_typed_with_env(&mut self.store, &func_env, host_tx_value);
         let gas_remaining_fn =
             Function::new_typed_with_env(&mut self.store, &func_env, host_gas_remaining);
         let emit_event_fn =
@@ -1177,9 +1163,7 @@ mod tests {
         let mut vm = ArcVM::new();
         let wasm = wat_gas_accounting();
         let module = vm.compile(&wasm).unwrap();
-        let result = vm
-            .execute(&module, "run", &[], 1_000_000)
-            .unwrap();
+        let result = vm.execute(&module, "run", &[], 1_000_000).unwrap();
         assert!(result.success);
         // use_gas(500) + use_gas(300) = 800
         assert_eq!(result.gas_used, 800);
@@ -1388,7 +1372,6 @@ mod tests {
         assert!(result.events.is_empty());
     }
 
-
     /// Module that calls ai_inference with model "gpt-4" and input "hello world".
     fn wat_ai_inference() -> Vec<u8> {
         wat::parse_str(
@@ -1463,5 +1446,4 @@ mod tests {
         assert_eq!(ai_result.gas_cost, 1430);
         assert_eq!(result.gas_used, 1430);
     }
-
 }

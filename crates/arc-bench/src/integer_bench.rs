@@ -21,15 +21,33 @@ fn main() {
     eprintln!("═══════════════════════════════════════════════════════════");
     eprintln!("ARC Chain - Integer Engine Cross-Platform Benchmark");
     eprintln!("═══════════════════════════════════════════════════════════");
-    eprintln!("  Platform: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    eprintln!(
+        "  Platform: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     eprintln!("  Runs:     {}", runs);
     eprintln!();
 
     // Build test models of increasing size
     let configs = vec![
         ("2-layer tiny (v=50, d=32, h=2, ff=64)", 50, 32, 2, 64, 2),
-        ("4-layer small (v=100, d=64, h=2, ff=128)", 100, 64, 2, 128, 4),
-        ("4-layer medium (v=200, d=128, h=4, ff=256)", 200, 128, 4, 256, 4),
+        (
+            "4-layer small (v=100, d=64, h=2, ff=128)",
+            100,
+            64,
+            2,
+            128,
+            4,
+        ),
+        (
+            "4-layer medium (v=200, d=128, h=4, ff=256)",
+            200,
+            128,
+            4,
+            256,
+            4,
+        ),
     ];
 
     let prompt = vec![1u32, 2, 3, 4, 5];

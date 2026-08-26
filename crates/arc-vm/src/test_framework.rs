@@ -435,7 +435,11 @@ impl TestRunner {
                 key,
                 expected,
             } => {
-                let actual = self.state.get(&(*address, *key)).copied().unwrap_or([0u8; 32]);
+                let actual = self
+                    .state
+                    .get(&(*address, *key))
+                    .copied()
+                    .unwrap_or([0u8; 32]);
                 if actual == *expected {
                     Ok(())
                 } else {

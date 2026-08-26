@@ -7,7 +7,7 @@
 //! Security: With 10% malicious validators, P(corruption) = 0.018%.
 //!           With 20% malicious validators, P(corruption) = 0.47%.
 
-use arc_crypto::{hash_bytes, Hash256};
+use arc_crypto::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
 
 /// Default committee size for Tier 2+ inference.
@@ -131,7 +131,9 @@ pub fn aggregate_votes(
         std::collections::HashMap::new();
 
     for (_, output_hash) in &valid_votes {
-        let entry = vote_counts.entry(output_hash.0).or_insert((*output_hash, 0));
+        let entry = vote_counts
+            .entry(output_hash.0)
+            .or_insert((*output_hash, 0));
         entry.1 += 1;
     }
 
@@ -239,11 +241,7 @@ mod tests {
         let committee = select_committee(&seed, &validators, 2, 7);
 
         let output = hash_bytes(b"correct-output");
-        let votes: Vec<_> = committee
-            .members
-            .iter()
-            .map(|m| (*m, output))
-            .collect();
+        let votes: Vec<_> = committee.members.iter().map(|m| (*m, output)).collect();
 
         match aggregate_votes(&committee, &votes) {
             CommitteeResult::Consensus { agreeing, .. } => {

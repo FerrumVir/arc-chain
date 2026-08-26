@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 // ── WAL Types ───────────────────────────────────────────────────────────────
@@ -98,10 +98,7 @@ impl WalWriter {
     /// Spawns a background thread for async I/O.
     pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let mut writer = BufWriter::with_capacity(256 * 1024, file); // 256KB buffer
 
         let (sender, receiver): (Sender<WalCommand>, Receiver<WalCommand>) = channel::unbounded();
@@ -109,7 +106,10 @@ impl WalWriter {
         let shutdown_clone = shutdown.clone();
 
         // The WAL directory is the parent of the WAL file path.
-        let wal_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+        let wal_dir = path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf();
 
         // Determine starting sequence by reading existing entries (before path is moved)
         let seq = Self::count_entries(&path);
@@ -223,7 +223,11 @@ impl WalWriter {
 
         // Best effort - if the channel is full or disconnected, we log and continue.
         // In production, this should never happen (writer is faster than execution).
-        if self.sender.send(WalCommand::Append(Box::new(entry))).is_err() {
+        if self
+            .sender
+            .send(WalCommand::Append(Box::new(entry)))
+            .is_err()
+        {
             tracing::error!("WAL writer channel disconnected");
         }
     }
@@ -326,11 +330,7 @@ impl WalWriter {
         let is_dir = wal_path.is_dir();
 
         // Track bytes written to the current segment for auto-rotation.
-        let mut bytes_written: u64 = writer
-            .get_ref()
-            .metadata()
-            .map(|m| m.len())
-            .unwrap_or(0);
+        let mut bytes_written: u64 = writer.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
 
         /// Helper: check if auto-rotation is needed and perform it.
         fn maybe_auto_rotate(
@@ -487,9 +487,10 @@ impl WalWriter {
     fn find_latest_segment(dir: &Path) -> (u64, PathBuf) {
         let segments = Self::list_segments(dir);
         if let Some(last) = segments.last()
-            && let Some(num) = Self::parse_segment_number(last) {
-                return (num, last.clone());
-            }
+            && let Some(num) = Self::parse_segment_number(last)
+        {
+            return (num, last.clone());
+        }
         (0, dir.join("wal-00000000.bin"))
     }
 
@@ -500,9 +501,11 @@ impl WalWriter {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                    && name.starts_with("wal-") && name.ends_with(".bin") {
-                        segments.push(path);
-                    }
+                    && name.starts_with("wal-")
+                    && name.ends_with(".bin")
+                {
+                    segments.push(path);
+                }
             }
         }
         segments.sort();
@@ -599,9 +602,11 @@ pub fn latest_block_height_in_wal_dir(dir: impl AsRef<Path>) -> u64 {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(name) = path.file_name().and_then(|n| n.to_str())
-                && name.starts_with("wal-") && name.ends_with(".bin") {
-                    segments.push(path);
-                }
+                && name.starts_with("wal-")
+                && name.ends_with(".bin")
+            {
+                segments.push(path);
+            }
         }
     }
     segments.sort();
@@ -617,10 +622,7 @@ pub fn latest_block_height_in_wal_dir(dir: impl AsRef<Path>) -> u64 {
     const MAX_SEGMENTS_TO_SCAN: usize = 3;
     let scan_count = segments.len().min(MAX_SEGMENTS_TO_SCAN);
     for seg in segments.iter().rev().take(scan_count) {
-        let max = read_wal(seg)
-            .into_iter()
-            .map(|e| e.block_height)
-            .max();
+        let max = read_wal(seg).into_iter().map(|e| e.block_height).max();
         if let Some(h) = max {
             return h;
         }
@@ -668,8 +670,7 @@ pub struct Snapshot {
 impl Snapshot {
     /// Write snapshot to disk as LZ4-compressed bincode.
     pub fn write_to(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let data = bincode::serialize(self)
-            .map_err(std::io::Error::other)?;
+        let data = bincode::serialize(self).map_err(std::io::Error::other)?;
         let compressed = lz4_flex::compress_prepend_size(&data);
 
         let mut file = File::create(path)?;
@@ -753,17 +754,11 @@ mod tests {
         {
             let writer = WalWriter::new(&path).expect("create wal");
             writer.append(
-                WalOp::SetAccount(
-                    test_addr(1),
-                    Account::new(test_addr(1), 1000),
-                ),
+                WalOp::SetAccount(test_addr(1), Account::new(test_addr(1), 1000)),
                 1,
             );
             writer.append(
-                WalOp::SetAccount(
-                    test_addr(2),
-                    Account::new(test_addr(2), 2000),
-                ),
+                WalOp::SetAccount(test_addr(2), Account::new(test_addr(2), 2000)),
                 1,
             );
             writer.append(WalOp::Checkpoint(hash_bytes(b"root1")), 1);
@@ -1107,8 +1102,22 @@ mod tests {
         assert_eq!(segments_after.len(), 2);
 
         // Remaining segments should be 2 and 3
-        assert!(segments_after[0].file_name().unwrap().to_str().unwrap().contains("00000002"));
-        assert!(segments_after[1].file_name().unwrap().to_str().unwrap().contains("00000003"));
+        assert!(
+            segments_after[0]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("00000002")
+        );
+        assert!(
+            segments_after[1]
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("00000003")
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1200,10 +1209,7 @@ mod tests {
         {
             let writer = WalWriter::with_segments(&dir, 1024).expect("create");
             for h in 0u64..200 {
-                writer.append(
-                    WalOp::Checkpoint(Hash256::ZERO),
-                    h,
-                );
+                writer.append(WalOp::Checkpoint(Hash256::ZERO), h);
             }
             writer.sync();
             // Drop the writer so the bg thread flushes before we read.

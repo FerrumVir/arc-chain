@@ -40,7 +40,7 @@
 //! 4. `active * (acc_next - acc_prev - product) = 0` - accumulation
 //! 5. `active * is_last_col * (output - acc_next - bias) = 0` - final output
 
-use crate::{hash_bytes, Hash256};
+use crate::{Hash256, hash_bytes};
 use serde::{Deserialize, Serialize};
 
 /// Number of columns in the Dense layer trace.
@@ -184,8 +184,17 @@ pub fn generate_dense_trace(layer: &DenseLayerInput) -> Vec<Vec<i64>> {
     }
 
     vec![
-        active, row_idx, col_idx, weight, input_col,
-        product, acc_prev, acc_next, is_last_col, bias_col, output_col,
+        active,
+        row_idx,
+        col_idx,
+        weight,
+        input_col,
+        product,
+        acc_prev,
+        acc_next,
+        is_last_col,
+        bias_col,
+        output_col,
     ]
 }
 
@@ -195,7 +204,11 @@ pub fn generate_dense_trace(layer: &DenseLayerInput) -> Vec<Vec<i64>> {
 /// Used for testing and as a fallback when the stwo-prover feature is disabled.
 pub fn verify_dense_trace(trace: &[Vec<i64>]) -> Result<(), String> {
     if trace.len() != DENSE_TRACE_COLS {
-        return Err(format!("Expected {} columns, got {}", DENSE_TRACE_COLS, trace.len()));
+        return Err(format!(
+            "Expected {} columns, got {}",
+            DENSE_TRACE_COLS,
+            trace.len()
+        ));
     }
 
     let n_rows = trace[0].len();
@@ -284,14 +297,10 @@ pub fn prove_dense_layer(layer: &DenseLayerInput) -> Result<DenseLayerProof, Str
     let binding_hash = hash_bytes(&binding_input);
 
     // Compute input/output hashes
-    let input_bytes: Vec<u8> = layer.input.iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
+    let input_bytes: Vec<u8> = layer.input.iter().flat_map(|v| v.to_le_bytes()).collect();
     let input_hash = hash_bytes(&input_bytes);
 
-    let output_bytes: Vec<u8> = layer.output.iter()
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
+    let output_bytes: Vec<u8> = layer.output.iter().flat_map(|v| v.to_le_bytes()).collect();
     let output_hash = hash_bytes(&output_bytes);
 
     // Proof data: a real Circle STARK receipt when the prover is compiled in,
@@ -340,9 +349,7 @@ pub fn prove_dense_layer(layer: &DenseLayerInput) -> Result<DenseLayerProof, Str
 /// - Layer k's output_hash == layer (k+1)'s input_hash (chaining)
 /// - The first layer's input_hash matches the model input
 /// - The last layer's output_hash matches the model output
-pub fn prove_folded_inference(
-    layers: &[DenseLayerInput],
-) -> Result<FoldedInferenceProof, String> {
+pub fn prove_folded_inference(layers: &[DenseLayerInput]) -> Result<FoldedInferenceProof, String> {
     let total_start = Instant::now();
 
     if layers.is_empty() {
@@ -352,8 +359,7 @@ pub fn prove_folded_inference(
     // Prove each layer
     let mut layer_proofs = Vec::with_capacity(layers.len());
     for (i, layer) in layers.iter().enumerate() {
-        let proof = prove_dense_layer(layer)
-            .map_err(|e| format!("Layer {i} proof failed: {e}"))?;
+        let proof = prove_dense_layer(layer).map_err(|e| format!("Layer {i} proof failed: {e}"))?;
         layer_proofs.push(proof);
     }
 
@@ -379,7 +385,8 @@ pub fn prove_folded_inference(
     }
     let composition_proof = hash_bytes(&comp_input).0.to_vec();
 
-    let total_proof_size: usize = layer_proofs.iter()
+    let total_proof_size: usize = layer_proofs
+        .iter()
         .map(|p| p.proof_data.len())
         .sum::<usize>()
         + composition_proof.len();
@@ -488,7 +495,12 @@ pub fn prove_sharded_dense(
             vec![0i64; out_size]
         };
         let shard_output = dense_forward_i64(
-            &shard_weights, &shard_bias, &shard_input, shard_width, out_size);
+            &shard_weights,
+            &shard_bias,
+            &shard_input,
+            shard_width,
+            out_size,
+        );
 
         // Update running partial sums
         for i in 0..out_size {
@@ -496,7 +508,11 @@ pub fn prove_sharded_dense(
         }
 
         let partial_hash = hash_bytes(
-            &partial_sums.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>());
+            &partial_sums
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+        );
 
         // Create DenseLayerInput for this shard
         let layer_input = DenseLayerInput {
@@ -522,16 +538,13 @@ pub fn prove_sharded_dense(
     }
 
     // Final output = partial_sums (which includes bias from last shard)
-    let output_bytes: Vec<u8> = partial_sums.iter()
-        .flat_map(|v| v.to_le_bytes()).collect();
+    let output_bytes: Vec<u8> = partial_sums.iter().flat_map(|v| v.to_le_bytes()).collect();
     let output_hash = hash_bytes(&output_bytes);
 
-    let input_bytes: Vec<u8> = input.iter()
-        .flat_map(|v| v.to_le_bytes()).collect();
+    let input_bytes: Vec<u8> = input.iter().flat_map(|v| v.to_le_bytes()).collect();
     let input_hash = hash_bytes(&input_bytes);
 
-    let total_proof_size: usize = shard_proofs.iter()
-        .map(|s| s.proof.proof_data.len()).sum();
+    let total_proof_size: usize = shard_proofs.iter().map(|s| s.proof.proof_data.len()).sum();
 
     Ok(ShardedLayerProof {
         shard_proofs,
@@ -554,15 +567,24 @@ pub fn verify_sharded_proof(proof: &ShardedLayerProof) -> Result<(), String> {
     let mut expected_col = 0;
     for (i, shard) in proof.shard_proofs.iter().enumerate() {
         if shard.col_start != expected_col {
-            return Err(format!("Shard {i}: expected col_start={expected_col}, got {}", shard.col_start));
+            return Err(format!(
+                "Shard {i}: expected col_start={expected_col}, got {}",
+                shard.col_start
+            ));
         }
         if shard.col_end <= shard.col_start {
-            return Err(format!("Shard {i}: invalid range [{}, {})", shard.col_start, shard.col_end));
+            return Err(format!(
+                "Shard {i}: invalid range [{}, {})",
+                shard.col_start, shard.col_end
+            ));
         }
         expected_col = shard.col_end;
     }
     if expected_col != proof.in_size {
-        return Err(format!("Shards cover {} columns, expected {}", expected_col, proof.in_size));
+        return Err(format!(
+            "Shards cover {} columns, expected {}",
+            expected_col, proof.in_size
+        ));
     }
 
     Ok(())
@@ -591,8 +613,12 @@ mod tests {
         let output = dense_forward_i64(&weights, &bias, &input, 3, 2);
 
         let layer = DenseLayerInput {
-            weights, bias, input, output,
-            in_size: 3, out_size: 2,
+            weights,
+            bias,
+            input,
+            output,
+            in_size: 3,
+            out_size: 2,
         };
 
         let trace = generate_dense_trace(&layer);
@@ -618,8 +644,12 @@ mod tests {
         let output = dense_forward_i64(&weights, &bias, &input, in_size, out_size);
 
         let layer = DenseLayerInput {
-            weights, bias, input, output,
-            in_size, out_size,
+            weights,
+            bias,
+            input,
+            output,
+            in_size,
+            out_size,
         };
 
         let proof = prove_dense_layer(&layer).unwrap();
@@ -653,14 +683,20 @@ mod tests {
 
         let layers = vec![
             DenseLayerInput {
-                weights: w1, bias: b1,
-                input: input1, output: output1.clone(),
-                in_size: dim1, out_size: dim2,
+                weights: w1,
+                bias: b1,
+                input: input1,
+                output: output1.clone(),
+                in_size: dim1,
+                out_size: dim2,
             },
             DenseLayerInput {
-                weights: w2, bias: b2,
-                input: output1, output: output2,
-                in_size: dim2, out_size: dim3,
+                weights: w2,
+                bias: b2,
+                input: output1,
+                output: output2,
+                in_size: dim2,
+                out_size: dim3,
             },
         ];
 
@@ -694,8 +730,12 @@ mod tests {
         let output = dense_forward_i64(&weights, &bias, &input, in_size, out_size);
 
         let layer = DenseLayerInput {
-            weights, bias, input, output,
-            in_size, out_size,
+            weights,
+            bias,
+            input,
+            output,
+            in_size,
+            out_size,
         };
 
         let proof = prove_dense_layer(&layer).unwrap();
@@ -711,8 +751,12 @@ mod tests {
         let output = dense_forward_i64(&weights, &bias, &input, 2, 2);
 
         let layer = DenseLayerInput {
-            weights, bias, input, output,
-            in_size: 2, out_size: 2,
+            weights,
+            bias,
+            input,
+            output,
+            in_size: 2,
+            out_size: 2,
         };
 
         let mut trace = generate_dense_trace(&layer);
@@ -743,14 +787,18 @@ mod tests {
 
         // Unsharded proof
         let layer = DenseLayerInput {
-            weights: weights.clone(), bias: bias.clone(),
-            input: input.clone(), output: output.clone(),
-            in_size, out_size,
+            weights: weights.clone(),
+            bias: bias.clone(),
+            input: input.clone(),
+            output: output.clone(),
+            in_size,
+            out_size,
         };
         let unsharded = prove_dense_layer(&layer).unwrap();
 
         // Sharded proof
-        let sharded = prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
+        let sharded =
+            prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
 
         // Output hashes must match
         assert_eq!(unsharded.output_hash, sharded.output_hash);
@@ -775,12 +823,17 @@ mod tests {
         let bias: Vec<i64> = (0..out_size).map(|_| next()).collect();
         let input: Vec<i64> = (0..in_size).map(|_| next()).collect();
 
-        let sharded = prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
+        let sharded =
+            prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
         assert_eq!(sharded.shard_proofs.len(), 4);
         assert!(verify_sharded_proof(&sharded).is_ok());
 
-        println!("Sharded 128×256 in {}ms, {} shards, {} bytes total",
-            sharded.total_proving_time_ms, sharded.shard_proofs.len(), sharded.total_proof_size);
+        println!(
+            "Sharded 128×256 in {}ms, {} shards, {} bytes total",
+            sharded.total_proving_time_ms,
+            sharded.shard_proofs.len(),
+            sharded.total_proof_size
+        );
     }
 
     #[test]
@@ -802,7 +855,8 @@ mod tests {
         let input: Vec<i64> = (0..in_size).map(|_| next()).collect();
 
         let start = Instant::now();
-        let sharded = prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
+        let sharded =
+            prove_sharded_dense(&weights, &bias, &input, in_size, out_size, shard_cols).unwrap();
         let total_ms = start.elapsed().as_millis();
 
         assert_eq!(sharded.shard_proofs.len(), 8);
@@ -817,12 +871,18 @@ mod tests {
         let scaled_per_shard = per_shard_ms * 262;
         let scaled_total = scaled_per_shard * 32; // 32 shards for 16384/512
 
-        println!("Test: {}×{} in {}ms ({} shards, {}ms/shard)",
-            out_size, in_size, total_ms, 8, per_shard_ms);
-        println!("Extrapolated 16384×16384: {}ms/shard × 32 shards = {}ms total",
-            scaled_per_shard, scaled_total);
-        println!("For 80 layers (50B model): {}s total proving time",
-            (scaled_total * 80 * 7) / 1000); // 7 weight matrices per layer
+        println!(
+            "Test: {}×{} in {}ms ({} shards, {}ms/shard)",
+            out_size, in_size, total_ms, 8, per_shard_ms
+        );
+        println!(
+            "Extrapolated 16384×16384: {}ms/shard × 32 shards = {}ms total",
+            scaled_per_shard, scaled_total
+        );
+        println!(
+            "For 80 layers (50B model): {}s total proving time",
+            (scaled_total * 80 * 7) / 1000
+        ); // 7 weight matrices per layer
     }
 
     #[test]
@@ -847,14 +907,20 @@ mod tests {
 
         let layers = vec![
             DenseLayerInput {
-                weights: w1, bias: b1,
-                input: input1, output: output1,
-                in_size: dim, out_size: dim,
+                weights: w1,
+                bias: b1,
+                input: input1,
+                output: output1,
+                in_size: dim,
+                out_size: dim,
             },
             DenseLayerInput {
-                weights: w2, bias: b2,
-                input: wrong_input, output: output2,
-                in_size: dim, out_size: dim,
+                weights: w2,
+                bias: b2,
+                input: wrong_input,
+                output: output2,
+                in_size: dim,
+                out_size: dim,
             },
         ];
 

@@ -1,8 +1,5 @@
-use arc_crypto::{Hash256, hash_bytes, ThresholdEncryption};
-use arc_crypto::bls::{
-    BlsKeypair, BlsPublicKey, BlsSignature,
-    bls_keygen, bls_sign,
-};
+use arc_crypto::bls::{BlsKeypair, BlsPublicKey, BlsSignature, bls_keygen, bls_sign};
+use arc_crypto::{Hash256, ThresholdEncryption, hash_bytes};
 use arc_types::Transaction;
 use crossbeam::queue::SegQueue;
 use dashmap::DashMap;
@@ -200,16 +197,18 @@ impl BlsCommittee {
         let keypairs: Vec<BlsKeypair> = (0..n)
             .map(|i| bls_keygen(format!("ARC-committee-member-{i}").as_bytes()))
             .collect();
-        let public_keys: Vec<BlsPublicKey> = keypairs.iter()
-            .map(|kp| kp.public.clone())
-            .collect();
-        Self { keypairs, public_keys }
+        let public_keys: Vec<BlsPublicKey> = keypairs.iter().map(|kp| kp.public.clone()).collect();
+        Self {
+            keypairs,
+            public_keys,
+        }
     }
 
     /// Have all committee members sign a slot message and return the signatures.
     pub fn sign_slot(&self, slot: u64) -> Vec<BlsSignature> {
         let msg = ThresholdEncryption::slot_message(slot);
-        self.keypairs.iter()
+        self.keypairs
+            .iter()
             .map(|kp| bls_sign(&kp.secret, &msg))
             .collect()
     }
@@ -511,8 +510,8 @@ impl EncryptedMempool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arc_crypto::{hash_bytes, THRESHOLD_TAG_LEN};
     use arc_crypto::bls::bls_verify;
+    use arc_crypto::{THRESHOLD_TAG_LEN, hash_bytes};
 
     fn addr(n: u8) -> Hash256 {
         hash_bytes(&[n])
@@ -541,8 +540,10 @@ mod tests {
     #[test]
     fn test_capacity() {
         let pool = Mempool::new(2);
-        pool.insert(Transaction::new_transfer(addr(1), addr(2), 1, 0)).unwrap();
-        pool.insert(Transaction::new_transfer(addr(1), addr(2), 2, 1)).unwrap();
+        pool.insert(Transaction::new_transfer(addr(1), addr(2), 1, 0))
+            .unwrap();
+        pool.insert(Transaction::new_transfer(addr(1), addr(2), 2, 1))
+            .unwrap();
         let result = pool.insert(Transaction::new_transfer(addr(1), addr(2), 3, 2));
         assert!(result.is_err());
     }
@@ -551,7 +552,8 @@ mod tests {
     fn test_fifo_order() {
         let pool = Mempool::new(100);
         for i in 0..10u64 {
-            pool.insert(Transaction::new_transfer(addr(1), addr(2), i, i)).unwrap();
+            pool.insert(Transaction::new_transfer(addr(1), addr(2), i, i))
+                .unwrap();
         }
         let batch = pool.drain(10);
         assert_eq!(batch.len(), 10);
@@ -618,7 +620,10 @@ mod tests {
         let plaintext_bytes = bincode::serialize(&tx).unwrap();
         // Payload includes 12-byte nonce prefix, so offset by that
         let ct_body_start = 12;
-        let ct_body_end = etx.encrypted_payload.len().saturating_sub(THRESHOLD_TAG_LEN);
+        let ct_body_end = etx
+            .encrypted_payload
+            .len()
+            .saturating_sub(THRESHOLD_TAG_LEN);
         if ct_body_end > ct_body_start && ct_body_end - ct_body_start >= plaintext_bytes.len() {
             assert_ne!(
                 &etx.encrypted_payload[ct_body_start..ct_body_start + plaintext_bytes.len()],
@@ -687,8 +692,14 @@ mod tests {
         assert_eq!(revealed.len(), 10, "all 10 should decrypt successfully");
 
         for (i, r) in revealed.iter().enumerate() {
-            assert_eq!(r.transaction.hash, originals[i].hash, "hash mismatch at {i}");
-            assert_eq!(r.transaction.nonce, originals[i].nonce, "nonce mismatch at {i}");
+            assert_eq!(
+                r.transaction.hash, originals[i].hash,
+                "hash mismatch at {i}"
+            );
+            assert_eq!(
+                r.transaction.nonce, originals[i].nonce,
+                "nonce mismatch at {i}"
+            );
             assert_eq!(r.reveal_round, 42);
             assert_eq!(r.encrypted_id, encrypted[i].id);
         }
@@ -732,7 +743,8 @@ mod tests {
         // The commitment must not contain the sender address bytes directly
         let sender_bytes = sender.as_ref();
         assert_ne!(
-            &etx.sender_commitment.0[..], sender_bytes,
+            &etx.sender_commitment.0[..],
+            sender_bytes,
             "commitment must not expose raw sender bytes"
         );
 
@@ -755,7 +767,10 @@ mod tests {
 
         // Tamper with a byte in the encrypted payload (after nonce, before tag)
         let payload_body_start = 12;
-        let payload_body_end = etx.encrypted_payload.len().saturating_sub(THRESHOLD_TAG_LEN);
+        let payload_body_end = etx
+            .encrypted_payload
+            .len()
+            .saturating_sub(THRESHOLD_TAG_LEN);
         if payload_body_end > payload_body_start + 1 {
             etx.encrypted_payload[payload_body_start] ^= 0xFF;
         }
@@ -799,7 +814,8 @@ mod tests {
         let originals: Vec<Transaction> = (0..5u64)
             .map(|i| Transaction::new_transfer(addr(1), addr(2), i * 100, i))
             .collect();
-        let encrypted: Vec<EncryptedTx> = originals.iter()
+        let encrypted: Vec<EncryptedTx> = originals
+            .iter()
             .map(|tx| EncryptedMempool::encrypt_transaction(tx, &slot_key, slot))
             .collect();
 

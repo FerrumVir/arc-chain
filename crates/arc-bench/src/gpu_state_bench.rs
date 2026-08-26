@@ -101,10 +101,7 @@ pub fn run_gpu_state_benchmark() {
 
     // Report memory model
     if let Some(cache) = state_gpu.gpu_cache() {
-        println!(
-            "  Memory model: {:?}",
-            cache.memory_model()
-        );
+        println!("  Memory model: {:?}", cache.memory_model());
         let stats = cache.stats();
         println!(
             "  GPU accounts: {}, Warm accounts: {}",
@@ -166,7 +163,9 @@ pub fn run_gpu_state_benchmark() {
         let stats = cache.stats();
         println!(
             "  Cache stats: GPU hits={}, CPU hits={}, misses={}, hit_rate={:.1}%",
-            stats.gpu_hits, stats.cpu_hits, stats.misses,
+            stats.gpu_hits,
+            stats.cpu_hits,
+            stats.misses,
             stats.gpu_hit_rate * 100.0
         );
     }
@@ -186,10 +185,7 @@ pub fn run_gpu_state_benchmark() {
         "║  Transfer TPS:      Baseline {:.0} → GPU {:.0}  ({:.1}x)",
         baseline_tps, gpu_tps, transfer_speedup
     );
-    println!(
-        "║  Accounts:          {}",
-        num_accounts
-    );
+    println!("║  Accounts:          {}", num_accounts);
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
 

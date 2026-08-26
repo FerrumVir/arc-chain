@@ -1,34 +1,39 @@
-pub mod mmap_state;
-pub mod simd_parse;
 pub mod block_stm;
 pub mod gpu_state;
 pub mod io_backend;
 pub mod jmt_store;
 pub mod light_client;
+pub mod mmap_state;
+pub mod simd_parse;
 pub mod wal;
 
 use arc_crypto::{Hash256, IncrementalMerkle, MerkleTree, hash_bytes, hash_pair};
-use arc_types::{Account, Address, Identity, IdentityLevel, Transaction, TxBody, TxType, TxReceipt, TransferBody, Block, BlockHeader, ProtocolVersion};
 use arc_types::economics::StateRentConfig;
 use arc_types::transaction::{
-    GasMeter, gas_costs, CapacityAdvertisementBody, InferenceEscrowOpenBody,
-    ModelRegistrationBody, ModelRequestBody, ShardCoverageClaimBody,
-    MIN_MODEL_REGISTRATION_FEE,
+    CapacityAdvertisementBody, GasMeter, InferenceEscrowOpenBody, MIN_MODEL_REGISTRATION_FEE,
+    ModelRegistrationBody, ModelRequestBody, ShardCoverageClaimBody, gas_costs,
+};
+use arc_types::{
+    Account, Address, Block, BlockHeader, Identity, IdentityLevel, ProtocolVersion, Transaction,
+    TransferBody, TxBody, TxReceipt, TxType,
 };
 
 use crate::jmt_store::JmtStateTree;
-use light_client::{StateProof, HeaderProof, TxInclusionProof, LightSnapshot};
-use serde::{Serialize, Deserialize};
 use dashmap::{DashMap, DashSet};
+use light_client::{HeaderProof, LightSnapshot, StateProof, TxInclusionProof};
 use parking_lot::RwLock;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
-pub use wal::{WalWriter, WalOp, WalEntry, Snapshot, PersistenceConfig, read_wal, read_wal_dir, find_last_checkpoint, latest_block_height_in_wal_dir};
+pub use wal::{
+    PersistenceConfig, Snapshot, WalEntry, WalOp, WalWriter, find_last_checkpoint,
+    latest_block_height_in_wal_dir, read_wal, read_wal_dir,
+};
 
 #[derive(Error, Debug)]
 pub enum StateError {
@@ -55,9 +60,11 @@ pub enum StateError {
     #[error("sync incomplete: {received}/{total} chunks received")]
     SyncIncomplete { received: u32, total: u32 },
     #[error("state root mismatch: expected {expected}, computed {computed}")]
-    StateRootMismatch { expected: Hash256, computed: Hash256 },
+    StateRootMismatch {
+        expected: Hash256,
+        computed: Hash256,
+    },
 }
-
 
 // ---------------------------------------------------------------------------
 // Chunked State Snapshot Protocol - types for fast state sync
@@ -345,8 +352,8 @@ impl StateDB {
 
     /// Create a new state with WAL persistence.
     pub fn with_persistence(wal_path: impl AsRef<Path>) -> Result<Self, StateError> {
-        let wal = WalWriter::new(wal_path)
-            .map_err(|e| StateError::PersistenceError(e.to_string()))?;
+        let wal =
+            WalWriter::new(wal_path).map_err(|e| StateError::PersistenceError(e.to_string()))?;
         Ok(Self {
             accounts: DashMap::new(),
             storage: DashMap::new(),
@@ -397,7 +404,10 @@ impl StateDB {
     ///
     /// Hot accounts are stored in GPU unified/managed memory for ~40x bandwidth
     /// improvement. Falls back to CPU-only if no GPU is detected.
-    pub fn with_genesis_gpu(prefunded: &[(Address, u64)], gpu_config: gpu_state::GpuStateCacheConfig) -> Self {
+    pub fn with_genesis_gpu(
+        prefunded: &[(Address, u64)],
+        gpu_config: gpu_state::GpuStateCacheConfig,
+    ) -> Self {
         let cache = Arc::new(gpu_state::GpuStateCache::new(gpu_config));
         let mut state = Self::with_genesis(prefunded);
         // Pre-load genesis accounts into GPU cache.
@@ -423,7 +433,10 @@ impl StateDB {
             }
         }
         self.gpu_cache = Some(cache);
-        tracing::info!(loaded = loaded, "GPU state cache enabled, pre-loaded accounts");
+        tracing::info!(
+            loaded = loaded,
+            "GPU state cache enabled, pre-loaded accounts"
+        );
     }
 
     /// Get the GPU state cache (if enabled) for direct access.
@@ -433,12 +446,16 @@ impl StateDB {
 
     /// Create state with WAL persistence + genesis accounts.
     /// On startup: if WAL exists, replay it to recover state. Otherwise start fresh with genesis.
-    pub fn with_genesis_persistent(prefunded: &[(Address, u64)], wal_dir: impl AsRef<Path>) -> Result<Self, StateError> {
+    pub fn with_genesis_persistent(
+        prefunded: &[(Address, u64)],
+        wal_dir: impl AsRef<Path>,
+    ) -> Result<Self, StateError> {
         let wal_dir = wal_dir.as_ref();
 
         // Ensure the data directory exists
-        std::fs::create_dir_all(wal_dir)
-            .map_err(|e| StateError::PersistenceError(format!("failed to create data dir {:?}: {}", wal_dir, e)))?;
+        std::fs::create_dir_all(wal_dir).map_err(|e| {
+            StateError::PersistenceError(format!("failed to create data dir {:?}: {}", wal_dir, e))
+        })?;
 
         let wal_path = wal_dir.join("state.wal");
 
@@ -606,7 +623,8 @@ impl StateDB {
             if height_before != height_after {
                 tracing::warn!(
                     "Snapshot height changed ({} → {}), retrying for consistency",
-                    height_before, height_after
+                    height_before,
+                    height_after
                 );
                 continue; // Retry - a block was applied during iteration
             }
@@ -625,7 +643,8 @@ impl StateDB {
     /// Deploy a contract (store bytecode in the contracts cache).
     pub fn deploy_contract(&self, address: &Address, bytecode: Vec<u8>) {
         self.contracts.insert(address.0, bytecode.clone());
-        self.wal.append(WalOp::SetContract(*address, bytecode), self.height());
+        self.wal
+            .append(WalOp::SetContract(*address, bytecode), self.height());
     }
 
     /// Get contract bytecode.
@@ -641,10 +660,11 @@ impl StateDB {
         }
         // Check signed benchmark block data
         if let Some(&(height, idx)) = self.tx_index.get(tx_hash).as_deref()
-            && let Some(block_data) = self.signed_block_data.get(&height) {
-                let (txs_vec, _, _) = &*block_data;
-                return txs_vec.get(idx as usize).cloned();
-            }
+            && let Some(block_data) = self.signed_block_data.get(&height)
+        {
+            let (txs_vec, _, _) = &*block_data;
+            return txs_vec.get(idx as usize).cloned();
+        }
         None
     }
 
@@ -707,9 +727,7 @@ impl StateDB {
     /// such escrow exists. Used by the validator task to check status,
     /// gather votes, and decide whether to vote/finalize.
     pub fn tier1_request_snapshot(&self, request_id: &[u8; 32]) -> Option<Tier1RequestSnapshot> {
-        let escrow_addr = arc_crypto::hash_bytes(
-            &[b"arc-infreq", request_id.as_ref()].concat(),
-        );
+        let escrow_addr = arc_crypto::hash_bytes(&[b"arc-infreq", request_id.as_ref()].concat());
         let escrow = self.get_account(&escrow_addr)?;
         if escrow.balance == 0 && escrow.code_hash == Hash256::ZERO {
             return None;
@@ -725,8 +743,7 @@ impl StateDB {
         let votes_bytes = self
             .get_storage(&escrow_addr, &arc_crypto::hash_bytes(b"tier1.votes"))
             .unwrap_or_default();
-        let votes: Vec<(Address, Hash256)> =
-            bincode::deserialize(&votes_bytes).unwrap_or_default();
+        let votes: Vec<(Address, Hash256)> = bincode::deserialize(&votes_bytes).unwrap_or_default();
         let requester_bytes = self
             .get_storage(&escrow_addr, &arc_crypto::hash_bytes(b"tier1.requester"))
             .unwrap_or_default();
@@ -783,7 +800,7 @@ impl StateDB {
                 (a, arc_crypto::hash_bytes(&input))
             })
             .collect();
-        scored.sort_by_key(|a| a.1 .0);
+        scored.sort_by_key(|a| a.1.0);
         scored
             .into_iter()
             .take(committee_size as usize)
@@ -797,10 +814,8 @@ impl StateDB {
             .entry(contract.0)
             .or_default()
             .insert(key, value.clone());
-        self.wal.append(
-            WalOp::SetStorage(*contract, key, value),
-            self.height(),
-        );
+        self.wal
+            .append(WalOp::SetStorage(*contract, key, value), self.height());
     }
 
     /// Get a storage value for a contract.
@@ -823,10 +838,8 @@ impl StateDB {
         if let Some(map) = self.storage.get(&contract.0) {
             map.remove(key);
         }
-        self.wal.append(
-            WalOp::DeleteStorage(*contract, *key),
-            self.height(),
-        );
+        self.wal
+            .append(WalOp::DeleteStorage(*contract, *key), self.height());
     }
 
     /// Get an account (returns None if not found).
@@ -836,9 +849,10 @@ impl StateDB {
     pub fn get_account(&self, addr: &Address) -> Option<Account> {
         // Fast path: check GPU cache first.
         if let Some(ref cache) = self.gpu_cache
-            && let Some(acct) = cache.get_account_fast(&addr.0) {
-                return Some(acct);
-            }
+            && let Some(acct) = cache.get_account_fast(&addr.0)
+        {
+            return Some(acct);
+        }
         self.accounts.get(&addr.0).map(|a| a.clone())
     }
 
@@ -972,9 +986,10 @@ impl StateDB {
         // from the last 1000 entries for crash recovery.
         let wal_seq = self.wal.sequence();
         if wal_seq > 1000
-            && let Err(e) = self.wal.delete_segments_before(wal_seq - 1000) {
-                tracing::warn!("WAL segment cleanup failed: {}", e);
-            }
+            && let Err(e) = self.wal.delete_segments_before(wal_seq - 1000)
+        {
+            tracing::warn!("WAL segment cleanup failed: {}", e);
+        }
     }
 
     /// Get a block by height.
@@ -987,9 +1002,10 @@ impl StateDB {
         let h = self.height();
         for height in (0..=h).rev() {
             if let Some(block) = self.blocks.get(&height)
-                && block.hash.0 == *hash {
-                    return Some(block.clone());
-                }
+                && block.hash.0 == *hash
+            {
+                return Some(block.clone());
+            }
         }
         None
     }
@@ -1030,17 +1046,20 @@ impl StateDB {
             );
 
             // Pre-size receipts with placeholders so we can write by index
-            receipts.resize(transactions.len(), TxReceipt {
-                tx_hash: Hash256::ZERO,
-                block_height: height,
-                block_hash: Hash256::ZERO,
-                index: 0,
-                success: false,
-                gas_used: 0,
-                value_commitment: None,
-                inclusion_proof: None,
-                logs: vec![],
-            });
+            receipts.resize(
+                transactions.len(),
+                TxReceipt {
+                    tx_hash: Hash256::ZERO,
+                    block_height: height,
+                    block_hash: Hash256::ZERO,
+                    index: 0,
+                    success: false,
+                    gas_used: 0,
+                    value_commitment: None,
+                    inclusion_proof: None,
+                    logs: vec![],
+                },
+            );
 
             // Collect all tx hashes up front (order must match input)
             for tx in transactions.iter() {
@@ -1169,7 +1188,8 @@ impl StateDB {
 
         // Store block + WAL
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
 
         // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
@@ -1183,7 +1203,6 @@ impl StateDB {
 
         Ok((block, receipts))
     }
-
 
     /// Execute a batch of transactions with signature verification.
     /// Unsigned or invalid-signature transactions are marked as failed.
@@ -1226,12 +1245,16 @@ impl StateDB {
         // naturally, reducing cross-batch conflicts.
         let mut sorted_indices: Vec<usize> = (0..transactions.len()).collect();
         sorted_indices.sort_by(|&a, &b| {
-            transactions[a].from.0.cmp(&transactions[b].from.0)
+            transactions[a]
+                .from
+                .0
+                .cmp(&transactions[b].from.0)
                 .then(transactions[a].nonce.cmp(&transactions[b].nonce))
         });
 
         // Build a re-ordered transaction slice for partitioning.
-        let sorted_txs: Vec<Transaction> = sorted_indices.iter()
+        let sorted_txs: Vec<Transaction> = sorted_indices
+            .iter()
             .map(|&i| transactions[i].clone())
             .collect();
         // Map from sorted position back to original index.
@@ -1245,7 +1268,9 @@ impl StateDB {
             *h
         };
 
-        let parent = self.blocks.get(&(height - 1))
+        let parent = self
+            .blocks
+            .get(&(height - 1))
             .map(|b| b.hash)
             .unwrap_or(Hash256::ZERO);
 
@@ -1294,19 +1319,22 @@ impl StateDB {
         }
 
         // Unwrap all receipts (all slots should be filled)
-        let receipts: Vec<TxReceipt> = receipts.into_iter()
+        let receipts: Vec<TxReceipt> = receipts
+            .into_iter()
             .enumerate()
-            .map(|(i, r)| r.unwrap_or(TxReceipt {
-                tx_hash: transactions[i].hash,
-                block_height: height,
-                block_hash: Hash256::ZERO,
-                index: i as u32,
-                success: false,
-                gas_used: 0,
-                value_commitment: None,
-                inclusion_proof: None,
-                logs: vec![],
-            }))
+            .map(|(i, r)| {
+                r.unwrap_or(TxReceipt {
+                    tx_hash: transactions[i].hash,
+                    block_height: height,
+                    block_hash: Hash256::ZERO,
+                    index: i as u32,
+                    success: false,
+                    gas_used: 0,
+                    value_commitment: None,
+                    inclusion_proof: None,
+                    logs: vec![],
+                })
+            })
             .collect();
 
         // Build block (same as sequential path)
@@ -1356,7 +1384,8 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
 
         Ok((block, final_receipts))
@@ -1403,17 +1432,22 @@ impl StateDB {
                     batch_sig_valid[i] = Some(false);
                     continue;
                 }
-                if let arc_crypto::signature::Signature::Ed25519 { public_key, signature } = &tx.signature {
+                if let arc_crypto::signature::Signature::Ed25519 {
+                    public_key,
+                    signature,
+                } = &tx.signature
+                {
                     if signature.len() == 64
-                        && let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key) {
-                            let mut sig_bytes = [0u8; 64];
-                            sig_bytes.copy_from_slice(signature);
-                            ed_indices.push(i);
-                            ed_msgs.push(tx.hash.0.to_vec());
-                            ed_sigs.push(ed25519_dalek::Signature::from_bytes(&sig_bytes));
-                            ed_vks.push(vk);
-                            continue;
-                        }
+                        && let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+                    {
+                        let mut sig_bytes = [0u8; 64];
+                        sig_bytes.copy_from_slice(signature);
+                        ed_indices.push(i);
+                        ed_msgs.push(tx.hash.0.to_vec());
+                        ed_sigs.push(ed25519_dalek::Signature::from_bytes(&sig_bytes));
+                        ed_vks.push(vk);
+                        continue;
+                    }
                     batch_sig_valid[i] = Some(false); // malformed
                 }
                 // Non-Ed25519 signatures fall through to individual verification
@@ -1532,7 +1566,8 @@ impl StateDB {
 
         // Store block + WAL
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
 
         // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
@@ -1587,7 +1622,10 @@ impl StateDB {
             }
 
             match &tx.signature {
-                arc_crypto::signature::Signature::Ed25519 { public_key, signature } => {
+                arc_crypto::signature::Signature::Ed25519 {
+                    public_key,
+                    signature,
+                } => {
                     if signature.len() == 64 {
                         let mut sig_bytes = [0u8; 64];
                         sig_bytes.copy_from_slice(signature);
@@ -1630,17 +1668,20 @@ impl StateDB {
             // Block-STM parallel path for large batches
             let batches = block_stm::partition_batches(transactions);
 
-            receipts.resize(transactions.len(), TxReceipt {
-                tx_hash: Hash256::ZERO,
-                block_height: height,
-                block_hash: Hash256::ZERO,
-                index: 0,
-                success: false,
-                gas_used: 0,
-                value_commitment: None,
-                inclusion_proof: None,
-                logs: vec![],
-            });
+            receipts.resize(
+                transactions.len(),
+                TxReceipt {
+                    tx_hash: Hash256::ZERO,
+                    block_height: height,
+                    block_hash: Hash256::ZERO,
+                    index: 0,
+                    success: false,
+                    gas_used: 0,
+                    value_commitment: None,
+                    inclusion_proof: None,
+                    logs: vec![],
+                },
+            );
 
             for tx in transactions.iter() {
                 tx_hashes.push(tx.hash);
@@ -1713,7 +1754,11 @@ impl StateDB {
         // ── Phase 3: Finalize block ──────────────────────────────────────
         let total_gas: u64 = receipts.iter().map(|r| r.gas_used).sum();
         if total_gas > gas_costs::BLOCK_GAS_LIMIT * 80 / 100 {
-            tracing::warn!(total_gas, limit = gas_costs::BLOCK_GAS_LIMIT, "Block nearing gas limit");
+            tracing::warn!(
+                total_gas,
+                limit = gas_costs::BLOCK_GAS_LIMIT,
+                "Block nearing gas limit"
+            );
         }
 
         // Refund matured, unchallenged Tier 2 attestation bonds at this height
@@ -1761,7 +1806,8 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
 
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
@@ -1883,7 +1929,8 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
 
         Ok((block, receipts))
@@ -1931,18 +1978,21 @@ impl StateDB {
                 // Single tx -- no rayon overhead
                 let idx = batch[0];
                 match self.execute_tx(&transactions[idx]) {
-                    Ok(gas) => { receipt_success[idx] = true; receipt_gas[idx] = gas; }
-                    Err(_) => { receipt_gas[idx] = Self::gas_cost_for_tx(&transactions[idx]); }
+                    Ok(gas) => {
+                        receipt_success[idx] = true;
+                        receipt_gas[idx] = gas;
+                    }
+                    Err(_) => {
+                        receipt_gas[idx] = Self::gas_cost_for_tx(&transactions[idx]);
+                    }
                 }
             } else {
                 // Parallel execution within the batch
                 let results: Vec<(usize, bool, u64)> = batch
                     .par_iter()
-                    .map(|&idx| {
-                        match self.execute_tx(&transactions[idx]) {
-                            Ok(gas) => (idx, true, gas),
-                            Err(_) => (idx, false, Self::gas_cost_for_tx(&transactions[idx])),
-                        }
+                    .map(|&idx| match self.execute_tx(&transactions[idx]) {
+                        Ok(gas) => (idx, true, gas),
+                        Err(_) => (idx, false, Self::gas_cost_for_tx(&transactions[idx])),
                     })
                     .collect();
                 for (idx, ok, gas) in results {
@@ -2016,17 +2066,15 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
 
         Ok((block, receipts))
     }
 
     /// Optimistic parallel execution - pre-sorted by sender nonce for maximum throughput.
-    pub fn execute_optimistic(
-        &self,
-        transactions: &[Transaction],
-    ) -> (usize, usize) {
+    pub fn execute_optimistic(&self, transactions: &[Transaction]) -> (usize, usize) {
         let mut shards: HashMap<[u8; 32], Vec<&Transaction>> = HashMap::new();
         for tx in transactions {
             self.mark_tx_accounts_dirty(tx);
@@ -2077,8 +2125,7 @@ impl StateDB {
                                 amount_commitment: None,
                             }))
                             .expect("serializable");
-                            let mut base_hasher =
-                                blake3::Hasher::new_derive_key("ARC-chain-tx-v1");
+                            let mut base_hasher = blake3::Hasher::new_derive_key("ARC-chain-tx-v1");
                             base_hasher.update(&[TxType::Transfer as u8]);
                             base_hasher.update(sender.as_ref());
 
@@ -2086,11 +2133,8 @@ impl StateDB {
                                 batch.nonce_start + shard_idx as u64 * batch.txs_per_sender;
                             for j in 0..batch.txs_per_sender {
                                 let nonce = nonce_start + j;
-                                let hash = compute_benchmark_tx_hash(
-                                    &base_hasher,
-                                    nonce,
-                                    &body_bytes,
-                                );
+                                let hash =
+                                    compute_benchmark_tx_hash(&base_hasher, nonce, &body_bytes);
                                 // Single DashMap insert: hash → (height, global_index)
                                 state.tx_index.insert(hash.0, (batch.height, global_idx));
                                 global_idx += 1;
@@ -2199,9 +2243,7 @@ impl StateDB {
                 base_hasher.update(sender.as_ref());
 
                 (0..txs_per_sender)
-                    .map(|j| {
-                        compute_benchmark_tx_hash(&base_hasher, nonce_start + j, &body_bytes)
-                    })
+                    .map(|j| compute_benchmark_tx_hash(&base_hasher, nonce_start + j, &body_bytes))
                     .collect::<Vec<Hash256>>()
             })
             .collect();
@@ -2303,7 +2345,10 @@ impl StateDB {
 
                 for tx in chunk {
                     match &tx.signature {
-                        arc_crypto::Signature::Ed25519 { public_key, signature } => {
+                        arc_crypto::Signature::Ed25519 {
+                            public_key,
+                            signature,
+                        } => {
                             if let (Ok(vk), Ok(sig)) = (
                                 ed25519_dalek::VerifyingKey::from_bytes(public_key),
                                 <[u8; 64]>::try_from(signature.as_slice())
@@ -2330,11 +2375,17 @@ impl StateDB {
                         vec![true; chunk.len()]
                     } else {
                         // Batch failed - fall back to individual verification
-                        chunk.iter().map(|tx| tx.verify_signature().is_ok()).collect()
+                        chunk
+                            .iter()
+                            .map(|tx| tx.verify_signature().is_ok())
+                            .collect()
                     }
                 } else {
                     // Non-Ed25519 or parse error - verify individually
-                    chunk.iter().map(|tx| tx.verify_signature().is_ok()).collect()
+                    chunk
+                        .iter()
+                        .map(|tx| tx.verify_signature().is_ok())
+                        .collect()
                 }
             })
             .collect();
@@ -2416,10 +2467,8 @@ impl StateDB {
         self.blocks.insert(height, block.clone());
 
         // ── 7. Store success flags for receipt reconstruction ────────────
-        self.signed_block_data.insert(
-            height,
-            (vec![], receipt_success, block.hash),
-        );
+        self.signed_block_data
+            .insert(height, (vec![], receipt_success, block.hash));
 
         // ── 8. Build indexes in parallel ─────────────────────────────────
         // Hash→(height,idx) index + full tx bodies for /tx/{hash}/full
@@ -2487,11 +2536,7 @@ impl StateDB {
     }
 
     /// Reconstruct a benchmark receipt on-demand from (height, tx_index).
-    pub fn reconstruct_benchmark_receipt(
-        &self,
-        height: u64,
-        tx_index: u32,
-    ) -> Option<TxReceipt> {
+    pub fn reconstruct_benchmark_receipt(&self, height: u64, tx_index: u32) -> Option<TxReceipt> {
         let tx = self.reconstruct_benchmark_tx(height, tx_index)?;
         let block = self.blocks.get(&height)?;
 
@@ -2696,13 +2741,14 @@ impl StateDB {
             TxBody::Transfer(body) => {
                 // Use get_mut for zero-copy in-place modification
                 {
-                    let mut sender = self.accounts
-                        .get_mut(&tx.from.0)
-                        .ok_or_else(|| {
-                            // Lazy create if not found
-                            self.accounts.insert(tx.from.0, Account::new(tx.from, 0));
-                            StateError::InsufficientBalance { have: 0, need: body.amount }
-                        })?;
+                    let mut sender = self.accounts.get_mut(&tx.from.0).ok_or_else(|| {
+                        // Lazy create if not found
+                        self.accounts.insert(tx.from.0, Account::new(tx.from, 0));
+                        StateError::InsufficientBalance {
+                            have: 0,
+                            need: body.amount,
+                        }
+                    })?;
                     if sender.nonce != tx.nonce {
                         return Err(StateError::InvalidNonce {
                             expected: sender.nonce,
@@ -2719,32 +2765,37 @@ impl StateDB {
                     sender.nonce += 1;
                     // Eagerly update JMT leaf for sender.
                     if self.use_jmt {
-                        let sender_hash = hash_bytes(&bincode::serialize(sender.value()).unwrap_or_default());
+                        let sender_hash =
+                            hash_bytes(&bincode::serialize(sender.value()).unwrap_or_default());
                         self.jmt.lock().update_leaf(tx.from.0, sender_hash);
                     }
                     // WAL snapshot only if WAL is active (null WAL returns early)
                     if self.wal.is_active() {
                         let snap = sender.clone();
                         drop(sender);
-                        self.wal.append(WalOp::SetAccount(tx.from, snap), self.height());
+                        self.wal
+                            .append(WalOp::SetAccount(tx.from, snap), self.height());
                     }
                 }
 
                 // Credit receiver in-place
                 {
-                    let mut receiver = self.accounts
+                    let mut receiver = self
+                        .accounts
                         .entry(body.to.0)
                         .or_insert_with(|| Account::new(body.to, 0));
                     receiver.balance = receiver.balance.saturating_add(body.amount);
                     // Eagerly update JMT leaf for receiver.
                     if self.use_jmt {
-                        let recv_hash = hash_bytes(&bincode::serialize(receiver.value()).unwrap_or_default());
+                        let recv_hash =
+                            hash_bytes(&bincode::serialize(receiver.value()).unwrap_or_default());
                         self.jmt.lock().update_leaf(body.to.0, recv_hash);
                     }
                     if self.wal.is_active() {
                         let snap = receiver.clone();
                         drop(receiver);
-                        self.wal.append(WalOp::SetAccount(body.to, snap), self.height());
+                        self.wal
+                            .append(WalOp::SetAccount(body.to, snap), self.height());
                     }
                 }
 
@@ -2767,12 +2818,14 @@ impl StateDB {
                 sender.balance -= body.amount;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 let mut agent = self.get_or_create_account(&body.agent_id);
                 agent.balance = agent.balance.saturating_add(body.amount);
                 self.accounts.insert(body.agent_id.0, agent.clone());
-                self.wal.append(WalOp::SetAccount(body.agent_id, agent), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(body.agent_id, agent), self.height());
 
                 Ok(gas.consumed)
             }
@@ -2853,10 +2906,7 @@ impl StateDB {
                     sender.staked_balance += body.amount;
 
                     // Update validator tracking
-                    let prev_stake = self.validators
-                        .get(&tx.from.0)
-                        .map(|v| *v)
-                        .unwrap_or(0);
+                    let prev_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
                     let new_stake = prev_stake.saturating_add(body.amount);
                     self.validators.insert(tx.from.0, new_stake);
 
@@ -2885,10 +2935,7 @@ impl StateDB {
                     sender.balance = body.amount;
 
                     // Update validator tracking
-                    let prev_stake = self.validators
-                        .get(&tx.from.0)
-                        .map(|v| *v)
-                        .unwrap_or(0);
+                    let prev_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
                     let new_stake = prev_stake.saturating_sub(body.amount);
                     if new_stake == 0 {
                         self.validators.remove(&tx.from.0);
@@ -2916,7 +2963,8 @@ impl StateDB {
 
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
                 Ok(gas.consumed)
             }
             TxBody::WasmCall(body) => {
@@ -2930,7 +2978,8 @@ impl StateDB {
                 }
 
                 // --- Contract lookup ---
-                let bytecode = self.get_contract(&body.contract)
+                let bytecode = self
+                    .get_contract(&body.contract)
                     .ok_or(StateError::ContractNotFound(body.contract))?;
 
                 let is_evm = bytecode.len() < 4 || &bytecode[..4] != WASM_MAGIC;
@@ -2948,7 +2997,8 @@ impl StateDB {
                     // Nonce increment - revm will see the updated state.
                     sender.nonce += 1;
                     self.accounts.insert(tx.from.0, sender.clone());
-                    self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                    self.wal
+                        .append(WalOp::SetAccount(tx.from, sender), self.height());
                     // Actual EVM execution delegated to node layer (arc-vm::evm).
                     tracing::debug!(
                         contract = ?body.contract,
@@ -2970,14 +3020,19 @@ impl StateDB {
                         let mut contract_acct = self.get_or_create_account(&body.contract);
                         contract_acct.balance = body.value;
                         self.accounts.insert(body.contract.0, contract_acct.clone());
-                        self.wal.append(WalOp::SetAccount(body.contract, contract_acct), self.height());
+                        self.wal.append(
+                            WalOp::SetAccount(body.contract, contract_acct),
+                            self.height(),
+                        );
                     }
 
                     // WASM execution via wasmer with full host imports.
                     {
                         use std::sync::Mutex as StdMutex;
-                        use wasmer::{imports, Function, FunctionEnv, FunctionEnvMut,
-                                     Instance, Memory, Module as WasmModule, Store};
+                        use wasmer::{
+                            Function, FunctionEnv, FunctionEnvMut, Instance, Memory,
+                            Module as WasmModule, Store, imports,
+                        };
 
                         // Shared state for host functions
                         struct WasmHostState {
@@ -2994,7 +3049,11 @@ impl StateDB {
                             memory: StdMutex<Option<Memory>>,
                         }
 
-                        let wasm_gas_limit = if body.gas_limit > 0 { body.gas_limit } else { 10_000_000 };
+                        let wasm_gas_limit = if body.gas_limit > 0 {
+                            body.gas_limit
+                        } else {
+                            10_000_000
+                        };
                         let host = WasmHostState {
                             gas_used: std::sync::atomic::AtomicU64::new(0),
                             gas_limit: wasm_gas_limit,
@@ -3014,11 +3073,16 @@ impl StateDB {
 
                         // Host: use_gas(amount: i64)
                         let h_use_gas = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |mut env: FunctionEnvMut<'_, WasmHostState>, amount: i64| {
-                                if amount <= 0 { return; }
+                                if amount <= 0 {
+                                    return;
+                                }
                                 let data = env.data_mut();
-                                let prev = data.gas_used.fetch_add(amount as u64, std::sync::atomic::Ordering::Relaxed);
+                                let prev = data
+                                    .gas_used
+                                    .fetch_add(amount as u64, std::sync::atomic::Ordering::Relaxed);
                                 if prev + amount as u64 > data.gas_limit {
                                     *data.out_of_gas.lock().unwrap() = true;
                                 }
@@ -3027,16 +3091,18 @@ impl StateDB {
 
                         // Host: log(ptr: i32, len: i32)
                         let h_log = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |mut env: FunctionEnvMut<'_, WasmHostState>, ptr: i32, len: i32| {
                                 let (data, wstore) = env.data_and_store_mut();
                                 if let Some(ref mem) = *data.memory.lock().unwrap() {
                                     let view = mem.view(&wstore);
                                     let mut buf = vec![0u8; len as usize];
                                     if view.read(ptr as u64, &mut buf).is_ok() {
-                                        data.logs.lock().unwrap().push(
-                                            String::from_utf8_lossy(&buf).to_string()
-                                        );
+                                        data.logs
+                                            .lock()
+                                            .unwrap()
+                                            .push(String::from_utf8_lossy(&buf).to_string());
                                     }
                                 }
                             },
@@ -3044,8 +3110,12 @@ impl StateDB {
 
                         // Host: storage_get(key_ptr: i32, val_ptr: i32) -> i32
                         let h_storage_get = Function::new_typed_with_env(
-                            &mut store, &func_env,
-                            |mut env: FunctionEnvMut<'_, WasmHostState>, key_ptr: i32, val_ptr: i32| -> i32 {
+                            &mut store,
+                            &func_env,
+                            |mut env: FunctionEnvMut<'_, WasmHostState>,
+                             key_ptr: i32,
+                             val_ptr: i32|
+                             -> i32 {
                                 let (data, wstore) = env.data_and_store_mut();
                                 let mem_guard = data.memory.lock().unwrap();
                                 let mem = match *mem_guard {
@@ -3055,14 +3125,18 @@ impl StateDB {
                                 drop(mem_guard);
                                 let view = mem.view(&wstore);
                                 let mut key = [0u8; 32];
-                                if view.read(key_ptr as u64, &mut key).is_err() { return -1; }
+                                if view.read(key_ptr as u64, &mut key).is_err() {
+                                    return -1;
+                                }
                                 let cache = data.storage_cache.lock().unwrap();
                                 match cache.get(&key) {
                                     Some(Some(val)) => {
                                         let val = val.clone();
                                         drop(cache);
                                         let view2 = mem.view(&wstore);
-                                        if view2.write(val_ptr as u64, &val).is_err() { return -1; }
+                                        if view2.write(val_ptr as u64, &val).is_err() {
+                                            return -1;
+                                        }
                                         val.len() as i32
                                     }
                                     Some(None) => -1,
@@ -3073,8 +3147,12 @@ impl StateDB {
 
                         // Host: storage_set(key_ptr: i32, val_ptr: i32, val_len: i32)
                         let h_storage_set = Function::new_typed_with_env(
-                            &mut store, &func_env,
-                            |mut env: FunctionEnvMut<'_, WasmHostState>, key_ptr: i32, val_ptr: i32, val_len: i32| {
+                            &mut store,
+                            &func_env,
+                            |mut env: FunctionEnvMut<'_, WasmHostState>,
+                             key_ptr: i32,
+                             val_ptr: i32,
+                             val_len: i32| {
                                 let (data, wstore) = env.data_and_store_mut();
                                 let mem_guard = data.memory.lock().unwrap();
                                 let mem = match *mem_guard {
@@ -3084,17 +3162,25 @@ impl StateDB {
                                 drop(mem_guard);
                                 let view = mem.view(&wstore);
                                 let mut key = [0u8; 32];
-                                if view.read(key_ptr as u64, &mut key).is_err() { return; }
+                                if view.read(key_ptr as u64, &mut key).is_err() {
+                                    return;
+                                }
                                 let mut val = vec![0u8; val_len as usize];
-                                if view.read(val_ptr as u64, &mut val).is_err() { return; }
-                                data.storage_cache.lock().unwrap().insert(key, Some(val.clone()));
+                                if view.read(val_ptr as u64, &mut val).is_err() {
+                                    return;
+                                }
+                                data.storage_cache
+                                    .lock()
+                                    .unwrap()
+                                    .insert(key, Some(val.clone()));
                                 data.storage_writes.lock().unwrap().push((key, val));
                             },
                         );
 
                         // Host: caller(ptr: i32) - write caller address to WASM memory
                         let h_caller = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |mut env: FunctionEnvMut<'_, WasmHostState>, ptr: i32| {
                                 let (data, wstore) = env.data_and_store_mut();
                                 if let Some(ref mem) = *data.memory.lock().unwrap() {
@@ -3106,7 +3192,8 @@ impl StateDB {
 
                         // Host: self_address(ptr: i32)
                         let h_self_address = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |mut env: FunctionEnvMut<'_, WasmHostState>, ptr: i32| {
                                 let (data, wstore) = env.data_and_store_mut();
                                 if let Some(ref mem) = *data.memory.lock().unwrap() {
@@ -3118,7 +3205,8 @@ impl StateDB {
 
                         // Host: block_height() -> i64
                         let h_block_height = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |env: FunctionEnvMut<'_, WasmHostState>| -> i64 {
                                 env.data().block_height as i64
                             },
@@ -3126,7 +3214,8 @@ impl StateDB {
 
                         // Host: tx_value() -> i64
                         let h_tx_value = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |env: FunctionEnvMut<'_, WasmHostState>| -> i64 {
                                 env.data().call_value as i64
                             },
@@ -3134,7 +3223,8 @@ impl StateDB {
 
                         // Host: gas_remaining() -> i64
                         let h_gas_remaining = Function::new_typed_with_env(
-                            &mut store, &func_env,
+                            &mut store,
+                            &func_env,
                             |env: FunctionEnvMut<'_, WasmHostState>| -> i64 {
                                 let data = env.data();
                                 let used = data.gas_used.load(std::sync::atomic::Ordering::Relaxed);
@@ -3156,14 +3246,18 @@ impl StateDB {
                             }
                         };
 
-                        let module = WasmModule::new(&store, &bytecode)
-                            .map_err(|e| StateError::ExecutionError(format!("WASM compile: {}", e)))?;
-                        let instance = Instance::new(&mut store, &module, &import_object)
-                            .map_err(|e| StateError::ExecutionError(format!("WASM instantiate: {}", e)))?;
+                        let module = WasmModule::new(&store, &bytecode).map_err(|e| {
+                            StateError::ExecutionError(format!("WASM compile: {}", e))
+                        })?;
+                        let instance =
+                            Instance::new(&mut store, &module, &import_object).map_err(|e| {
+                                StateError::ExecutionError(format!("WASM instantiate: {}", e))
+                            })?;
 
                         // Wire up memory reference so host functions can access it
                         if let Ok(memory) = instance.exports.get_memory("memory") {
-                            *func_env.as_mut(&mut store).memory.lock().unwrap() = Some(memory.clone());
+                            *func_env.as_mut(&mut store).memory.lock().unwrap() =
+                                Some(memory.clone());
                         }
 
                         // Pre-populate storage cache from StateDB
@@ -3174,16 +3268,20 @@ impl StateDB {
                             }
                         }
 
-                        let func = instance.exports.get_function(&body.function)
-                            .map_err(|e| StateError::ExecutionError(
-                                format!("function '{}' not found: {}", body.function, e)
-                            ))?;
+                        let func = instance.exports.get_function(&body.function).map_err(|e| {
+                            StateError::ExecutionError(format!(
+                                "function '{}' not found: {}",
+                                body.function, e
+                            ))
+                        })?;
 
                         let call_result = func.call(&mut store, &[]);
 
                         // Check gas exhaustion
                         let host_state = func_env.as_ref(&store);
-                        let wasm_gas_used = host_state.gas_used.load(std::sync::atomic::Ordering::Relaxed);
+                        let wasm_gas_used = host_state
+                            .gas_used
+                            .load(std::sync::atomic::Ordering::Relaxed);
                         let was_out_of_gas = *host_state.out_of_gas.lock().unwrap();
 
                         if was_out_of_gas || wasm_gas_used > wasm_gas_limit {
@@ -3197,9 +3295,8 @@ impl StateDB {
                         match call_result {
                             Ok(_) => {
                                 // Flush storage writes to StateDB on success
-                                let writes = std::mem::take(
-                                    &mut *host_state.storage_writes.lock().unwrap()
-                                );
+                                let writes =
+                                    std::mem::take(&mut *host_state.storage_writes.lock().unwrap());
                                 for (key, value) in writes {
                                     self.set_storage(&body.contract, Hash256(key), value);
                                 }
@@ -3219,20 +3316,24 @@ impl StateDB {
                                     // Persist reverted sender balance
                                     self.accounts.insert(tx.from.0, sender.clone());
 
-                                    if let Some(mut contract_acct) = self.accounts.get_mut(&body.contract.0) {
+                                    if let Some(mut contract_acct) =
+                                        self.accounts.get_mut(&body.contract.0)
+                                    {
                                         contract_acct.balance -= body.value;
                                     }
                                 }
-                                return Err(StateError::ExecutionError(
-                                    format!("WASM exec failed: {}", e)
-                                ));
+                                return Err(StateError::ExecutionError(format!(
+                                    "WASM exec failed: {}",
+                                    e
+                                )));
                             }
                         }
                     }
 
                     sender.nonce += 1;
                     self.accounts.insert(tx.from.0, sender.clone());
-                    self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                    self.wal
+                        .append(WalOp::SetAccount(tx.from, sender), self.height());
                 }
 
                 Ok(gas.consumed)
@@ -3289,15 +3390,20 @@ impl StateDB {
                 let code_hash = hash_bytes(&body.bytecode);
                 let contract_acct = Account::new_contract(contract_addr, code_hash);
                 self.accounts.insert(contract_addr.0, contract_acct.clone());
-                self.wal.append(WalOp::SetAccount(contract_addr, contract_acct), self.height());
+                self.wal.append(
+                    WalOp::SetAccount(contract_addr, contract_acct),
+                    self.height(),
+                );
 
                 // --- Constructor execution ---
                 if !body.constructor_args.is_empty() {
                     // Compile the module and call `init` with full host imports.
                     // Uses wasmer directly to avoid circular arc-vm dependency.
-                    use std::sync::{Mutex as StdMutex};
-                    use wasmer::{imports, Function, FunctionEnv, FunctionEnvMut,
-                                 Instance, Memory, Module as WasmModule, Store};
+                    use std::sync::Mutex as StdMutex;
+                    use wasmer::{
+                        Function, FunctionEnv, FunctionEnvMut, Instance, Memory,
+                        Module as WasmModule, Store, imports,
+                    };
 
                     struct InitHostState {
                         gas_used: std::sync::atomic::AtomicU64,
@@ -3330,34 +3436,45 @@ impl StateDB {
                     let func_env = FunctionEnv::new(&mut store, init_host);
 
                     let h_use_gas = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |mut env: FunctionEnvMut<'_, InitHostState>, amount: i64| {
-                            if amount <= 0 { return; }
+                            if amount <= 0 {
+                                return;
+                            }
                             let data = env.data_mut();
-                            let prev = data.gas_used.fetch_add(amount as u64, std::sync::atomic::Ordering::Relaxed);
+                            let prev = data
+                                .gas_used
+                                .fetch_add(amount as u64, std::sync::atomic::Ordering::Relaxed);
                             if prev + amount as u64 > data.gas_limit {
                                 *data.out_of_gas.lock().unwrap() = true;
                             }
                         },
                     );
                     let h_log = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |mut env: FunctionEnvMut<'_, InitHostState>, ptr: i32, len: i32| {
                             let (data, wstore) = env.data_and_store_mut();
                             if let Some(ref mem) = *data.memory.lock().unwrap() {
                                 let view = mem.view(&wstore);
                                 let mut buf = vec![0u8; len as usize];
                                 if view.read(ptr as u64, &mut buf).is_ok() {
-                                    data.logs.lock().unwrap().push(
-                                        String::from_utf8_lossy(&buf).to_string()
-                                    );
+                                    data.logs
+                                        .lock()
+                                        .unwrap()
+                                        .push(String::from_utf8_lossy(&buf).to_string());
                                 }
                             }
                         },
                     );
                     let h_storage_get = Function::new_typed_with_env(
-                        &mut store, &func_env,
-                        |mut env: FunctionEnvMut<'_, InitHostState>, key_ptr: i32, val_ptr: i32| -> i32 {
+                        &mut store,
+                        &func_env,
+                        |mut env: FunctionEnvMut<'_, InitHostState>,
+                         key_ptr: i32,
+                         val_ptr: i32|
+                         -> i32 {
                             let (data, wstore) = env.data_and_store_mut();
                             let mem_guard = data.memory.lock().unwrap();
                             let mem = match *mem_guard {
@@ -3367,14 +3484,18 @@ impl StateDB {
                             drop(mem_guard);
                             let view = mem.view(&wstore);
                             let mut key = [0u8; 32];
-                            if view.read(key_ptr as u64, &mut key).is_err() { return -1; }
+                            if view.read(key_ptr as u64, &mut key).is_err() {
+                                return -1;
+                            }
                             let cache = data.storage_cache.lock().unwrap();
                             match cache.get(&key) {
                                 Some(Some(val)) => {
                                     let val = val.clone();
                                     drop(cache);
                                     let view2 = mem.view(&wstore);
-                                    if view2.write(val_ptr as u64, &val).is_err() { return -1; }
+                                    if view2.write(val_ptr as u64, &val).is_err() {
+                                        return -1;
+                                    }
                                     val.len() as i32
                                 }
                                 _ => -1,
@@ -3382,8 +3503,12 @@ impl StateDB {
                         },
                     );
                     let h_storage_set = Function::new_typed_with_env(
-                        &mut store, &func_env,
-                        |mut env: FunctionEnvMut<'_, InitHostState>, key_ptr: i32, val_ptr: i32, val_len: i32| {
+                        &mut store,
+                        &func_env,
+                        |mut env: FunctionEnvMut<'_, InitHostState>,
+                         key_ptr: i32,
+                         val_ptr: i32,
+                         val_len: i32| {
                             let (data, wstore) = env.data_and_store_mut();
                             let mem_guard = data.memory.lock().unwrap();
                             let mem = match *mem_guard {
@@ -3393,15 +3518,23 @@ impl StateDB {
                             drop(mem_guard);
                             let view = mem.view(&wstore);
                             let mut key = [0u8; 32];
-                            if view.read(key_ptr as u64, &mut key).is_err() { return; }
+                            if view.read(key_ptr as u64, &mut key).is_err() {
+                                return;
+                            }
                             let mut val = vec![0u8; val_len as usize];
-                            if view.read(val_ptr as u64, &mut val).is_err() { return; }
-                            data.storage_cache.lock().unwrap().insert(key, Some(val.clone()));
+                            if view.read(val_ptr as u64, &mut val).is_err() {
+                                return;
+                            }
+                            data.storage_cache
+                                .lock()
+                                .unwrap()
+                                .insert(key, Some(val.clone()));
                             data.storage_writes.lock().unwrap().push((key, val));
                         },
                     );
                     let h_caller = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |mut env: FunctionEnvMut<'_, InitHostState>, ptr: i32| {
                             let (data, wstore) = env.data_and_store_mut();
                             if let Some(ref mem) = *data.memory.lock().unwrap() {
@@ -3411,7 +3544,8 @@ impl StateDB {
                         },
                     );
                     let h_self_address = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |mut env: FunctionEnvMut<'_, InitHostState>, ptr: i32| {
                             let (data, wstore) = env.data_and_store_mut();
                             if let Some(ref mem) = *data.memory.lock().unwrap() {
@@ -3421,17 +3555,20 @@ impl StateDB {
                         },
                     );
                     let h_block_height = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |env: FunctionEnvMut<'_, InitHostState>| -> i64 {
                             env.data().block_height as i64
                         },
                     );
                     let h_tx_value = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |_env: FunctionEnvMut<'_, InitHostState>| -> i64 { 0i64 },
                     );
                     let h_gas_remaining = Function::new_typed_with_env(
-                        &mut store, &func_env,
+                        &mut store,
+                        &func_env,
                         |env: FunctionEnvMut<'_, InitHostState>| -> i64 {
                             let data = env.data();
                             let used = data.gas_used.load(std::sync::atomic::Ordering::Relaxed);
@@ -3455,8 +3592,10 @@ impl StateDB {
 
                     let module = WasmModule::new(&store, &body.bytecode)
                         .map_err(|e| StateError::ExecutionError(format!("WASM compile: {}", e)))?;
-                    let instance = Instance::new(&mut store, &module, &import_object)
-                        .map_err(|e| StateError::ExecutionError(format!("WASM instantiate: {}", e)))?;
+                    let instance =
+                        Instance::new(&mut store, &module, &import_object).map_err(|e| {
+                            StateError::ExecutionError(format!("WASM instantiate: {}", e))
+                        })?;
 
                     if let Ok(memory) = instance.exports.get_memory("memory") {
                         *func_env.as_mut(&mut store).memory.lock().unwrap() = Some(memory.clone());
@@ -3469,16 +3608,15 @@ impl StateDB {
                         let was_out_of_gas = *host_state.out_of_gas.lock().unwrap();
                         if was_out_of_gas {
                             return Err(StateError::ExecutionError(
-                                "constructor out of gas".into()
+                                "constructor out of gas".into(),
                             ));
                         }
 
                         match call_result {
                             Ok(_) => {
                                 // Flush constructor storage writes to StateDB
-                                let writes = std::mem::take(
-                                    &mut *host_state.storage_writes.lock().unwrap()
-                                );
+                                let writes =
+                                    std::mem::take(&mut *host_state.storage_writes.lock().unwrap());
                                 for (key, value) in writes {
                                     self.set_storage(&contract_addr, Hash256(key), value);
                                 }
@@ -3491,9 +3629,10 @@ impl StateDB {
                                 // Constructor failed - remove the deployed contract
                                 self.contracts.remove(&contract_addr.0);
                                 self.accounts.remove(&contract_addr.0);
-                                return Err(StateError::ExecutionError(
-                                    format!("constructor exec: {}", e)
-                                ));
+                                return Err(StateError::ExecutionError(format!(
+                                    "constructor exec: {}",
+                                    e
+                                )));
                             }
                         }
                     }
@@ -3503,7 +3642,8 @@ impl StateDB {
                 sender.balance -= total_cost;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 tracing::info!(
                     contract = ?contract_addr,
@@ -3551,7 +3691,8 @@ impl StateDB {
                 if body.initial_stake < Self::MIN_VALIDATOR_STAKE {
                     return Err(StateError::ExecutionError(format!(
                         "initial stake {} below minimum {}",
-                        body.initial_stake, Self::MIN_VALIDATOR_STAKE
+                        body.initial_stake,
+                        Self::MIN_VALIDATOR_STAKE
                     )));
                 }
 
@@ -3562,10 +3703,12 @@ impl StateDB {
 
                 // Register in validator set
                 self.validators.insert(tx.from.0, body.initial_stake);
-                self.staking_pool.fetch_add(body.initial_stake, Ordering::Relaxed);
+                self.staking_pool
+                    .fetch_add(body.initial_stake, Ordering::Relaxed);
 
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 tracing::info!(
                     validator = ?tx.from,
@@ -3585,7 +3728,8 @@ impl StateDB {
                 }
 
                 // Return all staked balance
-                let staked = self.validators
+                let staked = self
+                    .validators
                     .remove(&tx.from.0)
                     .map(|(_, v)| v)
                     .unwrap_or(0);
@@ -3600,7 +3744,8 @@ impl StateDB {
 
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 tracing::info!(
                     validator = ?tx.from,
@@ -3619,7 +3764,8 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
                 // Actual reward distribution is epoch-based
                 Ok(gas.consumed)
             }
@@ -3632,10 +3778,7 @@ impl StateDB {
                     });
                 }
 
-                let current_stake = self.validators
-                    .get(&tx.from.0)
-                    .map(|v| *v)
-                    .unwrap_or(0);
+                let current_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
 
                 if body.new_stake > current_stake {
                     // Increasing stake: deduct difference from balance
@@ -3669,7 +3812,8 @@ impl StateDB {
 
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 tracing::debug!(
                     validator = ?tx.from,
@@ -3693,7 +3837,8 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 match body.action {
                     arc_types::transaction::GovernanceAction::Execute => {
@@ -3726,14 +3871,16 @@ impl StateDB {
                 sender.balance -= body.amount;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit bridge escrow account (well-known address)
                 let escrow_addr = hash_bytes(b"ARC-bridge-escrow");
                 let mut escrow = self.get_or_create_account(&escrow_addr);
                 escrow.balance = body.amount;
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 tracing::info!(
                     from = ?tx.from,
@@ -3763,13 +3910,15 @@ impl StateDB {
                 // Increment sender nonce (bridge relayer)
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit recipient
                 let mut recipient = self.get_or_create_account(&body.recipient);
                 recipient.balance = body.amount;
                 self.accounts.insert(body.recipient.0, recipient.clone());
-                self.wal.append(WalOp::SetAccount(body.recipient, recipient), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(body.recipient, recipient), self.height());
 
                 tracing::info!(
                     recipient = ?body.recipient,
@@ -3813,7 +3962,8 @@ impl StateDB {
                 }
 
                 // Net balances per recipient (multiple entries to same agent get summed)
-                let mut net_credits: std::collections::HashMap<[u8; 32], u64> = std::collections::HashMap::new();
+                let mut net_credits: std::collections::HashMap<[u8; 32], u64> =
+                    std::collections::HashMap::new();
                 for entry in &body.entries {
                     *net_credits.entry(entry.agent_id.0).or_insert(0) += entry.amount;
                 }
@@ -3822,7 +3972,8 @@ impl StateDB {
                 sender.balance -= total_amount;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit each unique recipient once (netted)
                 for (agent_addr, net_amount) in &net_credits {
@@ -3830,7 +3981,8 @@ impl StateDB {
                     let mut agent = self.get_or_create_account(&agent_address);
                     agent.balance = agent.balance.saturating_add(*net_amount);
                     self.accounts.insert(*agent_addr, agent.clone());
-                    self.wal.append(WalOp::SetAccount(agent_address, agent), self.height());
+                    self.wal
+                        .append(WalOp::SetAccount(agent_address, agent), self.height());
                 }
 
                 Ok(gas.consumed)
@@ -3855,7 +4007,8 @@ impl StateDB {
                 sender.balance -= body.deposit;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Record channel deposit in a deterministic escrow address
                 // Channel escrow = BLAKE3("arc-channel" || channel_id)
@@ -3870,7 +4023,8 @@ impl StateDB {
                 escrow.code_hash = tx.from;
                 escrow.storage_root = body.counterparty;
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 Ok(gas.consumed)
             }
@@ -3910,23 +4064,28 @@ impl StateDB {
                 }
 
                 // Validate final balances don't exceed locked funds
-                let claimed_total = body.opener_balance.saturating_add(body.counterparty_balance);
+                let claimed_total = body
+                    .opener_balance
+                    .saturating_add(body.counterparty_balance);
                 if claimed_total > total_locked {
-                    return Err(StateError::ExecutionError(
-                        format!("channel close exceeds locked funds: claimed={}, locked={}", claimed_total, total_locked),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "channel close exceeds locked funds: claimed={}, locked={}",
+                        claimed_total, total_locked
+                    )));
                 }
 
                 // Drain escrow
                 let mut escrow_mut = self.get_or_create_account(&escrow_addr);
                 escrow_mut.balance = 0;
                 self.accounts.insert(escrow_addr.0, escrow_mut.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow_mut), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow_mut), self.height());
 
                 // Credit opener - ADD back their channel share to existing balance
                 sender.balance += body.opener_balance;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit counterparty - address was stored in escrow.storage_root
                 // during ChannelOpen (see above). This is the definitive on-chain
@@ -3935,8 +4094,12 @@ impl StateDB {
                 if body.counterparty_balance > 0 && counterparty_addr != Hash256::ZERO {
                     let mut counterparty = self.get_or_create_account(&counterparty_addr);
                     counterparty.balance += body.counterparty_balance;
-                    self.accounts.insert(counterparty_addr.0, counterparty.clone());
-                    self.wal.append(WalOp::SetAccount(counterparty_addr, counterparty), self.height());
+                    self.accounts
+                        .insert(counterparty_addr.0, counterparty.clone());
+                    self.wal.append(
+                        WalOp::SetAccount(counterparty_addr, counterparty),
+                        self.height(),
+                    );
                 }
 
                 Ok(gas.consumed)
@@ -3960,7 +4123,8 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Validate escrow exists and has locked funds
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
@@ -3989,30 +4153,29 @@ impl StateDB {
                 // the state is already finalized - no further disputes allowed.
                 if escrow.staked_balance > 0 && self.height() >= escrow.staked_balance {
                     return Err(StateError::ExecutionError(
-                        "channel dispute: challenge period has expired, state is finalized".to_string(),
+                        "channel dispute: challenge period has expired, state is finalized"
+                            .to_string(),
                     ));
                 }
 
                 // State nonce must be strictly higher than the previously disputed state.
                 // This prevents replay attacks with old channel states.
                 if escrow.staked_balance > 0 && body.state_nonce <= escrow.nonce {
-                    return Err(StateError::ExecutionError(
-                        format!(
-                            "channel dispute: state_nonce {} must exceed previously disputed nonce {}",
-                            body.state_nonce, escrow.nonce
-                        ),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "channel dispute: state_nonce {} must exceed previously disputed nonce {}",
+                        body.state_nonce, escrow.nonce
+                    )));
                 }
 
                 // Validate balance conservation: claimed split must not exceed locked funds.
-                let claimed_total = body.opener_balance.saturating_add(body.counterparty_balance);
+                let claimed_total = body
+                    .opener_balance
+                    .saturating_add(body.counterparty_balance);
                 if claimed_total > escrow.balance {
-                    return Err(StateError::ExecutionError(
-                        format!(
-                            "channel dispute: claimed balances ({}) exceed locked funds ({})",
-                            claimed_total, escrow.balance
-                        ),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "channel dispute: claimed balances ({}) exceed locked funds ({})",
+                        claimed_total, escrow.balance
+                    )));
                 }
 
                 // Update dispute state in escrow.
@@ -4020,7 +4183,8 @@ impl StateDB {
                 escrow.nonce = body.state_nonce;
                 escrow.staked_balance = challenge_expiry;
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4035,7 +4199,8 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Validate proof is non-empty
                 if body.proof_data.is_empty() {
@@ -4065,7 +4230,10 @@ impl StateDB {
                         merkle_siblings: vec![vec![]], // single-child: no siblings needed
                         expected_merkle_root: body.block_hash.0, // single-child: root = child hash
                     };
-                    if !arc_crypto::stwo_air::verify_recursive_proof(&recursive_input, &body.proof_data) {
+                    if !arc_crypto::stwo_air::verify_recursive_proof(
+                        &recursive_input,
+                        &body.proof_data,
+                    ) {
                         return Err(StateError::ExecutionError(
                             "shard proof: STARK proof verification failed".to_string(),
                         ));
@@ -4084,10 +4252,12 @@ impl StateDB {
                 let mut proof_record = self.get_or_create_account(&proof_key);
                 // Store proof hash in the "balance" field as a u64 fingerprint
                 // (first 8 bytes of BLAKE3 hash). Full proof data is in the TX itself.
-                proof_record.balance = u64::from_le_bytes(proof_hash.0[..8].try_into().unwrap_or([0u8; 8]));
+                proof_record.balance =
+                    u64::from_le_bytes(proof_hash.0[..8].try_into().unwrap_or([0u8; 8]));
                 proof_record.nonce = body.block_height;
                 self.accounts.insert(proof_key.0, proof_record.clone());
-                self.wal.append(WalOp::SetAccount(proof_key, proof_record), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(proof_key, proof_record), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4147,10 +4317,8 @@ impl StateDB {
                             if self.wal.is_active() {
                                 let snap = treasury.clone();
                                 drop(treasury);
-                                self.wal.append(
-                                    WalOp::SetAccount(treasury_addr, snap),
-                                    self.height(),
-                                );
+                                self.wal
+                                    .append(WalOp::SetAccount(treasury_addr, snap), self.height());
                             }
                         }
                     }
@@ -4167,7 +4335,8 @@ impl StateDB {
                 sender.balance = sender.balance - body.bond + paid_reward;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // 5. Bond handling.
                 //    bond == 0 (community-worker path): nothing to lock, so no
@@ -4179,8 +4348,7 @@ impl StateDB {
                 //    top of this file (code_hash = attester, nonce = release
                 //    height, storage_root = MAGIC|status).
                 if body.bond > 0 {
-                    let escrow_addr =
-                        hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
+                    let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
                     let release_height = self.height().saturating_add(body.challenge_period);
                     let mut escrow = self.get_or_create_account(&escrow_addr);
                     escrow.balance = body.bond;
@@ -4225,11 +4393,13 @@ impl StateDB {
                 }
 
                 // 3. Look up the attestation escrow
-                let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
+                let escrow_addr =
+                    hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
                     return Err(StateError::ExecutionError(
-                        "inference challenge: attestation escrow not found or already resolved".to_string(),
+                        "inference challenge: attestation escrow not found or already resolved"
+                            .to_string(),
                     ));
                 }
 
@@ -4237,7 +4407,8 @@ impl StateDB {
                 sender.balance -= body.challenger_bond;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // 5. Lock challenger's bond in the same escrow AND mark the
                 //    escrow CHALLENGED so the bond-maturation sweep leaves it
@@ -4253,7 +4424,8 @@ impl StateDB {
                     escrow.storage_root = Hash256(sr);
                 }
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 // 6. Dispute resolution: if challenger_output_hash differs from the
                 //    attested output, the dispute is recorded.  On-chain re-execution
@@ -4280,9 +4452,10 @@ impl StateDB {
 
                 // Validate tier (1-4)
                 if body.tier == 0 || body.tier > 4 {
-                    return Err(StateError::ExecutionError(
-                        format!("inference register: invalid tier {}, must be 1-4", body.tier),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "inference register: invalid tier {}, must be 1-4",
+                        body.tier
+                    )));
                 }
 
                 // Validate sufficient balance for stake bond
@@ -4297,12 +4470,10 @@ impl StateDB {
                 let min_stakes = [0u64, 1_000, 5_000, 10_000, 25_000];
                 let min_stake = min_stakes[body.tier as usize];
                 if body.stake_bond < min_stake {
-                    return Err(StateError::ExecutionError(
-                        format!(
-                            "inference register: stake {} below minimum {} for tier {}",
-                            body.stake_bond, min_stake, body.tier
-                        ),
-                    ));
+                    return Err(StateError::ExecutionError(format!(
+                        "inference register: stake {} below minimum {} for tier {}",
+                        body.stake_bond, min_stake, body.tier
+                    )));
                 }
 
                 // Lock stake: move from balance to staked_balance
@@ -4310,7 +4481,8 @@ impl StateDB {
                 sender.staked_balance += body.stake_bond;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4334,8 +4506,7 @@ impl StateDB {
                     });
                 }
 
-                let escrow_addr_bytes =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr_bytes = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 let escrow_addr = Hash256(escrow_addr_bytes);
                 let existing = self.get_or_create_account(&escrow_addr);
                 if existing.balance != 0 {
@@ -4350,7 +4521,8 @@ impl StateDB {
                 sender.balance -= body.max_fee;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Credit escrow + stash metadata commitment.
                 let commitment = InferenceEscrowOpenBody::metadata_commitment(
@@ -4385,13 +4557,11 @@ impl StateDB {
                 }
                 if body.replicas.is_empty() {
                     return Err(StateError::ExecutionError(
-                        "inference escrow release: must name at least one replica"
-                            .into(),
+                        "inference escrow release: must name at least one replica".into(),
                     ));
                 }
 
-                let escrow_addr_bytes =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr_bytes = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 let escrow_addr = Hash256(escrow_addr_bytes);
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
@@ -4410,15 +4580,15 @@ impl StateDB {
                 );
                 if escrow.storage_root.0 != expected {
                     return Err(StateError::ExecutionError(
-                        "inference escrow release: metadata commitment mismatch"
-                            .into(),
+                        "inference escrow release: metadata commitment mismatch".into(),
                     ));
                 }
 
                 // Advance release-submitter nonce.
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // 40/25/15/20 split; treasury absorbs all truncation residue.
                 let total = escrow.balance;
@@ -4427,14 +4597,12 @@ impl StateDB {
                 let observer_share = total * 15 / 100;
                 let per_replica = replicas_pool / body.replicas.len() as u64;
                 let replicas_paid = per_replica * body.replicas.len() as u64;
-                let treasury_share =
-                    total - proposer_share - replicas_paid - observer_share;
+                let treasury_share = total - proposer_share - replicas_paid - observer_share;
 
                 // Credit proposer.
                 let mut proposer_acc = self.get_or_create_account(&body.proposer);
                 proposer_acc.balance += proposer_share;
-                self.accounts
-                    .insert(body.proposer.0, proposer_acc.clone());
+                self.accounts.insert(body.proposer.0, proposer_acc.clone());
                 self.wal.append(
                     WalOp::SetAccount(body.proposer, proposer_acc),
                     self.height(),
@@ -4452,10 +4620,8 @@ impl StateDB {
                 let mut obs = self.get_or_create_account(&body.observer_pool);
                 obs.balance += observer_share;
                 self.accounts.insert(body.observer_pool.0, obs.clone());
-                self.wal.append(
-                    WalOp::SetAccount(body.observer_pool, obs),
-                    self.height(),
-                );
+                self.wal
+                    .append(WalOp::SetAccount(body.observer_pool, obs), self.height());
 
                 // Credit treasury (includes rounding residue).
                 let mut tre = self.get_or_create_account(&body.treasury);
@@ -4470,10 +4636,8 @@ impl StateDB {
                 released.balance = 0;
                 released.storage_root = Hash256::ZERO;
                 self.accounts.insert(escrow_addr_bytes, released.clone());
-                self.wal.append(
-                    WalOp::SetAccount(escrow_addr, released),
-                    self.height(),
-                );
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, released), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4506,8 +4670,7 @@ impl StateDB {
                 }
                 // Reject duplicate registrations (same model_id already
                 // on-chain). Keeps the registry tamper-evident.
-                let registry_addr_bytes =
-                    ModelRegistrationBody::registry_account(&body.model_id);
+                let registry_addr_bytes = ModelRegistrationBody::registry_account(&body.model_id);
                 let registry_addr = Hash256(registry_addr_bytes);
                 let existing = self.get_or_create_account(&registry_addr);
                 if existing.storage_root != Hash256::ZERO {
@@ -4520,13 +4683,15 @@ impl StateDB {
                 sender.balance -= fee;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 let treasury = Hash256(arc_crypto::hash_bytes(b"arc-treasury").0);
                 let mut tre = self.get_or_create_account(&treasury);
                 tre.balance += fee;
                 self.accounts.insert(treasury.0, tre.clone());
-                self.wal.append(WalOp::SetAccount(treasury, tre), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(treasury, tre), self.height());
 
                 // Write the registry entry.
                 let commitment = ModelRegistrationBody::metadata_commitment(
@@ -4543,7 +4708,8 @@ impl StateDB {
                 // patch can meter royalty payouts from this pool.
                 reg.balance = 0; // fees already sent to treasury; reg holds no value today
                 self.accounts.insert(registry_addr_bytes, reg.clone());
-                self.wal.append(WalOp::SetAccount(registry_addr, reg), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(registry_addr, reg), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4561,10 +4727,10 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                let req_addr_bytes =
-                    ModelRequestBody::request_account(&body.request_id);
+                let req_addr_bytes = ModelRequestBody::request_account(&body.request_id);
                 let req_addr = Hash256(req_addr_bytes);
                 let mut req = self.get_or_create_account(&req_addr);
                 // Encode request state in existing account slots:
@@ -4581,7 +4747,8 @@ impl StateDB {
                 meta.extend_from_slice(&tx.from.0);
                 req.storage_root = arc_crypto::hash_bytes(&meta);
                 self.accounts.insert(req_addr_bytes, req.clone());
-                self.wal.append(WalOp::SetAccount(req_addr, req), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(req_addr, req), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4616,15 +4783,14 @@ impl StateDB {
                 sender.balance -= body.bond;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Lock bond in the deterministic claim account. Ranges
                 // are committed via storage_root so slashing/release can
                 // verify what was claimed without a separate DashMap.
-                let claim_addr_bytes = ShardCoverageClaimBody::claim_account(
-                    &body.model_id,
-                    &body.node_pubkey,
-                );
+                let claim_addr_bytes =
+                    ShardCoverageClaimBody::claim_account(&body.model_id, &body.node_pubkey);
                 let claim_addr = Hash256(claim_addr_bytes);
                 let mut claim = self.get_or_create_account(&claim_addr);
                 if claim.balance != 0 {
@@ -4647,7 +4813,8 @@ impl StateDB {
                 meta.extend_from_slice(&tx.from.0);
                 claim.storage_root = arc_crypto::hash_bytes(&meta);
                 self.accounts.insert(claim_addr_bytes, claim.clone());
-                self.wal.append(WalOp::SetAccount(claim_addr, claim), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(claim_addr, claim), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4670,10 +4837,10 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
-                let cap_addr_bytes =
-                    CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
+                let cap_addr_bytes = CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
                 let cap_addr = Hash256(cap_addr_bytes);
                 let mut cap = self.get_or_create_account(&cap_addr);
                 // Encode capacity in storage_root so a replay of history
@@ -4691,7 +4858,8 @@ impl StateDB {
                 cap.nonce = self.height(); // advertised_at
                 cap.storage_root = arc_crypto::hash_bytes(&meta);
                 self.accounts.insert(cap_addr_bytes, cap.clone());
-                self.wal.append(WalOp::SetAccount(cap_addr, cap), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(cap_addr, cap), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4716,15 +4884,19 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // Derive a proposal-specific account from the input
                 // snapshot hash so replays collide and the latest
                 // proposer for a given input wins (last-write in
                 // block order).
-                let prop_addr = Hash256(arc_crypto::hash_bytes(
-                    &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()].concat(),
-                ).0);
+                let prop_addr = Hash256(
+                    arc_crypto::hash_bytes(
+                        &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()].concat(),
+                    )
+                    .0,
+                );
                 let mut prop = self.get_or_create_account(&prop_addr);
                 // Serialize compact representation into storage_root so
                 // the exact assignment replayed from history matches.
@@ -4742,7 +4914,8 @@ impl StateDB {
                 prop.nonce = self.height();
                 prop.storage_root = arc_crypto::hash_bytes(&buf);
                 self.accounts.insert(prop_addr.0, prop.clone());
-                self.wal.append(WalOp::SetAccount(prop_addr, prop), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(prop_addr, prop), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4760,8 +4933,7 @@ impl StateDB {
                     });
                 }
 
-                let escrow_addr_bytes =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr_bytes = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 let escrow_addr = Hash256(escrow_addr_bytes);
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
@@ -4798,16 +4970,15 @@ impl StateDB {
                 sender.balance += escrow.balance;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 let mut refunded = escrow;
                 refunded.balance = 0;
                 refunded.storage_root = Hash256::ZERO;
                 self.accounts.insert(escrow_addr_bytes, refunded.clone());
-                self.wal.append(
-                    WalOp::SetAccount(escrow_addr, refunded),
-                    self.height(),
-                );
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, refunded), self.height());
 
                 Ok(gas.consumed)
             }
@@ -4888,12 +5059,11 @@ impl StateDB {
                 sender.balance -= body.max_reward;
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // ── 4. Create request escrow ──
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 let mut escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance != 0 || escrow.code_hash != Hash256::ZERO {
                     return Err(StateError::ExecutionError(
@@ -4923,7 +5093,8 @@ impl StateDB {
                 meta.extend_from_slice(&self.height().to_le_bytes());
                 escrow.storage_root = hash_bytes(&meta);
                 self.accounts.insert(escrow_addr.0, escrow.clone());
-                self.wal.append(WalOp::SetAccount(escrow_addr, escrow), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
 
                 // Store the requester address so finalize knows whom to refund.
                 self.set_storage(
@@ -4942,8 +5113,7 @@ impl StateDB {
                 self.set_storage(
                     &escrow_addr,
                     hash_bytes(b"tier1.votes"),
-                    bincode::serialize(&Vec::<(Address, Hash256)>::new())
-                        .unwrap_or_default(),
+                    bincode::serialize(&Vec::<(Address, Hash256)>::new()).unwrap_or_default(),
                 );
                 // Persist the request_id at a known storage key so a node
                 // restart can rebuild `tier1_pending` (which is in-memory
@@ -4999,9 +5169,7 @@ impl StateDB {
                 }
 
                 // ── 3. Look up request escrow ──
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
                     return Err(StateError::ExecutionError(
@@ -5065,9 +5233,7 @@ impl StateDB {
 
                 // ── 5. Load existing votes, reject duplicates, append ──
                 let key = hash_bytes(b"tier1.votes");
-                let existing = self
-                    .get_storage(&escrow_addr, &key)
-                    .unwrap_or_default();
+                let existing = self.get_storage(&escrow_addr, &key).unwrap_or_default();
                 let mut votes: Vec<(Address, Hash256)> =
                     bincode::deserialize(&existing).unwrap_or_default();
                 if votes.iter().any(|(v, _)| v.0 == tx.from.0) {
@@ -5076,10 +5242,9 @@ impl StateDB {
                     ));
                 }
                 votes.push((tx.from, body.output_hash));
-                let encoded =
-                    bincode::serialize(&votes).map_err(|e| StateError::ExecutionError(
-                        format!("tier1 vote: serialize votes: {}", e),
-                    ))?;
+                let encoded = bincode::serialize(&votes).map_err(|e| {
+                    StateError::ExecutionError(format!("tier1 vote: serialize votes: {}", e))
+                })?;
                 self.set_storage(&escrow_addr, key, encoded);
 
                 // ── 6. If voter attached blob, store it for the requester ──
@@ -5094,7 +5259,8 @@ impl StateDB {
                 // ── 7. Bump signer nonce ──
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // ── 8. Flip status to Voting (if still Open) ──
                 if status == TIER1_STATUS_OPEN {
@@ -5123,12 +5289,11 @@ impl StateDB {
                 }
                 sender.nonce += 1;
                 self.accounts.insert(tx.from.0, sender.clone());
-                self.wal.append(WalOp::SetAccount(tx.from, sender), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
 
                 // ── 2. Look up request escrow ──
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 let escrow = self.get_or_create_account(&escrow_addr);
                 if escrow.balance == 0 {
                     return Err(StateError::ExecutionError(
@@ -5156,8 +5321,7 @@ impl StateDB {
                 let vote_count = votes.len();
 
                 // ── 4. Determine if finalization is eligible ──
-                let timeout_reached =
-                    now >= anchor_height.saturating_add(deadline_blocks);
+                let timeout_reached = now >= anchor_height.saturating_add(deadline_blocks);
                 let all_voted = vote_count >= committee_size;
                 if !timeout_reached && !all_voted {
                     return Err(StateError::ExecutionError(format!(
@@ -5200,15 +5364,11 @@ impl StateDB {
                 let new_status: u8;
                 if majority.1 >= min_agreement {
                     // Consensus reached: pay agreeing voters, rebate requester, treasury cut.
-                    let voters_pool =
-                        max_reward * ttx::TIER1_REWARD_SHARE_VOTERS_BPS / 10_000;
-                    let refund =
-                        max_reward * ttx::TIER1_REWARD_SHARE_REFUND_BPS / 10_000;
-                    let treasury =
-                        max_reward * ttx::TIER1_REWARD_SHARE_TREASURY_BPS / 10_000;
+                    let voters_pool = max_reward * ttx::TIER1_REWARD_SHARE_VOTERS_BPS / 10_000;
+                    let refund = max_reward * ttx::TIER1_REWARD_SHARE_REFUND_BPS / 10_000;
+                    let treasury = max_reward * ttx::TIER1_REWARD_SHARE_TREASURY_BPS / 10_000;
                     // Anti-rounding remainder goes to treasury.
-                    let remainder = max_reward
-                        .saturating_sub(voters_pool + refund + treasury);
+                    let remainder = max_reward.saturating_sub(voters_pool + refund + treasury);
 
                     let agreeing: Vec<Address> = votes
                         .iter()
@@ -5220,8 +5380,7 @@ impl StateDB {
                     } else {
                         voters_pool / agreeing.len() as u64
                     };
-                    let voter_rem =
-                        voters_pool.saturating_sub(per_voter * agreeing.len() as u64);
+                    let voter_rem = voters_pool.saturating_sub(per_voter * agreeing.len() as u64);
 
                     // Credit each agreeing voter.
                     for v in &agreeing {
@@ -5336,12 +5495,11 @@ impl StateDB {
                 // [[accounts]] entry (blake3(&[0u8])).
                 let pool_addr = arc_types::transaction::faucet_pool_address();
                 {
-                    let mut pool = self
-                        .accounts
-                        .get_mut(&pool_addr.0)
-                        .ok_or_else(|| StateError::ExecutionError(
+                    let mut pool = self.accounts.get_mut(&pool_addr.0).ok_or_else(|| {
+                        StateError::ExecutionError(
                             "faucet claim: system faucet pool account is not prefunded".into(),
-                        ))?;
+                        )
+                    })?;
                     if pool.balance < body.amount {
                         return Err(StateError::InsufficientBalance {
                             have: pool.balance,
@@ -5356,7 +5514,8 @@ impl StateDB {
                     if self.wal.is_active() {
                         let snap = pool.clone();
                         drop(pool);
-                        self.wal.append(WalOp::SetAccount(pool_addr, snap), self.height());
+                        self.wal
+                            .append(WalOp::SetAccount(pool_addr, snap), self.height());
                     }
                 }
 
@@ -5368,13 +5527,15 @@ impl StateDB {
                         .or_insert_with(|| Account::new(body.recipient, 0));
                     recipient.balance = recipient.balance.saturating_add(body.amount);
                     if self.use_jmt {
-                        let h = hash_bytes(&bincode::serialize(recipient.value()).unwrap_or_default());
+                        let h =
+                            hash_bytes(&bincode::serialize(recipient.value()).unwrap_or_default());
                         self.jmt.lock().update_leaf(body.recipient.0, h);
                     }
                     if self.wal.is_active() {
                         let snap = recipient.clone();
                         drop(recipient);
-                        self.wal.append(WalOp::SetAccount(body.recipient, snap), self.height());
+                        self.wal
+                            .append(WalOp::SetAccount(body.recipient, snap), self.height());
                     }
                 }
 
@@ -5485,7 +5646,8 @@ impl StateDB {
         }
 
         self.blocks.insert(height, block.clone());
-        self.wal.append(WalOp::SetBlock(height, block.clone()), height);
+        self.wal
+            .append(WalOp::SetBlock(height, block.clone()), height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
 
         // Auto-prune old state every 100 blocks unless in archive mode.
@@ -5690,10 +5852,12 @@ impl StateDB {
         let cutoff = current - keep_blocks;
 
         // Remove receipts whose block_height is at or below the cutoff.
-        self.receipts.retain(|_, receipt| receipt.block_height > cutoff);
+        self.receipts
+            .retain(|_, receipt| receipt.block_height > cutoff);
 
         // Remove tx_index entries that point to pruned blocks.
-        self.tx_index.retain(|_, &mut (block_height, _)| block_height > cutoff);
+        self.tx_index
+            .retain(|_, &mut (block_height, _)| block_height > cutoff);
 
         // Remove full transactions for pruned blocks.
         self.full_transactions.retain(|hash, _| {
@@ -5833,45 +5997,62 @@ impl StateDB {
                     .push(tx.hash);
             }
             TxBody::MultiSig(_) | TxBody::DeployContract(_) | TxBody::RegisterAgent(_) => {}
-            TxBody::JoinValidator(_) | TxBody::LeaveValidator | TxBody::ClaimRewards | TxBody::UpdateStake(_) => {}
+            TxBody::JoinValidator(_)
+            | TxBody::LeaveValidator
+            | TxBody::ClaimRewards
+            | TxBody::UpdateStake(_) => {}
             TxBody::Governance(_) => {}
             TxBody::BridgeLock(_) => {
                 // Escrow account is well-known; index it
                 let escrow_addr = hash_bytes(b"ARC-bridge-escrow");
-                self.account_txs.entry(escrow_addr.0).or_default().push(tx.hash);
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::BridgeMint(body) => {
-                self.account_txs.entry(body.recipient.0).or_default().push(tx.hash);
+                self.account_txs
+                    .entry(body.recipient.0)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::BatchSettle(body) => {
                 for entry in &body.entries {
-                    self.account_txs.entry(entry.agent_id.0).or_default().push(tx.hash);
+                    self.account_txs
+                        .entry(entry.agent_id.0)
+                        .or_default()
+                        .push(tx.hash);
                 }
             }
             TxBody::ChannelOpen(_) | TxBody::ChannelClose(_) | TxBody::ChannelDispute(_) => {}
             TxBody::ShardProof(_) => {}
             TxBody::InferenceAttestation(_) => {
                 let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
-                self.account_txs.entry(escrow_addr.0).or_default().push(tx.hash);
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::InferenceChallenge(body) => {
-                let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
-                self.account_txs.entry(escrow_addr.0).or_default().push(tx.hash);
+                let escrow_addr =
+                    hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
+                self.account_txs
+                    .entry(escrow_addr.0)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::InferenceRegister(_) => {
                 // Registration modifies sender's staked_balance; sender is already tracked.
             }
             TxBody::InferenceEscrowOpen(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.account_txs
                     .entry(escrow_addr)
                     .or_default()
                     .push(tx.hash);
             }
             TxBody::InferenceEscrowRelease(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.account_txs
                     .entry(escrow_addr)
                     .or_default()
@@ -5893,8 +6074,7 @@ impl StateDB {
                     .push(tx.hash);
             }
             TxBody::InferenceEscrowRefund(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.account_txs
                     .entry(escrow_addr)
                     .or_default()
@@ -5909,15 +6089,15 @@ impl StateDB {
                 self.account_txs.entry(req_addr).or_default().push(tx.hash);
             }
             TxBody::ShardCoverageClaim(body) => {
-                let claim_addr = ShardCoverageClaimBody::claim_account(
-                    &body.model_id,
-                    &body.node_pubkey,
-                );
-                self.account_txs.entry(claim_addr).or_default().push(tx.hash);
+                let claim_addr =
+                    ShardCoverageClaimBody::claim_account(&body.model_id, &body.node_pubkey);
+                self.account_txs
+                    .entry(claim_addr)
+                    .or_default()
+                    .push(tx.hash);
             }
             TxBody::CapacityAdvertisement(body) => {
-                let cap_addr =
-                    CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
+                let cap_addr = CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
                 self.account_txs.entry(cap_addr).or_default().push(tx.hash);
             }
             TxBody::ShardAssignmentProposal(_) => {
@@ -5939,27 +6119,21 @@ impl StateDB {
                 // Index against the request escrow address so a polling
                 // client (`GET /inference/onchain/result/:id`) can find
                 // the create tx by request_id.
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.account_txs
                     .entry(escrow_addr.0)
                     .or_default()
                     .push(tx.hash);
             }
             TxBody::InferenceVote(body) => {
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.account_txs
                     .entry(escrow_addr.0)
                     .or_default()
                     .push(tx.hash);
             }
             TxBody::InferenceFinalize(body) => {
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.account_txs
                     .entry(escrow_addr.0)
                     .or_default()
@@ -5972,19 +6146,34 @@ impl StateDB {
     fn mark_tx_accounts_dirty(&self, tx: &Transaction) {
         self.dirty_accounts.insert(tx.from.0);
         match &tx.body {
-            TxBody::Transfer(body) => { self.dirty_accounts.insert(body.to.0); }
-            TxBody::Settle(body) => { self.dirty_accounts.insert(body.agent_id.0); }
-            TxBody::Swap(body) => { self.dirty_accounts.insert(body.counterparty.0); }
-            TxBody::Stake(body) => { self.dirty_accounts.insert(body.validator.0); }
-            TxBody::WasmCall(body) => { self.dirty_accounts.insert(body.contract.0); }
-            TxBody::Escrow(body) => { self.dirty_accounts.insert(body.beneficiary.0); }
+            TxBody::Transfer(body) => {
+                self.dirty_accounts.insert(body.to.0);
+            }
+            TxBody::Settle(body) => {
+                self.dirty_accounts.insert(body.agent_id.0);
+            }
+            TxBody::Swap(body) => {
+                self.dirty_accounts.insert(body.counterparty.0);
+            }
+            TxBody::Stake(body) => {
+                self.dirty_accounts.insert(body.validator.0);
+            }
+            TxBody::WasmCall(body) => {
+                self.dirty_accounts.insert(body.contract.0);
+            }
+            TxBody::Escrow(body) => {
+                self.dirty_accounts.insert(body.beneficiary.0);
+            }
             TxBody::DeployContract(_) => {
                 // The contract address is deterministic - mark it dirty
                 let contract_addr = compute_contract_address(&tx.from, tx.nonce);
                 self.dirty_accounts.insert(contract_addr.0);
             }
             TxBody::RegisterAgent(_) | TxBody::MultiSig(_) => {}
-            TxBody::JoinValidator(_) | TxBody::LeaveValidator | TxBody::ClaimRewards | TxBody::UpdateStake(_) => {}
+            TxBody::JoinValidator(_)
+            | TxBody::LeaveValidator
+            | TxBody::ClaimRewards
+            | TxBody::UpdateStake(_) => {}
             TxBody::Governance(_) => {}
             TxBody::BridgeLock(_) => {
                 let escrow_addr = hash_bytes(b"ARC-bridge-escrow");
@@ -6009,9 +6198,10 @@ impl StateDB {
                 // Also mark the counterparty as dirty - their balance is modified during close.
                 // The counterparty address is stored in the escrow account's storage_root.
                 if let Some(escrow) = self.accounts.get(&escrow_addr.0)
-                    && escrow.storage_root != Hash256::ZERO {
-                        self.dirty_accounts.insert(escrow.storage_root.0);
-                    }
+                    && escrow.storage_root != Hash256::ZERO
+                {
+                    self.dirty_accounts.insert(escrow.storage_root.0);
+                }
             }
             TxBody::ChannelDispute(body) => {
                 let escrow_addr = hash_bytes(&[b"arc-channel", body.channel_id.as_ref()].concat());
@@ -6030,20 +6220,19 @@ impl StateDB {
                 self.dirty_accounts.insert(escrow_addr.0);
             }
             TxBody::InferenceChallenge(body) => {
-                let escrow_addr = hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
+                let escrow_addr =
+                    hash_bytes(&[b"arc-inference", body.attestation_hash.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
             }
             TxBody::InferenceRegister(_) => {
                 // Sender account is already marked dirty (line above match).
             }
             TxBody::InferenceEscrowOpen(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.dirty_accounts.insert(escrow_addr);
             }
             TxBody::InferenceEscrowRelease(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.dirty_accounts.insert(escrow_addr);
                 self.dirty_accounts.insert(body.proposer.0);
                 for r in &body.replicas {
@@ -6053,8 +6242,7 @@ impl StateDB {
                 self.dirty_accounts.insert(body.treasury.0);
             }
             TxBody::InferenceEscrowRefund(body) => {
-                let escrow_addr =
-                    InferenceEscrowOpenBody::escrow_address(&body.request_id);
+                let escrow_addr = InferenceEscrowOpenBody::escrow_address(&body.request_id);
                 self.dirty_accounts.insert(escrow_addr);
             }
             TxBody::ModelRegistration(body) => {
@@ -6068,21 +6256,17 @@ impl StateDB {
                 self.dirty_accounts.insert(req_addr);
             }
             TxBody::ShardCoverageClaim(body) => {
-                let claim_addr = ShardCoverageClaimBody::claim_account(
-                    &body.model_id,
-                    &body.node_pubkey,
-                );
+                let claim_addr =
+                    ShardCoverageClaimBody::claim_account(&body.model_id, &body.node_pubkey);
                 self.dirty_accounts.insert(claim_addr);
             }
             TxBody::CapacityAdvertisement(body) => {
-                let cap_addr =
-                    CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
+                let cap_addr = CapacityAdvertisementBody::capacity_account(&body.node_pubkey);
                 self.dirty_accounts.insert(cap_addr);
             }
             TxBody::ShardAssignmentProposal(body) => {
                 let prop_addr = arc_crypto::hash_bytes(
-                    &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()]
-                        .concat(),
+                    &[b"arc-planner-proposal", body.input_snapshot_hash.0.as_ref()].concat(),
                 )
                 .0;
                 self.dirty_accounts.insert(prop_addr);
@@ -6094,9 +6278,7 @@ impl StateDB {
             }
             TxBody::InferenceRequest(body) => {
                 // Request: signer balance debited + escrow created.
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
             }
             TxBody::InferenceVote(_body) => {
@@ -6109,9 +6291,7 @@ impl StateDB {
                 // (this runs before/parallel-to execute_tx in some paths). Mark the escrow
                 // and the treasury; agreeing voters are marked by execute_tx via direct
                 // accounts.insert (which the dirty tracker also picks up).
-                let escrow_addr = hash_bytes(
-                    &[b"arc-infreq", body.request_id.as_ref()].concat(),
-                );
+                let escrow_addr = hash_bytes(&[b"arc-infreq", body.request_id.as_ref()].concat());
                 self.dirty_accounts.insert(escrow_addr.0);
                 let treasury_addr = arc_types::transaction::faucet_pool_address();
                 self.dirty_accounts.insert(treasury_addr.0);
@@ -6312,16 +6492,19 @@ impl StateDB {
     /// Export the current state as a snapshot for state sync.
     /// New nodes can download this to bootstrap without replaying from genesis.
     pub fn export_snapshot(&self) -> Snapshot {
-        let accounts: Vec<(Address, Account)> = self.accounts
+        let accounts: Vec<(Address, Account)> = self
+            .accounts
             .iter()
             .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
             .collect();
 
-        let storage: wal::ContractStorage = self.storage
+        let storage: wal::ContractStorage = self
+            .storage
             .iter()
             .map(|entry| {
                 let key = Hash256(*entry.key());
-                let values: Vec<(Hash256, Vec<u8>)> = entry.value()
+                let values: Vec<(Hash256, Vec<u8>)> = entry
+                    .value()
                     .iter()
                     .map(|inner| (*inner.key(), inner.value().clone()))
                     .collect();
@@ -6329,7 +6512,8 @@ impl StateDB {
             })
             .collect();
 
-        let contracts: Vec<(Address, Vec<u8>)> = self.contracts
+        let contracts: Vec<(Address, Vec<u8>)> = self
+            .contracts
             .iter()
             .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
             .collect();
@@ -6440,7 +6624,8 @@ impl StateDB {
     /// against `diff.new_root` - a mismatch indicates a fraudulent proposal.
     pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Hash256 {
         for change in &diff.changes {
-            self.accounts.insert(change.address.0, change.account.clone());
+            self.accounts
+                .insert(change.address.0, change.account.clone());
             self.dirty_accounts.insert(change.address.0);
         }
         self.compute_state_root()
@@ -6478,7 +6663,10 @@ impl StateDB {
     pub fn is_compliant(&self, address: &Address) -> bool {
         match self.get_identity(address) {
             Some(id) => {
-                let level_ok = matches!(id.level, IdentityLevel::Verified | IdentityLevel::Institutional);
+                let level_ok = matches!(
+                    id.level,
+                    IdentityLevel::Verified | IdentityLevel::Institutional
+                );
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -6524,9 +6712,9 @@ impl StateDB {
             .get_index(&address.0)
             .ok_or(StateError::AccountNotFound(*address))?;
 
-        let merkle_proof = tree.proof(index).ok_or_else(|| {
-            StateError::ExecutionError("failed to generate Merkle proof".into())
-        })?;
+        let merkle_proof = tree
+            .proof(index)
+            .ok_or_else(|| StateError::ExecutionError("failed to generate Merkle proof".into()))?;
 
         let height = self.height();
         let timestamp = self
@@ -6569,9 +6757,9 @@ impl StateDB {
             .get_tx_location(&tx_hash.0)
             .ok_or_else(|| StateError::ExecutionError("transaction not found".into()))?;
 
-        let block = self
-            .get_block(block_height)
-            .ok_or_else(|| StateError::ExecutionError(format!("block {} not found", block_height)))?;
+        let block = self.get_block(block_height).ok_or_else(|| {
+            StateError::ExecutionError(format!("block {} not found", block_height))
+        })?;
 
         let tree = MerkleTree::from_leaves(block.tx_hashes.clone());
         let merkle_proof = tree.proof(tx_index as usize).ok_or_else(|| {
@@ -6646,10 +6834,7 @@ impl StateDB {
         let mut chunks = Vec::with_capacity(total_chunks as usize);
         let mut chunk_proofs = Vec::with_capacity(total_chunks as usize);
 
-        for (i, accounts_slice) in all_accounts
-            .chunks(chunk_size)
-            .enumerate()
-        {
+        for (i, accounts_slice) in all_accounts.chunks(chunk_size).enumerate() {
             let chunk_data = bincode::serialize(accounts_slice).expect("serializable");
             let chunk_proof = hash_bytes(&chunk_data);
             chunk_proofs.push(chunk_proof);
@@ -6666,8 +6851,8 @@ impl StateDB {
 
         // Handle the empty-state case: produce a single empty chunk.
         if chunks.is_empty() {
-            let empty_data = bincode::serialize(&Vec::<(Address, Account)>::new())
-                .expect("serializable");
+            let empty_data =
+                bincode::serialize(&Vec::<(Address, Account)>::new()).expect("serializable");
             let chunk_proof = hash_bytes(&empty_data);
             chunk_proofs.push(chunk_proof);
             chunks.push(StateSnapshot {
@@ -6856,8 +7041,14 @@ impl StateDB {
         let state_root = self.compute_state_root();
 
         // Hash the manifest metadata (excluding manifest_hash itself).
-        let pre_hash_data = bincode::serialize(&(version, &state_root, total_accounts, total_chunks, chunk_size))
-            .expect("serializable");
+        let pre_hash_data = bincode::serialize(&(
+            version,
+            &state_root,
+            total_accounts,
+            total_chunks,
+            chunk_size,
+        ))
+        .expect("serializable");
         let manifest_hash = hash_bytes(&pre_hash_data);
 
         SnapshotManifest {
@@ -7080,10 +7271,7 @@ mod tests {
 
     #[test]
     fn test_snapshot_roundtrip() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 500_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000)]);
 
         state.deploy_contract(&addr(10), vec![0x00, 0x61, 0x73, 0x6d]);
         state.set_storage(&addr(10), hash_bytes(b"k"), b"v".to_vec());
@@ -7113,7 +7301,6 @@ mod tests {
         let (_, receipts2) = state.execute_block_verified(&[tx2], addr(99)).unwrap();
         assert!(!receipts2[0].success);
     }
-
 
     #[test]
     fn test_identity_registry() {
@@ -7192,10 +7379,7 @@ mod tests {
     fn test_propose_verify_state_diff() {
         // Proposer: execute a block and export state diff.
         // The proposer knows affected accounts from the tx bodies.
-        let proposer_state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 0),
-        ]);
+        let proposer_state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
         let tx = Transaction::new_transfer(addr(1), addr(2), 500, 0);
         let (block, _receipts) = proposer_state.execute_block(&[tx], addr(99)).unwrap();
 
@@ -7205,10 +7389,7 @@ mod tests {
         assert_eq!(diff.new_root, block.header.state_root);
 
         // Verifier: apply the state diff (without re-executing)
-        let verifier_state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 0),
-        ]);
+        let verifier_state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
         let verifier_root = verifier_state.apply_state_diff(&diff);
 
         // Root must match the diff's declared root
@@ -7246,14 +7427,17 @@ mod tests {
 
         // Create some accounts
         db.accounts.insert(addr1.0, Account::new(addr1, 1000));
-        db.accounts.insert(addr2.0, Account {
-            address: addr2,
-            balance: 2000,
-            nonce: 5,
-            code_hash: Hash256::ZERO,
-            storage_root: Hash256::ZERO,
-            staked_balance: 0,
-        });
+        db.accounts.insert(
+            addr2.0,
+            Account {
+                address: addr2,
+                balance: 2000,
+                nonce: 5,
+                code_hash: Hash256::ZERO,
+                storage_root: Hash256::ZERO,
+                staked_balance: 0,
+            },
+        );
 
         // Mark as dirty
         db.dirty_accounts.insert(addr1.0);
@@ -7274,15 +7458,20 @@ mod tests {
         let addr2 = hash_bytes(&[2]);
 
         // Proposer executes transactions
-        proposer_db.accounts.insert(addr1.0, Account {
-            address: addr1,
-            balance: 900,
-            nonce: 1,
-            code_hash: Hash256::ZERO,
-            storage_root: Hash256::ZERO,
-            staked_balance: 0,
-        });
-        proposer_db.accounts.insert(addr2.0, Account::new(addr2, 100));
+        proposer_db.accounts.insert(
+            addr1.0,
+            Account {
+                address: addr1,
+                balance: 900,
+                nonce: 1,
+                code_hash: Hash256::ZERO,
+                storage_root: Hash256::ZERO,
+                staked_balance: 0,
+            },
+        );
+        proposer_db
+            .accounts
+            .insert(addr2.0, Account::new(addr2, 100));
         proposer_db.dirty_accounts.insert(addr1.0);
         proposer_db.dirty_accounts.insert(addr2.0);
 
@@ -7302,14 +7491,17 @@ mod tests {
         let addr1 = hash_bytes(&[1]);
 
         // Proposer creates a diff
-        proposer_db.accounts.insert(addr1.0, Account {
-            address: addr1,
-            balance: 900,
-            nonce: 1,
-            code_hash: Hash256::ZERO,
-            storage_root: Hash256::ZERO,
-            staked_balance: 0,
-        });
+        proposer_db.accounts.insert(
+            addr1.0,
+            Account {
+                address: addr1,
+                balance: 900,
+                nonce: 1,
+                code_hash: Hash256::ZERO,
+                storage_root: Hash256::ZERO,
+                staked_balance: 0,
+            },
+        );
         proposer_db.dirty_accounts.insert(addr1.0);
 
         let affected = vec![addr1];
@@ -7328,10 +7520,7 @@ mod tests {
 
     #[test]
     fn test_chunked_snapshot_export_single_chunk() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000),
-            (addr(2), 2_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 1_000), (addr(2), 2_000)]);
 
         // chunk_size large enough to fit everything in one chunk
         let (manifest, chunks) = state.export_chunked_snapshot(100);
@@ -7439,11 +7628,7 @@ mod tests {
 
     #[test]
     fn test_chunked_snapshot_manifest_hash_deterministic() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000),
-            (addr(2), 2_000),
-            (addr(3), 3_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 1_000), (addr(2), 2_000), (addr(3), 3_000)]);
 
         let (m1, _) = state.export_chunked_snapshot(2);
         let (m2, _) = state.export_chunked_snapshot(2);
@@ -7519,11 +7704,8 @@ mod tests {
 
     #[test]
     fn test_state_summary() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 500_000),
-            (addr(3), 250_000),
-        ]);
+        let state =
+            StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 500_000), (addr(3), 250_000)]);
 
         let summary = state.state_summary();
         assert_eq!(summary.account_count, 3);
@@ -7546,10 +7728,7 @@ mod tests {
 
     #[test]
     fn test_prune_old_receipts() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 10_000_000),
-            (addr(2), 10_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 10_000_000), (addr(2), 10_000_000)]);
 
         // Execute several blocks to build up receipts.
         for i in 0..5 {
@@ -7567,17 +7746,17 @@ mod tests {
         // Only receipts from blocks 4 and 5 should remain.
         assert_eq!(state.receipts.len(), 2);
         for entry in state.receipts.iter() {
-            assert!(entry.value().block_height > 3,
-                "receipt at height {} should have been pruned", entry.value().block_height);
+            assert!(
+                entry.value().block_height > 3,
+                "receipt at height {} should have been pruned",
+                entry.value().block_height
+            );
         }
     }
 
     #[test]
     fn test_prune_old_receipts_noop_when_young() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 10_000_000),
-            (addr(2), 10_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 10_000_000), (addr(2), 10_000_000)]);
 
         let tx = Transaction::new_transfer(addr(1), addr(2), 100, 0);
         state.execute_block(&[tx], addr(99)).unwrap();
@@ -7592,8 +7771,8 @@ mod tests {
     #[test]
     fn test_collect_rent_deducts_balance() {
         let state = StateDB::with_genesis(&[
-            (addr(1), 5_000_000),   // above dust threshold (1_000_000)
-            (addr(2), 10_000_000),  // above dust threshold
+            (addr(1), 5_000_000),  // above dust threshold (1_000_000)
+            (addr(2), 10_000_000), // above dust threshold
         ]);
 
         let config = StateRentConfig::default();
@@ -7616,9 +7795,7 @@ mod tests {
     fn test_collect_rent_marks_dormant() {
         // Account with balance just above dust threshold → rent pushes it below.
         let balance = 1_000_100; // dust = 1_000_000, rent = 128 → after: 999_972 < 1_000_000
-        let state = StateDB::with_genesis(&[
-            (addr(1), balance),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), balance)]);
 
         let config = StateRentConfig::default();
         let (collected, dormant) = state.collect_rent(&config);
@@ -7649,9 +7826,7 @@ mod tests {
 
     #[test]
     fn test_collect_rent_zero_rent_noop() {
-        let state = StateDB::with_genesis(&[
-            (addr(1), 5_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 5_000_000)]);
 
         let config = StateRentConfig {
             cost_per_byte_per_epoch: 0,
@@ -7666,7 +7841,7 @@ mod tests {
     // ── Channel integration tests ────────────────────────────────────────
 
     use arc_types::transaction::{
-        ChannelOpenBody, ChannelCloseBody, ChannelDisputeBody, InferenceRegisterBody,
+        ChannelCloseBody, ChannelDisputeBody, ChannelOpenBody, InferenceRegisterBody,
     };
 
     fn make_channel_tx(from: Address, nonce: u64, body: TxBody, tx_type: TxType) -> Transaction {
@@ -7690,12 +7865,17 @@ mod tests {
         let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
         let channel_id = hash_bytes(b"test-channel-1");
 
-        let tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
 
         let (_, receipts) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(receipts[0].success, "ChannelOpen should succeed");
@@ -7708,8 +7888,8 @@ mod tests {
         let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
         let escrow = state.get_account(&escrow_addr).unwrap();
         assert_eq!(escrow.balance, 100_000);
-        assert_eq!(escrow.code_hash, addr(1));      // opener
-        assert_eq!(escrow.storage_root, addr(2));    // counterparty
+        assert_eq!(escrow.code_hash, addr(1)); // opener
+        assert_eq!(escrow.storage_root, addr(2)); // counterparty
     }
 
     #[test]
@@ -7718,23 +7898,33 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-2");
 
         // Open
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         let (_, r) = state.execute_block(&[open_tx], addr(99)).unwrap();
         assert!(r[0].success);
 
         // Close (opener closes, split 60K/40K)
-        let close_tx = make_channel_tx(addr(1), 1, TxBody::ChannelClose(ChannelCloseBody {
-            channel_id,
-            opener_balance: 60_000,
-            counterparty_balance: 40_000,
-            counterparty_sig: vec![0u8; 64],
-            state_nonce: 1,
-        }), TxType::ChannelClose);
+        let close_tx = make_channel_tx(
+            addr(1),
+            1,
+            TxBody::ChannelClose(ChannelCloseBody {
+                channel_id,
+                opener_balance: 60_000,
+                counterparty_balance: 40_000,
+                counterparty_sig: vec![0u8; 64],
+                state_nonce: 1,
+            }),
+            TxType::ChannelClose,
+        );
         let (_, r) = state.execute_block(&[close_tx], addr(99)).unwrap();
         assert!(r[0].success, "ChannelClose should succeed");
 
@@ -7758,32 +7948,42 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-3");
 
         // Open channel
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
         // Dispute from counterparty (addr(2))
-        let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 70_000,
-            counterparty_balance: 30_000,
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 5,
-            challenge_period: 100,
-        }), TxType::ChannelDispute);
+        let dispute_tx = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 70_000,
+                counterparty_balance: 30_000,
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 5,
+                challenge_period: 100,
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
         assert!(r[0].success, "ChannelDispute should succeed");
 
         // Check escrow state updated
         let escrow_addr = hash_bytes(&[b"arc-channel", channel_id.as_ref()].concat());
         let escrow = state.get_account(&escrow_addr).unwrap();
-        assert_eq!(escrow.nonce, 5);                // state_nonce recorded
-        assert!(escrow.staked_balance > 0);          // challenge_expiry set
-        assert_eq!(escrow.balance, 100_000);         // funds still locked
+        assert_eq!(escrow.nonce, 5); // state_nonce recorded
+        assert!(escrow.staked_balance > 0); // challenge_expiry set
+        assert_eq!(escrow.balance, 100_000); // funds still locked
     }
 
     #[test]
@@ -7792,35 +7992,50 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-4");
 
         // Open
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
         // First dispute with nonce 10
-        let d1 = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 60_000,
-            counterparty_balance: 40_000,
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 10,
-            challenge_period: 100,
-        }), TxType::ChannelDispute);
+        let d1 = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 60_000,
+                counterparty_balance: 40_000,
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 10,
+                challenge_period: 100,
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[d1], addr(99)).unwrap();
         assert!(r[0].success);
 
         // Second dispute with lower nonce (5) - should fail
-        let d2 = make_channel_tx(addr(1), 1, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 80_000,
-            counterparty_balance: 20_000,
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 5, // lower than 10!
-            challenge_period: 100,
-        }), TxType::ChannelDispute);
+        let d2 = make_channel_tx(
+            addr(1),
+            1,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 80_000,
+                counterparty_balance: 20_000,
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 5, // lower than 10!
+                challenge_period: 100,
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[d2], addr(99)).unwrap();
         assert!(!r[0].success, "Dispute with lower nonce should be rejected");
     }
@@ -7831,36 +8046,54 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-5");
 
         // Open
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
         // Dispute (sets challenge_expiry far in the future)
-        let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 60_000,
-            counterparty_balance: 40_000,
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 1,
-            challenge_period: 100_000, // very long
-        }), TxType::ChannelDispute);
+        let dispute_tx = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 60_000,
+                counterparty_balance: 40_000,
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 1,
+                challenge_period: 100_000, // very long
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
         assert!(r[0].success);
 
         // Try to close - should fail (active dispute)
-        let close_tx = make_channel_tx(addr(1), 1, TxBody::ChannelClose(ChannelCloseBody {
-            channel_id,
-            opener_balance: 100_000,
-            counterparty_balance: 0,
-            counterparty_sig: vec![0u8; 64],
-            state_nonce: 1,
-        }), TxType::ChannelClose);
+        let close_tx = make_channel_tx(
+            addr(1),
+            1,
+            TxBody::ChannelClose(ChannelCloseBody {
+                channel_id,
+                opener_balance: 100_000,
+                counterparty_balance: 0,
+                counterparty_sig: vec![0u8; 64],
+                state_nonce: 1,
+            }),
+            TxType::ChannelClose,
+        );
         let (_, r) = state.execute_block(&[close_tx], addr(99)).unwrap();
-        assert!(!r[0].success, "Close should be blocked during active dispute");
+        assert!(
+            !r[0].success,
+            "Close should be blocked during active dispute"
+        );
     }
 
     #[test]
@@ -7869,42 +8102,60 @@ mod tests {
         let channel_id = hash_bytes(b"test-channel-6");
 
         // Open with 100K deposit
-        let open_tx = make_channel_tx(addr(1), 0, TxBody::ChannelOpen(ChannelOpenBody {
-            channel_id,
-            counterparty: addr(2),
-            deposit: 100_000,
-            timeout_blocks: 100,
-        }), TxType::ChannelOpen);
+        let open_tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::ChannelOpen(ChannelOpenBody {
+                channel_id,
+                counterparty: addr(2),
+                deposit: 100_000,
+                timeout_blocks: 100,
+            }),
+            TxType::ChannelOpen,
+        );
         state.execute_block(&[open_tx], addr(99)).unwrap();
 
         // Dispute claiming more than deposited - should fail
-        let dispute_tx = make_channel_tx(addr(2), 0, TxBody::ChannelDispute(ChannelDisputeBody {
-            channel_id,
-            opener_balance: 80_000,
-            counterparty_balance: 40_000, // 80K + 40K = 120K > 100K!
-            other_party_sig: vec![0u8; 64],
-            state_nonce: 1,
-            challenge_period: 100,
-        }), TxType::ChannelDispute);
+        let dispute_tx = make_channel_tx(
+            addr(2),
+            0,
+            TxBody::ChannelDispute(ChannelDisputeBody {
+                channel_id,
+                opener_balance: 80_000,
+                counterparty_balance: 40_000, // 80K + 40K = 120K > 100K!
+                other_party_sig: vec![0u8; 64],
+                state_nonce: 1,
+                challenge_period: 100,
+            }),
+            TxType::ChannelDispute,
+        );
         let (_, r) = state.execute_block(&[dispute_tx], addr(99)).unwrap();
-        assert!(!r[0].success, "Dispute exceeding deposit should be rejected");
+        assert!(
+            !r[0].success,
+            "Dispute exceeding deposit should be rejected"
+        );
     }
 
     #[test]
     fn test_inference_register_locks_stake() {
         let state = StateDB::with_genesis(&[(addr(1), 100_000)]);
 
-        let tx = make_channel_tx(addr(1), 0, TxBody::InferenceRegister(InferenceRegisterBody {
-            tier: 2,
-            stake_bond: 5_000,
-        }), TxType::InferenceRegister);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceRegister(InferenceRegisterBody {
+                tier: 2,
+                stake_bond: 5_000,
+            }),
+            TxType::InferenceRegister,
+        );
 
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
         assert!(r[0].success, "InferenceRegister should succeed");
 
         let acct = state.get_account(&addr(1)).unwrap();
-        assert_eq!(acct.balance, 95_000);        // 100K - 5K
-        assert_eq!(acct.staked_balance, 5_000);  // locked
+        assert_eq!(acct.balance, 95_000); // 100K - 5K
+        assert_eq!(acct.staked_balance, 5_000); // locked
     }
 
     #[test]
@@ -7912,13 +8163,21 @@ mod tests {
         let state = StateDB::with_genesis(&[(addr(1), 100_000)]);
 
         // Tier 2 requires 5K minimum, try with only 1K
-        let tx = make_channel_tx(addr(1), 0, TxBody::InferenceRegister(InferenceRegisterBody {
-            tier: 2,
-            stake_bond: 1_000, // below min for tier 2
-        }), TxType::InferenceRegister);
+        let tx = make_channel_tx(
+            addr(1),
+            0,
+            TxBody::InferenceRegister(InferenceRegisterBody {
+                tier: 2,
+                stake_bond: 1_000, // below min for tier 2
+            }),
+            TxType::InferenceRegister,
+        );
 
         let (_, r) = state.execute_block(&[tx], addr(99)).unwrap();
-        assert!(!r[0].success, "InferenceRegister with insufficient stake should fail");
+        assert!(
+            !r[0].success,
+            "InferenceRegister with insufficient stake should fail"
+        );
     }
 
     // ── Milestone B: InferenceEscrow integration tests ───────────────────
@@ -7928,7 +8187,7 @@ mod tests {
     // increase by their share; total conserved."
 
     use arc_types::transaction::{
-        InferenceEscrowOpenBody, InferenceEscrowReleaseBody, InferenceEscrowRefundBody,
+        InferenceEscrowOpenBody, InferenceEscrowRefundBody, InferenceEscrowReleaseBody,
     };
 
     /// Convenience: same 32-byte request_id in every test, keyed on test name
@@ -7967,17 +8226,11 @@ mod tests {
         assert_eq!(payer.nonce, 1);
 
         // Escrow account holds the max_fee.
-        let escrow_addr =
-            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         let escrow = state.get_account(&escrow_addr).unwrap();
         assert_eq!(escrow.balance, 10_000);
         // The escrow's storage_root commits to the payer's identity.
-        let expected = InferenceEscrowOpenBody::metadata_commitment(
-            &addr(1),
-            &model_id(),
-            32,
-            10,
-        );
+        let expected = InferenceEscrowOpenBody::metadata_commitment(&addr(1), &model_id(), 32, 10);
         assert_eq!(escrow.storage_root.0, expected);
     }
 
@@ -8084,8 +8337,7 @@ mod tests {
         let r3 = state.get_account(&addr(5)).unwrap();
         let obs = state.get_account(&addr(10)).unwrap();
         let tre = state.get_account(&addr(11)).unwrap();
-        let escrow_addr =
-            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         let escrow = state.get_account(&escrow_addr).unwrap();
 
         // 40% proposer, 25% replicas (split 3 ways evenly with rounding → treasury),
@@ -8102,8 +8354,8 @@ mod tests {
         assert_eq!(tre.balance, 2_001);
 
         // Conservation: payer is short 10_000; beneficiaries are up 10_000.
-        let credited = proposer.balance + r1.balance + r2.balance + r3.balance
-            + obs.balance + tre.balance;
+        let credited =
+            proposer.balance + r1.balance + r2.balance + r3.balance + obs.balance + tre.balance;
         assert_eq!(credited, 10_000);
         assert_eq!(payer.balance, 990_000);
 
@@ -8151,8 +8403,7 @@ mod tests {
         assert!(rs[0].success);
         assert!(!rs[1].success, "release with wrong payer must fail");
         // Escrow still holds funds; nobody got paid.
-        let escrow_addr =
-            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 5_000);
     }
 
@@ -8236,8 +8487,7 @@ mod tests {
         assert!(rs[0].success, "refund after timeout should succeed");
 
         assert_eq!(state.get_account(&addr(1)).unwrap().balance, 1_000_000);
-        let escrow_addr =
-            Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
+        let escrow_addr = Hash256(InferenceEscrowOpenBody::escrow_address(&request_id));
         assert_eq!(state.get_account(&escrow_addr).unwrap().balance, 0);
     }
 
@@ -8277,10 +8527,7 @@ mod tests {
     #[test]
     fn test_escrow_refund_rejects_non_payer() {
         // addr(1) opens; addr(2) tries to refund → rejected (not original payer).
-        let state = StateDB::with_genesis(&[
-            (addr(1), 1_000_000),
-            (addr(2), 100_000),
-        ]);
+        let state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 100_000)]);
         let request_id = req(b"not-your-money");
         let open = make_channel_tx(
             addr(1),
@@ -8322,8 +8569,8 @@ mod tests {
     // (duplicate registration, insufficient balance, empty ranges).
 
     use arc_types::transaction::{
-        CapacityAdvertisementBody, ModelRegistrationBody, ModelRequestBody,
-        ShardCoverageClaimBody, MIN_MODEL_REGISTRATION_FEE,
+        CapacityAdvertisementBody, MIN_MODEL_REGISTRATION_FEE, ModelRegistrationBody,
+        ModelRequestBody, ShardCoverageClaimBody,
     };
 
     fn test_model_id() -> Hash256 {
@@ -8397,7 +8644,10 @@ mod tests {
         let (_, r1) = state.execute_block(&[tx1], addr(99)).unwrap();
         assert!(r1[0].success);
         let (_, r2) = state.execute_block(&[tx2], addr(99)).unwrap();
-        assert!(!r2[0].success, "second registration for same model_id must fail");
+        assert!(
+            !r2[0].success,
+            "second registration for same model_id must fail"
+        );
     }
 
     #[test]
@@ -8584,13 +8834,15 @@ mod tests {
     // Lives at the bottom of the test module so the helpers above (`addr`,
     // `make_channel_tx`) are in scope.
 
-    use arc_types::transaction::{FaucetClaimBody, FAUCET_CLAIM_MAX};
+    use arc_types::transaction::{FAUCET_CLAIM_MAX, FaucetClaimBody};
 
     /// Convenience: seed a validator at `signer` with stake = MIN_VALIDATOR_STAKE
     /// so `is_validator(&signer)` returns true without paying the
     /// JoinValidator-debit / nonce-bump path.
     fn seed_validator(state: &StateDB, signer: Address) {
-        state.validators.insert(signer.0, StateDB::MIN_VALIDATOR_STAKE);
+        state
+            .validators
+            .insert(signer.0, StateDB::MIN_VALIDATOR_STAKE);
     }
 
     #[test]
@@ -8633,10 +8885,7 @@ mod tests {
     fn test_faucet_claim_rejects_non_validator_signer() {
         let pool_addr = arc_types::transaction::faucet_pool_address();
         let not_a_validator = addr(8);
-        let state = StateDB::with_genesis(&[
-            (pool_addr, 1_000_000),
-            (not_a_validator, 0),
-        ]);
+        let state = StateDB::with_genesis(&[(pool_addr, 1_000_000), (not_a_validator, 0)]);
         // Deliberately do NOT seed_validator.
 
         let tx = make_channel_tx(
@@ -8658,16 +8907,17 @@ mod tests {
         // Pool untouched, recipient never created.
         let pool = state.get_account(&pool_addr).unwrap();
         assert_eq!(pool.balance, 1_000_000);
-        assert!(state.get_account(&addr(43)).is_none() || state.get_account(&addr(43)).unwrap().balance == 0);
+        assert!(
+            state.get_account(&addr(43)).is_none()
+                || state.get_account(&addr(43)).unwrap().balance == 0
+        );
     }
 
     #[test]
     fn test_faucet_claim_rejects_amount_over_max() {
         let pool_addr = arc_types::transaction::faucet_pool_address();
         let validator = addr(9);
-        let state = StateDB::with_genesis(&[
-            (pool_addr, 1_000_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(pool_addr, 1_000_000_000)]);
         seed_validator(&state, validator);
 
         let tx = make_channel_tx(
@@ -8687,9 +8937,7 @@ mod tests {
     fn test_faucet_claim_rejects_zero_amount() {
         let pool_addr = arc_types::transaction::faucet_pool_address();
         let validator = addr(10);
-        let state = StateDB::with_genesis(&[
-            (pool_addr, 1_000_000),
-        ]);
+        let state = StateDB::with_genesis(&[(pool_addr, 1_000_000)]);
         seed_validator(&state, validator);
 
         let tx = make_channel_tx(
@@ -8744,25 +8992,27 @@ mod tests {
         let kp = KeyPair::generate_ed25519();
         let validator = kp.address();
 
-        let proposer_state = StateDB::with_genesis(&[
-            (pool_addr, 100_000_000),
-        ]);
+        let proposer_state = StateDB::with_genesis(&[(pool_addr, 100_000_000)]);
         seed_validator(&proposer_state, validator);
 
         let mut tx = Transaction::new_faucet_claim(validator, addr(50), 10_000, 0);
         tx.sign(&kp).expect("sign ok");
         let wire = bincode::serialize(&tx).expect("serialize tx");
 
-        let peer_state = StateDB::with_genesis(&[
-            (pool_addr, 100_000_000),
-        ]);
+        let peer_state = StateDB::with_genesis(&[(pool_addr, 100_000_000)]);
         seed_validator(&peer_state, validator);
 
         // sig_verified is `#[serde(default)]` so the peer deserializes
         // with the flag cleared — same as a real network hop.
         let peer_tx: Transaction = bincode::deserialize(&wire).expect("deserialize tx");
-        assert!(!peer_tx.sig_verified, "wire-format tx must arrive with sig_verified=false");
-        assert!(!peer_tx.is_unsigned(), "wire-format tx must still carry the validator sig");
+        assert!(
+            !peer_tx.sig_verified,
+            "wire-format tx must arrive with sig_verified=false"
+        );
+        assert!(
+            !peer_tx.is_unsigned(),
+            "wire-format tx must still carry the validator sig"
+        );
 
         let (_, r) = peer_state.execute_block(&[peer_tx], addr(99)).unwrap();
         assert!(
@@ -8787,8 +9037,8 @@ mod tests {
         committee_size: u8,
         deadline_blocks: u64,
     ) -> arc_types::transaction::Transaction {
-        use arc_types::transaction::{InferenceRequestBody, Transaction, TxBody, TxType};
         use arc_crypto::Signature;
+        use arc_types::transaction::{InferenceRequestBody, Transaction, TxBody, TxType};
         let input_blob = b"[INST] hi [/INST]".to_vec();
         let input_hash = hash_bytes(&input_blob);
         let body = TxBody::InferenceRequest(InferenceRequestBody {
@@ -8824,8 +9074,8 @@ mod tests {
         committee_seed: Hash256,
         output_hash: Hash256,
     ) -> arc_types::transaction::Transaction {
-        use arc_types::transaction::{InferenceVoteBody, Transaction, TxBody, TxType};
         use arc_crypto::Signature;
+        use arc_types::transaction::{InferenceVoteBody, Transaction, TxBody, TxType};
         let body = TxBody::InferenceVote(InferenceVoteBody {
             request_id,
             output_hash,
@@ -8853,8 +9103,8 @@ mod tests {
         nonce: u64,
         request_id: [u8; 32],
     ) -> arc_types::transaction::Transaction {
-        use arc_types::transaction::{InferenceFinalizeBody, Transaction, TxBody, TxType};
         use arc_crypto::Signature;
+        use arc_types::transaction::{InferenceFinalizeBody, Transaction, TxBody, TxType};
         let body = TxBody::InferenceFinalize(InferenceFinalizeBody { request_id });
         let mut tx = Transaction {
             tx_type: TxType::InferenceFinalize,
@@ -8876,7 +9126,9 @@ mod tests {
         let requester = addr(1);
         let state = StateDB::with_genesis(&[(requester, 100)]);
         // Register a validator so block production has a proposer.
-        state.validators.insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
+        state
+            .validators
+            .insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
 
         let req_id = [42u8; 32];
         let tx = build_tier1_request(requester, 0, req_id, 10, 1, 20);
@@ -8900,13 +9152,15 @@ mod tests {
     fn tier1_request_rejects_oversized_input() {
         let requester = addr(1);
         let state = StateDB::with_genesis(&[(requester, 1_000_000)]);
-        state.validators.insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
+        state
+            .validators
+            .insert(addr(99).0, StateDB::MIN_VALIDATOR_STAKE);
 
         // Construct an oversized prompt directly.
-        use arc_types::transaction::{
-            InferenceRequestBody, Transaction, TxBody, TxType, TIER1_INPUT_BLOB_MAX,
-        };
         use arc_crypto::Signature;
+        use arc_types::transaction::{
+            InferenceRequestBody, TIER1_INPUT_BLOB_MAX, Transaction, TxBody, TxType,
+        };
         let oversized = vec![0u8; TIER1_INPUT_BLOB_MAX + 1];
         let body = TxBody::InferenceRequest(InferenceRequestBody {
             request_id: [1u8; 32],
@@ -9108,7 +9362,10 @@ mod tests {
         assert_eq!(w.nonce, 1);
 
         // Treasury debited by exactly the reward.
-        assert_eq!(state.get_account(&pool).unwrap().balance, treasury_start - REWARD);
+        assert_eq!(
+            state.get_account(&pool).unwrap().balance,
+            treasury_start - REWARD
+        );
 
         // Bond locked in escrow, tagged OPEN, refund target = worker.
         let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
@@ -9139,7 +9396,13 @@ mod tests {
         );
         // No escrow account is created for a zero bond.
         let escrow_addr = hash_bytes(&[b"arc-inference", att_hash.as_ref()].concat());
-        assert!(state.get_account(&escrow_addr).map(|e| e.balance).unwrap_or(0) == 0);
+        assert!(
+            state
+                .get_account(&escrow_addr)
+                .map(|e| e.balance)
+                .unwrap_or(0)
+                == 0
+        );
         assert_eq!(state.pending_bond_release_count(), 0);
         assert_eq!(sum_all_balances(&state), before, "supply conserved");
     }
@@ -9204,9 +9467,11 @@ mod tests {
         assert!(r[0].success);
 
         assert_eq!(state.get_account(&worker).unwrap().balance, REWARD - bond);
-        assert!(state
-            .get_account(&arc_types::transaction::faucet_pool_address())
-            .is_none());
+        assert!(
+            state
+                .get_account(&arc_types::transaction::faucet_pool_address())
+                .is_none()
+        );
         assert_eq!(sum_all_balances(&state), before, "supply conserved");
     }
 
@@ -9232,7 +9497,10 @@ mod tests {
         // Not released before the window: a sweep one block early is a no-op.
         assert_eq!(state.sweep_matured_bond_releases(release_h - 1), 0);
         assert_eq!(state.get_account(&escrow_addr).unwrap().balance, bond);
-        assert_eq!(state.get_account(&worker).unwrap().balance, worker_after_attest);
+        assert_eq!(
+            state.get_account(&worker).unwrap().balance,
+            worker_after_attest
+        );
 
         // Released exactly at the deadline: escrow → 0, worker regains the bond.
         assert_eq!(state.sweep_matured_bond_releases(release_h), 1);
@@ -9335,7 +9603,10 @@ mod tests {
         let faucet = make_channel_tx(
             validator,
             0,
-            TxBody::FaucetClaim(FaucetClaimBody { recipient: worker_c, amount: 10_000 }),
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: worker_c,
+                amount: 10_000,
+            }),
             TxType::FaucetClaim,
         );
         assert!(state.execute_block(&[faucet], validator).unwrap().1[0].success);

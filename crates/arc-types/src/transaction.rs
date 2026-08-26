@@ -1,5 +1,5 @@
 use arc_crypto::Hash256;
-use arc_crypto::signature::{Signature, KeyPair, SignatureError};
+use arc_crypto::signature::{KeyPair, Signature, SignatureError};
 use serde::{Deserialize, Serialize};
 
 use crate::account::Address;
@@ -1169,7 +1169,13 @@ impl CompactTransfer {
         hasher.update(to.as_ref());
         hasher.update(&amount.to_le_bytes());
         let hash = Hash256(*hasher.finalize().as_bytes());
-        Self { from, to, amount, nonce, hash }
+        Self {
+            from,
+            to,
+            amount,
+            nonce,
+            hash,
+        }
     }
 
     /// Serialize into a fixed-size 250-byte buffer.
@@ -1192,7 +1198,12 @@ impl Transaction {
     /// must `tx.sign(&validator_keypair)` before submitting). The executor
     /// will reject the tx unless `validator` is an active validator at
     /// commit time.
-    pub fn new_faucet_claim(validator: Address, recipient: Address, amount: u64, nonce: u64) -> Self {
+    pub fn new_faucet_claim(
+        validator: Address,
+        recipient: Address,
+        amount: u64,
+        nonce: u64,
+    ) -> Self {
         let body = TxBody::FaucetClaim(FaucetClaimBody { recipient, amount });
         let mut tx = Self {
             tx_type: TxType::FaucetClaim,
@@ -1571,7 +1582,10 @@ mod tests {
         b.fee = 20;
         let hash_b = b.compute_hash();
 
-        assert_ne!(hash_a, hash_b, "different fees must produce different hashes");
+        assert_ne!(
+            hash_a, hash_b,
+            "different fees must produce different hashes"
+        );
     }
 
     // ── Gas metering ──

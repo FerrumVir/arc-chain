@@ -13,8 +13,8 @@ use quinn::crypto::rustls::QuicClientConfig;
 use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -453,25 +453,37 @@ fn verify_handshake(msg: &HandshakeMessage) -> anyhow::Result<()> {
 
     // 3. Protocol version compatibility check.
     // Treat version 0 as v1 (old nodes that don't send protocol_version).
-    let peer_version = if msg.protocol_version == 0 { 1 } else { msg.protocol_version };
-    let peer_min = if msg.min_compatible_version == 0 { 1 } else { msg.min_compatible_version };
+    let peer_version = if msg.protocol_version == 0 {
+        1
+    } else {
+        msg.protocol_version
+    };
+    let peer_min = if msg.min_compatible_version == 0 {
+        1
+    } else {
+        msg.min_compatible_version
+    };
 
     if peer_min > crate::protocol::PROTOCOL_VERSION {
         anyhow::bail!(
             "peer requires protocol version >= {} but we are at {}",
-            peer_min, crate::protocol::PROTOCOL_VERSION
+            peer_min,
+            crate::protocol::PROTOCOL_VERSION
         );
     }
     if peer_version < crate::protocol::MIN_COMPATIBLE_VERSION {
         anyhow::bail!(
             "peer protocol version {} is below our minimum {}",
-            peer_version, crate::protocol::MIN_COMPATIBLE_VERSION
+            peer_version,
+            crate::protocol::MIN_COMPATIBLE_VERSION
         );
     }
 
     tracing::debug!(
         "Peer {} handshake OK: protocol v{}, dag_round={}",
-        msg.validator_address, peer_version, msg.dag_round
+        msg.validator_address,
+        peer_version,
+        msg.dag_round
     );
 
     Ok(())
@@ -486,7 +498,9 @@ struct PeerRateLimiter {
 
 impl PeerRateLimiter {
     fn new() -> Self {
-        Self { counters: DashMap::new() }
+        Self {
+            counters: DashMap::new(),
+        }
     }
 
     /// Returns true if the message should be allowed, false if rate-limited.
@@ -567,8 +581,12 @@ impl PeerConnections {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
                     write_message(entry.value_mut(), msg_type, payload),
-                ).await {
-                    Ok(Ok(())) => { sent += 1; }
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        sent += 1;
+                    }
                     Ok(Err(e)) => {
                         warn!("Failed to send to peer: {}", e);
                         dead_peers.push(*key);
@@ -585,7 +603,13 @@ impl PeerConnections {
             self.meta.remove(&key);
         }
         if msg_type == MessageType::DagBlockWithTxs && peer_count > 0 {
-            debug!("Broadcast {:?}: sent to {}/{} peers ({} bytes)", msg_type, sent, peer_count, payload.len());
+            debug!(
+                "Broadcast {:?}: sent to {}/{} peers ({} bytes)",
+                msg_type,
+                sent,
+                peer_count,
+                payload.len()
+            );
         }
     }
 
@@ -598,7 +622,10 @@ impl PeerConnections {
                 self.meta.remove(&target.0);
             }
         } else {
-            debug!("send_to: peer {} not connected, cannot send {:?}", target, msg_type);
+            debug!(
+                "send_to: peer {} not connected, cannot send {:?}",
+                target, msg_type
+            );
         }
     }
 }
@@ -658,11 +685,16 @@ pub async fn run_transport(
         let mut bound: Option<quinn::Endpoint> = None;
         for attempt in 0..5 {
             match quinn::Endpoint::server(server_config.clone(), configured_addr) {
-                Ok(ep) => { bound = Some(ep); break; }
+                Ok(ep) => {
+                    bound = Some(ep);
+                    break;
+                }
                 Err(e) => {
                     warn!(
                         "QUIC bind on {} attempt {} failed: {} - retrying in 2s",
-                        configured_addr, attempt + 1, e
+                        configured_addr,
+                        attempt + 1,
+                        e
                     );
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }
@@ -678,7 +710,8 @@ pub async fn run_transport(
                          will participate normally as a consumer/observer but cannot \
                          accept inbound dials as a public seed. Common cause on \
                          Windows: Hyper-V's dynamic UDP exclusion range covers {}.",
-                        configured_addr.port(), configured_addr.port()
+                        configured_addr.port(),
+                        configured_addr.port()
                     );
                     bound = Some(ep);
                 }
@@ -747,7 +780,11 @@ pub async fn run_transport(
             let ep = endpoint.clone();
             let addr = *peer_addr;
             let handshake_msg = make_signed_handshake(
-                local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+                local_address,
+                local_stake,
+                listen_addr.port(),
+                genesis_hash,
+                &keypair,
             );
             let ctx = PeerContext::new(
                 local_address,
@@ -765,14 +802,19 @@ pub async fn run_transport(
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(timeout_secs),
                         dial_peer(&ep, addr, &handshake_msg, &ctx),
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(Ok(())) => {
                             info!("Connected to bootstrap peer {} (attempt {})", addr, attempt);
                             break;
                         }
                         Ok(Err(e)) => {
                             if attempt < 3 {
-                                warn!("Failed to connect to {} (attempt {}): {} - retrying", addr, attempt, e);
+                                warn!(
+                                    "Failed to connect to {} (attempt {}): {} - retrying",
+                                    addr, attempt, e
+                                );
                                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                             } else {
                                 warn!("Failed to connect to {} after 3 attempts: {}", addr, e);
@@ -780,9 +822,15 @@ pub async fn run_transport(
                         }
                         Err(_) => {
                             if attempt < 3 {
-                                warn!("Timeout connecting to {} ({}s, attempt {}) - retrying", addr, timeout_secs, attempt);
+                                warn!(
+                                    "Timeout connecting to {} ({}s, attempt {}) - retrying",
+                                    addr, timeout_secs, attempt
+                                );
                             } else {
-                                warn!("Timeout connecting to {} after 3 attempts ({}s each)", addr, timeout_secs);
+                                warn!(
+                                    "Timeout connecting to {} after 3 attempts ({}s each)",
+                                    addr, timeout_secs
+                                );
                             }
                         }
                     }
@@ -793,20 +841,30 @@ pub async fn run_transport(
         for h in dial_handles {
             let _ = h.await;
         }
-        info!("Bootstrap dial phase complete, {} peers connected", peer_count.load(Ordering::Relaxed));
+        info!(
+            "Bootstrap dial phase complete, {} peers connected",
+            peer_count.load(Ordering::Relaxed)
+        );
     }
 
     // ── Dial persisted peers (from previous sessions) ───────────────────
     let persisted_peers = load_peers_from_disk(&data_dir);
     if !persisted_peers.is_empty() {
-        info!("Loading {} persisted peers from disk", persisted_peers.len());
+        info!(
+            "Loading {} persisted peers from disk",
+            persisted_peers.len()
+        );
     }
     for peer_addr in &persisted_peers {
         if bootstrap_peers.contains(peer_addr) {
             continue;
         }
         let handshake_msg = make_signed_handshake(
-            local_address, local_stake, listen_addr.port(), genesis_hash, &keypair,
+            local_address,
+            local_stake,
+            listen_addr.port(),
+            genesis_hash,
+            &keypair,
         );
         let ctx = PeerContext::new(
             local_address,
@@ -816,9 +874,7 @@ pub async fn run_transport(
             &pex_dial_tx,
             &rate_limiter,
         );
-        match dial_peer(&endpoint, *peer_addr, &handshake_msg, &ctx)
-        .await
-        {
+        match dial_peer(&endpoint, *peer_addr, &handshake_msg, &ctx).await {
             Ok(()) => info!("Connected to persisted peer {}", peer_addr),
             Err(e) => debug!("Failed to connect to persisted peer {}: {}", peer_addr, e),
         }
@@ -849,7 +905,11 @@ pub async fn run_transport(
                         conn_out.broadcast(MessageType::TxGossip, &bytes).await;
                     }
                 }
-                OutboundMessage::BroadcastStateDiff { block_hash, diff, block_height } => {
+                OutboundMessage::BroadcastStateDiff {
+                    block_hash,
+                    diff,
+                    block_height,
+                } => {
                     let payload = crate::protocol::StateDiffMessage {
                         block_hash,
                         diff,
@@ -859,30 +919,58 @@ pub async fn run_transport(
                         conn_out.broadcast(MessageType::StateDiff, &bytes).await;
                     }
                 }
-                OutboundMessage::BroadcastInferenceRequest { request_id, input, max_tokens, requester } => {
+                OutboundMessage::BroadcastInferenceRequest {
+                    request_id,
+                    input,
+                    max_tokens,
+                    requester,
+                } => {
                     let payload = crate::protocol::InferenceRequestMessage {
-                        request_id, input, max_tokens, requester,
+                        request_id,
+                        input,
+                        max_tokens,
+                        requester,
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
-                        conn_out.broadcast(MessageType::InferenceRequest, &bytes).await;
+                        conn_out
+                            .broadcast(MessageType::InferenceRequest, &bytes)
+                            .await;
                     }
                 }
-                OutboundMessage::SendInferenceResponse { request_id, output, output_hash, model_hash, ms_per_token, responder } => {
+                OutboundMessage::SendInferenceResponse {
+                    request_id,
+                    output,
+                    output_hash,
+                    model_hash,
+                    ms_per_token,
+                    responder,
+                } => {
                     let payload = crate::protocol::InferenceResponseMessage {
-                        request_id, output, output_hash, model_hash, ms_per_token, responder,
+                        request_id,
+                        output,
+                        output_hash,
+                        model_hash,
+                        ms_per_token,
+                        responder,
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
-                        conn_out.broadcast(MessageType::InferenceResponse, &bytes).await;
+                        conn_out
+                            .broadcast(MessageType::InferenceResponse, &bytes)
+                            .await;
                     }
                 }
                 OutboundMessage::SendShardForward { target, message } => {
                     if let Ok(bytes) = bincode::serialize(&message) {
-                        conn_out.send_to(&target, MessageType::ShardForward, &bytes).await;
+                        conn_out
+                            .send_to(&target, MessageType::ShardForward, &bytes)
+                            .await;
                     }
                 }
                 OutboundMessage::SendShardResult { target, message } => {
                     if let Ok(bytes) = bincode::serialize(&message) {
-                        conn_out.send_to(&target, MessageType::ShardResult, &bytes).await;
+                        conn_out
+                            .send_to(&target, MessageType::ShardResult, &bytes)
+                            .await;
                     }
                 }
                 OutboundMessage::BroadcastShardAnnounce { message } => {
@@ -890,7 +978,10 @@ pub async fn run_transport(
                         conn_out.broadcast(MessageType::ShardAnnounce, &bytes).await;
                     }
                 }
-                OutboundMessage::BroadcastHeartbeatWithRound { dag_round, committed_round } => {
+                OutboundMessage::BroadcastHeartbeatWithRound {
+                    dag_round,
+                    committed_round,
+                } => {
                     let payload = crate::protocol::HeartbeatMessage {
                         dag_round,
                         committed_round,
@@ -900,16 +991,28 @@ pub async fn run_transport(
                         conn_out.broadcast(MessageType::Heartbeat, &bytes).await;
                     }
                 }
-                OutboundMessage::SendRoundSyncRequest { target, my_round, my_committed } => {
+                OutboundMessage::SendRoundSyncRequest {
+                    target,
+                    my_round,
+                    my_committed,
+                } => {
                     let payload = crate::protocol::RoundSyncRequestMessage {
                         my_round,
                         my_committed,
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
-                        conn_out.send_to(&target, MessageType::RoundSyncRequest, &bytes).await;
+                        conn_out
+                            .send_to(&target, MessageType::RoundSyncRequest, &bytes)
+                            .await;
                     }
                 }
-                OutboundMessage::SendRoundSyncResponse { target, current_round, last_committed_round, validator_count, total_stake } => {
+                OutboundMessage::SendRoundSyncResponse {
+                    target,
+                    current_round,
+                    last_committed_round,
+                    validator_count,
+                    total_stake,
+                } => {
                     let payload = crate::protocol::RoundSyncResponseMessage {
                         current_round,
                         last_committed_round,
@@ -917,7 +1020,9 @@ pub async fn run_transport(
                         total_stake,
                     };
                     if let Ok(bytes) = bincode::serialize(&payload) {
-                        conn_out.send_to(&target, MessageType::RoundSyncResponse, &bytes).await;
+                        conn_out
+                            .send_to(&target, MessageType::RoundSyncResponse, &bytes)
+                            .await;
                     }
                 }
             }
@@ -1250,7 +1355,10 @@ async fn dial_peer(
     // Reject self-connections. The seeds file includes our own IP,
     // and 0.0.0.0 != our public IP, so the bootstrap skip-self check misses it.
     if remote.validator_address == local_address {
-        debug!("Rejected self-connection (dial) to {}", remote.validator_address);
+        debug!(
+            "Rejected self-connection (dial) to {}",
+            remote.validator_address
+        );
         return Ok(());
     }
 
@@ -1271,9 +1379,7 @@ async fn dial_peer(
     );
 
     // Register peer + metadata
-    connections
-        .peers
-        .insert(remote.validator_address.0, send);
+    connections.peers.insert(remote.validator_address.0, send);
     connections.insert_meta(remote.validator_address.0, dial_addr, remote.stake);
     peer_count.fetch_add(1, Ordering::Relaxed);
     let _ = inbound_tx
@@ -1296,7 +1402,16 @@ async fn dial_peer(
     let rate_limiter_clone = rate_limiter.clone();
     tokio::spawn(async move {
         let _conn = conn; // keep Quinn Connection alive until recv loop exits
-        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref, &rate_limiter_clone).await;
+        handle_peer_recv(
+            recv,
+            peer_addr_hash,
+            local_address,
+            &inbound_clone,
+            &pex_dial_clone,
+            &connections_ref,
+            &rate_limiter_clone,
+        )
+        .await;
         rate_limiter_clone.remove_peer(&peer_addr_hash);
         connections_ref.peers.remove(&peer_addr_hash.0);
         connections_ref.meta.remove(&peer_addr_hash.0);
@@ -1351,7 +1466,10 @@ async fn accept_peer(
 
     // Reject self-connections
     if remote.validator_address == local_address {
-        debug!("Rejected self-connection (accept) from {}", remote.validator_address);
+        debug!(
+            "Rejected self-connection (accept) from {}",
+            remote.validator_address
+        );
         return Ok(());
     }
 
@@ -1370,9 +1488,7 @@ async fn accept_peer(
     );
 
     // Register peer + metadata
-    connections
-        .peers
-        .insert(remote.validator_address.0, send);
+    connections.peers.insert(remote.validator_address.0, send);
     connections.insert_meta(remote.validator_address.0, dial_addr, remote.stake);
     peer_count.fetch_add(1, Ordering::Relaxed);
     let _ = inbound_tx
@@ -1393,7 +1509,16 @@ async fn accept_peer(
     let rate_limiter_clone = rate_limiter.clone();
     tokio::spawn(async move {
         let _conn = conn; // keep Quinn Connection alive until recv loop exits
-        handle_peer_recv(recv, peer_addr_hash, local_address, &inbound_clone, &pex_dial_clone, &connections_ref, &rate_limiter_clone).await;
+        handle_peer_recv(
+            recv,
+            peer_addr_hash,
+            local_address,
+            &inbound_clone,
+            &pex_dial_clone,
+            &connections_ref,
+            &rate_limiter_clone,
+        )
+        .await;
         rate_limiter_clone.remove_peer(&peer_addr_hash);
         connections_ref.peers.remove(&peer_addr_hash.0);
         connections_ref.meta.remove(&peer_addr_hash.0);
@@ -1449,7 +1574,10 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize DagBlockWithTxs from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize DagBlockWithTxs from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
@@ -1466,7 +1594,10 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize TxGossip from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize TxGossip from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
@@ -1475,8 +1606,7 @@ async fn handle_peer_recv(
                     Ok(msg) => {
                         debug!(
                             "Received state diff for block {} from {}",
-                            msg.block_hash,
-                            peer_address
+                            msg.block_hash, peer_address
                         );
                         let _ = inbound_tx
                             .send(InboundMessage::StateDiff {
@@ -1487,7 +1617,10 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize StateDiff from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize StateDiff from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
@@ -1495,7 +1628,11 @@ async fn handle_peer_recv(
                 match bincode::deserialize::<crate::protocol::PeerExchangeMessage>(&data) {
                     Ok(msg) => {
                         if msg.peers.len() > 128 {
-                            warn!("PEX from {} has {} peers (>128), truncating", peer_address, msg.peers.len());
+                            warn!(
+                                "PEX from {} has {} peers (>128), truncating",
+                                peer_address,
+                                msg.peers.len()
+                            );
                         }
                         debug!(
                             "Received PEX with {} peers from {}",
@@ -1526,18 +1663,25 @@ async fn handle_peer_recv(
                             }
                             // Queue for dialing
                             if let Ok(addr) = pex_peer.socket_addr.parse::<SocketAddr>() {
-                                debug!("PEX: queueing discovered peer {} at {}", pex_peer.address, addr);
+                                debug!(
+                                    "PEX: queueing discovered peer {} at {}",
+                                    pex_peer.address, addr
+                                );
                                 let _ = pex_dial_tx.try_send(addr);
                             }
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize PeerExchange from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize PeerExchange from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::SnapshotManifestRequest => {
-                match bincode::deserialize::<crate::protocol::SnapshotManifestRequestMessage>(&data) {
+                match bincode::deserialize::<crate::protocol::SnapshotManifestRequestMessage>(&data)
+                {
                     Ok(_msg) => {
                         debug!("Received snapshot manifest request from {}", peer_address);
                         let _ = inbound_tx
@@ -1547,12 +1691,17 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize SnapshotManifestRequest from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize SnapshotManifestRequest from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::SnapshotManifestResponse => {
-                match bincode::deserialize::<crate::protocol::SnapshotManifestResponseMessage>(&data) {
+                match bincode::deserialize::<crate::protocol::SnapshotManifestResponseMessage>(
+                    &data,
+                ) {
                     Ok(msg) => {
                         debug!(
                             "Received snapshot manifest from {} (height={}, chunks={})",
@@ -1566,7 +1715,10 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize SnapshotManifestResponse from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize SnapshotManifestResponse from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
@@ -1586,7 +1738,10 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize SnapshotChunkRequest from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize SnapshotChunkRequest from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
@@ -1605,14 +1760,20 @@ async fn handle_peer_recv(
                             .await;
                     }
                     Err(e) => {
-                        warn!("Failed to deserialize SnapshotChunkResponse from {}: {}", peer_address, e);
+                        warn!(
+                            "Failed to deserialize SnapshotChunkResponse from {}: {}",
+                            peer_address, e
+                        );
                     }
                 }
             }
             MessageType::InferenceRequest => {
                 match bincode::deserialize::<crate::protocol::InferenceRequestMessage>(&data) {
                     Ok(msg) => {
-                        info!("Inference request from {} ({})", peer_address, msg.request_id);
+                        info!(
+                            "Inference request from {} ({})",
+                            peer_address, msg.request_id
+                        );
                         let _ = inbound_tx
                             .send(InboundMessage::InferenceRequest {
                                 request_id: msg.request_id,
@@ -1628,7 +1789,10 @@ async fn handle_peer_recv(
             MessageType::InferenceResponse => {
                 match bincode::deserialize::<crate::protocol::InferenceResponseMessage>(&data) {
                     Ok(msg) => {
-                        info!("Inference response from {} for {}", peer_address, msg.request_id);
+                        info!(
+                            "Inference response from {} for {}",
+                            peer_address, msg.request_id
+                        );
                         let _ = inbound_tx
                             .send(InboundMessage::InferenceResponse {
                                 request_id: msg.request_id,
@@ -1647,26 +1811,31 @@ async fn handle_peer_recv(
                 // Heartbeat now carries round info for partition detection.
                 // Old heartbeats (empty payload) are still valid - just skip parse.
                 if !data.is_empty()
-                    && let Ok(hb) = bincode::deserialize::<crate::protocol::HeartbeatMessage>(&data) {
-                        let _ = inbound_tx.send(InboundMessage::HeartbeatWithRound {
+                    && let Ok(hb) = bincode::deserialize::<crate::protocol::HeartbeatMessage>(&data)
+                {
+                    let _ = inbound_tx
+                        .send(InboundMessage::HeartbeatWithRound {
                             peer: peer_address,
                             dag_round: hb.dag_round,
                             committed_round: hb.committed_round,
-                        }).await;
-                    }
+                        })
+                        .await;
+                }
             }
             MessageType::ShardForward => {
                 match bincode::deserialize::<crate::protocol::ShardForwardMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::ShardForward {
-                            request_id: msg.request_id,
-                            model_id: msg.model_id,
-                            next_layer: msg.next_layer,
-                            total_layers: msg.total_layers,
-                            token_position: msg.token_position,
-                            activations: msg.activations,
-                            activation_hash: msg.activation_hash,
-                        }).await;
+                        let _ = inbound_tx
+                            .send(InboundMessage::ShardForward {
+                                request_id: msg.request_id,
+                                model_id: msg.model_id,
+                                next_layer: msg.next_layer,
+                                total_layers: msg.total_layers,
+                                token_position: msg.token_position,
+                                activations: msg.activations,
+                                activation_hash: msg.activation_hash,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad ShardForward from {}: {}", peer_address, e),
                 }
@@ -1674,12 +1843,14 @@ async fn handle_peer_recv(
             MessageType::ShardResult => {
                 match bincode::deserialize::<crate::protocol::ShardResultMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::ShardResult {
-                            request_id: msg.request_id,
-                            token_id: msg.token_id,
-                            logits_hash: msg.logits_hash,
-                            responder: msg.responder,
-                        }).await;
+                        let _ = inbound_tx
+                            .send(InboundMessage::ShardResult {
+                                request_id: msg.request_id,
+                                token_id: msg.token_id,
+                                logits_hash: msg.logits_hash,
+                                responder: msg.responder,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad ShardResult from {}: {}", peer_address, e),
                 }
@@ -1687,15 +1858,17 @@ async fn handle_peer_recv(
             MessageType::ShardAnnounce => {
                 match bincode::deserialize::<crate::protocol::ShardAnnounceMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::ShardAnnounce {
-                            model_id: msg.model_id,
-                            start_layer: msg.start_layer,
-                            end_layer: msg.end_layer,
-                            expert_indices: msg.expert_indices,
-                            node_address: msg.node_address,
-                            available_memory: msg.available_memory,
-                            gpu_tier: msg.gpu_tier,
-                        }).await;
+                        let _ = inbound_tx
+                            .send(InboundMessage::ShardAnnounce {
+                                model_id: msg.model_id,
+                                start_layer: msg.start_layer,
+                                end_layer: msg.end_layer,
+                                expert_indices: msg.expert_indices,
+                                node_address: msg.node_address,
+                                available_memory: msg.available_memory,
+                                gpu_tier: msg.gpu_tier,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad ShardAnnounce from {}: {}", peer_address, e),
                 }
@@ -1703,11 +1876,13 @@ async fn handle_peer_recv(
             MessageType::RoundSyncRequest => {
                 match bincode::deserialize::<crate::protocol::RoundSyncRequestMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::RoundSyncRequest {
-                            peer: peer_address,
-                            their_round: msg.my_round,
-                            their_committed: msg.my_committed,
-                        }).await;
+                        let _ = inbound_tx
+                            .send(InboundMessage::RoundSyncRequest {
+                                peer: peer_address,
+                                their_round: msg.my_round,
+                                their_committed: msg.my_committed,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad RoundSyncRequest from {}: {}", peer_address, e),
                 }
@@ -1715,17 +1890,22 @@ async fn handle_peer_recv(
             MessageType::RoundSyncResponse => {
                 match bincode::deserialize::<crate::protocol::RoundSyncResponseMessage>(&data) {
                     Ok(msg) => {
-                        let _ = inbound_tx.send(InboundMessage::RoundSyncResponse {
-                            current_round: msg.current_round,
-                            last_committed_round: msg.last_committed_round,
-                        }).await;
+                        let _ = inbound_tx
+                            .send(InboundMessage::RoundSyncResponse {
+                                current_round: msg.current_round,
+                                last_committed_round: msg.last_committed_round,
+                            })
+                            .await;
                     }
                     Err(e) => warn!("Bad RoundSyncResponse from {}: {}", peer_address, e),
                 }
             }
             // Handshake messages are handled during connection setup, not here.
             MessageType::Handshake | MessageType::HandshakeAck => {
-                debug!("Unexpected handshake message from {} in data loop", peer_address);
+                debug!(
+                    "Unexpected handshake message from {} in data loop",
+                    peer_address
+                );
             }
         }
     }
