@@ -37,6 +37,30 @@ env:
   # which is staged behind its own flip-to-blocking TODO.
 
 jobs:
+  # ----------------------------------------------- release/install contract --
+  # Cheap, deterministic, and completely offline. This recreates release
+  # artifacts from fixtures and runs the installer through PATH shims, catching
+  # a desktop-only release, renamed asset, checksum bypass, architecture drift,
+  # or accidental service start before a tag can be cut.
+  release-contract:
+    name: release + installer contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax and offline contract tests
+        run: bash tests/release/run.sh
+      - name: ShellCheck release/install scripts
+        run: |
+          shellcheck \
+            install.sh \
+            scripts/install-community-node.sh \
+            scripts/auto-update.sh \
+            scripts/sero-quickstart.sh \
+            scripts/release/assemble-release.sh \
+            tests/release/*.sh \
+            tests/release/helpers/*.sh
+
   # ---------------------------------------------------------------- fmt ----
   # Cheapest gate in the repo, so it runs alone and fails in seconds instead
   # of waiting behind a multi-minute cargo build.

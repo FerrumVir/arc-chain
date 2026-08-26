@@ -1,19 +1,9 @@
-name: Release
+name: Release ARC
 
-# Builds and publishes the arc-node CLI binaries for a tag.
-#
-# THE FAILURE THIS WORKFLOW MUST NEVER REPEAT
-# v0.7.10 and v0.7.11 (and earlier, v0.5.5 and v0.5.6) were published with the
-# desktop bundles attached but NO arc-node assets. Everything downstream reads
-# those asset names literally:
-#   - the desktop app's binary bootstrap fetches arc-node from
-#     releases/latest/download/, so it 404s
-#   - the README / install-community-node.sh installer 404s
-# A release missing these assets is not a partial release, it is a broken one.
-# The `preflight` step in the publish job below turns that into a hard failure
-# here, and .github/workflows/release-desktop.yml refuses to publish the
-# desktop side unless these assets exist. Do not weaken either check.
-
+# One tag, one workflow, one publisher. v0.7.10 and v0.7.11 were broken by
+# two sibling workflows: the desktop workflow created a release with its
+# GITHUB_TOKEN, and that event could not trigger the headless workflow. This
+# graph builds every supported asset first and calls the release API once.
 on:
   push:
     tags:
@@ -21,179 +11,377 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release'
+        description: Existing immutable tag to release (for example v0.8.0)
         required: true
-        default: 'v0.4.0'
+        type: string
 
-# Never cancel a release mid-flight; serialise per tag instead.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    # Optional legs may fail without failing the job (and therefore without
-    # blocking the release); required legs may not.
-    continue-on-error: ${{ matrix.optional == true }}
+  validate:
+    name: Validate immutable release ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      date: ${{ steps.release.outputs.date }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - id: release
+        name: Match tag, source, and application versions
+        shell: bash
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -Eeuo pipefail
+          TAG="$REQUESTED_TAG"
+          if [[ ! "$TAG" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "::error::Release tags must be strict vMAJOR.MINOR.PATCH values; got '$TAG'."
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+
+          git show-ref --verify --quiet "refs/tags/$TAG" || {
+            echo "::error::Tag '$TAG' does not exist. workflow_dispatch never creates or moves tags."
+            exit 1
+          }
+          TAG_COMMIT="$(git rev-list -n 1 "$TAG")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+            echo "::error::Checkout $HEAD_COMMIT does not match immutable tag $TAG ($TAG_COMMIT)."
+            exit 1
+          fi
+
+          WORKSPACE_VERSION="$(awk '
+            /^\[workspace\.package\]$/ { in_package=1; next }
+            /^\[/ { in_package=0 }
+            in_package && /^version[[:space:]]*=/ {
+              gsub(/[[:space:]\"]/], "", $0)
+              sub(/^version=/, "", $0)
+              print
+              exit
+            }
+          ' Cargo.toml)"
+          DESKTOP_VERSION="$(python3 -c 'import json; print(json.load(open("desktop/src-tauri/tauri.conf.json"))["version"])')"
+          DESKTOP_CARGO_VERSION="$(awk '
+            /^\[package\]$/ { in_package=1; next }
+            /^\[/ { in_package=0 }
+            in_package && /^version[[:space:]]*=/ {
+              gsub(/[[:space:]\"]/], "", $0)
+              sub(/^version=/, "", $0)
+              print
+              exit
+            }
+          ' desktop/src-tauri/Cargo.toml)"
+          for pair in \
+            "workspace:$WORKSPACE_VERSION" \
+            "desktop-tauri:$DESKTOP_VERSION" \
+            "desktop-cargo:$DESKTOP_CARGO_VERSION"; do
+            component="${pair%%:*}"
+            actual="${pair#*:}"
+            if [ "$actual" != "$VERSION" ]; then
+              echo "::error::$component version is $actual but tag is $TAG. Align versions before tagging."
+              exit 1
+            fi
+          done
+
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } >> "$GITHUB_OUTPUT"
+
+  headless:
+    name: Headless ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            asset: arc-node-macos-arm64
-            binary: arc-node
-          # Intel Mac binary: cross-compiled from macos-14 (Apple Silicon)
-          # since macos-13 hosted pool has multi-hour queue waits.
-          - os: macos-14
-            target: x86_64-apple-darwin
-            asset: arc-node-macos-x86_64
-            binary: arc-node
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            asset: arc-node-windows-x86_64.exe
-            binary: arc-node.exe
-          - os: ubuntu-22.04
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            asset: arc-node-linux-x86_64
-            binary: arc-node
-          # ARM64 Linux: the cheap way to serve Raspberry Pi / Ampere / Graviton
-          # node operators, and a second ARM data point for the determinism
-          # story. Marked optional because GitHub's `ubuntu-22.04-arm` hosted
-          # runners are not available on every plan for private repos - if this
-          # leg is skipped or fails, the release still publishes without it.
-          # Once it has been observed green, drop `optional` and add
-          # arc-node-linux-arm64 to REQUIRED_ASSETS in the publish job.
-          - os: ubuntu-22.04-arm
+            node-binary: arc-node
+            cli-binary: arc
+            extension: ''
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
-            asset: arc-node-linux-arm64
-            binary: arc-node
-            optional: true
+            node-binary: arc-node
+            cli-binary: arc
+            extension: ''
+          - platform: macos-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            node-binary: arc-node
+            cli-binary: arc
+            extension: ''
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            node-binary: arc-node
+            cli-binary: arc
+            extension: ''
+          - platform: windows-x86_64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            node-binary: arc-node.exe
+            cli-binary: arc.exe
+            extension: .exe
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ matrix.target }}
+          shared-key: release-headless-${{ matrix.target }}
           workspaces: . -> target
 
-      # --locked: a release binary must be built from the exact dependency
-      # graph recorded in the tracked Cargo.lock. Without it, the binary
-      # attached to a tag cannot be reproduced from that tag - which was the
-      # situation for every release before the lockfile was committed and the
-      # stwo git dependency was pinned.
-      - name: Build arc-node release
-        shell: bash
-        run: cargo build --release --locked -p arc-node --features candle --target ${{ matrix.target }}
-
-      - name: Strip binary
-        if: runner.os != 'Windows'
-        run: |
-          strip target/${{ matrix.target }}/release/${{ matrix.binary }} || true
-
-      - name: Rename binary
+      - name: Build locked node and CLI
         shell: bash
         run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.asset }}
+          set -Eeuo pipefail
+          cargo build --release --locked -p arc-node --features candle --target "${{ matrix.target }}"
+          cargo build --release --locked -p arc-cli --target "${{ matrix.target }}"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Name and smoke-test release binaries
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          NODE_ASSET="arc-node-${{ matrix.platform }}${{ matrix.extension }}"
+          CLI_ASSET="arc-cli-${{ matrix.platform }}${{ matrix.extension }}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.node-binary }}" "$NODE_ASSET"
+          cp "target/${{ matrix.target }}/release/${{ matrix.cli-binary }}" "$CLI_ASSET"
+          chmod +x "$NODE_ASSET" "$CLI_ASSET"
+          "./$NODE_ASSET" --version | grep -F " $VERSION"
+          "./$CLI_ASSET" --version | grep -F " $VERSION"
+
+      - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          name: headless-${{ matrix.platform }}
+          path: |
+            arc-node-${{ matrix.platform }}${{ matrix.extension }}
+            arc-cli-${{ matrix.platform }}${{ matrix.extension }}
           if-no-files-found: error
+          retention-days: 2
 
-  release:
-    name: Publish release
-    needs: build
-    runs-on: ubuntu-latest
+  linux-server-compat:
+    name: Ubuntu 24/26 smoke (${{ matrix.platform }})
+    needs: [validate, headless]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: headless-${{ matrix.platform }}
+          path: release-smoke
+
+      - name: Execute both binaries without a display on supported Ubuntu servers
+        shell: bash
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -Eeuo pipefail
+          chmod +x release-smoke/arc-node-${{ matrix.platform }} release-smoke/arc-cli-${{ matrix.platform }}
+          for ubuntu in 24.04 26.04; do
+            docker pull "ubuntu:$ubuntu"
+            for binary in arc-node-${{ matrix.platform }} arc-cli-${{ matrix.platform }}; do
+              docker run --rm \
+                --env DISPLAY= \
+                --volume "$PWD/release-smoke:/release:ro" \
+                "ubuntu:$ubuntu" "/release/$binary" --version \
+                | grep -F " $VERSION"
+            done
+          done
+
+  desktop:
+    name: Desktop ${{ matrix.platform }}
+    needs: validate
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runner: macos-14
+            rust-target: aarch64-apple-darwin
+            tauri-args: --target aarch64-apple-darwin
+            artifact-glob: |
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+              desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            rust-target: x86_64-apple-darwin
+            tauri-args: --target x86_64-apple-darwin
+            artifact-glob: |
+              desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz
+              desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
+              desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          - platform: windows-x86_64
+            runner: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            tauri-args: --target x86_64-pc-windows-msvc
+            artifact-glob: |
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
+              desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+          - platform: linux-x86_64
+            runner: ubuntu-22.04
+            rust-target: x86_64-unknown-linux-gnu
+            tauri-args: --target x86_64-unknown-linux-gnu
+            artifact-glob: |
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.sig
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+              desktop/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Install Linux desktop dependencies
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf libfuse2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - run: npm ci
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-desktop-${{ matrix.rust-target }}
+          workspaces: desktop/src-tauri -> target
+
+      - name: Build signed updater bundles
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is required. Unsigned updater artifacts are never published."
+            exit 1
+          fi
+          npx tauri build ${{ matrix.tauri-args }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arc-desktop-${{ matrix.platform }}
+          path: ${{ matrix.artifact-glob }}
+          if-no-files-found: error
+          retention-days: 2
+
+  publish:
+    name: Validate and publish complete release
+    needs: [validate, headless, linux-server-compat, desktop]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        with:
+          ref: ${{ needs.validate.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Move binaries
+      - name: Assemble assets, updater manifest, and checksums
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          RELEASE_DATE: ${{ needs.validate.outputs.date }}
+          REPOSITORY: ${{ github.repository }}
+        run: ./scripts/release/assemble-release.sh
+
+      - name: Show final release contract
         run: |
-          mkdir -p release-files
-          find artifacts -type f -exec cp {} release-files/ \;
+          set -Eeuo pipefail
           ls -lh release-files
+          cat release-files/SHA256SUMS
 
-      # HARD GATE. `continue-on-error` on the optional matrix leg means the
-      # build job can succeed with assets missing, and a half-populated
-      # release is exactly the demo-fatal failure this workflow exists to
-      # prevent. Enumerate what must be present and refuse to publish
-      # otherwise.
-      - name: Preflight - every required arc-node asset is present
-        run: |
-          set -euo pipefail
-          REQUIRED_ASSETS="
-          arc-node-macos-arm64
-          arc-node-macos-x86_64
-          arc-node-windows-x86_64.exe
-          arc-node-linux-x86_64
-          "
-          missing=0
-          for asset in $REQUIRED_ASSETS; do
-            if [ -s "release-files/$asset" ]; then
-              echo "ok: $asset ($(stat -c%s "release-files/$asset") bytes)"
-            else
-              echo "::error::missing or empty required release asset: $asset"
-              missing=1
-            fi
-          done
-          if [ "$missing" -ne 0 ]; then
-            echo "::error::Refusing to publish. A release without the arc-node binaries 404s the desktop app's binary bootstrap and the README installer. Fix the failed build leg and re-run - do not publish a partial release."
-            exit 1
-          fi
-          echo "All required arc-node assets present."
-
-      - name: Determine tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Create or update release
+      # This is intentionally the only release-publishing action in the repo.
+      # Every build/signature/checksum gate above must pass before it runs.
+      - name: Publish all assets after validation
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: ARC Chain ${{ needs.validate.outputs.tag }}
           body: |
-            ARC Chain release.
+            ## Headless / server node
 
-            Features:
-            - Pipeline-parallel sharded inference (split a model across N nodes)
-            - Cross-platform integer determinism (BLAKE3 verified hidden states)
-            - Community installer with persistent service + auto-update
+            Linux (x86_64 and ARM64), macOS (Apple Silicon and Intel), and
+            Windows x86_64 command-line binaries are attached. Linux and macOS:
 
-            Install on Mac/Linux:
+            ```bash
+            curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/latest/download/install.sh
+            bash install.sh
             ```
-            curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
-            ```
+
+            Windows Server users can download the `arc-node-windows-x86_64.exe`
+            and `arc-cli-windows-x86_64.exe` assets and verify SHA256SUMS.
+
+            ## Desktop GUI
+
+            Signed Tauri updater artifacts and desktop installers are attached
+            for macOS Apple Silicon/Intel, Windows x86_64, and Linux x86_64.
+            Linux ARM64 is headless-only in this release.
+
+            Verify any asset with the attached `SHA256SUMS` file.
           files: release-files/*
-          generate_release_notes: false
-          # Was `false`, which silently tolerated an empty upload set. The
-          # preflight above already guarantees the files exist; this makes a
-          # glob that matches nothing an error rather than a quiet no-op.
           fail_on_unmatched_files: true
+          generate_release_notes: false
+          make_latest: true

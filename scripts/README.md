@@ -8,7 +8,7 @@ These four are the ones a visitor or community node operator runs.
 
 | Script | When to use |
 |--------|-------------|
-| [`install-community-node.sh`](install-community-node.sh) | **Joining the network.** One-command installer. Downloads the `arc-node` binary, seeds, and genesis, generates a unique validator seed, and installs a launchd / systemd service with daily auto-update. It does **not** download a model — a node joins without one and contributes consensus immediately; pass `--model /path/to.gguf` to also serve inference. |
+| [`install-community-node.sh`](install-community-node.sh) | **Joining the network headlessly.** Compatibility entry point for the root [`install.sh`](../install.sh). It installs checksummed `arc-node` + `arc-cli` assets, immutable-tag seeds/genesis, a stake-0 service, and an optional verified updater. It does **not** download a model; pass `--model /absolute/path.gguf` to execute compatible local inference. |
 | [`arc-demo.sh`](arc-demo.sh) | **Trying the demo.** End-to-end: discover the live shard pipeline → run real inference → re-run for determinism check → run a different prompt for isolation check → print summary. Single command, no install. |
 | [`arc-verify.sh`](arc-verify.sh) | **Auditing a past inference.** Takes any attestation `tx_hash` (or `--latest`) and re-derives the inference, comparing both `output_hash` and `model_hash` to the recorded claim. |
 | [`arc-bench.sh`](arc-bench.sh) | **Reproducing the factual benchmark.** Runs 5 (or 10 with `ARC_BENCH_FULL=1`) factual prompts through the sharded pipeline, checks each output for an expected keyword, emits a markdown report. |
@@ -51,25 +51,25 @@ whichever seed actually holds the record, and reports
 `VERIFIED (recomputed)` or `VERIFIED (from cache)` rather than collapsing both
 into one verdict.
 
-**`install-community-node.sh`** no longer resolves `releases/latest`. The two
-newest releases are desktop-only bundles with no `arc-node` CLI asset, so the
-old logic downloaded a 404 and died under `set -euo pipefail`. It now walks the
-release list newest-first and picks the first tag whose asset for your platform
-is actually fetchable (v0.7.7 today), and prints an actionable message listing
-the desktop app, `ARC_NODE_VERSION`, and build-from-source when nothing matches.
-The generated daily auto-updater carries the same fix.
+**`install-community-node.sh`** is now a compatibility wrapper around the one
+canonical root `install.sh`. The canonical installer resolves either the latest
+release or one exact pin, requires every platform asset, and verifies all
+downloads with that release's `SHA256SUMS`. It does not walk backward through
+old tags: an incomplete latest release is a failed release and produces an
+actionable missing-asset error.
 
 ```bash
-ARC_NODE_VERSION=0.7.7 bash scripts/install-community-node.sh   # pin a tag
+curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/latest/download/install.sh
+bash install.sh                         # latest complete release
+bash install.sh --version X.Y.Z         # exact deterministic pin
+bash install.sh --no-service --no-auto-update
 ```
 
-The service it installs launches with `--stake 0 --min-stake 0
---community-mode`. Keep it that way: a node that joins with stake above the
-500,000 minimum is merged into the frozen validator set at the next epoch
-boundary and cannot be removed without restarting every seed.
-
-`arc-node-linux-aarch64` has never been published in any release. ARM Linux
-must build from source.
+The service launches with `--stake 0 --min-stake 0 --community-mode`. Keep it
+that way: a community node does not enter the validator set. Release targets
+are Linux x86_64 and ARM64, macOS Apple Silicon and Intel, and Windows x86_64;
+the shell installer manages Linux/macOS, while Windows service setup is manual.
+See [`docs/HEADLESS_INSTALL.md`](../docs/HEADLESS_INSTALL.md).
 
 ## Operator scripts (testnet maintenance)
 
@@ -89,11 +89,11 @@ These predate the sharded inference work and are kept for backward compatibility
 
 | Script | Notes |
 |--------|-------|
-| [`sero-quickstart.sh`](sero-quickstart.sh) | Older simpler installer. **Prefer `install-community-node.sh`** for new installs. |
+| [`sero-quickstart.sh`](sero-quickstart.sh) | Deprecated model-argument wrapper around the canonical root installer. |
 | [`join-inference.sh`](join-inference.sh) | Build-from-source inference node setup. |
 | [`inference-benchmark.sh`](inference-benchmark.sh) | Sequential vs parallel inference benchmark for the parallel-mode load-balancing demo. |
 | [`inference-router.sh`](inference-router.sh) | Round-robin distributor for the parallel inference demo. |
-| [`auto-update.sh`](auto-update.sh) | Older auto-updater. The new community installer ships its own auto-updater. |
+| [`auto-update.sh`](auto-update.sh) | Compatibility wrapper that invokes the installed checksummed `arc-installer --update-only`. |
 | [`check-attestations.sh`](check-attestations.sh) | Lists recent inference attestations from the chain. |
 | [`test-inference.sh`](test-inference.sh) | One-off inference smoke test. |
 
@@ -125,7 +125,8 @@ curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/arc
 
 **I want to join the network as a community node:**
 ```bash
-curl -sSL https://raw.githubusercontent.com/FerrumVir/arc-chain/main/scripts/install-community-node.sh | bash
+curl -fsSLO https://github.com/FerrumVir/arc-chain/releases/latest/download/install.sh
+bash install.sh
 ```
 
 **I want to reproduce the factual benchmark:**

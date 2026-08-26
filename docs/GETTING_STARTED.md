@@ -195,7 +195,13 @@ The node runs at ~5-15% CPU when idle, spiking briefly during inference. RAM usa
 
 **How do I update?**
 
-Auto. When a version newer than `v0.7.11` ships, ARC Node downloads the signed update and applies it on next launch. You'll see a small badge in the status pill. No action needed. The signing key is pinned to the GitHub release pipeline — you can verify by reading `desktop/src-tauri/tauri.conf.json` in the repo.
+The macOS, Windows NSIS, and Linux AppImage builds consume the signed Tauri
+`latest.json` manifest. The updater refuses an artifact whose signature does
+not match the public key pinned in `desktop/src-tauri/tauri.conf.json`. Linux
+`.deb` and `.rpm` installs remain owned by their package managers, so update
+those by downloading and installing the new package; the app must not overwrite
+package-managed files. Headless/server updates are separate and documented in
+[`HEADLESS_INSTALL.md`](HEADLESS_INSTALL.md).
 
 **How do I uninstall?**
 
