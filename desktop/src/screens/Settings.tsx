@@ -1,15 +1,14 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { AlertTriangle, Check, RefreshCw, Trash2 } from "lucide-react";
-import { useState } from "react";
-import { check as tauriCheckUpdate } from "@tauri-apps/plugin-updater";
-import { relaunch as tauriRelaunch } from "@tauri-apps/plugin-process";
+import { useEffect, useState } from "react";
 import { Card, CardHeader } from "../components/Card";
 import { NotAvailable } from "../components/NotAvailable";
 import { StatusPill } from "../components/StatusPill";
-import { api, isTauri } from "../lib/tauri";
+import { api } from "../lib/tauri";
 import { formatInt } from "../lib/format";
 import { useAppStore } from "../lib/store";
 import { DEFAULT_NODE_CONFIG, type NodeConfig } from "../lib/types";
+import { appUpdater, useUpdaterSnapshot } from "../lib/updater";
 
 export function Settings() {
   const config = useAppStore((s) => s.config);
@@ -31,51 +30,20 @@ export function Settings() {
   const [saved, setSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  // A single source of update truth: the Tauri updater plugin, which reads
-  // the signed manifest. The old `api.checkForUpdate` hit the GitHub
-  // releases API instead, so the badge and the Install button could — and
-  // routinely did — disagree.
-  const {
-    data: update,
-    refetch: checkUpdate,
-    isFetching,
-  } = useQuery({
-    queryKey: ["update-check"],
-    queryFn: async () => {
-      // The updater plugin only exists inside the native shell. In the
-      // browser preview say so plainly rather than throwing.
-      if (!isTauri) return { hasUpdate: false, version: null };
-      const u = await tauriCheckUpdate();
-      return { hasUpdate: !!u, version: u?.version ?? null };
-    },
-    enabled: false,
-  });
-  const [installing, setInstalling] = useState(false);
-  const [installError, setInstallError] = useState<string | null>(null);
+  // One app-wide updater state is shared by startup, periodic, and manual
+  // checks. Settings only renders it; navigating here cannot start a second
+  // polling loop or race a background check.
+  const update = useUpdaterSnapshot();
+  const savedAutoUpdate =
+    config?.autoUpdate ?? DEFAULT_NODE_CONFIG.autoUpdate;
+  const autoUpdateHasUnsavedChange = autoUpdate !== savedAutoUpdate;
 
-  // Tauri auto-update: download the new bundle then relaunch the app.
-  // Without the relaunch() call the installer overwrites the .app/.exe but
-  // the existing process exits without reopening — user sees "auto-update
-  // ran but the window never came back". The Rust-side updater plugin is
-  // already registered in lib.rs; this is the missing JS-side trigger.
-  const installUpdate = async () => {
-    setInstalling(true);
-    setInstallError(null);
-    try {
-      const u = await tauriCheckUpdate();
-      if (!u) {
-        setInstallError("No update available.");
-        setInstalling(false);
-        return;
-      }
-      await u.downloadAndInstall();
-      await tauriRelaunch();
-      // relaunch() never returns — process is replaced.
-    } catch (e) {
-      setInstallError(e instanceof Error ? e.message : String(e));
-      setInstalling(false);
-    }
-  };
+  // Native config hydration can complete after the first render. Keep the
+  // form aligned with the persisted preference without overwriting a user's
+  // in-progress toggle for unrelated config updates.
+  useEffect(() => {
+    setAutoUpdate(config?.autoUpdate ?? DEFAULT_NODE_CONFIG.autoUpdate);
+  }, [config?.autoUpdate]);
 
   const save = async () => {
     // Previously `if (!config) return;` — so on a fresh install, where
@@ -195,9 +163,12 @@ export function Settings() {
               data-testid="toggle-autoupdate"
             />
             <div>
-              <div style={{ fontWeight: 500 }}>Keep node up to date</div>
+              <div style={{ fontWeight: 500 }}>
+                Check for app updates automatically
+              </div>
               <div style={{ fontSize: "var(--text-sm)", color: "var(--text-muted)" }}>
-                Check GitHub for new releases daily and upgrade automatically.
+                Check shortly after ARC starts and once every 24 hours. Updates
+                are never installed without your confirmation.
               </div>
             </div>
           </label>
@@ -250,7 +221,11 @@ export function Settings() {
         <CardHeader
           title="Updates"
           action={
-            update?.version ? (
+            update.phase === "checking" ? (
+              <StatusPill level="info" label="Checking" />
+            ) : update.phase === "ready" ? (
+              <StatusPill level="info" label="Ready" />
+            ) : update.version ? (
               <StatusPill level="info" label={`v${update.version}`} />
             ) : null
           }
@@ -261,46 +236,92 @@ export function Settings() {
             color: "var(--text-muted)",
             marginBottom: "var(--space-3)",
           }}
+          data-testid="update-policy"
         >
-          {update === undefined
-            ? "Check for a new signed release."
-            : update.hasUpdate
-              ? `Version ${update.version} is available. Click below to download, install, and relaunch.`
-              : "You're running the latest version."}
+          {autoUpdateHasUnsavedChange
+            ? autoUpdate
+              ? "Save settings to enable automatic background checks."
+              : "Save settings to turn automatic background checks off."
+            : autoUpdate
+              ? "Automatic checks run after startup and every 24 hours. Background checks never download or install an update."
+              : "Automatic background checks are off. You can still check manually below."}
         </p>
-        {installError && (
+        <p
+          style={{
+            fontSize: "var(--text-sm)",
+            color:
+              update.phase === "error"
+                ? "var(--danger)"
+                : "var(--text-secondary)",
+            marginBottom: "var(--space-3)",
+          }}
+          data-testid="update-status"
+          data-update-phase={update.phase}
+        >
+          {update.message}
+          {update.phase === "downloading" &&
+          update.contentLength !== null &&
+          update.contentLength > 0
+            ? ` (${Math.min(100, Math.round((update.downloadedBytes / update.contentLength) * 100))}%)`
+            : ""}
+        </p>
+        {update.error && (
           <p
             style={{
               fontSize: "var(--text-sm)",
-              color: "var(--danger)",
+              color:
+                update.phase === "ready"
+                  ? "var(--warning)"
+                  : "var(--danger)",
               marginBottom: "var(--space-3)",
             }}
             data-testid="update-error"
           >
-            Update failed: {installError}
+            {update.phase === "ready"
+              ? `Relaunch failed: ${update.error}`
+              : `Update error: ${update.error}`}
           </p>
         )}
+        <p
+          style={{
+            fontSize: "var(--text-xs)",
+            color: "var(--text-muted)",
+            marginBottom: "var(--space-3)",
+          }}
+        >
+          Install policy: after you choose Install, ARC downloads and verifies
+          the signed bundle, installs it, then immediately relaunches. If
+          installation fails, ARC keeps running this version.
+        </p>
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
           <button
             className="btn btn-secondary"
-            onClick={() => checkUpdate()}
-            disabled={isFetching || installing}
+            onClick={() => void appUpdater.checkForUpdates("manual")}
+            disabled={
+              update.phase === "checking" ||
+              update.phase === "downloading" ||
+              update.phase === "ready"
+            }
             data-testid="btn-check-update"
           >
             <RefreshCw
               size={14}
-              style={isFetching ? { animation: "spin 1s linear infinite" } : {}}
+              style={
+                update.phase === "checking"
+                  ? { animation: "spin 1s linear infinite" }
+                  : {}
+              }
             />{" "}
-            Check for updates
+            {update.phase === "checking" ? "Checking…" : "Check for updates"}
           </button>
-          {update?.hasUpdate && (
+          {update.canInstall && update.version && (
             <button
               className="btn btn-primary"
-              onClick={installUpdate}
-              disabled={installing}
+              onClick={() => void appUpdater.installAvailableUpdate()}
+              disabled={update.phase === "downloading"}
               data-testid="btn-install-update"
             >
-              {installing ? "Installing…" : `Install v${update.version} & relaunch`}
+              {`Install v${update.version} & relaunch`}
             </button>
           )}
         </div>

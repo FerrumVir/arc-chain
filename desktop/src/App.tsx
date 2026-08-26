@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
@@ -12,6 +12,7 @@ import { Settings } from "./screens/Settings";
 import { Wallet } from "./screens/Wallet";
 import { useAppStore } from "./lib/store";
 import { api } from "./lib/tauri";
+import { appUpdater } from "./lib/updater";
 
 const SCREENS = {
   dashboard: Dashboard,
@@ -31,6 +32,7 @@ export function App() {
   const setConfig = useAppStore((s) => s.setConfig);
   const setIdentity = useAppStore((s) => s.setIdentity);
   const setOnboarded = useAppStore((s) => s.setOnboarded);
+  const [configHydrated, setConfigHydrated] = useState(false);
 
   // Compute onboarded from *either* the explicit flag (set by the wizard on
   // launch) or the presence of a persisted identity+config pair. This way a
@@ -38,6 +40,7 @@ export function App() {
   const onboarded = onboardedFlag || (!!identity && !!config);
 
   useEffect(() => {
+    let active = true;
     (async () => {
       const [loadedIdentity, loadedConfig] = await Promise.all([
         api.loadIdentity().catch(() => null),
@@ -46,9 +49,24 @@ export function App() {
       if (loadedIdentity) setIdentity(loadedIdentity);
       if (loadedConfig) setConfig(loadedConfig);
       if (loadedIdentity && loadedConfig) setOnboarded(true);
+      if (active) setConfigHydrated(true);
     })();
+    return () => {
+      active = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // `autoUpdate` used to be persisted but never read. Wait for the native
+  // store to hydrate so a stale localStorage value cannot start a check that
+  // the persisted setting disabled, then let the singleton scheduler own one
+  // startup timer and one daily interval for the whole app.
+  useEffect(() => {
+    appUpdater.setAutoChecksEnabled(
+      configHydrated && config?.autoUpdate === true,
+    );
+    return () => appUpdater.setAutoChecksEnabled(false);
+  }, [configHydrated, config?.autoUpdate]);
 
   if (!onboarded) {
     return <Onboarding />;

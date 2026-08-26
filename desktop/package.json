@@ -10,6 +10,7 @@
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
+    "test:unit": "playwright test tests/update-controller.spec.ts",
     "test": "playwright test",
     "test:ui": "playwright test --ui",
     "test:install": "playwright install chromium"

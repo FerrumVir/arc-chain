@@ -28,13 +28,46 @@ test.describe("Settings", () => {
     await page.goto("/");
     await page.getByTestId("nav-settings").click();
     await page.getByTestId("btn-check-update").click();
-    // Update state now comes solely from the Tauri updater plugin, which
-    // doesn't exist in the browser preview - so outside the native shell
-    // the honest answer is "you're on the latest". The old assertion looked
-    // for a hardcoded "v0.5.2" from the removed GitHub-API command.
-    await expect(
-      page.getByText(/You're running the latest version/),
-    ).toBeVisible({ timeout: 4000 });
+    // A browser preview cannot verify a native signed bundle. It must not
+    // claim "latest" merely because the updater plugin is unavailable.
+    await expect(page.getByTestId("update-status")).toHaveAttribute(
+      "data-update-phase",
+      "unsupported",
+    );
+    await expect(page.getByTestId("update-status")).toContainText(
+      "installed ARC app",
+    );
+  });
+
+  test("auto-update preference persists and describes background behavior", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("update-policy")).toContainText(
+      "after startup and every 24 hours",
+    );
+
+    await page.getByTestId("toggle-autoupdate").uncheck();
+    await expect(page.getByTestId("update-policy")).toContainText(
+      "Save settings to turn automatic background checks off",
+    );
+    await page.getByTestId("btn-save-settings").click();
+    await expect(page.getByTestId("btn-save-settings")).toContainText("Saved");
+    await expect(page.getByTestId("update-policy")).toContainText(
+      "background checks are off",
+    );
+
+    // `seedOnboarded` is an init script and intentionally rewrites the fixture
+    // on every reload, so inspect the same persisted blob the app will read on
+    // its next real launch instead of having the fixture overwrite it first.
+    const persistedAutoUpdate = await page.evaluate(() => {
+      const raw = localStorage.getItem("arc-desktop-state-v1");
+      return raw ? JSON.parse(raw).config?.autoUpdate : null;
+    });
+    expect(persistedAutoUpdate).toBe(false);
+    await expect(page.getByTestId("toggle-autoupdate")).not.toBeChecked();
+    await expect(page.getByTestId("btn-check-update")).toBeEnabled();
   });
 
   test("p2p port is its own field, not RPC + 1", async ({ page }) => {
