@@ -16,6 +16,37 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerStateDiffError {
+    UnexpectedSource,
+    HeightMismatch,
+    StateRootMismatch,
+}
+
+/// A state diff is only a performance hint, never proof of execution. Bind it
+/// to the authenticated author of the committed DAG block and compare it with
+/// the result of local canonical execution before accepting it as corroborating
+/// data. Callers must not apply `diff` to derive `executed_root`.
+fn verify_peer_state_diff(
+    source: Hash256,
+    expected_author: Hash256,
+    reported_height: u64,
+    executed_height: u64,
+    diff: &arc_types::StateDiff,
+    executed_root: Hash256,
+) -> Result<(), PeerStateDiffError> {
+    if source != expected_author {
+        return Err(PeerStateDiffError::UnexpectedSource);
+    }
+    if reported_height != executed_height {
+        return Err(PeerStateDiffError::HeightMismatch);
+    }
+    if diff.new_root != executed_root {
+        return Err(PeerStateDiffError::StateRootMismatch);
+    }
+    Ok(())
+}
+
 /// Orchestrates DAG consensus for a single validator node.
 pub struct ConsensusManager {
     /// The underlying DAG consensus engine.
@@ -33,8 +64,9 @@ pub struct ConsensusManager {
     /// Whether this node runs in proposer mode (full execution + state diff export).
     /// When false, acts as a verifier (applies diffs, confirms roots).
     pub proposer_mode: bool,
-    /// Pending state diffs received from proposer nodes, keyed by block hash.
-    pending_diffs: dashmap::DashMap<[u8; 32], (arc_types::StateDiff, u64)>,
+    /// Pending state-diff hints keyed by block hash. The source is the peer
+    /// identity authenticated by transport; diffs never replace local execution.
+    pending_diffs: dashmap::DashMap<[u8; 32], (Hash256, arc_types::StateDiff, u64)>,
     /// VRF-based proposer selector (None = VRF disabled, backward compat).
     vrf_selector: Option<ProposerSelector>,
     /// Encrypted mempool for MEV-protected commit-reveal transactions.
@@ -515,17 +547,39 @@ impl ConsensusManager {
                             }
                         }
                         InboundMessage::StateDiff {
+                            source,
                             block_hash,
                             diff,
                             block_height,
                         } => {
-                            // Store the state diff for when this block commits.
+                            // State diffs are optional hints, not execution
+                            // proofs. Reject unsolicited hashes and bind the
+                            // authenticated transport identity to the DAG block
+                            // author before retaining bounded pending state.
+                            let Some(block) = self.engine.get_block(&block_hash) else {
+                                warn!(
+                                    source = %source,
+                                    block = %block_hash,
+                                    "Rejected unsolicited state diff for unknown DAG block"
+                                );
+                                continue;
+                            };
+                            if block.author != source {
+                                warn!(
+                                    source = %source,
+                                    expected = %block.author,
+                                    block = %block_hash,
+                                    "Rejected state diff from non-author peer"
+                                );
+                                continue;
+                            }
                             self.pending_diffs
-                                .insert(block_hash.0, (diff, block_height));
+                                .insert(block_hash.0, (source, diff, block_height));
                             debug!(
                                 block = %block_hash,
+                                source = %source,
                                 height = block_height,
-                                "Received state diff from proposer"
+                                "Retained authenticated state-diff hint"
                             );
                         }
                         InboundMessage::Transactions(txs) => {
@@ -1207,13 +1261,15 @@ impl ConsensusManager {
 
                             let start = std::time::Instant::now();
 
-                            // Check if we have a state diff from a proposer.
+                            // A peer diff is optional corroborating data only.
+                            // Every validator executes the exact committed
+                            // transaction bodies locally; no network payload may
+                            // replace this state transition.
                             let received_diff = self.pending_diffs.remove(&dag_block.hash.0);
 
-                            if self.proposer_mode || received_diff.is_none() {
-                                // ── PROPOSER PATH: adaptive execution (auto-selects Sequential vs BlockSTM) ──
-                                match state
-                                    .execute_block_adaptive(&committed_txs, self.validator_address)
+                            {
+                                // ── CANONICAL PATH: local adaptive execution ──
+                                match state.execute_block_adaptive(&committed_txs, dag_block.author)
                                 {
                                     Ok((block, receipts)) => {
                                         let elapsed = start.elapsed();
@@ -1256,8 +1312,45 @@ impl ConsensusManager {
                                             let _ = self.engine.commit_cross_shard(*cs_hash);
                                         }
 
-                                        // Export state diff and broadcast to verifiers.
-                                        if self.proposer_mode {
+                                        // Validate an authenticated hint only
+                                        // after local execution produced the
+                                        // canonical height/root. A forged but
+                                        // self-consistent diff cannot affect
+                                        // state because it is never applied.
+                                        if let Some((_, (source, diff, reported_height))) =
+                                            received_diff.as_ref()
+                                        {
+                                            match verify_peer_state_diff(
+                                                *source,
+                                                dag_block.author,
+                                                *reported_height,
+                                                block.header.height,
+                                                diff,
+                                                block.header.state_root,
+                                            ) {
+                                                Ok(()) => debug!(
+                                                    block = %dag_block.hash,
+                                                    source = %source,
+                                                    "State-diff hint corroborated local execution"
+                                                ),
+                                                Err(reason) => warn!(
+                                                    block = %dag_block.hash,
+                                                    source = %source,
+                                                    ?reason,
+                                                    declared_root = %diff.new_root,
+                                                    executed_root = %block.header.state_root,
+                                                    "Rejected state-diff hint after local execution"
+                                                ),
+                                            }
+                                        }
+
+                                        // Only a DAG block's authenticated
+                                        // author may broadcast its optional
+                                        // diff. Other validators already have
+                                        // the locally executed result.
+                                        if self.proposer_mode
+                                            && dag_block.author == self.validator_address
+                                        {
                                             let dirty = state.drain_dirty_addresses();
                                             let diff = state.export_state_diff(&dirty);
                                             if let Some(ref tx_chan) = outbound_tx {
@@ -1294,45 +1387,6 @@ impl ConsensusManager {
                                     Err(e) => {
                                         warn!("DAG commit block execution failed: {}", e);
                                     }
-                                }
-                            } else {
-                                // ── VERIFIER PATH: apply state diff ───────────
-                                let Some((_, (diff, _height))) = received_diff else {
-                                    warn!(
-                                        "Verifier path reached without state diff for {}",
-                                        dag_block.hash
-                                    );
-                                    continue;
-                                };
-                                let verified_root = state.apply_state_diff(&diff);
-
-                                if verified_root == diff.new_root {
-                                    info!(
-                                        hash = %dag_block.hash,
-                                        txs = committed_txs.len(),
-                                        elapsed_ms = start.elapsed().as_millis(),
-                                        "Block verified (state diff applied)"
-                                    );
-                                    if let Some(mut proof) =
-                                        self.engine.finality_proofs.get_mut(&dag_block.hash)
-                                    {
-                                        proof.height = state.height();
-                                    }
-                                } else {
-                                    // FRAUD DETECTED: proposer's state diff doesn't match
-                                    // our independent verification. Do NOT update finality
-                                    // proof - this block should not be considered verified.
-                                    // State was already mutated by apply_state_diff; the
-                                    // computed root is our ground truth (not the proposer's).
-                                    warn!(
-                                        hash = %dag_block.hash,
-                                        expected = %diff.new_root,
-                                        computed = %verified_root,
-                                        proposer = %dag_block.author,
-                                        "FRAUD: state diff root mismatch - block NOT finalized"
-                                    );
-                                    // TODO: submit on-chain fraud proof for economic slashing
-                                    // TODO: re-execute from committed_txs to recover correct state
                                 }
                             }
                         }
@@ -1514,6 +1568,62 @@ impl ConsensusManager {
 mod tests {
     use super::*;
     use arc_crypto::hash_bytes;
+    use arc_types::{Account, AccountChange, StateDiff};
+
+    #[test]
+    fn peer_state_diff_requires_authenticated_block_author_and_exact_height() {
+        let author = hash_bytes(b"author");
+        let outsider = hash_bytes(b"outsider");
+        let root = hash_bytes(b"executed-root");
+        let diff = StateDiff {
+            changes: Vec::new(),
+            new_root: root,
+        };
+
+        assert_eq!(
+            verify_peer_state_diff(outsider, author, 8, 8, &diff, root),
+            Err(PeerStateDiffError::UnexpectedSource)
+        );
+        assert_eq!(
+            verify_peer_state_diff(author, author, 7, 8, &diff, root),
+            Err(PeerStateDiffError::HeightMismatch)
+        );
+        assert!(verify_peer_state_diff(author, author, 8, 8, &diff, root).is_ok());
+    }
+
+    #[test]
+    fn self_consistent_forged_state_diff_cannot_replace_local_execution() {
+        let author = hash_bytes(b"author");
+        let funded = hash_bytes(b"funded");
+        let attacker = hash_bytes(b"attacker");
+
+        // Build a root that is internally consistent for an attacker-chosen
+        // balance mutation. This is exactly what the old apply-and-compare path
+        // accepted as proof.
+        let forged_state = StateDB::with_genesis(&[(funded, 1_000)]);
+        let forged_account = Account::new(attacker, u64::MAX);
+        forged_state.update_account(&attacker, forged_account.clone());
+        let forged_root = forged_state.get_state_root();
+        let forged_diff = StateDiff {
+            changes: vec![AccountChange {
+                address: attacker,
+                account: forged_account,
+            }],
+            new_root: forged_root,
+        };
+
+        // Canonical local execution did not create the attacker account, so
+        // its independently computed root wins and the hint is rejected.
+        let canonical_state = StateDB::with_genesis(&[(funded, 1_000)]);
+        let canonical_root = canonical_state.get_state_root();
+        assert_ne!(forged_root, canonical_root);
+        assert_eq!(
+            verify_peer_state_diff(author, author, 1, 1, &forged_diff, canonical_root,),
+            Err(PeerStateDiffError::StateRootMismatch)
+        );
+        assert!(canonical_state.get_account(&attacker).is_none());
+        assert_eq!(canonical_state.get_state_root(), canonical_root);
+    }
 
     #[test]
     fn test_consensus_manager_core_tier() {

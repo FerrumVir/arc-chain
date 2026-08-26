@@ -59,8 +59,11 @@ pub enum InboundMessage {
     },
     Transactions(Vec<Vec<u8>>),
     /// State diff from a proposer node (Propose-Verify protocol).
-    /// Verifiers apply the diff and confirm the root matches.
+    /// `source` is the identity authenticated by the QUIC handshake. Consensus
+    /// must bind it to the author of `block_hash`; payload fields alone are not
+    /// an authorization boundary.
     StateDiff {
+        source: Hash256,
         block_hash: Hash256,
         diff: arc_types::StateDiff,
         block_height: u64,
@@ -1615,6 +1618,7 @@ async fn handle_peer_recv(
                         );
                         let _ = inbound_tx
                             .send(InboundMessage::StateDiff {
+                                source: peer_address,
                                 block_hash: msg.block_hash,
                                 diff: msg.diff,
                                 block_height: msg.block_height,

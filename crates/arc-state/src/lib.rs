@@ -6617,25 +6617,98 @@ impl StateDB {
         StateDiff { changes, new_root }
     }
 
-    /// Apply a state diff from a proposer and return the resulting state root.
+    /// Atomically apply a state diff whose declared root matches the resulting
+    /// state. A malformed or mismatched diff leaves both accounts and the
+    /// incremental state-root cache exactly as they were before this call.
     ///
-    /// Called by verifier nodes.  Applies the account changes, marks them dirty,
-    /// and recomputes the state root.  The caller compares the returned root
-    /// against `diff.new_root` - a mismatch indicates a fraudulent proposal.
-    pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Hash256 {
+    /// This is only a safe *application primitive*. A self-consistent diff does
+    /// not prove that its changes were produced by a committed block, so
+    /// consensus must authenticate its sender and independently execute the
+    /// committed transactions before treating the diff as valid.
+    pub fn apply_state_diff(&self, diff: &arc_types::StateDiff) -> Result<Hash256, StateError> {
+        use std::collections::HashSet;
+
+        // Flush any state changes that predate this diff so rollback has a
+        // stable root to restore. Reject ambiguous/malformed change sets before
+        // the first write.
+        let original_root = self.compute_state_root();
+        let mut seen = HashSet::with_capacity(diff.changes.len());
+        for change in &diff.changes {
+            if change.address != change.account.address {
+                return Err(StateError::ExecutionError(format!(
+                    "state diff account key {} does not match embedded address {}",
+                    change.address, change.account.address
+                )));
+            }
+            if !seen.insert(change.address.0) {
+                return Err(StateError::ExecutionError(format!(
+                    "state diff contains duplicate account {}",
+                    change.address
+                )));
+            }
+        }
+
+        // Snapshot exactly the keys this diff may mutate. No WAL entry is
+        // emitted until validation succeeds, so a rejected diff has no durable
+        // side effects either.
+        let originals: Vec<([u8; 32], Option<Account>)> = diff
+            .changes
+            .iter()
+            .map(|change| {
+                (
+                    change.address.0,
+                    self.accounts.get(&change.address.0).map(|a| a.clone()),
+                )
+            })
+            .collect();
+
         for change in &diff.changes {
             self.accounts
                 .insert(change.address.0, change.account.clone());
             self.dirty_accounts.insert(change.address.0);
         }
-        self.compute_state_root()
+        let computed_root = self.compute_state_root();
+        if computed_root != diff.new_root {
+            for (key, original) in originals {
+                match original {
+                    Some(account) => {
+                        self.accounts.insert(key, account);
+                    }
+                    None => {
+                        self.accounts.remove(&key);
+                    }
+                }
+                self.dirty_accounts.insert(key);
+            }
+            let restored_root = self.compute_state_root();
+            if restored_root != original_root {
+                return Err(StateError::PersistenceError(format!(
+                    "state diff rollback failed: expected root {}, restored {}",
+                    original_root, restored_root
+                )));
+            }
+            return Err(StateError::ExecutionError(format!(
+                "state diff root mismatch: declared {}, computed {}",
+                diff.new_root, computed_root
+            )));
+        }
+
+        // Persist only a fully validated diff. This keeps restart state aligned
+        // with the in-memory state without making rejected writes durable.
+        let height = self.height();
+        for change in &diff.changes {
+            self.wal.append(
+                WalOp::SetAccount(change.address, change.account.clone()),
+                height,
+            );
+        }
+        self.wal.append(WalOp::Checkpoint(computed_root), height);
+        Ok(computed_root)
     }
 
-    /// Verify a state diff: apply it and check if the root matches.
-    /// Returns true if the roots match (valid diff), false if fraud detected.
+    /// Verify and atomically apply a state diff.
     pub fn verify_state_diff(&self, diff: &arc_types::StateDiff) -> bool {
-        let computed_root = self.apply_state_diff(diff);
-        computed_root == diff.new_root
+        self.apply_state_diff(diff).is_ok()
     }
 
     /// Collect the current dirty account addresses (snapshot for export_state_diff).
@@ -7390,7 +7463,7 @@ mod tests {
 
         // Verifier: apply the state diff (without re-executing)
         let verifier_state = StateDB::with_genesis(&[(addr(1), 1_000_000), (addr(2), 0)]);
-        let verifier_root = verifier_state.apply_state_diff(&diff);
+        let verifier_root = verifier_state.apply_state_diff(&diff).unwrap();
 
         // Root must match the diff's declared root
         assert_eq!(verifier_root, diff.new_root);
@@ -7413,10 +7486,17 @@ mod tests {
         let mut diff = state.export_state_diff(&affected);
         diff.new_root = Hash256([0xDE; 32]); // tamper with the root
 
-        // Verifier applies diff and gets a different root
+        // A bad root rejects atomically; no attacker-controlled account state
+        // survives the failed verification.
         let verifier = StateDB::with_genesis(&[(addr(1), 1_000_000)]);
-        let verifier_root = verifier.apply_state_diff(&diff);
-        assert_ne!(verifier_root, diff.new_root, "fraud should be detected");
+        let before_root = verifier.get_state_root();
+        let before_sender = verifier.get_account(&addr(1)).unwrap();
+        assert!(verifier.apply_state_diff(&diff).is_err());
+        assert_eq!(verifier.get_state_root(), before_root);
+        let restored_sender = verifier.get_account(&addr(1)).unwrap();
+        assert_eq!(restored_sender.balance, before_sender.balance);
+        assert_eq!(restored_sender.nonce, before_sender.nonce);
+        assert!(verifier.get_account(&addr(2)).is_none());
     }
 
     #[test]
@@ -7512,6 +7592,65 @@ mod tests {
 
         // Verifier detects fraud
         assert!(!verifier_db.verify_state_diff(&diff));
+        assert!(verifier_db.get_account(&addr1).is_none());
+    }
+
+    #[test]
+    fn state_diff_rejects_duplicate_and_mismatched_account_keys_without_mutation() {
+        use arc_types::{AccountChange, StateDiff};
+
+        let state = StateDB::with_genesis(&[(addr(1), 1_000)]);
+        let before_root = state.get_state_root();
+        let changed = Account::new(addr(1), 123);
+
+        let duplicate = StateDiff {
+            changes: vec![
+                AccountChange {
+                    address: addr(1),
+                    account: changed.clone(),
+                },
+                AccountChange {
+                    address: addr(1),
+                    account: changed,
+                },
+            ],
+            new_root: Hash256::ZERO,
+        };
+        assert!(state.apply_state_diff(&duplicate).is_err());
+        assert_eq!(state.get_account(&addr(1)).unwrap().balance, 1_000);
+        assert_eq!(state.get_state_root(), before_root);
+
+        let mismatched_key = StateDiff {
+            changes: vec![AccountChange {
+                address: addr(2),
+                account: Account::new(addr(3), 999_999),
+            }],
+            new_root: Hash256::ZERO,
+        };
+        assert!(state.apply_state_diff(&mismatched_key).is_err());
+        assert!(state.get_account(&addr(2)).is_none());
+        assert!(state.get_account(&addr(3)).is_none());
+        assert_eq!(state.get_state_root(), before_root);
+    }
+
+    #[test]
+    fn state_diff_root_mismatch_rolls_back_jmt_cache() {
+        use arc_types::{AccountChange, StateDiff};
+
+        let mut state = StateDB::with_genesis(&[(addr(1), 1_000)]);
+        state.enable_jmt();
+        let before_root = state.get_state_root();
+        let diff = StateDiff {
+            changes: vec![AccountChange {
+                address: addr(2),
+                account: Account::new(addr(2), u64::MAX),
+            }],
+            new_root: hash_bytes(b"attacker-declared-root"),
+        };
+
+        assert!(state.apply_state_diff(&diff).is_err());
+        assert!(state.get_account(&addr(2)).is_none());
+        assert_eq!(state.get_state_root(), before_root);
     }
 
     // -----------------------------------------------------------------------
