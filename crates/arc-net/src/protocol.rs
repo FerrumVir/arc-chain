@@ -85,10 +85,29 @@ impl MessageType {
 /// The receiver verifies: (1) public_key hashes to validator_address,
 /// (2) challenge_sig is a valid Ed25519 signature over
 /// `BLAKE3("ARC-peer-auth-v1" || nonce || genesis_hash)`.
-/// Current wire protocol version. Bump on breaking changes.
-pub const PROTOCOL_VERSION: u32 = 2;
+/// Current wire protocol version. Version 3 is the explicit cutover for the
+/// incompatible consensus/network behavior introduced after the v2 fleet.
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Minimum protocol version we can talk to.
-pub const MIN_COMPATIBLE_VERSION: u32 = 1;
+///
+/// This intentionally equals [`PROTOCOL_VERSION`] for the v3 cutover. A v3
+/// node rejects v1/v2, and the advertised minimum makes an unmodified v2 node
+/// reject v3 as too new, preventing a mixed fleet from appearing connected
+/// while interpreting consensus traffic differently.
+pub const MIN_COMPATIBLE_VERSION: u32 = 3;
+
+/// Whether the inclusive protocol ranges advertised by two peers overlap.
+///
+/// Kept as the single compatibility predicate so the handshake path and the
+/// cutover regression tests cannot drift into one-sided version acceptance.
+pub(crate) const fn protocol_ranges_overlap(
+    local_current: u32,
+    local_minimum: u32,
+    peer_current: u32,
+    peer_minimum: u32,
+) -> bool {
+    peer_minimum <= local_current && local_minimum <= peer_current
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HandshakeMessage {
@@ -361,6 +380,39 @@ pub async fn read_message<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn v3_cutover_is_mutually_incompatible_with_v2() {
+        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(MIN_COMPATIBLE_VERSION, 3);
+
+        // New v3 node receives the version range advertised by the old v2
+        // implementation (current=2, minimum=1).
+        assert!(!protocol_ranges_overlap(
+            PROTOCOL_VERSION,
+            MIN_COMPATIBLE_VERSION,
+            2,
+            1,
+        ));
+
+        // Old v2 node receives the new v3 range (current=3, minimum=3).
+        assert!(!protocol_ranges_overlap(
+            2,
+            1,
+            PROTOCOL_VERSION,
+            MIN_COMPATIBLE_VERSION,
+        ));
+    }
+
+    #[test]
+    fn v3_peers_remain_compatible_with_each_other() {
+        assert!(protocol_ranges_overlap(
+            PROTOCOL_VERSION,
+            MIN_COMPATIBLE_VERSION,
+            PROTOCOL_VERSION,
+            MIN_COMPATIBLE_VERSION,
+        ));
+    }
 
     #[tokio::test]
     async fn roundtrip_framing() {

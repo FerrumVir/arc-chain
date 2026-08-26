@@ -464,14 +464,19 @@ fn verify_handshake(msg: &HandshakeMessage) -> anyhow::Result<()> {
         msg.min_compatible_version
     };
 
-    if peer_min > crate::protocol::PROTOCOL_VERSION {
-        anyhow::bail!(
-            "peer requires protocol version >= {} but we are at {}",
-            peer_min,
-            crate::protocol::PROTOCOL_VERSION
-        );
-    }
-    if peer_version < crate::protocol::MIN_COMPATIBLE_VERSION {
+    if !crate::protocol::protocol_ranges_overlap(
+        crate::protocol::PROTOCOL_VERSION,
+        crate::protocol::MIN_COMPATIBLE_VERSION,
+        peer_version,
+        peer_min,
+    ) {
+        if peer_min > crate::protocol::PROTOCOL_VERSION {
+            anyhow::bail!(
+                "peer requires protocol version >= {} but we are at {}",
+                peer_min,
+                crate::protocol::PROTOCOL_VERSION
+            );
+        }
         anyhow::bail!(
             "peer protocol version {} is below our minimum {}",
             peer_version,
