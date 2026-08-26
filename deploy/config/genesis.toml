@@ -6,6 +6,9 @@
 [chain]
 name = "arc-testnet"
 chain_id = "0x415243"  # "ARC" in ASCII hex
+# Intentionally incomplete until fresh per-validator keyfiles are generated
+# off-repo and only their public addresses are approved here.
+validator_set_complete = false
 
 # -- Faucet Account (1 billion ARC) --------------------------------
 # Used by the testnet faucet to fund test accounts.
@@ -37,22 +40,10 @@ balance = 100_000
 address = "0c389a743e34fda435fbd575bb889dbc0d3e66b9f9d81e00be33b7188509e7eb"
 balance = 100_000
 
-# -- Genesis Validators --------------------------------------------
-# All 4 validators are part of the initial validator set.
-# Seeds must match the --seed / config.toml [validator].seed on each node.
-
-[[validators]]
-seed = "arc-validator-0"
-stake = 5_000_000
-
-[[validators]]
-seed = "arc-validator-1"
-stake = 5_000_000
-
-[[validators]]
-seed = "arc-validator-2"
-stake = 5_000_000
-
-[[validators]]
-seed = "arc-validator-3"
-stake = 5_000_000
+# -- Genesis Validators (migration required) -----------------------
+# Never store signing-key contents or deterministic seeds in genesis.
+# Add fresh public ARC addresses here, then set the flag above to true:
+#
+# [[validators]]
+# address = "<64-character public ARC address from arc keygen>"
+# stake = 5_000_000

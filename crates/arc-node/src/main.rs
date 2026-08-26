@@ -1,7 +1,8 @@
 mod config;
+mod validator_identity;
 
-use anyhow::Result;
-use arc_crypto::{Hash256, KeyPair, hash_bytes};
+use anyhow::{Context, Result, bail};
+use arc_crypto::{Hash256, hash_bytes};
 use arc_mempool::Mempool;
 use arc_net::transport::{InboundMessage, OutboundMessage, run_transport};
 use arc_node::{benchmark::BenchmarkPool, consensus::ConsensusManager, rpc};
@@ -9,11 +10,13 @@ use arc_state::StateDB;
 use arc_types::Block;
 use clap::{CommandFactory, Parser};
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
+use zeroize::Zeroize;
 
 #[derive(Parser)]
 #[command(name = "arc-node", version, about = "ARC Chain Node")]
@@ -79,25 +82,27 @@ struct Cli {
     #[arg(long, default_value_t = 500_000)]
     min_stake: u64,
 
-    /// Validator identity seed (used to derive a unique address).
-    /// Different seeds produce different validator addresses.
-    /// Default: "arc-validator-0"
-    ///
-    /// Prefer the ARC_VALIDATOR_SEED environment variable when this value is
-    /// secret material. The desktop app derives this from the wallet's BIP-39
-    /// phrase, and a process's argv is world-readable — any user on the
-    /// machine can recover it with `ps`. An environment variable is readable
-    /// only by the owning user, so the phrase stays out of the process table.
-    #[arg(long, env = "ARC_VALIDATOR_SEED", default_value = "arc-validator-0")]
-    validator_seed: String,
+    /// Mode-0600 Ed25519 JSON keyfile created by `arc keygen`.
+    /// Required for every production validator with non-zero stake.
+    #[arg(long, env = "ARC_VALIDATOR_KEY_FILE")]
+    validator_key_file: Option<String>,
+
+    /// Legacy deterministic seed for stake-zero nodes or disposable devnets.
+    /// A production staked node always rejects this secret-bearing interface.
+    #[arg(long, env = "ARC_VALIDATOR_SEED")]
+    validator_seed: Option<String>,
+
+    /// DANGEROUS: permit seed-derived staked identities and an incomplete
+    /// genesis on a disposable local development network. Never use this on
+    /// a production, public, or value-bearing chain.
+    #[arg(long, default_value_t = false)]
+    insecure_dev_validator_seed: bool,
 
     /// Public label for this node in the shard registry (shown by GET /shards
     /// on every seed, so treat it as public).
     ///
-    /// Defaults to a short hash of the validator seed. It must never default
-    /// to the seed itself: the desktop app uses the wallet's BIP-39 phrase as
-    /// the seed, and this value is broadcast to every seed and served to any
-    /// caller of /shards.
+    /// Defaults to a short hash of public node metadata. It must never derive
+    /// from signing material because this value is broadcast to every seed.
     #[arg(long, env = "ARC_NODE_NAME")]
     node_name: Option<String>,
 
@@ -596,10 +601,8 @@ fn pick_seed_rpc(cli: &Cli) -> Option<String> {
 /// assignment registers in the same pipeline that tier-1 voting reads.
 /// The node's public label for the shard registry.
 ///
-/// Deliberately never `cli.validator_seed`: the desktop derives that from the
-/// wallet's BIP-39 phrase, and this string is POSTed to every seed and handed
-/// out by GET /shards. A short hash is a stable public identifier that leaks
-/// nothing about the key.
+/// Deliberately never derived from validator signing material: this string is
+/// POSTed to every seed and handed out by GET /shards.
 fn public_node_name(cli: &Cli) -> String {
     if let Some(n) = cli.node_name.as_deref() {
         let n = n.trim();
@@ -607,8 +610,25 @@ fn public_node_name(cli: &Cli) -> String {
             return n.to_string();
         }
     }
-    let digest = arc_crypto::hash_bytes(cli.validator_seed.as_bytes());
+    let hostname = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string());
+    let public_metadata = format!("{}|{}|{}|{}", hostname, cli.rpc, cli.p2p_port, cli.data_dir);
+    let digest = arc_crypto::hash_bytes(public_metadata.as_bytes());
     format!("arc-{}", &hex::encode(digest.0)[..8])
+}
+
+/// A stake-zero node may continue providing outbound community inference
+/// while the shipped production genesis awaits its public validator keys.
+/// It must not treat that placeholder as a consensus validator set.
+fn is_genesis_migration_observer(
+    genesis: Option<&config::GenesisConfig>,
+    stake: u64,
+    insecure_dev_mode: bool,
+) -> bool {
+    stake == 0
+        && !insecure_dev_mode
+        && genesis.is_some_and(|config| !config.chain.validator_set_complete)
 }
 
 async fn auto_shard_join(cli: &Cli) -> Option<(usize, usize)> {
@@ -720,45 +740,12 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Validator auto-shard: ask a seed which layers to hold ──────────
-    // Fires for staked nodes (stake>0) with a model loaded and no explicit
-    // --shard-range / --shard-start / --shard-end. POSTs /shards/join on a
-    // seed, which returns the biggest uncovered layer range in the current
-    // pipeline. Setting shard_ranges here means the later sharded model
-    // load picks up only that slice instead of holding the full model.
-    // Community workers (stake=0) skip this — they hold the full model by
-    // design and auto-register via /community/register.
-    if cli.auto_shard_join
-        && cli.stake > 0
-        && cli.model.is_some()
-        && cli.shard_ranges.is_empty()
-        && cli.shard_start.is_none()
-        && cli.shard_end.is_none()
-    {
-        match auto_shard_join(&cli).await {
-            Some((start, end)) => {
-                tracing::info!(
-                    "auto-shard: seed assigned this validator layers [{}, {}) — loading shard",
-                    start,
-                    end
-                );
-                cli.shard_ranges.push(format!("{}:{}", start, end));
-            }
-            None => {
-                tracing::info!(
-                    "auto-shard: no assignment received; loading FULL model. \
-                     Pass --shard-range a:b to override, or check seed connectivity."
-                );
-            }
-        }
-    }
-
     // ── Load config file and merge with CLI args ────────────────────────
     // Priority: explicit CLI arg > config file value > hardcoded default.
     // We use clap's ArgMatches to detect which args were explicitly provided.
     let matches = Cli::command().get_matches_from(std::env::args_os());
 
-    let node_cfg = if let Some(config_path) = &cli.config {
+    let mut node_cfg = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path).expect("Failed to load node config");
         tracing::info!("Loaded node config from {}", config_path);
         cfg
@@ -809,13 +796,15 @@ async fn main() -> Result<()> {
             node_cfg.validator.min_stake
         };
 
-    // Precedence: --validator-seed, then ARC_VALIDATOR_SEED, then the config
-    // file. EnvVariable must be honoured alongside CommandLine — the desktop
-    // passes the wallet phrase through the environment so it stays out of the
-    // world-readable process table, and treating that as "unset" would run the
-    // node under the default identity and accrue earnings to a key the user
-    // does not hold.
-    let validator_seed = match matches.value_source("validator_seed") {
+    // Identity precedence: CLI / environment, then node config. Production
+    // staked nodes are allowed only the keyfile path; resolve_identity below
+    // rejects every seed-bearing production configuration.
+    let validator_key_file = match matches.value_source("validator_key_file") {
+        Some(clap::parser::ValueSource::CommandLine)
+        | Some(clap::parser::ValueSource::EnvVariable) => cli.validator_key_file.clone(),
+        _ => node_cfg.validator.key_file.clone(),
+    };
+    let mut validator_seed = match matches.value_source("validator_seed") {
         Some(clap::parser::ValueSource::CommandLine)
         | Some(clap::parser::ValueSource::EnvVariable) => cli.validator_seed.clone(),
         _ => node_cfg.validator.seed.clone(),
@@ -934,6 +923,118 @@ async fn main() -> Result<()> {
         std::process::exit(1);
     }
 
+    // ── Fail-closed genesis + validator identity preflight ─────────────
+    // This runs before any validator joins P2P, advertises stake, or asks a
+    // remote seed for a shard assignment.
+    let genesis_cfg = cli
+        .genesis
+        .as_deref()
+        .map(config::load_genesis)
+        .transpose()
+        .context("validator startup cannot continue with the configured genesis")?;
+    let migration_observer =
+        is_genesis_migration_observer(genesis_cfg.as_ref(), stake, cli.insecure_dev_validator_seed);
+    let (mut genesis_validators, genesis_hash) = match genesis_cfg.as_ref() {
+        Some(genesis) if migration_observer => {
+            (Vec::new(), genesis.migration_observer_network_hash()?)
+        }
+        Some(genesis) => (
+            genesis.validated_validator_set(cli.insecure_dev_validator_seed)?,
+            genesis.network_hash(cli.insecure_dev_validator_seed)?,
+        ),
+        None => (Vec::new(), Block::genesis().hash),
+    };
+    let chain_participation_enabled = !migration_observer;
+    if migration_observer {
+        tracing::warn!("╔══════════════════════════════════════════════════════════════╗");
+        tracing::warn!("║  VALIDATOR-SET MIGRATION PENDING: COMMUNITY OBSERVER MODE   ║");
+        tracing::warn!("╚══════════════════════════════════════════════════════════════╝");
+        tracing::warn!(
+            "Stake-zero community inference remains enabled, but chain P2P, consensus, and on-chain voting are disabled until genesis contains the approved public validator addresses and validator_set_complete = true."
+        );
+    }
+
+    let identity = validator_identity::resolve_identity(
+        validator_key_file.as_deref().map(Path::new),
+        validator_seed.as_deref(),
+        stake,
+        cli.insecure_dev_validator_seed,
+    )
+    .context("failed to establish validator signing identity")?;
+    let validator_address = identity.keypair.address();
+    let identity_source = identity.source;
+    let validator_keypair = identity.keypair;
+
+    if stake > 0 {
+        match genesis_cfg.as_ref() {
+            Some(genesis) => {
+                if genesis.chain.validator_set_complete
+                    && identity_source != validator_identity::IdentitySource::Keyfile
+                {
+                    bail!(
+                        "a complete/production genesis requires a mode-0600 Ed25519 validator keyfile; insecure seed-derived identities are forbidden even when the dev flag is present"
+                    );
+                }
+                config::verify_staked_identity(&genesis_validators, validator_address, stake)?;
+            }
+            None if cli.insecure_dev_validator_seed => {
+                // Preserve single-node development ergonomics while keeping
+                // the bypass unmistakable and impossible without the flag.
+                genesis_validators.push((validator_address, stake));
+                config::verify_staked_identity(&genesis_validators, validator_address, stake)?;
+            }
+            None => bail!(
+                "staked validators require --genesis <path> with validator_set_complete = true and an entry matching the keyfile's public address and configured stake"
+            ),
+        }
+    }
+
+    // Best-effort removal of copied legacy seed material after derivation.
+    if let Some(seed) = validator_seed.as_mut() {
+        seed.zeroize();
+    }
+    if let Some(seed) = cli.validator_seed.as_mut() {
+        seed.zeroize();
+    }
+    if let Some(seed) = node_cfg.validator.seed.as_mut() {
+        seed.zeroize();
+    }
+
+    if cli.insecure_dev_validator_seed {
+        tracing::warn!("╔══════════════════════════════════════════════════════════════╗");
+        tracing::warn!("║  INSECURE DISPOSABLE DEVELOPMENT VALIDATOR MODE             ║");
+        tracing::warn!("║  NEVER USE THIS MODE ON A PUBLIC OR VALUE-BEARING NETWORK   ║");
+        tracing::warn!("╚══════════════════════════════════════════════════════════════╝");
+    }
+
+    // Ask for a shard only after the signing identity and genesis membership
+    // have passed validation, so a misconfigured validator performs no remote
+    // mutation before failing startup.
+    if cli.auto_shard_join
+        && stake > 0
+        && cli.model.is_some()
+        && cli.shard_ranges.is_empty()
+        && cli.shard_start.is_none()
+        && cli.shard_end.is_none()
+    {
+        match auto_shard_join(&cli).await {
+            Some((start, end)) => {
+                tracing::info!(
+                    "auto-shard: seed assigned this validator layers [{}, {}) — loading shard",
+                    start,
+                    end
+                );
+                cli.shard_ranges.push(format!("{}:{}", start, end));
+            }
+            None => {
+                tracing::info!(
+                    "auto-shard: no assignment received; loading FULL model. \
+                     Pass --shard-range a:b to override, or check seed connectivity."
+                );
+            }
+        }
+    }
+
     // ── Loud warning: staking into a network you don't own ─────────────
     // Joining a public network with stake > 0 is a one-way door. The peer is
     // merged into every seed's ValidatorSet, absorbed by `freeze_epoch()` at
@@ -972,14 +1073,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Derive validator keypair and address from seed ─────────────────
-    // Deterministic: same seed → same keypair → same address across restarts.
-    let validator_seed_bytes =
-        blake3::derive_key("ARC-chain-validator-keypair-v1", validator_seed.as_bytes());
-    let signing_key = ed25519_dalek::SigningKey::from_bytes(&validator_seed_bytes);
-    let validator_keypair = KeyPair::Ed25519(signing_key);
-    let validator_address = validator_keypair.address();
-
     // ── Determine stake tier for display ───────────────────────────────
     let tier = arc_consensus::StakeTier::from_stake(stake)
         .map(|t| format!("{:?}", t))
@@ -990,7 +1083,16 @@ async fn main() -> Result<()> {
     tracing::info!("║   Testnet Node v0.3.0                 ║");
     tracing::info!("╚═══════════════════════════════════════╝");
     tracing::info!("Validator  : {}", validator_address);
-    tracing::info!("Seed       : {}", validator_seed);
+    tracing::info!(
+        "Identity   : {}",
+        match identity_source {
+            validator_identity::IdentitySource::Keyfile => "Ed25519 keyfile",
+            validator_identity::IdentitySource::InsecureDevelopmentSeed => {
+                "INSECURE development seed"
+            }
+            validator_identity::IdentitySource::StakeZeroSeed => "stake-zero observer identity",
+        }
+    );
     tracing::info!("Stake      : {} ARC ({})", stake, tier);
     tracing::info!("RPC        : {}", rpc_addr);
     tracing::info!("P2P port   : {}", p2p_port);
@@ -1009,42 +1111,17 @@ async fn main() -> Result<()> {
     // Priority: --genesis file > hardcoded defaults.
     // In benchmark mode (without --genesis), use deterministic ed25519
     // keypair-derived addresses so signatures can be verified.
-    // Extract genesis validators (for consensus) if --genesis is provided.
-    // All nodes MUST use the same genesis → same validator set from round 0.
-    let genesis_validators: Vec<(Hash256, u64)> = if let Some(genesis_path) = &cli.genesis {
-        let genesis_cfg =
-            config::load_genesis(genesis_path).expect("Failed to load genesis config");
-        genesis_cfg
-            .validators
-            .iter()
-            .map(|v| {
-                let seed_bytes =
-                    blake3::derive_key("ARC-chain-validator-keypair-v1", v.seed.as_bytes());
-                let sk = ed25519_dalek::SigningKey::from_bytes(&seed_bytes);
-                let kp = KeyPair::Ed25519(sk);
-                (kp.address(), v.stake)
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
     // Chain identity as DECLARED by the genesis file. Only a genesis file can
     // name the network, so a node started without --genesis carries None here
     // and GET /network/info reports the name and chain_id as null with a
     // reason rather than inventing one (and never says "mainnet").
-    let genesis_chain_identity: Option<rpc::ChainIdentity> = cli
-        .genesis
-        .as_ref()
-        .and_then(|p| config::load_genesis(p).ok())
-        .map(|cfg| rpc::ChainIdentity {
-            name: cfg.chain.name,
-            chain_id: cfg.chain.chain_id,
+    let genesis_chain_identity: Option<rpc::ChainIdentity> =
+        genesis_cfg.as_ref().map(|cfg| rpc::ChainIdentity {
+            name: cfg.chain.name.clone(),
+            chain_id: cfg.chain.chain_id.clone(),
         });
 
-    let genesis_accounts: Vec<(Hash256, u64)> = if let Some(genesis_path) = &cli.genesis {
-        let genesis_cfg =
-            config::load_genesis(genesis_path).expect("Failed to load genesis config");
+    let genesis_accounts: Vec<(Hash256, u64)> = if let Some(genesis_cfg) = genesis_cfg.as_ref() {
         tracing::info!(
             "Genesis: {} ({} accounts, {} validators)",
             genesis_cfg.chain.name,
@@ -1393,29 +1470,32 @@ async fn main() -> Result<()> {
     let (outbound_tx, outbound_rx) = mpsc::channel::<OutboundMessage>(4000);
     let peer_count = Arc::new(AtomicU32::new(0));
 
-    // Deterministic genesis hash (same for all nodes with same genesis config)
-    let genesis_hash = Block::genesis().hash;
+    if chain_participation_enabled {
+        // Parse bootstrap peers only for a node allowed to join this chain.
+        let bootstrap_peers: Vec<SocketAddr> =
+            peers.iter().filter_map(|p| p.parse().ok()).collect();
+        let listen_addr: SocketAddr = format!("0.0.0.0:{}", p2p_port).parse()?;
 
-    // Parse bootstrap peers
-    let bootstrap_peers: Vec<SocketAddr> = peers.iter().filter_map(|p| p.parse().ok()).collect();
-
-    let listen_addr: SocketAddr = format!("0.0.0.0:{}", p2p_port).parse()?;
-
-    // ── Start P2P transport in background ──────────────────────────────
-    let peer_count_transport = peer_count.clone();
-    let transport_keypair = validator_keypair.clone();
-    tokio::spawn(run_transport(
-        listen_addr,
-        bootstrap_peers,
-        validator_address,
-        stake,
-        genesis_hash,
-        outbound_rx,
-        inbound_tx,
-        peer_count_transport,
-        transport_keypair,
-        data_dir.clone(),
-    ));
+        // The authenticated handshake commits to the canonical parsed genesis
+        // hash, separating chains with different identities/state/validators.
+        let peer_count_transport = peer_count.clone();
+        let transport_keypair = validator_keypair.clone();
+        tokio::spawn(run_transport(
+            listen_addr,
+            bootstrap_peers,
+            validator_address,
+            stake,
+            genesis_hash,
+            outbound_rx,
+            inbound_tx,
+            peer_count_transport,
+            transport_keypair,
+            data_dir.clone(),
+        ));
+    } else {
+        drop(outbound_rx);
+        drop(inbound_tx);
+    }
 
     // ── Start benchmark signing pool + indexer (if benchmark mode) ─────
     let benchmark_pool = if cli.benchmark {
@@ -1451,112 +1531,123 @@ async fn main() -> Result<()> {
         .filter(|(addr, _)| *addr != validator_address)
         .cloned()
         .collect();
-    let all_vals: Vec<(Hash256, u64)> = {
+    let all_vals: Vec<(Hash256, u64)> = if chain_participation_enabled {
         let mut v = vec![(validator_address, stake)];
         v.extend(&peer_vals);
         v
+    } else {
+        Vec::new()
     };
     let dag_validators = Arc::new(parking_lot::RwLock::new(all_vals));
     let dag_round = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let mut consensus = ConsensusManager::new_with_keypair(
-        validator_address,
-        stake,
-        4, /* num_shards */
-        cli.benchmark,
-        &peer_vals,
-        validator_keypair.clone(),
-    );
-    consensus.dag_validators = Some(dag_validators.clone());
-    consensus.dag_round = Some(dag_round.clone());
-    consensus.dag_committed = Some(dag_committed.clone());
-    // DAG persistence WAL - survives restarts
-    let dag_wal_path = format!("{}/dag-wal", data_dir);
-    std::fs::create_dir_all(&dag_wal_path).ok();
 
-    // ── v0.7.0: DAG WAL recovery on boot ────────────────────────────────
-    //
-    // Pre-v0.7 the dag-wal was write-only: every block.proposed and every
-    // block.received called wal.append, but nothing ever read those
-    // segments back at startup. The seed boots, sees `current_round = 0`,
-    // and any block from a peer at round=N gets rejected as "too far
-    // ahead" once N > 1M. NYC hit this on the v0.7.0 upgrade attempt:
-    // 76 segments of accumulated DAG history sat on disk, ignored.
-    //
-    // The fix: scan dag-wal/ for the highest block_height we've ever
-    // persisted. That's the round we WERE at the moment we crashed/
-    // shutdown. Hand it to consensus.set_initial_round so the engine
-    // resumes from there instead of fighting peers about it.
-    //
-    // We don't replay block contents — peers will re-deliver any DAG
-    // blocks we still need on the normal consensus path. We only need
-    // the round number to skip the max-jump rejection.
-    // Bounded read: scans only the latest segment (≤64 MB), not every
-    // segment. NYC's dag-wal is 5 GB+ and growing; reading the whole
-    // history at boot would balloon memory and slow startup minutes.
-    let recovered_round = arc_state::latest_block_height_in_wal_dir(&dag_wal_path);
-    if recovered_round > 0 {
-        // committed lags round by PRUNE_DEPTH (100) under the consensus
-        // engine's normal pruning rule; saturating_sub keeps it sane on
-        // tiny round numbers.
-        let recovered_committed = recovered_round.saturating_sub(100);
-        consensus
-            .engine
-            .set_initial_round(recovered_round, recovered_committed);
-        tracing::info!(
-            recovered_round,
-            recovered_committed,
-            "DAG WAL recovered from disk - resuming consensus mid-stream"
+    if chain_participation_enabled {
+        let mut consensus = ConsensusManager::new_with_keypair(
+            validator_address,
+            stake,
+            4, /* num_shards */
+            cli.benchmark,
+            &peer_vals,
+            validator_keypair.clone(),
         );
-    } else {
-        tracing::info!("DAG WAL is empty - starting fresh from round 0");
-    }
+        consensus.dag_validators = Some(dag_validators.clone());
+        consensus.dag_round = Some(dag_round.clone());
+        consensus.dag_committed = Some(dag_committed.clone());
+        // DAG persistence WAL - survives restarts
+        let dag_wal_path = format!("{}/dag-wal", data_dir);
+        std::fs::create_dir_all(&dag_wal_path).ok();
 
-    if let Ok(dag_wal) = arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
-        consensus.dag_wal = Some(Arc::new(dag_wal));
-        tracing::info!("DAG persistence WAL enabled: {}", dag_wal_path);
+        // ── v0.7.0: DAG WAL recovery on boot ────────────────────────────────
+        //
+        // Pre-v0.7 the dag-wal was write-only: every block.proposed and every
+        // block.received called wal.append, but nothing ever read those
+        // segments back at startup. The seed boots, sees `current_round = 0`,
+        // and any block from a peer at round=N gets rejected as "too far
+        // ahead" once N > 1M. NYC hit this on the v0.7.0 upgrade attempt:
+        // 76 segments of accumulated DAG history sat on disk, ignored.
+        //
+        // The fix: scan dag-wal/ for the highest block_height we've ever
+        // persisted. That's the round we WERE at the moment we crashed/
+        // shutdown. Hand it to consensus.set_initial_round so the engine
+        // resumes from there instead of fighting peers about it.
+        //
+        // We don't replay block contents — peers will re-deliver any DAG
+        // blocks we still need on the normal consensus path. We only need
+        // the round number to skip the max-jump rejection.
+        // Bounded read: scans only the latest segment (≤64 MB), not every
+        // segment. NYC's dag-wal is 5 GB+ and growing; reading the whole
+        // history at boot would balloon memory and slow startup minutes.
+        let recovered_round = arc_state::latest_block_height_in_wal_dir(&dag_wal_path);
+        if recovered_round > 0 {
+            // committed lags round by PRUNE_DEPTH (100) under the consensus
+            // engine's normal pruning rule; saturating_sub keeps it sane on
+            // tiny round numbers.
+            let recovered_committed = recovered_round.saturating_sub(100);
+            consensus
+                .engine
+                .set_initial_round(recovered_round, recovered_committed);
+            tracing::info!(
+                recovered_round,
+                recovered_committed,
+                "DAG WAL recovered from disk - resuming consensus mid-stream"
+            );
+        } else {
+            tracing::info!("DAG WAL is empty - starting fresh from round 0");
+        }
+
+        if let Ok(dag_wal) = arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
+            consensus.dag_wal = Some(Arc::new(dag_wal));
+            tracing::info!("DAG persistence WAL enabled: {}", dag_wal_path);
+        }
+        consensus.set_proposer_mode(cli.proposer_mode);
+        let state_clone = state.clone();
+        let mempool_clone = mempool.clone();
+        let pool_clone = benchmark_pool.clone();
+        // Run consensus on a dedicated thread with its own tokio runtime.
+        // This prevents broadcast/transport/RPC tasks from starving the
+        // consensus loop (the root cause of random freezes at ~4000 rounds).
+        // If the consensus thread panics, log the error and exit the process -
+        // a node without consensus is useless and should restart via systemd.
+        std::thread::Builder::new()
+            .name("consensus".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("consensus runtime");
+                    rt.block_on(async move {
+                        consensus
+                            .run_consensus_loop(
+                                state_clone,
+                                mempool_clone,
+                                Some(inbound_rx),
+                                Some(outbound_tx),
+                                pool_clone,
+                            )
+                            .await;
+                    });
+                }));
+                match result {
+                    Ok(()) => {
+                        tracing::error!("Consensus loop exited unexpectedly - shutting down");
+                    }
+                    Err(panic_info) => {
+                        tracing::error!("CONSENSUS THREAD PANICKED: {:?}", panic_info);
+                    }
+                }
+                // Exit the process - a node without consensus must restart
+                std::process::exit(1);
+            })
+            .expect("spawn consensus thread");
+    } else {
+        drop(inbound_rx);
+        drop(outbound_tx);
+        tracing::warn!(
+            "Chain P2P/consensus is OFF while genesis validator migration is pending; community HTTP inference remains active"
+        );
     }
-    consensus.set_proposer_mode(cli.proposer_mode);
-    let state_clone = state.clone();
-    let mempool_clone = mempool.clone();
-    let pool_clone = benchmark_pool.clone();
-    // Run consensus on a dedicated thread with its own tokio runtime.
-    // This prevents broadcast/transport/RPC tasks from starving the
-    // consensus loop (the root cause of random freezes at ~4000 rounds).
-    // If the consensus thread panics, log the error and exit the process -
-    // a node without consensus is useless and should restart via systemd.
-    std::thread::Builder::new()
-        .name("consensus".into())
-        .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("consensus runtime");
-                rt.block_on(async move {
-                    consensus
-                        .run_consensus_loop(
-                            state_clone,
-                            mempool_clone,
-                            Some(inbound_rx),
-                            Some(outbound_tx),
-                            pool_clone,
-                        )
-                        .await;
-                });
-            }));
-            match result {
-                Ok(()) => {
-                    tracing::error!("Consensus loop exited unexpectedly - shutting down");
-                }
-                Err(panic_info) => {
-                    tracing::error!("CONSENSUS THREAD PANICKED: {:?}", panic_info);
-                }
-            }
-            // Exit the process - a node without consensus must restart
-            std::process::exit(1);
-        })
-        .expect("spawn consensus thread");
 
     // ── Start ETH JSON-RPC server (MetaMask, Hardhat, Foundry) ──────────
     if eth_rpc_port > 0 {
@@ -1602,7 +1693,7 @@ async fn main() -> Result<()> {
     // deterministic stub output in that case (single-validator dev mode).
     // In multi-validator production, stub voters disagree with real-model
     // voters, so they effectively abstain from consensus.
-    {
+    if chain_participation_enabled {
         let validator_task = arc_node::inference_validator::InferenceValidatorTask::new(
             state.clone(),
             mempool.clone(),
@@ -1617,6 +1708,10 @@ async fn main() -> Result<()> {
             "Tier 1 validator task spawned (candle={}, tokenizer={})",
             candle_engine.is_some(),
             inference_model.is_some()
+        );
+    } else {
+        tracing::info!(
+            "Tier 1 on-chain validator task skipped in genesis-migration community observer mode"
         );
     }
 
@@ -1888,7 +1983,7 @@ async fn main() -> Result<()> {
     }
 
     if community_mode {
-        let validator_seed_c = validator_seed.clone();
+        let public_node_name_c = public_node_name(&cli);
         let worker_id = format!("0x{}", hex::encode(validator_address.0));
         let hostname = std::process::Command::new("hostname")
             .output()
@@ -1965,7 +2060,7 @@ async fn main() -> Result<()> {
             };
             let register_payload = serde_json::json!({
                 "worker_id": worker_id_c,
-                "name": format!("{} ({})", validator_seed_c, hostname_c),
+                "name": format!("{} ({})", public_node_name_c, hostname_c),
                 "capabilities": capabilities,
                 "model": model_name_c,
                 "platform": platform_c,
@@ -2410,6 +2505,26 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shipped_placeholder_allows_stake_zero_community_observer_only() {
+        let cli =
+            Cli::try_parse_from(["arc-node", "--community", "--genesis", "genesis.toml"]).unwrap();
+        let genesis: config::GenesisConfig =
+            toml::from_str(include_str!("../../../genesis.toml")).unwrap();
+
+        assert_eq!(cli.stake, 0);
+        assert!(is_genesis_migration_observer(
+            Some(&genesis),
+            cli.stake,
+            cli.insecure_dev_validator_seed,
+        ));
+        assert!(genesis.validated_validator_set(false).is_err());
+        assert_ne!(
+            genesis.migration_observer_network_hash().unwrap(),
+            Hash256::ZERO
+        );
+    }
 
     #[test]
     fn pulled_stub_rewritten_to_seed_host_port() {

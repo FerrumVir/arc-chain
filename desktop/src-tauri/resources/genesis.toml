@@ -6,6 +6,9 @@
 [chain]
 name = "arc-testnet"
 chain_id = "0x415243"  # "ARC" in ASCII hex
+# Fail closed until fresh validator keyfiles are generated off-repo and only
+# their public addresses are committed to the canonical validator set.
+validator_set_complete = false
 
 # ── Prefunded Genesis Accounts ──────────────────────────────────────────
 # blake3::hash(&[i]) for i in 0..10, each with 1 trillion ARC
@@ -30,37 +33,10 @@ balance = 1_000_000_000_000
 address = "0c389a743e34fda435fbd575bb889dbc0d3e66b9f9d81e00be33b7188509e7eb"
 balance = 1_000_000_000_000
 
-# ── Genesis Validators (Testnet) ──────────────────────────────────────
-# These seeds MUST match the --validator-seed flag each node uses.
-# All nodes load this file → all nodes have the same validator set from
-# round 0 → deterministic leader selection → consensus.
-
-[[validators]]
-seed = "NYC"
-stake = 5_000_000
-
-[[validators]]
-seed = "LAX"
-stake = 5_000_000
-
-[[validators]]
-seed = "AMS"
-stake = 5_000_000
-
-[[validators]]
-seed = "LHR"
-stake = 5_000_000
-
-[[validators]]
-seed = "NRT"
-stake = 5_000_000
-
-[[validators]]
-seed = "SGP"
-stake = 5_000_000
-
-# SAO + JNB retired 2026-04-22 (closes GH #32). They were RPC-dead for weeks
-# and their datacenters had unreliable peer connectivity. Removing from
-# genesis shrinks the validator set to 6; takes effect only on nodes that
-# rebuild from fresh state (live chain has the 8-validator set in its DAG
-# history and ignores this change until a coordinated restart).
+# ── Genesis Validators (migration required) ────────────────────────────
+# Never store signing-key contents or deterministic seeds in genesis.
+# Add fresh public ARC addresses here, then set the flag above to true:
+#
+# [[validators]]
+# address = "<64-character public ARC address from arc keygen>"
+# stake = 5_000_000
