@@ -1,15 +1,215 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
   <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="/brand/arc-logo-white.png" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="description" content="ARC Chain Block Explorer - Real-time blockchain data for the ARC L1 network" />
-    <meta name="theme-color" content="#03030A" />
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="ARC Chain block explorer with source-pinned block, transaction, and account lookup."
+    />
+    <meta name="theme-color" content="#080a12" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='29' fill='%23080a12' stroke='%23b8ff5a' stroke-width='3'/%3E%3Cpath d='M19 46 30 17h5l11 29h-7l-2-7H27l-2 7zm10-13h6l-3-9z' fill='%23b8ff5a'/%3E%3C/svg%3E" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; connect-src http://149.28.32.76:9090 http://140.82.16.112:9090 http://136.244.109.1:9090 http://104.238.171.11:9090 http://202.182.107.41:9090 http://149.28.153.31:9090; img-src 'self' data:; style-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'"
+    />
     <title>ARC Explorer</title>
+    <link rel="stylesheet" href="./styles.css?v=2" />
+    <script src="./app.js?v=2" defer></script>
   </head>
   <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <header class="topbar">
+      <a class="brand" href="#/" aria-label="ARC Explorer home">
+        <span class="brand-mark" aria-hidden="true"><span>A</span></span>
+        <span class="brand-copy"><strong>ARC</strong><small>EXPLORER</small></span>
+      </a>
+
+      <div class="source-control">
+        <label for="source-select">Data source</label>
+        <div class="select-wrap">
+          <span id="source-dot" class="status-dot unknown" aria-hidden="true"></span>
+          <select id="source-select" aria-describedby="source-help"></select>
+        </div>
+        <button id="refresh-button" class="icon-button" type="button" aria-label="Refresh selected source" title="Refresh selected source">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M20 6v5h-5M4 18v-5h5M18.2 9A7 7 0 0 0 6.7 6.7L4 9m16 6-2.7 2.3A7 7 0 0 1 5.8 15" />
+          </svg>
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <div class="eyebrow"><span></span>ARC TESTNET / SOURCE-PINNED</div>
+        <h1 id="hero-title">See what this node<br /><em>can actually prove.</em></h1>
+        <p>
+          Every number, block, and lookup below comes from one selected RPC node.
+          Switch sources explicitly—heights and state roots are never blended.
+        </p>
+
+        <form id="search-form" class="search" role="search">
+          <label class="sr-only" for="search-input">Search ARC Chain</label>
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="11" cy="11" r="7"></circle>
+            <path d="m20 20-4-4"></path>
+          </svg>
+          <input
+            id="search-input"
+            type="search"
+            spellcheck="false"
+            autocomplete="off"
+            placeholder="Block height, transaction hash, or address"
+          />
+          <label class="sr-only" for="search-kind">Lookup type</label>
+          <select id="search-kind">
+            <option value="auto">Auto</option>
+            <option value="block">Block</option>
+            <option value="tx">Transaction</option>
+            <option value="address">Address</option>
+          </select>
+          <button type="submit">Explore</button>
+        </form>
+        <p id="search-error" class="field-error" role="alert"></p>
+      </section>
+
+      <section id="connection-banner" class="connection-banner loading" aria-live="polite">
+        <span class="banner-pulse" aria-hidden="true"></span>
+        <div>
+          <strong id="banner-title">Connecting to selected source…</strong>
+          <span id="banner-detail">No data has been loaded yet.</span>
+        </div>
+      </section>
+
+      <section class="source-ribbon" aria-label="Selected source details">
+        <div>
+          <span class="micro-label">Pinned source</span>
+          <strong id="source-name">—</strong>
+        </div>
+        <div class="source-endpoint">
+          <span class="micro-label">RPC endpoint</span>
+          <code id="source-endpoint">—</code>
+        </div>
+        <div>
+          <span class="micro-label">Last refreshed</span>
+          <strong id="last-refreshed">Not yet</strong>
+        </div>
+        <p id="source-help">Changing source reloads every panel from that node.</p>
+      </section>
+
+      <section class="metric-grid" aria-label="Selected node metrics">
+        <article class="metric-card accent">
+          <span class="metric-icon" aria-hidden="true">↗</span>
+          <p>Reported height</p>
+          <strong id="metric-height">—</strong>
+          <small id="metric-height-note">Waiting for selected node</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon" aria-hidden="true">◇</span>
+          <p>Newest stored block</p>
+          <strong id="metric-stored-height">—</strong>
+          <small id="metric-stored-note">Waiting for block header</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon" aria-hidden="true">◷</span>
+          <p>Latest block age</p>
+          <strong id="metric-block-age">—</strong>
+          <small id="metric-liveness-note">Liveness unknown</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon" aria-hidden="true">≡</span>
+          <p>Reported transactions</p>
+          <strong id="metric-transactions">—</strong>
+          <small>stats.total_transactions from this source</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon" aria-hidden="true">⌁</span>
+          <p>Connected peers</p>
+          <strong id="metric-peers">—</strong>
+          <small>Local peer view</small>
+        </article>
+        <article class="metric-card">
+          <span class="metric-icon" aria-hidden="true">✦</span>
+          <p>Reported validators</p>
+          <strong id="metric-validators">—</strong>
+          <small id="metric-validator-note">Active split may be unavailable</small>
+        </article>
+      </section>
+
+      <section class="content-grid">
+        <article class="panel blocks-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="micro-label">Selected chain view</span>
+              <h2>Recent stored blocks</h2>
+            </div>
+            <span id="blocks-status" class="quiet-pill">Loading</span>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Height</th>
+                  <th>Age</th>
+                  <th>Transactions</th>
+                  <th>Producer</th>
+                  <th>Block hash</th>
+                </tr>
+              </thead>
+              <tbody id="blocks-body">
+                <tr><td colspan="5" class="empty-cell">Loading blocks from the selected source…</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <aside class="panel facts-panel">
+          <div class="panel-heading">
+            <div>
+              <span class="micro-label">RPC truth</span>
+              <h2>Source facts</h2>
+            </div>
+          </div>
+          <dl class="facts" id="source-facts">
+            <div><dt>Node version</dt><dd>—</dd></div>
+            <div><dt>Chain</dt><dd>—</dd></div>
+            <div><dt>Health response</dt><dd>—</dd></div>
+            <div><dt>Mempool</dt><dd>—</dd></div>
+            <div><dt>Latest block hash</dt><dd>—</dd></div>
+            <div><dt>Latest state root</dt><dd>—</dd></div>
+          </dl>
+          <p class="facts-note">
+            “Reachable” means the RPC answered. Block liveness is evaluated separately from the newest retained block timestamp.
+          </p>
+        </aside>
+      </section>
+
+      <section id="inspector" class="panel inspector" aria-labelledby="inspector-title">
+        <div class="panel-heading inspector-heading">
+          <div>
+            <span id="inspector-kicker" class="micro-label">Lookup</span>
+            <h2 id="inspector-title">Select a block or search the chain</h2>
+          </div>
+          <button id="inspector-close" class="text-button" type="button" hidden>Close</button>
+        </div>
+        <div id="inspector-content" class="inspector-content">
+          <div class="inspector-empty">
+            <span aria-hidden="true">⌕</span>
+            <p>Block, transaction, and address details stay pinned to the source above.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div><span class="brand-mini">ARC</span> Verifiable infrastructure for deterministic intelligence.</div>
+      <p>No simulated throughput. No cross-node aggregation. Unknown data stays unknown.</p>
+    </footer>
+
+    <noscript>
+      <div class="noscript">ARC Explorer needs JavaScript to query the selected RPC node.</div>
+    </noscript>
   </body>
 </html>
