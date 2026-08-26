@@ -37,11 +37,11 @@ build:
 # Format in place. Run this once, as its own commit, before making the CI fmt
 # job blocking - the first diff is large and purely mechanical.
 fmt:
-	cargo fmt --all
+	./scripts/rustfmt-workspace.sh
 
 # What CI runs.
 fmt-check:
-	cargo fmt --all --check
+	./scripts/rustfmt-workspace.sh --check
 
 lint:
 	cargo clippy --workspace --all-targets --locked -- -D warnings
