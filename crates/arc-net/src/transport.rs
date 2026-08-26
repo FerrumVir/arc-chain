@@ -14,7 +14,7 @@ use quinn::crypto::rustls::QuicServerConfig;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
@@ -49,9 +49,14 @@ pub enum InboundMessage {
     PeerConnected {
         address: Hash256,
         stake: u64,
+        /// Monotonic process-local generation for this peer connection.
+        connection_id: u64,
     },
     PeerDisconnected {
         address: Hash256,
+        /// Generation that closed. Consensus ignores this event if a newer
+        /// connection for `address` is already live.
+        connection_id: u64,
     },
     DagBlockWithTxs {
         block: DagBlock,
@@ -541,8 +546,11 @@ impl PeerRateLimiter {
 
 // ─── Peer Connection Map ────────────────────────────────────────────────────
 
-/// Metadata for a connected peer (dial address + stake).
-struct PeerMeta {
+/// One live peer generation. Keeping stream and metadata in the same DashMap
+/// entry makes replacement/removal atomic for a validator address.
+struct PeerConnection<S> {
+    connection_id: u64,
+    send: S,
     /// The address to dial this peer at (IP from connection + listen_port from handshake).
     dial_addr: SocketAddr,
     /// The peer's self-reported stake.
@@ -550,22 +558,44 @@ struct PeerMeta {
 }
 
 /// Tracks active peer send streams and metadata for outbound broadcast.
-struct PeerConnections {
-    peers: DashMap<[u8; 32], quinn::SendStream>,
-    meta: DashMap<[u8; 32], PeerMeta>,
+struct PeerConnections<S = quinn::SendStream> {
+    peers: DashMap<[u8; 32], PeerConnection<S>>,
+    next_connection_id: AtomicU64,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
 }
 
-impl PeerConnections {
-    fn new() -> Self {
+impl<S> PeerConnections<S> {
+    fn new(inbound_tx: mpsc::Sender<InboundMessage>, peer_count: Arc<AtomicU32>) -> Self {
         Self {
             peers: DashMap::new(),
-            meta: DashMap::new(),
+            // Zero is reserved as "no generation" in diagnostics/tests.
+            next_connection_id: AtomicU64::new(1),
+            inbound_tx,
+            peer_count,
         }
     }
 
-    /// Store peer metadata after successful handshake.
-    fn insert_meta(&self, key: [u8; 32], dial_addr: SocketAddr, stake: u64) {
-        self.meta.insert(key, PeerMeta { dial_addr, stake });
+    /// Atomically claim a validator-address slot for one connection. This
+    /// closes the check-then-insert dual-dial race: exactly one concurrent
+    /// handshake wins and owns the returned generation.
+    fn try_insert(&self, key: [u8; 32], send: S, dial_addr: SocketAddr, stake: u64) -> Option<u64> {
+        use dashmap::mapref::entry::Entry;
+
+        match self.peers.entry(key) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(entry) => {
+                let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+                entry.insert(PeerConnection {
+                    connection_id,
+                    send,
+                    dial_addr,
+                    stake,
+                });
+                self.peer_count.fetch_add(1, Ordering::Relaxed);
+                Some(connection_id)
+            }
+        }
     }
 
     /// Check if a peer is currently connected by validator address bytes.
@@ -573,22 +603,60 @@ impl PeerConnections {
         self.peers.contains_key(key)
     }
 
+    /// Remove only the exact connection generation that failed. If a reconnect
+    /// has already installed a newer generation, the stale cleanup is a no-op.
+    fn remove_if_current(&self, key: &[u8; 32], connection_id: u64) -> bool {
+        use dashmap::mapref::entry::Entry;
+
+        match self.peers.entry(*key) {
+            Entry::Occupied(entry) if entry.get().connection_id == connection_id => {
+                entry.remove();
+                self.peer_count.fetch_sub(1, Ordering::Relaxed);
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
+impl PeerConnections<quinn::SendStream> {
+    async fn remove_and_notify(&self, address: Hash256, connection_id: u64) -> bool {
+        if !self.remove_if_current(&address.0, connection_id) {
+            return false;
+        }
+        let _ = self
+            .inbound_tx
+            .send(InboundMessage::PeerDisconnected {
+                address,
+                connection_id,
+            })
+            .await;
+        true
+    }
+
     async fn broadcast(&self, msg_type: MessageType, payload: &[u8]) {
         // Snapshot peer keys first - do NOT hold DashMap shard locks during
         // network I/O. The old code held iter_mut() locks for the entire
         // broadcast, which blocked peer insert/remove operations for seconds.
-        let peer_keys: Vec<[u8; 32]> = self.peers.iter().map(|e| *e.key()).collect();
+        let peer_keys: Vec<([u8; 32], u64)> = self
+            .peers
+            .iter()
+            .map(|e| (*e.key(), e.connection_id))
+            .collect();
         let peer_count = peer_keys.len();
         let mut sent = 0usize;
         let mut dead_peers = Vec::new();
-        for key in &peer_keys {
+        for (key, connection_id) in &peer_keys {
             if let Some(mut entry) = self.peers.get_mut(key) {
+                if entry.connection_id != *connection_id {
+                    continue;
+                }
                 // 5-second timeout per peer prevents one slow/dead peer from
                 // blocking the entire outbound fanout task, which was the
                 // secondary cause of the P2P channel filling up.
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    write_message(entry.value_mut(), msg_type, payload),
+                    write_message(&mut entry.send, msg_type, payload),
                 )
                 .await
                 {
@@ -597,18 +665,17 @@ impl PeerConnections {
                     }
                     Ok(Err(e)) => {
                         warn!("Failed to send to peer: {}", e);
-                        dead_peers.push(*key);
+                        dead_peers.push((*key, *connection_id));
                     }
                     Err(_) => {
                         warn!("Timeout writing to peer, removing dead connection");
-                        dead_peers.push(*key);
+                        dead_peers.push((*key, *connection_id));
                     }
                 }
             }
         }
-        for key in dead_peers {
-            self.peers.remove(&key);
-            self.meta.remove(&key);
+        for (key, connection_id) in dead_peers {
+            self.remove_and_notify(Hash256(key), connection_id).await;
         }
         if msg_type == MessageType::DagBlockWithTxs && peer_count > 0 {
             debug!(
@@ -623,17 +690,25 @@ impl PeerConnections {
 
     /// Send a message to a specific peer by validator address.
     async fn send_to(&self, target: &Hash256, msg_type: MessageType, payload: &[u8]) {
-        if let Some(mut entry) = self.peers.get_mut(&target.0) {
-            if let Err(e) = write_message(entry.value_mut(), msg_type, payload).await {
+        let failed_generation = if let Some(mut entry) = self.peers.get_mut(&target.0) {
+            let connection_id = entry.connection_id;
+            if let Err(e) = write_message(&mut entry.send, msg_type, payload).await {
                 warn!("Failed to send {:?} to {}: {}", msg_type, target, e);
-                self.peers.remove(&target.0);
-                self.meta.remove(&target.0);
+                Some(connection_id)
+            } else {
+                None
             }
         } else {
             debug!(
                 "send_to: peer {} not connected, cannot send {:?}",
                 target, msg_type
             );
+            None
+        };
+        // The DashMap guard above must be dropped before removal. The old code
+        // attempted `remove` while holding `get_mut`, which can deadlock.
+        if let Some(connection_id) = failed_generation {
+            self.remove_and_notify(*target, connection_id).await;
         }
     }
 }
@@ -753,7 +828,7 @@ pub async fn run_transport(
         info!("P2P transport listening on {}", listen_addr);
     }
 
-    let connections = Arc::new(PeerConnections::new());
+    let connections = Arc::new(PeerConnections::new(inbound_tx.clone(), peer_count.clone()));
     let rate_limiter = Arc::new(PeerRateLimiter::new());
     let keypair = Arc::new(local_keypair);
 
@@ -798,7 +873,6 @@ pub async fn run_transport(
                 local_address,
                 &connections,
                 &inbound_tx,
-                &peer_count,
                 &pex_dial_tx,
                 &rate_limiter,
             );
@@ -878,7 +952,6 @@ pub async fn run_transport(
             local_address,
             &connections,
             &inbound_tx,
-            &peer_count,
             &pex_dial_tx,
             &rate_limiter,
         );
@@ -1057,7 +1130,6 @@ pub async fn run_transport(
         let ep = endpoint.clone();
         let kp = keypair.clone();
         let itx = inbound_tx.clone();
-        let pc = peer_count.clone();
         let pdt = pex_dial_tx.clone();
         let rl = rate_limiter.clone();
         let dd = data_dir.clone();
@@ -1074,8 +1146,7 @@ pub async fn run_transport(
                 tokio::select! {
                     _ = pex_tick.tick() => {
                         let mut all_peers: Vec<crate::protocol::PexPeerInfo> = conn_bg
-                            .meta.iter()
-                            .filter(|e| conn_bg.peers.contains_key(e.key()))
+                            .peers.iter()
                             .map(|entry| crate::protocol::PexPeerInfo {
                                 address: Hash256(*entry.key()),
                                 socket_addr: entry.value().dial_addr.to_string(),
@@ -1105,25 +1176,34 @@ pub async fn run_transport(
                         // peer stream. Dead QUIC streams fail immediately, letting us
                         // prune stale entries that would otherwise block reconnect.
                         {
-                            let peer_keys: Vec<[u8; 32]> = conn_bg.peers.iter().map(|e| *e.key()).collect();
+                            let peer_keys: Vec<([u8; 32], u64)> = conn_bg
+                                .peers
+                                .iter()
+                                .map(|e| (*e.key(), e.connection_id))
+                                .collect();
                             let mut dead = Vec::new();
-                            for key in &peer_keys {
+                            for (key, connection_id) in &peer_keys {
                                 if let Some(mut entry) = conn_bg.peers.get_mut(key) {
+                                    if entry.connection_id != *connection_id {
+                                        continue;
+                                    }
                                     // Write a Heartbeat message (type 0, empty payload)
-                                    if write_message(entry.value_mut(), MessageType::Heartbeat, &[]).await.is_err() {
-                                        dead.push(*key);
+                                    if write_message(&mut entry.send, MessageType::Heartbeat, &[]).await.is_err() {
+                                        dead.push((*key, *connection_id));
                                     }
                                 }
                             }
-                            for key in &dead {
-                                conn_bg.peers.remove(key);
-                                conn_bg.meta.remove(key);
-                                debug!("Pruned dead peer connection");
+                            for (key, connection_id) in dead {
+                                if conn_bg
+                                    .remove_and_notify(Hash256(key), connection_id)
+                                    .await
+                                {
+                                    debug!(connection_id, "Pruned dead peer connection");
+                                }
                             }
                         }
 
-                        let connected_addrs: std::collections::HashSet<SocketAddr> = conn_bg.meta.iter()
-                            .filter(|e| conn_bg.peers.contains_key(e.key()))
+                        let connected_addrs: std::collections::HashSet<SocketAddr> = conn_bg.peers.iter()
                             .map(|e| e.value().dial_addr)
                             .collect();
                         let allow_lo = std::env::var("ARC_ALLOW_LOOPBACK_PEERS").is_ok();
@@ -1152,7 +1232,6 @@ pub async fn run_transport(
                                 local_address,
                                 &conn_bg,
                                 &itx,
-                                &pc,
                                 &pdt,
                                 &rl,
                             );
@@ -1167,8 +1246,6 @@ pub async fn run_transport(
                                 }
                             });
                         }
-                        let actual = conn_bg.peers.len() as u32;
-                        pc.store(actual, Ordering::Relaxed);
                     }
                 }
             }
@@ -1209,7 +1286,6 @@ pub async fn run_transport(
                     local_address,
                     &connections,
                     &inbound_tx,
-                    &peer_count,
                     &pex_dial_tx,
                     &rate_limiter,
                 );
@@ -1237,7 +1313,7 @@ pub async fn run_transport(
 
             // ── PEX auto-dial (from handle_peer_recv) ──────────────────
             // Spawn the entire processing into a separate task. The select body
-            // must NEVER iterate the DashMap (`conn_pex.meta.iter()`) because
+            // must NEVER iterate the peer DashMap because
             // it can deadlock with another task holding a write lock on the
             // same shard. The "already connected" check belongs inside the
             // spawned task, not the select body.
@@ -1252,13 +1328,15 @@ pub async fn run_transport(
                         local_address,
                         &connections,
                         &inbound_tx,
-                        &peer_count,
                         &pex_dial_tx,
                         &rate_limiter,
                     );
                     tokio::spawn(async move {
                         // Skip if already connected (moved out of select body)
-                        let already = conn_pex_clone.meta.iter().any(|e| e.value().dial_addr == peer_addr);
+                        let already = conn_pex_clone
+                            .peers
+                            .iter()
+                            .any(|e| e.value().dial_addr == peer_addr);
                         if already { return; }
                         info!("PEX: dialing discovered peer {}", peer_addr);
                         match tokio::time::timeout(
@@ -1290,7 +1368,6 @@ struct PeerContext {
     local_address: Hash256,
     connections: Arc<PeerConnections>,
     inbound_tx: mpsc::Sender<InboundMessage>,
-    peer_count: Arc<AtomicU32>,
     pex_dial_tx: mpsc::Sender<SocketAddr>,
     rate_limiter: Arc<PeerRateLimiter>,
 }
@@ -1301,7 +1378,6 @@ impl PeerContext {
         local_address: Hash256,
         connections: &Arc<PeerConnections>,
         inbound_tx: &mpsc::Sender<InboundMessage>,
-        peer_count: &Arc<AtomicU32>,
         pex_dial_tx: &mpsc::Sender<SocketAddr>,
         rate_limiter: &Arc<PeerRateLimiter>,
     ) -> Self {
@@ -1309,7 +1385,6 @@ impl PeerContext {
             local_address,
             connections: connections.clone(),
             inbound_tx: inbound_tx.clone(),
-            peer_count: peer_count.clone(),
             pex_dial_tx: pex_dial_tx.clone(),
             rate_limiter: rate_limiter.clone(),
         }
@@ -1327,7 +1402,6 @@ async fn dial_peer(
     let local_address = ctx.local_address;
     let connections = &ctx.connections;
     let inbound_tx = &ctx.inbound_tx;
-    let peer_count = &ctx.peer_count;
     let pex_dial_tx = &ctx.pex_dial_tx;
     let rate_limiter = &ctx.rate_limiter;
 
@@ -1386,14 +1460,23 @@ async fn dial_peer(
         remote.validator_address, remote.stake, dial_addr
     );
 
-    // Register peer + metadata
-    connections.peers.insert(remote.validator_address.0, send);
-    connections.insert_meta(remote.validator_address.0, dial_addr, remote.stake);
-    peer_count.fetch_add(1, Ordering::Relaxed);
+    // Atomically register peer + metadata. A simultaneous inbound/outbound
+    // handshake for the same validator can pass the fast check above; only one
+    // may claim the address slot.
+    let Some(connection_id) =
+        connections.try_insert(remote.validator_address.0, send, dial_addr, remote.stake)
+    else {
+        info!(
+            peer = %remote.validator_address,
+            "Concurrent connection already won validator slot (dial)"
+        );
+        return Ok(());
+    };
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
             address: remote.validator_address,
             stake: remote.stake,
+            connection_id,
         })
         .await;
 
@@ -1405,7 +1488,6 @@ async fn dial_peer(
     let peer_addr_hash = remote.validator_address;
     let inbound_clone = inbound_tx.clone();
     let connections_ref = connections.clone();
-    let peer_count_clone = peer_count.clone();
     let pex_dial_clone = pex_dial_tx.clone();
     let rate_limiter_clone = rate_limiter.clone();
     tokio::spawn(async move {
@@ -1420,15 +1502,18 @@ async fn dial_peer(
             &rate_limiter_clone,
         )
         .await;
-        rate_limiter_clone.remove_peer(&peer_addr_hash);
-        connections_ref.peers.remove(&peer_addr_hash.0);
-        connections_ref.meta.remove(&peer_addr_hash.0);
-        peer_count_clone.fetch_sub(1, Ordering::Relaxed);
-        let _ = inbound_clone
-            .send(InboundMessage::PeerDisconnected {
-                address: peer_addr_hash,
-            })
-            .await;
+        if connections_ref
+            .remove_and_notify(peer_addr_hash, connection_id)
+            .await
+        {
+            rate_limiter_clone.remove_peer(&peer_addr_hash);
+        } else {
+            debug!(
+                peer = %peer_addr_hash,
+                connection_id,
+                "Ignored stale dial-connection cleanup"
+            );
+        }
     });
 
     Ok(())
@@ -1444,7 +1529,6 @@ async fn accept_peer(
     let local_address = ctx.local_address;
     let connections = &ctx.connections;
     let inbound_tx = &ctx.inbound_tx;
-    let peer_count = &ctx.peer_count;
     let pex_dial_tx = &ctx.pex_dial_tx;
     let rate_limiter = &ctx.rate_limiter;
 
@@ -1495,14 +1579,21 @@ async fn accept_peer(
         remote.validator_address, remote.stake, dial_addr
     );
 
-    // Register peer + metadata
-    connections.peers.insert(remote.validator_address.0, send);
-    connections.insert_meta(remote.validator_address.0, dial_addr, remote.stake);
-    peer_count.fetch_add(1, Ordering::Relaxed);
+    // Atomic address-slot claim closes the dual-dial check/insert race.
+    let Some(connection_id) =
+        connections.try_insert(remote.validator_address.0, send, dial_addr, remote.stake)
+    else {
+        info!(
+            peer = %remote.validator_address,
+            "Concurrent connection already won validator slot (accept)"
+        );
+        return Ok(());
+    };
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
             address: remote.validator_address,
             stake: remote.stake,
+            connection_id,
         })
         .await;
 
@@ -1512,7 +1603,6 @@ async fn accept_peer(
     let peer_addr_hash = remote.validator_address;
     let inbound_clone = inbound_tx.clone();
     let connections_ref = connections.clone();
-    let peer_count_clone = peer_count.clone();
     let pex_dial_clone = pex_dial_tx.clone();
     let rate_limiter_clone = rate_limiter.clone();
     tokio::spawn(async move {
@@ -1527,15 +1617,18 @@ async fn accept_peer(
             &rate_limiter_clone,
         )
         .await;
-        rate_limiter_clone.remove_peer(&peer_addr_hash);
-        connections_ref.peers.remove(&peer_addr_hash.0);
-        connections_ref.meta.remove(&peer_addr_hash.0);
-        peer_count_clone.fetch_sub(1, Ordering::Relaxed);
-        let _ = inbound_clone
-            .send(InboundMessage::PeerDisconnected {
-                address: peer_addr_hash,
-            })
-            .await;
+        if connections_ref
+            .remove_and_notify(peer_addr_hash, connection_id)
+            .await
+        {
+            rate_limiter_clone.remove_peer(&peer_addr_hash);
+        } else {
+            debug!(
+                peer = %peer_addr_hash,
+                connection_id,
+                "Ignored stale accepted-connection cleanup"
+            );
+        }
     });
 
     Ok(())
@@ -1925,7 +2018,7 @@ async fn handle_peer_recv(
 /// Save known peer dial addresses to `known_peers.json` in the data directory.
 fn save_peers_to_disk(data_dir: &str, connections: &PeerConnections) {
     let peers: Vec<String> = connections
-        .meta
+        .peers
         .iter()
         .map(|entry| entry.value().dial_addr.to_string())
         .collect();
@@ -1959,5 +2052,69 @@ fn load_peers_from_disk(data_dir: &str) -> Vec<SocketAddr> {
             .filter_map(|s| s.parse().ok())
             .collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_connections() -> (PeerConnections<()>, Arc<AtomicU32>) {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        let peer_count = Arc::new(AtomicU32::new(0));
+        (
+            PeerConnections::new(inbound_tx, peer_count.clone()),
+            peer_count,
+        )
+    }
+
+    #[test]
+    fn validator_slot_has_only_one_concurrent_owner() {
+        let (connections, peer_count) = test_connections();
+        let peer = [3_u8; 32];
+        let dial_addr: SocketAddr = "127.0.0.1:7331".parse().unwrap();
+
+        let connection_id = connections
+            .try_insert(peer, (), dial_addr, 500_000)
+            .expect("first connection should own the validator slot");
+        assert!(
+            connections
+                .try_insert(peer, (), dial_addr, 500_000)
+                .is_none()
+        );
+        assert_eq!(connections.peers.len(), 1);
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            connections.peers.get(&peer).unwrap().connection_id,
+            connection_id
+        );
+    }
+
+    #[test]
+    fn stale_disconnect_cannot_remove_replacement_generation() {
+        let (connections, peer_count) = test_connections();
+        let peer = [9_u8; 32];
+        let dial_addr: SocketAddr = "127.0.0.1:7332".parse().unwrap();
+
+        let old_id = connections
+            .try_insert(peer, (), dial_addr, 500_000)
+            .unwrap();
+        assert!(connections.remove_if_current(&peer, old_id));
+        let replacement_id = connections
+            .try_insert(peer, (), dial_addr, 500_000)
+            .unwrap();
+        assert!(replacement_id > old_id);
+
+        // The old reader exits after the replacement has claimed the same
+        // validator address. Its delayed cleanup must be a no-op.
+        assert!(!connections.remove_if_current(&peer, old_id));
+        assert_eq!(
+            connections.peers.get(&peer).unwrap().connection_id,
+            replacement_id
+        );
+        assert_eq!(peer_count.load(Ordering::Relaxed), 1);
+
+        assert!(connections.remove_if_current(&peer, replacement_id));
+        assert_eq!(peer_count.load(Ordering::Relaxed), 0);
     }
 }

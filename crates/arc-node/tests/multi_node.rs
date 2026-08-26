@@ -304,7 +304,9 @@ async fn test_two_nodes_connect() {
     let msg_b = timeout(Duration::from_secs(5), inbound_rx_b.recv()).await;
     assert!(msg_b.is_ok(), "Node B did not receive PeerConnected");
     match msg_b.unwrap() {
-        Some(InboundMessage::PeerConnected { address, stake: s }) => {
+        Some(InboundMessage::PeerConnected {
+            address, stake: s, ..
+        }) => {
             assert_eq!(address, address_a, "Node B should see Node A's address");
             assert_eq!(s, stake, "Stake should match");
         }
@@ -315,7 +317,9 @@ async fn test_two_nodes_connect() {
     let msg_a = timeout(Duration::from_secs(5), inbound_rx_a.recv()).await;
     assert!(msg_a.is_ok(), "Node A did not receive PeerConnected");
     match msg_a.unwrap() {
-        Some(InboundMessage::PeerConnected { address, stake: s }) => {
+        Some(InboundMessage::PeerConnected {
+            address, stake: s, ..
+        }) => {
             assert_eq!(address, address_b, "Node A should see Node B's address");
             assert_eq!(s, stake, "Stake should match");
         }

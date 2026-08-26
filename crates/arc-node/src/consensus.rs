@@ -23,6 +23,119 @@ enum PeerStateDiffError {
     StateRootMismatch,
 }
 
+/// Latest transport generation observed for one authenticated peer. A closed
+/// generation is retained as a tombstone so a delayed `PeerConnected` event
+/// cannot resurrect a connection whose disconnect was delivered first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerConnectionGeneration {
+    connection_id: u64,
+    connected: bool,
+}
+
+/// Record a live connection only when it is newer than the peer's last event.
+/// An equal-generation disconnect wins over a reordered connect event.
+fn record_peer_connected(
+    peers: &mut std::collections::HashMap<Hash256, PeerConnectionGeneration>,
+    address: Hash256,
+    connection_id: u64,
+) -> bool {
+    match peers.get(&address) {
+        Some(current) if connection_id <= current.connection_id => false,
+        _ => {
+            peers.insert(
+                address,
+                PeerConnectionGeneration {
+                    connection_id,
+                    connected: true,
+                },
+            );
+            true
+        }
+    }
+}
+
+/// Record a disconnect for exactly this generation (or a newer event that
+/// overtook an older live generation). Returns true only when the event
+/// transitions the peer from live to disconnected.
+fn record_peer_disconnected(
+    peers: &mut std::collections::HashMap<Hash256, PeerConnectionGeneration>,
+    address: Hash256,
+    connection_id: u64,
+) -> bool {
+    let Some(current) = peers.get(&address).copied() else {
+        peers.insert(
+            address,
+            PeerConnectionGeneration {
+                connection_id,
+                connected: false,
+            },
+        );
+        return false;
+    };
+
+    if connection_id < current.connection_id
+        || (connection_id == current.connection_id && !current.connected)
+    {
+        return false;
+    }
+
+    peers.insert(
+        address,
+        PeerConnectionGeneration {
+            connection_id,
+            connected: false,
+        },
+    );
+    current.connected
+}
+
+#[cfg(test)]
+mod peer_connection_generation_tests {
+    use super::*;
+    use arc_crypto::hash_bytes;
+
+    #[test]
+    fn connected_validator_generation_ignores_stale_disconnect() {
+        let peer = hash_bytes(b"reconnecting-validator");
+        let mut connected = std::collections::HashMap::new();
+
+        assert!(record_peer_connected(&mut connected, peer, 41));
+        assert!(record_peer_disconnected(&mut connected, peer, 41));
+        assert!(record_peer_connected(&mut connected, peer, 42));
+
+        // The old connection's reader exits after the replacement is live.
+        // Its delayed cleanup must not remove the newer quorum member.
+        assert!(!record_peer_disconnected(&mut connected, peer, 41));
+        assert_eq!(
+            connected.get(&peer),
+            Some(&PeerConnectionGeneration {
+                connection_id: 42,
+                connected: true,
+            })
+        );
+
+        assert!(record_peer_disconnected(&mut connected, peer, 42));
+        assert!(!connected.get(&peer).unwrap().connected);
+    }
+
+    #[test]
+    fn disconnected_generation_tombstone_rejects_reordered_connect() {
+        let peer = hash_bytes(b"reordered-validator");
+        let mut connected = std::collections::HashMap::new();
+
+        // Transport removal can overtake the connect notification on the
+        // shared channel. Retaining a tombstone prevents false live quorum.
+        assert!(!record_peer_disconnected(&mut connected, peer, 7));
+        assert!(!record_peer_connected(&mut connected, peer, 7));
+        assert!(!connected.get(&peer).unwrap().connected);
+
+        assert!(record_peer_connected(&mut connected, peer, 8));
+        assert!(!record_peer_connected(&mut connected, peer, 7));
+        assert_eq!(connected.get(&peer).unwrap().connection_id, 8);
+        assert!(connected.get(&peer).unwrap().connected);
+    }
+}
+
 /// A state diff is only a performance hint, never proof of execution. Bind it
 /// to the authenticated author of the committed DAG block and compare it with
 /// the result of local canonical execution before accepting it as corroborating
@@ -307,6 +420,14 @@ impl ConsensusManager {
         // Track last proposed round to avoid double-proposing.
         let mut last_proposed_round: Option<u64> = None;
 
+        // Genesis membership and live transport connectivity are different
+        // facts. The validator set must be known/frozen before networking,
+        // but proposing before enough of that set is connected strands this
+        // node's round-0 block before peers can receive it. Track authenticated
+        // connections and wait for live quorum before proposing.
+        let mut connected_validators =
+            std::collections::HashMap::<Hash256, PeerConnectionGeneration>::new();
+
         // Pending encrypted transaction batches, keyed by DAG block hash.
         // Stored at proposal time, revealed after DAG commit.
         let pending_encrypted: DashMap<[u8; 32], Vec<arc_mempool::EncryptedTx>> = DashMap::new();
@@ -345,7 +466,23 @@ impl ConsensusManager {
             if let Some(ref mut rx) = inbound_rx {
                 while let Ok(msg) = rx.try_recv() {
                     match msg {
-                        InboundMessage::PeerConnected { address, stake } => {
+                        InboundMessage::PeerConnected {
+                            address,
+                            stake,
+                            connection_id,
+                        } => {
+                            if !record_peer_connected(
+                                &mut connected_validators,
+                                address,
+                                connection_id,
+                            ) {
+                                debug!(
+                                    peer = %address,
+                                    connection_id,
+                                    "Ignored stale or reordered peer-connected event"
+                                );
+                                continue;
+                            }
                             // Check if this peer is already in our validator set.
                             // If so, this is a reconnect - do NOT reset the DAG,
                             // which would destroy all round progress and cause
@@ -428,7 +565,22 @@ impl ConsensusManager {
                                 }
                             }
                         }
-                        InboundMessage::PeerDisconnected { address } => {
+                        InboundMessage::PeerDisconnected {
+                            address,
+                            connection_id,
+                        } => {
+                            if !record_peer_disconnected(
+                                &mut connected_validators,
+                                address,
+                                connection_id,
+                            ) {
+                                debug!(
+                                    peer = %address,
+                                    connection_id,
+                                    "Ignored stale or duplicate peer-disconnected event"
+                                );
+                                continue;
+                            }
                             // CRITICAL: genesis validators (those in the frozen set)
                             // must NEVER be removed from the active validator set.
                             // The transport layer emits PeerDisconnected for the OLD
@@ -779,6 +931,23 @@ impl ConsensusManager {
             let multi_validator = self.is_multi_validator();
             let current_round = self.engine.current_round();
             let already_proposed = last_proposed_round == Some(current_round);
+            let has_connected_quorum = if multi_validator {
+                let vs = self.engine.validator_set();
+                let local_stake = vs
+                    .get_validator(&self.validator_address)
+                    .map(|validator| validator.stake)
+                    .unwrap_or(0);
+                let peer_stake: u64 = connected_validators
+                    .iter()
+                    .filter(|(_, generation)| generation.connected)
+                    .filter_map(|(address, _)| {
+                        vs.get_validator(address).map(|validator| validator.stake)
+                    })
+                    .sum();
+                local_stake.saturating_add(peer_stake) >= vs.quorum
+            } else {
+                true
+            };
 
             // ── Pre-feed benchmark transactions into mempool ──────────────
             // Do this BEFORE the propose check so transactions are always
@@ -860,7 +1029,7 @@ impl ConsensusManager {
             // In single-validator mode, use VRF to gate proposals. The 2-round
             // commit rule handles safety regardless (won't commit without quorum).
             let allow_propose = if multi_validator {
-                true // DAG: all validators propose every round
+                has_connected_quorum // DAG: wait until peers can receive round 0
             } else {
                 vrf_approved // Single-validator: VRF gates block production
             };
