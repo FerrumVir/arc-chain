@@ -66,8 +66,8 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Block</p><p class="text-2xl font-extrabold text-arc-400 mono mt-1" id="dagRound">-</p></div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Finalized</p><p class="text-2xl font-extrabold text-white mono mt-1" id="committed">-</p></div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Validators</p><p class="text-2xl font-extrabold text-emerald-400 mono mt-1" id="validatorCount">-</p></div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Blocks/sec</p><p class="text-2xl font-extrabold text-white mono mt-1" id="rps">-</p></div>
-    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">TPS</p><p class="text-2xl font-extrabold text-yellow-400 mono mt-1" id="tps">-</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">DAG rounds/sec</p><p class="text-2xl font-extrabold text-white mono mt-1" id="rps">-</p></div>
+    <div class="bg-surface-2 border border-surface-4 rounded-xl p-4"><p class="text-[11px] uppercase tracking-wider text-gray-500 font-medium">Measured benchmark TPS</p><p class="text-2xl font-extrabold text-yellow-400 mono mt-1" id="tps">-</p></div>
   </div>
 
   <!-- Chain + Nodes -->
@@ -79,13 +79,13 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
         <div class="flex justify-between"><span class="text-gray-500">Accounts</span><span class="text-white font-medium mono" id="accounts">-</span></div>
         <div class="flex justify-between"><span class="text-gray-500">Peers</span><span class="text-white font-medium mono" id="peers">-</span></div>
         <div class="flex justify-between"><span class="text-gray-500">Uptime</span><span class="text-white font-medium mono" id="uptime">-</span></div>
-        <div class="flex justify-between border-t border-surface-4 pt-2 mt-2"><span class="text-gray-500">Codebase</span><span class="text-white font-medium text-xs">101K LOC Rust</span></div>
-        <div class="flex justify-between"><span class="text-gray-500">Tests</span><span class="text-white font-medium text-xs">1,234 passing</span></div>
-        <div class="flex justify-between"><span class="text-gray-500">Regions</span><span class="text-white font-medium text-xs">6 continents</span></div>
+        <div class="flex justify-between border-t border-surface-4 pt-2 mt-2"><span class="text-gray-500">Metric source</span><span class="text-white font-medium text-xs">Selected RPC host</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Chain scope</span><span class="text-white font-medium text-xs">Host-pinned</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Locations</span><span class="text-white font-medium text-xs">6 configured cities</span></div>
       </div>
     </div>
     <div class="bg-surface-2 border border-surface-4 rounded-xl p-5">
-      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Nodes - 6 Continents</h2>
+      <h2 class="text-xs uppercase tracking-wider text-gray-500 font-semibold mb-4">Seed Hosts - 6 Cities</h2>
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-2" id="nodeGrid"></div>
     </div>
   </div>
@@ -105,7 +105,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
           A model that <span class="text-arc-300 font-semibold">cannot fit on any single node</span> is split at transformer layer boundaries.
           Each request flows through the pipeline of shard-holders via HTTP, with
           <span class="text-emerald-300 font-semibold">BLAKE3 hashes verifying every hidden state</span> in transit.
-          Pure i64 arithmetic. <span class="text-yellow-300 font-semibold">0% quality loss</span> vs the source GGUF.
+          Pure i64 arithmetic. Output hashes and measured latency are shown from the coordinator response below.
         </p>
       </div>
       <div class="flex gap-3 text-right flex-wrap">
@@ -122,11 +122,11 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
           <div class="text-sm font-bold text-emerald-300 mono" id="shardCount">-</div>
         </div>
         <div class="bg-surface-3 border border-emerald-500/40 rounded-lg px-3 py-2">
-          <div class="text-[8px] uppercase tracking-wider text-emerald-300">Runs Served</div>
+          <div class="text-[8px] uppercase tracking-wider text-emerald-300">Coordinator Runs*</div>
           <div class="text-sm font-bold text-emerald-300 mono" id="shardRunsTotal">-</div>
         </div>
         <div class="bg-surface-3 border border-emerald-500/40 rounded-lg px-3 py-2">
-          <div class="text-[8px] uppercase tracking-wider text-emerald-300">Bytes Forwarded</div>
+          <div class="text-[8px] uppercase tracking-wider text-emerald-300">Coordinator Bytes*</div>
           <div class="text-sm font-bold text-emerald-300 mono" id="shardBytesTotal">-</div>
         </div>
       </div>
@@ -221,7 +221,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
         <span id="communityJobs" class="text-[10px] text-violet-300 font-mono">0 jobs completed</span>
       </div>
       <div id="communityWorkerList" class="space-y-1 mb-3"></div>
-      <div class="text-[9px] text-gray-500">Community nodes providing inference compute. Join with one command below.</div>
+      <div class="text-[9px] text-gray-500">Registered community workers. Completed jobs come from each seed's worker scoreboard.</div>
     </div>
 
     <!-- "Join the network" - the conversion event for visitors -->
@@ -248,40 +248,40 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       <div>
         <h2 class="text-base font-bold text-white flex items-center gap-2">
           <span class="inline-block w-2.5 h-2.5 rounded-full bg-emerald-400 pulse-dot shadow-lg shadow-emerald-400/50"></span>
-          Parallel AI Inference (Load Balancing)
+          Coordinator Concurrency Test
           <span class="text-[10px] font-normal text-emerald-400 ml-1 px-2 py-0.5 rounded-full bg-emerald-500/10 border border-emerald-500/30">LIVE</span>
         </h2>
-        <p class="text-[11px] text-gray-400 mt-1">Each node runs a full copy of the SAME model. Same prompt → same hash on every device → cross-platform determinism proven.</p>
+        <p class="text-[11px] text-gray-400 mt-1">Compares repeated requests through the selected shard coordinator. This measures request concurrency and cache behavior; it does not claim that each response came from a different device.</p>
       </div>
       <div class="grid grid-cols-3 gap-4 text-right">
         <div>
-          <div class="text-[9px] uppercase tracking-wider text-gray-500">Inference Nodes</div>
+          <div class="text-[9px] uppercase tracking-wider text-gray-500">Configured Seed Hosts</div>
           <div class="text-2xl font-extrabold text-emerald-400 mono" id="infNodeCount">-</div>
         </div>
         <div>
           <div class="text-[9px] uppercase tracking-wider text-gray-500">Speedup</div>
-          <div class="text-2xl font-extrabold text-yellow-400 mono">6.2×</div>
+          <div class="text-2xl font-extrabold text-yellow-400 mono" id="headlineSpeedup">-</div>
         </div>
         <div>
-          <div class="text-[9px] uppercase tracking-wider text-gray-500">Total Runs</div>
+          <div class="text-[9px] uppercase tracking-wider text-gray-500">Recent Records</div>
           <div class="text-2xl font-extrabold text-white mono" id="infCount">-</div>
         </div>
       </div>
     </div>
 
-    <!-- Custom prompt input - runs on all 8 nodes in parallel -->
+    <!-- Custom prompt input - concurrent requests through one coordinator -->
     <div class="mb-4 p-4 bg-surface-3 border border-emerald-500/30 rounded-xl">
-      <label class="text-[10px] uppercase tracking-wider text-emerald-400 font-bold block mb-2">Type a prompt - watch all 8 devices answer it together</label>
+      <label class="text-[10px] uppercase tracking-wider text-emerald-400 font-bold block mb-2">Type a prompt - compare concurrent coordinator responses</label>
       <div class="flex gap-2">
         <input type="text" id="customPrompt" placeholder="What is the capital of France?" value="What is the capital of France?"
                class="flex-1 px-3 py-2 bg-surface-2 border border-surface-4 rounded-lg text-white text-sm placeholder-gray-600 focus:border-emerald-500 focus:outline-none mono"
                onkeypress="if(event.key==='Enter')runCustomPromptOnAll()">
         <button onclick="runCustomPromptOnAll()" id="customBtn"
                 class="px-5 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-sm whitespace-nowrap transition shadow-lg shadow-emerald-500/30">
-          ▶ Run on All 8
+          ▶ Run Concurrent Requests
         </button>
       </div>
-      <div id="customStatus" class="text-[10px] text-gray-500 mt-2">Same prompt sent to all 8 nodes simultaneously. All produce identical hash = cross-device determinism proven.</div>
+      <div id="customStatus" class="text-[10px] text-gray-500 mt-2">Sends one request per configured seed slot to the same active coordinator. Equal hashes verify repeatability for this coordinator and request.</div>
 
       <!-- Per-node response cards (populated on run) -->
       <div id="customResults" class="hidden grid grid-cols-2 md:grid-cols-4 gap-2 mt-3"></div>
@@ -290,8 +290,8 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
       <div id="customHashSummary" class="hidden mt-3 p-3 bg-surface-2 border border-arc-500/30 rounded-lg text-[11px]"></div>
     </div>
 
-    <!-- Click any node to test inference live -->
-    <div class="text-[10px] uppercase tracking-wider text-gray-500 mb-2 font-semibold">Or click any device to run a quick test</div>
+    <!-- Configured shard hosts; inference requests still use the coordinator. -->
+    <div class="text-[10px] uppercase tracking-wider text-gray-500 mb-2 font-semibold">Configured shard hosts · inference requests use the selected coordinator</div>
     <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2 mb-4" id="inferenceNodeGrid"></div>
 
     <!-- Live benchmark button -->
@@ -300,7 +300,7 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
         ⚡ Run Live Benchmark
       </button>
       <div class="flex-1 text-[11px]">
-        <div id="benchStatus" class="text-gray-400">Compares <span class="text-yellow-400 font-semibold">1 node sequential</span> vs <span class="text-emerald-400 font-semibold">8 nodes parallel</span>. Same prompt. Different machines. Identical hash.</div>
+        <div id="benchStatus" class="text-gray-400">Compares <span class="text-yellow-400 font-semibold">5 sequential</span> vs <span class="text-emerald-400 font-semibold">5 concurrent</span> requests through one coordinator. Repeated prompts may use its cache.</div>
       </div>
     </div>
 
@@ -308,11 +308,11 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
     <div id="benchResult" class="hidden mt-4 p-4 bg-surface-3 border border-arc-500/30 rounded-lg">
       <div class="grid grid-cols-3 gap-4 mb-3">
         <div>
-          <div class="text-[9px] uppercase tracking-wider text-gray-500">Sequential (1 node)</div>
+          <div class="text-[9px] uppercase tracking-wider text-gray-500">Sequential requests</div>
           <div class="text-xl font-bold text-yellow-400 mono" id="benchSeq">-</div>
         </div>
         <div>
-          <div class="text-[9px] uppercase tracking-wider text-gray-500">Distributed (8 nodes)</div>
+          <div class="text-[9px] uppercase tracking-wider text-gray-500">Concurrent requests</div>
           <div class="text-xl font-bold text-emerald-400 mono" id="benchDist">-</div>
         </div>
         <div>
@@ -354,16 +354,25 @@ body{font-family:'Inter',sans-serif}.mono{font-family:'JetBrains Mono',monospace
 </footer>
 
 <script>
-// Try multiple nodes - use first one that responds
+// Keep the active seed inventory in one place. RPC fallback and scoreboard
+// polling are derived from this list so retired hosts cannot linger in a
+// second, stale topology constant.
+const NODES=Object.freeze([
+  {name:'NYC',ip:'149.28.32.76',loc:'New York',flag:'🇺🇸',inference:true},
+  {name:'LAX',ip:'140.82.16.112',loc:'Los Angeles',flag:'🇺🇸',inference:true},
+  {name:'AMS',ip:'136.244.109.1',loc:'Amsterdam',flag:'🇳🇱',inference:true},
+  {name:'LHR',ip:'104.238.171.11',loc:'London',flag:'🇬🇧',inference:true},
+  {name:'NRT',ip:'202.182.107.41',loc:'Tokyo',flag:'🇯🇵',inference:true},
+  {name:'SGP',ip:'149.28.153.31',loc:'Singapore',flag:'🇸🇬',inference:true},
+]);
+
+// Try the configured hosts and pin every subsequent chain read to the first
+// responsive one. The testnet seeds can have different chain state.
 let RPC='http://140.82.16.112:9090';
-const RPC_FALLBACKS=['http://136.244.109.1:9090','http://104.238.171.11:9090','http://149.28.32.76:9090','http://202.182.107.41:9090','http://149.28.153.31:9090'];
-// Sharded inference goes to a seed coordinator on port 9090.
-// 2026-08-17: this used to point at http://149.28.32.76:10000, an SSH reverse
-// tunnel to a Mac M2 Ultra that is no longer reachable (connect fails, code
-// 000). The pipeline it described - Mac holding a 27-layer tail shard, NYC
-// [0,2), LAX [2,5) - has not been the topology since April. The live layout is
-// 6 layer ranges replicated 3x across the 6 seeds; any seed can coordinate.
-const SHARDED_COORDINATOR = 'http://104.238.171.11:9090';
+const RPC_FALLBACKS=NODES.map(n=>`http://${n.ip}:9090`).filter(url=>url!==RPC);
+// Inference is coordinated by one explicitly selected seed. A response from
+// this endpoint is never presented as proof that all configured hosts ran it.
+const SHARDED_COORDINATOR='http://104.238.171.11:9090';
 // Write to an element only if it exists. Two ids in this block (`height`,
 // `mempool`) have no matching element, and a null deref there was throwing
 // inside the stats try/catch - which silently killed every field after it.
@@ -371,27 +380,32 @@ function setText(id, value){
   const el = document.getElementById(id);
   if (el) el.textContent = value;
 }
+function makeElement(tag,className,text){
+  const el=document.createElement(tag);
+  if(className)el.className=className;
+  if(text!==undefined)el.textContent=String(text);
+  return el;
+}
+function safeHttpUrl(value){
+  try{
+    const url=new URL(String(value),window.location.href);
+    return url.protocol==='http:'||url.protocol==='https:'?url.href:null;
+  }catch(e){return null;}
+}
+function escapeHtml(value){
+  return String(value??'').replace(/[&<>"']/g,ch=>({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  })[ch]);
+}
 async function findRPC(){
   try{const r=await fetch(RPC+'/health',{signal:AbortSignal.timeout(3000)});if(r.ok)return}catch(e){}
   for(const fb of RPC_FALLBACKS){
     try{const r=await fetch(fb+'/health',{signal:AbortSignal.timeout(3000)});if(r.ok){RPC=fb;return}}catch(e){}
   }
 }
-const NODES=[
-  {name:'NYC',ip:'149.28.32.76',loc:'New York',flag:'🇺🇸',inference:true},
-  {name:'LAX',ip:'140.82.16.112',loc:'Los Angeles',flag:'🇺🇸',inference:true},
-  {name:'AMS',ip:'136.244.109.1',loc:'Amsterdam',flag:'🇳🇱',inference:true},
-  {name:'LHR',ip:'104.238.171.11',loc:'London',flag:'🇬🇧',inference:true},
-  {name:'NRT',ip:'202.182.107.41',loc:'Tokyo',flag:'🇯🇵',inference:true},
-  {name:'SGP',ip:'149.28.153.31',loc:'Singapore',flag:'🇸🇬',inference:true},
-  // SAO 216.238.120.27 and JNB 139.84.237.49 were retired 2026-04-22 (GH #32)
-  // and no longer accept connections. Removed 2026-08-17 - they rendered as
-  // permanently-dead tiles.
-];
-
 let lastRound=0,lastTime=Date.now(),lastTxCount=0;
 
-// Fetch all 8 nodes in PARALLEL (no sequential blocking)
+// Fetch all configured hosts in parallel (no sequential blocking).
 async function renderNodes(){
   const grid=document.getElementById('nodeGrid');
   const results=await Promise.allSettled(NODES.map(async n=>{
@@ -400,39 +414,46 @@ async function renderNodes(){
       return{n,d:await r.json(),ok:true};
     }catch(e){return{n,ok:false}}
   }));
-  // Compute best values across ALL nodes (not just one RPC)
-  let maxRound=0,maxCommitted=0,maxPeers=0,nodesUp=0;
+  grid.replaceChildren();
   for(const{value:v}of results){
-    if(v.ok){
-      nodesUp++;
-      if(v.d.dag_round>maxRound)maxRound=v.d.dag_round;
-      if(v.d.dag_committed>maxCommitted)maxCommitted=v.d.dag_committed;
-      if(v.d.peers>maxPeers)maxPeers=v.d.peers;
-    }
-  }
-  // Update hero stats from best node data (fixes "Finalized: 0" when RPC node hasn't committed)
-  if(maxRound>0) document.getElementById('dagRound').textContent=maxRound.toLocaleString();
-  if(maxCommitted>0) document.getElementById('committed').textContent=maxCommitted.toLocaleString();
-
-  grid.innerHTML='';
-  for(const{value:v}of results){
-    const el=document.createElement('div');
+    const el=makeElement('div');
     if(v.ok){
       const d=v.d,n=v.n;
       el.className='bg-surface-3 border border-surface-4 rounded-lg p-2.5 text-center hover:border-arc-500/30 transition cursor-pointer';
-      el.onclick=()=>showModal(n.name+' - '+n.loc,[['Status','🟢 Online'],['Block',d.dag_round.toLocaleString()],['Finalized',d.dag_committed.toLocaleString()],['Peers',d.peers],['Validators',d.validators],['Uptime',Math.floor(d.uptime_secs/60)+'m'],['RPC','http://'+n.ip+':9090','http://'+n.ip+':9090/health']]);
-      el.innerHTML=`<div class="flex items-center justify-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span><span class="text-white font-semibold text-xs">${n.name}</span></div><div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div><div class="mono text-arc-400 text-[11px] mt-1">#${d.dag_round.toLocaleString()}</div>`;
+      const round=Number.isFinite(Number(d.dag_round))?Number(d.dag_round):'-';
+      const committed=Number.isFinite(Number(d.dag_committed))?Number(d.dag_committed):'-';
+      el.addEventListener('click',()=>showModal(n.name+' - '+n.loc,[['Status','🟢 Online'],['Block',round],['Finalized',committed],['Peers',d.peers],['Validators',d.validators],['Uptime',Math.floor((Number(d.uptime_secs)||0)/60)+'m'],['RPC','http://'+n.ip+':9090','http://'+n.ip+':9090/health']]));
+      const header=makeElement('div','flex items-center justify-center gap-1');
+      header.append(
+        makeElement('span','w-1.5 h-1.5 rounded-full bg-emerald-400'),
+        makeElement('span','text-white font-semibold text-xs',n.name),
+      );
+      el.append(
+        header,
+        makeElement('div','text-[10px] text-gray-500',`${n.flag} ${n.loc}`),
+        makeElement('div','mono text-arc-400 text-[11px] mt-1',`#${round==='-'?'-':round.toLocaleString()}`),
+      );
     }else{
       const n=v.n;
       el.className='bg-surface-3 border border-red-900/30 rounded-lg p-2.5 text-center';
-      el.innerHTML=`<div class="flex items-center justify-center gap-1"><span class="w-1.5 h-1.5 rounded-full bg-red-400"></span><span class="text-white font-semibold text-xs">${n.name}</span></div><div class="text-[10px] text-gray-500">${n.flag} ${n.loc}</div><div class="text-red-400 text-[11px] mt-1">offline</div>`;
+      const header=makeElement('div','flex items-center justify-center gap-1');
+      header.append(
+        makeElement('span','w-1.5 h-1.5 rounded-full bg-red-400'),
+        makeElement('span','text-white font-semibold text-xs',n.name),
+      );
+      el.append(
+        header,
+        makeElement('div','text-[10px] text-gray-500',`${n.flag} ${n.loc}`),
+        makeElement('div','text-red-400 text-[11px] mt-1','offline'),
+      );
     }
     grid.appendChild(el);
   }
 }
 
-// Live benchmark - runs single-node sequential vs distributed parallel
-// directly from the dashboard. Shows the speedup in real time.
+// Live benchmark - compares sequential and concurrent requests through the
+// same coordinator. Repeated prompts may be cache hits, so this is not a
+// cross-device benchmark.
 async function runLiveBenchmark(){
   const btn=document.getElementById('benchBtn');
   const status=document.getElementById('benchStatus');
@@ -440,8 +461,6 @@ async function runLiveBenchmark(){
   const N=5; // 5 inferences per mode
   const PROMPT='What is 2+2?';
   const MAX_TOKENS=10;
-  const infNodes=NODES.filter(n=>n.inference);
-
   btn.disabled=true;
   btn.textContent='Running…';
   btn.classList.remove('bg-emerald-500','hover:bg-emerald-400');
@@ -492,6 +511,7 @@ async function runLiveBenchmark(){
   // Compare
   const speedup=(seqMs/distMs).toFixed(2);
   document.getElementById('benchSpeedup').textContent=`${speedup}× faster`;
+  document.getElementById('headlineSpeedup').textContent=`${speedup}×`;
 
   // Verify determinism
   const allHashes=[...seqHashes,...distHashes].filter(h=>h);
@@ -499,12 +519,14 @@ async function runLiveBenchmark(){
   const hashLine=document.getElementById('benchHashLine');
   if(unique.size===1){
     const h=[...unique][0];
-    hashLine.innerHTML=`<span class="text-emerald-400 font-bold">✓ All ${allHashes.length} responses produced IDENTICAL hash:</span> <code class="text-arc-400 mono">${h.slice(0,40)}...</code>`;
+    const summary=makeElement('span','text-emerald-400 font-bold',`✓ All ${allHashes.length} responses produced the same hash: `);
+    const code=makeElement('code','text-arc-400 mono',`${String(h).slice(0,40)}...`);
+    hashLine.replaceChildren(summary,code);
   }else{
-    hashLine.innerHTML=`<span class="text-yellow-400">⚠ ${unique.size} unique hashes across ${allHashes.length} responses</span>`;
+    hashLine.replaceChildren(makeElement('span','text-yellow-400',`⚠ ${unique.size} unique hashes across ${allHashes.length} responses`));
   }
 
-  status.innerHTML=`<span class="text-emerald-400 font-bold">✓ Done!</span> ${speedup}× speedup with cross-device determinism proof.`;
+  status.textContent=`Done: ${speedup}× sequential/concurrent wall-time ratio through one coordinator. Repeated prompts may use cache.`;
 
   // Re-enable button
   btn.disabled=false;
@@ -604,10 +626,10 @@ async function refreshShardRegistry(){
       const isLast = s.end_layer === totalLayersCount;
       const role = isFirst && isLast ? 'WHOLE' : isFirst ? 'EMBED + L' : isLast ? 'L + LM HEAD' : 'L';
       html += `
-        <div class="flex-1 min-w-[110px] bg-surface-2 border-2 border-arc-500/40 rounded-xl p-3 hover:border-arc-400 hover:shadow-lg hover:shadow-arc-500/30 transition cursor-pointer text-center" id="shard-card-${i}" title="${s.node_name} holds layers ${s.start_layer} to ${s.end_layer-1} (${memDisplay} of weights)">
+        <div class="flex-1 min-w-[110px] bg-surface-2 border-2 border-arc-500/40 rounded-xl p-3 hover:border-arc-400 hover:shadow-lg hover:shadow-arc-500/30 transition cursor-pointer text-center" id="shard-card-${i}" title="${escapeHtml(s.node_name)} holds layers ${escapeHtml(s.start_layer)} to ${escapeHtml(s.end_layer-1)} (${escapeHtml(memDisplay)} of weights)">
           <div class="text-[8px] uppercase tracking-wider text-arc-400 font-bold">${role}</div>
-          <div class="text-sm font-extrabold text-white mt-0.5">${s.node_name}</div>
-          <div class="text-[10px] mono text-gray-400 mt-1">L${s.start_layer}–L${s.end_layer-1}</div>
+          <div class="text-sm font-extrabold text-white mt-0.5">${escapeHtml(s.node_name)}</div>
+          <div class="text-[10px] mono text-gray-400 mt-1">L${escapeHtml(s.start_layer)}–L${escapeHtml(s.end_layer-1)}</div>
           <div class="text-[9px] text-gray-500">${layerCount} layers · ${pct}%</div>
           <div class="text-[10px] mono text-emerald-400 mt-1">${memDisplay}</div>
         </div>
@@ -710,10 +732,10 @@ async function runShardedInference(){
 
     if(d.success){
       const trace = d.shard_trace || [];
-      const totalBytes = d.total_bytes_transferred || 0;
+      const totalBytes=Number(d.total_bytes_transferred)||0;
       const totalKb = (totalBytes / 1024).toFixed(1);
-      const msPerTok = d.ms_per_token || 0;
-      const tokensGen = d.tokens_generated || 0;
+      const msPerTok=Number.isFinite(Number(d.ms_per_token))?Number(d.ms_per_token):'-';
+      const tokensGen=Number(d.tokens_generated)||0;
       // Save to localStorage history
       saveShardedRun({prompt, output: d.output||'', hash: d.output_hash||'', ts: Date.now(), wall_ms: elapsed, ms_per_token: msPerTok, pipeline_length: d.pipeline_length||0});
 
@@ -754,20 +776,21 @@ async function runShardedInference(){
       resultEl.classList.remove('hidden');
       const traceRows = trace.map(h => `
         <tr class="border-b border-surface-4 last:border-0">
-          <td class="py-1.5 px-2 text-[10px] mono text-arc-300 font-bold">${h.hop}</td>
-          <td class="py-1.5 px-2 text-[10px] text-white">${h.node}</td>
-          <td class="py-1.5 px-2 text-[10px] mono text-gray-400">${h.layers}</td>
-          <td class="py-1.5 px-2 text-[10px] text-emerald-400 font-mono text-right">${h.compute_ms}ms</td>
-          <td class="py-1.5 px-2 text-[10px] text-yellow-400 font-mono text-right">${h.wall_ms}ms</td>
-          <td class="py-1.5 px-2 text-[10px] text-gray-500 font-mono text-right">${(h.payload_bytes/1024).toFixed(1)} KB</td>
+          <td class="py-1.5 px-2 text-[10px] mono text-arc-300 font-bold">${escapeHtml(h.hop)}</td>
+          <td class="py-1.5 px-2 text-[10px] text-white">${escapeHtml(h.node)}</td>
+          <td class="py-1.5 px-2 text-[10px] mono text-gray-400">${escapeHtml(h.layers)}</td>
+          <td class="py-1.5 px-2 text-[10px] text-emerald-400 font-mono text-right">${escapeHtml(h.compute_ms)}ms</td>
+          <td class="py-1.5 px-2 text-[10px] text-yellow-400 font-mono text-right">${escapeHtml(h.wall_ms)}ms</td>
+          <td class="py-1.5 px-2 text-[10px] text-gray-500 font-mono text-right">${(Number(h.payload_bytes||0)/1024).toFixed(1)} KB</td>
           <td class="py-1.5 px-2 text-[10px] text-center">${h.is_terminal ? '<span class="text-emerald-400">✓ token</span>' : '<span class="text-gray-500">→ hidden</span>'}</td>
         </tr>
       `).join('');
 
       const attestation = d.attestation || {};
-      const txHash = attestation.tx_hash || '';
+      const txHash=String(attestation.tx_hash||'');
       // /tx/ endpoint expects 64-hex (no 0x prefix)
-      const txHashClean = txHash.replace(/^0x/, '');
+      const candidateHash=txHash.replace(/^0x/,'');
+      const txHashClean=/^[0-9a-fA-F]{64}$/.test(candidateHash)?candidateHash:'';
       const explorerUrl = txHashClean ? `/tx/${txHashClean}` : '';
       const txHashShort = txHash ? `${txHash.slice(0, 18)}…` : '-';
       const cache = d.cache || {};
@@ -777,8 +800,8 @@ async function runShardedInference(){
              <div class="flex items-center gap-2">
                <span class="text-2xl">✓</span>
                <div class="flex-1">
-                 <div class="text-[12px] font-bold text-emerald-300 uppercase tracking-wider">Deterministic cache hit · served in ${elapsed} ms</div>
-                 <div class="text-[10px] text-gray-300 mt-0.5">Bit-identical output_hash to a prior 79-second sharded run. Same model + same input ALWAYS produces the same output - proven by the integer engine, no re-derivation needed.</div>
+                 <div class="text-[12px] font-bold text-emerald-300 uppercase tracking-wider">Coordinator cache hit · served in ${elapsed} ms</div>
+                 <div class="text-[10px] text-gray-300 mt-0.5">The selected coordinator reported this response as cached. The output hash below is the value returned for this request.</div>
                </div>
              </div>
            </div>`
@@ -786,7 +809,7 @@ async function runShardedInference(){
              <div class="flex items-center gap-2">
                <span class="text-lg">▶</span>
                <div class="flex-1">
-                 <div class="text-[11px] font-semibold text-arc-300 uppercase tracking-wider">First run · full 7-shard pipeline · ${elapsed} ms wall</div>
+                 <div class="text-[11px] font-semibold text-arc-300 uppercase tracking-wider">Coordinator cache miss · ${escapeHtml(d.pipeline_length||currentPipeline.length)}-shard trace · ${elapsed} ms wall</div>
                  <div class="text-[9px] text-gray-500 mt-0.5">Cached for next time. Click again - it'll come back in milliseconds.</div>
                </div>
              </div>
@@ -799,25 +822,25 @@ async function runShardedInference(){
           </div>
           ${cacheBanner}
           <div class="mb-3 p-3 bg-surface-3 rounded-lg">
-            <div class="text-[10px] text-gray-500 mb-1">→ ${prompt}</div>
-            <div class="text-sm text-white leading-snug">${(d.output || '').replace(/</g,'&lt;')}</div>
+            <div class="text-[10px] text-gray-500 mb-1">→ ${escapeHtml(prompt)}</div>
+            <div class="text-sm text-white leading-snug">${escapeHtml(d.output||'')}</div>
           </div>
           <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
             <div class="bg-surface-3 rounded p-2 text-center">
               <div class="text-[9px] uppercase text-gray-500">Output hash (BLAKE3)</div>
-              <div class="text-[10px] mono text-arc-400 truncate" title="${d.output_hash}">${(d.output_hash || '').slice(0, 18)}…</div>
+              <div class="text-[10px] mono text-arc-400 truncate" title="${escapeHtml(d.output_hash)}">${escapeHtml(String(d.output_hash||'').slice(0,18))}…</div>
             </div>
             <div class="bg-surface-3 rounded p-2 text-center">
               <div class="text-[9px] uppercase text-gray-500">On-chain attestation</div>
-              ${txHash ? `<a href="${RPC}${explorerUrl}" target="_blank" class="text-[10px] mono text-emerald-400 truncate hover:underline" title="${txHash}">${txHashShort} ↗</a>` : '<div class="text-[10px] text-gray-500">-</div>'}
+              ${txHashClean ? `<a href="${escapeHtml(RPC+explorerUrl)}" target="_blank" rel="noopener noreferrer" class="text-[10px] mono text-emerald-400 truncate hover:underline" title="${escapeHtml(txHash)}">${escapeHtml(txHashShort)} ↗</a>` : '<div class="text-[10px] text-gray-500">not mined / unavailable</div>'}
             </div>
             <div class="bg-surface-3 rounded p-2 text-center">
               <div class="text-[9px] uppercase text-gray-500">ms / token</div>
               <div class="text-sm font-bold text-emerald-400 mono">${msPerTok}</div>
             </div>
             <div class="bg-surface-3 rounded p-2 text-center">
-              <div class="text-[9px] uppercase text-gray-500">Quality loss vs FP16</div>
-              <div class="text-sm font-bold text-yellow-400">0.00%</div>
+              <div class="text-[9px] uppercase text-gray-500">Quantization</div>
+              <div class="text-sm font-bold text-yellow-400">INT16</div>
             </div>
           </div>
           <div class="overflow-x-auto">
@@ -838,13 +861,13 @@ async function runShardedInference(){
           </div>
         </div>
       `;
-      status.innerHTML = `<span class="text-emerald-400 font-bold">✓ Done</span> - ${currentPipeline.length} shards, ${tokensGen} tokens, ${elapsed}ms wall, identical hash on every replay.`;
+      status.textContent=`Done: coordinator returned ${tokensGen} tokens with ${trace.length} trace hops in ${elapsed}ms.`;
     } else {
-      status.innerHTML = `<span class="text-red-400">✗ Failed:</span> ${d.error || JSON.stringify(d)}`;
+      status.textContent=`Failed: ${String(d.error||'coordinator returned an unsuccessful response')}`;
     }
   }catch(e){
     clearInterval(animTimer);
-    status.innerHTML = `<span class="text-red-400">✗ Error:</span> ${e.message}`;
+    status.textContent=`Error: ${String(e.message||e)}`;
   } finally {
     btn.disabled = false;
     btn.textContent = '▶ Run Through Pipeline';
@@ -887,27 +910,37 @@ function renderShardedHistory(){
   // Group by hash to detect determinism - runs with the same hash get a "✓ verified" badge
   const counts = {};
   hist.forEach(r => { counts[r.hash] = (counts[r.hash] || 0) + 1; });
-  list.innerHTML = hist.map((r, idx) => {
+  list.replaceChildren();
+  hist.forEach((r, idx) => {
     const verified = counts[r.hash] > 1;
     const ago = Math.floor((Date.now() - r.ts) / 1000);
     const agoStr = ago < 60 ? `${ago}s ago` : ago < 3600 ? `${Math.floor(ago/60)}m ago` : `${Math.floor(ago/3600)}h ago`;
-    const safePrompt = (r.prompt||'').replace(/'/g,"\\'").replace(/"/g,'&quot;');
-    return `
-      <div class="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-2 border border-surface-4 rounded-lg text-[10px]" id="hist-row-${idx}">
-        <div class="flex items-center gap-2 flex-1 min-w-0">
-          ${verified ? '<span class="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[8px] font-bold border border-emerald-500/40">✓ ×' + counts[r.hash] + '</span>' : '<span class="px-1.5 py-0.5 rounded bg-arc-500/10 text-arc-300 text-[8px] font-bold border border-arc-500/30">FRESH</span>'}
-          <span class="text-gray-400 truncate" title="${(r.prompt||'').replace(/"/g,'&quot;')}">${(r.prompt||'').slice(0,40)}</span>
-          <span class="text-white truncate" title="${(r.output||'').replace(/"/g,'&quot;')}">→ ${(r.output||'').slice(0,40)}</span>
-        </div>
-        <div class="flex items-center gap-2 flex-shrink-0">
-          <span class="text-gray-600 mono text-[9px]" title="${r.hash}">${(r.hash||'').slice(0,16)}…</span>
-          <span class="text-yellow-400 mono">${r.wall_ms}ms</span>
-          <span class="text-gray-500">${agoStr}</span>
-          <button onclick="verifyHistoryRun(${idx}, '${safePrompt}', '${r.hash||''}')" class="px-1.5 py-0.5 rounded bg-arc-500/10 hover:bg-arc-500/30 text-arc-300 text-[9px] font-bold border border-arc-500/30 transition" title="Re-run this prompt and verify the output_hash matches">↻ Verify</button>
-        </div>
-      </div>
-    `;
-  }).join('');
+    const row=makeElement('div','flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-2 border border-surface-4 rounded-lg text-[10px]');
+    row.id=`hist-row-${idx}`;
+    const left=makeElement('div','flex items-center gap-2 flex-1 min-w-0');
+    const badge=makeElement('span',verified
+      ? 'px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[8px] font-bold border border-emerald-500/40'
+      : 'px-1.5 py-0.5 rounded bg-arc-500/10 text-arc-300 text-[8px] font-bold border border-arc-500/30',
+      verified?`✓ ×${counts[r.hash]}`:'FRESH');
+    const prompt=makeElement('span','text-gray-400 truncate',String(r.prompt||'').slice(0,40));
+    prompt.title=String(r.prompt||'');
+    const output=makeElement('span','text-white truncate',`→ ${String(r.output||'').slice(0,40)}`);
+    output.title=String(r.output||'');
+    left.append(badge,prompt,output);
+
+    const right=makeElement('div','flex items-center gap-2 flex-shrink-0');
+    const hash=makeElement('span','text-gray-600 mono text-[9px]',`${String(r.hash||'').slice(0,16)}…`);
+    hash.title=String(r.hash||'');
+    const wall=makeElement('span','text-yellow-400 mono',`${Number(r.wall_ms)||0}ms`);
+    const time=makeElement('span','text-gray-500',agoStr);
+    const verify=makeElement('button','px-1.5 py-0.5 rounded bg-arc-500/10 hover:bg-arc-500/30 text-arc-300 text-[9px] font-bold border border-arc-500/30 transition','↻ Verify');
+    verify.type='button';
+    verify.title='Re-run this prompt and verify the output_hash matches';
+    verify.addEventListener('click',()=>verifyHistoryRun(idx,String(r.prompt||''),String(r.hash||'')));
+    right.append(hash,wall,time,verify);
+    row.append(left,right);
+    list.appendChild(row);
+  });
 }
 
 // Re-run a past prompt and check the new output_hash matches the saved one.
@@ -951,9 +984,9 @@ async function verifyHistoryRun(idx, prompt, originalHash){
   }
 }
 
-// Run a custom prompt on ALL inference-enabled nodes in parallel.
-// Shows per-device response cards + hash equivalence summary.
-// This is the demo's centerpiece: type prompt → see all 8 devices answer with identical hash.
+// Run one concurrent request per configured seed slot through the selected
+// coordinator. Slots are deliberately not labelled as devices: this endpoint
+// does not prove which shard host served each response.
 async function runCustomPromptOnAll(){
   const promptEl=document.getElementById('customPrompt');
   const btn=document.getElementById('customBtn');
@@ -963,7 +996,10 @@ async function runCustomPromptOnAll(){
   const prompt=(promptEl.value||'').trim();
   if(!prompt){promptEl.focus();return}
 
-  const infNodes=NODES.filter(n=>n.inference);
+  const requestSlots=NODES.filter(n=>n.inference).map((_,index)=>({
+    id:`request-${index+1}`,
+    label:`Request ${index+1}`,
+  }));
   btn.disabled=true;
   btn.textContent='Running…';
   btn.classList.remove('bg-emerald-500','hover:bg-emerald-400');
@@ -971,32 +1007,32 @@ async function runCustomPromptOnAll(){
   resultsEl.classList.remove('hidden');
   hashEl.classList.add('hidden');
 
-  // Render placeholder cards immediately so user sees activity
-  resultsEl.innerHTML=infNodes.map(n=>`
-    <div class="bg-surface-2 border border-surface-4 rounded-lg p-2.5" id="card-${n.name}">
-      <div class="flex items-center justify-between mb-1">
-        <span class="text-white font-bold text-xs">${n.flag} ${n.name}</span>
-        <span class="text-[9px] text-yellow-400 mono pulse-dot">▶ running</span>
-      </div>
-      <div class="text-[10px] text-gray-500 mono truncate">${n.loc}</div>
-      <div class="text-[10px] text-gray-600 mt-1.5">waiting for response…</div>
-    </div>
-  `).join('');
+  // Render placeholder cards immediately so user sees activity.
+  resultsEl.replaceChildren();
+  requestSlots.forEach(slot=>{
+    const card=makeElement('div','bg-surface-2 border border-surface-4 rounded-lg p-2.5');
+    card.id=`card-${slot.id}`;
+    const header=makeElement('div','flex items-center justify-between mb-1');
+    header.append(
+      makeElement('span','text-white font-bold text-xs',slot.label),
+      makeElement('span','text-[9px] text-yellow-400 mono pulse-dot','▶ running'),
+    );
+    card.append(
+      header,
+      makeElement('div','text-[10px] text-gray-500 mono truncate','selected coordinator'),
+      makeElement('div','text-[10px] text-gray-600 mt-1.5','waiting for response…'),
+    );
+    resultsEl.appendChild(card);
+  });
 
-  status.innerHTML=`<span class="text-yellow-400">▶</span> Sending prompt to ${infNodes.length} devices in parallel…`;
+  status.textContent=`Sending ${requestSlots.length} concurrent requests through the selected coordinator…`;
 
   const overallStart=Date.now();
 
-  // Fire all 8 requests at once through the working sharded pipeline. The
-  // seed nodes each hold only a 2-5 layer slice (they cooperate to cover
-  // the 32 transformer blocks), so a single-node /inference/run on any one
-  // seed returns <unk> tokens. Routing each call through the shard
-  // coordinator exercises the real pipeline; Mac caches by (model, input,
-  // max_tokens) so the first request computes and the other 7 hit cache -
-  // the wall-time spread across the 8 cards is the real-world "first-hit
-  // vs warm-hit" latency story, and the hash is identical because every
-  // call sees the same deterministic integer forward.
-  const promises=infNodes.map(async n=>{
+  // Fire every request through the same shard coordinator. The coordinator
+  // may satisfy repeated inputs from cache, so the measured spread is not a
+  // per-device latency comparison.
+  const promises=requestSlots.map(async slot=>{
     const t0=Date.now();
     try{
       const r=await fetch(SHARDED_COORDINATOR+'/inference/run_consensus',{
@@ -1011,34 +1047,42 @@ async function runCustomPromptOnAll(){
       // level (no `inference` wrapper); adapt so the card renderer below
       // keeps working unchanged.
       const inf=d.inference?d.inference:{output:d.output,output_hash:d.output_hash,ms_per_token:d.ms_per_token};
-      const card=document.getElementById(`card-${n.name}`);
+      const card=document.getElementById(`card-${slot.id}`);
       if(card){
         card.className='bg-surface-2 border border-emerald-500/40 rounded-lg p-2.5';
-        card.innerHTML=`
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-white font-bold text-xs">${n.flag} ${n.name}</span>
-            <span class="text-[9px] text-emerald-400 mono">✓ ${elapsed}ms</span>
-          </div>
-          <div class="text-[10px] text-gray-500 mono truncate">${inf.ms_per_token||'?'}ms/tok</div>
-          <div class="text-[10px] text-white mt-1.5 leading-tight" style="display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;">${(inf.output||'-').replace(/</g,'&lt;')}</div>
-          <div class="text-[9px] mono text-arc-400 mt-1.5 truncate" title="${inf.output_hash||''}">${(inf.output_hash||'').slice(0,18)}…</div>
-        `;
+        const header=makeElement('div','flex items-center justify-between mb-1');
+        header.append(
+          makeElement('span','text-white font-bold text-xs',slot.label),
+          makeElement('span','text-[9px] text-emerald-400 mono',`✓ ${elapsed}ms`),
+        );
+        const output=makeElement('div','text-[10px] text-white mt-1.5 leading-tight',String(inf.output||'-'));
+        output.style.cssText='display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;';
+        const hash=makeElement('div','text-[9px] mono text-arc-400 mt-1.5 truncate',`${String(inf.output_hash||'').slice(0,18)}…`);
+        hash.title=String(inf.output_hash||'');
+        card.replaceChildren(
+          header,
+          makeElement('div','text-[10px] text-gray-500 mono truncate',`${inf.ms_per_token||'?'}ms/tok`),
+          output,
+          hash,
+        );
       }
-      return{node:n,ok:true,hash:inf.output_hash,output:inf.output,elapsed,ms_per_token:inf.ms_per_token};
+      return{slot,ok:true,hash:inf.output_hash,output:inf.output,elapsed,ms_per_token:inf.ms_per_token};
     }catch(e){
-      const card=document.getElementById(`card-${n.name}`);
+      const card=document.getElementById(`card-${slot.id}`);
       if(card){
         card.className='bg-surface-2 border border-red-500/40 rounded-lg p-2.5';
-        card.innerHTML=`
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-white font-bold text-xs">${n.flag} ${n.name}</span>
-            <span class="text-[9px] text-red-400 mono">✗ failed</span>
-          </div>
-          <div class="text-[10px] text-gray-500 mono truncate">${n.loc}</div>
-          <div class="text-[10px] text-red-400 mt-1.5">${(e.message||'error').slice(0,40)}</div>
-        `;
+        const header=makeElement('div','flex items-center justify-between mb-1');
+        header.append(
+          makeElement('span','text-white font-bold text-xs',slot.label),
+          makeElement('span','text-[9px] text-red-400 mono','✗ failed'),
+        );
+        card.replaceChildren(
+          header,
+          makeElement('div','text-[10px] text-gray-500 mono truncate','selected coordinator'),
+          makeElement('div','text-[10px] text-red-400 mt-1.5',String(e.message||'error').slice(0,80)),
+        );
       }
-      return{node:n,ok:false,error:e.message};
+      return{slot,ok:false,error:e.message};
     }
   });
 
@@ -1049,91 +1093,58 @@ async function runCustomPromptOnAll(){
 
   // Hash comparison summary
   hashEl.classList.remove('hidden');
+  hashEl.replaceChildren();
   if(hashes.size===0){
-    hashEl.innerHTML=`<span class="text-red-400 font-bold">✗ No nodes returned a hash.</span>`;
+    hashEl.appendChild(makeElement('span','text-red-400 font-bold','✗ No request returned a hash.'));
   }else if(hashes.size===1){
     const h=[...hashes][0];
     const fastest=Math.min(...okResults.map(r=>r.elapsed));
     const slowest=Math.max(...okResults.map(r=>r.elapsed));
-    hashEl.innerHTML=`
-      <div class="flex items-center gap-2 mb-1.5">
-        <span class="text-emerald-400 font-bold text-sm">✓ ALL ${okResults.length} devices produced IDENTICAL output_hash</span>
-      </div>
-      <div class="mono text-arc-400 text-[10px] break-all mb-2">${h}</div>
-      <div class="grid grid-cols-3 gap-3 text-[10px]">
-        <div><span class="text-gray-500">Wall time:</span> <span class="text-white font-bold">${totalMs}ms</span></div>
-        <div><span class="text-gray-500">Fastest device:</span> <span class="text-emerald-400 font-bold">${fastest}ms</span></div>
-        <div><span class="text-gray-500">Slowest device:</span> <span class="text-yellow-400 font-bold">${slowest}ms</span></div>
-      </div>
-      <div class="text-[10px] text-gray-500 mt-2">This is cryptographic proof of cross-device deterministic inference. Run it again on a different prompt - same result.</div>
-    `;
+    const title=makeElement('div','flex items-center gap-2 mb-1.5');
+    title.appendChild(makeElement('span','text-emerald-400 font-bold text-sm',`✓ ${okResults.length} coordinator responses produced the same output_hash`));
+    const hash=makeElement('div','mono text-arc-400 text-[10px] break-all mb-2',String(h));
+    const timings=makeElement('div','grid grid-cols-3 gap-3 text-[10px]');
+    timings.append(
+      makeElement('div','text-white',`Wall time: ${totalMs}ms`),
+      makeElement('div','text-emerald-400',`Fastest response: ${fastest}ms`),
+      makeElement('div','text-yellow-400',`Slowest response: ${slowest}ms`),
+    );
+    hashEl.append(title,hash,timings,makeElement('div','text-[10px] text-gray-500 mt-2','This verifies repeatability for requests handled by this coordinator. It is not proof that different physical hosts independently computed the response.'));
   }else{
-    hashEl.innerHTML=`
-      <span class="text-yellow-400 font-bold">⚠ ${hashes.size} unique hashes across ${okResults.length} devices</span>
-      <div class="text-[10px] text-gray-500 mt-1">This usually means a node is running a different model file. Each model_hash should be identical for cross-device determinism.</div>
-    `;
+    hashEl.append(
+      makeElement('span','text-yellow-400 font-bold',`⚠ ${hashes.size} unique hashes across ${okResults.length} coordinator responses`),
+      makeElement('div','text-[10px] text-gray-500 mt-1','The coordinator returned inconsistent output hashes for an identical request; inspect the response trace and cache state.'),
+    );
   }
 
-  status.innerHTML=`<span class="text-emerald-400 font-bold">✓ Done</span> - ${okResults.length}/${infNodes.length} devices responded in ${totalMs}ms wall time.`;
+  status.textContent=`Done: ${okResults.length}/${requestSlots.length} coordinator requests responded in ${totalMs}ms wall time.`;
 
   btn.disabled=false;
-  btn.textContent='▶ Run on All 8';
+  btn.textContent='▶ Run Concurrent Requests';
   btn.classList.add('bg-emerald-500','hover:bg-emerald-400');
   btn.classList.remove('bg-gray-600','cursor-not-allowed');
-}
-
-// Run inference on a specific node from the dashboard (click handler)
-async function runInferenceOn(ip,name){
-  showModal(`Inference on ${name}`,[
-    ['Status','🔄 Running...'],
-    ['Node',`${name} (${ip})`],
-    ['Prompt','What is the largest planet?'],
-  ]);
-  try{
-    const start=Date.now();
-    // Route through the shard coordinator - single-node /inference/run
-    // on a seed only has 2-5 layers and returns <unk> tokens.
-    const r=await fetch(SHARDED_COORDINATOR+'/inference/run_consensus',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({input:'What is the largest planet?',max_tokens:15,k:3}),
-      signal:AbortSignal.timeout(60000)
-    });
-    const d=await r.json();
-    const inf=d.inference||{output:d.output,output_hash:d.output_hash,model_hash:d.model_hash,engine:d.engine,ms_per_token:d.ms_per_token};
-    const att=d.attestation||{};
-    const elapsed=Date.now()-start;
-    showModal(`Inference on ${name}`,[
-      ['Status','✅ Complete'],
-      ['Node',`${name} (${ip})`],
-      ['Output',(inf.output||'').slice(0,80)],
-      ['Output Hash',inf.output_hash||'?'],
-      ['Model Hash',inf.model_hash||'?'],
-      ['Engine',inf.engine||'?'],
-      ['Speed',`${inf.ms_per_token||'?'} ms/tok`],
-      ['Wall time',`${elapsed} ms`],
-      ['Attestation Tx',att.tx_hash||'?'],
-      ['Tip','Run on another node - the output_hash will be IDENTICAL'],
-    ]);
-  }catch(e){
-    showModal(`Inference on ${name}`,[
-      ['Status','❌ Failed'],
-      ['Node',`${name} (${ip})`],
-      ['Error',e.message],
-    ]);
-  }
 }
 
 // Modal
 function showModal(title,rows){
   document.getElementById('modalTitle').textContent=title;
-  document.getElementById('modalBody').innerHTML=rows.map(([k,v,link])=>
-    `<div class="flex flex-col sm:flex-row sm:justify-between gap-1 py-2 border-b border-surface-4 last:border-0">
-      <span class="text-gray-500 text-sm">${k}</span>
-      ${link?`<a href="${link}" target="_blank" class="mono text-sm text-arc-400 hover:underline break-all">${v}</a>`
-            :`<span class="mono text-sm text-white break-all">${v}</span>`}
-    </div>`
-  ).join('');
+  const body=document.getElementById('modalBody');
+  body.replaceChildren();
+  rows.forEach(([key,value,link])=>{
+    const row=makeElement('div','flex flex-col sm:flex-row sm:justify-between gap-1 py-2 border-b border-surface-4 last:border-0');
+    row.appendChild(makeElement('span','text-gray-500 text-sm',key));
+    const href=link?safeHttpUrl(link):null;
+    if(href){
+      const anchor=makeElement('a','mono text-sm text-arc-400 hover:underline break-all',value);
+      anchor.href=href;
+      anchor.target='_blank';
+      anchor.rel='noopener noreferrer';
+      row.appendChild(anchor);
+    }else{
+      row.appendChild(makeElement('span','mono text-sm text-white break-all',value));
+    }
+    body.appendChild(row);
+  });
   const m=document.getElementById('modal');m.classList.remove('hidden');m.classList.add('flex');
 }
 function closeModal(){const m=document.getElementById('modal');m.classList.add('hidden');m.classList.remove('flex')}
@@ -1167,27 +1178,18 @@ function showInferenceDetail(a){
   ]);
 }
 
-// Aggregate sharded inference counters across all 8 seed nodes.
-// Each coordinator (the node that received /inference/run_sharded) keeps
-// its own in-memory counter. By summing across all of them we get the
-// network-wide total that survives single-node restarts.
-async function aggregateShardedCounters(){
+// These counters are process-local and reset when a coordinator restarts.
+// Read only the selected coordinator instead of presenting a sum across
+// independent seed processes as a durable network-wide metric.
+async function refreshCoordinatorCounters(){
   const shardRunsEl = document.getElementById('shardRunsTotal');
   const shardBytesEl = document.getElementById('shardBytesTotal');
   if(!shardRunsEl && !shardBytesEl) return;
-  let totalRuns = 0;
-  let totalBytes = 0;
-  const results = await Promise.allSettled(NODES.map(n =>
-    fetch(`http://${n.ip}:9090/stats`, {signal: AbortSignal.timeout(3000)})
-      .then(r => r.ok ? r.json() : null)
-      .catch(() => null)
-  ));
-  for(const r of results){
-    const d = r.value;
-    if(!d) continue;
-    totalRuns += d.sharded_runs_total || 0;
-    totalBytes += d.sharded_bytes_total || 0;
-  }
+  const response=await fetch(`${SHARDED_COORDINATOR}/stats`,{signal:AbortSignal.timeout(3000)});
+  if(!response.ok)return;
+  const stats=await response.json();
+  const totalRuns=Number(stats.sharded_runs_total)||0;
+  const totalBytes=Number(stats.sharded_bytes_total)||0;
   if(shardRunsEl){
     shardRunsEl.textContent = totalRuns.toLocaleString();
   }
@@ -1221,23 +1223,22 @@ async function refresh(){
     setText('validatorCount', d.validators);
     setText('peers', d.connected_peers);
     setText('rps', rps);
-    // Show total transaction count (more meaningful than instantaneous TPS)
-    // Show benchmark TPS if running, otherwise total transactions
+    // Only show TPS when the node reports a measured benchmark value. A total
+    // transaction count is not a throughput metric.
     const benchTps = d.benchmark_tps || 0;
-    setText('tps', benchTps > 0
-      ? benchTps.toLocaleString()
-      : (d.total_transactions ?? 0).toLocaleString());
+    setText('tps',benchTps>0?Number(benchTps).toLocaleString():'-');
     const mins=Math.floor(d.uptime_secs/60);const hrs=Math.floor(mins/60);
     setText('uptime', hrs>0?`${hrs}h ${mins%60}m`:`${mins}m`);
-    document.getElementById('subtitle').innerHTML=`<span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot"></span>Live - block ${d.dag_round.toLocaleString()} · ${d.dag_committed.toLocaleString()} finalized · ${d.total_transactions} txs`;
-    // Sharded inference network counters - aggregate across ALL nodes
-    // (resilient to single-coordinator restart resetting its in-memory counter)
-    aggregateShardedCounters();
+    const subtitle=document.getElementById('subtitle');
+    const liveDot=makeElement('span','inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 mr-1 pulse-dot');
+    subtitle.replaceChildren(liveDot,document.createTextNode(`Live - block ${Number(d.dag_round).toLocaleString()} · ${Number(d.dag_committed).toLocaleString()} finalized · ${Number(d.total_transactions)||0} txs`));
+    // Coordinator-local counters; these are not durable network totals.
+    refreshCoordinatorCounters().catch(()=>{});
   }catch(e){ console.error('stats refresh failed:', e); }
 
   // Nodes - fetched by renderNodes() above (runs in parallel, no blocking)
 
-  // Cross-device inference aggregation: fetch from ALL 8 seeds in parallel,
+  // Cross-host inference aggregation: fetch from all configured seeds in parallel,
   // dedupe by tx_hash, group by model, and show which device(s) saw each.
   try{
     const results=await Promise.allSettled(NODES.map(async n=>{
@@ -1256,6 +1257,13 @@ async function refresh(){
     for(const{value:v}of results){
       if(!v||!v.attestations)continue;
       for(const a of v.attestations){
+        const inf=a.inference||{};
+        // Older nodes pad this endpoint with unrelated tx_type="Other" rows.
+        // Do not turn those records into inference activity.
+        const isInference=a.tx_type==='InferenceAttestation'||Boolean(
+          inf.output_hash||inf.model_hash||inf.input||inf.output
+        );
+        if(!isInference)continue;
         const hash=a.tx_hash||a.from||'';
         if(!hash)continue;
         if(!byHash[hash]){
@@ -1265,7 +1273,6 @@ async function refresh(){
         // Track which nodes do inference (have attestations)
         nodesWithInference.add(v.node.name);
         // Track models
-        const inf=a.inference||{};
         const modelHash=inf.model_hash||'unknown';
         const modelName=inf.model||'unknown';
         if(!modelStats[modelHash]){
@@ -1293,36 +1300,47 @@ async function refresh(){
     const infNodeCountEl=document.getElementById('infNodeCount');
     if(infNodeCountEl)infNodeCountEl.textContent=infNodes.length;
 
-    // Render inference-enabled node grid - visual cards with click-to-test
+    // Render configured shard hosts. Requests elsewhere on this page are sent
+    // to SHARDED_COORDINATOR, so these are intentionally not click-to-run cards.
     const infNodeGrid=document.getElementById('inferenceNodeGrid');
     if(infNodeGrid){
-      infNodeGrid.innerHTML=infNodes.map(n=>`
-        <div class="bg-surface-3 border border-emerald-500/40 rounded-xl p-3 text-center hover:border-emerald-400 hover:shadow-lg hover:shadow-emerald-500/20 hover:-translate-y-0.5 transition-all cursor-pointer group" onclick='runInferenceOn("${n.ip}","${n.name}")'>
-          <div class="text-2xl mb-1">${n.flag}</div>
-          <div class="text-sm text-white font-bold">${n.name}</div>
-          <div class="text-[9px] text-gray-500">${n.loc}</div>
-          <div class="text-[9px] mono text-emerald-400 mt-1.5 opacity-0 group-hover:opacity-100 transition">▶ click to run</div>
-        </div>
-      `).join('');
+      infNodeGrid.replaceChildren();
+      infNodes.forEach(n=>{
+        const card=makeElement('div','bg-surface-3 border border-emerald-500/40 rounded-xl p-3 text-center');
+        card.append(
+          makeElement('div','text-2xl mb-1',n.flag),
+          makeElement('div','text-sm text-white font-bold',n.name),
+          makeElement('div','text-[9px] text-gray-500',n.loc),
+          makeElement('div','text-[9px] mono text-emerald-400 mt-1.5','configured shard host'),
+        );
+        infNodeGrid.appendChild(card);
+      });
     }
 
     // Render model breakdown cards
     const breakdown=document.getElementById('modelBreakdown');
     const models=Object.values(modelStats);
     if(models.length>0){
-      breakdown.innerHTML=models.slice(0,6).map(m=>`
-        <div class="bg-surface-3 border border-surface-4 rounded-lg p-3 hover:border-emerald-500/30 transition">
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-white font-semibold text-xs truncate max-w-[180px]">${m.name}</span>
-            <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">${m.count} runs</span>
-          </div>
-          <div class="text-[10px] text-gray-500 mono truncate">${m.modelHash.slice(0,30)}</div>
-          <div class="flex items-center justify-between mt-2 text-[10px]">
-            <span class="text-gray-500">${[...m.workers].join(', ')}</span>
-            <span class="text-arc-400 mono">${m.latestMs} ms/tok</span>
-          </div>
-        </div>
-      `).join('');
+      breakdown.replaceChildren();
+      models.slice(0,6).forEach(m=>{
+        const card=makeElement('div','bg-surface-3 border border-surface-4 rounded-lg p-3 hover:border-emerald-500/30 transition');
+        const header=makeElement('div','flex items-center justify-between mb-1');
+        header.append(
+          makeElement('span','text-white font-semibold text-xs truncate max-w-[180px]',m.name),
+          makeElement('span','px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20',`${m.count} runs`),
+        );
+        const footer=makeElement('div','flex items-center justify-between mt-2 text-[10px]');
+        footer.append(
+          makeElement('span','text-gray-500',[...m.workers].join(', ')),
+          makeElement('span','text-arc-400 mono',`${m.latestMs} ms/tok`),
+        );
+        card.append(
+          header,
+          makeElement('div','text-[10px] text-gray-500 mono truncate',String(m.modelHash).slice(0,30)),
+          footer,
+        );
+        breakdown.appendChild(card);
+      });
     }else{
       breakdown.innerHTML='<div class="col-span-full text-gray-600 text-sm text-center py-4">No inference activity yet. Start a node with <code class="mono text-arc-400">./scripts/join-inference.sh --model path.gguf</code></div>';
     }
@@ -1330,33 +1348,39 @@ async function refresh(){
     // Render inference feed (recent attestations with cross-device badge)
     const list=document.getElementById('inferenceList');
     if(allAttestations.length>0){
-      list.innerHTML=allAttestations.slice(0,15).map(a=>{
+      list.replaceChildren();
+      allAttestations.slice(0,15).forEach(a=>{
         const inf=a.inference||{};
         const seenCount=a.seen_on.size;
         const input=(inf.input||'-').slice(0,50);
         const output=(inf.output||'-').slice(0,80);
         const isSharded = inf.sharded === true || inf.engine?.includes('sharded');
-        const crossDeviceBadge=seenCount>1
-          ? `<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">✓ ${seenCount} devices</span>`
-          : `<span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surface-4 text-gray-400">1 device</span>`;
-        const shardedBadge = isSharded
-          ? `<span class="px-1.5 py-0.5 rounded text-[9px] font-bold bg-arc-500/20 text-arc-300 border border-arc-500/40" title="ran through the pipeline-parallel sharded inference">SHARDED · ${inf.pipeline_length||'?'} shards</span>`
-          : '';
-        return `
-        <div class="py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition" onclick='showInferenceDetail(${JSON.stringify(a)})'>
-          <div class="flex items-center justify-between mb-1">
-            <div class="flex items-center gap-2 flex-wrap">
-              <span class="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">AI</span>
-              ${shardedBadge}
-              ${crossDeviceBadge}
-              <span class="text-[10px] text-gray-500 mono">${inf.ms_per_token||'?'}ms/tok</span>
-            </div>
-          </div>
-          <div class="text-[11px] text-gray-400 truncate">→ ${input}</div>
-          <div class="text-[11px] text-white truncate">← ${output}</div>
-          <div class="text-[9px] text-gray-600 mono mt-1">${(a.tx_hash||'').slice(0,40)}...</div>
-        </div>`;
-      }).join('');
+        const row=makeElement('div','py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition');
+        row.tabIndex=0;
+        row.setAttribute('role','button');
+        const badges=makeElement('div','flex items-center gap-2 flex-wrap');
+        badges.appendChild(makeElement('span','px-1.5 py-0.5 rounded text-[9px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20','AI'));
+        if(isSharded){
+          badges.appendChild(makeElement('span','px-1.5 py-0.5 rounded text-[9px] font-bold bg-arc-500/20 text-arc-300 border border-arc-500/40',`SHARDED · ${inf.pipeline_length||'?'} shards`));
+        }
+        badges.appendChild(makeElement('span',seenCount>1
+          ? 'px-1.5 py-0.5 rounded text-[9px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+          : 'px-1.5 py-0.5 rounded text-[9px] font-semibold bg-surface-4 text-gray-400',
+          seenCount>1?`seen on ${seenCount} hosts`:'seen on 1 host'));
+        badges.appendChild(makeElement('span','text-[10px] text-gray-500 mono',`${inf.ms_per_token||'?'}ms/tok`));
+        row.append(
+          badges,
+          makeElement('div','text-[11px] text-gray-400 truncate',`→ ${input}`),
+          makeElement('div','text-[11px] text-white truncate',`← ${output}`),
+          makeElement('div','text-[9px] text-gray-600 mono mt-1',`${String(a.tx_hash||'').slice(0,40)}...`),
+        );
+        const open=()=>showInferenceDetail(a);
+        row.addEventListener('click',open);
+        row.addEventListener('keydown',event=>{
+          if(event.key==='Enter'||event.key===' '){event.preventDefault();open();}
+        });
+        list.appendChild(row);
+      });
     }else{
       list.innerHTML='<p class="text-gray-600 text-sm">No attestations yet. <a href="https://github.com/FerrumVir/arc-chain" class="text-arc-400 hover:underline">Run a node with inference →</a></p>';
     }
@@ -1370,37 +1394,54 @@ async function refresh(){
     const statsR=await fetch(RPC+'/stats',{signal:AbortSignal.timeout(5000)});
     const stats=await statsR.json();
     const bench=stats.benchmark_executed||0;
-    const total=stats.total_transactions||0;
     const tps=stats.benchmark_tps||0;
-    let html='';
+    let hasRows=false;
+    list.replaceChildren();
     if(bench>0){
-      html+=`<div class="flex items-center justify-between py-2 border-b border-surface-4">
-        <div class="flex items-center gap-2">
-          <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-yellow-500/10 text-yellow-400 border border-yellow-500/20">BENCH</span>
-          <span class="text-[11px] text-gray-400">Signed benchmark transactions</span>
-        </div>
-        <div class="text-right">
-          <span class="mono text-xs text-white font-medium">${bench.toLocaleString()} txs</span>
-          <div class="text-[10px] text-emerald-400">${tps.toLocaleString()} TPS</div>
-        </div>
-      </div>`;
+      const row=makeElement('div','flex items-center justify-between py-2 border-b border-surface-4');
+      const label=makeElement('div','flex items-center gap-2');
+      label.append(
+        makeElement('span','px-1.5 py-0.5 rounded text-[10px] font-semibold bg-yellow-500/10 text-yellow-400 border border-yellow-500/20','BENCH'),
+        makeElement('span','text-[11px] text-gray-400','Signed benchmark transactions'),
+      );
+      const values=makeElement('div','text-right');
+      values.append(
+        makeElement('span','mono text-xs text-white font-medium',`${Number(bench).toLocaleString()} txs`),
+        makeElement('div','text-[10px] text-emerald-400',`${Number(tps).toLocaleString()} TPS`),
+      );
+      row.append(label,values);
+      list.appendChild(row);
+      hasRows=true;
     }
     // Show any faucet/transfer attestations
     try{
       const ar=await fetch(RPC+'/inference/attestations',{signal:AbortSignal.timeout(3000)});
       const ad=await ar.json();
-      (ad.attestations||[]).slice(0,8).forEach(tx=>{
-        html+=`<div class="flex items-center justify-between py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition" onclick="showTxDetail('${tx.tx_hash||tx.from||''}')">
-          <div class="flex items-center gap-2">
-            <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-arc-500/10 text-arc-400 border border-arc-500/20">TX</span>
-            <span class="mono text-[11px] text-gray-400">${(tx.tx_hash||tx.from||'').slice(0,20)}...</span>
-          </div>
-          <span class="mono text-xs text-white font-medium">${(tx.amount||0).toLocaleString()} ARC</span>
-        </div>`;
+      (ad.attestations||[]).filter(tx=>tx.tx_type!=='Other').slice(0,8).forEach(tx=>{
+        const hash=String(tx.tx_hash||tx.from||'');
+        if(!hash)return;
+        const row=makeElement('div','flex items-center justify-between py-2 border-b border-surface-4 last:border-0 cursor-pointer hover:bg-surface-3/50 rounded px-2 -mx-2 transition');
+        row.tabIndex=0;
+        row.setAttribute('role','button');
+        const label=makeElement('div','flex items-center gap-2');
+        label.append(
+          makeElement('span','px-1.5 py-0.5 rounded text-[10px] font-semibold bg-arc-500/10 text-arc-400 border border-arc-500/20','TX'),
+          makeElement('span','mono text-[11px] text-gray-400',`${hash.slice(0,20)}...`),
+        );
+        row.append(label,makeElement('span','mono text-xs text-white font-medium',`${Number(tx.amount)||0} ARC`));
+        const open=()=>showTxDetail(hash);
+        row.addEventListener('click',open);
+        row.addEventListener('keydown',event=>{
+          if(event.key==='Enter'||event.key===' '){event.preventDefault();open();}
+        });
+        list.appendChild(row);
+        hasRows=true;
       });
     }catch(e2){}
-    if(!html) html='<p class="text-gray-600 text-sm">Send tokens via the <a href="http://140.82.16.112:3100" class="text-arc-400 hover:underline">Wallet</a></p>';
-    list.innerHTML=html;
+    if(!hasRows){
+      const empty=makeElement('p','text-gray-600 text-sm','No recent transactions are available from the selected chain host.');
+      list.appendChild(empty);
+    }
   }catch(e){}
 
   document.getElementById('lastUpdate').textContent=`Updated ${new Date().toLocaleTimeString()} · auto-refreshes every 5s`;
@@ -1468,19 +1509,11 @@ async function probePresetCache(){
 // Merge unique workers by worker_id, render in the Community Network section.
 // Updates every 10 seconds.
 //
-// 2026-08-17, two corrections:
-//  1. This used to hit `:3001/community/list`. Port 3001 is the community
-//     gateway and it does NOT serve the worker list - GET /workers/scoreboard
-//     on :3001 returns 404. Read the scoreboard from :9090 instead.
-//  2. /community/list PRUNES the registry as a side effect; /workers/scoreboard
-//     does not. Polling community/list every 10s was actively emptying the
-//     list it was trying to display. AMS now reports count_total 0.
-// Worker registrations are node-local, not replicated, so merging across seeds
-// is still required: NYC and LAX report 6, LHR 9, AMS 0.
-const GATEWAY_SEEDS = [
-  '149.28.32.76','140.82.16.112','136.244.109.1','104.238.171.11',
-  '202.182.107.41','149.28.153.31'
-];
+// Worker registrations are node-local, not replicated, so merge unique worker
+// records from the active seed inventory. The scoreboard's canonical completed
+// work field is success_count; work_completed is retained only for older nodes.
+const GATEWAY_SEEDS=NODES.map(n=>n.ip);
+const completedJobsOf=worker=>Number(worker.success_count??worker.work_completed??0)||0;
 
 async function refreshCommunityWorkers(){
   const seen = new Map(); // worker_id -> worker
@@ -1498,9 +1531,8 @@ async function refreshCommunityWorkers(){
         seen.set(w.worker_id, w);
       } else {
         // Keep the record with the most completed work. The scoreboard reports
-        // success_count; the older community/list shape used work_completed.
-        const jobsOf = x => (x.success_count ?? x.work_completed ?? 0);
-        if(jobsOf(w) > jobsOf(seen.get(w.worker_id))){
+        // success_count; an older response shape used work_completed.
+        if(completedJobsOf(w)>completedJobsOf(seen.get(w.worker_id))){
           seen.set(w.worker_id, w);
         }
       }
@@ -1511,7 +1543,7 @@ async function refreshCommunityWorkers(){
   // successes. Expect 0 today: no worker on the live net has a nonzero
   // success_count, because the sharded pipeline dispatches to shard nodes
   // rather than to scoreboard workers.
-  totalJobs = workers.reduce((n, w) => n + (w.success_count ?? w.work_completed ?? 0), 0);
+  totalJobs=workers.reduce((count,worker)=>count+completedJobsOf(worker),0);
   // Update count badge
   const countEl = document.getElementById('communityCount');
   if(countEl) countEl.textContent = `${workers.length} worker${workers.length !== 1 ? 's' : ''}`;
@@ -1521,28 +1553,33 @@ async function refreshCommunityWorkers(){
   // Render worker list
   const listEl = document.getElementById('communityWorkerList');
   if(!listEl) return;
+  listEl.replaceChildren();
   if(workers.length === 0){
-    listEl.innerHTML = '<div class="text-[10px] text-gray-600 italic">No community workers online yet. Be the first - run the install command below.</div>';
+    listEl.appendChild(makeElement('div','text-[10px] text-gray-600 italic','No community workers are registered on the responding seeds.'));
     return;
   }
-  listEl.innerHTML = workers.map(w => {
-    const name = (w.name || w.worker_id.slice(0,12)).slice(0,25);
-    const plat = w.platform || '?';
-    const work = w.work_completed || 0;
+  workers.forEach(w=>{
+    const workerId=String(w.worker_id||'unknown-worker');
+    const name=String(w.name||workerId.slice(0,12)).slice(0,25);
+    const plat=String(w.platform||'?').slice(0,30);
+    const work=completedJobsOf(w);
     const ago = w.registered_at ? Math.floor((Date.now()/1000 - w.registered_at)/60) : 0;
     const timeStr = ago < 60 ? `${ago}m ago` : ago < 1440 ? `${Math.floor(ago/60)}h ago` : `${Math.floor(ago/1440)}d ago`;
-    return `<div class="flex items-center justify-between bg-surface-2 border border-violet-500/20 rounded-lg px-3 py-1.5">
-      <div class="flex items-center gap-2">
-        <span class="inline-block w-1.5 h-1.5 rounded-full bg-violet-400"></span>
-        <span class="text-[11px] text-white font-medium">${name}</span>
-        <span class="text-[9px] text-gray-500">${plat}</span>
-      </div>
-      <div class="flex items-center gap-3">
-        <span class="text-[9px] text-violet-300 font-mono">${work} jobs</span>
-        <span class="text-[9px] text-gray-600">joined ${timeStr}</span>
-      </div>
-    </div>`;
-  }).join('');
+    const row=makeElement('div','flex items-center justify-between bg-surface-2 border border-violet-500/20 rounded-lg px-3 py-1.5');
+    const identity=makeElement('div','flex items-center gap-2');
+    identity.append(
+      makeElement('span','inline-block w-1.5 h-1.5 rounded-full bg-violet-400'),
+      makeElement('span','text-[11px] text-white font-medium',name),
+      makeElement('span','text-[9px] text-gray-500',plat),
+    );
+    const activity=makeElement('div','flex items-center gap-3');
+    activity.append(
+      makeElement('span','text-[9px] text-violet-300 font-mono',`${work} jobs`),
+      makeElement('span','text-[9px] text-gray-600',`joined ${timeStr}`),
+    );
+    row.append(identity,activity);
+    listEl.appendChild(row);
+  });
 }
 
 // Start community worker polling
