@@ -12,6 +12,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-release-files}"
 RELEASE_TAG="${RELEASE_TAG:-}"
 REPOSITORY="${REPOSITORY:-FerrumVir/arc-chain}"
 RELEASE_DATE="${RELEASE_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+GENESIS_FILE="${GENESIS_FILE:-genesis.toml}"
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+GENESIS_VALIDATOR="$SCRIPT_DIR/validate-genesis.py"
 
 die() {
     printf 'release assembly: %s\n' "$*" >&2
@@ -24,8 +27,16 @@ printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' \
 [ -d "$ARTIFACTS_DIR" ] || die "artifact directory does not exist: $ARTIFACTS_DIR"
 [ -f install.sh ] || die "run from the repository root (install.sh is missing)"
 [ -f testnet-seeds.txt ] || die "testnet-seeds.txt is missing"
-[ -f genesis.toml ] || die "genesis.toml is missing"
+[ -f "$GENESIS_FILE" ] || die "genesis file is missing: $GENESIS_FILE"
+[ -f "$GENESIS_VALIDATOR" ] || die "genesis validator is missing: $GENESIS_VALIDATOR"
 command -v python3 >/dev/null 2>&1 || die "python3 is required to generate latest.json"
+
+# Validate before clearing or writing OUTPUT_DIR. A release may ship either a
+# complete public-address-only validator set or the explicit empty migration
+# placeholder used by stake-zero community observers. It must never package a
+# deterministic seed, private key, partial validator set, or implicit mode.
+python3 "$GENESIS_VALIDATOR" "$GENESIS_FILE" \
+    || die "refusing to package unsafe genesis: $GENESIS_FILE"
 
 case "$OUTPUT_DIR" in
     ''|/|.|..|"$PWD") die "refusing unsafe OUTPUT_DIR: $OUTPUT_DIR" ;;
@@ -125,7 +136,7 @@ copy_as "$(find_one "$ARTIFACTS_DIR/arc-desktop-linux-x86_64" '*.rpm')" \
 # Auto-update installs this checksummed copy, not a moving main-branch script.
 copy_as install.sh install.sh
 copy_as testnet-seeds.txt testnet-seeds.txt
-copy_as genesis.toml genesis.toml
+copy_as "$GENESIS_FILE" genesis.toml
 
 VERSION="${RELEASE_TAG#v}"
 BASE_URL="https://github.com/${REPOSITORY}/releases/download/${RELEASE_TAG}"

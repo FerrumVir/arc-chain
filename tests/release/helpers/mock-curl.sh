@@ -82,7 +82,11 @@ render_asset() {
             printf '127.0.0.1:19091\n' >"$destination"
             ;;
         genesis.toml)
-            printf '[chain]\n' >"$destination"
+            printf '%s\n' \
+                '[chain]' \
+                'name = "arc-release-observer-fixture"' \
+                'chain_id = "0x415243"' \
+                'validator_set_complete = false' >"$destination"
             ;;
         install.sh)
             printf '#!/usr/bin/env bash\nexit 0\n' >"$destination"
@@ -131,7 +135,7 @@ case "$url" in
         emit_text '127.0.0.1:19091'
         ;;
     https://raw.githubusercontent.com/FerrumVir/arc-chain/*/genesis.toml)
-        emit_text '[chain]'
+        emit_text $'[chain]\nname = "arc-release-observer-fixture"\nchain_id = "0x415243"\nvalidator_set_complete = false'
         ;;
     http://localhost:*/health|http://127.0.0.1:*/health)
         requested_port="$(printf '%s' "$url" | sed -E 's#^http://(localhost|127\.0\.0\.1):([0-9]+)/health$#\2#')"

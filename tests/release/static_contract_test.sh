@@ -7,8 +7,12 @@ REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 . "$TEST_DIR/helpers/testlib.sh"
 
 RELEASE_WORKFLOW="$REPO_ROOT/.github/workflows/release.yml"
+CI_WORKFLOW="$REPO_ROOT/.github/workflows/ci.yml"
 ASSEMBLER="$REPO_ROOT/scripts/release/assemble-release.sh"
 INSTALLER="$REPO_ROOT/install.sh"
+LEGACY_INSTALLER="$REPO_ROOT/scripts/install-node.sh"
+GENESIS_VALIDATOR="$REPO_ROOT/scripts/release/validate-genesis.py"
+SECRET_SCANNER="$TEST_DIR/current_tree_secret_scan.sh"
 
 REQUIRED_ASSETS='
 arc-node-linux-x86_64
@@ -156,6 +160,79 @@ installer_normalizes_service_identity_and_secret_permissions() {
     fi
 }
 
+release_genesis_is_validated_before_packaging() {
+    grep -Fq 'validate-genesis.py' "$ASSEMBLER" || {
+        printf 'release assembler never invokes the fail-closed genesis validator\n'
+        return 1
+    }
+    # shellcheck disable=SC2016 # Intentional literal contract in the assembler.
+    grep -Fq 'python3 "$GENESIS_VALIDATOR" "$GENESIS_FILE"' "$ASSEMBLER" || {
+        printf 'release assembler does not validate the exact genesis file it packages\n'
+        return 1
+    }
+    python3 "$GENESIS_VALIDATOR" "$REPO_ROOT/genesis.toml" >/dev/null || {
+        printf 'canonical release genesis does not satisfy the release safety contract\n'
+        return 1
+    }
+}
+
+legacy_installer_cannot_create_a_validator_identity() {
+    if grep -Eq -- '(^|[[:space:]])--stake[[:space:]]+[1-9]|stake[[:space:]]*=[[:space:]]*[1-9]' \
+        "$LEGACY_INSTALLER"; then
+        printf 'legacy installer can still configure non-zero validator stake\n'
+        return 1
+    fi
+    if grep -Eq -- '--validator-seed|--validator-key-file|insecure-dev-validator-seed|openssl[[:space:]]+(genpkey|rand)' \
+        "$LEGACY_INSTALLER"; then
+        printf 'legacy installer can still generate or pass production validator identity material\n'
+        return 1
+    fi
+    # shellcheck disable=SC2016 # Intentional literal contract in the wrapper.
+    grep -Fq 'exec bash "$SCRIPT_DIR/../install.sh" "$@"' "$LEGACY_INSTALLER" || {
+        printf 'repository-local legacy path does not delegate to root install.sh\n'
+        return 1
+    }
+    grep -Fq 'https://raw.githubusercontent.com/FerrumVir/arc-chain/main/install.sh' \
+        "$LEGACY_INSTALLER" || {
+        printf 'curl-piped legacy path does not route to the supported installer\n'
+        return 1
+    }
+}
+
+secret_scan_is_pinned_to_the_current_tree() {
+    grep -Fq 'secret-scan:' "$CI_WORKFLOW" || {
+        printf 'blocking CI workflow has no current-tree secret scan job\n'
+        return 1
+    }
+    grep -Fq 'bash tests/release/current_tree_secret_scan.sh' "$CI_WORKFLOW" || {
+        printf 'CI secret scan does not run the reviewed contract script\n'
+        return 1
+    }
+    grep -Fq 'GITLEAKS_VERSION=8.30.1' "$SECRET_SCANNER" || {
+        printf 'Gitleaks binary version is not pinned\n'
+        return 1
+    }
+    grep -Fq 'ARCHIVE_SHA256=' "$SECRET_SCANNER" || {
+        printf 'Gitleaks download is not bound to a checksum\n'
+        return 1
+    }
+    # shellcheck disable=SC2016 # Intentional literal contract in the scanner.
+    grep -Fq 'git -C "$REPO_ROOT" archive --format=tar HEAD' "$SECRET_SCANNER" || {
+        printf 'secret scanner does not materialize exactly the current commit tree\n'
+        return 1
+    }
+    # shellcheck disable=SC2016 # Intentional literal contract in the scanner.
+    grep -Fq '"$GITLEAKS_BIN" dir' "$SECRET_SCANNER" || {
+        printf 'secret scanner is not using Gitleaks directory mode\n'
+        return 1
+    }
+    if grep -Eq 'fetch-depth:[[:space:]]*0|gitleaks([^[:alnum:]]|.*[[:space:]])git([[:space:]]|$)' \
+        "$CI_WORKFLOW" "$SECRET_SCANNER"; then
+        printf 'secret gate scans compromised Git history instead of the current tree\n'
+        return 1
+    fi
+}
+
 linux_compat_smoke_has_one_docker_run() {
     local smoke_block docker_run_count
     smoke_block="$(awk '
@@ -192,7 +269,7 @@ linux_compat_smoke_has_one_docker_run() {
 
 relevant_shell_is_syntax_valid() {
     local file
-    for file in "$INSTALLER" "$ASSEMBLER" "$TEST_DIR"/*.sh "$TEST_DIR"/helpers/*.sh; do
+    for file in "$INSTALLER" "$LEGACY_INSTALLER" "$ASSEMBLER" "$TEST_DIR"/*.sh "$TEST_DIR"/helpers/*.sh; do
         bash -n "$file" || return 1
     done
 }
@@ -204,6 +281,9 @@ run_test 'installer and update-only path verify SHA-256 before replacement' inst
 run_test 'raw node consumers use exact versioned release URLs' raw_node_downloads_are_version_pinned
 run_test 'update-only path refuses equal and older semantic versions' updater_has_semver_downgrade_guard
 run_test 'installer normalizes service identity and protects its seed' installer_normalizes_service_identity_and_secret_permissions
+run_test 'release assembly validates the exact shipped genesis before packaging' release_genesis_is_validated_before_packaging
+run_test 'legacy installer cannot create or expose a staked validator identity' legacy_installer_cannot_create_a_validator_identity
+run_test 'blocking secret scan is checksummed, version-pinned, and current-tree only' secret_scan_is_pinned_to_the_current_tree
 run_test 'Ubuntu compatibility loop has one non-duplicated docker invocation' linux_compat_smoke_has_one_docker_run
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
 

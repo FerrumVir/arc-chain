@@ -69,11 +69,13 @@ new_assembly_fixture() {
 
 run_assembler() {
     local sandbox="$1" release_tag="${2:-v0.8.0}"
+    local genesis_file="${3:-$REPO_ROOT/genesis.toml}"
     (
         cd "$REPO_ROOT" || exit 1
         env \
             ARTIFACTS_DIR="$sandbox/artifacts" \
             OUTPUT_DIR="$sandbox/output" \
+            GENESIS_FILE="$genesis_file" \
             RELEASE_TAG="$release_tag" \
             RELEASE_DATE='2026-08-26T12:00:00Z' \
             REPOSITORY='FerrumVir/arc-chain' \
@@ -124,6 +126,41 @@ complete_fixture_produces_verifiable_contract() {
         'latest.json payload URLs must point at the immutable release tag' || return 1
     assert_file_contains "$sandbox/output/latest.json" '/releases/download/v0\.8\.0/' \
         'latest.json has no exact-tag artifact URL' || return 1
+    assert_file_contains "$sandbox/output/genesis.toml" \
+        '^validator_set_complete[[:space:]]*=[[:space:]]*false$' \
+        'release did not preserve the explicit stake-zero observer placeholder' || return 1
+    assert_file_not_contains "$sandbox/output/genesis.toml" '^\[\[validators\]\]' \
+        'incomplete release genesis contains a partial validator set' || return 1
+}
+
+unsafe_production_genesis_is_rejected_before_manifest() {
+    local sandbox genesis_file output status
+    new_assembly_fixture
+    sandbox="$NEW_ASSEMBLY_SANDBOX"
+    genesis_file="$sandbox/unsafe-genesis.toml"
+    cat >"$genesis_file" <<'TOML'
+[chain]
+name = "unsafe-production-fixture"
+chain_id = "0x415243"
+validator_set_complete = true
+
+[[validators]]
+insecure_dev_seed = "release-contract-must-reject-this"
+stake = 5_000_000
+TOML
+    output="$sandbox/unsafe-genesis.out"
+    run_assembler "$sandbox" 'v0.8.0' "$genesis_file" >"$output" 2>&1
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        printf 'assembler accepted a complete genesis containing deterministic identity material\n'
+        return 1
+    fi
+    assert_file_contains "$output" 'forbidden secret-bearing field.*insecure_dev_seed' \
+        'unsafe-genesis refusal did not identify the forbidden field' || return 1
+    if [ -s "$sandbox/output/SHA256SUMS" ]; then
+        printf 'unsafe genesis left a publish-ready checksum manifest\n'
+        return 1
+    fi
 }
 
 every_headless_asset_is_individually_required() {
@@ -184,6 +221,7 @@ non_semver_release_tag_is_rejected() {
 }
 
 run_test 'complete fixture produces exact-tag manifest and verified SHA256SUMS' complete_fixture_produces_verifiable_contract
+run_test 'unsafe production genesis is rejected before a publishable manifest exists' unsafe_production_genesis_is_rejected_before_manifest
 run_test 'each of the ten canonical headless assets is independently required' every_headless_asset_is_individually_required
 run_test 'duplicate same-named artifacts fail closed' duplicate_asset_is_rejected
 run_test 'release assembly accepts only strict vX.Y.Z tags' non_semver_release_tag_is_rejected

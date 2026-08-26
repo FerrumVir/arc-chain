@@ -55,11 +55,27 @@ jobs:
           shellcheck \
             install.sh \
             scripts/install-community-node.sh \
+            scripts/install-node.sh \
             scripts/auto-update.sh \
             scripts/sero-quickstart.sh \
             scripts/release/assemble-release.sh \
             tests/release/*.sh \
             tests/release/helpers/*.sh
+
+  # ------------------------------------------------ current-tree secrets ----
+  # Full history intentionally contains the retired deterministic validator
+  # material, so scanning history would create a permanent false gate. This
+  # job archives and scans only the exact checked-out commit with a checksummed,
+  # pinned Gitleaks binary; any secret present in the releasable tree blocks CI.
+  secret-scan:
+    name: secret scan (current tree)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - run: bash tests/release/current_tree_secret_scan.sh
 
   # ----------------------------------------------- static web contracts ----
   # These sites intentionally have no package manifest or build step. Their

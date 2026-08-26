@@ -6,6 +6,7 @@ status=0
 
 for test_file in \
     "$TEST_DIR/static_contract_test.sh" \
+    "$TEST_DIR/genesis_contract_test.sh" \
     "$TEST_DIR/release_assembly_test.sh" \
     "$TEST_DIR/installer_behavior_test.sh"
 do

@@ -7,6 +7,7 @@ REPO_ROOT="$(CDPATH='' cd -- "$TEST_DIR/../.." && pwd)"
 . "$TEST_DIR/helpers/testlib.sh"
 
 INSTALLER="$REPO_ROOT/scripts/install-community-node.sh"
+LEGACY_INSTALLER="$REPO_ROOT/scripts/install-node.sh"
 CANONICAL_ASSETS='
 arc-node-linux-x86_64
 arc-cli-linux-x86_64
@@ -265,6 +266,15 @@ no_service_no_updater_really_is_install_only() {
         'generated runner does not use RPC+1 for P2P' || return 1
     assert_file_contains "$sandbox/arc/bin/run-arc-node" '--community-mode' \
         'generated runner omits mandatory stake-0 community mode' || return 1
+    assert_file_contains "$sandbox/arc/bin/run-arc-node" '--stake 0' \
+        'generated observer runner does not force stake to zero' || return 1
+    assert_file_contains "$sandbox/arc/bin/run-arc-node" '--min-stake 0' \
+        'generated observer runner does not disable validator minimum stake' || return 1
+    assert_file_contains "$sandbox/arc/genesis.toml" \
+        '^validator_set_complete[[:space:]]*=[[:space:]]*false$' \
+        'installed release genesis is not an explicit observer placeholder' || return 1
+    assert_file_not_contains "$sandbox/arc/genesis.toml" '^\[\[validators\]\]' \
+        'installed observer genesis contains a partial validator set' || return 1
     assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--model([[:space:]]|$)' \
         'generated runner passes --model even though no model was configured' || return 1
     assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--validator-seed' \
@@ -418,6 +428,40 @@ update_only_preserves_custom_port_and_empty_model() {
     fi
 }
 
+legacy_installer_delegates_without_generating_validator_material() {
+    local sandbox output expected_args actual_args
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    mkdir -p "$sandbox/legacy/scripts"
+    cp "$LEGACY_INSTALLER" "$sandbox/legacy/scripts/install-node.sh"
+    cat >"$sandbox/legacy/install.sh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+printf '%s\n' "$@" >"${ARC_LEGACY_ARGS_LOG:?}"
+SH
+    chmod +x "$sandbox/legacy/install.sh"
+    output="$sandbox/legacy.out"
+    env -i \
+        PATH='/usr/bin:/bin' \
+        ARC_LEGACY_ARGS_LOG="$sandbox/legacy-args.log" \
+        /bin/bash "$sandbox/legacy/scripts/install-node.sh" \
+        --no-service --no-auto-update --port 18444 >"$output" 2>&1 || {
+            cat "$output"
+            return 1
+        }
+    expected_args=$'--no-service\n--no-auto-update\n--port\n18444'
+    actual_args="$(cat "$sandbox/legacy-args.log")"
+    assert_equals "$expected_args" "$actual_args" \
+        'legacy wrapper did not forward arguments exactly to root install.sh' || return 1
+    assert_file_contains "$output" 'legacy validator installation is retired' \
+        'legacy wrapper does not explain the safe migration' || return 1
+    if find "$sandbox/legacy" -type f \( -name '*validator*' -o -name '*.key' \) | grep -q .; then
+        printf 'legacy wrapper generated validator material before delegating:\n'
+        find "$sandbox/legacy" -type f -print
+        return 1
+    fi
+}
+
 run_test 'offline platform aliases install exact-tag node + CLI assets without starting' install_only_platform_matrix
 run_test 'checksum mismatch rejects and removes staged executables' tampered_binary_is_rejected
 run_test 'ARC_NODE_VERSION requires strict X.Y.Z before network-shaped requests' invalid_version_pin_fails_before_asset_download
@@ -426,5 +470,6 @@ run_test 'sudo/root execution normalizes ownership to the invoking community use
 run_test 'Windows remains a documented manual-binary path, not a shell install path' windows_is_manual_only
 run_test 'update-only refuses downgrade before downloading artifacts' update_only_refuses_downgrade
 run_test 'update-only preserves custom ports and an intentionally empty model' update_only_preserves_custom_port_and_empty_model
+run_test 'legacy installer delegates to stake-zero root installer without key generation' legacy_installer_delegates_without_generating_validator_material
 
 finish_tests
