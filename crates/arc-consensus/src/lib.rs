@@ -730,6 +730,11 @@ pub struct ConsensusEngine {
     /// Ordinary parent rules apply to every later round; retaining this value
     /// also permits strict replay of late bootstrap-round blocks after restart.
     recovery_bootstrap_round: RwLock<Option<u64>>,
+    /// First retained round in an independently pinned, content-addressed local
+    /// recovery generation. Its missing parents are covered by that durable
+    /// checkpoint boundary only while startup replay is explicitly active.
+    local_recovery_boundary_round: RwLock<Option<u64>>,
+    local_recovery_replay_active: std::sync::atomic::AtomicBool,
 }
 
 impl ConsensusEngine {
@@ -778,6 +783,8 @@ impl ConsensusEngine {
             testnet_mode: false,
             consensus_domain: RwLock::new(None),
             recovery_bootstrap_round: RwLock::new(None),
+            local_recovery_boundary_round: RwLock::new(None),
+            local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -819,6 +826,8 @@ impl ConsensusEngine {
             testnet_mode: false,
             consensus_domain: RwLock::new(None),
             recovery_bootstrap_round: RwLock::new(None),
+            local_recovery_boundary_round: RwLock::new(None),
+            local_recovery_replay_active: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -933,6 +942,73 @@ impl ConsensusEngine {
         *active = Some(bootstrap_round);
         self.reset_round_timer();
         Ok(bootstrap_round)
+    }
+
+    /// Move an otherwise-empty recovered engine to an independently pinned
+    /// local generation boundary before replaying its bounded DAG window.
+    /// The generation manifest is verified by the node against the active
+    /// ARCCHKPT domain, validator-set commitment, and canonical state anchor
+    /// before this method is called. Network input is not started until
+    /// [`Self::finish_recovery_generation_replay`] closes the one-round parent
+    /// exception.
+    pub fn install_recovery_generation_cursor(
+        &self,
+        retention_floor_round: u64,
+        current_round: u64,
+        next_commit_round: u64,
+    ) -> Result<(), ConsensusError> {
+        const MAX_RETAINED_ROUND_SPAN: u64 = 4_096;
+        let bootstrap = self.recovery_bootstrap_round.read().ok_or_else(|| {
+            ConsensusError::InvalidBlock(
+                "local recovery generation requires the signed bootstrap cursor".into(),
+            )
+        })?;
+        if self.consensus_domain.read().is_none()
+            || !self.dag.is_empty()
+            || self.local_recovery_replay_active.load(Ordering::SeqCst)
+            || self.local_recovery_boundary_round.read().is_some()
+        {
+            return Err(ConsensusError::InvalidBlock(
+                "local recovery generation must be installed once on an empty domain-bound engine"
+                    .into(),
+            ));
+        }
+        if self.current_round.load(Ordering::SeqCst) != bootstrap
+            || self.last_committed_round.load(Ordering::SeqCst) != bootstrap
+            || retention_floor_round < bootstrap
+            || retention_floor_round > next_commit_round
+            || next_commit_round > current_round
+            || current_round.saturating_sub(retention_floor_round) > MAX_RETAINED_ROUND_SPAN
+        {
+            return Err(ConsensusError::InvalidBlock(
+                "local recovery generation cursors are inconsistent or outside the bounded window"
+                    .into(),
+            ));
+        }
+
+        *self.local_recovery_boundary_round.write() = Some(retention_floor_round);
+        self.current_round.store(current_round, Ordering::SeqCst);
+        self.last_committed_round
+            .store(next_commit_round, Ordering::SeqCst);
+        self.local_recovery_replay_active
+            .store(true, Ordering::SeqCst);
+        self.reset_round_timer();
+        Ok(())
+    }
+
+    /// Close the local generation boundary before any transport task starts.
+    /// After this point every newly received block, including a late block at
+    /// the retained floor round, must satisfy ordinary parent availability.
+    pub fn finish_recovery_generation_replay(&self) -> Result<(), ConsensusError> {
+        if !self
+            .local_recovery_replay_active
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(ConsensusError::InvalidBlock(
+                "local recovery generation replay is not active".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Whether `round` is the exact parentless genesis round of the active
@@ -1518,6 +1594,23 @@ impl ConsensusEngine {
             if !block.parents.is_empty() {
                 return Err(ConsensusError::InvalidBlock(
                     "bootstrap block must not have parents".into(),
+                ));
+            }
+        } else if self.local_recovery_replay_active.load(Ordering::SeqCst)
+            && self.local_recovery_boundary_round.read().as_ref() == Some(&block.round)
+        {
+            // A content-addressed, externally pinned local generation is the
+            // trust boundary for exactly its oldest retained round. Original
+            // parent hashes stay in the signed block hash for audit, but their
+            // block bodies were compacted into the prior canonical baseline.
+            if block.parents.is_empty()
+                || block.parents.contains(&Hash256::ZERO)
+                || block.parents.iter().copied().collect::<HashSet<_>>().len()
+                    != block.parents.len()
+            {
+                return Err(ConsensusError::InvalidBlock(
+                    "local recovery boundary has an empty, zero, or duplicate parent commitment"
+                        .into(),
                 ));
             }
         } else {
@@ -3271,6 +3364,47 @@ mod tests {
         assert!(engine.install_recovery_cursor(u64::MAX).is_err());
         assert_eq!(engine.install_recovery_cursor(50).unwrap(), 51);
         assert!(engine.install_recovery_cursor(51).is_err());
+    }
+
+    #[test]
+    fn pinned_generation_boundary_is_parent_relaxed_only_during_local_replay() {
+        let engine = ConsensusEngine::new(test_validator_set(4), test_addr(0));
+        let domain = ConsensusDomain::new(hash_bytes(b"generation-domain"), 4, 12);
+        engine.install_consensus_domain(domain.clone()).unwrap();
+        assert_eq!(engine.install_recovery_cursor(100).unwrap(), 101);
+        engine
+            .install_recovery_generation_cursor(109, 111, 110)
+            .unwrap();
+        assert_eq!(engine.current_round(), 111);
+        assert_eq!(engine.last_committed_round(), 110);
+
+        let mut boundary = Vec::new();
+        for author in [test_addr(0), test_addr(1), test_addr(2)] {
+            let block = make_block_in_domain(
+                author,
+                109,
+                vec![hash_bytes(format!("compacted-parent-{author}").as_bytes())],
+                vec![],
+                1_000,
+                &domain,
+            );
+            engine.receive_block(&block).unwrap();
+            boundary.push(block.hash);
+        }
+        let child = make_block_in_domain(test_addr(3), 110, boundary, vec![], 1_001, &domain);
+        engine.receive_block(&child).unwrap();
+        engine.finish_recovery_generation_replay().unwrap();
+        assert!(engine.finish_recovery_generation_replay().is_err());
+
+        let late_boundary = make_block_in_domain(
+            test_addr(3),
+            109,
+            vec![hash_bytes(b"missing-after-replay")],
+            vec![],
+            1_002,
+            &domain,
+        );
+        assert!(engine.receive_block(&late_boundary).is_err());
     }
 
     #[test]
