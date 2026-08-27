@@ -36,10 +36,10 @@ const EXAMPLES = [
 /// with "Pipeline gap" (chain-side bug: retired SAO+JNB shards still in
 /// the ShardRegistry trip every coordinator's planner before any token is
 /// emitted), retry against the same coordinators using /inference/run
-/// directly. Loses k-of-n consensus, but the coordinator still emits an
-/// on-chain attestation and the user gets a real answer instead of an
-/// error. Once the ShardRegistry is cleaned up, this third tier becomes
-/// dormant.
+/// directly. This loses k-of-n agreement and does not imply an on-chain
+/// attestation or payment, but the response remains explicitly labelled with
+/// its coordinator. Once the ShardRegistry is complete, this third tier
+/// becomes dormant.
 async function runInferenceSmart(
   prompt: string,
   maxTokens: number,
@@ -54,7 +54,7 @@ async function runInferenceSmart(
       if (
         cmsg.includes("Pipeline gap") ||
         cmsg.includes("503") ||
-        cmsg.includes("all") // "all 6 coordinators failed; last: ..."
+        cmsg.includes("all coordinators failed")
       ) {
         return await api.runInferenceViaCoordinatorDirect(prompt, maxTokens);
       }
