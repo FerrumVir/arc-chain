@@ -352,6 +352,9 @@ enum RecoveryCommand {
     Export {
         #[arg(long)]
         data_dir: String,
+        /// Exact-height LZ4 snapshot captured from /sync/snapshot alongside the WAL.
+        #[arg(long)]
+        snapshot: String,
         #[arg(long)]
         genesis: String,
         /// JSON array of {address, public_key, stake} records for the approved set.
@@ -936,6 +939,7 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
         }
         RecoveryCommand::Export {
             data_dir,
+            snapshot,
             genesis,
             validator_public_keys,
             output,
@@ -959,10 +963,11 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
                 public_set == approved_set,
                 "validator public-key file addresses/stakes differ from the complete genesis set"
             );
-            let state = StateDB::load_legacy_recovery_source(
+            let state = StateDB::load_legacy_recovery_source_with_snapshot(
                 &data_dir,
                 network.genesis_hash,
                 allow_unbound_legacy_wal,
+                &snapshot,
             )?;
             let created_at_unix_ms = created_at_unix_ms.unwrap_or(
                 SystemTime::now()

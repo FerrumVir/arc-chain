@@ -6,7 +6,8 @@
 //! validator identity + stake supermajority. The complete package is verified
 //! in memory before any active-data marker is written.
 
-use crate::{StateDB, StateError, WalOp, read_wal_strict};
+use crate::wal::{ContractStorage, Snapshot};
+use crate::{StateDB, StateError, WalEntry, WalOp, read_wal_strict};
 use arc_crypto::{Hash256, IncrementalMerkle, KeyPair, Signature, hash_bytes};
 use arc_types::{
     Account, Address, Block, BlockHeader, EventLog, Identity, ProtocolVersion, Transaction,
@@ -14,7 +15,7 @@ use arc_types::{
 };
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,11 @@ pub const ARCCHKPT_FORMAT_VERSION: u16 = 1;
 /// A future format can raise this safely by chunking and authenticating each
 /// section independently.
 pub const ARCCHKPT_MAX_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+/// Snapshot-assisted legacy recovery is intentionally bounded to the same
+/// in-memory envelope as an ARCCHKPT payload. The legacy LZ4 framing carries
+/// its decompressed length in the first four bytes, so reject allocation bombs
+/// before asking the decoder to reserve attacker-controlled memory.
+pub const LEGACY_SNAPSHOT_MAX_BYTES: usize = ARCCHKPT_MAX_PAYLOAD_BYTES;
 /// Protocol-v3 recovery has one fixed six-validator trust committee.
 pub const RECOVERY_VALIDATOR_SET_SIZE: usize = 6;
 /// Five identities are required in addition to strict >2/3 signed stake.
@@ -990,6 +996,349 @@ fn consensus_state_root_from_sections(
     Hash256(*hasher.finalize().as_bytes())
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LegacyBoundary {
+    height: u64,
+    state_root: Hash256,
+    checkpoint_index: usize,
+}
+
+fn legacy_post_root_state_mutation(op: &WalOp) -> bool {
+    matches!(
+        op,
+        WalOp::SetAccount(..)
+            | WalOp::SetStorage(..)
+            | WalOp::DeleteStorage(..)
+            | WalOp::SetContract(..)
+            | WalOp::SetIdentity(..)
+    )
+}
+
+/// Locate the latest structurally complete block boundary without trusting a
+/// final WAL record merely because it calls itself a checkpoint. A later torn
+/// suffix has no matching SetBlock+root and is deliberately not selected.
+fn latest_complete_legacy_boundary(entries: &[WalEntry]) -> Result<LegacyBoundary, StateError> {
+    let mut blocks = HashMap::<u64, usize>::new();
+    let mut latest = None;
+    for (index, entry) in entries.iter().enumerate() {
+        match &entry.op {
+            WalOp::SetBlock(height, block) => {
+                if *height == block.header.height
+                    && block.hash == Block::compute_hash(&block.header)
+                {
+                    blocks.insert(*height, index);
+                }
+            }
+            WalOp::Checkpoint(root) => {
+                let height = entry.block_height;
+                let Some(&block_index) = blocks.get(&height) else {
+                    continue;
+                };
+                let WalOp::SetBlock(_, block) = &entries[block_index].op else {
+                    unreachable!("legacy block index is created only from SetBlock")
+                };
+                if block.header.state_root != *root
+                    || entries[block_index + 1..index]
+                        .iter()
+                        .any(|candidate| legacy_post_root_state_mutation(&candidate.op))
+                {
+                    continue;
+                }
+                latest = Some(LegacyBoundary {
+                    height,
+                    state_root: *root,
+                    checkpoint_index: index,
+                });
+            }
+            _ => {}
+        }
+    }
+    latest.ok_or_else(|| {
+        StateError::PersistenceError(
+            "legacy source has no complete SetBlock + Checkpoint boundary".into(),
+        )
+    })
+}
+
+fn validate_legacy_boundary(
+    entries: &[WalEntry],
+    boundary: &LegacyBoundary,
+) -> Result<(), StateError> {
+    let committed = &entries[..=boundary.checkpoint_index];
+    let mut blocks = BTreeMap::<u64, (usize, &Block)>::new();
+    let mut checkpoints = BTreeMap::<u64, (usize, Hash256)>::new();
+
+    for (index, entry) in committed.iter().enumerate() {
+        match &entry.op {
+            WalOp::SetBlock(height, block) => {
+                if *height != entry.block_height || *height != block.header.height {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy SetBlock at WAL sequence {} has inconsistent heights: tag={}, key={}, header={}",
+                        entry.sequence, entry.block_height, height, block.header.height
+                    )));
+                }
+                if block.hash != Block::compute_hash(&block.header) {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy block {} has an invalid header hash at WAL sequence {}",
+                        height, entry.sequence
+                    )));
+                }
+                if blocks.insert(*height, (index, block)).is_some() {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy WAL rewrites canonical block height {height}"
+                    )));
+                }
+            }
+            WalOp::Checkpoint(root) => {
+                if checkpoints
+                    .insert(entry.block_height, (index, *root))
+                    .is_some()
+                {
+                    return Err(StateError::PersistenceError(format!(
+                        "legacy WAL has duplicate checkpoints at height {}",
+                        entry.block_height
+                    )));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let expected_block_count = boundary
+        .height
+        .checked_add(1)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| StateError::PersistenceError("legacy height exceeds usize".into()))?;
+    if blocks.len() != expected_block_count {
+        return Err(StateError::PersistenceError(format!(
+            "legacy WAL is missing canonical blocks through height {}: expected {}, got {}",
+            boundary.height,
+            expected_block_count,
+            blocks.len()
+        )));
+    }
+
+    let mut previous = None;
+    for height in 0..=boundary.height {
+        let Some(&(block_index, block)) = blocks.get(&height) else {
+            return Err(StateError::PersistenceError(format!(
+                "legacy WAL is missing canonical block {height}"
+            )));
+        };
+        if let Some(parent) = previous
+            && block.header.parent_hash != parent
+        {
+            return Err(StateError::PersistenceError(format!(
+                "legacy canonical block parent mismatch at height {height}"
+            )));
+        }
+        previous = Some(block.hash);
+
+        let Some(&(checkpoint_index, checkpoint_root)) = checkpoints.get(&height) else {
+            if height == 0 {
+                continue;
+            }
+            return Err(StateError::PersistenceError(format!(
+                "legacy canonical block {height} has no durable checkpoint"
+            )));
+        };
+        if checkpoint_index <= block_index || checkpoint_root != block.header.state_root {
+            return Err(StateError::PersistenceError(format!(
+                "legacy block/checkpoint mismatch at height {height}"
+            )));
+        }
+        if committed[block_index + 1..checkpoint_index]
+            .iter()
+            .any(|entry| legacy_post_root_state_mutation(&entry.op))
+        {
+            return Err(StateError::PersistenceError(format!(
+                "legacy WAL mutates root-covered state after SetBlock and before Checkpoint at height {height}"
+            )));
+        }
+    }
+
+    let Some(&(final_index, final_root)) = checkpoints.get(&boundary.height) else {
+        return Err(StateError::PersistenceError(
+            "selected legacy boundary lost its checkpoint".into(),
+        ));
+    };
+    if final_index != boundary.checkpoint_index || final_root != boundary.state_root {
+        return Err(StateError::PersistenceError(
+            "selected legacy boundary differs from validated checkpoint chain".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_legacy_recovery_snapshot(path: &Path) -> Result<Snapshot, StateError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to inspect legacy recovery snapshot {path:?}: {error}"
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(StateError::PersistenceError(format!(
+            "legacy recovery snapshot must be a regular non-symlink file: {path:?}"
+        )));
+    }
+    let compressed_len: usize = metadata
+        .len()
+        .try_into()
+        .map_err(|_| StateError::PersistenceError("snapshot file size exceeds usize".into()))?;
+    if !(4..=LEGACY_SNAPSHOT_MAX_BYTES).contains(&compressed_len) {
+        return Err(StateError::PersistenceError(format!(
+            "legacy recovery snapshot compressed size {compressed_len} is outside 4..={LEGACY_SNAPSHOT_MAX_BYTES} bytes"
+        )));
+    }
+    let mut file = File::open(path).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to open legacy recovery snapshot {path:?}: {error}"
+        ))
+    })?;
+    let mut compressed = Vec::with_capacity(compressed_len);
+    file.read_to_end(&mut compressed).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "failed to read legacy recovery snapshot {path:?}: {error}"
+        ))
+    })?;
+    if compressed.len() != compressed_len {
+        return Err(StateError::PersistenceError(format!(
+            "legacy recovery snapshot changed size while being read: expected {compressed_len}, got {}",
+            compressed.len()
+        )));
+    }
+    let decoded_len =
+        u32::from_le_bytes(compressed[..4].try_into().expect("four bytes checked")) as usize;
+    if decoded_len > LEGACY_SNAPSHOT_MAX_BYTES {
+        return Err(StateError::PersistenceError(format!(
+            "legacy recovery snapshot requests {decoded_len} decompressed bytes, limit is {LEGACY_SNAPSHOT_MAX_BYTES}"
+        )));
+    }
+    let decoded = lz4_flex::decompress_size_prepended(&compressed).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "invalid legacy recovery snapshot compression at {path:?}: {error}"
+        ))
+    })?;
+    let snapshot: Snapshot = bincode::deserialize(&decoded).map_err(|error| {
+        StateError::PersistenceError(format!(
+            "invalid legacy recovery snapshot payload at {path:?}: {error}"
+        ))
+    })?;
+    validate_legacy_snapshot_shape(&snapshot)?;
+    Ok(snapshot)
+}
+
+fn validate_legacy_snapshot_shape(snapshot: &Snapshot) -> Result<(), StateError> {
+    let mut accounts = HashSet::with_capacity(snapshot.accounts.len());
+    for (address, account) in &snapshot.accounts {
+        if *address != account.address {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot account key {address} differs from embedded address {}",
+                account.address
+            )));
+        }
+        if !accounts.insert(address.0) {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot duplicates account {address}"
+            )));
+        }
+    }
+
+    let mut storage_addresses = HashSet::with_capacity(snapshot.storage.len());
+    for (address, entries) in &snapshot.storage {
+        if !storage_addresses.insert(address.0) {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot duplicates storage address {address}"
+            )));
+        }
+        let mut keys = HashSet::with_capacity(entries.len());
+        for (key, _) in entries {
+            if !keys.insert(key.0) {
+                return Err(StateError::PersistenceError(format!(
+                    "legacy snapshot duplicates storage key {key} for {address}"
+                )));
+            }
+        }
+    }
+
+    let mut contracts = HashSet::with_capacity(snapshot.contracts.len());
+    for (address, bytecode) in &snapshot.contracts {
+        if !contracts.insert(address.0) {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot duplicates contract {address}"
+            )));
+        }
+        let account = snapshot
+            .accounts
+            .iter()
+            .find_map(|(candidate, account)| (candidate == address).then_some(account))
+            .ok_or_else(|| {
+                StateError::PersistenceError(format!(
+                    "legacy snapshot contract {address} has no account"
+                ))
+            })?;
+        let code_hash = hash_bytes(bytecode);
+        if account.code_hash != code_hash {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot contract {address} bytecode hash {code_hash} differs from account commitment {}",
+                account.code_hash
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_storage(mut storage: ContractStorage) -> ContractStorage {
+    for (_, entries) in &mut storage {
+        entries.sort_by_key(|entry| entry.0.0);
+    }
+    storage.sort_by_key(|entry| entry.0.0);
+    storage
+}
+
+fn validate_snapshot_sections_against_wal(
+    snapshot: &Snapshot,
+    state: &StateDB,
+) -> Result<(), StateError> {
+    let wal_storage = canonical_storage(
+        state
+            .storage
+            .iter()
+            .map(|entry| {
+                (
+                    Hash256(*entry.key()),
+                    entry
+                        .value()
+                        .iter()
+                        .map(|value| (*value.key(), value.value().clone()))
+                        .collect(),
+                )
+            })
+            .collect(),
+    );
+    let snapshot_storage = canonical_storage(snapshot.storage.clone());
+    if bincode::serialize(&wal_storage).ok() != bincode::serialize(&snapshot_storage).ok() {
+        return Err(StateError::PersistenceError(
+            "legacy snapshot contract storage differs from canonical WAL replay".into(),
+        ));
+    }
+
+    let mut wal_contracts: Vec<_> = state
+        .contracts
+        .iter()
+        .map(|entry| (Hash256(*entry.key()), entry.value().clone()))
+        .collect();
+    wal_contracts.sort_by_key(|entry| entry.0.0);
+    let mut snapshot_contracts = snapshot.contracts.clone();
+    snapshot_contracts.sort_by_key(|entry| entry.0.0);
+    if wal_contracts != snapshot_contracts {
+        return Err(StateError::PersistenceError(
+            "legacy snapshot contract bytecode differs from canonical WAL replay".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl StateDB {
     fn export_recovery_payload(&self) -> RecoveryPayload {
         let mut blocks: Vec<_> = self
@@ -1184,7 +1533,42 @@ impl StateDB {
         expected_genesis_hash: Hash256,
         allow_unbound_legacy_wal: bool,
     ) -> Result<Self, StateError> {
-        let wal_dir = wal_dir.as_ref();
+        Self::load_legacy_recovery_source_inner(
+            wal_dir.as_ref(),
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            None,
+        )
+    }
+
+    /// Load a legacy recovery source and bind its canonical block boundary to
+    /// a same-height live state snapshot.
+    ///
+    /// Old ARC nodes did not persist every in-memory state section in every
+    /// execution path. A WAL remains authoritative for block/history ordering,
+    /// while the snapshot supplies exactly accounts/storage/contracts. The
+    /// snapshot is never trusted by metadata: its account root is recomputed
+    /// and must equal both the final complete WAL checkpoint and block header.
+    pub fn load_legacy_recovery_source_with_snapshot(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: impl AsRef<Path>,
+    ) -> Result<Self, StateError> {
+        Self::load_legacy_recovery_source_inner(
+            wal_dir.as_ref(),
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            Some(snapshot_path.as_ref()),
+        )
+    }
+
+    fn load_legacy_recovery_source_inner(
+        wal_dir: &Path,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: Option<&Path>,
+    ) -> Result<Self, StateError> {
         if wal_dir.join(ACTIVE_RECOVERY_MARKER).exists() {
             return Err(StateError::PersistenceError(
                 "source data directory already has an active recovery; chained recovery export is not supported by this format revision"
@@ -1236,54 +1620,66 @@ impl StateDB {
                 "legacy recovery source WAL is empty".into(),
             ));
         }
+
+        let snapshot = snapshot_path
+            .map(read_legacy_recovery_snapshot)
+            .transpose()?;
+        let boundary = latest_complete_legacy_boundary(&entries)?;
+        if let Some(snapshot) = snapshot.as_ref()
+            && (snapshot.block_height != boundary.height
+                || snapshot.state_root != boundary.state_root)
+        {
+            return Err(StateError::PersistenceError(format!(
+                "legacy snapshot/WAL boundary mismatch: snapshot height/root {}/{}, latest complete WAL height/root {}/{}",
+                snapshot.block_height, snapshot.state_root, boundary.height, boundary.state_root
+            )));
+        }
+
+        validate_legacy_boundary(&entries, &boundary)?;
+        let committed_entries = &entries[..=boundary.checkpoint_index];
         let state = StateDB::new();
-        for entry in &entries {
+        for entry in committed_entries {
             state.apply_wal_op(&entry.op);
         }
         state.rebuild_transaction_indexes();
-        let Some(last_checkpoint_index) = entries
-            .iter()
-            .rposition(|entry| matches!(&entry.op, WalOp::Checkpoint(_)))
-        else {
-            return Err(StateError::PersistenceError(
-                "legacy source has no complete block checkpoint".into(),
-            ));
-        };
-        let checkpoint_entry = &entries[last_checkpoint_index];
-        let WalOp::Checkpoint(expected_root) = &checkpoint_entry.op else {
-            unreachable!("rposition selected a checkpoint")
-        };
-        if checkpoint_entry.block_height != state.height() {
-            return Err(StateError::PersistenceError(format!(
-                "legacy source is not block-atomic: final checkpoint is height {}, final block is {}",
-                checkpoint_entry.block_height,
-                state.height()
-            )));
-        }
-        for trailing in &entries[last_checkpoint_index + 1..] {
-            if !matches!(
-                &trailing.op,
-                WalOp::SetEventLogs(_, _)
-                    | WalOp::SetDagBlock(_, _)
-                    | WalOp::SetDagRound(_)
-                    | WalOp::CommitDagBlock(_)
-            ) {
-                return Err(StateError::PersistenceError(format!(
-                    "legacy source has state mutation after its final checkpoint at WAL sequence {}",
-                    trailing.sequence
-                )));
-            }
-        }
         if state.get_block(0).is_none() {
             return Err(StateError::PersistenceError(
                 "legacy source does not retain genesis block 0".into(),
             ));
         }
-        let actual_root = state.compute_state_root();
-        if actual_root != *expected_root {
+
+        if let Some(snapshot) = snapshot.as_ref() {
+            validate_snapshot_sections_against_wal(snapshot, &state)?;
+            state.import_snapshot(snapshot, boundary.state_root)?;
+            // import_snapshot changes only the three snapshot-covered state
+            // sections and height. WAL-derived blocks/history/receipts remain.
+            state.rebuild_transaction_indexes();
+        } else {
+            let actual_root = state.compute_state_root();
+            if actual_root != boundary.state_root {
+                return Err(StateError::PersistenceError(format!(
+                    "legacy source checkpoint root mismatch: WAL {}, replayed {}; provide an exact-height --snapshot capture so missing legacy state can be root-verified without weakening the checkpoint",
+                    boundary.state_root, actual_root
+                )));
+            }
+        }
+
+        if state.height() != boundary.height || state.get_state_root() != boundary.state_root {
             return Err(StateError::PersistenceError(format!(
-                "legacy source checkpoint root mismatch: WAL {expected_root}, replayed {actual_root}"
+                "legacy canonical boundary changed after replay: expected height/root {}/{}, got {}/{}",
+                boundary.height,
+                boundary.state_root,
+                state.height(),
+                state.get_state_root()
             )));
+        }
+        if boundary.checkpoint_index + 1 < entries.len() {
+            tracing::warn!(
+                ignored_entries = entries.len() - boundary.checkpoint_index - 1,
+                first_ignored_sequence = entries[boundary.checkpoint_index + 1].sequence,
+                committed_height = boundary.height,
+                "Ignored WAL suffix after the latest fully committed legacy block boundary"
+            );
         }
         Ok(state)
     }
@@ -2235,6 +2631,171 @@ mod tests {
         fs::remove_dir_all(active_dir).unwrap();
     }
 
+    fn legacy_snapshot_fixture(
+        label: &str,
+    ) -> (PathBuf, PathBuf, Snapshot, Address, Address, Hash256) {
+        let data_dir = temp_dir(label);
+        let snapshot_path = data_dir.with_extension("snapshot.lz4");
+        let sender = hash_bytes(format!("{label}-sender").as_bytes());
+        let recipient = hash_bytes(format!("{label}-recipient").as_bytes());
+        let reference = StateDB::with_genesis(&[(sender, 1_000), (recipient, 0)]);
+        let transaction = Transaction::new_transfer(sender, recipient, 125, 0);
+        let (block, receipts) = reference.execute_block(&[transaction], sender).unwrap();
+        assert!(receipts[0].success);
+        let snapshot = reference.export_snapshot();
+        assert_eq!(snapshot.block_height, 1);
+        assert_eq!(snapshot.state_root, block.header.state_root);
+        snapshot.write_to(&snapshot_path).unwrap();
+
+        // Recreate the complete block/history boundary but deliberately omit
+        // the recipient account from the WAL. This models the real legacy
+        // failure mode: the block root is canonical, while WAL-only replay is
+        // missing live state that the exact-height snapshot still commits.
+        let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
+        writer.append(WalOp::SetAccount(sender, Account::new(sender, 1_000)), 0);
+        writer.append(WalOp::SetBlock(0, Block::genesis()), 0);
+        writer.append(
+            WalOp::SetAccount(sender, reference.get_account(&sender).unwrap()),
+            1,
+        );
+        writer.append(WalOp::SetBlock(1, block), 1);
+        writer.append(WalOp::Checkpoint(snapshot.state_root), 1);
+        writer.sync().unwrap();
+        drop(writer);
+
+        (
+            data_dir,
+            snapshot_path,
+            snapshot.clone(),
+            sender,
+            recipient,
+            snapshot.state_root,
+        )
+    }
+
+    #[test]
+    fn snapshot_assisted_legacy_loader_recovers_only_root_bound_live_sections() {
+        let (data_dir, snapshot_path, _, sender, recipient, root) =
+            legacy_snapshot_fixture("snapshot-assisted");
+        let error = StateDB::load_legacy_recovery_source(&data_dir, Hash256::ZERO, true)
+            .err()
+            .expect("WAL-only replay with missing state must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("provide an exact-height --snapshot")
+        );
+
+        let loaded = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .unwrap();
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.get_state_root(), root);
+        assert_eq!(loaded.get_account(&sender).unwrap().balance, 875);
+        assert_eq!(loaded.get_account(&recipient).unwrap().balance, 125);
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_assisted_loader_discards_validly_framed_uncommitted_suffix() {
+        let (data_dir, snapshot_path, _, _, _, root) = legacy_snapshot_fixture("snapshot-trailing");
+        let attacker = hash_bytes(b"snapshot-trailing-attacker");
+        let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
+        writer.append(
+            WalOp::SetAccount(attacker, Account::new(attacker, u64::MAX)),
+            2,
+        );
+        writer.sync().unwrap();
+        drop(writer);
+
+        let loaded = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .unwrap();
+        assert_eq!(loaded.height(), 1);
+        assert_eq!(loaded.get_state_root(), root);
+        assert!(loaded.get_account(&attacker).is_none());
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_assisted_loader_rejects_complete_looking_forged_higher_boundary() {
+        let (data_dir, snapshot_path, snapshot, _, _, _) =
+            legacy_snapshot_fixture("snapshot-forged");
+        let header = BlockHeader {
+            height: 2,
+            timestamp: 2,
+            parent_hash: hash_bytes(b"forged-parent"),
+            tx_root: Hash256::ZERO,
+            state_root: snapshot.state_root,
+            proof_hash: Hash256::ZERO,
+            tx_count: 0,
+            producer: hash_bytes(b"forged-producer"),
+            protocol_version: ProtocolVersion::new(0, 1, 0),
+            state_diff: None,
+        };
+        let forged = Block::new(header, Vec::new());
+        let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
+        writer.append(WalOp::SetBlock(2, forged), 2);
+        writer.append(WalOp::Checkpoint(snapshot.state_root), 2);
+        writer.sync().unwrap();
+        drop(writer);
+
+        let error = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .err()
+        .expect("a complete-looking suffix cannot roll the snapshot boundary forward");
+        assert!(error.to_string().contains("snapshot/WAL boundary mismatch"));
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn snapshot_assisted_loader_rejects_uncommitted_storage_and_allocation_bombs() {
+        let (data_dir, snapshot_path, mut snapshot, _, _, _) =
+            legacy_snapshot_fixture("snapshot-storage");
+        snapshot.storage.push((
+            hash_bytes(b"uncommitted-contract"),
+            vec![(hash_bytes(b"key"), b"value".to_vec())],
+        ));
+        snapshot.write_to(&snapshot_path).unwrap();
+        let error = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .err()
+        .expect("snapshot-only storage is not committed by the WAL");
+        assert!(error.to_string().contains("storage differs"));
+
+        let bomb = data_dir.with_extension("snapshot-bomb.lz4");
+        let requested = (LEGACY_SNAPSHOT_MAX_BYTES as u32).saturating_add(1);
+        fs::write(&bomb, requested.to_le_bytes()).unwrap();
+        let error = read_legacy_recovery_snapshot(&bomb).unwrap_err();
+        assert!(error.to_string().contains("decompressed bytes"));
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+        fs::remove_file(bomb).unwrap();
+    }
+
     #[test]
     fn legacy_export_loader_is_read_only_and_requires_explicit_unbound_override() {
         let source_dir = temp_dir("legacy-export-source");
@@ -2245,14 +2806,15 @@ mod tests {
             genesis_hash,
         )
         .unwrap();
-        let root = state.get_state_root();
-        state.wal.append(WalOp::Checkpoint(root), state.height());
-        state.wal.sync().unwrap();
+        let (block, _) = state
+            .execute_block_verified_at(&[], hash_bytes(b"legacy-producer"), 1)
+            .unwrap();
+        let root = block.header.state_root;
         drop(state);
 
         let loaded =
             StateDB::load_legacy_recovery_source(&source_dir, genesis_hash, false).unwrap();
-        assert_eq!(loaded.height(), 0);
+        assert_eq!(loaded.height(), 1);
         assert_eq!(loaded.get_state_root(), root);
         assert!(!source_dir.join(ACTIVE_RECOVERY_MARKER).exists());
 
