@@ -5312,13 +5312,11 @@ mod tests {
         assert_eq!(sum_s, sum_d, "SIMD and scalar must produce identical sums");
     }
 
-    /// Repro for project_i16_ppl_bug.md - I8Weights::quantize_f32 truncates
-    /// abs_max to i64 before computing the scale, destroying precision when
-    /// abs_max < ~5. Fix is to compute scale in f64:
+    /// Regression for project_i16_ppl_bug.md. I8Weights::quantize_f32 once
+    /// truncated abs_max to i64 before computing the scale, destroying
+    /// precision when abs_max < ~5. The scale must be computed in f64:
     ///   ((abs_max as f64 * ONE as f64) / 127.0).round().max(1.0) as i64
-    /// After applying the fix, remove #[ignore] so CI guards the invariant.
     #[test]
-    #[ignore = "reproduces an unfixed scale-precision bug; remove #[ignore] after applying fix"]
     fn test_i8_scale_roundtrip_small_abs_max() {
         for &abs_max in &[0.1_f32, 0.5, 0.9, 1.2, 2.3] {
             // Single-row matrix with exactly abs_max as the peak value.

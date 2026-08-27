@@ -361,100 +361,114 @@ fn expected_sequence(fixture: &GoldenFixture) -> SequenceResult {
 fn golden_cached_integer_whole_model_is_thread_count_independent() {
     let fixture = fixture();
     assert_eq!(fixture.name, "cached-integer-i8-i16-v1");
-
-    let scalar_pool = ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .expect("one-thread pool");
-    let scalar = scalar_pool.install(|| {
-        let model = build_fixture_model(&fixture);
-        assert_eq!(
-            hex::encode(model.weight_hash().0),
-            fixture.expected.model_weight_hash
-        );
-        run_whole_model(&model, &fixture.sequence_tokens)
-    });
-
-    let parallel_pool = ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .expect("four-thread pool");
-    let parallel_i16 = parallel_pool.install(|| {
-        let mut model = build_fixture_model(&fixture);
-        model.enable_i16();
-        assert_eq!(
-            model.effective_precision_label(),
-            "INT16 integer (per-row, cross-platform deterministic)"
-        );
-        run_whole_model(&model, &fixture.sequence_tokens)
-    });
-
     let expected = expected_sequence(&fixture);
-    assert_eq!(scalar, expected, "one-thread I8 path drifted from the KAT");
-    assert_eq!(
-        parallel_i16, expected,
-        "four-thread promoted-I16 path drifted from the KAT"
-    );
+
+    // Exercise the exact production compute primitive under the widths users
+    // can select with --threads / POST /node/threads. A scheduler or reduction
+    // change must never alter tokens, logits, or KV-cache bytes.
+    for threads in [1, 2, 4] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("determinism test pool");
+
+        let (i8, promoted_i16) = pool.install(|| {
+            let model = build_fixture_model(&fixture);
+            assert_eq!(
+                hex::encode(model.weight_hash().0),
+                fixture.expected.model_weight_hash
+            );
+            let i8 = run_whole_model(&model, &fixture.sequence_tokens);
+
+            let mut model = build_fixture_model(&fixture);
+            model.enable_i16();
+            assert_eq!(
+                model.effective_precision_label(),
+                "INT16 integer (per-row, cross-platform deterministic)"
+            );
+            let promoted_i16 = run_whole_model(&model, &fixture.sequence_tokens);
+            (i8, promoted_i16)
+        });
+
+        assert_eq!(
+            i8, expected,
+            "{threads}-thread I8 path drifted from the KAT"
+        );
+        assert_eq!(
+            promoted_i16, expected,
+            "{threads}-thread promoted-I16 path drifted from the KAT"
+        );
+    }
 }
 
 #[test]
 fn golden_cached_integer_three_way_shards_match_whole_model() {
     let fixture = fixture();
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .expect("four-thread pool");
-
-    let (full_shard, split_shards) = pool.install(|| {
-        let mut full_model = build_fixture_model(&fixture);
-        full_model.enable_i16();
-        let full = run_full_shard(&full_model, &fixture.sequence_tokens);
-
-        let mut split_model = build_fixture_model(&fixture);
-        split_model.enable_i16();
-        let split = run_split_shards(
-            &split_model,
-            &fixture.sequence_tokens,
-            &fixture.shard_boundaries,
-        );
-        (full, split)
-    });
-
     let expected = expected_sequence(&fixture);
-    assert_eq!(
-        full_shard, expected,
-        "whole-model shard drifted from the KAT"
-    );
-    assert_eq!(
-        split_shards.sequence, expected,
-        "three-way shard pipeline drifted from the KAT"
-    );
-    assert_eq!(
-        split_shards.hidden_hashes, fixture.expected.shard_hidden_hashes,
-        "a shard-boundary hidden state drifted from the KAT"
-    );
+
+    for threads in [1, 2, 4] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("determinism test pool");
+
+        let (full_shard, split_shards) = pool.install(|| {
+            let mut full_model = build_fixture_model(&fixture);
+            full_model.enable_i16();
+            let full = run_full_shard(&full_model, &fixture.sequence_tokens);
+
+            let mut split_model = build_fixture_model(&fixture);
+            split_model.enable_i16();
+            let split = run_split_shards(
+                &split_model,
+                &fixture.sequence_tokens,
+                &fixture.shard_boundaries,
+            );
+            (full, split)
+        });
+
+        assert_eq!(
+            full_shard, expected,
+            "{threads}-thread whole-model shard drifted from the KAT"
+        );
+        assert_eq!(
+            split_shards.sequence, expected,
+            "{threads}-thread three-way shard pipeline drifted from the KAT"
+        );
+        assert_eq!(
+            split_shards.hidden_hashes, fixture.expected.shard_hidden_hashes,
+            "{threads}-thread shard-boundary hidden state drifted from the KAT"
+        );
+    }
 }
 
 #[test]
 fn golden_cached_integer_autoregressive_output_matches_known_answer() {
     let fixture = fixture();
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .expect("four-thread pool");
-    let (tokens, output_hash) = pool.install(|| {
-        let mut model = build_fixture_model(&fixture);
-        model.enable_i16();
-        model.generate(
-            &fixture.generation_prompt,
-            fixture.generation_max_tokens,
-            &[],
-        )
-    });
 
-    assert_eq!(tokens, fixture.expected.generated_tokens);
-    assert_eq!(
-        hex::encode(output_hash.0),
-        fixture.expected.generated_output_hash
-    );
+    for threads in [1, 2, 4] {
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .expect("determinism test pool");
+        let (tokens, output_hash) = pool.install(|| {
+            let mut model = build_fixture_model(&fixture);
+            model.enable_i16();
+            model.generate(
+                &fixture.generation_prompt,
+                fixture.generation_max_tokens,
+                &[],
+            )
+        });
+
+        assert_eq!(
+            tokens, fixture.expected.generated_tokens,
+            "{threads}-thread generation changed tokens"
+        );
+        assert_eq!(
+            hex::encode(output_hash.0),
+            fixture.expected.generated_output_hash,
+            "{threads}-thread generation changed the output hash"
+        );
+    }
 }
