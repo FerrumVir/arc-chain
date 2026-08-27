@@ -2504,6 +2504,12 @@ impl StateDB {
                     "canonical block linkage/hash invalid at height {height}"
                 )));
             }
+            if block.header.protocol_version.major == 3 && block.header.proof_hash == Hash256::ZERO
+            {
+                return Err(StateError::PersistenceError(format!(
+                    "protocol-v3 canonical block {height} is not bound to a DAG decision"
+                )));
+            }
             previous = block;
         }
         Ok(())
@@ -3487,11 +3493,13 @@ mod tests {
         transaction.fee = crate::V3_MIN_TRANSFER_FEE;
         state.sign_transaction(&mut transaction, &sender).unwrap();
         let transaction_hash = transaction.hash;
+        let dag_decision = hash_bytes(b"test recovery DAG decision at H+2");
         let (block, receipts) = state
-            .execute_block_adaptive_at(
+            .execute_block_adaptive_at_with_proof(
                 &[transaction],
                 validator_keys[0].address(),
                 1_787_777_001_000,
+                dag_decision,
             )
             .unwrap();
         assert!(receipts[0].success);
@@ -3501,6 +3509,7 @@ mod tests {
             "the first ordinary transaction block must be H+2 after the dedicated H+1 transition"
         );
         assert_eq!(block.header.protocol_version, RECOVERY_PROTOCOL_VERSION);
+        assert_eq!(block.header.proof_hash, dag_decision);
         let root = block.header.state_root;
         let height = block.header.height;
         drop(state);
