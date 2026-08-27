@@ -37,6 +37,13 @@ const ACTIVE_RECOVERY_MARKER: &str = "recovery.active";
 const ACTIVE_RECOVERY_PREFIX: &str = "recovery-";
 const ACTIVE_RECOVERY_SUFFIX: &str = ".arcchkpt";
 
+/// The third prefunded legacy system account funds the one-time conversion
+/// of synthetic legacy validator weights into real bonded account balances.
+/// The transition debits it exactly; it never mints stake.
+pub fn recovery_stake_reserve_address() -> Address {
+    hash_bytes(&[2u8])
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryValidator {
     pub address: Address,
@@ -674,44 +681,41 @@ impl RecoveryPayload {
             )));
         }
 
-        let source_validators: HashMap<_, _> = self.validators.iter().copied().collect();
-        for (address, stake) in &self.validators {
-            let account_index = self
-                .accounts
-                .binary_search_by_key(&address.0, |entry| entry.0.0)
-                .map_err(|_| {
-                    RecoveryError::Invalid(format!(
-                        "source validator {address} has no account record"
-                    ))
-                })?;
-            let account = &self.accounts[account_index].1;
-            if account.staked_balance != *stake {
-                return Err(RecoveryError::Invalid(format!(
-                    "source validator {address} account stake {} differs from validator-map stake {stake}",
-                    account.staked_balance
-                )));
-            }
-        }
-        for (address, account) in &self.accounts {
-            if account.staked_balance != 0 && !source_validators.contains_key(address) {
-                return Err(RecoveryError::Invalid(format!(
-                    "account {address} has bonded stake {} but is absent from the source validator map",
-                    account.staked_balance
-                )));
-            }
-        }
-
         let mut accounts = self.accounts.clone();
-        // Release each old validator's bonded position only in the migration
-        // view, then bond the exact same aggregate amount to the approved new
-        // set. Liquid balances, nonces, code, and total account supply remain
-        // unchanged.
-        for (address, _) in &self.validators {
-            let index = accounts
-                .binary_search_by_key(&address.0, |entry| entry.0.0)
-                .expect("source validator account was validated above");
-            accounts[index].1.staked_balance = 0;
+        // Some legacy fleets recorded validator weights only in the validator
+        // map; their account.staked_balance remained zero. Move any real legacy
+        // bonds into the target positions, then fund only the synthetic
+        // shortfall from an explicit prefunded system reserve. This handles
+        // both legacy shapes while conserving liquid+bonded supply exactly.
+        let mut real_legacy_bonds = 0u64;
+        for (_, account) in &mut accounts {
+            real_legacy_bonds = real_legacy_bonds
+                .checked_add(account.staked_balance)
+                .ok_or_else(|| {
+                    RecoveryError::Invalid("legacy account stake exceeds u64::MAX".into())
+                })?;
+            account.staked_balance = 0;
         }
+        let reserve_debit = target_stake.checked_sub(real_legacy_bonds).ok_or_else(|| {
+            RecoveryError::Invalid(format!(
+                "real legacy account bonds {real_legacy_bonds} exceed target stake {target_stake}"
+            ))
+        })?;
+        let reserve_address = recovery_stake_reserve_address();
+        let reserve_index = accounts
+            .binary_search_by_key(&reserve_address.0, |entry| entry.0.0)
+            .map_err(|_| {
+                RecoveryError::Invalid(format!(
+                    "recovery stake reserve {reserve_address} is absent from source state"
+                ))
+            })?;
+        if accounts[reserve_index].1.balance < reserve_debit {
+            return Err(RecoveryError::Invalid(format!(
+                "recovery stake reserve has {}, needs {reserve_debit}",
+                accounts[reserve_index].1.balance
+            )));
+        }
+        accounts[reserve_index].1.balance -= reserve_debit;
         for validator in validators {
             let index = match accounts.binary_search_by_key(&validator.address.0, |entry| entry.0.0)
             {
@@ -1661,6 +1665,11 @@ mod tests {
             total = total.checked_add(validator.stake).unwrap();
         }
         state.staking_pool.store(total, Ordering::Release);
+        let reserve = recovery_stake_reserve_address();
+        state
+            .accounts
+            .insert(reserve.0, Account::new(reserve, total.saturating_mul(2)));
+        state.dirty_accounts.insert(reserve.0);
     }
 
     fn checkpoint() -> (ArcCheckpoint, Vec<KeyPair>, RecoveryNetworkPolicy) {
@@ -1766,6 +1775,64 @@ mod tests {
                 .unwrap();
             assert_eq!(transitioned[index].1.staked_balance, 0);
         }
+        for validator in &target_validators {
+            let index = transitioned
+                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+                .unwrap();
+            assert_eq!(transitioned[index].1.staked_balance, validator.stake);
+        }
+    }
+
+    #[test]
+    fn synthetic_legacy_validator_weights_are_bonded_from_system_reserve() {
+        let (_, source_validators) = validators();
+        let (_, target_validators) = validators();
+        let total: u64 = source_validators
+            .iter()
+            .map(|validator| validator.stake)
+            .sum();
+        let reserve = recovery_stake_reserve_address();
+        let state = StateDB::with_genesis(&[(reserve, total * 2), (hash_bytes(b"holder"), 42)]);
+        for validator in &source_validators {
+            state
+                .validators
+                .insert(validator.address.0, validator.stake);
+        }
+        state.staking_pool.store(total, Ordering::Release);
+        let source_supply: u128 = state
+            .export_recovery_payload()
+            .accounts
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+
+        let checkpoint = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"synthetic-stake-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        let transitioned = checkpoint
+            .payload
+            .transition_accounts(&target_validators)
+            .unwrap();
+        let target_supply: u128 = transitioned
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+        assert_eq!(source_supply, target_supply);
+        let reserve_index = transitioned
+            .binary_search_by_key(&reserve.0, |entry| entry.0.0)
+            .unwrap();
+        assert_eq!(transitioned[reserve_index].1.balance, total);
         for validator in &target_validators {
             let index = transitioned
                 .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
@@ -2152,7 +2219,7 @@ mod tests {
         .unwrap();
         let root = state.get_state_root();
         state.wal.append(WalOp::Checkpoint(root), state.height());
-        state.wal.sync();
+        state.wal.sync().unwrap();
         drop(state);
 
         let loaded =
