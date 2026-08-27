@@ -30,7 +30,8 @@ import type { EarningsProjection, RewardEconomics } from "../lib/types";
  * 5. **This is a testnet treasury transfer, not revenue.** Stated on every
  *    variant. No fiat figure and no currency symbol appears anywhere.
  * 6. **Every number is attributable.** The host each figure came from is named
- *    inline, because the seeds are separate chains.
+ *    inline. Cross-source aggregation requires independently verified
+ *    canonical agreement.
  *
  * Two reads are joined here: `/worker/earnings/{addr}` supplies the rate and
  * the reward and rollout gate, `/economics/rewards` supplies worker certificate
@@ -223,7 +224,8 @@ function TreasuryLine({
         {remaining !== null && (
           <> — about {formatInt(remaining)} more successful 0x25 receipts</>
         )}
-        . Do not aggregate it across the currently divergent public seeds.
+        . Do not aggregate host-scoped evidence across sources without verified
+        canonical agreement.
       </p>
     );
   }
@@ -253,8 +255,8 @@ function TreasuryLine({
           </>
         )}
         . Rewards stop when it is empty. This is a finite host-scoped treasury,
-        not a balance reserved for you; do not combine it with another seed
-        while the public fleet is divergent.
+        not a balance reserved for you; do not aggregate it with another source
+        unless canonical agreement is independently verified.
       </div>
       {econ.fundingDetail && (
         <div

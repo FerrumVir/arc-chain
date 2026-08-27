@@ -28,13 +28,10 @@ import type {
 /**
  * The Network screen: check the chain, any time, without leaving the app.
  *
- * Everything here reads the ONE pinned chain host. That is not a performance
- * choice — the six seeds are independent chains that share a DAG round but not
- * state, with different block hashes at the same height and heights spanning
- * 51k to 135k. Reading two and showing them side by side would present a
- * structural divergence as if it were a fault, and would make a balance or a
- * height look wrong when both were correct for their own chain. See CLAUDE.md
- * rule 4.
+ * Everything here reads one selected chain host and attributes every value to
+ * it. Fleet-wide canonicality, the signed legacy checkpoint, and preserved
+ * forks belong in the composite explorer, which audits those sources instead
+ * of blending them into one unqualified number.
  *
  * This screen replaced an "Explorer" button that opened
  * `http://140.82.16.112:3200` — a hardcoded LAX IP, serving a network
@@ -65,6 +62,10 @@ const BLOCK_AGE_STALL_SECS = 3600;
 
 /** ARC base units per whole ARC, for rendering validator stake. */
 const ARC_BASE_UNITS = 1_000_000_000;
+
+/** Public composite explorer deployed from this repository's Pages artifact. */
+const COMPOSITE_EXPLORER_URL =
+  "https://ferrumvir.github.io/arc-chain/explorer/";
 
 export function Network() {
   const pendingLookup = useAppStore((s) => s.pendingLookup);
@@ -148,16 +149,26 @@ export function Network() {
             )}
           </p>
         </div>
-        {host && (
+        <div style={{ display: "flex", gap: "var(--space-2)", flexWrap: "wrap" }}>
           <button
-            className="btn btn-secondary"
-            onClick={() => api.openExternal(`${host}/block/latest`)}
-            data-testid="btn-open-raw-json"
-            title={`Opens ${host}/block/latest in your browser — the newest block header as this host serves it.`}
+            className="btn btn-primary"
+            onClick={() => api.openExternal(COMPOSITE_EXPLORER_URL)}
+            data-testid="btn-open-composite-explorer"
+            title="Opens ARC's canonical checkpoint, protocol-v3 continuation, and explicit preserved-fork views."
           >
-            <ArrowUpRight size={14} /> Raw block JSON ({hostLabel(host)})
+            <ArrowUpRight size={14} /> Composite explorer
           </button>
-        )}
+          {host && (
+            <button
+              className="btn btn-secondary"
+              onClick={() => api.openExternal(`${host}/block/latest`)}
+              data-testid="btn-open-raw-json"
+              title={`Opens ${host}/block/latest in your browser — the newest block header as this host serves it.`}
+            >
+              <ArrowUpRight size={14} /> Raw block JSON ({hostLabel(host)})
+            </button>
+          )}
+        </div>
       </div>
 
       {overview?.unavailable && (
@@ -417,9 +428,9 @@ function TxLookupCard({
           lineHeight: 1.6,
         }}
       >
-        Resolved against the one chain host this session is pinned to. A hash
-        that exists on a different seed will not be found here — the seeds are
-        separate chains.
+        Resolved against the selected chain host. For checkpoint-spanning
+        history, replica agreement, or a preserved fork, use the composite
+        explorer; this host-scoped lookup never blends sources.
       </p>
 
       {lookup.error && (
@@ -852,7 +863,8 @@ function RecentInferenceCard({
           data-testid="padding-filtered-note"
         >
           {formatInt(dropped)} row{dropped === 1 ? "" : "s"} from{" "}
-          {hostLabel(host)} were not inference records — this endpoint tops its
+          {hostLabel(host)} {dropped === 1 ? "was" : "were"} not an inference
+          record{dropped === 1 ? "" : "s"} — this endpoint tops its
           list up with unrelated transactions once real attestations run out.
           They are excluded here.
         </p>

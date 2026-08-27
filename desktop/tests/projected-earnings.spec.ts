@@ -56,8 +56,8 @@ test.describe("Projected earnings - populated", () => {
     await expect(assumptions).toContainText("successful mined 0x25");
     await expect(assumptions).toContainText("approval collection");
     await expect(assumptions).toContainText("no worker bond");
-    // The rate must be attributed to a host, because the seeds are separate
-    // chains and a rate from one says nothing about another.
+    // The rate must be attributed to a host. Cross-source aggregation requires
+    // independently verified canonical agreement.
     await expect(assumptions).toContainText(/LAX|\d+\.\d+\.\d+\.\d+/);
   });
 
@@ -81,6 +81,10 @@ test.describe("Projected earnings - populated", () => {
     await expect(treasury).toContainText("ARC");
     // The anti-"unlimited payout" sentence.
     await expect(treasury).toContainText("Rewards stop when it is empty");
+    await expect(treasury).toContainText(
+      "unless canonical agreement is independently verified",
+    );
+    await expect(treasury).not.toContainText("public fleet is divergent");
   });
 
   test("shows consensus global, worker, and coordinator promotional caps", async ({

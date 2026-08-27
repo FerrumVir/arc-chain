@@ -54,6 +54,8 @@ test.describe("Dashboard zero-peer recovery", () => {
     // threshold into an earnings promise.
     await expect(banner).toContainText("Client mode");
     await expect(banner).toContainText("scoped to that host");
+    await expect(banner).toContainText("composite explorer");
+    await expect(banner).not.toContainText("public seeds remain divergent");
     await expect(banner).toContainText("cannot receive peer-routed community work");
     await expect(banner).toContainText("0 peers");
     await expect(banner).toContainText("NYC");

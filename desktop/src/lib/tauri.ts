@@ -59,7 +59,7 @@ function liveBase(): string | null {
 const MOCK_REWARD_PER_RECEIPT = 2.5;
 
 const SETTLEMENT_WRITE_UNAVAILABLE =
-  "is unavailable in the v0.8.0 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
+  "is unavailable before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not ready on the selected path. VRF selection and server-derived replica labels are not validator approval. Unpaid inference remains available, but running it does not earn ARC.";
 
 function settlementWriteUnavailable(flow: string): Error {
   return new Error(`${flow} ${SETTLEMENT_WRITE_UNAVAILABLE}`);

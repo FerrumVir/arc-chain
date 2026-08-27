@@ -103,4 +103,20 @@ test.describe("Onboarding wizard", () => {
       /do not multiply rewards or guarantee demand/i,
     );
   });
+
+  test("observer setup never claims that a model will be downloaded", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    await page.getByTestId("btn-continue-welcome").click();
+    await page.getByTestId("btn-reveal-seed").click();
+    await page.getByTestId("btn-continue-identity").click();
+    await page.getByTestId("tier-skip").click();
+    await page.getByTestId("btn-continue-model").click();
+
+    const summary = page.getByTestId("launch-summary");
+    await expect(summary).toContainText("observer/router");
+    await expect(summary).toContainText("without local model execution");
+    await expect(summary).not.toContainText("fetch the selected model");
+  });
 });

@@ -745,9 +745,11 @@ export function Onboarding() {
                               ? "Claiming welcome tokens"
                               : "Finishing up"}
                 </h1>
-                <p className="onboarding-subtitle">
+                <p className="onboarding-subtitle" data-testid="launch-summary">
                   {!launching &&
-                    "We'll fetch the selected model, download the node binary, start the process, and request testnet faucet credit. Setup does not guarantee peers, work, or rewards."}
+                    (selectedTier === "skip"
+                      ? "We'll download the node binary, start an observer/router without local model execution, and request testnet faucet credit. Setup does not guarantee peers, work, or rewards."
+                      : "We'll fetch the selected model, download the node binary, start the process, and request testnet faucet credit. Setup does not guarantee peers, work, or rewards.")}
                   {launching && launchStage === "model" && modelProgress && (
                     <>
                       {formatBytes(modelProgress.downloadedBytes)} of{" "}

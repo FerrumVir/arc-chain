@@ -63,10 +63,9 @@ export function Earnings() {
           >
             <p style={{ marginTop: 0 }}>
               A raw <code>InferenceAttestation</code> (<code>0x16</code>) is a
-              computation claim and pays nothing. The candidate&rsquo;s
-              configured <strong>2.50 ARC</strong> amount applies only when a
-              separate <code>CommunityInferenceReward</code> (<code>0x25</code>)
-              transaction succeeds in a mined block.
+              computation claim and pays nothing. Any policy-reported ARC reward
+              applies only when a separate <code>CommunityInferenceReward</code>{" "}
+              (<code>0x25</code>) transaction succeeds in a mined block.
             </p>
             <p>All of these gates have to pass first:</p>
             <ol style={{ paddingLeft: "1.2em" }}>

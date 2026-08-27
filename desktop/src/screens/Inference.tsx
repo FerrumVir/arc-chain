@@ -32,14 +32,10 @@ const EXAMPLES = [
 /// coordinator via /inference/run_consensus so a fresh-install user gets
 /// a real answer without configuring anything.
 ///
-/// Second fallback: if /inference/run_consensus fails on every coordinator
-/// with "Pipeline gap" (chain-side bug: retired SAO+JNB shards still in
-/// the ShardRegistry trip every coordinator's planner before any token is
-/// emitted), retry against the same coordinators using /inference/run
-/// directly. This loses k-of-n agreement and does not imply an on-chain
-/// attestation or payment, but the response remains explicitly labelled with
-/// its coordinator. Once the ShardRegistry is complete, this third tier
-/// becomes dormant.
+/// Second fallback: if /inference/run_consensus reports a service/topology
+/// failure, retry against the same coordinators using /inference/run directly.
+/// This loses k-of-n agreement and does not imply an on-chain attestation or
+/// payment, but the response remains explicitly labelled with its coordinator.
 async function runInferenceSmart(
   prompt: string,
   maxTokens: number,
@@ -142,9 +138,10 @@ export function Inference() {
                   trace shows shard hops only when the coordinator reports one.
                 </p>
                 <p>
-                  2. Returns the reported output commitment and model ID. In
-                  the candidate the model ID hashes every artifact byte; public
-                  v2 seeds still report a shape-derived ID.
+                  2. Returns the reported output commitment and model ID. On
+                  the protocol-v3 path the model ID hashes every artifact byte.
+                  Older nodes may report only a shape-derived ID, which is not
+                  exact artifact identity.
                 </p>
                 <p>
                   3. The serving coordinator may submit an{" "}
@@ -167,8 +164,9 @@ export function Inference() {
                 fontSize: "var(--text-xs)",
                 color: "var(--text-muted)",
               }}
+              data-testid="inference-model-policy"
             >
-              model: Llama-2-7B-Chat Q4
+              model identity: reported with response
             </span>
           }
         />
@@ -263,9 +261,9 @@ export function Inference() {
             <span>
               <strong>Testnet escrow is unavailable.</strong> Exact-artifact
               binding and validator-authorized settlement are not complete, so
-              this build will not sign or submit a paid request. Free/community
-              inference remains available. VRF or replica selection is not
-              validator payment approval.
+              this build will not sign or submit a paid request. Unpaid
+              inference remains available, but running it does not earn ARC.
+              VRF or replica selection is not validator payment approval.
             </span>
           </div>
           <div style={{ flex: 1, minWidth: "var(--space-3)" }} />

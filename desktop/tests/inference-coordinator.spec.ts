@@ -90,7 +90,8 @@ test.describe("Inference - coordinator fallback (Milestone A, #35)", () => {
     const unavailable = page.getByTestId("paid-mode-unavailable");
     await expect(unavailable).toContainText("Testnet escrow is unavailable");
     await expect(unavailable).toContainText("will not sign or submit");
-    await expect(unavailable).toContainText("Free/community inference remains available");
+    await expect(unavailable).toContainText("Unpaid inference remains available");
+    await expect(unavailable).toContainText("does not earn ARC");
     await expect(unavailable).toContainText(
       "VRF or replica selection is not validator payment approval",
     );
@@ -98,6 +99,12 @@ test.describe("Inference - coordinator fallback (Milestone A, #35)", () => {
     await expect(page.getByTestId("inference-max-fee")).toHaveCount(0);
     await expect(page.getByTestId("btn-run-inference")).toContainText(
       "Run inference",
+    );
+    await expect(page.getByTestId("inference-model-policy")).toHaveText(
+      "model identity: reported with response",
+    );
+    await expect(page.getByTestId("inference-screen")).not.toContainText(
+      "model: Llama-2-7B-Chat Q4",
     );
 
     await page.getByTestId("inference-prompt").fill("Free path");

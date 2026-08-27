@@ -359,8 +359,9 @@ export function Dashboard() {
               <strong>Client mode</strong> — your node has 0 peers, so reads and
               inference requests are using {hostLabel(status.coordinatorUrl)}.
               Any balance, faucet response, or transaction is scoped to that
-              host while the public seeds remain divergent. This process cannot
-              receive peer-routed community work in its current state.
+              host. Use the composite explorer to audit canonical agreement and
+              preserved forks. This process cannot receive peer-routed community
+              work in its current state.
             </>
           ) : (
             <>
@@ -582,8 +583,8 @@ export function Dashboard() {
             children: (
               <p>
                 Validator records reported by the one chain host selected for
-                this session. Because the public seeds currently diverge, this
-                is not a trustworthy network-wide node count.
+                this session. Treat this as host-scoped unless canonical fleet
+                agreement is independently verified.
               </p>
             ),
           }}
@@ -602,8 +603,9 @@ export function Dashboard() {
                 </p>
                 <p>
                   Round progress does not prove block finality or agreement
-                  with the other public seeds. Check block age, hash, and state
-                  root before describing the chain as healthy.
+                  with other sources. Check block age, hash, state root, and the
+                  composite recovery boundary before describing the chain as
+                  healthy.
                 </p>
               </>
             ),
@@ -638,8 +640,8 @@ export function Dashboard() {
                 Recent inference claims
                 <InfoPopover title="What this evidence proves">
                   <p>
-                    In the v0.8.0 candidate, a worker is eligible only after
-                    it fully loads the exact model artifact requested. The
+                    On the protocol-v3 path, a worker is eligible only after it
+                    fully loads the exact model artifact requested. The
                     coordinator independently recomputes every token through
                     authenticated 2-of-3 agreement for each layer range.
                   </p>
@@ -659,10 +661,10 @@ export function Dashboard() {
                     receipt. With six equal validators, that means five.
                   </p>
                   <p style={{ color: "var(--text-muted)", fontSize: 11 }}>
-                    Raw <code>0x16</code> attestations pay nothing. The
-                    configured <code>2.5 ARC</code> amount applies only to a
-                    successful mined <code>0x25</code> receipt. This candidate
-                    fails closed while approval collection is unavailable.
+                    Raw <code>0x16</code> attestations pay nothing. Any
+                    policy-reported ARC reward applies only to a successful
+                    mined <code>0x25</code> receipt. Settlement fails closed
+                    while approval collection is unavailable.
                   </p>
                 </InfoPopover>
               </span>

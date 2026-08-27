@@ -98,6 +98,18 @@ test.describe("Network screen - identity and attribution", () => {
     await expect(btn).toContainText("Raw block JSON");
     await expect(btn).not.toContainText(/explorer/i);
   });
+
+  test("offers the canonical composite explorer without blending host data", async ({
+    page,
+  }) => {
+    await gotoNetwork(page);
+    const btn = page.getByTestId("btn-open-composite-explorer");
+    await expect(btn).toBeVisible();
+    await expect(btn).toHaveText(/Composite explorer/i);
+    await expect(page.getByTestId("tx-lookup")).toContainText(
+      "this host-scoped lookup never blends sources",
+    );
+  });
 });
 
 test.describe("Network screen - stalled block production", () => {
@@ -325,11 +337,14 @@ test.describe("Network screen - transaction lookup", () => {
     await expect(page.getByTestId("tx-status-not-found")).toHaveCount(0);
   });
 
-  test("states that a hash on another seed will not be found here", async ({
+  test("routes cross-boundary and preserved-fork questions to the composite explorer", async ({
     page,
   }) => {
     await gotoNetwork(page);
     await expect(page.getByTestId("tx-lookup")).toContainText(
+      "For checkpoint-spanning history, replica agreement, or a preserved fork",
+    );
+    await expect(page.getByTestId("tx-lookup")).not.toContainText(
       "the seeds are separate chains",
     );
   });
@@ -373,7 +388,7 @@ test.describe("Network screen - blocks and attestations", () => {
     const note = page.getByTestId("padding-filtered-note");
     await expect(note).toBeVisible();
     // The mock carries exactly one `tx_type: "Other"` padding row.
-    await expect(note).toContainText("were not inference records");
+    await expect(note).toContainText("1 row from LAX was not an inference record");
     // Three of four fixtures are real inference records.
     await expect(
       page.getByTestId("recent-inference").locator(".feed-item"),
