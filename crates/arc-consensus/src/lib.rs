@@ -490,6 +490,23 @@ impl DagBlock {
         Hash256(*hasher.finalize().as_bytes())
     }
 
+    /// Commit one exact recovery-domain DAG decision into the canonical state
+    /// block produced for it.
+    ///
+    /// The DAG hash already binds author, parents, transaction hashes,
+    /// timestamp, and ordering. Repeating the recovery domain and round here
+    /// gives the state layer a purpose-specific commitment which cannot be
+    /// replayed across chains, recovery epochs, validator sets, or DAG rounds.
+    pub fn state_decision_commitment(&self, domain: &ConsensusDomain) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-dag-state-decision-v3");
+        hasher.update(domain.domain_hash.as_ref());
+        hasher.update(&domain.recovery_epoch.to_be_bytes());
+        hasher.update(&domain.validator_set_id.to_be_bytes());
+        hasher.update(self.hash.as_ref());
+        hasher.update(&self.round.to_be_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
     /// Compute the ordering commitment for a list of transaction hashes.
     /// This is BLAKE3 over the concatenated tx hashes in **canonical lexicographic
     /// order**. Validators recompute this commitment by sorting the block's
@@ -677,7 +694,8 @@ pub struct ConsensusEngine {
     validator_keys: DashMap<Address, [u8; 32]>,
     /// Equivocation detector: (author, round) → first block hash seen.
     /// If a second block from the same author in the same round arrives,
-    /// that's equivocation and the author gets slashed.
+    /// legacy mode may slash it; a recovery domain preserves fixed authority
+    /// and fences any ambiguously certified leader round instead.
     author_round_blocks: DashMap<(Address, u64), Hash256>,
     /// Data availability commitments.
     pub da_commitments: DashMap<Hash256, data_availability::DACommitment>,
@@ -1549,7 +1567,6 @@ impl ConsensusEngine {
         // 7. Equivocation detection: same author must not have two blocks in the same round
         let key = (block.author, block.round);
         if let Some(equivocation) = self.detect_equivocation(block) {
-            // Equivocation detected! Slash the offender.
             let evidence =
                 arc_crypto::hash_pair(&equivocation.block1_hash, &equivocation.block2_hash);
             warn!(
@@ -1559,25 +1576,41 @@ impl ConsensusEngine {
                 equivocating_block = %equivocation.block2_hash,
                 "EQUIVOCATION DETECTED - validator produced two blocks in the same round"
             );
-            let mut vs = self.validator_set.write();
-            if let Ok(record) = vs.report_offense(
-                block.author,
-                SlashableOffense::EquivocationDAG,
-                evidence,
-                block.round,
-                block.timestamp,
-            ) {
+
+            if self.consensus_domain.read().is_some() {
+                // Protocol-v3 membership and voting power come exclusively
+                // from the signed recovery checkpoint. Applying a slash while
+                // receiving the second of two equivocations makes stake depend
+                // on message arrival order and can make honest validators use
+                // different parent/quorum thresholds. Retain both signed
+                // blocks as evidence; the commit rule below deterministically
+                // fences the ambiguous round without mutating authority.
                 warn!(
                     offender = %block.author,
-                    slash_amount = record.slash_amount,
-                    "Slash applied for DAG equivocation"
+                    evidence = %evidence,
+                    "Domain-bound equivocation retained as evidence; validator authority is unchanged"
                 );
-                // Actually reduce the validator's stake via enforce_slash
-                vs.apply_slash(&block.author, record.slash_amount);
+            } else {
+                // Preserve legacy behavior outside a recovery domain.
+                let mut vs = self.validator_set.write();
+                if let Ok(record) = vs.report_offense(
+                    block.author,
+                    SlashableOffense::EquivocationDAG,
+                    evidence,
+                    block.round,
+                    block.timestamp,
+                ) {
+                    warn!(
+                        offender = %block.author,
+                        slash_amount = record.slash_amount,
+                        "Slash applied for DAG equivocation"
+                    );
+                    // Actually reduce the validator's stake via enforce_slash
+                    vs.apply_slash(&block.author, record.slash_amount);
+                }
             }
-            drop(vs);
             // Still insert the equivocating block (the DAG handles it)
-            // but the validator has been penalized.
+            // so domain-bound commit can detect and fence ambiguity.
         } else {
             // Atomic insert-if-absent: use entry() API to avoid TOCTOU race
             // where two concurrent receive_block calls both pass contains_key
@@ -1653,6 +1686,42 @@ impl ConsensusEngine {
         Ok(())
     }
 
+    /// Return the unique-certifier stake of one valid two-round commit
+    /// certificate, or `None` when no such certificate is locally available.
+    fn two_round_commit_support(
+        &self,
+        block_hash: &Hash256,
+        round: u64,
+        validator_set: &ValidatorSet,
+    ) -> Option<u64> {
+        for child_hash in self.blocks_in_round(round + 1) {
+            let Some(child) = self.dag.get(&child_hash) else {
+                continue;
+            };
+            if !child.parents.contains(block_hash) {
+                continue;
+            }
+
+            let mut supporting_stake = 0u64;
+            let mut seen_certifiers = HashSet::new();
+            for certifier_hash in self.blocks_in_round(round + 2) {
+                if let Some(certifier) = self.dag.get(&certifier_hash)
+                    && certifier.parents.contains(&child_hash)
+                    && let Some(validator) = validator_set.get_validator(&certifier.author)
+                    && seen_certifiers.insert(certifier.author)
+                {
+                    supporting_stake = supporting_stake
+                        .checked_add(validator.stake)
+                        .expect("unique certifier stake cannot exceed checked total stake");
+                }
+            }
+            if supporting_stake >= validator_set.quorum {
+                return Some(supporting_stake);
+            }
+        }
+        None
+    }
+
     /// Try to commit blocks using the two-round commit rule.
     ///
     /// # Commit Rule
@@ -1673,6 +1742,7 @@ impl ConsensusEngine {
         }
         let current = self.current_round.load(Ordering::SeqCst);
         let mut newly_committed = Vec::new();
+        let domain_bound = self.consensus_domain.read().is_some();
 
         // We need at least round 2 to have any commits (R, R+1, R+2 pattern)
         if current < 2 {
@@ -1716,6 +1786,7 @@ impl ConsensusEngine {
                 Some(frozen_vals[r as usize % frozen_vals.len()])
             };
 
+            let mut certified_leader_blocks = Vec::<(DagBlock, u64)>::new();
             for block_b_hash in &round_r_blocks {
                 // Skip if already committed
                 if committed_set.contains(block_b_hash) {
@@ -1732,55 +1803,45 @@ impl ConsensusEngine {
                     continue; // Not the leader - skip
                 }
 
-                // Step 1: Find a block C in round R+1 that references B
-                let round_r1_blocks = self.blocks_in_round(r + 1);
-                for block_c_hash in &round_r1_blocks {
-                    if let Some(block_c) = self.dag.get(block_c_hash) {
-                        if !block_c.parents.contains(block_b_hash) {
-                            continue;
-                        }
-
-                        // Step 2: Check if C is referenced by >= quorum stake in round R+2
-                        let round_r2_blocks = self.blocks_in_round(r + 2);
-                        let mut supporting_stake = 0u64;
-                        let mut seen_certifiers = HashSet::new();
-
-                        for block_d_hash in &round_r2_blocks {
-                            if let Some(block_d) = self.dag.get(block_d_hash)
-                                && block_d.parents.contains(block_c_hash)
-                                && let Some(validator) = vs.get_validator(&block_d.author)
-                                && seen_certifiers.insert(block_d.author)
-                            {
-                                supporting_stake =
-                                    supporting_stake.checked_add(validator.stake).expect(
-                                        "unique certifier stake cannot exceed checked total stake",
-                                    );
-                            }
-                        }
-
-                        if supporting_stake >= vs.quorum {
-                            // Block B is committed!
-                            if let Some(block_b) = self.dag.get(block_b_hash) {
-                                info!(
-                                    round = block_b.round,
-                                    hash = %block_b.hash,
-                                    "Block committed via two-round rule"
-                                );
-
-                                debug!(
-                                    hash = %block_b.hash,
-                                    signing_stake = supporting_stake,
-                                    total_stake = vs.total_stake,
-                                    "Commit support observed; proof export remains disabled because D-block signatures do not sign a canonical B-finality transcript"
-                                );
-
-                                newly_committed.push(block_b.clone());
-                            }
-                            // Once committed via one certifier, no need to check others
-                            break;
-                        }
-                    }
+                if let Some(supporting_stake) = self.two_round_commit_support(block_b_hash, r, &vs)
+                    && let Some(block) = self.dag.get(block_b_hash)
+                {
+                    certified_leader_blocks.push((block.clone(), supporting_stake));
                 }
+            }
+
+            certified_leader_blocks.sort_by_key(|(block, _)| block.hash.0);
+            certified_leader_blocks.dedup_by_key(|(block, _)| block.hash.0);
+
+            if domain_bound && certified_leader_blocks.len() != 1 {
+                if certified_leader_blocks.len() > 1 {
+                    let hashes: Vec<_> = certified_leader_blocks
+                        .iter()
+                        .map(|(block, _)| block.hash)
+                        .collect();
+                    tracing::error!(
+                        round = r,
+                        leader = ?leader,
+                        ?hashes,
+                        "Ambiguous certified recovery-domain leader round; commit cursor is fenced"
+                    );
+                }
+                break;
+            }
+
+            for (block, supporting_stake) in certified_leader_blocks {
+                info!(
+                    round = block.round,
+                    hash = %block.hash,
+                    "Block committed via two-round rule"
+                );
+                debug!(
+                    hash = %block.hash,
+                    signing_stake = supporting_stake,
+                    total_stake = vs.total_stake,
+                    "Commit support observed; proof export remains disabled because D-block signatures do not sign a canonical B-finality transcript"
+                );
+                newly_committed.push(block);
             }
 
             let leader_block_committed = newly_committed.iter().any(|b| b.round == r);
@@ -2812,6 +2873,19 @@ mod tests {
         block
     }
 
+    fn make_block_in_domain(
+        author: Address,
+        round: u64,
+        parents: Vec<Hash256>,
+        transactions: Vec<Hash256>,
+        timestamp: u64,
+        domain: &ConsensusDomain,
+    ) -> DagBlock {
+        let mut block = make_block(author, round, parents, transactions, timestamp);
+        block.hash = block.compute_hash_in_domain(domain);
+        block
+    }
+
     // ── 1. Validator Set Management ──────────────────────────────────────────
 
     #[test]
@@ -3116,6 +3190,40 @@ mod tests {
     }
 
     #[test]
+    fn state_decision_commitment_binds_domain_block_hash_and_round() {
+        let domain = ConsensusDomain::new(hash_bytes(b"state-decision-domain"), 3, 9);
+        let block = make_block_in_domain(
+            test_addr(1),
+            7,
+            vec![hash_bytes(b"parent")],
+            vec![hash_bytes(b"tx")],
+            1_000,
+            &domain,
+        );
+        let commitment = block.state_decision_commitment(&domain);
+        assert_eq!(commitment, block.state_decision_commitment(&domain));
+        assert_ne!(commitment, Hash256::ZERO);
+
+        let other_hash_domain =
+            ConsensusDomain::new(hash_bytes(b"other-state-decision-domain"), 3, 9);
+        let other_epoch = ConsensusDomain::new(domain.domain_hash, 4, 9);
+        let other_set = ConsensusDomain::new(domain.domain_hash, 3, 10);
+        assert_ne!(
+            commitment,
+            block.state_decision_commitment(&other_hash_domain)
+        );
+        assert_ne!(commitment, block.state_decision_commitment(&other_epoch));
+        assert_ne!(commitment, block.state_decision_commitment(&other_set));
+
+        let mut other_hash = block.clone();
+        other_hash.hash = hash_bytes(b"other-dag-block-hash");
+        assert_ne!(commitment, other_hash.state_decision_commitment(&domain));
+        let mut other_round = block.clone();
+        other_round.round += 1;
+        assert_ne!(commitment, other_round.state_decision_commitment(&domain));
+    }
+
+    #[test]
     fn signed_recovery_cursor_allows_exactly_one_parentless_domain_round() {
         let vs = test_validator_set(4);
         let engine = ConsensusEngine::new(vs, test_addr(0));
@@ -3329,6 +3437,175 @@ mod tests {
     }
 
     // ── 4. Commit Rule ───────────────────────────────────────────────────────
+
+    fn install_certified_leader_equivocation(
+        engine: &ConsensusEngine,
+        domain: &ConsensusDomain,
+        reverse_arrival: bool,
+    ) -> (DagBlock, DagBlock) {
+        let mut validators: Vec<_> = engine
+            .frozen_validator_set()
+            .validators
+            .iter()
+            .map(|validator| validator.address)
+            .collect();
+        validators.sort_by_key(|address| address.0);
+        assert_eq!(validators.len(), 6);
+        let leader = validators[0];
+
+        let first = make_block_in_domain(
+            leader,
+            0,
+            Vec::new(),
+            vec![hash_bytes(b"equivocation-transfer-a")],
+            100,
+            domain,
+        );
+        let second = make_block_in_domain(
+            leader,
+            0,
+            Vec::new(),
+            vec![hash_bytes(b"equivocation-transfer-b")],
+            101,
+            domain,
+        );
+        let mut round_zero = vec![first.clone(), second.clone()];
+        round_zero.extend(
+            validators
+                .iter()
+                .copied()
+                .filter(|author| *author != leader)
+                .enumerate()
+                .map(|(index, author)| {
+                    make_block_in_domain(
+                        author,
+                        0,
+                        Vec::new(),
+                        Vec::new(),
+                        110 + index as u64,
+                        domain,
+                    )
+                }),
+        );
+        if reverse_arrival {
+            round_zero.reverse();
+        }
+        for block in &round_zero {
+            engine.receive_block(block).unwrap();
+        }
+        assert!(engine.advance_round());
+
+        // Every round-one block references both leader equivocations and one
+        // block from every other author. Each equivocation therefore has
+        // children, while parent stake is counted once per unique author.
+        let mut round_zero_parents: Vec<_> = round_zero.iter().map(|block| block.hash).collect();
+        round_zero_parents.sort_by_key(|hash| hash.0);
+        let mut round_one: Vec<_> = validators
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, author)| {
+                make_block_in_domain(
+                    author,
+                    1,
+                    round_zero_parents.clone(),
+                    Vec::new(),
+                    200 + index as u64,
+                    domain,
+                )
+            })
+            .collect();
+        if reverse_arrival {
+            round_one.reverse();
+        }
+        for block in &round_one {
+            engine.receive_block(block).unwrap();
+        }
+        assert!(engine.advance_round());
+
+        // Five equal-stake certifiers suffice; all six are supplied so both
+        // equivocating leader hashes independently satisfy the old rule.
+        let mut round_one_parents: Vec<_> = round_one.iter().map(|block| block.hash).collect();
+        round_one_parents.sort_by_key(|hash| hash.0);
+        let mut round_two: Vec<_> = validators
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, author)| {
+                make_block_in_domain(
+                    author,
+                    2,
+                    round_one_parents.clone(),
+                    Vec::new(),
+                    300 + index as u64,
+                    domain,
+                )
+            })
+            .collect();
+        if reverse_arrival {
+            round_two.reverse();
+        }
+        for block in &round_two {
+            engine.receive_block(block).unwrap();
+        }
+        (first, second)
+    }
+
+    fn validator_stakes(engine: &ConsensusEngine) -> Vec<(Address, u64)> {
+        let mut stakes: Vec<_> = engine
+            .validator_set()
+            .validators
+            .iter()
+            .map(|validator| (validator.address, validator.stake))
+            .collect();
+        stakes.sort_by_key(|entry| entry.0.0);
+        stakes
+    }
+
+    #[test]
+    fn recovery_domain_certified_leader_equivocation_fences_both_arrival_orders() {
+        let domain = ConsensusDomain::new(hash_bytes(b"equivocation-domain"), 1, 1);
+        let validator_set = test_validator_set(6);
+        let engine_forward = ConsensusEngine::new(validator_set.clone(), test_addr(0));
+        let engine_reverse = ConsensusEngine::new(validator_set, test_addr(0));
+        engine_forward
+            .install_consensus_domain(domain.clone())
+            .unwrap();
+        engine_reverse
+            .install_consensus_domain(domain.clone())
+            .unwrap();
+        let initial_forward = validator_stakes(&engine_forward);
+        let initial_reverse = validator_stakes(&engine_reverse);
+
+        let (forward_first, forward_second) =
+            install_certified_leader_equivocation(&engine_forward, &domain, false);
+        let (reverse_first, reverse_second) =
+            install_certified_leader_equivocation(&engine_reverse, &domain, true);
+        let frozen = engine_forward.frozen_validator_set();
+        assert!(
+            engine_forward
+                .two_round_commit_support(&forward_first.hash, 0, &frozen)
+                .is_some()
+        );
+        assert!(
+            engine_forward
+                .two_round_commit_support(&forward_second.hash, 0, &frozen)
+                .is_some()
+        );
+        assert_eq!(forward_first.hash, reverse_first.hash);
+        assert_eq!(forward_second.hash, reverse_second.hash);
+
+        for engine in [&engine_forward, &engine_reverse] {
+            assert!(engine.try_commit().is_empty());
+            assert!(engine.try_commit().is_empty());
+            assert_eq!(engine.last_committed_round(), 0);
+            assert!(engine.committed_blocks().is_empty());
+        }
+        assert_eq!(validator_stakes(&engine_forward), initial_forward);
+        assert_eq!(validator_stakes(&engine_reverse), initial_reverse);
+        assert_eq!(engine_forward.validator_set().total_stake, 6 * STAKE_ARC);
+        assert_eq!(engine_reverse.validator_set().total_stake, 6 * STAKE_ARC);
+    }
 
     #[test]
     fn test_commit_rule_two_round() {
