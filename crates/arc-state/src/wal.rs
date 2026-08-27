@@ -393,6 +393,13 @@ impl WalWriter {
         self.handle.is_some()
     }
 
+    /// Directory containing this writer's WAL file or segments.
+    ///
+    /// A null writer has no persistence target and therefore returns `None`.
+    pub fn directory(&self) -> Option<&Path> {
+        (!self.is_null).then_some(self.wal_dir.as_path())
+    }
+
     /// Return the first fatal writer failure, if persistence is unhealthy.
     pub fn failure(&self) -> Option<WalError> {
         self.failure.get().cloned()
@@ -1789,10 +1796,20 @@ mod tests {
     #[test]
     fn wal_null_writer() {
         let writer = WalWriter::null();
+        assert_eq!(writer.directory(), None);
         // Should not panic or error
         writer.append(WalOp::Checkpoint(Hash256::ZERO), 0);
         // Sync on null writer is a no-op
         writer.sync().unwrap();
+    }
+
+    #[test]
+    fn wal_writer_reports_its_persistence_directory() {
+        let wal_dir = tmp_dir("persistence-directory");
+        let writer = WalWriter::new(wal_dir.join("state.wal")).unwrap();
+        assert_eq!(writer.directory(), Some(wal_dir.as_path()));
+        drop(writer);
+        std::fs::remove_dir_all(wal_dir).unwrap();
     }
 
     #[test]

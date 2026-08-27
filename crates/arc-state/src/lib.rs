@@ -8387,6 +8387,13 @@ impl StateDB {
         self.wal.failure()
     }
 
+    /// Return the directory containing the active state WAL.
+    ///
+    /// Benchmark/in-memory states use a null WAL and return `None`.
+    pub fn persistence_dir(&self) -> Option<std::path::PathBuf> {
+        self.wal.directory().map(Path::to_path_buf)
+    }
+
     /// Flush WAL to disk and report whether the barrier was durable.
     pub fn try_sync_wal(&self) -> Result<(), StateError> {
         self.durable_wal_barrier()
@@ -9215,6 +9222,18 @@ mod tests {
             .to_string();
         assert!(error.contains("data directory genesis mismatch"), "{error}");
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn persistence_directory_is_exposed_only_for_durable_state() {
+        assert_eq!(StateDB::new().persistence_dir(), None);
+
+        let dir = persistent_test_dir("persistence-directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = StateDB::with_persistence(dir.join("state.wal")).unwrap();
+        assert_eq!(state.persistence_dir().as_deref(), Some(dir.as_path()));
+        drop(state);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
