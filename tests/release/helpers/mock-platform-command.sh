@@ -62,6 +62,16 @@ case "$command_name" in
         printf 'chown %s\n' "$*" >>"${MOCK_OWNER_LOG:?MOCK_OWNER_LOG is required}"
         exit 0
         ;;
+    runuser)
+        # The installer uses runuser only to prove the selected community user
+        # can access its directories. The contract test cannot create an OS
+        # account, so consume `-u USER --` and execute the probe unchanged.
+        [ "${1:-}" = -u ] && [ "$#" -ge 4 ] || exit 2
+        shift 2
+        [ "${1:-}" = -- ] || exit 2
+        shift
+        "$@"
+        ;;
     sudo)
         printf '%s %s\n' "$command_name" "$*" >>"${MOCK_SERVICE_LOG:?MOCK_SERVICE_LOG is required}"
         exit 0

@@ -54,7 +54,7 @@ new_sandbox() {
     cp "$TEST_DIR/helpers/mock-curl.sh" "$mock_bin/curl"
     cp "$TEST_DIR/helpers/mock-platform-command.sh" "$mock_bin/platform-command"
     chmod +x "$mock_bin/curl" "$mock_bin/platform-command"
-    for command_name in uname sleep free sysctl openssl hostname id getent chown sudo systemctl launchctl; do
+    for command_name in uname sleep free sysctl openssl hostname id getent chown runuser sudo systemctl launchctl; do
         ln -s platform-command "$mock_bin/$command_name"
     done
     NEW_SANDBOX="$sandbox"
@@ -112,7 +112,11 @@ assert_log_contains_literal() {
 
 file_mode() {
     local file="$1"
-    stat -f '%Lp' "$file" 2>/dev/null || stat -c '%a' "$file"
+    # GNU stat accepts `-f` but interprets it as filesystem statistics, so a
+    # BSD-first probe can succeed with several lines of unrelated output.
+    # GNU's file-format form is unambiguous; BSD stat rejects it and falls
+    # through to its native `%Lp` format.
+    stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file"
 }
 
 file_sha256() {

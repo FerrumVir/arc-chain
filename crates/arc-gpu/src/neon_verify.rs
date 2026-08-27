@@ -123,9 +123,9 @@ fn neon_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
 fn neon_batch_verify_inner(tasks: &[VerifyTask]) -> Vec<bool> {
     use rayon::prelude::*;
     if tasks.len() >= 256 {
-        tasks.par_iter().map(|t| verify_custom(t)).collect()
+        tasks.par_iter().map(verify_custom).collect()
     } else {
-        tasks.iter().map(|t| verify_custom(t)).collect()
+        tasks.iter().map(verify_custom).collect()
     }
 }
 
