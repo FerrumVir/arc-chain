@@ -96,6 +96,95 @@ const COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS: u64 = 120_000;
 const COMMUNITY_AUTH_REPLAY_RETENTION_MS: u64 = COMMUNITY_AUTH_MAX_CLOCK_SKEW_MS * 2 + 1;
 const COMMUNITY_AUTH_REPLAY_CACHE_MAX: usize = 100_000;
 const COMMUNITY_MUTATION_BODY_LIMIT_BYTES: usize = 64 * 1024;
+const COMMUNITY_RPC_BASE_MAX: usize = 64;
+const COMMUNITY_RPC_BASE_MAX_BYTES: usize = 2_048;
+
+/// Validate and canonicalize operator-configured RPC origins.
+///
+/// Community requests carry signed prompts, results, and validator approval
+/// payloads. Signatures provide integrity but not confidentiality, so a
+/// production remote origin must use HTTPS. Plain HTTP is accepted only for
+/// loopback or behind the explicit disposable-dev override. Redirects are
+/// disabled on the clients that consume these bases.
+pub fn validate_community_rpc_bases(
+    raw_bases: &[String],
+    allow_insecure_remote_http_for_dev: bool,
+) -> Result<Vec<String>, String> {
+    if raw_bases.len() > COMMUNITY_RPC_BASE_MAX {
+        return Err(format!(
+            "configured {} community RPC bases; maximum is {COMMUNITY_RPC_BASE_MAX}",
+            raw_bases.len()
+        ));
+    }
+    let mut canonical = std::collections::BTreeSet::new();
+    for raw in raw_bases {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err("community RPC base URL cannot be empty".to_string());
+        }
+        if raw.len() > COMMUNITY_RPC_BASE_MAX_BYTES {
+            return Err(format!(
+                "community RPC base URL exceeds {COMMUNITY_RPC_BASE_MAX_BYTES} bytes"
+            ));
+        }
+        let url = reqwest::Url::parse(raw)
+            .map_err(|error| format!("invalid community RPC base URL {raw:?}: {error}"))?;
+        if url.cannot_be_a_base() {
+            return Err(format!(
+                "community RPC URL {raw:?} is not an absolute base URL"
+            ));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(format!(
+                "community RPC URL {raw:?} must not contain userinfo or credentials"
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(format!(
+                "community RPC URL {raw:?} must not contain a query or fragment"
+            ));
+        }
+        if !matches!(url.path(), "" | "/") {
+            return Err(format!(
+                "community RPC URL {raw:?} must be an origin without a path"
+            ));
+        }
+        let host = url
+            .host_str()
+            .ok_or_else(|| format!("community RPC URL {raw:?} has no host"))?;
+        let host_without_dot = host.trim_end_matches('.');
+        let parsed_ip = host_without_dot.parse::<std::net::IpAddr>().ok();
+        if parsed_ip.is_some_and(|ip| ip.is_unspecified()) {
+            return Err(format!(
+                "community RPC URL {raw:?} uses an unspecified bind address"
+            ));
+        }
+        if url.port() == Some(0) {
+            return Err(format!("community RPC URL {raw:?} uses port zero"));
+        }
+        let loopback = host_without_dot.eq_ignore_ascii_case("localhost")
+            || host_without_dot
+                .to_ascii_lowercase()
+                .ends_with(".localhost")
+            || parsed_ip.is_some_and(|ip| ip.is_loopback());
+        match url.scheme() {
+            "https" => {}
+            "http" if loopback || allow_insecure_remote_http_for_dev => {}
+            "http" => {
+                return Err(format!(
+                    "remote community RPC URL {raw:?} must use https (plaintext http is loopback/dev only)"
+                ));
+            }
+            scheme => {
+                return Err(format!(
+                    "community RPC URL {raw:?} uses unsupported scheme {scheme:?}; expected https"
+                ));
+            }
+        }
+        canonical.insert(url.as_str().trim_end_matches('/').to_string());
+    }
+    Ok(canonical.into_iter().collect())
+}
 
 #[derive(Default)]
 struct CommunityReplayCache {
@@ -325,10 +414,12 @@ pub struct NodeState {
     pub compute_pool: Arc<parking_lot::RwLock<Option<Arc<rayon::ThreadPool>>>>,
     /// Width of `compute_pool`. 0 = no dedicated pool (rayon global).
     pub compute_threads: Arc<AtomicU32>,
-    /// Seed RPC endpoints ("host:9090") this node can pull shard topology
-    /// from when its own registry lacks full coverage. Populated from
-    /// --peers / --seeds-file in main.rs.
+    /// Explicit shard RPC base URLs this node can pull topology
+    /// from. These come from --shard-hosts, never P2P bootstrap addresses.
     pub seed_rpc_addrs: Arc<Vec<String>>,
+    /// Explicit, validated base URLs for authenticated community mutations
+    /// and validator reward approvals. These never derive from P2P peers.
+    pub community_rpc_bases: Arc<Vec<String>>,
     /// Last shard-registry bootstrap attempt, so a coordinator under load
     /// doesn't hammer the seeds once per failing request.
     pub last_registry_bootstrap: Arc<Mutex<Option<std::time::Instant>>>,
@@ -947,6 +1038,7 @@ pub fn build_node_state(
         // (it can't in practice — no TLS backend selection happens here).
         inference_http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .pool_max_idle_per_host(8)
             .build()
@@ -956,6 +1048,7 @@ pub fn build_node_state(
         compute_pool: Arc::new(parking_lot::RwLock::new(None)),
         compute_threads: Arc::new(AtomicU32::new(0)),
         seed_rpc_addrs: Arc::new(Vec::new()),
+        community_rpc_bases: Arc::new(Vec::new()),
         last_registry_bootstrap: Arc::new(Mutex::new(None)),
         // No genesis file is visible from here; `serve` overwrites this when
         // main.rs was given --genesis.
@@ -1253,11 +1346,14 @@ pub async fn serve(
     dag_round: Option<Arc<AtomicU64>>,
     dag_committed: Option<Arc<AtomicU64>>,
     shard_infos: Vec<ShardInfo>,
-    // seed_rpc_addrs: seed RPC endpoints ("host:9090") used to bootstrap the
+    // seed_rpc_addrs: absolute seed RPC base URLs used to bootstrap the
     //   shard registry when this node is asked to coordinate but only knows
     //   its own shards.
-    // compute_threads: dedicated inference-pool width; 0 = rayon's global pool.
     seed_rpc_addrs: Vec<String>,
+    // Validated absolute http(s) origins for community/reward traffic.
+    // Remote production origins are HTTPS; plaintext is loopback/dev only.
+    community_rpc_bases: Vec<String>,
+    // compute_threads: dedicated inference-pool width; 0 = rayon's global pool.
     compute_threads: usize,
     // chain_identity: the genesis file's declared chain name / chain_id, when
     //   the node was started with --genesis. Surfaced by GET /network/info so
@@ -1313,6 +1409,7 @@ pub async fn serve(
 
     node.shard_infos = shard_infos.clone();
     node.seed_rpc_addrs = Arc::new(seed_rpc_addrs);
+    node.community_rpc_bases = Arc::new(community_rpc_bases);
     // Seed the local registry with every range this node holds so /shards
     // reports the full picture the moment RPC comes up. The registry is
     // keyed by (socket_addr + range) so two entries with the same socket but
@@ -4821,6 +4918,10 @@ fn reward_approval_prerequisites(node: &NodeState) -> Result<(), &'static str> {
     if node.state.recovery_context().is_none() {
         return Err("protocol-v3 recovery epoch and transaction domain are unavailable");
     }
+    if node.community_rpc_bases.len() < arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED
+    {
+        return Err("fewer than five explicit validator community RPC origins are configured");
+    }
     if node.state.active_validators().len()
         != arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
     {
@@ -7795,6 +7896,7 @@ async fn bootstrap_shard_registry_from_seeds(node: &NodeState) -> usize {
     }
     let client = match reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
@@ -7804,11 +7906,17 @@ async fn bootstrap_shard_registry_from_seeds(node: &NodeState) -> usize {
     let mut merged = 0usize;
     let now = std::time::Instant::now();
     for seed in seeds.iter() {
-        let seed_host = seed
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(seed.as_str());
-        let resp = match client.get(format!("http://{}/shards", seed)).send().await {
+        let Some(seed_url) = reqwest::Url::parse(seed).ok() else {
+            continue;
+        };
+        let Some(seed_host) = seed_url.host_str() else {
+            continue;
+        };
+        let seed_socket_host = match seed_host.parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V6(_)) => format!("[{seed_host}]"),
+            _ => seed_host.to_string(),
+        };
+        let resp = match client.get(format!("{seed}/shards")).send().await {
             Ok(r) if r.status().is_success() => r,
             _ => continue,
         };
@@ -7830,7 +7938,7 @@ async fn bootstrap_shard_registry_from_seeds(node: &NodeState) -> usize {
                             .next()
                             .and_then(|p| p.parse::<u16>().ok())
                             .unwrap_or(9090);
-                        si.socket_addr = format!("{}:{}", seed_host, port);
+                        si.socket_addr = format!("{}:{}", seed_socket_host, port);
                     }
                     candidates.push(si);
                 }
@@ -10341,14 +10449,14 @@ async fn collect_community_reward_approvals(
     let local = sign_validated_reward_approval(node, &payload.reward)?;
     let mut approvals = vec![local];
     let mut requests = tokio::task::JoinSet::new();
-    for seed in node.seed_rpc_addrs.iter() {
+    for seed in node.community_rpc_bases.iter() {
         let signed = sign_community_request(
             COMMUNITY_REWARD_APPROVE_PATH,
             payload.clone(),
             coordinator_key,
         )?;
         let client = node.inference_http.clone();
-        let url = format!("http://{seed}{COMMUNITY_REWARD_APPROVE_PATH}");
+        let url = format!("{seed}{COMMUNITY_REWARD_APPROVE_PATH}");
         requests.spawn(async move {
             let response = client
                 .post(url)
@@ -11214,6 +11322,7 @@ async fn community_reward_policy(AxumState(node): AxumState<NodeState>) -> Json<
         "issuance_ready": community_rewards_v1_effective(&node),
         "readiness_unavailable_reason": readiness_error,
         "active_validator_count": node.state.active_validators().len(),
+        "configured_community_rpc_origins": node.community_rpc_bases.len(),
         "validator_set_size_required": arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE,
         "validator_approvals_required": arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED,
         "validator_set_id": reward_recovery_validator_set_id(&node),
@@ -12950,6 +13059,48 @@ mod tests {
         assert!(COMMUNITY_REWARD_APPROVAL_COLLECTION_READY);
     }
 
+    #[test]
+    fn community_rpc_origins_require_https_remotely_and_canonicalize() {
+        let bases = validate_community_rpc_bases(
+            &[
+                "https://Seed.Example:443/".to_string(),
+                "http://127.0.0.1:9090".to_string(),
+                "https://seed.example".to_string(),
+            ],
+            false,
+        )
+        .expect("HTTPS remote and loopback HTTP origins are valid");
+        assert_eq!(bases.len(), 2, "canonical duplicates are removed");
+        assert!(bases.iter().any(|base| base == "https://seed.example"));
+        assert!(bases.iter().any(|base| base == "http://127.0.0.1:9090"));
+
+        let error = validate_community_rpc_bases(&["http://10.0.0.8:9090".to_string()], false)
+            .expect_err("remote plaintext must fail closed");
+        assert!(error.contains("must use https"), "{error}");
+        assert!(
+            validate_community_rpc_bases(&["http://10.0.0.8:9090".to_string()], true).is_ok(),
+            "the explicit disposable-dev override is the only remote HTTP escape hatch"
+        );
+    }
+
+    #[test]
+    fn community_rpc_origins_reject_dangerous_url_forms() {
+        for dangerous in [
+            "ftp://seed.example",
+            "https://user@seed.example",
+            "https://seed.example/private-prefix",
+            "https://seed.example?target=other",
+            "https://seed.example#fragment",
+            "http://0.0.0.0:9090",
+            "https://seed.example:0",
+        ] {
+            assert!(
+                validate_community_rpc_bases(&[dangerous.to_string()], false).is_err(),
+                "dangerous origin unexpectedly accepted: {dangerous}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn public_reward_endpoints_fail_closed_when_runtime_prerequisites_are_unavailable() {
         let mut node = fake_node_with_workers(Vec::new());
@@ -13350,6 +13501,7 @@ mod tests {
             compute_pool: Arc::new(parking_lot::RwLock::new(None)),
             compute_threads: Arc::new(AtomicU32::new(0)),
             seed_rpc_addrs: Arc::new(Vec::new()),
+            community_rpc_bases: Arc::new(Vec::new()),
             last_registry_bootstrap: Arc::new(Mutex::new(None)),
             chain_identity: None,
             own_compute_ms: Arc::new(parking_lot::Mutex::new(std::collections::VecDeque::new())),

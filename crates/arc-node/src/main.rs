@@ -58,9 +58,28 @@ struct Cli {
     #[arg(long)]
     seeds_file: Option<String>,
 
-    /// Hosts to pull the sharded-inference registry from over HTTP, WITHOUT
-    /// joining their P2P network or consensus (comma-separated; a bare host
-    /// gets the conventional RPC port 9090).
+    /// HTTPS origin for a seed/community RPC service. Repeat once per seed
+    /// (or provide a comma-separated ARC_COMMUNITY_RPC_URLS value). These
+    /// URLs drive worker registration/claims/results and 5-of-6 reward
+    /// approvals; they are never derived from P2P peer addresses.
+    #[arg(
+        long = "community-rpc-url",
+        env = "ARC_COMMUNITY_RPC_URLS",
+        value_delimiter = ',',
+        action = clap::ArgAction::Append,
+        value_name = "URL"
+    )]
+    community_rpc_urls: Vec<String>,
+
+    /// DANGEROUS: allow plaintext HTTP community RPC to a non-loopback host
+    /// on a disposable development network. Production remote URLs require
+    /// HTTPS. Loopback HTTP is accepted without this flag.
+    #[arg(long, default_value_t = false)]
+    allow_insecure_community_rpc: bool,
+
+    /// Origins to pull the sharded-inference registry from over HTTP(S),
+    /// WITHOUT joining their P2P network or consensus (comma-separated; a
+    /// bare host gets port 9090 and is permitted only for loopback/dev HTTP).
     ///
     /// This exists because coordinating inference and joining a chain are
     /// separate concerns that --peers/--seeds-file conflate. Those flags join
@@ -692,20 +711,25 @@ fn rewrite_pulled_self_shard(self_shard: &mut serde_json::Value, pulled_from_add
         return;
     }
     let declared_port = sa.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
-    let fallback_port = pulled_from_addr
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.parse::<u16>().ok())
+    let parsed_origin = reqwest::Url::parse(pulled_from_addr)
+        .or_else(|_| reqwest::Url::parse(&format!("http://{pulled_from_addr}")))
+        .ok();
+    let fallback_port = parsed_origin
+        .as_ref()
+        .and_then(reqwest::Url::port_or_known_default)
         .unwrap_or(9090);
     let port = declared_port.unwrap_or(fallback_port);
-    let host = pulled_from_addr
-        .rsplit_once(':')
-        .map(|(h, _)| h)
-        .unwrap_or(pulled_from_addr);
+    let Some(origin_host) = parsed_origin.as_ref().and_then(reqwest::Url::host_str) else {
+        return;
+    };
+    let host = match origin_host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(_)) => format!("[{origin_host}]"),
+        _ => origin_host.to_string(),
+    };
     if let Some(obj) = self_shard.as_object_mut() {
         obj.insert(
             "socket_addr".to_string(),
-            serde_json::Value::String(format!("{}:{}", host, port)),
+            serde_json::Value::String(format!("{host}:{port}")),
         );
     }
 }
@@ -979,35 +1003,6 @@ fn detect_ram_mb() -> u64 {
     8192
 }
 
-/// Derive a seed RPC URL ("host:9090") from --peers or --seeds-file.
-/// Convention: seeds expose RPC on port 9090 regardless of the P2P port
-/// they advertise in seeds files. Returns the first usable host.
-fn pick_seed_rpc(cli: &Cli) -> Option<String> {
-    for p in &cli.peers {
-        if let Some(host) = p.split(':').next()
-            && !host.is_empty()
-        {
-            return Some(format!("{}:9090", host));
-        }
-    }
-    if let Some(path) = &cli.seeds_file
-        && let Ok(content) = std::fs::read_to_string(path)
-    {
-        for raw in content.lines() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Some(host) = line.split(':').next()
-                && !host.is_empty()
-            {
-                return Some(format!("{}:9090", host));
-            }
-        }
-    }
-    None
-}
-
 /// Ask a seed for our shard assignment by POSTing /shards/join. Used by
 /// validators that didn't pass an explicit --shard-range; the seed finds
 /// the biggest uncovered layer gap in the pipeline and returns a range
@@ -1040,7 +1035,7 @@ fn public_node_name(cli: &Cli) -> String {
 /// retry or a different coordinator rather than reusing the wire envelope.
 async fn post_signed_community<T: serde::Serialize>(
     client: &reqwest::Client,
-    target: &str,
+    rpc_base: &str,
     path: &str,
     payload: T,
     keypair: &arc_crypto::KeyPair,
@@ -1050,12 +1045,12 @@ async fn post_signed_community<T: serde::Serialize>(
         .map_err(anyhow::Error::msg)
         .context("sign community HTTP mutation")?;
     client
-        .post(format!("http://{target}{path}"))
+        .post(format!("{rpc_base}{path}"))
         .json(&signed)
         .timeout(timeout)
         .send()
         .await
-        .with_context(|| format!("POST authenticated community mutation to {target}{path}"))
+        .with_context(|| format!("POST authenticated community mutation to {rpc_base}{path}"))
 }
 
 /// A stake-zero node may continue providing outbound community inference
@@ -1071,9 +1066,18 @@ fn is_genesis_migration_observer(
         && genesis.is_some_and(|config| !config.chain.validator_set_complete)
 }
 
-async fn auto_shard_join(cli: &Cli, model_artifact_id: Hash256) -> Option<(usize, usize)> {
-    let seed = pick_seed_rpc(cli)?;
-    let url = format!("http://{}/shards/join", seed);
+async fn auto_shard_join(
+    cli: &Cli,
+    rpc_base: &str,
+    model_artifact_id: Hash256,
+) -> Option<(usize, usize)> {
+    if rpc_base.is_empty() {
+        tracing::warn!(
+            "auto-shard requires an explicit --community-rpc-url; P2P peers are not RPC origins"
+        );
+        return None;
+    }
+    let url = format!("{rpc_base}/shards/join");
     // Every joiner presents the BLAKE3 commitment of the exact source
     // artifact. Shape metadata cannot distinguish different weights.
     let model_id_hex = hex::encode(model_artifact_id.0);
@@ -1090,6 +1094,7 @@ async fn auto_shard_join(cli: &Cli, model_artifact_id: Hash256) -> Option<(usize
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .ok()?;
     let resp = match client.post(&url).json(&body).send().await {
@@ -1285,6 +1290,56 @@ async fn main() -> Result<()> {
     peers.sort();
     peers.dedup();
 
+    // Community/reward RPC trust is explicit and independent of P2P. A QUIC
+    // peer address says nothing about an HTTP port, TLS certificate, gateway,
+    // or reverse-proxy origin, so never synthesize one from `peers`.
+    let raw_community_rpc_urls = if !cli.community_rpc_urls.is_empty() {
+        cli.community_rpc_urls.clone()
+    } else {
+        node_cfg.community.rpc_urls.clone()
+    };
+    let allow_insecure_community_rpc = if matches.value_source("allow_insecure_community_rpc")
+        == Some(clap::parser::ValueSource::CommandLine)
+    {
+        cli.allow_insecure_community_rpc
+    } else {
+        node_cfg.community.allow_insecure_remote_http
+    };
+    let community_rpc_bases =
+        rpc::validate_community_rpc_bases(&raw_community_rpc_urls, allow_insecure_community_rpc)
+            .map_err(anyhow::Error::msg)
+            .context("invalid community RPC configuration")?;
+    let mut raw_coordinator_rpc_bases = community_rpc_bases.clone();
+    for shard_host in &cli.shard_hosts {
+        let shard_host = shard_host.trim();
+        if shard_host.is_empty() {
+            continue;
+        }
+        raw_coordinator_rpc_bases.push(if shard_host.contains("://") {
+            shard_host.to_string()
+        } else if shard_host.contains(':') {
+            format!("http://{shard_host}")
+        } else {
+            format!("http://{shard_host}:9090")
+        });
+    }
+    let coordinator_rpc_bases =
+        rpc::validate_community_rpc_bases(&raw_coordinator_rpc_bases, allow_insecure_community_rpc)
+            .map_err(anyhow::Error::msg)
+            .context("invalid coordinator/shard RPC configuration")?;
+    if allow_insecure_community_rpc {
+        tracing::warn!(
+            "INSECURE DEV OVERRIDE: remote plaintext community RPC is allowed; never use this on a public or value-bearing network"
+        );
+    }
+    if cli.enable_community_rewards_v1
+        && community_rpc_bases.len() < arc_types::transaction::COMMUNITY_REWARD_APPROVALS_REQUIRED
+    {
+        bail!(
+            "--enable-community-rewards-v1 requires at least five explicit --community-rpc-url HTTPS origins for five-of-six approval collection"
+        );
+    }
+
     // Benchmark settings: CLI > config > default
     let _bench_batch =
         if matches.value_source("bench_batch") == Some(clap::parser::ValueSource::CommandLine) {
@@ -1466,6 +1521,10 @@ async fn main() -> Result<()> {
     {
         match auto_shard_join(
             &cli,
+            coordinator_rpc_bases
+                .first()
+                .map(String::as_str)
+                .unwrap_or(""),
             model_artifact_id.expect("--model commitment established above"),
         )
         .await
@@ -2350,27 +2409,10 @@ async fn main() -> Result<()> {
     // so the registry converges fast.
     if !shard_infos_for_broadcast.is_empty() {
         let sis = shard_infos_for_broadcast.clone();
-        // Build the list of peer RPC URLs from the seeds file. The seeds file
-        // contains "host:p2p_port" lines; the RPC port is always p2p - 1 in
-        // our deployment, but we conservatively try both 9090 (the seed default)
-        // and (p2p_port - 1) to handle community nodes on different ports.
-        let mut seed_addrs: Vec<String> = Vec::new();
-        for p in &peers {
-            // p is a SocketAddr string like "1.2.3.4:9091"
-            if let Some(host) = p.split(':').next() {
-                seed_addrs.push(format!("{}:9090", host));
-                if let Some(port_str) = p.split(':').nth(1)
-                    && let Ok(port) = port_str.parse::<u16>()
-                    && port > 1
-                    && port - 1 != 9090
-                {
-                    seed_addrs.push(format!("{}:{}", host, port - 1));
-                }
-            }
-        }
-        seed_addrs.sort();
-        seed_addrs.dedup();
-        let seed_addrs_pull = seed_addrs.clone();
+        // RPC origins are explicit TLS/gateway configuration. Never infer an
+        // HTTP port from a P2P bootstrap address.
+        let seed_rpc_bases = coordinator_rpc_bases.clone();
+        let seed_rpc_bases_pull = seed_rpc_bases.clone();
 
         // Background broadcaster: post our shard to every seed AND to our
         // own localhost so the self-entry in the local registry gets its
@@ -2387,6 +2429,7 @@ async fn main() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
             let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
             {
                 Ok(c) => c,
@@ -2402,8 +2445,8 @@ async fn main() -> Result<()> {
                         .send()
                         .await;
                     // Then announce to remote seeds
-                    for addr in &seed_addrs {
-                        let url = format!("http://{}/shards/announce", addr);
+                    for rpc_base in &seed_rpc_bases {
+                        let url = format!("{rpc_base}/shards/announce");
                         let _ = client.post(&url).json(&payload).send().await;
                     }
                 }
@@ -2422,6 +2465,7 @@ async fn main() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
             {
                 Ok(c) => c,
@@ -2447,8 +2491,8 @@ async fn main() -> Result<()> {
                 // re-announcing - that IS the routable address for that shard
                 // holder, and it's what the receiver-side fix for direct
                 // /shards/announce broadcasts produces too.
-                for addr in &seed_addrs_pull {
-                    if let Ok(resp) = client.get(format!("http://{}/shards", addr)).send().await
+                for rpc_base in &seed_rpc_bases_pull {
+                    if let Ok(resp) = client.get(format!("{rpc_base}/shards")).send().await
                         && let Ok(mut json) = resp.json::<serde_json::Value>().await
                     {
                         // New peers emit `self_shards: [ShardInfo, ...]`; legacy
@@ -2460,7 +2504,7 @@ async fn main() -> Result<()> {
                         {
                             for entry in arr.iter_mut() {
                                 if !entry.is_null() {
-                                    rewrite_pulled_self_shard(entry, addr);
+                                    rewrite_pulled_self_shard(entry, rpc_base);
                                     to_announce.push(entry.clone());
                                 }
                             }
@@ -2468,7 +2512,7 @@ async fn main() -> Result<()> {
                         if let Some(self_shard) = json.get_mut("self_shard")
                             && !self_shard.is_null()
                         {
-                            rewrite_pulled_self_shard(self_shard, addr);
+                            rewrite_pulled_self_shard(self_shard, rpc_base);
                             to_announce.push(self_shard.clone());
                         }
                         for shard_val in to_announce {
@@ -2500,6 +2544,7 @@ async fn main() -> Result<()> {
     // would start POSTing /community/register and /community/heartbeat to
     // every seed listed. Read-only coordinators need to be able to say no.
     let community_mode = (cli.community_mode || stake == 0) && !cli.no_community;
+    let community_networking = community_mode && !community_rpc_bases.is_empty();
     if cli.no_community && (cli.community_mode || stake == 0) {
         tracing::info!(
             "--no-community: observer mode. This node will NOT register, heartbeat or \
@@ -2507,7 +2552,13 @@ async fn main() -> Result<()> {
         );
     }
 
-    if community_mode {
+    if community_mode && !community_networking {
+        tracing::warn!(
+            "Community mode has no coordinator RPC origin. Configure one or more explicit --community-rpc-url https://... values; P2P seeds are intentionally not converted into HTTP targets."
+        );
+    }
+
+    if community_networking {
         tracing::info!("╔═══════════════════════════════════════╗");
         tracing::info!("║  COMMUNITY MODE ACTIVE                ║");
         tracing::info!("║  Registering with seed coordinators   ║");
@@ -2515,7 +2566,7 @@ async fn main() -> Result<()> {
         tracing::info!("╚═══════════════════════════════════════╝");
     }
 
-    if community_mode {
+    if community_networking {
         let public_node_name_c = public_node_name(&cli);
         let worker_id = format!("0x{}", hex::encode(validator_address.0));
         let hostname = std::process::Command::new("hostname")
@@ -2544,15 +2595,7 @@ async fn main() -> Result<()> {
             );
         }
 
-        // Derive seed RPC endpoints from the peers list (P2P port - 1, usually 9090)
-        let mut seed_rpc_addrs: Vec<String> = Vec::new();
-        for p in &peers {
-            if let Some(host) = p.split(':').next() {
-                seed_rpc_addrs.push(format!("{}:9090", host));
-            }
-        }
-        seed_rpc_addrs.sort();
-        seed_rpc_addrs.dedup();
+        let community_rpc_targets = community_rpc_bases.clone();
 
         let worker_id_c = worker_id.clone();
         let hostname_c = hostname.clone();
@@ -2561,7 +2604,7 @@ async fn main() -> Result<()> {
         let model_id_c = worker_model
             .as_ref()
             .map(|(_, model_id, _)| model_id.clone());
-        let seed_rpc_addrs_c = seed_rpc_addrs.clone();
+        let community_rpc_targets_c = community_rpc_targets.clone();
         let registration_keypair = validator_keypair.clone();
 
         tokio::spawn(async move {
@@ -2569,6 +2612,7 @@ async fn main() -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
             {
                 Ok(c) => c,
@@ -2615,7 +2659,7 @@ async fn main() -> Result<()> {
             loop {
                 let register_tick = ticks.is_multiple_of(4);
                 let mut set = tokio::task::JoinSet::new();
-                for addr in &seed_rpc_addrs_c {
+                for addr in &community_rpc_targets_c {
                     let client = client.clone();
                     let addr = addr.clone();
                     let register_payload = register_payload.clone();
@@ -2677,7 +2721,7 @@ async fn main() -> Result<()> {
             (inference_model.clone(), worker_model.clone())
         {
             let worker_id_w = worker_id.clone();
-            let seed_rpc_addrs_w = seed_rpc_addrs.clone();
+            let community_rpc_targets_w = community_rpc_targets.clone();
             // Worker keypair + address for signing InferenceAttestation txs
             // (v0.7.0). On every successful submit we build a signed
             // tx with `from = worker_address` so on-chain rewards accrue
@@ -2697,6 +2741,7 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 let client = match reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(35)) // 30s claim + 5s overhead
+                    .redirect(reqwest::redirect::Policy::none())
                     .build()
                 {
                     Ok(c) => c,
@@ -2733,7 +2778,7 @@ async fn main() -> Result<()> {
                         model_id: worker_model_id.clone(),
                     };
                     let mut claims = tokio::task::JoinSet::new();
-                    for addr in &seed_rpc_addrs_w {
+                    for addr in &community_rpc_targets_w {
                         let client = client.clone();
                         let body = claim_body.clone();
                         let target = addr.clone();
@@ -3036,11 +3081,8 @@ async fn main() -> Result<()> {
                         // there. Subsequent attestations increment locally.
                         if !attestation_nonce_initialized.load(std::sync::atomic::Ordering::Relaxed)
                         {
-                            let q_url = format!(
-                                "http://{}/account/0x{}",
-                                winner,
-                                hex::encode(worker_address.0)
-                            );
+                            let q_url =
+                                format!("{}/account/0x{}", winner, hex::encode(worker_address.0));
                             if let Ok(resp) = client.get(&q_url).send().await
                                 && let Ok(v) = resp.json::<serde_json::Value>().await
                             {
@@ -3194,34 +3236,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Seed RPC endpoints the coordinator can pull shard topology from when
-    // its own registry doesn't cover the model. Convention: seeds serve RPC
-    // on 9090 regardless of the P2P port advertised in the seeds file.
-    let coordinator_seed_rpcs: Vec<String> = {
-        let mut v: Vec<String> = peers
-            .iter()
-            .filter_map(|p| p.split(':').next())
-            .filter(|h| !h.is_empty())
-            .map(|h| format!("{}:9090", h))
-            .collect();
-        // --shard-hosts: registry sources reached over HTTP only, never
-        // dialed for P2P. A bare host takes the conventional RPC port; an
-        // explicit host:port is honoured so a non-standard RPC port works.
-        for h in &cli.shard_hosts {
-            let h = h.trim();
-            if h.is_empty() {
-                continue;
-            }
-            v.push(if h.contains(':') {
-                h.to_string()
-            } else {
-                format!("{}:9090", h)
-            });
-        }
-        v.sort();
-        v.dedup();
-        v
-    };
+    // Explicit HTTP(S) registry origins only. Consensus/P2P bootstrap
+    // addresses never become RPC destinations by port-number convention.
+    let coordinator_seed_rpcs = coordinator_rpc_bases;
 
     // Inference pool width: explicit --threads wins, then [inference] threads
     // from the config file, else 0 = rayon's global pool (which honours
@@ -3251,6 +3268,7 @@ async fn main() -> Result<()> {
         Some(dag_committed),
         shard_infos,
         coordinator_seed_rpcs,
+        community_rpc_bases,
         compute_threads,
         genesis_chain_identity,
         cli.enable_community_rewards_v1,
@@ -3329,6 +3347,29 @@ mod tests {
         let cli = Cli::try_parse_from(["arc-node"]).unwrap();
         assert_eq!(cli.rpc, "127.0.0.1:9944");
         assert_eq!(cli.eth_rpc_port, 0);
+        assert!(cli.community_rpc_urls.is_empty());
+    }
+
+    #[test]
+    fn community_rpc_url_is_repeatable_and_separate_from_p2p() {
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "--peers",
+            "seed-p2p.example:9945",
+            "--community-rpc-url",
+            "https://seed-a.example",
+            "--community-rpc-url",
+            "https://seed-b.example:9443",
+        ])
+        .unwrap();
+        assert_eq!(cli.peers, ["seed-p2p.example:9945"]);
+        assert_eq!(
+            cli.community_rpc_urls,
+            [
+                "https://seed-a.example".to_string(),
+                "https://seed-b.example:9443".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3375,14 +3416,14 @@ mod tests {
     #[test]
     fn pulled_stub_rewritten_to_seed_host_port() {
         // AMS announces self_shard with socket_addr=0.0.0.0:9090. We pulled
-        // from http://136.244.109.1:9090/shards, so the routable addr for AMS
-        // IS the URL we pulled from - use it.
+        // through its HTTPS gateway, so that origin's host is routable while
+        // the shard's declared serving port remains authoritative.
         let mut v = json!({
             "start_layer": 10, "end_layer": 14, "socket_addr": "0.0.0.0:9090",
             "node_name": "AMS"
         });
-        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
-        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+        rewrite_pulled_self_shard(&mut v, "https://seed-ams.example");
+        assert_eq!(v["socket_addr"], "seed-ams.example:9090");
     }
 
     #[test]
@@ -3411,8 +3452,8 @@ mod tests {
         let mut v = json!({
             "socket_addr": "0.0.0.0:junk", "node_name": "X"
         });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+        rewrite_pulled_self_shard(&mut v, "https://1.2.3.4:9443");
+        assert_eq!(v["socket_addr"], "1.2.3.4:9443");
     }
 
     #[test]
@@ -3454,7 +3495,7 @@ mod tests {
 
     #[test]
     fn pulled_url_with_no_port_is_tolerated() {
-        // Defensive: if seed_addrs_pull accidentally carries a host without a port,
+        // Defensive: if a legacy caller carries a host without a port,
         // rewrite still produces a sensible string (host + default 9090).
         let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
         rewrite_pulled_self_shard(&mut v, "136.244.109.1");

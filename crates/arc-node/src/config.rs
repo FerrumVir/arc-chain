@@ -276,6 +276,22 @@ pub struct NodeConfig {
     pub benchmark: BenchmarkConfig,
     #[serde(default)]
     pub inference: InferenceConfig,
+    #[serde(default)]
+    pub community: CommunityConfig,
+}
+
+/// Outbound authenticated community/reward RPC configuration. Kept separate
+/// from `[p2p] peers`: a QUIC consensus address is never an HTTP trust or TLS
+/// configuration.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CommunityConfig {
+    /// Absolute RPC origins, e.g. `https://seed-1.arc.network`.
+    #[serde(default)]
+    pub rpc_urls: Vec<String>,
+    /// Disposable development only. Remote production origins require HTTPS;
+    /// loopback HTTP does not need this override.
+    #[serde(default)]
+    pub allow_insecure_remote_http: bool,
 }
 
 /// Inference runtime configuration.
@@ -542,6 +558,8 @@ mod tests {
         assert_eq!(cfg.validator.min_stake, 500_000);
         assert_eq!(cfg.storage.data_dir, "./arc-data");
         assert_eq!(cfg.inference.threads, 0);
+        assert!(cfg.community.rpc_urls.is_empty());
+        assert!(!cfg.community.allow_insecure_remote_http);
     }
 
     #[test]
@@ -630,6 +648,10 @@ mod tests {
             [storage]
             data_dir = "/var/arc/data"
 
+            [community]
+            rpc_urls = ["https://seed-a.example", "https://seed-b.example"]
+            allow_insecure_remote_http = false
+
             [benchmark]
             batch_size = 1000
             interval_ms = 100
@@ -651,6 +673,8 @@ mod tests {
         assert_eq!(cfg.validator.stake, 10_000_000);
         assert_eq!(cfg.validator.min_stake, 1_000_000);
         assert_eq!(cfg.storage.data_dir, "/var/arc/data");
+        assert_eq!(cfg.community.rpc_urls.len(), 2);
+        assert!(!cfg.community.allow_insecure_remote_http);
         assert_eq!(cfg.benchmark.batch_size, 1000);
         assert_eq!(cfg.benchmark.interval_ms, 100);
         assert_eq!(cfg.benchmark.sender_start, 10);
