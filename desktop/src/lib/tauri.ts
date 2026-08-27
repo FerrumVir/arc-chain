@@ -30,6 +30,7 @@ import type {
   Tier1Submitted,
   Tier1Vote,
   TxLookup,
+  WalletTxResult,
 } from "./types";
 
 const IS_TAURI =
@@ -226,12 +227,12 @@ function confirmedEarningsFromBody(body: unknown): Earnings | null {
 
 /** Mirrors commands.rs::COORDINATOR_HOSTS, NYC included. */
 const COORDINATOR_HOSTS = [
-  "http://149.28.32.76:9090", // NYC
-  "http://140.82.16.112:9090", // LAX
-  "http://136.244.109.1:9090", // AMS
-  "http://104.238.171.11:9090", // LHR
-  "http://202.182.107.41:9090", // NRT
-  "http://149.28.153.31:9090", // SGP
+  "https://149-28-32-76.nip.io", // NYC
+  "https://140-82-16-112.nip.io", // LAX
+  "https://136-244-109-1.nip.io", // AMS
+  "https://104-238-171-11.nip.io", // LHR
+  "https://202-182-107-41.nip.io", // NRT
+  "https://149-28-153-31.nip.io", // SGP
 ];
 
 /**
@@ -263,6 +264,25 @@ function strip0x(s: string): string {
 
 /** ARC base units per whole ARC. Mirrors rpc_client.rs::ARC_BASE_UNITS. */
 const ARC_BASE_UNITS = 1_000_000_000;
+
+function exactBaseUnits(value: unknown, field: string): string {
+  if (typeof value === "string" && /^\d+$/.test(value)) return value;
+  if (
+    typeof value === "number" &&
+    Number.isSafeInteger(value) &&
+    value >= 0
+  ) {
+    return String(value);
+  }
+  throw new Error(`${field} is not an exact base-unit integer`);
+}
+
+function arcFromBaseUnits(value: string): string {
+  const padded = value.padStart(10, "0");
+  const whole = padded.slice(0, -9).replace(/^0+(?=\d)/, "");
+  const fraction = padded.slice(-9).replace(/0+$/, "");
+  return fraction ? `${whole}.${fraction}` : whole;
+}
 
 async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
   const base = liveBase()!;
@@ -592,27 +612,51 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (!addr) {
         return {
           address: "",
-          balance: 0,
+          balanceBase: "0",
+          balanceArc: "0",
           nonce: 0,
-          stakedBalance: 0,
+          stakedBalanceBase: "0",
+          stakedBalanceArc: "0",
         } as T;
       }
       try {
         const r = await fetch(`${base}/account/${addr}`);
         if (r.status === 404) {
-          return { address: addr, balance: 0, nonce: 0, stakedBalance: 0 } as T;
+          return {
+            address: addr,
+            balanceBase: "0",
+            balanceArc: "0",
+            nonce: 0,
+            stakedBalanceBase: "0",
+            stakedBalanceArc: "0",
+          } as T;
         }
         const v = await r.json();
+        const balanceBase = exactBaseUnits(v.balance, "balance");
+        const stakedBalanceBase = exactBaseUnits(
+          v.staked_balance,
+          "staked_balance",
+        );
         return {
           address: v.address ?? addr,
-          balance: v.balance ?? 0,
+          balanceBase,
+          balanceArc: arcFromBaseUnits(balanceBase),
           nonce: v.nonce ?? 0,
-          stakedBalance: v.staked_balance ?? 0,
+          stakedBalanceBase,
+          stakedBalanceArc: arcFromBaseUnits(stakedBalanceBase),
         } as T;
-      } catch {
-        return { address: addr, balance: 0, nonce: 0, stakedBalance: 0 } as T;
+      } catch (error) {
+        throw new Error(
+          `could not read an exact wallet balance: ${error instanceof Error ? error.message : String(error)}`,
+        );
       }
     }
+    case "send_arc":
+      // Browser-live mode intentionally has no signing material. Never add a
+      // seed argument here: native Rust signing is the security boundary.
+      throw new Error(
+        "Sending ARC requires the native desktop app so signing stays in Rust.",
+      );
     case "faucet_claim": {
       const stored = localStorage.getItem("arc-desktop-state-v1");
       const addr = stored
@@ -627,10 +671,56 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       const v = await r.json();
       if (!r.ok)
         throw new Error(v.error ?? `faucet error ${r.status}`);
+      if (v.status !== "pending") {
+        throw new Error("faucet did not acknowledge the claim as pending");
+      }
+      const txHash = strip0x(String(v.tx_hash ?? ""));
+      if (!/^[0-9a-f]{64}$/.test(txHash)) {
+        throw new Error("faucet returned no valid transaction hash");
+      }
+      const amountBase = exactBaseUnits(v.amount, "faucet amount");
+      const receipt = await getDetailed(`/tx/${txHash}`);
+      const receiptBody = receipt.kind === "ok" ? receipt.body : null;
+      const mined = receiptBody !== null;
+      const success =
+        receiptBody && typeof receiptBody.success === "boolean"
+          ? receiptBody.success
+          : null;
+      const receiptStatus = mined
+        ? success === true
+          ? "mined_success"
+          : success === false
+            ? "mined_failed"
+            : "receipt_unavailable"
+        : receipt.kind === "notFound"
+          ? "pending"
+          : "receipt_unavailable";
       return {
-        txHash: v.tx_hash,
-        amount: v.amount,
-        message: v.message,
+        txHash,
+        amountBase,
+        amountArc: arcFromBaseUnits(amountBase),
+        receiptStatus,
+        mined,
+        success,
+        blockHeight:
+          receiptBody && typeof receiptBody.block_height === "number"
+            ? receiptBody.block_height
+            : null,
+        blockHash:
+          receiptBody && typeof receiptBody.block_hash === "string"
+            ? strip0x(receiptBody.block_hash)
+            : null,
+        sourceHost: base,
+        unavailable:
+          receiptStatus === "receipt_unavailable"
+            ? "the receipt lookup could not establish transaction success"
+            : null,
+        message:
+          receiptStatus === "mined_success"
+            ? "Faucet claim has a successful mined receipt."
+            : receiptStatus === "mined_failed"
+              ? "Faucet claim was mined but failed."
+              : "Faucet claim was accepted and is waiting for a mined receipt.",
       } as T;
     }
     case "run_inference": {
@@ -1742,16 +1832,41 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
     case "fetch_balance":
       return {
         address: "fakehex0000000000000000000000000000000000000000000000000000000000",
-        balance: 28_500,
+        balanceBase: "28500000000000",
+        balanceArc: "28500",
         nonce: 3,
-        stakedBalance: 0,
+        stakedBalanceBase: "0",
+        stakedBalanceArc: "0",
       } as T;
     case "faucet_claim":
       return {
         txHash:
-          "0x8f31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
-        amount: 10_000,
-        message: "Sent 10000 ARC to fakehex…",
+          "8f31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
+        amountBase: "1000000000",
+        amountArc: "1",
+        receiptStatus: "pending",
+        mined: false,
+        success: null,
+        blockHeight: null,
+        blockHash: null,
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        message: "Faucet claim was accepted and is waiting for a mined receipt.",
+      } as T;
+    case "send_arc":
+      return {
+        txHash:
+          "8e31fe12aab4c7d2e44a88b1f91023abfe23bb8a4446f23a62033001cb22e1e9",
+        amountBase: "1250000000",
+        amountArc: "1.25",
+        receiptStatus: "pending",
+        mined: false,
+        success: null,
+        blockHeight: null,
+        blockHash: null,
+        sourceHost: MOCK_CHAIN_HOST,
+        unavailable: null,
+        message: "Transfer was accepted and is waiting for a mined receipt.",
       } as T;
     case "run_inference": {
       const { prompt } = args as { prompt: string };
@@ -1995,6 +2110,8 @@ export const api = {
   lookupTx: (hash: string) => invoke<TxLookup>("lookup_tx", { hash }),
   fetchBalance: () => invoke<AccountBalance>("fetch_balance"),
   faucetClaim: () => invoke<FaucetResult>("faucet_claim"),
+  sendArc: (to: string, amountArc: string) =>
+    invoke<WalletTxResult>("send_arc", { to, amountArc }),
   // `chatTemplate` asks the serving node to apply the loaded model's own
   // chat template. The client no longer wraps prompts in Llama-2's
   // `[INST] ... [/INST]` tags, which were wrong for other architectures and

@@ -7,6 +7,7 @@ mod rpc_client;
 mod store;
 mod tray;
 mod types;
+mod wallet;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,6 +31,9 @@ pub struct AppState {
     /// 1.5s and probing six seeds that often would be pointless load on a
     /// live production network.
     pub chain_host: Arc<Mutex<Option<(commands::ChainHostChoice, std::time::Instant)>>>,
+    /// Serializes wallet writes so two UI clicks cannot sign the same account
+    /// nonce concurrently. This lock never contains the recovery phrase.
+    pub wallet_write: Arc<Mutex<()>>,
     /// Whether a system tray icon was actually created. Gates hide-to-tray:
     /// on a desktop with no tray, hiding the window makes the app
     /// unreachable.
@@ -52,6 +56,9 @@ pub fn run() {
     let data_dir = Arc::new(Mutex::new(PathBuf::new()));
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
+        // A signed transaction is bound to the elected origin. Never allow a
+        // gateway redirect to move that POST to another scheme or host.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .unwrap_or_default();
 
@@ -63,6 +70,7 @@ pub fn run() {
         http,
         tier1_routes: Arc::new(Mutex::new(HashMap::new())),
         chain_host: Arc::new(Mutex::new(None)),
+        wallet_write: Arc::new(Mutex::new(())),
         has_tray: has_tray.clone(),
     };
 
@@ -276,6 +284,7 @@ pub fn run() {
             commands::reveal_seed_phrase,
             commands::fetch_balance,
             commands::faucet_claim,
+            commands::send_arc,
             commands::run_inference,
             commands::run_inference_via_coordinator,
             commands::run_inference_via_coordinator_direct,

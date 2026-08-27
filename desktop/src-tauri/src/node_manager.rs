@@ -264,7 +264,15 @@ impl NodeManager {
         // validates blocks, and helps the network without requiring a
         // 4 GB model download.
         if config.role == "worker" && config.model_path.is_some() {
+            if !binary_supports_flag(&binary, "--community-rpc-url") {
+                anyhow::bail!(
+                    "this arc-node predates secure community RPC origins; update arc-node before starting community mode"
+                );
+            }
             cmd.arg("--community-mode");
+            for origin in crate::rpc_client::PRODUCTION_RPC_ORIGINS {
+                cmd.arg("--community-rpc-url").arg(origin);
+            }
         }
 
         if let Some(model) = &config.model_path {
@@ -810,6 +818,19 @@ mod tests {
         // `/bin/echo` is not arc-node, so the probe returns false rather
         // than panicking - the safe default for an unknown binary.
         assert!(!binary_supports_flag(Path::new("/nonexistent/arc-node"), "--threads"));
+    }
+
+    #[test]
+    fn production_community_origins_are_six_distinct_https_origins() {
+        let unique: std::collections::HashSet<_> =
+            crate::rpc_client::PRODUCTION_RPC_ORIGINS.into_iter().collect();
+        assert_eq!(unique.len(), 6);
+        for origin in unique {
+            assert!(origin.starts_with("https://"));
+            assert!(origin.ends_with(".nip.io"));
+            assert!(!origin.contains(":9090"));
+            assert!(!origin["https://".len()..].contains('/'));
+        }
     }
 
     #[test]

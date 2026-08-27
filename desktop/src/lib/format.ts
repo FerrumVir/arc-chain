@@ -9,6 +9,14 @@ export function formatInt(n: number): string {
   return n.toLocaleString("en-US");
 }
 
+/** Group an exact ARC decimal string without converting it to a Number. */
+export function formatArcExact(value: string): string {
+  if (!/^\d+(?:\.\d{1,9})?$/.test(value)) return value;
+  const [whole, fraction] = value.split(".");
+  const grouped = BigInt(whole).toLocaleString("en-US");
+  return fraction ? `${grouped}.${fraction}` : grouped;
+}
+
 export function formatAddress(addr: string, prefix = 6, suffix = 4): string {
   if (addr.length <= prefix + suffix + 3) return addr;
   return `${addr.slice(0, prefix)}…${addr.slice(-suffix)}`;

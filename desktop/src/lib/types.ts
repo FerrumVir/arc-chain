@@ -37,7 +37,7 @@ export interface NodeStatus {
   lastError: string | null;
   /**
    * If the local node has no peers but a public seed coordinator's `/health`
-   * responded, this is its origin (e.g. `http://140.82.16.112:9090`). The UI
+   * responded, this is its origin (e.g. `https://140-82-16-112.nip.io`). The UI
    * shows "Client mode (via LAX)" and the onboarding gate lets the user
    * through even when residential UDP P2P is blocked.
    */
@@ -463,16 +463,36 @@ export interface TxLookup extends Unavailable {
 
 export interface AccountBalance {
   address: string;
-  balance: number;
+  /** Exact base-unit integer; string avoids JavaScript's 53-bit rounding. */
+  balanceBase: string;
+  /** Exact ARC decimal with at most nine fractional digits. */
+  balanceArc: string;
   nonce: number;
-  stakedBalance: number;
+  stakedBalanceBase: string;
+  stakedBalanceArc: string;
 }
 
-export interface FaucetResult {
+export type WalletReceiptStatus =
+  | "pending"
+  | "mined_success"
+  | "mined_failed"
+  | "receipt_unavailable";
+
+export interface WalletTxResult {
   txHash: string;
-  amount: number;
+  amountBase: string;
+  amountArc: string;
+  receiptStatus: WalletReceiptStatus;
+  mined: boolean;
+  success: boolean | null;
+  blockHeight: number | null;
+  blockHash: string | null;
+  sourceHost: string;
+  unavailable: string | null;
   message: string;
 }
+
+export type FaucetResult = WalletTxResult;
 
 export interface ResetPeerStateResult {
   removedPath: string;

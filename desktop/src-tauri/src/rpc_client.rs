@@ -17,8 +17,10 @@ use crate::types::{
     AccountBalance, Attestation, BlockSummary, ConfirmedRewardReceipt, Earnings,
     EarningsProjection, FaucetResult, InferenceConsensus, InferenceHop, InferenceResult,
     NetworkOverview, NetworkStats, NodeContribution, NodeStatus, RecentBlocks, RewardEconomics,
-    TxLookup, ValidatorInfo,
+    TxLookup, ValidatorInfo, WalletTxResult,
 };
+use arc_crypto::Hash256;
+use arc_types::Transaction;
 use serde_json::Value;
 use tracing::{debug, info, warn};
 
@@ -27,14 +29,15 @@ use tracing::{debug, info, warn};
 /// (HTTPS RPC fallback) instead of showing a hard "offline" — most consumer
 /// ISPs silently drop outbound UDP on non-standard ports, which kills our
 /// QUIC handshake to seed UDP 9091. Order biases North America first.
-const STATUS_COORDINATORS: [&str; 6] = [
-    "http://149.28.32.76:9090",   // NYC
-    "http://140.82.16.112:9090",  // LAX
-    "http://136.244.109.1:9090",  // AMS
-    "http://104.238.171.11:9090", // LHR
-    "http://202.182.107.41:9090", // NRT
-    "http://149.28.153.31:9090",  // SGP
+pub(crate) const PRODUCTION_RPC_ORIGINS: [&str; 6] = [
+    "https://149-28-32-76.nip.io",   // NYC
+    "https://140-82-16-112.nip.io",  // LAX
+    "https://136-244-109-1.nip.io",  // AMS
+    "https://104-238-171-11.nip.io", // LHR
+    "https://202-182-107-41.nip.io", // NRT
+    "https://149-28-153-31.nip.io",  // SGP
 ];
+const STATUS_COORDINATORS: [&str; 6] = PRODUCTION_RPC_ORIGINS;
 
 /// Return the first coordinator to answer 200 on `/health`, or `None` if
 /// every public seed is unreachable (genuine offline — total network failure
@@ -585,28 +588,228 @@ pub async fn fetch_balance(
         // Account not yet seen on-chain = zero balance, zero nonce.
         return Ok(AccountBalance {
             address: address_hex.to_string(),
-            balance: 0,
+            balance_base: "0".to_string(),
+            balance_arc: "0".to_string(),
             nonce: 0,
-            staked_balance: 0,
+            staked_balance_base: "0".to_string(),
+            staked_balance_arc: "0".to_string(),
         });
     }
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
     }
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
+    let balance = v
+        .get("balance")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| "account response is missing an exact u64 balance".to_string())?;
+    let staked_balance = v
+        .get("staked_balance")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| "account response is missing an exact u64 staked_balance".to_string())?;
+    let nonce = v
+        .get("nonce")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "account response is missing an exact u64 nonce".to_string())?;
+    let response_address = v
+        .get("address")
+        .and_then(Value::as_str)
+        .unwrap_or(address_hex);
+    if strip_0x(response_address) != strip_0x(address_hex) {
+        return Err("account response address does not match the requested wallet".to_string());
+    }
     Ok(AccountBalance {
-        address: v
-            .get("address")
-            .and_then(|x| x.as_str())
-            .unwrap_or(address_hex)
-            .to_string(),
-        balance: v.get("balance").and_then(|x| x.as_u64()).unwrap_or(0),
-        nonce: v.get("nonce").and_then(|x| x.as_u64()).unwrap_or(0),
-        staked_balance: v
-            .get("staked_balance")
-            .and_then(|x| x.as_u64())
-            .unwrap_or(0),
+        address: strip_0x(response_address),
+        balance_base: balance.to_string(),
+        balance_arc: crate::wallet::format_arc_amount(balance),
+        nonce,
+        staked_balance_base: staked_balance.to_string(),
+        staked_balance_arc: crate::wallet::format_arc_amount(staked_balance),
     })
+}
+
+/// Fetch the transaction-signing domain from the same pinned host that will
+/// receive the signed transaction. Missing or inconsistent recovery metadata
+/// fails closed: signing for the wrong domain weakens replay protection.
+pub async fn transaction_signing_domain(
+    http: &reqwest::Client,
+    base_url: &str,
+) -> Result<Option<Hash256>, String> {
+    let resp = http
+        .get(format!("{}/network/info", base_url))
+        .send()
+        .await
+        .map_err(|e| format!("could not read transaction domain from {base_url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "{} cannot establish the chain transaction domain (GET /network/info returned HTTP {})",
+            base_url,
+            resp.status()
+        ));
+    }
+    let value: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid /network/info response from {base_url}: {e}"))?;
+    transaction_signing_domain_from_value(&value, base_url)
+}
+
+fn transaction_signing_domain_from_value(
+    value: &Value,
+    base_url: &str,
+) -> Result<Option<Hash256>, String> {
+    let active = value
+        .get("recovery_active")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| format!("{base_url} did not state whether recovery-domain signing is active"))?;
+    let raw_domain = value
+        .get("recovery_domain")
+        .or_else(|| value.get("transaction_domain"))
+        .and_then(Value::as_str);
+
+    if !active {
+        if raw_domain.is_some() {
+            return Err(format!(
+                "{base_url} returned a transaction domain while recovery_active=false"
+            ));
+        }
+        if value
+            .get("protocol_version")
+            .and_then(Value::as_str)
+            .is_some_and(|version| version.starts_with("3."))
+        {
+            return Err(format!(
+                "{base_url} reports protocol v3 without an active recovery transaction domain"
+            ));
+        }
+        return Ok(None);
+    }
+
+    let raw_domain = raw_domain
+        .ok_or_else(|| format!("{base_url} reports recovery_active=true but no recovery_domain"))?;
+    let clean = raw_domain.strip_prefix("0x").unwrap_or(raw_domain);
+    let domain = Hash256::from_hex(clean)
+        .map_err(|_| format!("{base_url} returned a malformed 32-byte recovery_domain"))?;
+    if domain == Hash256::ZERO {
+        return Err(format!("{base_url} returned an all-zero recovery_domain"));
+    }
+    Ok(Some(domain))
+}
+
+fn wallet_result_from_lookup(
+    tx_hash: String,
+    amount_base: u64,
+    lookup: TxLookup,
+    flow: &str,
+) -> WalletTxResult {
+    let (receipt_status, mined, unavailable, message) = match (
+        lookup.status.as_str(),
+        lookup.success,
+    ) {
+        ("mined", Some(true)) => (
+            "mined_success",
+            true,
+            None,
+            lookup
+                .block_height
+                .map(|height| format!("{flow} confirmed in block #{height}."))
+                .unwrap_or_else(|| format!("{flow} has a successful mined receipt.")),
+        ),
+        ("mined", Some(false)) => (
+            "mined_failed",
+            true,
+            None,
+            lookup
+                .block_height
+                .map(|height| format!("{flow} was mined but failed in block #{height}."))
+                .unwrap_or_else(|| format!("{flow} was mined but execution failed.")),
+        ),
+        ("not_found", _) => (
+            "pending",
+            false,
+            None,
+            format!("{flow} was accepted and is waiting for a mined receipt."),
+        ),
+        ("mined", None) => (
+            "receipt_unavailable",
+            true,
+            Some("the mined receipt did not include an execution result".to_string()),
+            format!("{flow} is in a block, but its success result is unavailable."),
+        ),
+        _ => (
+            "receipt_unavailable",
+            false,
+            lookup.unavailable.clone().or_else(|| {
+                Some("the receipt lookup could not establish transaction status".to_string())
+            }),
+            format!("{flow} was accepted, but its mined receipt could not be verified yet."),
+        ),
+    };
+
+    WalletTxResult {
+        tx_hash,
+        amount_base: amount_base.to_string(),
+        amount_arc: crate::wallet::format_arc_amount(amount_base),
+        receipt_status: receipt_status.to_string(),
+        mined,
+        success: lookup.success,
+        block_height: lookup.block_height,
+        block_hash: lookup.block_hash,
+        source_host: lookup.source_host,
+        unavailable,
+        message,
+    }
+}
+
+pub async fn submit_signed_transfer(
+    http: &reqwest::Client,
+    base_url: &str,
+    tx: &Transaction,
+    amount_base: u64,
+) -> Result<WalletTxResult, String> {
+    let local_hash = tx.hash.to_hex();
+    let resp = http
+        .post(format!("{}/tx/submit_signed", base_url))
+        .json(tx)
+        .send()
+        .await
+        .map_err(|e| format!("transfer submission failed: {e}"))?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(format!(
+            "transfer was rejected by {} (HTTP {}): {}",
+            base_url,
+            status,
+            body.trim()
+        ));
+    }
+    let value: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("invalid transfer submission response from {base_url}: {e}"))?;
+    if value.get("status").and_then(Value::as_str) != Some("pending") {
+        return Err(format!(
+            "{} did not acknowledge the signed transfer as pending",
+            base_url
+        ));
+    }
+    let remote_hash = value
+        .get("tx_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("{base_url} omitted tx_hash from the submission response"))?;
+    if strip_0x(remote_hash) != local_hash {
+        return Err(format!(
+            "{} acknowledged a different transaction hash; refusing to track it",
+            base_url
+        ));
+    }
+
+    let lookup = lookup_tx(http, base_url, &local_hash).await;
+    Ok(wallet_result_from_lookup(
+        local_hash,
+        amount_base,
+        lookup,
+        "Transfer",
+    ))
 }
 
 pub async fn faucet_claim(
@@ -630,19 +833,26 @@ pub async fn faucet_claim(
         return Err(format!("{} ({})", err, status));
     }
     let v: Value = resp.json().await.map_err(|e| e.to_string())?;
-    Ok(FaucetResult {
-        tx_hash: v
-            .get("tx_hash")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        amount: v.get("amount").and_then(|x| x.as_u64()).unwrap_or(0),
-        message: v
-            .get("message")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-    })
+    let tx_hash = v
+        .get("tx_hash")
+        .and_then(Value::as_str)
+        .map(strip_0x)
+        .filter(|hash| is_tx_hash(hash))
+        .ok_or_else(|| "faucet accepted the request but returned no valid transaction hash".to_string())?;
+    let amount = v
+        .get("amount")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "faucet response omitted its exact base-unit amount".to_string())?;
+    if v.get("status").and_then(Value::as_str) != Some("pending") {
+        return Err("faucet did not acknowledge the claim as pending".to_string());
+    }
+    let lookup = lookup_tx(http, base_url, &tx_hash).await;
+    Ok(wallet_result_from_lookup(
+        tx_hash,
+        amount,
+        lookup,
+        "Faucet claim",
+    ))
 }
 
 /// Parse the `shard_trace` array a coordinator returns alongside a sharded
@@ -785,7 +995,7 @@ pub async fn run_inference(
 
 /// Milestone A: fall back to a seed coordinator's `/inference/run_consensus`
 /// when the local node cannot serve inference (observer role, no model
-/// loaded). `coord_base` is a full origin like `http://149.28.32.76:9090`.
+/// loaded). `coord_base` is a full origin like `https://149-28-32-76.nip.io`.
 ///
 /// Caller must pass an http client with a long timeout - consensus
 /// inference on the 6-seed pipeline takes 30–60 s for a short prompt.
@@ -2278,5 +2488,101 @@ mod chain_read_tests {
         // `/worker/earnings` sends `today_arc: null` deliberately.
         let v = json!({ "today_arc": Value::Null });
         assert_eq!(pick_f64(&v, &["today_arc"]), None);
+    }
+
+    #[test]
+    fn protocol_v3_signing_domain_is_required_and_exact() {
+        let domain = "ab".repeat(32);
+        let parsed = transaction_signing_domain_from_value(
+            &json!({
+                "protocol_version": "3.0.0",
+                "recovery_active": true,
+                "recovery_domain": format!("0x{domain}"),
+            }),
+            "https://seed.nip.io",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(parsed.to_hex(), domain);
+
+        for bad in [
+            json!({"protocol_version":"3.0.0", "recovery_active":true, "recovery_domain":null}),
+            json!({"protocol_version":"3.0.0", "recovery_active":true, "recovery_domain":"0x00"}),
+            json!({"protocol_version":"3.0.0", "recovery_active":true, "recovery_domain":format!("0x{}", "00".repeat(32))}),
+            json!({"protocol_version":"3.0.0", "recovery_active":false, "recovery_domain":null}),
+        ] {
+            assert!(
+                transaction_signing_domain_from_value(&bad, "https://seed.nip.io").is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_domain_is_allowed_only_when_explicitly_inactive() {
+        assert_eq!(
+            transaction_signing_domain_from_value(
+                &json!({
+                    "protocol_version": "2.0.0",
+                    "recovery_active": false,
+                    "recovery_domain": null,
+                }),
+                "http://127.0.0.1:9090",
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn wallet_result_never_calls_submission_a_confirmation() {
+        let pending = wallet_result_from_lookup(
+            "aa".repeat(32),
+            1_000_000_000,
+            TxLookup {
+                source_host: "https://seed.nip.io".to_string(),
+                unavailable: None,
+                hash: "aa".repeat(32),
+                status: "not_found".to_string(),
+                block_height: None,
+                block_hash: None,
+                tx_index: None,
+                success: None,
+                gas_used: None,
+            },
+            "Transfer",
+        );
+        assert_eq!(pending.amount_base, "1000000000");
+        assert_eq!(pending.amount_arc, "1");
+        assert_eq!(pending.receipt_status, "pending");
+        assert!(!pending.mined);
+        assert_eq!(pending.success, None);
+        assert!(!pending.message.to_ascii_lowercase().contains("confirmed"));
+    }
+
+    #[test]
+    fn only_a_successful_mined_receipt_is_confirmed() {
+        for (success, expected) in [(true, "mined_success"), (false, "mined_failed")] {
+            let result = wallet_result_from_lookup(
+                "bb".repeat(32),
+                10_000,
+                TxLookup {
+                    source_host: "https://seed.nip.io".to_string(),
+                    unavailable: None,
+                    hash: "bb".repeat(32),
+                    status: "mined".to_string(),
+                    block_height: Some(42),
+                    block_hash: Some("cc".repeat(32)),
+                    tx_index: Some(1),
+                    success: Some(success),
+                    gas_used: Some(21_000),
+                },
+                "Faucet claim",
+            );
+            assert!(result.mined);
+            assert_eq!(result.receipt_status, expected);
+            assert_eq!(result.amount_arc, "0.00001");
+            assert_eq!(result.success, Some(success));
+            assert_eq!(result.block_height, Some(42));
+        }
     }
 }

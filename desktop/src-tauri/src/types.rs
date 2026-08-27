@@ -111,7 +111,7 @@ pub struct NodeStatus {
     pub rpc_port: u16,
     pub last_error: Option<String>,
     /// HTTPS RPC origin of a reachable public seed coordinator (e.g.
-    /// `http://140.82.16.112:9090`). Set whenever any `COORDINATOR_HOSTS`
+    /// `https://140-82-16-112.nip.io`). Set whenever any `COORDINATOR_HOSTS`
     /// entry returned 200 on `/health` during the last poll. Lets the UI
     /// show "Lite mode (via NYC)" instead of a hard "offline" when local
     /// P2P fails — common on residential ISPs that drop outbound UDP on
@@ -266,18 +266,38 @@ pub struct BinaryStatus {
 #[serde(rename_all = "camelCase")]
 pub struct AccountBalance {
     pub address: String,
-    pub balance: u64,
+    /// Exact base-unit integer. Serialized as a string so values above
+    /// JavaScript's 53-bit safe-integer ceiling cannot be rounded in IPC.
+    pub balance_base: String,
+    /// Exact 9-decimal ARC representation derived from `balance_base`.
+    pub balance_arc: String,
     pub nonce: u64,
-    pub staked_balance: u64,
+    pub staked_balance_base: String,
+    pub staked_balance_arc: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct FaucetResult {
+pub struct WalletTxResult {
     pub tx_hash: String,
-    pub amount: u64,
+    /// Exact base units submitted, kept as a string across IPC.
+    pub amount_base: String,
+    /// Exact human ARC amount (at most nine fractional digits).
+    pub amount_arc: String,
+    /// `pending`, `mined_success`, `mined_failed`, or `receipt_unavailable`.
+    pub receipt_status: String,
+    /// True only when `GET /tx/{hash}` returned a mined receipt.
+    pub mined: bool,
+    /// The mined receipt's execution result; absent until a receipt exists.
+    pub success: Option<bool>,
+    pub block_height: Option<u64>,
+    pub block_hash: Option<String>,
+    pub source_host: String,
+    pub unavailable: Option<String>,
     pub message: String,
 }
+
+pub type FaucetResult = WalletTxResult;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

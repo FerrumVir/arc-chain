@@ -509,8 +509,58 @@ pub async fn faucet_claim(state: State<'_, AppState>) -> CmdResult<FaucetResult>
         store.identity.as_ref().map(|i| i.address.clone())
     }
     .ok_or_else(|| "no identity".to_string())?;
-    let host = chain_host(&state).await;
+    let host = crate::wallet::validate_rpc_origin(&chain_host(&state).await)?;
     rpc_client::faucet_claim(&state.http, &host, &addr).await
+}
+
+/// Sign and submit an ARC transfer without ever handing recovery material to
+/// the WebView. IPC contains only the recipient and a decimal amount string.
+#[tauri::command]
+pub async fn send_arc(
+    state: State<'_, AppState>,
+    to: String,
+    amount_arc: String,
+) -> CmdResult<WalletTxResult> {
+    let amount_base = crate::wallet::parse_arc_amount(&amount_arc)?;
+    if amount_base == 0 {
+        return Err("amount must be greater than zero".to_string());
+    }
+
+    // Prevent concurrent clicks from reading and signing the same nonce.
+    let _write_guard = state.wallet_write.lock().await;
+    let address = {
+        let store = state.store.lock().await;
+        store.identity.as_ref().map(|identity| identity.address.clone())
+    }
+    .ok_or_else(|| "no identity".to_string())?;
+
+    let host = crate::wallet::validate_rpc_origin(&chain_host(&state).await)?;
+    let account = rpc_client::fetch_balance(&state.http, &host, &address).await?;
+    let available = account
+        .balance_base
+        .parse::<u64>()
+        .map_err(|_| "selected host returned an invalid wallet balance".to_string())?;
+    if amount_base > available {
+        return Err(format!(
+            "insufficient balance: available {} ARC, requested {} ARC",
+            account.balance_arc,
+            crate::wallet::format_arc_amount(amount_base)
+        ));
+    }
+
+    // Read the domain from the exact pinned origin before touching the
+    // recovery phrase. Missing v3 recovery metadata fails closed.
+    let domain = rpc_client::transaction_signing_domain(&state.http, &host).await?;
+    let tx = {
+        let store = state.store.lock().await;
+        let identity = store
+            .identity
+            .as_ref()
+            .ok_or_else(|| "no identity".to_string())?;
+        crate::wallet::signed_transfer(identity, &to, amount_base, account.nonce, domain)?
+    };
+
+    rpc_client::submit_signed_transfer(&state.http, &host, &tx, amount_base).await
 }
 
 // The chain host is elected ONCE and then pinned for the life of the
@@ -958,28 +1008,14 @@ fn tier1_candidate_hosts() -> Vec<String> {
 
 /// Candidate hosts for free coordinator inference and read-only compatibility
 /// queries. New paid/Tier 1 request writes are disabled above.
-const COORDINATOR_HOSTS: [&str; 6] = [
-    "http://149.28.32.76:9090",   // NYC
-    "http://140.82.16.112:9090",  // LAX
-    "http://136.244.109.1:9090",  // AMS
-    "http://104.238.171.11:9090", // LHR
-    "http://202.182.107.41:9090", // NRT
-    "http://149.28.153.31:9090",  // SGP
-];
+const COORDINATOR_HOSTS: [&str; 6] = rpc_client::PRODUCTION_RPC_ORIGINS;
 
 /// The public testnet seeds, as candidates for chain reads.
 ///
 /// No longer a priority list with a pinned `[0]` — `chain_host()` elects
 /// among these by block freshness on every TTL expiry. Order is
 /// presentational only.
-const WALLET_HOSTS: [&str; 6] = [
-    "http://149.28.32.76:9090",   // NYC
-    "http://140.82.16.112:9090",  // LAX
-    "http://136.244.109.1:9090",  // AMS
-    "http://104.238.171.11:9090", // LHR
-    "http://202.182.107.41:9090", // NRT
-    "http://149.28.153.31:9090",  // SGP
-];
+const WALLET_HOSTS: [&str; 6] = rpc_client::PRODUCTION_RPC_ORIGINS;
 
 /// Paid inference escrow is intentionally unavailable in this recovery
 /// candidate.
