@@ -216,10 +216,10 @@
   }
 
   function validateWorkerId(raw) {
-    const value = String(raw ?? "").trim();
-    if (!value) return { error: "Enter the exact worker ID reported by your node." };
-    if (value.length > 160 || !/^[a-zA-Z0-9:_-]+$/.test(value)) return { error: "Worker IDs may contain letters, digits, colon, underscore, and hyphen." };
-    return { value };
+    const value = network.normalizeHex(String(raw ?? "").trim(), 32);
+    return value
+      ? { value }
+      : { error: "Enter the 32-byte ARC worker address reported by your node (64 hex characters, with optional 0x)." };
   }
 
   async function loadWorkerEarnings(options) {

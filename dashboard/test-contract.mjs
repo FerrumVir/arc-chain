@@ -203,11 +203,12 @@ await test("observed rate times reward is never synthesized into a projection", 
 
 await test("worker lookup is pinned to canonical v3 source and read-only endpoints", async () => {
   const calls = [];
+  const worker = hex("1");
   const fetchImpl = mockFetch({
-    "https://v3-a.example.test/worker/earnings/worker-1": { body: { onchain_balance_arc: 4, confirmed_receipt_count: 2, confirmed_receipts: [{}, {}], confirmed_gross_earnings_arc: 5, projected_daily_arc: null, projected_daily_unavailable_reason: "insufficient observations" } },
+    [`https://v3-a.example.test/worker/earnings/${worker}`]: { body: { onchain_balance_arc: 4, confirmed_receipt_count: 2, confirmed_receipts: [{}, {}], confirmed_gross_earnings_arc: 5, projected_daily_arc: null, projected_daily_unavailable_reason: "insufficient observations" } },
     "https://v3-a.example.test/economics/rewards": { body: { attestation_reward_arc: 2.5 } },
   }, calls);
-  const result = await app.loadWorkerEarnings({ resolver: makeResolver(), fetchImpl, workerId: "worker-1", checkpointAudit: { state: "verified" } });
+  const result = await app.loadWorkerEarnings({ resolver: makeResolver(), fetchImpl, workerId: `0x${worker}`, checkpointAudit: { state: "verified" } });
   assert.equal(result.source.id, "v3-a");
   assert.equal(result.balance, 4);
   assert.ok(calls.every((call) => call.options.method === "GET"));
@@ -215,8 +216,8 @@ await test("worker lookup is pinned to canonical v3 source and read-only endpoin
 });
 
 await test("worker IDs are validated before path construction", () => {
-  assert.match(app.validateWorkerId("../../health").error, /may contain/);
-  assert.deepEqual(app.validateWorkerId("worker:abc_1"), { value: "worker:abc_1" });
+  assert.match(app.validateWorkerId("../../health").error, /32-byte ARC worker address/);
+  assert.deepEqual(app.validateWorkerId(`0x${hex("a")}`), { value: hex("a") });
 });
 
 await test("transaction lookup searches canonical segments and excludes preserved fork", async () => {
