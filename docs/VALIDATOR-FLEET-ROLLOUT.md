@@ -191,6 +191,17 @@ approved public manifest. Require:
 
 Keep reward issuance disabled throughout this rehearsal.
 
+Use `scripts/recovery/recovery_rollout.py` for both the isolated rehearsal and
+the production cutover. Its manifest is canonical JSON, create-only, mode
+`0444`, and protected by a SHA-256 sidecar. `run` is plan/preflight-only unless
+both `--execute --go-hash <locked-manifest-sha256>` and the exact
+`ARC_RECOVERY_GO="GO <locked-manifest-sha256>"` value are present. The harness
+imports the quorum-verified checkpoint into six fresh data directories, proves
+the selected legacy block H and v3 transition H+1, requires advancing
+same-height hash/root convergence, restarts one validator at a time, and checks
+the configured reward policy. Receipt mode additionally requires the exact
+successful mined `0x25` receipt and receipt-backed worker earnings on all six.
+
 ## 5. Execute the coordinated v3 cutover
 
 With six equal-stake validators, the strict greater-than-two-thirds quorum is
@@ -212,6 +223,15 @@ maintenance halt as permission to mix protocols or lower quorum.
 7. Require all six to converge on the same advancing height/hash/root for a
    full observation window before reopening ordinary traffic.
 
+Each production validator RPC must bind loopback. Configure all six explicit
+`--community-rpc-url https://...` origins on every validator; P2P peers are not
+RPC discovery. The locked rollout installs a SHA-pinned Caddy TLS gateway for
+an exact IP-derived `nip.io` hostname (`sslip.io` is the resealed-manifest
+fallback), a loopback request/rate-limit filter, strict body limits, security
+headers, and a reviewed path allowlist. Unknown paths fail closed. Raw public
+`:9090` endpoints and clear-text remote community origins are not acceptable
+frontend or validator configuration.
+
 If five prepared v3 validators cannot establish the approved chain, stop all
 new processes and preserve logs/data for diagnosis. Do not fall back to the
 compromised identities. Recovery means correcting the v3 configuration or
@@ -226,17 +246,20 @@ execution requires an explicit reward approval from at least
 two thirds of active stake. Approval evidence is capped at 64 entries and is
 bound to the complete reward commitment.
 
-The coordinator does not yet collect that approval quorum. Reward construction
-therefore fails closed even when `--enable-community-rewards-v1` is requested;
-the local flag and genesis activation height are necessary but not sufficient
-to issue a reward.
+The unreleased candidate now collects approvals from the six explicitly
+configured HTTPS community RPC origins. Each remote validator authenticates
+the coordinator request, independently revalidates the complete job/result and
+reward commitment, and signs only its own approval. The coordinator accepts
+five distinct approvals only when they also cover strict greater-than-two-
+thirds active stake; a dead sixth origin cannot delay an already valid quorum.
+Failure is atomic: no mempool submission, worker-success increment, or earned
+balance is reported without the approval quorum.
 
-Leave `--enable-community-rewards-v1` off until the team:
-
-- implements and audits coordinator collection of the on-chain approval
-  quorum; and
-- documents treasury limits and monitoring and approves a bounded testnet
-  canary.
+This implementation is not evidence of deployment. Leave
+`--enable-community-rewards-v1` off until the exact candidate has passed the
+six-validator harness, the team has documented treasury limits and monitoring,
+and operators approve a bounded testnet receipt canary in the locked rollout
+manifest.
 
 For an approved canary, verify in order:
 
@@ -250,9 +273,9 @@ For an approved canary, verify in order:
 7. replaying the job, certificate, or transaction pays nothing;
 8. `/worker/earnings/:address` counts only the successful mined receipt.
 
-Only then expose ordinary community work. Public HTTP coordinator endpoints
-still need deployment-layer TLS, authentication/rate limits, and SSRF-safe
-network policy before treating them as hardened Internet-facing APIs.
+Only then expose ordinary community work. Public coordinator origins must be
+the locked HTTPS gateways described above; signed proof of possession does not
+replace TLS, body/rate limits, or a fail-closed route allowlist.
 
 ## Automatic stop conditions
 

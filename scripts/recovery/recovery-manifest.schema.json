@@ -1,0 +1,200 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://arc.network/schemas/recovery-rollout-v1.json",
+  "title": "ARC six-validator recovery rollout manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "rollout_id",
+    "mode",
+    "chain",
+    "artifacts",
+    "checks",
+    "gateway",
+    "validators"
+  ],
+  "properties": {
+    "schema": { "const": "arc.recovery.rollout.v1" },
+    "rollout_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
+    "mode": { "enum": ["local", "production"] },
+    "chain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "chain_id",
+        "protocol_version",
+        "recovery_epoch",
+        "validator_set_id",
+        "source_height",
+        "source_block_hash",
+        "transition_height",
+        "transition_block_hash",
+        "full_state_root",
+        "approved_checkpoint_manifest_hash"
+      ],
+      "properties": {
+        "chain_id": { "type": "string", "minLength": 1 },
+        "protocol_version": { "type": "string", "pattern": "^3\\.[0-9]+\\.[0-9]+$" },
+        "recovery_epoch": { "type": "integer", "minimum": 1 },
+        "validator_set_id": { "type": "integer", "minimum": 1 },
+        "source_height": { "type": "integer", "minimum": 0 },
+        "source_block_hash": { "$ref": "#/$defs/hash" },
+        "transition_height": { "type": "integer", "minimum": 1 },
+        "transition_block_hash": { "$ref": "#/$defs/hash" },
+        "full_state_root": { "$ref": "#/$defs/hash" },
+        "approved_checkpoint_manifest_hash": { "$ref": "#/$defs/hash" }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["binary", "genesis", "checkpoint"],
+      "properties": {
+        "binary": { "$ref": "#/$defs/artifact" },
+        "genesis": { "$ref": "#/$defs/artifact" },
+        "checkpoint": { "$ref": "#/$defs/artifact" },
+        "caddy": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "startup_timeout_seconds",
+        "convergence_timeout_seconds",
+        "observation_seconds",
+        "restart_timeout_seconds",
+        "poll_interval_seconds",
+        "min_height_advance",
+        "reward"
+      ],
+      "properties": {
+        "startup_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 3600 },
+        "convergence_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 7200 },
+        "observation_seconds": { "type": "integer", "minimum": 1, "maximum": 3600 },
+        "restart_timeout_seconds": { "type": "integer", "minimum": 10, "maximum": 3600 },
+        "poll_interval_seconds": { "type": "integer", "minimum": 1, "maximum": 30 },
+        "min_height_advance": { "type": "integer", "minimum": 1, "maximum": 10000 },
+        "reward": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "expect_protocol_active", "expect_issuance_ready"],
+          "properties": {
+            "mode": { "enum": ["policy", "receipt"] },
+            "expect_protocol_active": { "type": "boolean" },
+            "expect_issuance_ready": { "type": "boolean" },
+            "probe_argv": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "probe_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "tx_hash": { "$ref": "#/$defs/hash" },
+            "job_id": { "$ref": "#/$defs/hash" },
+            "worker": { "$ref": "#/$defs/hash" },
+            "expected_reward_base": { "type": "integer", "minimum": 1 }
+          }
+        }
+      }
+    },
+    "gateway": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": { "mode": { "const": "none" } }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "acme_email", "public_get_paths", "public_post_paths"],
+          "properties": {
+            "mode": { "const": "caddy-nginx" },
+            "acme_email": { "type": "string", "format": "email" },
+            "public_get_paths": {
+              "const": [
+                "/health",
+                "/network/info",
+                "/stats",
+                "/validators",
+                "/block/latest",
+                "/blocks",
+                "/inference/attestations",
+                "/economics/rewards",
+                "/community/reward_policy",
+                "/shards",
+                "/models",
+                "/models/shards"
+              ]
+            },
+            "public_post_paths": {
+              "const": [
+                "/inference/run",
+                "/inference/run_consensus",
+                "/community/register",
+                "/community/heartbeat",
+                "/community/claim_work",
+                "/community/submit_work",
+                "/tx/submit_signed"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "validators": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 6,
+      "items": { "$ref": "#/$defs/validator" }
+    }
+  },
+  "$defs": {
+    "hash": { "type": "string", "pattern": "^(0x)?[0-9a-f]{64}$" },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "type": "string", "pattern": "^/" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "validator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "address",
+        "stake",
+        "key_file",
+        "rpc_listen",
+        "rpc_url",
+        "p2p_port",
+        "p2p_advertise",
+        "data_dir",
+        "extra_args"
+      ],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
+        "address": { "$ref": "#/$defs/hash" },
+        "stake": { "type": "integer", "minimum": 1 },
+        "key_file": { "type": "string", "pattern": "^/" },
+        "rpc_listen": { "type": "string", "minLength": 3 },
+        "rpc_url": { "type": "string", "format": "uri" },
+        "p2p_port": { "type": "integer", "minimum": 1024, "maximum": 65535 },
+        "p2p_advertise": { "type": "string", "minLength": 3 },
+        "data_dir": { "type": "string", "pattern": "^/" },
+        "extra_args": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "host": { "type": "string", "minLength": 1 },
+        "ssh_user": { "type": "string", "minLength": 1 },
+        "remote_root": { "type": "string", "pattern": "^/" },
+        "service_user": { "type": "string", "minLength": 1 },
+        "service_name": { "type": "string", "pattern": "^arc-node-v3-[a-z0-9-]+\\.service$" },
+        "public_hostname": { "type": "string", "pattern": "^[A-Za-z0-9.-]+\\.(nip|sslip)\\.io$" }
+      }
+    }
+  }
+}

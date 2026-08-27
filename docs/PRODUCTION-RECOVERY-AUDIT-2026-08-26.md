@@ -82,12 +82,17 @@ layer range and token. Payment is deliberately separate:
   that host's retained index. Pending, failed, pruned, or raw `0x16` records are
   not earnings.
 
-Approval collection is not implemented yet. The candidate intentionally
-reports the effective reward gate disabled and refuses to build a reward
-transaction. It does not manufacture validator approvals from shard signatures
-and does not expose a validator-signing oracle. Projected rewards remain hidden
-until the selected coordinator confirms both protocol activation and approval
-collection, then has enough mined receipt history to measure a rate.
+The unreleased candidate now implements authenticated approval collection from
+six explicit HTTPS community RPC origins. It does not derive RPC authority from
+P2P peers, accept clear-text remote origins by default, manufacture approvals
+from shard signatures, or expose a validator-signing oracle. Five distinct
+validators must independently revalidate and sign the exact reward commitment,
+and those approvals must also cover strict greater-than-two-thirds active
+stake. A failure leaves the mempool, success counters, and earnings unchanged.
+This code is not yet published or deployed, so it is not evidence that the
+audited public fleet can issue rewards today. Projected rewards remain hidden
+until the selected live coordinator reports issuance ready and has enough
+successful mined receipt history to measure a rate.
 
 The desktop's legacy paid-escrow and Tier 1 request commands are also disabled
 before identity access, signing, nonce reads, or network writes. Their old
@@ -106,8 +111,8 @@ Free/community inference remains available without opening escrow.
   does not by itself disqualify a community worker, but no reward is available
   merely for registering or submitting `0x16`. All exact-model, assignment,
   verification, strict validator authorization, activation, treasury, and mined
-  `0x25` gates above must pass. The current candidate fails closed before
-  issuance because approval collection is unavailable.
+  `0x25` gates above must pass. The public fleet cannot currently do so because
+  this candidate and its coordinated v3 trust root are not deployed.
 - **What hardware is required?** An observer/router needs no model or GPU. The
   current full-model worker target is Llama-2-7B Q4_K_M, about 4 GB on disk.
   Use at least 8 GB RAM; 12 GB or more gives safer OS/chain headroom. More CPU
@@ -119,9 +124,13 @@ Free/community inference remains available without opening escrow.
 Before publishing a “working network” walkthrough, operators must choose an
 approved canonical genesis or checkpoint, rotate the six validator identities
 whose legacy seed material appeared in repository history, configure the full
-trusted validator set, implement peer-authenticated reward-approval collection,
-choose and record the activation height, execute one coordinated strict-quorum
-cutover, and verify common-height block hash plus state root agreement.
+trusted validator set and six explicit HTTPS community RPC origins, choose and
+record the activation height, execute one coordinated strict-quorum cutover,
+and verify common-height block hash plus state root agreement. The content-
+addressed `scripts/recovery/recovery_rollout.py` plan defaults to read-only,
+requires an exact GO hash before mutation, imports only into fresh data
+directories, checks H/H+1 continuity and restart convergence, and can require a
+successful reward receipt plus receipt-only earnings on every validator.
 
 Only after that should the team use
 [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) to record the
