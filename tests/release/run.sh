@@ -8,6 +8,7 @@ for test_file in \
     "$TEST_DIR/static_contract_test.sh" \
     "$TEST_DIR/public_site_contract_test.sh" \
     "$TEST_DIR/community_diagnostics_contract_test.sh" \
+    "$TEST_DIR/recovery_archive_contract_test.sh" \
     "$TEST_DIR/documentation_contract_test.sh" \
     "$TEST_DIR/legacy_operations_retirement_test.sh" \
     "$TEST_DIR/secret_scan_materialization_test.sh" \
