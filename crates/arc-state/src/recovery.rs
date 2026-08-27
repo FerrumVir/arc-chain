@@ -7,7 +7,7 @@
 //! in memory before any active-data marker is written.
 
 use crate::{StateDB, StateError, WalOp, read_wal_strict};
-use arc_crypto::{Hash256, KeyPair, Signature, hash_bytes};
+use arc_crypto::{Hash256, IncrementalMerkle, KeyPair, Signature, hash_bytes};
 use arc_types::{
     Account, Address, Block, BlockHeader, EventLog, Identity, ProtocolVersion, Transaction,
     TxReceipt, strict_supermajority_threshold,
@@ -22,6 +22,12 @@ use std::sync::atomic::Ordering;
 
 pub const ARCCHKPT_MAGIC: [u8; 8] = *b"ARCCHKPT";
 pub const ARCCHKPT_FORMAT_VERSION: u16 = 1;
+/// Format-v1 checkpoints are decoded as one in-memory object. Bound the input
+/// before deserialization so an operator cannot accidentally hand an offline
+/// signer or validator a sparse/hostile file that exhausts the machine.
+/// A future format can raise this safely by chunking and authenticating each
+/// section independently.
+pub const ARCCHKPT_MAX_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 pub const RECOVERY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     major: 3,
     minor: 0,
@@ -294,13 +300,12 @@ impl ArcCheckpoint {
         mut spec: RecoveryExportSpec,
     ) -> Result<Self, RecoveryError> {
         canonicalize_recovery_validators(&mut spec.validators)?;
-        let mut payload = state.export_recovery_payload();
-        payload.validators = spec
-            .validators
-            .iter()
-            .map(|validator| (validator.address, validator.stake))
-            .collect();
-        payload.staking_pool = checked_total_stake(&payload.validators)?;
+        // Payload is the exact legacy source state. Validator replacement and
+        // missing zero-balance validator accounts are deterministic H+1
+        // transition effects, not edits to the source snapshot. Keeping both
+        // states distinct lets offline signers recompute the legacy state root
+        // as well as the post-transition v3 root.
+        let payload = state.export_recovery_payload();
         payload.validate_canonical()?;
 
         let Some((source_height, source_block)) = payload.blocks.last() else {
@@ -308,14 +313,35 @@ impl ArcCheckpoint {
                 "source state contains no canonical anchor block".into(),
             ));
         };
+        let replayed_source_state_root = payload.legacy_state_root();
+        let state_source_root = state.compute_state_root();
+        if replayed_source_state_root != state_source_root {
+            return Err(RecoveryError::Invalid(format!(
+                "exported source state root {} differs from replayed state root {}",
+                replayed_source_state_root, state_source_root
+            )));
+        }
+        // Legacy genesis used a zero state_root in block 0. Every later block
+        // must bind the actual replayed state root in its header.
+        if (*source_height != 0 || source_block.header.state_root != Hash256::ZERO)
+            && source_block.header.state_root != replayed_source_state_root
+        {
+            return Err(RecoveryError::Invalid(format!(
+                "source anchor state root {} differs from replayed state root {}",
+                source_block.header.state_root, replayed_source_state_root
+            )));
+        }
         let context = RecoveryContext::new(
             &spec.chain_id,
             spec.genesis_hash,
             spec.recovery_epoch,
             spec.validator_set_id,
         );
-        let full_state_root =
-            payload.consensus_state_root(&context, spec.community_rewards_v1_activation_height);
+        let full_state_root = payload.transition_consensus_state_root(
+            &context,
+            spec.community_rewards_v1_activation_height,
+            &spec.validators,
+        )?;
         let payload_hash = payload.content_hash();
         let manifest = RecoveryManifest {
             format_version: ARCCHKPT_FORMAT_VERSION,
@@ -323,7 +349,7 @@ impl ArcCheckpoint {
             genesis_hash: spec.genesis_hash,
             source_height: *source_height,
             source_block_hash: source_block.hash,
-            source_state_root: source_block.header.state_root,
+            source_state_root: replayed_source_state_root,
             source_consensus_round: spec.source_consensus_round,
             recovery_epoch: spec.recovery_epoch,
             validator_set_id: spec.validator_set_id,
@@ -408,7 +434,6 @@ impl ArcCheckpoint {
         }
         validate_recovery_validators(&self.manifest.validators)?;
         self.payload.validate_canonical()?;
-
         let Some((height, anchor)) = self.payload.blocks.last() else {
             return Err(RecoveryError::Invalid(
                 "checkpoint has no anchor block".into(),
@@ -417,36 +442,38 @@ impl ArcCheckpoint {
         if *height != self.manifest.source_height
             || anchor.header.height != self.manifest.source_height
             || anchor.hash != self.manifest.source_block_hash
-            || anchor.header.state_root != self.manifest.source_state_root
         {
             return Err(RecoveryError::Invalid(
-                "source height/hash/root does not match the retained anchor block".into(),
+                "source height/hash does not match the retained anchor block".into(),
             ));
         }
-        if self.payload.validators
-            != self
-                .manifest
-                .validators
-                .iter()
-                .map(|validator| (validator.address, validator.stake))
-                .collect::<Vec<_>>()
+        if (*height != 0 || anchor.header.state_root != Hash256::ZERO)
+            && anchor.header.state_root != self.manifest.source_state_root
         {
             return Err(RecoveryError::Invalid(
-                "payload validator state differs from manifest validator set".into(),
+                "source anchor header does not commit the replayed source state root".into(),
             ));
         }
         if self.payload.staking_pool != checked_total_stake(&self.payload.validators)? {
             return Err(RecoveryError::Invalid(
-                "staking pool does not equal the exact recovery validator stake".into(),
+                "source staking pool does not equal its retained validator stake".into(),
             ));
         }
         if self.payload.content_hash() != self.manifest.payload_hash {
             return Err(RecoveryError::Invalid("payload hash mismatch".into()));
         }
-        let full_root = self.payload.consensus_state_root(
+        let source_root = self.payload.legacy_state_root();
+        if source_root != self.manifest.source_state_root {
+            return Err(RecoveryError::Invalid(format!(
+                "replayed source state root mismatch: manifest {}, computed {}",
+                self.manifest.source_state_root, source_root
+            )));
+        }
+        let full_root = self.payload.transition_consensus_state_root(
             &self.manifest.recovery_context(),
             self.manifest.community_rewards_v1_activation_height,
-        );
+            &self.manifest.validators,
+        )?;
         if full_root != self.manifest.full_state_root {
             return Err(RecoveryError::Invalid(format!(
                 "full state root mismatch: manifest {}, computed {}",
@@ -579,6 +606,11 @@ impl ArcCheckpoint {
         let mut len = [0u8; 8];
         file.read_exact(&mut len)?;
         let declared = u64::from_be_bytes(len);
+        if declared > ARCCHKPT_MAX_PAYLOAD_BYTES as u64 {
+            return Err(RecoveryError::Invalid(format!(
+                "checkpoint payload is {declared} bytes; format-v1 safety limit is {ARCCHKPT_MAX_PAYLOAD_BYTES} bytes"
+            )));
+        }
         if metadata_len != declared.saturating_add(16) {
             return Err(RecoveryError::Invalid(format!(
                 "file length mismatch: declared {declared} payload bytes, file is {metadata_len} bytes"
@@ -588,8 +620,9 @@ impl ArcCheckpoint {
             .map_err(|_| RecoveryError::Invalid("checkpoint is too large for this host".into()))?;
         let mut bytes = vec![0u8; usize_len];
         file.read_exact(&mut bytes)?;
-        let checkpoint: Self = bincode::deserialize(&bytes)
-            .map_err(|error| RecoveryError::Codec(error.to_string()))?;
+        let checkpoint: Self =
+            bincode::deserialize_limited_exact::<Self, ARCCHKPT_MAX_PAYLOAD_BYTES>(&bytes)
+                .map_err(|error| RecoveryError::Codec(error.to_string()))?;
         if checkpoint.magic != magic {
             return Err(RecoveryError::Invalid(
                 "inner and outer ARCCHKPT magic differ".into(),
@@ -605,6 +638,119 @@ impl RecoveryPayload {
         let mut hasher = blake3::Hasher::new_derive_key("ARCCHKPT-payload-content-v1");
         hasher.update(&bytes);
         Hash256(*hasher.finalize().as_bytes())
+    }
+
+    /// Recompute the legacy account-only Merkle root from the exact retained
+    /// source accounts. This is intentionally independent of StateDB caches,
+    /// dirty-key tracking, and the replacement validator set.
+    pub fn legacy_state_root(&self) -> Hash256 {
+        let mut tree = IncrementalMerkle::new();
+        for (address, account) in &self.accounts {
+            let bytes = bincode::serialize(account).expect("canonical account is serializable");
+            tree.update(address.0, hash_bytes(&bytes));
+        }
+        tree.rebuild();
+        tree.root()
+    }
+
+    fn transition_accounts(
+        &self,
+        validators: &[RecoveryValidator],
+    ) -> Result<Vec<(Address, Account)>, RecoveryError> {
+        let source_stake = checked_total_stake(&self.validators)?;
+        if self.staking_pool != source_stake {
+            return Err(RecoveryError::Invalid(
+                "source staking pool does not equal its retained validator stake".into(),
+            ));
+        }
+        let target_stake = validators.iter().try_fold(0u64, |total, validator| {
+            total
+                .checked_add(validator.stake)
+                .ok_or_else(|| RecoveryError::Invalid("validator stake exceeds u64::MAX".into()))
+        })?;
+        if target_stake != source_stake {
+            return Err(RecoveryError::Invalid(format!(
+                "recovery validator stake {target_stake} must equal conserved source stake {source_stake}"
+            )));
+        }
+
+        let source_validators: HashMap<_, _> = self.validators.iter().copied().collect();
+        for (address, stake) in &self.validators {
+            let account_index = self
+                .accounts
+                .binary_search_by_key(&address.0, |entry| entry.0.0)
+                .map_err(|_| {
+                    RecoveryError::Invalid(format!(
+                        "source validator {address} has no account record"
+                    ))
+                })?;
+            let account = &self.accounts[account_index].1;
+            if account.staked_balance != *stake {
+                return Err(RecoveryError::Invalid(format!(
+                    "source validator {address} account stake {} differs from validator-map stake {stake}",
+                    account.staked_balance
+                )));
+            }
+        }
+        for (address, account) in &self.accounts {
+            if account.staked_balance != 0 && !source_validators.contains_key(address) {
+                return Err(RecoveryError::Invalid(format!(
+                    "account {address} has bonded stake {} but is absent from the source validator map",
+                    account.staked_balance
+                )));
+            }
+        }
+
+        let mut accounts = self.accounts.clone();
+        // Release each old validator's bonded position only in the migration
+        // view, then bond the exact same aggregate amount to the approved new
+        // set. Liquid balances, nonces, code, and total account supply remain
+        // unchanged.
+        for (address, _) in &self.validators {
+            let index = accounts
+                .binary_search_by_key(&address.0, |entry| entry.0.0)
+                .expect("source validator account was validated above");
+            accounts[index].1.staked_balance = 0;
+        }
+        for validator in validators {
+            let index = match accounts.binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+            {
+                Ok(index) => index,
+                Err(index) => {
+                    accounts.insert(
+                        index,
+                        (validator.address, Account::new(validator.address, 0)),
+                    );
+                    index
+                }
+            };
+            accounts[index].1.staked_balance = validator.stake;
+        }
+        Ok(accounts)
+    }
+
+    fn transition_consensus_state_root(
+        &self,
+        context: &RecoveryContext,
+        reward_activation_height: Option<u64>,
+        validators: &[RecoveryValidator],
+    ) -> Result<Hash256, RecoveryError> {
+        let accounts = self.transition_accounts(validators)?;
+        let target_validators: Vec<_> = validators
+            .iter()
+            .map(|validator| (validator.address, validator.stake))
+            .collect();
+        let target_staking_pool = checked_total_stake(&target_validators)?;
+        Ok(consensus_state_root_from_sections(
+            context,
+            reward_activation_height,
+            &accounts,
+            &self.storage,
+            &self.contracts,
+            &self.identities,
+            &target_validators,
+            target_staking_pool,
+        ))
     }
 
     pub fn consensus_state_root(
@@ -1139,6 +1285,17 @@ impl StateDB {
 
     fn install_verified_checkpoint(&self, checkpoint: &ArcCheckpoint) -> Result<(), RecoveryError> {
         let payload = &checkpoint.payload;
+        let transitioned_accounts = payload.transition_accounts(&checkpoint.manifest.validators)?;
+        let transitioned_staking_pool =
+            checkpoint
+                .manifest
+                .validators
+                .iter()
+                .try_fold(0u64, |total, validator| {
+                    total.checked_add(validator.stake).ok_or_else(|| {
+                        RecoveryError::Invalid("validator stake exceeds u64::MAX".into())
+                    })
+                })?;
         self.accounts.clear();
         self.storage.clear();
         self.blocks.clear();
@@ -1151,7 +1308,7 @@ impl StateDB {
         self.event_logs.clear();
         self.validators.clear();
 
-        for (address, account) in &payload.accounts {
+        for (address, account) in &transitioned_accounts {
             self.accounts.insert(address.0, account.clone());
             self.dirty_accounts.insert(address.0);
         }
@@ -1183,11 +1340,11 @@ impl StateDB {
         for (height, logs) in &payload.event_logs {
             self.event_logs.insert(*height, logs.clone());
         }
-        for (address, stake) in &payload.validators {
-            self.validators.insert(address.0, *stake);
+        for validator in &checkpoint.manifest.validators {
+            self.validators.insert(validator.address.0, validator.stake);
         }
         self.staking_pool
-            .store(payload.staking_pool, Ordering::Release);
+            .store(transitioned_staking_pool, Ordering::Release);
         self.community_rewards_v1_activation_height.store(
             checkpoint
                 .manifest
@@ -1489,10 +1646,28 @@ mod tests {
         (keys, validators)
     }
 
+    fn bond_source_stake(state: &StateDB, validators: &[RecoveryValidator]) {
+        let mut total = 0u64;
+        for validator in validators {
+            let mut account = state
+                .get_account(&validator.address)
+                .unwrap_or_else(|| Account::new(validator.address, 0));
+            account.staked_balance = validator.stake;
+            state.accounts.insert(validator.address.0, account);
+            state.dirty_accounts.insert(validator.address.0);
+            state
+                .validators
+                .insert(validator.address.0, validator.stake);
+            total = total.checked_add(validator.stake).unwrap();
+        }
+        state.staking_pool.store(total, Ordering::Release);
+    }
+
     fn checkpoint() -> (ArcCheckpoint, Vec<KeyPair>, RecoveryNetworkPolicy) {
         let (keys, validators) = validators();
         let state =
             StateDB::with_genesis(&[(hash_bytes(b"alice"), 10_000), (hash_bytes(b"bob"), 20_000)]);
+        bond_source_stake(&state, &validators);
         let genesis_hash = hash_bytes(b"approved-v3-genesis");
         let mut checkpoint = ArcCheckpoint::export_unsigned(
             &state,
@@ -1537,6 +1712,153 @@ mod tests {
             .unwrap();
         assert_eq!(checkpoint.manifest_hash(), hash);
         assert_eq!(checkpoint.signatures.len(), 5);
+        let transitioned = checkpoint
+            .payload
+            .transition_accounts(&checkpoint.manifest.validators)
+            .unwrap();
+        for validator in &checkpoint.manifest.validators {
+            let account = transitioned
+                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+                .expect("every replacement validator has an explicit account");
+            assert_eq!(transitioned[account].1.staked_balance, validator.stake);
+        }
+    }
+
+    #[test]
+    fn validator_rotation_moves_bonded_stake_without_minting_supply() {
+        let (_, source_validators) = validators();
+        let (_, target_validators) = validators();
+        let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42_000)]);
+        bond_source_stake(&state, &source_validators);
+        let source_supply: u128 = state
+            .export_recovery_payload()
+            .accounts
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+
+        let checkpoint = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"rotation-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        let transitioned = checkpoint
+            .payload
+            .transition_accounts(&target_validators)
+            .unwrap();
+        let target_supply: u128 = transitioned
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+        assert_eq!(source_supply, target_supply);
+        for validator in &source_validators {
+            let index = transitioned
+                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+                .unwrap();
+            assert_eq!(transitioned[index].1.staked_balance, 0);
+        }
+        for validator in &target_validators {
+            let index = transitioned
+                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+                .unwrap();
+            assert_eq!(transitioned[index].1.staked_balance, validator.stake);
+        }
+    }
+
+    #[test]
+    fn validator_rotation_rejects_any_change_to_total_bonded_stake() {
+        let (_, source_validators) = validators();
+        let (_, mut target_validators) = validators();
+        target_validators[0].stake += 1;
+        let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42_000)]);
+        bond_source_stake(&state, &source_validators);
+        let error = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"rotation-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("must equal conserved source stake")
+        );
+    }
+
+    #[test]
+    fn verifier_rejects_payload_whose_legacy_root_differs_from_source() {
+        let (mut checkpoint, _, _) = checkpoint();
+        checkpoint.payload.accounts[0].1.balance += 1;
+        checkpoint.manifest.payload_hash = checkpoint.payload.content_hash();
+        let error = checkpoint.verify_content().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("replayed source state root mismatch")
+        );
+    }
+
+    #[test]
+    fn oversized_checkpoint_is_rejected_before_payload_allocation() {
+        let dir = temp_dir("oversized");
+        let path = dir.join("oversized.arcchkpt");
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&ARCCHKPT_MAGIC).unwrap();
+        file.write_all(&(ARCCHKPT_MAX_PAYLOAD_BYTES as u64 + 1).to_be_bytes())
+            .unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let error = ArcCheckpoint::read_from(&path).unwrap_err();
+        assert!(error.to_string().contains("format-v1 safety limit"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn exporter_rejects_anchor_root_that_differs_from_replayed_state() {
+        let state = StateDB::with_genesis(&[(hash_bytes(b"source-account"), 100)]);
+        let mut anchor = state.get_block(0).unwrap();
+        anchor.header.state_root = hash_bytes(b"forged-source-root");
+        anchor.hash = Block::compute_hash(&anchor.header);
+        state.blocks.insert(0, anchor);
+        let (_, validators) = validators();
+        bond_source_stake(&state, &validators);
+        let error = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"approved-v3-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from replayed state root")
+        );
     }
 
     #[test]
@@ -1745,6 +2067,7 @@ mod tests {
         let recipient = hash_bytes(b"post-recovery-recipient");
         let source = StateDB::with_genesis(&[(sender.address(), 10_000), (recipient, 0)]);
         let (validator_keys, validators) = validators();
+        bond_source_stake(&source, &validators);
         let genesis_hash = hash_bytes(b"post-recovery-genesis");
         let mut checkpoint = ArcCheckpoint::export_unsigned(
             &source,
