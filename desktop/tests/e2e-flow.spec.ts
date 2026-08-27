@@ -33,6 +33,12 @@ test.describe("Onboarding → launch end-to-end", () => {
     await page.getByTestId("btn-continue-identity").click();
     // Model picker (v0.6.0). This spec used to assert step-launch here.
     await expect(page.getByTestId("step-model")).toBeVisible();
+    await expect(page.getByTestId("tier-standard")).toBeVisible();
+    await expect(page.getByTestId("tier-standard")).toContainText(
+      /ARC compatible/i,
+    );
+    await expect(page.getByTestId("tier-tiny")).toHaveCount(0);
+    await expect(page.getByTestId("tier-big")).toHaveCount(0);
     await page.getByTestId("tier-skip").click();
     await page.getByTestId("btn-continue-model").click();
     await expect(page.getByTestId("step-launch")).toBeVisible();
@@ -122,6 +128,20 @@ test.describe("Raw inference claims never become earnings", () => {
     // validator's row and an old-seed padding row) must not be counted.
     await expect(page.getByText(/2 yours · 4 shown/)).toBeVisible();
     await expect(feed.getByText("network claim", { exact: true })).toHaveCount(2);
+  });
+});
+
+test.describe("Existing observer upgrade", () => {
+  test("offers only the exact ARC-compatible 7B artifact", async ({ page }) => {
+    await seedOnboardedLegacy(page);
+    await page.goto("/");
+    await expect(page.getByTestId("observer-upgrade-banner")).toBeVisible();
+    await page.getByTestId("btn-open-upgrade").click();
+    await expect(page.getByTestId("upgrade-tier-standard")).toContainText(
+      /ARC compatible/i,
+    );
+    await expect(page.getByTestId("upgrade-tier-tiny")).toHaveCount(0);
+    await expect(page.getByTestId("upgrade-tier-big")).toHaveCount(0);
   });
 });
 
@@ -425,7 +445,8 @@ test.describe("Unified release publishes a signed update manifest", () => {
 
   test("workflow signs with TAURI_SIGNING_PRIVATE_KEY secret", () => {
     expect(wf).toContain("TAURI_SIGNING_PRIVATE_KEY");
-    expect(wf).toContain("TAURI_SIGNING_PRIVATE_KEY_PASSWORD");
+    expect(wf).toContain("environment: release");
+    expect(wf).not.toContain("TAURI_SIGNING_PRIVATE_KEY_PASSWORD");
   });
 
   test("assembler emits latest.json with per-target url + signature", () => {

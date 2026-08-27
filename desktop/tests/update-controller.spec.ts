@@ -233,6 +233,41 @@ test.describe("UpdateController", () => {
     controller.dispose();
   });
 
+  test("native Linux packages can check but cannot invoke in-app install", async () => {
+    let installCalls = 0;
+    const instructions =
+      "Install the new .deb or .rpm with the same package manager used for ARC.";
+    const controller = createUpdateController({
+      supported: true,
+      check: async () => ({
+        version: "0.8.1",
+        canInstall: false,
+        installInstructions: instructions,
+        downloadAndInstall: async () => {
+          installCalls += 1;
+        },
+      }),
+      relaunch: async () => {},
+    });
+
+    await controller.checkForUpdates("manual");
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      version: "0.8.1",
+      canInstall: false,
+      message: instructions,
+    });
+
+    await controller.installAvailableUpdate();
+    expect(installCalls).toBe(0);
+    expect(controller.getSnapshot()).toMatchObject({
+      phase: "available",
+      canInstall: false,
+      message: instructions,
+    });
+    controller.dispose();
+  });
+
   test("keeps an installed update ready if relaunch fails", async () => {
     let checkCalls = 0;
     const controller = createUpdateController({

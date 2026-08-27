@@ -1,5 +1,9 @@
 import { expect, test } from "@playwright/test";
-import { seedOnboarded, seedOnboardedWithoutConfig } from "./helpers";
+import {
+  seedMockOverrides,
+  seedOnboarded,
+  seedOnboardedWithoutConfig,
+} from "./helpers";
 
 test.describe("Settings", () => {
   test.beforeEach(async ({ page }) => {
@@ -36,6 +40,24 @@ test.describe("Settings", () => {
     );
     await expect(page.getByTestId("update-status")).toContainText(
       "installed ARC app",
+    );
+  });
+
+  test("Linux package installs show package-manager update policy", async ({
+    page,
+  }) => {
+    await seedMockOverrides(page, {
+      update_install_policy: {
+        canInstall: false,
+        channel: "package-manager",
+        instructions:
+          "Install the new .deb or .rpm with the same package manager used for ARC.",
+      },
+    });
+    await page.goto("/");
+    await page.getByTestId("nav-settings").click();
+    await expect(page.getByTestId("update-install-policy")).toContainText(
+      "Install the new .deb or .rpm",
     );
   });
 

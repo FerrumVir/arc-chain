@@ -23,6 +23,10 @@ export type UpdateDownloadEvent =
  */
 export interface UpdateCandidate {
   version: string;
+  /** False for Linux .deb/.rpm installs owned by the package manager. */
+  canInstall?: boolean;
+  /** Exact next step shown when `canInstall` is false. */
+  installInstructions?: string;
   downloadAndInstall: (
     onEvent?: (event: UpdateDownloadEvent) => void,
   ) => Promise<void>;
@@ -199,15 +203,19 @@ export class UpdateController {
 
         const checkedAt = (this.runtime.now ?? Date.now)();
         if (next) {
+          const canInstall = next.canInstall !== false;
           this.setSnapshot({
             phase: "available",
             version: next.version,
-            message: `Version ${next.version} is available.`,
+            message: canInstall
+              ? `Version ${next.version} is available.`
+              : (next.installInstructions ??
+                `Version ${next.version} is available through your package manager.`),
             error: null,
             checkedAt,
             downloadedBytes: 0,
             contentLength: null,
-            canInstall: true,
+            canInstall,
             restartRequired: false,
           });
         } else {
@@ -231,7 +239,8 @@ export class UpdateController {
           message: `Update check failed: ${detail}`,
           error: detail,
           checkedAt: (this.runtime.now ?? Date.now)(),
-          canInstall: this.candidate !== null,
+          canInstall:
+            this.candidate !== null && this.candidate.canInstall !== false,
           restartRequired: false,
         });
       } finally {
@@ -263,6 +272,20 @@ export class UpdateController {
         phase: "error",
         message: "No checked update is ready to install.",
         error: "Check for updates before installing.",
+        canInstall: false,
+        restartRequired: false,
+      });
+      return Promise.resolve(this.snapshot);
+    }
+
+    if (this.candidate.canInstall === false) {
+      this.setSnapshot({
+        ...this.snapshot,
+        phase: "available",
+        message:
+          this.candidate.installInstructions ??
+          `Version ${this.candidate.version} is available through your package manager.`,
+        error: null,
         canInstall: false,
         restartRequired: false,
       });
@@ -345,7 +368,7 @@ export class UpdateController {
           version,
           message: `Update was not installed: ${detail}`,
           error: detail,
-          canInstall: true,
+          canInstall: candidate.canInstall !== false,
           restartRequired: false,
         });
       } finally {

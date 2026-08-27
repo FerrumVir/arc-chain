@@ -4,7 +4,7 @@ import {
   type DownloadEvent,
 } from "@tauri-apps/plugin-updater";
 import { relaunch as tauriRelaunch } from "@tauri-apps/plugin-process";
-import { isTauri } from "./tauri";
+import { api, isTauri } from "./tauri";
 import {
   createUpdateController,
   type UpdateCandidate,
@@ -19,11 +19,16 @@ const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
 export const appUpdater = createUpdateController({
   supported: isTauri,
   check: async () => {
-    const update = await tauriCheckUpdate({ timeout: CHECK_TIMEOUT_MS });
+    const [update, policy] = await Promise.all([
+      tauriCheckUpdate({ timeout: CHECK_TIMEOUT_MS }),
+      api.updateInstallPolicy(),
+    ]);
     if (!update) return null;
 
     const candidate: UpdateCandidate = {
       version: update.version,
+      canInstall: policy.canInstall,
+      installInstructions: policy.instructions,
       downloadAndInstall: (onEvent) =>
         update.downloadAndInstall(
           onEvent as ((event: DownloadEvent) => void) | undefined,

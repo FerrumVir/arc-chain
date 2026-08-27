@@ -30,6 +30,7 @@ import type {
   Tier1Submitted,
   Tier1Vote,
   TxLookup,
+  UpdateInstallPolicy,
   WalletTxResult,
 } from "./types";
 
@@ -1407,25 +1408,19 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     case "get_autostart":
       return false as T;
+    case "update_install_policy":
+      return {
+        canInstall: false,
+        channel: "package-manager",
+        instructions: "Browser previews cannot install application updates.",
+      } as T;
     case "list_model_tiers":
       return [
         {
-          id: "tiny",
-          displayName: "TinyLlama 1.1B (Q4_K_M)",
-          sizeBytes: 669_262_336,
-          url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        },
-        {
           id: "standard",
-          displayName: "Llama-2 7B Chat (Q4_K_M)",
-          sizeBytes: 4_081_004_544,
+          displayName: "Llama-2 7B Chat (Q4_K_M) — ARC compatible",
+          sizeBytes: 4_081_004_224,
           url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
-        },
-        {
-          id: "big",
-          displayName: "Llama-2 13B Chat (Q4_K_M)",
-          sizeBytes: 7_866_070_016,
-          url: "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_K_M.gguf",
         },
       ] as T;
     case "recommended_tier":
@@ -1616,7 +1611,7 @@ const DEFAULT_HARDWARE: HardwareInfo = {
   ramGb: 64,
   gpuName: "Apple M2 Ultra (76-core)",
   gpuVramGb: 64,
-  recommendedModel: "Llama-2-13B Q4_K_M (7.3 GB)",
+  recommendedModel: "Llama-2-7B Q4_K_M (3.8 GB, ARC compatible)",
   recommendedRole: "worker",
 };
 
@@ -2055,25 +2050,19 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       } as T;
     case "get_autostart":
       return true as T;
+    case "update_install_policy":
+      return {
+        canInstall: true,
+        channel: "native",
+        instructions: "ARC can install this signed update in place.",
+      } as T;
     case "list_model_tiers":
       return [
         {
-          id: "tiny",
-          displayName: "TinyLlama 1.1B (Q4_K_M)",
-          sizeBytes: 669_262_336,
-          url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        },
-        {
           id: "standard",
-          displayName: "Llama-2 7B Chat (Q4_K_M)",
-          sizeBytes: 4_081_004_544,
+          displayName: "Llama-2 7B Chat (Q4_K_M) — ARC compatible",
+          sizeBytes: 4_081_004_224,
           url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
-        },
-        {
-          id: "big",
-          displayName: "Llama-2 13B Chat (Q4_K_M)",
-          sizeBytes: 7_866_070_016,
-          url: "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_K_M.gguf",
         },
       ] as T;
     case "recommended_tier":
@@ -2228,6 +2217,8 @@ export const api = {
     invoke<ThreadsApplied>("set_worker_threads", { threads }),
   ensureBinary: () => invoke<BinaryStatus>("ensure_binary"),
   getAutostart: () => invoke<boolean>("get_autostart"),
+  updateInstallPolicy: () =>
+    invoke<UpdateInstallPolicy>("update_install_policy"),
   listModelTiers: () => invoke<ModelTierInfo[]>("list_model_tiers"),
   recommendedTier: () => invoke<string>("recommended_tier"),
   existingModelForTier: (tier: string) =>

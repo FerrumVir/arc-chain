@@ -294,6 +294,7 @@ pub fn run() {
             commands::clear_crash,
             commands::ensure_binary,
             commands::get_autostart,
+            commands::update_install_policy,
             commands::list_model_tiers,
             commands::recommended_tier,
             commands::existing_model_for_tier,

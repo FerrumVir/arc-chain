@@ -179,7 +179,8 @@ local to screens; use the tokens for new general UI styling.
 - Recovery material is protected as a private local file, not by the native OS
   keychain/credential store.
 - The app and earnings UI can report only selected-host and mined-receipt
-  evidence. The observer genesis disables reward issuance, and no public-v3
-  cutover is claimed.
+  evidence. The bundled recovered genesis schedules reward activation at block
+  137146, but issuance and earnings still fail closed until the public-v3
+  cutover and independent runtime gate are proven live.
 - `.deb` and `.rpm` installs remain package-manager updates; only macOS,
   Windows NSIS, and AppImage consume the in-app signed updater payload.

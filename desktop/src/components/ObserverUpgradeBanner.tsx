@@ -55,9 +55,8 @@ export function ObserverUpgradeBanner() {
       ([loadedTiers, rec]) => {
         if (cancelled) return;
         setTiers(loadedTiers);
-        const safeRec = rec === "none" ? "tiny" : rec;
-        setRecommendedTier(safeRec);
-        setSelectedTier(safeRec);
+        setRecommendedTier(rec);
+        setSelectedTier(rec === "none" ? null : rec);
       },
     );
     return () => {
@@ -220,7 +219,7 @@ export function ObserverUpgradeBanner() {
                 marginBottom: "var(--space-2)",
               }}
             >
-              Pick a model tier
+              Enable ARC-compatible compute
             </h2>
             <p
               style={{
@@ -230,10 +229,10 @@ export function ObserverUpgradeBanner() {
                 marginBottom: "var(--space-5)",
               }}
             >
-              We've pre-selected the tier that fits your machine. Only a model
-              that loads completely and exactly matches a requested artifact is
-              eligible for that work. Model size changes disk and RAM use, not
-              the reward paid for a successful receipt.
+              ARC work currently accepts one exact 7B artifact. It is
+              pre-selected only on machines with at least 16 GB RAM. A complete
+              verified download makes the node eligible; it does not guarantee
+              assignment or a mined reward receipt.
             </p>
 
             {!busy && (

@@ -638,9 +638,15 @@ export interface BinaryStatus {
   alreadyInstalled: boolean;
 }
 
-/** A model tier the desktop will auto-download from a stable HF mirror. */
+export interface UpdateInstallPolicy {
+  canInstall: boolean;
+  channel: "appimage" | "native" | "package-manager";
+  instructions: string;
+}
+
+/** The exact ARC-compatible model the desktop can auto-download. */
 export interface ModelTierInfo {
-  /** Stable id used everywhere (`tiny` | `standard` | `big`). */
+  /** Stable id used by persisted desktop configuration. */
   id: string;
   /** Human label e.g. "Llama-2 7B Chat (Q4_K_M)". */
   displayName: string;

@@ -34,6 +34,11 @@ export function Settings() {
   // checks. Settings only renders it; navigating here cannot start a second
   // polling loop or race a background check.
   const update = useUpdaterSnapshot();
+  const updateInstallPolicy = useQuery({
+    queryKey: ["update-install-policy"],
+    queryFn: api.updateInstallPolicy,
+    staleTime: Infinity,
+  });
   const savedAutoUpdate =
     config?.autoUpdate ?? DEFAULT_NODE_CONFIG.autoUpdate;
   const autoUpdateHasUnsavedChange = autoUpdate !== savedAutoUpdate;
@@ -288,10 +293,11 @@ export function Settings() {
             color: "var(--text-muted)",
             marginBottom: "var(--space-3)",
           }}
+          data-testid="update-install-policy"
         >
-          Install policy: after you choose Install, ARC downloads and verifies
-          the signed bundle, installs it, then immediately relaunches. If
-          installation fails, ARC keeps running this version.
+          {updateInstallPolicy.data?.canInstall === false
+            ? `Install policy: ${updateInstallPolicy.data.instructions}`
+            : "Install policy: after you choose Install, ARC downloads and verifies the signed bundle, installs it, then immediately relaunches. If installation fails, ARC keeps running this version."}
         </p>
         <div style={{ display: "flex", gap: "var(--space-2)" }}>
           <button

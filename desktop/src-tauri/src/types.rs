@@ -249,6 +249,17 @@ pub struct NetworkStats {
 // reads the signed release manifest — the only source that can actually
 // install anything.
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateInstallPolicy {
+    /// True only when Tauri can safely replace this distribution in place.
+    pub can_install: bool,
+    /// `appimage`, `native`, or `package-manager`.
+    pub channel: String,
+    /// User-facing next step when in-app installation is unavailable.
+    pub instructions: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BinaryStatus {

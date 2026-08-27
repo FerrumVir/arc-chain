@@ -88,9 +88,9 @@ export function Onboarding() {
     }
   }, [step, identity]);
 
-  // Load model tiers + the recommended-for-this-machine tier when we land
-  // on the model step. Pre-select the recommended one so the typical user
-  // can keep clicking through without thinking.
+  // Load the network-compatible model and recommend it only when local RAM is
+  // sufficient. Lower-memory machines default to observer/router mode rather
+  // than downloading an artifact that cannot run safely.
   useEffect(() => {
     if (step !== "model" || tiers.length > 0) return;
     let cancelled = false;
@@ -98,11 +98,8 @@ export function Onboarding() {
       ([loadedTiers, rec]) => {
         if (cancelled) return;
         setTiers(loadedTiers);
-        // "none" comes back when the machine isn't strong enough — pre-select
-        // tiny so the user has a sensible default to override or skip.
-        const safeRec = rec === "none" ? "tiny" : rec;
-        setRecommendedTier(safeRec);
-        setSelectedTier(safeRec);
+        setRecommendedTier(rec);
+        setSelectedTier(rec === "none" ? "skip" : rec);
       },
     );
     return () => {
@@ -142,8 +139,8 @@ export function Onboarding() {
     const wantsModel = tier !== "skip";
 
     try {
-      // 1. Download the model first if the user picked one. Big tier is
-      //    ~7.9 GB; we surface progress via the modelProgress event.
+      // 1. Download the exact production-compatible 7B artifact if selected;
+      //    progress is surfaced through the modelProgress event.
       let modelPath: string | null = null;
       if (wantsModel) {
         setLaunchStage("model");
@@ -268,7 +265,7 @@ export function Onboarding() {
                     {
                       icon: Sparkles,
                       title: "One click setup",
-                      desc: "Pick a model that fits your hardware. We download and configure it; exact-artifact eligibility, assignment, and rewards remain visible gates.",
+                      desc: "Choose the exact ARC-compatible 7B model or observer mode. We verify every downloaded byte; assignment and rewards remain visible gates.",
                     },
                     {
                       icon: ShieldCheck,
@@ -544,12 +541,12 @@ export function Onboarding() {
 
             {step === "model" && (
               <div data-testid="step-model">
-                <h1 className="onboarding-title">Pick your model</h1>
+                <h1 className="onboarding-title">Choose your compute mode</h1>
                 <p className="onboarding-subtitle">
-                  A fully loaded model makes your node eligible only for work
-                  requesting that exact artifact ID. We pre-selected the tier
-                  that fits your machine. Larger files use more disk and RAM;
-                  they do not multiply rewards or guarantee demand.
+                  ARC production work currently uses one exact 7B artifact.
+                  Machines with at least 16 GB RAM pre-select it; smaller
+                  machines stay useful as observer/routers. A model creates
+                  eligibility, not guaranteed assignments or rewards.
                 </p>
 
                 <div

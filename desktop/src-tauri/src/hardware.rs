@@ -54,14 +54,13 @@ pub fn detect() -> HardwareInfo {
     }
 }
 
-fn recommend(ram_gb: u64, gpu_gb: Option<u64>) -> (&'static str, &'static str) {
-    let vram = gpu_gb.unwrap_or(0);
-    match (ram_gb, vram) {
-        (r, v) if r >= 64 && v >= 24 => ("Llama-2-70B Q4_K_M (39 GB)", "worker"),
-        (r, v) if r >= 32 && v >= 16 => ("Llama-2-13B Q4_K_M (7.3 GB)", "worker"),
-        (r, _) if r >= 16 => ("Llama-2-7B Q4_K_M (3.8 GB)", "worker"),
-        (r, _) if r >= 8 => ("TinyLlama-1.1B Q4 (0.6 GB)", "worker"),
-        _ => ("Verifier only (no model)", "verifier"),
+fn recommend(ram_gb: u64, _gpu_gb: Option<u64>) -> (&'static str, &'static str) {
+    match ram_gb {
+        r if r >= 16 => ("Llama-2-7B Q4_K_M (3.8 GB, ARC compatible)", "worker"),
+        _ => (
+            "Observer/router (16 GB RAM required for ARC 7B work)",
+            "verifier",
+        ),
     }
 }
 
@@ -98,8 +97,9 @@ fn detect_gpu() -> (Option<String>, Option<u64>) {
 ///
 /// Replaces `wmic`, which Windows 11 24H2 and Server 2025 no longer install
 /// by default — the command simply failed to launch there, so VRAM read as 0,
-/// `recommended_tier` could never select the "big" tier (it requires
-/// `vram >= 16`), and `recommend()` silently degraded to RAM-only branches.
+/// hardware reporting could not be trusted for safe model sizing. Production
+/// eligibility is now pinned to one 7B artifact and a 16 GB RAM floor; GPU
+/// discovery remains useful diagnostic information only.
 ///
 /// Two further fixes over the old CSV parse:
 /// - It picked the *first* line containing a comma, which on a laptop is

@@ -133,6 +133,44 @@ pub async fn get_autostart(app: AppHandle) -> CmdResult<bool> {
     Ok(app.autolaunch().is_enabled().unwrap_or(false))
 }
 
+fn update_install_policy_for(os: &str, appimage: Option<&Path>) -> UpdateInstallPolicy {
+    if os == "linux" {
+        let appimage_ready = appimage
+            .filter(|path| path.is_absolute() && path.is_file())
+            .is_some();
+        if appimage_ready {
+            return UpdateInstallPolicy {
+                can_install: true,
+                channel: "appimage".into(),
+                instructions: "ARC can install this signed AppImage update in place.".into(),
+            };
+        }
+        return UpdateInstallPolicy {
+            can_install: false,
+            channel: "package-manager".into(),
+            instructions: "A signed update is available. Install the new .deb or .rpm with the same package manager used for this ARC installation.".into(),
+        };
+    }
+
+    UpdateInstallPolicy {
+        can_install: true,
+        channel: "native".into(),
+        instructions: "ARC can install this signed update in place.".into(),
+    }
+}
+
+/// Report whether this distribution can consume Tauri's updater payload.
+/// Linux package installs must remain owned by apt/dnf/rpm; only an actual
+/// AppImage launch receives in-app replacement.
+#[tauri::command]
+pub async fn update_install_policy() -> CmdResult<UpdateInstallPolicy> {
+    let appimage = std::env::var_os("APPIMAGE").map(PathBuf::from);
+    Ok(update_install_policy_for(
+        std::env::consts::OS,
+        appimage.as_deref(),
+    ))
+}
+
 #[tauri::command]
 pub async fn load_config(state: State<'_, AppState>) -> CmdResult<Option<NodeConfig>> {
     let store = state.store.lock().await;
@@ -1660,23 +1698,12 @@ fn resolve_testnet_resources(app: &AppHandle) -> TestnetResources {
 // `--community-mode` to arc-node, so the coordinator never dispatched
 // inference to the user. They were a passive validator forever.
 //
-// v0.6.0 fixes that: onboarding picks a hardware-appropriate model, downloads
-// the GGUF from a stable HF mirror, configures the node as a worker. The
-// runtime distinction (worker vs observer) becomes a consequence of "did
-// the user download a model?" instead of a UI choice they make blindly.
-//
-// All three tiers are llama-architecture (the only family arc-inference's
-// candle backend supports today - see `quantized_llama::ModelWeights` in
-// crates/arc-inference/src/candle_backend.rs). Sizes are Q4_K_M quantization
-// from TheBloke's GGUF mirrors:
-//   tiny     ~669 MB   TinyLlama-1.1B-Chat   - laptops without GPU, mobile-class
-//   standard ~4.08 GB  Llama-2-7B-Chat       - 16GB+ RAM, the network's primary tier
-//   big      ~7.87 GB  Llama-2-13B-Chat      - workstations w/ GPU
-//
-// Llama-2-70B (~39 GB) intentionally not in the auto-download set: too large
-// to push through a one-click onboarding without scaring users. Operators
-// who want it can `huggingface-cli download` manually + Settings → "use
-// existing model".
+// v0.8.0 downloads only the exact model artifact accepted by the recovered
+// production network. Offering hardware-sized alternatives here is actively
+// harmful: a TinyLlama or 13B worker can load successfully but its model ID can
+// never match a 7B production assignment, leaving the user with a multi-GB
+// download and zero eligible jobs. Other GGUFs may still be selected manually
+// for local inference, but the earning-compatible onboarding path is singular.
 struct ModelTierSpec {
     id: &'static str,
     display_name: &'static str,
@@ -1689,25 +1716,11 @@ struct ModelTierSpec {
 
 const MODEL_TIERS: &[ModelTierSpec] = &[
     ModelTierSpec {
-        id: "tiny",
-        display_name: "TinyLlama 1.1B (Q4_K_M)",
-        url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        size_bytes: 668_788_096,
-        sha256: "9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0",
-    },
-    ModelTierSpec {
         id: "standard",
-        display_name: "Llama-2 7B Chat (Q4_K_M)",
+        display_name: "Llama-2 7B Chat (Q4_K_M) — ARC compatible",
         url: "https://huggingface.co/TheBloke/Llama-2-7B-Chat-GGUF/resolve/main/llama-2-7b-chat.Q4_K_M.gguf",
         size_bytes: 4_081_004_224,
         sha256: "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa",
-    },
-    ModelTierSpec {
-        id: "big",
-        display_name: "Llama-2 13B Chat (Q4_K_M)",
-        url: "https://huggingface.co/TheBloke/Llama-2-13B-chat-GGUF/resolve/main/llama-2-13b-chat.Q4_K_M.gguf",
-        size_bytes: 7_865_956_224,
-        sha256: "7ddfe27f61bf994542c22aca213c46ecbd8a624cca74abff02a7b5a8c18f787f",
     },
 ];
 
@@ -1773,26 +1786,15 @@ pub async fn list_model_tiers() -> CmdResult<Vec<ModelTierInfo>> {
         .collect())
 }
 
-/// Map detected hardware → recommended tier id. Mirrors the existing
-/// `hardware::recommend()` mapping but returns just the tier id (not the
-/// human-readable model name) so the frontend has something stable to
-/// pre-select in the picker.
+/// Recommend the one production-compatible tier only when the machine has
+/// enough RAM. A larger GPU does not make a different model ID eligible.
 ///
 /// Returns "none" when the machine isn't strong enough to run any tier
 /// usefully — frontend should offer "verifier-only" mode instead.
 #[tauri::command]
 pub async fn recommended_tier() -> CmdResult<String> {
     let hw = hardware::detect();
-    let vram = hw.gpu_vram_gb.unwrap_or(0);
-    let tier = if hw.ram_gb >= 32 && vram >= 16 {
-        "big"
-    } else if hw.ram_gb >= 16 {
-        "standard"
-    } else if hw.ram_gb >= 8 {
-        "tiny"
-    } else {
-        "none"
-    };
+    let tier = if hw.ram_gb >= 16 { "standard" } else { "none" };
     Ok(tier.into())
 }
 
@@ -1847,8 +1849,8 @@ pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
         std::fs::create_dir_all(parent).map_err(map_err)?;
     }
 
-    // Long timeout for the slowest tier on a residential connection: 13B
-    // chat is ~7.9 GB, on a 5 Mbps link that's ~3.5 hours. 4 hours.
+    // The production 7B artifact is ~4.1 GB; four hours keeps slow residential
+    // connections viable without allowing an unbounded request.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(4 * 60 * 60))
         .build()
@@ -2113,9 +2115,50 @@ mod release_binary_tests {
 
     #[test]
     fn every_builtin_model_has_a_fixed_sha256() {
+        assert_eq!(MODEL_TIERS.len(), 1);
         for spec in MODEL_TIERS {
             assert_eq!(model_digest(spec).unwrap().len(), 32, "{}", spec.id);
             assert_eq!(spec.sha256.len(), 64, "{}", spec.id);
+        }
+        let production = &MODEL_TIERS[0];
+        assert_eq!(production.id, "standard");
+        assert_eq!(production.size_bytes, 4_081_004_224);
+        assert_eq!(
+            production.sha256,
+            "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
+        );
+    }
+
+    #[test]
+    fn linux_native_packages_cannot_call_in_app_install() {
+        let policy = update_install_policy_for("linux", None);
+        assert!(!policy.can_install);
+        assert_eq!(policy.channel, "package-manager");
+        assert!(policy.instructions.contains(".deb or .rpm"));
+    }
+
+    #[test]
+    fn only_a_real_appimage_path_enables_linux_in_app_install() {
+        let missing = std::env::temp_dir().join("arc-missing-appimage");
+        assert!(!update_install_policy_for("linux", Some(&missing)).can_install);
+
+        let path = std::env::temp_dir().join(format!(
+            "arc-updater-policy-{}.AppImage",
+            std::process::id()
+        ));
+        std::fs::write(&path, b"appimage-test").unwrap();
+        let policy = update_install_policy_for("linux", Some(&path));
+        assert!(policy.can_install);
+        assert_eq!(policy.channel, "appimage");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn macos_and_windows_keep_native_signed_updates() {
+        for os in ["macos", "windows"] {
+            let policy = update_install_policy_for(os, None);
+            assert!(policy.can_install, "{os}");
+            assert_eq!(policy.channel, "native", "{os}");
         }
     }
 
