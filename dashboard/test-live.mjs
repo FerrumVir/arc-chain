@@ -28,13 +28,13 @@ const config = network.normalizeConfig(await loadRawConfig(configTarget));
 assert.ok(config.checkpoint, "live dashboard gate requires an approved recovery checkpoint");
 const resolver = network.createCanonicalResolver(config);
 
-const [boundary, fleet, inference] = await Promise.all([
+const [boundary, fleet] = await Promise.all([
   dashboard.verifyRecoveryBoundary({ resolver, fetchImpl: fetch }),
   dashboard.collectFleetHealth({ resolver, fetchImpl: fetch }),
-  dashboard.loadInferenceEvidence({ resolver, fetchImpl: fetch }),
 ]);
 
-assert.equal(boundary.state, "verified", `H+1 recovery proof is ${boundary.state}: ${boundary.reason ?? "no reason"}`);
+assert.equal(boundary.state, "verified", `exact recovery checkpoint proof is ${boundary.state}: ${boundary.reason ?? "no reason"}`);
+const inference = await dashboard.loadInferenceEvidence({ resolver, fetchImpl: fetch, checkpointAudit: boundary });
 assert.notEqual(fleet.state, "fork", `v3 replicas disagree at common height ${fleet.commonHeight}`);
 assert.notEqual(fleet.state, "offline", "all configured v3 replicas are offline");
 assert.ok(fleet.current?.reachable, "checkpoint-selected v3 source must be reachable");

@@ -28,16 +28,21 @@ const config = network.normalizeConfig(await loadRawConfig(configTarget));
 assert.ok(config.checkpoint, "live explorer gate requires an approved recovery checkpoint");
 const resolver = network.createCanonicalResolver(config);
 const checkpoint = config.checkpoint;
+const checkpointAudit = await explorer.verifyRecoveryCheckpoint({ resolver, fetchImpl: fetch });
+assert.equal(checkpointAudit.state, "verified", `exact recovery checkpoint proof is ${checkpointAudit.state}: ${checkpointAudit.reason ?? "no reason"}`);
 
-const legacy = await explorer.queryBlock({ resolver, fetchImpl: fetch, height: checkpoint.height, sourceId: "canonical" });
+const legacy = await explorer.queryBlock({ resolver, fetchImpl: fetch, height: checkpoint.height, sourceId: "canonical", checkpointAudit });
 assert.equal(legacy.route.sourceId, checkpoint.legacySourceId);
+assert.equal(legacy.route.canonical, true, "signed H must be canonical only after the full replica audit");
 assert.equal(network.blockHash(legacy.block), checkpoint.blockHash, "legacy H hash must match configured signed checkpoint");
 assert.equal(network.stateRoot(legacy.block), checkpoint.stateRoot, "legacy H state root must match configured signed checkpoint");
 
-const boundary = await explorer.queryBlock({ resolver, fetchImpl: fetch, height: checkpoint.recoveryHeight, sourceId: "canonical" });
+const boundary = await explorer.queryBlock({ resolver, fetchImpl: fetch, height: checkpoint.recoveryHeight, sourceId: "canonical", checkpointAudit });
 assert.equal(boundary.route.sourceId, checkpoint.v3SourceId);
+assert.equal(boundary.route.canonical, true, "H+1 must be canonical only after the full replica audit");
 assert.equal(boundary.boundary.state, "verified", "v3 H+1 parent must link to signed H");
-if (checkpoint.boundaryBlockHash) assert.equal(network.blockHash(boundary.block), checkpoint.boundaryBlockHash, "H+1 hash must match configured boundary hash");
+assert.equal(network.blockHash(boundary.block), checkpoint.boundaryBlockHash, "H+1 hash must match configured boundary hash");
+assert.equal(network.stateRoot(boundary.block), checkpoint.boundaryStateRoot, "H+1 state root must match configured boundary root");
 
 const current = resolver.currentSource();
 const [health, latest] = await Promise.all([
