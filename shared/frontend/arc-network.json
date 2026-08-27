@@ -1,0 +1,15 @@
+{
+  "schema": "arc.frontend.network.v1",
+  "state": "maintenance",
+  "updatedAt": "2026-08-27T00:00:00Z",
+  "network": {
+    "name": "ARC Testnet",
+    "chainId": "arc-testnet"
+  },
+  "checkpoint": null,
+  "sources": [],
+  "services": {},
+  "notices": [
+    "Canonical recovery metadata has not been published. Explorer and dashboard claims are paused rather than inferred from legacy peers."
+  ]
+}

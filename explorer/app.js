@@ -1,1005 +1,685 @@
-(function arcExplorerModule(factory) {
+(function (root, factory) {
+  const network = root?.ArcNetwork || (typeof require === "function" ? require("../shared/frontend/arc-network.js") : null);
+  const api = factory(network);
+  if (typeof module === "object" && module.exports) module.exports = api;
+  if (root) root.ArcExplorer = api;
+  if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", api.boot, { once: true });
+})(typeof globalThis !== "undefined" ? globalThis : this, function (network) {
   "use strict";
 
-  const api = factory();
-  if (typeof module !== "undefined" && module.exports) {
-    module.exports = api;
-  }
-  if (typeof window !== "undefined" && typeof document !== "undefined") {
-    window.ArcExplorer = api;
-    window.addEventListener("DOMContentLoaded", api.boot, { once: true });
-  }
-})(function arcExplorerFactory() {
-  "use strict";
+  if (!network) throw new Error("ARC network resolver did not load");
 
-  const SOURCES = Object.freeze([
-    Object.freeze({ id: "nyc", name: "NYC", region: "US East", baseUrl: "http://149.28.32.76:9090" }),
-    Object.freeze({ id: "lax", name: "LAX", region: "US West", baseUrl: "http://140.82.16.112:9090" }),
-    Object.freeze({ id: "ams", name: "AMS", region: "Europe", baseUrl: "http://136.244.109.1:9090" }),
-    Object.freeze({ id: "lhr", name: "LHR", region: "Europe", baseUrl: "http://104.238.171.11:9090" }),
-    Object.freeze({ id: "nrt", name: "NRT", region: "Asia", baseUrl: "http://202.182.107.41:9090" }),
-    Object.freeze({ id: "sgp", name: "SGP", region: "Asia", baseUrl: "http://149.28.153.31:9090" }),
-  ]);
-
-  const SOURCE_BY_ID = new Map(SOURCES.map((source) => [source.id, source]));
-  const HASH_PATTERN = /^[0-9a-f]{64}$/i;
-  const HEIGHT_PATTERN = /^\d+$/;
-  const LIVENESS_FRESH_SECS = 30 * 60;
-  const REQUEST_TIMEOUT_MS = 7000;
-  const MAX_RESPONSE_CHARS = 5_000_000;
-  const REFRESH_INTERVAL_MS = 20_000;
+  const REFRESH_INTERVAL_MS = 30_000;
+  const REQUEST_TIMEOUT_MS = 8_000;
 
   class RpcError extends Error {
-    constructor(message, status, details) {
+    constructor(message, status, sourceId) {
       super(message);
       this.name = "RpcError";
       this.status = status || 0;
-      this.details = details || null;
-      this.aborted = Boolean(details && details.aborted);
+      this.sourceId = sourceId || null;
     }
   }
 
-  function sourceFor(sourceId) {
-    return SOURCE_BY_ID.get(String(sourceId || "").toLowerCase()) || null;
-  }
-
-  function buildRpcUrl(sourceId, path) {
-    const source = sourceFor(sourceId);
-    if (!source) {
-      throw new Error(`Unknown ARC RPC source: ${sourceId}`);
-    }
-    if (typeof path !== "string" || !path.startsWith("/") || path.startsWith("//") || path.includes("://")) {
-      throw new Error("RPC path must be a source-relative absolute path");
-    }
-    return `${source.baseUrl}${path}`;
-  }
-
-  function normalizeHex(value) {
-    const normalized = String(value || "").trim().replace(/^0x/i, "").toLowerCase();
-    return HASH_PATTERN.test(normalized) ? normalized : null;
-  }
-
-  function classifyLookup(rawValue, requestedKind) {
-    const value = String(rawValue || "").trim();
+  function classifyLookup(raw, requestedKind) {
+    const value = String(raw ?? "").trim();
     const kind = requestedKind || "auto";
-
-    if (!value) {
-      return { error: "Enter a block height, transaction hash, or address." };
-    }
-
-    if (kind === "block" || (kind === "auto" && HEIGHT_PATTERN.test(value))) {
-      if (!HEIGHT_PATTERN.test(value)) {
-        return { error: "Block heights contain digits only." };
-      }
+    if (!value) return { error: "Enter a block height, transaction hash, or address." };
+    if (kind === "block" || (kind === "auto" && /^\d+$/.test(value))) {
+      if (!/^\d+$/.test(value)) return { error: "Block heights contain digits only." };
       const height = Number(value);
-      if (!Number.isSafeInteger(height) || height < 0) {
-        return { error: "That block height is outside the safe lookup range." };
-      }
+      if (!Number.isSafeInteger(height)) return { error: "Block height is outside the supported range." };
       return { kind: "block", value: String(height) };
     }
+    const normalized = network.normalizeHex(value, 32);
+    if (!normalized) return { error: "Transactions and addresses must be 32-byte hexadecimal values." };
+    if (kind === "tx" || kind === "address") return { kind, value: normalized };
+    return { kind: "lookup", value: normalized };
+  }
 
-    const hash = normalizeHex(value);
-    if (!hash) {
-      return { error: "Hashes and ARC addresses must be exactly 32 bytes (64 hex characters)." };
+  function extractBlocks(payload) {
+    const candidates = Array.isArray(payload) ? payload : payload?.blocks ?? payload?.items ?? payload?.data?.blocks ?? [];
+    return Array.isArray(candidates)
+      ? [...candidates].filter(Boolean).sort((a, b) => (network.blockHeight(b) ?? -1) - (network.blockHeight(a) ?? -1))
+      : [];
+  }
+
+  function extractRows(payload) {
+    if (Array.isArray(payload)) return payload;
+    for (const key of ["attestations", "transactions", "items", "records", "activity", "workers"]) {
+      if (Array.isArray(payload?.[key])) return payload[key];
+      if (Array.isArray(payload?.data?.[key])) return payload.data[key];
     }
-
-    if (kind === "tx") return { kind: "tx", value: hash };
-    if (kind === "address") return { kind: "address", value: hash };
-    return { kind: "lookup", value: hash };
+    return [];
   }
 
-  function finiteNonNegative(value) {
-    const number = typeof value === "number" ? value : Number(value);
-    return Number.isFinite(number) && number >= 0 ? number : null;
-  }
-
-  function reportedHeightFrom(payloads) {
-    const candidates = [
-      payloads.network && payloads.network.height,
-      payloads.info && payloads.info.block_height,
-      payloads.stats && payloads.stats.block_height,
-      payloads.health && payloads.health.height,
-    ]
-      .map(finiteNonNegative)
-      .filter((value) => value !== null);
-    return candidates.length ? Math.max(...candidates) : null;
-  }
-
-  function evaluateLiveness(health, latestBlock, nowMs) {
-    const currentTime = finiteNonNegative(nowMs) === null ? Date.now() : Number(nowMs);
-    const explicitAge = health ? finiteNonNegative(health.last_block_age_secs) : null;
-
-    if (health && typeof health.chain_advancing === "boolean" && explicitAge !== null) {
-      return {
-        state: health.chain_advancing ? "advancing" : "stalled",
-        ageSecs: Math.floor(explicitAge),
-        basis: "selected node /health block-liveness fields",
-      };
+  function numberOrNull(...values) {
+    for (const value of values) {
+      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (typeof value === "string" && value.trim() && Number.isFinite(Number(value))) return Number(value);
     }
-
-    const timestamp = latestBlock && latestBlock.header
-      ? finiteNonNegative(latestBlock.header.timestamp)
-      : null;
-    if (timestamp === null || timestamp === 0) {
-      return { state: "unknown", ageSecs: null, basis: "no readable retained block timestamp" };
-    }
-    if (timestamp > currentTime + 60_000) {
-      return { state: "unknown", ageSecs: null, basis: "retained block timestamp is ahead of this browser clock" };
-    }
-
-    const ageSecs = Math.max(0, Math.floor((currentTime - timestamp) / 1000));
-    return {
-      state: ageSecs <= LIVENESS_FRESH_SECS ? "advancing" : "stalled",
-      ageSecs,
-      basis: `selected source block timestamp (${LIVENESS_FRESH_SECS}s freshness window)`,
-    };
+    return null;
   }
 
-  function sortBlocksNewestFirst(blocks) {
-    if (!Array.isArray(blocks)) return [];
-    return blocks
-      .filter((block) => block && finiteNonNegative(block.height ?? (block.header && block.header.height)) !== null)
-      .slice()
-      .sort((left, right) => {
-        const leftHeight = finiteNonNegative(left.height ?? (left.header && left.header.height));
-        const rightHeight = finiteNonNegative(right.height ?? (right.header && right.header.height));
-        return rightHeight - leftHeight;
-      });
+  function reportedHeight(snapshot) {
+    const values = [
+      snapshot?.health?.height,
+      snapshot?.health?.block_height,
+      snapshot?.info?.height,
+      snapshot?.info?.block_height,
+      snapshot?.stats?.height,
+      snapshot?.stats?.block_height,
+      network.blockHeight(snapshot?.latest),
+    ].map((value) => numberOrNull(value)).filter((value) => value !== null);
+    return values.length ? Math.max(...values) : null;
   }
 
-  function boundedItems(items, limit) {
-    const sourceItems = Array.isArray(items) ? items : [];
-    const requestedLimit = Number.isSafeInteger(limit) && limit >= 0 ? limit : 0;
-    return {
-      visible: sourceItems.slice(0, requestedLimit),
-      total: sourceItems.length,
-      truncated: sourceItems.length > requestedLimit,
-    };
-  }
-
-  function formatInteger(value) {
-    if (value === null || value === undefined || value === "") return "Unknown";
-    if (typeof value === "number" && Number.isFinite(value)) return Math.trunc(value).toLocaleString("en-US");
-    const text = String(value);
-    if (/^\d+$/.test(text)) {
-      try {
-        return BigInt(text).toLocaleString("en-US");
-      } catch (_) {
-        return text;
-      }
-    }
-    return text;
-  }
-
-  function formatDuration(seconds) {
-    const value = finiteNonNegative(seconds);
-    if (value === null) return "Unknown";
-    const whole = Math.floor(value);
-    if (whole < 5) return "just now";
-    if (whole < 60) return `${whole}s`;
-    if (whole < 3600) return `${Math.floor(whole / 60)}m ${whole % 60}s`;
-    if (whole < 86400) return `${Math.floor(whole / 3600)}h ${Math.floor((whole % 3600) / 60)}m`;
-    return `${Math.floor(whole / 86400)}d ${Math.floor((whole % 86400) / 3600)}h`;
-  }
-
-  function formatHash(value, leading, trailing) {
-    const text = String(value || "").replace(/^0x/i, "");
-    if (!text) return "Unknown";
-    const start = leading === undefined ? 10 : leading;
-    const end = trailing === undefined ? 8 : trailing;
-    return text.length > start + end + 1 ? `0x${text.slice(0, start)}…${text.slice(-end)}` : `0x${text}`;
-  }
-
-  function formatTimestamp(timestampMs) {
-    const value = finiteNonNegative(timestampMs);
-    if (value === null || value === 0) return "Unknown";
-    const date = new Date(value);
-    return Number.isNaN(date.getTime()) ? "Unknown" : date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "medium" });
-  }
-
-  function errorMessage(error, resource) {
-    const noun = resource || "resource";
-    if (error && error.status === 404) {
-      return `The selected node does not have this ${noun} in its retained or indexed history.`;
-    }
-    if (error && error.status === 400) {
-      return `The selected node rejected this ${noun} lookup as invalid.`;
-    }
-    if (error && error.aborted) return "Lookup canceled.";
-    return error && error.message ? error.message : `Unable to load this ${noun} from the selected node.`;
-  }
-
-  async function requestJson(sourceId, path, options) {
-    const opts = options || {};
+  async function requestJson(fetchImpl, source, path, options) {
+    const settings = options || {};
     const controller = new AbortController();
-    const externalSignal = opts.signal;
-    const abortFromExternal = () => controller.abort();
-    if (externalSignal) {
-      if (externalSignal.aborted) controller.abort();
-      else externalSignal.addEventListener("abort", abortFromExternal, { once: true });
+    const timeout = setTimeout(() => controller.abort("timeout"), settings.timeoutMs || REQUEST_TIMEOUT_MS);
+    const abort = () => controller.abort(settings.signal?.reason || "caller-abort");
+    if (settings.signal) {
+      if (settings.signal.aborted) abort();
+      else settings.signal.addEventListener("abort", abort, { once: true });
     }
-    const timeout = setTimeout(() => controller.abort(), opts.timeoutMs || REQUEST_TIMEOUT_MS);
-
     try {
-      const response = await fetch(buildRpcUrl(sourceId, path), {
+      const response = await fetchImpl(network.buildRpcUrl(source, path), {
         method: "GET",
         headers: { Accept: "application/json" },
         cache: "no-store",
         signal: controller.signal,
       });
-      const text = await response.text();
-      if (text.length > MAX_RESPONSE_CHARS) {
-        throw new RpcError("RPC response exceeded the explorer safety limit.", response.status);
-      }
-      let payload = null;
-      if (text) {
-        try {
-          payload = JSON.parse(text);
-        } catch (_) {
-          throw new RpcError("RPC returned a non-JSON response.", response.status, { responseText: text.slice(0, 160) });
-        }
-      }
-      if (!response.ok) {
-        const detail = payload && (payload.error || payload.message);
-        throw new RpcError(detail || `RPC returned HTTP ${response.status}.`, response.status, payload);
-      }
-      return payload;
+      if (!response.ok) throw new RpcError(`RPC returned HTTP ${response.status}`, response.status, source.id);
+      return await response.json();
     } catch (error) {
       if (error instanceof RpcError) throw error;
-      if (controller.signal.aborted) {
-        if (externalSignal && externalSignal.aborted) {
-          throw new RpcError("Request canceled.", 0, { aborted: true });
-        }
-        throw new RpcError(`RPC request timed out after ${opts.timeoutMs || REQUEST_TIMEOUT_MS}ms.`, 0);
-      }
-      throw new RpcError(error && error.message ? error.message : "RPC request failed.", 0);
+      if (controller.signal.aborted) throw new RpcError("RPC request timed out or was cancelled", 0, source.id);
+      throw new RpcError(error?.message || "RPC request failed", 0, source.id);
     } finally {
       clearTimeout(timeout);
-      if (externalSignal) externalSignal.removeEventListener("abort", abortFromExternal);
+      if (settings.signal) settings.signal.removeEventListener("abort", abort);
     }
   }
 
+  async function optionalRequest(fetchImpl, source, path, options) {
+    try {
+      return { ok: true, value: await requestJson(fetchImpl, source, path, options) };
+    } catch (error) {
+      return { ok: false, error };
+    }
+  }
+
+  async function queryBlock(options) {
+    const { resolver, fetchImpl, height, sourceId, signal } = options;
+    const route = resolver.routeBlock(height, { sourceId });
+    if (!route.ok) throw new RpcError(`Cannot resolve block: ${route.reason}`, 0, route.sourceId);
+    const [blockResult, txsResult] = await Promise.all([
+      optionalRequest(fetchImpl, route.source, `/block/${route.height}`, { signal }),
+      optionalRequest(fetchImpl, route.source, `/block/${route.height}/txs?offset=0&limit=100`, { signal }),
+    ]);
+    if (!blockResult.ok) throw blockResult.error;
+    return {
+      route,
+      block: blockResult.value,
+      transactions: txsResult.ok ? txsResult.value : null,
+      boundary: network.boundaryVerification(blockResult.value, resolver.config.checkpoint),
+    };
+  }
+
+  async function queryTransaction(options) {
+    const { resolver, fetchImpl, hash, sourceId, signal } = options;
+    const planned = resolver.lookupSources({ sourceId });
+    const attempts = await Promise.all(planned.map(async ({ source }) => {
+      const [full, receipt] = await Promise.all([
+        optionalRequest(fetchImpl, source, `/tx/${hash}/full`, { signal }),
+        optionalRequest(fetchImpl, source, `/tx/${hash}`, { signal }),
+      ]);
+      if (!full.ok && !receipt.ok) return { source, found: false, errors: [full.error, receipt.error] };
+      const fullValue = full.ok ? full.value : null;
+      const receiptValue = receipt.ok ? receipt.value : null;
+      const classification = network.classifyReceipt({
+        tx: fullValue?.transaction ?? fullValue?.tx ?? fullValue,
+        receipt: receiptValue?.receipt ?? receiptValue,
+      });
+      const provenance = classification.height === null
+        ? { canonical: false, segment: "unverified", reason: "receipt-height-unavailable" }
+        : resolver.classifyOccurrence(source.id, classification.height);
+      return { source, found: true, full: fullValue, receipt: receiptValue, classification, provenance };
+    }));
+    return {
+      occurrences: attempts.filter((attempt) => attempt.found),
+      failures: attempts.filter((attempt) => !attempt.found),
+      plannedSources: planned.map((entry) => entry.sourceId),
+    };
+  }
+
+  async function queryAddress(options) {
+    const { resolver, fetchImpl, address, sourceId, signal } = options;
+    const planned = resolver.lookupSources({ sourceId });
+    const attempts = await Promise.all(planned.map(async ({ source }) => {
+      const [account, history] = await Promise.all([
+        optionalRequest(fetchImpl, source, `/account/${address}`, { signal }),
+        optionalRequest(fetchImpl, source, `/account/${address}/txs`, { signal }),
+      ]);
+      const historyValue = history.ok ? history.value : null;
+      const txHashes = historyValue?.tx_hashes ?? historyValue?.transactions ?? [];
+      const found = account.ok || (Array.isArray(txHashes) && txHashes.length > 0);
+      return { source, found, account: account.ok ? account.value : null, history: historyValue };
+    }));
+    return { records: attempts.filter((attempt) => attempt.found), failures: attempts.filter((attempt) => !attempt.found) };
+  }
+
   function boot() {
-    const byId = (id) => document.getElementById(id);
+    const $ = (id) => document.getElementById(id);
     const elements = {
-      sourceSelect: byId("source-select"),
-      sourceDot: byId("source-dot"),
-      refreshButton: byId("refresh-button"),
-      sourceName: byId("source-name"),
-      sourceEndpoint: byId("source-endpoint"),
-      lastRefreshed: byId("last-refreshed"),
-      banner: byId("connection-banner"),
-      bannerTitle: byId("banner-title"),
-      bannerDetail: byId("banner-detail"),
-      metricHeight: byId("metric-height"),
-      metricHeightNote: byId("metric-height-note"),
-      metricStoredHeight: byId("metric-stored-height"),
-      metricStoredNote: byId("metric-stored-note"),
-      metricBlockAge: byId("metric-block-age"),
-      metricLivenessNote: byId("metric-liveness-note"),
-      metricTransactions: byId("metric-transactions"),
-      metricPeers: byId("metric-peers"),
-      metricValidators: byId("metric-validators"),
-      metricValidatorNote: byId("metric-validator-note"),
-      blocksStatus: byId("blocks-status"),
-      blocksBody: byId("blocks-body"),
-      sourceFacts: byId("source-facts"),
-      searchForm: byId("search-form"),
-      searchInput: byId("search-input"),
-      searchKind: byId("search-kind"),
-      searchError: byId("search-error"),
-      inspector: byId("inspector"),
-      inspectorKicker: byId("inspector-kicker"),
-      inspectorTitle: byId("inspector-title"),
-      inspectorClose: byId("inspector-close"),
-      inspectorContent: byId("inspector-content"),
+      networkLabel: $("network-label"), sourceSelect: $("source-select"), sourceDot: $("source-dot"), refreshButton: $("refresh-button"),
+      banner: $("connection-banner"), bannerTitle: $("banner-title"), bannerDetail: $("banner-detail"), sourceName: $("source-name"), sourceEndpoint: $("source-endpoint"), lastRefreshed: $("last-refreshed"), sourceHelp: $("source-help"),
+      recoveryTitle: $("recovery-title"), recoverySummary: $("recovery-summary"), checkpointHeight: $("checkpoint-height"), checkpointHash: $("checkpoint-hash"), boundaryHeight: $("boundary-height"), boundaryState: $("boundary-state"), continuationLabel: $("continuation-label"), manifestHash: $("manifest-hash"),
+      metricHeight: $("metric-height"), metricHeightNote: $("metric-height-note"), metricStoredHeight: $("metric-stored-height"), metricStoredNote: $("metric-stored-note"), metricBlockAge: $("metric-block-age"), metricLivenessNote: $("metric-liveness-note"), metricTransactions: $("metric-transactions"), metricPeers: $("metric-peers"), metricValidators: $("metric-validators"), metricValidatorNote: $("metric-validator-note"),
+      blocksStatus: $("blocks-status"), blocksBody: $("blocks-body"), sourceFacts: $("source-facts"), inferenceStatus: $("inference-status"), inferenceList: $("inference-list"), rewardsStatus: $("rewards-status"), rewardsList: $("rewards-list"),
+      searchForm: $("search-form"), searchInput: $("search-input"), searchKind: $("search-kind"), searchError: $("search-error"), inspector: $("inspector"), inspectorKicker: $("inspector-kicker"), inspectorTitle: $("inspector-title"), inspectorClose: $("inspector-close"), inspectorContent: $("inspector-content"),
     };
+    const state = { config: null, resolver: null, sourceId: "canonical", refreshController: null, lookupController: null, timer: null };
 
-    const state = {
-      sourceId: "nyc",
-      refreshController: null,
-      lookupController: null,
-      refreshGeneration: 0,
-      lookupGeneration: 0,
-      timer: null,
+    const text = (node, value) => { if (node) node.textContent = value == null ? "" : String(value); };
+    const clear = (node) => { if (node) node.replaceChildren(); };
+    const create = (tag, className, content) => {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (content !== undefined && content !== null) node.textContent = String(content);
+      return node;
     };
+    const formatInteger = (value) => {
+      const number = numberOrNull(value);
+      return number === null ? "Unavailable" : new Intl.NumberFormat().format(number);
+    };
+    const formatTimestamp = (timestamp) => {
+      const raw = numberOrNull(timestamp);
+      if (raw === null) return "Unavailable";
+      const date = new Date(raw < 10_000_000_000 ? raw * 1000 : raw);
+      return Number.isNaN(date.getTime()) ? "Unavailable" : date.toLocaleString();
+    };
+    const sourceDisplay = (source) => `${source.name}${source.region ? ` · ${source.region}` : ""}`;
+    const currentSource = () => state.sourceId === "canonical" ? state.resolver?.currentSource() : state.resolver?.source(state.sourceId);
 
-    function text(element, value) {
-      if (element) element.textContent = value === null || value === undefined ? "—" : String(value);
+    function setBanner(kind, title, detail) {
+      elements.banner.className = `connection-banner ${kind}`;
+      text(elements.bannerTitle, title);
+      text(elements.bannerDetail, detail);
+      elements.sourceDot.className = `status-dot ${kind === "online" ? "online" : kind === "degraded" ? "stalled" : kind === "error" ? "offline" : "unknown"}`;
     }
 
-    function create(tagName, className, value) {
-      const element = document.createElement(tagName);
-      if (className) element.className = className;
-      if (value !== undefined && value !== null) element.textContent = String(value);
-      return element;
+    function fact(label, value, title) {
+      const row = create("div");
+      row.append(create("dt", "", label));
+      const dd = create("dd", "", value ?? "Unavailable");
+      if (title) dd.title = title;
+      row.append(dd);
+      return row;
     }
 
-    function clear(element) {
-      if (element) element.replaceChildren();
+    function renderFacts(source, snapshot, liveness) {
+      clear(elements.sourceFacts);
+      const latest = snapshot?.latest;
+      elements.sourceFacts.append(
+        fact("Source", source ? sourceDisplay(source) : "Unavailable"),
+        fact("Node version", snapshot?.info?.version ?? snapshot?.health?.version ?? "Unavailable"),
+        fact("Reachability", snapshot ? "RPC answered" : "Unreachable"),
+        fact("Chain liveness", liveness?.state ?? "Unknown", liveness?.basis),
+        fact("Latest block hash", network.formatHash(network.blockHash(latest)), network.blockHash(latest)),
+        fact("Latest state root", network.formatHash(network.stateRoot(latest)), network.stateRoot(latest)),
+      );
     }
 
-    function selectedSource() {
-      return sourceFor(state.sourceId) || SOURCES[0];
-    }
-
-    function savedSourceId() {
-      const params = new URLSearchParams(window.location.search);
-      const querySource = params.get("source");
-      if (sourceFor(querySource)) return querySource.toLowerCase();
-      try {
-        const stored = window.localStorage.getItem("arc-explorer-source");
-        if (sourceFor(stored)) return stored.toLowerCase();
-      } catch (_) {
-        // Storage can be disabled. The default remains deterministic.
+    function renderRecovery(boundary) {
+      const checkpoint = state.config?.checkpoint;
+      if (!checkpoint) {
+        text(elements.recoveryTitle, "Recovery checkpoint unavailable");
+        text(elements.recoverySummary, "Canonical claims are paused. Legacy peers are not automatically treated as one chain.");
+        return;
       }
-      return SOURCES[0].id;
-    }
-
-    function persistSourceId(sourceId) {
-      try {
-        window.localStorage.setItem("arc-explorer-source", sourceId);
-      } catch (_) {
-        // The URL still records the source when storage is unavailable.
-      }
-      const url = new URL(window.location.href);
-      url.searchParams.set("source", sourceId);
-      window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+      text(elements.recoveryTitle, `Signed checkpoint #${formatInteger(checkpoint.height)} → protocol v3`);
+      text(elements.recoverySummary, "History through H is served by the approved legacy archive. H+1 begins the configured v3 continuation.");
+      text(elements.checkpointHeight, `H ${formatInteger(checkpoint.height)}`);
+      text(elements.checkpointHash, network.formatHash(checkpoint.blockHash, 10, 8));
+      elements.checkpointHash.title = `0x${checkpoint.blockHash}`;
+      text(elements.boundaryHeight, `H+1 ${formatInteger(checkpoint.recoveryHeight)}`);
+      const messages = {
+        verified: "Parent hash matches signed H",
+        mismatch: "PARENT HASH MISMATCH",
+        unknown: "Parent link unavailable",
+        "not-boundary": "Boundary response unavailable",
+      };
+      text(elements.boundaryState, messages[boundary?.state] || "Parent link not checked");
+      elements.boundaryState.className = boundary?.state === "verified" ? "truth-good" : boundary?.state === "mismatch" ? "truth-bad" : "truth-warn";
+      text(elements.continuationLabel, `Continuation #${formatInteger(checkpoint.recoveryHeight + 1)}+`);
+      text(elements.manifestHash, `Manifest ${network.formatHash(checkpoint.manifestHash, 8, 6)}`);
+      elements.manifestHash.title = `0x${checkpoint.manifestHash}`;
     }
 
     function populateSources() {
       clear(elements.sourceSelect);
-      for (const source of SOURCES) {
-        const option = create("option", "", `${source.name} · ${source.region}`);
+      const canonical = create("option", "", "Canonical timeline · automatic");
+      canonical.value = "canonical";
+      elements.sourceSelect.append(canonical);
+      for (const source of state.config.sources.filter((item) => item.enabled)) {
+        const prefix = source.kind === "legacy-fork" ? "NON-CANONICAL" : source.kind === "diagnostic" ? "DIAGNOSTIC" : source.kind === "legacy-canonical" ? "SIGNED ARCHIVE" : source.id === state.config.checkpoint?.v3SourceId ? "V3 CANONICAL" : "V3 REPLICA";
+        const option = create("option", "", `${prefix} · ${sourceDisplay(source)}`);
         option.value = source.id;
         elements.sourceSelect.append(option);
       }
+      elements.sourceSelect.value = "canonical";
     }
 
     function updateSourceChrome() {
-      const source = selectedSource();
-      elements.sourceSelect.value = source.id;
-      text(elements.sourceName, `${source.name} · ${source.region}`);
-      text(elements.sourceEndpoint, source.baseUrl);
-    }
-
-    function setSourceDot(mode) {
-      elements.sourceDot.className = `status-dot ${mode || "unknown"}`;
-    }
-
-    function setBanner(mode, title, detail) {
-      elements.banner.className = `connection-banner ${mode}`;
-      text(elements.bannerTitle, title);
-      text(elements.bannerDetail, detail);
-    }
-
-    function setRefreshBusy(busy) {
-      elements.refreshButton.classList.toggle("spinning", busy);
-      elements.refreshButton.disabled = busy;
-    }
-
-    function setMetricPlaceholders() {
-      text(elements.metricHeight, "—");
-      text(elements.metricHeightNote, "Waiting for selected node");
-      text(elements.metricStoredHeight, "—");
-      text(elements.metricStoredNote, "Waiting for block header");
-      text(elements.metricBlockAge, "—");
-      text(elements.metricLivenessNote, "Liveness unknown");
-      text(elements.metricTransactions, "—");
-      text(elements.metricPeers, "—");
-      text(elements.metricValidators, "—");
-      text(elements.metricValidatorNote, "Active split may be unavailable");
-    }
-
-    function fulfilled(result) {
-      return result && result.status === "fulfilled" ? result.value : null;
-    }
-
-    function renderFacts(facts) {
-      clear(elements.sourceFacts);
-      for (const [label, value, title] of facts) {
-        const row = create("div");
-        const term = create("dt", "", label);
-        const detail = create("dd", "", value === null || value === undefined ? "Unknown" : value);
-        if (title) detail.title = title;
-        row.append(term, detail);
-        elements.sourceFacts.append(row);
+      const source = currentSource();
+      if (state.sourceId === "canonical") {
+        text(elements.sourceName, "Canonical timeline");
+        text(elements.sourceEndpoint, source ? `Height-routed · current ${source.name}` : "No canonical route configured");
+        text(elements.sourceHelp, "Blocks resolve to the signed legacy archive through H and protocol v3 from H+1 onward.");
+      } else {
+        text(elements.sourceName, source ? sourceDisplay(source) : "Unavailable source");
+        text(elements.sourceEndpoint, source?.baseUrl ?? "Unavailable");
+        text(elements.sourceHelp, source?.id === state.config.checkpoint?.v3SourceId ? "Explicit canonical v3 source view." : "Explicit source view. Results are not promoted into the canonical timeline.");
       }
     }
 
-    function blockHeight(block) {
-      return finiteNonNegative(block && (block.height ?? (block.header && block.header.height)));
+    function resetMetrics() {
+      for (const node of [elements.metricHeight, elements.metricStoredHeight, elements.metricBlockAge, elements.metricTransactions, elements.metricPeers, elements.metricValidators]) text(node, "—");
+      text(elements.metricHeightNote, "Awaiting source evidence");
+      text(elements.metricStoredNote, "No block header loaded");
+      text(elements.metricLivenessNote, "Liveness unknown");
+      text(elements.metricValidatorNote, "Availability unknown");
     }
 
-    function blockHash(block) {
-      return block && (block.hash || block.block_hash);
+    function blockTimestamp(block) {
+      const header = network.blockHeader(block);
+      return numberOrNull(header.timestamp, block?.timestamp);
     }
 
-    function blockHeader(block) {
-      return (block && block.header) || block || {};
+    function txCount(block) {
+      const header = network.blockHeader(block);
+      const explicit = numberOrNull(block?.tx_count, header.tx_count, block?.transactions_count);
+      if (explicit !== null) return explicit;
+      if (Array.isArray(block?.transactions)) return block.transactions.length;
+      if (Array.isArray(block?.tx_hashes)) return block.tx_hashes.length;
+      return null;
     }
 
-    function renderBlocks(blocks) {
-      const sorted = sortBlocksNewestFirst(blocks).slice(0, 12);
+    function renderBlocks(blocks, source) {
       clear(elements.blocksBody);
-      if (!sorted.length) {
-        const row = create("tr");
-        const cell = create("td", "empty-cell", "No retained blocks were returned by this source for the requested range.");
-        cell.colSpan = 5;
-        row.append(cell);
-        elements.blocksBody.append(row);
-        text(elements.blocksStatus, "No retained data");
+      if (!blocks.length) {
+        const tr = create("tr");
+        const td = create("td", "empty-cell", "No retained blocks were returned by this source.");
+        td.colSpan = 5;
+        tr.append(td);
+        elements.blocksBody.append(tr);
+        text(elements.blocksStatus, "Unavailable");
         return;
       }
-
-      for (const block of sorted) {
-        const header = blockHeader(block);
-        const height = blockHeight(block);
-        const row = create("tr", "data-row");
-
+      for (const block of blocks.slice(0, 12)) {
+        const height = network.blockHeight(block);
+        const canonical = height === null ? { canonical: false, segment: "unverified" } : state.resolver.classifyOccurrence(source.id, height);
+        const tr = create("tr");
         const heightCell = create("td");
-        const heightButton = create("button", "table-link height-link", `#${formatInteger(height)}`);
-        heightButton.type = "button";
-        heightButton.addEventListener("click", () => navigate("block", String(height)));
-        heightCell.append(heightButton);
-
-        const timestamp = finiteNonNegative(header.timestamp);
-        const age = timestamp && timestamp <= Date.now() + 60_000 ? Math.max(0, Math.floor((Date.now() - timestamp) / 1000)) : null;
-        const ageCell = create("td", "", formatDuration(age));
-        if (timestamp) ageCell.title = formatTimestamp(timestamp);
-
-        const txCell = create("td", "", formatInteger(header.tx_count ?? (block.tx_hashes && block.tx_hashes.length)));
-        const producerCell = create("td", "", formatHash(header.producer, 6, 5));
-        producerCell.title = String(header.producer || "Unknown");
-
-        const hashCell = create("td");
-        const hashButton = create("button", "table-link", formatHash(blockHash(block)));
-        hashButton.type = "button";
-        hashButton.title = String(blockHash(block) || "Unknown");
-        hashButton.addEventListener("click", () => navigate("block", String(height)));
-        hashCell.append(hashButton);
-
-        row.append(heightCell, ageCell, txCell, producerCell, hashCell);
-        elements.blocksBody.append(row);
+        const button = create("button", "table-link", height === null ? "Unknown" : `#${formatInteger(height)}`);
+        button.type = "button";
+        if (height !== null) button.addEventListener("click", () => navigate("block", String(height)));
+        heightCell.append(button);
+        const segment = canonical.canonical ? canonical.segment.replaceAll("-", " ") : "non-canonical / unverified";
+        const stamp = blockTimestamp(block);
+        const age = stamp === null ? null : Math.max(0, Math.round((Date.now() - (stamp < 10_000_000_000 ? stamp * 1000 : stamp)) / 1000));
+        tr.append(heightCell, create("td", canonical.canonical ? "truth-good" : "truth-warn", segment), create("td", "", age === null ? "Unavailable" : network.formatDuration(age)), create("td", "", formatInteger(txCount(block))), create("td", "", network.formatHash(network.blockHash(block))));
+        elements.blocksBody.append(tr);
       }
-      text(elements.blocksStatus, `${sorted.length} retained`);
+      text(elements.blocksStatus, `${Math.min(12, blocks.length)} shown · ${source.name}`);
     }
 
-    function factsFrom(payloads, latest) {
-      const header = blockHeader(latest);
-      const version = (payloads.network && payloads.network.node_version)
-        || (payloads.info && payloads.info.version)
-        || (payloads.health && payloads.health.version)
-        || (payloads.stats && payloads.stats.version);
-      const chain = (payloads.network && payloads.network.network)
-        || (payloads.info && payloads.info.chain)
-        || (payloads.stats && payloads.stats.chain);
-      const healthStatus = payloads.health && payloads.health.status;
-      const mempool = (payloads.info && payloads.info.mempool_size) ?? (payloads.stats && payloads.stats.mempool_size);
-      return [
-        ["Node version", version || "Unknown"],
-        ["Chain", chain || "Undeclared / unknown"],
-        ["Health response", healthStatus || "Endpoint unavailable"],
-        ["Mempool", mempool === undefined ? "Unknown" : formatInteger(mempool)],
-        ["Latest block hash", formatHash(blockHash(latest)), blockHash(latest)],
-        ["Latest state root", formatHash(header.state_root), header.state_root],
-      ];
+    function renderInference(payload, source) {
+      clear(elements.inferenceList);
+      const rows = extractRows(payload);
+      const normalized = rows.map((row) => ({ row, receipt: network.classifyReceipt(row) }));
+      const confirmed = normalized.filter(({ receipt }) => receipt.inferenceConfirmed && receipt.height !== null && state.resolver.classifyOccurrence(source.id, receipt.height).canonical);
+      const excluded = rows.length - confirmed.length;
+      if (!confirmed.length) elements.inferenceList.append(create("p", "empty-cell", rows.length ? `${rows.length} observation(s) returned, but none had a successful canonical mined receipt.` : "No inference activity was returned."));
+      for (const { row, receipt } of confirmed.slice(0, 8)) {
+        const card = create("article", "evidence-card");
+        const heading = create("div", "evidence-heading");
+        heading.append(create("strong", "", `Inference receipt · #${formatInteger(receipt.height)}`), create("span", "status-pill online", "MINED SUCCESS"));
+        card.append(heading, create("code", "", receipt.txHash ? `0x${receipt.txHash}` : "Transaction hash unavailable"), create("small", "", `Source: ${source.name} · ${row.model_id ? `model ${network.formatHash(row.model_id)}` : "model unavailable"}`));
+        if (receipt.txHash) card.addEventListener("click", () => navigate("tx", receipt.txHash));
+        elements.inferenceList.append(card);
+      }
+      text(elements.inferenceStatus, `${confirmed.length} confirmed${excluded ? ` · ${excluded} excluded` : ""}`);
     }
 
-    async function refresh(options) {
-      const opts = options || {};
-      const source = selectedSource();
-      const generation = ++state.refreshGeneration;
-      if (state.refreshController) state.refreshController.abort();
+    function economicValue(payload, keys) {
+      for (const key of keys) {
+        const value = key.split(".").reduce((current, part) => current?.[part], payload);
+        if (value !== undefined && value !== null && value !== "") return value;
+      }
+      return null;
+    }
+
+    function renderRewards(payload) {
+      clear(elements.rewardsList);
+      const enabled = economicValue(payload, ["community_rewards_v1_enabled", "enabled", "issuance.enabled"]);
+      const active = economicValue(payload, ["community_rewards_v1_protocol_active", "protocol_active", "issuance.protocol_active"]);
+      const reward = economicValue(payload, ["attestation_reward_arc", "community_attestation_reward_arc", "reward_per_attestation_arc"]);
+      const observed = economicValue(payload, ["attestations_per_day_observed", "observed.attestations_per_day"]);
+      const readiness = enabled === true && active === true ? "Enabled and protocol-active" : enabled === false || active === false ? "Not issuing" : "Unavailable";
+      elements.rewardsList.append(
+        fact("Issuance", readiness),
+        fact("Attestation reward", reward === null ? "Unavailable" : `${reward} ARC configured rate`),
+        fact("Observed worker rate", observed === null ? "Unavailable" : `${observed}/day · backward-looking`),
+        fact("Projected earnings", reward !== null && observed !== null ? `${Number(reward) * Number(observed)} ARC/day · projection, not earned` : "Unavailable without observed worker evidence"),
+      );
+      text(elements.rewardsStatus, payload ? "Current source report" : "Unavailable");
+    }
+
+    async function loadSnapshot(source, signal) {
+      const requests = await Promise.all([
+        optionalRequest(window.fetch.bind(window), source, "/health", { signal }),
+        optionalRequest(window.fetch.bind(window), source, "/info", { signal }),
+        optionalRequest(window.fetch.bind(window), source, "/stats", { signal }),
+        optionalRequest(window.fetch.bind(window), source, "/validators", { signal }),
+        optionalRequest(window.fetch.bind(window), source, "/block/latest", { signal }),
+      ]);
+      const [health, info, stats, validators, latest] = requests.map((result) => result.ok ? result.value : null);
+      if (!requests.some((result) => result.ok)) throw requests[0].error;
+      const height = network.blockHeight(latest) ?? numberOrNull(health?.height, info?.block_height, stats?.block_height);
+      let blocks = latest ? [latest] : [];
+      if (height !== null) {
+        const from = Math.max(0, height - 11);
+        const recent = await optionalRequest(window.fetch.bind(window), source, `/blocks?from=${from}&to=${height}&limit=12`, { signal });
+        if (recent.ok && extractBlocks(recent.value).length) blocks = extractBlocks(recent.value);
+      }
+      return { health, info, stats, validators, latest, blocks };
+    }
+
+    async function refresh() {
+      if (!state.resolver) return;
+      state.refreshController?.abort();
       state.refreshController = new AbortController();
       const signal = state.refreshController.signal;
-
-      setRefreshBusy(true);
-      setSourceDot("unknown");
-      setBanner("loading", `Connecting to ${source.name}…`, `All panels are pinned to ${source.baseUrl}.`);
-      text(elements.blocksStatus, "Loading");
-      if (!opts.keepMetrics) setMetricPlaceholders();
-
-      const paths = ["/health", "/info", "/stats", "/validators", "/network/info", "/block/latest"];
-      const results = await Promise.allSettled(paths.map((path) => requestJson(source.id, path, { signal })));
-      if (generation !== state.refreshGeneration || source.id !== state.sourceId) return;
-
-      const payloads = {
-        health: fulfilled(results[0]),
-        info: fulfilled(results[1]),
-        stats: fulfilled(results[2]),
-        validators: fulfilled(results[3]),
-        network: fulfilled(results[4]),
-      };
-      let latest = fulfilled(results[5]);
-      const reachable = results.some((result) => result.status === "fulfilled");
-
-      if (!reachable) {
-        setRefreshBusy(false);
-        setSourceDot("offline");
-        const mixedContent = window.location.protocol === "https:" && source.baseUrl.startsWith("http:");
-        const detail = mixedContent
-          ? "These seed RPCs currently expose HTTP only; an HTTPS page cannot read them without an HTTPS reverse proxy."
-          : `No read endpoint answered at ${source.baseUrl}. Try another source or check network access.`;
-        setBanner("error", `${source.name} is unreachable`, detail);
-        renderBlocks([]);
-        renderFacts(factsFrom(payloads, null));
+      elements.refreshButton.classList.add("spinning");
+      const source = currentSource();
+      updateSourceChrome();
+      if (!source) {
+        resetMetrics();
+        renderFacts(null, null, null);
+        renderRecovery(null);
+        setBanner("degraded", "Canonical recovery is not configured", state.config.notices[0] || "No approved checkpoint and v3 source are available.");
+        text(elements.blocksStatus, "Paused");
+        text(elements.inferenceStatus, "Paused");
+        text(elements.rewardsStatus, "Paused");
+        elements.refreshButton.classList.remove("spinning");
         return;
       }
-
-      const reportedHeight = reportedHeightFrom(payloads);
-      let blocks = [];
-      if (reportedHeight !== null) {
-        const from = Math.max(0, Math.floor(reportedHeight) - 15);
-        try {
-          const range = await requestJson(source.id, `/blocks?from=${from}&to=${Math.floor(reportedHeight)}&limit=16`, { signal });
-          blocks = range && Array.isArray(range.blocks) ? range.blocks : [];
-        } catch (error) {
-          if (error.aborted) return;
+      const alternate = state.sourceId !== "canonical" && source.id !== state.config.checkpoint?.v3SourceId && source.id !== state.config.checkpoint?.legacySourceId;
+      setBanner("loading", alternate ? "Loading explicit alternate source…" : "Loading canonical source…", sourceDisplay(source));
+      try {
+        const [snapshotResult, boundaryResult, inferenceResult, rewardsResult] = await Promise.all([
+          loadSnapshot(source, signal).then((value) => ({ ok: true, value }), (error) => ({ ok: false, error })),
+          state.config.checkpoint ? optionalRequest(window.fetch.bind(window), state.resolver.source(state.config.checkpoint.v3SourceId), `/block/${state.config.checkpoint.recoveryHeight}`, { signal }) : Promise.resolve({ ok: false }),
+          optionalRequest(window.fetch.bind(window), source, "/inference/attestations?limit=20", { signal }),
+          optionalRequest(window.fetch.bind(window), source, "/economics/rewards", { signal }),
+        ]);
+        if (signal.aborted) return;
+        if (!snapshotResult.ok) throw snapshotResult.error;
+        const snapshot = snapshotResult.value;
+        const height = reportedHeight(snapshot);
+        const liveness = network.evaluateLiveness(snapshot.health, snapshot.latest);
+        text(elements.metricHeight, formatInteger(height));
+        text(elements.metricHeightNote, state.sourceId === "canonical" ? "Protocol-v3 current source" : "Explicit source report");
+        text(elements.metricStoredHeight, formatInteger(network.blockHeight(snapshot.latest)));
+        text(elements.metricStoredNote, snapshot.latest ? formatTimestamp(blockTimestamp(snapshot.latest)) : "Header unavailable");
+        text(elements.metricBlockAge, liveness.ageSecs === null ? "—" : network.formatDuration(liveness.ageSecs));
+        text(elements.metricLivenessNote, `${liveness.state} · ${liveness.basis}`);
+        text(elements.metricTransactions, formatInteger(numberOrNull(snapshot.stats?.total_transactions, snapshot.info?.total_transactions)));
+        text(elements.metricPeers, formatInteger(numberOrNull(snapshot.health?.peers, snapshot.info?.peer_count, snapshot.stats?.connected_peers)));
+        const validatorRows = Array.isArray(snapshot.validators) ? snapshot.validators : snapshot.validators?.validators;
+        text(elements.metricValidators, formatInteger(numberOrNull(snapshot.stats?.validators, snapshot.info?.validator_count, validatorRows?.length)));
+        text(elements.metricValidatorNote, validatorRows ? `${validatorRows.length} records returned` : "Validator records unavailable");
+        renderFacts(source, snapshot, liveness);
+        renderBlocks(snapshot.blocks, source);
+        const boundary = boundaryResult.ok ? network.boundaryVerification(boundaryResult.value, state.config.checkpoint) : { state: "unknown" };
+        renderRecovery(boundary);
+        renderInference(inferenceResult.ok ? inferenceResult.value : null, source);
+        renderRewards(rewardsResult.ok ? rewardsResult.value : null);
+        text(elements.lastRefreshed, new Date().toLocaleTimeString());
+        if (boundary.state === "mismatch") setBanner("error", "Recovery boundary mismatch", "H+1 does not reference the configured signed checkpoint. Do not treat this continuation as canonical.");
+        else if (alternate) setBanner("degraded", "NON-CANONICAL source view", `${sourceDisplay(source)} is being queried explicitly and is not merged into canonical results.`);
+        else if (liveness.state === "stalled") setBanner("degraded", "RPC reachable, chain appears stalled", `${sourceDisplay(source)} answered, but its newest block is stale.`);
+        else setBanner("online", "Canonical source reachable", `${sourceDisplay(source)} · liveness ${liveness.state}`);
+      } catch (error) {
+        if (!signal.aborted) {
+          resetMetrics();
+          renderFacts(source, null, null);
+          renderRecovery(null);
+          setBanner("error", "Selected source is unreachable", `${sourceDisplay(source)}: ${error.message}`);
         }
+      } finally {
+        elements.refreshButton.classList.remove("spinning");
       }
-      if (!latest && blocks.length) {
-        latest = sortBlocksNewestFirst(blocks)[0];
-      }
-      if (latest && !blocks.some((block) => blockHeight(block) === blockHeight(latest))) {
-        blocks.push(latest);
-      }
-
-      const liveness = evaluateLiveness(payloads.health, latest, Date.now());
-      const storedHeight = blockHeight(latest);
-      const lag = reportedHeight !== null && storedHeight !== null ? Math.max(0, Math.floor(reportedHeight - storedHeight)) : null;
-      const transactionCount = payloads.stats && payloads.stats.total_transactions;
-      const peers = (payloads.health && payloads.health.peers) ?? (payloads.stats && payloads.stats.connected_peers);
-      const registeredValidators = (payloads.network && payloads.network.validators_registered)
-        ?? (payloads.validators && payloads.validators.count)
-        ?? (payloads.health && payloads.health.validators)
-        ?? (payloads.stats && payloads.stats.validators);
-      const activeValidators = payloads.network && payloads.network.validators_active;
-
-      text(elements.metricHeight, reportedHeight === null ? "Unknown" : formatInteger(reportedHeight));
-      text(elements.metricHeightNote, "Highest height reported by this source during refresh");
-      text(elements.metricStoredHeight, storedHeight === null ? "Unknown" : formatInteger(storedHeight));
-      text(elements.metricStoredNote, lag === null ? "No retained header available" : lag === 0 ? "Matches reported height" : `${formatInteger(lag)} behind reported height`);
-      text(elements.metricBlockAge, formatDuration(liveness.ageSecs));
-      text(elements.metricLivenessNote, liveness.state === "advancing" ? "Block timestamp is fresh" : liveness.state === "stalled" ? "Block production appears stalled" : "Cannot infer block liveness");
-      text(elements.metricTransactions, transactionCount === undefined ? "Unknown" : formatInteger(transactionCount));
-      text(elements.metricPeers, peers === undefined ? "Unknown" : formatInteger(peers));
-      text(elements.metricValidators, registeredValidators === undefined ? "Unknown" : formatInteger(registeredValidators));
-      text(elements.metricValidatorNote, activeValidators === undefined || activeValidators === null ? "Reported set; active split unavailable" : `${formatInteger(activeValidators)} active by this node's rule`);
-
-      renderBlocks(blocks);
-      renderFacts(factsFrom(payloads, latest));
-      text(elements.lastRefreshed, new Date().toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit", second: "2-digit" }));
-
-      if (liveness.state === "advancing") {
-        setSourceDot("online");
-        setBanner("online", `${source.name} RPC reachable`, `Newest retained block #${formatInteger(storedHeight)} is ${formatDuration(liveness.ageSecs)} old.`);
-      } else if (liveness.state === "stalled") {
-        setSourceDot("stalled");
-        setBanner("degraded", `${source.name} reachable · block production stale`, `Newest retained block is ${formatDuration(liveness.ageSecs)} old; RPC availability is not proof of chain progress.`);
-      } else {
-        setSourceDot("unknown");
-        setBanner("degraded", `${source.name} RPC reachable · liveness unknown`, liveness.basis);
-      }
-
-      setRefreshBusy(false);
-      if (opts.rerunLookup !== false) handleRoute();
     }
 
-    function setInspectorHeading(kicker, title, closable) {
+    function setInspector(kicker, title) {
       text(elements.inspectorKicker, kicker);
       text(elements.inspectorTitle, title);
-      elements.inspectorClose.hidden = !closable;
-    }
-
-    function renderInspectorEmpty() {
-      setInspectorHeading("Lookup", "Select a block or search the chain", false);
+      elements.inspectorClose.hidden = false;
       clear(elements.inspectorContent);
-      const wrapper = create("div", "inspector-empty");
-      wrapper.append(create("span", "", "⌕"), create("p", "", "Block, transaction, and address details stay pinned to the source above."));
-      elements.inspectorContent.append(wrapper);
     }
 
-    function renderInspectorLoading(kind, value) {
-      setInspectorHeading(kind, `Loading ${value}`, true);
-      clear(elements.inspectorContent);
-      const wrapper = create("div", "loading-state");
-      wrapper.append(create("div", "loading-ring"), create("p", "", `Querying ${selectedSource().name}; no other source will be used as a fallback.`));
-      elements.inspectorContent.append(wrapper);
+    function inspectorLoading(kicker, title) {
+      setInspector(kicker, title);
+      const wrap = create("div", "inspector-empty");
+      wrap.append(create("span", "loading-ring"), create("p", "", "Resolving source and loading evidence…"));
+      elements.inspectorContent.append(wrap);
     }
 
-    function renderInspectorError(kind, error, resource) {
-      setInspectorHeading(kind, `${resource} unavailable`, true);
-      clear(elements.inspectorContent);
-      const wrapper = create("div", "error-state");
-      wrapper.append(create("strong", "", error && error.status ? `HTTP ${error.status}` : "RPC unavailable"));
-      wrapper.append(create("p", "", errorMessage(error, String(resource).toLowerCase())));
-      wrapper.append(create("p", "", `Source: ${selectedSource().baseUrl}. ARC nodes can prune old blocks and indexes, so a 404 is source-specific.`));
-      elements.inspectorContent.append(wrapper);
+    function inspectorError(kicker, title, message) {
+      setInspector(kicker, title);
+      const wrap = create("div", "error-state");
+      wrap.append(create("strong", "", title), create("p", "", message));
+      elements.inspectorContent.append(wrap);
     }
 
-    function appendDetailGrid(parent, fields) {
-      const list = create("dl", "detail-grid");
-      for (const field of fields) {
-        if (field.value === undefined) continue;
-        const item = create("div", `detail-item${field.wide ? " wide" : ""}`);
-        const term = create("dt", "", field.label);
-        const detail = create("dd");
-        if (field.action && field.value !== null) {
-          const button = create("button", "hash-link", field.display || String(field.value));
-          button.type = "button";
-          button.addEventListener("click", field.action);
-          detail.append(button);
-        } else {
-          detail.textContent = field.display || (field.value === null ? "Unknown" : String(field.value));
-        }
-        if (field.title) detail.title = String(field.title);
-        item.append(term, detail);
-        list.append(item);
+    function detailGrid(items) {
+      const grid = create("dl", "detail-grid");
+      for (const [label, value, wide] of items) {
+        const row = create("div", `detail-item${wide ? " wide" : ""}`);
+        row.append(create("dt", "", label), create("dd", "", value ?? "Unavailable"));
+        grid.append(row);
       }
-      parent.append(list);
+      return grid;
     }
 
-    function appendRawSection(parent, title, payload) {
+    function rawSection(label, value) {
       const section = create("section", "detail-section");
-      section.append(create("h3", "", title));
-      const pre = create("pre", "raw-data");
-      pre.textContent = JSON.stringify(payload, null, 2);
-      section.append(pre);
-      parent.append(section);
-    }
-
-    function appendTransactionChips(parent, hashes, limit) {
-      const section = create("section", "detail-section");
-      section.append(create("h3", "", "Transactions visible from this source"));
-      const bounded = boundedItems(hashes, limit === undefined ? 100 : limit);
-      if (!bounded.total) {
-        section.append(create("p", "", "No transaction hashes were returned for this record."));
-      } else {
-        if (bounded.truncated) {
-          section.append(create("p", "inspector-note", `Showing the first ${formatInteger(bounded.visible.length)} of ${formatInteger(bounded.total)} hashes returned by this source. The address-history RPC is currently unpaginated.`));
-        }
-        const list = create("ul", "chip-list");
-        for (const hashValue of bounded.visible) {
-          const hash = normalizeHex(hashValue);
-          if (!hash) continue;
-          const item = create("li");
-          const button = create("button", "", formatHash(hash, 12, 10));
-          button.type = "button";
-          button.title = `0x${hash}`;
-          button.addEventListener("click", () => navigate("tx", hash));
-          item.append(button);
-          list.append(item);
-        }
-        section.append(list);
-      }
-      parent.append(section);
-    }
-
-    function renderBlockDetail(block, txPayload) {
-      const header = blockHeader(block);
-      const height = blockHeight(block);
-      const hash = blockHash(block);
-      setInspectorHeading("Block", `Block #${formatInteger(height)}`, true);
-      clear(elements.inspectorContent);
-      const root = create("div");
-      appendDetailGrid(root, [
-        { label: "Height", value: height, display: formatInteger(height) },
-        { label: "Timestamp", value: header.timestamp, display: formatTimestamp(header.timestamp) },
-        { label: "Transactions", value: header.tx_count, display: formatInteger(header.tx_count) },
-        { label: "Block hash", value: hash, display: formatHash(hash, 18, 14), title: hash, wide: true },
-        { label: "Producer", value: header.producer, display: formatHash(header.producer, 18, 14), title: header.producer, wide: true },
-        { label: "Parent hash", value: header.parent_hash, display: formatHash(header.parent_hash, 18, 14), title: header.parent_hash, wide: true },
-        { label: "Transaction root", value: header.tx_root, display: formatHash(header.tx_root, 18, 14), title: header.tx_root, wide: true },
-        { label: "State root", value: header.state_root, display: formatHash(header.state_root, 18, 14), title: header.state_root, wide: true },
-        { label: "Protocol", value: header.protocol_version, display: header.protocol_version ? `${header.protocol_version.major}.${header.protocol_version.minor}.${header.protocol_version.patch}` : "Unknown" },
-      ]);
-
-      const returned = txPayload && Array.isArray(txPayload.transactions) ? txPayload.transactions : [];
-      const hashes = returned.map((transaction) => transaction.hash).filter(Boolean);
-      if (!hashes.length && Array.isArray(block.tx_hashes)) hashes.push(...block.tx_hashes);
-      appendTransactionChips(root, hashes, 100);
-
-      const nav = create("section", "detail-section");
-      nav.append(create("h3", "", "Adjacent heights on this source"));
-      const buttons = create("ul", "chip-list");
-      if (height > 0) {
-        const previousItem = create("li");
-        const previous = create("button", "", `← Block #${formatInteger(height - 1)}`);
-        previous.type = "button";
-        previous.addEventListener("click", () => navigate("block", String(height - 1)));
-        previousItem.append(previous);
-        buttons.append(previousItem);
-      }
-      const nextItem = create("li");
-      const next = create("button", "", `Block #${formatInteger(height + 1)} →`);
-      next.type = "button";
-      next.addEventListener("click", () => navigate("block", String(height + 1)));
-      nextItem.append(next);
-      buttons.append(nextItem);
-      nav.append(buttons);
-      root.append(nav);
-      appendRawSection(root, "Raw source response", block);
-      elements.inspectorContent.append(root);
-    }
-
-    function renderTransactionDetail(hash, full, receipt, note) {
-      const body = full && full.body;
-      const success = full && typeof full.success === "boolean" ? full.success : receipt && receipt.success;
-      setInspectorHeading("Transaction", formatHash(hash, 14, 12), true);
-      clear(elements.inspectorContent);
-      const root = create("div");
-      if (note) root.append(create("p", "inspector-note", note));
-
-      appendDetailGrid(root, [
-        { label: "Status", value: success, display: success === true ? "Success" : success === false ? "Failed" : "Receipt status unavailable" },
-        { label: "Type", value: full && full.tx_type, display: (full && full.tx_type) || "Body unavailable" },
-        { label: "Block", value: (full && full.block_height) ?? (receipt && receipt.block_height), display: formatInteger((full && full.block_height) ?? (receipt && receipt.block_height)) },
-        { label: "Hash", value: hash, display: `0x${hash}`, wide: true },
-        {
-          label: "From",
-          value: full && full.from,
-          display: full && full.from ? formatHash(full.from, 18, 14) : "Unavailable in receipt",
-          title: full && full.from,
-          wide: true,
-          action: full && normalizeHex(full.from) ? () => navigate("address", normalizeHex(full.from)) : null,
-        },
-        {
-          label: "To",
-          value: body && body.to,
-          display: body && body.to ? formatHash(body.to, 18, 14) : "Not a transfer / unavailable",
-          title: body && body.to,
-          wide: true,
-          action: body && normalizeHex(body.to) ? () => navigate("address", normalizeHex(body.to)) : null,
-        },
-        { label: "Nonce", value: full && full.nonce, display: full && full.nonce !== undefined ? formatInteger(full.nonce) : "Unavailable" },
-        { label: "Fee (raw)", value: full && full.fee, display: full && full.fee !== undefined ? formatInteger(full.fee) : "Unavailable" },
-        { label: "Gas used", value: (full && full.gas_used) ?? (receipt && receipt.gas_used), display: formatInteger((full && full.gas_used) ?? (receipt && receipt.gas_used)) },
-      ]);
-
-      if (body) appendRawSection(root, "Transaction body", body);
-      appendRawSection(root, "Raw source response", full || receipt);
-      elements.inspectorContent.append(root);
-    }
-
-    function renderAddressDetail(address, account, history) {
-      const hashes = history && Array.isArray(history.tx_hashes) ? history.tx_hashes : [];
-      setInspectorHeading("Address", formatHash(address, 14, 12), true);
-      clear(elements.inspectorContent);
-      const root = create("div");
-      if (!account) {
-        root.append(create("p", "inspector-note", "This source returned no current account record. Any history below is the node's local address index, not proof of a current balance."));
-      }
-      appendDetailGrid(root, [
-        { label: "Address", value: address, display: `0x${address}`, wide: true },
-        { label: "Balance (raw units)", value: account && account.balance, display: account && account.balance !== undefined ? formatInteger(account.balance) : "Account record unavailable" },
-        { label: "Nonce", value: account && account.nonce, display: account && account.nonce !== undefined ? formatInteger(account.nonce) : "Account record unavailable" },
-        { label: "Indexed transactions", value: history && history.tx_count, display: history && history.tx_count !== undefined ? formatInteger(history.tx_count) : "History endpoint unavailable" },
-        { label: "Code hash", value: account && account.code_hash, display: account && account.code_hash ? formatHash(account.code_hash, 18, 14) : "None / unavailable", title: account && account.code_hash, wide: true },
-        { label: "Storage root", value: account && account.storage_root, display: account && account.storage_root ? formatHash(account.storage_root, 18, 14) : "None / unavailable", title: account && account.storage_root, wide: true },
-      ]);
-      const boundedHistory = boundedItems(hashes, 50);
-      appendTransactionChips(root, hashes, 50);
-      if (account) appendRawSection(root, "Raw account response", account);
-      if (history) {
-        appendRawSection(root, "Address-history response preview", {
-          ...history,
-          tx_hashes: boundedHistory.visible,
-          explorer_preview_truncated: boundedHistory.truncated,
-          explorer_preview_count: boundedHistory.visible.length,
-        });
-      }
-      elements.inspectorContent.append(root);
-    }
-
-    function beginLookup(kind, value) {
-      if (state.lookupController) state.lookupController.abort();
-      state.lookupController = new AbortController();
-      const generation = ++state.lookupGeneration;
-      const sourceId = state.sourceId;
-      renderInspectorLoading(kind, value);
-      return {
-        generation,
-        sourceId,
-        signal: state.lookupController.signal,
-        current() {
-          return generation === state.lookupGeneration && sourceId === state.sourceId;
-        },
-      };
+      section.append(create("h3", "", label), create("pre", "raw-data", JSON.stringify(value, null, 2)));
+      return section;
     }
 
     async function inspectBlock(value) {
       const parsed = classifyLookup(value, "block");
-      if (parsed.error) {
-        renderInspectorError("Block", new RpcError(parsed.error, 400), "Block");
-        return;
-      }
-      const lookup = beginLookup("Block", `#${formatInteger(parsed.value)}`);
-      const [blockResult, txResult] = await Promise.allSettled([
-        requestJson(lookup.sourceId, `/block/${parsed.value}`, { signal: lookup.signal }),
-        requestJson(lookup.sourceId, `/block/${parsed.value}/txs?offset=0&limit=100`, { signal: lookup.signal }),
-      ]);
-      if (!lookup.current()) return;
-      if (blockResult.status === "rejected") {
-        if (!blockResult.reason.aborted) renderInspectorError("Block", blockResult.reason, "Block");
-        return;
-      }
-      renderBlockDetail(blockResult.value, fulfilled(txResult));
-      elements.inspector.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-
-    async function inspectTransaction(value) {
-      const hash = normalizeHex(value);
-      if (!hash) {
-        renderInspectorError("Transaction", new RpcError("Invalid transaction hash.", 400), "Transaction");
-        return;
-      }
-      const lookup = beginLookup("Transaction", formatHash(hash, 14, 12));
-      const [fullResult, receiptResult] = await Promise.allSettled([
-        requestJson(lookup.sourceId, `/tx/${hash}/full`, { signal: lookup.signal }),
-        requestJson(lookup.sourceId, `/tx/${hash}`, { signal: lookup.signal }),
-      ]);
-      if (!lookup.current()) return;
-      const full = fulfilled(fullResult);
-      const receipt = fulfilled(receiptResult);
-      if (!full && !receipt) {
-        const error = fullResult.status === "rejected" ? fullResult.reason : receiptResult.reason;
-        if (!error.aborted) renderInspectorError("Transaction", error, "Transaction");
-        return;
-      }
-      const note = full ? null : "This source returned a receipt but not the full transaction body. The explorer is showing only fields the receipt proves.";
-      renderTransactionDetail(hash, full, receipt, note);
-      elements.inspector.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-
-    async function inspectAddress(value) {
-      const address = normalizeHex(value);
-      if (!address) {
-        renderInspectorError("Address", new RpcError("Invalid ARC address.", 400), "Address");
-        return;
-      }
-      const lookup = beginLookup("Address", formatHash(address, 14, 12));
-      const [accountResult, historyResult] = await Promise.allSettled([
-        requestJson(lookup.sourceId, `/account/${address}`, { signal: lookup.signal }),
-        requestJson(lookup.sourceId, `/account/${address}/txs`, { signal: lookup.signal }),
-      ]);
-      if (!lookup.current()) return;
-      const account = fulfilled(accountResult);
-      const history = fulfilled(historyResult);
-      const hasHistory = history && Array.isArray(history.tx_hashes) && history.tx_hashes.length > 0;
-      if (!account && !hasHistory) {
-        const error = accountResult.status === "rejected" ? accountResult.reason : new RpcError("Address not found.", 404);
-        if (!error.aborted) renderInspectorError("Address", error, "Address");
-        return;
-      }
-      renderAddressDetail(address, account, history);
-      elements.inspector.scrollIntoView({ behavior: "smooth", block: "start" });
-    }
-
-    async function inspectAutoHash(value) {
-      const hash = normalizeHex(value);
-      if (!hash) {
-        renderInspectorError("Lookup", new RpcError("Invalid 32-byte value.", 400), "Lookup");
-        return;
-      }
-      const lookup = beginLookup("Auto lookup", formatHash(hash, 14, 12));
-      let full = null;
+      if (parsed.error) return inspectorError("Block", "Invalid height", parsed.error);
+      state.lookupController?.abort();
+      state.lookupController = new AbortController();
+      inspectorLoading("Block", `#${formatInteger(parsed.value)}`);
       try {
-        full = await requestJson(lookup.sourceId, `/tx/${hash}/full`, { signal: lookup.signal });
+        const result = await queryBlock({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), height: parsed.value, sourceId: state.sourceId, signal: state.lookupController.signal });
+        setInspector(result.route.canonical ? "Canonical block" : "NON-CANONICAL BLOCK", `Block #${formatInteger(result.route.height)}`);
+        const warning = !result.route.canonical ? create("p", "inspector-note warning", result.route.warning || "This result is outside the configured canonical route.") : null;
+        if (warning) elements.inspectorContent.append(warning);
+        if (result.boundary.state === "verified") elements.inspectorContent.append(create("p", "inspector-note good", "Recovery boundary verified: H+1 parent hash matches the signed H checkpoint."));
+        if (result.boundary.state === "mismatch") elements.inspectorContent.append(create("p", "inspector-note error", "Recovery boundary mismatch: this block cannot be presented as the configured continuation."));
+        const header = network.blockHeader(result.block);
+        elements.inspectorContent.append(detailGrid([
+          ["Canonical status", result.route.canonical ? "Canonical" : "Alternate / non-canonical"],
+          ["Segment", result.route.segment.replaceAll("-", " ")],
+          ["Source", sourceDisplay(result.route.source)],
+          ["Timestamp", formatTimestamp(header.timestamp)],
+          ["Block hash", network.blockHash(result.block) ? `0x${network.blockHash(result.block)}` : "Unavailable", true],
+          ["Parent hash", network.parentHash(result.block) ? `0x${network.parentHash(result.block)}` : "Unavailable", true],
+          ["State root", network.stateRoot(result.block) ? `0x${network.stateRoot(result.block)}` : "Unavailable", true],
+          ["Transactions", formatInteger(txCount(result.block))],
+        ]), rawSection("Block response", result.block));
+        if (result.transactions) elements.inspectorContent.append(rawSection("Transaction index response", result.transactions));
       } catch (error) {
-        if (error.aborted || !lookup.current()) return;
-        if (error.status !== 404) {
-          renderInspectorError("Auto lookup", error, "Transaction");
-          return;
-        }
+        if (!state.lookupController.signal.aborted) inspectorError("Block", "Block unavailable", error.message);
       }
-      if (!lookup.current()) return;
-      if (full) {
-        let receipt = null;
-        try {
-          receipt = await requestJson(lookup.sourceId, `/tx/${hash}`, { signal: lookup.signal });
-        } catch (_) {
-          // The full record already proves the transaction exists.
-        }
-        if (lookup.current()) renderTransactionDetail(hash, full, receipt, null);
-        return;
-      }
+    }
 
-      const [accountResult, historyResult] = await Promise.allSettled([
-        requestJson(lookup.sourceId, `/account/${hash}`, { signal: lookup.signal }),
-        requestJson(lookup.sourceId, `/account/${hash}/txs`, { signal: lookup.signal }),
-      ]);
-      if (!lookup.current()) return;
-      const account = fulfilled(accountResult);
-      const history = fulfilled(historyResult);
-      const hasHistory = history && Array.isArray(history.tx_hashes) && history.tx_hashes.length > 0;
-      if (account || hasHistory) {
-        renderAddressDetail(hash, account, history);
-      } else {
-        renderInspectorError("Auto lookup", new RpcError("No transaction or address record was found on this source.", 404), "Lookup");
+    function occurrenceCard(occurrence) {
+      const { source, classification, provenance } = occurrence;
+      const card = create("article", `occurrence-card ${provenance.canonical ? "canonical" : "alternate"}`);
+      const heading = create("div", "evidence-heading");
+      heading.append(create("strong", "", sourceDisplay(source)), create("span", `status-pill ${provenance.canonical ? "online" : "degraded"}`, provenance.canonical ? "CANONICAL" : "NOT CANONICAL"));
+      card.append(heading, detailGrid([
+        ["Receipt", classification.receiptBacked ? classification.status : "Absent / unproven"],
+        ["Category", classification.category],
+        ["Block", formatInteger(classification.height)],
+        ["Segment", provenance.segment?.replaceAll("-", " ")],
+        ["Inference", classification.inferenceConfirmed ? "Confirmed mined receipt" : "Not confirmed"],
+        ["Reward", classification.rewardEarned ? "Earned · successful mined receipt" : "Not counted as earned"],
+      ]));
+      if (occurrence.full) card.append(rawSection("Transaction", occurrence.full));
+      if (occurrence.receipt) card.append(rawSection("Receipt", occurrence.receipt));
+      return card;
+    }
+
+    async function inspectTransaction(hash) {
+      state.lookupController?.abort();
+      state.lookupController = new AbortController();
+      inspectorLoading("Transaction / receipt", network.formatHash(hash, 14, 12));
+      try {
+        const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId, signal: state.lookupController.signal });
+        if (!result.occurrences.length) return inspectorError("Transaction / receipt", "Transaction not found", `No record was returned by ${result.plannedSources.length} permitted source(s). Alternate forks were not searched unless explicitly selected.`);
+        setInspector("Transaction / receipt", network.formatHash(hash, 14, 12));
+        elements.inspectorContent.append(create("p", "inspector-note", "Each occurrence is classified independently. A transaction on an alternate source is never promoted to the canonical timeline."));
+        for (const occurrence of result.occurrences) elements.inspectorContent.append(occurrenceCard(occurrence));
+      } catch (error) {
+        if (!state.lookupController.signal.aborted) inspectorError("Transaction / receipt", "Lookup failed", error.message);
       }
-      elements.inspector.scrollIntoView({ behavior: "smooth", block: "start" });
+    }
+
+    async function inspectAddress(address) {
+      state.lookupController?.abort();
+      state.lookupController = new AbortController();
+      inspectorLoading("Address", network.formatHash(address, 14, 12));
+      try {
+        const result = await queryAddress({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), address, sourceId: state.sourceId, signal: state.lookupController.signal });
+        if (!result.records.length) return inspectorError("Address", "Address unavailable", "No account or indexed history was returned by the permitted sources.");
+        setInspector("Address · source-separated", network.formatHash(address, 14, 12));
+        elements.inspectorContent.append(create("p", "inspector-note", "Balances and histories below remain source-scoped. They are not added together across the recovery boundary."));
+        for (const record of result.records) {
+          const card = create("article", "occurrence-card");
+          card.append(create("h3", "", sourceDisplay(record.source)), detailGrid([
+            ["Balance (raw)", formatInteger(record.account?.balance)], ["Nonce", formatInteger(record.account?.nonce)], ["Indexed transactions", formatInteger(record.history?.tx_count ?? record.history?.tx_hashes?.length)],
+          ]));
+          if (record.account) card.append(rawSection("Account response", record.account));
+          if (record.history) card.append(rawSection("Address history", record.history));
+          elements.inspectorContent.append(card);
+        }
+      } catch (error) {
+        if (!state.lookupController.signal.aborted) inspectorError("Address", "Lookup failed", error.message);
+      }
+    }
+
+    async function inspectAutoHash(hash) {
+      const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId });
+      if (result.occurrences.length) return inspectTransaction(hash);
+      return inspectAddress(hash);
     }
 
     function parseRoute() {
       const raw = window.location.hash.replace(/^#\/?/, "");
       if (!raw) return null;
-      const separator = raw.indexOf("/");
-      if (separator === -1) return null;
-      try {
-        return { kind: raw.slice(0, separator), value: decodeURIComponent(raw.slice(separator + 1)) };
-      } catch (_) {
-        return null;
-      }
+      const split = raw.indexOf("/");
+      if (split < 0) return null;
+      try { return { kind: raw.slice(0, split), value: decodeURIComponent(raw.slice(split + 1)) }; } catch (_error) { return null; }
     }
 
     function handleRoute() {
       const route = parseRoute();
       if (!route) {
-        if (state.lookupController) state.lookupController.abort();
-        state.lookupGeneration += 1;
-        renderInspectorEmpty();
+        elements.inspectorClose.hidden = true;
+        text(elements.inspectorKicker, "Lookup");
+        text(elements.inspectorTitle, "Search canonical history or select an alternate source");
+        clear(elements.inspectorContent);
+        const empty = create("div", "inspector-empty");
+        empty.append(create("span", "", "⌕"), create("p", "", "Block lookup resolves by checkpoint height. Transaction and address searches retain source provenance for every result."));
+        elements.inspectorContent.append(empty);
         return;
       }
+      if (!state.resolver) return inspectorError("Lookup", "Configuration unavailable", "The canonical resolver has not loaded.");
       if (route.kind === "block") inspectBlock(route.value);
       else if (route.kind === "tx") inspectTransaction(route.value);
       else if (route.kind === "address") inspectAddress(route.value);
-      else if (route.kind === "lookup") inspectAutoHash(route.value);
-      else renderInspectorError("Lookup", new RpcError("Unsupported explorer route.", 400), "Lookup");
+      else if (route.kind === "lookup") inspectAutoHash(route.value).catch((error) => inspectorError("Lookup", "Lookup failed", error.message));
+      else inspectorError("Lookup", "Unsupported route", "Use a block, transaction, or address search.");
     }
 
     function navigate(kind, value) {
-      const nextHash = `#/${kind}/${encodeURIComponent(value)}`;
-      if (window.location.hash === nextHash) handleRoute();
-      else window.location.hash = nextHash;
+      const hash = `#/${kind}/${encodeURIComponent(value)}`;
+      if (window.location.hash === hash) handleRoute();
+      else window.location.hash = hash;
     }
 
-    function selectSource(sourceId) {
-      if (!sourceFor(sourceId)) return;
-      state.sourceId = sourceId;
-      if (state.lookupController) state.lookupController.abort();
-      state.lookupGeneration += 1;
-      renderInspectorEmpty();
-      persistSourceId(sourceId);
+    elements.sourceSelect.addEventListener("change", () => {
+      state.sourceId = elements.sourceSelect.value;
       updateSourceChrome();
-      refresh({ keepMetrics: false, rerunLookup: true });
-    }
-
-    elements.sourceSelect.addEventListener("change", (event) => selectSource(event.target.value));
-    elements.refreshButton.addEventListener("click", () => refresh({ keepMetrics: true, rerunLookup: true }));
-    elements.inspectorClose.addEventListener("click", () => { window.location.hash = "#/"; });
+      refresh();
+      handleRoute();
+    });
+    elements.refreshButton.addEventListener("click", refresh);
     elements.searchForm.addEventListener("submit", (event) => {
       event.preventDefault();
-      const lookup = classifyLookup(elements.searchInput.value, elements.searchKind.value);
-      text(elements.searchError, lookup.error || "");
-      if (!lookup.error) navigate(lookup.kind, lookup.value);
+      const parsed = classifyLookup(elements.searchInput.value, elements.searchKind.value);
+      text(elements.searchError, parsed.error || "");
+      if (!parsed.error) navigate(parsed.kind, parsed.value);
     });
+    elements.inspectorClose.addEventListener("click", () => { window.location.hash = "#/"; });
     window.addEventListener("hashchange", handleRoute);
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) refresh({ keepMetrics: true, rerunLookup: false });
-    });
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
 
-    populateSources();
-    state.sourceId = savedSourceId();
-    updateSourceChrome();
-    refresh({ keepMetrics: false, rerunLookup: true });
-    state.timer = window.setInterval(() => {
-      if (!document.hidden) refresh({ keepMetrics: true, rerunLookup: false });
-    }, REFRESH_INTERVAL_MS);
+    (async () => {
+      try {
+        const meta = document.querySelector('meta[name="arc-network-config"]');
+        state.config = await network.loadConfig({
+          injected: window.__ARC_NETWORK_CONFIG__,
+          fetchImpl: window.fetch.bind(window),
+          url: meta?.content || "../shared/frontend/arc-network.json",
+        });
+        state.resolver = network.createCanonicalResolver(state.config);
+        text(elements.networkLabel, `${state.config.network.name} / ${state.config.state.toUpperCase()}`);
+        populateSources();
+        updateSourceChrome();
+        renderRecovery(null);
+        await refresh();
+        handleRoute();
+        state.timer = window.setInterval(() => { if (!document.hidden) refresh(); }, REFRESH_INTERVAL_MS);
+      } catch (error) {
+        resetMetrics();
+        renderFacts(null, null, null);
+        setBanner("error", "Explorer configuration rejected", error.message);
+        inspectorError("Configuration", "No canonical chain view", "Publish a valid arc.frontend.network.v1 configuration. No legacy peer was selected automatically.");
+      }
+    })();
   }
 
   return Object.freeze({
-    SOURCES,
     RpcError,
-    boundedItems,
-    buildRpcUrl,
     classifyLookup,
-    evaluateLiveness,
-    formatDuration,
-    formatHash,
-    normalizeHex,
-    reportedHeightFrom,
-    sortBlocksNewestFirst,
+    extractBlocks,
+    extractRows,
+    reportedHeight,
+    requestJson,
+    queryBlock,
+    queryTransaction,
+    queryAddress,
     boot,
   });
 });

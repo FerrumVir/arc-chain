@@ -1,0 +1,55 @@
+{
+  "schema": "arc.frontend.network.v1",
+  "state": "recovered",
+  "updatedAt": "2026-08-27T00:00:00Z",
+  "network": {
+    "name": "ARC Local Recovery Example",
+    "chainId": "arc-local-v3"
+  },
+  "checkpoint": {
+    "height": 999,
+    "recoveryHeight": 1000,
+    "blockHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "stateRoot": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "manifestHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "legacySourceId": "legacy-signed",
+    "v3SourceId": "v3-primary"
+  },
+  "sources": [
+    {
+      "id": "legacy-signed",
+      "name": "Signed legacy archive",
+      "kind": "legacy-canonical",
+      "baseUrl": "http://127.0.0.1:19090",
+      "enabled": true
+    },
+    {
+      "id": "v3-primary",
+      "name": "Protocol v3 primary",
+      "kind": "v3",
+      "baseUrl": "http://127.0.0.1:29090",
+      "replicaGroup": "v3-main",
+      "enabled": true
+    },
+    {
+      "id": "v3-replica",
+      "name": "Protocol v3 replica",
+      "kind": "v3",
+      "baseUrl": "http://127.0.0.1:39090",
+      "replicaGroup": "v3-main",
+      "enabled": true
+    },
+    {
+      "id": "legacy-fork-preserved",
+      "name": "Preserved legacy fork",
+      "kind": "legacy-fork",
+      "baseUrl": "http://127.0.0.1:49090",
+      "enabled": true,
+      "description": "Explicit historical diagnostics only; never canonical."
+    }
+  ],
+  "services": {},
+  "notices": [
+    "Example values only. Replace every checkpoint commitment and endpoint with approved production data."
+  ]
+}
