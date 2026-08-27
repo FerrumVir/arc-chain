@@ -44,6 +44,29 @@ jobs:
           node shared/frontend/test-arc-network.mjs
           node explorer/test-contract.mjs
 
+      - name: Require live truth before publishing an active network
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          NETWORK_STATE="$(node -e '
+            const fs = require("node:fs");
+            const config = JSON.parse(fs.readFileSync("shared/frontend/arc-network.json", "utf8"));
+            process.stdout.write(typeof config.state === "string" ? config.state : "");
+          ')"
+          case "$NETWORK_STATE" in
+            maintenance)
+              echo "Maintenance config is honest without live network claims."
+              ;;
+            recovered|degraded)
+              ARC_LIVE_CONFIG=shared/frontend/arc-network.json node dashboard/test-live.mjs
+              ARC_LIVE_CONFIG=shared/frontend/arc-network.json node explorer/test-live.mjs
+              ;;
+            *)
+              echo "::error::Refusing Pages publication for unsupported or missing network state: ${NETWORK_STATE:-missing}."
+              exit 1
+              ;;
+          esac
+
       - name: Assemble one immutable site artifact
         env:
           ARC_PUBLIC_SITE_SHA: ${{ github.sha }}

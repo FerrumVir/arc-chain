@@ -31,13 +31,13 @@ mkdir -p -- \
     "$OUTPUT_DIR/explorer" \
     "$OUTPUT_DIR/shared/frontend"
 
-# The source dashboard lives one directory below the shared resolver. At the
-# public-site root it is a sibling instead, so rewrite only these two audited
-# relative URLs. This keeps the same source usable in repository-local tests
-# and on GitHub project Pages (which may itself have a path prefix).
+# The source dashboard lives under dashboard/, but the deployed dashboard lives
+# at the public-site root. Rewrite every audited path whose relative base changes
+# during that move. Relative `./` links preserve the GitHub project-Pages prefix.
 sed \
     -e 's#content="../shared/frontend/arc-network.json"#content="./shared/frontend/arc-network.json"#' \
     -e 's#src="../shared/frontend/arc-network.js#src="./shared/frontend/arc-network.js#' \
+    -e 's#href="../explorer/#href="./explorer/#g' \
     dashboard/index.html > "$OUTPUT_DIR/index.html"
 grep -Fq 'content="./shared/frontend/arc-network.json"' "$OUTPUT_DIR/index.html" \
     || die "dashboard network-config URL rewrite failed"
@@ -46,8 +46,19 @@ grep -Fq 'src="./shared/frontend/arc-network.js' "$OUTPUT_DIR/index.html" \
 if grep -Fq '../shared/frontend' "$OUTPUT_DIR/index.html"; then
     die "dashboard retained a source-tree-only shared URL"
 fi
+grep -Fq 'href="./explorer/"' "$OUTPUT_DIR/index.html" \
+    || die "dashboard explorer URL rewrite failed"
+if grep -Fq '../explorer/' "$OUTPUT_DIR/index.html"; then
+    die "dashboard retained a source-tree-only explorer URL"
+fi
 
-cp -- dashboard/tailwind.css dashboard/app.css dashboard/app.js "$OUTPUT_DIR/"
+cp -- dashboard/tailwind.css dashboard/app.css "$OUTPUT_DIR/"
+sed 's#\.\./explorer/#./explorer/#g' dashboard/app.js > "$OUTPUT_DIR/app.js"
+grep -Fq './explorer/#/tx/' "$OUTPUT_DIR/app.js" \
+    || die "dashboard receipt explorer URL rewrite failed"
+if grep -Fq '../explorer/' "$OUTPUT_DIR/app.js"; then
+    die "dashboard retained a source-tree-only receipt URL"
+fi
 cp -- explorer/index.html explorer/app.js explorer/styles.css "$OUTPUT_DIR/explorer/"
 cp -- shared/frontend/arc-network.js shared/frontend/arc-network.json \
     "$OUTPUT_DIR/shared/frontend/"

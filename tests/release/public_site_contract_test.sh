@@ -51,6 +51,11 @@ pages_workflow_is_pinned_and_self_contained() {
         && grep -Fq 'needs: build' "$WORKFLOW" \
         && grep -Fq -- "- 'shared/frontend/**'" "$WORKFLOW" \
         && grep -Fq 'node shared/frontend/test-arc-network.mjs' "$WORKFLOW" \
+        && grep -Fq 'case "$NETWORK_STATE" in' "$WORKFLOW" \
+        && grep -Fq 'maintenance)' "$WORKFLOW" \
+        && grep -Fq 'recovered|degraded)' "$WORKFLOW" \
+        && grep -Fq 'ARC_LIVE_CONFIG=shared/frontend/arc-network.json node dashboard/test-live.mjs' "$WORKFLOW" \
+        && grep -Fq 'ARC_LIVE_CONFIG=shared/frontend/arc-network.json node explorer/test-live.mjs' "$WORKFLOW" \
         && grep -Fq './scripts/build-public-site.sh public-site' "$WORKFLOW"
 }
 
@@ -84,6 +89,13 @@ site_builder_is_reproducible_and_complete() (
     grep -Fq 'content="./shared/frontend/arc-network.json"' "$output/index.html" || return 1
     grep -Fq 'src="./shared/frontend/arc-network.js' "$output/index.html" || return 1
     ! grep -Fq '../shared/frontend' "$output/index.html" || return 1
+    [ "$(grep -Fc 'href="./explorer/"' "$output/index.html")" -eq 2 ] || {
+        printf 'assembled root dashboard does not contain both prefix-safe explorer links\n'
+        return 1
+    }
+    ! grep -Fq '../explorer/' "$output/index.html" || return 1
+    grep -Fq './explorer/#/tx/' "$output/app.js" || return 1
+    ! grep -Fq '../explorer/' "$output/app.js" || return 1
     [ "$(cat "$output/deployed-commit.txt")" = contract-test ] || return 1
     (cd / && shasum -a 256 -c "$output/SHA256SUMS") >/dev/null || return 1
     first_hash="$(shasum -a 256 "$output/SHA256SUMS")"

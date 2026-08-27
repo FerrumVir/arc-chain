@@ -252,10 +252,19 @@ await test("production network config has one same-origin declaration", () => {
   assert.equal((html.match(/name="arc-network-config"/g) || []).length, 1);
 });
 
-await test("default checked-in config fails closed pending approved recovery metadata", () => {
-  assert.equal(defaultConfig.state, "maintenance");
-  assert.equal(defaultConfig.checkpoint, null);
-  assert.deepEqual(defaultConfig.sources, []);
+await test("checked-in config is honest maintenance or a complete active recovery inventory", () => {
+  const normalized = network.normalizeConfig(defaultConfig);
+  if (normalized.state === "maintenance") {
+    assert.equal(normalized.checkpoint, null);
+    assert.deepEqual(normalized.sources, []);
+    return;
+  }
+
+  assert.ok(["recovered", "degraded"].includes(normalized.state));
+  assert.ok(normalized.checkpoint, "active config must bind the recovery checkpoint");
+  const replicas = network.createCanonicalResolver(normalized).v3Replicas();
+  assert.equal(replicas.length, 6, "active config must publish the complete six-validator v3 fleet");
+  assert.equal(new Set(replicas.map((source) => source.baseUrl)).size, 6);
 });
 
 await test("retired, raw, and mutating inference endpoints are absent", () => {
