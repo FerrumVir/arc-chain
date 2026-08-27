@@ -68,11 +68,16 @@ site_builder_is_reproducible_and_complete() (
     for path in \
         index.html tailwind.css app.css app.js .nojekyll deployed-commit.txt SHA256SUMS \
         explorer/index.html explorer/app.js explorer/styles.css \
-        shared/frontend/arc-network.js shared/frontend/arc-network.json \
-        wallet/index.html docs/STATUS.md
+        shared/frontend/arc-network.js shared/frontend/arc-network.json
     do
         [ -e "$output/$path" ] || {
             printf 'assembled public site is missing %s\n' "$path"
+            return 1
+        }
+    done
+    for forbidden in wallet/index.html docs/STATUS.md; do
+        [ ! -e "$output/$forbidden" ] || {
+            printf 'assembled public site contains forbidden legacy surface %s\n' "$forbidden"
             return 1
         }
     done
@@ -114,7 +119,7 @@ site_builder_rejects_broad_targets() {
 
 run_test 'Pages workflow uses pinned, secret-free deployment actions' pages_workflow_is_pinned_and_self_contained
 run_test 'every GitHub Action is pinned to a full immutable SHA' every_action_is_commit_sha_pinned
-run_test 'public console assembles reproducibly with every product surface' site_builder_is_reproducible_and_complete
+run_test 'public console assembles reproducibly without unsafe legacy surfaces' site_builder_is_reproducible_and_complete
 run_test 'public-console builder refuses destructive broad targets' site_builder_rejects_broad_targets
 
 finish_tests

@@ -22,14 +22,13 @@ esac
 for required in \
     dashboard/index.html dashboard/tailwind.css dashboard/app.css dashboard/app.js \
     explorer/index.html explorer/app.js explorer/styles.css \
-    shared/frontend/arc-network.js shared/frontend/arc-network.json \
-    wallet/index.html docs/STATUS.md; do
+    shared/frontend/arc-network.js shared/frontend/arc-network.json; do
     [ -s "$required" ] || die "required source is missing or empty: $required"
 done
 
 rm -rf -- "$OUTPUT_DIR"
 mkdir -p -- \
-    "$OUTPUT_DIR/explorer" "$OUTPUT_DIR/wallet" "$OUTPUT_DIR/docs" \
+    "$OUTPUT_DIR/explorer" \
     "$OUTPUT_DIR/shared/frontend"
 
 # The source dashboard lives one directory below the shared resolver. At the
@@ -52,8 +51,11 @@ cp -- dashboard/tailwind.css dashboard/app.css dashboard/app.js "$OUTPUT_DIR/"
 cp -- explorer/index.html explorer/app.js explorer/styles.css "$OUTPUT_DIR/explorer/"
 cp -- shared/frontend/arc-network.js shared/frontend/arc-network.json \
     "$OUTPUT_DIR/shared/frontend/"
-cp -- wallet/index.html "$OUTPUT_DIR/wallet/index.html"
-cp -- docs/STATUS.md "$OUTPUT_DIR/docs/STATUS.md"
+
+# The legacy wallet is deliberately excluded: it stores a private key in
+# localStorage, imports live remote code, and calls plaintext/retired RPC
+# routes. Historical STATUS.md is also not a live product surface. Neither may
+# be reintroduced without a dedicated security and current-truth contract.
 
 # The console is already a complete static site; do not let Jekyll transform it.
 : > "$OUTPUT_DIR/.nojekyll"

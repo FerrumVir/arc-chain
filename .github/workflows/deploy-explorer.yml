@@ -7,8 +7,6 @@ on:
       - 'dashboard/**'
       - 'explorer/**'
       - 'shared/frontend/**'
-      - 'wallet/**'
-      - 'docs/STATUS.md'
       - 'scripts/build-public-site.sh'
       - '.github/workflows/deploy-explorer.yml'
   workflow_dispatch:
