@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
@@ -1003,6 +1003,85 @@ struct LegacyBoundary {
     checkpoint_index: usize,
 }
 
+/// Read the longest checksum- and sequence-valid WAL prefix while retaining a
+/// precise reason for any rejected tail. This is used only with an exact-height
+/// snapshot: the caller must prove the selected block boundary matches the
+/// independently captured snapshot before it may ignore `tail_error`.
+fn read_legacy_wal_prefix(path: &Path) -> Result<(Vec<WalEntry>, Option<String>), StateError> {
+    let file = File::open(path).map_err(|error| {
+        StateError::PersistenceError(format!("failed to open legacy WAL {path:?}: {error}"))
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut expected_sequence = 0u64;
+
+    loop {
+        let mut length_bytes = [0u8; 4];
+        let first = reader.read(&mut length_bytes[..1]).map_err(|error| {
+            StateError::PersistenceError(format!("failed to read legacy WAL {path:?}: {error}"))
+        })?;
+        if first == 0 {
+            return Ok((entries, None));
+        }
+        if let Err(error) = reader.read_exact(&mut length_bytes[1..]) {
+            return Ok((
+                entries,
+                Some(format!("truncated WAL frame length: {error}")),
+            ));
+        }
+        let length = u32::from_le_bytes(length_bytes) as usize;
+        if length == 0 || length > ARCCHKPT_MAX_PAYLOAD_BYTES {
+            return Ok((entries, Some(format!("invalid WAL frame length {length}"))));
+        }
+        let mut encoded = vec![0u8; length];
+        if let Err(error) = reader.read_exact(&mut encoded) {
+            return Ok((
+                entries,
+                Some(format!("truncated WAL frame payload: {error}")),
+            ));
+        }
+        let entry: WalEntry = match bincode::deserialize(&encoded) {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Ok((
+                    entries,
+                    Some(format!("invalid WAL entry encoding: {error}")),
+                ));
+            }
+        };
+        let checksum_payload =
+            bincode::serialize(&(&entry.block_height, &entry.sequence, &entry.op)).map_err(
+                |error| {
+                    StateError::PersistenceError(format!(
+                        "failed to recompute legacy WAL checksum: {error}"
+                    ))
+                },
+            )?;
+        if entry.checksum != crc32fast::hash(&checksum_payload) {
+            return Ok((
+                entries,
+                Some(format!(
+                    "WAL checksum mismatch at sequence {}",
+                    entry.sequence
+                )),
+            ));
+        }
+        if entry.sequence != expected_sequence {
+            return Ok((
+                entries,
+                Some(format!(
+                    "WAL sequence gap: expected {expected_sequence}, got {}",
+                    entry.sequence
+                )),
+            ));
+        }
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            StateError::PersistenceError("legacy WAL sequence overflows u64".into())
+        })?;
+        entries.push(entry);
+    }
+}
+
 fn legacy_post_root_state_mutation(op: &WalOp) -> bool {
     matches!(
         op,
@@ -1610,20 +1689,27 @@ impl StateDB {
             }
         }
 
-        let entries = read_wal_strict(&wal_path).map_err(|error| {
-            StateError::PersistenceError(format!(
-                "legacy recovery source WAL is incomplete or corrupt: {error}"
-            ))
-        })?;
+        let snapshot = snapshot_path
+            .map(read_legacy_recovery_snapshot)
+            .transpose()?;
+        let (entries, rejected_tail) = if snapshot.is_some() {
+            read_legacy_wal_prefix(&wal_path)?
+        } else {
+            (
+                read_wal_strict(&wal_path).map_err(|error| {
+                    StateError::PersistenceError(format!(
+                        "legacy recovery source WAL is incomplete or corrupt: {error}"
+                    ))
+                })?,
+                None,
+            )
+        };
         if entries.is_empty() {
             return Err(StateError::PersistenceError(
                 "legacy recovery source WAL is empty".into(),
             ));
         }
 
-        let snapshot = snapshot_path
-            .map(read_legacy_recovery_snapshot)
-            .transpose()?;
         let boundary = latest_complete_legacy_boundary(&entries)?;
         if let Some(snapshot) = snapshot.as_ref()
             && (snapshot.block_height != boundary.height
@@ -1679,6 +1765,13 @@ impl StateDB {
                 first_ignored_sequence = entries[boundary.checkpoint_index + 1].sequence,
                 committed_height = boundary.height,
                 "Ignored WAL suffix after the latest fully committed legacy block boundary"
+            );
+        }
+        if let Some(reason) = rejected_tail {
+            tracing::warn!(
+                committed_height = boundary.height,
+                rejected_tail = %reason,
+                "Quarantined invalid WAL tail after snapshot-bound legacy block boundary"
             );
         }
         Ok(state)
@@ -2703,7 +2796,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_assisted_loader_discards_validly_framed_uncommitted_suffix() {
+    fn snapshot_assisted_loader_discards_validly_framed_and_torn_uncommitted_suffix() {
         let (data_dir, snapshot_path, _, _, _, root) = legacy_snapshot_fixture("snapshot-trailing");
         let attacker = hash_bytes(b"snapshot-trailing-attacker");
         let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
@@ -2713,6 +2806,14 @@ mod tests {
         );
         writer.sync().unwrap();
         drop(writer);
+        let mut wal = OpenOptions::new()
+            .append(true)
+            .open(data_dir.join("state.wal"))
+            .unwrap();
+        wal.write_all(&64u32.to_le_bytes()).unwrap();
+        wal.write_all(b"physically-torn-tail").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
 
         let loaded = StateDB::load_legacy_recovery_source_with_snapshot(
             &data_dir,
