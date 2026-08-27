@@ -12,6 +12,12 @@
     "blockHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "stateRoot": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
     "manifestHash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "boundaryBlockHash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "boundaryStateRoot": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "recoveryDomain": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "recoveryEpoch": 1,
+    "validatorSetId": 1,
+    "protocolVersion": "3.0.0",
     "legacySourceId": "legacy-signed",
     "v3SourceId": "v3-primary"
   },

@@ -23,6 +23,12 @@ const recovered = {
     blockHash: hex("a"),
     stateRoot: hex("b"),
     manifestHash: hex("c"),
+    boundaryBlockHash: hex("d"),
+    boundaryStateRoot: hex("e"),
+    recoveryDomain: hex("f"),
+    recoveryEpoch: 7,
+    validatorSetId: 9,
+    protocolVersion: "3.0.0",
     legacySourceId: "legacy",
     v3SourceId: "v3-a",
   },
@@ -61,6 +67,24 @@ test("fails closed when recovered mode has no checkpoint", () => {
 test("requires H+1 as the recovery height", () => {
   const invalid = { ...recovered, checkpoint: { ...recovered.checkpoint, recoveryHeight: H + 2 } };
   assert.throws(() => network.normalizeConfig(invalid), /must equal checkpoint.height \+ 1/);
+});
+
+test("recovered configuration requires exact boundary and recovery identity commitments", () => {
+  for (const field of ["boundaryBlockHash", "boundaryStateRoot", "recoveryDomain", "recoveryEpoch", "validatorSetId", "protocolVersion"]) {
+    const invalid = structuredClone(recovered);
+    delete invalid.checkpoint[field];
+    assert.throws(() => network.normalizeConfig(invalid), new RegExp(`checkpoint\\.${field}`));
+  }
+});
+
+test("one recovered v3 source may serve both retained legacy history and continuation", () => {
+  const shared = structuredClone(recovered);
+  shared.checkpoint.legacySourceId = "v3-a";
+  shared.sources = shared.sources.filter((source) => source.id !== "legacy");
+  const normalized = network.normalizeConfig(shared);
+  const sharedResolver = network.createCanonicalResolver(normalized);
+  assert.equal(sharedResolver.routeBlock(H).sourceId, "v3-a");
+  assert.equal(sharedResolver.routeBlock(H + 1).sourceId, "v3-a");
 });
 
 test("rejects non-loopback clear-text RPCs", () => {
@@ -181,7 +205,7 @@ test("successful inference receipts are confirmed activity", () => {
 
 test("H+1 parent linkage is independently verified", () => {
   const result = network.boundaryVerification(
-    { header: { height: H + 1, parent_hash: recovered.checkpoint.blockHash } },
+    { header: { height: H + 1, parent_hash: recovered.checkpoint.blockHash, hash: recovered.checkpoint.boundaryBlockHash, state_root: recovered.checkpoint.boundaryStateRoot } },
     config.checkpoint,
   );
   assert.equal(result.state, "verified");
@@ -189,10 +213,66 @@ test("H+1 parent linkage is independently verified", () => {
 
 test("H+1 parent mismatch is never hidden", () => {
   const result = network.boundaryVerification(
-    { header: { height: H + 1, parent_hash: hex("f") } },
+    { header: { height: H + 1, parent_hash: hex("0"), hash: recovered.checkpoint.boundaryBlockHash, state_root: recovered.checkpoint.boundaryStateRoot } },
     config.checkpoint,
   );
   assert.equal(result.state, "mismatch");
+});
+
+test("signed H requires exact height, block hash, and state root", () => {
+  assert.equal(network.checkpointVerification(
+    { header: { height: H, hash: recovered.checkpoint.blockHash, state_root: recovered.checkpoint.stateRoot } },
+    config.checkpoint,
+  ).state, "verified");
+  assert.equal(network.checkpointVerification(
+    { header: { height: H, hash: recovered.checkpoint.blockHash, state_root: hex("0") } },
+    config.checkpoint,
+  ).state, "mismatch");
+});
+
+function exactNetworkInfo(overrides = {}) {
+  return {
+    chain_id: recovered.network.chainId,
+    protocol_version: recovered.checkpoint.protocolVersion,
+    recovery_active: true,
+    recovery_epoch: recovered.checkpoint.recoveryEpoch,
+    validator_set_id: recovered.checkpoint.validatorSetId,
+    recovery_domain: recovered.checkpoint.recoveryDomain,
+    checkpoint_manifest_hash: recovered.checkpoint.manifestHash,
+    ...overrides,
+  };
+}
+
+test("network identity requires exact chain, v3, epoch, set, domain, and manifest", () => {
+  assert.equal(network.networkInfoVerification(exactNetworkInfo(), config).state, "verified");
+  for (const [field, value] of [["chain_id", "wrong"], ["protocol_version", "3.0.1"], ["recovery_active", false], ["recovery_epoch", 8], ["validator_set_id", 10], ["recovery_domain", hex("0")], ["checkpoint_manifest_hash", hex("1")]]) {
+    const result = network.networkInfoVerification(exactNetworkInfo({ [field]: value }), config);
+    assert.equal(result.state, "mismatch", field);
+  }
+});
+
+test("full checkpoint audit verifies signed H plus every configured v3 replica", () => {
+  const boundaryBlock = { header: { height: H + 1, parent_hash: recovered.checkpoint.blockHash, hash: recovered.checkpoint.boundaryBlockHash, state_root: recovered.checkpoint.boundaryStateRoot } };
+  const result = network.auditRecoveryCheckpoint({
+    config,
+    legacyBlock: { header: { height: H, hash: recovered.checkpoint.blockHash, state_root: recovered.checkpoint.stateRoot } },
+    replicas: ["v3-a", "v3-b"].map((sourceId) => ({ sourceId, boundaryBlock, networkInfo: exactNetworkInfo() })),
+  });
+  assert.equal(result.state, "verified");
+  assert.equal(result.replicas.length, 2);
+});
+
+test("missing replica or wrong H never receives canonical status", () => {
+  const boundaryBlock = { header: { height: H + 1, parent_hash: recovered.checkpoint.blockHash, hash: recovered.checkpoint.boundaryBlockHash, state_root: recovered.checkpoint.boundaryStateRoot } };
+  const incomplete = network.auditRecoveryCheckpoint({
+    config,
+    legacyBlock: { header: { height: H, hash: recovered.checkpoint.blockHash, state_root: recovered.checkpoint.stateRoot } },
+    replicas: [{ sourceId: "v3-a", boundaryBlock, networkInfo: exactNetworkInfo() }],
+  });
+  assert.equal(incomplete.state, "unknown");
+  const configured = resolver.classifyOccurrence("v3-a", H + 2);
+  assert.equal(network.gateCanonical(configured, incomplete).canonical, false);
+  assert.equal(network.gateCanonical(configured, { state: "verified" }).canonical, true);
 });
 
 test("stale blocks are reported as stalled", () => {

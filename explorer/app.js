@@ -110,25 +110,64 @@
     }
   }
 
+  async function verifyRecoveryCheckpoint(options) {
+    const { resolver, fetchImpl, signal } = options;
+    const checkpoint = resolver.config.checkpoint;
+    const legacySource = checkpoint ? resolver.source(checkpoint.legacySourceId) : null;
+    const replicas = resolver.v3Replicas();
+    if (!checkpoint || !legacySource || !replicas.length) return { state: "unknown", reason: "checkpoint-sources-unavailable", legacy: { state: "unknown" }, replicas: [] };
+    const [legacy, replicaEvidence] = await Promise.all([
+      optionalRequest(fetchImpl, legacySource, `/block/${checkpoint.height}`, { signal }),
+      Promise.all(replicas.map(async (source) => {
+        const [boundary, info] = await Promise.all([
+          optionalRequest(fetchImpl, source, `/block/${checkpoint.recoveryHeight}`, { signal }),
+          optionalRequest(fetchImpl, source, "/network/info", { signal }),
+        ]);
+        return boundary.ok && info.ok
+          ? { sourceId: source.id, boundaryBlock: boundary.value, networkInfo: info.value }
+          : { sourceId: source.id, error: [boundary, info].filter((entry) => !entry.ok).map((entry) => entry.error?.message).join("; ") || "replica-evidence-unavailable" };
+      })),
+    ]);
+    return network.auditRecoveryCheckpoint({ config: resolver.config, legacyBlock: legacy.ok ? legacy.value : null, replicas: replicaEvidence });
+  }
+
+  function downgradeRoute(route, reason, warning) {
+    if (!route.canonical) return route;
+    return { ...route, canonical: false, configuredCanonical: true, reason, warning };
+  }
+
   async function queryBlock(options) {
-    const { resolver, fetchImpl, height, sourceId, signal } = options;
-    const route = resolver.routeBlock(height, { sourceId });
-    if (!route.ok) throw new RpcError(`Cannot resolve block: ${route.reason}`, 0, route.sourceId);
+    const { resolver, fetchImpl, height, sourceId, signal, checkpointAudit } = options;
+    const configuredRoute = resolver.routeBlock(height, { sourceId });
+    if (!configuredRoute.ok) throw new RpcError(`Cannot resolve block: ${configuredRoute.reason}`, 0, configuredRoute.sourceId);
     const [blockResult, txsResult] = await Promise.all([
-      optionalRequest(fetchImpl, route.source, `/block/${route.height}`, { signal }),
-      optionalRequest(fetchImpl, route.source, `/block/${route.height}/txs?offset=0&limit=100`, { signal }),
+      optionalRequest(fetchImpl, configuredRoute.source, `/block/${configuredRoute.height}`, { signal }),
+      optionalRequest(fetchImpl, configuredRoute.source, `/block/${configuredRoute.height}/txs?offset=0&limit=100`, { signal }),
     ]);
     if (!blockResult.ok) throw blockResult.error;
+    const checkpoint = resolver.config.checkpoint;
+    const boundary = network.boundaryVerification(blockResult.value, checkpoint);
+    let route = network.gateCanonical(configuredRoute, checkpointAudit);
+    if (configuredRoute.canonical && network.blockHeight(blockResult.value) !== configuredRoute.height) {
+      route = downgradeRoute(route.canonical ? route : configuredRoute, "queried-height-mismatch", "The source returned a different block height than requested; this result is not canonical.");
+    }
+    if (configuredRoute.canonical && configuredRoute.height === checkpoint?.height) {
+      const signed = network.checkpointVerification(blockResult.value, checkpoint);
+      if (signed.state !== "verified") route = downgradeRoute(route.canonical ? route : configuredRoute, `signed-checkpoint-${signed.state}`, "The returned H block does not exactly match the signed hash and state root.");
+    }
+    if (configuredRoute.canonical && configuredRoute.height === checkpoint?.recoveryHeight && boundary.state !== "verified") {
+      route = downgradeRoute(route.canonical ? route : configuredRoute, `recovery-boundary-${boundary.state}`, "The returned H+1 block does not exactly match the approved parent, block hash, and state root.");
+    }
     return {
       route,
       block: blockResult.value,
       transactions: txsResult.ok ? txsResult.value : null,
-      boundary: network.boundaryVerification(blockResult.value, resolver.config.checkpoint),
+      boundary,
     };
   }
 
   async function queryTransaction(options) {
-    const { resolver, fetchImpl, hash, sourceId, signal } = options;
+    const { resolver, fetchImpl, hash, sourceId, signal, checkpointAudit } = options;
     const planned = resolver.lookupSources({ sourceId });
     const attempts = await Promise.all(planned.map(async ({ source }) => {
       const [full, receipt] = await Promise.all([
@@ -142,9 +181,10 @@
         tx: fullValue?.transaction ?? fullValue?.tx ?? fullValue,
         receipt: receiptValue?.receipt ?? receiptValue,
       });
-      const provenance = classification.height === null
+      const configured = classification.height === null
         ? { canonical: false, segment: "unverified", reason: "receipt-height-unavailable" }
         : resolver.classifyOccurrence(source.id, classification.height);
+      const provenance = network.gateCanonical(configured, checkpointAudit);
       return { source, found: true, full: fullValue, receipt: receiptValue, classification, provenance };
     }));
     return {
@@ -155,7 +195,7 @@
   }
 
   async function queryAddress(options) {
-    const { resolver, fetchImpl, address, sourceId, signal } = options;
+    const { resolver, fetchImpl, address, sourceId, signal, checkpointAudit } = options;
     const planned = resolver.lookupSources({ sourceId });
     const attempts = await Promise.all(planned.map(async ({ source }) => {
       const [account, history] = await Promise.all([
@@ -165,7 +205,13 @@
       const historyValue = history.ok ? history.value : null;
       const txHashes = historyValue?.tx_hashes ?? historyValue?.transactions ?? [];
       const found = account.ok || (Array.isArray(txHashes) && txHashes.length > 0);
-      return { source, found, account: account.ok ? account.value : null, history: historyValue };
+      const configuredCanonical = sourceId === "canonical"
+        && (source.id === resolver.config.checkpoint?.v3SourceId || source.id === resolver.config.checkpoint?.legacySourceId);
+      const provenance = network.gateCanonical(
+        configuredCanonical ? { canonical: true, segment: "canonical-segment-source" } : { canonical: false, segment: "alternate-source" },
+        checkpointAudit,
+      );
+      return { source, found, account: account.ok ? account.value : null, history: historyValue, provenance };
     }));
     return { records: attempts.filter((attempt) => attempt.found), failures: attempts.filter((attempt) => !attempt.found) };
   }
@@ -180,7 +226,7 @@
       blocksStatus: $("blocks-status"), blocksBody: $("blocks-body"), sourceFacts: $("source-facts"), inferenceStatus: $("inference-status"), inferenceList: $("inference-list"), rewardsStatus: $("rewards-status"), rewardsList: $("rewards-list"),
       searchForm: $("search-form"), searchInput: $("search-input"), searchKind: $("search-kind"), searchError: $("search-error"), inspector: $("inspector"), inspectorKicker: $("inspector-kicker"), inspectorTitle: $("inspector-title"), inspectorClose: $("inspector-close"), inspectorContent: $("inspector-content"),
     };
-    const state = { config: null, resolver: null, sourceId: "canonical", refreshController: null, lookupController: null, timer: null };
+    const state = { config: null, resolver: null, sourceId: "canonical", checkpointAudit: { state: "unknown", reason: "not-audited" }, refreshController: null, lookupController: null, timer: null };
 
     const text = (node, value) => { if (node) node.textContent = value == null ? "" : String(value); };
     const clear = (node) => { if (node) node.replaceChildren(); };
@@ -320,7 +366,8 @@
       }
       for (const block of blocks.slice(0, 12)) {
         const height = network.blockHeight(block);
-        const canonical = height === null ? { canonical: false, segment: "unverified" } : state.resolver.classifyOccurrence(source.id, height);
+        const configured = height === null ? { canonical: false, segment: "unverified" } : state.resolver.classifyOccurrence(source.id, height);
+        const canonical = network.gateCanonical(configured, state.checkpointAudit);
         const tr = create("tr");
         const heightCell = create("td");
         const button = create("button", "table-link", height === null ? "Unknown" : `#${formatInteger(height)}`);
@@ -340,7 +387,10 @@
       clear(elements.inferenceList);
       const rows = extractRows(payload);
       const normalized = rows.map((row) => ({ row, receipt: network.classifyReceipt(row) }));
-      const confirmed = normalized.filter(({ receipt }) => receipt.inferenceConfirmed && receipt.height !== null && state.resolver.classifyOccurrence(source.id, receipt.height).canonical);
+      const confirmed = normalized.filter(({ receipt }) => {
+        if (!receipt.inferenceConfirmed || receipt.height === null) return false;
+        return network.gateCanonical(state.resolver.classifyOccurrence(source.id, receipt.height), state.checkpointAudit).canonical;
+      });
       const excluded = rows.length - confirmed.length;
       if (!confirmed.length) elements.inferenceList.append(create("p", "empty-cell", rows.length ? `${rows.length} observation(s) returned, but none had a successful canonical mined receipt.` : "No inference activity was returned."));
       for (const { row, receipt } of confirmed.slice(0, 8)) {
@@ -368,12 +418,16 @@
       const active = economicValue(payload, ["community_rewards_v1_protocol_active", "protocol_active", "issuance.protocol_active"]);
       const reward = economicValue(payload, ["attestation_reward_arc", "community_attestation_reward_arc", "reward_per_attestation_arc"]);
       const observed = economicValue(payload, ["attestations_per_day_observed", "observed.attestations_per_day"]);
+      const projected = numberOrNull(payload?.projected_daily_arc);
+      const projectionReason = typeof payload?.projected_daily_unavailable_reason === "string" && payload.projected_daily_unavailable_reason.trim()
+        ? payload.projected_daily_unavailable_reason.trim()
+        : "worker-specific authoritative projection is available only from /worker/earnings/{worker}";
       const readiness = enabled === true && active === true ? "Enabled and protocol-active" : enabled === false || active === false ? "Not issuing" : "Unavailable";
       elements.rewardsList.append(
         fact("Issuance", readiness),
         fact("Attestation reward", reward === null ? "Unavailable" : `${reward} ARC configured rate`),
         fact("Observed worker rate", observed === null ? "Unavailable" : `${observed}/day · backward-looking`),
-        fact("Projected earnings", reward !== null && observed !== null ? `${Number(reward) * Number(observed)} ARC/day · projection, not earned` : "Unavailable without observed worker evidence"),
+        fact("Projected earnings", projected !== null && projected >= 0 ? `${projected} ARC/day · endpoint projection, not earned` : `Unavailable · ${projectionReason}`),
       );
       text(elements.rewardsStatus, payload ? "Current source report" : "Unavailable");
     }
@@ -420,14 +474,15 @@
       const alternate = state.sourceId !== "canonical" && source.id !== state.config.checkpoint?.v3SourceId && source.id !== state.config.checkpoint?.legacySourceId;
       setBanner("loading", alternate ? "Loading explicit alternate source…" : "Loading canonical source…", sourceDisplay(source));
       try {
-        const [snapshotResult, boundaryResult, inferenceResult, rewardsResult] = await Promise.all([
+        const [snapshotResult, checkpointAudit, inferenceResult, rewardsResult] = await Promise.all([
           loadSnapshot(source, signal).then((value) => ({ ok: true, value }), (error) => ({ ok: false, error })),
-          state.config.checkpoint ? optionalRequest(window.fetch.bind(window), state.resolver.source(state.config.checkpoint.v3SourceId), `/block/${state.config.checkpoint.recoveryHeight}`, { signal }) : Promise.resolve({ ok: false }),
+          verifyRecoveryCheckpoint({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
           optionalRequest(window.fetch.bind(window), source, "/inference/attestations?limit=20", { signal }),
           optionalRequest(window.fetch.bind(window), source, "/economics/rewards", { signal }),
         ]);
         if (signal.aborted) return;
         if (!snapshotResult.ok) throw snapshotResult.error;
+        state.checkpointAudit = checkpointAudit;
         const snapshot = snapshotResult.value;
         const height = reportedHeight(snapshot);
         const liveness = network.evaluateLiveness(snapshot.health, snapshot.latest);
@@ -444,15 +499,15 @@
         text(elements.metricValidatorNote, validatorRows ? `${validatorRows.length} records returned` : "Validator records unavailable");
         renderFacts(source, snapshot, liveness);
         renderBlocks(snapshot.blocks, source);
-        const boundary = boundaryResult.ok ? network.boundaryVerification(boundaryResult.value, state.config.checkpoint) : { state: "unknown" };
-        renderRecovery(boundary);
+        renderRecovery(checkpointAudit);
         renderInference(inferenceResult.ok ? inferenceResult.value : null, source);
         renderRewards(rewardsResult.ok ? rewardsResult.value : null);
         text(elements.lastRefreshed, new Date().toLocaleTimeString());
-        if (boundary.state === "mismatch") setBanner("error", "Recovery boundary mismatch", "H+1 does not reference the configured signed checkpoint. Do not treat this continuation as canonical.");
+        if (checkpointAudit.state === "mismatch") setBanner("error", "Recovery checkpoint mismatch", "Exact H, H+1, chain identity, epoch, validator set, domain, or manifest differs. Canonical labels are paused.");
         else if (alternate) setBanner("degraded", "NON-CANONICAL source view", `${sourceDisplay(source)} is being queried explicitly and is not merged into canonical results.`);
         else if (liveness.state === "stalled") setBanner("degraded", "RPC reachable, chain appears stalled", `${sourceDisplay(source)} answered, but its newest block is stale.`);
-        else setBanner("online", "Canonical source reachable", `${sourceDisplay(source)} · liveness ${liveness.state}`);
+        else if (checkpointAudit.state === "verified") setBanner("online", "Canonical recovery verified", `${sourceDisplay(source)} · exact checkpoint and ${checkpointAudit.replicas.length} v3 replica identities verified · liveness ${liveness.state}`);
+        else setBanner("degraded", "Canonical evidence incomplete", `${sourceDisplay(source)} is reachable, but exact checkpoint evidence is unavailable. No result is labeled canonical.`);
       } catch (error) {
         if (!signal.aborted) {
           resetMetrics();
@@ -509,7 +564,7 @@
       state.lookupController = new AbortController();
       inspectorLoading("Block", `#${formatInteger(parsed.value)}`);
       try {
-        const result = await queryBlock({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), height: parsed.value, sourceId: state.sourceId, signal: state.lookupController.signal });
+        const result = await queryBlock({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), height: parsed.value, sourceId: state.sourceId, signal: state.lookupController.signal, checkpointAudit: state.checkpointAudit });
         setInspector(result.route.canonical ? "Canonical block" : "NON-CANONICAL BLOCK", `Block #${formatInteger(result.route.height)}`);
         const warning = !result.route.canonical ? create("p", "inspector-note warning", result.route.warning || "This result is outside the configured canonical route.") : null;
         if (warning) elements.inspectorContent.append(warning);
@@ -555,7 +610,7 @@
       state.lookupController = new AbortController();
       inspectorLoading("Transaction / receipt", network.formatHash(hash, 14, 12));
       try {
-        const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId, signal: state.lookupController.signal });
+        const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId, signal: state.lookupController.signal, checkpointAudit: state.checkpointAudit });
         if (!result.occurrences.length) return inspectorError("Transaction / receipt", "Transaction not found", `No record was returned by ${result.plannedSources.length} permitted source(s). Alternate forks were not searched unless explicitly selected.`);
         setInspector("Transaction / receipt", network.formatHash(hash, 14, 12));
         elements.inspectorContent.append(create("p", "inspector-note", "Each occurrence is classified independently. A transaction on an alternate source is never promoted to the canonical timeline."));
@@ -570,7 +625,7 @@
       state.lookupController = new AbortController();
       inspectorLoading("Address", network.formatHash(address, 14, 12));
       try {
-        const result = await queryAddress({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), address, sourceId: state.sourceId, signal: state.lookupController.signal });
+        const result = await queryAddress({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), address, sourceId: state.sourceId, signal: state.lookupController.signal, checkpointAudit: state.checkpointAudit });
         if (!result.records.length) return inspectorError("Address", "Address unavailable", "No account or indexed history was returned by the permitted sources.");
         setInspector("Address · source-separated", network.formatHash(address, 14, 12));
         elements.inspectorContent.append(create("p", "inspector-note", "Balances and histories below remain source-scoped. They are not added together across the recovery boundary."));
@@ -589,7 +644,7 @@
     }
 
     async function inspectAutoHash(hash) {
-      const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId });
+      const result = await queryTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash, sourceId: state.sourceId, checkpointAudit: state.checkpointAudit });
       if (result.occurrences.length) return inspectTransaction(hash);
       return inspectAddress(hash);
     }
@@ -677,6 +732,7 @@
     extractRows,
     reportedHeight,
     requestJson,
+    verifyRecoveryCheckpoint,
     queryBlock,
     queryTransaction,
     queryAddress,

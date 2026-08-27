@@ -21,7 +21,21 @@ const resolver = network.createCanonicalResolver({
   schema: "arc.frontend.network.v1",
   state: "recovered",
   network: { name: "ARC Testnet", chainId: "arc-testnet-v3" },
-  checkpoint: { height: H, recoveryHeight: H + 1, blockHash: hex("a"), stateRoot: hex("b"), manifestHash: hex("c"), legacySourceId: "legacy", v3SourceId: "v3" },
+  checkpoint: {
+    height: H,
+    recoveryHeight: H + 1,
+    blockHash: hex("a"),
+    stateRoot: hex("b"),
+    manifestHash: hex("c"),
+    boundaryBlockHash: hex("d"),
+    boundaryStateRoot: hex("e"),
+    recoveryDomain: hex("f"),
+    recoveryEpoch: 7,
+    validatorSetId: 9,
+    protocolVersion: "3.0.0",
+    legacySourceId: "legacy",
+    v3SourceId: "v3",
+  },
   sources: [
     { id: "legacy", name: "Legacy", kind: "legacy-canonical", baseUrl: "https://legacy.example.test" },
     { id: "v3", name: "v3", kind: "v3", baseUrl: "https://v3.example.test" },
@@ -46,6 +60,21 @@ function mockFetch(routes, calls = []) {
     return route ? response(route.status ?? 200, route.body) : response(404, { error: "not found" });
   };
 }
+
+function exactNetworkInfo(overrides = {}) {
+  return {
+    chain_id: "arc-testnet-v3",
+    protocol_version: "3.0.0",
+    recovery_active: true,
+    recovery_epoch: 7,
+    validator_set_id: 9,
+    recovery_domain: hex("f"),
+    checkpoint_manifest_hash: hex("c"),
+    ...overrides,
+  };
+}
+
+const verifiedAudit = { state: "verified" };
 
 await test("classifies decimal block heights", () => {
   assert.deepEqual(app.classifyLookup("00089", "auto"), { kind: "block", value: "89" });
@@ -75,7 +104,7 @@ await test("canonical block lookup routes H to legacy", async () => {
     "https://legacy.example.test/block/88": { body: { header: { height: H, hash: hex("a"), state_root: hex("b") } } },
     "https://legacy.example.test/block/88/txs?offset=0&limit=100": { body: { tx_hashes: [] } },
   }, calls);
-  const result = await app.queryBlock({ resolver, fetchImpl, height: H, sourceId: "canonical" });
+  const result = await app.queryBlock({ resolver, fetchImpl, height: H, sourceId: "canonical", checkpointAudit: verifiedAudit });
   assert.equal(result.route.sourceId, "legacy");
   assert.equal(result.route.segment, "signed-checkpoint");
   assert.ok(calls.every((call) => call.url.startsWith("https://legacy.example.test/")));
@@ -86,7 +115,7 @@ await test("canonical block lookup verifies the H+1 parent link on v3", async ()
     "https://v3.example.test/block/89": { body: { header: { height: H + 1, hash: hex("d"), parent_hash: hex("a"), state_root: hex("e") } } },
     "https://v3.example.test/block/89/txs?offset=0&limit=100": { body: { tx_hashes: [] } },
   });
-  const result = await app.queryBlock({ resolver, fetchImpl, height: H + 1, sourceId: "canonical" });
+  const result = await app.queryBlock({ resolver, fetchImpl, height: H + 1, sourceId: "canonical", checkpointAudit: verifiedAudit });
   assert.equal(result.route.segment, "recovery-boundary");
   assert.equal(result.boundary.state, "verified");
 });
@@ -100,6 +129,26 @@ await test("explicit fork block lookup stays non-canonical", async () => {
   assert.equal(result.route.expectedCanonicalSourceId, "legacy");
 });
 
+await test("canonical labels fail closed without a complete checkpoint audit", async () => {
+  const fetchImpl = mockFetch({
+    "https://legacy.example.test/block/88": { body: { header: { height: H, hash: hex("a"), state_root: hex("b") } } },
+  });
+  const result = await app.queryBlock({ resolver, fetchImpl, height: H, sourceId: "canonical" });
+  assert.equal(result.route.canonical, false);
+  assert.equal(result.route.configuredCanonical, true);
+});
+
+await test("full explorer checkpoint audit checks H, H+1, and network identity", async () => {
+  const routes = {
+    "https://legacy.example.test/block/88": { body: { header: { height: H, hash: hex("a"), state_root: hex("b") } } },
+    "https://v3.example.test/block/89": { body: { header: { height: H + 1, parent_hash: hex("a"), hash: hex("d"), state_root: hex("e") } } },
+    "https://v3.example.test/network/info": { body: exactNetworkInfo() },
+  };
+  assert.equal((await app.verifyRecoveryCheckpoint({ resolver, fetchImpl: mockFetch(routes) })).state, "verified");
+  routes["https://v3.example.test/network/info"] = { body: exactNetworkInfo({ checkpoint_manifest_hash: hex("0") }) };
+  assert.equal((await app.verifyRecoveryCheckpoint({ resolver, fetchImpl: mockFetch(routes) })).state, "mismatch");
+});
+
 await test("canonical transaction lookup searches both canonical segments but not forks", async () => {
   const calls = [];
   const hash = hex("2");
@@ -107,7 +156,7 @@ await test("canonical transaction lookup searches both canonical segments but no
     [`https://legacy.example.test/tx/${hash}/full`]: { body: { tx_type: "Transfer", hash } },
     [`https://legacy.example.test/tx/${hash}`]: { body: { status: "success", block_height: H } },
   }, calls);
-  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical" });
+  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical", checkpointAudit: verifiedAudit });
   assert.deepEqual(result.plannedSources, ["v3", "legacy"]);
   assert.equal(result.occurrences.length, 1);
   assert.equal(result.occurrences[0].provenance.canonical, true);
@@ -119,7 +168,7 @@ await test("a legacy source occurrence above H is shown as non-canonical", async
   const fetchImpl = mockFetch({
     [`https://legacy.example.test/tx/${hash}`]: { body: { status: "success", block_height: H + 3 } },
   });
-  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "legacy" });
+  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "legacy", checkpointAudit: verifiedAudit });
   assert.equal(result.occurrences[0].provenance.canonical, false);
   assert.equal(result.occurrences[0].provenance.expectedCanonicalSourceId, "v3");
 });
@@ -129,7 +178,7 @@ await test("pending reward submissions never appear earned", async () => {
   const fetchImpl = mockFetch({
     [`https://v3.example.test/tx/${hash}/full`]: { body: { tx_type: "CommunityInferenceReward", hash, status: "submitted" } },
   });
-  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical" });
+  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical", checkpointAudit: verifiedAudit });
   assert.equal(result.occurrences[0].classification.rewardEarned, false);
   assert.equal(result.occurrences[0].classification.receiptBacked, false);
 });
@@ -140,7 +189,7 @@ await test("successful mined inference receipts expose canonical provenance", as
     [`https://v3.example.test/tx/${hash}/full`]: { body: { type: "InferenceAttestation", hash } },
     [`https://v3.example.test/tx/${hash}`]: { body: { receipt_status: "success", height: H + 9 } },
   });
-  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical" });
+  const result = await app.queryTransaction({ resolver, fetchImpl, hash, sourceId: "canonical", checkpointAudit: verifiedAudit });
   assert.equal(result.occurrences[0].classification.inferenceConfirmed, true);
   assert.equal(result.occurrences[0].provenance.canonical, true);
 });
@@ -151,7 +200,7 @@ await test("address responses stay separated by source", async () => {
     [`https://v3.example.test/account/${address}`]: { body: { balance: 7, nonce: 1 } },
     [`https://legacy.example.test/account/${address}`]: { body: { balance: 4, nonce: 0 } },
   });
-  const result = await app.queryAddress({ resolver, fetchImpl, address, sourceId: "canonical" });
+  const result = await app.queryAddress({ resolver, fetchImpl, address, sourceId: "canonical", checkpointAudit: verifiedAudit });
   assert.equal(result.records.length, 2);
   assert.deepEqual(result.records.map((record) => record.account.balance), [7, 4]);
 });

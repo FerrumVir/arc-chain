@@ -104,15 +104,24 @@
     const v3SourceId = nonEmpty(raw.v3SourceId, "checkpoint.v3SourceId");
     const legacy = sourcesById.get(legacySourceId);
     const v3 = sourcesById.get(v3SourceId);
-    if (!legacy || legacy.kind !== "legacy-canonical") {
-      throw new ConfigurationError("checkpoint.legacySourceId must reference a legacy-canonical source");
+    const sharedRecoveredSource = legacySourceId === v3SourceId && legacy?.kind === "v3";
+    if (!legacy || (legacy.kind !== "legacy-canonical" && !sharedRecoveredSource)) {
+      throw new ConfigurationError("checkpoint.legacySourceId must reference a legacy-canonical source or the retained-history v3 source");
     }
     if (!v3 || v3.kind !== "v3") throw new ConfigurationError("checkpoint.v3SourceId must reference a v3 source");
     if (!legacy.enabled || !v3.enabled) throw new ConfigurationError("checkpoint sources must be enabled");
-    const boundaryBlockHash = raw.boundaryBlockHash == null ? null : normalizeHex(raw.boundaryBlockHash, 32);
-    if (raw.boundaryBlockHash != null && !boundaryBlockHash) {
-      throw new ConfigurationError("checkpoint.boundaryBlockHash must be a 32-byte hex value when present");
-    }
+    const boundaryBlockHash = normalizeHex(raw.boundaryBlockHash, 32);
+    const boundaryStateRoot = normalizeHex(raw.boundaryStateRoot, 32);
+    const recoveryDomain = normalizeHex(raw.recoveryDomain, 32);
+    const recoveryEpoch = integer(raw.recoveryEpoch);
+    const validatorSetId = integer(raw.validatorSetId);
+    const protocolVersion = typeof raw.protocolVersion === "string" ? raw.protocolVersion.trim() : "";
+    if (!boundaryBlockHash) throw new ConfigurationError("checkpoint.boundaryBlockHash must be a 32-byte hex value");
+    if (!boundaryStateRoot) throw new ConfigurationError("checkpoint.boundaryStateRoot must be a 32-byte hex value");
+    if (!recoveryDomain) throw new ConfigurationError("checkpoint.recoveryDomain must be a 32-byte hex value");
+    if (recoveryEpoch === null || recoveryEpoch < 1) throw new ConfigurationError("checkpoint.recoveryEpoch must be a positive integer");
+    if (validatorSetId === null || validatorSetId < 1) throw new ConfigurationError("checkpoint.validatorSetId must be a positive integer");
+    if (!/^3\.\d+\.\d+$/.test(protocolVersion)) throw new ConfigurationError("checkpoint.protocolVersion must be a protocol-v3 semantic version");
     return Object.freeze({
       height,
       recoveryHeight,
@@ -120,6 +129,11 @@
       stateRoot,
       manifestHash,
       boundaryBlockHash,
+      boundaryStateRoot,
+      recoveryDomain,
+      recoveryEpoch,
+      validatorSetId,
+      protocolVersion,
       legacySourceId,
       v3SourceId,
       createdAt: typeof raw.createdAt === "string" ? raw.createdAt : null,
@@ -382,15 +396,134 @@
     });
   }
 
+  function checkpointVerification(block, checkpoint) {
+    if (!checkpoint) return { state: "unknown", reason: "checkpoint-unavailable" };
+    const actual = {
+      height: blockHeight(block),
+      blockHash: blockHash(block),
+      stateRoot: stateRoot(block),
+    };
+    const missing = Object.entries(actual).filter(([, value]) => value === null).map(([key]) => key);
+    if (missing.length) return { state: "unknown", reason: `checkpoint-${missing.join("-")}-unavailable`, ...actual };
+    const mismatches = [];
+    if (actual.height !== checkpoint.height) mismatches.push("height");
+    if (actual.blockHash !== checkpoint.blockHash) mismatches.push("blockHash");
+    if (actual.stateRoot !== checkpoint.stateRoot) mismatches.push("stateRoot");
+    return mismatches.length
+      ? { state: "mismatch", reason: "checkpoint-commitment-mismatch", mismatches, ...actual }
+      : { state: "verified", ...actual };
+  }
+
   function boundaryVerification(block, checkpoint) {
     if (!checkpoint) return { state: "unknown", reason: "checkpoint-unavailable" };
     const height = blockHeight(block);
     if (height !== checkpoint.recoveryHeight) return { state: "not-boundary", height };
     const parent = parentHash(block);
-    if (!parent) return { state: "unknown", height, reason: "parent-hash-unavailable" };
-    return parent === checkpoint.blockHash
-      ? { state: "verified", height, parentHash: parent }
-      : { state: "mismatch", height, parentHash: parent, expectedParentHash: checkpoint.blockHash };
+    const hash = blockHash(block);
+    const root = stateRoot(block);
+    const missing = [!parent && "parentHash", !hash && "blockHash", !root && "stateRoot"].filter(Boolean);
+    if (missing.length) return { state: "unknown", height, reason: `boundary-${missing.join("-")}-unavailable` };
+    const mismatches = [];
+    if (parent !== checkpoint.blockHash) mismatches.push("parentHash");
+    if (hash !== checkpoint.boundaryBlockHash) mismatches.push("blockHash");
+    if (root !== checkpoint.boundaryStateRoot) mismatches.push("stateRoot");
+    return mismatches.length
+      ? {
+          state: "mismatch",
+          height,
+          parentHash: parent,
+          blockHash: hash,
+          stateRoot: root,
+          mismatches,
+          expectedParentHash: checkpoint.blockHash,
+          expectedBlockHash: checkpoint.boundaryBlockHash,
+          expectedStateRoot: checkpoint.boundaryStateRoot,
+        }
+      : { state: "verified", height, parentHash: parent, blockHash: hash, stateRoot: root };
+  }
+
+  function networkInfoVerification(info, configInput) {
+    const config = configInput?.sourcesById instanceof Map ? configInput : normalizeConfig(configInput);
+    const checkpoint = config.checkpoint;
+    if (!checkpoint) return { state: "unknown", reason: "checkpoint-unavailable" };
+    if (!isObject(info)) return { state: "unknown", reason: "network-info-unavailable" };
+    const expected = {
+      chain_id: config.network.chainId,
+      protocol_version: checkpoint.protocolVersion,
+      recovery_active: true,
+      recovery_epoch: checkpoint.recoveryEpoch,
+      validator_set_id: checkpoint.validatorSetId,
+    };
+    const missing = Object.keys(expected).filter((key) => info[key] === null || info[key] === undefined);
+    for (const key of ["recovery_domain", "checkpoint_manifest_hash"]) {
+      if (!normalizeHex(info[key], 32)) missing.push(key);
+    }
+    if (missing.length) return { state: "unknown", reason: "network-info-fields-unavailable", missing };
+    const mismatches = Object.entries(expected)
+      .filter(([key, value]) => info[key] !== value)
+      .map(([key]) => key);
+    if (normalizeHex(info.recovery_domain, 32) !== checkpoint.recoveryDomain) mismatches.push("recovery_domain");
+    if (normalizeHex(info.checkpoint_manifest_hash, 32) !== checkpoint.manifestHash) mismatches.push("checkpoint_manifest_hash");
+    return mismatches.length
+      ? { state: "mismatch", reason: "network-identity-mismatch", mismatches }
+      : { state: "verified" };
+  }
+
+  function auditRecoveryCheckpoint(input) {
+    const config = input?.config?.sourcesById instanceof Map ? input.config : normalizeConfig(input?.config);
+    const resolver = createCanonicalResolver(config);
+    const checkpoint = config.checkpoint;
+    if (!checkpoint) return { state: "unknown", reason: "checkpoint-unavailable", legacy: { state: "unknown" }, replicas: [] };
+    const legacy = checkpointVerification(input?.legacyBlock, checkpoint);
+    const evidence = Array.isArray(input?.replicas) ? input.replicas : [];
+    const evidenceById = new Map();
+    let duplicateSource = false;
+    for (const entry of evidence) {
+      if (!entry || typeof entry.sourceId !== "string") continue;
+      if (evidenceById.has(entry.sourceId)) duplicateSource = true;
+      else evidenceById.set(entry.sourceId, entry);
+    }
+    const replicas = resolver.v3Replicas().map((source) => {
+      const entry = evidenceById.get(source.id);
+      if (!entry || entry.error) {
+        return { sourceId: source.id, state: "unknown", reason: entry?.error || "replica-evidence-unavailable" };
+      }
+      const boundary = boundaryVerification(entry.boundaryBlock, checkpoint);
+      const networkInfo = networkInfoVerification(entry.networkInfo, config);
+      const state = boundary.state === "mismatch" || networkInfo.state === "mismatch"
+        ? "mismatch"
+        : boundary.state === "verified" && networkInfo.state === "verified"
+          ? "verified"
+          : "unknown";
+      return { sourceId: source.id, state, boundary, networkInfo };
+    });
+    const hasMismatch = duplicateSource || legacy.state === "mismatch" || replicas.some((entry) => entry.state === "mismatch");
+    const allVerified = legacy.state === "verified" && replicas.length > 0 && replicas.every((entry) => entry.state === "verified");
+    return {
+      state: hasMismatch ? "mismatch" : allVerified ? "verified" : "unknown",
+      reason: duplicateSource
+        ? "duplicate-replica-evidence"
+        : hasMismatch
+          ? "checkpoint-or-replica-mismatch"
+          : allVerified
+            ? "exact-checkpoint-and-replica-identity-match"
+            : "checkpoint-evidence-incomplete",
+      legacy,
+      replicas,
+    };
+  }
+
+  function gateCanonical(provenance, audit) {
+    if (!provenance?.canonical) return provenance;
+    if (audit?.state === "verified") return { ...provenance, checkpointVerified: true };
+    return {
+      ...provenance,
+      canonical: false,
+      configuredCanonical: true,
+      checkpointVerified: false,
+      reason: audit?.state === "mismatch" ? "checkpoint-audit-mismatch" : "checkpoint-audit-unavailable",
+      warning: "This source is configured for the canonical timeline, but the exact recovery checkpoint and every v3 replica identity have not been verified.",
+    };
   }
 
   function formatHash(value, left, right) {
@@ -427,7 +560,11 @@
     evaluateLiveness,
     auditCommonHeight,
     classifyReceipt,
+    checkpointVerification,
     boundaryVerification,
+    networkInfoVerification,
+    auditRecoveryCheckpoint,
+    gateCanonical,
     formatHash,
     formatDuration,
   });

@@ -22,7 +22,21 @@ function makeResolver() {
     schema: "arc.frontend.network.v1",
     state: "recovered",
     network: { name: "ARC Testnet", chainId: "arc-testnet-v3" },
-    checkpoint: { height: H, recoveryHeight: H + 1, blockHash: hex("a"), stateRoot: hex("b"), manifestHash: hex("c"), legacySourceId: "legacy", v3SourceId: "v3-a" },
+    checkpoint: {
+      height: H,
+      recoveryHeight: H + 1,
+      blockHash: hex("a"),
+      stateRoot: hex("b"),
+      manifestHash: hex("c"),
+      boundaryBlockHash: hex("d"),
+      boundaryStateRoot: hex("e"),
+      recoveryDomain: hex("f"),
+      recoveryEpoch: 7,
+      validatorSetId: 9,
+      protocolVersion: "3.0.0",
+      legacySourceId: "legacy",
+      v3SourceId: "v3-a",
+    },
     sources: [
       { id: "legacy", name: "Legacy", kind: "legacy-canonical", baseUrl: "https://legacy.example.test" },
       { id: "v3-a", name: "v3 A", kind: "v3", replicaGroup: "main", baseUrl: "https://v3-a.example.test" },
@@ -54,6 +68,31 @@ function healthyFleetRoutes(options = {}) {
     "https://v3-b.example.test/block/latest": { body: { header: { height: 103, hash: hex("3"), state_root: hex("4"), timestamp: 2_000 } } },
     "https://v3-a.example.test/block/101": { body: { header: { height: 101, hash: hex("1"), state_root: hex("2") } } },
     "https://v3-b.example.test/block/101": { body: { header: { height: 101, hash: hex("1"), state_root: rootB } } },
+  };
+}
+
+function exactNetworkInfo(overrides = {}) {
+  return {
+    chain_id: "arc-testnet-v3",
+    protocol_version: "3.0.0",
+    recovery_active: true,
+    recovery_epoch: 7,
+    validator_set_id: 9,
+    recovery_domain: hex("f"),
+    checkpoint_manifest_hash: hex("c"),
+    ...overrides,
+  };
+}
+
+function recoveryAuditRoutes(overrides = {}) {
+  const boundary = { header: { height: H + 1, parent_hash: hex("a"), hash: hex("d"), state_root: hex("e") } };
+  return {
+    "https://legacy.example.test/block/500": { body: { header: { height: H, hash: hex("a"), state_root: hex("b") } } },
+    "https://v3-a.example.test/block/501": { body: boundary },
+    "https://v3-b.example.test/block/501": { body: boundary },
+    "https://v3-a.example.test/network/info": { body: exactNetworkInfo() },
+    "https://v3-b.example.test/network/info": { body: exactNetworkInfo() },
+    ...overrides,
   };
 }
 
@@ -95,16 +134,24 @@ await test("stale canonical source is reported as degraded", async () => {
   assert.equal(result.current.liveness.state, "stalled");
 });
 
-await test("recovery boundary verifies H+1 parent against signed H", async () => {
+await test("recovery audit verifies exact H, H+1, and every replica identity", async () => {
   const resolver = makeResolver();
-  const fetchImpl = mockFetch({ "https://v3-a.example.test/block/501": { body: { header: { height: H + 1, parent_hash: hex("a"), hash: hex("5"), state_root: hex("6") } } } });
+  const fetchImpl = mockFetch(recoveryAuditRoutes());
   assert.equal((await app.verifyRecoveryBoundary({ resolver, fetchImpl })).state, "verified");
 });
 
-await test("recovery parent mismatch stays a blocking mismatch", async () => {
+await test("any replica recovery identity mismatch stays blocking", async () => {
   const resolver = makeResolver();
-  const fetchImpl = mockFetch({ "https://v3-a.example.test/block/501": { body: { header: { height: H + 1, parent_hash: hex("f"), hash: hex("5"), state_root: hex("6") } } } });
+  const fetchImpl = mockFetch(recoveryAuditRoutes({
+    "https://v3-b.example.test/network/info": { body: exactNetworkInfo({ recovery_epoch: 8 }) },
+  }));
   assert.equal((await app.verifyRecoveryBoundary({ resolver, fetchImpl })).state, "mismatch");
+});
+
+await test("an unreachable configured replica leaves checkpoint status unknown", async () => {
+  const routes = recoveryAuditRoutes();
+  delete routes["https://v3-b.example.test/network/info"];
+  assert.equal((await app.verifyRecoveryBoundary({ resolver: makeResolver(), fetchImpl: mockFetch(routes) })).state, "unknown");
 });
 
 await test("inference feed includes only successful canonical mined receipts", async () => {
@@ -115,7 +162,7 @@ await test("inference feed includes only successful canonical mined receipts", a
     { schema: "arc.inference.activity.v1", record_kind: "mined_inference_attestation", source: "chain_receipt", mined: true, receipt_status: "success", success: true, tx_type: "InferenceAttestation", block_height: H - 1, tx_hash: hex("9") },
   ];
   const fetchImpl = mockFetch({ "https://v3-a.example.test/inference/attestations?limit=50": { body: { attestations: rows } } });
-  const result = await app.loadInferenceEvidence({ resolver, fetchImpl });
+  const result = await app.loadInferenceEvidence({ resolver, fetchImpl, checkpointAudit: { state: "verified" } });
   assert.equal(result.confirmed.length, 1);
   assert.equal(result.confirmed[0].receipt.txHash, hex("7"));
   assert.equal(result.excluded, 2);
@@ -129,24 +176,38 @@ await test("missing worker earnings fields remain unavailable, never zero", () =
   assert.equal(normalized.readiness, "unknown");
 });
 
-await test("projection uses observed rate and configured reward while remaining separate from earned balance", () => {
+await test("projection is accepted only from the authoritative earnings response", () => {
   const normalized = app.normalizeWorkerEarnings(
-    { onchain_balance_arc: 12.5, total_rewards: 5, attestations_per_day_observed: 3, community_rewards_v1_enabled: true, community_rewards_v1_protocol_active: true, community_rewards_v1_approval_collection_ready: true },
+    { onchain_balance_arc: 12.5, confirmed_receipt_count: 1, confirmed_receipts: [{ tx_hash: hex("1") }], confirmed_gross_earnings_arc: 2.5, attestations_per_day_observed: 3, projected_daily_arc: 7.5, projected_daily_unavailable_reason: null, reward_per_attestation_arc: 2.5, community_rewards_v1_enabled: true, community_rewards_v1_protocol_active: true, community_rewards_v1_approval_collection_ready: true },
     { attestation_reward_arc: 2.5 },
   );
   assert.equal(normalized.balance, 12.5);
-  assert.equal(normalized.totalRewards, 5);
+  assert.equal(normalized.totalRewards, 1);
   assert.equal(normalized.projectedPerDay, 7.5);
   assert.equal(normalized.readiness, "ready");
+});
+
+await test("observed rate times reward is never synthesized into a projection", () => {
+  const normalized = app.normalizeWorkerEarnings({
+    confirmed_receipt_count: 0,
+    confirmed_receipts: [],
+    confirmed_gross_earnings_arc: 0,
+    attestations_per_day_observed: 3,
+    reward_per_attestation_arc: 2.5,
+    projected_daily_arc: null,
+    projected_daily_unavailable_reason: "treasury proof unavailable",
+  }, {});
+  assert.equal(normalized.projectedPerDay, null);
+  assert.equal(normalized.projectionReason, "treasury proof unavailable");
 });
 
 await test("worker lookup is pinned to canonical v3 source and read-only endpoints", async () => {
   const calls = [];
   const fetchImpl = mockFetch({
-    "https://v3-a.example.test/worker/earnings/worker-1": { body: { onchain_balance_arc: 4, total_rewards: 2 } },
+    "https://v3-a.example.test/worker/earnings/worker-1": { body: { onchain_balance_arc: 4, confirmed_receipt_count: 2, confirmed_receipts: [{}, {}], confirmed_gross_earnings_arc: 5, projected_daily_arc: null, projected_daily_unavailable_reason: "insufficient observations" } },
     "https://v3-a.example.test/economics/rewards": { body: { attestation_reward_arc: 2.5 } },
   }, calls);
-  const result = await app.loadWorkerEarnings({ resolver: makeResolver(), fetchImpl, workerId: "worker-1" });
+  const result = await app.loadWorkerEarnings({ resolver: makeResolver(), fetchImpl, workerId: "worker-1", checkpointAudit: { state: "verified" } });
   assert.equal(result.source.id, "v3-a");
   assert.equal(result.balance, 4);
   assert.ok(calls.every((call) => call.options.method === "GET"));
@@ -165,7 +226,7 @@ await test("transaction lookup searches canonical segments and excludes preserve
     [`https://v3-a.example.test/tx/${hash}/full`]: { body: { tx_type: "Transfer", hash } },
     [`https://v3-a.example.test/tx/${hash}`]: { body: { status: "success", block_height: H + 4 } },
   }, calls);
-  const result = await app.lookupTransaction({ resolver: makeResolver(), fetchImpl, hash });
+  const result = await app.lookupTransaction({ resolver: makeResolver(), fetchImpl, hash, checkpointAudit: { state: "verified" } });
   assert.deepEqual(result.searched, ["v3-a", "legacy"]);
   assert.equal(result.occurrences[0].provenance.canonical, true);
   assert.ok(!calls.some((call) => call.url.includes("fork.example.test")));
@@ -174,7 +235,7 @@ await test("transaction lookup searches canonical segments and excludes preserve
 await test("pending reward transaction is never counted as earned", async () => {
   const hash = hex("e");
   const fetchImpl = mockFetch({ [`https://v3-a.example.test/tx/${hash}/full`]: { body: { tx_type: "CommunityInferenceReward", hash, status: "pending" } } });
-  const result = await app.lookupTransaction({ resolver: makeResolver(), fetchImpl, hash });
+  const result = await app.lookupTransaction({ resolver: makeResolver(), fetchImpl, hash, checkpointAudit: { state: "verified" } });
   assert.equal(result.occurrences[0].classification.rewardEarned, false);
 });
 

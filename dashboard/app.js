@@ -139,15 +139,30 @@
   async function verifyRecoveryBoundary(options) {
     const { resolver, fetchImpl, signal } = options;
     const checkpoint = resolver.config.checkpoint;
-    const source = resolver.currentSource();
-    if (!checkpoint || !source) return { state: "unknown", reason: "checkpoint-or-v3-source-unavailable" };
-    const result = await optionalRequest(fetchImpl, source, `/block/${checkpoint.recoveryHeight}`, { signal });
-    if (!result.ok) return { state: "unknown", reason: result.error?.message || "boundary-block-unavailable" };
-    return { ...network.boundaryVerification(result.value, checkpoint), block: result.value, sourceId: source.id };
+    const legacySource = checkpoint ? resolver.source(checkpoint.legacySourceId) : null;
+    const replicas = resolver.v3Replicas();
+    if (!checkpoint || !legacySource || !replicas.length) return { state: "unknown", reason: "checkpoint-sources-unavailable", legacy: { state: "unknown" }, replicas: [] };
+    const [legacy, replicaEvidence] = await Promise.all([
+      optionalRequest(fetchImpl, legacySource, `/block/${checkpoint.height}`, { signal }),
+      Promise.all(replicas.map(async (source) => {
+        const [boundary, info] = await Promise.all([
+          optionalRequest(fetchImpl, source, `/block/${checkpoint.recoveryHeight}`, { signal }),
+          optionalRequest(fetchImpl, source, "/network/info", { signal }),
+        ]);
+        return boundary.ok && info.ok
+          ? { sourceId: source.id, boundaryBlock: boundary.value, networkInfo: info.value }
+          : { sourceId: source.id, error: [boundary, info].filter((entry) => !entry.ok).map((entry) => entry.error?.message).join("; ") || "replica-evidence-unavailable" };
+      })),
+    ]);
+    return network.auditRecoveryCheckpoint({
+      config: resolver.config,
+      legacyBlock: legacy.ok ? legacy.value : null,
+      replicas: replicaEvidence,
+    });
   }
 
   async function loadInferenceEvidence(options) {
-    const { resolver, fetchImpl, signal, limit = 50 } = options;
+    const { resolver, fetchImpl, signal, checkpointAudit, limit = 50 } = options;
     const source = resolver.currentSource();
     if (!source) return { source: null, rows: [], confirmed: [], excluded: 0, error: "canonical-v3-source-unavailable" };
     const result = await optionalRequest(fetchImpl, source, `/inference/attestations?limit=${limit}`, { signal });
@@ -155,7 +170,8 @@
     const rows = extractRows(result.value);
     const classified = rows.map((row) => {
       const receipt = network.classifyReceipt(row);
-      const provenance = receipt.height === null ? { canonical: false, segment: "unverified" } : resolver.classifyOccurrence(source.id, receipt.height);
+      const configured = receipt.height === null ? { canonical: false, segment: "unverified" } : resolver.classifyOccurrence(source.id, receipt.height);
+      const provenance = network.gateCanonical(configured, checkpointAudit);
       return { row, receipt, provenance };
     });
     const confirmed = classified.filter((entry) => entry.receipt.inferenceConfirmed && entry.provenance.canonical);
@@ -172,20 +188,31 @@
 
   function normalizeWorkerEarnings(earnings, economics) {
     const balance = numberOrNull(earnings?.onchain_balance_arc, earnings?.balance_arc);
-    const totalRewards = integerOrNull(earnings?.total_rewards, earnings?.mined_reward_count);
-    const observedRate = numberOrNull(earnings?.attestations_per_day_observed, earnings?.observed_attestations_per_day);
-    const rewardPerAttestation = numberOrNull(
-      earnings?.reward_per_attestation_arc,
-      economicValue(economics, ["attestation_reward_arc", "community_attestation_reward_arc", "reward_per_attestation_arc"]),
-    );
-    const enabled = earnings?.community_rewards_v1_enabled ?? economicValue(economics, ["community_rewards_v1_enabled", "enabled", "issuance.enabled"]);
-    const active = earnings?.community_rewards_v1_protocol_active ?? economicValue(economics, ["community_rewards_v1_protocol_active", "protocol_active", "issuance.protocol_active"]);
-    const approvals = earnings?.community_rewards_v1_approval_collection_ready ?? economicValue(economics, ["approval_collection_ready", "issuance.approval_collection_ready"]);
-    const projectedPerDay = observedRate !== null && rewardPerAttestation !== null ? observedRate * rewardPerAttestation : null;
+    const confirmedReceipts = Array.isArray(earnings?.confirmed_receipts) ? earnings.confirmed_receipts : null;
+    const confirmedReceiptCount = integerOrNull(earnings?.confirmed_receipt_count);
+    const confirmedGross = numberOrNull(earnings?.confirmed_gross_earnings_arc);
+    const receiptEvidenceConsistent = confirmedReceipts !== null
+      && confirmedReceiptCount !== null
+      && confirmedReceipts.length === confirmedReceiptCount
+      && confirmedGross !== null
+      && confirmedGross >= 0;
+    const totalRewards = receiptEvidenceConsistent ? confirmedReceiptCount : null;
+    const observedRateValue = numberOrNull(earnings?.attestations_per_day_observed);
+    const observedRate = observedRateValue !== null && observedRateValue >= 0 ? observedRateValue : null;
+    const rewardValue = numberOrNull(earnings?.reward_per_attestation_arc);
+    const rewardPerAttestation = rewardValue !== null && rewardValue >= 0 ? rewardValue : null;
+    const enabled = earnings?.community_rewards_v1_enabled;
+    const active = earnings?.community_rewards_v1_protocol_active;
+    const approvals = earnings?.community_rewards_v1_approval_collection_ready;
+    const projectionValue = numberOrNull(earnings?.projected_daily_arc);
+    const projectionReason = typeof earnings?.projected_daily_unavailable_reason === "string" && earnings.projected_daily_unavailable_reason.trim()
+      ? earnings.projected_daily_unavailable_reason.trim()
+      : null;
+    const projectedPerDay = projectionValue !== null && projectionValue >= 0 && projectionReason === null ? projectionValue : null;
     let readiness = "unknown";
     if (enabled === false || active === false || approvals === false) readiness = "blocked";
     else if (enabled === true && active === true && approvals === true) readiness = "ready";
-    return { balance, totalRewards, observedRate, rewardPerAttestation, projectedPerDay, enabled, active, approvals, readiness, raw: earnings };
+    return { balance, totalRewards, confirmedGross: receiptEvidenceConsistent ? confirmedGross : null, confirmedReceipts, receiptEvidenceConsistent, observedRate, rewardPerAttestation, projectedPerDay, projectionReason, enabled, active, approvals, readiness, raw: earnings, economics };
   }
 
   function validateWorkerId(raw) {
@@ -196,9 +223,10 @@
   }
 
   async function loadWorkerEarnings(options) {
-    const { resolver, fetchImpl, workerId, signal } = options;
+    const { resolver, fetchImpl, workerId, signal, checkpointAudit } = options;
     const validated = validateWorkerId(workerId);
     if (validated.error) throw new Error(validated.error);
+    if (checkpointAudit?.state !== "verified") throw new Error("Canonical recovery checkpoint is not fully verified; earnings are paused.");
     const source = resolver.currentSource();
     if (!source) throw new Error("Canonical v3 source is unavailable");
     const [earnings, economics] = await Promise.all([
@@ -215,7 +243,7 @@
   }
 
   async function lookupTransaction(options) {
-    const { resolver, fetchImpl, hash, signal } = options;
+    const { resolver, fetchImpl, hash, signal, checkpointAudit } = options;
     const validated = validateHash(hash);
     if (validated.error) throw new Error(validated.error);
     const plans = resolver.lookupSources();
@@ -228,7 +256,8 @@
       const fullValue = full.ok ? full.value : null;
       const receiptValue = receipt.ok ? receipt.value : null;
       const classification = network.classifyReceipt({ tx: fullValue?.transaction ?? fullValue?.tx ?? fullValue, receipt: receiptValue?.receipt ?? receiptValue });
-      const provenance = classification.height === null ? { canonical: false, segment: "unverified", reason: "receipt-height-unavailable" } : resolver.classifyOccurrence(source.id, classification.height);
+      const configured = classification.height === null ? { canonical: false, segment: "unverified", reason: "receipt-height-unavailable" } : resolver.classifyOccurrence(source.id, classification.height);
+      const provenance = network.gateCanonical(configured, checkpointAudit);
       return { source, found: true, full: fullValue, receipt: receiptValue, classification, provenance };
     }));
     return { hash: validated.value, occurrences: attempts.filter((attempt) => attempt.found), searched: plans.map((plan) => plan.sourceId) };
@@ -244,7 +273,7 @@
       workerForm: $("worker-form"), workerId: $("worker-id"), workerError: $("worker-error"), workerBalance: $("worker-balance"), workerRewards: $("worker-rewards"), workerRate: $("worker-rate"), workerProjection: $("worker-projection"), workerReadiness: $("worker-readiness"),
       receiptForm: $("receipt-form"), receiptHash: $("receipt-hash"), receiptError: $("receipt-error"), receiptResult: $("receipt-result"),
     };
-    const state = { config: null, resolver: null, controller: null, timer: null };
+    const state = { config: null, resolver: null, checkpointAudit: { state: "unknown", reason: "not-audited" }, controller: null, timer: null };
     const text = (node, value) => { if (node) node.textContent = value == null ? "" : String(value); };
     const clear = (node) => { if (node) node.replaceChildren(); };
     const create = (tag, className, content) => { const node = document.createElement(tag); if (className) node.className = className; if (content !== undefined && content !== null) node.textContent = String(content); return node; };
@@ -278,9 +307,9 @@
       text(elements.boundaryBlock, `#${formatInteger(checkpoint.recoveryHeight)}`);
       text(elements.v3Range, `#${formatInteger(checkpoint.recoveryHeight + 1)}…latest`);
       text(elements.v3Source, state.resolver.currentSource()?.name ?? "Source unavailable");
-      if (boundary?.state === "verified") { setBadge(elements.boundaryBadge, "good", "H+1 VERIFIED"); text(elements.boundaryProof, "Parent matches signed H"); }
-      else if (boundary?.state === "mismatch") { setBadge(elements.boundaryBadge, "bad", "BOUNDARY MISMATCH"); text(elements.boundaryProof, "Parent does not match H"); }
-      else { setBadge(elements.boundaryBadge, "warn", "PROOF UNAVAILABLE"); text(elements.boundaryProof, boundary?.reason || "Parent unverified"); }
+      if (boundary?.state === "verified") { setBadge(elements.boundaryBadge, "good", "CHECKPOINT VERIFIED"); text(elements.boundaryProof, "Exact H, H+1, and every v3 identity match"); }
+      else if (boundary?.state === "mismatch") { setBadge(elements.boundaryBadge, "bad", "CHECKPOINT MISMATCH"); text(elements.boundaryProof, "A signed commitment or replica identity differs"); }
+      else { setBadge(elements.boundaryBadge, "warn", "PROOF UNAVAILABLE"); text(elements.boundaryProof, boundary?.reason || "Exact checkpoint evidence unavailable"); }
     }
 
     function endpointLabel(source) {
@@ -350,7 +379,7 @@
       text(elements.workerRate, result.observedRate === null ? "—" : `${result.observedRate}/day`);
       text(elements.workerProjection, formatArc(result.projectedPerDay));
       const mapping = {
-        ready: ["good", "good", "Reward issuance path reports ready", `Protocol active, issuance enabled, and validator approval collection ready on ${result.source.name}. Projections remain non-guaranteed.`],
+        ready: ["good", "good", "Reward issuance path reports ready", `Protocol active, issuance enabled, and validator approval collection ready on ${result.source.name}. ${result.projectedPerDay === null ? `Projection unavailable: ${result.projectionReason || "the earnings endpoint supplied no authoritative projection"}.` : "The shown projection is the endpoint's explicit non-guaranteed projection."}`],
         blocked: ["bad", "bad", "Reward issuance is blocked", `At least one required readiness flag is false. No pending amount is presented as earned.`],
         unknown: ["warn", "warn", "Reward readiness is incomplete", "One or more protocol, issuance, or validator-approval fields were unavailable."],
       };
@@ -391,16 +420,18 @@
       elements.refresh.classList.add("spinning"); elements.refresh.disabled = true;
       setTruth("loading", "Auditing configured canonical sources…", "Checking H+1 parent linkage, replica freshness, and one common-height commitment.");
       try {
-        const [fleet, boundary, inference] = await Promise.all([
+        const [fleet, boundary] = await Promise.all([
           collectFleetHealth({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
           verifyRecoveryBoundary({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
-          loadInferenceEvidence({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal }),
         ]);
         if (signal.aborted) return;
+        state.checkpointAudit = boundary;
+        const inference = await loadInferenceEvidence({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), signal, checkpointAudit: boundary });
+        if (signal.aborted) return;
         renderContinuity(boundary); renderFleet(fleet); renderInference(inference);
-        if (boundary.state === "mismatch") setTruth("bad", "Recovery boundary mismatch", "H+1 does not reference the signed H checkpoint. This continuation must not be treated as canonical.");
+        if (boundary.state === "mismatch") setTruth("bad", "Recovery checkpoint mismatch", "Exact H, H+1, chain identity, recovery epoch, validator set, domain, or manifest differs on a configured replica. Canonical and earnings claims are paused.");
         else if (fleet.state === "fork") setTruth("bad", "COMMON-HEIGHT FORK CONFIRMED", `Configured v3 replicas disagree at #${formatInteger(fleet.commonHeight)}. Stop canonical and reward claims until recovery selection is resolved.`);
-        else if (fleet.state === "healthy" && boundary.state === "verified") setTruth("good", "Canonical v3 continuation verified", `H+1 links to the signed checkpoint and ${fleet.reachable.length}/${fleet.replicaCount} configured replica(s) are healthy.`);
+        else if (fleet.state === "healthy" && boundary.state === "verified") setTruth("good", "Canonical v3 continuation verified", `Signed H, exact H+1, and chain/recovery identity match on all ${boundary.replicas.length} configured v3 replica(s); ${fleet.reachable.length}/${fleet.replicaCount} are healthy.`);
         else if (fleet.state === "unconfigured") setTruth("warn", "Canonical recovery is not configured", state.config.notices[0] || "Publish signed checkpoint and endpoint metadata before using this console.");
         else setTruth("warn", "Canonical evidence is incomplete", `Fleet ${fleet.state}; boundary ${boundary.state}. Missing evidence is not treated as success.`);
         text(elements.lastUpdated, `Updated ${new Date().toLocaleTimeString()}`);
@@ -415,14 +446,14 @@
     elements.workerForm.addEventListener("submit", async (event) => {
       event.preventDefault(); text(elements.workerError, "");
       const button = elements.workerForm.querySelector("button"); button.disabled = true;
-      try { renderWorker(await loadWorkerEarnings({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), workerId: elements.workerId.value })); }
+      try { renderWorker(await loadWorkerEarnings({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), workerId: elements.workerId.value, checkpointAudit: state.checkpointAudit })); }
       catch (error) { text(elements.workerError, error.message); }
       finally { button.disabled = false; }
     });
     elements.receiptForm.addEventListener("submit", async (event) => {
       event.preventDefault(); text(elements.receiptError, "");
       const button = elements.receiptForm.querySelector("button"); button.disabled = true; clear(elements.receiptResult); elements.receiptResult.append(create("div", "empty", "Searching canonical segments…"));
-      try { renderReceipt(await lookupTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash: elements.receiptHash.value })); }
+      try { renderReceipt(await lookupTransaction({ resolver: state.resolver, fetchImpl: window.fetch.bind(window), hash: elements.receiptHash.value, checkpointAudit: state.checkpointAudit })); }
       catch (error) { text(elements.receiptError, error.message); clear(elements.receiptResult); elements.receiptResult.append(create("div", "empty", "Receipt lookup did not run.")); }
       finally { button.disabled = false; }
     });
