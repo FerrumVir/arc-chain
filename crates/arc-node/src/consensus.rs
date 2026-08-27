@@ -135,6 +135,42 @@ fn local_proposal_with_preimages(
     Ok(Some((block, transactions)))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LocalProposalBroadcast {
+    NotPresent,
+    Enqueued,
+    Backpressured,
+}
+
+fn try_rebroadcast_local_proposal(
+    engine: &ConsensusEngine,
+    local_address: Hash256,
+    round: u64,
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    outbound: Option<&mpsc::Sender<OutboundMessage>>,
+) -> Result<LocalProposalBroadcast, String> {
+    let Some((block, transactions)) =
+        local_proposal_with_preimages(engine, local_address, round, pending)
+            .map_err(|error| format!("local proposal/preimage invariant failed: {error:?}"))?
+    else {
+        return Ok(LocalProposalBroadcast::NotPresent);
+    };
+    let outbound =
+        outbound.ok_or_else(|| "recovery DAG proposal has no outbound transport".to_string())?;
+    match outbound.try_send(OutboundMessage::BroadcastDagBlock {
+        block,
+        transactions,
+    }) {
+        Ok(()) => Ok(LocalProposalBroadcast::Enqueued),
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+            Ok(LocalProposalBroadcast::Backpressured)
+        }
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err("recovery DAG outbound transport channel is closed".to_string())
+        }
+    }
+}
+
 fn prune_irreversible_preimages(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     latest_round: &dashmap::DashMap<[u8; 32], u64>,
@@ -829,6 +865,42 @@ impl ConsensusManager {
                                 // byte-identical re-broadcast so unanimity does
                                 // not depend on connection-event timing.
                                 recovery_rebroadcast_pending = true;
+                                let round = self.engine.current_round();
+                                match try_rebroadcast_local_proposal(
+                                    &self.engine,
+                                    self.validator_address,
+                                    round,
+                                    &pending_txs,
+                                    outbound_tx.as_ref(),
+                                ) {
+                                    Ok(LocalProposalBroadcast::Enqueued) => {
+                                        recovery_rebroadcast_pending = false;
+                                        next_recovery_rebroadcast =
+                                            Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
+                                    }
+                                    Ok(LocalProposalBroadcast::NotPresent) => {
+                                        recovery_rebroadcast_pending = false;
+                                    }
+                                    Ok(LocalProposalBroadcast::Backpressured) => {
+                                        // Do not drain a newly connected peer's
+                                        // block behind this event and advance
+                                        // locally before our own durable block
+                                        // has entered the transport queue.
+                                        debug!(
+                                            round,
+                                            "Recovery DAG reconnect re-broadcast is backpressured"
+                                        );
+                                        break;
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            round,
+                                            %error,
+                                            "Fatal recovery DAG reconnect re-broadcast failure"
+                                        );
+                                        return;
+                                    }
+                                }
                             }
                             // Transport authentication proves the peer identity,
                             // but its advertised stake is still self-asserted.
@@ -994,6 +1066,39 @@ impl ConsensusManager {
                                         txs = block.transactions.len(),
                                         "Received DAG block from peer"
                                     );
+                                    if self.engine.requires_full_round_participation() {
+                                        let round = self.engine.current_round();
+                                        match try_rebroadcast_local_proposal(
+                                            &self.engine,
+                                            self.validator_address,
+                                            round,
+                                            &pending_txs,
+                                            outbound_tx.as_ref(),
+                                        ) {
+                                            Ok(LocalProposalBroadcast::Enqueued) => {
+                                                recovery_rebroadcast_pending = false;
+                                                next_recovery_rebroadcast = Instant::now()
+                                                    + RECOVERY_DAG_REBROADCAST_INTERVAL;
+                                            }
+                                            Ok(LocalProposalBroadcast::NotPresent) => {}
+                                            Ok(LocalProposalBroadcast::Backpressured) => {
+                                                recovery_rebroadcast_pending = true;
+                                                debug!(
+                                                    round,
+                                                    "Deferred recovery round advance until exact local proposal can be re-broadcast"
+                                                );
+                                                continue;
+                                            }
+                                            Err(error) => {
+                                                tracing::error!(
+                                                    round,
+                                                    %error,
+                                                    "Fatal recovery DAG pre-advance re-broadcast failure"
+                                                );
+                                                return;
+                                            }
+                                        }
+                                    }
                                     let round_before = self.engine.current_round();
                                     let advanced = self.engine.advance_round();
                                     // Only reset the view-change timer if the
@@ -1274,50 +1379,25 @@ impl ConsensusManager {
             }
             if recovery_rebroadcast_pending && self.engine.requires_full_round_participation() {
                 let round = self.engine.current_round();
-                match local_proposal_with_preimages(
+                match try_rebroadcast_local_proposal(
                     &self.engine,
                     self.validator_address,
                     round,
                     &pending_txs,
+                    outbound_tx.as_ref(),
                 ) {
-                    Ok(Some((block, transactions))) => {
-                        let Some(tx_chan) = outbound_tx.as_ref() else {
-                            tracing::error!(
-                                round,
-                                "Recovery DAG proposal cannot be re-broadcast without transport"
-                            );
-                            return;
-                        };
-                        match tx_chan.try_send(OutboundMessage::BroadcastDagBlock {
-                            block,
-                            transactions,
-                        }) {
-                            Ok(()) => {
-                                recovery_rebroadcast_pending = false;
-                                next_recovery_rebroadcast =
-                                    Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                debug!(round, "Recovery DAG re-broadcast channel is full; retrying")
-                            }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                                tracing::error!(
-                                    round,
-                                    "Recovery DAG re-broadcast transport channel is closed"
-                                );
-                                return;
-                            }
-                        }
-                    }
-                    Ok(None) => {
+                    Ok(LocalProposalBroadcast::Enqueued | LocalProposalBroadcast::NotPresent) => {
                         recovery_rebroadcast_pending = false;
                         next_recovery_rebroadcast =
                             Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
                     }
+                    Ok(LocalProposalBroadcast::Backpressured) => {
+                        debug!(round, "Recovery DAG re-broadcast channel is full; retrying")
+                    }
                     Err(error) => {
                         tracing::error!(
                             round,
-                            ?error,
+                            %error,
                             "Fatal local DAG re-broadcast/preimage invariant failure"
                         );
                         return;
@@ -2362,18 +2442,62 @@ mod tests {
 
         let pending = dashmap::DashMap::new();
         for source in 0..5 {
-            let (block, bodies) =
-                local_proposal_with_preimages(&engines[source], validators[source], 101, &pending)
-                    .unwrap()
-                    .expect("old validator must retain its exact current proposal");
+            let (sender, mut receiver) = mpsc::channel(1);
+            assert_eq!(
+                try_rebroadcast_local_proposal(
+                    &engines[source],
+                    validators[source],
+                    101,
+                    &pending,
+                    Some(&sender),
+                )
+                .unwrap(),
+                LocalProposalBroadcast::Enqueued
+            );
+            if source == 0 {
+                assert_eq!(
+                    try_rebroadcast_local_proposal(
+                        &engines[source],
+                        validators[source],
+                        101,
+                        &pending,
+                        Some(&sender),
+                    )
+                    .unwrap(),
+                    LocalProposalBroadcast::Backpressured,
+                    "a full transport queue must defer advance rather than lose catch-up"
+                );
+            }
+            let OutboundMessage::BroadcastDagBlock {
+                block,
+                transactions,
+            } = receiver.try_recv().unwrap()
+            else {
+                panic!("reconnect must enqueue an exact DAG proposal")
+            };
             assert_eq!(block.hash, proposals[source].hash);
-            assert!(bodies.is_empty());
+            assert!(transactions.is_empty());
             engines[5].receive_block(&block).unwrap();
         }
-        let (restarted_block, restarted_bodies) =
-            local_proposal_with_preimages(&engines[5], validators[5], 101, &pending)
-                .unwrap()
-                .expect("restart must restore its one legal proposal");
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert_eq!(
+            try_rebroadcast_local_proposal(
+                &engines[5],
+                validators[5],
+                101,
+                &pending,
+                Some(&sender),
+            )
+            .unwrap(),
+            LocalProposalBroadcast::Enqueued
+        );
+        let OutboundMessage::BroadcastDagBlock {
+            block: restarted_block,
+            transactions: restarted_bodies,
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("restart must enqueue its exact durable DAG proposal")
+        };
         assert_eq!(restarted_block.hash, proposals[5].hash);
         assert!(restarted_bodies.is_empty());
         for engine in engines.iter().take(5) {
