@@ -706,6 +706,12 @@ pub struct ConsensusEngine {
     /// `None` preserves legacy DAG hashes. ARCCHKPT activation installs this
     /// before any proposal, receive, or local-WAL cursor restoration.
     consensus_domain: RwLock<Option<ConsensusDomain>>,
+    /// First DAG round in a recovered consensus domain. The signed recovery
+    /// manifest certifies the source cursor, so `source_round + 1` is the one
+    /// and only non-zero round allowed to start without legacy DAG parents.
+    /// Ordinary parent rules apply to every later round; retaining this value
+    /// also permits strict replay of late bootstrap-round blocks after restart.
+    recovery_bootstrap_round: RwLock<Option<u64>>,
 }
 
 impl ConsensusEngine {
@@ -753,6 +759,7 @@ impl ConsensusEngine {
             node_role: NodeRole::Full,
             testnet_mode: false,
             consensus_domain: RwLock::new(None),
+            recovery_bootstrap_round: RwLock::new(None),
         }
     }
 
@@ -793,6 +800,7 @@ impl ConsensusEngine {
             node_role: NodeRole::Full,
             testnet_mode: false,
             consensus_domain: RwLock::new(None),
+            recovery_bootstrap_round: RwLock::new(None),
         }
     }
 
@@ -858,6 +866,63 @@ impl ConsensusEngine {
         self.consensus_domain.read().clone()
     }
 
+    /// Install the cursor certified by an ARCCHKPT manifest.
+    ///
+    /// Recovery creates a new domain-separated DAG epoch. Legacy rounds do not
+    /// have hashes in that domain, so the first recovered round is deliberately
+    /// parentless. This exception is restricted to exactly
+    /// `source_consensus_round + 1` and can only be installed on an empty,
+    /// already-domain-bound engine.
+    pub fn install_recovery_cursor(
+        &self,
+        source_consensus_round: u64,
+    ) -> Result<u64, ConsensusError> {
+        if self.consensus_domain.read().is_none() {
+            return Err(ConsensusError::InvalidBlock(
+                "recovery cursor requires an installed consensus domain".into(),
+            ));
+        }
+        let bootstrap_round = source_consensus_round.checked_add(1).ok_or_else(|| {
+            ConsensusError::InvalidBlock("recovery source consensus round overflows u64".into())
+        })?;
+
+        let mut active = self.recovery_bootstrap_round.write();
+        if let Some(existing) = *active {
+            if existing == bootstrap_round
+                && self.current_round.load(Ordering::SeqCst) == bootstrap_round
+                && self.last_committed_round.load(Ordering::SeqCst) == bootstrap_round
+            {
+                return Ok(bootstrap_round);
+            }
+            return Err(ConsensusError::InvalidBlock(
+                "recovery cursor is already bound to another position".into(),
+            ));
+        }
+        if !self.dag.is_empty()
+            || self.current_round.load(Ordering::SeqCst) != 0
+            || self.last_committed_round.load(Ordering::SeqCst) != 0
+        {
+            return Err(ConsensusError::InvalidBlock(
+                "recovery cursor must be installed before DAG/local-WAL recovery".into(),
+            ));
+        }
+
+        self.current_round.store(bootstrap_round, Ordering::SeqCst);
+        // This cursor means every legacy round is finalized by the signed
+        // recovery decision; try_commit must begin with the new-domain round.
+        self.last_committed_round
+            .store(bootstrap_round, Ordering::SeqCst);
+        *active = Some(bootstrap_round);
+        self.reset_round_timer();
+        Ok(bootstrap_round)
+    }
+
+    /// Whether `round` is the exact parentless genesis round of the active
+    /// recovered DAG domain.
+    pub fn is_recovery_bootstrap_round(&self, round: u64) -> bool {
+        self.recovery_bootstrap_round.read().as_ref() == Some(&round)
+    }
+
     /// Get the current round number.
     pub fn current_round(&self) -> u64 {
         self.current_round.load(Ordering::SeqCst)
@@ -891,6 +956,102 @@ impl ConsensusEngine {
                 committed
             );
         }
+    }
+
+    /// Restore one locally persisted commit after its complete DAG block has
+    /// been revalidated in the active recovery domain.
+    ///
+    /// Commit records must be contiguous from the signed bootstrap cursor and
+    /// can only name a block for which the local WAL also contains the full
+    /// two-round DAG window. The state layer separately checks that the count
+    /// of these records matches the post-transition canonical block count.
+    pub fn restore_recovery_commit_from_local_wal(
+        &self,
+        block_hash: Hash256,
+    ) -> Result<u64, ConsensusError> {
+        if self.consensus_domain.read().is_none() || self.recovery_bootstrap_round.read().is_none()
+        {
+            return Err(ConsensusError::InvalidBlock(
+                "recovery commit replay requires a bound recovery domain/cursor".into(),
+            ));
+        }
+        let block = self.dag.get(&block_hash).ok_or_else(|| {
+            ConsensusError::InvalidBlock(format!(
+                "recovery commit {} has no validated DAG block",
+                block_hash
+            ))
+        })?;
+        let expected_round = self.last_committed_round.load(Ordering::SeqCst);
+        if block.round != expected_round {
+            return Err(ConsensusError::InvalidBlock(format!(
+                "non-contiguous recovery commit: expected round {expected_round}, got {}",
+                block.round
+            )));
+        }
+        let proof_round = block.round.checked_add(2).ok_or_else(|| {
+            ConsensusError::InvalidBlock("recovery commit proof round overflows u64".into())
+        })?;
+        if self.current_round.load(Ordering::SeqCst) < proof_round {
+            return Err(ConsensusError::InvalidBlock(format!(
+                "recovery commit for round {} lacks its complete two-round DAG window",
+                block.round
+            )));
+        }
+        let mut leaders: Vec<_> = self
+            .frozen_validator_set
+            .read()
+            .validators
+            .iter()
+            .map(|validator| validator.address)
+            .collect();
+        leaders.sort_by_key(|address| address.0);
+        let Some(leader) = leaders.get(block.round as usize % leaders.len().max(1)) else {
+            return Err(ConsensusError::InvalidBlock(
+                "recovery commit cannot be verified with an empty validator set".into(),
+            ));
+        };
+        if &block.author != leader {
+            return Err(ConsensusError::InvalidBlock(format!(
+                "recovery commit {} is not the deterministic leader block for round {}",
+                block_hash, block.round
+            )));
+        }
+        let vs = self.frozen_validator_set.read();
+        let certified = self
+            .blocks_in_round(block.round + 1)
+            .into_iter()
+            .filter_map(|hash| self.dag.get(&hash).map(|candidate| candidate.clone()))
+            .filter(|candidate| candidate.parents.contains(&block_hash))
+            .any(|candidate| {
+                let mut support = 0u64;
+                let mut authors = HashSet::new();
+                for hash in self.blocks_in_round(block.round + 2) {
+                    if let Some(certifier) = self.dag.get(&hash)
+                        && certifier.parents.contains(&candidate.hash)
+                        && authors.insert(certifier.author)
+                        && let Some(validator) = vs.get_validator(&certifier.author)
+                    {
+                        support = support
+                            .checked_add(validator.stake)
+                            .expect("unique certifier stake cannot exceed total stake");
+                    }
+                }
+                support >= vs.quorum
+            });
+        if !certified {
+            return Err(ConsensusError::InvalidBlock(format!(
+                "recovery commit {} lacks a valid two-round quorum certificate",
+                block_hash
+            )));
+        }
+        let next = block.round.checked_add(1).ok_or_else(|| {
+            ConsensusError::InvalidBlock("recovery commit cursor overflows u64".into())
+        })?;
+        if !self.committed.read().contains(&block_hash) {
+            self.committed.write().push(block_hash);
+        }
+        self.last_committed_round.store(next, Ordering::SeqCst);
+        Ok(next)
     }
 
     /// Record an unauthenticated peer round hint without mutating consensus
@@ -1132,10 +1293,18 @@ impl ConsensusEngine {
         }
 
         let round = self.current_round.load(Ordering::SeqCst);
+        if self
+            .author_round_blocks
+            .contains_key(&(self.local_address, round))
+        {
+            // In particular, this prevents a restart from signing a second
+            // block after the first proposal was restored from local WAL.
+            return Err(ConsensusError::DuplicateBlock);
+        }
 
         // Collect parents from the previous round (round - 1).
         // For round 0, there are no parents.
-        let parents = if round == 0 {
+        let parents = if round == 0 || self.is_recovery_bootstrap_round(round) {
             Vec::new()
         } else {
             let prev_round = round - 1;
@@ -1216,6 +1385,8 @@ impl ConsensusEngine {
 
         // Insert into our own DAG
         self.insert_block_into_dag(&block);
+        self.author_round_blocks
+            .insert((block.author, block.round), block.hash);
 
         // Create DA commitment for this block
         let block_data = bincode::serialize(&block.transactions).unwrap_or_default();
@@ -1323,11 +1494,12 @@ impl ConsensusEngine {
         }
 
         // 5. Parent validation
-        if block.round == 0 {
-            // Round 0 blocks should have no parents
+        if block.round == 0 || self.is_recovery_bootstrap_round(block.round) {
+            // Round 0 and the exact recovery-domain bootstrap round have no
+            // parents. The latter is certified by the signed ARCCHKPT cursor.
             if !block.parents.is_empty() {
                 return Err(ConsensusError::InvalidBlock(
-                    "round 0 block must not have parents".into(),
+                    "bootstrap block must not have parents".into(),
                 ));
             }
         } else {
@@ -2941,6 +3113,56 @@ mod tests {
         assert!(!block.verify_hash_in_domain(&domain_b));
         assert!(!block.verify_hash());
         assert!(engine.install_consensus_domain(domain_b).is_err());
+    }
+
+    #[test]
+    fn signed_recovery_cursor_allows_exactly_one_parentless_domain_round() {
+        let vs = test_validator_set(4);
+        let engine = ConsensusEngine::new(vs, test_addr(0));
+        assert!(engine.install_recovery_cursor(100).is_err());
+
+        let domain = ConsensusDomain::new(hash_bytes(b"cursor-domain"), 3, 9);
+        engine.install_consensus_domain(domain.clone()).unwrap();
+        assert_eq!(engine.install_recovery_cursor(100).unwrap(), 101);
+        assert_eq!(engine.current_round(), 101);
+        assert_eq!(engine.last_committed_round(), 101);
+        assert!(engine.is_recovery_bootstrap_round(101));
+
+        let own = engine.propose_block(vec![], 1_000).unwrap();
+        assert!(own.parents.is_empty());
+        assert_eq!(
+            engine.propose_block(vec![], 1_001).unwrap_err(),
+            ConsensusError::DuplicateBlock,
+            "restart/retry must never sign a second block in the same round"
+        );
+
+        for author in [test_addr(1), test_addr(2)] {
+            let mut block = make_block(author, 101, vec![], vec![], 1_000);
+            block.hash = block.compute_hash_in_domain(&domain);
+            engine.receive_block(&block).unwrap();
+        }
+        assert!(engine.advance_round());
+        assert_eq!(engine.current_round(), 102);
+        let next = engine.propose_block(vec![], 2_000).unwrap();
+        assert_eq!(next.parents.len(), 3);
+
+        let mut invalid = make_block(test_addr(3), 102, vec![], vec![], 2_001);
+        invalid.hash = invalid.compute_hash_in_domain(&domain);
+        assert_eq!(
+            engine.receive_block(&invalid).unwrap_err(),
+            ConsensusError::InsufficientParents
+        );
+    }
+
+    #[test]
+    fn signed_recovery_cursor_refuses_overflow_and_rebinding() {
+        let engine = ConsensusEngine::new(test_validator_set(4), test_addr(0));
+        engine
+            .install_consensus_domain(ConsensusDomain::new(hash_bytes(b"cursor-domain"), 3, 9))
+            .unwrap();
+        assert!(engine.install_recovery_cursor(u64::MAX).is_err());
+        assert_eq!(engine.install_recovery_cursor(50).unwrap(), 51);
+        assert!(engine.install_recovery_cursor(51).is_err());
     }
 
     #[test]

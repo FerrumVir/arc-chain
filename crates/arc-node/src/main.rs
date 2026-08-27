@@ -9,9 +9,11 @@ use arc_node::{benchmark::BenchmarkPool, consensus::ConsensusManager, rpc};
 use arc_state::StateDB;
 use arc_types::Block;
 use clap::{CommandFactory, Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -549,6 +551,380 @@ fn print_recovery_summary(
         }))?
     );
     Ok(())
+}
+
+const RECOVERY_DAG_BINDING_VERSION: u16 = 1;
+const RECOVERY_DAG_BINDING_FILE: &str = "recovery-dag.binding.json";
+
+/// Local DAG persistence is useful only after it is bound to the signed
+/// checkpoint which created its consensus domain. This small readable file is
+/// not a trust root: every field is re-derived from the stored ARCCHKPT at
+/// every startup and any mismatch aborts the node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryDagBinding {
+    format_version: u16,
+    manifest_hash: Hash256,
+    consensus_domain: arc_consensus::ConsensusDomain,
+    source_height: u64,
+    transition_height: u64,
+    source_consensus_round: u64,
+    initial_consensus_round: u64,
+}
+
+#[derive(Debug)]
+struct RecoveryDagStartup {
+    wal_dir: PathBuf,
+    binding: RecoveryDagBinding,
+    archived_legacy_wal: Option<PathBuf>,
+}
+
+/// Preserve recovered validator state exactly. Re-seeding the genesis set
+/// after post-H+1 WAL replay rewinds legitimate validator changes and creates
+/// a different state root on a rolling restart.
+fn prepare_replayed_consensus_state(
+    state: &StateDB,
+    genesis_validators: &[(Hash256, u64)],
+) -> Result<()> {
+    if state.recovery_context().is_some() {
+        let height = state.height();
+        let anchor = state
+            .get_block(height)
+            .ok_or_else(|| anyhow::anyhow!("recovered state has no canonical block at {height}"))?;
+        let computed = state.get_state_root();
+        ensure!(
+            computed == anchor.header.state_root,
+            "recovered state root changed after replay: block {} commits {}, replay computes {}",
+            height,
+            anchor.header.state_root,
+            computed
+        );
+        tracing::info!(
+            height,
+            state_root = %computed,
+            "Recovered validator/state replay rechecked against its canonical block"
+        );
+    } else if !genesis_validators.is_empty() {
+        state.seed_genesis_validators(genesis_validators);
+        tracing::info!(
+            "Seeded {} genesis validators into StateDB.validators",
+            genesis_validators.len()
+        );
+    }
+    Ok(())
+}
+
+fn rebuild_replayed_derived_indexes(state: &StateDB) {
+    let tier1 = state.rebuild_tier1_pending();
+    if tier1 > 0 {
+        tracing::info!(
+            "Rebuilt {} Tier 1 pending requests from on-disk state",
+            tier1
+        );
+    }
+    let bonds = state.rebuild_pending_bond_releases();
+    if bonds > 0 {
+        tracing::info!(
+            "Rebuilt {} pending inference-bond releases from on-disk escrow state",
+            bonds
+        );
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)
+        .with_context(|| format!("failed to open directory {} for fsync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to fsync directory {}", path.display()))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn write_recovery_dag_binding_atomically(path: &Path, binding: &RecoveryDagBinding) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("recovery DAG binding has no parent directory"))?;
+    let tmp = parent.join(format!(".{RECOVERY_DAG_BINDING_FILE}.new"));
+    let bytes = serde_json::to_vec_pretty(binding)?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .with_context(|| format!("failed to create recovery DAG binding {}", tmp.display()))?;
+    if let Err(error) = (|| -> std::io::Result<()> {
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()
+    })() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error).context("failed to durably write recovery DAG binding");
+    }
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("failed to activate recovery DAG binding {}", path.display()))?;
+    sync_directory(parent)
+}
+
+fn read_recovery_dag_binding(path: &Path) -> Result<RecoveryDagBinding> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat recovery DAG binding {}", path.display()))?;
+    ensure!(
+        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        "recovery DAG binding {} must be a regular file",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= 64 * 1024,
+        "recovery DAG binding {} exceeds 64 KiB",
+        path.display()
+    );
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read recovery DAG binding {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid recovery DAG binding {}", path.display()))
+}
+
+fn archive_legacy_dag_wal(data_dir: &Path, manifest_hash: Hash256) -> Result<Option<PathBuf>> {
+    let legacy = data_dir.join("dag-wal");
+    let metadata = match std::fs::symlink_metadata(&legacy) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to inspect legacy DAG WAL {}", legacy.display()));
+        }
+    };
+    ensure!(
+        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+        "legacy DAG WAL {} must be a real directory before archival",
+        legacy.display()
+    );
+    let archive = data_dir.join(format!("dag-wal.pre-recovery-{}", manifest_hash.to_hex()));
+    ensure!(
+        !archive.exists(),
+        "both legacy DAG WAL {} and archive {} exist; refusing ambiguous recovery startup",
+        legacy.display(),
+        archive.display()
+    );
+    std::fs::rename(&legacy, &archive).with_context(|| {
+        format!(
+            "failed to archive legacy DAG WAL {} as {}",
+            legacy.display(),
+            archive.display()
+        )
+    })?;
+    sync_directory(data_dir)?;
+    Ok(Some(archive))
+}
+
+fn prepare_recovery_dag_startup(
+    data_dir: &Path,
+    state: &StateDB,
+) -> Result<Option<RecoveryDagStartup>> {
+    let Some(context) = state.recovery_context() else {
+        return Ok(None);
+    };
+    let manifest_hash = state
+        .recovery_manifest_hash()
+        .ok_or_else(|| anyhow::anyhow!("recovery state is missing its manifest hash"))?;
+    let checkpoint_path = data_dir.join(format!("recovery-{}.arcchkpt", manifest_hash.to_hex()));
+    let checkpoint =
+        arc_state::recovery::ArcCheckpoint::read_from(&checkpoint_path).with_context(|| {
+            format!(
+                "failed to reopen active recovery checkpoint {} for DAG binding",
+                checkpoint_path.display()
+            )
+        })?;
+    ensure!(
+        checkpoint.manifest_hash() == manifest_hash,
+        "active recovery checkpoint hash changed before DAG startup"
+    );
+    ensure!(
+        checkpoint.manifest.recovery_context() == context,
+        "active recovery checkpoint context differs from replayed state"
+    );
+    let transition_height = checkpoint
+        .manifest
+        .source_height
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("recovery transition height overflows u64"))?;
+    ensure!(
+        state.height() >= transition_height,
+        "replayed recovery state height {} precedes transition height {}",
+        state.height(),
+        transition_height
+    );
+    let initial_consensus_round = checkpoint
+        .manifest
+        .source_consensus_round
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("recovery source consensus round overflows u64"))?;
+    let binding = RecoveryDagBinding {
+        format_version: RECOVERY_DAG_BINDING_VERSION,
+        manifest_hash,
+        consensus_domain: arc_consensus::ConsensusDomain::new(
+            context.domain_hash(),
+            context.recovery_epoch,
+            context.validator_set_id,
+        ),
+        source_height: checkpoint.manifest.source_height,
+        transition_height,
+        source_consensus_round: checkpoint.manifest.source_consensus_round,
+        initial_consensus_round,
+    };
+
+    let archived_legacy_wal = archive_legacy_dag_wal(data_dir, manifest_hash)?;
+    let wal_dir = data_dir.join(format!("dag-wal-recovery-{}", manifest_hash.to_hex()));
+    match std::fs::symlink_metadata(&wal_dir) {
+        Ok(metadata) => ensure!(
+            metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
+            "recovery DAG WAL {} must be a real directory",
+            wal_dir.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&wal_dir).with_context(|| {
+                format!("failed to create recovery DAG WAL {}", wal_dir.display())
+            })?;
+            sync_directory(data_dir)?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect recovery DAG WAL {}", wal_dir.display())
+            });
+        }
+    }
+
+    let binding_path = wal_dir.join(RECOVERY_DAG_BINDING_FILE);
+    if binding_path.exists() {
+        let stored = read_recovery_dag_binding(&binding_path)?;
+        ensure!(
+            stored == binding,
+            "recovery DAG WAL binding differs from the signed active checkpoint"
+        );
+    } else {
+        let mut entries = std::fs::read_dir(&wal_dir)
+            .with_context(|| format!("failed to inspect {}", wal_dir.display()))?;
+        ensure!(
+            entries.next().is_none(),
+            "recovery DAG WAL {} contains data without a binding; refusing replay",
+            wal_dir.display()
+        );
+        write_recovery_dag_binding_atomically(&binding_path, &binding)?;
+    }
+
+    Ok(Some(RecoveryDagStartup {
+        wal_dir,
+        binding,
+        archived_legacy_wal,
+    }))
+}
+
+fn replay_recovery_dag_wal(
+    engine: &arc_consensus::ConsensusEngine,
+    startup: &RecoveryDagStartup,
+    expected_commits: u64,
+) -> Result<(u64, u64, Vec<arc_types::Transaction>)> {
+    let installed = engine
+        .install_recovery_cursor(startup.binding.source_consensus_round)
+        .map_err(|error| anyhow::anyhow!("failed to install signed recovery cursor: {error}"))?;
+    ensure!(
+        installed == startup.binding.initial_consensus_round,
+        "installed recovery cursor differs from signed DAG binding"
+    );
+    let entries = arc_state::wal::read_wal_dir_strict(&startup.wal_dir).with_context(|| {
+        format!(
+            "recovery DAG WAL {} is corrupt or incomplete",
+            startup.wal_dir.display()
+        )
+    })?;
+    let mut commits = 0u64;
+    let mut transactions = std::collections::HashMap::<[u8; 32], arc_types::Transaction>::new();
+    for entry in entries {
+        match entry.op {
+            arc_state::WalOp::SetFullTransaction(expected_hash, transaction) => {
+                ensure!(
+                    transaction.hash == expected_hash && entry.block_height >= installed,
+                    "persisted DAG transaction key/round differs from its WAL envelope"
+                );
+                transaction
+                    .verify_signature_in_domain(&startup.binding.consensus_domain.domain_hash)
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "persisted DAG transaction {} failed recovery-domain validation: {}",
+                            expected_hash,
+                            error
+                        )
+                    })?;
+                transactions.entry(expected_hash.0).or_insert(transaction);
+            }
+            arc_state::WalOp::SetDagBlock(expected_hash, bytes) => {
+                ensure!(
+                    bytes.len() <= 64 * 1024 * 1024,
+                    "recovery DAG block {} exceeds 64 MiB",
+                    expected_hash
+                );
+                let block: arc_consensus::DagBlock = bincode::deserialize(&bytes)
+                    .with_context(|| format!("invalid persisted DAG block {expected_hash}"))?;
+                ensure!(
+                    block.hash == expected_hash && block.round == entry.block_height,
+                    "persisted DAG block key/round differs from its WAL envelope"
+                );
+                ensure!(
+                    block
+                        .transactions
+                        .iter()
+                        .all(|hash| transactions.contains_key(&hash.0)),
+                    "persisted DAG block {} is missing one or more durable transaction bodies",
+                    expected_hash
+                );
+                engine.receive_block(&block).map_err(|error| {
+                    anyhow::anyhow!(
+                        "persisted DAG block {} failed recovery-domain validation: {}",
+                        expected_hash,
+                        error
+                    )
+                })?;
+                let _ = engine.advance_round();
+            }
+            arc_state::WalOp::SetDagRound(round) => {
+                ensure!(
+                    round >= startup.binding.initial_consensus_round
+                        && round <= engine.current_round(),
+                    "persisted DAG cursor {} is not justified by replayed quorum blocks (current {})",
+                    round,
+                    engine.current_round()
+                );
+            }
+            arc_state::WalOp::CommitDagBlock(hash) => {
+                engine
+                    .restore_recovery_commit_from_local_wal(hash)
+                    .map_err(|error| {
+                        anyhow::anyhow!("persisted DAG commit {hash} is invalid: {error}")
+                    })?;
+                commits = commits
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("recovery DAG commit count overflows u64"))?;
+            }
+            _ => bail!(
+                "recovery DAG WAL contains a non-DAG state operation at sequence {}",
+                entry.sequence
+            ),
+        }
+    }
+    ensure!(
+        commits == expected_commits,
+        "recovery DAG/state WAL commit mismatch: DAG has {}, canonical state has {} post-transition blocks",
+        commits,
+        expected_commits
+    );
+    let mut transactions: Vec<_> = transactions.into_values().collect();
+    transactions.sort_by_key(|transaction| transaction.hash.0);
+    Ok((
+        engine.current_round(),
+        engine.last_committed_round(),
+        transactions,
+    ))
 }
 
 fn run_operator_command(command: OperatorCommand) -> Result<()> {
@@ -1734,19 +2110,11 @@ async fn main() -> Result<()> {
             db.archive_mode = true;
             tracing::info!("Archive mode ENABLED - no pruning, full transaction history retained");
         }
-        // Pre-populate StateDB.validators with the genesis validator set so
-        // `is_validator()` returns true for the 8 genesis validators on
-        // every node, regardless of how far behind the local commit log
-        // is. Required for TxBody::FaucetClaim (and any future
-        // validator-authorized body) to apply on peers that haven't synced
-        // chain history.
-        if !genesis_validators.is_empty() {
-            db.seed_genesis_validators(&genesis_validators);
-            tracing::info!(
-                "Seeded {} genesis validators into StateDB.validators",
-                genesis_validators.len()
-            );
-        }
+        // Legacy state still needs its configured validator seed. Recovered
+        // state already contains the exact H+1 validator map plus any later
+        // WAL changes; preserve it and fail if replay no longer matches the
+        // canonical block root.
+        prepare_replayed_consensus_state(&db, &genesis_validators)?;
         db
     });
 
@@ -1759,15 +2127,7 @@ async fn main() -> Result<()> {
     // InferenceRequest.apply — escrows applied before that storage entry
     // existed (pre-2026-06-04) can't be recovered automatically and stay
     // stuck.
-    {
-        let rebuilt = state.rebuild_tier1_pending();
-        if rebuilt > 0 {
-            tracing::info!(
-                "Rebuilt {} Tier 1 pending requests from on-disk state",
-                rebuilt
-            );
-        }
-    }
+    rebuild_replayed_derived_indexes(&state);
 
     // ── State Sync Protocol (A5) - bootstrap from peer snapshot ─────
     // Auto-sync: if this node has peers configured and state is fresh (height 0),
@@ -2098,6 +2458,7 @@ async fn main() -> Result<()> {
     let dag_committed = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     if chain_participation_enabled {
+        let recovery_dag_startup = prepare_recovery_dag_startup(Path::new(&data_dir), &state)?;
         let mut consensus = ConsensusManager::new_with_keypair(
             validator_address,
             stake,
@@ -2107,13 +2468,20 @@ async fn main() -> Result<()> {
             validator_keypair.clone(),
         );
         if let Some(context) = state.recovery_context() {
+            let domain = arc_consensus::ConsensusDomain::new(
+                context.domain_hash(),
+                context.recovery_epoch,
+                context.validator_set_id,
+            );
+            if let Some(startup) = recovery_dag_startup.as_ref() {
+                ensure!(
+                    startup.binding.consensus_domain == domain,
+                    "recovery DAG binding differs from the active consensus domain"
+                );
+            }
             consensus
                 .engine
-                .install_consensus_domain(arc_consensus::ConsensusDomain::new(
-                    context.domain_hash(),
-                    context.recovery_epoch,
-                    context.validator_set_id,
-                ))
+                .install_consensus_domain(domain)
                 .map_err(|error| {
                     anyhow::anyhow!("failed to install recovery consensus domain: {error}")
                 })?;
@@ -2121,9 +2489,19 @@ async fn main() -> Result<()> {
         consensus.dag_validators = Some(dag_validators.clone());
         consensus.dag_round = Some(dag_round.clone());
         consensus.dag_committed = Some(dag_committed.clone());
-        // DAG persistence WAL - survives restarts
-        let dag_wal_path = format!("{}/dag-wal", data_dir);
-        std::fs::create_dir_all(&dag_wal_path).ok();
+        // DAG persistence WAL - survives restarts. Recovery domains use a
+        // content-addressed directory with an exact signed binding; legacy
+        // pre-recovery WAL is archived and never inspected as a cursor.
+        let dag_wal_path = recovery_dag_startup
+            .as_ref()
+            .map(|startup| startup.wal_dir.clone())
+            .unwrap_or_else(|| Path::new(&data_dir).join("dag-wal"));
+        std::fs::create_dir_all(&dag_wal_path).with_context(|| {
+            format!(
+                "failed to create DAG WAL directory {}",
+                dag_wal_path.display()
+            )
+        })?;
 
         // ── v0.7.0: DAG WAL recovery on boot ────────────────────────────────
         //
@@ -2145,27 +2523,68 @@ async fn main() -> Result<()> {
         // Bounded read: scans only the latest segment (≤64 MB), not every
         // segment. NYC's dag-wal is 5 GB+ and growing; reading the whole
         // history at boot would balloon memory and slow startup minutes.
-        let recovered_round = arc_state::latest_block_height_in_wal_dir(&dag_wal_path);
-        if recovered_round > 0 {
-            // The highest WAL round does not prove that any earlier leader was
-            // committed. Preserve the commit cursor until an exact local commit
-            // record or quorum-certified checkpoint recovery path is available.
-            let recovered_committed = 0;
-            consensus
-                .engine
-                .restore_round_from_local_wal(recovered_round, recovered_committed);
+        if let Some(startup) = recovery_dag_startup.as_ref() {
+            let expected_commits = state
+                .height()
+                .checked_sub(startup.binding.transition_height)
+                .ok_or_else(|| anyhow::anyhow!("recovery state precedes transition height"))?;
+            let (recovered_round, recovered_committed, recovered_transactions) =
+                replay_recovery_dag_wal(consensus.engine.as_ref(), startup, expected_commits)?;
+            let mut restored_transactions = 0usize;
+            for transaction in recovered_transactions {
+                if state.get_receipt(&transaction.hash.0).is_none() {
+                    mempool.insert(transaction).map_err(|error| {
+                        anyhow::anyhow!(
+                            "failed to restore a recovery-domain DAG transaction into the mempool: {error}"
+                        )
+                    })?;
+                    restored_transactions += 1;
+                }
+            }
+            dag_round.store(recovered_round, std::sync::atomic::Ordering::SeqCst);
+            dag_committed.store(recovered_committed, std::sync::atomic::Ordering::SeqCst);
             tracing::info!(
                 recovered_round,
                 recovered_committed,
-                "DAG WAL round restored from local disk; commit cursor remains fail-closed pending certified recovery"
+                manifest_hash = %startup.binding.manifest_hash,
+                archived_legacy_wal = ?startup.archived_legacy_wal,
+                restored_transactions,
+                "Recovery DAG cursor and WAL are bound to the signed ARCCHKPT domain"
             );
         } else {
-            tracing::info!("DAG WAL is empty - starting fresh from round 0");
+            let recovered_round = arc_state::latest_block_height_in_wal_dir(&dag_wal_path);
+            if recovered_round > 0 {
+                // The highest WAL round does not prove that any earlier leader was
+                // committed. Preserve the commit cursor until an exact local commit
+                // record or quorum-certified checkpoint recovery path is available.
+                let recovered_committed = 0;
+                consensus
+                    .engine
+                    .restore_round_from_local_wal(recovered_round, recovered_committed);
+                tracing::info!(
+                    recovered_round,
+                    recovered_committed,
+                    "DAG WAL round restored from local disk; commit cursor remains fail-closed pending certified recovery"
+                );
+            } else {
+                tracing::info!("DAG WAL is empty - starting fresh from round 0");
+            }
         }
 
-        if let Ok(dag_wal) = arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
-            consensus.dag_wal = Some(Arc::new(dag_wal));
-            tracing::info!("DAG persistence WAL enabled: {}", dag_wal_path);
+        match arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
+            Ok(dag_wal) => {
+                consensus.dag_wal = Some(Arc::new(dag_wal));
+                tracing::info!("DAG persistence WAL enabled: {}", dag_wal_path.display());
+            }
+            Err(error) if recovery_dag_startup.is_some() => {
+                return Err(error)
+                    .context("recovery consensus requires a durable, domain-bound DAG WAL");
+            }
+            Err(error) => tracing::warn!(
+                error = %error,
+                path = %dag_wal_path.display(),
+                "DAG persistence WAL is unavailable"
+            ),
         }
         consensus.set_proposer_mode(cli.proposer_mode);
         let state_clone = state.clone();
@@ -3281,7 +3700,60 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arc_consensus::{ConsensusEngine, DagBlock, STAKE_ARC, Validator, ValidatorSet};
+    use arc_state::{WalOp, WalWriter};
     use serde_json::json;
+
+    fn recovery_test_binding(domain: arc_consensus::ConsensusDomain) -> RecoveryDagBinding {
+        RecoveryDagBinding {
+            format_version: RECOVERY_DAG_BINDING_VERSION,
+            manifest_hash: hash_bytes(b"manifest"),
+            consensus_domain: domain,
+            source_height: 900,
+            transition_height: 901,
+            source_consensus_round: 100,
+            initial_consensus_round: 101,
+        }
+    }
+
+    fn recovery_test_block(
+        author: Hash256,
+        round: u64,
+        parents: Vec<Hash256>,
+        domain: &arc_consensus::ConsensusDomain,
+    ) -> DagBlock {
+        let transactions = Vec::new();
+        let ordering_commitment = DagBlock::compute_ordering_commitment(&transactions);
+        let mut block = DagBlock {
+            author,
+            round,
+            parents,
+            transactions,
+            timestamp: round,
+            hash: Hash256::ZERO,
+            signature: Vec::new(),
+            ordering_commitment,
+        };
+        block.hash = block.compute_hash_in_domain(domain);
+        block
+    }
+
+    fn recovery_test_engine(
+        validators: &[Hash256],
+        domain: &arc_consensus::ConsensusDomain,
+    ) -> ConsensusEngine {
+        let set = ValidatorSet::new(
+            validators
+                .iter()
+                .enumerate()
+                .map(|(index, address)| Validator::new(*address, STAKE_ARC, index as u16).unwrap())
+                .collect(),
+            1,
+        );
+        let engine = ConsensusEngine::new(set, validators[0]);
+        engine.install_consensus_domain(domain.clone()).unwrap();
+        engine
+    }
 
     #[test]
     fn sha256_streaming_matches_known_vector() {
@@ -3411,6 +3883,147 @@ mod tests {
             .is_err(),
             "activation must require data-dir, genesis, and the exact manifest pin"
         );
+    }
+
+    #[test]
+    fn recovery_dag_binding_archives_legacy_history_and_refuses_ambiguity() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-dag-binding-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+        let legacy = data_dir.join("dag-wal");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::write(legacy.join("wal-00000000.bin"), b"legacy-history").unwrap();
+        let manifest_hash = hash_bytes(b"manifest");
+
+        let archive = archive_legacy_dag_wal(&data_dir, manifest_hash)
+            .unwrap()
+            .expect("legacy WAL should be archived");
+        assert!(!legacy.exists());
+        assert_eq!(
+            std::fs::read(archive.join("wal-00000000.bin")).unwrap(),
+            b"legacy-history"
+        );
+
+        std::fs::create_dir(&legacy).unwrap();
+        assert!(archive_legacy_dag_wal(&data_dir, manifest_hash).is_err());
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_dag_binding_round_trip_is_exact_and_tamper_visible() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-dag-file-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+        let path = data_dir.join(RECOVERY_DAG_BINDING_FILE);
+        let binding = recovery_test_binding(arc_consensus::ConsensusDomain::new(
+            hash_bytes(b"domain"),
+            7,
+            11,
+        ));
+        write_recovery_dag_binding_atomically(&path, &binding).unwrap();
+        assert_eq!(read_recovery_dag_binding(&path).unwrap(), binding);
+
+        let mut tampered = binding.clone();
+        tampered.source_consensus_round += 1;
+        std::fs::write(&path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        assert_ne!(read_recovery_dag_binding(&path).unwrap(), binding);
+        std::fs::remove_dir_all(&data_dir).unwrap();
+    }
+
+    #[test]
+    fn recovery_dag_restart_replays_domain_blocks_and_certified_commit() {
+        let data_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-dag-replay-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&data_dir).unwrap();
+        let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"domain"), 7, 11);
+        let binding = recovery_test_binding(domain.clone());
+        let validators: Vec<Hash256> = (0..4).map(|index| hash_bytes(&[index as u8])).collect();
+        let bootstrap = binding.initial_consensus_round;
+
+        let transaction_key = arc_crypto::KeyPair::generate_ed25519();
+        let mut transaction = arc_types::Transaction::new_transfer(
+            transaction_key.address(),
+            hash_bytes(b"recipient"),
+            7,
+            0,
+        );
+        transaction
+            .sign_in_domain(&transaction_key, &domain.domain_hash)
+            .unwrap();
+
+        let mut round_0: Vec<_> = validators
+            .iter()
+            .map(|author| recovery_test_block(*author, bootstrap, Vec::new(), &domain))
+            .collect();
+        round_0[0].transactions = vec![transaction.hash];
+        round_0[0].ordering_commitment =
+            DagBlock::compute_ordering_commitment(&round_0[0].transactions);
+        round_0[0].hash = round_0[0].compute_hash_in_domain(&domain);
+        let parents_0: Vec<_> = round_0.iter().map(|block| block.hash).collect();
+        let round_1: Vec<_> = validators
+            .iter()
+            .map(|author| recovery_test_block(*author, bootstrap + 1, parents_0.clone(), &domain))
+            .collect();
+        let parents_1: Vec<_> = round_1.iter().map(|block| block.hash).collect();
+        let round_2: Vec<_> = validators
+            .iter()
+            .map(|author| recovery_test_block(*author, bootstrap + 2, parents_1.clone(), &domain))
+            .collect();
+
+        let writer = WalWriter::with_segments(&data_dir, 64 * 1024 * 1024).unwrap();
+        writer.append(
+            WalOp::SetFullTransaction(transaction.hash, transaction.clone()),
+            bootstrap,
+        );
+        for block in round_0.iter().chain(&round_1).chain(&round_2) {
+            writer.append(
+                WalOp::SetDagBlock(block.hash, bincode::serialize(block).unwrap()),
+                block.round,
+            );
+        }
+        let mut sorted_validators = validators.clone();
+        sorted_validators.sort_by_key(|address| address.0);
+        let leader = sorted_validators[bootstrap as usize % sorted_validators.len()];
+        let leader_hash = round_0
+            .iter()
+            .find(|block| block.author == leader)
+            .unwrap()
+            .hash;
+        writer.append(WalOp::CommitDagBlock(leader_hash), bootstrap);
+        writer.sync().unwrap();
+        drop(writer);
+
+        let startup = RecoveryDagStartup {
+            wal_dir: data_dir.clone(),
+            binding,
+            archived_legacy_wal: None,
+        };
+        for _ in 0..2 {
+            let engine = recovery_test_engine(&validators, &domain);
+            let (round, committed, transactions) =
+                replay_recovery_dag_wal(&engine, &startup, 1).unwrap();
+            assert_eq!(round, bootstrap + 3);
+            assert_eq!(committed, bootstrap + 1);
+            assert_eq!(
+                transactions
+                    .iter()
+                    .map(|transaction| transaction.hash)
+                    .collect::<Vec<_>>(),
+                vec![transaction.hash]
+            );
+            assert_eq!(engine.committed_blocks(), vec![leader_hash]);
+        }
+
+        let wrong_domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"wrong"), 7, 11);
+        let engine = recovery_test_engine(&validators, &wrong_domain);
+        assert!(replay_recovery_dag_wal(&engine, &startup, 1).is_err());
+        std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
     #[test]

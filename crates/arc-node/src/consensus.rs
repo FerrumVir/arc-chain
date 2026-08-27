@@ -632,8 +632,8 @@ impl ConsensusManager {
                                     continue;
                                 }
                             };
-                            for tx in verified {
-                                pending_txs.insert(tx.hash.0, tx);
+                            for tx in &verified {
+                                pending_txs.insert(tx.hash.0, tx.clone());
                             }
                             // Feed block into consensus engine
                             match self.engine.receive_block(&block) {
@@ -642,6 +642,15 @@ impl ConsensusManager {
                                     if let Some(ref wal) = self.dag_wal
                                         && let Ok(bytes) = bincode::serialize(&block)
                                     {
+                                        for tx in &verified {
+                                            wal.append(
+                                                arc_state::WalOp::SetFullTransaction(
+                                                    tx.hash,
+                                                    tx.clone(),
+                                                ),
+                                                block.round,
+                                            );
+                                        }
                                         wal.append(
                                             arc_state::WalOp::SetDagBlock(block.hash, bytes),
                                             block.round,
@@ -970,25 +979,26 @@ impl ConsensusManager {
             // IMPORTANT: Check parent readiness BEFORE draining the mempool.
             // If the peer's block from the previous round hasn't arrived yet,
             // we would fail to propose and lose the drained transactions.
-            let has_quorum_parents = if current_round == 0 {
-                true // Round 0 has no parent requirement
-            } else {
-                let vs = self.engine.validator_set();
-                let prev_blocks = self.engine.blocks_in_round(current_round - 1);
-                let mut parent_stake = 0u64;
-                let mut seen_authors = std::collections::HashSet::new();
-                for hash in &prev_blocks {
-                    if let Some(block) = self.engine.get_block(hash)
-                        && let Some(validator) = vs.get_validator(&block.author)
-                        && seen_authors.insert(block.author)
-                    {
-                        parent_stake = parent_stake
-                            .checked_add(validator.stake)
-                            .expect("unique parent stake cannot exceed validator-set total");
+            let has_quorum_parents =
+                if current_round == 0 || self.engine.is_recovery_bootstrap_round(current_round) {
+                    true // Genesis of a legacy or signed recovery DAG domain
+                } else {
+                    let vs = self.engine.validator_set();
+                    let prev_blocks = self.engine.blocks_in_round(current_round - 1);
+                    let mut parent_stake = 0u64;
+                    let mut seen_authors = std::collections::HashSet::new();
+                    for hash in &prev_blocks {
+                        if let Some(block) = self.engine.get_block(hash)
+                            && let Some(validator) = vs.get_validator(&block.author)
+                            && seen_authors.insert(block.author)
+                        {
+                            parent_stake = parent_stake
+                                .checked_add(validator.stake)
+                                .expect("unique parent stake cannot exceed validator-set total");
+                        }
                     }
-                }
-                parent_stake >= vs.quorum
-            };
+                    parent_stake >= vs.quorum
+                };
 
             // ── VRF proposer eligibility check ──────────────────────────
             // In DAG consensus, ALL validators propose every round - that's
@@ -1169,6 +1179,15 @@ impl ConsensusManager {
                                 if let Some(ref wal) = self.dag_wal
                                     && let Ok(bytes) = bincode::serialize(&block)
                                 {
+                                    for tx in &transactions {
+                                        wal.append(
+                                            arc_state::WalOp::SetFullTransaction(
+                                                tx.hash,
+                                                tx.clone(),
+                                            ),
+                                            block.round,
+                                        );
+                                    }
                                     wal.append(
                                         arc_state::WalOp::SetDagBlock(block.hash, bytes),
                                         block.round,
