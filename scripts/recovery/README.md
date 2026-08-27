@@ -207,7 +207,9 @@ scripts/recovery/archive-fleet-to-drive.sh seal \
   --allow-unbound-legacy-wal
 
 locked_sha256='<sealed rollout-manifest sha256>'
-ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id" \
+destination='arc-drive:ARC Chain Recovery/captures/'"$capture_id"
+destination_sha256="$(printf %s "$destination" | sha256sum | cut -d' ' -f1)"
+ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id DEST $destination_sha256 LEGACY_WAL UNBOUND" \
   scripts/recovery/archive-fleet-to-drive.sh seal \
     --freeze-plan /secure/operator/arc-freeze.lock.json \
     --manifest /secure/operator/arc-recovery.lock.json \
@@ -218,23 +220,25 @@ ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id" \
 
 The production rollout manifest must contain the same `freeze_plan_sha256` and
 `capture_id`; neither the archive seal nor `recovery_rollout.py run --execute`
-accepts a production GO phrase without both. `seal` rechecks the immutable
+accepts a production GO phrase without both. `seal` rechecks the read-only
 rollout sidecar, every artifact hash, the paired reference export, and the
-5-of-6 signed checkpoint. On each host it copies a
-private working tree and runs the capture's own on-disk snapshot against that
-capture's own stopped WAL. Each result is classified as `valid_canonical`,
+5-of-6 signed checkpoint. On each host it runs the read-only exporter directly
+against the content-indexed, persistently fenced source without creating a
+second full data tree. Each final capture is classified as `valid_canonical`,
 `valid_noncanonical_fork`, or `preserved_unclassified`. It never substitutes
 the sealed canonical reference snapshot for a validator's missing or divergent
-snapshot. At least one real canonical match is required; all six bundles,
-including forks and unclassified evidence, are retained and uploaded under
-`arc-drive:ARC Chain Recovery/<rollout-manifest hash>`. A changed or missing
+snapshot. The independently reproduced shared reference snapshot/WAL pair—not
+one of the later live captures—is the canonical recovery source. All six final
+captures may therefore be forks or unclassified and are still retained and
+uploaded under the exact capture-scoped destination
+`arc-drive:ARC Chain Recovery/captures/<capture-id>`. A changed or missing
 capture or a Drive object bound to a different freeze hash stops before upload
 or replacement. A per-node semantic export failure is preserved as
 unclassified evidence and cannot masquerade as either a fork or a canonical
-source. If strict offline recovery trims an uncheckpointed WAL tail, the
-recovered prefix and quarantined tail are both retained as immutable evidence.
+source. If strict offline recovery trims an uncheckpointed WAL tail, hashes of
+the accepted prefix and quarantined tail bind the exact retained source bytes.
 
-Each bundle contains the complete stopped legacy data directory, persistent
+Each streamed bundle contains the complete stopped legacy data directory, persistent
 fence evidence, optional public legacy binary/genesis inputs, and semantic
 export result. Shared uploads include the sealed source snapshot/reference
 WAL, final binary, genesis, source/public validator sets, signed checkpoint,
@@ -246,15 +250,19 @@ After all six bundle/inventory pairs have been uploaded and independently
 checked, the operator builds canonical `SHA256SUMS` and
 `ARCHIVE-MANIFEST.json`. The manifest binds every shared input, all six
 classifications, bundle/inventory sizes and SHA-256 values, both archive helper
-hashes, the source commit, freeze digest, capture ID, and rollout digest. Those
-metadata files are uploaded and checked only after the bundles. Immutable
-`COMPLETE.json`, which binds the archive-manifest hash, is the final remote
-mutation. Partial destinations without it are resumable but must never be
-consumed. Verify a destination before use:
+hashes, rollout tool/schema hashes, the independently verified canonical
+reference, source commit, freeze digest, capture ID, and prearchive rollout
+digest. Those
+metadata files are uploaded and checked only after the bundles. Content-addressed
+`COMPLETE.json`, which binds the archive-manifest hash, is the final create-only
+mutation in this execution. Google Drive is not WORM or intrinsically
+immutable: partial destinations without COMPLETE are resumable but must never
+be consumed, and every object is re-downloaded and cryptographically checked.
+Verify a destination before use:
 
 ```bash
 scripts/recovery/archive-fleet-to-drive.sh verify-complete \
-  --destination 'arc-drive:ARC Chain Recovery/<rollout-manifest hash>'
+  --destination 'arc-drive:ARC Chain Recovery/captures/<capture-id>'
 ```
 
 An absent, non-canonical, mismatched, or tampered `COMPLETE.json`, manifest, or

@@ -91,6 +91,7 @@ class ManifestFixture:
                         "public_hostname": f"{ip.replace('.', '-')}.nip.io",
                         "model_path": "/opt/arc-models/llama2-7b.gguf",
                         "model_sha256": rollout.CANONICAL_MODEL_SHA256,
+                        "model_size_bytes": rollout.CANONICAL_MODEL_SIZE_BYTES,
                         "shard_ranges": balanced_ranges[index],
                     }
                 )
@@ -126,7 +127,18 @@ class ManifestFixture:
                 {
                     "archive": {
                         "freeze_plan_sha256": "e" * 64,
-                        "capture_id": "f" * 64,
+                        "capture_id": rollout.capture_id_for_freeze_plan_hash("e" * 64),
+                        "destination": "arc-drive:ARC Chain Recovery/captures/"
+                        + rollout.capture_id_for_freeze_plan_hash("e" * 64),
+                        "allow_unbound_legacy_wal": False,
+                        "archive_orchestrator_sha256": "d" * 64,
+                        "remote_helper_sha256": "a" * 64,
+                        "rollout_tool_sha256": "b" * 64,
+                        "rollout_schema_sha256": "c" * 64,
+                        "complete_sha256": "0" * 64,
+                        "archive_manifest_sha256": "0" * 64,
+                        "sha256sums_sha256": "0" * 64,
+                        "prearchive_rollout_sha256": "0" * 64,
                     }
                 }
                 if production
@@ -259,6 +271,101 @@ class RecoveryRolloutTests(unittest.TestCase):
             with self.assertRaisesRegex(rollout.RolloutError, "protected flag"):
                 rollout.validate_manifest(override)
 
+    def test_final_archive_manifest_is_roots_only_projection_of_prearchive(self) -> None:
+        prearchive = self.fixture(production=True)
+        prearchive_digest = rollout.sha256_bytes(rollout.canonical_bytes(prearchive))
+        self.assertEqual(rollout.prearchive_projection_digest(prearchive), prearchive_digest)
+        final = copy.deepcopy(prearchive)
+        final["archive"].update(
+            {
+                "complete_sha256": "1" * 64,
+                "archive_manifest_sha256": "2" * 64,
+                "sha256sums_sha256": "3" * 64,
+                "prearchive_rollout_sha256": prearchive_digest,
+            }
+        )
+        self.assertIs(rollout.validate_manifest(final), final)
+        with self.assertRaisesRegex(rollout.RolloutError, "exact prearchive manifest"):
+            rollout.require_prearchive_manifest(final)
+        rollout.require_prearchive_manifest(prearchive)
+
+        mutations = (
+            lambda value: value["validators"][0].__setitem__("host", "192.0.2.99"),
+            lambda value: value["artifacts"]["binary"].__setitem__("sha256", "9" * 64),
+            lambda value: value["checks"].__setitem__("observation_seconds", 2),
+            lambda value: value["validators"][0].__setitem__("shard_ranges", [[0, 6], [12, 17], [22, 27]]),
+        )
+        for mutate in mutations:
+            changed = copy.deepcopy(final)
+            mutate(changed)
+            with self.assertRaisesRegex(rollout.RolloutError, "outside the four archive finalization roots"):
+                rollout.validate_manifest(changed)
+
+        partial = copy.deepcopy(prearchive)
+        partial["archive"]["complete_sha256"] = "1" * 64
+        with self.assertRaisesRegex(rollout.RolloutError, "either all-zero prearchive or all nonzero"):
+            rollout.validate_manifest(partial)
+
+    def test_production_resume_markers_provenance_and_path_separation(self) -> None:
+        value = self.fixture(production=True)
+        script_root = Path(rollout.__file__).resolve().parent
+        value["archive"].update(
+            {
+                "archive_orchestrator_sha256": digest(script_root / "archive-fleet-to-drive.sh"),
+                "remote_helper_sha256": digest(script_root / "archive-node.sh"),
+                "rollout_tool_sha256": digest(Path(rollout.__file__).resolve()),
+                "rollout_schema_sha256": digest(script_root / "recovery-manifest.schema.json"),
+            }
+        )
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        harness.verify_execution_provenance()
+        changed = copy.deepcopy(value)
+        changed["archive"]["remote_helper_sha256"] = "f" * 64
+        with self.assertRaisesRegex(rollout.RolloutError, "remote archive helper bytes differ"):
+            rollout.RecoveryRollout(changed, "d" * 64).verify_execution_provenance()
+
+        self.assertTrue(rollout.paths_overlap("/root/arc-data", "/root/arc-data/v3"))
+        self.assertFalse(rollout.paths_overlap("/root/arc-data", "/var/lib/arc-v3"))
+        nested = copy.deepcopy(value)
+        nested["validators"][0]["remote_root"] = "/var/lib/arc-v3/release"
+        with self.assertRaisesRegex(rollout.RolloutError, "disjoint, non-nested"):
+            rollout.validate_manifest(nested)
+
+        ssh_calls: list[tuple[str, tuple[str, ...]]] = []
+        harness.ssh = mock.Mock(
+            side_effect=lambda node, script, args=(), **kwargs: ssh_calls.append(
+                (script, tuple(args))
+            )
+            or ""
+        )
+        harness.scp = mock.Mock()
+        node = value["validators"][0]
+        harness._stage_production_node(node)
+        harness._stage_production_node(node)
+        harness._install_gateway_and_unit(node)
+        harness._install_gateway_and_unit(node)
+        scripts = "\n".join(script for script, _ in ssh_calls)
+        for required in (
+            ".arc-recovery-rollout-owner",
+            ".arc-recovery-stage-complete",
+            "validate_marker",
+            "deployment-files.sha256",
+            'test "$(cat "$owner")" = "$digest"',
+            'cmp --silent "$root/$unit" "$installed"',
+        ):
+            self.assertIn(required, scripts)
+        self.assertTrue(
+            any(
+                f".arc-recovery-import-{harness.digest}" in argument
+                for _, arguments in ssh_calls
+                for argument in arguments
+            )
+        )
+        self.assertGreaterEqual(scripts.count("validate_marker"), 2)
+
+        source = Path(rollout.__file__).read_text(encoding="utf-8")
+        self.assertIn("verify_production_archive(verify_live_captures=True)", source)
+
     def test_seal_is_canonical_read_only_hash_bound_and_create_only(self) -> None:
         draft = self.root / "draft.json"
         sealed = self.root / "locked.json"
@@ -280,23 +387,34 @@ class RecoveryRolloutTests(unittest.TestCase):
         local = self.fixture()
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(rollout.RolloutError, "--go-hash"):
-                rollout.require_go(local, locked_hash, None)
+                rollout.require_go(local, locked_hash, None, None, None)
         with mock.patch.dict(os.environ, {"ARC_RECOVERY_GO": f"GO {locked_hash}"}, clear=True):
-            rollout.require_go(local, locked_hash, locked_hash)
+            rollout.require_go(local, locked_hash, locked_hash, None, None)
         with mock.patch.dict(os.environ, {"ARC_RECOVERY_GO": f"GO {'b' * 64}"}, clear=True):
             with self.assertRaisesRegex(rollout.RolloutError, "ARC_RECOVERY_GO"):
-                rollout.require_go(local, locked_hash, locked_hash)
+                rollout.require_go(local, locked_hash, locked_hash, None, None)
 
         production = self.fixture(production=True)
-        production_phrase = (
-            f"GO {locked_hash} FREEZE {'e' * 64} CAPTURE {'f' * 64}"
+        prearchive_digest = rollout.prearchive_projection_digest(production)
+        production["archive"].update(
+            {
+                "complete_sha256": "1" * 64,
+                "archive_manifest_sha256": "2" * 64,
+                "sha256sums_sha256": "3" * 64,
+                "prearchive_rollout_sha256": prearchive_digest,
+            }
         )
-        self.assertEqual(rollout.execution_authorization(production, locked_hash), production_phrase)
+        rollout.validate_manifest(production)
+        production_phrase = rollout.execution_authorization(production, locked_hash, "2" * 64)
+        self.assertIn(f"FREEZE {'e' * 64}", production_phrase)
+        self.assertIn(f"CAPTURE {production['archive']['capture_id']}", production_phrase)
+        self.assertIn(f"ARCHIVE {'2' * 64}", production_phrase)
+        self.assertIn("LEGACY_WAL BOUND", production_phrase)
         with mock.patch.dict(os.environ, {"ARC_RECOVERY_GO": production_phrase}, clear=True):
-            rollout.require_go(production, locked_hash, locked_hash)
+            rollout.require_go(production, locked_hash, locked_hash, "2" * 64, "2" * 64)
         with mock.patch.dict(os.environ, {"ARC_RECOVERY_GO": f"GO {locked_hash}"}, clear=True):
             with self.assertRaisesRegex(rollout.RolloutError, "ARC_RECOVERY_GO"):
-                rollout.require_go(production, locked_hash, locked_hash)
+                rollout.require_go(production, locked_hash, locked_hash, "2" * 64, "2" * 64)
 
     def test_runtime_uses_six_explicit_origins_and_restart_omits_checkpoint(self) -> None:
         value = self.fixture()

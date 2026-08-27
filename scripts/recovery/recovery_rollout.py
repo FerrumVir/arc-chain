@@ -71,6 +71,7 @@ PROTECTED_FLAGS = {
 REQUIRED_VALIDATORS = 6
 REQUIRED_APPROVALS = 5
 CANONICAL_MODEL_SHA256 = "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
+CANONICAL_MODEL_SIZE_BYTES = 4_081_004_224
 CANONICAL_MODEL_LAYERS = 32
 REQUIRED_SHARD_REPLICATION = 3
 REQUIRED_LAYERS_PER_VALIDATOR = (
@@ -132,6 +133,13 @@ SOURCE_ONLY_NOT_PUBLIC_PATHS = (
 PUBLIC_INFERENCE_TIMEOUT_SECONDS = 4000
 VALIDATOR_APPROVAL_TIMEOUT_SECONDS = 1500
 WORKER_SUBMIT_TIMEOUT_SECONDS = 2700
+CAPTURE_DOMAIN = b"ARC recovery capture v2\0"
+ARCHIVE_FINALIZATION_FIELDS = (
+    "complete_sha256",
+    "archive_manifest_sha256",
+    "sha256sums_sha256",
+    "prearchive_rollout_sha256",
+)
 
 
 class RolloutError(RuntimeError):
@@ -156,6 +164,53 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def capture_id_for_freeze_plan_hash(freeze_plan_sha256: str) -> str:
+    if not LOWER_HEX_32_RE.fullmatch(freeze_plan_sha256):
+        fail("freeze plan sha256 must be exactly 64 lowercase hexadecimal characters")
+    return hashlib.sha256(CAPTURE_DOMAIN + bytes.fromhex(freeze_plan_sha256)).hexdigest()
+
+
+def prearchive_projection_digest(manifest: Mapping[str, Any]) -> str:
+    projection = json.loads(json.dumps(manifest))
+    archive = projection.get("archive")
+    if not isinstance(archive, dict):
+        fail("prearchive projection requires manifest.archive")
+    for field in ARCHIVE_FINALIZATION_FIELDS:
+        archive[field] = "0" * 64
+    return sha256_bytes(canonical_bytes(projection))
+
+
+def require_prearchive_manifest(manifest: Mapping[str, Any]) -> None:
+    archive = manifest.get("archive")
+    if not isinstance(archive, Mapping) or any(
+        archive.get(field) != "0" * 64 for field in ARCHIVE_FINALIZATION_FIELDS
+    ):
+        fail(
+            "archive sealing requires the exact prearchive manifest with all four "
+            "archive finalization roots zero"
+        )
+
+
+def validate_drive_remote(value: Any, field: str) -> str:
+    remote = required_string(value, field)
+    if (
+        "\x00" in remote
+        or "\n" in remote
+        or "\r" in remote
+        or remote.startswith("-")
+        or ":" not in remote
+        or remote.endswith("/")
+        or "/../" in f"/{remote.split(':', 1)[1]}/"
+    ):
+        fail(f"{field} must be an exact, non-option rclone remote path without traversal")
+    remote_name, remote_path = remote.split(":", 1)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", remote_name):
+        fail(f"{field} has an unsafe rclone remote name")
+    if not remote_path or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._/@%+=,-]{0,511}", remote_path):
+        fail(f"{field} has an unsafe rclone remote path")
+    return remote
 
 
 def bare_hash(value: Any, field: str) -> str:
@@ -201,7 +256,14 @@ def absolute_path(value: Any, field: str) -> str:
         fail(f"{field} is too broad to be a rollout path")
     if "\x00" in raw or "\n" in raw or "\r" in raw:
         fail(f"{field} contains an unsafe character")
+    if os.path.normpath(raw) != raw:
+        fail(f"{field} must be lexically normalized without dot segments or a trailing slash")
     return raw
+
+
+def paths_overlap(left: str, right: str) -> bool:
+    common = os.path.commonpath((left, right))
+    return common in {left, right}
 
 
 def validate_artifact(value: Any, field: str) -> dict[str, Any]:
@@ -283,11 +345,53 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         archive = require_keys(
             manifest.get("archive"),
             "manifest.archive",
-            ("freeze_plan_sha256", "capture_id"),
+            (
+                "freeze_plan_sha256",
+                "capture_id",
+                "destination",
+                "allow_unbound_legacy_wal",
+                "archive_orchestrator_sha256",
+                "remote_helper_sha256",
+                "rollout_tool_sha256",
+                "rollout_schema_sha256",
+                "complete_sha256",
+                "archive_manifest_sha256",
+                "sha256sums_sha256",
+                "prearchive_rollout_sha256",
+            ),
         )
-        for key in ("freeze_plan_sha256", "capture_id"):
+        for key in (
+            "freeze_plan_sha256",
+            "capture_id",
+            "archive_orchestrator_sha256",
+            "remote_helper_sha256",
+            "rollout_tool_sha256",
+            "rollout_schema_sha256",
+            "complete_sha256",
+            "archive_manifest_sha256",
+            "sha256sums_sha256",
+            "prearchive_rollout_sha256",
+        ):
             if not isinstance(archive[key], str) or not LOWER_HEX_32_RE.fullmatch(archive[key]):
                 fail(f"manifest.archive.{key} must be exactly 64 lowercase hexadecimal characters")
+        expected_capture = capture_id_for_freeze_plan_hash(archive["freeze_plan_sha256"])
+        if archive["capture_id"] != expected_capture:
+            fail("manifest.archive.capture_id is not derived from the exact freeze-plan hash")
+        validate_drive_remote(archive["destination"], "manifest.archive.destination")
+        if not archive["destination"].endswith(f"/captures/{archive['capture_id']}"):
+            fail("manifest.archive.destination must be the exact capture-scoped path")
+        if not isinstance(archive["allow_unbound_legacy_wal"], bool):
+            fail("manifest.archive.allow_unbound_legacy_wal must be a boolean")
+        finalization_values = [archive[field] for field in ARCHIVE_FINALIZATION_FIELDS]
+        zeros = "0" * 64
+        if all(value == zeros for value in finalization_values):
+            pass  # exact prearchive form, sealed before any remote archive exists
+        elif any(value == zeros for value in finalization_values):
+            fail("manifest.archive finalization roots must be either all-zero prearchive or all nonzero")
+        elif prearchive_projection_digest(manifest) != archive["prearchive_rollout_sha256"]:
+            fail(
+                "final manifest differs from its prearchive manifest outside the four archive finalization roots"
+            )
     elif "archive" in manifest:
         fail("local rehearsals must not contain manifest.archive")
 
@@ -459,6 +563,7 @@ def validate_manifest(value: Any) -> dict[str, Any]:
             "public_hostname",
             "model_path",
             "model_sha256",
+            "model_size_bytes",
             "shard_ranges",
         )
         node = require_keys(raw_node, field, common + (production if mode == "production" else ()))
@@ -520,6 +625,8 @@ def validate_manifest(value: Any) -> dict[str, Any]:
             if not SAFE_REMOTE_RE.fullmatch(remote_root):
                 fail(f"{field}.remote_root is unsafe")
             remote_roots.add(remote_root)
+            if paths_overlap(remote_root, data_dir):
+                fail(f"{field}.remote_root and data_dir must be disjoint, non-nested paths")
             service_name = required_string(node["service_name"], f"{field}.service_name")
             if not re.fullmatch(r"arc-node-v3-[a-z0-9-]+\.service", service_name):
                 fail(f"{field}.service_name must be an arc-node-v3-*.service")
@@ -539,6 +646,10 @@ def validate_manifest(value: Any) -> dict[str, Any]:
             if node["model_sha256"] != CANONICAL_MODEL_SHA256:
                 fail(
                     f"{field}.model_sha256 must pin the canonical v0.8 Llama-2-7B artifact"
+                )
+            if node["model_size_bytes"] != CANONICAL_MODEL_SIZE_BYTES:
+                fail(
+                    f"{field}.model_size_bytes must pin the exact reviewed 4,081,004,224-byte model"
                 )
             ranges = node["shard_ranges"]
             if not isinstance(ranges, list) or not ranges:
@@ -835,7 +946,14 @@ class RecoveryRollout:
             ],
         }
 
-    def recovery_cli(self, action: str, node: Mapping[str, Any] | None = None, *, remote: bool = False) -> list[str]:
+    def recovery_cli(
+        self,
+        action: str,
+        node: Mapping[str, Any] | None = None,
+        *,
+        remote: bool = False,
+        data_dir_override: str | None = None,
+    ) -> list[str]:
         artifacts = self.manifest["artifacts"]
         if remote:
             if node is None:
@@ -864,7 +982,7 @@ class RecoveryRollout:
         if action == "import":
             if node is None:
                 fail("recovery import requires a node")
-            base += ["--data-dir", node["data_dir"]]
+            base += ["--data-dir", data_dir_override or node["data_dir"]]
         return base
 
     def runtime_argv(self, node: Mapping[str, Any], *, remote: bool = False) -> list[str]:
@@ -978,12 +1096,70 @@ class RecoveryRollout:
             fail("checkpoint does not carry a verified 5-of-6 signature quorum")
         self.say("PASS checkpoint content, GO pin, v3 boundary, and 5-of-6 signature quorum")
 
-    def preflight(self) -> None:
+    def verify_execution_provenance(self) -> None:
+        if self.manifest["mode"] != "production":
+            return
+        archive = self.manifest["archive"]
+        script_root = Path(__file__).resolve().parent
+        expected = (
+            (script_root / "archive-fleet-to-drive.sh", archive["archive_orchestrator_sha256"], "archive orchestrator"),
+            (script_root / "archive-node.sh", archive["remote_helper_sha256"], "remote archive helper"),
+            (Path(__file__).resolve(), archive["rollout_tool_sha256"], "executing rollout tool"),
+            (script_root / "recovery-manifest.schema.json", archive["rollout_schema_sha256"], "rollout schema"),
+        )
+        for path, wanted, label in expected:
+            details = path.lstat()
+            if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+                fail(f"{label} is missing, non-regular, or a symlink: {path}")
+            if sha256_file(path) != wanted:
+                fail(f"{label} bytes differ from the SHA-256 sealed in the rollout manifest")
+
+    def verify_production_archive(self, *, verify_live_captures: bool = False) -> str:
+        if self.manifest["mode"] != "production":
+            fail("remote archive verification is production-only")
+        archive = self.manifest["archive"]
+        if any(archive[field] == "0" * 64 for field in ARCHIVE_FINALIZATION_FIELDS):
+            fail("production rollout execution requires a roots-only finalized archive manifest")
+        self.verify_execution_provenance()
+        verifier = Path(__file__).resolve().parent / "archive-fleet-to-drive.sh"
+        command = [
+                str(verifier),
+                "verify-complete",
+                "--destination",
+                archive["destination"],
+                "--expected-complete-sha256",
+                archive["complete_sha256"],
+                "--expected-archive-manifest-sha256",
+                archive["archive_manifest_sha256"],
+                "--expected-sha256sums-sha256",
+                archive["sha256sums_sha256"],
+                "--expected-prearchive-rollout-sha256",
+                archive["prearchive_rollout_sha256"],
+            ]
+        for node in self.validators:
+            command.extend(("--new-node-paths", node["name"], node["remote_root"], node["data_dir"]))
+        if verify_live_captures:
+            command.append("--verify-live-captures")
+        output = run_checked(
+            command,
+            timeout=24 * 60 * 60,
+        ).stdout
+        match = re.search(r"archive_manifest=([0-9a-f]{64})(?:\s|$)", output)
+        if match is None:
+            fail("archive verifier did not emit a canonical archive-manifest hash")
+        self.say(
+            f"PASS complete remote archive and every SHA-256-bound object ({match.group(1)})"
+        )
+        return match.group(1)
+
+    def preflight(self) -> str | None:
         self.verify_checkpoint()
         if self.manifest["mode"] == "local":
             self._preflight_local()
-        else:
-            self._preflight_production()
+            return None
+        archive_manifest_sha256 = self.verify_production_archive()
+        self._preflight_production()
+        return archive_manifest_sha256
 
     def _preflight_local(self) -> None:
         for node in self.validators:
@@ -1036,32 +1212,75 @@ class RecoveryRollout:
     def _preflight_production(self) -> None:
         script = r"""
 set -eu
-root=$1 data=$2 key=$3 service=$4 gateway_service=$5 filter_service=$6 rpc=$7 model=$8 model_sha=$9
+root=$1 data=$2 key=$3 service=$4 gateway_service=$5 filter_service=$6 rpc=$7 model=$8 model_sha=$9 model_size=${10} digest=${11} transition=${12} checkpoint_manifest=${13} runtime_argv_sha=${14}
 command -v sha256sum >/dev/null
 command -v systemctl >/dev/null
 command -v curl >/dev/null
 command -v ss >/dev/null
+command -v python3 >/dev/null
+command -v cmp >/dev/null
 command -v nginx >/dev/null 2>&1 || command -v apt-get >/dev/null
-test ! -e "$root"
-test ! -e "$data"
+owner="$root/.arc-recovery-rollout-owner"
+stage="$root/.arc-recovery-stage-complete"
+partial="${data}.arc-recovery-import-${digest}"
+partial_owner="${partial}.owner"
+if test -e "$root"; then
+  test -d "$root" && test ! -L "$root"
+  test -f "$owner" && test ! -L "$owner"
+  test "$(cat "$owner")" = "$digest"
+else
+  test ! -e "$data"
+  test ! -e "$partial"
+  test ! -e "$partial_owner"
+fi
+if test -e "$data"; then
+  test -d "$data" && test ! -L "$data"
+  python3 - "$data/.arc-recovery-rollout.json" "$digest" "$transition" "$checkpoint_manifest" <<'PY'
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); v=json.loads(p.read_text(encoding="utf-8"))
+e={"schema":"arc.recovery.import-complete.v1","rollout_manifest_sha256":sys.argv[2],"transition_height":int(sys.argv[3]),"checkpoint_manifest_hash":sys.argv[4]}
+if p.is_symlink() or v != e or p.read_text(encoding="utf-8") != json.dumps(e,sort_keys=True,separators=(",",":"))+"\n": raise SystemExit("existing v3 data is not an exact completed import for this rollout")
+PY
+elif test -e "$partial" || test -e "$partial_owner"; then
+  test -f "$partial_owner" && test ! -L "$partial_owner"
+  test "$(cat "$partial_owner")" = "$digest"
+  test ! -e "$partial" || { test -d "$partial" && test ! -L "$partial"; }
+fi
 test -f "$key"
 test "$(stat -c %a "$key")" = 600
-test ! -e "/etc/systemd/system/$service"
-test ! -e "/etc/systemd/system/$gateway_service"
-test ! -e "/etc/systemd/system/$filter_service"
+for unit in "$service" "$gateway_service" "$filter_service"; do
+  installed="/etc/systemd/system/$unit"
+  if test -e "$installed"; then
+    test -f "$stage" && test ! -L "$stage" && test "$(cat "$stage")" = "$digest"
+    test -f "$installed" && test ! -L "$installed"
+    cmp --silent "$root/$unit" "$installed"
+  fi
+done
 test -f "$model"
 test ! -L "$model"
+test "$(stat -c %s "$model")" = "$model_size"
 printf '%s  %s\n' "$model_sha" "$model" | sha256sum --check --strict
 listeners=$(ss -ltnp | grep -E ':(80|443)[[:space:]]' || true)
-if [ -n "$listeners" ] && printf '%s\n' "$listeners" | grep -v nginx >/dev/null; then
-  printf 'ports 80/443 are occupied by a non-nginx process\n%s\n' "$listeners" >&2
+if [ -n "$listeners" ] && printf '%s\n' "$listeners" | grep -Ev '(nginx|caddy)' >/dev/null; then
+  printf 'ports 80/443 are occupied by an unapproved process\n%s\n' "$listeners" >&2
   exit 1
 fi
-if pgrep -x arc-node >/dev/null 2>&1; then
-  printf 'legacy or unapproved arc-node is still running\n' >&2
-  exit 1
+if printf '%s\n' "$listeners" | grep caddy >/dev/null; then
+  systemctl is-active --quiet "$gateway_service"
+  test -f "/etc/systemd/system/$gateway_service"
+  cmp --silent "$root/$gateway_service" "/etc/systemd/system/$gateway_service"
 fi
-for retired in arc-self-heal.service arc-node.service; do
+pids=$(pgrep -x arc-node || true)
+if [ -n "$pids" ]; then
+  test "$(printf '%s\n' "$pids" | wc -l | tr -d ' ')" = 1
+  pid=$(systemctl show "$service" --property=MainPID --value)
+  test "$pid" = "$pids"
+  systemctl is-active --quiet "$service"
+  test "$(readlink "/proc/$pid/exe")" = "$root/arc-node"
+  test "$(sha256sum "/proc/$pid/cmdline" | cut -d' ' -f1)" = "$runtime_argv_sha"
+fi
+test ! -e /root/.arc-recovery-legacy-start-allowed
+for retired in arc-self-heal.service arc-node.service arc-node-update.service; do
   fence="/etc/systemd/system/$retired.d/arc-recovery-freeze.conf"
   test -f "$fence"
   test ! -L "$fence"
@@ -1072,6 +1291,8 @@ for retired in arc-self-heal.service arc-node.service; do
     exit 1
   fi
 done
+! systemctl is-active --quiet arc-node-update.timer
+! systemctl is-enabled --quiet arc-node-update.timer
 case "$rpc" in 127.*|localhost:*) ;; *) printf 'RPC is not loopback\n' >&2; exit 1 ;; esac
 """
         for node in self.validators:
@@ -1092,6 +1313,17 @@ case "$rpc" in 127.*|localhost:*) ;; *) printf 'RPC is not loopback\n' >&2; exit
                     node["rpc_listen"],
                     node["model_path"],
                     node["model_sha256"],
+                    str(node["model_size_bytes"]),
+                    self.digest,
+                    str(self.chain["transition_height"]),
+                    bare_hash(self.chain["approved_checkpoint_manifest_hash"], "checkpoint manifest hash"),
+                    sha256_bytes(
+                        b"\0".join(
+                            item.encode("utf-8")
+                            for item in self.runtime_argv(node, remote=True)
+                        )
+                        + b"\0"
+                    ),
                 ),
             )
             self.say(f"PASS {node['name']} remote fresh-dir/key/service/DNS preflight")
@@ -1840,7 +2072,48 @@ WantedBy=multi-user.target
 
     def _stage_production_node(self, node: Mapping[str, Any]) -> None:
         root = node["remote_root"]
-        self.ssh(node, 'set -eu\numask 077\nmkdir --mode=0700 -- "$1"\n', (root,))
+        self.ssh(
+            node,
+            r'''set -eu
+umask 077
+root=$1 digest=$2 parent=${1%/*}
+test -d "$parent" && test ! -L "$parent"
+if test -e "$root"; then
+  test -d "$root" && test ! -L "$root"
+  test -f "$root/.arc-recovery-rollout-owner" && test ! -L "$root/.arc-recovery-rollout-owner"
+  test "$(cat "$root/.arc-recovery-rollout-owner")" = "$digest"
+else
+  temporary=$(mktemp -d "$parent/.arc-recovery-rollout.XXXXXX")
+  printf '%s\n' "$digest" > "$temporary/.arc-recovery-rollout-owner"
+  chmod 0400 "$temporary/.arc-recovery-rollout-owner"
+  mv --no-clobber -T -- "$temporary" "$root"
+  if test -e "$temporary"; then
+    find "$temporary" -xdev -depth -delete
+    test -d "$root" && test ! -L "$root"
+    test "$(cat "$root/.arc-recovery-rollout-owner")" = "$digest"
+  fi
+fi
+''',
+            (root, self.digest),
+        )
+        self.ssh(
+            node,
+            r'''set -eu
+root=$1
+shift
+if find "$root" -maxdepth 1 -type l -print -quit | grep . >/dev/null; then exit 1; fi
+for name in arc-node genesis.toml recovery.arcchkpt legacy-validator-set-40m.json caddy Caddyfile nginx-filter.conf deployment-files.sha256 "$@"; do
+  path="$root/$name"
+  test ! -e "$path" || { test -f "$path" && test ! -L "$path"; }
+done
+''',
+            (
+                root,
+                node["service_name"],
+                self.gateway_service_name(node),
+                self.filter_service_name(node),
+            ),
+        )
         artifacts = self.manifest["artifacts"]
         for source, destination in (
             (artifacts["binary"]["path"], f"{root}/arc-node"),
@@ -1865,9 +2138,36 @@ WantedBy=multi-user.target
                 path = Path(temporary) / name
                 path.write_text(contents, encoding="utf-8")
                 self.scp(node, str(path), f"{root}/{name}")
+            deployment_hashes = {
+                "arc-node": artifacts["binary"]["sha256"],
+                "genesis.toml": artifacts["genesis"]["sha256"],
+                "recovery.arcchkpt": artifacts["checkpoint"]["sha256"],
+                "legacy-validator-set-40m.json": artifacts["legacy_validator_set"]["sha256"],
+                "caddy": artifacts["caddy"]["sha256"],
+                **{
+                    name: sha256_file(Path(temporary) / name)
+                    for name in configs
+                },
+            }
+            index = Path(temporary) / "deployment-files.sha256"
+            index.write_text(
+                "".join(f"{digest}  {name}\n" for name, digest in sorted(deployment_hashes.items())),
+                encoding="ascii",
+            )
+            deployment_index_sha = sha256_file(index)
+            self.scp(node, str(index), f"{root}/deployment-files.sha256")
         verify_script = r"""
 set -eu
-root=$1 binary_sha=$2 genesis_sha=$3 checkpoint_sha=$4 legacy_validators_sha=$5 caddy_sha=$6 model=$7 model_sha=$8
+root=$1 binary_sha=$2 genesis_sha=$3 checkpoint_sha=$4 legacy_validators_sha=$5 caddy_sha=$6 model=$7 model_sha=$8 model_size=$9 digest=${10} deployment_index_sha=${11}
+test -d "$root" && test ! -L "$root"
+test "$(cat "$root/.arc-recovery-rollout-owner")" = "$digest"
+test -f "$root/deployment-files.sha256" && test ! -L "$root/deployment-files.sha256"
+printf '%s  %s/deployment-files.sha256\n' "$deployment_index_sha" "$root" | sha256sum --check --strict
+if find "$root" -maxdepth 1 -type l -print -quit | grep . >/dev/null; then
+  printf 'staged rollout root contains a symlink\n' >&2
+  exit 1
+fi
+(cd "$root" && sha256sum --check --strict deployment-files.sha256)
 printf '%s  %s/arc-node\n' "$binary_sha" "$root" | sha256sum --check --strict
 printf '%s  %s/genesis.toml\n' "$genesis_sha" "$root" | sha256sum --check --strict
 printf '%s  %s/recovery.arcchkpt\n' "$checkpoint_sha" "$root" | sha256sum --check --strict
@@ -1875,10 +2175,21 @@ printf '%s  %s/legacy-validator-set-40m.json\n' "$legacy_validators_sha" "$root"
 printf '%s  %s/caddy\n' "$caddy_sha" "$root" | sha256sum --check --strict
 test -f "$model"
 test ! -L "$model"
+test "$(stat -c %s "$model")" = "$model_size"
 printf '%s  %s\n' "$model_sha" "$model" | sha256sum --check --strict
 chmod 0500 "$root/arc-node" "$root/caddy"
 chmod 0400 "$root/genesis.toml" "$root/recovery.arcchkpt" "$root/legacy-validator-set-40m.json" "$root/Caddyfile" "$root"/*.conf "$root"/*.service
 "$root/caddy" validate --config "$root/Caddyfile" --adapter caddyfile
+if test -e "$root/.arc-recovery-stage-complete"; then
+  test -f "$root/.arc-recovery-stage-complete" && test ! -L "$root/.arc-recovery-stage-complete"
+  test "$(cat "$root/.arc-recovery-stage-complete")" = "$digest"
+else
+  python3 - "$root/.arc-recovery-stage-complete" "$digest" <<'PY'
+import os,sys
+fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o400)
+with os.fdopen(fd,"w",encoding="ascii") as h: h.write(sys.argv[2]+"\n"); h.flush(); os.fsync(h.fileno())
+PY
+fi
 """
         self.ssh(
             node,
@@ -1892,21 +2203,103 @@ chmod 0400 "$root/genesis.toml" "$root/recovery.arcchkpt" "$root/legacy-validato
                 artifacts["caddy"]["sha256"],
                 node["model_path"],
                 node["model_sha256"],
+                str(node["model_size_bytes"]),
+                self.digest,
+                deployment_index_sha,
             ),
         )
         remote_verify = self.recovery_cli("verify", node, remote=True)
-        remote_import = self.recovery_cli("import", node, remote=True)
+        partial_data = f"{node['data_dir']}.arc-recovery-import-{self.digest}"
+        remote_import = self.recovery_cli(
+            "import", node, remote=True, data_dir_override=partial_data
+        )
         self.ssh(node, 'set -eu\nexec "$@"\n', tuple(remote_verify), timeout=600)
-        self.ssh(node, 'set -eu\ntest ! -e "$1"\nshift\nexec "$@"\n', (node["data_dir"], *remote_import), timeout=600)
+        import_script = r'''
+set -eu
+data=$1 partial=$2 digest=$3 transition=$4 checkpoint_manifest=$5
+owner="${partial}.owner"
+marker_name=.arc-recovery-rollout.json
+validate_marker() {
+  python3 - "$1/$marker_name" "$digest" "$transition" "$checkpoint_manifest" <<'PY'
+import json,pathlib,sys
+p=pathlib.Path(sys.argv[1]); v=json.loads(p.read_text(encoding="utf-8"))
+e={"schema":"arc.recovery.import-complete.v1","rollout_manifest_sha256":sys.argv[2],"transition_height":int(sys.argv[3]),"checkpoint_manifest_hash":sys.argv[4]}
+if p.is_symlink() or v != e or p.read_text(encoding="utf-8") != json.dumps(e,sort_keys=True,separators=(",",":"))+"\n": raise SystemExit("import completion marker differs")
+PY
+}
+if test -e "$data"; then
+  test -d "$data" && test ! -L "$data"
+  validate_marker "$data"
+  if test -e "$owner"; then test -f "$owner" && test ! -L "$owner" && test "$(cat "$owner")" = "$digest"; rm -f -- "$owner"; fi
+  exit 0
+fi
+resume_owned_partial=false
+if test -e "$owner"; then
+  test -f "$owner" && test ! -L "$owner" && test "$(cat "$owner")" = "$digest"
+  resume_owned_partial=true
+else
+  test ! -e "$partial"
+  python3 - "$owner" "$digest" <<'PY'
+import os,sys
+fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o400)
+with os.fdopen(fd,"w",encoding="ascii") as h: h.write(sys.argv[2]+"\n"); h.flush(); os.fsync(h.fileno())
+PY
+fi
+if test -e "$partial"; then
+  test "$resume_owned_partial" = true
+  test -d "$partial" && test ! -L "$partial"
+  if test -f "$partial/$marker_name" && test ! -L "$partial/$marker_name"; then
+    validate_marker "$partial"
+    mv --no-clobber -T -- "$partial" "$data"
+    test ! -e "$partial"
+    validate_marker "$data"
+    rm -f -- "$owner"
+    exit 0
+  fi
+  find "$partial" -xdev -depth -delete
+fi
+shift 5
+summary=$("$@")
+python3 - "$summary" "$transition" "$checkpoint_manifest" <<'PY'
+import json,sys
+v=json.loads(sys.argv[1]); h=str(v.get("manifest_hash","")).removeprefix("0x")
+if v.get("status")!="ACTIVATED" or v.get("height")!=int(sys.argv[2]) or h!=sys.argv[3]: raise SystemExit("recovery import did not activate the exact approved H+1 checkpoint")
+PY
+python3 - "$partial/$marker_name" "$digest" "$transition" "$checkpoint_manifest" <<'PY'
+import json,os,sys
+p=sys.argv[1]; v={"schema":"arc.recovery.import-complete.v1","rollout_manifest_sha256":sys.argv[2],"transition_height":int(sys.argv[3]),"checkpoint_manifest_hash":sys.argv[4]}; b=(json.dumps(v,sort_keys=True,separators=(",",":"))+"\n").encode(); fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|getattr(os,"O_NOFOLLOW",0),0o400)
+with os.fdopen(fd,"wb") as h: h.write(b); h.flush(); os.fsync(h.fileno())
+PY
+mv --no-clobber -T -- "$partial" "$data"
+test ! -e "$partial"
+validate_marker "$data"
+rm -f -- "$owner"
+'''
+        self.ssh(
+            node,
+            import_script,
+            (
+                node["data_dir"],
+                partial_data,
+                self.digest,
+                str(self.chain["transition_height"]),
+                bare_hash(self.chain["approved_checkpoint_manifest_hash"], "checkpoint manifest hash"),
+                *remote_import,
+            ),
+            timeout=600,
+        )
         self.say(f"PASS {node['name']} staged exact artifacts and imported checkpoint into fresh data")
 
     def _install_gateway_and_unit(self, node: Mapping[str, Any]) -> None:
         root = node["remote_root"]
         gateway_script = r"""
 set -eu
-root=$1 hostname=$2 service=$3 gateway_service=$4 filter_service=$5
+root=$1 hostname=$2 service=$3 gateway_service=$4 filter_service=$5 digest=$6
 export DEBIAN_FRONTEND=noninteractive
-for retired in arc-self-heal.service arc-node.service; do
+test -d "$root" && test ! -L "$root"
+test -f "$root/.arc-recovery-stage-complete" && test ! -L "$root/.arc-recovery-stage-complete"
+test ! -e /root/.arc-recovery-legacy-start-allowed
+for retired in arc-self-heal.service arc-node.service arc-node-update.service; do
   fence="/etc/systemd/system/$retired.d/arc-recovery-freeze.conf"
   test -f "$fence"
   grep -Fxq 'RefuseManualStart=yes' "$fence"
@@ -1914,14 +2307,30 @@ for retired in arc-self-heal.service arc-node.service; do
   ! systemctl is-active --quiet "$retired"
   ! systemctl is-enabled --quiet "$retired"
 done
-old_nginx_active=$(systemctl is-active nginx.service 2>/dev/null || true)
-old_nginx_enabled=$(systemctl is-enabled nginx.service 2>/dev/null || true)
-{
-  printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  printf 'nginx_active=%s\n' "$old_nginx_active"
-  printf 'nginx_enabled=%s\n' "$old_nginx_enabled"
-  ss -ltnp | grep -E ':(80|443)[[:space:]]' || true
-} > "$root/pre-gateway.inventory"
+inventory="$root/pre-gateway.inventory"
+if test -e "$inventory"; then
+  test -f "$inventory" && test ! -L "$inventory"
+  test "$(grep -c '^rollout_manifest_sha256=' "$inventory")" = 1
+  grep -Fxq "rollout_manifest_sha256=$digest" "$inventory"
+  test "$(grep -c '^nginx_active=' "$inventory")" = 1
+  test "$(grep -c '^nginx_enabled=' "$inventory")" = 1
+else
+  temporary=$(mktemp "$root/.pre-gateway.XXXXXX")
+  {
+    printf 'captured_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'rollout_manifest_sha256=%s\n' "$digest"
+    printf 'nginx_active=%s\n' "$(systemctl is-active nginx.service 2>/dev/null || true)"
+    printf 'nginx_enabled=%s\n' "$(systemctl is-enabled nginx.service 2>/dev/null || true)"
+    ss -ltnp | grep -E ':(80|443)[[:space:]]' || true
+  } > "$temporary"
+  chmod 0400 "$temporary"
+  mv --no-clobber -T -- "$temporary" "$inventory"
+  if test -e "$temporary"; then rm -f -- "$temporary"; fi
+  test -f "$inventory" && test ! -L "$inventory"
+  grep -Fxq "rollout_manifest_sha256=$digest" "$inventory"
+fi
+old_nginx_active=$(sed -n 's/^nginx_active=//p' "$inventory")
+old_nginx_enabled=$(sed -n 's/^nginx_enabled=//p' "$inventory")
 rollback_on_error() {
   status=$?
   if [ "$status" -ne 0 ]; then
@@ -1944,13 +2353,20 @@ if ss -ltnp | grep -E ':(80|443)[[:space:]]' >/dev/null; then
   printf 'ports 80/443 remain occupied after stopping system nginx\n' >&2
   exit 1
 fi
-mkdir --mode=0700 "$root/nginx-state" "$root/caddy-data" "$root/caddy-config"
+for directory in "$root/nginx-state" "$root/caddy-data" "$root/caddy-config"; do
+  if test -e "$directory"; then test -d "$directory" && test ! -L "$directory"; else mkdir --mode=0700 "$directory"; fi
+done
 /usr/sbin/nginx -t -c "$root/nginx-filter.conf" -p "$root/nginx-state"
 "$root/caddy" validate --config "$root/Caddyfile" --adapter caddyfile
 for unit in "$service" "$gateway_service" "$filter_service"; do
-  test ! -e "/etc/systemd/system/$unit"
-  cp --no-clobber "$root/$unit" "/etc/systemd/system/$unit"
-  chmod 0644 "/etc/systemd/system/$unit"
+  installed="/etc/systemd/system/$unit"
+  if test -e "$installed"; then
+    test -f "$installed" && test ! -L "$installed"
+    cmp --silent "$root/$unit" "$installed"
+  else
+    cp --no-clobber "$root/$unit" "$installed"
+  fi
+  chmod 0644 "$installed"
 done
 systemctl daemon-reload
 systemctl enable "$filter_service" "$gateway_service" "$service"
@@ -1973,6 +2389,7 @@ systemctl is-active --quiet "$filter_service"
 systemctl is-active --quiet "$gateway_service"
 trap - EXIT
 """
+        self.prepared_production.add(node["name"])
         self.ssh(
             node,
             gateway_script,
@@ -1982,10 +2399,10 @@ trap - EXIT
                 node["service_name"],
                 self.gateway_service_name(node),
                 self.filter_service_name(node),
+                self.digest,
             ),
             timeout=900,
         )
-        self.prepared_production.add(node["name"])
         self.say(f"PASS {node['name']} issued trusted Caddy TLS and installed locked gateway/filter/node units")
 
     def production_service(self, node: Mapping[str, Any], action: str) -> None:
@@ -2161,7 +2578,46 @@ fi
                 time.sleep(self.checks["poll_interval_seconds"])
         raise RolloutError(f"production shard topology did not converge: {last_error}")
 
+    def prove_production_runtime_inventory(self) -> None:
+        script = r"""
+set -eu
+service=$1 argv_sha=$2 executable=$3 model=$4 model_sha=$5 model_size=$6
+pid=$(systemctl show "$service" --property=MainPID --value)
+case "$pid" in ''|0|*[!0-9]*) printf 'service has no exact MainPID\n' >&2; exit 1 ;; esac
+test -d "/proc/$pid"
+test "$(cat "/proc/$pid/comm")" = arc-node
+test "$(pgrep -x arc-node)" = "$pid"
+test "$(readlink "/proc/$pid/exe")" = "$executable"
+test "$(sha256sum "/proc/$pid/cmdline" | cut -d' ' -f1)" = "$argv_sha"
+test -f "$model"
+test ! -L "$model"
+test "$(stat -c %s "$model")" = "$model_size"
+printf '%s  %s\n' "$model_sha" "$model" | sha256sum --check --strict
+"""
+        for node in self.validators:
+            argv_bytes = b"\0".join(
+                item.encode("utf-8") for item in self.runtime_argv(node, remote=True)
+            ) + b"\0"
+            self.ssh(
+                node,
+                script,
+                (
+                    node["service_name"],
+                    sha256_bytes(argv_bytes),
+                    f"{node['remote_root']}/arc-node",
+                    node["model_path"],
+                    node["model_sha256"],
+                    str(node["model_size_bytes"]),
+                ),
+            )
+        self.say(
+            "PASS all six systemd MainPIDs use the sealed absolute model path, exact model bytes/size, and per-node shard argv"
+        )
+
     def execute_production(self) -> None:
+        # Re-hash every executing rollout/archive component after authorization
+        # and immediately before the first remote mutation.
+        self.verify_execution_provenance()
         complete = False
         try:
             for node in self.validators:
@@ -2175,6 +2631,7 @@ fi
                     future.result()
             self.production_service(self.validators[-1], "start")
             self.wait_nodes_ready()
+            self.prove_production_runtime_inventory()
             for node in self.validators:
                 self._prove_production_listener(node)
             self.say("PASS all public sources use verified HTTPS and every arc-node RPC listener is loopback-only")
@@ -2185,6 +2642,7 @@ fi
                 before = self.wait_convergence()[0]
                 self.production_service(node, "restart")
                 self.wait_nodes_ready(timeout=self.checks["restart_timeout_seconds"])
+                self.prove_production_runtime_inventory()
                 after = self.wait_convergence(
                     minimum_height=before + self.checks["min_height_advance"],
                     timeout=self.checks["restart_timeout_seconds"],
@@ -2194,6 +2652,7 @@ fi
             evidence = self.obtain_receipt_evidence()
             if evidence is not None:
                 self.prove_reward_receipt(evidence)
+            self.verify_production_archive(verify_live_captures=True)
             complete = True
         finally:
             if not complete:
@@ -2204,8 +2663,22 @@ fi
                             self.ssh(
                                 node,
                                 r'''set -eu
-systemctl disable --now "$1" "$2" "$3"
 inventory=$4
+root=$5 digest=$6
+test -f "$root/.arc-recovery-rollout-owner" && test ! -L "$root/.arc-recovery-rollout-owner"
+test "$(cat "$root/.arc-recovery-rollout-owner")" = "$digest"
+test -f "$inventory" && test ! -L "$inventory"
+grep -Fxq "rollout_manifest_sha256=$digest" "$inventory"
+for unit in "$1" "$2" "$3"; do
+  installed="/etc/systemd/system/$unit"
+  if test -e "$installed"; then
+    test -f "$installed" && test ! -L "$installed"
+    cmp --silent "$root/$unit" "$installed"
+    systemctl disable --now "$unit"
+  else
+    ! systemctl is-active --quiet "$unit"
+  fi
+done
 old_active=$(sed -n 's/^nginx_active=//p' "$inventory")
 old_enabled=$(sed -n 's/^nginx_enabled=//p' "$inventory")
 if [ "$old_enabled" = enabled ]; then systemctl enable nginx.service; fi
@@ -2216,6 +2689,8 @@ if [ "$old_active" = active ]; then systemctl start nginx.service; fi
                                     self.gateway_service_name(node),
                                     self.filter_service_name(node),
                                     f"{node['remote_root']}/pre-gateway.inventory",
+                                    node["remote_root"],
+                                    self.digest,
                                 ),
                                 timeout=90,
                             )
@@ -2238,20 +2713,40 @@ def parse_evidence_file(path: Path) -> ReceiptEvidence:
         fail(f"cannot read reward evidence: {error}")
 
 
-def execution_authorization(manifest: Mapping[str, Any], digest: str) -> str:
+def execution_authorization(
+    manifest: Mapping[str, Any], digest: str, archive_manifest_sha256: str | None = None
+) -> str:
     if manifest["mode"] == "production":
+        if archive_manifest_sha256 is None or not LOWER_HEX_32_RE.fullmatch(archive_manifest_sha256):
+            fail("production authorization requires the verified archive-manifest sha256")
         archive = manifest["archive"]
+        destination_sha = sha256_bytes(archive["destination"].encode())
+        policy = "UNBOUND" if archive["allow_unbound_legacy_wal"] else "BOUND"
         return (
             f"GO {digest} FREEZE {archive['freeze_plan_sha256']} "
-            f"CAPTURE {archive['capture_id']}"
+            f"CAPTURE {archive['capture_id']} ARCHIVE {archive_manifest_sha256} "
+            f"DEST {destination_sha} LEGACY_WAL {policy}"
         )
     return f"GO {digest}"
 
 
-def require_go(manifest: Mapping[str, Any], digest: str, supplied_hash: str | None) -> None:
+def require_go(
+    manifest: Mapping[str, Any],
+    digest: str,
+    supplied_hash: str | None,
+    supplied_archive_hash: str | None,
+    verified_archive_hash: str | None,
+) -> None:
     if supplied_hash != digest:
         fail(f"--go-hash must exactly equal the locked rollout sha256 {digest}")
-    expected = execution_authorization(manifest, digest)
+    if manifest["mode"] == "production":
+        if supplied_archive_hash != verified_archive_hash:
+            fail(
+                "--archive-manifest-sha256 must exactly equal the fully verified remote archive"
+            )
+    elif supplied_archive_hash is not None:
+        fail("local rehearsals must not supply --archive-manifest-sha256")
+    expected = execution_authorization(manifest, digest, verified_archive_hash)
     if os.environ.get("ARC_RECOVERY_GO") != expected:
         fail(f"execution requires ARC_RECOVERY_GO={expected!r}")
 
@@ -2266,6 +2761,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--manifest", required=True, type=Path)
     run.add_argument("--execute", action="store_true")
     run.add_argument("--go-hash")
+    run.add_argument("--archive-manifest-sha256")
     verify = subparsers.add_parser("verify", help="read-only live convergence and optional mined-reward verification")
     verify.add_argument("--manifest", required=True, type=Path)
     verify.add_argument("--reward-evidence", type=Path)
@@ -2284,9 +2780,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "seal":
             digest = seal_manifest(args.draft, args.output)
             manifest, _ = load_sealed_manifest(args.output)
-            authorization = execution_authorization(manifest, digest)
             print(f"SEALED {args.output} sha256={digest}")
-            print(f"Execution authorization: ARC_RECOVERY_GO='{authorization}' --go-hash {digest}")
+            if manifest["mode"] == "production":
+                print("Execution remains locked until the bound remote archive is complete and fully verified; run the read-only plan next.")
+            else:
+                authorization = execution_authorization(manifest, digest)
+                print(f"Execution authorization: ARC_RECOVERY_GO='{authorization}' --go-hash {digest}")
             return 0
         manifest, digest = load_sealed_manifest(args.manifest)
         rollout = RecoveryRollout(manifest, digest)
@@ -2305,13 +2804,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"VERIFIED locked rollout sha256={digest}")
             return 0
         rollout.describe_plan()
-        rollout.preflight()
+        archive_manifest_sha256 = rollout.preflight()
         if not args.execute:
-            authorization = execution_authorization(manifest, digest)
+            authorization = execution_authorization(manifest, digest, archive_manifest_sha256)
             print("PLAN ONLY: no directory, process, service, package, proxy, certificate, or remote file was changed")
-            print(f"To execute this exact plan: ARC_RECOVERY_GO='{authorization}' {Path(sys.argv[0]).name} run --manifest {shlex.quote(str(args.manifest))} --execute --go-hash {digest}")
+            archive_arg = (
+                f" --archive-manifest-sha256 {archive_manifest_sha256}"
+                if archive_manifest_sha256 is not None
+                else ""
+            )
+            print(f"To execute this exact plan: ARC_RECOVERY_GO='{authorization}' {Path(sys.argv[0]).name} run --manifest {shlex.quote(str(args.manifest))} --execute --go-hash {digest}{archive_arg}")
             return 0
-        require_go(manifest, digest, args.go_hash)
+        require_go(
+            manifest,
+            digest,
+            args.go_hash,
+            args.archive_manifest_sha256,
+            archive_manifest_sha256,
+        )
         rollout.execute()
         return 0
     except RolloutError as error:
