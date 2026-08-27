@@ -171,6 +171,71 @@ fn try_rebroadcast_local_proposal(
     }
 }
 
+/// Queue the smallest recovery-DAG window that can heal a clean rolling
+/// restart. A validator can stop after its current proposal was fsynced and
+/// delivered to its peers but before their proposals for that round reached
+/// its own WAL. The live peers then advance exactly one round and stall. Their
+/// current blocks are not admissible on the restarted node until it receives
+/// the missing parent-round blocks, so replay must be parent-first.
+///
+/// Only the node's exact, already-signed local proposals are queued. This does
+/// not create a view-change certificate, relax parent quorum, or permit a
+/// second proposal for either round.
+fn queue_recovery_reconnect_replay(
+    engine: &ConsensusEngine,
+    pending_rounds: &mut std::collections::BTreeSet<u64>,
+) {
+    let current_round = engine.current_round();
+    if !engine.is_recovery_bootstrap_round(current_round)
+        && let Some(parent_round) = current_round.checked_sub(1)
+    {
+        pending_rounds.insert(parent_round);
+    }
+    pending_rounds.insert(current_round);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecoveryReplayDrain {
+    Complete,
+    Backpressured { round: u64 },
+}
+
+/// Enqueue queued reconnect proposals in ascending round order and retain the
+/// first unsent round on backpressure. Transport ordering therefore puts the
+/// missing parent before a dependent current-round block whenever both use the
+/// same connection, while the retained queue makes a full channel lossless.
+fn try_drain_recovery_reconnect_replay(
+    engine: &ConsensusEngine,
+    local_address: Hash256,
+    pending_rounds: &mut std::collections::BTreeSet<u64>,
+    pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
+    outbound: Option<&mpsc::Sender<OutboundMessage>>,
+) -> Result<RecoveryReplayDrain, String> {
+    while let Some(round) = pending_rounds.first().copied() {
+        match try_rebroadcast_local_proposal(engine, local_address, round, pending, outbound)? {
+            LocalProposalBroadcast::Enqueued => {
+                pending_rounds.remove(&round);
+            }
+            LocalProposalBroadcast::NotPresent => {
+                let local_is_validator = engine.validator_set().can_produce_blocks(&local_address);
+                if local_is_validator && round < engine.current_round() {
+                    return Err(format!(
+                        "recovery reconnect parent proposal for round {round} is missing"
+                    ));
+                }
+                // The current proposal can legitimately be absent when a peer
+                // connects before this node has collected all parents. An
+                // observer also has no local proposal to replay.
+                pending_rounds.remove(&round);
+            }
+            LocalProposalBroadcast::Backpressured => {
+                return Ok(RecoveryReplayDrain::Backpressured { round });
+            }
+        }
+    }
+    Ok(RecoveryReplayDrain::Complete)
+}
+
 fn prune_irreversible_preimages(
     pending: &dashmap::DashMap<[u8; 32], arc_types::Transaction>,
     latest_round: &dashmap::DashMap<[u8; 32], u64>,
@@ -813,6 +878,7 @@ impl ConsensusManager {
         let mut last_proposed_round = recovered_local_round;
         let mut recovery_rebroadcast_pending = recovered_local_round.is_some();
         let mut next_recovery_rebroadcast = Instant::now();
+        let mut recovery_reconnect_replay = std::collections::BTreeSet::<u64>::new();
 
         // Genesis membership and live transport connectivity are different
         // facts. The validator set must be known/frozen before networking,
@@ -822,7 +888,7 @@ impl ConsensusManager {
         let mut connected_validators =
             std::collections::HashMap::<Hash256, PeerConnectionGeneration>::new();
 
-        loop {
+        'consensus_loop: loop {
             // Single-validator: 1ms tight loop for max TPS.
             // Multi-validator: 50ms to give peer blocks time to arrive
             // before re-checking quorum parents. This amortizes the
@@ -837,6 +903,37 @@ impl ConsensusManager {
             // (~100-200ms cross-continent = 5-10 rounds/sec actual).
             let tick = if self.is_multi_validator() { 50 } else { 1 };
             tokio::time::sleep(tokio::time::Duration::from_millis(tick)).await;
+
+            // A previous reconnect attempt may have found the outbound queue
+            // full. Retry its exact parent-first window before accepting a
+            // dependent peer block or advancing local consensus state.
+            if self.engine.requires_full_round_participation()
+                && !recovery_reconnect_replay.is_empty()
+            {
+                match try_drain_recovery_reconnect_replay(
+                    &self.engine,
+                    self.validator_address,
+                    &mut recovery_reconnect_replay,
+                    &pending_txs,
+                    outbound_tx.as_ref(),
+                ) {
+                    Ok(RecoveryReplayDrain::Complete) => {
+                        next_recovery_rebroadcast =
+                            Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
+                    }
+                    Ok(RecoveryReplayDrain::Backpressured { round }) => {
+                        debug!(round, "Recovery DAG reconnect replay remains backpressured");
+                        continue;
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            "Fatal recovery DAG reconnect replay failure"
+                        );
+                        return;
+                    }
+                }
+            }
 
             // ── 0. Process inbound network messages ─────────────────────
             if let Some(ref mut rx) = inbound_rx {
@@ -860,43 +957,40 @@ impl ConsensusManager {
                                 continue;
                             }
                             if self.engine.requires_full_round_participation() {
-                                // A validator may reconnect after our current
-                                // proposal's original broadcast. Queue a
-                                // byte-identical re-broadcast so unanimity does
-                                // not depend on connection-event timing.
-                                recovery_rebroadcast_pending = true;
-                                let round = self.engine.current_round();
-                                match try_rebroadcast_local_proposal(
+                                // A validator may reconnect one round behind
+                                // after its proposal reached us but our same-
+                                // round proposal did not reach its WAL. Replay
+                                // that missing parent before the current block.
+                                queue_recovery_reconnect_replay(
+                                    &self.engine,
+                                    &mut recovery_reconnect_replay,
+                                );
+                                match try_drain_recovery_reconnect_replay(
                                     &self.engine,
                                     self.validator_address,
-                                    round,
+                                    &mut recovery_reconnect_replay,
                                     &pending_txs,
                                     outbound_tx.as_ref(),
                                 ) {
-                                    Ok(LocalProposalBroadcast::Enqueued) => {
-                                        recovery_rebroadcast_pending = false;
+                                    Ok(RecoveryReplayDrain::Complete) => {
                                         next_recovery_rebroadcast =
                                             Instant::now() + RECOVERY_DAG_REBROADCAST_INTERVAL;
                                     }
-                                    Ok(LocalProposalBroadcast::NotPresent) => {
-                                        recovery_rebroadcast_pending = false;
-                                    }
-                                    Ok(LocalProposalBroadcast::Backpressured) => {
+                                    Ok(RecoveryReplayDrain::Backpressured { round }) => {
                                         // Do not drain a newly connected peer's
-                                        // block behind this event and advance
-                                        // locally before our own durable block
+                                        // dependent block or advance locally
+                                        // before the exact parent-first window
                                         // has entered the transport queue.
                                         debug!(
                                             round,
-                                            "Recovery DAG reconnect re-broadcast is backpressured"
+                                            "Recovery DAG reconnect replay is backpressured"
                                         );
-                                        break;
+                                        continue 'consensus_loop;
                                     }
                                     Err(error) => {
                                         tracing::error!(
-                                            round,
                                             %error,
-                                            "Fatal recovery DAG reconnect re-broadcast failure"
+                                            "Fatal recovery DAG reconnect replay failure"
                                         );
                                         return;
                                     }
@@ -1365,6 +1459,16 @@ impl ConsensusManager {
                         }
                     }
                 }
+            }
+
+            // A PeerConnected event can discover backpressure while enqueueing
+            // the parent-first window. Do not process a dependent block or
+            // advance this tick; the retry at the top of the next tick drains
+            // the retained oldest round first.
+            if self.engine.requires_full_round_participation()
+                && !recovery_reconnect_replay.is_empty()
+            {
+                continue;
             }
 
             // A recovery-domain validator that restarts after fsync has already
@@ -2389,7 +2493,7 @@ mod tests {
     }
 
     #[test]
-    fn rolling_restart_rebroadcasts_exact_proposals_and_all_six_advance() {
+    fn rolling_restart_replays_missing_parent_before_current_and_all_six_advance() {
         let validators: Vec<_> = (0..6)
             .map(|index| hash_bytes(format!("restart-validator-{index}").as_bytes()))
             .collect();
@@ -2417,7 +2521,7 @@ mod tests {
                 engine
             })
             .collect();
-        let proposals: Vec<_> = engines
+        let bootstrap_proposals: Vec<_> = engines
             .iter()
             .enumerate()
             .map(|(index, engine)| {
@@ -2427,87 +2531,147 @@ mod tests {
             })
             .collect();
 
-        // Model lost initial broadcasts: the five continuously-running nodes
-        // know one another's blocks but not the restarted sixth; the restarted
-        // node has only its own fsync-replayed proposal.
-        for (target, engine) in engines.iter().take(5).enumerate() {
-            for (source, proposal) in proposals.iter().take(5).enumerate() {
+        // All live peers received the soon-to-stop validator's bootstrap
+        // proposal, so all six original engines can advance one round.
+        for (target, engine) in engines.iter().enumerate() {
+            for (source, proposal) in bootstrap_proposals.iter().enumerate() {
                 if source != target {
                     engine.receive_block(proposal).unwrap();
                 }
             }
-            assert!(!engine.advance_round());
+            assert!(engine.advance_round());
+            assert_eq!(engine.current_round(), 102);
         }
-        assert!(!engines[5].advance_round());
+
+        // Five continuously-running validators produce round 102. They cannot
+        // advance without validator 5, but their round-102 blocks all depend on
+        // the complete six-author bootstrap parent set.
+        let current_proposals: Vec<_> = engines
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(index, engine)| {
+                engine
+                    .propose_block(Vec::new(), 2_000 + index as u64)
+                    .unwrap()
+            })
+            .collect();
+        for (target, engine) in engines.iter().take(5).enumerate() {
+            for (source, proposal) in current_proposals.iter().enumerate() {
+                if source != target {
+                    engine.receive_block(proposal).unwrap();
+                }
+            }
+            assert!(!engine.advance_round(), "5/6 must remain below unanimity");
+        }
+
+        // The restarted validator restores only its own durable round-101
+        // proposal. This is the exact live failure: valid peer round-102 blocks
+        // remain inadmissible because their other five parent bodies are not in
+        // the restarted process.
+        let restarted = ConsensusEngine::new(validator_set, validators[5]);
+        restarted.install_consensus_domain(domain).unwrap();
+        restarted.install_recovery_cursor(100).unwrap();
+        restarted.receive_block(&bootstrap_proposals[5]).unwrap();
+        for proposal in &current_proposals {
+            assert!(
+                restarted.receive_block(proposal).is_err(),
+                "a signature must not bypass missing parent validation"
+            );
+        }
+        assert_eq!(restarted.current_round(), 101);
 
         let pending = dashmap::DashMap::new();
         for source in 0..5 {
-            let (sender, mut receiver) = mpsc::channel(1);
-            assert_eq!(
-                try_rebroadcast_local_proposal(
-                    &engines[source],
-                    validators[source],
-                    101,
-                    &pending,
-                    Some(&sender),
-                )
-                .unwrap(),
-                LocalProposalBroadcast::Enqueued
-            );
+            let mut queued = std::collections::BTreeSet::new();
+            queue_recovery_reconnect_replay(&engines[source], &mut queued);
+            assert_eq!(queued.iter().copied().collect::<Vec<_>>(), vec![101, 102]);
+
+            // A one-slot transport proves ordering and lossless retry for the
+            // first peer. The others use two slots to prove the complete
+            // parent-first window is emitted in one drain.
+            let (sender, mut receiver) = mpsc::channel(if source == 0 { 1 } else { 2 });
             if source == 0 {
                 assert_eq!(
-                    try_rebroadcast_local_proposal(
+                    try_drain_recovery_reconnect_replay(
                         &engines[source],
                         validators[source],
-                        101,
+                        &mut queued,
                         &pending,
                         Some(&sender),
                     )
                     .unwrap(),
-                    LocalProposalBroadcast::Backpressured,
-                    "a full transport queue must defer advance rather than lose catch-up"
+                    RecoveryReplayDrain::Backpressured { round: 102 }
                 );
+                assert_eq!(queued.iter().copied().collect::<Vec<_>>(), vec![102]);
+            } else {
+                assert_eq!(
+                    try_drain_recovery_reconnect_replay(
+                        &engines[source],
+                        validators[source],
+                        &mut queued,
+                        &pending,
+                        Some(&sender),
+                    )
+                    .unwrap(),
+                    RecoveryReplayDrain::Complete
+                );
+                assert!(queued.is_empty());
             }
             let OutboundMessage::BroadcastDagBlock {
                 block,
                 transactions,
             } = receiver.try_recv().unwrap()
             else {
-                panic!("reconnect must enqueue an exact DAG proposal")
+                panic!("reconnect must enqueue an exact parent proposal")
             };
-            assert_eq!(block.hash, proposals[source].hash);
+            assert_eq!(block.hash, bootstrap_proposals[source].hash);
             assert!(transactions.is_empty());
-            engines[5].receive_block(&block).unwrap();
-        }
-        let (sender, mut receiver) = mpsc::channel(1);
-        assert_eq!(
-            try_rebroadcast_local_proposal(
-                &engines[5],
-                validators[5],
-                101,
-                &pending,
-                Some(&sender),
-            )
-            .unwrap(),
-            LocalProposalBroadcast::Enqueued
-        );
-        let OutboundMessage::BroadcastDagBlock {
-            block: restarted_block,
-            transactions: restarted_bodies,
-        } = receiver.try_recv().unwrap()
-        else {
-            panic!("restart must enqueue its exact durable DAG proposal")
-        };
-        assert_eq!(restarted_block.hash, proposals[5].hash);
-        assert!(restarted_bodies.is_empty());
-        for engine in engines.iter().take(5) {
-            engine.receive_block(&restarted_block).unwrap();
+            restarted.receive_block(&block).unwrap();
+
+            if source == 0 {
+                assert_eq!(
+                    try_drain_recovery_reconnect_replay(
+                        &engines[source],
+                        validators[source],
+                        &mut queued,
+                        &pending,
+                        Some(&sender),
+                    )
+                    .unwrap(),
+                    RecoveryReplayDrain::Complete,
+                    "draining one transport slot must retry the retained current round"
+                );
+                assert!(queued.is_empty());
+            }
+            let OutboundMessage::BroadcastDagBlock {
+                block: current,
+                transactions: current_transactions,
+            } = receiver.try_recv().unwrap()
+            else {
+                panic!("reconnect must enqueue the exact current proposal after its parent")
+            };
+            assert_eq!(current.hash, current_proposals[source].hash);
+            assert!(current_transactions.is_empty());
         }
 
-        for engine in &engines {
-            assert!(engine.advance_round());
-            assert_eq!(engine.current_round(), 102);
+        assert!(restarted.advance_round());
+        assert_eq!(restarted.current_round(), 102);
+
+        // Once the missing parent window is present, the exact same peer
+        // current blocks become admissible. The restarted validator then makes
+        // its one legal round-102 proposal and restores six-of-six progress.
+        for proposal in &current_proposals {
+            restarted.receive_block(proposal).unwrap();
         }
+        let restarted_current = restarted.propose_block(Vec::new(), 3_000).unwrap();
+        for engine in engines.iter().take(5) {
+            engine.receive_block(&restarted_current).unwrap();
+            assert!(engine.advance_round());
+            assert_eq!(engine.current_round(), 103);
+        }
+        assert!(restarted.advance_round());
+        assert_eq!(restarted.current_round(), 103);
     }
 
     #[test]
