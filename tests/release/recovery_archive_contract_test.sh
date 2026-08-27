@@ -11,9 +11,9 @@ NODE_HELPER="$REPO_ROOT/scripts/recovery/archive-node.sh"
 
 freeze_and_seal_have_independent_exact_authorizations() {
     for required in \
-        "expected_go=\"FREEZE \$capture_id\"" \
+        "expected_go=\"FREEZE \$freeze_sha CAPTURE \$capture_id\"" \
         '"${ARC_RECOVERY_FREEZE_GO:-}" = "$expected_go"' \
-        "expected_go=\"GO \$manifest_sha\"" \
+        "expected_go=\"GO \$manifest_sha FREEZE \$freeze_sha CAPTURE \$capture_id\"" \
         '"${ARC_RECOVERY_GO:-}" = "$expected_go"' \
         'execute=false' \
         "grep -Eq '^[0-9a-f]{64}\$'"
@@ -45,15 +45,36 @@ path = pathlib.Path(sys.argv[1])
 assert stat.S_IMODE(path.stat().st_mode) & 0o222 == 0
 assert stat.S_IMODE(path.with_name(path.name + ".sha256").stat().st_mode) & 0o222 == 0
 value = json.loads(path.read_text())
-assert value["schema"] == "arc.recovery.freeze-plan.v1"
+assert value["schema"] == "arc.recovery.freeze-plan.v2"
 assert value["sentinels"] == ["nyc", "lax"]
 assert [item["name"] for item in value["nodes"]] == ["nyc", "lax", "ams", "lhr", "nrt", "sgp"]
+assert len(value["remote_helper_sha256"]) == 64
+assert len(value["orchestrator_sha256"]) == 64
+assert len(value["source_commit"]) in {40, 64}
 payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 assert path.read_bytes() == payload
 digest = hashlib.sha256(payload).hexdigest()
 assert path.with_name(path.name + ".sha256").read_text() == f"{digest}  {path.name}\n"
 PY
     "$ORCHESTRATOR" seal-freeze-plan --window replacement --output "$plan" >/dev/null 2>&1 && return 1
+
+    chmod 600 "$plan" "$plan.sha256"
+    python3 - "$plan" <<'PY' || return 1
+import hashlib
+import json
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+value["remote_helper_sha256"] = "0" * 64
+payload = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+path.write_bytes(payload)
+path.with_name(path.name + ".sha256").write_text(
+    f"{hashlib.sha256(payload).hexdigest()}  {path.name}\n"
+)
+PY
+    chmod 444 "$plan" "$plan.sha256"
+    "$ORCHESTRATOR" capture --freeze-plan "$plan" --plan >/dev/null 2>&1 && return 1
     return 0
 )
 
@@ -155,9 +176,9 @@ legacy_source_set_is_manifest_bound_staged_and_archived() {
         'artifacts.source_wal.sha256' \
         'stage_file "$node" "$manifest_sha" legacy-validators' \
         'legacy-validator-set-40m.json' \
-        'upload_immutable "$legacy_validator_set"' \
-        'upload_immutable "$source_snapshot"' \
-        'upload_immutable "$source_wal"' \
+        'copy_shared_input "$legacy_validator_set"' \
+        'copy_shared_input "$source_snapshot"' \
+        'copy_shared_input "$source_wal"' \
         'verify_reference_pair'
     do
         grep -Fq -- "$required" "$ORCHESTRATOR" || {
@@ -231,6 +252,7 @@ forks_are_labelled_retained_and_only_canonical_match_gates_seal() {
 mixed_all_six_classifications_are_counted_without_dropping_invalid_evidence() (
     # Sourcing defines the exact production summarizer; the empty command only
     # prints usage and performs no mutation.
+    # shellcheck source=/dev/null
     . "$ORCHESTRATOR" >/dev/null
     local summary
     summary="$(printf '%s\n' \
@@ -254,8 +276,11 @@ mixed_all_six_classifications_are_counted_without_dropping_invalid_evidence() (
 )
 
 offline_wal_boundary_slices_and_reconstructs_exact_immutable_bytes() (
+    # shellcheck source=/dev/null
     . "$NODE_HELPER" >/dev/null
-    local fixture="$TEST_TMP/wal-boundary"
+    local fixture
+    fixture="$(mktemp -d)"
+    trap 'rm -rf -- "$fixture"' EXIT
     mkdir -p "$fixture/evidence"
     printf 'committed-tail' > "$fixture/state.wal"
     cat > "$fixture/export-summary.json" <<'JSON'
@@ -336,6 +361,133 @@ archives_are_create_only_and_exclude_private_noncanonical_bulk() {
     fi
 }
 
+freeze_execution_rehashes_the_exact_reviewed_helper() {
+    for required in \
+        '"remote_helper_sha256": helper_sha' \
+        '"orchestrator_sha256": orchestrator_sha' \
+        '"source_commit": source_commit' \
+        'actual=$(sha256sum "$helper" | cut -d" " -f1)' \
+        'test "$actual" = "$expected"' \
+        'exec "$helper" "$@"'
+    do
+        grep -Fq -- "$required" "$ORCHESTRATOR" || {
+            printf 'freeze/helper source binding is missing: %s\n' "$required"
+            return 1
+        }
+    done
+}
+
+archive_manifest_and_complete_are_canonical_all_six_and_fail_closed() (
+    # shellcheck source=/dev/null
+    . "$ORCHESTRATOR" >/dev/null
+    local fixture
+    fixture="$(mktemp -d)"
+    trap 'rm -rf -- "$fixture"' EXIT
+    mkdir -p "$fixture/shared" "$fixture/metadata" "$fixture/complete" "$fixture/remote" "$fixture/bin"
+    printf 'alpha\n' > "$fixture/shared/a.txt"
+    printf 'beta\n' > "$fixture/shared/b.txt"
+    python3 - "$fixture/statuses.jsonl" <<'PY' || return 1
+import hashlib
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+nodes = ("nyc", "lax", "ams", "lhr", "nrt", "sgp")
+classifications = (
+    "valid_canonical", "valid_noncanonical_fork", "valid_noncanonical_fork",
+    "valid_noncanonical_fork", "valid_noncanonical_fork", "preserved_unclassified",
+)
+rows = []
+for index, (node, classification) in enumerate(zip(nodes, classifications), 1):
+    def digest(label):
+        return hashlib.sha256(f"{node}-{label}".encode()).hexdigest()
+    prefix = f"legacy-{node}"
+    rows.append({
+        "schema": "arc.recovery.bundle-status.v1",
+        "capture_id": "b" * 64,
+        "node": node,
+        "rollout_manifest_sha256": "c" * 64,
+        "classification": classification,
+        "bundle": {
+            "name": prefix + ".tar.zst", "size": index,
+            "sha256": digest("bundle"),
+            "sidecar_name": prefix + ".tar.zst.sha256",
+            "sidecar_sha256": digest("bundle-sidecar"),
+        },
+        "inventory": {
+            "name": prefix + ".inventory", "size": index + 10,
+            "sha256": digest("inventory"),
+            "sidecar_name": prefix + ".inventory.sha256",
+            "sidecar_sha256": digest("inventory-sidecar"),
+        },
+    })
+path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows))
+PY
+    local archive_sha
+    archive_sha="$(build_archive_metadata \
+        "$fixture/shared" "$fixture/statuses.jsonl" "$fixture/metadata" "$fixture/complete" \
+        "$(printf 'a%.0s' {1..64})" "$(printf 'b%.0s' {1..64})" \
+        "$(printf 'c%.0s' {1..64})" "$(printf '1%.0s' {1..40})" \
+        "$(printf 'd%.0s' {1..64})" "$(printf 'e%.0s' {1..64})" 1 4 1)" || return 1
+    [ "$archive_sha" = "$(hash_file "$fixture/metadata/ARCHIVE-MANIFEST.json")" ] || return 1
+    python3 - "$fixture/metadata/ARCHIVE-MANIFEST.json" "$fixture/complete/COMPLETE.json" <<'PY' || return 1
+import json
+import pathlib
+import sys
+manifest = json.loads(pathlib.Path(sys.argv[1]).read_text())
+complete = json.loads(pathlib.Path(sys.argv[2]).read_text())
+assert manifest["schema"] == "arc.recovery.archive-manifest.v1"
+assert [row["node"] for row in manifest["validator_bundles"]] == ["nyc", "lax", "ams", "lhr", "nrt", "sgp"]
+assert manifest["classification_counts"] == {
+    "valid_canonical": 1,
+    "valid_noncanonical_fork": 4,
+    "preserved_unclassified": 1,
+}
+assert {row["name"] for row in manifest["shared_inputs"]} == {"a.txt", "b.txt"}
+assert complete["schema"] == "arc.recovery.archive-complete.v1"
+assert complete["validator_bundle_count"] == 6
+assert complete["object_count_before_complete"] == 29
+PY
+    cp "$fixture/metadata/ARCHIVE-MANIFEST.json" "$fixture/remote/"
+    cp "$fixture/metadata/ARCHIVE-MANIFEST.json.sha256" "$fixture/remote/"
+    cat > "$fixture/bin/rclone" <<'SH'
+#!/bin/sh
+test "$1" = cat || exit 2
+path=${2#local:}
+exec /bin/cat -- "$path"
+SH
+    chmod 700 "$fixture/bin/rclone"
+    PATH="$fixture/bin:$PATH" verify_remote_complete "local:$fixture/remote" >/dev/null 2>&1 && return 1
+    cp "$fixture/complete/COMPLETE.json" "$fixture/remote/"
+    PATH="$fixture/bin:$PATH" verify_remote_complete "local:$fixture/remote" >/dev/null || return 1
+    chmod 600 "$fixture/remote/COMPLETE.json"
+    printf ' ' >> "$fixture/remote/COMPLETE.json"
+    PATH="$fixture/bin:$PATH" verify_remote_complete "local:$fixture/remote" >/dev/null 2>&1 && return 1
+    return 0
+)
+
+archive_upload_orders_checks_manifest_and_complete_last() {
+    python3 - "$ORCHESTRATOR" <<'PY' || return 1
+import pathlib
+import sys
+text = pathlib.Path(sys.argv[1]).read_text()
+text = text[text.index("seal_phase()") :]
+markers = [
+    'rclone check "$source_dir" "$destination"',
+    'rclone check "$shared_root" "$destination"',
+    'rclone copy "$metadata_root" "$destination"',
+    'rclone check "$metadata_root" "$destination"',
+    'upload_immutable "$complete_root/COMPLETE.json" "$destination/COMPLETE.json"',
+    'verify_remote_complete "$destination" "$complete_root/COMPLETE.json"',
+]
+positions = [text.index(marker) for marker in markers[:-1]] + [text.rindex(markers[-1])]
+assert positions == sorted(positions), positions
+assert 'if [ "$complete_exists" != true ]; then' in text
+assert 'existing COMPLETE.json exactly matches; verification-only resume' in text
+PY
+}
+
 archive_scripts_are_lintable() {
     bash -n "$NODE_HELPER" "$ORCHESTRATOR" || return 1
     shellcheck -S warning "$NODE_HELPER" "$ORCHESTRATOR"
@@ -363,6 +515,12 @@ run_test 'Drive upload uses two bounded three-node batches and aggregates every 
     drive_upload_is_operator_owned_bounded_parallel_and_aggregate_checked
 run_test 'archives are create-only, retain complete chain data, and exclude out-of-tree secrets/build/Git' \
     archives_are_create_only_and_exclude_private_noncanonical_bulk
+run_test 'freeze plan binds source and every remote helper execution re-hashes exact bytes' \
+    freeze_execution_rehashes_the_exact_reviewed_helper
+run_test 'top-level archive manifest binds all six bundles and consumers reject missing/tampered COMPLETE' \
+    archive_manifest_and_complete_are_canonical_all_six_and_fail_closed
+run_test 'bundle checks precede archive metadata and immutable COMPLETE is the last upload' \
+    archive_upload_orders_checks_manifest_and_complete_last
 run_test 'fleet archive scripts pass shell syntax and warning lint' archive_scripts_are_lintable
 
 finish_tests

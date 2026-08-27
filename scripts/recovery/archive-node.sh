@@ -45,6 +45,7 @@ Usage (operator orchestration only):
     SOURCE_CONSENSUS_ROUND CREATED_AT_UNIX_MS \
     RECOVERY_EPOCH VALIDATOR_SET_ID ALLOW_UNBOUND_LEGACY_WAL
   archive-node.sh bundle CAPTURE_SHA256 NODE MANIFEST_SHA256
+  archive-node.sh bundle-status CAPTURE_SHA256 NODE MANIFEST_SHA256
   archive-node.sh verify-index CAPTURE_DIRECTORY
 
 fence-stop must complete on enough validators to halt quorum before
@@ -1309,6 +1310,80 @@ bundle_capture() {
         "$node" "$classification" "$(stat -c %s "$archive")" "$(hash_file "$archive")"
 }
 
+bundle_status() {
+    local capture_id="$1" node="$2" manifest="$3"
+    require_hash "$capture_id" "capture id"
+    require_node "$node"
+    require_hash "$manifest" "manifest hash"
+    require_commands python3 stat
+    local archive_root="$ARCHIVE_BASE/$manifest"
+    local archive="$archive_root/legacy-$node.tar.zst"
+    local checksum="$archive.sha256"
+    local inventory="$archive_root/legacy-$node.inventory"
+    local inventory_checksum="$inventory.sha256"
+    local candidate
+    for candidate in "$archive" "$checksum" "$inventory" "$inventory_checksum"; do
+        [ -f "$candidate" ] && [ ! -L "$candidate" ] || \
+            die "bundle status input is missing, non-regular, or a symlink: $candidate"
+    done
+
+    local archive_sha inventory_sha checksum_sha inventory_checksum_sha classification
+    archive_sha="$(hash_file "$archive")"
+    inventory_sha="$(hash_file "$inventory")"
+    [ "$(cat "$checksum")" = "$archive_sha  ${archive##*/}" ] || \
+        die "archive sidecar does not exactly bind the verified archive"
+    [ "$(cat "$inventory_checksum")" = "$inventory_sha  ${inventory##*/}" ] || \
+        die "inventory sidecar does not exactly bind the verified inventory"
+    grep -Fxq "manifest_sha256=$manifest" "$inventory" || \
+        die "bundle inventory rollout manifest differs"
+    grep -Fxq "capture_id=$capture_id" "$inventory" || \
+        die "bundle inventory capture id differs"
+    grep -Fxq "node=$node" "$inventory" || die "bundle inventory node differs"
+    classification="$(sed -n 's/^classification=//p' "$inventory")"
+    case "$classification" in
+        valid_canonical|valid_noncanonical_fork|preserved_unclassified) ;;
+        *) die "bundle inventory has an invalid classification" ;;
+    esac
+    checksum_sha="$(hash_file "$checksum")"
+    inventory_checksum_sha="$(hash_file "$inventory_checksum")"
+
+    python3 - "$capture_id" "$node" "$manifest" "$classification" \
+        "${archive##*/}" "$(stat -c %s "$archive")" "$archive_sha" \
+        "${checksum##*/}" "$checksum_sha" \
+        "${inventory##*/}" "$(stat -c %s "$inventory")" "$inventory_sha" \
+        "${inventory_checksum##*/}" "$inventory_checksum_sha" <<'PY'
+import json
+import sys
+
+(capture_id, node, manifest, classification, archive_name, archive_size,
+ archive_sha, archive_sidecar_name, archive_sidecar_sha, inventory_name,
+ inventory_size, inventory_sha, inventory_sidecar_name,
+ inventory_sidecar_sha) = sys.argv[1:]
+value = {
+    "schema": "arc.recovery.bundle-status.v1",
+    "capture_id": capture_id,
+    "node": node,
+    "rollout_manifest_sha256": manifest,
+    "classification": classification,
+    "bundle": {
+        "name": archive_name,
+        "size": int(archive_size),
+        "sha256": archive_sha,
+        "sidecar_name": archive_sidecar_name,
+        "sidecar_sha256": archive_sidecar_sha,
+    },
+    "inventory": {
+        "name": inventory_name,
+        "size": int(inventory_size),
+        "sha256": inventory_sha,
+        "sidecar_name": inventory_sidecar_name,
+        "sidecar_sha256": inventory_sidecar_sha,
+    },
+}
+print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+PY
+}
+
 ACTION="${1:-}"
 case "$ACTION" in
     fence-stop)
@@ -1340,6 +1415,10 @@ case "$ACTION" in
     bundle)
         [ "$#" -eq 4 ] || { usage >&2; exit 2; }
         bundle_capture "$2" "$3" "$4"
+        ;;
+    bundle-status)
+        [ "$#" -eq 4 ] || { usage >&2; exit 2; }
+        bundle_status "$2" "$3" "$4"
         ;;
     binding-status)
         [ "$#" -eq 3 ] || { usage >&2; exit 2; }

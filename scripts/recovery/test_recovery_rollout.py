@@ -122,6 +122,16 @@ class ManifestFixture:
             "schema": rollout.SCHEMA,
             "rollout_id": "recovery-v3-test",
             "mode": "production" if production else "local",
+            **(
+                {
+                    "archive": {
+                        "freeze_plan_sha256": "e" * 64,
+                        "capture_id": "f" * 64,
+                    }
+                }
+                if production
+                else {}
+            ),
             "chain": {
                 "chain_id": "arc-recovery-test",
                 "genesis_hash": "0x" + "0" * 64,
@@ -210,6 +220,20 @@ class RecoveryRolloutTests(unittest.TestCase):
         with self.assertRaisesRegex(rollout.RolloutError, "missing: caddy"):
             rollout.validate_manifest(missing_caddy)
 
+        missing_archive = copy.deepcopy(value)
+        missing_archive.pop("archive")
+        with self.assertRaisesRegex(rollout.RolloutError, "manifest.archive"):
+            rollout.validate_manifest(missing_archive)
+        malformed_archive = copy.deepcopy(value)
+        malformed_archive["archive"]["capture_id"] = "F" * 64
+        with self.assertRaisesRegex(rollout.RolloutError, "capture_id"):
+            rollout.validate_manifest(malformed_archive)
+
+        local_archive = self.fixture()
+        local_archive["archive"] = {"freeze_plan_sha256": "e" * 64, "capture_id": "f" * 64}
+        with self.assertRaisesRegex(rollout.RolloutError, "must not contain"):
+            rollout.validate_manifest(local_archive)
+
     def test_production_requires_canonical_model_and_exact_balanced_3x_shards(self) -> None:
         value = self.fixture(production=True)
         self.assertIs(rollout.validate_manifest(value), value)
@@ -253,14 +277,26 @@ class RecoveryRolloutTests(unittest.TestCase):
 
     def test_exact_go_requires_argument_and_independent_phrase(self) -> None:
         locked_hash = "a" * 64
+        local = self.fixture()
         with mock.patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(rollout.RolloutError, "--go-hash"):
-                rollout.require_go(locked_hash, None)
+                rollout.require_go(local, locked_hash, None)
         with mock.patch.dict(os.environ, {"ARC_RECOVERY_GO": f"GO {locked_hash}"}, clear=True):
-            rollout.require_go(locked_hash, locked_hash)
+            rollout.require_go(local, locked_hash, locked_hash)
         with mock.patch.dict(os.environ, {"ARC_RECOVERY_GO": f"GO {'b' * 64}"}, clear=True):
             with self.assertRaisesRegex(rollout.RolloutError, "ARC_RECOVERY_GO"):
-                rollout.require_go(locked_hash, locked_hash)
+                rollout.require_go(local, locked_hash, locked_hash)
+
+        production = self.fixture(production=True)
+        production_phrase = (
+            f"GO {locked_hash} FREEZE {'e' * 64} CAPTURE {'f' * 64}"
+        )
+        self.assertEqual(rollout.execution_authorization(production, locked_hash), production_phrase)
+        with mock.patch.dict(os.environ, {"ARC_RECOVERY_GO": production_phrase}, clear=True):
+            rollout.require_go(production, locked_hash, locked_hash)
+        with mock.patch.dict(os.environ, {"ARC_RECOVERY_GO": f"GO {locked_hash}"}, clear=True):
+            with self.assertRaisesRegex(rollout.RolloutError, "ARC_RECOVERY_GO"):
+                rollout.require_go(production, locked_hash, locked_hash)
 
     def test_runtime_uses_six_explicit_origins_and_restart_omits_checkpoint(self) -> None:
         value = self.fixture()
@@ -413,6 +449,11 @@ class RecoveryRolloutTests(unittest.TestCase):
         self.assertIn("listen 127.0.0.1:18080", nginx)
         self.assertNotIn("listen 9090", nginx)
         self.assertIn("location = /internal/community/reward/approve", nginx)
+        self.assertIn("location = /community/submit_work", nginx)
+        self.assertIn(f"proxy_read_timeout {rollout.PUBLIC_INFERENCE_TIMEOUT_SECONDS}s", nginx)
+        self.assertIn(f"proxy_read_timeout {rollout.WORKER_SUBMIT_TIMEOUT_SECONDS}s", nginx)
+        self.assertIn(f"proxy_read_timeout {rollout.VALIDATOR_APPROVAL_TIMEOUT_SECONDS}s", nginx)
+        self.assertNotIn("proxy_read_timeout 3700s", nginx)
         self.assertIn("health|info|network/info", nginx)
         self.assertIn("account/(?:0x)?[0-9a-fA-F]{64}(?:/txs)?", nginx)
         internal = caddy[caddy.index("@validatorApproval"):]
@@ -434,6 +475,44 @@ class RecoveryRolloutTests(unittest.TestCase):
             "/inference/cleanup_shard",
         ):
             self.assertNotIn(private_path, rollout.DEFAULT_PUBLIC_POST_PATHS)
+
+    def test_schema_and_readme_exactly_match_the_sealed_public_api(self) -> None:
+        schema = json.loads(MODULE_PATH.with_name("recovery-manifest.schema.json").read_text())
+        gateway = schema["properties"]["gateway"]["oneOf"][1]["properties"]
+        self.assertEqual(tuple(gateway["public_get_paths"]["const"]), rollout.DEFAULT_PUBLIC_GET_PATHS)
+        self.assertEqual(tuple(gateway["public_post_paths"]["const"]), rollout.DEFAULT_PUBLIC_POST_PATHS)
+
+        readme = (MODULE_PATH.parents[2] / "README.md").read_text(encoding="utf-8")
+
+        def documented(begin: str, end: str) -> tuple[str, ...]:
+            body = readme.split(begin, 1)[1].split(end, 1)[0]
+            return tuple(
+                line[1:-1]
+                for line in body.splitlines()
+                if line.startswith("`") and line.endswith("`")
+            )
+
+        self.assertEqual(
+            documented("<!-- ARC_PUBLIC_GET_BEGIN -->", "<!-- ARC_PUBLIC_GET_END -->"),
+            rollout.DEFAULT_PUBLIC_GET_PATHS,
+        )
+        self.assertEqual(
+            documented(
+                "<!-- ARC_PUBLIC_PARAMETERIZED_GET_BEGIN -->",
+                "<!-- ARC_PUBLIC_PARAMETERIZED_GET_END -->",
+            ),
+            rollout.PUBLIC_PARAMETERIZED_GET_PATHS,
+        )
+        self.assertEqual(
+            documented("<!-- ARC_PUBLIC_POST_BEGIN -->", "<!-- ARC_PUBLIC_POST_END -->"),
+            rollout.DEFAULT_PUBLIC_POST_PATHS,
+        )
+        for path in rollout.INTERNAL_VALIDATOR_POST_PATHS + rollout.SOURCE_ONLY_NOT_PUBLIC_PATHS:
+            self.assertIn(f"`{path}`", readme)
+            self.assertNotIn(path, rollout.DEFAULT_PUBLIC_POST_PATHS)
+        self.assertIn("4,000-second", readme)
+        self.assertIn("2,700-second", readme)
+        self.assertIn("1,500-second", readme)
 
     def test_production_shard_gate_requires_exact_origin_bound_3x_view_on_every_node(self) -> None:
         value = self.fixture(production=True)

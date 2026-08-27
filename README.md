@@ -578,7 +578,7 @@ endpoints return 404 on the current binary.
 | Heterogeneous hardware scheduler, race-top-K | `/inference/plan` — planned |
 | Peer-to-peer weight distribution | planned |
 | Replicated chain across the seeds (one shared state) | v3 repair candidate built; public cutover blocked on validator key rotation and an approved genesis/checkpoint |
-| Block explorer | source-pinned static candidate built; not yet publicly deployed |
+| Block explorer | source-pinned static candidate built; not yet publicly deployed, so no explorer URL is currently supported |
 
 ---
 
@@ -601,25 +601,73 @@ rollout has installed and verified the corresponding gateways.
 Raw public `http://IP:9090` origins are legacy diagnostics, not supported v3
 client or validator configuration. Non-loopback production RPC must use HTTPS.
 
-Key endpoints:
+The sealed protocol-v3 gateway exposes only the following exact public API.
+Unknown paths and methods return 404/405; a handler existing in source does not
+make it public.
 
-| Path | Purpose |
-|---|---|
-| `/health`, `/stats`, `/info` | node + chain health |
-| `/block/latest`, `/block/{n}` | blocks (per-seed — see the state note above) |
-| `/inference/run`, `/inference/run_sharded` | single-node + sharded inference |
-| `/inference/attestations` | bounded public commitments/status for legacy inference claims; never raw prompts/outputs and never payment |
-| `/inference/results` | bounded, TTL-pruned node-local commitment metadata; raw prompts/outputs are not public |
-| `/tx/submit`, `/tx/{hash}` | transactions |
-| `/validators`, `/shards` | network state |
-| `/account/{addr}` | balances |
-| `/faucet/claim`, `/faucet/status`, `/tx/{hash}` | faucet submission is pending; only a successful mined receipt confirms the 1 ARC credit |
-| `/community/reward_policy` | active policy, recovery epoch, validator set, exact reward, and issuance readiness |
-| `/community/reward_approval/{job_id}` | local approval/submission status bound to the recovery epoch and validator set |
-| `/community/reward_job/{job_id}`, `/community/reward_receipt/{tx_hash}` | pending, mined-success, or mined-failed `0x25` evidence |
-| `/worker/earnings/{addr}` | confirmed mined `0x25` receipt rows; projection is null with an explicit reason unless policy, history, and treasury evidence permit one |
-| `/workers/scoreboard` | registered community workers |
-| `/eth` | Ethereum JSON-RPC (MetaMask compatible) |
+Public GET paths carried verbatim in the sealed rollout manifest:
+
+<!-- ARC_PUBLIC_GET_BEGIN -->
+`/health`
+`/info`
+`/network/info`
+`/stats`
+`/validators`
+`/block/latest`
+`/blocks`
+`/inference/attestations`
+`/economics/rewards`
+`/faucet/status`
+`/community/list`
+`/community/reward_policy`
+`/workers/scoreboard`
+`/shards`
+`/models`
+`/models/shards`
+<!-- ARC_PUBLIC_GET_END -->
+
+The gateway also admits these strictly shaped public GET routes:
+
+<!-- ARC_PUBLIC_PARAMETERIZED_GET_BEGIN -->
+`/block/{height}`
+`/block/{height}/txs`
+`/tx/{hash}`
+`/tx/{hash}/full`
+`/account/{address}`
+`/account/{address}/txs`
+`/worker/earnings/{address}`
+`/community/reward_receipt/{tx_hash}`
+`/community/reward_job/{job_id}`
+<!-- ARC_PUBLIC_PARAMETERIZED_GET_END -->
+
+Public POST paths carried verbatim in the sealed rollout manifest:
+
+<!-- ARC_PUBLIC_POST_BEGIN -->
+`/inference/run`
+`/inference/run_consensus`
+`/community/register`
+`/community/heartbeat`
+`/community/claim_work`
+`/community/submit_work`
+`/tx/submit_signed`
+`/faucet/claim`
+<!-- ARC_PUBLIC_POST_END -->
+
+`/inference/run*` has a 4,000-second upstream timeout, worker submission has a
+2,700-second timeout, and the validator-only approval path has a 1,500-second
+timeout. The faucet POST is only a submission; only a successful mined receipt confirms the 1 ARC credit.
+
+`/internal/community/reward/approve`, `/shards/announce`,
+`/inference/forward_shard`, and `/inference/cleanup_shard` are restricted to the
+six sealed validator IPs and have no browser CORS policy. The source handlers
+`/inference/run_sharded`, `/inference/results`, `/tx/submit`,
+`/community/reward_approval/{job_id}`, and `/eth` are intentionally not routed
+by the public v3 gateway. Legacy/demo documents describing those paths are not
+the production API contract.
+
+`/worker/earnings/{address}` returns confirmed mined `0x25` receipt rows;
+projection is null with an explicit reason unless policy, history, treasury,
+and remaining consensus budget all permit one.
 
 The public v2 seeds still exhibit two known API bugs: `/models` double-counts
 replicated layer coverage, and `/worker/earnings/{addr}` reports display
@@ -629,8 +677,7 @@ range union, while earnings count only successful retained
 attestation, failed receipt, or faucet POST never increments confirmed ARC.
 Forward projections are available only from an explicit active reward policy,
 confirmed receipt history, a treasury that can fund another full reward, and
-remaining consensus block/epoch/worker/coordinator budget; otherwise the value
-is null and the API returns the reason. The v0.8 reward is a protocol-capped
+remaining consensus block/epoch/worker/coordinator budget; otherwise the value is null and the API returns the reason. The v0.8 reward is a protocol-capped
 testnet promotional compute subsidy, not customer demand or revenue. Five-of-six
 recomputation proves output agreement, not that a customer paid for the job.
 Those fixes are not live until the fleet cutover completes.

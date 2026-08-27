@@ -86,6 +86,7 @@ DEFAULT_PUBLIC_GET_PATHS = (
     "/blocks",
     "/inference/attestations",
     "/economics/rewards",
+    "/faucet/status",
     "/community/list",
     "/community/reward_policy",
     "/workers/scoreboard",
@@ -102,7 +103,35 @@ DEFAULT_PUBLIC_POST_PATHS = (
     "/community/claim_work",
     "/community/submit_work",
     "/tx/submit_signed",
+    "/faucet/claim",
 )
+PUBLIC_PARAMETERIZED_GET_PATHS = (
+    "/block/{height}",
+    "/block/{height}/txs",
+    "/tx/{hash}",
+    "/tx/{hash}/full",
+    "/account/{address}",
+    "/account/{address}/txs",
+    "/worker/earnings/{address}",
+    "/community/reward_receipt/{tx_hash}",
+    "/community/reward_job/{job_id}",
+)
+INTERNAL_VALIDATOR_POST_PATHS = (
+    "/internal/community/reward/approve",
+    "/shards/announce",
+    "/inference/forward_shard",
+    "/inference/cleanup_shard",
+)
+SOURCE_ONLY_NOT_PUBLIC_PATHS = (
+    "/inference/run_sharded",
+    "/inference/results",
+    "/tx/submit",
+    "/community/reward_approval/{job_id}",
+    "/eth",
+)
+PUBLIC_INFERENCE_TIMEOUT_SECONDS = 4000
+VALIDATOR_APPROVAL_TIMEOUT_SECONDS = 1500
+WORKER_SUBMIT_TIMEOUT_SECONDS = 2700
 
 
 class RolloutError(RuntimeError):
@@ -239,6 +268,7 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         value,
         "manifest",
         ("schema", "rollout_id", "mode", "chain", "artifacts", "checks", "gateway", "validators"),
+        ("archive",),
     )
     if manifest["schema"] != SCHEMA:
         fail(f"manifest.schema must be {SCHEMA}")
@@ -248,6 +278,18 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     mode = manifest["mode"]
     if mode not in {"local", "production"}:
         fail("manifest.mode must be local or production")
+
+    if mode == "production":
+        archive = require_keys(
+            manifest.get("archive"),
+            "manifest.archive",
+            ("freeze_plan_sha256", "capture_id"),
+        )
+        for key in ("freeze_plan_sha256", "capture_id"):
+            if not isinstance(archive[key], str) or not LOWER_HEX_32_RE.fullmatch(archive[key]):
+                fail(f"manifest.archive.{key} must be exactly 64 lowercase hexadecimal characters")
+    elif "archive" in manifest:
+        fail("local rehearsals must not contain manifest.archive")
 
     chain = require_keys(
         manifest["chain"],
@@ -378,7 +420,7 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         for key, expected in (("public_get_paths", DEFAULT_PUBLIC_GET_PATHS), ("public_post_paths", DEFAULT_PUBLIC_POST_PATHS)):
             paths = gateway.get(key)
             if paths != list(expected):
-                fail(f"manifest.gateway.{key} must exactly match the reviewed v1 allowlist")
+                fail(f"manifest.gateway.{key} must exactly match the sealed protocol-v3 allowlist")
 
     validators = manifest["validators"]
     if not isinstance(validators, list) or len(validators) != REQUIRED_VALIDATORS:
@@ -1658,6 +1700,7 @@ http {{
     limit_req_zone $binary_remote_addr zone=arc_read_{zone}:10m rate=30r/s;
     limit_req_zone $binary_remote_addr zone=arc_write_{zone}:10m rate=30r/m;
     limit_req_zone $binary_remote_addr zone=arc_shard_{zone}:10m rate=100r/s;
+    limit_conn_zone $binary_remote_addr zone=arc_conn_{zone}:10m;
     set_real_ip_from 127.0.0.1;
     real_ip_header X-Forwarded-For;
     real_ip_recursive on;
@@ -1669,7 +1712,7 @@ http {{
         allow 127.0.0.1;
         deny all;
         client_max_body_size 1m;
-        location ~ ^/(?:health|info|network/info|stats|validators|block/latest|blocks|inference/attestations|economics/rewards|community/list|community/reward_policy|workers/scoreboard|shards|models|models/shards)$ {{
+        location ~ ^/(?:health|info|network/info|stats|validators|block/latest|blocks|inference/attestations|economics/rewards|faucet/status|community/list|community/reward_policy|workers/scoreboard|shards|models|models/shards)$ {{
             limit_except GET OPTIONS {{ deny all; }}
             limit_req zone=arc_read_{zone} burst=60 nodelay;
             proxy_pass http://{upstream};
@@ -1683,22 +1726,51 @@ http {{
             proxy_http_version 1.1;
             proxy_read_timeout 60s;
         }}
-        location ~ ^/(?:inference/run(?:_consensus)?|community/(?:register|heartbeat|claim_work|submit_work)|tx/submit_signed)$ {{
+        location ~ ^/inference/run(?:_consensus)?$ {{
             limit_except POST OPTIONS {{ deny all; }}
             limit_req zone=arc_write_{zone} burst=10 nodelay;
+            limit_conn arc_conn_{zone} 4;
             proxy_pass http://{upstream};
             proxy_http_version 1.1;
-            proxy_read_timeout 180s;
+            proxy_read_timeout {PUBLIC_INFERENCE_TIMEOUT_SECONDS}s;
             proxy_send_timeout 60s;
+        }}
+        location = /community/submit_work {{
+            limit_except POST OPTIONS {{ deny all; }}
+            limit_req zone=arc_write_{zone} burst=10 nodelay;
+            limit_conn arc_conn_{zone} 4;
+            proxy_pass http://{upstream};
+            proxy_http_version 1.1;
+            proxy_read_timeout {WORKER_SUBMIT_TIMEOUT_SECONDS}s;
+            proxy_send_timeout 60s;
+        }}
+        location ~ ^/(?:community/(?:register|heartbeat|claim_work)|tx/submit_signed)$ {{
+            limit_except POST OPTIONS {{ deny all; }}
+            limit_req zone=arc_write_{zone} burst=10 nodelay;
+            limit_conn arc_conn_{zone} 4;
+            proxy_pass http://{upstream};
+            proxy_http_version 1.1;
+            proxy_read_timeout 120s;
+            proxy_send_timeout 60s;
+        }}
+        location = /faucet/claim {{
+            limit_except POST OPTIONS {{ deny all; }}
+            limit_req zone=arc_write_{zone} burst=2 nodelay;
+            limit_conn arc_conn_{zone} 2;
+            proxy_pass http://{upstream};
+            proxy_http_version 1.1;
+            proxy_read_timeout 120s;
+            proxy_send_timeout 30s;
         }}
         location = /internal/community/reward/approve {{
 {allow_lines}
             deny all;
             limit_except POST {{ deny all; }}
             limit_req zone=arc_write_{zone} burst=10 nodelay;
+            limit_conn arc_conn_{zone} 8;
             proxy_pass http://{upstream};
             proxy_http_version 1.1;
-            proxy_read_timeout 180s;
+            proxy_read_timeout {VALIDATOR_APPROVAL_TIMEOUT_SECONDS}s;
         }}
         location ~ ^/(?:shards/announce|inference/(?:forward_shard|cleanup_shard))$ {{
 {allow_lines}
@@ -2166,10 +2238,20 @@ def parse_evidence_file(path: Path) -> ReceiptEvidence:
         fail(f"cannot read reward evidence: {error}")
 
 
-def require_go(digest: str, supplied_hash: str | None) -> None:
+def execution_authorization(manifest: Mapping[str, Any], digest: str) -> str:
+    if manifest["mode"] == "production":
+        archive = manifest["archive"]
+        return (
+            f"GO {digest} FREEZE {archive['freeze_plan_sha256']} "
+            f"CAPTURE {archive['capture_id']}"
+        )
+    return f"GO {digest}"
+
+
+def require_go(manifest: Mapping[str, Any], digest: str, supplied_hash: str | None) -> None:
     if supplied_hash != digest:
         fail(f"--go-hash must exactly equal the locked rollout sha256 {digest}")
-    expected = f"GO {digest}"
+    expected = execution_authorization(manifest, digest)
     if os.environ.get("ARC_RECOVERY_GO") != expected:
         fail(f"execution requires ARC_RECOVERY_GO={expected!r}")
 
@@ -2201,8 +2283,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         if args.command == "seal":
             digest = seal_manifest(args.draft, args.output)
+            manifest, _ = load_sealed_manifest(args.output)
+            authorization = execution_authorization(manifest, digest)
             print(f"SEALED {args.output} sha256={digest}")
-            print(f"Execution authorization: ARC_RECOVERY_GO='GO {digest}' --go-hash {digest}")
+            print(f"Execution authorization: ARC_RECOVERY_GO='{authorization}' --go-hash {digest}")
             return 0
         manifest, digest = load_sealed_manifest(args.manifest)
         rollout = RecoveryRollout(manifest, digest)
@@ -2223,10 +2307,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         rollout.describe_plan()
         rollout.preflight()
         if not args.execute:
+            authorization = execution_authorization(manifest, digest)
             print("PLAN ONLY: no directory, process, service, package, proxy, certificate, or remote file was changed")
-            print(f"To execute this exact plan: ARC_RECOVERY_GO='GO {digest}' {Path(sys.argv[0]).name} run --manifest {shlex.quote(str(args.manifest))} --execute --go-hash {digest}")
+            print(f"To execute this exact plan: ARC_RECOVERY_GO='{authorization}' {Path(sys.argv[0]).name} run --manifest {shlex.quote(str(args.manifest))} --execute --go-hash {digest}")
             return 0
-        require_go(digest, args.go_hash)
+        require_go(manifest, digest, args.go_hash)
         rollout.execute()
         return 0
     except RolloutError as error:

@@ -14,10 +14,26 @@
     "gateway",
     "validators"
   ],
+  "allOf": [
+    {
+      "if": { "properties": { "mode": { "const": "production" } }, "required": ["mode"] },
+      "then": { "required": ["archive"] },
+      "else": { "not": { "required": ["archive"] } }
+    }
+  ],
   "properties": {
     "schema": { "const": "arc.recovery.rollout.v1" },
     "rollout_id": { "type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$" },
     "mode": { "enum": ["local", "production"] },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["freeze_plan_sha256", "capture_id"],
+      "properties": {
+        "freeze_plan_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "capture_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
     "chain": {
       "type": "object",
       "additionalProperties": false,
@@ -129,6 +145,7 @@
             "public_get_paths": {
               "const": [
                 "/health",
+                "/info",
                 "/network/info",
                 "/stats",
                 "/validators",
@@ -136,6 +153,7 @@
                 "/blocks",
                 "/inference/attestations",
                 "/economics/rewards",
+                "/faucet/status",
                 "/community/list",
                 "/community/reward_policy",
                 "/workers/scoreboard",
@@ -152,7 +170,8 @@
                 "/community/heartbeat",
                 "/community/claim_work",
                 "/community/submit_work",
-                "/tx/submit_signed"
+                "/tx/submit_signed",
+                "/faucet/claim"
               ]
             }
           }

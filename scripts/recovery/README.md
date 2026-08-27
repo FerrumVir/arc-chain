@@ -6,9 +6,11 @@ keys, sign a checkpoint, or authorize production. Those are human/offline
 decisions. It makes the approved decision reproducible and refuses a partial,
 mutable, clear-text, or same-data-directory rollout.
 
-The default `run` behavior is read-only. Production mutation requires the same
+The default `run` behavior is read-only. A local mutation requires the same
 SHA-256 three times: the sealed manifest sidecar, `--go-hash`, and the exact
-`ARC_RECOVERY_GO="GO <hash>"` phrase.
+`ARC_RECOVERY_GO="GO <hash>"` phrase. Production additionally binds the sealed
+freeze-plan digest and its deterministically derived capture ID in both the
+rollout manifest and the exact GO phrase.
 
 ## Inputs
 
@@ -26,6 +28,8 @@ than JSON Schema and rejects unknown fields. A draft binds:
   mined-receipt reward gate;
 - production-only IP-derived `nip.io` (or resealed `sslip.io` fallback)
   hostnames, SSH/service identity, and create-only release/unit paths;
+- production-only `archive.freeze_plan_sha256` and `archive.capture_id`, which
+  must match the independently sealed six-node freeze exactly;
 - the pre-positioned canonical GGUF path and SHA-256 on every validator, plus
   exact per-node ranges that give every one of the 32 layers three replicas
   while loading exactly 16 layers on each validator.
@@ -101,9 +105,19 @@ deleted.
 
 ## Execute the production cutover
 
-Use the identical command with a sealed `mode: "production"` manifest only
-after the legacy fleet archive is complete and all legacy `arc-node` processes
-are stopped. The orchestrator:
+Use a sealed `mode: "production"` manifest only after the legacy fleet archive
+has a valid `COMPLETE.json` and all legacy `arc-node` processes are stopped.
+Production execution uses the extended phrase printed by `seal`:
+
+```bash
+ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id" \
+  python3 scripts/recovery/recovery_rollout.py run \
+    --manifest /secure/operator/arc-recovery.lock.json \
+    --execute \
+    --go-hash "$locked_sha256"
+```
+
+The orchestrator:
 
 1. stages and re-hashes the exact binary/genesis/checkpoint/Caddy artifacts;
 2. validates the checkpoint and Caddy configuration remotely;
@@ -126,7 +140,8 @@ the old archived fleet and never falls back to compromised identities.
 The legacy freeze and the final checkpoint seal are deliberately separate.
 The final checkpoint hash cannot exist until the forked fleet has stopped, so
 requiring that hash before capture would create a circular authorization. Seal
-a small, create-only freeze plan first:
+a small, create-only freeze plan v2 first. It binds the exact remote helper
+bytes, orchestrator bytes, source commit, sentinel order, and six hosts:
 
 ```bash
 scripts/recovery/archive-fleet-to-drive.sh seal-freeze-plan \
@@ -136,15 +151,19 @@ scripts/recovery/archive-fleet-to-drive.sh seal-freeze-plan \
 scripts/recovery/archive-fleet-to-drive.sh capture \
   --freeze-plan /secure/operator/arc-freeze.lock.json
 
-freeze_sha256='<hash printed by seal-freeze-plan>'
-ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256" \
+freeze_sha256='<freeze-plan hash printed by seal-freeze-plan>'
+capture_id='<capture id printed by seal-freeze-plan>'
+ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256 CAPTURE $capture_id" \
   scripts/recovery/archive-fleet-to-drive.sh capture \
     --freeze-plan /secure/operator/arc-freeze.lock.json \
     --execute
 ```
 
-The default `capture` is read-only. Execution installs a persistent systemd
-restart fence and cleanly stops NYC and then LAX, leaving only four of six
+The capture ID is `SHA256("ARC recovery capture v2\0" || freeze_plan_digest)`;
+it is not an operator-selected label. The default `capture` is read-only.
+Immediately before every remote helper invocation, the orchestrator re-hashes
+the installed helper and refuses any byte mismatch. Execution installs a
+persistent systemd restart fence and cleanly stops NYC and then LAX, leaving only four of six
 equal-stake validators running when five are required. Only after that quorum
 halt does it fence and stop the remaining four. After all six writers are
 proven PID-free, it copies and fsyncs each complete `arc-data` directory
@@ -188,7 +207,7 @@ scripts/recovery/archive-fleet-to-drive.sh seal \
   --allow-unbound-legacy-wal
 
 locked_sha256='<sealed rollout-manifest sha256>'
-ARC_RECOVERY_GO="GO $locked_sha256" \
+ARC_RECOVERY_GO="GO $locked_sha256 FREEZE $freeze_sha256 CAPTURE $capture_id" \
   scripts/recovery/archive-fleet-to-drive.sh seal \
     --freeze-plan /secure/operator/arc-freeze.lock.json \
     --manifest /secure/operator/arc-recovery.lock.json \
@@ -197,8 +216,11 @@ ARC_RECOVERY_GO="GO $locked_sha256" \
     --execute
 ```
 
-`seal` rechecks the immutable rollout sidecar, every artifact hash, the paired
-reference export, and the 5-of-6 signed checkpoint. On each host it copies a
+The production rollout manifest must contain the same `freeze_plan_sha256` and
+`capture_id`; neither the archive seal nor `recovery_rollout.py run --execute`
+accepts a production GO phrase without both. `seal` rechecks the immutable
+rollout sidecar, every artifact hash, the paired reference export, and the
+5-of-6 signed checkpoint. On each host it copies a
 private working tree and runs the capture's own on-disk snapshot against that
 capture's own stopped WAL. Each result is classified as `valid_canonical`,
 `valid_noncanonical_fork`, or `preserved_unclassified`. It never substitutes
@@ -219,6 +241,48 @@ WAL, final binary, genesis, source/public validator sets, signed checkpoint,
 rollout manifest, capture ID, and `SHA256SUMS`. Private identities, service
 environments, build caches, model weights, and Git objects outside `arc-data`
 remain excluded; DAG persistence inside `arc-data` is retained in full.
+
+After all six bundle/inventory pairs have been uploaded and independently
+checked, the operator builds canonical `SHA256SUMS` and
+`ARCHIVE-MANIFEST.json`. The manifest binds every shared input, all six
+classifications, bundle/inventory sizes and SHA-256 values, both archive helper
+hashes, the source commit, freeze digest, capture ID, and rollout digest. Those
+metadata files are uploaded and checked only after the bundles. Immutable
+`COMPLETE.json`, which binds the archive-manifest hash, is the final remote
+mutation. Partial destinations without it are resumable but must never be
+consumed. Verify a destination before use:
+
+```bash
+scripts/recovery/archive-fleet-to-drive.sh verify-complete \
+  --destination 'arc-drive:ARC Chain Recovery/<rollout-manifest hash>'
+```
+
+An absent, non-canonical, mismatched, or tampered `COMPLETE.json`, manifest, or
+sidecar fails closed.
+
+## Sealed production API
+
+The public GET allowlist carried verbatim in the manifest is `/health`,
+`/info`, `/network/info`, `/stats`, `/validators`, `/block/latest`, `/blocks`,
+`/inference/attestations`, `/economics/rewards`, `/faucet/status`,
+`/community/list`, `/community/reward_policy`, `/workers/scoreboard`, `/shards`,
+`/models`, and `/models/shards`. Strict parameterized public reads cover only
+blocks, transactions, accounts, worker earnings, reward receipts, and reward
+jobs in the shapes documented in the repository README.
+
+The public POST allowlist is exactly `/inference/run`,
+`/inference/run_consensus`, `/community/register`, `/community/heartbeat`,
+`/community/claim_work`, `/community/submit_work`, `/tx/submit_signed`, and
+`/faucet/claim`. Inference has a 4,000-second upstream timeout, worker result
+submission 2,700 seconds, and validator approval 1,500 seconds.
+
+`/internal/community/reward/approve`, `/shards/announce`,
+`/inference/forward_shard`, and `/inference/cleanup_shard` are validator-IP-only.
+Source handlers `/inference/run_sharded`, `/inference/results`, `/tx/submit`,
+`/community/reward_approval/{job_id}`, and `/eth` are not public v3 routes.
+Unknown paths fail closed. The block explorer is a source-pinned static
+candidate, not a deployed public service; configured origins or a successful
+frontend build do not prove an explorer deployment or fleet cutover.
 
 ## Reward gates
 
