@@ -9,7 +9,7 @@ use arc_types::{Account, Address, Block, EventLog, Identity, Transaction, TxRece
 use crossbeam::channel::{self, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -34,6 +34,38 @@ pub struct WalEntry {
     pub op: WalOp,
     /// CRC32 checksum of the serialized (block_height, sequence, op).
     pub checksum: u32,
+}
+
+/// A physically incomplete final frame that may be discarded only after a
+/// caller has independently validated an earlier complete block checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RepairableWalTail {
+    TruncatedFrameLength,
+    TruncatedFramePayload,
+}
+
+impl RepairableWalTail {
+    pub(crate) fn stable_reason(self) -> &'static str {
+        match self {
+            Self::TruncatedFrameLength => "truncated_wal_frame_length",
+            Self::TruncatedFramePayload => "truncated_wal_frame_payload",
+        }
+    }
+}
+
+/// Strictly decoded state-WAL prefix plus its exact physical frame offsets.
+///
+/// Complete malformed frames are errors, never repairable tails. Only an EOF
+/// in the final frame is classified as repairable, and the recovery layer must
+/// still prove that `entries` contain an earlier complete block checkpoint
+/// before it may truncate anything.
+#[derive(Debug)]
+pub(crate) struct RepairableWalRead {
+    pub(crate) entries: Vec<WalEntry>,
+    pub(crate) frame_end_offsets: Vec<u64>,
+    pub(crate) original_bytes: u64,
+    pub(crate) original_hash: blake3::Hash,
+    pub(crate) torn_tail: Option<RepairableWalTail>,
 }
 
 /// State operations that the WAL records.
@@ -937,6 +969,386 @@ impl Drop for WalWriter {
 
 // ── WAL Reader (for crash recovery) ─────────────────────────────────────────
 
+const MAX_WAL_ENTRY_BYTES: usize = 1024 * 1024 * 1024;
+
+fn finish_repairable_read(
+    reader: &BufReader<File>,
+    path: &Path,
+    entries: Vec<WalEntry>,
+    frame_end_offsets: Vec<u64>,
+    original_bytes: u64,
+    torn_tail: Option<RepairableWalTail>,
+) -> std::io::Result<RepairableWalRead> {
+    let final_bytes = reader.get_ref().metadata()?.len();
+    if final_bytes != original_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "WAL changed size while being inspected: path={path:?}, before={original_bytes}, after={final_bytes}"
+            ),
+        ));
+    }
+    let mut identity = reader.get_ref().try_clone()?;
+    let original_hash = hash_file_range(&mut identity, 0, original_bytes)?;
+    if identity.metadata()?.len() != original_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("WAL changed while being hashed: {path:?}"),
+        ));
+    }
+    Ok(RepairableWalRead {
+        entries,
+        frame_end_offsets,
+        original_bytes,
+        original_hash,
+        torn_tail,
+    })
+}
+
+/// Strictly read the longest physically complete state-WAL prefix.
+///
+/// This deliberately differs from [`read_wal`]: an invalid length, encoding,
+/// checksum, or sequence is always fatal. A short final length/payload is
+/// merely classified for the recovery layer, which may repair it only after
+/// independently proving an earlier block checkpoint and replayed state root.
+pub(crate) fn read_repairable_wal_prefix(
+    path: impl AsRef<Path>,
+) -> std::io::Result<RepairableWalRead> {
+    let path = path.as_ref();
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("state WAL must be a regular non-symlink file: {path:?}"),
+        ));
+    }
+    let original_bytes = metadata.len();
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut entries = Vec::new();
+    let mut frame_end_offsets = Vec::new();
+    let mut expected_sequence = 0u64;
+    let mut offset = 0u64;
+
+    loop {
+        let mut len_buf = [0u8; 4];
+        let first = reader.read(&mut len_buf[..1])?;
+        if first == 0 {
+            if offset != original_bytes {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "WAL parsed byte count differs from file size: parsed={offset}, file={original_bytes}"
+                    ),
+                ));
+            }
+            return finish_repairable_read(
+                &reader,
+                path,
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                None,
+            );
+        }
+        if let Err(error) = reader.read_exact(&mut len_buf[1..]) {
+            if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                return Err(error);
+            }
+            return finish_repairable_read(
+                &reader,
+                path,
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                Some(RepairableWalTail::TruncatedFrameLength),
+            );
+        }
+
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_WAL_ENTRY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid WAL frame length {len}"),
+            ));
+        }
+        let declared_frame_end = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(len as u64))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL byte offset overflow")
+            })?;
+        if declared_frame_end > original_bytes {
+            return finish_repairable_read(
+                &reader,
+                path,
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                Some(RepairableWalTail::TruncatedFramePayload),
+            );
+        }
+        let mut data = vec![0u8; len];
+        if let Err(error) = reader.read_exact(&mut data) {
+            if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                return Err(error);
+            }
+            return finish_repairable_read(
+                &reader,
+                path,
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                Some(RepairableWalTail::TruncatedFramePayload),
+            );
+        }
+
+        let entry: WalEntry = bincode::deserialize(&data).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid WAL entry encoding: {error}"),
+            )
+        })?;
+        let payload = bincode::serialize(&(&entry.block_height, &entry.sequence, &entry.op))
+            .map_err(std::io::Error::other)?;
+        if entry.checksum != crc32fast::hash(&payload) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL checksum mismatch at sequence {}", entry.sequence),
+            ));
+        }
+        if entry.sequence != expected_sequence {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "WAL sequence gap: expected {expected_sequence}, got {}",
+                    entry.sequence
+                ),
+            ));
+        }
+
+        offset = declared_frame_end;
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL sequence overflow")
+        })?;
+        entries.push(entry);
+        frame_end_offsets.push(offset);
+    }
+}
+
+fn hash_file_range(file: &mut File, start: u64, length: u64) -> std::io::Result<blake3::Hash> {
+    file.seek(SeekFrom::Start(start))?;
+    let mut remaining = length;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut hasher = blake3::Hasher::new();
+    while remaining != 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = file.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "state WAL changed while hashing its rejected tail",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+    Ok(hasher.finalize())
+}
+
+fn copy_file_range(
+    source: &mut File,
+    destination: &mut File,
+    start: u64,
+    length: u64,
+) -> std::io::Result<()> {
+    source.seek(SeekFrom::Start(start))?;
+    let mut remaining = length;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining != 0 {
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = source.read(&mut buffer[..limit])?;
+        if read == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "state WAL changed while copying its rejected tail",
+            ));
+        }
+        destination.write_all(&buffer[..read])?;
+        remaining -= read as u64;
+    }
+    Ok(())
+}
+
+fn verify_quarantine_file(
+    path: &Path,
+    expected_length: u64,
+    expected_hash: blake3::Hash,
+) -> std::io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() != expected_length
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("existing WAL quarantine is not the expected regular file: {path:?}"),
+        ));
+    }
+    let mut file = File::open(path)?;
+    let actual_hash = hash_file_range(&mut file, 0, expected_length)?;
+    if actual_hash != expected_hash {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("existing WAL quarantine content hash mismatch: {path:?}"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_wal_file_identity(
+    path: impl AsRef<Path>,
+    expected_bytes: u64,
+    expected_hash: blake3::Hash,
+) -> std::io::Result<()> {
+    let path = path.as_ref();
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.len() != expected_bytes
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state WAL identity changed before replay: {path:?}"),
+        ));
+    }
+    let mut file = File::open(path)?;
+    let actual_hash = hash_file_range(&mut file, 0, expected_bytes)?;
+    if actual_hash != expected_hash || file.metadata()?.len() != expected_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("state WAL content changed before replay: {path:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Durably preserve an exact rejected WAL suffix, then truncate the active WAL.
+///
+/// Quarantine publication happens before truncation. A crash before publication
+/// leaves the active WAL untouched; a crash after publication can safely retry
+/// against the content-addressed evidence file.
+pub(crate) fn quarantine_and_truncate_wal_tail(
+    path: impl AsRef<Path>,
+    accepted_prefix_bytes: u64,
+    original_bytes: u64,
+    expected_original_hash: blake3::Hash,
+) -> std::io::Result<PathBuf> {
+    let path = path.as_ref();
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("state WAL must be a regular non-symlink file: {path:?}"),
+        ));
+    }
+    if metadata.len() != original_bytes || accepted_prefix_bytes >= original_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "state WAL repair boundary is stale or empty: accepted={accepted_prefix_bytes}, expected_original={original_bytes}, actual_original={}",
+                metadata.len()
+            ),
+        ));
+    }
+
+    let tail_bytes = original_bytes - accepted_prefix_bytes;
+    let mut source = OpenOptions::new().read(true).write(true).open(path)?;
+    if hash_file_range(&mut source, 0, original_bytes)? != expected_original_hash
+        || source.metadata()?.len() != original_bytes
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "state WAL changed after checkpoint validation and before quarantine",
+        ));
+    }
+    let tail_hash = hash_file_range(&mut source, accepted_prefix_bytes, tail_bytes)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state.wal");
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let quarantine_path = parent.join(format!("{file_name}.quarantine-{}.bin", tail_hash.to_hex()));
+
+    if quarantine_path.exists() {
+        verify_quarantine_file(&quarantine_path, tail_bytes, tail_hash)?;
+    } else {
+        let mut temporary = None;
+        for serial in 0..100u32 {
+            let candidate = parent.join(format!(
+                ".{file_name}.quarantine-tmp-{}-{serial}",
+                std::process::id()
+            ));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(file) => {
+                    temporary = Some((candidate, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let Some((temporary_path, mut temporary_file)) = temporary else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique WAL quarantine temporary file",
+            ));
+        };
+        if let Err(error) = copy_file_range(
+            &mut source,
+            &mut temporary_file,
+            accepted_prefix_bytes,
+            tail_bytes,
+        )
+        .and_then(|()| temporary_file.sync_all())
+        {
+            let _ = fs::remove_file(&temporary_path);
+            return Err(error);
+        }
+        drop(temporary_file);
+
+        match fs::hard_link(&temporary_path, &quarantine_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                verify_quarantine_file(&quarantine_path, tail_bytes, tail_hash)?;
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary_path);
+                return Err(error);
+            }
+        }
+        fs::remove_file(&temporary_path)?;
+        WalWriter::sync_parent_directory(&quarantine_path)?;
+        verify_quarantine_file(&quarantine_path, tail_bytes, tail_hash)?;
+    }
+
+    if source.metadata()?.len() != original_bytes
+        || hash_file_range(&mut source, accepted_prefix_bytes, tail_bytes)? != tail_hash
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "state WAL changed after its rejected tail was quarantined",
+        ));
+    }
+    source.set_len(accepted_prefix_bytes)?;
+    source.sync_all()?;
+    WalWriter::sync_parent_directory(path)?;
+    Ok(quarantine_path)
+}
+
 /// Read all entries from a WAL file. Used during crash recovery.
 pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
     let file = match File::open(path.as_ref()) {
@@ -997,7 +1409,6 @@ fn read_wal_strict_segment(
     path: &Path,
     expected_sequence: &mut u64,
 ) -> std::io::Result<Vec<WalEntry>> {
-    const MAX_ENTRY_BYTES: usize = 1024 * 1024 * 1024;
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
@@ -1015,7 +1426,7 @@ fn read_wal_strict_segment(
             )
         })?;
         let len = u32::from_le_bytes(len_buf) as usize;
-        if len == 0 || len > MAX_ENTRY_BYTES {
+        if len == 0 || len > MAX_WAL_ENTRY_BYTES {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("invalid WAL frame length {len}"),

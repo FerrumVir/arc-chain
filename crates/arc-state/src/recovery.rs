@@ -6,7 +6,10 @@
 //! validator identity + stake supermajority. The complete package is verified
 //! in memory before any active-data marker is written.
 
-use crate::wal::{ContractStorage, Snapshot};
+use crate::wal::{
+    ContractStorage, RepairableWalRead, Snapshot, quarantine_and_truncate_wal_tail,
+    read_repairable_wal_prefix, verify_wal_file_identity,
+};
 use crate::{StateDB, StateError, WalEntry, WalOp, read_wal_strict};
 use arc_crypto::{Hash256, IncrementalMerkle, KeyPair, MerkleTree, Signature, hash_bytes};
 use arc_types::{
@@ -1737,6 +1740,201 @@ fn validate_snapshot_sections_against_wal(
     Ok(())
 }
 
+/// Exact physical repair performed on a post-recovery state WAL before replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryWalRepairReport {
+    pub recovery_wal_original_bytes: u64,
+    pub recovery_wal_accepted_prefix_bytes: u64,
+    pub recovery_wal_quarantined_tail_bytes: u64,
+    pub recovery_wal_tail_reason: String,
+    pub recovery_wal_quarantine_path: Option<PathBuf>,
+}
+
+struct PostRecoveryWalPlan {
+    entries: Vec<WalEntry>,
+    report: RecoveryWalRepairReport,
+    original_hash: blake3::Hash,
+}
+
+fn plan_post_recovery_wal(
+    mut read: RepairableWalRead,
+    transition_height: u64,
+) -> Result<PostRecoveryWalPlan, StateError> {
+    if read.entries.is_empty() {
+        if read.original_bytes != 0 {
+            let reason = read
+                .torn_tail
+                .map(|tail| tail.stable_reason())
+                .unwrap_or("nonempty undecodable WAL");
+            return Err(StateError::PersistenceError(format!(
+                "post-recovery WAL contains bytes but no complete block checkpoint ({reason})"
+            )));
+        }
+        return Ok(PostRecoveryWalPlan {
+            entries: Vec::new(),
+            report: RecoveryWalRepairReport {
+                recovery_wal_original_bytes: 0,
+                recovery_wal_accepted_prefix_bytes: 0,
+                recovery_wal_quarantined_tail_bytes: 0,
+                recovery_wal_tail_reason: "none".into(),
+                recovery_wal_quarantine_path: None,
+            },
+            original_hash: read.original_hash,
+        });
+    }
+
+    let mut blocks = HashMap::<u64, (usize, Hash256)>::new();
+    let mut checkpoint_heights = HashSet::new();
+    let mut latest_boundary = None;
+    let mut previous_entry_height = transition_height;
+    for (index, entry) in read.entries.iter().enumerate() {
+        if entry.block_height <= transition_height {
+            return Err(StateError::PersistenceError(format!(
+                "post-recovery WAL entry {} targets height {} at/before transition {}",
+                entry.sequence, entry.block_height, transition_height
+            )));
+        }
+        if entry.block_height < previous_entry_height {
+            return Err(StateError::PersistenceError(format!(
+                "post-recovery WAL height regresses at sequence {}: previous={}, actual={}",
+                entry.sequence, previous_entry_height, entry.block_height
+            )));
+        }
+        previous_entry_height = entry.block_height;
+
+        match &entry.op {
+            WalOp::SetBlock(height, block) => {
+                if *height != entry.block_height || block.header.height != *height {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery SetBlock at sequence {} has inconsistent heights: tag={}, key={}, header={}",
+                        entry.sequence, entry.block_height, height, block.header.height
+                    )));
+                }
+                if block.hash != Block::compute_hash(&block.header) {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery SetBlock at height {height} has an invalid header hash"
+                    )));
+                }
+                if blocks
+                    .insert(*height, (index, block.header.state_root))
+                    .is_some()
+                {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery WAL rewrites canonical block height {height}"
+                    )));
+                }
+            }
+            WalOp::Checkpoint(root) => {
+                if !checkpoint_heights.insert(entry.block_height) {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery WAL has duplicate checkpoints at height {}",
+                        entry.block_height
+                    )));
+                }
+                let Some(&(block_index, block_root)) = blocks.get(&entry.block_height) else {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery checkpoint at height {} has no preceding SetBlock",
+                        entry.block_height
+                    )));
+                };
+                if block_index >= index || block_root != *root {
+                    return Err(StateError::PersistenceError(format!(
+                        "post-recovery block/checkpoint mismatch at height {}",
+                        entry.block_height
+                    )));
+                }
+                latest_boundary = Some((index, entry.block_height));
+            }
+            _ => {}
+        }
+    }
+
+    let Some((checkpoint_index, checkpoint_height)) = latest_boundary else {
+        return Err(StateError::PersistenceError(
+            "post-recovery WAL has no complete block checkpoint".into(),
+        ));
+    };
+    let mut expected_height = transition_height.checked_add(1).ok_or_else(|| {
+        StateError::PersistenceError("recovery transition height overflows u64".into())
+    })?;
+    let mut committed_blocks: Vec<_> = blocks
+        .iter()
+        .filter_map(|(height, (index, _))| (*index <= checkpoint_index).then_some(*height))
+        .collect();
+    committed_blocks.sort_unstable();
+    for height in committed_blocks {
+        if height != expected_height || !checkpoint_heights.contains(&height) {
+            return Err(StateError::PersistenceError(format!(
+                "post-recovery WAL lacks a contiguous SetBlock + Checkpoint boundary at height {expected_height}"
+            )));
+        }
+        expected_height = expected_height.checked_add(1).ok_or_else(|| {
+            StateError::PersistenceError("post-recovery block height overflows u64".into())
+        })?;
+    }
+    if expected_height
+        != checkpoint_height.checked_add(1).ok_or_else(|| {
+            StateError::PersistenceError("post-recovery checkpoint height overflows u64".into())
+        })?
+    {
+        return Err(StateError::PersistenceError(format!(
+            "post-recovery WAL is missing a complete block checkpoint through height {checkpoint_height}"
+        )));
+    }
+    let accepted_prefix_bytes = *read
+        .frame_end_offsets
+        .get(checkpoint_index)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "post-recovery checkpoint has no physical WAL frame offset".into(),
+            )
+        })?;
+    let quarantined_tail_bytes = read
+        .original_bytes
+        .checked_sub(accepted_prefix_bytes)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "post-recovery checkpoint offset exceeds WAL file size".into(),
+            )
+        })?;
+    let valid_tail_entries = read
+        .entries
+        .len()
+        .checked_sub(checkpoint_index + 1)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "post-recovery checkpoint index exceeds parsed entries".into(),
+            )
+        })?;
+    let recovery_wal_tail_reason = match (valid_tail_entries, read.torn_tail) {
+        (0, None) => "none".to_string(),
+        (count, None) => format!("uncommitted_valid_entries_after_checkpoint:{count}"),
+        (0, Some(tail)) => tail.stable_reason().to_string(),
+        (count, Some(tail)) => format!(
+            "uncommitted_valid_entries_after_checkpoint:{count};{}",
+            tail.stable_reason()
+        ),
+    };
+    if (quarantined_tail_bytes == 0) != (recovery_wal_tail_reason == "none") {
+        return Err(StateError::PersistenceError(
+            "post-recovery WAL physical tail accounting contradicts its classification".into(),
+        ));
+    }
+
+    read.entries.truncate(checkpoint_index + 1);
+    Ok(PostRecoveryWalPlan {
+        entries: read.entries,
+        report: RecoveryWalRepairReport {
+            recovery_wal_original_bytes: read.original_bytes,
+            recovery_wal_accepted_prefix_bytes: accepted_prefix_bytes,
+            recovery_wal_quarantined_tail_bytes: quarantined_tail_bytes,
+            recovery_wal_tail_reason,
+            recovery_wal_quarantine_path: None,
+        },
+        original_hash: read.original_hash,
+    })
+}
+
 impl StateDB {
     fn export_recovery_payload(&self) -> RecoveryPayload {
         let mut blocks: Vec<_> = self
@@ -2405,29 +2603,88 @@ impl StateDB {
         }
         Self::verify_or_create_genesis_binding(wal_dir, wal_path.exists(), network.genesis_hash)?;
 
-        let recovered_entries = if wal_path.exists() {
-            read_wal_strict(&wal_path).map_err(|error| {
+        let transition_height = checkpoint.manifest.source_height + 1;
+        let wal_existed = wal_path.exists();
+        let mut wal_plan = if wal_existed {
+            let read = read_repairable_wal_prefix(&wal_path).map_err(|error| {
                 StateError::PersistenceError(format!(
-                    "recovery WAL is not fully valid; refusing partial replay: {error}"
+                    "recovery WAL contains non-repairable corruption; refusing replay: {error}"
                 ))
-            })?
+            })?;
+            plan_post_recovery_wal(read, transition_height)?
         } else {
-            Vec::new()
+            PostRecoveryWalPlan {
+                entries: Vec::new(),
+                report: RecoveryWalRepairReport {
+                    recovery_wal_original_bytes: 0,
+                    recovery_wal_accepted_prefix_bytes: 0,
+                    recovery_wal_quarantined_tail_bytes: 0,
+                    recovery_wal_tail_reason: "none".into(),
+                    recovery_wal_quarantine_path: None,
+                },
+                original_hash: blake3::hash(&[]),
+            }
         };
+
+        // Prove the selected physical prefix against the signed checkpoint and
+        // its canonical state root before preserving or truncating any byte.
+        for entry in &wal_plan.entries {
+            staged.apply_wal_op(&entry.op);
+        }
+        staged.rebuild_transaction_indexes();
+        staged.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
+
+        if wal_plan.report.recovery_wal_quarantined_tail_bytes != 0 {
+            let quarantine_path = quarantine_and_truncate_wal_tail(
+                &wal_path,
+                wal_plan.report.recovery_wal_accepted_prefix_bytes,
+                wal_plan.report.recovery_wal_original_bytes,
+                wal_plan.original_hash,
+            )
+            .map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "failed to durably quarantine post-recovery WAL tail: {error}"
+                ))
+            })?;
+            wal_plan.report.recovery_wal_quarantine_path = Some(quarantine_path.clone());
+            tracing::warn!(
+                recovery_wal_original_bytes = wal_plan.report.recovery_wal_original_bytes,
+                recovery_wal_accepted_prefix_bytes =
+                    wal_plan.report.recovery_wal_accepted_prefix_bytes,
+                recovery_wal_quarantined_tail_bytes =
+                    wal_plan.report.recovery_wal_quarantined_tail_bytes,
+                recovery_wal_tail_reason = %wal_plan.report.recovery_wal_tail_reason,
+                recovery_wal_quarantine_path = ?quarantine_path,
+                "quarantined post-recovery state WAL suffix before replay"
+            );
+        } else if wal_existed {
+            verify_wal_file_identity(
+                &wal_path,
+                wal_plan.report.recovery_wal_original_bytes,
+                wal_plan.original_hash,
+            )
+            .map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "recovery WAL changed after checkpoint validation; refusing replay: {error}"
+                ))
+            })?;
+            tracing::info!(
+                recovery_wal_original_bytes = wal_plan.report.recovery_wal_original_bytes,
+                recovery_wal_accepted_prefix_bytes =
+                    wal_plan.report.recovery_wal_accepted_prefix_bytes,
+                recovery_wal_quarantined_tail_bytes = 0u64,
+                recovery_wal_tail_reason = "none",
+                "post-recovery state WAL ends at a verified block checkpoint"
+            );
+        }
+
         let state = StateDB::with_persistence(&wal_path)?;
         state.install_verified_checkpoint(&checkpoint)?;
-        let transition_height = checkpoint.manifest.source_height + 1;
-        for entry in &recovered_entries {
-            if entry.block_height <= transition_height {
-                return Err(StateError::PersistenceError(format!(
-                    "post-recovery WAL entry {} targets height {} at/before transition {}",
-                    entry.sequence, entry.block_height, transition_height
-                )));
-            }
+        for entry in &wal_plan.entries {
             state.apply_wal_op(&entry.op);
         }
         state.rebuild_transaction_indexes();
-        state.verify_recovery_restart(&recovered_entries, &checkpoint)?;
+        state.verify_recovery_restart(&wal_plan.entries, &checkpoint)?;
         Ok(state)
     }
 
@@ -2587,6 +2844,7 @@ fn sync_parent(path: &Path) -> Result<(), RecoveryError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -2695,6 +2953,68 @@ mod tests {
             community_rewards_v1_activation_height: Some(100),
         };
         (checkpoint, keys, policy)
+    }
+
+    fn persistent_recovery_fixture(
+        label: &str,
+    ) -> (
+        StateDB,
+        ArcCheckpoint,
+        Vec<KeyPair>,
+        RecoveryNetworkPolicy,
+        PathBuf,
+        PathBuf,
+    ) {
+        let (checkpoint, keys, policy) = checkpoint();
+        let source_dir = temp_dir(&format!("{label}-source"));
+        let active_dir = temp_dir(&format!("{label}-active"));
+        let package = source_dir.join("candidate.arcchkpt");
+        checkpoint.write_to(&package).unwrap();
+        let state = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy.clone(),
+            Some(RecoveryImport {
+                checkpoint_path: package,
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            }),
+        )
+        .unwrap();
+        (state, checkpoint, keys, policy, source_dir, active_dir)
+    }
+
+    fn commit_empty_recovery_block(
+        state: &StateDB,
+        producer: Address,
+        timestamp: u64,
+        decision_label: &[u8],
+    ) -> Block {
+        state
+            .execute_block_adaptive_at_with_proof(
+                &[],
+                producer,
+                timestamp,
+                hash_bytes(decision_label),
+            )
+            .unwrap()
+            .0
+    }
+
+    fn recovery_wal_quarantines(active_dir: &Path) -> Vec<PathBuf> {
+        let mut quarantines: Vec<_> = fs::read_dir(active_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.starts_with("state.wal.quarantine-") && name.ends_with(".bin")
+                    })
+            })
+            .collect();
+        quarantines.sort();
+        quarantines
     }
 
     fn payload_with_one_canonical_transaction() -> RecoveryPayload {
@@ -3401,39 +3721,247 @@ mod tests {
     }
 
     #[test]
-    fn restart_fails_closed_on_torn_post_recovery_wal() {
-        let (checkpoint, _, policy) = checkpoint();
-        let source_dir = temp_dir("torn-source");
-        let active_dir = temp_dir("torn-active");
-        let source = source_dir.join("candidate.arcchkpt");
-        checkpoint.write_to(&source).unwrap();
-        let approved = checkpoint.manifest_hash();
-        let state = StateDB::with_genesis_persistent_recovery(
-            &[],
-            &active_dir,
-            policy.clone(),
-            Some(RecoveryImport {
-                checkpoint_path: source,
-                approved_manifest_hash: approved,
-            }),
+    fn restart_quarantines_torn_post_recovery_wal_at_prior_checkpoint() {
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("torn");
+        let block = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"torn-tail-prior-checkpoint",
+        );
+        let expected_height = block.header.height;
+        let expected_root = block.header.state_root;
+        drop(state);
+        let wal_path = active_dir.join("state.wal");
+        let accepted_prefix = fs::read(&wal_path).unwrap();
+        let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
+        wal.write_all(&64u32.to_le_bytes()).unwrap();
+        wal.write_all(b"torn-final-payload").unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let original = fs::read(&wal_path).unwrap();
+        let planned = plan_post_recovery_wal(
+            read_repairable_wal_prefix(&wal_path).unwrap(),
+            checkpoint.manifest.source_height + 1,
         )
         .unwrap();
+        assert_eq!(
+            planned.report.recovery_wal_original_bytes,
+            original.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_accepted_prefix_bytes,
+            accepted_prefix.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_quarantined_tail_bytes,
+            (original.len() - accepted_prefix.len()) as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_tail_reason,
+            "truncated_wal_frame_payload"
+        );
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy.clone(), None)
+                .unwrap();
+        assert_eq!(restarted.height(), expected_height);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        drop(restarted);
+        assert_eq!(fs::read(&wal_path).unwrap(), accepted_prefix);
+        let quarantines = recovery_wal_quarantines(&active_dir);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(
+            fs::read(&quarantines[0]).unwrap(),
+            original[accepted_prefix.len()..]
+        );
+
+        let restarted_again =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted_again.height(), expected_height);
+        assert_eq!(restarted_again.get_state_root(), expected_root);
+        drop(restarted_again);
+        assert_eq!(recovery_wal_quarantines(&active_dir), quarantines);
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn restart_quarantines_complete_uncheckpointed_next_block() {
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("complete-uncheckpointed");
+        let committed = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"complete-tail-prior-checkpoint",
+        );
+        let expected_height = committed.header.height;
+        let expected_root = committed.header.state_root;
         drop(state);
-        OpenOptions::new()
-            .append(true)
-            .open(active_dir.join("state.wal"))
-            .unwrap()
-            .write_all(&64u32.to_le_bytes())
-            .unwrap();
+
+        let wal_path = active_dir.join("state.wal");
+        let accepted_prefix = fs::read(&wal_path).unwrap();
+        let next_height = expected_height + 1;
+        let next_block = Block::new(
+            BlockHeader {
+                height: next_height,
+                timestamp: 1_787_777_002_000,
+                parent_hash: committed.hash,
+                tx_root: MerkleTree::from_leaves(Vec::new()).root(),
+                state_root: expected_root,
+                proof_hash: hash_bytes(b"complete-but-uncheckpointed-decision"),
+                tx_count: 0,
+                producer: keys[0].address(),
+                protocol_version: RECOVERY_PROTOCOL_VERSION,
+                state_diff: None,
+            },
+            Vec::new(),
+        );
+        let writer = crate::WalWriter::new(&wal_path).unwrap();
+        writer.append(WalOp::SetBlock(next_height, next_block), next_height);
+        writer.sync().unwrap();
+        drop(writer);
+        let original = fs::read(&wal_path).unwrap();
+        let planned = plan_post_recovery_wal(
+            read_repairable_wal_prefix(&wal_path).unwrap(),
+            checkpoint.manifest.source_height + 1,
+        )
+        .unwrap();
+        assert_eq!(
+            planned.report.recovery_wal_original_bytes,
+            original.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_accepted_prefix_bytes,
+            accepted_prefix.len() as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_quarantined_tail_bytes,
+            (original.len() - accepted_prefix.len()) as u64
+        );
+        assert_eq!(
+            planned.report.recovery_wal_tail_reason,
+            "uncommitted_valid_entries_after_checkpoint:1"
+        );
+
+        let restarted =
+            StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None).unwrap();
+        assert_eq!(restarted.height(), expected_height);
+        assert_eq!(restarted.get_state_root(), expected_root);
+        assert!(restarted.get_block(next_height).is_none());
+        drop(restarted);
+        assert_eq!(fs::read(&wal_path).unwrap(), accepted_prefix);
+        let quarantines = recovery_wal_quarantines(&active_dir);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(
+            fs::read(&quarantines[0]).unwrap(),
+            original[accepted_prefix.len()..]
+        );
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn post_recovery_wal_without_any_checkpoint_stays_fatal() {
+        let (state, checkpoint, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("no-checkpoint");
+        drop(state);
+        let transition = checkpoint.manifest.transition_block().unwrap();
+        let next_height = transition.header.height + 1;
+        let uncommitted = Block::new(
+            BlockHeader {
+                height: next_height,
+                timestamp: 1_787_777_001_000,
+                parent_hash: transition.hash,
+                tx_root: MerkleTree::from_leaves(Vec::new()).root(),
+                state_root: transition.header.state_root,
+                proof_hash: hash_bytes(b"no-checkpoint-decision"),
+                tx_count: 0,
+                producer: keys[0].address(),
+                protocol_version: RECOVERY_PROTOCOL_VERSION,
+                state_diff: None,
+            },
+            Vec::new(),
+        );
+        let wal_path = active_dir.join("state.wal");
+        let writer = crate::WalWriter::new(&wal_path).unwrap();
+        writer.append(WalOp::SetBlock(next_height, uncommitted), next_height);
+        writer.sync().unwrap();
+        drop(writer);
+        let original = fs::read(&wal_path).unwrap();
 
         let error = StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None)
             .err()
-            .expect("torn recovery WAL must fail startup");
+            .expect("post-transition entries without a checkpoint must remain fatal");
         assert!(
-            error
-                .to_string()
-                .contains("refusing partial replay: truncated WAL frame payload")
+            error.to_string().contains("no complete block checkpoint"),
+            "{error}"
         );
+        assert_eq!(fs::read(&wal_path).unwrap(), original);
+        assert!(recovery_wal_quarantines(&active_dir).is_empty());
+
+        fs::remove_dir_all(source_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
+    }
+
+    #[test]
+    fn checksum_corruption_in_committed_wal_middle_stays_fatal() {
+        let (state, _, keys, policy, source_dir, active_dir) =
+            persistent_recovery_fixture("corrupt-middle");
+        let first = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_001_000,
+            b"corrupt-middle-first",
+        );
+        let _second = commit_empty_recovery_block(
+            &state,
+            keys[0].address(),
+            1_787_777_002_000,
+            b"corrupt-middle-second",
+        );
+        drop(state);
+
+        let wal_path = active_dir.join("state.wal");
+        let inspection = read_repairable_wal_prefix(&wal_path).unwrap();
+        let checkpoint_index = inspection
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.block_height == first.header.height
+                    && matches!(entry.op, WalOp::Checkpoint(_))
+            })
+            .unwrap();
+        assert!(checkpoint_index + 1 < inspection.entries.len());
+        let checksum_byte_offset = inspection.frame_end_offsets[checkpoint_index] - 1;
+        let mut wal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal_path)
+            .unwrap();
+        wal.seek(SeekFrom::Start(checksum_byte_offset)).unwrap();
+        let mut checksum_byte = [0u8; 1];
+        wal.read_exact(&mut checksum_byte).unwrap();
+        checksum_byte[0] ^= 0x80;
+        wal.seek(SeekFrom::Start(checksum_byte_offset)).unwrap();
+        wal.write_all(&checksum_byte).unwrap();
+        wal.sync_all().unwrap();
+        drop(wal);
+        let corrupted = fs::read(&wal_path).unwrap();
+
+        let error = StateDB::with_genesis_persistent_recovery(&[], &active_dir, policy, None)
+            .err()
+            .expect("checksum corruption before later committed frames must remain fatal");
+        assert!(
+            error.to_string().contains("WAL checksum mismatch"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&wal_path).unwrap(), corrupted);
+        assert!(recovery_wal_quarantines(&active_dir).is_empty());
+
         fs::remove_dir_all(source_dir).unwrap();
         fs::remove_dir_all(active_dir).unwrap();
     }
