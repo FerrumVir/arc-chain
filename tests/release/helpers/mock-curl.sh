@@ -91,9 +91,18 @@ render_asset() {
         genesis.toml)
             printf '%s\n' \
                 '[chain]' \
-                "name = \"arc-release-observer-fixture-v$version\"" \
+                "name = \"arc-release-recovered-fixture-v$version\"" \
                 'chain_id = "0x415243"' \
-                'validator_set_complete = false' >"$destination"
+                'validator_set_complete = true' \
+                'community_rewards_v1_activation_height = 137146' \
+                '' \
+                '[[accounts]]' \
+                'address = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
+                'balance = 0' \
+                '' \
+                '[[validators]]' \
+                'address = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"' \
+                'stake = 5_000_000' >"$destination"
             ;;
         install.sh)
             printf '#!/usr/bin/env bash\n# release v%s\nexit 0\n' "$version" >"$destination"
@@ -142,7 +151,7 @@ case "$url" in
         emit_text '127.0.0.1:19091'
         ;;
     https://raw.githubusercontent.com/FerrumVir/arc-chain/*/genesis.toml)
-        emit_text $'[chain]\nname = "arc-release-observer-fixture"\nchain_id = "0x415243"\nvalidator_set_complete = false'
+        emit_text $'[chain]\nname = "arc-release-recovered-fixture"\nchain_id = "0x415243"\nvalidator_set_complete = true\ncommunity_rewards_v1_activation_height = 137146\n\n[[accounts]]\naddress = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"\nbalance = 0\n\n[[validators]]\naddress = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"\nstake = 5_000_000'
         ;;
     http://localhost:*/health|http://127.0.0.1:*/health)
         requested_port="$(printf '%s' "$url" | sed -E 's#^http://(localhost|127\.0\.0\.1):([0-9]+)/health$#\2#')"

@@ -127,13 +127,13 @@ complete_fixture_produces_verifiable_contract() {
     assert_file_contains "$sandbox/output/latest.json" '/releases/download/v0\.8\.0/' \
         'latest.json has no exact-tag artifact URL' || return 1
     assert_file_contains "$sandbox/output/genesis.toml" \
-        '^validator_set_complete[[:space:]]*=[[:space:]]*false$' \
-        'release did not preserve the explicit stake-zero observer placeholder' || return 1
-    assert_file_not_contains "$sandbox/output/genesis.toml" '^\[\[validators\]\]' \
-        'incomplete release genesis contains a partial validator set' || return 1
-    assert_file_not_contains "$sandbox/output/genesis.toml" \
-        '^community_rewards_v1_activation_height[[:space:]]*=' \
-        'observer release unexpectedly schedules community reward activation' || return 1
+        '^validator_set_complete[[:space:]]*=[[:space:]]*true$' \
+        'release did not preserve the approved complete validator set' || return 1
+    assert_file_contains "$sandbox/output/genesis.toml" '^\[\[validators\]\]' \
+        'release genesis omitted the approved validator set' || return 1
+    assert_file_contains "$sandbox/output/genesis.toml" \
+        '^community_rewards_v1_activation_height[[:space:]]*=[[:space:]]*137146$' \
+        'release did not preserve the checkpoint-bound reward activation height' || return 1
 }
 
 complete_scheduled_genesis_is_preserved() {

@@ -211,9 +211,10 @@ authenticated recomputation, a signed worker certificate, active genesis
 protocol activation, validator approval collection, strict
 greater-than-two-thirds identity and active-stake approval, a funded treasury,
 and successful block inclusion. With six equally staked validators, five must
-approve. The source candidate implements approval collection, but it is not
-available on the current v2 public fleet and the checked-in observer genesis
-keeps issuance disabled. Until the coordinated cutover proves that path, the
+approve. The source candidate implements approval collection, and the
+checkpoint-bound recovered genesis schedules activation at block 137146, but
+neither is available on the current v2 public fleet. Until the coordinated
+cutover proves that path and enables the independent runtime switch, the
 candidate fails closed and shows no forward reward projection.
 
 The deployed v2 seeds expose legacy count × constant display arithmetic. That

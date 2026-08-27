@@ -66,6 +66,11 @@ jobs:
             echo "::error::Checkout $HEAD_COMMIT does not match tag $TAG ($TAG_COMMIT)."
             exit 1
           fi
+          git fetch --no-tags --force origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main; then
+            echo "::error::Tag $TAG targets $TAG_COMMIT, which has not been merged to main."
+            exit 1
+          fi
 
           WORKSPACE_VERSION="$(awk '
             /^\[workspace\.package\]$/ { in_package=1; next }
@@ -386,11 +391,11 @@ jobs:
             done
 
             # Boot the real headless node, not just clap's `--version` path.
-            # The shipped incomplete genesis deliberately enters the
-            # stake-zero migration-observer mode, so this exercises config,
-            # data-dir creation and Axum health serving without joining or
-            # mutating any network. Bash `/dev/tcp` avoids installing curl in
-            # the otherwise-clean server image.
+            # The shipped recovered genesis is complete, but stake defaults to
+            # zero and --no-community suppresses registration. This exercises
+            # config, data-dir creation and Axum health serving without a
+            # validator key, peers, or any external network mutation. Bash
+            # `/dev/tcp` avoids installing curl in the clean server image.
             docker run --rm \
               --env DISPLAY= \
               --volume "$PWD/release-smoke:/release:ro" \
@@ -416,10 +421,9 @@ jobs:
                     printf "GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n" >&3
                     cat <&3
                   '\'' 2>/dev/null) && printf "%s" "$response" | grep -q "HTTP/1.1 200"; then
-                    # An isolated migration observer has no advancing chain,
-                    # so truthful health is normally `degraded`; the smoke
-                    # requires a valid liveness classification, not a false
-                    # green chain claim.
+                    # An isolated stake-zero node has no advancing chain, so
+                    # truthful health is normally `degraded`; the smoke needs
+                    # a valid liveness classification, not a false green claim.
                     printf "%s\n" "$response" | grep -Eq '"status":"(ok|degraded)"'
                     exit 0
                   fi
@@ -522,7 +526,6 @@ jobs:
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -Eeuo pipefail
           if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
@@ -627,13 +630,13 @@ jobs:
             ID/notarized or Windows Authenticode signed, so operating-system
             trust approval may be required.
 
-            The checked-in genesis is a stake-zero migration-observer placeholder:
-            it does not activate reward issuance, and work is not guaranteed.
-            Once an approved validator genesis activates the policy, stake-zero
-            workers are eligible, but only a successful mined `0x25`
-            `CommunityInferenceReward` receipt is earned. Projected earnings are
-            null with an explicit reason unless policy, receipt-rate, and funded
-            treasury evidence are all available.
+            The checked-in genesis is the checkpoint-bound recovered testnet
+            definition with six rotated public validator identities and reward
+            activation at block 137146. For stake-zero workers, eligibility
+            exists only while the recovered fleet is live, issuance-ready, and
+            funded; only a successful mined `0x25` `CommunityInferenceReward`
+            receipt is earned. Projected earnings are null with an explicit reason
+            unless policy, receipt-rate, and treasury evidence are available.
 
             Verify any asset with the attached `SHA256SUMS` file.
         run: |

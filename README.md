@@ -170,13 +170,14 @@ The GUI is not a server binary: it needs a
 graphical session. An EC2/VPS/SSH-only machine should use the headless installer
 below. Linux ARM64 is also headless-only.
 
-The public v0.7.11 desktop bundled updater configuration but did not invoke the
-update lifecycle, so it must not be described as auto-updating. The v0.8.0
-candidate now checks the signed manifest shortly after startup and every 24
-hours when the setting is enabled. Background checks do not download or install
-anything; the user confirms installation. macOS, Windows, and Linux AppImage
-can then update in place. `.deb` and `.rpm` remain owned by their package
-managers and must be upgraded by installing the new package.
+The public v0.7.11 desktop could manually check, verify, and install a signed
+update from Settings, but its saved automatic-update preference never started
+a scheduler. The v0.8.0 candidate now checks the signed manifest shortly after
+startup and every 24 hours when that setting is enabled. Background checks do
+not download or install anything; the user confirms installation. macOS,
+Windows, and Linux AppImage can then update in place. `.deb` and `.rpm` remain
+owned by their package managers; the app reports the available version but
+cannot invoke in-app replacement for those channels.
 
 **📖 Desktop controls:** [Getting Started with ARC Node](docs/GETTING_STARTED.md)
 — release gates, identity, inference evidence, faucet, mined reward receipts,
@@ -355,9 +356,10 @@ version-skewed public fleet:
    does not collect votes or auto-slash. Treat a `committee` field as metadata,
    not verification. Community reward `0x25` uses a separate strict active-set
    authorization contract. The v3 candidate collects independent approvals
-   from the explicit HTTPS validator origins and requires five of six; the
-   checked-in observer genesis keeps issuance disabled until the coordinated
-   rollout supplies an approved activation and validator set.
+   from the explicit HTTPS validator origins and requires five of six. The
+   checked-in recovered genesis binds the rotated six-validator set and block
+   137146 activation boundary; issuance still fails closed until the
+   coordinated rollout is live and the independent runtime switch is enabled.
 
 9. **Post-quantum signature code paths.** Falcon-512 and ML-DSA exist alongside
    Ed25519, BLS12-381, and secp256k1 in the current source tree. This is not a
@@ -556,7 +558,7 @@ be described as deployed together.
 | Latency-aware replica selection per layer range | ✅ rolling EWMA |
 | Auto-shard node onboarding | ✅ `--auto-shard` flag |
 | Inference computation certificate | legacy/history-only tx `0x16`; v3 rejects standalone submission and embeds/reverifies the worker certificate inside payable `0x25` |
-| Community reward settlement | tx `0x25`, five-of-six active-validator identity + stake approvals; implemented and receipt-gated, but disabled by the checked-in observer genesis and not deployed |
+| Community reward settlement | tx `0x25`, five-of-six active-validator identity + stake approvals; implemented and receipt-gated; recovered genesis activates at block 137146, but the candidate is not deployed |
 | EVM (Solidity) + WASM (Rust / C / Go) both | ✅ revm 19, Wasmer 6.0 |
 | 5 signature algorithms incl. 2 post-quantum | ✅ Ed25519 · Falcon-512 · BLS · ML-DSA · secp256k1 |
 | BLS threshold encrypted mempool (MEV protection) | not shipped: v0.8 explicitly leaves the proposer-local, non-replicated prototype disabled |

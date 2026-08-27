@@ -105,20 +105,20 @@ machine as a validator layer shard. Never substitute `--shard-range 0:32` for
 that flag: doing so publishes an overlapping shard that is normally
 unreachable behind NAT.
 
-The recovery candidate currently bundles an explicit incomplete validator-set
-placeholder. With that file, a stake-zero process starts in HTTP-only migration
-observer mode: community inference can be tested, but chain P2P, consensus,
-voting, and mined rewards remain disabled. Operators must publish the approved
-public-address genesis/checkpoint described in
+The recovery candidate bundles the checkpoint-bound complete validator set:
+six rotated public identities and reward activation at block 137146. A
+stake-zero process uses that recovered network identity while keeping local
+consensus and voting disabled; community work and chain reads use the six
+reviewed HTTPS origins. The file does not prove that the public cutover is
+live. Confirm the rollout checks in
 [VALIDATOR-FLEET-ROLLOUT.md](VALIDATOR-FLEET-ROLLOUT.md) before describing the
-node as joined to the repaired chain.
+node as connected to the repaired fleet.
 
-The checked-in placeholder also omits
-`[chain].community_rewards_v1_activation_height`. Absence means consensus
-rejects reward tx `0x25`; `--enable-community-rewards-v1` cannot override it
-and startup rejects that flag/schedule mismatch. An activation may be added
-only to a complete approved validator genesis, where it becomes part of the
-network identity hash.
+The activation height is part of the semantic network hash. Consensus still
+rejects reward tx `0x25` until that height, and the independent
+`--enable-community-rewards-v1` switch cannot override a mismatched network or
+missing validator approval quorum. Absence means consensus rejects reward tx
+`0x25`; a local flag cannot manufacture network activation.
 
 ### Worker hardware and model
 
@@ -245,7 +245,7 @@ and chain-data contents are never replacement targets.
 
 That transaction also catches an attempted unsafe in-place upgrade whose old
 WAL lacks the network marker or has the wrong genesis hash. Rollback is not
-state migration, so the operator must still select a fresh observer data
+state migration, so the operator must still select a fresh stake-zero data
 directory or an approved validator checkpoint migration before retrying.
 
 Run the same updater manually:

@@ -365,10 +365,13 @@ no_service_no_updater_really_is_install_only() {
             "generated runner is missing reviewed origin: $origin" || return 1
     done
     assert_file_contains "$sandbox/arc/genesis.toml" \
-        '^validator_set_complete[[:space:]]*=[[:space:]]*false$' \
-        'installed release genesis is not an explicit observer placeholder' || return 1
-    assert_file_not_contains "$sandbox/arc/genesis.toml" '^\[\[validators\]\]' \
-        'installed observer genesis contains a partial validator set' || return 1
+        '^validator_set_complete[[:space:]]*=[[:space:]]*true$' \
+        'installed release genesis does not carry the approved validator set' || return 1
+    assert_file_contains "$sandbox/arc/genesis.toml" '^\[\[validators\]\]' \
+        'installed release genesis omitted its public validator set' || return 1
+    assert_file_contains "$sandbox/arc/genesis.toml" \
+        '^community_rewards_v1_activation_height[[:space:]]*=[[:space:]]*137146$' \
+        'installed release genesis omitted the checkpoint-bound activation height' || return 1
     assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--model([[:space:]]|$)' \
         'generated runner passes --model even though no model was configured' || return 1
     assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--full-integer-worker' \

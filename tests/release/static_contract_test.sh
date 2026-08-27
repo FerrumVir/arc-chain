@@ -731,7 +731,9 @@ publish_is_pinned_to_one_validated_commit_and_create_only() {
 
     for required in \
         'sha: ${{ steps.release.outputs.sha }}' \
-        'echo "sha=$TAG_COMMIT"'
+        'echo "sha=$TAG_COMMIT"' \
+        'git fetch --no-tags --force origin main:refs/remotes/origin/main' \
+        'git merge-base --is-ancestor "$TAG_COMMIT" refs/remotes/origin/main'
     do
         printf '%s\n' "$validate_block" | grep -Fq -- "$required" || {
             printf 'release validation does not export the validated tag commit: missing %s\n' "$required"
