@@ -1470,33 +1470,6 @@ impl ConsensusManager {
                                             committed_txs.len() as f64
                                         };
 
-                                        // Run EVM execution for any EVM contract calls.
-                                        let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
-                                        for (i, tx) in committed_txs.iter().enumerate() {
-                                            if receipts[i].success
-                                                && let arc_types::TxBody::WasmCall(ref body) =
-                                                    tx.body
-                                                && state.is_evm_contract(&body.contract)
-                                            {
-                                                let result = arc_vm::evm::evm_execute(
-                                                    &state,
-                                                    tx.from,
-                                                    body.contract,
-                                                    body.calldata.clone(),
-                                                    body.value,
-                                                    body.gas_limit.max(1_000_000),
-                                                );
-                                                for mut log in result.logs {
-                                                    log.tx_hash = tx.hash;
-                                                    log.block_height = block.header.height;
-                                                    block_logs.push(log);
-                                                }
-                                            }
-                                        }
-                                        if !block_logs.is_empty() {
-                                            state.store_event_logs(block.header.height, block_logs);
-                                        }
-
                                         // Commit cross-shard locks after successful execution
                                         for cs_hash in &cross_shard_hashes {
                                             let _ = self.engine.commit_cross_shard(*cs_hash);

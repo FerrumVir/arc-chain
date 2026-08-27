@@ -2224,6 +2224,14 @@ async fn submit_signed_tx(
     if uses_unready_paid_inference_protocol(&tx) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    if let TxBody::WasmCall(body) = &tx.body
+        && node.state.is_evm_contract(&body.contract)
+    {
+        // Read-only eth_call remains available. State-changing EVM calls are
+        // rejected at ingress as well as by the canonical executor so clients
+        // never receive a misleading pending transaction for a disabled path.
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     if node.state.verify_transaction_signature(&tx).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -4570,19 +4578,11 @@ fn eth_send_raw_transaction(node: &NodeState, params: &Value, id: &Value) -> Jso
         tx.hash = tx.compute_hash();
         tx
     } else {
-        // Contract call - map to WasmCall with raw calldata
-        let mut tx = Transaction::new_wasm_call(
-            sender_address,
-            to_address,
-            String::new(), // No function name in EVM ABI (selector is in calldata)
-            data_bytes.to_vec(),
-            value,
-            gas_limit,
-            nonce,
+        return eth_rpc_error(
+            id,
+            -32004,
+            "State-changing EVM calls are unavailable until canonical pre-root execution is activated; use eth_call for read-only simulation",
         );
-        tx.signature = secp_sig;
-        tx.hash = tx.compute_hash();
-        tx
     };
 
     // --- 8. Insert into mempool ---
@@ -14791,6 +14791,33 @@ mod tests {
             .await
             .expect("valid signed transaction");
         assert_eq!(node.mempool.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn generic_signed_ingress_rejects_state_changing_evm_call() {
+        let node = fake_node_with_workers(vec![]);
+        let key = KeyPair::generate_ed25519();
+        let contract = arc_crypto::hash_bytes(b"disabled-evm-contract");
+        node.state.deploy_contract(&contract, vec![0x60, 0x00]);
+        let mut transaction = Transaction::new_wasm_call(
+            key.address(),
+            contract,
+            String::new(),
+            vec![0xde, 0xad, 0xbe, 0xef],
+            0,
+            1_000_000,
+            0,
+        );
+        transaction.sign(&key).unwrap();
+
+        let error = submit_signed_tx(AxumState(node.clone()), Json(transaction))
+            .await
+            .err()
+            .expect("state-changing EVM call must stay dark at ingress");
+        assert_eq!(error, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(node.mempool.len(), 0);
+        assert!(node.state.event_logs.is_empty());
+        assert!(node.state.get_account(&key.address()).is_none());
     }
 
     #[tokio::test]

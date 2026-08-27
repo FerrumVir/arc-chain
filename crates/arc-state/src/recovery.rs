@@ -28,6 +28,10 @@ pub const ARCCHKPT_FORMAT_VERSION: u16 = 1;
 /// A future format can raise this safely by chunking and authenticating each
 /// section independently.
 pub const ARCCHKPT_MAX_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
+/// Protocol-v3 recovery has one fixed six-validator trust committee.
+pub const RECOVERY_VALIDATOR_SET_SIZE: usize = 6;
+/// Five identities are required in addition to strict >2/3 signed stake.
+pub const RECOVERY_SIGNATURES_REQUIRED: usize = 5;
 pub const RECOVERY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     major: 3,
     minor: 0,
@@ -567,15 +571,11 @@ impl ArcCheckpoint {
                 RecoveryError::Invalid("signed validator stake exceeds u64::MAX".into())
             })?;
         }
-        let required_identities = strict_supermajority_threshold(
-            u64::try_from(validator_map.len())
-                .map_err(|_| RecoveryError::Invalid("too many validators".into()))?,
-        );
-        if (seen.len() as u64) < required_identities {
+        if seen.len() < RECOVERY_SIGNATURES_REQUIRED {
             return Err(RecoveryError::Signature(format!(
                 "insufficient signer identities: have {}, require {} of {}",
                 seen.len(),
-                required_identities,
+                RECOVERY_SIGNATURES_REQUIRED,
                 validator_map.len()
             )));
         }
@@ -895,10 +895,11 @@ fn canonicalize_recovery_validators(
 }
 
 fn validate_recovery_validators(validators: &[RecoveryValidator]) -> Result<(), RecoveryError> {
-    if validators.is_empty() {
-        return Err(RecoveryError::Invalid(
-            "recovery validator set is empty".into(),
-        ));
+    if validators.len() != RECOVERY_VALIDATOR_SET_SIZE {
+        return Err(RecoveryError::Invalid(format!(
+            "protocol-v3 recovery requires exactly {RECOVERY_VALIDATOR_SET_SIZE} validators, got {}",
+            validators.len()
+        )));
     }
     require_sorted_unique(
         validators,
@@ -1939,6 +1940,33 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("insufficient signer identities"));
+    }
+
+    #[test]
+    fn recovery_rejects_any_validator_set_other_than_six() {
+        let (_, mut recovery_validators) = validators();
+        recovery_validators.pop();
+        let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42)]);
+        bond_source_stake(&state, &recovery_validators);
+
+        let error = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"wrong-validator-count-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: recovery_validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("requires exactly 6 validators"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -20,7 +20,6 @@
 //! is 2-3× on CPU-bound workloads (signature verification dominates).
 
 use crate::block_stm::BlockSTM;
-use crate::coalesce::CoalescedBatch;
 use arc_consensus::encode_block_data;
 use arc_state::StateDB;
 use arc_state::block_stm::execute_speculative;
@@ -191,7 +190,18 @@ impl Pipeline {
     /// Create and start the pipeline with the given config.
     ///
     /// Spawns 3 background threads (verify, execute, commit).
-    pub fn with_config(mut state: Arc<StateDB>, config: PipelineConfig) -> Self {
+    pub fn with_config(mut state: Arc<StateDB>, mut config: PipelineConfig) -> Self {
+        if config.coalesce_enabled {
+            // The historical coalescer wrote account snapshots outside the
+            // canonical StateDB executor/WAL and exposed only aggregate
+            // failures, so the commit stage could publish successful receipts
+            // for failed transactions. Keep the tuning flag for config-file
+            // compatibility, but force the unsafe engine dark in protocol v3.
+            warn!(
+                "Pipeline coalescing is disabled until its writes and per-transaction results are canonical and restart-durable"
+            );
+            config.coalesce_enabled = false;
+        }
         // Enable GPU state cache if requested.
         if config.gpu_state_enabled || config.execution_mode == ExecutionMode::GpuResident {
             let gpu_config = arc_state::gpu_state::GpuStateCacheConfig {
@@ -481,7 +491,6 @@ impl Pipeline {
         // ── Stage 3: Execute ─────────────────────────────────────────────
         // Capture config values for the execute thread.
         let exec_mode = config.execution_mode;
-        let coalesce_enabled = config.coalesce_enabled;
         let exec_state = Arc::clone(&state);
         thread::Builder::new()
             .name("pipeline-execute".into())
@@ -509,7 +518,7 @@ impl Pipeline {
 
                     let mut receipt_success = vec![false; n];
                     let mut actual_mode = exec_mode;
-                    let mut coalesce_reads_saved: Option<usize> = None;
+                    let coalesce_reads_saved: Option<usize> = None;
 
                     // ── Block-STARK witness: capture pre-state ───────────
                     // The block AIR constrains balance conservation and nonce
@@ -557,96 +566,6 @@ impl Pipeline {
                             .collect()
                     };
 
-                    // ── Optional: Coalescing pre-processing ──────────────
-                    if coalesce_enabled && !valid_txs.is_empty() {
-                        let coalesced = CoalescedBatch::from_transactions(valid_txs.clone());
-
-                        if coalesced.is_worthwhile() {
-                            match coalesced.execute(&exec_state) {
-                                Ok(stats) => {
-                                    info!(
-                                        total = stats.total_txs,
-                                        senders = stats.unique_senders,
-                                        receivers = stats.unique_receivers,
-                                        reads_saved = stats.reads_saved,
-                                        failed = stats.failed_txs,
-                                        remainder = stats.remainder_txs,
-                                        "Pipeline: coalesced execution"
-                                    );
-
-                                    coalesce_reads_saved = Some(stats.reads_saved);
-
-                                    // Mark all valid txs as successful (coalesce handles
-                                    // failures internally by not crediting, but from the
-                                    // pipeline's perspective the batch was processed).
-                                    // We conservatively mark everything successful and let
-                                    // the commit stage handle receipts.
-                                    for &idx in &orig_indices {
-                                        receipt_success[idx] = true;
-                                    }
-                                    // Mark failed coalesced txs appropriately.
-                                    // Coalescing doesn't give per-tx results, so we
-                                    // mark all as success. The state is already correct.
-
-                                    // Handle EVM logs for any WasmCall txs in the batch.
-                                    let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
-                                    for (j, tx) in valid_txs.iter().enumerate() {
-                                        if let TxBody::WasmCall(ref body) = tx.body
-                                            && exec_state.is_evm_contract(&body.contract)
-                                        {
-                                            let result = arc_vm::evm::evm_execute(
-                                                &exec_state,
-                                                tx.from,
-                                                body.contract,
-                                                body.calldata.clone(),
-                                                body.value,
-                                                body.gas_limit.max(1_000_000),
-                                            );
-                                            if !result.success {
-                                                receipt_success[orig_indices[j]] = false;
-                                            }
-                                            for mut log in result.logs {
-                                                log.tx_hash = tx.hash;
-                                                block_logs.push(log);
-                                            }
-                                        }
-                                    }
-                                    if !block_logs.is_empty() {
-                                        let height = exec_state.height();
-                                        exec_state.store_event_logs(height + 1, block_logs);
-                                    }
-
-                                    debug!(
-                                        txs = n,
-                                        success = receipt_success.iter().filter(|&&v| v).count(),
-                                        mode = ?actual_mode,
-                                        "Pipeline: transactions executed (coalesced)"
-                                    );
-
-                                    if tx_executed
-                                        .send(ExecutedBatch {
-                                            transactions: vbatch.transactions,
-                                            receipt_success,
-                                            producer: vbatch.producer,
-                                            execution_mode: actual_mode,
-                                            coalesce_reads_saved,
-                                            transfer_pre: transfer_pre.clone(),
-                                        })
-                                        .is_err()
-                                    {
-                                        break;
-                                    }
-                                    continue; // Skip the normal execution paths below.
-                                }
-                                Err(e) => {
-                                    warn!("Coalesced execution failed, falling back: {}", e);
-                                    // Fall through to normal execution.
-                                }
-                            }
-                        }
-                        // If not worthwhile, fall through to the normal path.
-                    }
-
                     // ── Block-STM path ───────────────────────────────────
                     if exec_mode == ExecutionMode::BlockSTM && !valid_txs.is_empty() {
                         let stm = BlockSTM::new(Arc::clone(&exec_state));
@@ -665,35 +584,6 @@ impl Pipeline {
                             // Block-STM succeeded within acceptable rounds.
                             for (j, &ok) in stm_result.success.iter().enumerate() {
                                 receipt_success[orig_indices[j]] = ok;
-                            }
-
-                            // EVM execution for WasmCall txs.
-                            let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
-                            for (j, tx) in valid_txs.iter().enumerate() {
-                                if receipt_success[orig_indices[j]]
-                                    && let TxBody::WasmCall(ref body) = tx.body
-                                    && exec_state.is_evm_contract(&body.contract)
-                                {
-                                    let result = arc_vm::evm::evm_execute(
-                                        &exec_state,
-                                        tx.from,
-                                        body.contract,
-                                        body.calldata.clone(),
-                                        body.value,
-                                        body.gas_limit.max(1_000_000),
-                                    );
-                                    if !result.success {
-                                        receipt_success[orig_indices[j]] = false;
-                                    }
-                                    for mut log in result.logs {
-                                        log.tx_hash = tx.hash;
-                                        block_logs.push(log);
-                                    }
-                                }
-                            }
-                            if !block_logs.is_empty() {
-                                let height = exec_state.height();
-                                exec_state.store_event_logs(height + 1, block_logs);
                             }
 
                             info!(
@@ -838,35 +728,6 @@ impl Pipeline {
                             receipt_success[orig_indices[idx]] = tx_ok;
                         }
 
-                        // EVM execution for WasmCall txs.
-                        let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
-                        for (j, tx) in valid_txs.iter().enumerate() {
-                            if receipt_success[orig_indices[j]]
-                                && let TxBody::WasmCall(ref body) = tx.body
-                                && exec_state.is_evm_contract(&body.contract)
-                            {
-                                let result = arc_vm::evm::evm_execute(
-                                    &exec_state,
-                                    tx.from,
-                                    body.contract,
-                                    body.calldata.clone(),
-                                    body.value,
-                                    body.gas_limit.max(1_000_000),
-                                );
-                                if !result.success {
-                                    receipt_success[orig_indices[j]] = false;
-                                }
-                                for mut log in result.logs {
-                                    log.tx_hash = tx.hash;
-                                    block_logs.push(log);
-                                }
-                            }
-                        }
-                        if !block_logs.is_empty() {
-                            let height = exec_state.height();
-                            exec_state.store_event_logs(height + 1, block_logs);
-                        }
-
                         info!(
                             txs = n,
                             success = receipt_success.iter().filter(|&&v| v).count(),
@@ -959,43 +820,12 @@ impl Pipeline {
                     }
 
                     // ── Sequential path (default / fallback) ─────────────
-                    let mut block_logs: Vec<arc_types::EventLog> = Vec::new();
-
                     for (i, tx) in vbatch.transactions.iter().enumerate() {
                         if vbatch.sig_valid[i] {
                             exec_state.mark_tx_accounts_dirty_pub(tx);
                             let tx_ok = exec_state.execute_tx_pub(tx).is_ok();
                             receipt_success[i] = tx_ok;
-
-                            // For EVM contract calls, run actual EVM execution
-                            // to handle storage writes, internal transfers, and event logs.
-                            if tx_ok
-                                && let TxBody::WasmCall(ref body) = tx.body
-                                && exec_state.is_evm_contract(&body.contract)
-                            {
-                                let result = arc_vm::evm::evm_execute(
-                                    &exec_state,
-                                    tx.from,
-                                    body.contract,
-                                    body.calldata.clone(),
-                                    body.value,
-                                    body.gas_limit.max(1_000_000),
-                                );
-                                if !result.success {
-                                    receipt_success[i] = false;
-                                }
-                                for mut log in result.logs {
-                                    log.tx_hash = tx.hash;
-                                    block_logs.push(log);
-                                }
-                            }
                         }
-                    }
-
-                    // Store event logs for this batch (height will be set at commit)
-                    if !block_logs.is_empty() {
-                        let height = exec_state.height();
-                        exec_state.store_event_logs(height + 1, block_logs);
                     }
 
                     debug!(
@@ -1341,8 +1171,66 @@ mod tests {
     }
 
     #[test]
-    fn test_pipeline_coalesce_mode() {
-        // Use two keypairs so we get multiple same-sender txs (triggers coalescing).
+    fn pipeline_cannot_mutate_state_after_rejected_evm_call() {
+        let keypair = KeyPair::generate_ed25519();
+        let sender = keypair.address();
+        let contract = addr(87);
+        let storage_key = hash_bytes(b"pipeline-evm-storage");
+        let state = Arc::new(StateDB::with_genesis(&[(sender, 1_000_000)]));
+        state.deploy_contract(&contract, vec![0x60, 0x00]);
+        state.set_storage(&contract, storage_key, b"before".to_vec());
+
+        let pipeline = Pipeline::with_config(
+            Arc::clone(&state),
+            PipelineConfig {
+                execution_mode: ExecutionMode::BlockSTM,
+                verify_mode: VerifyMode::Cpu,
+                coalesce_enabled: false,
+                ..Default::default()
+            },
+        );
+        let mut transaction = Transaction::new_wasm_call(
+            sender,
+            contract,
+            String::new(),
+            vec![0xde, 0xad, 0xbe, 0xef],
+            9,
+            1_000_000,
+            0,
+        );
+        transaction.sign(&keypair).unwrap();
+        let transaction_hash = transaction.hash;
+
+        pipeline
+            .submit(PipelineBatch {
+                transactions: vec![transaction],
+                producer: addr(99),
+            })
+            .unwrap();
+        let result = pipeline
+            .rx_out
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("pipeline result");
+
+        assert_eq!(result.success_count, 0);
+        let sender_account = state.get_account(&sender).unwrap();
+        assert_eq!(sender_account.balance, 1_000_000);
+        assert_eq!(sender_account.nonce, 0);
+        assert_eq!(
+            state.get_storage(&contract, &storage_key),
+            Some(b"before".to_vec())
+        );
+        assert!(state.event_logs.is_empty());
+        assert!(
+            !state
+                .get_receipt(&transaction_hash.0)
+                .expect("failed transaction still has a canonical receipt")
+                .success
+        );
+    }
+
+    #[test]
+    fn configured_coalescing_is_forced_to_canonical_fallback() {
         let kp = KeyPair::generate_ed25519();
         let sender = kp.address();
 
@@ -1361,7 +1249,10 @@ mod tests {
         };
         let pipeline = Pipeline::with_config(Arc::clone(&state), config);
 
-        assert!(pipeline.config().coalesce_enabled);
+        assert!(
+            !pipeline.config().coalesce_enabled,
+            "unsafe coalescing must remain disabled in protocol v3"
+        );
 
         // Create three txs from the same sender to the same receiver to ensure
         // coalescing is "worthwhile" (3 txs, 2 unique accounts).
@@ -1386,14 +1277,12 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.tx_count, 3);
         assert_eq!(result.success_count, 3);
-        // Coalescing should have been applied.
         assert!(
-            result.coalesce_reads_saved.is_some(),
-            "coalescing should report reads saved"
+            result.coalesce_reads_saved.is_none(),
+            "canonical fallback must not claim coalescing savings"
         );
-        assert!(
-            result.coalesce_reads_saved.unwrap() > 0,
-            "should have saved some reads"
-        );
+        assert_eq!(state.get_account(&sender).unwrap().nonce, 3);
+        assert_eq!(state.get_account(&sender).unwrap().balance, 1_000_000 - 600);
+        assert_eq!(state.get_account(&addr(2)).unwrap().balance, 600);
     }
 }

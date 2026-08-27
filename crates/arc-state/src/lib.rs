@@ -3319,15 +3319,6 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::WasmCall(body) => {
-                // --- Sender validation ---
-                let mut sender = self.get_or_create_account(&tx.from);
-                if sender.nonce != tx.nonce {
-                    return Err(StateError::InvalidNonce {
-                        expected: sender.nonce,
-                        got: tx.nonce,
-                    });
-                }
-
                 // --- Contract lookup ---
                 let bytecode = self
                     .get_contract(&body.contract)
@@ -3336,28 +3327,35 @@ impl StateDB {
                 let is_evm = bytecode.len() < 4 || &bytecode[..4] != WASM_MAGIC;
 
                 if is_evm {
-                    // --- EVM contract ---
-                    // Balance validation only (revm handles the actual transfer
-                    // and execution via evm_execute in the node layer).
-                    if body.value > 0 && sender.balance < body.value {
-                        return Err(StateError::InsufficientBalance {
-                            have: sender.balance,
-                            need: body.value,
-                        });
-                    }
-                    // Nonce increment - revm will see the updated state.
-                    sender.nonce += 1;
-                    self.accounts.insert(tx.from.0, sender.clone());
-                    self.wal
-                        .append(WalOp::SetAccount(tx.from, sender), self.height());
-                    // Actual EVM execution delegated to node layer (arc-vm::evm).
-                    tracing::debug!(
-                        contract = ?body.contract,
-                        calldata_len = body.calldata.len(),
-                        "EVM contract call - nonce incremented, execution delegated"
-                    );
+                    // State-changing EVM execution used to happen in arc-node
+                    // *after* this executor had computed and durably
+                    // checkpointed the block state root. That made the live
+                    // account/storage state differ from the authenticated
+                    // block and made restart fail on the trailing WAL writes.
+                    //
+                    // Protocol v3 therefore fails closed until EVM effects
+                    // can be produced and applied atomically inside this
+                    // canonical transition. This check deliberately precedes
+                    // sender lookup/creation, nonce changes, balance changes,
+                    // storage writes, logs, and WAL appends.
+                    return Err(StateError::ExecutionError(
+                        "state-changing EVM calls are unavailable until canonical pre-root execution is activated"
+                            .to_string(),
+                    ));
                 } else {
                     // --- WASM contract ---
+                    // Use a detached sender candidate so lookup failures above
+                    // and future preflight failures cannot fabricate an
+                    // account merely by submitting a rejected call.
+                    let mut sender = self
+                        .get_account(&tx.from)
+                        .unwrap_or_else(|| Account::new(tx.from, 0));
+                    if sender.nonce != tx.nonce {
+                        return Err(StateError::InvalidNonce {
+                            expected: sender.nonce,
+                            got: tx.nonce,
+                        });
+                    }
                     // Value transfer (WASM runtime doesn't handle it internally).
                     if body.value > 0 {
                         if sender.balance < body.value {
@@ -8070,6 +8068,204 @@ mod tests {
 
         state.delete_storage(&contract, &key);
         assert!(state.get_storage(&contract, &key).is_none());
+    }
+
+    fn signed_evm_call(
+        signer: &arc_crypto::signature::KeyPair,
+        contract: Address,
+        nonce: u64,
+        tag: u8,
+    ) -> Transaction {
+        let mut transaction = Transaction::new_wasm_call(
+            signer.address(),
+            contract,
+            String::new(),
+            vec![tag],
+            7,
+            1_000_000,
+            nonce,
+        );
+        transaction.sign(signer).unwrap();
+        transaction
+    }
+
+    fn assert_evm_call_left_no_state(
+        state: &StateDB,
+        sender: Address,
+        contract: Address,
+        storage_key: Hash256,
+        expected_root: Hash256,
+    ) {
+        let account = state.get_account(&sender).expect("funded sender remains");
+        assert_eq!(account.balance, 1_000_000);
+        assert_eq!(account.nonce, 0, "rejected EVM call cannot consume nonce");
+        assert_eq!(
+            state.get_storage(&contract, &storage_key),
+            Some(b"before".to_vec()),
+            "rejected EVM call cannot write storage"
+        );
+        assert!(
+            state.event_logs.is_empty(),
+            "rejected call cannot emit logs"
+        );
+        assert_eq!(
+            state.compute_state_root(),
+            expected_root,
+            "rejected call cannot change the authenticated state"
+        );
+    }
+
+    #[test]
+    fn state_changing_evm_call_fails_before_any_mutation() {
+        use arc_crypto::signature::KeyPair;
+
+        let signer = KeyPair::generate_ed25519();
+        let contract = addr(81);
+        let storage_key = hash_bytes(b"evm-atomic-storage");
+        let state = StateDB::with_genesis(&[(signer.address(), 1_000_000)]);
+        state.deploy_contract(&contract, vec![0x60, 0x00]);
+        state.set_storage(&contract, storage_key, b"before".to_vec());
+        let before_root = state.compute_state_root();
+
+        let error = state
+            .execute_tx_pub(&signed_evm_call(&signer, contract, 0, 1))
+            .expect_err("state-changing EVM execution must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("state-changing EVM calls are unavailable"),
+            "{error}"
+        );
+        assert_evm_call_left_no_state(&state, signer.address(), contract, storage_key, before_root);
+    }
+
+    #[test]
+    fn rejected_evm_call_matches_sequential_and_blockstm_roots() {
+        use arc_crypto::signature::KeyPair;
+
+        let signer = KeyPair::generate_ed25519();
+        let contract = addr(82);
+        let storage_key = hash_bytes(b"evm-engine-storage");
+        let genesis = [(signer.address(), 1_000_000)];
+        let sequential = StateDB::with_genesis(&genesis);
+        let blockstm = StateDB::with_genesis(&genesis);
+        for state in [&sequential, &blockstm] {
+            state.deploy_contract(&contract, vec![0x60, 0x01]);
+            state.set_storage(&contract, storage_key, b"before".to_vec());
+        }
+        let before_root = sequential.compute_state_root();
+        assert_eq!(before_root, blockstm.compute_state_root());
+        let transaction = signed_evm_call(&signer, contract, 0, 2);
+        let timestamp = 1_800_000_001_000;
+
+        let (sequential_block, sequential_receipts) = sequential
+            .execute_block_verified_at(std::slice::from_ref(&transaction), addr(99), timestamp)
+            .unwrap();
+        let (blockstm_block, blockstm_receipts) = blockstm
+            .execute_block_blockstm_at(&[transaction], addr(99), timestamp)
+            .unwrap();
+
+        assert!(!sequential_receipts[0].success);
+        assert!(!blockstm_receipts[0].success);
+        assert_eq!(sequential_block.header.state_root, before_root);
+        assert_eq!(blockstm_block.header.state_root, before_root);
+        assert_eq!(sequential_block.hash, blockstm_block.hash);
+        assert_evm_call_left_no_state(
+            &sequential,
+            signer.address(),
+            contract,
+            storage_key,
+            before_root,
+        );
+        assert_evm_call_left_no_state(
+            &blockstm,
+            signer.address(),
+            contract,
+            storage_key,
+            before_root,
+        );
+    }
+
+    #[test]
+    fn rejected_evm_calls_do_not_disturb_following_nonce_order() {
+        use arc_crypto::signature::KeyPair;
+
+        let signer = KeyPair::generate_ed25519();
+        let contract = addr(83);
+        let recipient = addr(84);
+        let state = StateDB::with_genesis(&[(signer.address(), 1_000_000), (recipient, 0)]);
+        state.deploy_contract(&contract, vec![0x60, 0x02]);
+
+        let first = signed_evm_call(&signer, contract, 0, 3);
+        let second = signed_evm_call(&signer, contract, 1, 4);
+        let mut transfer = Transaction::new_transfer(signer.address(), recipient, 11, 0);
+        transfer.sign(&signer).unwrap();
+        let (_, receipts) = state
+            .execute_block_blockstm_at(&[first, second, transfer], addr(99), 1_800_000_001_001)
+            .unwrap();
+
+        assert_eq!(
+            receipts
+                .iter()
+                .map(|receipt| receipt.success)
+                .collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+        let sender = state.get_account(&signer.address()).unwrap();
+        assert_eq!(sender.nonce, 1);
+        assert_eq!(sender.balance, 1_000_000 - 11);
+        assert_eq!(state.get_account(&recipient).unwrap().balance, 11);
+        assert!(state.event_logs.is_empty());
+    }
+
+    #[test]
+    fn rejected_evm_call_is_restart_stable() {
+        use arc_crypto::signature::KeyPair;
+
+        let signer = KeyPair::generate_ed25519();
+        let contract = addr(85);
+        let storage_key = hash_bytes(b"evm-restart-storage");
+        let directory = persistent_test_dir("evm-reject-restart");
+        let genesis_hash = hash_bytes(b"evm-reject-genesis");
+        let prefunded = [(signer.address(), 1_000_000)];
+        let state = StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        state.deploy_contract(&contract, vec![0x60, 0x03]);
+        state.set_storage(&contract, storage_key, b"before".to_vec());
+
+        let (block, receipts) = state
+            .execute_block_verified_at(
+                &[signed_evm_call(&signer, contract, 0, 5)],
+                addr(99),
+                1_800_000_001_002,
+            )
+            .unwrap();
+        assert!(!receipts[0].success);
+        let durable_root = block.header.state_root;
+        assert_evm_call_left_no_state(
+            &state,
+            signer.address(),
+            contract,
+            storage_key,
+            durable_root,
+        );
+        drop(state);
+
+        let recovered =
+            StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        assert_eq!(recovered.height(), 1);
+        assert_eq!(
+            recovered.get_block(1).unwrap().header.state_root,
+            durable_root
+        );
+        assert_evm_call_left_no_state(
+            &recovered,
+            signer.address(),
+            contract,
+            storage_key,
+            durable_root,
+        );
+        drop(recovered);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
