@@ -361,10 +361,10 @@ release_actions_are_exact_sha_allowlisted() {
     local actual expected ref
     expected="$(printf '%s\n' \
         'Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c' \
-        'actions/checkout@11d5960a326750d5838078e36cf38b85af677262' \
-        'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' \
-        'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020' \
-        'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' \
+        'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' \
+        'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' \
+        'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020' \
+        'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
         'dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c' \
         'dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772' \
         | LC_ALL=C sort)"
@@ -387,6 +387,28 @@ release_actions_are_exact_sha_allowlisted() {
             return 1
         fi
     done <<< "$actual"
+}
+
+github_owned_actions_are_node24_exact_sha_allowlisted() {
+    local actual expected
+    expected="$(printf '%s\n' \
+        'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' \
+        'actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d' \
+        'actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128' \
+        'actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c' \
+        'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020' \
+        'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
+        'actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9' \
+        | LC_ALL=C sort)"
+    actual="$(find "$REPO_ROOT/.github/workflows" -type f -name '*.yml' -print0 \
+        | LC_ALL=C sort -z \
+        | xargs -0 sed -n 's/^[[:space:]]*-\{0,1\}[[:space:]]*uses:[[:space:]]*\(actions\/[^#[:space:]]*@[0-9a-f]*\).*/\1/p' \
+        | LC_ALL=C sort -u)"
+    if [ "$actual" != "$expected" ]; then
+        printf 'GitHub-owned action allowlist changed or contains a non-Node-24 pin\nexpected:\n%s\nactual:\n%s\n' \
+            "$expected" "$actual"
+        return 1
+    fi
 }
 
 release_supply_chain_and_npm_audits_are_blocking() {
@@ -623,7 +645,7 @@ publish_is_pinned_to_one_validated_commit_and_create_only() {
         return 1
     fi
     checkout_count="$(grep -Fc \
-        'uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262' \
+        'uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' \
         "$RELEASE_WORKFLOW")"
     credential_count="$(grep -Fc 'persist-credentials: false' "$RELEASE_WORKFLOW")"
     if [ "$credential_count" -ne "$checkout_count" ]; then
@@ -694,6 +716,7 @@ run_test 'community join entrypoints delegate to the stake-zero checksummed inst
 run_test 'secret scans are pinned to the CI commit and local releasable worktree' secret_scan_is_pinned_to_the_current_tree
 run_test 'Ubuntu 24/26 smoke boots a real GUI-free node and checks health' linux_compat_smoke_executes_real_headless_node
 run_test 'release actions are exact-SHA pinned to the reviewed allowlist' release_actions_are_exact_sha_allowlisted
+run_test 'GitHub-owned actions are exact-SHA pinned to the reviewed Node 24 releases' github_owned_actions_are_node24_exact_sha_allowlisted
 run_test 'release cargo and npm supply-chain audits are exact-ref and blocking' release_supply_chain_and_npm_audits_are_blocking
 run_test 'release golden vectors cover Linux x86/ARM, both Macs, and Windows' cross_arch_golden_vectors_gate_publication
 run_test 'updater signatures verify against the embedded key and reject rotation' updater_signatures_are_verified_against_the_embedded_key

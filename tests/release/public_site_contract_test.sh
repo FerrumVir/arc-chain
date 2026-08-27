@@ -24,11 +24,11 @@ every_action_is_commit_sha_pinned() {
 
 pages_workflow_is_pinned_and_self_contained() {
     for pin in \
-        'actions/checkout@11d5960a326750d5838078e36cf38b85af677262' \
-        'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020' \
-        'actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b' \
-        'actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa' \
-        'actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e'
+        'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' \
+        'actions/setup-node@820762786026740c76f36085b0efc47a31fe5020' \
+        'actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d' \
+        'actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9' \
+        'actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128'
     do
         grep -Fq "$pin" "$WORKFLOW" || {
             printf 'public-console workflow is missing pinned action: %s\n' "$pin"
