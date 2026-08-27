@@ -186,15 +186,24 @@ Workflow text does not prove that repository settings are enabled. Before a
 release owner runs the tag workflow, the owner must verify all of these controls
 in GitHub's settings:
 
-- protect `main` and release tags with branch/tag rulesets, and enable immutable
-  releases;
+- protect `main` with a no-bypass PR/check/review ruleset. Protect semver tags
+  with two rulesets: owner-only creation, plus no-bypass update, deletion, and
+  non-fast-forward prevention. Enable immutable releases;
 - restrict Actions to an owner-reviewed allowlist and require full commit-SHA
   pinning;
 - create a protected `release` environment, restrict its deployment tags, add
-  required reviewers, move `TAURI_SIGNING_PRIVATE_KEY` from repository secrets
-  into that environment, and remove the repository-level copies. The retained
-  v0.7-compatible key encoding has no passphrase, so the workflow deliberately
-  does not inject a misleading password variable;
+  required reviewers, move `TAURI_SIGNING_PRIVATE_KEY` and the separate
+  `ARC_RELEASE_MANIFEST_PRIVATE_KEY` into that environment, and remove all
+  repository-level copies. The retained v0.7-compatible Tauri key encoding has
+  no passphrase, so the workflow deliberately does not inject a misleading
+  password variable. Run the protected-main signing preflight and require both
+  key canaries to verify before creating the non-movable `v0.8.0` tag;
+- after the independent PR approval and merge are complete, temporarily reduce
+  every non-owner collaborator below `write` until the workflow-created release
+  is complete, immutable, signature-verified, and smoke-tested. The detached
+  signature prevents unauthorized code from installing, but this short release
+  lock also prevents a write collaborator from first-publishing junk and
+  permanently burning the version as a denial of service;
 - configure Apple Developer ID signing/notarization and Windows Authenticode
   signing before claiming OS-signed installers. Until then, release notes must
   plainly label macOS and Windows packages unsigned; the Tauri updater payload
@@ -206,8 +215,10 @@ tag immediately before creation, and refuses to replace an existing release.
 Its publisher is blocked on the full quality harness, Cargo
 and npm dependency policy, and the five-platform inference known-answer matrix.
 That one new release must contain the CLI/headless and desktop artifacts,
-installer, updater manifest/signature, `SHA256SUMS`, seeds, and genesis from the
-same commit and version. The publication gate cryptographically verifies all
+installer, updater manifest/signature, owner-signed `SHA256SUMS` plus
+`SHA256SUMS.sig`, seeds, and genesis from the same commit and version. The
+signed manifest header binds repository, tag, and commit. The publication gate
+cryptographically verifies its signature and all
 four updater payloads against the public key embedded in that exact commit.
 Test Linux x86_64 in clean Ubuntu 24.04 and 26.04 containers with `DISPLAY`
 unset. Test Intel macOS with the headless x86_64 artifact. Confirm that

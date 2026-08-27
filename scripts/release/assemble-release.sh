@@ -10,6 +10,7 @@ set -Eeuo pipefail
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts}"
 OUTPUT_DIR="${OUTPUT_DIR:-release-files}"
 RELEASE_TAG="${RELEASE_TAG:-}"
+RELEASE_COMMIT="${RELEASE_COMMIT:-}"
 REPOSITORY="${REPOSITORY:-FerrumVir/arc-chain}"
 RELEASE_DATE="${RELEASE_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 GENESIS_FILE="${GENESIS_FILE:-genesis.toml}"
@@ -24,6 +25,10 @@ die() {
 [ -n "$RELEASE_TAG" ] || die "RELEASE_TAG is required"
 printf '%s\n' "$RELEASE_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' \
     || die "release tag must be strict vX.Y.Z (got: $RELEASE_TAG)"
+printf '%s\n' "$RELEASE_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+    || die "RELEASE_COMMIT must be the exact 40-character lowercase Git commit"
+printf '%s\n' "$REPOSITORY" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' \
+    || die "REPOSITORY must be an exact owner/name pair"
 [ -d "$ARTIFACTS_DIR" ] || die "artifact directory does not exist: $ARTIFACTS_DIR"
 [ -f install.sh ] || die "run from the repository root (install.sh is missing)"
 [ -f testnet-seeds.txt ] || die "testnet-seeds.txt is missing"
@@ -189,16 +194,24 @@ manifest = {
 PY
 
 # Hash every published file (including Tauri signatures and latest.json).
-# SHA256SUMS itself is intentionally the only file not listed in the manifest.
+# The signed header binds the manifest against cross-repository, cross-tag, and
+# cross-commit replay. SHA256SUMS and its detached signature are intentionally
+# not listed in the manifest, avoiding a circular digest.
 # shellcheck disable=SC2094 # find explicitly excludes the redirection target.
 (
     cd "$OUTPUT_DIR"
-    find . -maxdepth 1 -type f ! -name SHA256SUMS -print \
-        | sed 's#^\./##' \
-        | LC_ALL=C sort \
-        | while IFS= read -r file; do
-            printf '%s  %s\n' "$(sha256_file "$file")" "$file"
-        done > SHA256SUMS
+    {
+        printf '# ARC release manifest v1\n'
+        printf '# repository=%s\n' "$REPOSITORY"
+        printf '# tag=%s\n' "$RELEASE_TAG"
+        printf '# commit=%s\n' "$RELEASE_COMMIT"
+        find . -maxdepth 1 -type f ! -name SHA256SUMS -print \
+            | sed 's#^\./##' \
+            | LC_ALL=C sort \
+            | while IFS= read -r file; do
+                printf '%s  %s\n' "$(sha256_file "$file")" "$file"
+            done
+    } > SHA256SUMS
 )
 
 [ -s "$OUTPUT_DIR/SHA256SUMS" ] || die "failed to create SHA256SUMS"

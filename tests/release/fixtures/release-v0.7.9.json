@@ -3,6 +3,7 @@
   "draft": false,
   "prerelease": false,
   "immutable": true,
+  "author": {"login": "github-actions[bot]", "type": "Bot"},
   "assets": [
     {"name": "arc-node-linux-x86_64"},
     {"name": "arc-cli-linux-x86_64"},
@@ -15,6 +16,7 @@
     {"name": "arc-node-windows-x86_64.exe"},
     {"name": "arc-cli-windows-x86_64.exe"},
     {"name": "SHA256SUMS"},
+    {"name": "SHA256SUMS.sig"},
     {"name": "testnet-seeds.txt"},
     {"name": "genesis.toml"},
     {"name": "install.sh"}

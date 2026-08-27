@@ -321,7 +321,7 @@ current_scripts_and_docs_forbid_mutable_remote_execution() {
         "$REPO_ROOT/testnet/README.md" \
         "$REPO_ROOT/deploy/README.md"
     do
-        if grep -Eq 'raw[.]githubusercontent[.]com' "$file"; then
+        if grep -Eq 'raw[.]githubusercontent[.]com/[^/]+/[^/]+/(main|master)/' "$file"; then
             printf '%s still references executable content from mutable raw main\n' "$file"
             return 1
         fi

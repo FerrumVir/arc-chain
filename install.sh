@@ -137,7 +137,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-for command_name in curl awk sed grep mktemp uname id chmod mkdir cp mv dirname stat; do
+for command_name in curl awk sed grep mktemp uname id chmod mkdir cp mv dirname stat ssh-keygen; do
     command -v "$command_name" >/dev/null 2>&1 \
         || die "Required command is missing: $command_name"
 done
@@ -568,9 +568,10 @@ fi
 
 # SHA256SUMS and the payloads it authenticates live in the same GitHub
 # release. A mutable release could replace both together, so a checksum alone
-# is not an authenticity boundary. The sole publisher enables GitHub immutable
-# releases before creation; require that server-side property here as well and
-# reject drafts/prereleases from both pinned installs and unattended updates.
+# is not an authenticity boundary. The protected publisher uses the repository
+# GITHUB_TOKEN, which GitHub records as github-actions[bot]. Require that
+# server-authenticated author as defense in depth; the owner-controlled
+# detached manifest signature below remains the cryptographic trust boundary.
 require_release_boolean() {
     local key="$1"
     local expected="$2"
@@ -587,6 +588,14 @@ require_release_boolean() {
 require_release_boolean immutable true
 require_release_boolean draft false
 require_release_boolean prerelease false
+
+# GitHub's release API emits the top-level author object with `login` first.
+# Flatten whitespace only for this exact server-owned field; do not accept a
+# generic nested `login` from an asset uploader or other object.
+tr -d '\r\n' < "$TMP_DIR/release.json" > "$TMP_DIR/release-one-line.json"
+grep -Eq '"author"[[:space:]]*:[[:space:]]*\{[[:space:]]*"login"[[:space:]]*:[[:space:]]*"github-actions\[bot\]"([[:space:]]*[,}])' \
+    "$TMP_DIR/release-one-line.json" \
+    || die "Release metadata author must be github-actions[bot] from the protected publisher"
 
 RESOLVED_TAG="$(sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TMP_DIR/release.json" | head -n 1)"
 case "$RESOLVED_TAG" in v*) VERSION="${RESOLVED_TAG#v}" ;; *) die "Release metadata has no valid vX.Y.Z tag" ;; esac
@@ -627,6 +636,45 @@ RELEASE_URL="$DOWNLOAD_ROOT/$RESOLVED_TAG"
 info "Downloading checksums for $RESOLVED_TAG"
 github_curl "$RELEASE_URL/SHA256SUMS" > "$TMP_DIR/SHA256SUMS" \
     || die "Could not download $RELEASE_URL/SHA256SUMS"
+github_curl "$RELEASE_URL/SHA256SUMS.sig" > "$TMP_DIR/SHA256SUMS.sig" \
+    || die "Could not download $RELEASE_URL/SHA256SUMS.sig"
+
+# The bootstrap installer comes from the owner-created protected source tag.
+# This detached signature extends that trust to every release asset and defeats
+# a manual or alternate-workflow first publication, even if GitHub reports it
+# as immutable and authored by github-actions[bot].
+printf '%s\n' \
+    'arc-release namespaces="arc-release-manifest-v1" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPs2NAiDRXit9EM96A2GdXZgRqvXtl0lvryEAEAEjQfY arc-release-manifest-v1' \
+    > "$TMP_DIR/arc-release-allowed-signers"
+if ! ssh-keygen -Y verify \
+    -f "$TMP_DIR/arc-release-allowed-signers" \
+    -I arc-release \
+    -n arc-release-manifest-v1 \
+    -s "$TMP_DIR/SHA256SUMS.sig" \
+    < "$TMP_DIR/SHA256SUMS" >/dev/null 2>&1; then
+    die "Release SHA256SUMS signature is invalid or not owner-authorized"
+fi
+
+if ! github_curl "$API_ROOT/commits/$RESOLVED_TAG" > "$TMP_DIR/tag-commit.json"; then
+    die "Could not resolve the protected source tag commit: $RESOLVED_TAG"
+fi
+tr -d '\r\n' < "$TMP_DIR/tag-commit.json" > "$TMP_DIR/tag-commit-one-line.json"
+RESOLVED_COMMIT="$(sed -n \
+    's/^[[:space:]]*{[[:space:]]*"sha"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{40\}\)".*/\1/p' \
+    "$TMP_DIR/tag-commit-one-line.json")"
+printf '%s\n' "$RESOLVED_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+    || die "Protected source tag did not resolve to an exact Git commit"
+
+[ "$(sed -n '1p' "$TMP_DIR/SHA256SUMS")" = '# ARC release manifest v1' ] \
+    || die "Signed release manifest has the wrong schema"
+[ "$(sed -n '2p' "$TMP_DIR/SHA256SUMS")" = '# repository=FerrumVir/arc-chain' ] \
+    || die "Signed release manifest targets the wrong repository"
+[ "$(sed -n '3p' "$TMP_DIR/SHA256SUMS")" = "# tag=$RESOLVED_TAG" ] \
+    || die "Signed release manifest targets the wrong tag"
+[ "$(sed -n '4p' "$TMP_DIR/SHA256SUMS")" = "# commit=$RESOLVED_COMMIT" ] \
+    || die "Signed release manifest targets the wrong source commit"
+[ "$(grep -Ec '^# ' "$TMP_DIR/SHA256SUMS")" -eq 4 ] \
+    || die "Signed release manifest contains unexpected metadata fields"
 
 sha256_file() {
     if command -v sha256sum >/dev/null 2>&1; then

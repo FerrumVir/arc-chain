@@ -8,7 +8,8 @@ GUI applications; they are not substitutes for the headless `arc-node` binary.
 > candidate. The current public v0.7.11 release is desktop-only and cannot
 > install an SSH/headless node. The v0.8.0 commands below become valid only
 > after GitHub shows that exact release with `arc-node`, `arc-cli`, `install.sh`,
-> `genesis.toml`, `testnet-seeds.txt`, and `SHA256SUMS` assets. Nothing here
+> `genesis.toml`, `testnet-seeds.txt`, `SHA256SUMS`, and `SHA256SUMS.sig`
+> assets. Nothing here
 > claims that v0.8.0 is already deployed to the public seeds. v0.8.0 is not published or deployed.
 
 ## Supported release targets
@@ -29,36 +30,37 @@ Linux ARM64 desktop bundle and no Windows ARM64 release.
 
 ## Linux and macOS
 
-After the complete v0.8.0 release is published, download that exact installer
-asset and pin the same version when running it. Keeping download and execution
-separate makes network errors visible and lets you inspect the script first.
+After the complete v0.8.0 release is published, download the installer from
+the owner-created protected source tag and pin the same version when running
+it. Keeping download and execution separate makes network errors visible and
+lets you inspect the script first.
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
 bash install.sh --version 0.8.0
 ```
 
-That first script download is the bootstrap trust boundary: the URL is HTTPS
-and the installer refuses to continue unless GitHub reports the release as
-immutable. If you want to verify the bootstrap file before executing it,
-download `SHA256SUMS` from the same exact release and check only the
-`install.sh` row. On Linux:
+Verify the candidate's pinned installer hash before execution:
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/SHA256SUMS
-awk '$2 == "install.sh" { print; found=1 } END { exit !found }' SHA256SUMS | sha256sum -c -
+printf '%s  %s\n' 5cbe312ddfafe6a602a62d3573c09f2f92a001fefcd020ed531c2f693f12b293 install.sh | sha256sum -c -
 ```
 
-On macOS, use the same two commands with `shasum -a 256 -c -` in place of
-`sha256sum -c -` on the second line.
+On macOS, replace `sha256sum -c -` with `shasum -a 256 -c -`.
 
-Every later program/config download is verified automatically before any
-managed file is replaced.
+That first script download is the bootstrap trust boundary: HTTPS reads it
+from a semver tag whose creation is owner-only and whose update/deletion is
+blocked for everyone. The script requires OpenSSH 8.1 or newer and verifies
+the release's namespaced Ed25519 `SHA256SUMS.sig` against its embedded owner
+public key before it downloads executable payloads or replaces any managed
+file. An unsigned checksum file is never an authenticity boundary.
 
 The installer does not resolve `releases/latest/download` for the programs. It
 first reads one release's metadata, requires GitHub to report that release as
-immutable, non-draft, and non-prerelease, validates a strict
-`vMAJOR.MINOR.PATCH` tag, and downloads from that exact tag. It verifies the
+immutable, non-draft, and non-prerelease, requires the server-authenticated
+release author to be `github-actions[bot]`, validates a strict
+`vMAJOR.MINOR.PATCH` tag and protected source commit, and downloads from that
+exact tag. It verifies the signature first, then the
 current platform's node and CLI plus seeds and genesis against `SHA256SUMS`; if
 auto-update is enabled, it also verifies the installer copy it retains. A
 desktop-only or otherwise incomplete platform bundle is an error; it never
@@ -275,16 +277,20 @@ to downgrade it.
 
 ## Windows Server manual verification
 
-PowerShell does not use this Bash installer. Download these three files from
-the same release:
+PowerShell does not use this Bash installer. Download these four files from
+the same release and the allowed-signers file from the protected source tag:
 
 - `arc-node-windows-x86_64.exe`
 - `arc-cli-windows-x86_64.exe`
 - `SHA256SUMS`
+- `SHA256SUMS.sig`
+- `release/arc-release-allowed-signers` from tag `v0.8.0`
 
-Then compare PowerShell's digest with the corresponding manifest line:
+First use the Windows OpenSSH client to authenticate the exact manifest, then
+compare PowerShell's digest with the corresponding signed manifest line:
 
 ```powershell
+cmd.exe /d /c "ssh-keygen -Y verify -f arc-release-allowed-signers -I arc-release -n arc-release-manifest-v1 -s SHA256SUMS.sig < SHA256SUMS"
 Get-FileHash .\arc-node-windows-x86_64.exe -Algorithm SHA256
 Get-Content .\SHA256SUMS | Select-String 'arc-node-windows-x86_64.exe'
 ```

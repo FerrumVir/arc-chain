@@ -36,8 +36,8 @@ canonical_pairs_for_version() {
     for asset in $CANONICAL_ASSETS; do
         printf '%s/%s ' "$version" "$asset"
     done
-    printf '%s/SHA256SUMS %s/install.sh %s/testnet-seeds.txt %s/genesis.toml\n' \
-        "$version" "$version" "$version" "$version"
+    printf '%s/SHA256SUMS %s/SHA256SUMS.sig %s/install.sh %s/testnet-seeds.txt %s/genesis.toml\n' \
+        "$version" "$version" "$version" "$version" "$version"
 }
 
 new_sandbox() {
@@ -54,7 +54,7 @@ new_sandbox() {
     cp "$TEST_DIR/helpers/mock-curl.sh" "$mock_bin/curl"
     cp "$TEST_DIR/helpers/mock-platform-command.sh" "$mock_bin/platform-command"
     chmod +x "$mock_bin/curl" "$mock_bin/platform-command"
-    for command_name in uname sleep free sysctl openssl hostname id getent chown runuser sudo systemctl launchctl; do
+    for command_name in uname sleep free sysctl openssl ssh-keygen hostname id getent chown runuser sudo systemctl launchctl; do
         ln -s platform-command "$mock_bin/$command_name"
     done
     NEW_SANDBOX="$sandbox"
@@ -87,6 +87,11 @@ invoke_installer() {
         MOCK_HEALTH_PORT="${MOCK_HEALTH_PORT_UNDER_TEST:-}" \
         MOCK_HEALTH_STATUS="${MOCK_HEALTH_STATUS_UNDER_TEST:-ok}" \
         MOCK_TAMPER_BINARY="${MOCK_TAMPER_BINARY_UNDER_TEST:-0}" \
+        MOCK_TAMPER_MANIFEST_SIGNATURE="${MOCK_TAMPER_MANIFEST_SIGNATURE_UNDER_TEST:-0}" \
+        MOCK_MISSING_CHECKSUM="${MOCK_MISSING_CHECKSUM_UNDER_TEST:-0}" \
+        MOCK_MISSING_MANIFEST_SIGNATURE="${MOCK_MISSING_MANIFEST_SIGNATURE_UNDER_TEST:-0}" \
+        MOCK_DUPLICATE_CHECKSUM_ASSET="${MOCK_DUPLICATE_CHECKSUM_ASSET_UNDER_TEST:-}" \
+        MOCK_RELEASE_COMMIT="${MOCK_RELEASE_COMMIT_UNDER_TEST:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" \
         MOCK_SYSTEMD_NODE_ACTIVE="${MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST:-false}" \
         MOCK_SYSTEMD_NODE_ENABLED="${MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST:-false}" \
         MOCK_SYSTEMD_UPDATER_ACTIVE="${MOCK_SYSTEMD_UPDATER_ACTIVE_UNDER_TEST:-false}" \
@@ -161,6 +166,8 @@ Darwin|x86_64|arc-node-macos-x86_64|arc-cli-macos-x86_64
             "$os/$arch did not request $cli_asset from the exact tag" || return 1
         assert_log_contains_literal "$sandbox/curl.log" '/v0.8.0/SHA256SUMS' \
             "$os/$arch did not request SHA256SUMS from the exact tag" || return 1
+        assert_log_contains_literal "$sandbox/curl.log" '/v0.8.0/SHA256SUMS.sig' \
+            "$os/$arch did not request the detached manifest signature" || return 1
         if [ ! -x "$sandbox/arc/bin/arc-node" ] || [ ! -x "$sandbox/arc/bin/arc-cli" ]; then
             printf '%s/%s did not install executable arc-node and arc-cli files\n' "$os" "$arch"
             find "$sandbox/arc" -maxdepth 3 -type f -print
@@ -213,9 +220,9 @@ minified_github_api_json_without_newline_installs_exact_assets() {
     done
 }
 
-mutable_draft_and_prerelease_metadata_fail_before_asset_download() {
+untrusted_release_metadata_fails_before_asset_download() {
     local sandbox fixture output status field replacement
-    for field in immutable draft prerelease; do
+    for field in immutable draft prerelease author; do
         new_sandbox
         sandbox="$NEW_SANDBOX"
         fixture="$sandbox/rejected-$field.json"
@@ -223,6 +230,7 @@ mutable_draft_and_prerelease_metadata_fail_before_asset_download() {
             immutable) replacement='s/"immutable": true/"immutable": false/' ;;
             draft) replacement='s/"draft": false/"draft": true/' ;;
             prerelease) replacement='s/"prerelease": false/"prerelease": true/' ;;
+            author) replacement='s/github-actions\[bot\]/manual-publisher/' ;;
         esac
         sed "$replacement" "$TEST_DIR/fixtures/release-v0.8.0.json" > "$fixture"
         output="$sandbox/rejected-$field.out"
@@ -247,6 +255,85 @@ mutable_draft_and_prerelease_metadata_fail_before_asset_download() {
             return 1
         fi
     done
+}
+
+tampered_manifest_signature_fails_before_payload_download() {
+    local sandbox output status
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    output="$sandbox/rejected-signature.out"
+    MOCK_TAMPER_MANIFEST_SIGNATURE_UNDER_TEST=1
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.0.json" '0.8.0' \
+        --no-service --no-auto-update >"$output" 2>&1
+    status=$?
+    MOCK_TAMPER_MANIFEST_SIGNATURE_UNDER_TEST=0
+
+    [ "$status" -ne 0 ] || {
+        printf 'installer accepted a tampered manifest signature\n'
+        return 1
+    }
+    grep -Fq '/v0.8.0/SHA256SUMS.sig' "$sandbox/curl.log" || {
+        printf 'signature rejection test never downloaded the signature\n'
+        return 1
+    }
+    if grep -Eq '/v0\.8\.0/(arc-node|arc-cli)-' "$sandbox/curl.log"; then
+        printf 'installer downloaded executable payloads before rejecting the signature\n'
+        cat "$sandbox/curl.log"
+        return 1
+    fi
+}
+
+missing_checksum_or_signature_fails_before_payload_download() {
+    local sandbox output status missing
+    for missing in checksum signature; do
+        new_sandbox
+        sandbox="$NEW_SANDBOX"
+        output="$sandbox/missing-$missing.out"
+        MOCK_MISSING_CHECKSUM_UNDER_TEST=0
+        MOCK_MISSING_MANIFEST_SIGNATURE_UNDER_TEST=0
+        if [ "$missing" = checksum ]; then
+            MOCK_MISSING_CHECKSUM_UNDER_TEST=1
+        else
+            MOCK_MISSING_MANIFEST_SIGNATURE_UNDER_TEST=1
+        fi
+        invoke_installer "$sandbox" Linux x86_64 \
+            "$TEST_DIR/fixtures/release-v0.8.0.json" '0.8.0' \
+            --no-service --no-auto-update >"$output" 2>&1
+        status=$?
+        MOCK_MISSING_CHECKSUM_UNDER_TEST=0
+        MOCK_MISSING_MANIFEST_SIGNATURE_UNDER_TEST=0
+        [ "$status" -ne 0 ] || {
+            printf 'installer accepted a missing %s\n' "$missing"
+            return 1
+        }
+        if grep -Eq '/v0\.8\.0/(arc-node|arc-cli)-' "$sandbox/curl.log"; then
+            printf 'installer downloaded executable payloads after a missing %s\n' "$missing"
+            cat "$sandbox/curl.log"
+            return 1
+        fi
+    done
+}
+
+duplicate_checksum_entry_fails_before_replacement() {
+    local sandbox output status
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    output="$sandbox/duplicate-checksum.out"
+    MOCK_DUPLICATE_CHECKSUM_ASSET_UNDER_TEST=arc-node-linux-x86_64
+    invoke_installer "$sandbox" Linux x86_64 \
+        "$TEST_DIR/fixtures/release-v0.8.0.json" '0.8.0' \
+        --no-service --no-auto-update >"$output" 2>&1
+    status=$?
+    MOCK_DUPLICATE_CHECKSUM_ASSET_UNDER_TEST=''
+    [ "$status" -ne 0 ] || {
+        printf 'installer accepted duplicate checksum rows for one executable\n'
+        return 1
+    }
+    [ ! -e "$sandbox/arc/bin/arc-node" ] || {
+        printf 'duplicate checksum failure introduced the node executable\n'
+        return 1
+    }
 }
 
 tampered_binary_is_rejected() {
@@ -820,7 +907,10 @@ transaction_contract_covers_every_service_scope() {
 
 run_test 'offline platform aliases install exact-tag node + CLI assets without starting' install_only_platform_matrix
 run_test 'minified GitHub API JSON with no trailing newline installs exact-tag assets' minified_github_api_json_without_newline_installs_exact_assets
-run_test 'mutable, draft, and prerelease metadata fail before any asset download' mutable_draft_and_prerelease_metadata_fail_before_asset_download
+run_test 'mutable, draft, prerelease, and manual-publisher metadata fail before any asset download' untrusted_release_metadata_fails_before_asset_download
+run_test 'tampered release-manifest signature fails before executable download' tampered_manifest_signature_fails_before_payload_download
+run_test 'missing checksum or signature fails before executable download' missing_checksum_or_signature_fails_before_payload_download
+run_test 'duplicate executable checksum rows fail before replacement' duplicate_checksum_entry_fails_before_replacement
 run_test 'checksum mismatch rejects and removes staged executables' tampered_binary_is_rejected
 run_test 'ARC_NODE_VERSION requires strict X.Y.Z before network-shaped requests' invalid_version_pin_fails_before_asset_download
 run_test '--no-service --no-auto-update has no start, health, service, or updater side effects' no_service_no_updater_really_is_install_only

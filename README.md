@@ -20,12 +20,16 @@ upstream components vendored for reproducibility are identified under
 `latest` release is still the desktop-only v0.7.11 bundle, so this README does
 not use it as an install source. After the complete
 [exact v0.8.0 release](https://github.com/FerrumVir/arc-chain/releases/tag/v0.8.0)
-shows every required asset and `SHA256SUMS`, an SSH/EC2/VPS operator can run:
+shows every required asset, `SHA256SUMS`, and `SHA256SUMS.sig`, an
+SSH/EC2/VPS operator can run:
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
 bash install.sh --version 0.8.0
 ```
+
+Expected `install.sh` SHA-256 for this candidate:
+`5cbe312ddfafe6a602a62d3573c09f2f92a001fefcd020ed531c2f693f12b293`.
 
 The unified release contract restores headless Linux amd64 and arm64, Intel
 and Apple Silicon macOS, Windows CLI binaries, signed desktop-updater payloads,
@@ -197,15 +201,19 @@ after GitHub shows the complete `v0.8.0` release. The moving `latest` alias is
 never used by the initial install command.
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
 bash install.sh --version 0.8.0
 ```
 
-The installer uses an exact immutable, non-draft release tag after resolution,
-verifies `arc-node`, `arc-cli`, seeds, and genesis against that release's
-`SHA256SUMS`, and refuses mutable/prerelease metadata, missing assets, unknown
-versions, and downgrades. When auto-update is enabled it also verifies the
-release's installer before installing that copy. On Linux it installs a systemd
+Expected `install.sh` SHA-256:
+`5cbe312ddfafe6a602a62d3573c09f2f92a001fefcd020ed531c2f693f12b293`.
+
+The bootstrap installer comes from the owner-created protected source tag.
+It resolves an exact immutable, non-draft release, requires GitHub to identify
+the publisher as `github-actions[bot]`, and verifies the owner-signed
+`SHA256SUMS.sig` before trusting checksums for `arc-node`, `arc-cli`, seeds,
+genesis, or the retained updater. It refuses unsigned, mutable/prerelease,
+missing, unknown-version, and downgrade paths. On Linux it installs a systemd
 system service when run as root and a systemd user service otherwise; on macOS
 it installs a LaunchAgent. It preserves the private node identity across
 upgrades and never places it in the process command line. Managed stake-zero

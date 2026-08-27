@@ -1,0 +1,90 @@
+name: Release signing preflight
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-signing-preflight
+  cancel-in-progress: false
+
+jobs:
+  manifest-key:
+    name: protected manifest-key canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+
+      - name: Install the locked Tauri signer
+        run: npm ci --prefix desktop
+
+      - name: Sign and verify a fixed non-release canary
+        shell: bash
+        env:
+          ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${ARC_RELEASE_MANIFEST_PRIVATE_KEY:-}" ]; then
+            echo "::error::ARC_RELEASE_MANIFEST_PRIVATE_KEY is unavailable."
+            exit 1
+          fi
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is unavailable."
+            exit 1
+          fi
+          key_file="$RUNNER_TEMP/arc-release-manifest-key"
+          canary="$RUNNER_TEMP/arc-release-signing-canary"
+          tauri_canary="$RUNNER_TEMP/arc-tauri-signing-canary"
+          verifier_target="$RUNNER_TEMP/arc-tauri-verifier"
+          cleanup() {
+            rm -f -- \
+              "$key_file" "$canary" "$canary.sig" \
+              "$tauri_canary" "$tauri_canary.sig"
+          }
+          trap cleanup EXIT HUP INT TERM
+          umask 077
+          printf '%s\n' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$key_file"
+          printf '%s\n' 'ARC protected release signing canary v1' > "$canary"
+          chmod 600 "$key_file"
+          ssh-keygen -Y sign \
+            -f "$key_file" \
+            -n arc-release-manifest-v1 \
+            "$canary"
+          ssh-keygen -Y verify \
+            -f release/arc-release-allowed-signers \
+            -I arc-release \
+            -n arc-release-manifest-v1 \
+            -s "$canary.sig" \
+            < "$canary"
+
+          printf '%s\n' 'ARC protected Tauri signing canary v1' > "$tauri_canary"
+          npm --prefix desktop exec -- tauri signer sign "$tauri_canary"
+          tauri_public_key="$(python3 - <<'PY'
+          import json
+          from pathlib import Path
+          config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text())
+          print(config["plugins"]["updater"]["pubkey"])
+          PY
+          )"
+          CARGO_TARGET_DIR="$verifier_target" cargo build --quiet --locked \
+            --manifest-path tests/release/tauri-updater-verifier/Cargo.toml
+          "$verifier_target/debug/tauri-updater-verifier" \
+            "$tauri_public_key" "$tauri_canary" "$tauri_canary.sig"
+          cleanup
+          trap - EXIT HUP INT TERM

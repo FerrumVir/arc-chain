@@ -252,6 +252,35 @@ jobs:
           ref: ${{ needs.validate.outputs.sha }}
           persist-credentials: false
 
+      - name: Prove namespaced manifest verification on installer hosts
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          key="$RUNNER_TEMP/arc-portability-key"
+          probe="$RUNNER_TEMP/arc-portability-probe"
+          allowed="$RUNNER_TEMP/arc-portability-allowed-signers"
+          cleanup() {
+            rm -f -- "$key" "$key.pub" "$probe" "$probe.sig" "$allowed"
+          }
+          trap cleanup EXIT HUP INT TERM
+          ssh-keygen -q -t ed25519 -N '' -f "$key"
+          printf '%s\n' 'ARC release verifier portability probe v1' > "$probe"
+          printf 'arc-release namespaces="arc-release-manifest-v1" %s\n' \
+            "$(cat "$key.pub")" > "$allowed"
+          ssh-keygen -Y sign \
+            -f "$key" \
+            -n arc-release-manifest-v1 \
+            "$probe"
+          ssh-keygen -Y verify \
+            -f "$allowed" \
+            -I arc-release \
+            -n arc-release-manifest-v1 \
+            -s "$probe.sig" \
+            < "$probe"
+          cleanup
+          trap - EXIT HUP INT TERM
+
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
           toolchain: nightly-2026-03-16
@@ -568,8 +597,40 @@ jobs:
         env:
           RELEASE_TAG: ${{ needs.validate.outputs.tag }}
           RELEASE_DATE: ${{ needs.validate.outputs.date }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}
           REPOSITORY: ${{ github.repository }}
         run: ./scripts/release/assemble-release.sh
+
+      - name: Sign and verify the headless release manifest
+        shell: bash
+        env:
+          ARC_RELEASE_MANIFEST_PRIVATE_KEY: ${{ secrets.ARC_RELEASE_MANIFEST_PRIVATE_KEY }}
+        run: |
+          set -Eeuo pipefail
+          if [ -z "${ARC_RELEASE_MANIFEST_PRIVATE_KEY:-}" ]; then
+            echo "::error::ARC_RELEASE_MANIFEST_PRIVATE_KEY is unavailable in the protected release environment."
+            exit 1
+          fi
+          key_file="$RUNNER_TEMP/arc-release-manifest-key"
+          cleanup_key() {
+            rm -f -- "$key_file"
+          }
+          trap cleanup_key EXIT HUP INT TERM
+          umask 077
+          printf '%s\n' "$ARC_RELEASE_MANIFEST_PRIVATE_KEY" > "$key_file"
+          chmod 600 "$key_file"
+          ssh-keygen -Y sign \
+            -f "$key_file" \
+            -n arc-release-manifest-v1 \
+            release-files/SHA256SUMS
+          ssh-keygen -Y verify \
+            -f release/arc-release-allowed-signers \
+            -I arc-release \
+            -n arc-release-manifest-v1 \
+            -s release-files/SHA256SUMS.sig \
+            < release-files/SHA256SUMS
+          cleanup_key
+          trap - EXIT HUP INT TERM
 
       - name: Cryptographically verify every updater payload against the embedded key
         run: |
@@ -606,7 +667,7 @@ jobs:
             Linux and macOS install without a display using the exact release:
 
             ```bash
-            curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://github.com/${{ github.repository }}/releases/download/${{ needs.validate.outputs.tag }}/install.sh
+            curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/${{ github.repository }}/${{ needs.validate.outputs.tag }}/install.sh
             bash install.sh --version ${{ needs.validate.outputs.version }}
             ```
 
@@ -638,7 +699,8 @@ jobs:
             receipt is earned. Projected earnings are null with an explicit reason
             unless policy, receipt-rate, and treasury evidence are available.
 
-            Verify any asset with the attached `SHA256SUMS` file.
+            The protected source-tag installer verifies the owner-signed
+            `SHA256SUMS.sig` before it trusts any asset checksum.
         run: |
           set -Eeuo pipefail
 
@@ -691,5 +753,12 @@ jobs:
             "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.immutable')"
           if [ "$CREATED_RELEASE_IMMUTABLE" != true ]; then
             echo "::error::GitHub did not mark $RELEASE_TAG immutable after creation."
+            exit 1
+          fi
+
+          CREATED_RELEASE_AUTHOR="$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.author.login')"
+          if [ "$CREATED_RELEASE_AUTHOR" != 'github-actions[bot]' ]; then
+            echo "::error::Release author was $CREATED_RELEASE_AUTHOR, not the protected GitHub Actions publisher."
             exit 1
           fi

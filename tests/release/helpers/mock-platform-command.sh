@@ -28,6 +28,23 @@ case "$command_name" in
             exit 2
         fi
         ;;
+    ssh-keygen)
+        case " $* " in
+            *' -Y verify '*)
+                signature_file=''
+                while [ "$#" -gt 0 ]; do
+                    if [ "$1" = -s ] && [ "$#" -gt 1 ]; then
+                        signature_file="$2"
+                        break
+                    fi
+                    shift
+                done
+                [ -n "$signature_file" ] \
+                    && grep -Fxq 'ARC TEST RELEASE SIGNATURE v1' "$signature_file"
+                ;;
+            *) exit 2 ;;
+        esac
+        ;;
     hostname)
         printf 'arc-contract-test\n'
         ;;

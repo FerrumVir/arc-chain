@@ -21,6 +21,8 @@ INFERENCE_INSTALL="$REPO_ROOT/scripts/install-inference-node.sh"
 UPDATER_SIGNATURE_GATE="$TEST_DIR/verify_tauri_updater_signatures.sh"
 UPDATER_VERIFIER_MANIFEST="$TEST_DIR/tauri-updater-verifier/Cargo.toml"
 UPDATER_FIXTURE_DIR="$TEST_DIR/fixtures/tauri-updater"
+RELEASE_ALLOWED_SIGNERS="$REPO_ROOT/release/arc-release-allowed-signers"
+RELEASE_PREFLIGHT_WORKFLOW="$REPO_ROOT/.github/workflows/release-signing-preflight.yml"
 DESKTOP_CARGO_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
 DESKTOP_NPM_LOCK="$REPO_ROOT/desktop/package-lock.json"
 CANONICAL_SEEDS="$REPO_ROOT/testnet-seeds.txt"
@@ -199,6 +201,7 @@ checksum_manifest_is_published_and_gated() {
 }
 
 installer_and_updater_verify_checksums() {
+    local allowed_signer
     grep -Fq "$CHECKSUM_MANIFEST" "$INSTALLER" || {
         printf 'installer/update path does not download %s\n' "$CHECKSUM_MANIFEST"
         return 1
@@ -215,11 +218,81 @@ installer_and_updater_verify_checksums() {
         'require_release_boolean immutable true' \
         'require_release_boolean draft false' \
         'require_release_boolean prerelease false' \
+        'Release metadata author must be github-actions[bot] from the protected publisher' \
+        'SHA256SUMS.sig' \
+        'ssh-keygen -Y verify' \
+        '-n arc-release-manifest-v1' \
+        'Release SHA256SUMS signature is invalid or not owner-authorized' \
         "--proto '=https'" \
         "--proto-redir '=https'"
     do
         grep -Fq -- "$required" "$INSTALLER" || {
             printf 'installer/update path lacks immutable HTTPS release binding: %s\n' "$required"
+            return 1
+        }
+    done
+    [ -s "$RELEASE_ALLOWED_SIGNERS" ] || {
+        printf 'checked-in release allowed-signers file is missing\n'
+        return 1
+    }
+    allowed_signer="$(cat "$RELEASE_ALLOWED_SIGNERS")"
+    [ "$(grep -Fc -- "$allowed_signer" "$INSTALLER")" -eq 1 ] || {
+        printf 'installer signer line differs from the checked-in allowed-signers contract\n'
+        return 1
+    }
+    for header in \
+        '# ARC release manifest v1' \
+        '# repository=FerrumVir/arc-chain' \
+        '# tag=$RESOLVED_TAG' \
+        '# commit=$RESOLVED_COMMIT'
+    do
+        grep -Fq -- "$header" "$INSTALLER" || {
+            printf 'installer does not enforce signed manifest header: %s\n' "$header"
+            return 1
+        }
+    done
+}
+
+release_manifest_has_owner_signature_and_preflight() {
+    local file
+    for file in "$RELEASE_WORKFLOW" "$RELEASE_PREFLIGHT_WORKFLOW"; do
+        [ -f "$file" ] || {
+            printf 'release signing workflow is missing: %s\n' "$file"
+            return 1
+        }
+        for required in \
+            'ARC_RELEASE_MANIFEST_PRIVATE_KEY' \
+            'ssh-keygen -Y sign' \
+            'ssh-keygen -Y verify' \
+            '-I arc-release' \
+            '-n arc-release-manifest-v1' \
+            'release/arc-release-allowed-signers'
+        do
+            grep -Fq -- "$required" "$file" || {
+                printf 'release signing workflow %s omits: %s\n' "$file" "$required"
+                return 1
+            }
+        done
+    done
+    for required in \
+        'RELEASE_COMMIT: ${{ needs.validate.outputs.sha }}' \
+        'release-files/SHA256SUMS.sig' \
+        'gh release create "$RELEASE_TAG" release-files/*'
+    do
+        grep -Fq -- "$required" "$RELEASE_WORKFLOW" || {
+            printf 'release publisher omits signed manifest contract: %s\n' "$required"
+            return 1
+        }
+    done
+    for required in \
+        'environment: release' \
+        'ref: main' \
+        'TAURI_SIGNING_PRIVATE_KEY' \
+        'tauri signer sign' \
+        'tauri-updater-verifier'
+    do
+        grep -Fq -- "$required" "$RELEASE_PREFLIGHT_WORKFLOW" || {
+            printf 'pre-tag signing canary omits: %s\n' "$required"
             return 1
         }
     done
@@ -630,11 +703,19 @@ updater_signatures_are_verified_against_the_embedded_key() {
             return 1
         }
     done
-    grep -Fq 'find "$RELEASE_FILES_DIR" -type f -name '\''*.sig'\'' -print0' \
-        "$UPDATER_SIGNATURE_GATE" || {
-        printf 'updater-key proof does not enumerate every published signature\n'
-        return 1
-    }
+    for required in \
+        'arc-desktop-macos-arm64.app.tar.gz.sig' \
+        'arc-desktop-macos-x86_64.app.tar.gz.sig' \
+        'arc-desktop-windows-x86_64-setup.exe.sig' \
+        'arc-desktop-linux-x86_64.AppImage.sig' \
+        'SHA256SUMS.sig' \
+        'unexpected published signature artifact'
+    do
+        grep -Fq -- "$required" "$UPDATER_SIGNATURE_GATE" || {
+            printf 'updater-key proof omits or confuses signature artifact: %s\n' "$required"
+            return 1
+        }
+    done
     grep -Fq 'expected exactly four signed updater payloads' "$UPDATER_SIGNATURE_GATE" || {
         printf 'updater-key proof does not require the complete four-platform signature set\n'
         return 1
@@ -802,7 +883,9 @@ ref: ${{ needs.validate.outputs.sha }}' ]; then
         '--target "$EXPECTED_SHA"' \
         '"repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '\''.immutable'\''' \
         'if [ "$CREATED_RELEASE_IMMUTABLE" != true ]; then' \
-        'releases/download/${{ needs.validate.outputs.tag }}/install.sh' \
+        '"repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '\''.author.login'\''' \
+        "if [ \"\$CREATED_RELEASE_AUTHOR\" != 'github-actions[bot]' ]; then" \
+        'raw.githubusercontent.com/${{ github.repository }}/${{ needs.validate.outputs.tag }}/install.sh' \
         'bash install.sh --version ${{ needs.validate.outputs.version }}'
     do
         printf '%s\n' "$publish_block" | grep -Fq -- "$required" || {
@@ -850,6 +933,7 @@ run_test 'desktop packages the exact canonical release seed list' packaged_deskt
 run_test 'Linux ARM uses canonical arm64 names and is release-blocking' linux_arm_asset_name_is_consistent_and_required
 run_test 'release publishes and gates a SHA256SUMS manifest' checksum_manifest_is_published_and_gated
 run_test 'installer and update-only path verify SHA-256 before replacement' installer_and_updater_verify_checksums
+run_test 'headless manifest is owner-signed and both protected keys have a pre-tag canary' release_manifest_has_owner_signature_and_preflight
 run_test 'raw node consumers use exact versioned release URLs' raw_node_downloads_are_version_pinned
 run_test 'update-only path refuses equal and older semantic versions' updater_has_semver_downgrade_guard
 run_test 'installer normalizes service identity and protects its seed' installer_normalizes_service_identity_and_secret_permissions

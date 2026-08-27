@@ -77,6 +77,7 @@ run_assembler() {
             OUTPUT_DIR="$sandbox/output" \
             GENESIS_FILE="$genesis_file" \
             RELEASE_TAG="$release_tag" \
+            RELEASE_COMMIT='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
             RELEASE_DATE='2026-08-26T12:00:00Z' \
             REPOSITORY='FerrumVir/arc-chain' \
             /bin/bash "$ASSEMBLER"
@@ -104,15 +105,25 @@ complete_fixture_produces_verifiable_contract() {
     }
 
     expected_count="$(find "$sandbox/output" -maxdepth 1 -type f ! -name SHA256SUMS | wc -l | tr -d ' ')"
-    actual_count="$(awk 'NF == 2 { count += 1 } END { print count + 0 }' "$sandbox/output/SHA256SUMS")"
+    actual_count="$(awk '$1 ~ /^[0-9a-f]{64}$/ && NF == 2 { count += 1 } END { print count + 0 }' "$sandbox/output/SHA256SUMS")"
     assert_equals "$expected_count" "$actual_count" 'SHA256SUMS must cover every other published file exactly once' || return 1
 
     while read -r _hash filename; do
+        case "$_hash" in \#) continue ;; esac
         if [ ! -s "$sandbox/output/$filename" ]; then
             printf 'SHA256SUMS names a missing/empty file: %s\n' "$filename"
             return 1
         fi
     done <"$sandbox/output/SHA256SUMS"
+
+    assert_file_contains "$sandbox/output/SHA256SUMS" '^# ARC release manifest v1$' \
+        'signed manifest header omits its schema' || return 1
+    assert_file_contains "$sandbox/output/SHA256SUMS" '^# repository=FerrumVir/arc-chain$' \
+        'signed manifest header omits its repository binding' || return 1
+    assert_file_contains "$sandbox/output/SHA256SUMS" '^# tag=v0\.8\.0$' \
+        'signed manifest header omits its tag binding' || return 1
+    assert_file_contains "$sandbox/output/SHA256SUMS" '^# commit=a{40}$' \
+        'signed manifest header omits its commit binding' || return 1
 
     if command -v sha256sum >/dev/null 2>&1; then
         (cd "$sandbox/output" && sha256sum -c SHA256SUMS >/dev/null) || return 1

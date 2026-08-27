@@ -90,22 +90,29 @@ candidate_version_is_consistent() {
 }
 
 candidate_install_commands_are_exact_and_honest() {
-    local exact_url="https://github.com/FerrumVir/arc-chain/releases/download/v$CANDIDATE_VERSION/install.sh"
-    local file
+    local exact_url="https://raw.githubusercontent.com/FerrumVir/arc-chain/v$CANDIDATE_VERSION/install.sh"
+    local file installer_sha
+    if command -v sha256sum >/dev/null 2>&1; then
+        installer_sha="$(sha256sum "$REPO_ROOT/install.sh" | awk '{print $1}')"
+    else
+        installer_sha="$(shasum -a 256 "$REPO_ROOT/install.sh" | awk '{print $1}')"
+    fi
     for file in "$README" "$HEADLESS" "$WALKTHROUGH"; do
         require_literal "$file" "$exact_url" \
             'candidate install guide does not download the exact installer tag' || return 1
         require_literal "$file" "--version $CANDIDATE_VERSION" \
             'candidate install guide does not pin the matching installer version' || return 1
+        require_literal "$file" "$installer_sha" \
+            'candidate install guide does not pin the exact installer SHA-256' || return 1
         require_literal "$file" "--proto '=https' --proto-redir '=https' --tlsv1.2" \
             'candidate install guide permits a non-HTTPS bootstrap or redirect' || return 1
         require_literal "$file" 'not published' \
             'candidate install guide could be mistaken for an already-published release' || return 1
     done
-    require_literal "$HEADLESS" '$2 == "install.sh"' \
-        'headless guide does not isolate the installer checksum row' || return 1
-    require_literal "$HEADLESS" 'END { exit !found }' \
-        'headless guide does not isolate and require the installer checksum row' || return 1
+    require_literal "$HEADLESS" 'SHA256SUMS.sig' \
+        'headless guide omits the detached release-manifest signature' || return 1
+    require_literal "$HEADLESS" 'arc-release-manifest-v1' \
+        'headless guide omits the exact signature namespace' || return 1
     if grep -Fq '0.7.12' "$README" "$HEADLESS" "$WALKTHROUGH" "$ROLLOUT"; then
         printf 'the superseded v0.7.12 candidate remains in active v0.8.0 operator docs\n'
         return 1

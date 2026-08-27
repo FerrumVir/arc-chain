@@ -147,6 +147,9 @@ case "$url" in
         # Release walking is intentionally outside the hardened contract.
         exit 22
         ;;
+    https://api.github.com/repos/FerrumVir/arc-chain/commits/v*)
+        emit_text "{\"sha\":\"${MOCK_RELEASE_COMMIT:?MOCK_RELEASE_COMMIT is required}\"}"
+        ;;
     https://raw.githubusercontent.com/FerrumVir/arc-chain/*/testnet-seeds.txt)
         emit_text '127.0.0.1:19091'
         ;;
@@ -173,14 +176,33 @@ case "$url" in
         temp_dir="$(mktemp -d "${TMPDIR:-/tmp}/arc-mock-curl.XXXXXX")"
         trap 'rm -rf "$temp_dir"' EXIT
         if [ "$asset" = SHA256SUMS ]; then
+            [ "${MOCK_MISSING_CHECKSUM:-0}" = 0 ] || exit 22
             manifest="$temp_dir/SHA256SUMS"
-            : >"$manifest"
+            {
+                printf '# ARC release manifest v1\n'
+                printf '# repository=FerrumVir/arc-chain\n'
+                printf '# tag=v%s\n' "$version"
+                printf '# commit=%s\n' "${MOCK_RELEASE_COMMIT:?MOCK_RELEASE_COMMIT is required}"
+            } >"$manifest"
             for checksum_asset in ${MOCK_CHECKSUM_ASSETS:?MOCK_CHECKSUM_ASSETS is required}; do
                 fake="$temp_dir/$checksum_asset"
                 render_asset "$version" "$checksum_asset" "$fake"
                 printf '%s  %s\n' "$(sha256_of "$fake")" "$checksum_asset" >>"$manifest"
             done
+            if [ -n "${MOCK_DUPLICATE_CHECKSUM_ASSET:-}" ]; then
+                duplicate_line="$(grep -E \
+                    "[[:space:]]${MOCK_DUPLICATE_CHECKSUM_ASSET}$" \
+                    "$manifest" | head -n 1)"
+                printf '%s\n' "$duplicate_line" >> "$manifest"
+            fi
             emit_file "$manifest"
+        elif [ "$asset" = SHA256SUMS.sig ]; then
+            [ "${MOCK_MISSING_MANIFEST_SIGNATURE:-0}" = 0 ] || exit 22
+            if [ "${MOCK_TAMPER_MANIFEST_SIGNATURE:-0}" = 1 ]; then
+                emit_text 'ARC TEST TAMPERED SIGNATURE'
+            else
+                emit_text 'ARC TEST RELEASE SIGNATURE v1'
+            fi
         else
             fake="$temp_dir/$asset"
             render_asset "$version" "$asset" "$fake"

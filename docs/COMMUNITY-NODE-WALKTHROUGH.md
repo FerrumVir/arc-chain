@@ -57,12 +57,16 @@ closed; the CLI flag alone cannot turn issuance on.
 Narration: “This is a plain server over SSH—no desktop and no GUI.”
 
 ```bash
-curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://github.com/FerrumVir/arc-chain/releases/download/v0.8.0/install.sh
+curl -fsSLO --proto '=https' --proto-redir '=https' --tlsv1.2 https://raw.githubusercontent.com/FerrumVir/arc-chain/v0.8.0/install.sh
 bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
 ```
 
-The installer resolves one exact semantic-versioned release, verifies every
-download against `SHA256SUMS`, creates a stake-zero community service, and
+The pinned installer SHA-256 is
+`5cbe312ddfafe6a602a62d3573c09f2f92a001fefcd020ed531c2f693f12b293`.
+
+The protected source-tag installer resolves one exact semantic-versioned
+release and verifies the owner signature on `SHA256SUMS` before trusting any
+download hash. It creates a stake-zero community service and
 preserves its identity across updates. It never substitutes a desktop package
 for `arc-node`, and its RPC listener stays on `127.0.0.1` by default. A
 model-backed install uses the full deterministic integer-worker role without
