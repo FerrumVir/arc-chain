@@ -46,6 +46,10 @@ fn make_validator_keypair(seed: &str) -> KeyPair {
     KeyPair::Ed25519(signing_key)
 }
 
+fn validator_allowlist(addresses: &[Hash256]) -> Arc<std::collections::HashSet<[u8; 32]>> {
+    Arc::new(addresses.iter().map(|address| address.0).collect())
+}
+
 /// Standard genesis accounts shared across all test nodes.
 /// All nodes MUST use the same genesis to produce the same genesis hash,
 /// which is required for the QUIC handshake to succeed.
@@ -130,6 +134,9 @@ impl TestNode {
 
         let genesis_hash = Block::genesis().hash;
         let listen_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let mut transport_validators = vec![address];
+        transport_validators.extend(peer_validators.iter().map(|(peer, _)| *peer));
+        let transport_allowlist = validator_allowlist(&transport_validators);
 
         // Start transport
         let transport_keypair = keypair.clone();
@@ -141,6 +148,7 @@ impl TestNode {
             address,
             stake,
             genesis_hash,
+            transport_allowlist,
             outbound_rx,
             transport_inbound_tx,
             transport_peer_count,
@@ -264,6 +272,7 @@ async fn test_two_nodes_connect() {
         address_a,
         stake,
         genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_a,
         inbound_tx_a,
         pc_a,
@@ -288,6 +297,7 @@ async fn test_two_nodes_connect() {
         address_b,
         stake,
         genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_b,
         inbound_tx_b,
         pc_b,
@@ -344,6 +354,81 @@ async fn test_two_nodes_connect() {
 
     handle_a.abort();
     handle_b.abort();
+}
+
+/// An authenticated Ed25519 identity is still not a validator unless it is in
+/// the frozen validator set. Prove that a correctly signed but unknown node
+/// cannot consume a peer slot or emit `PeerConnected` on the validator.
+#[tokio::test]
+async fn test_unknown_validator_is_rejected_after_authentication() {
+    init_tracing();
+
+    let port_a = find_free_port().await;
+    let port_c = find_free_port().await;
+    let stake = 5_000_000u64;
+    let keypair_a = make_validator_keypair("allowlisted-validator-a");
+    let keypair_b = make_validator_keypair("allowlisted-validator-b");
+    let keypair_c = make_validator_keypair("unknown-validator-c");
+    let address_a = keypair_a.address();
+    let address_b = keypair_b.address();
+    let address_c = keypair_c.address();
+    let genesis_hash = Block::genesis().hash;
+
+    let (inbound_tx_a, mut inbound_rx_a) = mpsc::channel::<InboundMessage>(16);
+    let (_outbound_tx_a, outbound_rx_a) = mpsc::channel::<OutboundMessage>(16);
+    let peer_count_a = Arc::new(AtomicU32::new(0));
+    let handle_a = tokio::spawn(run_transport(
+        format!("127.0.0.1:{port_a}").parse().unwrap(),
+        vec![],
+        address_a,
+        stake,
+        genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
+        outbound_rx_a,
+        inbound_tx_a,
+        peer_count_a.clone(),
+        keypair_a,
+        String::new(),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // C has a valid key and is willing to trust A. A must nevertheless reject
+    // C because membership is determined by A's frozen validator set.
+    let (inbound_tx_c, mut inbound_rx_c) = mpsc::channel::<InboundMessage>(16);
+    let (_outbound_tx_c, outbound_rx_c) = mpsc::channel::<OutboundMessage>(16);
+    let peer_count_c = Arc::new(AtomicU32::new(0));
+    let handle_c = tokio::spawn(run_transport(
+        format!("127.0.0.1:{port_c}").parse().unwrap(),
+        vec![format!("127.0.0.1:{port_a}").parse().unwrap()],
+        address_c,
+        stake,
+        genesis_hash,
+        validator_allowlist(&[address_a, address_c]),
+        outbound_rx_c,
+        inbound_tx_c,
+        peer_count_c.clone(),
+        keypair_c,
+        String::new(),
+    ));
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(peer_count_a.load(Ordering::Relaxed), 0);
+    assert_eq!(peer_count_c.load(Ordering::Relaxed), 0);
+    assert!(
+        timeout(Duration::from_millis(250), inbound_rx_a.recv())
+            .await
+            .is_err(),
+        "allowlisted validator must not emit PeerConnected for an unknown identity"
+    );
+    assert!(
+        timeout(Duration::from_millis(250), inbound_rx_c.recv())
+            .await
+            .is_err(),
+        "unknown node must not observe a successful validator connection"
+    );
+
+    handle_a.abort();
+    handle_c.abort();
 }
 
 // ─── Test 2: Block Propagation ──────────────────────────────────────────────
@@ -681,6 +766,7 @@ async fn test_genesis_mismatch_rejected() {
         address_a,
         stake,
         genesis_hash_a,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_a,
         inbound_tx_a,
         pc_a,
@@ -703,6 +789,7 @@ async fn test_genesis_mismatch_rejected() {
         address_b,
         stake,
         genesis_hash_b, // MISMATCH - handshake should fail
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_b,
         inbound_tx_b,
         pc_b,
@@ -778,6 +865,7 @@ async fn test_transaction_gossip() {
         address_a,
         stake,
         genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_a,
         inbound_tx_a,
         pc_a,
@@ -801,6 +889,7 @@ async fn test_transaction_gossip() {
         address_b,
         stake,
         genesis_hash,
+        validator_allowlist(&[address_a, address_b]),
         outbound_rx_b,
         inbound_tx_b,
         pc_b,

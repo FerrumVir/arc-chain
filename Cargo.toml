@@ -72,6 +72,7 @@ tower-http = { version = "0.6", features = ["cors"] }
 quinn = "0.11"
 rcgen = "0.13"
 rustls = { version = "0.23", features = ["ring"] }
+webpki = { package = "rustls-webpki", version = "0.103" }
 
 # WASM runtime
 wasmer = "6.0"

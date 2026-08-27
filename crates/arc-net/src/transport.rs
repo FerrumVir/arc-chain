@@ -9,10 +9,10 @@ use arc_consensus::DagBlock;
 use arc_crypto::{Hash256, KeyPair, Signature as CryptoSignature, hash_bytes};
 use arc_types::Transaction;
 use dashmap::DashMap;
-#[cfg(not(feature = "strict-tls"))]
 use quinn::crypto::rustls::QuicClientConfig;
 use quinn::crypto::rustls::QuicServerConfig;
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -231,16 +231,229 @@ pub enum OutboundMessage {
 
 // ─── TLS Configuration ─────────────────────────────────────────────────────
 
-fn make_server_config() -> quinn::ServerConfig {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()])
-        .expect("failed to generate self-signed cert");
-    let cert_der = CertificateDer::from(cert.cert);
-    let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+fn validator_tls_identity(
+    keypair: &KeyPair,
+) -> anyhow::Result<(CertificateDer<'static>, PrivateKeyDer<'static>)> {
+    let KeyPair::Ed25519(signing_key) = keypair else {
+        anyhow::bail!("validator QUIC identity requires an Ed25519 validator key")
+    };
 
+    // RFC 8410 Ed25519 PrivateKeyInfo: the validator seed is wrapped in the
+    // inner CurvePrivateKey OCTET STRING. The resulting certificate's SPKI is
+    // therefore the exact public key from which the ARC validator address is
+    // derived; no second TLS identity is introduced.
+    let mut pkcs8 = Vec::with_capacity(48);
+    pkcs8.extend_from_slice(&[
+        0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04,
+        0x20,
+    ]);
+    pkcs8.extend_from_slice(&signing_key.to_bytes());
+    let private_der = PrivatePkcs8KeyDer::from(pkcs8);
+    let certificate_key =
+        rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&private_der, &rcgen::PKCS_ED25519).map_err(
+            |error| anyhow::anyhow!("failed to import validator key for QUIC TLS: {error}"),
+        )?;
+    let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+        .map_err(|error| anyhow::anyhow!("failed to build validator certificate: {error}"))?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params.distinguished_name.push(
+        rcgen::DnType::CommonName,
+        format!("arc-validator-{}", keypair.address().to_hex()),
+    );
+    let certificate = params
+        .self_signed(&certificate_key)
+        .map_err(|error| anyhow::anyhow!("failed to self-sign validator certificate: {error}"))?;
+    let cert_der = CertificateDer::from(certificate.der().to_vec());
+    let key_der = PrivatePkcs8KeyDer::from(certificate_key.serialize_der()).into();
+    Ok((cert_der, key_der))
+}
+
+fn validator_address_from_certificate(
+    certificate: &CertificateDer<'_>,
+) -> Result<Hash256, rustls::Error> {
+    const ED25519_SPKI_PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    let parsed = webpki::EndEntityCert::try_from(certificate)
+        .map_err(|_| rustls::Error::InvalidCertificate(rustls::CertificateError::BadEncoding))?;
+    let spki = parsed.subject_public_key_info();
+    let spki = spki.as_ref();
+    if spki.len() != ED25519_SPKI_PREFIX.len() + 32 || !spki.starts_with(&ED25519_SPKI_PREFIX) {
+        return Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::BadEncoding,
+        ));
+    }
+    Ok(hash_bytes(&spki[ED25519_SPKI_PREFIX.len()..]))
+}
+
+fn peer_tls_validator_address(connection: &quinn::Connection) -> anyhow::Result<Hash256> {
+    let identity = connection
+        .peer_identity()
+        .ok_or_else(|| anyhow::anyhow!("QUIC peer did not present a validator certificate"))?;
+    let certificates = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| anyhow::anyhow!("QUIC peer identity is not a rustls certificate chain"))?;
+    anyhow::ensure!(
+        certificates.len() == 1,
+        "validator QUIC peer must present exactly one leaf certificate"
+    );
+    validator_address_from_certificate(&certificates[0])
+        .map_err(|error| anyhow::anyhow!("invalid validator QUIC certificate: {error}"))
+}
+
+#[derive(Debug)]
+struct ValidatorCertificateVerifier {
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    root_hints: Vec<rustls::DistinguishedName>,
+}
+
+impl ValidatorCertificateVerifier {
+    fn new(allowed_validators: Arc<HashSet<[u8; 32]>>) -> Self {
+        Self {
+            allowed_validators,
+            root_hints: Vec::new(),
+        }
+    }
+
+    fn verify_membership(&self, certificate: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+        let address = validator_address_from_certificate(certificate)?;
+        if !self.allowed_validators.contains(&address.0) {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::UnknownIssuer,
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_tls12(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("rustls provider is installed before validator TLS construction");
+        rustls::crypto::verify_tls12_signature(
+            message,
+            certificate,
+            signature,
+            &provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .expect("rustls provider is installed before validator TLS construction");
+        rustls::crypto::verify_tls13_signature(
+            message,
+            certificate,
+            signature,
+            &provider.signature_verification_algorithms,
+        )
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for ValidatorCertificateVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if !intermediates.is_empty() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ));
+        }
+        self.verify_membership(end_entity)?;
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls12(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls13(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for ValidatorCertificateVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &self.root_hints
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        if !intermediates.is_empty() {
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::BadEncoding,
+            ));
+        }
+        self.verify_membership(end_entity)?;
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls12(message, certificate, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.verify_tls13(message, certificate, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![rustls::SignatureScheme::ED25519]
+    }
+}
+
+fn make_server_config(
+    keypair: &KeyPair,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+) -> anyhow::Result<quinn::ServerConfig> {
+    let (cert_der, key_der) = validator_tls_identity(keypair)?;
+    let client_verifier = Arc::new(ValidatorCertificateVerifier::new(allowed_validators));
     let server_crypto = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der.into())
-        .expect("failed to build rustls server config");
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(vec![cert_der], key_der)
+        .map_err(|error| {
+            anyhow::anyhow!("failed to build validator rustls server config: {error}")
+        })?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         QuicServerConfig::try_from(server_crypto).expect("failed to create QUIC server config"),
@@ -255,38 +468,22 @@ fn make_server_config() -> quinn::ServerConfig {
     transport.stream_receive_window(quinn::VarInt::from_u32(64 * 1024 * 1024)); // 64 MB
     transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024)); // 256 MB
 
-    server_config
+    Ok(server_config)
 }
 
-/// Build the QUIC client TLS configuration.
-///
-/// Without the `strict-tls` feature (default), this uses the testnet certificate verifier,
-/// which accepts all server certificates. Peer identity is instead verified by
-/// an Ed25519 proof bound to the QUIC/TLS exporter.
-///
-/// With `strict-tls` enabled, this panics at startup - certificate pinning is
-/// not yet implemented. This feature flag exists to prevent accidental production
-/// deployment without TLS-layer peer verification.
-#[cfg(feature = "strict-tls")]
-fn make_client_config() -> quinn::ClientConfig {
-    panic!(
-        "strict-tls requested, but validator certificate pinning is not implemented; refusing to start"
-    )
-}
-
-#[cfg(not(feature = "strict-tls"))]
-fn make_client_config() -> quinn::ClientConfig {
-    warn!(
-        "TLS certificate verification is DISABLED - using TestnetCertVerifier. \
-         Peer identity uses a TLS-exporter-bound Ed25519 proof, but certificates \
-         are not pinned. This configuration is not approved for production; \
-         `strict-tls` fails closed until pinning is implemented."
-    );
-
+fn make_client_config(
+    keypair: &KeyPair,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+) -> anyhow::Result<quinn::ClientConfig> {
+    let (cert_der, key_der) = validator_tls_identity(keypair)?;
+    let server_verifier = Arc::new(ValidatorCertificateVerifier::new(allowed_validators));
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TestnetCertVerifier))
-        .with_no_client_auth();
+        .with_custom_certificate_verifier(server_verifier)
+        .with_client_auth_cert(vec![cert_der], key_der)
+        .map_err(|error| {
+            anyhow::anyhow!("failed to build validator rustls client config: {error}")
+        })?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(
         QuicClientConfig::try_from(crypto).expect("failed to create QUIC client config"),
@@ -302,88 +499,7 @@ fn make_client_config() -> quinn::ClientConfig {
     transport.receive_window(quinn::VarInt::from_u32(256 * 1024 * 1024));
     client_config.transport_config(Arc::new(transport));
 
-    client_config
-}
-
-// Certificate pinning (fingerprint registry) is a future enhancement.
-// The current security model: TLS provides encryption, application-layer
-// TLS-exporter-bound Ed25519 proofs provide peer identity verification.
-
-/// TLS certificate verifier that accepts all certificates without validation.
-///
-/// # Security Model
-///
-/// In ARC Chain's permissioned validator network, peer identity is NOT verified
-/// at the TLS layer. Instead, the security model is:
-///
-/// 1. **TLS provides encryption only** - all QUIC traffic is encrypted in transit,
-///    preventing passive eavesdropping.
-/// 2. **Peer identity is verified at the application layer** by signing the
-///    TLS-exporter-bound handshake transcript (see [`verify_handshake`]). The
-///    public key is verified to derive to the claimed validator address.
-/// 3. **Genesis hash binding** - peers must share the same genesis hash, preventing
-///    cross-network connections.
-///
-/// This means TLS cert verification is intentionally skipped: validators use
-/// ephemeral self-signed certificates, and there is no CA or cert registry.
-/// A transparent MITM cannot relay a captured identity proof because the
-/// signed proof includes exporter bytes unique to each QUIC/TLS connection.
-/// Validator membership and voting stake are resolved separately from the
-/// fixed genesis validator set; the transport never grants membership from a
-/// self-reported handshake stake.
-///
-/// # Production Hardening
-///
-/// For production, consider implementing certificate pinning via a validator
-/// cert registry so that TLS itself authenticates peers (defense in depth).
-/// The `strict-tls` feature is a fail-closed guard: it panics at transport
-/// startup until pinning is implemented, preventing it from being mistaken for
-/// certificate verification.
-#[cfg(not(feature = "strict-tls"))]
-#[derive(Debug)]
-struct TestnetCertVerifier;
-
-#[cfg(not(feature = "strict-tls"))]
-impl rustls::client::danger::ServerCertVerifier for TestnetCertVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &CertificateDer<'_>,
-        _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ED25519,
-        ]
-    }
+    Ok(client_config)
 }
 
 // ─── TLS-session-bound peer authentication ─────────────────────────────────
@@ -811,12 +927,115 @@ pub async fn run_transport(
     local_address: Hash256,
     local_stake: u64,
     genesis_hash: Hash256,
-    mut outbound_rx: mpsc::Receiver<OutboundMessage>,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    outbound_rx: mpsc::Receiver<OutboundMessage>,
     inbound_tx: mpsc::Sender<InboundMessage>,
     peer_count: Arc<AtomicU32>,
     local_keypair: KeyPair,
     data_dir: String,
 ) {
+    run_transport_inner(
+        listen_addr,
+        bootstrap_peers,
+        local_address,
+        local_stake,
+        genesis_hash,
+        allowed_validators,
+        outbound_rx,
+        inbound_tx,
+        peer_count,
+        local_keypair,
+        data_dir,
+        None,
+    )
+    .await;
+}
+
+/// Start validator transport and report only after the authenticated QUIC
+/// endpoint is fully bound and its client configuration is installed. A
+/// production node must await this signal before starting consensus; otherwise
+/// a TLS/key/bind failure could leave a validator executing in isolation.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_transport_with_readiness(
+    listen_addr: SocketAddr,
+    bootstrap_peers: Vec<SocketAddr>,
+    local_address: Hash256,
+    local_stake: u64,
+    genesis_hash: Hash256,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    outbound_rx: mpsc::Receiver<OutboundMessage>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
+    local_keypair: KeyPair,
+    data_dir: String,
+    startup: tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>,
+) {
+    run_transport_inner(
+        listen_addr,
+        bootstrap_peers,
+        local_address,
+        local_stake,
+        genesis_hash,
+        allowed_validators,
+        outbound_rx,
+        inbound_tx,
+        peer_count,
+        local_keypair,
+        data_dir,
+        Some(startup),
+    )
+    .await;
+}
+
+fn report_transport_startup_failure(
+    startup: &mut Option<tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>>,
+    message: String,
+) {
+    if let Some(sender) = startup.take() {
+        let _ = sender.send(Err(message));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_transport_inner(
+    listen_addr: SocketAddr,
+    bootstrap_peers: Vec<SocketAddr>,
+    local_address: Hash256,
+    local_stake: u64,
+    genesis_hash: Hash256,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+    mut outbound_rx: mpsc::Receiver<OutboundMessage>,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    peer_count: Arc<AtomicU32>,
+    local_keypair: KeyPair,
+    data_dir: String,
+    mut startup: Option<tokio::sync::oneshot::Sender<std::result::Result<SocketAddr, String>>>,
+) {
+    if allowed_validators.is_empty() || !allowed_validators.contains(&local_address.0) {
+        let message = format!(
+            "P2P transport requires a non-empty fixed validator allowlist containing local identity {local_address}"
+        );
+        error!(
+            local = %local_address,
+            allowed = allowed_validators.len(),
+            %message
+        );
+        report_transport_startup_failure(&mut startup, message);
+        return;
+    }
+    if local_keypair.address() != local_address {
+        let message = format!(
+            "P2P transport local address {local_address} does not match validator key {}",
+            local_keypair.address()
+        );
+        error!(
+            declared = %local_address,
+            key_address = %local_keypair.address(),
+            %message
+        );
+        report_transport_startup_failure(&mut startup, message);
+        return;
+    }
     // ── Install rustls crypto provider (required for rustls 0.23+) ─────
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -843,7 +1062,16 @@ pub async fn run_transport(
     // (peers can't dial it on a known port). That is fine for the
     // residential consumers this fallback exists for — they're behind
     // NAT and never accept unsolicited inbound anyway.
-    let server_config = make_server_config();
+    let server_config = match make_server_config(&local_keypair, allowed_validators.clone()) {
+        Ok(config) => config,
+        Err(error) => {
+            let message =
+                format!("failed to construct validator-authenticated QUIC server: {error}");
+            error!(%message);
+            report_transport_startup_failure(&mut startup, message);
+            return;
+        }
+    };
     let configured_addr = listen_addr;
     let mut endpoint = {
         let mut bound: Option<quinn::Endpoint> = None;
@@ -865,6 +1093,14 @@ pub async fn run_transport(
             }
         }
         if bound.is_none() {
+            if local_stake > 0 {
+                let message = format!(
+                    "staked validator cannot bind configured QUIC address {configured_addr}; refusing an unreachable ephemeral identity"
+                );
+                error!(configured = %configured_addr, %message);
+                report_transport_startup_failure(&mut startup, message);
+                return;
+            }
             let fallback = SocketAddr::new(configured_addr.ip(), 0);
             match quinn::Endpoint::server(server_config.clone(), fallback) {
                 Ok(ep) => {
@@ -880,12 +1116,11 @@ pub async fn run_transport(
                     bound = Some(ep);
                 }
                 Err(e) => {
-                    error!(
-                        "QUIC bind failed on configured {} AND on ephemeral fallback: \
-                         {}. The OS likely does not permit this process to bind UDP \
-                         at all - check firewall/EDR policy.",
-                        configured_addr, e
+                    let message = format!(
+                        "QUIC bind failed on configured {configured_addr} and ephemeral fallback: {e}"
                     );
+                    error!(%message);
+                    report_transport_startup_failure(&mut startup, message);
                     return;
                 }
             }
@@ -893,7 +1128,17 @@ pub async fn run_transport(
         bound.unwrap()
     };
     // Set client config for outgoing connections on the same endpoint
-    endpoint.set_default_client_config(make_client_config());
+    let client_config = match make_client_config(&local_keypair, allowed_validators.clone()) {
+        Ok(config) => config,
+        Err(error) => {
+            let message =
+                format!("failed to construct validator-authenticated QUIC client: {error}");
+            error!(%message);
+            report_transport_startup_failure(&mut startup, message);
+            return;
+        }
+    };
+    endpoint.set_default_client_config(client_config);
 
     // Shadow the parameter with the actual bound address. If we fell
     // back to ephemeral, every downstream handshake/self-skip uses the
@@ -908,6 +1153,9 @@ pub async fn run_transport(
     } else {
         info!("P2P transport listening on {}", listen_addr);
     }
+    if let Some(sender) = startup.take() {
+        let _ = sender.send(Ok(listen_addr));
+    }
 
     let connections = Arc::new(PeerConnections::new(inbound_tx.clone(), peer_count.clone()));
     let rate_limiter = Arc::new(PeerRateLimiter::new());
@@ -918,6 +1166,9 @@ pub async fn run_transport(
         listen_port: listen_addr.port(),
         genesis_hash,
     };
+    let handshake_slots = Arc::new(tokio::sync::Semaphore::new(
+        allowed_validators.len().saturating_mul(2).max(8),
+    ));
 
     // ── PEX auto-dial channel ───────────────────────────────────────────
     let (pex_dial_tx, mut pex_dial_rx) = mpsc::channel::<SocketAddr>(64);
@@ -960,6 +1211,7 @@ pub async fn run_transport(
                 &inbound_tx,
                 &pex_dial_tx,
                 &rate_limiter,
+                &allowed_validators,
             );
             dial_handles.push(tokio::spawn(async move {
                 // Try up to 3 times with increasing timeouts. Intercontinental
@@ -1033,6 +1285,7 @@ pub async fn run_transport(
             &inbound_tx,
             &pex_dial_tx,
             &rate_limiter,
+            &allowed_validators,
         );
         match dial_peer(&endpoint, *peer_addr, &ctx).await {
             Ok(()) => info!("Connected to persisted peer {}", peer_addr),
@@ -1215,6 +1468,7 @@ pub async fn run_transport(
         let itx = inbound_tx.clone();
         let pdt = pex_dial_tx.clone();
         let rl = rate_limiter.clone();
+        let av = allowed_validators.clone();
         let dd = data_dir.clone();
         tokio::spawn(async move {
             let mut pex_tick = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -1317,6 +1571,7 @@ pub async fn run_transport(
                                 &itx,
                                 &pdt,
                                 &rl,
+                                &av,
                             );
                             tokio::spawn(async move {
                                 match tokio::time::timeout(
@@ -1358,11 +1613,20 @@ pub async fn run_transport(
                 let remote_addr = conn.remote_address();
                 info!("Incoming connection from {}", remote_addr);
 
-                // Enforce connection limit
-                if peer_count.load(Ordering::Relaxed) >= MAX_PEERS {
-                    warn!("Connection limit reached ({MAX_PEERS}), rejecting {}", remote_addr);
+                // A validator transport has no peers beyond the fixed set.
+                let max_validator_peers = allowed_validators.len().saturating_sub(1) as u32;
+                if peer_count.load(Ordering::Relaxed) >= max_validator_peers {
+                    warn!(
+                        "Fixed validator connection limit reached ({}), rejecting {}",
+                        max_validator_peers,
+                        remote_addr
+                    );
                     continue;
                 }
+                let Ok(handshake_permit) = handshake_slots.clone().try_acquire_owned() else {
+                    warn!("Validator handshake concurrency limit reached, rejecting {}", remote_addr);
+                    continue;
+                };
 
                 let ctx = PeerContext::new(
                     local_identity,
@@ -1371,9 +1635,11 @@ pub async fn run_transport(
                     &inbound_tx,
                     &pex_dial_tx,
                     &rate_limiter,
+                    &allowed_validators,
                 );
 
                 tokio::spawn(async move {
+                    let _handshake_permit = handshake_permit;
                     // 10-second handshake timeout - prevents attackers from
                     // holding connection slots with incomplete handshakes.
                     let result = tokio::time::timeout(
@@ -1408,6 +1674,7 @@ pub async fn run_transport(
                         &inbound_tx,
                         &pex_dial_tx,
                         &rate_limiter,
+                        &allowed_validators,
                     );
                     tokio::spawn(async move {
                         // Skip if already connected (moved out of select body)
@@ -1460,6 +1727,7 @@ struct PeerContext {
     inbound_tx: mpsc::Sender<InboundMessage>,
     pex_dial_tx: mpsc::Sender<SocketAddr>,
     rate_limiter: Arc<PeerRateLimiter>,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
 }
 
 impl PeerContext {
@@ -1471,6 +1739,7 @@ impl PeerContext {
         inbound_tx: &mpsc::Sender<InboundMessage>,
         pex_dial_tx: &mpsc::Sender<SocketAddr>,
         rate_limiter: &Arc<PeerRateLimiter>,
+        allowed_validators: &Arc<HashSet<[u8; 32]>>,
     ) -> Self {
         Self {
             identity,
@@ -1479,6 +1748,7 @@ impl PeerContext {
             inbound_tx: inbound_tx.clone(),
             pex_dial_tx: pex_dial_tx.clone(),
             rate_limiter: rate_limiter.clone(),
+            allowed_validators: allowed_validators.clone(),
         }
     }
 }
@@ -1493,8 +1763,6 @@ async fn dial_peer(
     let local_address = ctx.identity.address;
     let connections = &ctx.connections;
     let inbound_tx = &ctx.inbound_tx;
-    let pex_dial_tx = &ctx.pex_dial_tx;
-    let rate_limiter = &ctx.rate_limiter;
 
     let conn = endpoint.connect(peer_addr, "localhost")?.await?;
     let (mut send, mut recv) = conn.open_bi().await?;
@@ -1530,6 +1798,20 @@ async fn dial_peer(
 
     // Verify peer's identity: pubkey → address + valid signature
     verify_handshake(&remote, &session_binding)?;
+    let tls_address = peer_tls_validator_address(&conn)?;
+    if tls_address != remote.validator_address {
+        anyhow::bail!(
+            "peer TLS validator {} differs from exporter-bound handshake {}",
+            tls_address,
+            remote.validator_address
+        );
+    }
+    if !ctx.allowed_validators.contains(&remote.validator_address.0) {
+        anyhow::bail!(
+            "authenticated peer {} is not in the fixed validator transport allowlist",
+            remote.validator_address
+        );
+    }
 
     // Compute dialable address: remote IP + their listen port
     let dial_addr = SocketAddr::new(conn.remote_address().ip(), remote.listen_port);
@@ -1586,22 +1868,12 @@ async fn dial_peer(
     // connection and made recv fail within microseconds, triggering a
     // connect→disconnect cascade that prevented any block gossip.
     let peer_addr_hash = remote.validator_address;
-    let inbound_clone = inbound_tx.clone();
-    let connections_ref = connections.clone();
-    let pex_dial_clone = pex_dial_tx.clone();
-    let rate_limiter_clone = rate_limiter.clone();
+    let recv_context = PeerRecvContext::from_peer_context(ctx);
+    let connections_ref = recv_context.connections.clone();
+    let rate_limiter_clone = recv_context.rate_limiter.clone();
     tokio::spawn(async move {
         let _conn = conn; // keep Quinn Connection alive until recv loop exits
-        handle_peer_recv(
-            recv,
-            peer_addr_hash,
-            local_address,
-            &inbound_clone,
-            &pex_dial_clone,
-            &connections_ref,
-            &rate_limiter_clone,
-        )
-        .await;
+        handle_peer_recv(recv, peer_addr_hash, recv_context).await;
         if connections_ref
             .remove_and_notify(peer_addr_hash, connection_id)
             .await
@@ -1625,8 +1897,6 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
     let local_address = ctx.identity.address;
     let connections = &ctx.connections;
     let inbound_tx = &ctx.inbound_tx;
-    let pex_dial_tx = &ctx.pex_dial_tx;
-    let rate_limiter = &ctx.rate_limiter;
 
     let (mut send, mut recv) = conn.accept_bi().await?;
     let session_binding = connection_binding(&conn)?;
@@ -1653,6 +1923,20 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
 
     // Verify peer's identity: pubkey → address + valid signature
     verify_handshake(&remote, &session_binding)?;
+    let tls_address = peer_tls_validator_address(&conn)?;
+    if tls_address != remote.validator_address {
+        anyhow::bail!(
+            "peer TLS validator {} differs from exporter-bound handshake {}",
+            tls_address,
+            remote.validator_address
+        );
+    }
+    if !ctx.allowed_validators.contains(&remote.validator_address.0) {
+        anyhow::bail!(
+            "authenticated peer {} is not in the fixed validator transport allowlist",
+            remote.validator_address
+        );
+    }
 
     // Send our handshake ack (with our own signed challenge)
     let payload = bincode::serialize(&local_handshake)?;
@@ -1706,22 +1990,12 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
     // Connection stays alive for the duration of the recv loop. See
     // matching comment in connect_peer for the full explanation.
     let peer_addr_hash = remote.validator_address;
-    let inbound_clone = inbound_tx.clone();
-    let connections_ref = connections.clone();
-    let pex_dial_clone = pex_dial_tx.clone();
-    let rate_limiter_clone = rate_limiter.clone();
+    let recv_context = PeerRecvContext::from_peer_context(ctx);
+    let connections_ref = recv_context.connections.clone();
+    let rate_limiter_clone = recv_context.rate_limiter.clone();
     tokio::spawn(async move {
         let _conn = conn; // keep Quinn Connection alive until recv loop exits
-        handle_peer_recv(
-            recv,
-            peer_addr_hash,
-            local_address,
-            &inbound_clone,
-            &pex_dial_clone,
-            &connections_ref,
-            &rate_limiter_clone,
-        )
-        .await;
+        handle_peer_recv(recv, peer_addr_hash, recv_context).await;
         if connections_ref
             .remove_and_notify(peer_addr_hash, connection_id)
             .await
@@ -1741,15 +2015,48 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
 
 // ─── Per-Peer Recv Loop ─────────────────────────────────────────────────────
 
+struct PeerRecvContext {
+    local_address: Hash256,
+    inbound_tx: mpsc::Sender<InboundMessage>,
+    pex_dial_tx: mpsc::Sender<SocketAddr>,
+    connections: Arc<PeerConnections>,
+    rate_limiter: Arc<PeerRateLimiter>,
+    allowed_validators: Arc<HashSet<[u8; 32]>>,
+}
+
+impl PeerRecvContext {
+    fn from_peer_context(context: &PeerContext) -> Self {
+        Self {
+            local_address: context.identity.address,
+            inbound_tx: context.inbound_tx.clone(),
+            pex_dial_tx: context.pex_dial_tx.clone(),
+            connections: context.connections.clone(),
+            rate_limiter: context.rate_limiter.clone(),
+            allowed_validators: context.allowed_validators.clone(),
+        }
+    }
+}
+
 async fn handle_peer_recv(
     mut recv: quinn::RecvStream,
     peer_address: Hash256,
-    local_address: Hash256,
-    inbound_tx: &mpsc::Sender<InboundMessage>,
-    pex_dial_tx: &mpsc::Sender<SocketAddr>,
-    connections: &Arc<PeerConnections>,
-    rate_limiter: &Arc<PeerRateLimiter>,
+    context: PeerRecvContext,
 ) {
+    let PeerRecvContext {
+        local_address,
+        inbound_tx,
+        pex_dial_tx,
+        connections,
+        rate_limiter,
+        allowed_validators,
+    } = context;
+    if !allowed_validators.contains(&peer_address.0) {
+        warn!(
+            peer = %peer_address,
+            "Closing receive loop for identity outside fixed validator allowlist"
+        );
+        return;
+    }
     loop {
         let (msg_type, payload_len) = match read_message_header(&mut recv).await {
             Ok(header) => header,
@@ -1871,6 +2178,9 @@ async fn handle_peer_recv(
                             peer_address
                         );
                         for pex_peer in msg.peers.iter().take(16) {
+                            if !allowed_validators.contains(&pex_peer.address.0) {
+                                continue;
+                            }
                             // Skip self
                             if pex_peer.address == local_address {
                                 continue;
@@ -2309,39 +2619,146 @@ mod tests {
         verify_handshake(&decoded, &binding).expect("wire round trip should retain the proof");
     }
 
-    #[cfg(not(feature = "strict-tls"))]
     #[tokio::test]
     async fn both_quic_endpoints_derive_the_same_exporter_binding() {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let server =
-            quinn::Endpoint::server(make_server_config(), "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_key = KeyPair::generate_ed25519();
+        let client_key = KeyPair::generate_ed25519();
+        let allowed: Arc<HashSet<[u8; 32]>> = Arc::new(
+            [server_key.address().0, client_key.address().0]
+                .into_iter()
+                .collect(),
+        );
+        let server = quinn::Endpoint::server(
+            make_server_config(&server_key, allowed.clone()).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let accept = tokio::spawn(async move {
             let incoming = server.accept().await.expect("server endpoint is open");
             let connection = incoming.await.expect("server QUIC handshake succeeds");
-            connection_binding(&connection).expect("server exporter is available")
+            let peer = peer_tls_validator_address(&connection)
+                .expect("server sees the pinned client validator certificate");
+            (
+                connection_binding(&connection).expect("server exporter is available"),
+                peer,
+            )
         });
 
         let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-        client.set_default_client_config(make_client_config());
+        client.set_default_client_config(make_client_config(&client_key, allowed.clone()).unwrap());
         let connection = client
             .connect(server_addr, "localhost")
             .unwrap()
             .await
             .expect("client QUIC handshake succeeds");
         let client_binding = connection_binding(&connection).expect("client exporter is available");
-        let server_binding = accept.await.unwrap();
+        assert_eq!(
+            peer_tls_validator_address(&connection).unwrap(),
+            server_key.address()
+        );
+        let (server_binding, server_observed_client) = accept.await.unwrap();
 
         assert_eq!(client_binding, server_binding);
         assert_ne!(client_binding, [0_u8; 32]);
+        assert_eq!(server_observed_client, client_key.address());
     }
 
-    #[cfg(feature = "strict-tls")]
+    #[tokio::test]
+    async fn readiness_reports_fail_closed_validator_configuration() {
+        let keypair = KeyPair::generate_ed25519();
+        let (outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        drop(outbound_tx);
+
+        run_transport_with_readiness(
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            keypair.address(),
+            5_000_000,
+            Hash256([41_u8; 32]),
+            Arc::new(HashSet::new()),
+            outbound_rx,
+            inbound_tx,
+            Arc::new(AtomicU32::new(0)),
+            keypair,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            startup_tx,
+        )
+        .await;
+
+        let error = startup_rx
+            .await
+            .expect("transport must report its startup decision")
+            .unwrap_err();
+        assert!(error.contains("non-empty fixed validator allowlist"));
+    }
+
+    #[tokio::test]
+    async fn readiness_is_sent_only_after_authenticated_endpoint_binds() {
+        let keypair = KeyPair::generate_ed25519();
+        let address = keypair.address();
+        let (outbound_tx, outbound_rx) = mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = mpsc::channel(1);
+        let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(run_transport_with_readiness(
+            "127.0.0.1:0".parse().unwrap(),
+            Vec::new(),
+            address,
+            5_000_000,
+            Hash256([42_u8; 32]),
+            Arc::new([address.0].into_iter().collect()),
+            outbound_rx,
+            inbound_tx,
+            Arc::new(AtomicU32::new(0)),
+            keypair,
+            std::env::temp_dir().to_string_lossy().into_owned(),
+            startup_tx,
+        ));
+
+        let bound = tokio::time::timeout(std::time::Duration::from_secs(2), startup_rx)
+            .await
+            .expect("authenticated endpoint startup timed out")
+            .expect("transport dropped its startup result")
+            .expect("authenticated endpoint must bind");
+        assert!(bound.ip().is_loopback());
+        assert_ne!(bound.port(), 0);
+
+        drop(outbound_tx);
+        task.abort();
+    }
+
     #[test]
-    #[should_panic(expected = "certificate pinning is not implemented")]
-    fn strict_tls_feature_fails_closed_until_pinning_exists() {
-        let _ = make_client_config();
+    fn validator_certificate_is_the_arc_validator_key() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let keypair = KeyPair::generate_ed25519();
+        let (certificate, _) = validator_tls_identity(&keypair).unwrap();
+        let (certificate_again, _) = validator_tls_identity(&keypair).unwrap();
+        assert_eq!(
+            certificate.as_ref(),
+            certificate_again.as_ref(),
+            "a validator key must produce one stable pinned certificate"
+        );
+        assert_eq!(
+            validator_address_from_certificate(&certificate).unwrap(),
+            keypair.address()
+        );
+        assert!(validator_address_from_certificate(&CertificateDer::from(vec![1, 2, 3])).is_err());
+    }
+
+    #[test]
+    fn certificate_membership_rejects_a_valid_unknown_validator() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let allowed = KeyPair::generate_ed25519();
+        let unknown = KeyPair::generate_ed25519();
+        let (unknown_certificate, _) = validator_tls_identity(&unknown).unwrap();
+        let verifier = ValidatorCertificateVerifier::new(Arc::new(
+            [allowed.address().0].into_iter().collect(),
+        ));
+        assert!(verifier.verify_membership(&unknown_certificate).is_err());
     }
 
     #[test]

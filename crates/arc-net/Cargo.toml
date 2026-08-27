@@ -7,9 +7,8 @@ license.workspace = true
 
 [features]
 default = []
-# Fail-closed production guard. Certificate pinning is not implemented yet, so
-# enabling this feature deliberately stops transport startup instead of silently
-# retaining the accept-all testnet verifier.
+# Compatibility feature retained for downstream build scripts. Validator-key
+# certificate pinning and mutual TLS are unconditional in every build.
 strict-tls = []
 
 [dependencies]
@@ -29,6 +28,7 @@ rand.workspace = true
 blake3.workspace = true
 rcgen = { workspace = true }
 rustls = { workspace = true }
+webpki = { workspace = true }
 arc-consensus = { path = "../arc-consensus" }
 arc-state = { path = "../arc-state" }
 anyhow.workspace = true

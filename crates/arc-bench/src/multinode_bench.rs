@@ -221,6 +221,7 @@ impl BenchNode {
         port: u16,
         bootstrap_peers: Vec<SocketAddr>,
         genesis: &[(Hash256, u64)],
+        validators: &[(Hash256, u64)],
     ) -> Self {
         let keypair = make_validator_keypair(seed);
         let address = keypair.address();
@@ -235,6 +236,12 @@ impl BenchNode {
 
         let genesis_hash = Block::genesis().hash;
         let listen_addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let transport_allowlist = Arc::new(
+            validators
+                .iter()
+                .map(|(validator, _)| validator.0)
+                .collect::<std::collections::HashSet<_>>(),
+        );
 
         // Start QUIC transport
         let transport_keypair = keypair.clone();
@@ -246,6 +253,7 @@ impl BenchNode {
             address,
             stake,
             genesis_hash,
+            transport_allowlist,
             outbound_rx,
             transport_inbound_tx,
             transport_peer_count,
@@ -253,13 +261,19 @@ impl BenchNode {
             format!("/tmp/arc-bench-node-{}", port),
         ));
 
-        // Start DAG consensus - no pre-populated peers (dynamic discovery via transport)
+        let peer_validators: Vec<_> = validators
+            .iter()
+            .filter(|(validator, _)| *validator != address)
+            .copied()
+            .collect();
+        // Start DAG consensus with the same fixed validator authority set on
+        // every node. Transport connectivity never creates voting members.
         let consensus = ConsensusManager::new_with_keypair(
             address,
             stake,
             4,     // num_shards
             false, // not benchmark mode - we inject into mempool directly
-            &[],   // no pre-populated peers - discovered via QUIC handshake
+            &peer_validators,
             keypair,
         );
         let state_clone = state.clone();
@@ -400,7 +414,23 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
 
     // Start Node 0 (seed node, no bootstrap)
     let mut nodes = Vec::with_capacity(args.nodes);
-    let node_0 = BenchNode::start("bench-validator-0", stake, ports[0], vec![], &genesis).await;
+    let validators: Vec<_> = (0..args.nodes)
+        .map(|index| {
+            (
+                make_validator_keypair(&format!("bench-validator-{index}")).address(),
+                stake,
+            )
+        })
+        .collect();
+    let node_0 = BenchNode::start(
+        "bench-validator-0",
+        stake,
+        ports[0],
+        vec![],
+        &genesis,
+        &validators,
+    )
+    .await;
     nodes.push(node_0);
 
     // Brief delay for Node 0 to bind its QUIC listener
@@ -414,7 +444,7 @@ async fn run_benchmark(args: Args, cpu_cores: usize) {
         for port in ports.iter().take(i).skip(1) {
             bootstrap.push(format!("127.0.0.1:{}", port).parse().unwrap());
         }
-        let node = BenchNode::start(&seed, stake, ports[i], bootstrap, &genesis).await;
+        let node = BenchNode::start(&seed, stake, ports[i], bootstrap, &genesis, &validators).await;
         nodes.push(node);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
