@@ -25,7 +25,10 @@ than JSON Schema and rejects unknown fields. A draft binds:
 - timeouts, minimum observed height advance, and either a policy-only or real
   mined-receipt reward gate;
 - production-only IP-derived `nip.io` (or resealed `sslip.io` fallback)
-  hostnames, SSH/service identity, and create-only release/unit paths.
+  hostnames, SSH/service identity, and create-only release/unit paths;
+- the pre-positioned canonical GGUF path and SHA-256 on every validator, plus
+  exact per-node ranges that give every one of the 32 layers three replicas
+  while loading exactly 16 layers on each validator.
 
 Never put private key bytes, seed strings, passwords, tokens, or environment
 secrets in the manifest. `key_file` is only a path to a separately delivered
@@ -43,8 +46,10 @@ hostname. The manifest must carry the reviewed public GET/POST allowlists
 verbatim. The rollout stages the SHA-pinned Caddy binary, validates its config
 before issuance, persists ACME state under the release root, and installs a
 dedicated loopback nginx filter for body/rate limits. Only the six validator
-IPs may reach the signed internal approval path. Unknown paths return 404;
-there is no public `:9090` listener.
+IPs may reach the signed internal approval path or the shard announce,
+forward, and cleanup paths. Shard destinations are bound to these six explicit
+HTTPS origins and responses are authenticated by active validator keys.
+Unknown paths return 404; there is no public `:9090` listener.
 
 Production currently requires audited root-owned SSH/service operation because
 the gateway binds ports 80/443 and the validator keys remain mode `0600`.
@@ -107,7 +112,8 @@ are stopped. The orchestrator:
 5. obtains publicly trusted TLS or fails closed;
 6. starts five validators in a tight quorum batch, then the sixth;
 7. proves loopback-only node RPC, HTTPS health, H/H+1 continuity, advancing
-   convergence, and every one-at-a-time restart;
+   convergence, the sealed 32-layer/3x HTTPS shard topology, and every
+   one-at-a-time restart;
 8. proves reward-policy agreement and, when selected, one successful mined
    `0x25` receipt plus receipt-only worker earnings on every validator.
 
@@ -117,20 +123,97 @@ the old archived fleet and never falls back to compromised identities.
 
 ### Efficient legacy archive
 
-`archive-fleet-to-drive.sh` is plan-only by default and shares the same exact
-`GO <sealed-manifest-sha256>` execution boundary. At the final freeze it stops
-all six legacy processes cleanly, then uploads one hash-checked public-chain
-recovery bundle per host to `arc-drive:ARC Chain Recovery/<manifest hash>`.
-Each bundle contains the stopped canonical `state.wal` (including retained
-blocks, transactions, receipts, and accounts), exact public binary/genesis
-inputs, and pre-stop health/latest-block/DAG-round/validator evidence.
+The legacy freeze and the final checkpoint seal are deliberately separate.
+The final checkpoint hash cannot exist until the forked fleet has stopped, so
+requiring that hash before capture would create a circular authorization. Seal
+a small, create-only freeze plan first:
 
-It intentionally does not upload private identities, service environments,
-build caches, model weights, Git objects, or tens of gigabytes of legacy DAG
-trace per host. Those bytes remain untouched on each validator disk. The
-signed checkpoint independently binds canonical H/hash/root and the captured
-source consensus round, so excluding the non-canonical DAG trace cannot make
-block history appear reset or change the recovery boundary.
+```bash
+scripts/recovery/archive-fleet-to-drive.sh seal-freeze-plan \
+  --window arc-v3-cutover-2026-08 \
+  --output /secure/operator/arc-freeze.lock.json
+
+scripts/recovery/archive-fleet-to-drive.sh capture \
+  --freeze-plan /secure/operator/arc-freeze.lock.json
+
+freeze_sha256='<hash printed by seal-freeze-plan>'
+ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256" \
+  scripts/recovery/archive-fleet-to-drive.sh capture \
+    --freeze-plan /secure/operator/arc-freeze.lock.json \
+    --execute
+```
+
+The default `capture` is read-only. Execution captures a stable
+`/sync/snapshot` LZ4 payload plus bracketed snapshot metadata, health, latest
+block, DAG round, validator set, and network identity before it stops a node.
+It captures and cleanly stops NYC and then LAX, leaving only four of six equal-
+stake validators running when five are required. With finality halted, it
+captures the remaining four live RPCs in parallel, then stops all four and
+copies each final `state.wal`. `freeze` accepts an already-stopped node; it
+never uses SIGKILL. Every capture has a complete file index, refuses overwrite,
+and detects changed, missing, unexpected, symlink, or special-file content.
+
+Build the unsigned candidate from an accepted capture using the exact recovery
+exporter. The capture directory is the data directory and its LZ4 payload is
+the required snapshot; successful export independently decodes the snapshot,
+recomputes its account/storage/code root, and requires it to equal the latest
+complete WAL block/checkpoint boundary:
+
+```bash
+arc-node recovery export \
+  --data-dir /root/arc-recovery-captures/<freeze-sha256>/<node> \
+  --snapshot /root/arc-recovery-captures/<freeze-sha256>/<node>/state.snapshot.lz4 \
+  --genesis /secure/operator/genesis.toml \
+  --validator-public-keys /secure/operator/validator-public-keys.json \
+  --output /secure/operator/candidate.arcchkpt \
+  --source-consensus-round <captured-current-round> \
+  --recovery-epoch 1 \
+  --validator-set-id 1 \
+  --allow-unbound-legacy-wal
+```
+
+The last flag is necessary for the audited legacy WAL, which predates the
+authenticated genesis network hash. It is never implicit: both checkpoint
+creation and final archive sealing require the operator to state it, and the
+binding evidence records that exception. Sign the accepted candidate offline,
+seal the production rollout manifest, then plan and execute the second phase:
+
+```bash
+scripts/recovery/archive-fleet-to-drive.sh seal \
+  --freeze-plan /secure/operator/arc-freeze.lock.json \
+  --manifest /secure/operator/arc-recovery.lock.json \
+  --validator-public-keys /secure/operator/validator-public-keys.json \
+  --allow-unbound-legacy-wal
+
+locked_sha256='<sealed rollout-manifest sha256>'
+ARC_RECOVERY_GO="GO $locked_sha256" \
+  scripts/recovery/archive-fleet-to-drive.sh seal \
+    --freeze-plan /secure/operator/arc-freeze.lock.json \
+    --manifest /secure/operator/arc-recovery.lock.json \
+    --validator-public-keys /secure/operator/validator-public-keys.json \
+    --allow-unbound-legacy-wal \
+    --execute
+```
+
+`seal` rechecks the immutable rollout sidecar, every artifact hash, and the
+5-of-6 signed checkpoint. On each host it runs the same snapshot-assisted
+export against the unchanged capture. A capture is labelled `canonical_match`
+only when exported H, block hash, and full state root equal the selected
+checkpoint. At least one real match is required; all six bundles, including
+non-matching forks, are retained and uploaded under
+`arc-drive:ARC Chain Recovery/<rollout-manifest hash>`. A changed or missing
+capture, an invalid export, or a Drive object bound to a different freeze hash
+stops before upload or replacement.
+
+Each bundle contains the stopped `state.wal`, exact LZ4 snapshot, endpoint
+evidence, optional public legacy binary/genesis inputs, and the semantic export
+result. Shared uploads include the final binary, genesis, public validator set,
+signed checkpoint, sealed rollout manifest, capture ID, and `SHA256SUMS`. The
+archive intentionally excludes private identities, service environments,
+build caches, model weights, Git objects, and tens of gigabytes of legacy DAG
+trace. Those bytes remain untouched on each validator disk. Excluding the DAG
+bulk cannot silently choose a fork: the signed checkpoint and exporter provide
+the explicit H/hash/root recovery boundary.
 
 ## Reward gates
 

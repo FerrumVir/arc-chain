@@ -132,6 +132,28 @@ requires an exact GO hash before mutation, imports only into fresh data
 directories, checks H/H+1 continuity and restart convergence, and can require a
 successful reward receipt plus receipt-only earnings on every validator.
 
+The legacy archive now has a separate, earlier freeze authorization because a
+final checkpoint hash cannot truthfully exist before the forked fleet stops.
+`archive-fleet-to-drive.sh capture` requires an immutable freeze-plan sidecar
+and exact `FREEZE <hash>` phrase. It snapshots and cleanly stops NYC and LAX to
+drop the six-equal-stake fleet below its five-validator quorum, captures the
+remaining four live RPCs while finality is halted, then stops them and records
+all six final WALs. Every capture contains the exact LZ4 `/sync/snapshot`,
+bracketing metadata, public endpoint evidence, and a complete tamper-evident
+file index; no private identity, service environment, model/build cache, Git
+object, or bulky DAG trace is uploaded.
+
+After operators choose a source, the recovery exporter—not an endpoint label—
+must decode that snapshot and prove its H/full-root equals the latest complete
+WAL block/checkpoint boundary. The audited old WAL predates the authenticated
+genesis network hash, so its narrowly scoped `--allow-unbound-legacy-wal`
+exception must be explicit in both export and archive-seal evidence. Only after
+the 5-of-6 checkpoint and production rollout are sealed can the independent
+exact `GO <rollout-manifest-sha256>` phase bind all unchanged captures. It
+requires at least one H/hash/root match to the selected checkpoint but uploads
+all six bundles with honest `canonical_match` labels, preserving fork history
+instead of rewriting it to imply the testnet never diverged.
+
 Only after that should the team use
 [`COMMUNITY-NODE-WALKTHROUGH.md`](COMMUNITY-NODE-WALKTHROUGH.md) to record the
 2–3 minute demo. If any readiness field is false, any same-height root differs,

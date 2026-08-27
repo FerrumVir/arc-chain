@@ -50,6 +50,16 @@ Choose and document the last state that operators accept as canonical. If
 operators cannot agree on one block hash and root, stop and resolve that
 governance decision before building a replacement genesis or checkpoint.
 
+The freeze authorization must not depend on the final checkpoint hash, because
+that hash cannot be known until the forked fleet is stopped and its exact
+source is verified. Use `archive-fleet-to-drive.sh seal-freeze-plan` to create
+a reviewed, immutable six-host plan, then run `capture` in plan mode. Execution
+requires its own exact `ARC_RECOVERY_FREEZE_GO="FREEZE <freeze-plan-sha256>"`.
+The helper captures a bracketed LZ4 `/sync/snapshot`, endpoint evidence, and—
+after a clean TERM-only stop—the final `state.wal`. Complete capture indexes
+are create-only and fail on any changed, missing, unexpected, symlink, or
+special-file content.
+
 ## 2. Rotate every validator identity offline
 
 Generate six new Ed25519 keyfiles on trusted offline operator systems. One
@@ -211,16 +221,37 @@ than five approved v3 validators are online. Do not interpret that deliberate
 maintenance halt as permission to mix protocols or lower quorum.
 
 1. Announce a maintenance window and stop ordinary submissions.
-2. Stop all six legacy validator processes using their actual launch systems.
-3. Verify that no legacy process is still listening or sealing.
-4. Install the exact checksummed candidate and approved genesis/checkpoint on
+2. Execute the separately sealed freeze plan. It snapshots and stops NYC,
+   then snapshots and stops LAX. Four of six equal-stake validators cannot
+   reach the required five-validator quorum, so finality is now deliberately
+   halted.
+3. While quorum remains halted, capture stable live snapshots and endpoint
+   evidence from AMS, LHR, NRT, and SGP in parallel; only after all four live
+   captures complete, stop those four and copy every final WAL.
+4. Verify all six immutable capture indexes and that no legacy process is
+   listening or sealing. Preserve all six captures; do not discard a fork
+   because it is not ultimately selected.
+5. Use `arc-node recovery export --data-dir <capture> --snapshot
+   <capture>/state.snapshot.lz4 ...` to build the candidate from the accepted
+   source. Successful export—not snapshot metadata—must prove that the decoded
+   snapshot H/root equals the latest complete WAL block/checkpoint boundary.
+   The audited legacy WAL needs the explicit `--allow-unbound-legacy-wal`
+   exception because it predates the genesis network hash; record that fact.
+6. Sign the accepted candidate offline with the required 5-of-6 quorum and
+   seal the final production rollout manifest.
+7. Run `archive-fleet-to-drive.sh seal` in plan mode, then execute it only with
+   the exact `ARC_RECOVERY_GO="GO <rollout-manifest-sha256>"`. It re-exports
+   every unchanged snapshot/WAL pair, labels matches against the checkpoint's
+   H/hash/full-root, requires at least one real canonical match, and uploads
+   all six labelled fork bundles plus the shared signed artifacts immutably.
+8. Install the exact checksummed candidate and approved genesis/checkpoint on
    every host; install the host's new keyfile separately.
-5. Start enough prepared v3 validators in a tight window to reach quorum,
+9. Start enough prepared v3 validators in a tight window to reach quorum,
    then start the remainder.
-6. Confirm public address, keyfile source, protocol v3, genesis/checkpoint,
+10. Confirm public address, keyfile source, protocol v3, genesis/checkpoint,
    binary checksum, connected authenticated stake, and advancing chain on
    every host.
-7. Require all six to converge on the same advancing height/hash/root for a
+11. Require all six to converge on the same advancing height/hash/root for a
    full observation window before reopening ordinary traffic.
 
 Each production validator RPC must bind loopback. Configure these six explicit
