@@ -1047,8 +1047,7 @@ fn read_wal_strict_segment(
                 std::io::ErrorKind::InvalidData,
                 format!(
                     "WAL sequence gap: expected {}, got {}",
-                    *expected_sequence,
-                    entry.sequence
+                    *expected_sequence, entry.sequence
                 ),
             ));
         }
@@ -1080,10 +1079,7 @@ pub fn read_wal_dir_strict(dir: impl AsRef<Path>) -> std::io::Result<Vec<WalEntr
     let mut expected_sequence = 0u64;
     let mut all_entries = Vec::new();
     for segment in segments {
-        all_entries.extend(read_wal_strict_segment(
-            &segment,
-            &mut expected_sequence,
-        )?);
+        all_entries.extend(read_wal_strict_segment(&segment, &mut expected_sequence)?);
     }
     Ok(all_entries)
 }
