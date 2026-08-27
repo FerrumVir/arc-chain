@@ -1,6 +1,6 @@
-use crate::node_manager::{managed_binary_path, TestnetResources};
+use crate::node_manager::{TestnetResources, managed_binary_path};
 use crate::types::*;
-use crate::{hardware, identity, paths, rpc_client, AppState};
+use crate::{AppState, hardware, identity, paths, rpc_client};
 use sha2::{Digest as _, Sha256};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -717,21 +717,32 @@ async fn cached_chain_choice(state: &AppState) -> Option<ChainHostChoice> {
         .map(|(c, _)| c.clone())
 }
 
-/// Per-request inference timeout.
-///
-/// Was 600s per host, tried across hosts sequentially — a single dead
-/// coordinator could burn ten minutes before the next was attempted, and
-/// five of them meant the UI could hang for the better part of an hour. 120s
-/// is generous for a short prompt through the sharded pipeline and bounded
-/// enough that a wedged host costs one visible pause, not a demo.
-const INFERENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Mirror the coordinator's protocol budget: worker inference, independent
+/// validator recomputation, and remote reward approvals can span three model
+/// passes. Add 60 seconds beyond the server's capped deadline so a valid
+/// settled response is never cancelled by the desktop first.
+fn inference_timeout(max_tokens: u32) -> std::time::Duration {
+    const MIN_SERVER_SECS: u64 = 45;
+    const MAX_SERVER_SECS: u64 = 3_900;
+    const CLAIM_WINDOW_SECS: u64 = 30;
+    const CLIENT_HEADROOM_SECS: u64 = 60;
+    // One generation is budgeted at 3.3s/token. Dispatch can include the
+    // worker pass, coordinator verification, and validator approval pass,
+    // each with 50% headroom: ceil(14.85s * tokens) + claim window.
+    let estimated_ms = (max_tokens as u64).saturating_mul(14_850);
+    let estimated_secs = estimated_ms.saturating_add(999) / 1_000;
+    let server_secs = estimated_secs
+        .saturating_add(CLAIM_WINDOW_SECS)
+        .clamp(MIN_SERVER_SECS, MAX_SERVER_SECS);
+    std::time::Duration::from_secs(server_secs + CLIENT_HEADROOM_SECS)
+}
 
 /// How long a coordinator gets to answer `/health` before we skip it.
 const COORDINATOR_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
-fn inference_client() -> Result<reqwest::Client, String> {
+fn inference_client(max_tokens: u32) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .timeout(INFERENCE_TIMEOUT)
+        .timeout(inference_timeout(max_tokens))
         .build()
         .map_err(map_err)
 }
@@ -804,12 +815,13 @@ pub async fn run_inference(
 ) -> CmdResult<InferenceResult> {
     let port = state.node.lock().await.rpc_port;
     let host = paths::local_host(port);
-    let client = inference_client()?;
+    let max_tokens = max_tokens.unwrap_or(32);
+    let client = inference_client(max_tokens)?;
     let mut result = rpc_client::run_inference(
         &client,
         &host,
         &prompt,
-        max_tokens.unwrap_or(32),
+        max_tokens,
         chat_template.unwrap_or(true),
     )
     .await?;
@@ -821,8 +833,9 @@ pub async fn run_inference(
 /// testnet seed coordinator's `/inference/run_consensus` endpoint.
 ///
 /// Iterates the built-in `COORDINATOR_HOSTS` list until one seed responds
-/// with success. A 120s per-host timeout covers the full consensus pipeline
-/// for short prompts (NYC typical: 15–60s at k=3 through 6 ranges).
+/// with success. Each request uses the same token-scaled deadline as the
+/// coordinator plus client headroom, so reward verification can settle
+/// without the desktop cancelling first.
 ///
 /// This command is intentionally separate from `run_inference` so the UI
 /// can try the local node first (fast path when the user is a validator
@@ -836,8 +849,8 @@ pub async fn run_inference_via_coordinator(
     k: Option<u32>,
     chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
-    let client = inference_client()?;
     let max_tokens = max_tokens.unwrap_or(32);
+    let client = inference_client(max_tokens)?;
     let k = k.unwrap_or(3);
     let chat_template = chat_template.unwrap_or(true);
 
@@ -890,8 +903,8 @@ pub async fn run_inference_via_coordinator_direct(
     max_tokens: Option<u32>,
     chat_template: Option<bool>,
 ) -> CmdResult<InferenceResult> {
-    let client = inference_client()?;
     let max_tokens = max_tokens.unwrap_or(32);
+    let client = inference_client(max_tokens)?;
     let chat_template = chat_template.unwrap_or(true);
 
     let candidates = coordinator_candidates(&state).await;
@@ -919,8 +932,7 @@ pub async fn run_inference_via_coordinator_direct(
     ))
 }
 
-const SETTLEMENT_WRITE_UNAVAILABLE: &str =
-    "is unavailable in the v0.8.0 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
+const SETTLEMENT_WRITE_UNAVAILABLE: &str = "is unavailable in the v0.8.0 recovery candidate before any transaction is signed or submitted: exact model-artifact binding, validator-authenticated authorization, and settlement are not production-ready. VRF selection and server-derived replica labels are not validator approval. Free/community inference remains available.";
 
 fn settlement_write_unavailable<T>(flow: &str) -> CmdResult<T> {
     Err(format!("{} {}", flow, SETTLEMENT_WRITE_UNAVAILABLE))
@@ -2044,6 +2056,13 @@ mod release_binary_tests {
         let url = exact_release_asset_url("arc-node-linux-x86_64");
         assert!(url.contains(&format!("/v{}/", EXPECTED_NODE_VERSION)));
         assert!(!url.contains("/latest/"));
+    }
+
+    #[test]
+    fn desktop_inference_deadline_outlives_the_server_protocol_budget() {
+        assert_eq!(inference_timeout(0).as_secs(), 105);
+        assert_eq!(inference_timeout(32).as_secs(), 566);
+        assert_eq!(inference_timeout(u32::MAX).as_secs(), 3_960);
     }
 
     #[test]
