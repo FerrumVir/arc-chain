@@ -37,6 +37,83 @@ pub use wal::{
     latest_block_height_in_wal_dir, read_wal, read_wal_dir, read_wal_strict,
 };
 
+/// Protocol-v3 transfers pay at least one base unit into the fixed generic
+/// treasury. This makes every valid user-created history entry economically
+/// bounded while conserving supply.
+pub const V3_MIN_TRANSFER_FEE: u64 = 1;
+/// Hard ingress bound before any signature or body work.
+pub const V3_MAX_TRANSACTION_BYTES: u64 = 64 * 1024;
+/// Conservative launch bound for one canonical state block.
+pub const V3_MAX_TRANSACTIONS_PER_BLOCK: usize = 1_024;
+/// Launch policy: one transaction from an address per canonical state block.
+pub const V3_MAX_TRANSACTIONS_PER_SENDER_PER_BLOCK: usize = 1;
+
+pub const V3_COMMUNITY_REWARD_EPOCH_BLOCKS: u64 = 216_000;
+pub const V3_COMMUNITY_REWARD_MAX_PER_BLOCK: u64 = 1;
+pub const V3_COMMUNITY_REWARD_MAX_PER_EPOCH: u64 = 40;
+pub const V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH: u64 = 8;
+pub const V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH: u64 = 16;
+
+pub fn v3_fee_treasury_address() -> Address {
+    hash_bytes(b"arc-treasury")
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct CommunityRewardIssuancePolicy {
+    pub reward_amount: u64,
+    pub epoch_blocks: u64,
+    pub max_per_block: u64,
+    pub max_per_epoch: u64,
+    pub max_per_worker_epoch: u64,
+    pub max_per_coordinator_epoch: u64,
+}
+
+pub const fn community_reward_issuance_policy() -> CommunityRewardIssuancePolicy {
+    CommunityRewardIssuancePolicy {
+        reward_amount: arc_types::economics::INFERENCE_ATTESTATION_REWARD,
+        epoch_blocks: V3_COMMUNITY_REWARD_EPOCH_BLOCKS,
+        max_per_block: V3_COMMUNITY_REWARD_MAX_PER_BLOCK,
+        max_per_epoch: V3_COMMUNITY_REWARD_MAX_PER_EPOCH,
+        max_per_worker_epoch: V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH,
+        max_per_coordinator_epoch: V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH,
+    }
+}
+
+pub fn community_reward_issuance_policy_hash() -> Hash256 {
+    let policy = community_reward_issuance_policy();
+    let bytes = bincode::serialize(&policy).expect("issuance policy is serializable");
+    let mut hasher = blake3::Hasher::new_derive_key("ARC-community-reward-issuance-policy-v3");
+    hasher.update(&bytes);
+    Hash256(*hasher.finalize().as_bytes())
+}
+
+pub const fn community_reward_epoch_index(block_height: u64) -> u64 {
+    block_height / V3_COMMUNITY_REWARD_EPOCH_BLOCKS
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct CommunityRewardBudgetStatus {
+    pub block_height: u64,
+    pub epoch: u64,
+    pub issued_this_block: u64,
+    pub remaining_this_block: u64,
+    pub issued_this_epoch: u64,
+    pub remaining_this_epoch: u64,
+    pub worker_issued_this_epoch: u64,
+    pub worker_remaining_this_epoch: u64,
+    pub coordinator_issued_this_epoch: u64,
+    pub coordinator_remaining_this_epoch: u64,
+    pub policy_hash: Hash256,
+}
+
+#[derive(Debug)]
+struct CommunityRewardBudgetCandidates {
+    block: (Address, Account),
+    epoch: (Address, Account),
+    worker: (Address, Account),
+    coordinator: (Address, Account),
+}
+
 #[derive(Error, Debug)]
 pub enum StateError {
     #[error("account not found: {0:?}")]
@@ -150,6 +227,63 @@ const WASM_MAGIC: &[u8; 4] = b"\0asm";
 #[inline]
 fn below_policy_minimum(value: u64, minimum: u64) -> bool {
     value < minimum
+}
+
+fn is_reserved_system_account(address: &Address) -> bool {
+    // The first three content-derived accounts are finite protocol reserves:
+    // public faucet, community-reward treasury, and recovery validator-funding
+    // reserve. The legacy bridge/model treasuries are also state-machine-owned.
+    [
+        arc_types::transaction::faucet_pool_address(),
+        arc_types::transaction::inference_reward_treasury_address(),
+        hash_bytes(&[2u8]),
+        hash_bytes(b"ARC-bridge-escrow"),
+        v3_fee_treasury_address(),
+    ]
+    .contains(address)
+}
+
+fn community_reward_budget_address(
+    kind: &'static str,
+    height_or_epoch: u64,
+    identity: Option<&Address>,
+) -> Address {
+    let mut hasher = blake3::Hasher::new_derive_key(kind);
+    hasher.update(&height_or_epoch.to_le_bytes());
+    if let Some(identity) = identity {
+        hasher.update(identity.as_ref());
+    }
+    Hash256(*hasher.finalize().as_bytes())
+}
+
+fn community_reward_block_budget_address(height: u64) -> Address {
+    community_reward_budget_address("ARC-community-reward-block-budget-v3", height, None)
+}
+
+fn community_reward_epoch_budget_address(epoch: u64) -> Address {
+    community_reward_budget_address("ARC-community-reward-epoch-budget-v3", epoch, None)
+}
+
+fn community_reward_worker_budget_address(epoch: u64, worker: &Address) -> Address {
+    community_reward_budget_address(
+        "ARC-community-reward-worker-epoch-budget-v3",
+        epoch,
+        Some(worker),
+    )
+}
+
+fn community_reward_coordinator_budget_address(epoch: u64, coordinator: &Address) -> Address {
+    community_reward_budget_address(
+        "ARC-community-reward-coordinator-epoch-budget-v3",
+        epoch,
+        Some(coordinator),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum V3TransactionFamilyPolicy {
+    Allowed,
+    Denied,
 }
 
 // ── Tier 1 on-chain inference status bytes ────────────────────────────────
@@ -345,6 +479,19 @@ impl StateDB {
     /// consensus caller. This includes every queued append, flush, and fsync.
     fn durable_wal_barrier(&self) -> Result<(), StateError> {
         self.wal.sync().map_err(Self::wal_state_error)
+    }
+
+    fn validate_next_protocol_block_admission(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<(), StateError> {
+        if self.active_protocol_version().major == 3 {
+            let height = self.height().checked_add(1).ok_or_else(|| {
+                StateError::ExecutionError("prospective v3 block height overflow".to_string())
+            })?;
+            self.validate_v3_block_admission_at(transactions, height)?;
+        }
+        Ok(())
     }
 
     /// Create a new empty state (no persistence - benchmark mode).
@@ -1037,6 +1184,32 @@ impl StateDB {
         self.staking_pool.load(Ordering::Relaxed)
     }
 
+    fn add_staking_pool_checked(&self, amount: u64) -> Result<(), StateError> {
+        self.staking_pool
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(amount)
+            })
+            .map(|_| ())
+            .map_err(|current| {
+                StateError::ExecutionError(format!(
+                    "staking pool overflow: current={current}, add={amount}"
+                ))
+            })
+    }
+
+    fn subtract_staking_pool_checked(&self, amount: u64) -> Result<(), StateError> {
+        self.staking_pool
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(amount)
+            })
+            .map(|_| ())
+            .map_err(|current| {
+                StateError::ExecutionError(format!(
+                    "staking pool underflow: current={current}, subtract={amount}"
+                ))
+            })
+    }
+
     /// Get the staked amount for a specific validator address.
     pub fn get_validator_stake(&self, addr: &Address) -> Option<u64> {
         self.validators.get(&addr.0).map(|v| *v)
@@ -1230,6 +1403,672 @@ impl StateDB {
         Ok(())
     }
 
+    fn validate_v3_transaction_envelope(&self, tx: &Transaction) -> Result<(), StateError> {
+        if tx.tx_type != tx.body.tx_type() {
+            return Err(StateError::ExecutionError(format!(
+                "transaction type/body mismatch: envelope {:?}, body {:?}",
+                tx.tx_type,
+                tx.body.tx_type()
+            )));
+        }
+        if !Self::v3_allows_transaction(&tx.body) {
+            return Err(StateError::ExecutionError(format!(
+                "transaction type {:?} is unavailable in recovery protocol v3",
+                tx.tx_type
+            )));
+        }
+        let serialized_size = bincode::serialize(tx)
+            .map_err(|error| {
+                StateError::ExecutionError(format!(
+                    "transaction cannot be size-checked for v3 admission: {error}"
+                ))
+            })?
+            .len() as u64;
+        if serialized_size > V3_MAX_TRANSACTION_BYTES {
+            return Err(StateError::ExecutionError(format!(
+                "transaction size {serialized_size} exceeds v3 maximum {V3_MAX_TRANSACTION_BYTES}"
+            )));
+        }
+        let operation_gas = Self::gas_cost_for_tx(tx);
+        if tx.gas_limit != 0
+            && (tx.gas_limit < operation_gas || tx.gas_limit > gas_costs::BLOCK_GAS_LIMIT)
+        {
+            return Err(StateError::ExecutionError(format!(
+                "transaction gas limit {} is outside [{operation_gas}, {}]",
+                tx.gas_limit,
+                gas_costs::BLOCK_GAS_LIMIT
+            )));
+        }
+        // `sig_verified` is an in-memory performance hint, not an
+        // authorization capability. Reverify at the v3 state boundary so no
+        // alternate executor, RPC path, or forged local flag can bypass the
+        // recovery-domain signature check.
+        self.verify_transaction_signature(tx).map_err(|_| {
+            StateError::ExecutionError(
+                "invalid transaction signature for recovery protocol v3".to_string(),
+            )
+        })
+    }
+
+    fn validate_v3_transfer_admission(
+        &self,
+        tx: &Transaction,
+        body: &TransferBody,
+    ) -> Result<(), StateError> {
+        if body.amount == 0 {
+            return Err(StateError::ExecutionError(
+                "v3 transfer amount must be positive".to_string(),
+            ));
+        }
+        if tx.fee < V3_MIN_TRANSFER_FEE {
+            return Err(StateError::ExecutionError(format!(
+                "v3 transfer fee {} is below minimum {V3_MIN_TRANSFER_FEE}",
+                tx.fee
+            )));
+        }
+        if body.amount_commitment.is_some() {
+            return Err(StateError::ExecutionError(
+                "v3 transfer amount commitments are not active".to_string(),
+            ));
+        }
+        let fee_treasury = v3_fee_treasury_address();
+        if tx.from == body.to
+            || is_reserved_system_account(&tx.from)
+            || is_reserved_system_account(&body.to)
+            || tx.from == fee_treasury
+            || body.to == fee_treasury
+        {
+            return Err(StateError::ExecutionError(
+                "v3 transfer sender/recipient/system account collision".to_string(),
+            ));
+        }
+        let sender = self
+            .get_account(&tx.from)
+            .ok_or(StateError::InsufficientBalance {
+                have: 0,
+                need: body.amount.saturating_add(tx.fee),
+            })?;
+        if sender.nonce != tx.nonce {
+            return Err(StateError::InvalidNonce {
+                expected: sender.nonce,
+                got: tx.nonce,
+            });
+        }
+        sender
+            .nonce
+            .checked_add(1)
+            .ok_or_else(|| StateError::ExecutionError("transfer nonce overflow".to_string()))?;
+        let total_debit = body.amount.checked_add(tx.fee).ok_or_else(|| {
+            StateError::ExecutionError("transfer amount plus fee overflow".to_string())
+        })?;
+        if sender.balance < total_debit {
+            return Err(StateError::InsufficientBalance {
+                have: sender.balance,
+                need: total_debit,
+            });
+        }
+        let receiver = self
+            .get_account(&body.to)
+            .unwrap_or_else(|| Account::new(body.to, 0));
+        receiver.balance.checked_add(body.amount).ok_or_else(|| {
+            StateError::ExecutionError("transfer recipient balance overflow".to_string())
+        })?;
+        let treasury = self
+            .get_account(&fee_treasury)
+            .unwrap_or_else(|| Account::new(fee_treasury, 0));
+        treasury.balance.checked_add(tx.fee).ok_or_else(|| {
+            StateError::ExecutionError("transfer fee treasury balance overflow".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn validate_v3_faucet_admission(
+        &self,
+        tx: &Transaction,
+        body: &arc_types::transaction::FaucetClaimBody,
+    ) -> Result<(), StateError> {
+        if tx.fee != 0 {
+            return Err(StateError::ExecutionError(
+                "faucet claim cannot charge an unaccounted transaction fee".to_string(),
+            ));
+        }
+        if self.active_validators().len()
+            != arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
+        {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim requires the exact {}-validator recovery authority set",
+                arc_types::transaction::COMMUNITY_REWARD_VALIDATOR_SET_SIZE
+            )));
+        }
+        if !self.is_validator(&tx.from) {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim: signer {} is not an active validator",
+                tx.from.to_hex()
+            )));
+        }
+        if body.amount == 0 || body.amount > arc_types::transaction::FAUCET_CLAIM_MAX {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim: amount {} outside [1, {}]",
+                body.amount,
+                arc_types::transaction::FAUCET_CLAIM_MAX
+            )));
+        }
+        let pool = arc_types::transaction::faucet_pool_address();
+        let marker = arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient);
+        let recipient_is_existing_faucet_marker =
+            self.get_account(&body.recipient).is_some_and(|account| {
+                account.balance == 0
+                    && account.nonce == 1
+                    && account.code_hash != Hash256::ZERO
+                    && arc_types::transaction::FaucetClaimBody::marker_address(&account.code_hash)
+                        == body.recipient
+            });
+        if is_reserved_system_account(&body.recipient)
+            || marker == pool
+            || marker == body.recipient
+            || recipient_is_existing_faucet_marker
+        {
+            return Err(StateError::ExecutionError(
+                "faucet claim: system account address collision".to_string(),
+            ));
+        }
+        if self.accounts.contains_key(&marker.0) {
+            return Err(StateError::ExecutionError(format!(
+                "faucet claim: recipient {} has already claimed",
+                body.recipient
+            )));
+        }
+        let pool_account = self.get_account(&pool).ok_or_else(|| {
+            StateError::ExecutionError(
+                "faucet claim: system faucet pool account is not prefunded".to_string(),
+            )
+        })?;
+        if pool_account.balance < body.amount {
+            return Err(StateError::InsufficientBalance {
+                have: pool_account.balance,
+                need: body.amount,
+            });
+        }
+        let recipient = self
+            .get_account(&body.recipient)
+            .unwrap_or_else(|| Account::new(body.recipient, 0));
+        recipient.balance.checked_add(body.amount).ok_or_else(|| {
+            StateError::ExecutionError("faucet claim: recipient balance overflow".to_string())
+        })?;
+        Ok(())
+    }
+
+    fn next_community_reward_budget_counter(
+        &self,
+        address: Address,
+        code_hash: Hash256,
+        limit: u64,
+        label: &str,
+    ) -> Result<Account, StateError> {
+        let policy_hash = community_reward_issuance_policy_hash();
+        let mut account = self
+            .get_account(&address)
+            .unwrap_or_else(|| Account::new(address, 0));
+        if account.nonce != 0 || account.code_hash != Hash256::ZERO {
+            if account.balance != 0
+                || account.staked_balance != 0
+                || account.code_hash != code_hash
+                || account.storage_root != policy_hash
+            {
+                return Err(StateError::ExecutionError(format!(
+                    "community inference reward: invalid {label} budget account"
+                )));
+            }
+        } else if account.balance != 0
+            || account.staked_balance != 0
+            || account.storage_root != Hash256::ZERO
+        {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: {label} budget address collides with live state"
+            )));
+        }
+        let next = account.nonce.checked_add(1).ok_or_else(|| {
+            StateError::ExecutionError(format!(
+                "community inference reward: {label} budget counter overflow"
+            ))
+        })?;
+        if next > limit {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: {label} issuance limit {limit} reached"
+            )));
+        }
+        account.nonce = next;
+        account.code_hash = code_hash;
+        account.storage_root = policy_hash;
+        Ok(account)
+    }
+
+    fn community_reward_budget_candidates_at(
+        &self,
+        body: &arc_types::transaction::CommunityInferenceRewardBody,
+        height: u64,
+    ) -> Result<CommunityRewardBudgetCandidates, StateError> {
+        let epoch = height / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
+        let block_address = community_reward_block_budget_address(height);
+        let epoch_address = community_reward_epoch_budget_address(epoch);
+        let worker_address = community_reward_worker_budget_address(epoch, &body.worker);
+        let coordinator_address =
+            community_reward_coordinator_budget_address(epoch, &body.coordinator);
+        let addresses = [
+            block_address,
+            epoch_address,
+            worker_address,
+            coordinator_address,
+        ];
+        let unique: HashSet<_> = addresses.iter().map(|address| address.0).collect();
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let job_marker = arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+            &body.chain_domain,
+            &body.job_id,
+        );
+        let certificate_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                &body.chain_domain,
+                &body.worker,
+                &body.worker_certificate.attestation_hash,
+            );
+        if unique.len() != addresses.len()
+            || addresses.iter().any(|address| {
+                *address == treasury
+                    || *address == body.worker
+                    || *address == body.coordinator
+                    || *address == job_marker
+                    || *address == certificate_marker
+                    || is_reserved_system_account(address)
+            })
+        {
+            return Err(StateError::ExecutionError(
+                "community inference reward: issuance budget address collision".to_string(),
+            ));
+        }
+        let block = self.next_community_reward_budget_counter(
+            block_address,
+            hash_bytes(b"ARC-community-reward-block-budget-v3"),
+            V3_COMMUNITY_REWARD_MAX_PER_BLOCK,
+            "block",
+        )?;
+        let epoch_account = self.next_community_reward_budget_counter(
+            epoch_address,
+            hash_bytes(b"ARC-community-reward-epoch-budget-v3"),
+            V3_COMMUNITY_REWARD_MAX_PER_EPOCH,
+            "epoch",
+        )?;
+        let worker = self.next_community_reward_budget_counter(
+            worker_address,
+            body.worker,
+            V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH,
+            "worker epoch",
+        )?;
+        let coordinator = self.next_community_reward_budget_counter(
+            coordinator_address,
+            body.coordinator,
+            V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH,
+            "coordinator epoch",
+        )?;
+        Ok(CommunityRewardBudgetCandidates {
+            block: (block_address, block),
+            epoch: (epoch_address, epoch_account),
+            worker: (worker_address, worker),
+            coordinator: (coordinator_address, coordinator),
+        })
+    }
+
+    pub fn community_reward_budget_status(
+        &self,
+        worker: Address,
+        coordinator: Address,
+        block_height: u64,
+    ) -> CommunityRewardBudgetStatus {
+        let epoch = community_reward_epoch_index(block_height);
+        let count = |address: Address| {
+            self.get_account(&address)
+                .map(|account| account.nonce)
+                .unwrap_or(0)
+        };
+        let issued_this_block = count(community_reward_block_budget_address(block_height));
+        let issued_this_epoch = count(community_reward_epoch_budget_address(epoch));
+        let worker_issued_this_epoch =
+            count(community_reward_worker_budget_address(epoch, &worker));
+        let coordinator_issued_this_epoch = count(community_reward_coordinator_budget_address(
+            epoch,
+            &coordinator,
+        ));
+        CommunityRewardBudgetStatus {
+            block_height,
+            epoch,
+            issued_this_block,
+            remaining_this_block: V3_COMMUNITY_REWARD_MAX_PER_BLOCK
+                .saturating_sub(issued_this_block),
+            issued_this_epoch,
+            remaining_this_epoch: V3_COMMUNITY_REWARD_MAX_PER_EPOCH
+                .saturating_sub(issued_this_epoch),
+            worker_issued_this_epoch,
+            worker_remaining_this_epoch: V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH
+                .saturating_sub(worker_issued_this_epoch),
+            coordinator_issued_this_epoch,
+            coordinator_remaining_this_epoch: V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH
+                .saturating_sub(coordinator_issued_this_epoch),
+            policy_hash: community_reward_issuance_policy_hash(),
+        }
+    }
+
+    pub fn current_community_reward_budget_status(
+        &self,
+        worker: Address,
+        coordinator: Address,
+    ) -> CommunityRewardBudgetStatus {
+        self.community_reward_budget_status(worker, coordinator, self.height())
+    }
+
+    fn validate_community_reward_admission(
+        &self,
+        tx: &Transaction,
+        body: &arc_types::transaction::CommunityInferenceRewardBody,
+        execution_height: u64,
+    ) -> Result<(), StateError> {
+        if tx.fee != 0 {
+            return Err(StateError::ExecutionError(
+                "community inference reward cannot charge an unaccounted transaction fee"
+                    .to_string(),
+            ));
+        }
+        if self
+            .community_rewards_v1_activation_height()
+            .is_none_or(|activation| execution_height < activation)
+        {
+            return Err(StateError::ExecutionError(
+                "community inference reward: protocol feature is not active at this height"
+                    .to_string(),
+            ));
+        }
+        if !self.is_validator(&tx.from) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: signer {} is not an active validator",
+                tx.from.to_hex()
+            )));
+        }
+        let expected_domain =
+            arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain();
+        if body.chain_domain != expected_domain {
+            return Err(StateError::ExecutionError(
+                "community inference reward: wrong chain domain".to_string(),
+            ));
+        }
+        if body.job_id == Hash256::ZERO {
+            return Err(StateError::ExecutionError(
+                "community inference reward: job_id cannot be zero".to_string(),
+            ));
+        }
+        if body.coordinator != tx.from || !self.is_validator(&body.coordinator) {
+            return Err(StateError::ExecutionError(
+                "community inference reward: assignment coordinator must be the active outer signer"
+                    .to_string(),
+            ));
+        }
+        if body.assignment_epoch == Hash256::ZERO {
+            return Err(StateError::ExecutionError(
+                "community inference reward: assignment_epoch cannot be zero".to_string(),
+            ));
+        }
+        match self.recovery_context() {
+            Some(context)
+                if body.recovery_epoch == context.recovery_epoch
+                    && body.validator_set_id == context.validator_set_id
+                    && body.transaction_domain == context.domain_hash() => {}
+            Some(_) => {
+                return Err(StateError::ExecutionError(
+                    "community inference reward: recovery epoch, validator-set ID, or transaction domain does not match active state"
+                        .to_string(),
+                ));
+            }
+            None if body.recovery_epoch == 0
+                && body.validator_set_id == 0
+                && body.transaction_domain == Hash256::ZERO => {}
+            None => {
+                return Err(StateError::ExecutionError(
+                    "community inference reward: recovery binding is non-zero on legacy/dev state"
+                        .to_string(),
+                ));
+            }
+        }
+        let expected_job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &body.coordinator,
+            &body.assignment_epoch,
+            body.job_nonce,
+            &body.model_id,
+            &body.input_hash,
+            body.max_tokens,
+        );
+        if body.job_id != expected_job_id {
+            return Err(StateError::ExecutionError(
+                "community inference reward: job_id does not match its exact assignment commitment"
+                    .to_string(),
+            ));
+        }
+        if body.max_tokens == 0 {
+            return Err(StateError::ExecutionError(
+                "community inference reward: max_tokens must be positive".to_string(),
+            ));
+        }
+        if execution_height > body.expires_at_height {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: job expired at height {} (current {})",
+                body.expires_at_height, execution_height
+            )));
+        }
+        let worker_attestation = body.reconstruct_worker_attestation();
+        self.verify_transaction_signature(&worker_attestation)
+            .map_err(|_| {
+                StateError::ExecutionError(
+                    "community inference reward: invalid worker certificate signature".to_string(),
+                )
+            })?;
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let worker_stake = self.get_validator_stake(&body.worker).unwrap_or(0);
+        if below_policy_minimum(
+            worker_stake,
+            arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE,
+        ) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: worker stake {} is below active policy minimum {}",
+                worker_stake,
+                arc_types::transaction::COMMUNITY_REWARD_MIN_WORKER_STAKE
+            )));
+        }
+        if body.worker == treasury {
+            return Err(StateError::ExecutionError(
+                "community inference reward: treasury cannot be the worker".to_string(),
+            ));
+        }
+        let job_marker = arc_types::transaction::CommunityInferenceRewardBody::marker_address(
+            &body.chain_domain,
+            &body.job_id,
+        );
+        let certificate_marker =
+            arc_types::transaction::CommunityInferenceRewardBody::certificate_marker_address(
+                &body.chain_domain,
+                &body.worker,
+                &body.worker_certificate.attestation_hash,
+            );
+        if job_marker == certificate_marker
+            || job_marker == body.worker
+            || certificate_marker == body.worker
+            || job_marker == treasury
+            || certificate_marker == treasury
+        {
+            return Err(StateError::ExecutionError(
+                "community inference reward: marker address collision".to_string(),
+            ));
+        }
+        if self.accounts.contains_key(&job_marker.0) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: job {} already paid",
+                body.job_id.to_hex()
+            )));
+        }
+        if self.accounts.contains_key(&certificate_marker.0) {
+            return Err(StateError::ExecutionError(format!(
+                "community inference reward: worker certificate {} already paid",
+                body.worker_certificate.attestation_hash.to_hex()
+            )));
+        }
+        self.verify_community_reward_validator_approvals(body)?;
+        let reward = arc_types::economics::INFERENCE_ATTESTATION_REWARD;
+        let worker = self
+            .get_account(&body.worker)
+            .unwrap_or_else(|| Account::new(body.worker, 0));
+        worker.balance.checked_add(reward).ok_or_else(|| {
+            StateError::ExecutionError(
+                "community inference reward: worker balance overflow".to_string(),
+            )
+        })?;
+        let treasury_account = self.get_account(&treasury).ok_or_else(|| {
+            StateError::ExecutionError(
+                "community inference reward: treasury is not funded".to_string(),
+            )
+        })?;
+        if treasury_account.balance < reward {
+            return Err(StateError::InsufficientBalance {
+                have: treasury_account.balance,
+                need: reward,
+            });
+        }
+        if self.active_protocol_version().major == 3 {
+            self.community_reward_budget_candidates_at(body, execution_height)?;
+        }
+        Ok(())
+    }
+
+    /// Side-effect-free protocol-v3 ingress validation. RPC, gossip, DAG, and
+    /// restore paths use this before retaining a transaction; the state
+    /// executor independently enforces the same conditions before writes.
+    pub fn validate_v3_transaction_admission(&self, tx: &Transaction) -> Result<(), StateError> {
+        let execution_height = self.height().checked_add(1).ok_or_else(|| {
+            StateError::ExecutionError("prospective v3 block height overflow".to_string())
+        })?;
+        self.validate_v3_transaction_admission_at(tx, execution_height)
+    }
+
+    /// Exact-height variant used by canonical DAG/block validation.
+    pub fn validate_v3_transaction_admission_at(
+        &self,
+        tx: &Transaction,
+        execution_height: u64,
+    ) -> Result<(), StateError> {
+        if self.active_protocol_version().major != 3 {
+            return Err(StateError::ExecutionError(
+                "protocol-v3 admission requested without an active recovery context".to_string(),
+            ));
+        }
+        self.validate_v3_transaction_envelope(tx)?;
+        match &tx.body {
+            TxBody::Transfer(body) => self.validate_v3_transfer_admission(tx, body),
+            TxBody::FaucetClaim(body) => self.validate_v3_faucet_admission(tx, body),
+            TxBody::CommunityInferenceReward(body) => {
+                self.validate_community_reward_admission(tx, body, execution_height)
+            }
+            // Keep this list exhaustive rather than using a wildcard: a new
+            // transaction family must be consciously classified and wired
+            // before the crate can compile.
+            TxBody::Settle(_)
+            | TxBody::Swap(_)
+            | TxBody::Escrow(_)
+            | TxBody::Stake(_)
+            | TxBody::WasmCall(_)
+            | TxBody::MultiSig(_)
+            | TxBody::DeployContract(_)
+            | TxBody::RegisterAgent(_)
+            | TxBody::JoinValidator(_)
+            | TxBody::LeaveValidator
+            | TxBody::ClaimRewards
+            | TxBody::UpdateStake(_)
+            | TxBody::Governance(_)
+            | TxBody::BridgeLock(_)
+            | TxBody::BridgeMint(_)
+            | TxBody::BatchSettle(_)
+            | TxBody::ChannelOpen(_)
+            | TxBody::ChannelClose(_)
+            | TxBody::ChannelDispute(_)
+            | TxBody::ShardProof(_)
+            | TxBody::InferenceAttestation(_)
+            | TxBody::InferenceChallenge(_)
+            | TxBody::InferenceRegister(_)
+            | TxBody::InferenceEscrowOpen(_)
+            | TxBody::InferenceEscrowRelease(_)
+            | TxBody::InferenceEscrowRefund(_)
+            | TxBody::ModelRegistration(_)
+            | TxBody::ModelRequest(_)
+            | TxBody::ShardCoverageClaim(_)
+            | TxBody::CapacityAdvertisement(_)
+            | TxBody::ShardAssignmentProposal(_)
+            | TxBody::InferenceRequest(_)
+            | TxBody::InferenceVote(_)
+            | TxBody::InferenceFinalize(_) => Err(StateError::ExecutionError(
+                "transaction family has no protocol-v3 admission handler".to_string(),
+            )),
+        }
+    }
+
+    /// Validate a complete candidate v3 state block without mutation. The
+    /// launch policy permits one transaction per sender and rejects any
+    /// overlapping static account access sets, ensuring that individually
+    /// valid preflights cannot invalidate one another before execution.
+    pub fn validate_v3_block_admission(
+        &self,
+        transactions: &[Transaction],
+    ) -> Result<(), StateError> {
+        let execution_height = self.height().checked_add(1).ok_or_else(|| {
+            StateError::ExecutionError("prospective v3 block height overflow".to_string())
+        })?;
+        self.validate_v3_block_admission_at(transactions, execution_height)
+    }
+
+    /// Exact-height candidate-block validation for consensus.
+    pub fn validate_v3_block_admission_at(
+        &self,
+        transactions: &[Transaction],
+        execution_height: u64,
+    ) -> Result<(), StateError> {
+        if transactions.len() > V3_MAX_TRANSACTIONS_PER_BLOCK {
+            return Err(StateError::ExecutionError(format!(
+                "v3 block contains {} transactions; maximum is {V3_MAX_TRANSACTIONS_PER_BLOCK}",
+                transactions.len()
+            )));
+        }
+        let mut senders = HashMap::<[u8; 32], usize>::new();
+        let mut hashes = HashSet::with_capacity(transactions.len());
+        let mut accessed = HashSet::new();
+        for tx in transactions {
+            if !hashes.insert(tx.hash.0) {
+                return Err(StateError::ExecutionError(
+                    "v3 block contains a duplicate transaction hash".to_string(),
+                ));
+            }
+            let sender_count = senders.entry(tx.from.0).or_default();
+            *sender_count += 1;
+            if *sender_count > V3_MAX_TRANSACTIONS_PER_SENDER_PER_BLOCK {
+                return Err(StateError::ExecutionError(format!(
+                    "v3 block exceeds per-sender transaction limit for {}",
+                    tx.from.to_hex()
+                )));
+            }
+            self.validate_v3_transaction_admission_at(tx, execution_height)?;
+            for account in crate::block_stm::tx_access_set(tx).accounts {
+                if !accessed.insert(account) {
+                    return Err(StateError::ExecutionError(
+                        "v3 block contains overlapping transaction state access".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Get current block height.
     pub fn height(&self) -> u64 {
         *self.height.read()
@@ -1297,6 +2136,7 @@ impl StateDB {
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut tx_hashes = Vec::with_capacity(transactions.len());
 
@@ -1539,6 +2379,7 @@ impl StateDB {
         timestamp: u64,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         use rayon::prelude::*;
 
         // The transaction slice is already in canonical block/DAG order.
@@ -1697,6 +2538,7 @@ impl StateDB {
         timestamp: u64,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut tx_hashes = Vec::with_capacity(transactions.len());
 
@@ -1908,6 +2750,7 @@ impl StateDB {
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         use arc_gpu::metal_verify::{MetalVerifier, VerifyTask};
 
         let height = {
@@ -2153,6 +2996,7 @@ impl StateDB {
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -2280,6 +3124,7 @@ impl StateDB {
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         self.require_healthy_wal()?;
+        self.validate_next_protocol_block_admission(transactions)?;
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -2505,6 +3350,11 @@ impl StateDB {
         producer: Address,
         nonce_base: &mut u64,
     ) -> Result<Block, StateError> {
+        if self.active_protocol_version().major == 3 {
+            return Err(StateError::ExecutionError(
+                "unsigned benchmark execution is unavailable in recovery protocol v3".to_string(),
+            ));
+        }
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -2650,6 +3500,13 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<Block, StateError> {
+        self.require_healthy_wal()?;
+        if self.active_protocol_version().major == 3 {
+            return Err(StateError::ExecutionError(
+                "non-WAL benchmark execution is unavailable in recovery protocol v3".to_string(),
+            ));
+        }
+        self.validate_next_protocol_block_admission(transactions)?;
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -3067,6 +3924,63 @@ impl StateDB {
         }
     }
 
+    /// Protocol v3 deliberately exposes a tiny, audited transaction surface.
+    ///
+    /// Keep this match exhaustive (no wildcard): adding a new `TxType` (and
+    /// therefore a new `TxBody::tx_type()` mapping) must fail compilation
+    /// until the new family is explicitly classified. Most
+    /// legacy families remain decodable/replayable, but cannot enter new v3
+    /// consensus state until their authorization, atomicity, and conservation
+    /// invariants are proven.
+    fn v3_transaction_family_policy(tx_type: TxType) -> V3TransactionFamilyPolicy {
+        match tx_type {
+            TxType::Transfer | TxType::CommunityInferenceReward | TxType::FaucetClaim => {
+                V3TransactionFamilyPolicy::Allowed
+            }
+            TxType::InferenceAttestation
+            | TxType::Settle
+            | TxType::Swap
+            | TxType::Escrow
+            | TxType::Stake
+            | TxType::WasmCall
+            | TxType::MultiSig
+            | TxType::DeployContract
+            | TxType::RegisterAgent
+            | TxType::JoinValidator
+            | TxType::LeaveValidator
+            | TxType::ClaimRewards
+            | TxType::UpdateStake
+            | TxType::Governance
+            | TxType::BridgeLock
+            | TxType::BridgeMint
+            | TxType::BatchSettle
+            | TxType::ChannelOpen
+            | TxType::ChannelClose
+            | TxType::ChannelDispute
+            | TxType::ShardProof
+            | TxType::InferenceChallenge
+            | TxType::InferenceRegister
+            | TxType::InferenceEscrowOpen
+            | TxType::InferenceEscrowRelease
+            | TxType::InferenceEscrowRefund
+            | TxType::ModelRegistration
+            | TxType::ModelRequest
+            | TxType::ShardCoverageClaim
+            | TxType::CapacityAdvertisement
+            | TxType::ShardAssignmentProposal
+            | TxType::InferenceRequest
+            | TxType::InferenceVote
+            | TxType::InferenceFinalize => V3TransactionFamilyPolicy::Denied,
+        }
+    }
+
+    fn v3_allows_transaction(body: &TxBody) -> bool {
+        match Self::v3_transaction_family_policy(body.tx_type()) {
+            V3TransactionFamilyPolicy::Allowed => true,
+            V3TransactionFamilyPolicy::Denied => false,
+        }
+    }
+
     /// Execute a single transaction against state, enforcing gas metering.
     ///
     /// Returns the gas consumed on success. When `gas_limit == 0` (backward
@@ -3079,6 +3993,9 @@ impl StateDB {
                 tx.tx_type,
                 tx.body.tx_type()
             )));
+        }
+        if self.active_protocol_version().major == 3 {
+            self.validate_v3_transaction_envelope(tx)?;
         }
         // --- Gas metering setup ---
         let effective_limit = if tx.gas_limit > 0 {
@@ -3096,64 +4013,144 @@ impl StateDB {
 
         match &tx.body {
             TxBody::Transfer(body) => {
-                // Use get_mut for zero-copy in-place modification
-                {
-                    let mut sender = self.accounts.get_mut(&tx.from.0).ok_or_else(|| {
-                        // Lazy create if not found
-                        self.accounts.insert(tx.from.0, Account::new(tx.from, 0));
-                        StateError::InsufficientBalance {
-                            have: 0,
-                            need: body.amount,
-                        }
+                if self.active_protocol_version().major == 3 {
+                    self.validate_v3_transfer_admission(tx, body)?;
+                    let fee_treasury_addr = v3_fee_treasury_address();
+                    let total_debit = body.amount.checked_add(tx.fee).ok_or_else(|| {
+                        StateError::ExecutionError("transfer amount plus fee overflow".to_string())
                     })?;
-                    if sender.nonce != tx.nonce {
-                        return Err(StateError::InvalidNonce {
-                            expected: sender.nonce,
-                            got: tx.nonce,
-                        });
-                    }
-                    if sender.balance < body.amount {
-                        return Err(StateError::InsufficientBalance {
-                            have: sender.balance,
-                            need: body.amount,
-                        });
-                    }
-                    sender.balance -= body.amount;
-                    sender.nonce += 1;
-                    // Eagerly update JMT leaf for sender.
+                    let mut sender = self.get_account(&tx.from).ok_or_else(|| {
+                        StateError::ExecutionError(
+                            "v3 transfer sender disappeared after preflight".to_string(),
+                        )
+                    })?;
+                    let mut receiver = self
+                        .get_account(&body.to)
+                        .unwrap_or_else(|| Account::new(body.to, 0));
+                    let mut fee_treasury = self
+                        .get_account(&fee_treasury_addr)
+                        .unwrap_or_else(|| Account::new(fee_treasury_addr, 0));
+                    sender.balance = sender.balance.checked_sub(total_debit).ok_or_else(|| {
+                        StateError::ExecutionError("transfer sender balance underflow".to_string())
+                    })?;
+                    sender.nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                        StateError::ExecutionError("transfer nonce overflow".to_string())
+                    })?;
+                    receiver.balance =
+                        receiver.balance.checked_add(body.amount).ok_or_else(|| {
+                            StateError::ExecutionError(
+                                "transfer recipient balance overflow".to_string(),
+                            )
+                        })?;
+                    fee_treasury.balance =
+                        fee_treasury.balance.checked_add(tx.fee).ok_or_else(|| {
+                            StateError::ExecutionError(
+                                "transfer fee treasury balance overflow".to_string(),
+                            )
+                        })?;
+
+                    self.accounts.insert(tx.from.0, sender.clone());
+                    self.accounts.insert(body.to.0, receiver.clone());
+                    self.accounts
+                        .insert(fee_treasury_addr.0, fee_treasury.clone());
                     if self.use_jmt {
-                        let sender_hash =
-                            hash_bytes(&bincode::serialize(sender.value()).unwrap_or_default());
-                        self.jmt.lock().update_leaf(tx.from.0, sender_hash);
+                        let mut jmt = self.jmt.lock();
+                        for (address, account) in [
+                            (tx.from, &sender),
+                            (body.to, &receiver),
+                            (fee_treasury_addr, &fee_treasury),
+                        ] {
+                            let value =
+                                hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                            jmt.update_leaf(address.0, value);
+                        }
                     }
-                    // WAL snapshot only if WAL is active (null WAL returns early)
                     if self.wal.is_active() {
-                        let snap = sender.clone();
-                        drop(sender);
                         self.wal
-                            .append(WalOp::SetAccount(tx.from, snap), self.height());
+                            .append(WalOp::SetAccount(tx.from, sender), self.height());
+                        self.wal
+                            .append(WalOp::SetAccount(body.to, receiver), self.height());
+                        self.wal.append(
+                            WalOp::SetAccount(fee_treasury_addr, fee_treasury),
+                            self.height(),
+                        );
                     }
+                    return Ok(gas.consumed);
                 }
 
-                // Credit receiver in-place
-                {
-                    let mut receiver = self
-                        .accounts
-                        .entry(body.to.0)
-                        .or_insert_with(|| Account::new(body.to, 0));
-                    receiver.balance = receiver.balance.saturating_add(body.amount);
-                    // Eagerly update JMT leaf for receiver.
+                // Build the complete transition from detached snapshots. A
+                // missing sender, bad nonce, insufficient funds, nonce
+                // overflow, or recipient overflow must fail without creating
+                // or partially updating any account.
+                let mut sender =
+                    self.get_account(&tx.from)
+                        .ok_or(StateError::InsufficientBalance {
+                            have: 0,
+                            need: body.amount,
+                        })?;
+                if sender.nonce != tx.nonce {
+                    return Err(StateError::InvalidNonce {
+                        expected: sender.nonce,
+                        got: tx.nonce,
+                    });
+                }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("transfer nonce overflow".to_string())
+                })?;
+                if sender.balance < body.amount {
+                    return Err(StateError::InsufficientBalance {
+                        have: sender.balance,
+                        need: body.amount,
+                    });
+                }
+
+                if body.to == tx.from {
+                    // A self-transfer conserves value and consumes exactly one
+                    // nonce; applying debit and credit to separate snapshots
+                    // would otherwise overwrite one half of the transition.
+                    sender.nonce = next_nonce;
+                    self.accounts.insert(tx.from.0, sender.clone());
                     if self.use_jmt {
-                        let recv_hash =
-                            hash_bytes(&bincode::serialize(receiver.value()).unwrap_or_default());
-                        self.jmt.lock().update_leaf(body.to.0, recv_hash);
+                        let value = hash_bytes(&bincode::serialize(&sender).unwrap_or_default());
+                        self.jmt.lock().update_leaf(tx.from.0, value);
                     }
                     if self.wal.is_active() {
-                        let snap = receiver.clone();
-                        drop(receiver);
                         self.wal
-                            .append(WalOp::SetAccount(body.to, snap), self.height());
+                            .append(WalOp::SetAccount(tx.from, sender), self.height());
                     }
+                    return Ok(gas.consumed);
+                }
+
+                let mut receiver = self
+                    .get_account(&body.to)
+                    .unwrap_or_else(|| Account::new(body.to, 0));
+                let sender_balance = sender.balance.checked_sub(body.amount).ok_or_else(|| {
+                    StateError::ExecutionError("transfer sender balance underflow".to_string())
+                })?;
+                let receiver_balance =
+                    receiver.balance.checked_add(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError(
+                            "transfer recipient balance overflow".to_string(),
+                        )
+                    })?;
+                sender.balance = sender_balance;
+                sender.nonce = next_nonce;
+                receiver.balance = receiver_balance;
+
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.accounts.insert(body.to.0, receiver.clone());
+                if self.use_jmt {
+                    let mut jmt = self.jmt.lock();
+                    for (address, account) in [(tx.from, &sender), (body.to, &receiver)] {
+                        let value = hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                        jmt.update_leaf(address.0, value);
+                    }
+                }
+                if self.wal.is_active() {
+                    self.wal
+                        .append(WalOp::SetAccount(tx.from, sender), self.height());
+                    self.wal
+                        .append(WalOp::SetAccount(body.to, receiver), self.height());
                 }
 
                 Ok(gas.consumed)
@@ -3250,6 +4247,10 @@ impl StateDB {
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender
+                    .nonce
+                    .checked_add(1)
+                    .ok_or_else(|| StateError::ExecutionError("stake nonce overflow".into()))?;
 
                 if body.is_stake {
                     // --- Stake: move funds from balance to staked_balance ---
@@ -3259,16 +4260,30 @@ impl StateDB {
                             need: body.amount,
                         });
                     }
-                    sender.balance -= body.amount;
-                    sender.staked_balance += body.amount;
-
-                    // Update validator tracking
                     let prev_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
-                    let new_stake = prev_stake.saturating_add(body.amount);
-                    self.validators.insert(tx.from.0, new_stake);
+                    if sender.staked_balance < prev_stake {
+                        return Err(StateError::ExecutionError(format!(
+                            "validator account stake {} is below tracked validator stake {prev_stake}",
+                            sender.staked_balance
+                        )));
+                    }
+                    let new_balance = sender.balance.checked_sub(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError("stake balance underflow".into())
+                    })?;
+                    let new_account_stake = sender
+                        .staked_balance
+                        .checked_add(body.amount)
+                        .ok_or_else(|| {
+                            StateError::ExecutionError("account stake overflow".into())
+                        })?;
+                    let new_stake = prev_stake.checked_add(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError("validator stake overflow".into())
+                    })?;
+                    self.add_staking_pool_checked(body.amount)?;
 
-                    // Update global staking pool
-                    self.staking_pool.fetch_add(body.amount, Ordering::Relaxed);
+                    sender.balance = new_balance;
+                    sender.staked_balance = new_account_stake;
+                    self.validators.insert(tx.from.0, new_stake);
 
                     // Register as validator if crossing threshold
                     if prev_stake < Self::MIN_VALIDATOR_STAKE
@@ -3281,30 +4296,43 @@ impl StateDB {
                         );
                     }
                 } else {
-                    // --- Unstake: move funds from staked_balance back to balance ---
-                    if sender.staked_balance < body.amount {
+                    // --- Unstake only the validator-map component. The same
+                    // account field may also contain an inference-provider
+                    // bond, which is not withdrawable through this tx. ---
+                    let prev_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
+                    if prev_stake < body.amount {
                         return Err(StateError::InsufficientBalance {
-                            have: sender.staked_balance,
+                            have: prev_stake,
                             need: body.amount,
                         });
                     }
-                    sender.staked_balance -= body.amount;
-                    sender.balance = body.amount;
+                    if sender.staked_balance < prev_stake {
+                        return Err(StateError::ExecutionError(format!(
+                            "validator account stake {} is below tracked validator stake {prev_stake}",
+                            sender.staked_balance
+                        )));
+                    }
+                    let new_account_stake = sender
+                        .staked_balance
+                        .checked_sub(body.amount)
+                        .ok_or_else(|| {
+                            StateError::ExecutionError("account stake underflow".into())
+                        })?;
+                    let new_balance = sender.balance.checked_add(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError("unstake balance overflow".into())
+                    })?;
+                    let new_stake = prev_stake.checked_sub(body.amount).ok_or_else(|| {
+                        StateError::ExecutionError("validator stake underflow".into())
+                    })?;
+                    self.subtract_staking_pool_checked(body.amount)?;
 
-                    // Update validator tracking
-                    let prev_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
-                    let new_stake = prev_stake.saturating_sub(body.amount);
+                    sender.staked_balance = new_account_stake;
+                    sender.balance = new_balance;
                     if new_stake == 0 {
                         self.validators.remove(&tx.from.0);
                     } else {
                         self.validators.insert(tx.from.0, new_stake);
                     }
-
-                    // Update global staking pool
-                    self.staking_pool.fetch_sub(
-                        body.amount.min(self.staking_pool.load(Ordering::Relaxed)),
-                        Ordering::Relaxed,
-                    );
 
                     // Log validator removal if dropping below threshold
                     if prev_stake >= Self::MIN_VALIDATOR_STAKE
@@ -3318,7 +4346,7 @@ impl StateDB {
                     }
                 }
 
-                sender.nonce += 1;
+                sender.nonce = next_nonce;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
@@ -4037,6 +5065,9 @@ impl StateDB {
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("validator join nonce overflow".into())
+                })?;
                 if sender.balance < body.initial_stake {
                     return Err(StateError::InsufficientBalance {
                         have: sender.balance,
@@ -4050,16 +5081,35 @@ impl StateDB {
                         Self::MIN_VALIDATOR_STAKE
                     )));
                 }
+                let current_stake = self
+                    .validators
+                    .get(&tx.from.0)
+                    .map(|value| *value)
+                    .unwrap_or(0);
+                if current_stake != 0 {
+                    return Err(StateError::ExecutionError(format!(
+                        "validator already has {current_stake} tracked stake; use UpdateStake"
+                    )));
+                }
 
-                // Move balance to staked_balance
-                sender.balance -= body.initial_stake;
-                sender.staked_balance += body.initial_stake;
-                sender.nonce += 1;
+                let new_balance = sender
+                    .balance
+                    .checked_sub(body.initial_stake)
+                    .ok_or_else(|| StateError::ExecutionError("join balance underflow".into()))?;
+                let new_account_stake = sender
+                    .staked_balance
+                    .checked_add(body.initial_stake)
+                    .ok_or_else(|| StateError::ExecutionError("account stake overflow".into()))?;
+                self.add_staking_pool_checked(body.initial_stake)?;
+
+                // Move only the new validator component. Any existing
+                // inference-provider bond remains locked alongside it.
+                sender.balance = new_balance;
+                sender.staked_balance = new_account_stake;
+                sender.nonce = next_nonce;
 
                 // Register in validator set
                 self.validators.insert(tx.from.0, body.initial_stake);
-                self.staking_pool
-                    .fetch_add(body.initial_stake, Ordering::Relaxed);
 
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
@@ -4081,23 +5131,39 @@ impl StateDB {
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("validator exit nonce overflow".into())
+                })?;
 
-                // Return all staked balance
+                // Return exactly the validator-map component. Provider bonds
+                // and any other non-validator lock share staked_balance and
+                // must remain untouched.
                 let staked = self
                     .validators
-                    .remove(&tx.from.0)
-                    .map(|(_, v)| v)
+                    .get(&tx.from.0)
+                    .map(|value| *value)
                     .unwrap_or(0);
                 if staked > 0 {
-                    sender.staked_balance = sender.staked_balance.saturating_sub(staked);
-                    sender.balance = staked;
-                    self.staking_pool.fetch_sub(
-                        staked.min(self.staking_pool.load(Ordering::Relaxed)),
-                        Ordering::Relaxed,
-                    );
+                    if sender.staked_balance < staked {
+                        return Err(StateError::ExecutionError(format!(
+                            "validator account stake {} is below tracked validator stake {staked}",
+                            sender.staked_balance
+                        )));
+                    }
+                    let new_account_stake =
+                        sender.staked_balance.checked_sub(staked).ok_or_else(|| {
+                            StateError::ExecutionError("account stake underflow".into())
+                        })?;
+                    let new_balance = sender.balance.checked_add(staked).ok_or_else(|| {
+                        StateError::ExecutionError("validator exit balance overflow".into())
+                    })?;
+                    self.subtract_staking_pool_checked(staked)?;
+                    sender.staked_balance = new_account_stake;
+                    sender.balance = new_balance;
+                    self.validators.remove(&tx.from.0);
                 }
 
-                sender.nonce += 1;
+                sender.nonce = next_nonce;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
@@ -4132,8 +5198,17 @@ impl StateDB {
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("validator stake nonce overflow".into())
+                })?;
 
                 let current_stake = self.validators.get(&tx.from.0).map(|v| *v).unwrap_or(0);
+                if sender.staked_balance < current_stake {
+                    return Err(StateError::ExecutionError(format!(
+                        "validator account stake {} is below tracked validator stake {current_stake}",
+                        sender.staked_balance
+                    )));
+                }
 
                 if body.new_stake > current_stake {
                     // Increasing stake: deduct difference from balance
@@ -4144,18 +5219,29 @@ impl StateDB {
                             need: diff,
                         });
                     }
-                    sender.balance -= diff;
-                    sender.staked_balance += diff;
-                    self.staking_pool.fetch_add(diff, Ordering::Relaxed);
+                    let new_balance = sender.balance.checked_sub(diff).ok_or_else(|| {
+                        StateError::ExecutionError("stake increase balance underflow".into())
+                    })?;
+                    let new_account_stake =
+                        sender.staked_balance.checked_add(diff).ok_or_else(|| {
+                            StateError::ExecutionError("account stake overflow".into())
+                        })?;
+                    self.add_staking_pool_checked(diff)?;
+                    sender.balance = new_balance;
+                    sender.staked_balance = new_account_stake;
                 } else if body.new_stake < current_stake {
                     // Decreasing stake: return difference to balance
                     let diff = current_stake - body.new_stake;
-                    sender.staked_balance = sender.staked_balance.saturating_sub(diff);
-                    sender.balance = diff;
-                    self.staking_pool.fetch_sub(
-                        diff.min(self.staking_pool.load(Ordering::Relaxed)),
-                        Ordering::Relaxed,
-                    );
+                    let new_account_stake =
+                        sender.staked_balance.checked_sub(diff).ok_or_else(|| {
+                            StateError::ExecutionError("account stake underflow".into())
+                        })?;
+                    let new_balance = sender.balance.checked_add(diff).ok_or_else(|| {
+                        StateError::ExecutionError("stake decrease balance overflow".into())
+                    })?;
+                    self.subtract_staking_pool_checked(diff)?;
+                    sender.staked_balance = new_account_stake;
+                    sender.balance = new_balance;
                 }
 
                 // Update or remove validator entry
@@ -4165,7 +5251,7 @@ impl StateDB {
                     self.validators.insert(tx.from.0, body.new_stake);
                 }
 
-                sender.nonce += 1;
+                sender.nonce = next_nonce;
                 self.accounts.insert(tx.from.0, sender.clone());
                 self.wal
                     .append(WalOp::SetAccount(tx.from, sender), self.height());
@@ -4626,14 +5712,21 @@ impl StateDB {
                 // used to let anyone drain the treasury with bond=0. Verified
                 // community jobs are paid by `CommunityInferenceReward`.
 
-                // 1. Verify sender nonce.
-                let mut sender = self.get_or_create_account(&tx.from);
+                // 1. Verify sender nonce against a detached account. A stale
+                // transaction from a previously unseen sender must not create
+                // an unpersisted zero account on its failure path.
+                let mut sender = self
+                    .get_account(&tx.from)
+                    .unwrap_or_else(|| Account::new(tx.from, 0));
                 if sender.nonce != tx.nonce {
                     return Err(StateError::InvalidNonce {
                         expected: sender.nonce,
                         got: tx.nonce,
                     });
                 }
+                let next_nonce = sender.nonce.checked_add(1).ok_or_else(|| {
+                    StateError::ExecutionError("inference attestation nonce overflow".to_string())
+                })?;
 
                 // 2. Verify sender has sufficient balance for the bond.
                 if sender.balance < body.bond {
@@ -4643,15 +5736,7 @@ impl StateDB {
                     });
                 }
 
-                // 3. Lock the bond and consume the sender nonce. No treasury
-                // account is read or written on this path.
-                sender.balance -= body.bond;
-                sender.nonce += 1;
-                self.accounts.insert(tx.from.0, sender.clone());
-                self.wal
-                    .append(WalOp::SetAccount(tx.from, sender), self.height());
-
-                // 4. Bond handling.
+                // 3. Prebuild optional escrow state before the first write.
                 //    bond == 0 (community-worker path): nothing to lock, so no
                 //    escrow is created. bond > 0: lock the bond in a
                 //    deterministic escrow keyed by BLAKE3("arc-inference" ||
@@ -4659,10 +5744,22 @@ impl StateDB {
                 //    `challenge_period` blocks. See the escrow encoding at the
                 //    top of this file (code_hash = attester, nonce = release
                 //    height, storage_root = MAGIC|status).
-                if body.bond > 0 {
+                let escrow_candidate = if body.bond > 0 {
                     let escrow_addr = hash_bytes(&[b"arc-inference", tx.hash.as_ref()].concat());
-                    let release_height = self.height().saturating_add(body.challenge_period);
-                    let mut escrow = self.get_or_create_account(&escrow_addr);
+                    if self.accounts.contains_key(&escrow_addr.0) {
+                        return Err(StateError::ExecutionError(
+                            "inference attestation escrow already exists".to_string(),
+                        ));
+                    }
+                    let release_height = self
+                        .height()
+                        .checked_add(body.challenge_period)
+                        .ok_or_else(|| {
+                            StateError::ExecutionError(
+                                "inference attestation release height overflow".to_string(),
+                            )
+                        })?;
+                    let mut escrow = Account::new(escrow_addr, 0);
                     escrow.balance = body.bond;
                     escrow.code_hash = tx.from; // refund target
                     escrow.nonce = release_height; // maturation deadline
@@ -4670,6 +5767,23 @@ impl StateDB {
                     sr[..8].copy_from_slice(&ATTEST_ESCROW_MAGIC);
                     sr[8] = ATTEST_STATUS_OPEN;
                     escrow.storage_root = Hash256(sr);
+                    Some((escrow_addr, release_height, escrow))
+                } else {
+                    None
+                };
+
+                // 4. Commit only after every fallible precondition succeeded.
+                sender.balance = sender.balance.checked_sub(body.bond).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "inference attestation balance underflow".to_string(),
+                    )
+                })?;
+                sender.nonce = next_nonce;
+                self.accounts.insert(tx.from.0, sender.clone());
+                self.wal
+                    .append(WalOp::SetAccount(tx.from, sender), self.height());
+
+                if let Some((escrow_addr, release_height, escrow)) = escrow_candidate {
                     self.accounts.insert(escrow_addr.0, escrow.clone());
                     self.wal
                         .append(WalOp::SetAccount(escrow_addr, escrow), self.height());
@@ -4686,6 +5800,9 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::CommunityInferenceReward(body) => {
+                if self.active_protocol_version().major == 3 {
+                    self.validate_community_reward_admission(tx, body, self.height())?;
+                }
                 if !self.community_rewards_v1_active() {
                     return Err(StateError::ExecutionError(
                         "community inference reward: protocol feature is not active at this height"
@@ -4851,57 +5968,112 @@ impl StateDB {
                         "community inference reward: worker balance overflow".to_string(),
                     )
                 })?;
-                {
-                    let mut treasury =
-                        self.accounts.get_mut(&treasury_addr.0).ok_or_else(|| {
-                            StateError::ExecutionError(
-                                "community inference reward: treasury is not funded".to_string(),
-                            )
-                        })?;
-                    if treasury.balance < reward {
-                        return Err(StateError::InsufficientBalance {
-                            have: treasury.balance,
-                            need: reward,
-                        });
-                    }
-                    treasury.balance -= reward;
-                    if self.wal.is_active() {
-                        let snapshot = treasury.clone();
-                        drop(treasury);
-                        self.wal
-                            .append(WalOp::SetAccount(treasury_addr, snapshot), self.height());
-                    }
+                let mut treasury = self.get_account(&treasury_addr).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "community inference reward: treasury is not funded".to_string(),
+                    )
+                })?;
+                if treasury.balance < reward {
+                    return Err(StateError::InsufficientBalance {
+                        have: treasury.balance,
+                        need: reward,
+                    });
                 }
+                treasury.balance = treasury.balance.checked_sub(reward).ok_or_else(|| {
+                    StateError::ExecutionError(
+                        "community inference reward: treasury balance underflow".to_string(),
+                    )
+                })?;
 
-                self.accounts.insert(body.worker.0, worker.clone());
-                self.wal
-                    .append(WalOp::SetAccount(body.worker, worker), self.height());
-
-                // Zero-balance receipt marker. Its metadata is auditable and
-                // makes a second reward for the same job fail even if a
-                // validator signs a transaction with a fresh nonce/hash.
-                let mut job_marker = self.get_or_create_account(&job_marker_addr);
+                // Marker candidates are detached too. Although the addresses
+                // are cryptographic hashes, reject every semantic collision so
+                // a future hash/domain change cannot overwrite a live account.
+                if job_marker_addr == certificate_marker_addr
+                    || job_marker_addr == body.worker
+                    || certificate_marker_addr == body.worker
+                    || job_marker_addr == treasury_addr
+                    || certificate_marker_addr == treasury_addr
+                {
+                    return Err(StateError::ExecutionError(
+                        "community inference reward: marker address collision".to_string(),
+                    ));
+                }
+                let mut job_marker = Account::new(job_marker_addr, 0);
                 job_marker.nonce = 1;
                 job_marker.code_hash = body.worker;
                 job_marker.storage_root = body.output_hash;
+                let mut certificate_marker = Account::new(certificate_marker_addr, 0);
+                certificate_marker.nonce = 1;
+                certificate_marker.code_hash = body.worker;
+                certificate_marker.storage_root = body.job_id;
+                let budget_candidates = if self.active_protocol_version().major == 3 {
+                    Some(self.community_reward_budget_candidates_at(body, self.height())?)
+                } else {
+                    None
+                };
+
+                self.accounts.insert(treasury_addr.0, treasury.clone());
+                self.accounts.insert(body.worker.0, worker.clone());
                 self.accounts.insert(job_marker_addr.0, job_marker.clone());
+                self.accounts
+                    .insert(certificate_marker_addr.0, certificate_marker.clone());
+                if let Some(budget) = &budget_candidates {
+                    for (address, account) in [
+                        &budget.block,
+                        &budget.epoch,
+                        &budget.worker,
+                        &budget.coordinator,
+                    ] {
+                        self.accounts.insert(address.0, account.clone());
+                    }
+                }
+                if self.use_jmt {
+                    let mut jmt = self.jmt.lock();
+                    for (address, account) in [
+                        (treasury_addr, &treasury),
+                        (body.worker, &worker),
+                        (job_marker_addr, &job_marker),
+                        (certificate_marker_addr, &certificate_marker),
+                    ] {
+                        let value = hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                        jmt.update_leaf(address.0, value);
+                    }
+                    if let Some(budget) = &budget_candidates {
+                        for (address, account) in [
+                            &budget.block,
+                            &budget.epoch,
+                            &budget.worker,
+                            &budget.coordinator,
+                        ] {
+                            let value =
+                                hash_bytes(&bincode::serialize(account).unwrap_or_default());
+                            jmt.update_leaf(address.0, value);
+                        }
+                    }
+                }
+                self.wal
+                    .append(WalOp::SetAccount(treasury_addr, treasury), self.height());
+                self.wal
+                    .append(WalOp::SetAccount(body.worker, worker), self.height());
                 self.wal.append(
                     WalOp::SetAccount(job_marker_addr, job_marker),
                     self.height(),
                 );
-
-                // A second marker reserves the worker-signed certificate
-                // independently of the coordinator-controlled job ID.
-                let mut certificate_marker = self.get_or_create_account(&certificate_marker_addr);
-                certificate_marker.nonce = 1;
-                certificate_marker.code_hash = body.worker;
-                certificate_marker.storage_root = body.job_id;
-                self.accounts
-                    .insert(certificate_marker_addr.0, certificate_marker.clone());
                 self.wal.append(
                     WalOp::SetAccount(certificate_marker_addr, certificate_marker),
                     self.height(),
                 );
+                if let Some(budget) = budget_candidates {
+                    for (address, account) in [
+                        budget.block,
+                        budget.epoch,
+                        budget.worker,
+                        budget.coordinator,
+                    ] {
+                        self.wal
+                            .append(WalOp::SetAccount(address, account), self.height());
+                    }
+                }
 
                 Ok(gas.consumed)
             }
@@ -5984,6 +7156,9 @@ impl StateDB {
                 Ok(gas.consumed)
             }
             TxBody::FaucetClaim(body) => {
+                if self.active_protocol_version().major == 3 {
+                    self.validate_v3_faucet_admission(tx, body)?;
+                }
                 // Validator-authorized faucet drain. The signer (tx.from)
                 // must be in the active validator set — that authorization
                 // is what lets us debit a shared pool the signer doesn't
@@ -6026,6 +7201,24 @@ impl StateDB {
                 let pool_addr = arc_types::transaction::faucet_pool_address();
                 let marker_addr =
                     arc_types::transaction::FaucetClaimBody::marker_address(&body.recipient);
+                let recipient_is_existing_faucet_marker =
+                    self.get_account(&body.recipient).is_some_and(|account| {
+                        account.balance == 0
+                            && account.nonce == 1
+                            && account.code_hash != Hash256::ZERO
+                            && arc_types::transaction::FaucetClaimBody::marker_address(
+                                &account.code_hash,
+                            ) == body.recipient
+                    });
+                if is_reserved_system_account(&body.recipient)
+                    || marker_addr == pool_addr
+                    || marker_addr == body.recipient
+                    || recipient_is_existing_faucet_marker
+                {
+                    return Err(StateError::ExecutionError(
+                        "faucet claim: system account address collision".to_string(),
+                    ));
+                }
                 if self.accounts.contains_key(&marker_addr.0) {
                     return Err(StateError::ExecutionError(format!(
                         "faucet claim: recipient {} has already claimed",
@@ -6097,6 +7290,12 @@ impl StateDB {
     /// execute stage which runs on a dedicated thread.
     /// Returns gas consumed on success.
     pub fn execute_tx_pub(&self, tx: &Transaction) -> Result<u64, StateError> {
+        if self.active_protocol_version().major == 3 {
+            return Err(StateError::ExecutionError(
+                "pipeline/direct transaction execution is unavailable in recovery protocol v3"
+                    .to_string(),
+            ));
+        }
         self.execute_tx(tx)
     }
 
@@ -6117,6 +7316,11 @@ impl StateDB {
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         self.require_healthy_wal()?;
+        if self.active_protocol_version().major == 3 {
+            return Err(StateError::ExecutionError(
+                "pre-executed pipeline commit is unavailable in recovery protocol v3".to_string(),
+            ));
+        }
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -6542,6 +7746,12 @@ impl StateDB {
         match &tx.body {
             TxBody::Transfer(body) => {
                 self.account_txs.entry(body.to.0).or_default().push(tx.hash);
+                if self.active_protocol_version().major == 3 {
+                    self.account_txs
+                        .entry(v3_fee_treasury_address().0)
+                        .or_default()
+                        .push(tx.hash);
+                }
             }
             TxBody::Settle(body) => {
                 self.account_txs
@@ -6637,6 +7847,17 @@ impl StateDB {
                     .entry(arc_types::transaction::inference_reward_treasury_address().0)
                     .or_default()
                     .push(tx.hash);
+                if self.active_protocol_version().major == 3 {
+                    let epoch = self.height() / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
+                    for address in [
+                        community_reward_block_budget_address(self.height()),
+                        community_reward_epoch_budget_address(epoch),
+                        community_reward_worker_budget_address(epoch, &body.worker),
+                        community_reward_coordinator_budget_address(epoch, &body.coordinator),
+                    ] {
+                        self.account_txs.entry(address.0).or_default().push(tx.hash);
+                    }
+                }
             }
             TxBody::InferenceChallenge(body) => {
                 let escrow_addr =
@@ -6759,6 +7980,9 @@ impl StateDB {
         match &tx.body {
             TxBody::Transfer(body) => {
                 self.dirty_accounts.insert(body.to.0);
+                if self.active_protocol_version().major == 3 {
+                    self.dirty_accounts.insert(v3_fee_treasury_address().0);
+                }
             }
             TxBody::Settle(body) => {
                 self.dirty_accounts.insert(body.agent_id.0);
@@ -6849,6 +8073,17 @@ impl StateDB {
                     )
                     .0,
                 );
+                if self.active_protocol_version().major == 3 {
+                    let epoch = self.height() / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
+                    for address in [
+                        community_reward_block_budget_address(self.height()),
+                        community_reward_epoch_budget_address(epoch),
+                        community_reward_worker_budget_address(epoch, &body.worker),
+                        community_reward_coordinator_budget_address(epoch, &body.coordinator),
+                    ] {
+                        self.dirty_accounts.insert(address.0);
+                    }
+                }
             }
             TxBody::InferenceChallenge(body) => {
                 let escrow_addr =
@@ -6969,8 +8204,10 @@ impl StateDB {
         let cold_start = tree.is_empty() && !self.accounts.is_empty();
 
         if cold_start {
-            // First time: insert every account into the incremental tree.
-            let mut pairs: Vec<([u8; 32], Hash256)> = self
+            // First time: bulk-build the keyed tree. Calling `update` once per
+            // account rebuilds its index on every structural insertion and is
+            // quadratic for production snapshots.
+            let pairs: Vec<([u8; 32], Hash256)> = self
                 .accounts
                 .iter()
                 .map(|entry| {
@@ -6978,11 +8215,7 @@ impl StateDB {
                     (*entry.key(), hash_bytes(&bytes))
                 })
                 .collect();
-            pairs.sort_by_key(|(k, _)| *k);
-            for (k, h) in pairs {
-                tree.update(k, h);
-            }
-            tree.rebuild();
+            *tree = IncrementalMerkle::from_keyed_leaves(pairs);
             return tree.root();
         }
 
@@ -9177,7 +10410,9 @@ mod tests {
     // ── Channel integration tests ────────────────────────────────────────
 
     use arc_types::transaction::{
-        ChannelCloseBody, ChannelDisputeBody, ChannelOpenBody, InferenceRegisterBody,
+        BridgeLockBody, BridgeMintBody, ChannelCloseBody, ChannelDisputeBody, ChannelOpenBody,
+        DeployBody, EscrowBody, InferenceRegisterBody, JoinValidatorBody, ShardProofBody,
+        StakeBody, SwapBody, UpdateStakeBody, WasmCallBody,
     };
 
     fn make_channel_tx(from: Address, nonce: u64, body: TxBody, tx_type: TxType) -> Transaction {
@@ -9514,6 +10749,947 @@ mod tests {
             !r[0].success,
             "InferenceRegister with insufficient stake should fail"
         );
+    }
+
+    #[test]
+    fn validator_exit_paths_preserve_overlapping_provider_bond_and_supply() {
+        let worker = addr(31);
+        let state = StateDB::with_genesis(&[(worker, 1_000_000)]);
+        let initial_supply = 1_000_000u128;
+        let assert_state = |balance, locked, validator_stake, pool, nonce| {
+            let account = state.get_account(&worker).unwrap();
+            assert_eq!(account.balance, balance);
+            assert_eq!(account.staked_balance, locked);
+            assert_eq!(account.nonce, nonce);
+            assert_eq!(
+                state.get_validator_stake(&worker).unwrap_or(0),
+                validator_stake
+            );
+            assert_eq!(state.total_staked(), pool);
+            assert_eq!(
+                u128::from(account.balance) + u128::from(account.staked_balance),
+                initial_supply
+            );
+        };
+
+        let register = make_channel_tx(
+            worker,
+            0,
+            TxBody::InferenceRegister(InferenceRegisterBody {
+                tier: 4,
+                stake_bond: 25_000,
+            }),
+            TxType::InferenceRegister,
+        );
+        assert!(state.execute_tx(&register).is_ok());
+        assert_state(975_000, 25_000, 0, 0, 1);
+
+        // A provider bond alone is never validator stake and cannot be
+        // withdrawn through the generic unstake transaction.
+        let steal_provider_bond = make_channel_tx(
+            worker,
+            1,
+            TxBody::Stake(StakeBody {
+                amount: 25_000,
+                is_stake: false,
+                validator: worker,
+            }),
+            TxType::Stake,
+        );
+        assert!(state.execute_tx(&steal_provider_bond).is_err());
+        assert_state(975_000, 25_000, 0, 0, 1);
+
+        let join = make_channel_tx(
+            worker,
+            1,
+            TxBody::JoinValidator(JoinValidatorBody {
+                pubkey: [0u8; 32],
+                initial_stake: 100_000,
+            }),
+            TxType::JoinValidator,
+        );
+        assert!(state.execute_tx(&join).is_ok());
+        assert_state(875_000, 125_000, 100_000, 100_000, 2);
+
+        let partial_unstake = make_channel_tx(
+            worker,
+            2,
+            TxBody::Stake(StakeBody {
+                amount: 40_000,
+                is_stake: false,
+                validator: worker,
+            }),
+            TxType::Stake,
+        );
+        assert!(state.execute_tx(&partial_unstake).is_ok());
+        assert_state(915_000, 85_000, 60_000, 60_000, 3);
+
+        let update = make_channel_tx(
+            worker,
+            3,
+            TxBody::UpdateStake(UpdateStakeBody { new_stake: 50_000 }),
+            TxType::UpdateStake,
+        );
+        assert!(state.execute_tx(&update).is_ok());
+        assert_state(925_000, 75_000, 50_000, 50_000, 4);
+
+        let leave = make_channel_tx(worker, 4, TxBody::LeaveValidator, TxType::LeaveValidator);
+        assert!(state.execute_tx(&leave).is_ok());
+        assert_state(975_000, 25_000, 0, 0, 5);
+
+        let second_steal = make_channel_tx(
+            worker,
+            5,
+            TxBody::Stake(StakeBody {
+                amount: 25_000,
+                is_stake: false,
+                validator: worker,
+            }),
+            TxType::Stake,
+        );
+        assert!(state.execute_tx(&second_steal).is_err());
+        assert_state(975_000, 25_000, 0, 0, 5);
+    }
+
+    #[test]
+    fn validator_exit_arithmetic_failure_is_atomic() {
+        let validator = addr(32);
+        let state = StateDB::with_genesis(&[(validator, u64::MAX)]);
+        let mut account = state.get_account(&validator).unwrap();
+        account.staked_balance = StateDB::MIN_VALIDATOR_STAKE;
+        state.accounts.insert(validator.0, account.clone());
+        state
+            .validators
+            .insert(validator.0, StateDB::MIN_VALIDATOR_STAKE);
+        state
+            .staking_pool
+            .store(StateDB::MIN_VALIDATOR_STAKE, Ordering::Release);
+        let leave = make_channel_tx(validator, 0, TxBody::LeaveValidator, TxType::LeaveValidator);
+        let error = state.execute_tx(&leave).unwrap_err();
+        assert!(error.to_string().contains("balance overflow"));
+        let unchanged = state.get_account(&validator).unwrap();
+        assert_eq!(unchanged.balance, u64::MAX);
+        assert_eq!(unchanged.staked_balance, StateDB::MIN_VALIDATOR_STAKE);
+        assert_eq!(unchanged.nonce, 0);
+        assert_eq!(
+            state.get_validator_stake(&validator),
+            Some(StateDB::MIN_VALIDATOR_STAKE)
+        );
+        assert_eq!(state.total_staked(), StateDB::MIN_VALIDATOR_STAKE);
+
+        // A corrupt pool also fails before changing the account or map.
+        state.staking_pool.store(0, Ordering::Release);
+        let error = state.execute_tx(&leave).unwrap_err();
+        assert!(error.to_string().contains("balance overflow"));
+        // Remove the balance-overflow condition so the pool check becomes the
+        // first failing invariant.
+        let mut account = state.get_account(&validator).unwrap();
+        account.balance = 0;
+        state.accounts.insert(validator.0, account);
+        let error = state.execute_tx(&leave).unwrap_err();
+        assert!(error.to_string().contains("staking pool underflow"));
+        let unchanged = state.get_account(&validator).unwrap();
+        assert_eq!(unchanged.balance, 0);
+        assert_eq!(unchanged.staked_balance, StateDB::MIN_VALIDATOR_STAKE);
+        assert_eq!(unchanged.nonce, 0);
+        assert_eq!(
+            state.get_validator_stake(&validator),
+            Some(StateDB::MIN_VALIDATOR_STAKE)
+        );
+        assert_eq!(state.total_staked(), 0);
+    }
+
+    #[test]
+    fn recovery_v3_allowlist_classifies_every_family_and_rejects_unsafe_mutations() {
+        use V3TransactionFamilyPolicy::{Allowed, Denied};
+
+        // Every currently defined transaction family is classified here, and
+        // the production match is exhaustive. A new TxType therefore fails
+        // compilation until it receives an explicit v3 policy and a test row.
+        let policies = [
+            (TxType::Transfer, Allowed),
+            (TxType::Settle, Denied),
+            (TxType::Swap, Denied),
+            (TxType::Escrow, Denied),
+            (TxType::Stake, Denied),
+            (TxType::WasmCall, Denied),
+            (TxType::MultiSig, Denied),
+            (TxType::DeployContract, Denied),
+            (TxType::RegisterAgent, Denied),
+            (TxType::JoinValidator, Denied),
+            (TxType::LeaveValidator, Denied),
+            (TxType::ClaimRewards, Denied),
+            (TxType::UpdateStake, Denied),
+            (TxType::Governance, Denied),
+            (TxType::BridgeLock, Denied),
+            (TxType::BridgeMint, Denied),
+            (TxType::BatchSettle, Denied),
+            (TxType::ChannelOpen, Denied),
+            (TxType::ChannelClose, Denied),
+            (TxType::ChannelDispute, Denied),
+            (TxType::ShardProof, Denied),
+            (TxType::InferenceAttestation, Denied),
+            (TxType::InferenceChallenge, Denied),
+            (TxType::InferenceRegister, Denied),
+            (TxType::InferenceEscrowOpen, Denied),
+            (TxType::InferenceEscrowRelease, Denied),
+            (TxType::InferenceEscrowRefund, Denied),
+            (TxType::ModelRegistration, Denied),
+            (TxType::ModelRequest, Denied),
+            (TxType::ShardCoverageClaim, Denied),
+            (TxType::CapacityAdvertisement, Denied),
+            (TxType::ShardAssignmentProposal, Denied),
+            (TxType::FaucetClaim, Allowed),
+            (TxType::InferenceRequest, Denied),
+            (TxType::InferenceVote, Denied),
+            (TxType::InferenceFinalize, Denied),
+            (TxType::CommunityInferenceReward, Allowed),
+        ];
+        assert_eq!(policies.len(), 0x25);
+        let mut discriminants: Vec<_> =
+            policies.iter().map(|(tx_type, _)| *tx_type as u8).collect();
+        discriminants.sort_unstable();
+        assert_eq!(discriminants, (1u8..=0x25).collect::<Vec<_>>());
+        for (tx_type, expected) in policies {
+            assert_eq!(
+                StateDB::v3_transaction_family_policy(tx_type),
+                expected,
+                "unexpected v3 policy for {tx_type:?}"
+            );
+        }
+
+        let directory = persistent_test_dir("v3-denylist");
+        let signer = arc_crypto::KeyPair::generate_ed25519();
+        let counterparty = addr(41);
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let mut prefunded = vec![(signer.address(), 1_000_000), (counterparty, 500_000)];
+        prefunded.extend(validators.iter().map(|validator| (validator.address(), 0)));
+        let state = StateDB::with_genesis_persistent(
+            &prefunded,
+            &directory,
+            hash_bytes(b"v3-denylist-genesis"),
+        )
+        .unwrap();
+        let validator_set: Vec<_> = validators
+            .iter()
+            .enumerate()
+            .map(|(index, validator)| {
+                (
+                    validator.address(),
+                    if index < 4 { 6_666_667 } else { 6_666_666 },
+                )
+            })
+            .collect();
+        state.seed_genesis_validators(&validator_set);
+        state.staking_pool.store(
+            validator_set.iter().map(|entry| entry.1).sum(),
+            Ordering::Release,
+        );
+        *state.recovery_context.write() = Some(crate::recovery::RecoveryContext::new(
+            "0x415243",
+            hash_bytes(b"v3-denylist-genesis"),
+            1,
+            1,
+        ));
+        state.wal.sync().unwrap();
+
+        let channel_id = hash_bytes(b"unsafe-channel");
+        let denied = vec![
+            (
+                "swap",
+                TxBody::Swap(SwapBody {
+                    counterparty,
+                    offer_amount: 1,
+                    receive_amount: 500_000,
+                    offer_asset: Hash256::ZERO,
+                    receive_asset: Hash256::ZERO,
+                }),
+            ),
+            (
+                "escrow-release",
+                TxBody::Escrow(EscrowBody {
+                    beneficiary: signer.address(),
+                    amount: u64::MAX,
+                    conditions_hash: Hash256::ZERO,
+                    is_create: false,
+                }),
+            ),
+            (
+                "stake",
+                TxBody::Stake(StakeBody {
+                    amount: 100_000,
+                    is_stake: true,
+                    validator: signer.address(),
+                }),
+            ),
+            (
+                "wasm-call",
+                TxBody::WasmCall(WasmCallBody {
+                    contract: addr(42),
+                    function: "trap".into(),
+                    calldata: vec![0xff],
+                    value: 1,
+                    gas_limit: 1,
+                }),
+            ),
+            (
+                "deploy-invalid-compile",
+                TxBody::DeployContract(DeployBody {
+                    bytecode: b"\0asm-invalid".to_vec(),
+                    constructor_args: vec![0xff],
+                    state_rent_deposit: 1,
+                }),
+            ),
+            (
+                "join-validator",
+                TxBody::JoinValidator(JoinValidatorBody {
+                    pubkey: [1u8; 32],
+                    initial_stake: 100_000,
+                }),
+            ),
+            ("leave-validator", TxBody::LeaveValidator),
+            (
+                "update-stake",
+                TxBody::UpdateStake(UpdateStakeBody { new_stake: 1 }),
+            ),
+            (
+                "bridge-lock",
+                TxBody::BridgeLock(BridgeLockBody {
+                    destination_chain: 1,
+                    destination_address: [2u8; 32],
+                    amount: 10,
+                }),
+            ),
+            (
+                "bridge-mint",
+                TxBody::BridgeMint(BridgeMintBody {
+                    source_chain: 1,
+                    source_tx_hash: hash_bytes(b"replayable-source"),
+                    recipient: signer.address(),
+                    amount: u64::MAX,
+                    merkle_proof: vec![0],
+                }),
+            ),
+            (
+                "channel-open",
+                TxBody::ChannelOpen(ChannelOpenBody {
+                    channel_id,
+                    counterparty,
+                    deposit: 10,
+                    timeout_blocks: 10,
+                }),
+            ),
+            (
+                "channel-close",
+                TxBody::ChannelClose(ChannelCloseBody {
+                    channel_id,
+                    opener_balance: u64::MAX,
+                    counterparty_balance: 0,
+                    counterparty_sig: vec![],
+                    state_nonce: 1,
+                }),
+            ),
+            (
+                "channel-dispute",
+                TxBody::ChannelDispute(ChannelDisputeBody {
+                    channel_id,
+                    opener_balance: 1,
+                    counterparty_balance: 1,
+                    other_party_sig: vec![],
+                    state_nonce: 1,
+                    challenge_period: 1,
+                }),
+            ),
+            (
+                "shard-proof",
+                TxBody::ShardProof(ShardProofBody {
+                    shard_id: 0,
+                    block_height: 1,
+                    block_hash: hash_bytes(b"forged-shard-block"),
+                    prev_state_root: Hash256::ZERO,
+                    post_state_root: hash_bytes(b"forged-root"),
+                    tx_count: 1,
+                    proof_data: vec![0],
+                }),
+            ),
+        ];
+
+        let before_account =
+            bincode::serialize(&state.get_account(&signer.address()).unwrap()).unwrap();
+        let before_counterparty =
+            bincode::serialize(&state.get_account(&counterparty).unwrap()).unwrap();
+        let before_root = state.get_state_root();
+        let before_height = state.height();
+        let before_accounts = state.accounts.len();
+        let mut before_validators = state.active_validators();
+        before_validators.sort_by_key(|entry| entry.0.0);
+        let before_wal = std::fs::metadata(directory.join("state.wal"))
+            .unwrap()
+            .len();
+        let before_supply: u128 = state
+            .accounts
+            .iter()
+            .map(|account| {
+                u128::from(account.value().balance) + u128::from(account.value().staked_balance)
+            })
+            .sum();
+
+        for (label, body) in denied {
+            let mut transaction =
+                make_channel_tx(signer.address(), 0, body.clone(), body.tx_type());
+            state.sign_transaction(&mut transaction, &signer).unwrap();
+            state.verify_transaction_signature(&transaction).unwrap();
+            let error = state
+                .execute_tx(&transaction)
+                .expect_err("v3 denylisted transaction must fail before execution");
+            assert!(
+                error.to_string().contains("unavailable"),
+                "{label}: {error}"
+            );
+            state.wal.sync().unwrap();
+            assert_eq!(
+                bincode::serialize(&state.get_account(&signer.address()).unwrap()).unwrap(),
+                before_account,
+                "{label} changed signer"
+            );
+            assert_eq!(
+                bincode::serialize(&state.get_account(&counterparty).unwrap()).unwrap(),
+                before_counterparty,
+                "{label} changed counterparty"
+            );
+            assert_eq!(state.get_state_root(), before_root, "{label} changed root");
+            assert_eq!(state.height(), before_height, "{label} changed height");
+            assert_eq!(
+                state.accounts.len(),
+                before_accounts,
+                "{label} created account"
+            );
+            assert_eq!(
+                std::fs::metadata(directory.join("state.wal"))
+                    .unwrap()
+                    .len(),
+                before_wal,
+                "{label} wrote WAL"
+            );
+            assert_eq!(
+                state.active_validators().len(),
+                6,
+                "{label} changed committee"
+            );
+            let mut current_validators = state.active_validators();
+            current_validators.sort_by_key(|entry| entry.0.0);
+            assert_eq!(
+                current_validators, before_validators,
+                "{label} changed validator identities/stakes"
+            );
+            assert_eq!(
+                state
+                    .accounts
+                    .iter()
+                    .map(|account| {
+                        u128::from(account.value().balance)
+                            + u128::from(account.value().staked_balance)
+                    })
+                    .sum::<u128>(),
+                before_supply,
+                "{label} changed supply"
+            );
+        }
+
+        // Raw zero-bond attestations are intentionally not a v3 ingress
+        // family. Otherwise an attacker can generate unlimited fresh keys and
+        // permanently create one zero-balance nonce account per transaction.
+        for index in 0..32u8 {
+            let fresh_worker = arc_crypto::KeyPair::generate_ed25519();
+            assert!(state.get_account(&fresh_worker.address()).is_none());
+            let mut attestation = make_attestation(
+                fresh_worker.address(),
+                0,
+                0,
+                100,
+                &[b"v3-attestation-flood-".as_slice(), &[index]].concat(),
+            );
+            state
+                .sign_transaction(&mut attestation, &fresh_worker)
+                .unwrap();
+            let error = state.execute_tx(&attestation).unwrap_err();
+            assert!(error.to_string().contains("unavailable"));
+            assert!(
+                state.get_account(&fresh_worker.address()).is_none(),
+                "raw attestation {index} created a sender account"
+            );
+        }
+        state.wal.sync().unwrap();
+        assert_eq!(state.accounts.len(), before_accounts);
+        assert_eq!(state.get_state_root(), before_root);
+        assert_eq!(
+            std::fs::metadata(directory.join("state.wal"))
+                .unwrap()
+                .len(),
+            before_wal,
+            "rejected raw-attestation flood wrote WAL"
+        );
+
+        // A real recovery member is frozen just like an outsider.
+        let member = &validators[0];
+        for body in [
+            TxBody::LeaveValidator,
+            TxBody::UpdateStake(UpdateStakeBody { new_stake: 0 }),
+        ] {
+            let mut transaction =
+                make_channel_tx(member.address(), 0, body.clone(), body.tx_type());
+            state.sign_transaction(&mut transaction, member).unwrap();
+            assert!(state.execute_tx(&transaction).is_err());
+        }
+        assert_eq!(state.active_validators().len(), 6);
+        let mut current_validators = state.active_validators();
+        current_validators.sort_by_key(|entry| entry.0.0);
+        assert_eq!(current_validators, before_validators);
+        assert_eq!(state.get_state_root(), before_root);
+
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_v3_transfer_is_checked_atomic_and_domain_authenticated() {
+        let directory = persistent_test_dir("v3-transfer-atomic");
+        let sender = arc_crypto::KeyPair::generate_ed25519();
+        let receiver = arc_crypto::KeyPair::generate_ed25519();
+        let overflow_receiver = arc_crypto::KeyPair::generate_ed25519();
+        let second_sender = arc_crypto::KeyPair::generate_ed25519();
+        let second_receiver = arc_crypto::KeyPair::generate_ed25519();
+        let wrong_signer = arc_crypto::KeyPair::generate_ed25519();
+        let state = StateDB::with_genesis_persistent(
+            &[
+                (sender.address(), 100),
+                (receiver.address(), 0),
+                (overflow_receiver.address(), u64::MAX),
+                (second_sender.address(), 100),
+                (second_receiver.address(), 0),
+            ],
+            &directory,
+            hash_bytes(b"v3-transfer-atomic-genesis"),
+        )
+        .unwrap();
+        *state.recovery_context.write() = Some(crate::recovery::RecoveryContext::new(
+            "0x415243",
+            hash_bytes(b"v3-transfer-atomic-genesis"),
+            1,
+            1,
+        ));
+        state.wal.sync().unwrap();
+
+        let mut zero_fee = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        state.sign_transaction(&mut zero_fee, &sender).unwrap();
+        let error = state
+            .validate_v3_transaction_admission(&zero_fee)
+            .unwrap_err();
+        assert!(error.to_string().contains("below minimum"), "{error}");
+        assert!(state.execute_tx(&zero_fee).is_err());
+        assert_eq!(state.get_account(&sender.address()).unwrap().balance, 100);
+
+        // A v3 self-transfer is rejected: without a fee-bearing value move it
+        // is an inexpensive way to grow permanent history.
+        let mut self_transfer = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: sender.address(),
+                amount: 75,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        self_transfer.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut self_transfer, &sender).unwrap();
+        assert!(
+            state
+                .execute_tx(&self_transfer)
+                .unwrap_err()
+                .to_string()
+                .contains("collision")
+        );
+        let after_self = state.get_account(&sender.address()).unwrap();
+        assert_eq!(after_self.balance, 100);
+        assert_eq!(after_self.nonce, 0);
+
+        // Recipient overflow fails before sender debit/nonce/WAL mutation.
+        state.wal.sync().unwrap();
+        let before_sender = state.get_account(&sender.address()).unwrap();
+        let before_overflow = state.get_account(&overflow_receiver.address()).unwrap();
+        let before_accounts = state.accounts.len();
+        let before_wal = std::fs::metadata(directory.join("state.wal"))
+            .unwrap()
+            .len();
+        let mut overflow = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: overflow_receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        overflow.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut overflow, &sender).unwrap();
+        assert!(
+            state
+                .execute_tx(&overflow)
+                .unwrap_err()
+                .to_string()
+                .contains("overflow")
+        );
+        state.wal.sync().unwrap();
+        assert_eq!(
+            bincode::serialize(&state.get_account(&sender.address()).unwrap()).unwrap(),
+            bincode::serialize(&before_sender).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(&state.get_account(&overflow_receiver.address()).unwrap()).unwrap(),
+            bincode::serialize(&before_overflow).unwrap()
+        );
+        assert_eq!(state.accounts.len(), before_accounts);
+        assert_eq!(
+            std::fs::metadata(directory.join("state.wal"))
+                .unwrap()
+                .len(),
+            before_wal
+        );
+
+        // Missing senders and a forged sig_verified hint both fail without
+        // materializing an account.
+        let missing = arc_crypto::KeyPair::generate_ed25519();
+        let mut missing_tx = make_channel_tx(
+            missing.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        missing_tx.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut missing_tx, &missing).unwrap();
+        assert!(matches!(
+            state.execute_tx(&missing_tx),
+            Err(StateError::InsufficientBalance { have: 0, need: 2 })
+        ));
+        assert!(state.get_account(&missing.address()).is_none());
+
+        let mut forged = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        forged.fee = V3_MIN_TRANSFER_FEE;
+        forged.sig_verified = true;
+        assert!(
+            state
+                .execute_tx(&forged)
+                .unwrap_err()
+                .to_string()
+                .contains("signature")
+        );
+        assert_eq!(
+            bincode::serialize(&state.get_account(&sender.address()).unwrap()).unwrap(),
+            bincode::serialize(&before_sender).unwrap()
+        );
+
+        // A normal domain-signed transfer commits both account candidates.
+        let mut transfer = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 40,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        transfer.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut transfer, &sender).unwrap();
+        state
+            .validate_v3_transaction_admission_at(&transfer, state.height() + 1)
+            .unwrap();
+        state
+            .validate_v3_block_admission_at(std::slice::from_ref(&transfer), state.height() + 1)
+            .unwrap();
+
+        let mut denied_attestation =
+            make_attestation(sender.address(), 0, 0, 100, b"denied-block-attestation");
+        state
+            .sign_transaction(&mut denied_attestation, &sender)
+            .unwrap();
+
+        let mut bad_nonce = make_channel_tx(
+            sender.address(),
+            9,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        bad_nonce.fee = V3_MIN_TRANSFER_FEE;
+        state.sign_transaction(&mut bad_nonce, &sender).unwrap();
+
+        let mut invalid_signature = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        invalid_signature.fee = V3_MIN_TRANSFER_FEE;
+        state
+            .sign_transaction(&mut invalid_signature, &wrong_signer)
+            .unwrap();
+
+        let mut wrong_domain = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: receiver.address(),
+                amount: 1,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        wrong_domain.fee = V3_MIN_TRANSFER_FEE;
+        wrong_domain
+            .sign(&sender)
+            .expect("legacy-domain signature is well-formed but wrong for v3");
+
+        let mut same_sender_second = make_channel_tx(
+            sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: second_receiver.address(),
+                amount: 2,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        same_sender_second.fee = V3_MIN_TRANSFER_FEE;
+        state
+            .sign_transaction(&mut same_sender_second, &sender)
+            .unwrap();
+
+        let mut overlapping_treasury = make_channel_tx(
+            second_sender.address(),
+            0,
+            TxBody::Transfer(TransferBody {
+                to: second_receiver.address(),
+                amount: 3,
+                amount_commitment: None,
+            }),
+            TxType::Transfer,
+        );
+        overlapping_treasury.fee = V3_MIN_TRANSFER_FEE;
+        state
+            .sign_transaction(&mut overlapping_treasury, &second_sender)
+            .unwrap();
+        state
+            .validate_v3_transaction_admission_at(&overlapping_treasury, state.height() + 1)
+            .unwrap();
+
+        state.wal.sync().unwrap();
+        let fingerprint = || {
+            let mut accounts: Vec<_> = state
+                .accounts
+                .iter()
+                .map(|entry| {
+                    (
+                        *entry.key(),
+                        bincode::serialize(entry.value()).expect("account serializes"),
+                    )
+                })
+                .collect();
+            accounts.sort_by_key(|entry| entry.0);
+            (
+                state.height(),
+                state.get_state_root(),
+                accounts,
+                state.blocks.len(),
+                state.receipts.len(),
+                state.tx_index.len(),
+                state.full_transactions.len(),
+                std::fs::metadata(directory.join("state.wal"))
+                    .unwrap()
+                    .len(),
+            )
+        };
+        let before_rejections = fingerprint();
+        let oversized = vec![transfer.clone(); V3_MAX_TRANSACTIONS_PER_BLOCK + 1];
+        let rejected_blocks = vec![
+            ("denied family", vec![denied_attestation]),
+            ("bad nonce", vec![bad_nonce]),
+            ("invalid signature", vec![invalid_signature]),
+            ("wrong recovery domain", vec![wrong_domain]),
+            ("duplicate hash", vec![transfer.clone(), transfer.clone()]),
+            ("same sender", vec![transfer.clone(), same_sender_second]),
+            (
+                "overlapping state access",
+                vec![transfer.clone(), overlapping_treasury],
+            ),
+            ("too many transactions", oversized),
+        ];
+        for (label, candidate) in rejected_blocks {
+            let error = state
+                .execute_block_verified_at(&candidate, sender.address(), 1_787_857_623_001)
+                .expect_err("invalid v3 block must fail before state mutation");
+            state.wal.sync().unwrap();
+            assert_eq!(fingerprint(), before_rejections, "{label}: {error}");
+        }
+
+        let (block, receipts) = state
+            .execute_block_verified_at(
+                std::slice::from_ref(&transfer),
+                sender.address(),
+                1_787_857_623_002,
+            )
+            .unwrap();
+        assert_eq!(block.header.height, 1);
+        assert!(receipts[0].success);
+        assert_eq!(state.get_account(&sender.address()).unwrap().balance, 59);
+        assert_eq!(state.get_account(&sender.address()).unwrap().nonce, 1);
+        assert_eq!(state.get_account(&receiver.address()).unwrap().balance, 40);
+        assert_eq!(
+            state
+                .get_account(&v3_fee_treasury_address())
+                .unwrap()
+                .balance,
+            V3_MIN_TRANSFER_FEE
+        );
+
+        drop(state);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recovery_v3_faucet_rejects_reserved_and_marker_aliases_without_minting() {
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let validator = &validators[0];
+        let ordinary_recipient = arc_crypto::KeyPair::generate_ed25519().address();
+        let pool = arc_types::transaction::faucet_pool_address();
+        let reward_treasury = arc_types::transaction::inference_reward_treasury_address();
+        let recovery_reserve = hash_bytes(&[2u8]);
+        let legacy_bridge = hash_bytes(b"ARC-bridge-escrow");
+        let legacy_model_treasury = hash_bytes(b"arc-treasury");
+        let mut genesis = vec![
+            (pool, 10 * arc_types::transaction::FAUCET_CLAIM_MAX),
+            (reward_treasury, 20),
+            (recovery_reserve, 30),
+            (legacy_bridge, 40),
+            (legacy_model_treasury, 50),
+        ];
+        genesis.extend(validators.iter().map(|key| (key.address(), 0)));
+        let state = StateDB::with_genesis(&genesis);
+        state.seed_genesis_validators(
+            &validators
+                .iter()
+                .map(|key| (key.address(), StateDB::MIN_VALIDATOR_STAKE))
+                .collect::<Vec<_>>(),
+        );
+        *state.recovery_context.write() = Some(crate::recovery::RecoveryContext::new(
+            "0x415243",
+            hash_bytes(b"v3-faucet-alias-genesis"),
+            1,
+            1,
+        ));
+        let initial_supply = sum_all_balances(&state);
+
+        for recipient in [
+            pool,
+            reward_treasury,
+            recovery_reserve,
+            legacy_bridge,
+            legacy_model_treasury,
+        ] {
+            let mut claim = make_channel_tx(
+                validator.address(),
+                0,
+                TxBody::FaucetClaim(FaucetClaimBody {
+                    recipient,
+                    amount: 1,
+                }),
+                TxType::FaucetClaim,
+            );
+            state.sign_transaction(&mut claim, validator).unwrap();
+            assert!(
+                state
+                    .execute_tx(&claim)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("collision")
+            );
+            assert_eq!(sum_all_balances(&state), initial_supply);
+        }
+
+        // Create one legitimate marker, then prove it cannot be used as a
+        // recipient in a second claim.
+        let mut valid = make_channel_tx(
+            validator.address(),
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: ordinary_recipient,
+                amount: 1,
+            }),
+            TxType::FaucetClaim,
+        );
+        state.sign_transaction(&mut valid, validator).unwrap();
+        state.execute_tx(&valid).unwrap();
+        let marker = FaucetClaimBody::marker_address(&ordinary_recipient);
+        let supply_after_valid = sum_all_balances(&state);
+        assert_eq!(supply_after_valid, initial_supply);
+        let pool_after_valid = state.get_account(&pool).unwrap().balance;
+
+        let mut marker_claim = make_channel_tx(
+            validator.address(),
+            0,
+            TxBody::FaucetClaim(FaucetClaimBody {
+                recipient: marker,
+                amount: 1,
+            }),
+            TxType::FaucetClaim,
+        );
+        state
+            .sign_transaction(&mut marker_claim, validator)
+            .unwrap();
+        assert!(
+            state
+                .execute_tx(&marker_claim)
+                .unwrap_err()
+                .to_string()
+                .contains("collision")
+        );
+        assert_eq!(state.get_account(&pool).unwrap().balance, pool_after_valid);
+        assert_eq!(sum_all_balances(&state), supply_after_valid);
     }
 
     // ── Milestone B: InferenceEscrow integration tests ───────────────────
@@ -10854,6 +13030,74 @@ mod tests {
         tx
     }
 
+    fn make_recovery_signed_community_reward(
+        state: &StateDB,
+        aggregator: &arc_crypto::KeyPair,
+        worker: &arc_crypto::KeyPair,
+        approvers: &[arc_crypto::KeyPair],
+        job_nonce: u64,
+        tag: &[u8],
+    ) -> Transaction {
+        let mut worker_attestation = make_attestation(worker.address(), 0, 0, 100, tag);
+        state
+            .sign_transaction(&mut worker_attestation, worker)
+            .unwrap();
+        let TxBody::InferenceAttestation(attestation) = &worker_attestation.body else {
+            unreachable!();
+        };
+        let context = state.recovery_context().expect("recovery context");
+        let assignment_epoch = hash_bytes(&[b"v3-assignment-epoch", tag].concat());
+        let job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &aggregator.address(),
+            &assignment_epoch,
+            job_nonce,
+            &attestation.model_id,
+            &attestation.input_hash,
+            16,
+        );
+        let mut body = arc_types::transaction::CommunityInferenceRewardBody {
+            chain_domain:
+                arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain(),
+            job_id,
+            coordinator: aggregator.address(),
+            assignment_epoch,
+            job_nonce,
+            recovery_epoch: context.recovery_epoch,
+            validator_set_id: context.validator_set_id,
+            transaction_domain: context.domain_hash(),
+            worker: worker.address(),
+            model_id: attestation.model_id,
+            input_hash: attestation.input_hash,
+            output_hash: attestation.output_hash,
+            max_tokens: 16,
+            expires_at_height: state.height() + 100,
+            worker_certificate: arc_types::transaction::WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: attestation.challenge_period,
+                signature: worker_attestation.signature.clone(),
+            },
+            validator_approvals: Vec::new(),
+        };
+        let commitment = body.validator_approval_commitment();
+        body.validator_approvals = approvers
+            .iter()
+            .take(5)
+            .map(|validator| {
+                let signature = validator.sign(&commitment).unwrap();
+                arc_types::transaction::CommunityRewardValidatorApproval::from_ed25519_signature(
+                    validator.address(),
+                    signature,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut reward =
+            Transaction::new_community_inference_reward(aggregator.address(), job_nonce, body);
+        state.sign_transaction(&mut reward, aggregator).unwrap();
+        reward
+    }
+
     fn activated_reward_state(
         worker: Address,
         treasury_balance: u64,
@@ -10868,6 +13112,299 @@ mod tests {
         state.seed_genesis_validators(&validator_stakes);
         activate_community_rewards(&state);
         state
+    }
+
+    #[test]
+    fn recovery_v3_reward_accepts_embedded_domain_certificate_while_raw_tx_is_denied() {
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let mut genesis = vec![(treasury, 2 * REWARD)];
+        genesis.extend(validators.iter().map(|validator| (validator.address(), 0)));
+        let state = StateDB::with_genesis(&genesis);
+        let validator_set: Vec<_> = validators
+            .iter()
+            .enumerate()
+            .map(|(index, validator)| {
+                (
+                    validator.address(),
+                    if index < 4 { 6_666_667 } else { 6_666_666 },
+                )
+            })
+            .collect();
+        state.seed_genesis_validators(&validator_set);
+        state.staking_pool.store(40_000_000, Ordering::Release);
+        state.set_community_rewards_v1_activation_height(Some(0));
+        let context = crate::recovery::RecoveryContext::new(
+            "0x415243",
+            hash_bytes(b"v3-community-reward-genesis"),
+            7,
+            11,
+        );
+        *state.recovery_context.write() = Some(context.clone());
+
+        let mut worker_attestation = make_attestation(worker.address(), 0, 0, 100, b"v3-job");
+        state
+            .sign_transaction(&mut worker_attestation, &worker)
+            .unwrap();
+        let before_accounts = state.accounts.len();
+        let raw_error = state.execute_tx(&worker_attestation).unwrap_err();
+        assert!(raw_error.to_string().contains("unavailable"));
+        assert_eq!(state.accounts.len(), before_accounts);
+        assert!(state.get_account(&worker.address()).is_none());
+
+        let TxBody::InferenceAttestation(attestation) = &worker_attestation.body else {
+            unreachable!();
+        };
+        let assignment_epoch = hash_bytes(b"v3-assignment-epoch");
+        let job_nonce = 23;
+        let job_id = arc_types::transaction::CommunityInferenceRewardBody::derive_job_id(
+            &validators[0].address(),
+            &assignment_epoch,
+            job_nonce,
+            &attestation.model_id,
+            &attestation.input_hash,
+            16,
+        );
+        let mut body = arc_types::transaction::CommunityInferenceRewardBody {
+            chain_domain:
+                arc_types::transaction::CommunityInferenceRewardBody::expected_chain_domain(),
+            job_id,
+            coordinator: validators[0].address(),
+            assignment_epoch,
+            job_nonce,
+            recovery_epoch: context.recovery_epoch,
+            validator_set_id: context.validator_set_id,
+            transaction_domain: context.domain_hash(),
+            worker: worker.address(),
+            model_id: attestation.model_id,
+            input_hash: attestation.input_hash,
+            output_hash: attestation.output_hash,
+            max_tokens: 16,
+            expires_at_height: 100,
+            worker_certificate: arc_types::transaction::WorkerInferenceCertificate {
+                attestation_hash: worker_attestation.hash,
+                nonce: worker_attestation.nonce,
+                challenge_period: attestation.challenge_period,
+                signature: worker_attestation.signature.clone(),
+            },
+            validator_approvals: Vec::new(),
+        };
+        let commitment = body.validator_approval_commitment();
+        body.validator_approvals = validators
+            .iter()
+            .take(5)
+            .map(|validator| {
+                let signature = validator.sign(&commitment).unwrap();
+                arc_types::transaction::CommunityRewardValidatorApproval::from_ed25519_signature(
+                    validator.address(),
+                    signature,
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut reward =
+            Transaction::new_community_inference_reward(validators[0].address(), job_nonce, body);
+        state.sign_transaction(&mut reward, &validators[0]).unwrap();
+
+        let supply_before = sum_all_balances(&state);
+        state.execute_tx(&reward).unwrap();
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(state.get_account(&treasury).unwrap().balance, REWARD);
+        assert_eq!(sum_all_balances(&state), supply_before);
+
+        let status = state.community_reward_budget_status(
+            worker.address(),
+            validators[0].address(),
+            state.height(),
+        );
+        assert_eq!(status.issued_this_block, 1);
+        assert_eq!(status.remaining_this_block, 0);
+        assert_eq!(status.issued_this_epoch, 1);
+        assert_eq!(
+            status.remaining_this_epoch,
+            V3_COMMUNITY_REWARD_MAX_PER_EPOCH - 1
+        );
+        assert_eq!(status.worker_issued_this_epoch, 1);
+        assert_eq!(
+            status.worker_remaining_this_epoch,
+            V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH - 1
+        );
+        assert_eq!(status.coordinator_issued_this_epoch, 1);
+        assert_eq!(
+            status.coordinator_remaining_this_epoch,
+            V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH - 1
+        );
+        assert_eq!(status.policy_hash, community_reward_issuance_policy_hash());
+
+        let second = make_recovery_signed_community_reward(
+            &state,
+            &validators[0],
+            &worker,
+            &validators,
+            24,
+            b"v3-job-second",
+        );
+        let treasury_after_first = state.get_account(&treasury).unwrap().balance;
+        let worker_after_first = state.get_account(&worker.address()).unwrap().balance;
+        let error = state
+            .validate_v3_transaction_admission_at(&second, state.height())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("block issuance limit"),
+            "{error}"
+        );
+        assert!(state.execute_tx(&second).is_err());
+        assert_eq!(
+            state.get_account(&treasury).unwrap().balance,
+            treasury_after_first
+        );
+        assert_eq!(
+            state.get_account(&worker.address()).unwrap().balance,
+            worker_after_first
+        );
+
+        // Exercise every epoch cap with valid consensus-marker metadata.
+        *state.height.write() = 1;
+        let epoch = state.height() / V3_COMMUNITY_REWARD_EPOCH_BLOCKS;
+        let worker_budget = community_reward_worker_budget_address(epoch, &worker.address());
+        let mut worker_counter = state.get_account(&worker_budget).unwrap();
+        worker_counter.nonce = V3_COMMUNITY_REWARD_MAX_PER_WORKER_EPOCH;
+        state
+            .accounts
+            .insert(worker_budget.0, worker_counter.clone());
+        let error = state
+            .validate_v3_transaction_admission(&second)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("worker epoch issuance limit"),
+            "{error}"
+        );
+
+        worker_counter.nonce = 1;
+        state.accounts.insert(worker_budget.0, worker_counter);
+        let coordinator_budget =
+            community_reward_coordinator_budget_address(epoch, &validators[0].address());
+        let mut coordinator_counter = state.get_account(&coordinator_budget).unwrap();
+        coordinator_counter.nonce = V3_COMMUNITY_REWARD_MAX_PER_COORDINATOR_EPOCH;
+        state
+            .accounts
+            .insert(coordinator_budget.0, coordinator_counter.clone());
+        let error = state
+            .validate_v3_transaction_admission(&second)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("coordinator epoch issuance limit"),
+            "{error}"
+        );
+
+        coordinator_counter.nonce = 1;
+        state
+            .accounts
+            .insert(coordinator_budget.0, coordinator_counter);
+        let epoch_budget = community_reward_epoch_budget_address(epoch);
+        let mut epoch_counter = state.get_account(&epoch_budget).unwrap();
+        epoch_counter.nonce = V3_COMMUNITY_REWARD_MAX_PER_EPOCH;
+        state.accounts.insert(epoch_budget.0, epoch_counter);
+        let error = state
+            .validate_v3_transaction_admission(&second)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("epoch issuance limit"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn recovery_v3_reward_budget_counters_are_rooted_and_wal_restartable() {
+        let directory = persistent_test_dir("v3-reward-budget-restart");
+        let genesis_hash = hash_bytes(b"v3-reward-budget-restart-genesis");
+        let context = crate::recovery::RecoveryContext::new("0x415243", genesis_hash, 9, 12);
+        let validators: Vec<_> = (0..6)
+            .map(|_| arc_crypto::KeyPair::generate_ed25519())
+            .collect();
+        let worker = arc_crypto::KeyPair::generate_ed25519();
+        let treasury = arc_types::transaction::inference_reward_treasury_address();
+        let mut prefunded = vec![(treasury, 4 * REWARD)];
+        prefunded.extend(validators.iter().map(|validator| (validator.address(), 0)));
+        let validator_set: Vec<_> = validators
+            .iter()
+            .enumerate()
+            .map(|(index, validator)| {
+                (
+                    validator.address(),
+                    if index < 4 { 6_666_667 } else { 6_666_666 },
+                )
+            })
+            .collect();
+
+        let state = StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        state.seed_genesis_validators(&validator_set);
+        state.staking_pool.store(40_000_000, Ordering::Release);
+        state.set_community_rewards_v1_activation_height(Some(0));
+        *state.recovery_context.write() = Some(context.clone());
+
+        let reward = make_recovery_signed_community_reward(
+            &state,
+            &validators[0],
+            &worker,
+            &validators,
+            0,
+            b"persistent-budget-job",
+        );
+        let (block, receipts) = state
+            .execute_block_verified_at(
+                std::slice::from_ref(&reward),
+                validators[0].address(),
+                1_787_857_623_010,
+            )
+            .unwrap();
+        assert!(receipts[0].success);
+        state.wal.sync().unwrap();
+        let rooted_state = state.get_state_root();
+        assert_eq!(block.header.state_root, rooted_state);
+        let status =
+            state.current_community_reward_budget_status(worker.address(), validators[0].address());
+        assert_eq!(status.issued_this_block, 1);
+        assert_eq!(status.issued_this_epoch, 1);
+        assert_eq!(status.worker_issued_this_epoch, 1);
+        assert_eq!(status.coordinator_issued_this_epoch, 1);
+        let receipt_hash = receipts[0].tx_hash;
+        let block_hash = block.hash;
+        drop(state);
+
+        let restarted =
+            StateDB::with_genesis_persistent(&prefunded, &directory, genesis_hash).unwrap();
+        restarted.set_community_rewards_v1_activation_height(Some(0));
+        *restarted.recovery_context.write() = Some(context);
+        assert_eq!(restarted.height(), 1);
+        assert_eq!(restarted.get_state_root(), rooted_state);
+        assert_eq!(restarted.get_block(1).unwrap().hash, block_hash);
+        assert_eq!(
+            restarted.get_receipt(&receipt_hash.0).unwrap().block_hash,
+            block_hash
+        );
+        let restarted_status = restarted
+            .current_community_reward_budget_status(worker.address(), validators[0].address());
+        assert_eq!(restarted_status, status);
+        assert_eq!(
+            restarted.get_account(&worker.address()).unwrap().balance,
+            REWARD
+        );
+        assert_eq!(
+            restarted.get_account(&treasury).unwrap().balance,
+            3 * REWARD
+        );
+
+        drop(restarted);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn reward_rejection(state: &StateDB, reward: &Transaction) -> String {

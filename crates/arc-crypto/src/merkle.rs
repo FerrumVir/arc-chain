@@ -170,6 +170,38 @@ impl IncrementalMerkle {
         }
     }
 
+    /// Build a complete keyed tree in O(n log n) time without repeatedly
+    /// shifting vectors and rebuilding the key index for every insertion.
+    ///
+    /// This is the cold-start/snapshot path. `update` remains optimized for
+    /// the normal case where the tree already exists and only a few leaves
+    /// change. Duplicate keys are a caller invariant violation because one
+    /// state key cannot commit two different leaves.
+    pub fn from_keyed_leaves(mut entries: Vec<([u8; 32], Hash256)>) -> Self {
+        entries.sort_unstable_by_key(|entry| entry.0);
+        assert!(
+            entries.windows(2).all(|window| window[0].0 != window[1].0),
+            "incremental Merkle input contains duplicate keys"
+        );
+        let mut keys = Vec::with_capacity(entries.len());
+        let mut leaves = Vec::with_capacity(entries.len());
+        let mut key_index = HashMap::with_capacity(entries.len());
+        for (index, (key, hash)) in entries.into_iter().enumerate() {
+            keys.push(key);
+            leaves.push(hash);
+            key_index.insert(key, index);
+        }
+        let mut tree = Self {
+            keys,
+            leaves,
+            levels: Vec::new(),
+            real_lengths: Vec::new(),
+            key_index,
+        };
+        tree.rebuild();
+        tree
+    }
+
     /// Update an existing leaf or insert a new one.
     ///
     /// Returns `(leaf_index, is_new_key)`.  If `is_new_key` is true the
@@ -466,6 +498,45 @@ mod tests {
 
         let full_tree = MerkleTree::from_leaves(sorted_hashes);
         assert_eq!(im.root(), full_tree.root());
+    }
+
+    #[test]
+    fn bulk_keyed_build_matches_all_sizes_and_key_order_permutations() {
+        for size in [0u32, 1, 2, 3, 31, 32, 33, 257, 1_000] {
+            let ascending: Vec<_> = (0..size)
+                .map(|index| {
+                    let mut key = [0u8; 32];
+                    key[..4].copy_from_slice(&index.to_be_bytes());
+                    (key, hash_bytes(&index.to_le_bytes()))
+                })
+                .collect();
+            let expected = IncrementalMerkle::from_keyed_leaves(ascending.clone());
+
+            let mut reversed = ascending.clone();
+            reversed.reverse();
+            let mut permuted = ascending.clone();
+            permuted.sort_unstable_by_key(|(key, _)| hash_bytes(key).0);
+            if !permuted.is_empty() {
+                let rotation = permuted.len() / 3;
+                permuted.rotate_left(rotation);
+            }
+
+            for entries in [ascending, reversed, permuted] {
+                let bulk = IncrementalMerkle::from_keyed_leaves(entries);
+                assert_eq!(bulk.root(), expected.root(), "size {size}");
+                assert_eq!(bulk.len(), size as usize);
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate keys")]
+    fn bulk_keyed_build_rejects_duplicate_keys() {
+        let key = [7u8; 32];
+        IncrementalMerkle::from_keyed_leaves(vec![
+            (key, hash_bytes(b"first")),
+            (key, hash_bytes(b"second")),
+        ]);
     }
 
     #[test]

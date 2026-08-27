@@ -40,6 +40,10 @@ pub fn tx_access_set(tx: &Transaction) -> TxAccessSet {
     match &tx.body {
         TxBody::Transfer(body) => {
             accounts.insert(body.to.0);
+            // Protocol-v3 transfers all credit the fixed fee treasury. This
+            // conservative key is also safe for legacy transfers and prevents
+            // parallel lost updates when a v3 mixed block selects BlockSTM.
+            accounts.insert(crate::v3_fee_treasury_address().0);
         }
         TxBody::Settle(body) => {
             accounts.insert(body.agent_id.0);
@@ -347,15 +351,18 @@ mod tests {
     }
 
     #[test]
-    fn test_disjoint_transfers_one_batch() {
-        // A→B and C→D are disjoint - should be in the same batch
+    fn transfers_serialize_on_shared_v3_fee_treasury() {
+        // Sender/recipient pairs are disjoint, but every v3 transfer credits
+        // the canonical fee treasury, so conservative static scheduling keeps
+        // their writes in transaction order (also safe for legacy blocks).
         let txs = vec![
             make_transfer(addr(1), addr(2), 0),
             make_transfer(addr(3), addr(4), 0),
         ];
         let batches = partition_batches(&txs);
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 2);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 1);
     }
 
     #[test]
@@ -389,8 +396,8 @@ mod tests {
     #[test]
     fn test_mixed_conflict_pattern() {
         // A→B, C→D, E→B, C→F
-        // Batch 0: A→B, C→D (disjoint)
-        // Batch 1: E→B (conflicts with A→B on B), C→F (conflicts with C→D on C)
+        // All share the conservative v3 fee-treasury key, so none can execute
+        // concurrently even when their ordinary account pairs are disjoint.
         let txs = vec![
             make_transfer(addr(1), addr(2), 0), // A→B
             make_transfer(addr(3), addr(4), 0), // C→D
@@ -398,12 +405,8 @@ mod tests {
             make_transfer(addr(3), addr(6), 1), // C→F
         ];
         let batches = partition_batches(&txs);
-        // First two are disjoint → batch 0
-        // Third conflicts on addr(2) with first → batch 1
-        // Fourth conflicts on addr(3) with second → batch 1
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), 2);
-        assert_eq!(batches[1].len(), 2);
+        assert_eq!(batches.len(), 4);
+        assert!(batches.iter().all(|batch| batch.len() == 1));
     }
 
     #[test]

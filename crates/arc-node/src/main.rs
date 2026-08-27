@@ -360,6 +360,11 @@ enum RecoveryCommand {
         /// JSON array of {address, public_key, stake} records for the approved set.
         #[arg(long)]
         validator_public_keys: String,
+        /// Canonical archived source set as a JSON array of {address, stake}.
+        /// This must be the original eight-validator/40M legacy genesis set;
+        /// runtime peer registries are never used as recovery authority.
+        #[arg(long)]
+        legacy_validator_set: String,
         #[arg(long)]
         output: String,
         #[arg(long)]
@@ -427,6 +432,13 @@ enum RecoveryCommand {
 struct RecoveryValidatorFileEntry {
     address: String,
     public_key: String,
+    stake: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyRecoveryValidatorFileEntry {
+    address: String,
     stake: u64,
 }
 
@@ -507,6 +519,29 @@ fn load_recovery_validator_file(path: &str) -> Result<Vec<arc_state::recovery::R
         .collect()
 }
 
+fn load_legacy_recovery_validator_file(path: &str) -> Result<Vec<(Hash256, u64)>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read legacy recovery validator file {path}"))?;
+    let records: Vec<LegacyRecoveryValidatorFileEntry> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse legacy recovery validator file {path}"))?;
+    let validators = records
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| {
+            Ok((
+                parse_recovery_hash(
+                    &format!("legacy validator #{} address", index + 1),
+                    &record.address,
+                )?,
+                record.stake,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    arc_state::recovery::canonicalize_legacy_recovery_validator_set(validators)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("invalid canonical legacy validator file {path}"))
+}
+
 fn recovery_trust(
     genesis: &str,
     approved_manifest_hash: &str,
@@ -539,8 +574,12 @@ fn print_recovery_summary(
             "genesis_hash": format!("0x{}", checkpoint.manifest.genesis_hash.to_hex()),
             "source_height": checkpoint.manifest.source_height,
             "source_block_hash": format!("0x{}", checkpoint.manifest.source_block_hash.to_hex()),
+            "source_state_root": format!("0x{}", checkpoint.manifest.source_state_root.to_hex()),
+            "source_consensus_round": checkpoint.manifest.source_consensus_round,
+            "created_at_unix_ms": checkpoint.manifest.created_at_unix_ms,
             "transition_height": transition.header.height,
             "transition_block_hash": format!("0x{}", transition.hash.to_hex()),
+            "recovery_domain": format!("0x{}", checkpoint.manifest.recovery_context().domain_hash().to_hex()),
             "recovery_epoch": checkpoint.manifest.recovery_epoch,
             "validator_set_id": checkpoint.manifest.validator_set_id,
             "protocol_version": format!(
@@ -551,6 +590,11 @@ fn print_recovery_summary(
             ),
             "validator_count": checkpoint.manifest.validators.len(),
             "signature_count": checkpoint.signatures.len(),
+            "source_validator_count": checkpoint.payload.validators.len(),
+            "source_validator_stake": checkpoint.payload.staking_pool,
+            "source_validator_set_hash": format!("0x{}", checkpoint.payload.source_validator_set_hash().to_hex()),
+            "community_reward_issuance_policy": arc_state::community_reward_issuance_policy(),
+            "community_reward_issuance_policy_hash": format!("0x{}", arc_state::community_reward_issuance_policy_hash().to_hex()),
         }))?
     );
     Ok(())
@@ -942,6 +986,7 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
             snapshot,
             genesis,
             validator_public_keys,
+            legacy_validator_set,
             output,
             source_consensus_round,
             recovery_epoch,
@@ -952,6 +997,7 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
             let (genesis, network) =
                 recovery_network_from_genesis(&genesis, recovery_epoch, validator_set_id)?;
             let validators = load_recovery_validator_file(&validator_public_keys)?;
+            let legacy_validators = load_legacy_recovery_validator_file(&legacy_validator_set)?;
             let mut public_set: Vec<_> = validators
                 .iter()
                 .map(|validator| (validator.address, validator.stake))
@@ -963,11 +1009,12 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
                 public_set == approved_set,
                 "validator public-key file addresses/stakes differ from the complete genesis set"
             );
-            let state = StateDB::load_legacy_recovery_source_with_snapshot(
+            let state = StateDB::load_legacy_recovery_export_source(
                 &data_dir,
                 network.genesis_hash,
                 allow_unbound_legacy_wal,
                 &snapshot,
+                &legacy_validators,
             )?;
             let created_at_unix_ms = created_at_unix_ms.unwrap_or(
                 SystemTime::now()

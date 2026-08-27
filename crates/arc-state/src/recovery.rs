@@ -8,7 +8,7 @@
 
 use crate::wal::{ContractStorage, Snapshot};
 use crate::{StateDB, StateError, WalEntry, WalOp, read_wal_strict};
-use arc_crypto::{Hash256, IncrementalMerkle, KeyPair, Signature, hash_bytes};
+use arc_crypto::{Hash256, IncrementalMerkle, KeyPair, MerkleTree, Signature, hash_bytes};
 use arc_types::{
     Account, Address, Block, BlockHeader, EventLog, Identity, ProtocolVersion, Transaction,
     TxReceipt, strict_supermajority_threshold,
@@ -38,6 +38,15 @@ pub const LEGACY_SNAPSHOT_MAX_BYTES: usize = ARCCHKPT_MAX_PAYLOAD_BYTES;
 pub const RECOVERY_VALIDATOR_SET_SIZE: usize = 6;
 /// Five identities are required in addition to strict >2/3 signed stake.
 pub const RECOVERY_SIGNATURES_REQUIRED: usize = 5;
+/// The selected canonical legacy fork was created by the original eight
+/// deterministic genesis validators. Later peer registries contain zero-stake
+/// community identities and divergent dynamically admitted validators; none
+/// of those are a recovery trust source.
+pub const LEGACY_RECOVERY_VALIDATOR_SET_SIZE: usize = 8;
+/// Every validator in the selected legacy genesis carried exactly 5M stake.
+pub const LEGACY_RECOVERY_VALIDATOR_STAKE: u64 = 5_000_000;
+/// The canonical legacy validator-set total committed by the recovery input.
+pub const LEGACY_RECOVERY_TOTAL_STAKE: u64 = 40_000_000;
 pub const RECOVERY_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion {
     major: 3,
     minor: 0,
@@ -390,6 +399,11 @@ impl ArcCheckpoint {
     }
 
     pub fn add_signature(&mut self, keypair: &KeyPair) -> Result<(), RecoveryError> {
+        // Never let the low-level signing API bless content the signer has not
+        // independently validated. CLI callers also verify against their
+        // operator trust root, but this protects direct/library use from
+        // signing a structurally forged history.
+        self.verify_content()?;
         let address = keypair.address();
         let validator = self
             .manifest
@@ -653,6 +667,16 @@ impl RecoveryPayload {
         Hash256(*hasher.finalize().as_bytes())
     }
 
+    /// Domain-separated commitment to the source validator metadata that is
+    /// transitively signed through `manifest.payload_hash`.
+    pub fn source_validator_set_hash(&self) -> Hash256 {
+        let bytes = bincode::serialize(&(self.validators.as_slice(), self.staking_pool))
+            .expect("canonical source validator state is serializable");
+        let mut hasher = blake3::Hasher::new_derive_key("ARCCHKPT-source-validator-set-content-v1");
+        hasher.update(&bytes);
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
     /// Recompute the legacy account-only Merkle root from the exact retained
     /// source accounts. This is intentionally independent of StateDB caches,
     /// dirty-key tracking, and the replacement validator set.
@@ -688,25 +712,27 @@ impl RecoveryPayload {
         }
 
         let mut accounts = self.accounts.clone();
-        // Some legacy fleets recorded validator weights only in the validator
-        // map; their account.staked_balance remained zero. Move any real legacy
-        // bonds into the target positions, then fund only the synthetic
-        // shortfall from an explicit prefunded system reserve. This handles
-        // both legacy shapes while conserving liquid+bonded supply exactly.
-        let mut real_legacy_bonds = 0u64;
-        for (_, account) in &mut accounts {
-            real_legacy_bonds = real_legacy_bonds
-                .checked_add(account.staked_balance)
-                .ok_or_else(|| {
-                    RecoveryError::Invalid("legacy account stake exceeds u64::MAX".into())
-                })?;
-            account.staked_balance = 0;
+        // The selected legacy fleet recorded validator weight in the validator
+        // map, while its validator account `staked_balance` fields are expected
+        // to be zero. That account field is overloaded by legacy channel
+        // disputes and inference-provider bonds, so a non-zero value cannot be
+        // safely interpreted as validator stake without a separately signed
+        // per-address decomposition artifact. V3 deliberately has no guessing
+        // fallback: require the archived account bytes to prove zero and fund
+        // the exact source stake entirely from the explicit system reserve.
+        for (source_validator, _) in &self.validators {
+            let Ok(index) = accounts.binary_search_by_key(&source_validator.0, |entry| entry.0.0)
+            else {
+                continue;
+            };
+            if accounts[index].1.staked_balance != 0 {
+                return Err(RecoveryError::Invalid(format!(
+                    "source validator {source_validator} has ambiguous non-zero account staked_balance {}; a signed decomposition artifact is required",
+                    accounts[index].1.staked_balance
+                )));
+            }
         }
-        let reserve_debit = target_stake.checked_sub(real_legacy_bonds).ok_or_else(|| {
-            RecoveryError::Invalid(format!(
-                "real legacy account bonds {real_legacy_bonds} exceed target stake {target_stake}"
-            ))
-        })?;
+        let reserve_debit = target_stake;
         let reserve_address = recovery_stake_reserve_address();
         let reserve_index = accounts
             .binary_search_by_key(&reserve_address.0, |entry| entry.0.0)
@@ -734,6 +760,17 @@ impl RecoveryPayload {
                     index
                 }
             };
+            if self
+                .validators
+                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+                .is_err()
+                && accounts[index].1.staked_balance != 0
+            {
+                return Err(RecoveryError::Invalid(format!(
+                    "replacement validator {} collides with non-validator account metadata in staked_balance",
+                    validator.address
+                )));
+            }
             accounts[index].1.staked_balance = validator.stake;
         }
         Ok(accounts)
@@ -800,6 +837,12 @@ impl RecoveryPayload {
         require_sorted_unique(&self.event_logs, |entry| entry.0, "event logs")?;
         require_sorted_unique(&self.validators, |entry| entry.0.0, "validator state")?;
 
+        // Legacy benchmark blocks may repeat a zero transaction placeholder,
+        // so a hash is not itself a globally unique position. Preserve every
+        // exact canonical occurrence and require retained indexes/receipts to
+        // name one of them (and agree with each other when both exist).
+        let mut canonical_transaction_positions =
+            HashMap::<Hash256, Vec<(u64, u32, Hash256)>>::new();
         for (index, (height, block)) in self.blocks.iter().enumerate() {
             if *height != block.header.height || block.hash != Block::compute_hash(&block.header) {
                 return Err(RecoveryError::Invalid(format!(
@@ -810,6 +853,23 @@ impl RecoveryPayload {
                 return Err(RecoveryError::Invalid(format!(
                     "block {height} transaction count mismatch"
                 )));
+            }
+            let recomputed_tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+            if recomputed_tx_root != block.header.tx_root {
+                return Err(RecoveryError::Invalid(format!(
+                    "block {height} transaction root does not match its ordered transaction hashes"
+                )));
+            }
+            for (transaction_index, transaction_hash) in block.tx_hashes.iter().enumerate() {
+                let transaction_index = u32::try_from(transaction_index).map_err(|_| {
+                    RecoveryError::Invalid(format!(
+                        "block {height} has more transactions than its u32 index can represent"
+                    ))
+                })?;
+                canonical_transaction_positions
+                    .entry(*transaction_hash)
+                    .or_default()
+                    .push((*height, transaction_index, block.hash));
             }
             if index == 0 {
                 if *height != 0 || block.header.parent_hash != Hash256::ZERO {
@@ -836,6 +896,7 @@ impl RecoveryPayload {
                 )));
             }
         }
+        let mut receipt_positions = HashMap::<Hash256, (u64, u32)>::new();
         for (hash, receipt) in &self.receipts {
             if receipt.tx_hash != *hash {
                 return Err(RecoveryError::Invalid(format!(
@@ -843,12 +904,66 @@ impl RecoveryPayload {
                     receipt.tx_hash
                 )));
             }
+            let Some(positions) = canonical_transaction_positions.get(hash) else {
+                return Err(RecoveryError::Invalid(format!(
+                    "receipt {hash} does not refer to a retained canonical transaction"
+                )));
+            };
+            if !positions.iter().any(|(height, index, block_hash)| {
+                receipt.block_height == *height
+                    && receipt.index == *index
+                    && receipt.block_hash == *block_hash
+            }) {
+                return Err(RecoveryError::Invalid(format!(
+                    "receipt {hash} contradicts every retained canonical position"
+                )));
+            }
+            receipt_positions.insert(*hash, (receipt.block_height, receipt.index));
         }
         for (hash, transaction) in &self.full_transactions {
             if transaction.hash != *hash || transaction.compute_hash() != *hash {
                 return Err(RecoveryError::Invalid(format!(
                     "full transaction {hash} has invalid content hash"
                 )));
+            }
+            if !canonical_transaction_positions.contains_key(hash) {
+                return Err(RecoveryError::Invalid(format!(
+                    "full transaction {hash} is not retained in canonical history"
+                )));
+            }
+        }
+        for (hash, (height, index)) in &self.tx_index {
+            let Some(positions) = canonical_transaction_positions.get(hash) else {
+                return Err(RecoveryError::Invalid(format!(
+                    "transaction index {hash} does not refer to retained canonical history"
+                )));
+            };
+            if !positions
+                .iter()
+                .any(|(canonical_height, canonical_index, _)| {
+                    height == canonical_height && index == canonical_index
+                })
+            {
+                return Err(RecoveryError::Invalid(format!(
+                    "transaction index {hash} points to non-canonical position {height}:{index}"
+                )));
+            }
+            if receipt_positions
+                .get(hash)
+                .is_some_and(|receipt_position| receipt_position != &(*height, *index))
+            {
+                return Err(RecoveryError::Invalid(format!(
+                    "transaction index {hash} at {height}:{index} contradicts its retained receipt"
+                )));
+            }
+        }
+        for (address, transaction_hashes) in &self.account_txs {
+            for transaction_hash in transaction_hashes {
+                if !canonical_transaction_positions.contains_key(transaction_hash) {
+                    return Err(RecoveryError::Invalid(format!(
+                        "account history {address} refers to non-canonical transaction {transaction_hash}"
+                    )));
+                }
             }
         }
         for (address, identity) in &self.identities {
@@ -927,6 +1042,52 @@ fn validate_recovery_validators(validators: &[RecoveryValidator]) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// Validate and canonicalize the independently archived validator metadata
+/// for the selected legacy fork. This deliberately accepts only the original
+/// eight-validator, 40M-stake genesis shape. Runtime peer registries and
+/// divergent validator maps on other legacy forks are not authoritative.
+pub fn canonicalize_legacy_recovery_validator_set(
+    mut validators: Vec<(Address, u64)>,
+) -> Result<Vec<(Address, u64)>, RecoveryError> {
+    if validators.len() != LEGACY_RECOVERY_VALIDATOR_SET_SIZE {
+        return Err(RecoveryError::Invalid(format!(
+            "canonical legacy recovery requires exactly {LEGACY_RECOVERY_VALIDATOR_SET_SIZE} validators, got {}",
+            validators.len()
+        )));
+    }
+    validators.sort_by_key(|entry| entry.0.0);
+    require_sorted_unique(&validators, |entry| entry.0.0, "legacy recovery validators")?;
+
+    for (address, stake) in &validators {
+        if *address == Hash256::ZERO {
+            return Err(RecoveryError::Invalid(
+                "legacy recovery validator has the zero address".into(),
+            ));
+        }
+        if *stake == 0 {
+            return Err(RecoveryError::Invalid(format!(
+                "legacy recovery validator {address} has zero stake"
+            )));
+        }
+    }
+    let total = checked_total_stake(&validators).map_err(|_| {
+        RecoveryError::Invalid("legacy recovery validator stake exceeds u64::MAX".into())
+    })?;
+    for (address, stake) in &validators {
+        if *stake != LEGACY_RECOVERY_VALIDATOR_STAKE {
+            return Err(RecoveryError::Invalid(format!(
+                "legacy recovery validator {address} has stake {stake}, expected {LEGACY_RECOVERY_VALIDATOR_STAKE}"
+            )));
+        }
+    }
+    if total != LEGACY_RECOVERY_TOTAL_STAKE {
+        return Err(RecoveryError::Invalid(format!(
+            "legacy recovery validator stake is {total}, expected {LEGACY_RECOVERY_TOTAL_STAKE}"
+        )));
+    }
+    Ok(validators)
 }
 
 fn checked_total_stake(validators: &[(Address, u64)]) -> Result<u64, RecoveryError> {
@@ -1641,6 +1802,90 @@ impl StateDB {
         )
     }
 
+    /// Load the canonical legacy block/account boundary and bind the explicit
+    /// operator-archived source validator metadata used by ARCCHKPT export.
+    ///
+    /// Legacy snapshots do not carry validator state, and the selected WAL did
+    /// not persist the genesis validator map. The account root is therefore
+    /// verified first. Only then may this inject the independently supplied
+    /// eight-validator/40M consensus metadata; no account, block, receipt,
+    /// storage, or contract data is changed.
+    pub fn load_legacy_recovery_export_source(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: impl AsRef<Path>,
+        legacy_validators: &[(Address, u64)],
+    ) -> Result<Self, StateError> {
+        // Validate before the potentially expensive production WAL replay.
+        let legacy_validators =
+            canonicalize_legacy_recovery_validator_set(legacy_validators.to_vec())?;
+        let state = Self::load_legacy_recovery_source_inner(
+            wal_dir.as_ref(),
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            Some(snapshot_path.as_ref()),
+        )?;
+        state.bind_legacy_recovery_validator_set(&legacy_validators)?;
+        Ok(state)
+    }
+
+    fn bind_legacy_recovery_validator_set(
+        &self,
+        expected: &[(Address, u64)],
+    ) -> Result<(), StateError> {
+        let expected = canonicalize_legacy_recovery_validator_set(expected.to_vec())?;
+        let source_height = self.height();
+        let source_root = self.compute_state_root();
+        let source_anchor = self.get_block(source_height).ok_or_else(|| {
+            StateError::PersistenceError(format!(
+                "legacy validator binding has no source block at height {source_height}"
+            ))
+        })?;
+        if (source_height != 0 || source_anchor.header.state_root != Hash256::ZERO)
+            && source_anchor.header.state_root != source_root
+        {
+            return Err(StateError::PersistenceError(format!(
+                "refusing legacy validator binding because source block commits {}, replayed account root is {}",
+                source_anchor.header.state_root, source_root
+            )));
+        }
+
+        let mut persisted: Vec<_> = self
+            .validators
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), *entry.value()))
+            .collect();
+        persisted.sort_by_key(|entry| entry.0.0);
+        let persisted_pool = self.staking_pool.load(Ordering::Acquire);
+        if persisted.is_empty() && persisted_pool == 0 {
+            for (address, stake) in &expected {
+                self.validators.insert(address.0, *stake);
+            }
+            self.staking_pool
+                .store(LEGACY_RECOVERY_TOTAL_STAKE, Ordering::Release);
+        } else if persisted != expected || persisted_pool != LEGACY_RECOVERY_TOTAL_STAKE {
+            return Err(StateError::PersistenceError(format!(
+                "persisted legacy validator state differs from the explicit canonical source set: persisted count/stake {}/{}, expected {}/{}",
+                persisted.len(),
+                persisted_pool,
+                expected.len(),
+                LEGACY_RECOVERY_TOTAL_STAKE
+            )));
+        }
+
+        let rebound_root = self.compute_state_root();
+        if self.height() != source_height
+            || self.get_state_root() != source_root
+            || rebound_root != source_root
+        {
+            return Err(StateError::PersistenceError(
+                "legacy validator binding changed the verified block/account boundary".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn load_legacy_recovery_source_inner(
         wal_dir: &Path,
         expected_genesis_hash: Hash256,
@@ -2139,15 +2384,38 @@ mod tests {
         (keys, validators)
     }
 
-    fn bond_source_stake(state: &StateDB, validators: &[RecoveryValidator]) {
+    fn legacy_validator_set() -> Vec<(Address, u64)> {
+        (0..LEGACY_RECOVERY_VALIDATOR_SET_SIZE)
+            .map(|index| {
+                (
+                    hash_bytes(format!("legacy-validator-{index}").as_bytes()),
+                    LEGACY_RECOVERY_VALIDATOR_STAKE,
+                )
+            })
+            .collect()
+    }
+
+    fn target_validators_40m() -> (Vec<KeyPair>, Vec<RecoveryValidator>) {
+        let keys: Vec<_> = (0..RECOVERY_VALIDATOR_SET_SIZE)
+            .map(|_| KeyPair::generate_ed25519())
+            .collect();
+        let quotient = LEGACY_RECOVERY_TOTAL_STAKE / RECOVERY_VALIDATOR_SET_SIZE as u64;
+        let remainder = LEGACY_RECOVERY_TOTAL_STAKE % RECOVERY_VALIDATOR_SET_SIZE as u64;
+        let validators = keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| RecoveryValidator {
+                address: key.address(),
+                public_key: key.public_key_bytes().try_into().unwrap(),
+                stake: quotient + u64::from((index as u64) < remainder),
+            })
+            .collect();
+        (keys, validators)
+    }
+
+    fn seed_source_validator_metadata(state: &StateDB, validators: &[RecoveryValidator]) {
         let mut total = 0u64;
         for validator in validators {
-            let mut account = state
-                .get_account(&validator.address)
-                .unwrap_or_else(|| Account::new(validator.address, 0));
-            account.staked_balance = validator.stake;
-            state.accounts.insert(validator.address.0, account);
-            state.dirty_accounts.insert(validator.address.0);
             state
                 .validators
                 .insert(validator.address.0, validator.stake);
@@ -2165,7 +2433,7 @@ mod tests {
         let (keys, validators) = validators();
         let state =
             StateDB::with_genesis(&[(hash_bytes(b"alice"), 10_000), (hash_bytes(b"bob"), 20_000)]);
-        bond_source_stake(&state, &validators);
+        seed_source_validator_metadata(&state, &validators);
         let genesis_hash = hash_bytes(b"approved-v3-genesis");
         let mut checkpoint = ArcCheckpoint::export_unsigned(
             &state,
@@ -2198,6 +2466,34 @@ mod tests {
         (checkpoint, keys, policy)
     }
 
+    fn payload_with_one_canonical_transaction() -> RecoveryPayload {
+        let (checkpoint, _, _) = checkpoint();
+        let mut payload = checkpoint.payload;
+        let transaction_hash = hash_bytes(b"canonical-history-transaction");
+        let (_, block) = &mut payload.blocks[0];
+        block.tx_hashes = vec![transaction_hash];
+        block.header.tx_count = 1;
+        block.header.tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+        block.hash = Block::compute_hash(&block.header);
+        payload.receipts = vec![(
+            transaction_hash,
+            TxReceipt {
+                tx_hash: transaction_hash,
+                block_height: 0,
+                block_hash: block.hash,
+                index: 0,
+                success: true,
+                gas_used: 1,
+                value_commitment: None,
+                inclusion_proof: None,
+                logs: Vec::new(),
+            },
+        )];
+        payload.tx_index = vec![(transaction_hash, (0, 0))];
+        payload.validate_canonical().unwrap();
+        payload
+    }
+
     #[test]
     fn manifest_is_content_addressed_and_five_of_six_signed() {
         let (checkpoint, _, policy) = checkpoint();
@@ -2223,11 +2519,11 @@ mod tests {
     }
 
     #[test]
-    fn validator_rotation_moves_bonded_stake_without_minting_supply() {
+    fn validator_rotation_bonds_reserved_stake_without_minting_supply() {
         let (_, source_validators) = validators();
         let (_, target_validators) = validators();
         let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42_000)]);
-        bond_source_stake(&state, &source_validators);
+        seed_source_validator_metadata(&state, &source_validators);
         let source_supply: u128 = state
             .export_recovery_payload()
             .accounts
@@ -2259,10 +2555,11 @@ mod tests {
             .sum();
         assert_eq!(source_supply, target_supply);
         for validator in &source_validators {
-            let index = transitioned
-                .binary_search_by_key(&validator.address.0, |entry| entry.0.0)
-                .unwrap();
-            assert_eq!(transitioned[index].1.staked_balance, 0);
+            if let Ok(index) =
+                transitioned.binary_search_by_key(&validator.address.0, |entry| entry.0.0)
+            {
+                assert_eq!(transitioned[index].1.staked_balance, 0);
+            }
         }
         for validator in &target_validators {
             let index = transitioned
@@ -2270,6 +2567,51 @@ mod tests {
                 .unwrap();
             assert_eq!(transitioned[index].1.staked_balance, validator.stake);
         }
+    }
+
+    #[test]
+    fn validator_rotation_rejects_ambiguous_source_validator_staked_metadata() {
+        let (_, source_validators) = validators();
+        let (_, target_validators) = validators();
+        let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42_000)]);
+        seed_source_validator_metadata(&state, &source_validators);
+
+        let ambiguous_address = source_validators[0].address;
+        let mut ambiguous = Account::new(ambiguous_address, 17);
+        ambiguous.nonce = 9;
+        ambiguous.staked_balance = 23_714;
+        ambiguous.code_hash = hash_bytes(b"legacy-provider-or-dispute-owner");
+        ambiguous.storage_root = hash_bytes(b"legacy-provider-or-dispute-metadata");
+        state
+            .accounts
+            .insert(ambiguous_address.0, ambiguous.clone());
+        state.dirty_accounts.insert(ambiguous_address.0);
+
+        let error = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"ambiguous-source-validator-genesis"),
+                source_consensus_round: 1,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .expect_err("ambiguous overloaded source stake metadata must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("ambiguous non-zero account staked_balance"),
+            "{error}"
+        );
+        assert_eq!(
+            bincode::serialize(&state.get_account(&ambiguous_address).unwrap()).unwrap(),
+            bincode::serialize(&ambiguous).unwrap(),
+            "failed export must not rewrite source account metadata"
+        );
     }
 
     #[test]
@@ -2331,12 +2673,103 @@ mod tests {
     }
 
     #[test]
+    fn recovery_preserves_active_dispute_and_inference_provider_staked_metadata() {
+        let legacy_validators =
+            canonicalize_legacy_recovery_validator_set(legacy_validator_set()).unwrap();
+        let (_, target_validators) = target_validators_40m();
+        let reserve = recovery_stake_reserve_address();
+        let dispute_address = hash_bytes(b"active-channel-dispute-escrow");
+        let provider_address = hash_bytes(b"bonded-inference-provider");
+        let state = StateDB::with_genesis(&[(reserve, 1_000_000_000_000)]);
+        for (address, stake) in &legacy_validators {
+            state.validators.insert(address.0, *stake);
+        }
+        state
+            .staking_pool
+            .store(LEGACY_RECOVERY_TOTAL_STAKE, Ordering::Release);
+
+        // Exact legacy ChannelDispute encoding: nonce is the accepted state
+        // nonce and staked_balance is the still-active expiry height.
+        let mut dispute = Account::new(dispute_address, 75_000);
+        dispute.nonce = 9;
+        dispute.staked_balance = 237_145;
+        dispute.code_hash = hash_bytes(b"channel-opener");
+        dispute.storage_root = hash_bytes(b"channel-counterparty");
+        state.accounts.insert(dispute_address.0, dispute.clone());
+        state.dirty_accounts.insert(dispute_address.0);
+
+        // Exact legacy InferenceRegister shape: balance was debited and the
+        // provider bond remains locked in staked_balance.
+        let mut provider = Account::new(provider_address, 75_000);
+        provider.nonce = 1;
+        provider.staked_balance = 25_000;
+        state.accounts.insert(provider_address.0, provider.clone());
+        state.dirty_accounts.insert(provider_address.0);
+
+        let source_supply: u128 = state
+            .export_recovery_payload()
+            .accounts
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+        let checkpoint = ArcCheckpoint::export_unsigned(
+            &state,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"metadata-preservation-genesis"),
+                source_consensus_round: 9_774_808,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1_787_857_623_000,
+            },
+        )
+        .unwrap();
+        let transitioned = checkpoint
+            .payload
+            .transition_accounts(&target_validators)
+            .unwrap();
+        let transitioned_dispute = &transitioned[transitioned
+            .binary_search_by_key(&dispute_address.0, |entry| entry.0.0)
+            .unwrap()]
+        .1;
+        let transitioned_provider = &transitioned[transitioned
+            .binary_search_by_key(&provider_address.0, |entry| entry.0.0)
+            .unwrap()]
+        .1;
+        assert_eq!(
+            bincode::serialize(transitioned_dispute).unwrap(),
+            bincode::serialize(&dispute).unwrap()
+        );
+        assert_eq!(
+            bincode::serialize(transitioned_provider).unwrap(),
+            bincode::serialize(&provider).unwrap()
+        );
+
+        let transitioned_supply: u128 = transitioned
+            .iter()
+            .map(|(_, account)| u128::from(account.balance) + u128::from(account.staked_balance))
+            .sum();
+        assert_eq!(transitioned_supply, source_supply);
+
+        let mut colliding_target = target_validators;
+        colliding_target[0].address = provider_address;
+        colliding_target.sort_by_key(|validator| validator.address.0);
+        let error = checkpoint
+            .payload
+            .transition_accounts(&colliding_target)
+            .expect_err("replacement validator must not overwrite provider bond metadata");
+        assert!(error.to_string().contains("collides with non-validator"));
+    }
+
+    #[test]
     fn validator_rotation_rejects_any_change_to_total_bonded_stake() {
         let (_, source_validators) = validators();
         let (_, mut target_validators) = validators();
         target_validators[0].stake += 1;
         let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42_000)]);
-        bond_source_stake(&state, &source_validators);
+        seed_source_validator_metadata(&state, &source_validators);
         let error = ArcCheckpoint::export_unsigned(
             &state,
             RecoveryExportSpec {
@@ -2395,7 +2828,7 @@ mod tests {
         anchor.hash = Block::compute_hash(&anchor.header);
         state.blocks.insert(0, anchor);
         let (_, validators) = validators();
-        bond_source_stake(&state, &validators);
+        seed_source_validator_metadata(&state, &validators);
         let error = ArcCheckpoint::export_unsigned(
             &state,
             RecoveryExportSpec {
@@ -2435,7 +2868,7 @@ mod tests {
         let (_, mut recovery_validators) = validators();
         recovery_validators.pop();
         let state = StateDB::with_genesis(&[(hash_bytes(b"holder"), 42)]);
-        bond_source_stake(&state, &recovery_validators);
+        seed_source_validator_metadata(&state, &recovery_validators);
 
         let error = ArcCheckpoint::export_unsigned(
             &state,
@@ -2468,6 +2901,136 @@ mod tests {
             })
             .unwrap_err();
         assert!(error.to_string().contains("payload hash mismatch"));
+    }
+
+    #[test]
+    fn checkpoint_history_recomputes_transaction_roots_and_positions() {
+        let payload = payload_with_one_canonical_transaction();
+
+        let mut repeated_legacy_placeholder = payload.clone();
+        let block = &mut repeated_legacy_placeholder.blocks[0].1;
+        block.tx_hashes = vec![Hash256::ZERO, Hash256::ZERO];
+        block.header.tx_count = 2;
+        block.header.tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+        block.hash = Block::compute_hash(&block.header);
+        repeated_legacy_placeholder.receipts.clear();
+        repeated_legacy_placeholder.tx_index.clear();
+        repeated_legacy_placeholder
+            .validate_canonical()
+            .expect("repeated legacy zero placeholders are valid when not falsely indexed");
+
+        let mut changed_hash = payload.clone();
+        changed_hash.blocks[0].1.tx_hashes[0] = hash_bytes(b"swapped-history-transaction");
+        let error = changed_hash.validate_canonical().unwrap_err();
+        assert!(error.to_string().contains("transaction root"), "{error}");
+
+        let mut changed_receipt_hash = payload.clone();
+        changed_receipt_hash.receipts[0].1.block_hash = hash_bytes(b"wrong-receipt-block");
+        let error = changed_receipt_hash.validate_canonical().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts every retained canonical position"),
+            "{error}"
+        );
+
+        let mut changed_receipt_index = payload.clone();
+        changed_receipt_index.receipts[0].1.index = 1;
+        let error = changed_receipt_index.validate_canonical().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts every retained canonical position"),
+            "{error}"
+        );
+
+        let mut changed_index = payload;
+        changed_index.tx_index[0].1 = (0, 1);
+        let error = changed_index.validate_canonical().unwrap_err();
+        assert!(
+            error.to_string().contains("non-canonical position 0:1"),
+            "{error}"
+        );
+
+        let mut contradictory_duplicate = payload_with_one_canonical_transaction();
+        let transaction_hash = contradictory_duplicate.blocks[0].1.tx_hashes[0];
+        let block = &mut contradictory_duplicate.blocks[0].1;
+        block.tx_hashes.push(transaction_hash);
+        block.header.tx_count = 2;
+        block.header.tx_root = MerkleTree::from_leaves(block.tx_hashes.clone()).root();
+        block.hash = Block::compute_hash(&block.header);
+        contradictory_duplicate.receipts[0].1.block_hash = block.hash;
+        contradictory_duplicate.tx_index[0].1 = (0, 1);
+        let error = contradictory_duplicate.validate_canonical().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("contradicts its retained receipt"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tampered_transaction_history_cannot_be_signed_verified_or_imported() {
+        let (mut checkpoint, keys, policy) = checkpoint();
+        checkpoint.signatures.clear();
+        let transaction_hash = hash_bytes(b"history-before-tamper");
+        let (_, anchor) = &mut checkpoint.payload.blocks[0];
+        anchor.tx_hashes = vec![transaction_hash];
+        anchor.header.tx_count = 1;
+        anchor.header.tx_root = MerkleTree::from_leaves(anchor.tx_hashes.clone()).root();
+        anchor.hash = Block::compute_hash(&anchor.header);
+        checkpoint.manifest.source_block_hash = anchor.hash;
+        checkpoint.manifest.payload_hash = checkpoint.payload.content_hash();
+        checkpoint.verify_content().unwrap();
+
+        for key in keys.iter().take(5) {
+            checkpoint.add_signature(key).unwrap();
+        }
+        checkpoint
+            .verify(&RecoveryTrustRoot {
+                network: policy.clone(),
+                approved_manifest_hash: checkpoint.manifest_hash(),
+            })
+            .unwrap();
+
+        checkpoint.payload.blocks[0].1.tx_hashes[0] = hash_bytes(b"history-after-tamper");
+        checkpoint.manifest.payload_hash = checkpoint.payload.content_hash();
+        let malicious_manifest_hash = checkpoint.manifest_hash();
+        let content_error = checkpoint.verify_content().unwrap_err();
+        assert!(
+            content_error.to_string().contains("transaction root"),
+            "{content_error}"
+        );
+        let signing_error = checkpoint.add_signature(&keys[0]).unwrap_err();
+        assert!(
+            signing_error.to_string().contains("transaction root"),
+            "{signing_error}"
+        );
+
+        let checkpoint_dir = temp_dir("history-import-checkpoint");
+        let active_dir = temp_dir("history-import-active");
+        let checkpoint_path = checkpoint_dir.join("tampered.arcchkpt");
+        checkpoint.write_to(&checkpoint_path).unwrap();
+        let import_error = StateDB::with_genesis_persistent_recovery(
+            &[],
+            &active_dir,
+            policy,
+            Some(RecoveryImport {
+                checkpoint_path,
+                approved_manifest_hash: malicious_manifest_hash,
+            }),
+        )
+        .err()
+        .expect("tampered transaction history must not activate");
+        assert!(
+            import_error.to_string().contains("transaction root"),
+            "{import_error}"
+        );
+        assert!(!active_dir.join(ACTIVE_RECOVERY_MARKER).exists());
+
+        fs::remove_dir_all(checkpoint_dir).unwrap();
+        fs::remove_dir_all(active_dir).unwrap();
     }
 
     #[test]
@@ -2650,7 +3213,7 @@ mod tests {
         let recipient = hash_bytes(b"post-recovery-recipient");
         let source = StateDB::with_genesis(&[(sender.address(), 10_000), (recipient, 0)]);
         let (validator_keys, validators) = validators();
-        bond_source_stake(&source, &validators);
+        seed_source_validator_metadata(&source, &validators);
         let genesis_hash = hash_bytes(b"post-recovery-genesis");
         let mut checkpoint = ArcCheckpoint::export_unsigned(
             &source,
@@ -2696,6 +3259,7 @@ mod tests {
         )
         .unwrap();
         let mut transaction = Transaction::new_transfer(sender.address(), recipient, 250, 0);
+        transaction.fee = crate::V3_MIN_TRANSFER_FEE;
         state.sign_transaction(&mut transaction, &sender).unwrap();
         let transaction_hash = transaction.hash;
         let (block, receipts) = state
@@ -2726,6 +3290,13 @@ mod tests {
         assert_eq!(receipt.block_height, height);
         assert_eq!(restarted.get_account(&sender.address()).unwrap().nonce, 1);
         assert_eq!(restarted.get_account(&recipient).unwrap().balance, 250);
+        assert_eq!(
+            restarted
+                .get_account(&crate::v3_fee_treasury_address())
+                .unwrap()
+                .balance,
+            crate::V3_MIN_TRANSFER_FEE
+        );
 
         fs::remove_dir_all(source_dir).unwrap();
         fs::remove_dir_all(active_dir).unwrap();
@@ -2738,7 +3309,11 @@ mod tests {
         let snapshot_path = data_dir.with_extension("snapshot.lz4");
         let sender = hash_bytes(format!("{label}-sender").as_bytes());
         let recipient = hash_bytes(format!("{label}-recipient").as_bytes());
-        let reference = StateDB::with_genesis(&[(sender, 1_000), (recipient, 0)]);
+        let reference = StateDB::with_genesis(&[
+            (sender, 1_000),
+            (recipient, 0),
+            (recovery_stake_reserve_address(), 1_000_000_000_000),
+        ]);
         let transaction = Transaction::new_transfer(sender, recipient, 125, 0);
         let (block, receipts) = reference.execute_block(&[transaction], sender).unwrap();
         assert!(receipts[0].success);
@@ -2800,6 +3375,209 @@ mod tests {
 
         fs::remove_dir_all(data_dir).unwrap();
         fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn canonical_legacy_validator_input_rejects_wrong_shape_and_arithmetic() {
+        let canonical = legacy_validator_set();
+        let mut reversed = canonical.clone();
+        reversed.reverse();
+        let normalized = canonicalize_legacy_recovery_validator_set(reversed).unwrap();
+        assert_eq!(normalized, {
+            let mut expected = canonical.clone();
+            expected.sort_by_key(|entry| entry.0.0);
+            expected
+        });
+
+        let mut duplicate = canonical.clone();
+        duplicate[1].0 = duplicate[0].0;
+        assert!(
+            canonicalize_legacy_recovery_validator_set(duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("unique")
+        );
+
+        let mut zero = canonical.clone();
+        zero[0].1 = 0;
+        assert!(
+            canonicalize_legacy_recovery_validator_set(zero)
+                .unwrap_err()
+                .to_string()
+                .contains("zero stake")
+        );
+
+        let mut overflow = canonical.clone();
+        overflow[0].1 = u64::MAX;
+        overflow[1].1 = u64::MAX;
+        assert!(
+            canonicalize_legacy_recovery_validator_set(overflow)
+                .unwrap_err()
+                .to_string()
+                .contains("u64::MAX")
+        );
+
+        let mut wrong_stake = canonical.clone();
+        wrong_stake[0].1 -= 1;
+        wrong_stake[1].1 += 1;
+        assert!(
+            canonicalize_legacy_recovery_validator_set(wrong_stake)
+                .unwrap_err()
+                .to_string()
+                .contains("expected 5000000")
+        );
+
+        let mut polluted_peer_registry = canonical;
+        polluted_peer_registry.extend((0..10).map(|index| {
+            (
+                hash_bytes(format!("zero-stake-community-peer-{index}").as_bytes()),
+                0,
+            )
+        }));
+        assert!(
+            canonicalize_legacy_recovery_validator_set(polluted_peer_registry)
+                .unwrap_err()
+                .to_string()
+                .contains("exactly 8 validators")
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_validator_binding_preserves_root_and_enables_40m_transition() {
+        let (data_dir, snapshot_path, _, _, _, root) =
+            legacy_snapshot_fixture("legacy-validator-binding");
+        let legacy_validators = legacy_validator_set();
+
+        let unbound = StateDB::load_legacy_recovery_source_with_snapshot(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+        )
+        .unwrap();
+        let (_, target_validators) = target_validators_40m();
+        let missing = ArcCheckpoint::export_unsigned(
+            &unbound,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"legacy-validator-binding-genesis"),
+                source_consensus_round: 7,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators.clone(),
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("conserved source stake 0"));
+
+        let bound = StateDB::load_legacy_recovery_export_source(
+            &data_dir,
+            Hash256::ZERO,
+            true,
+            &snapshot_path,
+            &legacy_validators,
+        )
+        .unwrap();
+        assert_eq!(bound.height(), 1);
+        assert_eq!(bound.get_state_root(), root);
+        assert_eq!(bound.total_staked(), LEGACY_RECOVERY_TOTAL_STAKE);
+        assert_eq!(bound.active_validators().len(), 8);
+
+        let (_, wrong_target) = validators();
+        let mismatch = ArcCheckpoint::export_unsigned(
+            &bound,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"legacy-validator-binding-genesis"),
+                source_consensus_round: 7,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: wrong_target,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            mismatch
+                .to_string()
+                .contains("conserved source stake 40000000")
+        );
+
+        let checkpoint = ArcCheckpoint::export_unsigned(
+            &bound,
+            RecoveryExportSpec {
+                chain_id: "0x415243".into(),
+                genesis_hash: hash_bytes(b"legacy-validator-binding-genesis"),
+                source_consensus_round: 7,
+                recovery_epoch: 1,
+                validator_set_id: 1,
+                validators: target_validators,
+                community_rewards_v1_activation_height: None,
+                created_at_unix_ms: 1,
+            },
+        )
+        .unwrap();
+        checkpoint.verify_content().unwrap();
+        assert_eq!(checkpoint.manifest.source_state_root, root);
+        assert_eq!(checkpoint.payload.validators.len(), 8);
+        assert_eq!(checkpoint.payload.staking_pool, LEGACY_RECOVERY_TOTAL_STAKE);
+        assert_ne!(
+            checkpoint.payload.source_validator_set_hash(),
+            Hash256::ZERO
+        );
+
+        fs::remove_dir_all(data_dir).unwrap();
+        fs::remove_file(snapshot_path).unwrap();
+    }
+
+    #[test]
+    fn divergent_persisted_validator_sets_never_override_operator_input() {
+        for (label, retained, phantom) in [
+            ("lower", 7usize, 0usize),
+            ("higher", 8usize, 1usize),
+            ("polluted", 8usize, 10usize),
+        ] {
+            let (data_dir, snapshot_path, _, _, _, _) =
+                legacy_snapshot_fixture(&format!("legacy-validator-{label}"));
+            let state = StateDB::load_legacy_recovery_source_with_snapshot(
+                &data_dir,
+                Hash256::ZERO,
+                true,
+                &snapshot_path,
+            )
+            .unwrap();
+            let expected =
+                canonicalize_legacy_recovery_validator_set(legacy_validator_set()).unwrap();
+            for (address, stake) in expected.iter().take(retained) {
+                state.validators.insert(address.0, *stake);
+            }
+            for index in 0..phantom {
+                state.validators.insert(
+                    hash_bytes(format!("{label}-phantom-{index}").as_bytes()).0,
+                    if label == "higher" { 5_000_000 } else { 0 },
+                );
+            }
+            let persisted_total = state
+                .validators
+                .iter()
+                .try_fold(0u64, |total, entry| total.checked_add(*entry.value()))
+                .unwrap();
+            state.staking_pool.store(persisted_total, Ordering::Release);
+            let persisted_count = state.validators.len();
+
+            let error = state
+                .bind_legacy_recovery_validator_set(&expected)
+                .expect_err("divergent persisted validator metadata must fail closed");
+            assert!(error.to_string().contains("differs from the explicit"));
+            assert_eq!(state.validators.len(), persisted_count);
+            assert_eq!(state.total_staked(), persisted_total);
+
+            fs::remove_dir_all(data_dir).unwrap();
+            fs::remove_file(snapshot_path).unwrap();
+        }
     }
 
     #[test]
