@@ -1164,17 +1164,127 @@ struct LegacyBoundary {
     checkpoint_index: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LegacyWalRejectedTail {
+    TruncatedFrameLength,
+    InvalidFrameLength(u32),
+    TruncatedFramePayload,
+    InvalidEntryEncoding,
+    ChecksumMismatch(u64),
+    SequenceGap { expected: u64, actual: u64 },
+}
+
+impl LegacyWalRejectedTail {
+    fn stable_reason(&self) -> String {
+        match self {
+            Self::TruncatedFrameLength => "truncated_wal_frame_length".to_string(),
+            Self::InvalidFrameLength(length) => {
+                format!("invalid_wal_frame_length:{length}")
+            }
+            Self::TruncatedFramePayload => "truncated_wal_frame_payload".to_string(),
+            Self::InvalidEntryEncoding => "invalid_wal_entry_encoding".to_string(),
+            Self::ChecksumMismatch(sequence) => {
+                format!("wal_checksum_mismatch_at_sequence:{sequence}")
+            }
+            Self::SequenceGap { expected, actual } => {
+                format!("wal_sequence_gap:expected={expected},actual={actual}")
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LegacyWalPrefixRead {
+    entries: Vec<WalEntry>,
+    frame_end_offsets: Vec<u64>,
+    original_bytes: u64,
+    rejected_tail: Option<LegacyWalRejectedTail>,
+}
+
+/// Exact physical source-WAL boundary selected for snapshot-assisted recovery.
+///
+/// Operators can copy the first `source_wal_accepted_prefix_bytes` bytes as the
+/// canonical block-boundary evidence and quarantine the remaining bytes. The
+/// lengths always add back to `source_wal_original_bytes`; the loader never
+/// rewrites the source file.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LegacyWalBoundaryReport {
+    pub source_wal_original_bytes: u64,
+    pub source_wal_accepted_prefix_bytes: u64,
+    pub source_wal_quarantined_tail_bytes: u64,
+    pub source_wal_tail_reason: String,
+}
+
+fn legacy_wal_boundary_report(
+    read: &LegacyWalPrefixRead,
+    boundary: &LegacyBoundary,
+) -> Result<LegacyWalBoundaryReport, StateError> {
+    let accepted_prefix = *read
+        .frame_end_offsets
+        .get(boundary.checkpoint_index)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "selected legacy checkpoint has no physical WAL frame offset".into(),
+            )
+        })?;
+    let quarantined_tail = read
+        .original_bytes
+        .checked_sub(accepted_prefix)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "selected legacy checkpoint offset exceeds source WAL size".into(),
+            )
+        })?;
+    let valid_tail_entries = read
+        .entries
+        .len()
+        .checked_sub(boundary.checkpoint_index + 1)
+        .ok_or_else(|| {
+            StateError::PersistenceError(
+                "selected legacy checkpoint index exceeds parsed WAL entries".into(),
+            )
+        })?;
+    let source_wal_tail_reason = match (valid_tail_entries, &read.rejected_tail) {
+        (0, None) => "none".to_string(),
+        (count, None) => format!("uncommitted_valid_entries_after_checkpoint:{count}"),
+        (0, Some(reason)) => reason.stable_reason(),
+        (count, Some(reason)) => format!(
+            "uncommitted_valid_entries_after_checkpoint:{count};{}",
+            reason.stable_reason()
+        ),
+    };
+    if (quarantined_tail == 0) != (source_wal_tail_reason == "none") {
+        return Err(StateError::PersistenceError(
+            "legacy WAL physical tail accounting contradicts its classification".into(),
+        ));
+    }
+    Ok(LegacyWalBoundaryReport {
+        source_wal_original_bytes: read.original_bytes,
+        source_wal_accepted_prefix_bytes: accepted_prefix,
+        source_wal_quarantined_tail_bytes: quarantined_tail,
+        source_wal_tail_reason,
+    })
+}
+
 /// Read the longest checksum- and sequence-valid WAL prefix while retaining a
 /// precise reason for any rejected tail. This is used only with an exact-height
 /// snapshot: the caller must prove the selected block boundary matches the
 /// independently captured snapshot before it may ignore `tail_error`.
-fn read_legacy_wal_prefix(path: &Path) -> Result<(Vec<WalEntry>, Option<String>), StateError> {
+fn read_legacy_wal_prefix(path: &Path) -> Result<LegacyWalPrefixRead, StateError> {
     let file = File::open(path).map_err(|error| {
         StateError::PersistenceError(format!("failed to open legacy WAL {path:?}: {error}"))
     })?;
+    let original_bytes = file
+        .metadata()
+        .map_err(|error| {
+            StateError::PersistenceError(format!("failed to inspect legacy WAL {path:?}: {error}"))
+        })?
+        .len();
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
+    let mut frame_end_offsets = Vec::new();
     let mut expected_sequence = 0u64;
+    let mut offset = 0u64;
 
     loop {
         let mut length_bytes = [0u8; 4];
@@ -1182,32 +1292,73 @@ fn read_legacy_wal_prefix(path: &Path) -> Result<(Vec<WalEntry>, Option<String>)
             StateError::PersistenceError(format!("failed to read legacy WAL {path:?}: {error}"))
         })?;
         if first == 0 {
-            return Ok((entries, None));
+            let final_bytes = reader
+                .get_ref()
+                .metadata()
+                .map_err(|error| {
+                    StateError::PersistenceError(format!(
+                        "failed to re-inspect legacy WAL {path:?}: {error}"
+                    ))
+                })?
+                .len();
+            if final_bytes != original_bytes || offset != original_bytes {
+                return Err(StateError::PersistenceError(format!(
+                    "legacy WAL changed size while being read: before={original_bytes}, parsed={offset}, after={final_bytes}"
+                )));
+            }
+            return Ok(LegacyWalPrefixRead {
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: None,
+            });
         }
         if let Err(error) = reader.read_exact(&mut length_bytes[1..]) {
-            return Ok((
+            if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                return Err(StateError::PersistenceError(format!(
+                    "failed to read legacy WAL frame length from {path:?}: {error}"
+                )));
+            }
+            return Ok(LegacyWalPrefixRead {
                 entries,
-                Some(format!("truncated WAL frame length: {error}")),
-            ));
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::TruncatedFrameLength),
+            });
         }
-        let length = u32::from_le_bytes(length_bytes) as usize;
+        let length_u32 = u32::from_le_bytes(length_bytes);
+        let length = length_u32 as usize;
         if length == 0 || length > ARCCHKPT_MAX_PAYLOAD_BYTES {
-            return Ok((entries, Some(format!("invalid WAL frame length {length}"))));
+            return Ok(LegacyWalPrefixRead {
+                entries,
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::InvalidFrameLength(length_u32)),
+            });
         }
         let mut encoded = vec![0u8; length];
         if let Err(error) = reader.read_exact(&mut encoded) {
-            return Ok((
+            if error.kind() != std::io::ErrorKind::UnexpectedEof {
+                return Err(StateError::PersistenceError(format!(
+                    "failed to read legacy WAL frame payload from {path:?}: {error}"
+                )));
+            }
+            return Ok(LegacyWalPrefixRead {
                 entries,
-                Some(format!("truncated WAL frame payload: {error}")),
-            ));
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::TruncatedFramePayload),
+            });
         }
         let entry: WalEntry = match bincode::deserialize(&encoded) {
             Ok(entry) => entry,
-            Err(error) => {
-                return Ok((
+            Err(_) => {
+                return Ok(LegacyWalPrefixRead {
                     entries,
-                    Some(format!("invalid WAL entry encoding: {error}")),
-                ));
+                    frame_end_offsets,
+                    original_bytes,
+                    rejected_tail: Some(LegacyWalRejectedTail::InvalidEntryEncoding),
+                });
             }
         };
         let checksum_payload =
@@ -1219,27 +1370,35 @@ fn read_legacy_wal_prefix(path: &Path) -> Result<(Vec<WalEntry>, Option<String>)
                 },
             )?;
         if entry.checksum != crc32fast::hash(&checksum_payload) {
-            return Ok((
+            return Ok(LegacyWalPrefixRead {
                 entries,
-                Some(format!(
-                    "WAL checksum mismatch at sequence {}",
-                    entry.sequence
-                )),
-            ));
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::ChecksumMismatch(entry.sequence)),
+            });
         }
         if entry.sequence != expected_sequence {
-            return Ok((
+            return Ok(LegacyWalPrefixRead {
                 entries,
-                Some(format!(
-                    "WAL sequence gap: expected {expected_sequence}, got {}",
-                    entry.sequence
-                )),
-            ));
+                frame_end_offsets,
+                original_bytes,
+                rejected_tail: Some(LegacyWalRejectedTail::SequenceGap {
+                    expected: expected_sequence,
+                    actual: entry.sequence,
+                }),
+            });
         }
+        offset = offset
+            .checked_add(4)
+            .and_then(|value| value.checked_add(length as u64))
+            .ok_or_else(|| {
+                StateError::PersistenceError("legacy WAL byte offset overflows u64".into())
+            })?;
         expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
             StateError::PersistenceError("legacy WAL sequence overflows u64".into())
         })?;
         entries.push(entry);
+        frame_end_offsets.push(offset);
     }
 }
 
@@ -1778,6 +1937,7 @@ impl StateDB {
             allow_unbound_legacy_wal,
             None,
         )
+        .map(|(state, _)| state)
     }
 
     /// Load a legacy recovery source and bind its canonical block boundary to
@@ -1794,12 +1954,37 @@ impl StateDB {
         allow_unbound_legacy_wal: bool,
         snapshot_path: impl AsRef<Path>,
     ) -> Result<Self, StateError> {
-        Self::load_legacy_recovery_source_inner(
+        Self::load_legacy_recovery_source_with_snapshot_report(
+            wal_dir,
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            snapshot_path,
+        )
+        .map(|(state, _)| state)
+    }
+
+    /// Snapshot-assisted loader variant that also reports the exact physical
+    /// WAL prefix accepted through the selected checkpoint frame. The source
+    /// WAL remains read-only; operators may use the returned byte boundary to
+    /// archive the accepted prefix and quarantine the suffix byte-for-byte.
+    pub fn load_legacy_recovery_source_with_snapshot_report(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: impl AsRef<Path>,
+    ) -> Result<(Self, LegacyWalBoundaryReport), StateError> {
+        let (state, report) = Self::load_legacy_recovery_source_inner(
             wal_dir.as_ref(),
             expected_genesis_hash,
             allow_unbound_legacy_wal,
             Some(snapshot_path.as_ref()),
-        )
+        )?;
+        let report = report.ok_or_else(|| {
+            StateError::PersistenceError(
+                "snapshot-assisted loader did not produce a physical WAL boundary report".into(),
+            )
+        })?;
+        Ok((state, report))
     }
 
     /// Load the canonical legacy block/account boundary and bind the explicit
@@ -1817,17 +2002,41 @@ impl StateDB {
         snapshot_path: impl AsRef<Path>,
         legacy_validators: &[(Address, u64)],
     ) -> Result<Self, StateError> {
+        Self::load_legacy_recovery_export_source_with_report(
+            wal_dir,
+            expected_genesis_hash,
+            allow_unbound_legacy_wal,
+            snapshot_path,
+            legacy_validators,
+        )
+        .map(|(state, _)| state)
+    }
+
+    /// Export loader variant that returns the exact physical source-WAL
+    /// boundary selected by the signed snapshot height/root.
+    pub fn load_legacy_recovery_export_source_with_report(
+        wal_dir: impl AsRef<Path>,
+        expected_genesis_hash: Hash256,
+        allow_unbound_legacy_wal: bool,
+        snapshot_path: impl AsRef<Path>,
+        legacy_validators: &[(Address, u64)],
+    ) -> Result<(Self, LegacyWalBoundaryReport), StateError> {
         // Validate before the potentially expensive production WAL replay.
         let legacy_validators =
             canonicalize_legacy_recovery_validator_set(legacy_validators.to_vec())?;
-        let state = Self::load_legacy_recovery_source_inner(
+        let (state, report) = Self::load_legacy_recovery_source_inner(
             wal_dir.as_ref(),
             expected_genesis_hash,
             allow_unbound_legacy_wal,
             Some(snapshot_path.as_ref()),
         )?;
         state.bind_legacy_recovery_validator_set(&legacy_validators)?;
-        Ok(state)
+        let report = report.ok_or_else(|| {
+            StateError::PersistenceError(
+                "snapshot-assisted export did not produce a physical WAL boundary report".into(),
+            )
+        })?;
+        Ok((state, report))
     }
 
     fn bind_legacy_recovery_validator_set(
@@ -1891,7 +2100,7 @@ impl StateDB {
         expected_genesis_hash: Hash256,
         allow_unbound_legacy_wal: bool,
         snapshot_path: Option<&Path>,
-    ) -> Result<Self, StateError> {
+    ) -> Result<(Self, Option<LegacyWalBoundaryReport>), StateError> {
         if wal_dir.join(ACTIVE_RECOVERY_MARKER).exists() {
             return Err(StateError::PersistenceError(
                 "source data directory already has an active recovery; chained recovery export is not supported by this format revision"
@@ -1936,25 +2145,37 @@ impl StateDB {
         let snapshot = snapshot_path
             .map(read_legacy_recovery_snapshot)
             .transpose()?;
-        let (entries, rejected_tail) = if snapshot.is_some() {
-            read_legacy_wal_prefix(&wal_path)?
+        let prefix_read = snapshot
+            .as_ref()
+            .map(|_| read_legacy_wal_prefix(&wal_path))
+            .transpose()?;
+        let strict_entries = if prefix_read.is_none() {
+            Some(read_wal_strict(&wal_path).map_err(|error| {
+                StateError::PersistenceError(format!(
+                    "legacy recovery source WAL is incomplete or corrupt: {error}"
+                ))
+            })?)
         } else {
-            (
-                read_wal_strict(&wal_path).map_err(|error| {
-                    StateError::PersistenceError(format!(
-                        "legacy recovery source WAL is incomplete or corrupt: {error}"
-                    ))
-                })?,
-                None,
-            )
+            None
         };
+        let entries = prefix_read
+            .as_ref()
+            .map(|read| read.entries.as_slice())
+            .or(strict_entries.as_deref())
+            .ok_or_else(|| {
+                StateError::PersistenceError("legacy recovery source produced no WAL reader".into())
+            })?;
         if entries.is_empty() {
             return Err(StateError::PersistenceError(
                 "legacy recovery source WAL is empty".into(),
             ));
         }
 
-        let boundary = latest_complete_legacy_boundary(&entries)?;
+        let boundary = latest_complete_legacy_boundary(entries)?;
+        let wal_report = prefix_read
+            .as_ref()
+            .map(|read| legacy_wal_boundary_report(read, &boundary))
+            .transpose()?;
         if let Some(snapshot) = snapshot.as_ref()
             && (snapshot.block_height != boundary.height
                 || snapshot.state_root != boundary.state_root)
@@ -1965,7 +2186,7 @@ impl StateDB {
             )));
         }
 
-        validate_legacy_boundary(&entries, &boundary)?;
+        validate_legacy_boundary(entries, &boundary)?;
         let committed_entries = &entries[..=boundary.checkpoint_index];
         let state = StateDB::new();
         for entry in committed_entries {
@@ -2011,14 +2232,18 @@ impl StateDB {
                 "Ignored WAL suffix after the latest fully committed legacy block boundary"
             );
         }
-        if let Some(reason) = rejected_tail {
+        if let Some(report) = wal_report.as_ref()
+            && report.source_wal_quarantined_tail_bytes != 0
+        {
             tracing::warn!(
                 committed_height = boundary.height,
-                rejected_tail = %reason,
-                "Quarantined invalid WAL tail after snapshot-bound legacy block boundary"
+                accepted_prefix_bytes = report.source_wal_accepted_prefix_bytes,
+                quarantined_tail_bytes = report.source_wal_quarantined_tail_bytes,
+                tail_reason = %report.source_wal_tail_reason,
+                "Quarantined WAL tail after snapshot-bound legacy block boundary"
             );
         }
-        Ok(state)
+        Ok((state, wal_report))
     }
 
     fn install_verified_checkpoint(&self, checkpoint: &ArcCheckpoint) -> Result<(), RecoveryError> {
@@ -3583,24 +3808,24 @@ mod tests {
     #[test]
     fn snapshot_assisted_loader_discards_validly_framed_and_torn_uncommitted_suffix() {
         let (data_dir, snapshot_path, _, _, _, root) = legacy_snapshot_fixture("snapshot-trailing");
+        let wal_path = data_dir.join("state.wal");
+        let accepted_prefix = fs::read(&wal_path).unwrap();
         let attacker = hash_bytes(b"snapshot-trailing-attacker");
-        let writer = crate::WalWriter::new(data_dir.join("state.wal")).unwrap();
+        let writer = crate::WalWriter::new(&wal_path).unwrap();
         writer.append(
             WalOp::SetAccount(attacker, Account::new(attacker, u64::MAX)),
             2,
         );
         writer.sync().unwrap();
         drop(writer);
-        let mut wal = OpenOptions::new()
-            .append(true)
-            .open(data_dir.join("state.wal"))
-            .unwrap();
+        let mut wal = OpenOptions::new().append(true).open(&wal_path).unwrap();
         wal.write_all(&64u32.to_le_bytes()).unwrap();
         wal.write_all(b"physically-torn-tail").unwrap();
         wal.sync_all().unwrap();
         drop(wal);
+        let original = fs::read(&wal_path).unwrap();
 
-        let loaded = StateDB::load_legacy_recovery_source_with_snapshot(
+        let (loaded, report) = StateDB::load_legacy_recovery_source_with_snapshot_report(
             &data_dir,
             Hash256::ZERO,
             true,
@@ -3610,6 +3835,28 @@ mod tests {
         assert_eq!(loaded.height(), 1);
         assert_eq!(loaded.get_state_root(), root);
         assert!(loaded.get_account(&attacker).is_none());
+        assert_eq!(report.source_wal_original_bytes, original.len() as u64);
+        assert_eq!(
+            report.source_wal_accepted_prefix_bytes,
+            accepted_prefix.len() as u64
+        );
+        assert_eq!(
+            report.source_wal_quarantined_tail_bytes,
+            (original.len() - accepted_prefix.len()) as u64
+        );
+        assert_eq!(
+            report.source_wal_tail_reason,
+            "uncommitted_valid_entries_after_checkpoint:1;truncated_wal_frame_payload"
+        );
+        assert_eq!(
+            report.source_wal_accepted_prefix_bytes + report.source_wal_quarantined_tail_bytes,
+            report.source_wal_original_bytes
+        );
+        let split = report.source_wal_accepted_prefix_bytes as usize;
+        assert_eq!(&original[..split], accepted_prefix.as_slice());
+        let mut reconstructed = original[..split].to_vec();
+        reconstructed.extend_from_slice(&original[split..]);
+        assert_eq!(reconstructed, original);
 
         fs::remove_dir_all(data_dir).unwrap();
         fs::remove_file(snapshot_path).unwrap();

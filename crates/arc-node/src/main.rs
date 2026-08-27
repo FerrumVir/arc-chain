@@ -561,42 +561,62 @@ fn recovery_trust(
 fn print_recovery_summary(
     checkpoint: &arc_state::recovery::ArcCheckpoint,
     status: &str,
+    source_wal: Option<&arc_state::recovery::LegacyWalBoundaryReport>,
 ) -> Result<()> {
     let transition = checkpoint.manifest.transition_block()?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "status": status,
-            "manifest_hash": format!("0x{}", checkpoint.manifest_hash().to_hex()),
-            "payload_hash": format!("0x{}", checkpoint.manifest.payload_hash.to_hex()),
-            "full_state_root": format!("0x{}", checkpoint.manifest.full_state_root.to_hex()),
-            "chain_id": checkpoint.manifest.chain_id,
-            "genesis_hash": format!("0x{}", checkpoint.manifest.genesis_hash.to_hex()),
-            "source_height": checkpoint.manifest.source_height,
-            "source_block_hash": format!("0x{}", checkpoint.manifest.source_block_hash.to_hex()),
-            "source_state_root": format!("0x{}", checkpoint.manifest.source_state_root.to_hex()),
-            "source_consensus_round": checkpoint.manifest.source_consensus_round,
-            "created_at_unix_ms": checkpoint.manifest.created_at_unix_ms,
-            "transition_height": transition.header.height,
-            "transition_block_hash": format!("0x{}", transition.hash.to_hex()),
-            "recovery_domain": format!("0x{}", checkpoint.manifest.recovery_context().domain_hash().to_hex()),
-            "recovery_epoch": checkpoint.manifest.recovery_epoch,
-            "validator_set_id": checkpoint.manifest.validator_set_id,
-            "protocol_version": format!(
-                "{}.{}.{}",
-                checkpoint.manifest.protocol_version.major,
-                checkpoint.manifest.protocol_version.minor,
-                checkpoint.manifest.protocol_version.patch,
-            ),
-            "validator_count": checkpoint.manifest.validators.len(),
-            "signature_count": checkpoint.signatures.len(),
-            "source_validator_count": checkpoint.payload.validators.len(),
-            "source_validator_stake": checkpoint.payload.staking_pool,
-            "source_validator_set_hash": format!("0x{}", checkpoint.payload.source_validator_set_hash().to_hex()),
-            "community_reward_issuance_policy": arc_state::community_reward_issuance_policy(),
-            "community_reward_issuance_policy_hash": format!("0x{}", arc_state::community_reward_issuance_policy_hash().to_hex()),
-        }))?
-    );
+    let mut summary = serde_json::json!({
+        "status": status,
+        "manifest_hash": format!("0x{}", checkpoint.manifest_hash().to_hex()),
+        "payload_hash": format!("0x{}", checkpoint.manifest.payload_hash.to_hex()),
+        "full_state_root": format!("0x{}", checkpoint.manifest.full_state_root.to_hex()),
+        "chain_id": checkpoint.manifest.chain_id,
+        "genesis_hash": format!("0x{}", checkpoint.manifest.genesis_hash.to_hex()),
+        "source_height": checkpoint.manifest.source_height,
+        "source_block_hash": format!("0x{}", checkpoint.manifest.source_block_hash.to_hex()),
+        "source_state_root": format!("0x{}", checkpoint.manifest.source_state_root.to_hex()),
+        "source_consensus_round": checkpoint.manifest.source_consensus_round,
+        "created_at_unix_ms": checkpoint.manifest.created_at_unix_ms,
+        "transition_height": transition.header.height,
+        "transition_block_hash": format!("0x{}", transition.hash.to_hex()),
+        "recovery_domain": format!("0x{}", checkpoint.manifest.recovery_context().domain_hash().to_hex()),
+        "recovery_epoch": checkpoint.manifest.recovery_epoch,
+        "validator_set_id": checkpoint.manifest.validator_set_id,
+        "protocol_version": format!(
+            "{}.{}.{}",
+            checkpoint.manifest.protocol_version.major,
+            checkpoint.manifest.protocol_version.minor,
+            checkpoint.manifest.protocol_version.patch,
+        ),
+        "validator_count": checkpoint.manifest.validators.len(),
+        "signature_count": checkpoint.signatures.len(),
+        "source_validator_count": checkpoint.payload.validators.len(),
+        "source_validator_stake": checkpoint.payload.staking_pool,
+        "source_validator_set_hash": format!("0x{}", checkpoint.payload.source_validator_set_hash().to_hex()),
+        "community_reward_issuance_policy": arc_state::community_reward_issuance_policy(),
+        "community_reward_issuance_policy_hash": format!("0x{}", arc_state::community_reward_issuance_policy_hash().to_hex()),
+    });
+    if let Some(source_wal) = source_wal {
+        let summary = summary
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("recovery summary is not a JSON object"))?;
+        summary.insert(
+            "source_wal_original_bytes".into(),
+            source_wal.source_wal_original_bytes.into(),
+        );
+        summary.insert(
+            "source_wal_accepted_prefix_bytes".into(),
+            source_wal.source_wal_accepted_prefix_bytes.into(),
+        );
+        summary.insert(
+            "source_wal_quarantined_tail_bytes".into(),
+            source_wal.source_wal_quarantined_tail_bytes.into(),
+        );
+        summary.insert(
+            "source_wal_tail_reason".into(),
+            source_wal.source_wal_tail_reason.clone().into(),
+        );
+    }
+    println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
 
@@ -979,7 +999,7 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
     match command {
         RecoveryCommand::Inspect { checkpoint } => {
             let checkpoint = arc_state::recovery::ArcCheckpoint::read_from(checkpoint)?;
-            print_recovery_summary(&checkpoint, "UNTRUSTED_INSPECTION")
+            print_recovery_summary(&checkpoint, "UNTRUSTED_INSPECTION", None)
         }
         RecoveryCommand::Export {
             data_dir,
@@ -1009,7 +1029,7 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
                 public_set == approved_set,
                 "validator public-key file addresses/stakes differ from the complete genesis set"
             );
-            let state = StateDB::load_legacy_recovery_export_source(
+            let (state, source_wal) = StateDB::load_legacy_recovery_export_source_with_report(
                 &data_dir,
                 network.genesis_hash,
                 allow_unbound_legacy_wal,
@@ -1040,7 +1060,7 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
             )?;
             checkpoint.verify_content()?;
             checkpoint.write_to(&output)?;
-            print_recovery_summary(&checkpoint, "EXPORTED_UNSIGNED")
+            print_recovery_summary(&checkpoint, "EXPORTED_UNSIGNED", Some(&source_wal))
         }
         RecoveryCommand::Sign {
             checkpoint,
@@ -1062,7 +1082,7 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
             let keypair = validator_identity::load_ed25519_keyfile(Path::new(&validator_key_file))?;
             checkpoint.add_signature(&keypair)?;
             checkpoint.write_to(&output)?;
-            print_recovery_summary(&checkpoint, "SIGNED_CANDIDATE")
+            print_recovery_summary(&checkpoint, "SIGNED_CANDIDATE", None)
         }
         RecoveryCommand::Verify {
             checkpoint,
@@ -1079,7 +1099,7 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
                 validator_set_id,
             )?;
             checkpoint.verify(&trust)?;
-            print_recovery_summary(&checkpoint, "VERIFIED_QUORUM")
+            print_recovery_summary(&checkpoint, "VERIFIED_QUORUM", None)
         }
         RecoveryCommand::Import {
             checkpoint,
