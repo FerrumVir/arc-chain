@@ -589,11 +589,18 @@ pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
 /// a successful prefix. ARCCHKPT nodes fail closed so a restart cannot expose
 /// partially replayed consensus state as canonical.
 pub fn read_wal_strict(path: impl AsRef<Path>) -> std::io::Result<Vec<WalEntry>> {
+    let mut expected_sequence = 0u64;
+    read_wal_strict_segment(path.as_ref(), &mut expected_sequence)
+}
+
+fn read_wal_strict_segment(
+    path: &Path,
+    expected_sequence: &mut u64,
+) -> std::io::Result<Vec<WalEntry>> {
     const MAX_ENTRY_BYTES: usize = 1024 * 1024 * 1024;
-    let file = File::open(path.as_ref())?;
+    let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut entries = Vec::new();
-    let mut expected_sequence = 0u64;
 
     loop {
         let mut len_buf = [0u8; 4];
@@ -635,16 +642,17 @@ pub fn read_wal_strict(path: impl AsRef<Path>) -> std::io::Result<Vec<WalEntry>>
                 format!("WAL checksum mismatch at sequence {}", entry.sequence),
             ));
         }
-        if entry.sequence != expected_sequence {
+        if entry.sequence != *expected_sequence {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
-                    "WAL sequence gap: expected {expected_sequence}, got {}",
+                    "WAL sequence gap: expected {}, got {}",
+                    *expected_sequence,
                     entry.sequence
                 ),
             ));
         }
-        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+        *expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL sequence overflow")
         })?;
         entries.push(entry);
@@ -660,6 +668,24 @@ pub fn read_wal_dir(dir: impl AsRef<Path>) -> Vec<WalEntry> {
         all_entries.extend(read_wal(&seg_path));
     }
     all_entries
+}
+
+/// Strictly read every segmented WAL entry with one continuous sequence.
+///
+/// Recovery-domain DAG startup uses this instead of [`read_wal_dir`] so a
+/// corrupt/torn frame, a missing segment, or a cross-segment sequence gap
+/// aborts startup rather than silently accepting a valid-looking prefix.
+pub fn read_wal_dir_strict(dir: impl AsRef<Path>) -> std::io::Result<Vec<WalEntry>> {
+    let segments = WalWriter::list_segments(dir.as_ref());
+    let mut expected_sequence = 0u64;
+    let mut all_entries = Vec::new();
+    for segment in segments {
+        all_entries.extend(read_wal_strict_segment(
+            &segment,
+            &mut expected_sequence,
+        )?);
+    }
+    Ok(all_entries)
 }
 
 /// Find the highest `block_height` recorded in any WAL segment under `dir`.
