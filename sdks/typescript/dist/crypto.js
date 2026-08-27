@@ -5,42 +5,9 @@
  * Ed25519 key pair generation, signing, verification, and BLAKE3 address
  * derivation using @noble/ed25519 and @noble/hashes.
  */
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.KeyPair = void 0;
-const ed = __importStar(require("@noble/ed25519"));
+const ed25519_js_1 = require("@noble/curves/ed25519.js");
 const blake3_1 = require("@noble/hashes/blake3");
 const utils_1 = require("@noble/hashes/utils");
 /**
@@ -59,8 +26,8 @@ class KeyPair {
      * Generate a random Ed25519 key pair.
      */
     static async generate() {
-        const privateKey = ed.utils.randomPrivateKey();
-        const publicKey = await ed.getPublicKeyAsync(privateKey);
+        const privateKey = ed25519_js_1.ed25519.utils.randomSecretKey();
+        const publicKey = ed25519_js_1.ed25519.getPublicKey(privateKey);
         return new KeyPair(privateKey, publicKey);
     }
     /**
@@ -70,7 +37,7 @@ class KeyPair {
         if (seed.length !== 32) {
             throw new Error(`Seed must be exactly 32 bytes, got ${seed.length}`);
         }
-        const publicKey = await ed.getPublicKeyAsync(seed);
+        const publicKey = ed25519_js_1.ed25519.getPublicKey(seed);
         return new KeyPair(seed, publicKey);
     }
     /**
@@ -85,14 +52,14 @@ class KeyPair {
      * Sign a message and return the 64-byte Ed25519 signature.
      */
     async sign(message) {
-        return ed.signAsync(message, this._privateKey);
+        return ed25519_js_1.ed25519.sign(message, this._privateKey);
     }
     /**
      * Verify a signature against a message using this key pair's public key.
      */
     async verify(message, signature) {
         try {
-            return await ed.verifyAsync(signature, message, this._publicKey);
+            return ed25519_js_1.ed25519.verify(signature, message, this._publicKey);
         }
         catch {
             return false;
@@ -103,7 +70,7 @@ class KeyPair {
      */
     static async verifyWithPublicKey(publicKey, message, signature) {
         try {
-            return await ed.verifyAsync(signature, message, publicKey);
+            return ed25519_js_1.ed25519.verify(signature, message, publicKey);
         }
         catch {
             return false;
