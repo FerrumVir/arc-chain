@@ -58,7 +58,12 @@ jobs:
             scripts/install-node.sh \
             scripts/auto-update.sh \
             scripts/sero-quickstart.sh \
-            scripts/release/assemble-release.sh \
+            scripts/release/assemble-release.sh
+          # Contract tests intentionally single-quote literal shell/GitHub
+          # expressions and source fixture-selected helpers. Keep production
+          # scripts on ShellCheck's full policy while suppressing only those
+          # two inapplicable diagnostics in the test harness.
+          shellcheck --exclude=SC1090,SC2016 \
             tests/release/*.sh \
             tests/release/helpers/*.sh
 
