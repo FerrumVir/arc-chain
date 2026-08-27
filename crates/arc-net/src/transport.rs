@@ -756,16 +756,39 @@ impl<S> PeerConnections<S> {
         }
     }
 
-    /// Atomically claim a validator-address slot for one connection. This
-    /// closes the check-then-insert dual-dial race: exactly one concurrent
-    /// handshake wins and owns the returned generation.
-    fn try_insert(&self, key: [u8; 32], send: S, dial_addr: SocketAddr, stake: u64) -> Option<u64> {
+    /// Atomically install the newest authenticated connection generation for
+    /// one fixed validator identity.
+    ///
+    /// A clean process restart can leave the remote QUIC generation writable
+    /// in the kernel for substantially longer than the validator process is
+    /// alive. Refusing the replacement until that stale stream times out makes
+    /// a rolling restart look like a partition. The validator TLS certificate
+    /// and exporter-bound handshake are verified before this method is called,
+    /// so replacing this one identity's slot cannot admit a new member or grow
+    /// the fixed connection set. Generation-checked cleanup below prevents the
+    /// superseded reader from removing its replacement.
+    fn install_generation(
+        &self,
+        key: [u8; 32],
+        send: S,
+        dial_addr: SocketAddr,
+        stake: u64,
+    ) -> (u64, Option<u64>) {
         use dashmap::mapref::entry::Entry;
 
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         match self.peers.entry(key) {
-            Entry::Occupied(_) => None,
+            Entry::Occupied(mut entry) => {
+                let previous_id = entry.get().connection_id;
+                entry.insert(PeerConnection {
+                    connection_id,
+                    send,
+                    dial_addr,
+                    stake,
+                });
+                (connection_id, Some(previous_id))
+            }
             Entry::Vacant(entry) => {
-                let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
                 entry.insert(PeerConnection {
                     connection_id,
                     send,
@@ -773,7 +796,7 @@ impl<S> PeerConnections<S> {
                     stake,
                 });
                 self.peer_count.fetch_add(1, Ordering::Relaxed);
-                Some(connection_id)
+                (connection_id, None)
             }
         }
     }
@@ -1613,16 +1636,12 @@ async fn run_transport_inner(
                 let remote_addr = conn.remote_address();
                 info!("Incoming connection from {}", remote_addr);
 
-                // A validator transport has no peers beyond the fixed set.
-                let max_validator_peers = allowed_validators.len().saturating_sub(1) as u32;
-                if peer_count.load(Ordering::Relaxed) >= max_validator_peers {
-                    warn!(
-                        "Fixed validator connection limit reached ({}), rejecting {}",
-                        max_validator_peers,
-                        remote_addr
-                    );
-                    continue;
-                }
+                // Do not reject solely because every fixed validator-address
+                // slot is occupied. This connection may be the authenticated
+                // replacement for a stale pre-restart generation. Mutual TLS,
+                // the exporter-bound application handshake, and the fixed
+                // allowlist run before the address slot is installed; the map
+                // therefore remains bounded by the configured validator set.
                 let Ok(handshake_permit) = handshake_slots.clone().try_acquire_owned() else {
                     warn!("Validator handshake concurrency limit reached, rejecting {}", remote_addr);
                     continue;
@@ -1826,34 +1845,24 @@ async fn dial_peer(
         return Ok(());
     }
 
-    // Skip if already connected - prevents the dual-dial race where both
-    // nodes dial each other and the second insert overwrites the first's
-    // SendStream. The old recv handler's cleanup then removes the new entry.
-    if connections.is_connected(&remote.validator_address.0) {
-        info!(
-            "Already connected to {} (dial), skipping duplicate",
-            remote.validator_address
-        );
-        return Ok(());
-    }
-
     info!(
         "Handshake verified with {} (stake: {}, dial: {})",
         remote.validator_address, remote.stake, dial_addr
     );
 
-    // Atomically register peer + metadata. A simultaneous inbound/outbound
-    // handshake for the same validator can pass the fast check above; only one
-    // may claim the address slot.
-    let Some(connection_id) =
-        connections.try_insert(remote.validator_address.0, send, dial_addr, remote.stake)
-    else {
+    // Atomically install the newest authenticated generation. A delayed reader
+    // cleanup from the old generation is generation-checked below and cannot
+    // remove this replacement.
+    let (connection_id, replaced_generation) =
+        connections.install_generation(remote.validator_address.0, send, dial_addr, remote.stake);
+    if let Some(replaced_generation) = replaced_generation {
         info!(
             peer = %remote.validator_address,
-            "Concurrent connection already won validator slot (dial)"
+            replaced_generation,
+            connection_id,
+            "Replaced authenticated validator connection generation (dial)"
         );
-        return Ok(());
-    };
+    }
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
             address: remote.validator_address,
@@ -1954,30 +1963,24 @@ async fn accept_peer(conn: quinn::Connection, ctx: &PeerContext) -> anyhow::Resu
         return Ok(());
     }
 
-    // Skip if already connected (dual-dial dedup)
-    if connections.is_connected(&remote.validator_address.0) {
-        info!(
-            "Already connected to {} (accept), skipping duplicate",
-            remote.validator_address
-        );
-        return Ok(());
-    }
-
     info!(
         "Accepted verified peer {} (stake: {}, dial: {})",
         remote.validator_address, remote.stake, dial_addr
     );
 
-    // Atomic address-slot claim closes the dual-dial check/insert race.
-    let Some(connection_id) =
-        connections.try_insert(remote.validator_address.0, send, dial_addr, remote.stake)
-    else {
+    // Replace only this already-authenticated validator identity's generation.
+    // The fixed allowlist above bounds the address map; replacement keeps the
+    // peer count constant and makes a clean rolling restart immediately usable.
+    let (connection_id, replaced_generation) =
+        connections.install_generation(remote.validator_address.0, send, dial_addr, remote.stake);
+    if let Some(replaced_generation) = replaced_generation {
         info!(
             peer = %remote.validator_address,
-            "Concurrent connection already won validator slot (accept)"
+            replaced_generation,
+            connection_id,
+            "Replaced authenticated validator connection generation (accept)"
         );
-        return Ok(());
-    };
+    }
     let _ = inbound_tx
         .send(InboundMessage::PeerConnected {
             address: remote.validator_address,
@@ -2809,25 +2812,26 @@ mod tests {
     }
 
     #[test]
-    fn validator_slot_has_only_one_concurrent_owner() {
+    fn authenticated_reconnect_replaces_only_the_same_validator_slot() {
         let (connections, peer_count) = test_connections();
         let peer = [3_u8; 32];
         let dial_addr: SocketAddr = "127.0.0.1:7331".parse().unwrap();
 
-        let connection_id = connections
-            .try_insert(peer, (), dial_addr, 500_000)
-            .expect("first connection should own the validator slot");
-        assert!(
-            connections
-                .try_insert(peer, (), dial_addr, 500_000)
-                .is_none()
-        );
+        let (first_id, replaced) = connections.install_generation(peer, (), dial_addr, 500_000);
+        assert_eq!(replaced, None);
+        let (replacement_id, replaced) =
+            connections.install_generation(peer, (), dial_addr, 500_000);
+        assert_eq!(replaced, Some(first_id));
+        assert!(replacement_id > first_id);
         assert_eq!(connections.peers.len(), 1);
         assert_eq!(peer_count.load(Ordering::Relaxed), 1);
         assert_eq!(
             connections.peers.get(&peer).unwrap().connection_id,
-            connection_id
+            replacement_id
         );
+        assert!(!connections.remove_if_current(&peer, first_id));
+        assert!(connections.remove_if_current(&peer, replacement_id));
+        assert_eq!(peer_count.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -2836,13 +2840,12 @@ mod tests {
         let peer = [9_u8; 32];
         let dial_addr: SocketAddr = "127.0.0.1:7332".parse().unwrap();
 
-        let old_id = connections
-            .try_insert(peer, (), dial_addr, 500_000)
-            .unwrap();
+        let (old_id, replaced) = connections.install_generation(peer, (), dial_addr, 500_000);
+        assert_eq!(replaced, None);
         assert!(connections.remove_if_current(&peer, old_id));
-        let replacement_id = connections
-            .try_insert(peer, (), dial_addr, 500_000)
-            .unwrap();
+        let (replacement_id, replaced) =
+            connections.install_generation(peer, (), dial_addr, 500_000);
+        assert_eq!(replaced, None);
         assert!(replacement_id > old_id);
 
         // The old reader exits after the replacement has claimed the same
