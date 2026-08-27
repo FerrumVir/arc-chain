@@ -127,6 +127,13 @@ desktop_e2e() {
 }
 
 desktop_tauri_tests() {
+    # `tauri::generate_context!()` validates frontendDist at compile time.
+    # Build it here just as CI does so this gate also works from a pristine
+    # checkout instead of succeeding only when a developer has stale dist/.
+    (
+        cd desktop &&
+            npm run build
+    )
     cargo +stable test --manifest-path desktop/src-tauri/Cargo.toml --all-targets --locked
 }
 

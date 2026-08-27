@@ -255,7 +255,7 @@ struct Cli {
     /// Allow this validator to issue the v1, job-bound community inference
     /// reward transaction after a worker result is verified.
     ///
-    /// Keep this OFF while any validator still runs a pre-v0.7.12 binary:
+    /// Keep this OFF while any validator still runs a pre-v0.8.0 binary:
     /// older nodes cannot decode the new transaction variant. Deploy the new
     /// binary to the entire validator set first, verify one chain tip/state
     /// root, and commit one future
