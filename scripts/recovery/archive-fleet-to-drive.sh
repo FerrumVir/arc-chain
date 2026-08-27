@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Freeze all six legacy validators, create local immutable archives, and copy
-# them to the operator-authorized Google Drive remote. Dry-run is the default.
+# Freeze all six legacy validators, create immutable public-chain recovery
+# bundles, and copy them to the operator-authorized Google Drive remote.
+# Private identities and bulky reproducible caches/traces never leave the
+# validator disks. Dry-run is the default.
 set -Eeuo pipefail
 umask 077
 
@@ -27,8 +29,11 @@ Usage:
   ARC_RECOVERY_GO='GO SHA256' archive-fleet-to-drive.sh --manifest SHA256 --execute
 
 The default --plan is read-only. --execute stops all six legacy arc-node
-processes cleanly, creates one archive on each validator without deleting any
-legacy data, and uploads those archives to the configured Google Drive remote.
+processes cleanly, creates one public-chain recovery bundle on each validator
+without deleting any legacy data, and uploads those bundles to the configured
+Google Drive remote. Bundles contain canonical state history and exact public
+runtime inputs/evidence; private keys, service secrets, build caches, models,
+Git objects, and legacy DAG traces remain only on the untouched node disks.
 EOF
 }
 

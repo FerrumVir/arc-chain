@@ -115,6 +115,23 @@ On failure, the orchestrator stops/disables only the newly installed v3
 services. It does not delete imported data, artifacts, configs, journals, or
 the old archived fleet and never falls back to compromised identities.
 
+### Efficient legacy archive
+
+`archive-fleet-to-drive.sh` is plan-only by default and shares the same exact
+`GO <sealed-manifest-sha256>` execution boundary. At the final freeze it stops
+all six legacy processes cleanly, then uploads one hash-checked public-chain
+recovery bundle per host to `arc-drive:ARC Chain Recovery/<manifest hash>`.
+Each bundle contains the stopped canonical `state.wal` (including retained
+blocks, transactions, receipts, and accounts), exact public binary/genesis
+inputs, and pre-stop health/latest-block/DAG-round/validator evidence.
+
+It intentionally does not upload private identities, service environments,
+build caches, model weights, Git objects, or tens of gigabytes of legacy DAG
+trace per host. Those bytes remain untouched on each validator disk. The
+signed checkpoint independently binds canonical H/hash/root and the captured
+source consensus round, so excluding the non-canonical DAG trace cannot make
+block history appear reset or change the recovery boundary.
+
 ## Reward gates
 
 `checks.reward.mode: "policy"` verifies all six `/community/reward_policy`
