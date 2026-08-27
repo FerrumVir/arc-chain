@@ -169,6 +169,7 @@ fn verify_peer_state_diff(
 /// Verify that peer-supplied transaction bodies are the exact preimages for a
 /// DAG block's canonical hash list. The returned copies carry a process-local
 /// verification cache bit; that bit is never accepted from the wire.
+#[cfg(test)]
 fn verify_peer_dag_transactions(
     committed_hashes: &[Hash256],
     transactions: &[arc_types::Transaction],
