@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 // ── WAL Types ───────────────────────────────────────────────────────────────
@@ -82,11 +82,125 @@ enum WalCommand {
     /// so the on-disk format is unchanged.
     Append(Box<WalEntry>),
     /// Flush all pending writes and fsync.
-    Sync(channel::Sender<()>),
+    Sync(channel::Sender<Result<(), WalError>>),
     /// Rotate: close the current segment, open a new one.
-    Rotate(channel::Sender<()>),
+    Rotate(channel::Sender<Result<(), WalError>>),
     /// Shutdown the writer thread.
-    Shutdown,
+    Shutdown(channel::Sender<Result<(), WalError>>),
+    #[cfg(test)]
+    Disconnect,
+}
+
+/// A fatal WAL writer failure. The first failure is retained for the lifetime
+/// of the writer so callers cannot accidentally resume after durability was
+/// lost.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WalError {
+    operation: &'static str,
+    kind: std::io::ErrorKind,
+    message: String,
+}
+
+impl WalError {
+    fn io(operation: &'static str, error: &std::io::Error) -> Self {
+        Self {
+            operation,
+            kind: error.kind(),
+            message: error.to_string(),
+        }
+    }
+
+    fn message(
+        operation: &'static str,
+        kind: std::io::ErrorKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            operation,
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// The operation that first made the WAL unhealthy.
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    /// The underlying I/O error category.
+    pub fn kind(&self) -> std::io::ErrorKind {
+        self.kind
+    }
+}
+
+impl std::fmt::Display for WalError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "WAL {} failed ({:?}): {}",
+            self.operation, self.kind, self.message
+        )
+    }
+}
+
+impl std::error::Error for WalError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum WalFaultPoint {
+    ChecksumSerialization = 1,
+    EntrySerialization = 2,
+    Write = 3,
+    Flush = 4,
+    Fsync = 5,
+    Rotation = 6,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct WalFaultInjector {
+    next: std::sync::atomic::AtomicU8,
+}
+
+#[cfg(not(test))]
+#[derive(Default)]
+struct WalFaultInjector;
+
+impl WalFaultInjector {
+    fn new() -> Self {
+        #[cfg(test)]
+        {
+            Self::default()
+        }
+        #[cfg(not(test))]
+        {
+            Self
+        }
+    }
+
+    #[inline]
+    fn check(&self, point: WalFaultPoint) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self
+            .next
+            .compare_exchange(point as u8, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Err(std::io::Error::other(format!(
+                "injected WAL {point:?} failure"
+            )));
+        }
+
+        #[cfg(not(test))]
+        let _ = point;
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn inject(&self, point: WalFaultPoint) {
+        self.next.store(point as u8, Ordering::Release);
+    }
 }
 
 // ── WAL Writer ──────────────────────────────────────────────────────────────
@@ -98,6 +212,9 @@ pub struct WalWriter {
     sequence: AtomicU64,
     handle: Option<thread::JoinHandle<()>>,
     shutdown: Arc<AtomicBool>,
+    failure: Arc<OnceLock<WalError>>,
+    faults: Arc<WalFaultInjector>,
+    is_null: bool,
     /// Directory containing WAL segment files.
     wal_dir: PathBuf,
 }
@@ -107,12 +224,19 @@ impl WalWriter {
     /// Spawns a background thread for async I/O.
     pub fn new(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let existed = path.exists();
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        if !existed {
+            Self::sync_parent_directory(&path)?;
+        }
         let mut writer = BufWriter::with_capacity(256 * 1024, file); // 256KB buffer
 
         let (sender, receiver): (Sender<WalCommand>, Receiver<WalCommand>) = channel::unbounded();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
+        let failure = Arc::new(OnceLock::new());
+        let failure_clone = failure.clone();
+        let faults = Arc::new(WalFaultInjector::new());
+        let faults_clone = faults.clone();
 
         // The WAL directory is the parent of the WAL file path.
         let wal_dir = path
@@ -127,7 +251,15 @@ impl WalWriter {
         let handle = thread::Builder::new()
             .name("wal-writer".into())
             .spawn(move || {
-                Self::writer_loop(&mut writer, &receiver, &shutdown_clone, &writer_path, 0, 0);
+                Self::writer_loop(
+                    &mut writer,
+                    &receiver,
+                    &failure_clone,
+                    &faults_clone,
+                    &writer_path,
+                    0,
+                    0,
+                );
             })?;
 
         Ok(Self {
@@ -135,6 +267,9 @@ impl WalWriter {
             sequence: AtomicU64::new(seq),
             handle: Some(handle),
             shutdown,
+            failure,
+            faults,
+            is_null: false,
             wal_dir,
         })
     }
@@ -152,15 +287,22 @@ impl WalWriter {
 
         // Find the latest segment or create segment 0
         let (segment_number, seg_path) = Self::find_latest_segment(&wal_dir);
+        let segment_existed = seg_path.exists();
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&seg_path)?;
+        if !segment_existed {
+            Self::sync_parent_directory(&seg_path)?;
+        }
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
         let (sender, receiver): (Sender<WalCommand>, Receiver<WalCommand>) = channel::unbounded();
         let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = shutdown.clone();
+        let failure = Arc::new(OnceLock::new());
+        let failure_clone = failure.clone();
+        let faults = Arc::new(WalFaultInjector::new());
+        let faults_clone = faults.clone();
 
         let dir_clone = wal_dir.clone();
         let handle = thread::Builder::new()
@@ -169,7 +311,8 @@ impl WalWriter {
                 Self::writer_loop(
                     &mut writer,
                     &receiver,
-                    &shutdown_clone,
+                    &failure_clone,
+                    &faults_clone,
                     &dir_clone,
                     segment_number,
                     max_segment_size,
@@ -184,6 +327,9 @@ impl WalWriter {
             sequence: AtomicU64::new(seq),
             handle: Some(handle),
             shutdown,
+            failure,
+            faults,
+            is_null: false,
             wal_dir,
         })
     }
@@ -197,6 +343,9 @@ impl WalWriter {
             sequence: AtomicU64::new(0),
             handle: None,
             shutdown: Arc::new(AtomicBool::new(false)),
+            failure: Arc::new(OnceLock::new()),
+            faults: Arc::new(WalFaultInjector::new()),
+            is_null: true,
             wal_dir: PathBuf::new(),
         }
     }
@@ -212,15 +361,56 @@ impl WalWriter {
         self.handle.is_some()
     }
 
+    /// Return the first fatal writer failure, if persistence is unhealthy.
+    pub fn failure(&self) -> Option<WalError> {
+        self.failure.get().cloned()
+    }
+
+    /// Fail if the writer has lost its durability guarantee.
+    pub fn check_health(&self) -> Result<(), WalError> {
+        if self.is_null {
+            return Ok(());
+        }
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(WalError::message(
+                "health check",
+                std::io::ErrorKind::BrokenPipe,
+                "writer is shut down",
+            ));
+        }
+        Ok(())
+    }
+
     /// Non-blocking. Sends an entry to the background writer.
     pub fn append(&self, op: WalOp, block_height: u64) {
         // Null WAL: no writer thread, no handle → skip serialize/send entirely
-        if self.handle.is_none() {
+        if self.is_null {
+            return;
+        }
+
+        if self.check_health().is_err() {
             return;
         }
 
         let seq = self.sequence.fetch_add(1, Ordering::Relaxed);
-        let payload = bincode::serialize(&(&block_height, &seq, &op)).unwrap_or_default();
+        if let Err(error) = self.faults.check(WalFaultPoint::ChecksumSerialization) {
+            self.latch(WalError::io("checksum serialization", &error));
+            return;
+        }
+        let payload = match bincode::serialize(&(&block_height, &seq, &op)) {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.latch(WalError::message(
+                    "checksum serialization",
+                    std::io::ErrorKind::InvalidData,
+                    error.to_string(),
+                ));
+                return;
+            }
+        };
         let checksum = crc32fast::hash(&payload);
 
         let entry = WalEntry {
@@ -230,36 +420,69 @@ impl WalWriter {
             checksum,
         };
 
-        // Best effort - if the channel is full or disconnected, we log and continue.
-        // In production, this should never happen (writer is faster than execution).
         if self
             .sender
             .send(WalCommand::Append(Box::new(entry)))
             .is_err()
         {
-            tracing::error!("WAL writer channel disconnected");
+            self.latch(WalError::message(
+                "append channel send",
+                std::io::ErrorKind::BrokenPipe,
+                "writer channel disconnected",
+            ));
         }
     }
 
     /// Blocks until all pending entries are fsynced to disk.
     /// Call at block boundaries for durability guarantees.
-    pub fn sync(&self) {
-        let (done_tx, done_rx) = channel::bounded(1);
-        if self.sender.send(WalCommand::Sync(done_tx)).is_ok() {
-            let _ = done_rx.recv();
+    pub fn sync(&self) -> Result<(), WalError> {
+        if self.is_null {
+            return Ok(());
         }
+        self.check_health()?;
+        let (done_tx, done_rx) = channel::bounded(1);
+        self.sender.send(WalCommand::Sync(done_tx)).map_err(|_| {
+            self.latch(WalError::message(
+                "sync channel send",
+                std::io::ErrorKind::BrokenPipe,
+                "writer channel disconnected",
+            ))
+        })?;
+        done_rx.recv().map_err(|_| {
+            self.failure().unwrap_or_else(|| {
+                self.latch(WalError::message(
+                    "sync acknowledgement",
+                    std::io::ErrorKind::BrokenPipe,
+                    "writer exited before acknowledging fsync",
+                ))
+            })
+        })?
     }
 
     /// Request the writer thread to rotate: close the current segment file
     /// and open a new one. Blocks until rotation is complete.
-    pub fn rotate(&self) {
-        if self.handle.is_none() {
-            return;
+    pub fn rotate(&self) -> Result<(), WalError> {
+        if self.is_null {
+            return Ok(());
         }
+        self.check_health()?;
         let (done_tx, done_rx) = channel::bounded(1);
-        if self.sender.send(WalCommand::Rotate(done_tx)).is_ok() {
-            let _ = done_rx.recv();
-        }
+        self.sender.send(WalCommand::Rotate(done_tx)).map_err(|_| {
+            self.latch(WalError::message(
+                "rotation channel send",
+                std::io::ErrorKind::BrokenPipe,
+                "writer channel disconnected",
+            ))
+        })?;
+        done_rx.recv().map_err(|_| {
+            self.failure().unwrap_or_else(|| {
+                self.latch(WalError::message(
+                    "rotation acknowledgement",
+                    std::io::ErrorKind::BrokenPipe,
+                    "writer exited before acknowledging rotation",
+                ))
+            })
+        })?
     }
 
     /// Delete WAL segment files whose entries are all before the given sequence number.
@@ -313,22 +536,58 @@ impl WalWriter {
         Ok(deleted)
     }
 
-    /// Shut down the WAL writer, flushing all remaining entries.
-    pub fn shutdown(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-        let _ = self.sender.send(WalCommand::Shutdown);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+    /// Shut down the WAL writer, flushing and fsyncing all remaining entries.
+    pub fn shutdown(&mut self) -> Result<(), WalError> {
+        if self.is_null || self.handle.is_none() {
+            return self.failure().map_or(Ok(()), Err);
         }
+
+        self.shutdown.store(true, Ordering::Release);
+        let (done_tx, done_rx) = channel::bounded(1);
+        let send_result = self.sender.send(WalCommand::Shutdown(done_tx));
+        let acknowledgement = if send_result.is_ok() {
+            done_rx.recv().ok()
+        } else {
+            None
+        };
+
+        let join_result = self.handle.take().expect("WAL handle checked above").join();
+
+        if let Some(error) = self.failure() {
+            return Err(error);
+        }
+        if send_result.is_err() {
+            return Err(self.latch(WalError::message(
+                "shutdown channel send",
+                std::io::ErrorKind::BrokenPipe,
+                "writer channel disconnected",
+            )));
+        }
+        if join_result.is_err() {
+            return Err(self.latch(WalError::message(
+                "writer thread join",
+                std::io::ErrorKind::Other,
+                "writer thread panicked",
+            )));
+        }
+        acknowledgement.unwrap_or_else(|| {
+            Err(self.latch(WalError::message(
+                "shutdown acknowledgement",
+                std::io::ErrorKind::BrokenPipe,
+                "writer exited before acknowledging shutdown",
+            )))
+        })
     }
 
-    /// The background writer loop. Receives entries, writes them, periodically flushes.
+    /// The background writer loop. Receives entries, writes them, and flushes
+    /// each drained batch. Any failure is fatal and permanently latched.
     /// Handles Rotate commands by closing the current file and opening a new segment.
     /// When `max_segment_size > 0`, automatically rotates after the segment exceeds that size.
     fn writer_loop(
         writer: &mut BufWriter<File>,
         receiver: &Receiver<WalCommand>,
-        _shutdown: &AtomicBool,
+        failure: &OnceLock<WalError>,
+        faults: &WalFaultInjector,
         wal_path: &Path,
         initial_segment: u64,
         max_segment_size: u64,
@@ -341,92 +600,178 @@ impl WalWriter {
         // Track bytes written to the current segment for auto-rotation.
         let mut bytes_written: u64 = writer.get_ref().metadata().map(|m| m.len()).unwrap_or(0);
 
-        /// Helper: check if auto-rotation is needed and perform it.
-        fn maybe_auto_rotate(
-            writer: &mut BufWriter<File>,
-            wal_path: &Path,
-            is_dir: bool,
-            segment_number: &mut u64,
-            bytes_written: &mut u64,
-            max_segment_size: u64,
-        ) {
-            if max_segment_size > 0 && *bytes_written >= max_segment_size {
-                WalWriter::do_rotate(writer, wal_path, is_dir, segment_number);
-                *bytes_written = 0;
-            }
-        }
-
+        let mut deferred = None;
         loop {
-            match receiver.recv() {
-                Ok(WalCommand::Append(entry)) => {
-                    // Serialize entry with a length prefix (4 bytes LE)
-                    if let Ok(data) = bincode::serialize(&entry) {
-                        let entry_size = 4 + data.len() as u64;
-                        let len = (data.len() as u32).to_le_bytes();
-                        let _ = writer.write_all(&len);
-                        let _ = writer.write_all(&data);
-                        bytes_written += entry_size;
+            let command = match deferred.take() {
+                Some(command) => command,
+                None => match receiver.recv() {
+                    Ok(command) => command,
+                    Err(_) => {
+                        if let Err(error) = Self::flush_and_sync(writer, faults) {
+                            Self::latch_shared(failure, error);
+                        }
+                        return;
                     }
+                },
+            };
 
-                    // Drain any buffered entries without blocking
-                    while let Ok(cmd) = receiver.try_recv() {
-                        match cmd {
-                            WalCommand::Append(entry) => {
-                                if let Ok(data) = bincode::serialize(&entry) {
-                                    let entry_size = 4 + data.len() as u64;
-                                    let len = (data.len() as u32).to_le_bytes();
-                                    let _ = writer.write_all(&len);
-                                    let _ = writer.write_all(&data);
-                                    bytes_written += entry_size;
-                                }
-                            }
-                            WalCommand::Sync(done) => {
-                                let _ = writer.flush();
-                                let _ = writer.get_ref().sync_data();
-                                let _ = done.send(());
-                            }
-                            WalCommand::Rotate(done) => {
-                                Self::do_rotate(writer, wal_path, is_dir, &mut segment_number);
-                                bytes_written = 0;
-                                let _ = done.send(());
-                            }
-                            WalCommand::Shutdown => {
-                                let _ = writer.flush();
-                                let _ = writer.get_ref().sync_data();
-                                return;
-                            }
+            match command {
+                WalCommand::Append(entry) => {
+                    match Self::write_entry(writer, &entry, faults) {
+                        Ok(entry_size) => bytes_written += entry_size,
+                        Err(error) => {
+                            Self::latch_shared(failure, error);
+                            return;
                         }
                     }
-                    // Flush after draining batch
-                    let _ = writer.flush();
 
-                    // Auto-rotate if segment size exceeded
-                    maybe_auto_rotate(
-                        writer,
-                        wal_path,
-                        is_dir,
-                        &mut segment_number,
-                        &mut bytes_written,
-                        max_segment_size,
-                    );
+                    // Drain append commands into one buffered write batch, but
+                    // preserve command ordering by deferring the first barrier.
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(WalCommand::Append(entry)) => {
+                                match Self::write_entry(writer, &entry, faults) {
+                                    Ok(entry_size) => bytes_written += entry_size,
+                                    Err(error) => {
+                                        Self::latch_shared(failure, error);
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok(command) => {
+                                deferred = Some(command);
+                                break;
+                            }
+                            Err(channel::TryRecvError::Empty) => break,
+                            Err(channel::TryRecvError::Disconnected) => break,
+                        }
+                    }
+
+                    if let Err(error) = Self::flush_buffer(writer, faults) {
+                        Self::latch_shared(failure, error);
+                        return;
+                    }
+
+                    if max_segment_size > 0 && bytes_written >= max_segment_size {
+                        if let Err(error) =
+                            Self::do_rotate(writer, wal_path, is_dir, &mut segment_number, faults)
+                        {
+                            Self::latch_shared(failure, error);
+                            return;
+                        }
+                        bytes_written = 0;
+                    }
                 }
-                Ok(WalCommand::Sync(done)) => {
-                    let _ = writer.flush();
-                    let _ = writer.get_ref().sync_data();
-                    let _ = done.send(());
+                WalCommand::Sync(done) => {
+                    let result = Self::flush_and_sync(writer, faults)
+                        .map_err(|error| Self::latch_shared(failure, error));
+                    let failed = result.is_err();
+                    if done.send(result).is_err() {
+                        Self::latch_shared(
+                            failure,
+                            WalError::message(
+                                "sync acknowledgement",
+                                std::io::ErrorKind::BrokenPipe,
+                                "sync caller disconnected",
+                            ),
+                        );
+                        return;
+                    }
+                    if failed {
+                        return;
+                    }
                 }
-                Ok(WalCommand::Rotate(done)) => {
-                    Self::do_rotate(writer, wal_path, is_dir, &mut segment_number);
-                    bytes_written = 0;
-                    let _ = done.send(());
+                WalCommand::Rotate(done) => {
+                    let result =
+                        Self::do_rotate(writer, wal_path, is_dir, &mut segment_number, faults)
+                            .map_err(|error| Self::latch_shared(failure, error));
+                    let failed = result.is_err();
+                    if !failed {
+                        bytes_written = 0;
+                    }
+                    if done.send(result).is_err() {
+                        Self::latch_shared(
+                            failure,
+                            WalError::message(
+                                "rotation acknowledgement",
+                                std::io::ErrorKind::BrokenPipe,
+                                "rotation caller disconnected",
+                            ),
+                        );
+                        return;
+                    }
+                    if failed {
+                        return;
+                    }
                 }
-                Ok(WalCommand::Shutdown) | Err(_) => {
-                    let _ = writer.flush();
-                    let _ = writer.get_ref().sync_data();
+                WalCommand::Shutdown(done) => {
+                    let result = Self::flush_and_sync(writer, faults)
+                        .map_err(|error| Self::latch_shared(failure, error));
+                    let _ = done.send(result);
                     return;
                 }
+                #[cfg(test)]
+                WalCommand::Disconnect => return,
             }
         }
+    }
+
+    fn write_entry(
+        writer: &mut BufWriter<File>,
+        entry: &WalEntry,
+        faults: &WalFaultInjector,
+    ) -> Result<u64, WalError> {
+        faults
+            .check(WalFaultPoint::EntrySerialization)
+            .map_err(|error| WalError::io("entry serialization", &error))?;
+        let data = bincode::serialize(entry).map_err(|error| {
+            WalError::message(
+                "entry serialization",
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            )
+        })?;
+        let length = u32::try_from(data.len()).map_err(|_| {
+            WalError::message(
+                "entry framing",
+                std::io::ErrorKind::InvalidData,
+                format!("serialized entry is too large: {} bytes", data.len()),
+            )
+        })?;
+        faults
+            .check(WalFaultPoint::Write)
+            .map_err(|error| WalError::io("write", &error))?;
+        writer
+            .write_all(&length.to_le_bytes())
+            .and_then(|_| writer.write_all(&data))
+            .map_err(|error| WalError::io("write", &error))?;
+        Ok(4 + data.len() as u64)
+    }
+
+    fn flush_buffer(
+        writer: &mut BufWriter<File>,
+        faults: &WalFaultInjector,
+    ) -> Result<(), WalError> {
+        faults
+            .check(WalFaultPoint::Flush)
+            .map_err(|error| WalError::io("flush", &error))?;
+        writer
+            .flush()
+            .map_err(|error| WalError::io("flush", &error))
+    }
+
+    fn flush_and_sync(
+        writer: &mut BufWriter<File>,
+        faults: &WalFaultInjector,
+    ) -> Result<(), WalError> {
+        Self::flush_buffer(writer, faults)?;
+        faults
+            .check(WalFaultPoint::Fsync)
+            .map_err(|error| WalError::io("fsync", &error))?;
+        writer
+            .get_ref()
+            .sync_data()
+            .map_err(|error| WalError::io("fsync", &error))
     }
 
     /// Perform a segment rotation: flush + fsync the current writer, then
@@ -436,25 +781,78 @@ impl WalWriter {
         wal_path: &Path,
         is_dir: bool,
         segment_number: &mut u64,
-    ) {
-        // Flush and sync current file
-        let _ = writer.flush();
-        let _ = writer.get_ref().sync_data();
+        faults: &WalFaultInjector,
+    ) -> Result<(), WalError> {
+        Self::flush_and_sync(writer, faults)?;
+        faults
+            .check(WalFaultPoint::Rotation)
+            .map_err(|error| WalError::io("rotation", &error))?;
 
         // Determine the directory and new segment number
-        *segment_number += 1;
+        let next_segment = segment_number.checked_add(1).ok_or_else(|| {
+            WalError::message(
+                "rotation",
+                std::io::ErrorKind::InvalidInput,
+                "segment number overflow",
+            )
+        })?;
         let new_path = if is_dir {
-            wal_path.join(format!("wal-{:08}.bin", segment_number))
+            wal_path.join(format!("wal-{next_segment:08}.bin"))
         } else {
             let dir = wal_path.parent().unwrap_or_else(|| Path::new("."));
-            dir.join(format!("wal-{:08}.bin", segment_number))
+            dir.join(format!("wal-{next_segment:08}.bin"))
         };
 
-        // Open new segment file
-        if let Ok(file) = OpenOptions::new().create(true).append(true).open(&new_path) {
-            *writer = BufWriter::with_capacity(256 * 1024, file);
-        } else {
-            tracing::error!("Failed to open new WAL segment: {:?}", new_path);
+        // A new segment must never silently reuse a stale file. Persist its
+        // directory entry before allowing the rotation barrier to succeed.
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&new_path)
+            .map_err(|error| WalError::io("rotation open", &error))?;
+        Self::sync_parent_directory(&new_path)
+            .map_err(|error| WalError::io("rotation directory fsync", &error))?;
+
+        *writer = BufWriter::with_capacity(256 * 1024, file);
+        *segment_number = next_segment;
+        Ok(())
+    }
+
+    fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            File::open(parent)?.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Ok(())
+        }
+    }
+
+    fn latch(&self, error: WalError) -> WalError {
+        Self::latch_shared(&self.failure, error)
+    }
+
+    fn latch_shared(failure: &OnceLock<WalError>, error: WalError) -> WalError {
+        let first = failure.get_or_init(|| {
+            tracing::error!(operation = error.operation(), error = %error, "WAL durability failure");
+            error
+        });
+        first.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_failure(&self, point: WalFaultPoint) {
+        self.faults.inject(point);
+    }
+
+    #[cfg(test)]
+    fn disconnect_writer(&mut self) {
+        let _ = self.sender.send(WalCommand::Disconnect);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
     }
 
@@ -531,7 +929,9 @@ impl WalWriter {
 
 impl Drop for WalWriter {
     fn drop(&mut self) {
-        self.shutdown();
+        if let Err(error) = self.shutdown() {
+            tracing::error!(error = %error, "WAL shutdown did not complete durably");
+        }
     }
 }
 
@@ -866,7 +1266,7 @@ mod tests {
                 1,
             );
             writer.append(WalOp::Checkpoint(hash_bytes(b"root1")), 1);
-            writer.sync();
+            writer.sync().unwrap();
         }
 
         let entries = read_wal(&path);
@@ -887,7 +1287,7 @@ mod tests {
         {
             let writer = WalWriter::new(&path).expect("create wal");
             writer.append(WalOp::Checkpoint(hash_bytes(b"complete")), 1);
-            writer.sync();
+            writer.sync().unwrap();
         }
         OpenOptions::new()
             .append(true)
@@ -914,7 +1314,7 @@ mod tests {
                 WalOp::SetAccount(test_addr(1), Account::new(test_addr(1), 500)),
                 1,
             );
-            writer.sync();
+            writer.sync().unwrap();
         }
 
         let entries = read_wal(&path);
@@ -942,7 +1342,7 @@ mod tests {
                 2,
             );
             writer.append(WalOp::Checkpoint(hash_bytes(b"root2")), 2);
-            writer.sync();
+            writer.sync().unwrap();
         }
 
         let (seq, root) = find_last_checkpoint(&path).expect("should find checkpoint");
@@ -968,7 +1368,7 @@ mod tests {
                     1,
                 );
             }
-            writer.sync();
+            writer.sync().unwrap();
         }
 
         let entries = read_wal_from(&path, 3);
@@ -985,7 +1385,105 @@ mod tests {
         // Should not panic or error
         writer.append(WalOp::Checkpoint(Hash256::ZERO), 0);
         // Sync on null writer is a no-op
-        writer.sync();
+        writer.sync().unwrap();
+    }
+
+    #[test]
+    fn checksum_serialization_failure_is_latched() {
+        let path = tmp_path("wal_checksum_serialization_failure.bin");
+        let _ = fs::remove_file(&path);
+        let writer = WalWriter::new(&path).unwrap();
+        writer.inject_failure(WalFaultPoint::ChecksumSerialization);
+
+        writer.append(WalOp::Checkpoint(Hash256::ZERO), 1);
+        let error = writer.sync().unwrap_err();
+        assert_eq!(error.operation(), "checksum serialization");
+        assert_eq!(writer.failure(), Some(error));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn entry_serialization_failure_is_latched_by_sync_barrier() {
+        let path = tmp_path("wal_entry_serialization_failure.bin");
+        let _ = fs::remove_file(&path);
+        let writer = WalWriter::new(&path).unwrap();
+        writer.inject_failure(WalFaultPoint::EntrySerialization);
+
+        writer.append(WalOp::Checkpoint(Hash256::ZERO), 1);
+        let error = writer.sync().unwrap_err();
+        assert_eq!(error.operation(), "entry serialization");
+        assert_eq!(writer.failure(), Some(error));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_failure_is_latched_by_sync_barrier() {
+        let path = tmp_path("wal_write_failure.bin");
+        let _ = fs::remove_file(&path);
+        let writer = WalWriter::new(&path).unwrap();
+        writer.inject_failure(WalFaultPoint::Write);
+
+        writer.append(WalOp::Checkpoint(Hash256::ZERO), 1);
+        let error = writer.sync().unwrap_err();
+        assert_eq!(error.operation(), "write");
+        assert_eq!(writer.failure(), Some(error.clone()));
+        assert_eq!(writer.sync().unwrap_err(), error, "first error is sticky");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn flush_and_fsync_failures_are_observable() {
+        for (name, point, operation) in [
+            ("flush", WalFaultPoint::Flush, "flush"),
+            ("fsync", WalFaultPoint::Fsync, "fsync"),
+        ] {
+            let path = tmp_path(&format!("wal_{name}_failure.bin"));
+            let _ = fs::remove_file(&path);
+            let writer = WalWriter::new(&path).unwrap();
+            writer.inject_failure(point);
+
+            if point == WalFaultPoint::Flush {
+                writer.append(WalOp::Checkpoint(Hash256::ZERO), 1);
+            }
+            let error = writer.sync().unwrap_err();
+            assert_eq!(error.operation(), operation);
+            assert_eq!(writer.failure(), Some(error));
+
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn rotation_failure_is_latched_and_does_not_advance_segment() {
+        let dir = tmp_dir("wal_rotation_failure");
+        let writer = WalWriter::with_segments(&dir, u64::MAX).unwrap();
+        writer.inject_failure(WalFaultPoint::Rotation);
+
+        let error = writer.rotate().unwrap_err();
+        assert_eq!(error.operation(), "rotation");
+        assert_eq!(writer.sync().unwrap_err(), error);
+        assert!(!dir.join("wal-00000001.bin").exists());
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn disconnected_writer_channel_is_latched() {
+        let path = tmp_path("wal_channel_disconnect.bin");
+        let _ = fs::remove_file(&path);
+        let mut writer = WalWriter::new(&path).unwrap();
+        writer.disconnect_writer();
+
+        writer.append(WalOp::Checkpoint(Hash256::ZERO), 1);
+        let error = writer.sync().unwrap_err();
+        assert_eq!(error.operation(), "append channel send");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(writer.failure(), Some(error));
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -1075,7 +1573,7 @@ mod tests {
                     i / 10,
                 );
             }
-            writer.sync();
+            writer.sync().unwrap();
         }
 
         let entries = read_wal(&path);
@@ -1104,10 +1602,10 @@ mod tests {
                     1,
                 );
             }
-            writer.sync();
+            writer.sync().unwrap();
 
             // Rotate to segment 1
-            writer.rotate();
+            writer.rotate().unwrap();
 
             // Write more entries to segment 1
             for i in 5..10u64 {
@@ -1119,14 +1617,14 @@ mod tests {
                     2,
                 );
             }
-            writer.sync();
+            writer.sync().unwrap();
 
             // Rotate again to segment 2
-            writer.rotate();
+            writer.rotate().unwrap();
 
             // Write to segment 2
             writer.append(WalOp::Checkpoint(hash_bytes(b"root")), 2);
-            writer.sync();
+            writer.sync().unwrap();
         }
 
         // Verify segment files exist
@@ -1173,8 +1671,8 @@ mod tests {
                     1,
                 );
             }
-            writer.sync();
-            writer.rotate();
+            writer.sync().unwrap();
+            writer.rotate().unwrap();
 
             // Segment 1: entries 5..9
             for i in 5..10u64 {
@@ -1186,8 +1684,8 @@ mod tests {
                     2,
                 );
             }
-            writer.sync();
-            writer.rotate();
+            writer.sync().unwrap();
+            writer.rotate().unwrap();
 
             // Segment 2: entries 10..14
             for i in 10..15u64 {
@@ -1199,8 +1697,8 @@ mod tests {
                     3,
                 );
             }
-            writer.sync();
-            writer.rotate();
+            writer.sync().unwrap();
+            writer.rotate().unwrap();
 
             // Segment 3: entries 15..19
             for i in 15..20u64 {
@@ -1212,7 +1710,7 @@ mod tests {
                     4,
                 );
             }
-            writer.sync();
+            writer.sync().unwrap();
         }
 
         // Before deletion: 4 segments (0, 1, 2, 3)
@@ -1266,8 +1764,8 @@ mod tests {
                     1,
                 );
             }
-            writer.sync();
-            writer.rotate();
+            writer.sync().unwrap();
+            writer.rotate().unwrap();
 
             // Write entries 3..5 in segment 1
             for i in 3..6u64 {
@@ -1279,8 +1777,8 @@ mod tests {
                     2,
                 );
             }
-            writer.sync();
-            writer.rotate();
+            writer.sync().unwrap();
+            writer.rotate().unwrap();
 
             // Write entries 6..8 in segment 2
             for i in 6..9u64 {
@@ -1292,7 +1790,7 @@ mod tests {
                     3,
                 );
             }
-            writer.sync();
+            writer.sync().unwrap();
         }
 
         // Read all entries across segments
@@ -1338,7 +1836,7 @@ mod tests {
             for h in 0u64..200 {
                 writer.append(WalOp::Checkpoint(Hash256::ZERO), h);
             }
-            writer.sync();
+            writer.sync().unwrap();
             // Drop the writer so the bg thread flushes before we read.
             drop(writer);
         }
@@ -1373,7 +1871,7 @@ mod tests {
             writer.append(WalOp::Checkpoint(Hash256::ZERO), 50);
             writer.append(WalOp::Checkpoint(Hash256::ZERO), 999);
             writer.append(WalOp::Checkpoint(Hash256::ZERO), 12);
-            writer.sync();
+            writer.sync().unwrap();
         }
         assert_eq!(latest_block_height_in_wal_dir(&dir), 999);
         let _ = fs::remove_dir_all(&dir);

@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
 
 pub use wal::{
-    PersistenceConfig, Snapshot, WalEntry, WalOp, WalWriter, find_last_checkpoint,
+    PersistenceConfig, Snapshot, WalEntry, WalError, WalOp, WalWriter, find_last_checkpoint,
     latest_block_height_in_wal_dir, read_wal, read_wal_dir, read_wal_strict,
 };
 
@@ -326,6 +326,22 @@ pub struct StateDB {
 }
 
 impl StateDB {
+    fn wal_state_error(error: WalError) -> StateError {
+        StateError::PersistenceError(error.to_string())
+    }
+
+    /// Persistence failures are fatal for subsequent block application. A
+    /// caller must never mutate another block after the WAL lost durability.
+    fn require_healthy_wal(&self) -> Result<(), StateError> {
+        self.wal.check_health().map_err(Self::wal_state_error)
+    }
+
+    /// Complete the durable block boundary before returning a block to the
+    /// consensus caller. This includes every queued append, flush, and fsync.
+    fn durable_wal_barrier(&self) -> Result<(), StateError> {
+        self.wal.sync().map_err(Self::wal_state_error)
+    }
+
     /// Create a new empty state (no persistence - benchmark mode).
     pub fn new() -> Self {
         Self {
@@ -522,7 +538,7 @@ impl StateDB {
             let genesis = Block::genesis();
             state.blocks.insert(0, genesis.clone());
             state.wal.append(WalOp::SetBlock(0, genesis), 0);
-            state.wal.sync();
+            state.durable_wal_barrier()?;
 
             tracing::info!(
                 "Fresh state initialized with {} genesis accounts, WAL at {:?}",
@@ -999,7 +1015,9 @@ impl StateDB {
             };
             self.wal
                 .append(WalOp::SetEventLogs(height, combined), height);
-            self.wal.sync();
+            if let Err(error) = self.durable_wal_barrier() {
+                tracing::error!(height, error = %error, "event logs were not durably persisted");
+            }
         }
     }
 
@@ -1272,6 +1290,7 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut tx_hashes = Vec::with_capacity(transactions.len());
 
@@ -1449,7 +1468,7 @@ impl StateDB {
 
         // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
-        self.wal.sync();
+        self.durable_wal_barrier()?;
 
         // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
@@ -1513,6 +1532,7 @@ impl StateDB {
         producer: Address,
         timestamp: u64,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
         use rayon::prelude::*;
 
         // The transaction slice is already in canonical block/DAG order.
@@ -1645,7 +1665,7 @@ impl StateDB {
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &final_receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
-        self.wal.sync();
+        self.durable_wal_barrier()?;
 
         Ok((block, final_receipts))
     }
@@ -1670,6 +1690,7 @@ impl StateDB {
         producer: Address,
         timestamp: u64,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
         let mut receipts = Vec::with_capacity(transactions.len());
         let mut tx_hashes = Vec::with_capacity(transactions.len());
 
@@ -1858,7 +1879,7 @@ impl StateDB {
 
         // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
-        self.wal.sync();
+        self.durable_wal_barrier()?;
 
         // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
@@ -1880,6 +1901,7 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
         use arc_gpu::metal_verify::{MetalVerifier, VerifyTask};
 
         let height = {
@@ -2108,7 +2130,7 @@ impl StateDB {
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
-        self.wal.sync();
+        self.durable_wal_barrier()?;
 
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
         if count > 0 && count.is_multiple_of(10_000) {
@@ -2124,6 +2146,7 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -2233,7 +2256,7 @@ impl StateDB {
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
-        self.wal.sync();
+        self.durable_wal_barrier()?;
 
         Ok((block, receipts))
     }
@@ -2250,6 +2273,7 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -2372,7 +2396,7 @@ impl StateDB {
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
-        self.wal.sync();
+        self.durable_wal_barrier()?;
 
         Ok((block, receipts))
     }
@@ -6072,6 +6096,7 @@ impl StateDB {
         receipt_success: &[bool],
         producer: Address,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.require_healthy_wal()?;
         let height = {
             let mut h = self.height.write();
             *h += 1;
@@ -6151,7 +6176,7 @@ impl StateDB {
             .append(WalOp::SetBlock(height, block.clone()), height);
         self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
-        self.wal.sync();
+        self.durable_wal_barrier()?;
 
         // Auto-prune old state every 100 blocks unless in archive mode.
         // Archive nodes keep full history for block explorers and analytics.
@@ -7066,9 +7091,22 @@ impl StateDB {
         *self.height.read()
     }
 
-    /// Flush WAL to disk (call at block boundaries for durability).
+    /// Return the WAL's first fatal durability error, if any.
+    pub fn wal_failure(&self) -> Option<WalError> {
+        self.wal.failure()
+    }
+
+    /// Flush WAL to disk and report whether the barrier was durable.
+    pub fn try_sync_wal(&self) -> Result<(), StateError> {
+        self.durable_wal_barrier()
+    }
+
+    /// Best-effort compatibility wrapper for shutdown callers. Consensus block
+    /// paths use the fallible barrier directly and never acknowledge failures.
     pub fn sync_wal(&self) {
-        self.wal.sync();
+        if let Err(error) = self.try_sync_wal() {
+            tracing::error!(error = %error, "WAL shutdown sync failed");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -7886,6 +7924,33 @@ mod tests {
             .to_string();
         assert!(error.contains("data directory genesis mismatch"), "{error}");
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn block_is_not_acknowledged_when_wal_fsync_fails() {
+        let dir = persistent_test_dir("wal-boundary-failure");
+        std::fs::create_dir_all(&dir).unwrap();
+        let state = StateDB::with_persistence(dir.join("state.wal")).unwrap();
+        state.wal.inject_failure(crate::wal::WalFaultPoint::Fsync);
+
+        let error = state
+            .execute_block(&[], addr(99))
+            .expect_err("block boundary must propagate fsync failure");
+        assert!(matches!(error, StateError::PersistenceError(_)));
+        assert_eq!(state.wal_failure().unwrap().operation(), "fsync");
+
+        // The in-memory mutation happened before the filesystem reported the
+        // failure, but the sticky latch prevents any subsequent block attempt
+        // from advancing state or being acknowledged.
+        let failed_height = state.height();
+        let retry = state
+            .execute_block(&[], addr(99))
+            .expect_err("a failed WAL remains fatal");
+        assert!(matches!(retry, StateError::PersistenceError(_)));
+        assert_eq!(state.height(), failed_height);
+
+        drop(state);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
