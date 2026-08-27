@@ -284,12 +284,10 @@ impl InferenceValidatorTask {
             signature: arc_crypto::Signature::null(),
             sig_verified: false,
         };
-        tx.hash = tx.compute_hash();
-        // Sign with the validator's keypair.
-        if let Ok(sig) = self.validator_keypair.sign(&tx.hash) {
-            tx.signature = sig;
-            tx.sig_verified = true;
-        }
+        self.state
+            .sign_transaction(&mut tx, &self.validator_keypair)
+            .map_err(|error| anyhow::anyhow!("sign inference vote: {error}"))?;
+        tx.sig_verified = true;
         self.mempool
             .insert(tx)
             .map_err(|e| anyhow::anyhow!("mempool insert vote: {:?}", e))?;
@@ -322,11 +320,10 @@ impl InferenceValidatorTask {
             signature: arc_crypto::Signature::null(),
             sig_verified: false,
         };
-        att_tx.hash = att_tx.compute_hash();
-        if let Ok(sig) = self.validator_keypair.sign(&att_tx.hash) {
-            att_tx.signature = sig;
-            att_tx.sig_verified = true;
-        }
+        self.state
+            .sign_transaction(&mut att_tx, &self.validator_keypair)
+            .map_err(|error| anyhow::anyhow!("sign inference attestation: {error}"))?;
+        att_tx.sig_verified = true;
         if let Err(e) = self.mempool.insert(att_tx) {
             warn!(
                 request_id = %hex::encode(request_id),
@@ -411,11 +408,10 @@ impl InferenceValidatorTask {
             signature: arc_crypto::Signature::null(),
             sig_verified: false,
         };
-        tx.hash = tx.compute_hash();
-        if let Ok(sig) = self.validator_keypair.sign(&tx.hash) {
-            tx.signature = sig;
-            tx.sig_verified = true;
-        }
+        self.state
+            .sign_transaction(&mut tx, &self.validator_keypair)
+            .map_err(|error| anyhow::anyhow!("sign inference finalize: {error}"))?;
+        tx.sig_verified = true;
         self.mempool
             .insert(tx)
             .map_err(|e| anyhow::anyhow!("mempool insert finalize: {:?}", e))?;

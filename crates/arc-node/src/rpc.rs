@@ -1938,9 +1938,12 @@ async fn submit_tx(
             public_key: pk_arr,
             signature: sig_bytes,
         };
+        if let Some(domain) = node.state.transaction_domain_hash() {
+            tx.hash = tx.compute_hash_in_domain(&domain);
+        }
 
         // Verify signature before accepting
-        tx.verify_signature().map_err(|_| {
+        node.state.verify_transaction_signature(&tx).map_err(|_| {
             (
                 StatusCode::BAD_REQUEST,
                 "signature verification failed".to_string(),
@@ -1986,7 +1989,9 @@ async fn submit_batch(
     let mut hashes = Vec::new();
 
     for tx_req in req.transactions {
-        let Ok(mut tx) = signed_transfer_from_request(&tx_req) else {
+        let Ok(mut tx) =
+            signed_transfer_from_request_in_domain(&tx_req, node.state.transaction_domain_hash())
+        else {
             rejected += 1;
             continue;
         };
@@ -2012,6 +2017,13 @@ async fn submit_batch(
 }
 
 fn signed_transfer_from_request(req: &SubmitTxRequest) -> Result<Transaction, String> {
+    signed_transfer_from_request_in_domain(req, None)
+}
+
+fn signed_transfer_from_request_in_domain(
+    req: &SubmitTxRequest,
+    recovery_domain: Option<Hash256>,
+) -> Result<Transaction, String> {
     let from = Hash256::from_hex(&req.from).map_err(|_| "invalid from address".to_string())?;
     let to = Hash256::from_hex(&req.to).map_err(|_| "invalid to address".to_string())?;
     let signature_hex = req
@@ -2036,8 +2048,14 @@ fn signed_transfer_from_request(req: &SubmitTxRequest) -> Result<Transaction, St
         public_key: public_key_bytes,
         signature,
     };
-    tx.verify_signature()
-        .map_err(|_| "signature verification failed".to_string())?;
+    if let Some(domain) = recovery_domain {
+        tx.hash = tx.compute_hash_in_domain(&domain);
+    }
+    match recovery_domain {
+        Some(domain) => tx.verify_signature_in_domain(&domain),
+        None => tx.verify_signature(),
+    }
+    .map_err(|_| "signature verification failed".to_string())?;
     Ok(tx)
 }
 
@@ -2080,7 +2098,7 @@ async fn submit_signed_tx(
     if uses_unready_paid_inference_protocol(&tx) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    if tx.verify_signature().is_err() {
+    if node.state.verify_transaction_signature(&tx).is_err() {
         return Err(StatusCode::BAD_REQUEST);
     }
     // The issuance switch gates every public mempool ingress, not just the
@@ -2375,7 +2393,7 @@ async fn faucet_claim(
         let nonce = validator_account.nonce;
 
         let mut tx = Transaction::new_faucet_claim(validator_addr, to, FAUCET_CLAIM_AMOUNT, nonce);
-        tx.sign(keypair).map_err(|e| {
+        node.state.sign_transaction(&mut tx, keypair).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(FaucetErrorResponse {
@@ -7794,7 +7812,7 @@ fn submit_inference_attestation(
     };
 
     match node.validator_keypair.as_ref() {
-        Some(kp) => match tx.sign(kp) {
+        Some(kp) => match node.state.sign_transaction(&mut tx, kp) {
             Ok(()) => {
                 // sign() assigns tx.hash as part of signing.
                 tx.sig_verified = true;
@@ -7905,7 +7923,7 @@ async fn submit_or_relay_attestation(
         signature: arc_crypto::Signature::null(),
         sig_verified: false,
     };
-    if tx.sign(kp).is_err() {
+    if node.state.sign_transaction(&mut tx, kp).is_err() {
         let (h, s) = submit_inference_attestation(
             node,
             model_id,
@@ -11325,6 +11343,8 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
         let pv = &b.header.protocol_version;
         format!("{}.{}.{}", pv.major, pv.minor, pv.patch)
     });
+    let recovery_context = node.state.recovery_context();
+    let recovery_manifest_hash = node.state.recovery_manifest_hash();
 
     Json(json!({
         // ── Identity ──────────────────────────────────────────────────────
@@ -11368,6 +11388,14 @@ async fn network_info(AxumState(node): AxumState<NodeState>) -> Json<Value> {
             "unknown"
         },
         "node_version": env!("CARGO_PKG_VERSION"),
+        "recovery_active": recovery_context.is_some(),
+        "recovery_epoch": recovery_context.as_ref().map(|context| context.recovery_epoch),
+        "validator_set_id": recovery_context.as_ref().map(|context| context.validator_set_id),
+        "recovery_domain": recovery_context
+            .as_ref()
+            .map(|context| format!("0x{}", context.domain_hash().to_hex())),
+        "checkpoint_manifest_hash": recovery_manifest_hash
+            .map(|hash| format!("0x{}", hash.to_hex())),
 
         // ── Liveness ──────────────────────────────────────────────────────
         "height": height,

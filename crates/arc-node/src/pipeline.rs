@@ -223,6 +223,9 @@ impl Pipeline {
         // ── Stage 2: Verify (batch Ed25519 + individual fallback) ────────
         let verify_mode = config.verify_mode;
         let verify_cache = Arc::clone(&sig_cache);
+        // Recovery context is installed before the pipeline starts and is
+        // immutable for the lifetime of this process.
+        let recovery_domain = state.transaction_domain_hash();
         thread::Builder::new()
             .name("pipeline-verify".into())
             .spawn(move || {
@@ -254,7 +257,13 @@ impl Pipeline {
                     let hash_ok: Vec<bool> = batch
                         .transactions
                         .par_iter()
-                        .map(|tx| tx.compute_hash() == tx.hash)
+                        .map(|tx| {
+                            let expected = match recovery_domain {
+                                Some(domain) => tx.compute_hash_in_domain(&domain),
+                                None => tx.compute_hash(),
+                            };
+                            expected == tx.hash
+                        })
                         .collect();
 
                     // ── Phase 2: separate Ed25519 from others ────────────

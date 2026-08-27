@@ -5,7 +5,7 @@
 //! The async writer batches entries and flushes to SSD periodically.
 
 use arc_crypto::Hash256;
-use arc_types::{Account, Address, Block, TxReceipt};
+use arc_types::{Account, Address, Block, EventLog, Identity, Transaction, TxReceipt};
 use crossbeam::channel::{self, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
@@ -63,6 +63,15 @@ pub enum WalOp {
     SetDagRound(u64),
     /// Record a DAG block commit (hash of committed block).
     CommitDagBlock(Hash256),
+    /// Persist a full transaction body for restart-safe receipt/explorer state.
+    SetFullTransaction(Hash256, Transaction),
+    /// Persist EVM event logs associated with one canonical block.
+    SetEventLogs(u64, Vec<EventLog>),
+    /// Persist one identity-registry update.
+    SetIdentity(Address, Identity),
+    /// Persist the complete active validator map and staking pool atomically at
+    /// a block boundary. Appended at the end to retain legacy enum indexes.
+    SetValidatorState(Vec<(Address, u64)>, u64),
 }
 
 /// Internal command for the WAL background thread.
@@ -574,6 +583,75 @@ pub fn read_wal(path: impl AsRef<Path>) -> Vec<WalEntry> {
     entries
 }
 
+/// Strict WAL reader for recovery-mode startup.
+///
+/// Unlike [`read_wal`], this never treats corruption or a torn final frame as
+/// a successful prefix. ARCCHKPT nodes fail closed so a restart cannot expose
+/// partially replayed consensus state as canonical.
+pub fn read_wal_strict(path: impl AsRef<Path>) -> std::io::Result<Vec<WalEntry>> {
+    const MAX_ENTRY_BYTES: usize = 1024 * 1024 * 1024;
+    let file = File::open(path.as_ref())?;
+    let mut reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut expected_sequence = 0u64;
+
+    loop {
+        let mut len_buf = [0u8; 4];
+        let first = reader.read(&mut len_buf[..1])?;
+        if first == 0 {
+            break;
+        }
+        reader.read_exact(&mut len_buf[1..]).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("truncated WAL frame length: {error}"),
+            )
+        })?;
+        let len = u32::from_le_bytes(len_buf) as usize;
+        if len == 0 || len > MAX_ENTRY_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid WAL frame length {len}"),
+            ));
+        }
+        let mut data = vec![0u8; len];
+        reader.read_exact(&mut data).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("truncated WAL frame payload: {error}"),
+            )
+        })?;
+        let entry: WalEntry = bincode::deserialize(&data).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid WAL entry encoding: {error}"),
+            )
+        })?;
+        let payload = bincode::serialize(&(&entry.block_height, &entry.sequence, &entry.op))
+            .map_err(std::io::Error::other)?;
+        if entry.checksum != crc32fast::hash(&payload) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("WAL checksum mismatch at sequence {}", entry.sequence),
+            ));
+        }
+        if entry.sequence != expected_sequence {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "WAL sequence gap: expected {expected_sequence}, got {}",
+                    entry.sequence
+                ),
+            ));
+        }
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "WAL sequence overflow")
+        })?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
 /// Read all entries from all WAL segment files in a directory, in order.
 pub fn read_wal_dir(dir: impl AsRef<Path>) -> Vec<WalEntry> {
     let segments = WalWriter::list_segments(dir.as_ref());
@@ -774,6 +852,29 @@ mod tests {
         assert_eq!(entries[2].sequence, 2);
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn strict_reader_rejects_torn_tail_instead_of_accepting_prefix() {
+        let path = tmp_path("wal_strict_torn_tail.bin");
+        let _ = fs::remove_file(&path);
+        {
+            let writer = WalWriter::new(&path).expect("create wal");
+            writer.append(WalOp::Checkpoint(hash_bytes(b"complete")), 1);
+            writer.sync();
+        }
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&8u32.to_le_bytes())
+            .unwrap();
+
+        assert_eq!(read_wal(&path).len(), 1, "legacy reader accepts prefix");
+        let error = read_wal_strict(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("truncated WAL frame payload"));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

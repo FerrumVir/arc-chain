@@ -173,6 +173,14 @@ fn verify_peer_dag_transactions(
     committed_hashes: &[Hash256],
     transactions: &[arc_types::Transaction],
 ) -> Result<Vec<arc_types::Transaction>, PeerDagTransactionError> {
+    verify_peer_dag_transactions_in_domain(committed_hashes, transactions, None)
+}
+
+fn verify_peer_dag_transactions_in_domain(
+    committed_hashes: &[Hash256],
+    transactions: &[arc_types::Transaction],
+    recovery_domain: Option<Hash256>,
+) -> Result<Vec<arc_types::Transaction>, PeerDagTransactionError> {
     let mut attached_hashes: Vec<Hash256> = transactions.iter().map(|tx| tx.hash).collect();
     attached_hashes.sort_by_key(|hash| hash.0);
     let has_duplicates = attached_hashes.windows(2).any(|pair| pair[0] == pair[1]);
@@ -185,9 +193,11 @@ fn verify_peer_dag_transactions(
         .map(|tx| {
             let mut verified = tx.clone();
             verified.sig_verified = false;
-            verified
-                .verify_signature()
-                .map_err(|_| PeerDagTransactionError::InvalidTransaction(verified.hash))?;
+            match recovery_domain {
+                Some(domain) => verified.verify_signature_in_domain(&domain),
+                None => verified.verify_signature(),
+            }
+            .map_err(|_| PeerDagTransactionError::InvalidTransaction(verified.hash))?;
             verified.sig_verified = true;
             Ok(verified)
         })
@@ -596,9 +606,10 @@ impl ConsensusManager {
                             // vector can finalize a block whose transactions
                             // are unavailable (or populate pending state with
                             // transactions the author never committed to).
-                            let verified = match verify_peer_dag_transactions(
+                            let verified = match verify_peer_dag_transactions_in_domain(
                                 &block.transactions,
                                 &transactions,
+                                state.transaction_domain_hash(),
                             ) {
                                 Ok(verified) => verified,
                                 Err(PeerDagTransactionError::AttachmentMismatch) => {
@@ -714,7 +725,7 @@ impl ConsensusManager {
                                     // capacity and cache the result only in
                                     // this process.
                                     tx.sig_verified = false;
-                                    if tx.verify_signature().is_err() {
+                                    if state.verify_transaction_signature(&tx).is_err() {
                                         continue;
                                     }
                                     tx.sig_verified = true;
@@ -1334,11 +1345,17 @@ impl ConsensusManager {
                             // overlap with this block's execution.
                             let pre_verify_handle = {
                                 let mut txs = committed_txs.clone();
+                                let recovery_domain = state.transaction_domain_hash();
                                 tokio::spawn(async move {
                                     for tx in txs.iter_mut() {
                                         if !tx.is_unsigned()
                                             && !tx.sig_verified
-                                            && tx.verify_signature().is_ok()
+                                            && match recovery_domain {
+                                                Some(domain) => {
+                                                    tx.verify_signature_in_domain(&domain).is_ok()
+                                                }
+                                                None => tx.verify_signature().is_ok(),
+                                            }
                                         {
                                             tx.sig_verified = true;
                                         }

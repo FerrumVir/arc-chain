@@ -1,19 +1,20 @@
 mod config;
 mod validator_identity;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use arc_crypto::{Hash256, hash_bytes};
 use arc_mempool::Mempool;
 use arc_net::transport::{InboundMessage, OutboundMessage, run_transport};
 use arc_node::{benchmark::BenchmarkPool, consensus::ConsensusManager, rpc};
 use arc_state::StateDB;
 use arc_types::Block;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, Parser, Subcommand};
+use serde::Deserialize;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use zeroize::Zeroize;
@@ -21,6 +22,10 @@ use zeroize::Zeroize;
 #[derive(Parser)]
 #[command(name = "arc-node", version, about = "ARC Chain Node")]
 struct Cli {
+    /// Offline ARCCHKPT creation, approval, verification, and activation.
+    #[command(subcommand)]
+    operator_command: Option<OperatorCommand>,
+
     /// RPC listen address (changed from 9090 to avoid Prometheus default port conflict)
     #[arg(long, default_value = "127.0.0.1:9944")]
     rpc: String,
@@ -160,6 +165,24 @@ struct Cli {
     #[arg(long)]
     genesis: Option<String>,
 
+    /// Quorum-signed ARCCHKPT package to verify and activate in a fresh data
+    /// directory before P2P or consensus starts.
+    #[arg(long)]
+    recovery_checkpoint: Option<String>,
+
+    /// Exact content hash approved out of band for --recovery-checkpoint.
+    /// The node never trusts the validator set embedded in an unpinned file.
+    #[arg(long)]
+    approved_recovery_manifest_hash: Option<String>,
+
+    /// Non-zero recovery epoch expected in the approved ARCCHKPT manifest.
+    #[arg(long, default_value_t = 1)]
+    recovery_epoch: u64,
+
+    /// Non-zero validator-set generation expected in the ARCCHKPT manifest.
+    #[arg(long, default_value_t = 1)]
+    validator_set_id: u64,
+
     /// Path to a GGUF model file for on-chain inference.
     /// Loads the model into INT8 cached memory at startup.
     /// Enables the /inference/run RPC endpoint with real deterministic inference.
@@ -286,6 +309,367 @@ struct Cli {
     /// Defaults to on for aarch64, off elsewhere. Pass the flag to force it.
     #[arg(long, default_value_t = false)]
     enable_i16: bool,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum OperatorCommand {
+    /// Operate the quorum-certified ARCCHKPT recovery protocol.
+    Recovery {
+        #[command(subcommand)]
+        command: RecoveryCommand,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+enum RecoveryCommand {
+    /// Print the content hash and metadata without treating the file as trusted.
+    Inspect {
+        #[arg(long)]
+        checkpoint: String,
+    },
+    /// Export an unsigned, content-addressed checkpoint from a complete legacy WAL.
+    Export {
+        #[arg(long)]
+        data_dir: String,
+        #[arg(long)]
+        genesis: String,
+        /// JSON array of {address, public_key, stake} records for the approved set.
+        #[arg(long)]
+        validator_public_keys: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long)]
+        source_consensus_round: u64,
+        #[arg(long, default_value_t = 1)]
+        recovery_epoch: u64,
+        #[arg(long, default_value_t = 1)]
+        validator_set_id: u64,
+        /// Fixed manifest timestamp; defaults to the current Unix time in milliseconds.
+        #[arg(long)]
+        created_at_unix_ms: Option<u64>,
+        /// Explicitly permit an old WAL that predates genesis.network-hash.
+        #[arg(long, default_value_t = false)]
+        allow_unbound_legacy_wal: bool,
+    },
+    /// Validate an unsigned candidate and append one offline validator signature.
+    Sign {
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        genesis: String,
+        #[arg(long)]
+        approved_manifest_hash: String,
+        #[arg(long)]
+        validator_key_file: String,
+        #[arg(long)]
+        output: String,
+        #[arg(long, default_value_t = 1)]
+        recovery_epoch: u64,
+        #[arg(long, default_value_t = 1)]
+        validator_set_id: u64,
+    },
+    /// Verify content, exact hash pin, network policy, and signature quorum.
+    Verify {
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        genesis: String,
+        #[arg(long)]
+        approved_manifest_hash: String,
+        #[arg(long, default_value_t = 1)]
+        recovery_epoch: u64,
+        #[arg(long, default_value_t = 1)]
+        validator_set_id: u64,
+    },
+    /// Verify and atomically activate a checkpoint in a fresh data directory.
+    Import {
+        #[arg(long)]
+        checkpoint: String,
+        #[arg(long)]
+        data_dir: String,
+        #[arg(long)]
+        genesis: String,
+        #[arg(long)]
+        approved_manifest_hash: String,
+        #[arg(long, default_value_t = 1)]
+        recovery_epoch: u64,
+        #[arg(long, default_value_t = 1)]
+        validator_set_id: u64,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoveryValidatorFileEntry {
+    address: String,
+    public_key: String,
+    stake: u64,
+}
+
+fn parse_recovery_hash(label: &str, value: &str) -> Result<Hash256> {
+    let bare = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .unwrap_or(value);
+    Hash256::from_hex(bare)
+        .map_err(|_| anyhow::anyhow!("{label} must be exactly 32 bytes of hexadecimal"))
+}
+
+fn recovery_network_from_genesis(
+    genesis_path: &str,
+    recovery_epoch: u64,
+    validator_set_id: u64,
+) -> Result<(
+    config::GenesisConfig,
+    arc_state::recovery::RecoveryNetworkPolicy,
+)> {
+    ensure!(recovery_epoch > 0, "recovery_epoch must be non-zero");
+    ensure!(validator_set_id > 0, "validator_set_id must be non-zero");
+    let genesis = config::load_genesis(genesis_path)
+        .context("recovery requires a complete production genesis configuration")?;
+    let validators = genesis.validated_validator_set(false)?;
+    let genesis_hash = genesis.network_hash(false)?;
+    let network = arc_state::recovery::RecoveryNetworkPolicy {
+        chain_id: genesis.chain.chain_id.clone(),
+        genesis_hash,
+        recovery_epoch,
+        validator_set_id,
+        validators,
+        community_rewards_v1_activation_height: genesis
+            .chain
+            .community_rewards_v1_activation_height,
+    };
+    Ok((genesis, network))
+}
+
+fn load_recovery_validator_file(path: &str) -> Result<Vec<arc_state::recovery::RecoveryValidator>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read recovery validator file {path}"))?;
+    let records: Vec<RecoveryValidatorFileEntry> = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse recovery validator file {path}"))?;
+    ensure!(!records.is_empty(), "recovery validator file is empty");
+    records
+        .into_iter()
+        .enumerate()
+        .map(|(index, record)| {
+            let address = parse_recovery_hash(
+                &format!("validator #{} address", index + 1),
+                &record.address,
+            )?;
+            ensure!(record.stake > 0, "validator {address} has zero stake");
+            let public_hex = record
+                .public_key
+                .strip_prefix("0x")
+                .or_else(|| record.public_key.strip_prefix("0X"))
+                .unwrap_or(&record.public_key);
+            let public_bytes = hex::decode(public_hex)
+                .with_context(|| format!("validator {address} public_key is not hexadecimal"))?;
+            let public_key: [u8; 32] = public_bytes.try_into().map_err(|bytes: Vec<u8>| {
+                anyhow::anyhow!(
+                    "validator {address} public_key must be 32 bytes (found {})",
+                    bytes.len()
+                )
+            })?;
+            ensure!(
+                hash_bytes(&public_key) == address,
+                "validator {address} public_key derives to a different address"
+            );
+            Ok(arc_state::recovery::RecoveryValidator {
+                address,
+                public_key,
+                stake: record.stake,
+            })
+        })
+        .collect()
+}
+
+fn recovery_trust(
+    genesis: &str,
+    approved_manifest_hash: &str,
+    recovery_epoch: u64,
+    validator_set_id: u64,
+) -> Result<arc_state::recovery::RecoveryTrustRoot> {
+    let (_, network) = recovery_network_from_genesis(genesis, recovery_epoch, validator_set_id)?;
+    Ok(arc_state::recovery::RecoveryTrustRoot {
+        network,
+        approved_manifest_hash: parse_recovery_hash(
+            "approved_manifest_hash",
+            approved_manifest_hash,
+        )?,
+    })
+}
+
+fn print_recovery_summary(
+    checkpoint: &arc_state::recovery::ArcCheckpoint,
+    status: &str,
+) -> Result<()> {
+    let transition = checkpoint.manifest.transition_block()?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": status,
+            "manifest_hash": format!("0x{}", checkpoint.manifest_hash().to_hex()),
+            "payload_hash": format!("0x{}", checkpoint.manifest.payload_hash.to_hex()),
+            "full_state_root": format!("0x{}", checkpoint.manifest.full_state_root.to_hex()),
+            "chain_id": checkpoint.manifest.chain_id,
+            "genesis_hash": format!("0x{}", checkpoint.manifest.genesis_hash.to_hex()),
+            "source_height": checkpoint.manifest.source_height,
+            "source_block_hash": format!("0x{}", checkpoint.manifest.source_block_hash.to_hex()),
+            "transition_height": transition.header.height,
+            "transition_block_hash": format!("0x{}", transition.hash.to_hex()),
+            "recovery_epoch": checkpoint.manifest.recovery_epoch,
+            "validator_set_id": checkpoint.manifest.validator_set_id,
+            "protocol_version": format!(
+                "{}.{}.{}",
+                checkpoint.manifest.protocol_version.major,
+                checkpoint.manifest.protocol_version.minor,
+                checkpoint.manifest.protocol_version.patch,
+            ),
+            "validator_count": checkpoint.manifest.validators.len(),
+            "signature_count": checkpoint.signatures.len(),
+        }))?
+    );
+    Ok(())
+}
+
+fn run_operator_command(command: OperatorCommand) -> Result<()> {
+    let OperatorCommand::Recovery { command } = command;
+    match command {
+        RecoveryCommand::Inspect { checkpoint } => {
+            let checkpoint = arc_state::recovery::ArcCheckpoint::read_from(checkpoint)?;
+            print_recovery_summary(&checkpoint, "UNTRUSTED_INSPECTION")
+        }
+        RecoveryCommand::Export {
+            data_dir,
+            genesis,
+            validator_public_keys,
+            output,
+            source_consensus_round,
+            recovery_epoch,
+            validator_set_id,
+            created_at_unix_ms,
+            allow_unbound_legacy_wal,
+        } => {
+            let (genesis, network) =
+                recovery_network_from_genesis(&genesis, recovery_epoch, validator_set_id)?;
+            let validators = load_recovery_validator_file(&validator_public_keys)?;
+            let mut public_set: Vec<_> = validators
+                .iter()
+                .map(|validator| (validator.address, validator.stake))
+                .collect();
+            public_set.sort_by_key(|entry| entry.0.0);
+            let mut approved_set = network.validators.clone();
+            approved_set.sort_by_key(|entry| entry.0.0);
+            ensure!(
+                public_set == approved_set,
+                "validator public-key file addresses/stakes differ from the complete genesis set"
+            );
+            let state = StateDB::load_legacy_recovery_source(
+                &data_dir,
+                network.genesis_hash,
+                allow_unbound_legacy_wal,
+            )?;
+            let created_at_unix_ms = created_at_unix_ms.unwrap_or(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .context("host clock is before the Unix epoch")?
+                    .as_millis()
+                    .try_into()
+                    .context("Unix timestamp exceeds u64")?,
+            );
+            let checkpoint = arc_state::recovery::ArcCheckpoint::export_unsigned(
+                &state,
+                arc_state::recovery::RecoveryExportSpec {
+                    chain_id: genesis.chain.chain_id,
+                    genesis_hash: network.genesis_hash,
+                    source_consensus_round,
+                    recovery_epoch,
+                    validator_set_id,
+                    validators,
+                    community_rewards_v1_activation_height: network
+                        .community_rewards_v1_activation_height,
+                    created_at_unix_ms,
+                },
+            )?;
+            checkpoint.verify_content()?;
+            checkpoint.write_to(&output)?;
+            print_recovery_summary(&checkpoint, "EXPORTED_UNSIGNED")
+        }
+        RecoveryCommand::Sign {
+            checkpoint,
+            genesis,
+            approved_manifest_hash,
+            validator_key_file,
+            output,
+            recovery_epoch,
+            validator_set_id,
+        } => {
+            let mut checkpoint = arc_state::recovery::ArcCheckpoint::read_from(checkpoint)?;
+            let trust = recovery_trust(
+                &genesis,
+                &approved_manifest_hash,
+                recovery_epoch,
+                validator_set_id,
+            )?;
+            checkpoint.verify_candidate(&trust)?;
+            let keypair = validator_identity::load_ed25519_keyfile(Path::new(&validator_key_file))?;
+            checkpoint.add_signature(&keypair)?;
+            checkpoint.write_to(&output)?;
+            print_recovery_summary(&checkpoint, "SIGNED_CANDIDATE")
+        }
+        RecoveryCommand::Verify {
+            checkpoint,
+            genesis,
+            approved_manifest_hash,
+            recovery_epoch,
+            validator_set_id,
+        } => {
+            let checkpoint = arc_state::recovery::ArcCheckpoint::read_from(checkpoint)?;
+            let trust = recovery_trust(
+                &genesis,
+                &approved_manifest_hash,
+                recovery_epoch,
+                validator_set_id,
+            )?;
+            checkpoint.verify(&trust)?;
+            print_recovery_summary(&checkpoint, "VERIFIED_QUORUM")
+        }
+        RecoveryCommand::Import {
+            checkpoint,
+            data_dir,
+            genesis,
+            approved_manifest_hash,
+            recovery_epoch,
+            validator_set_id,
+        } => {
+            let (_, network) =
+                recovery_network_from_genesis(&genesis, recovery_epoch, validator_set_id)?;
+            let approved_manifest_hash =
+                parse_recovery_hash("approved_manifest_hash", &approved_manifest_hash)?;
+            let state = StateDB::with_genesis_persistent_recovery(
+                &[],
+                &data_dir,
+                network,
+                Some(arc_state::recovery::RecoveryImport {
+                    checkpoint_path: checkpoint.into(),
+                    approved_manifest_hash,
+                }),
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "ACTIVATED",
+                    "height": state.height(),
+                    "recovery_epoch": state.recovery_context().map(|context| context.recovery_epoch),
+                    "validator_set_id": state.recovery_context().map(|context| context.validator_set_id),
+                    "manifest_hash": state.recovery_manifest_hash().map(|hash| format!("0x{}", hash.to_hex())),
+                    "state_root": format!("0x{}", state.get_state_root().to_hex()),
+                    "data_dir": data_dir,
+                }))?
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Rewrites a pulled peer's `self_shard.socket_addr` in place when it carries
@@ -738,6 +1122,11 @@ async fn main() -> Result<()> {
         .init();
 
     let mut cli = Cli::parse();
+
+    if let Some(command) = cli.operator_command.take() {
+        run_operator_command(command)?;
+        return Ok(());
+    }
 
     // ── --community: one-flag community-node setup ─────────────────────
     // Forces stake=0 + community_mode=true, and auto-discovers a local
@@ -1212,11 +1601,54 @@ async fn main() -> Result<()> {
     };
 
     let state = Arc::new({
-        let mut db = StateDB::with_genesis_persistent(&genesis_accounts, &data_dir, genesis_hash)
-            .context("failed to initialize genesis-bound persistent state")?;
         let reward_activation_height = genesis_cfg
             .as_ref()
             .and_then(|config| config.chain.community_rewards_v1_activation_height);
+        if cli.recovery_checkpoint.is_some() && genesis_cfg.is_none() {
+            bail!(
+                "--recovery-checkpoint requires --genesis with the complete approved validator set"
+            );
+        }
+        if cli.recovery_checkpoint.is_none() && cli.approved_recovery_manifest_hash.is_some() {
+            bail!(
+                "--approved-recovery-manifest-hash is valid only with --recovery-checkpoint; an already-active data directory reads its pinned recovery.active marker"
+            );
+        }
+        let recovery_import = match (
+            cli.recovery_checkpoint.as_ref(),
+            cli.approved_recovery_manifest_hash.as_deref(),
+        ) {
+            (Some(path), Some(approved)) => Some(arc_state::recovery::RecoveryImport {
+                checkpoint_path: path.into(),
+                approved_manifest_hash: Hash256::from_hex(approved).map_err(|_| {
+                    anyhow::anyhow!(
+                        "--approved-recovery-manifest-hash must be exactly 32 bytes of hex"
+                    )
+                })?,
+            }),
+            (Some(_), None) => bail!(
+                "--recovery-checkpoint requires --approved-recovery-manifest-hash from the out-of-band GO decision"
+            ),
+            (None, _) => None,
+        };
+        let recovery_network = arc_state::recovery::RecoveryNetworkPolicy {
+            chain_id: genesis_cfg
+                .as_ref()
+                .map(|config| config.chain.chain_id.clone())
+                .unwrap_or_else(|| "0x415243".to_string()),
+            genesis_hash,
+            recovery_epoch: cli.recovery_epoch,
+            validator_set_id: cli.validator_set_id,
+            validators: genesis_validators.clone(),
+            community_rewards_v1_activation_height: reward_activation_height,
+        };
+        let mut db = StateDB::with_genesis_persistent_recovery(
+            &genesis_accounts,
+            &data_dir,
+            recovery_network,
+            recovery_import,
+        )
+        .context("failed to initialize genesis/recovery-bound persistent state")?;
         db.set_community_rewards_v1_activation_height(reward_activation_height);
         match reward_activation_height {
             Some(height) => tracing::info!(
@@ -1226,6 +1658,18 @@ async fn main() -> Result<()> {
             None => tracing::info!(
                 "Community reward v1 consensus activation is absent; tx 0x25 is disabled"
             ),
+        }
+        if let Some(context) = db.recovery_context() {
+            let manifest_hash = db
+                .recovery_manifest_hash()
+                .expect("recovery context always has a manifest hash");
+            tracing::info!(
+                recovery_epoch = context.recovery_epoch,
+                validator_set_id = context.validator_set_id,
+                checkpoint = %manifest_hash,
+                transition_height = db.height(),
+                "Quorum-certified ARCCHKPT recovery is active"
+            );
         }
         if cli.archive {
             db.archive_mode = true;
@@ -1298,6 +1742,12 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    if state.recovery_context().is_some() && sync_peer.is_some() {
+        bail!(
+            "legacy peer snapshot sync is forbidden after ARCCHKPT activation; recover only from the pinned local checkpoint plus its verified WAL"
+        );
+    }
 
     if let Some(peer) = &sync_peer {
         tracing::info!("Bootstrapping from peer: {}", peer);
@@ -1597,6 +2047,18 @@ async fn main() -> Result<()> {
             &peer_vals,
             validator_keypair.clone(),
         );
+        if let Some(context) = state.recovery_context() {
+            consensus
+                .engine
+                .install_consensus_domain(arc_consensus::ConsensusDomain::new(
+                    context.domain_hash(),
+                    context.recovery_epoch,
+                    context.validator_set_id,
+                ))
+                .map_err(|error| {
+                    anyhow::anyhow!("failed to install recovery consensus domain: {error}")
+                })?;
+        }
         consensus.dag_validators = Some(dag_validators.clone());
         consensus.dag_round = Some(dag_round.clone());
         consensus.dag_committed = Some(dag_committed.clone());
@@ -2418,9 +2880,24 @@ async fn main() -> Result<()> {
                                     .unwrap_or(value);
                                 Hash256::from_hex(bare).ok()
                             });
+                        let assignment_transaction_domain = job
+                            .get("transaction_domain")
+                            .and_then(|value| value.as_str())
+                            .and_then(|value| {
+                                let bare = value
+                                    .strip_prefix("0x")
+                                    .or_else(|| value.strip_prefix("0X"))
+                                    .unwrap_or(value);
+                                Hash256::from_hex(bare).ok()
+                            });
+                        let transaction_domain_is_malformed = job
+                            .get("transaction_domain")
+                            .is_some_and(|value| !value.is_null())
+                            && assignment_transaction_domain.is_none();
                         let assignment_model_matches =
                             assignment_model_id == Some(worker_model_id_hash);
                         if !assignment_model_matches
+                            || transaction_domain_is_malformed
                             || input.is_empty()
                             || input.len() > 32_768
                             || max_tokens == 0
@@ -2428,6 +2905,9 @@ async fn main() -> Result<()> {
                         {
                             let reason = if !assignment_model_matches {
                                 "assignment omitted or mismatched the worker's exact model artifact"
+                                    .to_string()
+                            } else if transaction_domain_is_malformed {
+                                "assignment carried a malformed recovery transaction domain"
                                     .to_string()
                             } else {
                                 format!(
@@ -2606,7 +3086,11 @@ async fn main() -> Result<()> {
                             sig_verified: false,
                         };
 
-                        let signed_attestation_hex = match tx.sign(&worker_keypair) {
+                        let signed_attestation = match assignment_transaction_domain {
+                            Some(domain) => tx.sign_in_domain(&worker_keypair, &domain),
+                            None => tx.sign(&worker_keypair),
+                        };
+                        let signed_attestation_hex = match signed_attestation {
                             Ok(()) => bincode::serialize(&tx)
                                 .ok()
                                 .map(|b| format!("0x{}", hex::encode(b))),
@@ -2845,6 +3329,47 @@ mod tests {
         let cli = Cli::try_parse_from(["arc-node"]).unwrap();
         assert_eq!(cli.rpc, "127.0.0.1:9944");
         assert_eq!(cli.eth_rpc_port, 0);
+    }
+
+    #[test]
+    fn recovery_operator_subcommands_have_stable_required_inputs() {
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "recovery",
+            "verify",
+            "--checkpoint",
+            "candidate.arcchkpt",
+            "--genesis",
+            "genesis.toml",
+            "--approved-manifest-hash",
+            &"11".repeat(32),
+        ])
+        .unwrap();
+        let Some(OperatorCommand::Recovery {
+            command:
+                RecoveryCommand::Verify {
+                    recovery_epoch,
+                    validator_set_id,
+                    ..
+                },
+        }) = cli.operator_command
+        else {
+            panic!("recovery verify command was not parsed")
+        };
+        assert_eq!(recovery_epoch, 1);
+        assert_eq!(validator_set_id, 1);
+
+        assert!(
+            Cli::try_parse_from([
+                "arc-node",
+                "recovery",
+                "import",
+                "--checkpoint",
+                "candidate.arcchkpt",
+            ])
+            .is_err(),
+            "activation must require data-dir, genesis, and the exact manifest pin"
+        );
     }
 
     #[test]

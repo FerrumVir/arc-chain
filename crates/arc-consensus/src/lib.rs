@@ -408,6 +408,26 @@ impl ValidatorSet {
 
 // ── DAG Block ────────────────────────────────────────────────────────────────
 
+/// Exact protocol-v3 recovery domain for DAG proposals and votes. Keeping the
+/// fields explicit makes status/audit output meaningful while `domain_hash`
+/// binds chain ID, genesis, recovery epoch, validator set, and protocol.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsensusDomain {
+    pub domain_hash: Hash256,
+    pub recovery_epoch: u64,
+    pub validator_set_id: u64,
+}
+
+impl ConsensusDomain {
+    pub fn new(domain_hash: Hash256, recovery_epoch: u64, validator_set_id: u64) -> Self {
+        Self {
+            domain_hash,
+            recovery_epoch,
+            validator_set_id,
+        }
+    }
+}
+
 /// A block in the DAG. Each validator proposes one block per round,
 /// referencing parent blocks from the previous round.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -450,6 +470,26 @@ impl DagBlock {
         Hash256(*hasher.finalize().as_bytes())
     }
 
+    /// Protocol-v3 DAG hash. A block signed in one recovery epoch or
+    /// validator-set domain is invalid in every other domain.
+    pub fn compute_hash_in_domain(&self, domain: &ConsensusDomain) -> Hash256 {
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-dag-block-v3");
+        hasher.update(domain.domain_hash.as_ref());
+        hasher.update(&domain.recovery_epoch.to_be_bytes());
+        hasher.update(&domain.validator_set_id.to_be_bytes());
+        hasher.update(self.author.as_ref());
+        hasher.update(&self.round.to_le_bytes());
+        for parent in &self.parents {
+            hasher.update(parent.as_ref());
+        }
+        for tx in &self.transactions {
+            hasher.update(tx.as_ref());
+        }
+        hasher.update(&self.timestamp.to_le_bytes());
+        hasher.update(self.ordering_commitment.as_ref());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
     /// Compute the ordering commitment for a list of transaction hashes.
     /// This is BLAKE3 over the concatenated tx hashes in **canonical lexicographic
     /// order**. Validators recompute this commitment by sorting the block's
@@ -469,6 +509,10 @@ impl DagBlock {
     /// Verify that the stored hash matches the computed hash.
     pub fn verify_hash(&self) -> bool {
         self.hash == self.compute_hash()
+    }
+
+    pub fn verify_hash_in_domain(&self, domain: &ConsensusDomain) -> bool {
+        self.hash == self.compute_hash_in_domain(domain)
     }
 
     /// Verify that the block's transactions are in canonical lexicographic order
@@ -659,6 +703,9 @@ pub struct ConsensusEngine {
     stake_tracker: parking_lot::Mutex<StakeTracker>,
     /// This node's role in the propose-verify protocol.
     node_role: NodeRole,
+    /// `None` preserves legacy DAG hashes. ARCCHKPT activation installs this
+    /// before any proposal, receive, or local-WAL cursor restoration.
+    consensus_domain: RwLock<Option<ConsensusDomain>>,
 }
 
 impl ConsensusEngine {
@@ -705,6 +752,7 @@ impl ConsensusEngine {
             stake_tracker: parking_lot::Mutex::new(StakeTracker::new()),
             node_role: NodeRole::Full,
             testnet_mode: false,
+            consensus_domain: RwLock::new(None),
         }
     }
 
@@ -744,6 +792,7 @@ impl ConsensusEngine {
             stake_tracker: parking_lot::Mutex::new(StakeTracker::new()),
             node_role: NodeRole::Full,
             testnet_mode: false,
+            consensus_domain: RwLock::new(None),
         }
     }
 
@@ -778,6 +827,35 @@ impl ConsensusEngine {
     pub fn register_validator_key(&self, address: Address, ed25519_pubkey: [u8; 32]) {
         self.validator_keys.insert(address, ed25519_pubkey);
         debug!(%address, "Registered validator public key");
+    }
+
+    /// Install the exact recovery domain before this engine observes any DAG
+    /// state. Rebinding a live engine would make its existing signatures
+    /// ambiguous and is therefore rejected.
+    pub fn install_consensus_domain(&self, domain: ConsensusDomain) -> Result<(), ConsensusError> {
+        let mut active = self.consensus_domain.write();
+        if let Some(existing) = active.as_ref() {
+            if existing == &domain {
+                return Ok(());
+            }
+            return Err(ConsensusError::InvalidBlock(
+                "consensus recovery domain is already bound to another epoch/set".into(),
+            ));
+        }
+        if !self.dag.is_empty()
+            || self.current_round.load(Ordering::SeqCst) != 0
+            || self.last_committed_round.load(Ordering::SeqCst) != 0
+        {
+            return Err(ConsensusError::InvalidBlock(
+                "consensus recovery domain must be installed before DAG/cursor recovery".into(),
+            ));
+        }
+        *active = Some(domain);
+        Ok(())
+    }
+
+    pub fn consensus_domain(&self) -> Option<ConsensusDomain> {
+        self.consensus_domain.read().clone()
     }
 
     /// Get the current round number.
@@ -1109,7 +1187,10 @@ impl ConsensusEngine {
             signature: Vec::new(),
             ordering_commitment,
         };
-        block.hash = block.compute_hash();
+        block.hash = match self.consensus_domain.read().as_ref() {
+            Some(domain) => block.compute_hash_in_domain(domain),
+            None => block.compute_hash(),
+        };
 
         // Sign the block hash with our keypair (if available)
         if let Some(ref keypair) = self.local_keypair {
@@ -1178,7 +1259,11 @@ impl ConsensusEngine {
         }
 
         // 3. Verify hash integrity
-        if !block.verify_hash() {
+        let valid_hash = match self.consensus_domain.read().as_ref() {
+            Some(domain) => block.verify_hash_in_domain(domain),
+            None => block.verify_hash(),
+        };
+        if !valid_hash {
             return Err(ConsensusError::InvalidBlock(
                 "hash does not match block contents".into(),
             ));
@@ -2838,6 +2923,24 @@ mod tests {
         // Block should be in the DAG
         assert_eq!(engine.dag_size(), 1);
         assert_eq!(engine.blocks_in_round(0).len(), 1);
+    }
+
+    #[test]
+    fn recovery_domain_prevents_cross_epoch_dag_replay() {
+        let vs = test_validator_set(4);
+        let engine = ConsensusEngine::new(vs, test_addr(0));
+        let domain_a = ConsensusDomain::new(hash_bytes(b"recovery-domain-a"), 1, 7);
+        let domain_b = ConsensusDomain::new(hash_bytes(b"recovery-domain-b"), 2, 8);
+        engine.install_consensus_domain(domain_a.clone()).unwrap();
+
+        let block = engine
+            .propose_block(vec![hash_bytes(b"tx")], 1_000)
+            .unwrap();
+
+        assert!(block.verify_hash_in_domain(&domain_a));
+        assert!(!block.verify_hash_in_domain(&domain_b));
+        assert!(!block.verify_hash());
+        assert!(engine.install_consensus_domain(domain_b).is_err());
     }
 
     #[test]

@@ -1669,6 +1669,22 @@ impl Transaction {
         Hash256(*hasher.finalize().as_bytes())
     }
 
+    /// Compute the protocol-v3 transaction hash for an exact recovery domain.
+    /// The same transaction fields signed for another chain, recovery epoch,
+    /// or validator-set ID produce a different hash and cannot be replayed.
+    pub fn compute_hash_in_domain(&self, recovery_domain: &Hash256) -> Hash256 {
+        let body_bytes = bincode::serialize(&self.body).expect("serializable");
+        let mut hasher = blake3::Hasher::new_derive_key("ARC-chain-tx-v3");
+        hasher.update(recovery_domain.as_ref());
+        hasher.update(&[self.tx_type as u8]);
+        hasher.update(self.from.as_ref());
+        hasher.update(&self.nonce.to_le_bytes());
+        hasher.update(&body_bytes);
+        hasher.update(&self.fee.to_le_bytes());
+        hasher.update(&self.gas_limit.to_le_bytes());
+        Hash256(*hasher.finalize().as_bytes())
+    }
+
     /// Sign this transaction in place.
     ///
     /// 1. Recomputes the hash from the current fields.
@@ -1677,6 +1693,19 @@ impl Transaction {
     pub fn sign(&mut self, keypair: &KeyPair) -> Result<(), SignatureError> {
         self.hash = self.compute_hash();
         self.signature = keypair.sign(&self.hash)?;
+        Ok(())
+    }
+
+    /// Sign for one protocol-v3 recovery domain. This must be used by clients
+    /// after the H+1 transition; legacy [`Self::sign`] remains unchanged.
+    pub fn sign_in_domain(
+        &mut self,
+        keypair: &KeyPair,
+        recovery_domain: &Hash256,
+    ) -> Result<(), SignatureError> {
+        self.hash = self.compute_hash_in_domain(recovery_domain);
+        self.signature = keypair.sign(&self.hash)?;
+        self.sig_verified = false;
         Ok(())
     }
 
@@ -1697,6 +1726,21 @@ impl Transaction {
             return Err(SignatureError::HashMismatch);
         }
         // Authorization: verify signature matches `from`
+        self.signature.verify(&self.hash, &self.from)
+    }
+
+    /// Verify content, signer, and signature in one exact recovery domain.
+    pub fn verify_signature_in_domain(
+        &self,
+        recovery_domain: &Hash256,
+    ) -> Result<(), SignatureError> {
+        if self.tx_type != self.body.tx_type() {
+            return Err(SignatureError::HashMismatch);
+        }
+        let expected = self.compute_hash_in_domain(recovery_domain);
+        if self.hash != expected {
+            return Err(SignatureError::HashMismatch);
+        }
         self.signature.verify(&self.hash, &self.from)
     }
 
@@ -1819,6 +1863,20 @@ mod tests {
         assert!(!tx.is_unsigned());
 
         tx.verify_signature().expect("verify ok");
+    }
+
+    #[test]
+    fn recovery_domain_prevents_cross_epoch_transaction_replay() {
+        let keypair = KeyPair::generate_ed25519();
+        let domain_a = hash_bytes(b"chain-A/recovery-1/set-1");
+        let domain_b = hash_bytes(b"chain-A/recovery-2/set-2");
+        let mut transaction = Transaction::new_transfer(keypair.address(), test_addr(2), 1_000, 0);
+
+        transaction.sign_in_domain(&keypair, &domain_a).unwrap();
+
+        transaction.verify_signature_in_domain(&domain_a).unwrap();
+        assert!(transaction.verify_signature_in_domain(&domain_b).is_err());
+        assert!(transaction.verify_signature().is_err());
     }
 
     #[test]

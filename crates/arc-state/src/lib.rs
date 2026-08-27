@@ -4,6 +4,7 @@ pub mod io_backend;
 pub mod jmt_store;
 pub mod light_client;
 pub mod mmap_state;
+pub mod recovery;
 pub mod simd_parse;
 pub mod wal;
 
@@ -14,8 +15,8 @@ use arc_types::transaction::{
     ModelRegistrationBody, ModelRequestBody, ShardCoverageClaimBody, gas_costs,
 };
 use arc_types::{
-    Account, Address, Block, BlockHeader, Identity, IdentityLevel, ProtocolVersion, Transaction,
-    TransferBody, TxBody, TxReceipt, TxType,
+    Account, Address, Block, BlockHeader, Identity, IdentityLevel, Transaction, TransferBody,
+    TxBody, TxReceipt, TxType,
 };
 
 use crate::jmt_store::JmtStateTree;
@@ -33,7 +34,7 @@ use thiserror::Error;
 
 pub use wal::{
     PersistenceConfig, Snapshot, WalEntry, WalOp, WalWriter, find_last_checkpoint,
-    latest_block_height_in_wal_dir, read_wal, read_wal_dir,
+    latest_block_height_in_wal_dir, read_wal, read_wal_dir, read_wal_strict,
 };
 
 #[derive(Error, Debug)]
@@ -317,6 +318,11 @@ pub struct StateDB {
     /// derived, in-memory index with no WAL op of its own — rebuilt on restart
     /// from the surviving escrow accounts by `rebuild_pending_bond_releases()`.
     pending_bond_releases: parking_lot::Mutex<BTreeMap<u64, Vec<[u8; 32]>>>,
+    /// Present only after a quorum-certified ARCCHKPT H+1 transition.
+    /// `None` preserves legacy state-root and protocol behavior byte-for-byte.
+    recovery_context: RwLock<Option<recovery::RecoveryContext>>,
+    /// Exact operator-approved manifest that established `recovery_context`.
+    recovery_manifest_hash: RwLock<Option<Hash256>>,
 }
 
 impl StateDB {
@@ -354,6 +360,8 @@ impl StateDB {
             community_rewards_v1_activation_height: AtomicU64::new(u64::MAX),
             tier1_pending: DashMap::new(),
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
+            recovery_context: RwLock::new(None),
+            recovery_manifest_hash: RwLock::new(None),
         }
     }
 
@@ -393,6 +401,8 @@ impl StateDB {
             community_rewards_v1_activation_height: AtomicU64::new(u64::MAX),
             tier1_pending: DashMap::new(),
             pending_bond_releases: parking_lot::Mutex::new(BTreeMap::new()),
+            recovery_context: RwLock::new(None),
+            recovery_manifest_hash: RwLock::new(None),
         })
     }
 
@@ -653,6 +663,22 @@ impl StateDB {
             }
             WalOp::SetContract(addr, bytecode) => {
                 self.contracts.insert(addr.0, bytecode.clone());
+            }
+            WalOp::SetFullTransaction(hash, transaction) => {
+                self.full_transactions.insert(hash.0, transaction.clone());
+            }
+            WalOp::SetEventLogs(height, logs) => {
+                self.event_logs.insert(*height, logs.clone());
+            }
+            WalOp::SetIdentity(address, identity) => {
+                self.identities.insert(address.0, identity.clone());
+            }
+            WalOp::SetValidatorState(validators, staking_pool) => {
+                self.validators.clear();
+                for (address, stake) in validators {
+                    self.validators.insert(address.0, *stake);
+                }
+                self.staking_pool.store(*staking_pool, Ordering::Release);
             }
             WalOp::Checkpoint(_) => {
                 // Checkpoints are informational - no state change
@@ -966,7 +992,14 @@ impl StateDB {
     /// Store event logs for a specific block height.
     pub fn store_event_logs(&self, height: u64, logs: Vec<arc_types::EventLog>) {
         if !logs.is_empty() {
-            self.event_logs.entry(height).or_default().extend(logs);
+            let combined = {
+                let mut entry = self.event_logs.entry(height).or_default();
+                entry.extend(logs);
+                entry.clone()
+            };
+            self.wal
+                .append(WalOp::SetEventLogs(height, combined), height);
+            self.wal.sync();
         }
     }
 
@@ -1367,7 +1400,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -1393,9 +1426,11 @@ impl StateDB {
         self.blocks.insert(height, block.clone());
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
 
         // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.wal.sync();
 
         // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
@@ -1495,7 +1530,7 @@ impl StateDB {
                         self.execute_tx(tx) // Pre-verified (faucet/RPC) - skip sig check
                     } else if tx.is_unsigned() {
                         Err(StateError::ExecutionError("unsigned transaction".into()))
-                    } else if tx.verify_signature().is_err() {
+                    } else if self.verify_transaction_signature(tx).is_err() {
                         Err(StateError::ExecutionError("invalid signature".into()))
                     } else {
                         self.execute_tx(tx)
@@ -1565,7 +1600,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -1589,7 +1624,9 @@ impl StateDB {
         self.blocks.insert(height, block.clone());
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &final_receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.wal.sync();
 
         Ok((block, final_receipts))
     }
@@ -1634,6 +1671,7 @@ impl StateDB {
         // batch operation (~2x faster than individual verification).
         // Transactions already verified at mempool insertion are skipped.
         let mut batch_sig_valid = vec![None; transactions.len()]; // None = needs individual check
+        let recovery_domain = self.transaction_domain_hash();
         {
             let mut ed_indices: Vec<usize> = Vec::new();
             let mut ed_msgs: Vec<Vec<u8>> = Vec::new();
@@ -1645,7 +1683,11 @@ impl StateDB {
                     continue; // unsigned handled below; pre-verified skipped
                 }
                 // Hash integrity check
-                if tx.compute_hash() != tx.hash {
+                let expected_hash = match recovery_domain {
+                    Some(domain) => tx.compute_hash_in_domain(&domain),
+                    None => tx.compute_hash(),
+                };
+                if expected_hash != tx.hash {
                     batch_sig_valid[i] = Some(false);
                     continue;
                 }
@@ -1691,7 +1733,9 @@ impl StateDB {
                     Err(_) => {
                         // Batch failed - fall back to individual verification to find bad ones
                         for &idx in &ed_indices {
-                            let valid = transactions[idx].verify_signature().is_ok();
+                            let valid = self
+                                .verify_transaction_signature(&transactions[idx])
+                                .is_ok();
                             batch_sig_valid[idx] = Some(valid);
                         }
                     }
@@ -1716,7 +1760,7 @@ impl StateDB {
                 } else {
                     Err(StateError::ExecutionError("invalid signature".into()))
                 }
-            } else if tx.verify_signature().is_err() {
+            } else if self.verify_transaction_signature(tx).is_err() {
                 Err(StateError::ExecutionError("invalid signature".into()))
             } else {
                 self.execute_tx(tx)
@@ -1765,7 +1809,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -1791,9 +1835,11 @@ impl StateDB {
         self.blocks.insert(height, block.clone());
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
 
         // WAL checkpoint at block boundary
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.wal.sync();
 
         // Check if we should take a snapshot
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
@@ -1837,10 +1883,15 @@ impl StateDB {
         let mut ed_tasks: Vec<VerifyTask> = Vec::new();
         let mut other_indices: Vec<usize> = Vec::new();
         let mut sig_valid = vec![false; transactions.len()];
+        let recovery_domain = self.transaction_domain_hash();
 
         for (i, tx) in transactions.iter().enumerate() {
             // Hash integrity check
-            if tx.compute_hash() != tx.hash {
+            let expected_hash = match recovery_domain {
+                Some(domain) => tx.compute_hash_in_domain(&domain),
+                None => tx.compute_hash(),
+            };
+            if expected_hash != tx.hash {
                 continue; // sig_valid[i] stays false
             }
 
@@ -2013,7 +2064,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -2036,7 +2087,9 @@ impl StateDB {
         self.blocks.insert(height, block.clone());
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.wal.sync();
 
         let count = self.snapshot_counter.fetch_add(1, Ordering::Relaxed);
         if count > 0 && count.is_multiple_of(10_000) {
@@ -2135,7 +2188,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -2159,7 +2212,9 @@ impl StateDB {
         self.blocks.insert(height, block.clone());
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.wal.sync();
 
         Ok((block, receipts))
     }
@@ -2272,7 +2327,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -2296,7 +2351,9 @@ impl StateDB {
         self.blocks.insert(height, block.clone());
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.wal.sync();
 
         Ok((block, receipts))
     }
@@ -2494,7 +2551,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: tx_per_block as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -2558,6 +2615,7 @@ impl StateDB {
 
         let tx_count = transactions.len();
         let t0 = std::time::Instant::now();
+        let recovery_domain = self.transaction_domain_hash();
 
         // ── 1. Batch verify Ed25519 signatures (parallel chunks) ──────────
         // Extract (message, signature, verifying_key) for batch verification.
@@ -2581,7 +2639,11 @@ impl StateDB {
                             // integrity or the ARC address derived from the
                             // verifying key. Both are consensus authorization
                             // requirements, even on the benchmark path.
-                            if tx.compute_hash() != tx.hash
+                            let expected_hash = match recovery_domain {
+                                Some(domain) => tx.compute_hash_in_domain(&domain),
+                                None => tx.compute_hash(),
+                            };
+                            if expected_hash != tx.hash
                                 || arc_crypto::address_from_ed25519_pubkey(public_key) != tx.from
                             {
                                 valid = false;
@@ -2615,14 +2677,14 @@ impl StateDB {
                         // Batch failed - fall back to individual verification
                         chunk
                             .iter()
-                            .map(|tx| tx.verify_signature().is_ok())
+                            .map(|tx| self.verify_transaction_signature(tx).is_ok())
                             .collect()
                     }
                 } else {
                     // Non-Ed25519 or parse error - verify individually
                     chunk
                         .iter()
-                        .map(|tx| tx.verify_signature().is_ok())
+                        .map(|tx| self.verify_transaction_signature(tx).is_ok())
                         .collect()
                 }
             })
@@ -2695,7 +2757,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: tx_count as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -4592,7 +4654,7 @@ impl StateDB {
                         tx.from.to_hex()
                     )));
                 }
-                tx.verify_signature().map_err(|_| {
+                self.verify_transaction_signature(tx).map_err(|_| {
                     StateError::ExecutionError(
                         "community inference reward: invalid validator signature".to_string(),
                     )
@@ -4623,12 +4685,13 @@ impl StateDB {
                 }
 
                 let worker_attestation = body.reconstruct_worker_attestation();
-                worker_attestation.verify_signature().map_err(|_| {
-                    StateError::ExecutionError(
-                        "community inference reward: invalid worker certificate signature"
-                            .to_string(),
-                    )
-                })?;
+                self.verify_transaction_signature(&worker_attestation)
+                    .map_err(|_| {
+                        StateError::ExecutionError(
+                            "community inference reward: invalid worker certificate signature"
+                                .to_string(),
+                        )
+                    })?;
 
                 let treasury_addr = arc_types::transaction::faucet_pool_address();
                 if body.worker == treasury_addr {
@@ -5982,7 +6045,7 @@ impl StateDB {
             proof_hash: Hash256::ZERO,
             tx_count: transactions.len() as u32,
             producer,
-            protocol_version: ProtocolVersion::GENESIS,
+            protocol_version: self.active_protocol_version(),
             state_diff: None,
         };
 
@@ -6006,7 +6069,9 @@ impl StateDB {
         self.blocks.insert(height, block.clone());
         self.wal
             .append(WalOp::SetBlock(height, block.clone()), height);
+        self.persist_restart_artifacts(transactions, &receipts, height);
         self.wal.append(WalOp::Checkpoint(state_root), height);
+        self.wal.sync();
 
         // Auto-prune old state every 100 blocks unless in archive mode.
         // Archive nodes keep full history for block explorers and analytics.
@@ -6298,6 +6363,35 @@ impl StateDB {
             }
         }
         blocks
+    }
+
+    /// Persist the non-account records required to reconstruct a complete
+    /// post-block state. The checkpoint is appended only after these records,
+    /// and callers fsync immediately after the checkpoint.
+    fn persist_restart_artifacts(
+        &self,
+        transactions: &[Transaction],
+        receipts: &[TxReceipt],
+        height: u64,
+    ) {
+        for (transaction, receipt) in transactions.iter().zip(receipts) {
+            self.wal
+                .append(WalOp::SetReceipt(transaction.hash, receipt.clone()), height);
+            self.wal.append(
+                WalOp::SetFullTransaction(transaction.hash, transaction.clone()),
+                height,
+            );
+        }
+        let mut validators: Vec<_> = self
+            .validators
+            .iter()
+            .map(|entry| (Hash256(*entry.key()), *entry.value()))
+            .collect();
+        validators.sort_by_key(|entry| entry.0.0);
+        self.wal.append(
+            WalOp::SetValidatorState(validators, self.staking_pool.load(Ordering::Acquire)),
+            height,
+        );
     }
 
     /// Index a transaction's sender and recipient addresses for `account_txs` lookups.
@@ -6714,6 +6808,12 @@ impl StateDB {
     /// rebuild → O(n).  This is the same cost as the old approach but
     /// happens rarely (most blocks only modify existing accounts).
     fn compute_state_root(&self) -> Hash256 {
+        // Protocol-v3 recovery commits every consensus-relevant persisted
+        // domain. Legacy nodes retain the account-only Merkle root exactly.
+        if let Some(context) = self.recovery_context() {
+            return self.compute_recovery_state_root(&context);
+        }
+
         // Delegate to JMT if enabled.
         if self.use_jmt {
             return self.compute_state_root_jmt();
@@ -7129,7 +7229,11 @@ impl StateDB {
 
     /// Register an on-chain identity for an account.
     pub fn register_identity(&self, identity: Identity) {
-        self.identities.insert(identity.address.0, identity);
+        self.identities.insert(identity.address.0, identity.clone());
+        self.wal.append(
+            WalOp::SetIdentity(identity.address, identity),
+            self.height(),
+        );
     }
 
     /// Look up the identity record for an address.
