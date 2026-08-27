@@ -38,7 +38,10 @@ mixed v0.7.2/v0.7.9 fleet as though these branch fixes are already live.
            configured_community_rpc_origins,validator_set_size_required,
            validator_approvals_required,recovery_epoch,validator_set_id,
            validator_set_commitment,transaction_domain,stake_zero_eligible,
-           worker_min_stake_base,reward_base,reward_arc,earnings_evidence}'
+           worker_min_stake_base,reward_base,reward_arc,issuance_policy,
+           issuance_policy_hash,prospective_budget,
+           treasury_rewards_remaining,reward_program,
+           reward_is_customer_demand,earnings_evidence}'
   ```
 
 For the six-validator recovery network, `configured_community_rpc_origins` is
@@ -61,7 +64,9 @@ bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
 The installer resolves one exact semantic-versioned release, verifies every
 download against `SHA256SUMS`, creates a stake-zero community service, and
 preserves its identity across updates. It never substitutes a desktop package
-for `arc-node`, and its RPC listener stays on `127.0.0.1` by default.
+for `arc-node`, and its RPC listener stays on `127.0.0.1` by default. A
+model-backed install uses the full deterministic integer-worker role without
+announcing the home machine as a validator shard.
 
 ## 0:35–1:00 — prove the process is running and inspect health
 
@@ -155,6 +160,9 @@ curl -fsS "$ARC_RPC/worker/earnings/$ARC_WORKER" \
          confirmed_gross_earnings_base,confirmed_gross_earnings_arc,
          confirmed_receipts,projected_daily_arc,
          projected_daily_unavailable_reason,projection_policy,
+         reward_issuance_policy_hash,reward_budget,
+         issuance_ready_for_worker,reward_program,
+         reward_is_customer_demand,
          reward_per_attestation_base,reward_per_attestation_arc,
          recovery_epoch,validator_set_id,stake_zero_eligible,
          last_reward_block,last_reward_tx_hash}'
@@ -168,15 +176,19 @@ Narration:
 - `confirmed_receipts` provides the rows, including block and recovery-domain
   bindings, that sum to `confirmed_gross_earnings_base`.
 - `projected_daily_arc` appears only when an explicit active policy, confirmed
-  receipt rate, and funded treasury support it. Otherwise it stays null and
-  `projected_daily_unavailable_reason` says why.
+  receipt rate, funded treasury, and remaining block/epoch/worker/coordinator
+  budgets support it. Otherwise it stays null and
+  `projected_daily_unavailable_reason` says why. It is a capped testnet
+  promotional subsidy projection, not evidence of customer demand or revenue.
 
 The receipt must say `status: mined_success`, `confirmed: true`, `success:
 true`, and `tx_type: 0x25` before the amount is earned. Then open the same hash
 in the static explorer, select the same origin as the data source, and show the
-matching block. A mined raw `InferenceAttestation` (`0x16`) pays nothing. If the
-hash is null, pending, pruned, a different type, or unsuccessful, the reward is
-not proven—wait or say so plainly.
+matching block. Protocol v3 rejects standalone `InferenceAttestation` (`0x16`)
+submission; a legacy historical `0x16` pays nothing. The worker certificate is
+embedded and reverified inside `0x25`. If the hash is null, pending, pruned, a
+different type, or unsuccessful, the reward is not proven—wait or say so
+plainly.
 
 ## Recording stop conditions
 

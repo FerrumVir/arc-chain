@@ -67,7 +67,7 @@ test.describe("Projected earnings - populated", () => {
     await gotoEarnings(page);
     await expect(
       page.getByTestId("projection-funding-label").first(),
-    ).toContainText("Testnet treasury transfer, not revenue");
+    ).toContainText("Promotional testnet subsidy, not demand or revenue");
   });
 
   test("surfaces the finite treasury as a selected-host ceiling", async ({
@@ -81,6 +81,18 @@ test.describe("Projected earnings - populated", () => {
     await expect(treasury).toContainText("ARC");
     // The anti-"unlimited payout" sentence.
     await expect(treasury).toContainText("Rewards stop when it is empty");
+  });
+
+  test("shows consensus global, worker, and coordinator promotional caps", async ({
+    page,
+  }) => {
+    await gotoEarnings(page);
+    const budget = page.getByTestId("projection-reward-budget");
+    await expect(budget).toContainText("Promotional cap, epoch 2");
+    await expect(budget).toContainText("31 global");
+    await expect(budget).toContainText("7 for this worker");
+    await expect(budget).toContainText("11 for this coordinator");
+    await expect(budget).toContainText("consensus-sealed");
   });
 
   test("reports the treasury remainder as fundable receipts, not currency", async ({
@@ -105,6 +117,39 @@ test.describe("Projected earnings - populated", () => {
     const assumptions = page.getByTestId("projection-assumptions");
     await expect(assumptions).toContainText("no worker bond");
     await expect(assumptions).not.toContainText("bond netted out");
+  });
+
+  test("uses only the backend-authoritative daily projection", async ({ page }) => {
+    await seedMockOverrides(page, {
+      fetch_earnings_projection: {
+        ...PROJECTION_NO_HISTORY,
+        attestationsPerDay: 999,
+        rewardPerAttestation: 2.5,
+        projectedDailyArc: 7.25,
+        projectedDailyUnavailableReason: null,
+      },
+    });
+    await gotoEarnings(page);
+    await expect(page.getByTestId("projection-per-day")).toHaveText("7.25");
+    await expect(page.getByTestId("projection-per-week")).toHaveText("50.75");
+  });
+
+  test("never reconstructs a forecast the backend withheld", async ({ page }) => {
+    await seedMockOverrides(page, {
+      fetch_earnings_projection: {
+        ...PROJECTION_NO_HISTORY,
+        attestationsPerDay: 999,
+        rewardPerAttestation: 2.5,
+        projectedDailyArc: null,
+        projectedDailyUnavailableReason:
+          "promotional reward budget is exhausted for this worker",
+      },
+    });
+    await gotoEarnings(page);
+    await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
+    await expect(page.getByTestId("projection-no-rate")).toContainText(
+      "promotional reward budget is exhausted",
+    );
   });
 
   test("shows the host's own caveat about how the rate was derived", async ({
@@ -164,9 +209,9 @@ test.describe("Projected earnings - no measured rate", () => {
     await gotoEarnings(page);
     const card = page.getByTestId("projection-no-rate");
     await expect(card).toContainText(
-      "No per-day figure is shown: a rate has to be measured",
+      "No per-day figure is shown unless the coordinator explicitly supplies one",
     );
-    await expect(card).toContainText("no history to measure a rate from");
+    await expect(card).toContainText("No successful mined reward receipts are retained");
     // The whole point: zero attestations must not become a zero rate and a
     // zero projection. No per-day figure may be rendered at all.
     await expect(page.getByTestId("projection-per-day")).toHaveCount(0);
@@ -182,7 +227,7 @@ test.describe("Projected earnings - no measured rate", () => {
     );
     await expect(
       page.getByTestId("projection-funding-label").first(),
-    ).toContainText("Testnet treasury transfer, not revenue");
+    ).toContainText("Promotional testnet subsidy, not demand or revenue");
   });
 });
 

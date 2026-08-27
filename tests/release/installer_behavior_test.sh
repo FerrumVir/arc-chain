@@ -185,6 +185,34 @@ $matrix
 EOF
 }
 
+minified_github_api_json_without_newline_installs_exact_assets() {
+    local sandbox fixture output status
+    new_sandbox
+    sandbox="$NEW_SANDBOX"
+    fixture="$sandbox/release-minified.json"
+    # Command substitution strips all trailing newlines; `tr` removes the
+    # internal pretty-print newlines, reproducing GitHub's one-line API body.
+    printf '%s' "$(tr -d '\n' < "$TEST_DIR/fixtures/release-v0.8.0.json")" > "$fixture"
+    [ "$(wc -l < "$fixture" | tr -d ' ')" -eq 0 ] || {
+        printf 'minified release fixture unexpectedly retained a newline\n'
+        return 1
+    }
+    output="$sandbox/minified-install.out"
+    ARC_NODE_VERSION_UNDER_TEST=''
+    invoke_installer "$sandbox" Linux amd64 "$fixture" 0.8.0 \
+        --no-service --no-auto-update >"$output" 2>&1
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        printf 'installer rejected GitHub-shaped minified JSON (exit %s):\n' "$status"
+        sed -n '1,120p' "$output"
+        return 1
+    fi
+    for asset in arc-node-linux-x86_64 arc-cli-linux-x86_64 SHA256SUMS testnet-seeds.txt genesis.toml; do
+        assert_log_contains_literal "$sandbox/curl.log" "/v0.8.0/$asset" \
+            "minified API install did not fetch exact-tag $asset" || return 1
+    done
+}
+
 tampered_binary_is_rejected() {
     local sandbox output status
     new_sandbox
@@ -307,6 +335,8 @@ no_service_no_updater_really_is_install_only() {
         'installed observer genesis contains a partial validator set' || return 1
     assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--model([[:space:]]|$)' \
         'generated runner passes --model even though no model was configured' || return 1
+    assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--full-integer-worker' \
+        'observer-only runner enables the full integer worker without a model' || return 1
     assert_file_not_contains "$sandbox/arc/bin/run-arc-node" '--validator-seed' \
         'generated runner exposes validator identity through argv' || return 1
 
@@ -579,6 +609,10 @@ prepare_transactional_user_install() {
         reset_transaction_test_environment
         return 1
     fi
+    assert_log_contains_literal "$sandbox/arc/bin/run-arc-node" \
+        "--model $sandbox/model.gguf --full-integer-worker" \
+        'model-backed community install does not enable the non-shard full integer worker role' \
+        || return 1
     ARC_NODE_VERSION_UNDER_TEST=''
     MOCK_SYSTEMD_NODE_ACTIVE_UNDER_TEST=true
     MOCK_SYSTEMD_NODE_ENABLED_UNDER_TEST=true
@@ -746,6 +780,7 @@ transaction_contract_covers_every_service_scope() {
 }
 
 run_test 'offline platform aliases install exact-tag node + CLI assets without starting' install_only_platform_matrix
+run_test 'minified GitHub API JSON with no trailing newline installs exact-tag assets' minified_github_api_json_without_newline_installs_exact_assets
 run_test 'checksum mismatch rejects and removes staged executables' tampered_binary_is_rejected
 run_test 'ARC_NODE_VERSION requires strict X.Y.Z before network-shaped requests' invalid_version_pin_fails_before_asset_download
 run_test '--no-service --no-auto-update has no start, health, service, or updater side effects' no_service_no_updater_really_is_install_only

@@ -660,6 +660,13 @@ jobs:
             exit 1
           fi
 
+          IMMUTABLE_RELEASES_ENABLED="$(gh api \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')"
+          if [ "$IMMUTABLE_RELEASES_ENABLED" != true ]; then
+            echo "::error::Repository immutable releases must be enabled before publication."
+            exit 1
+          fi
+
           EXISTING_TAGS="$RUNNER_TEMP/existing-release-tags.txt"
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --jq '.[].tag_name' > "$EXISTING_TAGS"
@@ -675,3 +682,10 @@ jobs:
             --title "ARC Chain $RELEASE_TAG" \
             --notes "$RELEASE_NOTES" \
             --latest
+
+          CREATED_RELEASE_IMMUTABLE="$(gh api \
+            "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.immutable')"
+          if [ "$CREATED_RELEASE_IMMUTABLE" != true ]; then
+            echo "::error::GitHub did not mark $RELEASE_TAG immutable after creation."
+            exit 1
+          fi

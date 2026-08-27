@@ -71,9 +71,7 @@ impl NodeManager {
     }
 
     pub fn uptime_seconds(&self) -> u64 {
-        self.started_at
-            .map(|t| t.elapsed().as_secs())
-            .unwrap_or(0)
+        self.started_at.map(|t| t.elapsed().as_secs()).unwrap_or(0)
     }
 
     pub fn is_running(&mut self) -> bool {
@@ -94,6 +92,8 @@ impl NodeManager {
     ///   --eth-rpc-port 0             disable the extra EVM RPC port
     ///   --community-mode             (worker role only) register with seed
     ///                                gateways as a volunteer inference worker
+    ///   --full-integer-worker        load full deterministic integer weights
+    ///                                without announcing a validator shard
     ///   --model <path>               (optional) GGUF weights for local inference
     ///
     /// Any of these missing would leave the node either bound to wrong
@@ -269,7 +269,12 @@ impl NodeManager {
                     "this arc-node predates secure community RPC origins; update arc-node before starting community mode"
                 );
             }
-            cmd.arg("--community-mode");
+            if !binary_supports_flag(&binary, "--full-integer-worker") {
+                anyhow::bail!(
+                    "this arc-node cannot run a deterministic community worker without announcing an overlapping shard; update arc-node before starting worker mode"
+                );
+            }
+            cmd.arg("--community-mode").arg("--full-integer-worker");
             for origin in crate::rpc_client::PRODUCTION_RPC_ORIGINS {
                 cmd.arg("--community-rpc-url").arg(origin);
             }
@@ -292,7 +297,7 @@ impl NodeManager {
                     .take(8)
                     .collect::<String>(),
                 if config.role == "worker" && config.model_path.is_some() {
-                    "--community-mode "
+                    "--community-mode --full-integer-worker "
                 } else {
                     ""
                 },
@@ -368,7 +373,8 @@ impl NodeManager {
             });
         }
 
-        self.stopping.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.stopping
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         *self.crash_info.lock().await = None;
         self.child = Some(child);
 
@@ -387,7 +393,9 @@ impl NodeManager {
         if self.child.is_none() {
             return;
         }
-        let Some(child) = self.child.as_mut() else { return };
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
         match child.try_wait() {
             Ok(Some(status)) => {
                 let was_stopping = self
@@ -536,7 +544,11 @@ pub fn env_binary_override() -> Option<PathBuf> {
 /// executable's ancestors (`target/debug/arc-desktop` lives inside the same
 /// checkout), so it resolves whichever way the app was launched.
 pub fn dev_build_binary() -> Option<PathBuf> {
-    let exe_name = if cfg!(windows) { "arc-node.exe" } else { "arc-node" };
+    let exe_name = if cfg!(windows) {
+        "arc-node.exe"
+    } else {
+        "arc-node"
+    };
 
     let mut roots: Vec<PathBuf> = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
@@ -808,7 +820,10 @@ mod tests {
         let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
         let busy_p2p = udp.local_addr().unwrap().port();
         let (_, chosen_p2p) = choose_port_pair(rpc, busy_p2p).expect("should find a free pair");
-        assert_ne!(chosen_p2p, busy_p2p, "must not hand back a UDP-busy p2p port");
+        assert_ne!(
+            chosen_p2p, busy_p2p,
+            "must not hand back a UDP-busy p2p port"
+        );
     }
 
     /// `--threads` must not report as supported just because
@@ -817,13 +832,17 @@ mod tests {
     fn flag_probe_requires_whole_token_match() {
         // `/bin/echo` is not arc-node, so the probe returns false rather
         // than panicking - the safe default for an unknown binary.
-        assert!(!binary_supports_flag(Path::new("/nonexistent/arc-node"), "--threads"));
+        assert!(!binary_supports_flag(
+            Path::new("/nonexistent/arc-node"),
+            "--threads"
+        ));
     }
 
     #[test]
     fn production_community_origins_are_six_distinct_https_origins() {
-        let unique: std::collections::HashSet<_> =
-            crate::rpc_client::PRODUCTION_RPC_ORIGINS.into_iter().collect();
+        let unique: std::collections::HashSet<_> = crate::rpc_client::PRODUCTION_RPC_ORIGINS
+            .into_iter()
+            .collect();
         assert_eq!(unique.len(), 6);
         for origin in unique {
             assert!(origin.starts_with("https://"));

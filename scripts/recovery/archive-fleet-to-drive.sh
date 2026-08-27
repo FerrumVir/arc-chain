@@ -53,16 +53,19 @@ Usage:
     --validator-public-keys /absolute/validators.json \
     --allow-unbound-legacy-wal --execute
 
-The freeze plan is sealed before the final checkpoint exists. `capture` first
-captures and cleanly stops NYC, then LAX, reducing six equal-stake validators
-below the five-validator quorum. It captures stable LZ4 snapshots/evidence on
-the four remaining RPCs while finality is halted, then stops them and copies
-their final WALs. No legacy byte is deleted.
+The freeze plan is sealed before the final checkpoint exists. `capture`
+persistently fences and cleanly stops NYC, then LAX, reducing six equal-stake
+validators below the five-validator quorum before any chain directory is
+copied. It then fences/stops the remaining four writers and copies each
+complete on-disk data directory offline. No legacy byte is deleted.
 
 `seal` runs only after the final 5-of-6 checkpoint and rollout manifest exist.
-The exact recovery exporter verifies each unchanged snapshot/WAL pair, labels
-canonical matches and forks honestly, bundles every capture, and uploads all
-six bundles plus the sealed public inputs under the rollout-manifest hash.
+The exact recovery exporter verifies each stopped WAL only with that capture's
+own on-disk snapshot. A derivable pair is labelled canonical or a fork; a
+missing, ambiguous, or torn pair is preserved_unclassified and is never
+combined with the canonical reference snapshot. Every capture is bundled and
+all six bundles plus the sealed public inputs are uploaded under the
+rollout-manifest hash.
 EOF
 }
 
@@ -258,19 +261,23 @@ remote_readiness() {
     done
 }
 
-ensure_capture_and_freeze() {
+ensure_stopped() {
+    local capture_id="$1" node="$2"
+    if run_remote "$node" stopped-status "$capture_id" "$node" >/dev/null 2>&1; then
+        run_remote "$node" stopped-status "$capture_id" "$node"
+        return 0
+    fi
+    run_remote "$node" fence-stop "$capture_id" "$node"
+    run_remote "$node" stopped-status "$capture_id" "$node"
+}
+
+ensure_offline_capture() {
     local capture_id="$1" node="$2"
     if run_remote "$node" status "$capture_id" "$node" >/dev/null 2>&1; then
         run_remote "$node" status "$capture_id" "$node"
         return 0
     fi
-    if run_remote "$node" live-status "$capture_id" "$node" >/dev/null 2>&1; then
-        run_remote "$node" freeze "$capture_id" "$node"
-    elif run_remote "$node" freeze "$capture_id" "$node" >/dev/null 2>&1; then
-        run_remote "$node" status "$capture_id" "$node"
-    else
-        run_remote "$node" capture-and-freeze "$capture_id" "$node"
-    fi
+    run_remote "$node" capture-offline "$capture_id" "$node"
     run_remote "$node" status "$capture_id" "$node"
 }
 
@@ -292,7 +299,7 @@ capture_phase() {
     printf 'ARC staged legacy freeze plan\n'
     printf '  capture:  %s\n' "$capture_id"
     printf '  sentinels: %s (quorum is halted after the second clean stop)\n' "${SENTINELS[*]}"
-    printf '  remaining: AMS LHR NRT SGP snapshot while halted, then clean stop\n'
+    printf '  remaining: AMS LHR NRT SGP fence/stop after quorum halt; then all-six offline copy\n'
     remote_readiness "$capture_id"
     if [ "$execute" != true ]; then
         printf 'archive fleet: PLAN ONLY; no service or remote/local file was changed\n'
@@ -303,12 +310,12 @@ capture_phase() {
         die "execution requires ARC_RECOVERY_FREEZE_GO='$expected_go'"
 
     install_helpers
-    printf 'archive fleet: capturing and stopping first sentinel NYC\n'
-    ensure_capture_and_freeze "$capture_id" nyc
-    printf 'archive fleet: capturing and stopping second sentinel LAX\n'
-    ensure_capture_and_freeze "$capture_id" lax
-    run_remote nyc status "$capture_id" nyc >/dev/null
-    run_remote lax status "$capture_id" lax >/dev/null
+    printf 'archive fleet: persistently fencing and stopping first sentinel NYC\n'
+    ensure_stopped "$capture_id" nyc
+    printf 'archive fleet: persistently fencing and stopping second sentinel LAX\n'
+    ensure_stopped "$capture_id" lax
+    run_remote nyc stopped-status "$capture_id" nyc >/dev/null
+    run_remote lax stopped-status "$capture_id" lax >/dev/null
     printf 'archive fleet: QUORUM HALTED (at most 4/6 legacy validators are running; 5 are required)\n'
 
     local log_root node
@@ -318,48 +325,48 @@ capture_phase() {
     local pids=() names=()
     for node in "${REMAINING[@]}"; do
         (
-            if run_remote "$node" live-status "$capture_id" "$node" >/dev/null 2>&1; then
-                run_remote "$node" live-status "$capture_id" "$node"
-            else
-                run_remote "$node" capture-live "$capture_id" "$node"
-            fi
-        ) > "$log_root/$node-live.log" 2>&1 &
+            ensure_stopped "$capture_id" "$node"
+        ) > "$log_root/$node-stop.log" 2>&1 &
         pids+=("$!")
         names+=("$node")
     done
     local failed=0 index
     for index in "${!pids[@]}"; do
         if wait "${pids[$index]}"; then
-            sed -n '1,30p' "$log_root/${names[$index]}-live.log"
+            sed -n '1,30p' "$log_root/${names[$index]}-stop.log"
         else
-            printf 'archive fleet: live capture failed: %s\n' "${names[$index]}" >&2
-            sed -n '1,100p' "$log_root/${names[$index]}-live.log" >&2
+            printf 'archive fleet: persistent writer stop failed: %s\n' "${names[$index]}" >&2
+            sed -n '1,100p' "$log_root/${names[$index]}-stop.log" >&2
             failed=1
         fi
     done
-    [ "$failed" -eq 0 ] || die "at least one post-halt live capture failed; sentinels remain stopped and no capture was overwritten"
+    [ "$failed" -eq 0 ] || die "at least one post-halt writer stop failed; stopped nodes remain persistently fenced"
+    for node in nyc lax ams lhr nrt sgp; do
+        run_remote "$node" stopped-status "$capture_id" "$node" >/dev/null
+    done
+    printf 'archive fleet: ALL LEGACY WRITERS HALTED; beginning offline all-six data copies\n'
 
     pids=() names=()
-    for node in "${REMAINING[@]}"; do
-        run_remote "$node" freeze "$capture_id" "$node" > "$log_root/$node-freeze.log" 2>&1 &
+    for node in nyc lax ams lhr nrt sgp; do
+        ensure_offline_capture "$capture_id" "$node" > "$log_root/$node-capture.log" 2>&1 &
         pids+=("$!")
         names+=("$node")
     done
     failed=0
     for index in "${!pids[@]}"; do
         if wait "${pids[$index]}"; then
-            sed -n '1,30p' "$log_root/${names[$index]}-freeze.log"
+            sed -n '1,30p' "$log_root/${names[$index]}-capture.log"
         else
-            printf 'archive fleet: final freeze failed: %s\n' "${names[$index]}" >&2
-            sed -n '1,100p' "$log_root/${names[$index]}-freeze.log" >&2
+            printf 'archive fleet: offline data capture failed: %s\n' "${names[$index]}" >&2
+            sed -n '1,100p' "$log_root/${names[$index]}-capture.log" >&2
             failed=1
         fi
     done
-    [ "$failed" -eq 0 ] || die "at least one node did not complete a clean final freeze; no SIGKILL or overwrite was attempted"
+    [ "$failed" -eq 0 ] || die "at least one stopped data directory was not captured; no SIGKILL or overwrite was attempted"
     for node in nyc lax ams lhr nrt sgp; do
         run_remote "$node" status "$capture_id" "$node"
     done
-    printf 'archive fleet: FREEZE CAPTURE COMPLETE capture=%s; all six legacy nodes are stopped\n' "$capture_id"
+    printf 'archive fleet: OFFLINE CAPTURE COMPLETE capture=%s; all six legacy nodes remain fenced/stopped\n' "$capture_id"
     printf 'archive fleet: next create/sign/seal the recovery checkpoint from an accepted capture; do not restart legacy nodes\n'
 }
 
@@ -415,6 +422,95 @@ upload_immutable() {
         --retries 5 --low-level-retries 20
 }
 
+summarize_binding_statuses() {
+    python3 -c '
+import json, sys
+expected = {"nyc", "lax", "ams", "lhr", "nrt", "sgp"}
+rows = [json.loads(line) for line in sys.stdin if line.strip()]
+names = [row.get("node") for row in rows]
+if len(rows) != 6 or set(names) != expected or len(names) != len(set(names)):
+    raise SystemExit("binding status stream must contain each reviewed validator exactly once")
+allowed = {"valid_canonical", "valid_noncanonical_fork", "preserved_unclassified"}
+if any(row.get("classification") not in allowed for row in rows):
+    raise SystemExit("binding status stream contains an unknown classification")
+counts = [sum(row["classification"] == item for row in rows) for item in (
+    "valid_canonical", "valid_noncanonical_fork", "preserved_unclassified"
+)]
+print(*counts)
+'
+}
+
+verify_reference_pair() {
+    local binary="$1" genesis="$2" validators="$3" legacy_validators="$4"
+    local snapshot="$5" source_wal="$6" source_round="$7" created_at="$8"
+    local recovery_epoch="$9" validator_set_id="${10}" source_height="${11}"
+    local source_hash="${12}" source_state_root="${13}" transition_state_root="${14}"
+    local checkpoint_manifest="${15}" allow_unbound="${16}"
+    local temporary
+    temporary="$(mktemp -d)"
+    cp -- "$source_wal" "$temporary/state.wal"
+    local command=(
+        "$binary" recovery export
+        --data-dir "$temporary"
+        --snapshot "$snapshot"
+        --genesis "$genesis"
+        --validator-public-keys "$validators"
+        --legacy-validator-set "$legacy_validators"
+        --output "$temporary/reference.arcchkpt"
+        --source-consensus-round "$source_round"
+        --created-at-unix-ms "$created_at"
+        --recovery-epoch "$recovery_epoch"
+        --validator-set-id "$validator_set_id"
+    )
+    if [ "$allow_unbound" = true ]; then
+        command+=(--allow-unbound-legacy-wal)
+    fi
+    "${command[@]}" > "$temporary/summary.json" 2> "$temporary/export.stderr"
+    python3 - "$temporary/summary.json" "$source_height" "$source_hash" \
+        "$source_state_root" "$transition_state_root" "$checkpoint_manifest" \
+        "$source_round" "$created_at" "$recovery_epoch" "$validator_set_id" <<'PY'
+import json
+import sys
+
+(path, source_height, source_hash, source_state_root, transition_state_root,
+ checkpoint_manifest, source_round, created_at, recovery_epoch,
+ validator_set_id) = sys.argv[1:]
+value = json.load(open(path, encoding="utf-8"))
+
+def bare(raw):
+    if not isinstance(raw, str):
+        raise SystemExit("reference export omitted a hash")
+    raw = raw.removeprefix("0x")
+    if len(raw) != 64 or any(char not in "0123456789abcdef" for char in raw):
+        raise SystemExit("reference export emitted a malformed hash")
+    return raw
+
+expected = {
+    "status": "EXPORTED_UNSIGNED",
+    "source_height": int(source_height),
+    "source_block_hash": bare(source_hash),
+    "source_state_root": bare(source_state_root),
+    "full_state_root": bare(transition_state_root),
+    "manifest_hash": bare(checkpoint_manifest),
+    "source_consensus_round": int(source_round),
+    "created_at_unix_ms": int(created_at),
+    "recovery_epoch": int(recovery_epoch),
+    "validator_set_id": int(validator_set_id),
+    "source_validator_count": 8,
+    "source_validator_stake": 40_000_000,
+    "source_validator_set_hash": "80d7c2d229fea4171732fd04451372d849fab7baefed143a2a445ae72f472ecd",
+}
+for field, wanted in expected.items():
+    got = value.get(field)
+    if field.endswith(("hash", "root")):
+        got = bare(got)
+    if got != wanted:
+        raise SystemExit(f"sealed reference snapshot/WAL {field} differs: expected {wanted!r}, got {got!r}")
+PY
+    find "$temporary" -depth -delete
+    printf 'archive fleet: PASS sealed source snapshot/WAL independently reproduces the selected checkpoint\n'
+}
+
 seal_phase() {
     local freeze_plan="" manifest="" validators="" execute=false allow_unbound=false
     while [ "$#" -gt 0 ]; do
@@ -429,7 +525,7 @@ seal_phase() {
             *) die "unknown seal option: $1" ;;
         esac
     done
-    require_commands python3 ssh scp rclone grep mktemp
+    require_commands python3 ssh scp rclone grep mktemp cp find
     require_absolute_file "$manifest" "rollout manifest"
     require_absolute_file "$validators" "validator public-key file"
     [ -x "$REMOTE_HELPER" ] || die "remote helper is missing or not executable"
@@ -443,34 +539,53 @@ seal_phase() {
     local validator_sha
     validator_sha="$(hash_file "$validators")"
 
-    local binary genesis checkpoint
-    local binary_sha genesis_sha checkpoint_sha
-    local source_height source_hash state_root checkpoint_manifest recovery_epoch validator_set_id
+    local binary genesis checkpoint legacy_validator_set source_snapshot source_wal
+    local binary_sha genesis_sha checkpoint_sha legacy_validator_set_sha source_snapshot_sha source_wal_sha
+    local source_height source_hash source_state_root transition_state_root checkpoint_manifest
+    local source_round created_at_unix_ms recovery_epoch validator_set_id
     binary="$(manifest_field "$manifest" artifacts.binary.path)"
     binary_sha="$(manifest_field "$manifest" artifacts.binary.sha256)"
     genesis="$(manifest_field "$manifest" artifacts.genesis.path)"
     genesis_sha="$(manifest_field "$manifest" artifacts.genesis.sha256)"
     checkpoint="$(manifest_field "$manifest" artifacts.checkpoint.path)"
     checkpoint_sha="$(manifest_field "$manifest" artifacts.checkpoint.sha256)"
+    legacy_validator_set="$(manifest_field "$manifest" artifacts.legacy_validator_set.path)"
+    legacy_validator_set_sha="$(manifest_field "$manifest" artifacts.legacy_validator_set.sha256)"
+    source_snapshot="$(manifest_field "$manifest" artifacts.source_snapshot.path)"
+    source_snapshot_sha="$(manifest_field "$manifest" artifacts.source_snapshot.sha256)"
+    source_wal="$(manifest_field "$manifest" artifacts.source_wal.path)"
+    source_wal_sha="$(manifest_field "$manifest" artifacts.source_wal.sha256)"
     source_height="$(manifest_field "$manifest" chain.source_height)"
     source_hash="$(manifest_field "$manifest" chain.source_block_hash)"
-    state_root="$(manifest_field "$manifest" chain.full_state_root)"
+    source_state_root="$(manifest_field "$manifest" chain.source_state_root)"
+    transition_state_root="$(manifest_field "$manifest" chain.full_state_root)"
     checkpoint_manifest="$(manifest_field "$manifest" chain.approved_checkpoint_manifest_hash)"
+    source_round="$(manifest_field "$manifest" chain.source_consensus_round)"
+    created_at_unix_ms="$(manifest_field "$manifest" chain.created_at_unix_ms)"
     recovery_epoch="$(manifest_field "$manifest" chain.recovery_epoch)"
     validator_set_id="$(manifest_field "$manifest" chain.validator_set_id)"
+
+    verify_reference_pair \
+        "$binary" "$genesis" "$validators" "$legacy_validator_set" \
+        "$source_snapshot" "$source_wal" "$source_round" "$created_at_unix_ms" \
+        "$recovery_epoch" "$validator_set_id" "$source_height" "$source_hash" \
+        "$source_state_root" "$transition_state_root" "$checkpoint_manifest" "$allow_unbound"
 
     printf 'ARC immutable legacy archive seal plan\n'
     printf '  capture:              %s\n' "$capture_id"
     printf '  rollout manifest:     %s\n' "$manifest_sha"
     printf '  validator public set: %s\n' "$validator_sha"
-    printf '  selected checkpoint:  H=%s hash=%s root=%s\n' "$source_height" "$source_hash" "$state_root"
+    printf '  legacy source set:    %s\n' "$legacy_validator_set_sha"
+    printf '  paired snapshot/WAL:  %s / %s\n' "$source_snapshot_sha" "$source_wal_sha"
+    printf '  selected checkpoint:  H=%s hash=%s source_root=%s transition_root=%s\n' \
+        "$source_height" "$source_hash" "$source_state_root" "$transition_state_root"
     printf '  unbound legacy WAL:   %s (explicitly persisted in binding evidence)\n' "$allow_unbound"
     printf '  destination:          %s/%s\n' "$DRIVE_REMOTE" "$manifest_sha"
     local node host
     for node in nyc lax ams lhr nrt sgp; do
         host="$(host_for "$node")"
         ssh "${SSH_OPTIONS[@]}" "$SSH_USER@$host" -- sh -c \
-            'test -s "$1/state.wal" && test -s "$1/state.snapshot.lz4" && test -s "$1/capture.files.sha256" && test -s "$1/capture.complete" && ! pgrep -x arc-node >/dev/null' \
+            'test -s "$1/data-dir/state.wal" && test -s "$1/capture.files.sha256" && test -s "$1/capture.complete" && ! pgrep -x arc-node >/dev/null' \
             sh "/root/arc-recovery-captures/$capture_id/$node"
         printf '  capture present/stopped: %s\n' "$node"
     done
@@ -494,6 +609,7 @@ seal_phase() {
             stage_file "$node" "$manifest_sha" binary "$binary" "$binary_sha"
             stage_file "$node" "$manifest_sha" genesis "$genesis" "$genesis_sha"
             stage_file "$node" "$manifest_sha" validators "$validators" "$validator_sha"
+            stage_file "$node" "$manifest_sha" legacy-validators "$legacy_validator_set" "$legacy_validator_set_sha"
             stage_file "$node" "$manifest_sha" checkpoint "$checkpoint" "$checkpoint_sha"
             stage_file "$node" "$manifest_sha" rollout-manifest "$manifest" "$manifest_sha"
         ) > "$log_root/$node-stage.log" 2>&1 &
@@ -516,8 +632,10 @@ seal_phase() {
     for node in nyc lax ams lhr nrt sgp; do
         run_remote "$node" bind \
             "$capture_id" "$node" "$manifest_sha" \
-            "$binary_sha" "$genesis_sha" "$validator_sha" "$checkpoint_sha" \
-            "$source_height" "$source_hash" "$state_root" "$checkpoint_manifest" \
+            "$binary_sha" "$genesis_sha" "$validator_sha" "$legacy_validator_set_sha" \
+            "$source_snapshot_sha" "$source_wal_sha" "$checkpoint_sha" \
+            "$source_height" "$source_hash" "$source_state_root" "$transition_state_root" \
+            "$checkpoint_manifest" "$source_round" "$created_at_unix_ms" \
             "$recovery_epoch" "$validator_set_id" "$allow_unbound" \
             > "$log_root/$node-bind.log" 2>&1 &
         pids+=("$!")
@@ -533,20 +651,23 @@ seal_phase() {
             failed=1
         fi
     done
-    [ "$failed" -eq 0 ] || die "at least one capture failed exact snapshot-assisted WAL export; no bundle or upload was attempted"
+    [ "$failed" -eq 0 ] || die "at least one capture could not produce immutable classification evidence; no bundle or upload was attempted"
 
-    local canonical_count=0 status canonical
+    local status
+    : > "$log_root/binding-statuses.jsonl"
     for node in nyc lax ams lhr nrt sgp; do
         status="$(run_remote "$node" binding-status "$manifest_sha" "$node")"
         printf '  binding: %s\n' "$status"
-        canonical="$(printf '%s' "$status" | python3 -c 'import json,sys; print(str(json.load(sys.stdin)["canonical_match"]).lower())')"
-        if [ "$canonical" = true ]; then
-            canonical_count=$((canonical_count + 1))
-        fi
+        printf '%s\n' "$status" >> "$log_root/binding-statuses.jsonl"
     done
+    local canonical_count fork_count unclassified_count
+    read -r canonical_count fork_count unclassified_count < <(
+        summarize_binding_statuses < "$log_root/binding-statuses.jsonl"
+    )
     [ "$canonical_count" -ge 1 ] || \
         die "none of the six preserved captures matches the selected checkpoint H/hash/root"
-    printf 'archive fleet: canonical checkpoint match proven on %s capture(s); all non-matching forks remain labelled and retained\n' "$canonical_count"
+    printf 'archive fleet: classification complete canonical=%s forks=%s preserved_unclassified=%s; all six remain labelled and retained\n' \
+        "$canonical_count" "$fork_count" "$unclassified_count"
 
     pids=() names=()
     for node in nyc lax ams lhr nrt sgp; do
@@ -579,6 +700,9 @@ seal_phase() {
         printf '%s  arc-node\n' "$binary_sha"
         printf '%s  genesis.toml\n' "$genesis_sha"
         printf '%s  validator-public-keys.json\n' "$validator_sha"
+        printf '%s  legacy-validator-set-40m.json\n' "$legacy_validator_set_sha"
+        printf '%s  source.snapshot.lz4\n' "$source_snapshot_sha"
+        printf '%s  source.state.wal\n' "$source_wal_sha"
         printf '%s  recovery.arcchkpt\n' "$checkpoint_sha"
         printf '%s  rollout-manifest.json\n' "$manifest_sha"
         printf '%s  rollout-manifest.json.sha256\n' "$(hash_file "$manifest.sha256")"
@@ -588,32 +712,61 @@ seal_phase() {
     upload_immutable "$binary" "$destination/arc-node"
     upload_immutable "$genesis" "$destination/genesis.toml"
     upload_immutable "$validators" "$destination/validator-public-keys.json"
+    upload_immutable "$legacy_validator_set" "$destination/legacy-validator-set-40m.json"
+    upload_immutable "$source_snapshot" "$destination/source.snapshot.lz4"
+    upload_immutable "$source_wal" "$destination/source.state.wal"
     upload_immutable "$checkpoint" "$destination/recovery.arcchkpt"
     upload_immutable "$manifest" "$destination/rollout-manifest.json"
     upload_immutable "$manifest.sha256" "$destination/rollout-manifest.json.sha256"
     upload_immutable "$log_root/SHA256SUMS" "$destination/SHA256SUMS"
 
-    local source_dir ssh_command suffix filename
-    for node in nyc lax ams lhr nrt sgp; do
-        host="$(host_for "$node")"
-        source_dir=":sftp:/root/arc-recovery-archive/$manifest_sha"
-        ssh_command="ssh -o BatchMode=yes -o StrictHostKeyChecking=yes $SSH_USER@$host"
-        for suffix in tar.zst tar.zst.sha256 inventory inventory.sha256; do
-            filename="legacy-$node.$suffix"
-            rclone copyto "$source_dir/$filename" "$destination/$filename" \
-                --sftp-ssh "$ssh_command" --immutable --checksum --metadata \
-                --retries 5 --low-level-retries 20
+    # The stopped fleet contains roughly 159 GiB. Stream at most three hosts
+    # concurrently from SFTP into the operator's Drive remote. Validators
+    # receive no Drive configuration or credentials, and each node stays at a
+    # single transfer so parallelism is explicit and bounded.
+    local upload_order=(nyc lax ams lhr nrt sgp)
+    local upload_index source_dir ssh_command suffix filename
+    failed=0
+    for upload_index in 0 3; do
+        pids=()
+        names=()
+        for node in "${upload_order[@]:upload_index:3}"; do
+            (
+                host="$(host_for "$node")"
+                source_dir=":sftp:/root/arc-recovery-archive/$manifest_sha"
+                ssh_command="ssh -o BatchMode=yes -o StrictHostKeyChecking=yes $SSH_USER@$host"
+                for suffix in tar.zst tar.zst.sha256 inventory inventory.sha256; do
+                    filename="legacy-$node.$suffix"
+                    rclone copyto "$source_dir/$filename" "$destination/$filename" \
+                        --sftp-ssh "$ssh_command" --immutable --checksum --metadata \
+                        --transfers 1 --checkers 1 --retries 5 --low-level-retries 20
+                done
+                rclone check "$source_dir" "$destination" \
+                    --sftp-ssh "$ssh_command" --checksum --one-way --checkers 1 \
+                    --include "legacy-$node.tar.zst" \
+                    --include "legacy-$node.tar.zst.sha256" \
+                    --include "legacy-$node.inventory" \
+                    --include "legacy-$node.inventory.sha256"
+                printf 'archive fleet: uploaded and hash-checked preserved classified capture %s\n' "$node"
+            ) > "$log_root/$node-upload.log" 2>&1 &
+            pids+=("$!")
+            names+=("$node")
         done
-        rclone check "$source_dir" "$destination" \
-            --sftp-ssh "$ssh_command" --checksum --one-way \
-            --include "legacy-$node.tar.zst" \
-            --include "legacy-$node.tar.zst.sha256" \
-            --include "legacy-$node.inventory" \
-            --include "legacy-$node.inventory.sha256"
-        printf 'archive fleet: uploaded and hash-checked preserved fork %s\n' "$node"
+        for index in "${!pids[@]}"; do
+            if wait "${pids[$index]}"; then
+                sed -n '1,80p' "$log_root/${names[$index]}-upload.log"
+            else
+                printf 'archive fleet: immutable SFTP-to-Drive upload/check failed: %s\n' \
+                    "${names[$index]}" >&2
+                sed -n '1,160p' "$log_root/${names[$index]}-upload.log" >&2
+                failed=1
+            fi
+        done
     done
-    printf 'archive fleet: COMPLETE capture=%s manifest=%s canonical_matches=%s destination=%s\n' \
-        "$capture_id" "$manifest_sha" "$canonical_count" "$destination"
+    [ "$failed" -eq 0 ] || \
+        die "one or more preserved validator uploads failed; COMPLETE was not emitted"
+    printf 'archive fleet: COMPLETE capture=%s manifest=%s canonical=%s forks=%s preserved_unclassified=%s destination=%s\n' \
+        "$capture_id" "$manifest_sha" "$canonical_count" "$fork_count" "$unclassified_count" "$destination"
 }
 
 COMMAND="${1:-}"

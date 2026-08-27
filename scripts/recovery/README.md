@@ -143,30 +143,32 @@ ARC_RECOVERY_FREEZE_GO="FREEZE $freeze_sha256" \
     --execute
 ```
 
-The default `capture` is read-only. Execution captures a stable
-`/sync/snapshot` LZ4 payload plus bracketed snapshot metadata, health, latest
-block, DAG round, validator set, and network identity before it stops a node.
-It captures and cleanly stops NYC and then LAX, leaving only four of six equal-
-stake validators running when five are required. With finality halted, it
-captures the remaining four live RPCs in parallel, then stops all four and
-copies each final `state.wal`. `freeze` accepts an already-stopped node; it
-never uses SIGKILL. Every capture has a complete file index, refuses overwrite,
-and detects changed, missing, unexpected, symlink, or special-file content.
+The default `capture` is read-only. Execution installs a persistent systemd
+restart fence and cleanly stops NYC and then LAX, leaving only four of six
+equal-stake validators running when five are required. Only after that quorum
+halt does it fence and stop the remaining four. After all six writers are
+proven PID-free, it copies and fsyncs each complete `arc-data` directory
+offline, including the final state and DAG WALs. It never uses SIGKILL and
+never relies on the racy legacy live-snapshot RPC. Every capture has a complete
+file index, refuses overwrite, and detects changed, missing, unexpected,
+symlink, or special-file content.
 
-Build the unsigned candidate from an accepted capture using the exact recovery
-exporter. The capture directory is the data directory and its LZ4 payload is
-the required snapshot; successful export independently decodes the snapshot,
-recomputes its account/storage/code root, and requires it to equal the latest
-complete WAL block/checkpoint boundary:
+The sealed production manifest carries the independently preserved exact-height
+source snapshot and its paired reference WAL as SHA-256-bound artifacts. Build
+the unsigned candidate from that pair using the exact recovery exporter;
+successful export decodes the snapshot, recomputes its account/storage/code
+root, and requires it to equal the complete WAL block/checkpoint boundary:
 
 ```bash
 arc-node recovery export \
-  --data-dir /root/arc-recovery-captures/<freeze-sha256>/<node> \
-  --snapshot /root/arc-recovery-captures/<freeze-sha256>/<node>/state.snapshot.lz4 \
+  --data-dir /secure/operator/reference-pair \
+  --snapshot /secure/operator/reference-pair/state.snapshot.lz4 \
   --genesis /secure/operator/genesis.toml \
   --validator-public-keys /secure/operator/validator-public-keys.json \
+  --legacy-validator-set /secure/operator/legacy-validator-set-40m.json \
   --output /secure/operator/candidate.arcchkpt \
-  --source-consensus-round <captured-current-round> \
+  --source-consensus-round 9774808 \
+  --created-at-unix-ms 1787857623000 \
   --recovery-epoch 1 \
   --validator-set-id 1 \
   --allow-unbound-legacy-wal
@@ -195,25 +197,28 @@ ARC_RECOVERY_GO="GO $locked_sha256" \
     --execute
 ```
 
-`seal` rechecks the immutable rollout sidecar, every artifact hash, and the
-5-of-6 signed checkpoint. On each host it runs the same snapshot-assisted
-export against the unchanged capture. A capture is labelled `canonical_match`
-only when exported H, block hash, and full state root equal the selected
-checkpoint. At least one real match is required; all six bundles, including
-non-matching forks, are retained and uploaded under
+`seal` rechecks the immutable rollout sidecar, every artifact hash, the paired
+reference export, and the 5-of-6 signed checkpoint. On each host it copies a
+private working tree and runs the capture's own on-disk snapshot against that
+capture's own stopped WAL. Each result is classified as `valid_canonical`,
+`valid_noncanonical_fork`, or `preserved_unclassified`. It never substitutes
+the sealed canonical reference snapshot for a validator's missing or divergent
+snapshot. At least one real canonical match is required; all six bundles,
+including forks and unclassified evidence, are retained and uploaded under
 `arc-drive:ARC Chain Recovery/<rollout-manifest hash>`. A changed or missing
-capture, an invalid export, or a Drive object bound to a different freeze hash
-stops before upload or replacement.
+capture or a Drive object bound to a different freeze hash stops before upload
+or replacement. A per-node semantic export failure is preserved as
+unclassified evidence and cannot masquerade as either a fork or a canonical
+source. If strict offline recovery trims an uncheckpointed WAL tail, the
+recovered prefix and quarantined tail are both retained as immutable evidence.
 
-Each bundle contains the stopped `state.wal`, exact LZ4 snapshot, endpoint
-evidence, optional public legacy binary/genesis inputs, and the semantic export
-result. Shared uploads include the final binary, genesis, public validator set,
-signed checkpoint, sealed rollout manifest, capture ID, and `SHA256SUMS`. The
-archive intentionally excludes private identities, service environments,
-build caches, model weights, Git objects, and tens of gigabytes of legacy DAG
-trace. Those bytes remain untouched on each validator disk. Excluding the DAG
-bulk cannot silently choose a fork: the signed checkpoint and exporter provide
-the explicit H/hash/root recovery boundary.
+Each bundle contains the complete stopped legacy data directory, persistent
+fence evidence, optional public legacy binary/genesis inputs, and semantic
+export result. Shared uploads include the sealed source snapshot/reference
+WAL, final binary, genesis, source/public validator sets, signed checkpoint,
+rollout manifest, capture ID, and `SHA256SUMS`. Private identities, service
+environments, build caches, model weights, and Git objects outside `arc-data`
+remain excluded; DAG persistence inside `arc-data` is retained in full.
 
 ## Reward gates
 
@@ -227,6 +232,36 @@ epoch, set, domain, validator-set commitment, and amount agreement.
 - fixed `tx_hash`, `job_id`, and `worker` values; or
 - `probe_argv` whose absolute executable is bound by `probe_sha256` and emits
   exactly `{"tx_hash":"0x...","job_id":"0x...","worker":"0x..."}`.
+
+For the production GO gate, use the repository probe rather than policy-only
+mode. It first requires an issuance-ready validator that sees an eligible
+full-model worker, submits one real one-token `/inference/run`, and refuses to
+emit evidence unless the response proves community routing, the canonical
+per-row INT8 execution profile, authenticated 2-of-3 verification for every
+range/position, five validator approvals, and a pending `0x25` transaction:
+
+```bash
+probe=/absolute/path/to/scripts/recovery/community-reward-probe.py
+probe_sha256=$(shasum -a 256 "$probe" | awk '{print $1}')
+```
+
+Bind those values into the draft before sealing:
+
+```json
+{
+  "mode": "receipt",
+  "expect_protocol_active": true,
+  "expect_issuance_ready": true,
+  "probe_argv": ["/absolute/path/to/scripts/recovery/community-reward-probe.py"],
+  "probe_sha256": "<exact 64-character hash above>",
+  "expected_reward_base": 2500000
+}
+```
+
+The stake-zero worker must already be running and registered with all six
+sealed HTTPS origins. `/workers/scoreboard` and `/community/list` are public
+read-only dashboard/probe endpoints; shard forwarding and reward approval stay
+validator-IP-only.
 
 The probe receives only these non-secret environment values:
 `ARC_RECOVERY_RPC_URLS`, `ARC_RECOVERY_ROLLOUT_MANIFEST_SHA256`, and
@@ -251,6 +286,7 @@ python3 -m py_compile \
   scripts/recovery/recovery_rollout.py \
   scripts/recovery/test_recovery_rollout.py
 python3 scripts/recovery/test_recovery_rollout.py
+python3 scripts/recovery/test_community_reward_probe.py
 ```
 
 The tests cover manifest strictness, six-validator and restart-quorum rules,

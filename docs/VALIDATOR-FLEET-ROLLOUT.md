@@ -55,10 +55,12 @@ that hash cannot be known until the forked fleet is stopped and its exact
 source is verified. Use `archive-fleet-to-drive.sh seal-freeze-plan` to create
 a reviewed, immutable six-host plan, then run `capture` in plan mode. Execution
 requires its own exact `ARC_RECOVERY_FREEZE_GO="FREEZE <freeze-plan-sha256>"`.
-The helper captures a bracketed LZ4 `/sync/snapshot`, endpoint evidence, and—
-after a clean TERM-only stop—the final `state.wal`. Complete capture indexes
+The helper persistently fences and cleanly stops enough writers to halt quorum
+before it copies any chain byte. It then fences all remaining writers and
+copies each complete `arc-data` directory offline. Complete capture indexes
 are create-only and fail on any changed, missing, unexpected, symlink, or
-special-file content.
+special-file content; the legacy `/sync/snapshot` endpoint is not trusted as a
+state barrier.
 
 ## 2. Rotate every validator identity offline
 
@@ -221,29 +223,34 @@ than five approved v3 validators are online. Do not interpret that deliberate
 maintenance halt as permission to mix protocols or lower quorum.
 
 1. Announce a maintenance window and stop ordinary submissions.
-2. Execute the separately sealed freeze plan. It snapshots and stops NYC,
-   then snapshots and stops LAX. Four of six equal-stake validators cannot
+2. Execute the separately sealed freeze plan. It persistently fences and stops
+   NYC, then LAX. Four of six equal-stake validators cannot
    reach the required five-validator quorum, so finality is now deliberately
    halted.
-3. While quorum remains halted, capture stable live snapshots and endpoint
-   evidence from AMS, LHR, NRT, and SGP in parallel; only after all four live
-   captures complete, stop those four and copy every final WAL.
+3. While quorum remains halted, persistently fence and stop AMS, LHR, NRT, and
+   SGP. Verify all six are PID-free, then copy/fsync all six complete data
+   directories offline. Do not deploy a new endpoint to the legacy binaries.
 4. Verify all six immutable capture indexes and that no legacy process is
    listening or sealing. Preserve all six captures; do not discard a fork
    because it is not ultimately selected.
-5. Use `arc-node recovery export --data-dir <capture> --snapshot
-   <capture>/state.snapshot.lz4 ...` to build the candidate from the accepted
-   source. Successful export—not snapshot metadata—must prove that the decoded
-   snapshot H/root equals the latest complete WAL block/checkpoint boundary.
+5. Use `arc-node recovery export --data-dir <paired-source> --snapshot
+   <sealed-source.snapshot.lz4> --legacy-validator-set
+   <legacy-validator-set-40m.json> ...` to reproduce the candidate. Successful
+   export—not endpoint metadata—must prove that the decoded snapshot H/root
+   equals the complete WAL block/checkpoint boundary.
    The audited legacy WAL needs the explicit `--allow-unbound-legacy-wal`
    exception because it predates the genesis network hash; record that fact.
 6. Sign the accepted candidate offline with the required 5-of-6 quorum and
    seal the final production rollout manifest.
 7. Run `archive-fleet-to-drive.sh seal` in plan mode, then execute it only with
    the exact `ARC_RECOVERY_GO="GO <rollout-manifest-sha256>"`. It re-exports
-   every unchanged snapshot/WAL pair, labels matches against the checkpoint's
-   H/hash/full-root, requires at least one real canonical match, and uploads
-   all six labelled fork bundles plus the shared signed artifacts immutably.
+   each stopped WAL only against that capture's own on-disk snapshot. A
+   derivable pair is classified as `valid_canonical` or
+   `valid_noncanonical_fork`; a missing, ambiguous, torn, or otherwise
+   non-derivable pair is `preserved_unclassified`. The sealed source snapshot
+   is independent canonical reference evidence and is never substituted into
+   a validator capture. At least one canonical match is required, and all six
+   labelled bundles are uploaded immutably.
 8. Install the exact checksummed candidate and approved genesis/checkpoint on
    every host; install the host's new keyfile separately.
 9. Start enough prepared v3 validators in a tight window to reach quorum,
@@ -272,7 +279,9 @@ configured origin **count**, so the sealed production value is `6`; it does
 not return the URL array. The locked rollout installs a SHA-pinned Caddy TLS gateway for
 an exact IP-derived `nip.io` hostname (`sslip.io` is the resealed-manifest
 fallback), a loopback request/rate-limit filter, strict body limits, security
-headers, and a reviewed path allowlist. Unknown paths fail closed. Raw public
+headers, an exact GitHub Pages CORS origin, and a reviewed path allowlist.
+Public preflight terminates at Caddy; internal validator routes never receive
+browser CORS. Unknown paths fail closed. Raw public
 `:9090` endpoints and clear-text remote community origins are not acceptable
 frontend or validator configuration.
 

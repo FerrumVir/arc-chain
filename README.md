@@ -226,7 +226,8 @@ bash install.sh --version 0.8.0 \
 # Install binaries/config only; print the command but do not start anything
 bash install.sh --version 0.8.0 --no-service --no-auto-update
 
-# Serve local inference (a model is optional and never passed as an empty arg)
+# Serve deterministic community inference. The installer adds
+# --full-integer-worker; it does not advertise this home node as a layer shard.
 bash install.sh --version 0.8.0 --model /absolute/path/to/model.gguf
 
 # Reproducible pin; an older version is rejected if a newer one is installed
@@ -254,6 +255,13 @@ by the network and are not guaranteed by the installer. See
 [`docs/HEADLESS_INSTALL.md`](docs/HEADLESS_INSTALL.md) for service commands,
 firewall notes, upgrade behavior, and Windows verification. The short operator
 demo is [`docs/COMMUNITY-NODE-WALKTHROUGH.md`](docs/COMMUNITY-NODE-WALKTHROUGH.md).
+
+With `--model`, the managed runner also passes `--full-integer-worker`. That
+loads all deterministic integer transformer layers so a claimed result can be
+independently recomputed, but deliberately emits no `ShardInfo`. Do not replace
+it with `--shard-range 0:32`: a residential node would then announce an
+overlapping, normally NAT-unreachable validator shard and poison the displayed
+coverage map.
 
 **📖 Desktop walkthrough:** [Getting Started with ARC Node](docs/GETTING_STARTED.md).
 
@@ -412,21 +420,29 @@ GPU speed or cross-GPU bit identity.
   range           replicas (any one answers, failover to the next)
   ─────           ────────────────────────────────────────────────
   [0,6)           AMS · LAX · NYC
-  [6,12)          AMS · LAX · LHR
-  [12,17)         AMS · LHR · NRT
-  [17,22)         LHR · NRT · SGP
-  [22,27)         NRT · NYC · SGP
-  [27,32)         LAX · NYC · SGP
+  [6,12)          LHR · NRT · SGP
+  [12,17)         NYC · LAX · LHR
+  [17,22)         NYC · AMS · NRT
+  [22,27)         LAX · NRT · SGP
+  [27,32)         AMS · LHR · SGP
 
   NYC 149.28.32.76   LAX 140.82.16.112   AMS 136.244.109.1
-  LHR 104.238.171.11 NRT 202.182.107.41  SGP 149.28.153.31   (port 9090)
+  LHR 104.238.171.11 NRT 202.182.107.41  SGP 149.28.153.31
 ```
 
-Each `→` is a `POST /inference/forward_shard` to the next shard. Each shard verifies the previous shard's BLAKE3 hash before computing. The last shard runs `final_norm + LM head + argmax` and returns the next token id. The coordinator collects tokens until `max_tokens` or EOS.
+Each `→` is a validator-only HTTPS `POST /inference/forward_shard` to the next
+shard. The public gateway denies that route unless the source is one of the six
+sealed validator IPs. Each shard verifies the previous shard's BLAKE3 hash
+before computing. The last shard runs `final_norm + LM head + argmax` and
+returns the next token id. The coordinator collects tokens until `max_tokens`
+or EOS.
 
 Coordinators batch the whole prompt into one round-trip per shard (`"prefill":"batch"`) and pick the lowest-latency replica for each range. Racing several replicas at once and taking the first to finish is designed but not shipped.
 
-Each node holds 15–17 of the 32 layers, about 2.9–3.3 GB. Verify the live map yourself: `curl http://104.238.171.11:9090/shards`.
+Each node holds exactly 16 of the 32 layers, and every layer has exactly three
+validator replicas. Verify the post-cutover map through a reviewed HTTPS
+origin, for example `curl https://104-238-171-11.nip.io/shards`; raw public
+`:9090` is intentionally unavailable.
 
 ---
 
@@ -508,7 +524,7 @@ desktop, and packaging behavior is enforced by the blocking Windows CI legs.
 | `arc-consensus` | 7,971 | DAG consensus, 2-round finality, slashing, VRF, epoch transitions |
 | `arc-gpu` | 5,250 | Metal MSL + WGSL Ed25519 batch verify (379 K / sec), GPU memory |
 | `arc-net` | 2,355 | QUIC transport, shred propagation, FEC, gossip, peer exchange |
-| `arc-mempool` | 876 | Lock-free queue, deduplication, BLS threshold encrypted mempool |
+| `arc-mempool` | 876 | Lock-free queue and deduplication; encrypted submission is not enabled in v0.8 |
 | `arc-cli`, `arc-channel`, `arc-bench`, `arc-relayer`, `arc-agents` | misc | CLI, payment channels, benchmarks, bridge, example agents |
 
 Plus: Python SDK (2,688 LOC), TypeScript SDK (2,011 LOC), Solidity contracts
@@ -531,11 +547,11 @@ be described as deployed together.
 | Authenticated range recomputation | candidate requires 2-of-3 for every range/token; not deployed |
 | Latency-aware replica selection per layer range | ✅ rolling EWMA |
 | Auto-shard node onboarding | ✅ `--auto-shard` flag |
-| Inference computation claims | tx `0x16`; never a payment |
+| Inference computation certificate | legacy/history-only tx `0x16`; v3 rejects standalone submission and embeds/reverifies the worker certificate inside payable `0x25` |
 | Community reward settlement | tx `0x25`, five-of-six active-validator identity + stake approvals; implemented and receipt-gated, but disabled by the checked-in observer genesis and not deployed |
 | EVM (Solidity) + WASM (Rust / C / Go) both | ✅ revm 19, Wasmer 6.0 |
 | 5 signature algorithms incl. 2 post-quantum | ✅ Ed25519 · Falcon-512 · BLS · ML-DSA · secp256k1 |
-| BLS threshold encrypted mempool (MEV protection) | ✅ commit-reveal |
+| BLS threshold encrypted mempool (MEV protection) | not shipped: v0.8 explicitly leaves the proposer-local, non-replicated prototype disabled |
 | Zero-fee agent settlements | ✅ `Settle` (0x06) · `RegisterAgent` (0x07) |
 | Wallet and dashboard UIs | public diagnostics exist; corrected candidate UI not yet deployed |
 
@@ -548,7 +564,7 @@ thing you would assume from the name is not happening yet:
 |---|---|
 | Validator slashing (equivocation, liveness) | implemented in `arc-consensus`; no slash has been triggered on the live net |
 | VRF committee re-execution | committee is selected and recorded; votes are never collected |
-| Public inference claims reaching blocks | host-dependent on the forked fleet; a mined `0x16` still pays nothing |
+| Legacy inference claims in historical blocks | host-dependent on the forked fleet; v3 rejects new standalone `0x16`, and a historical mined `0x16` pays nothing |
 | Exact model identity | public v2 `model_hash` is shape-derived; the unpublished v0.8.0/v3 candidate commits to every byte of the source model artifact |
 
 ### Roadmap — designed, not shipped
@@ -592,8 +608,8 @@ Key endpoints:
 | `/health`, `/stats`, `/info` | node + chain health |
 | `/block/latest`, `/block/{n}` | blocks (per-seed — see the state note above) |
 | `/inference/run`, `/inference/run_sharded` | single-node + sharded inference |
-| `/inference/attestations` | raw inference claim records (`0x16`; not payment) |
-| `/inference/results` | node-local inference results (in-memory, lost on restart) |
+| `/inference/attestations` | bounded public commitments/status for legacy inference claims; never raw prompts/outputs and never payment |
+| `/inference/results` | bounded, TTL-pruned node-local commitment metadata; raw prompts/outputs are not public |
 | `/tx/submit`, `/tx/{hash}` | transactions |
 | `/validators`, `/shards` | network state |
 | `/account/{addr}` | balances |
@@ -612,9 +628,12 @@ range union, while earnings count only successful retained
 `CommunityInferenceReward` receipts. A submitted reward, raw `0x16`
 attestation, failed receipt, or faucet POST never increments confirmed ARC.
 Forward projections are available only from an explicit active reward policy,
-confirmed receipt history, and a treasury that can fund another full reward;
-otherwise the value is null and the API returns the reason. Those fixes are
-not live until the fleet cutover completes.
+confirmed receipt history, a treasury that can fund another full reward, and
+remaining consensus block/epoch/worker/coordinator budget; otherwise the value
+is null and the API returns the reason. The v0.8 reward is a protocol-capped
+testnet promotional compute subsidy, not customer demand or revenue. Five-of-six
+recomputation proves output agreement, not that a customer paid for the job.
+Those fixes are not live until the fleet cutover completes.
 
 See `docs/HOW-SHARDING-WORKS.md` for the wire protocol.
 

@@ -423,6 +423,12 @@ pub struct CachedIntegerModel {
     pub ternary_hybrid_output: Option<crate::ternary_hybrid::TernaryHybridWeights>,
 }
 
+/// Exact execution profile required for reward-bearing whole-model community
+/// work. The validator shard fleet and the worker must execute the same
+/// quantization path, not merely start from the same GGUF bytes.
+pub const CANONICAL_REWARD_INFERENCE_PROFILE: &str =
+    "INT8 integer (per-row, cross-platform deterministic)";
+
 impl CachedIntegerModel {
     /// True only when every configured transformer layer has real weights.
     ///
@@ -539,8 +545,47 @@ impl CachedIntegerModel {
         } else if self.q4_layers.is_some() {
             "Q4 integer (cross-platform deterministic)"
         } else {
-            "INT8 integer (per-row, cross-platform deterministic)"
+            CANONICAL_REWARD_INFERENCE_PROFILE
         }
+    }
+
+    pub fn has_canonical_i8_profile(&self) -> bool {
+        self.q4_layers.is_none()
+            && self.q4_output.is_none()
+            && self.i16_layers.is_none()
+            && self.i16_output.is_none()
+            && self.block_i8_layers.is_none()
+            && self.block_i8_output.is_none()
+            && self.ternary_layers.is_none()
+            && self.ternary_output.is_none()
+            && self.ternary_hybrid_layers.is_none()
+            && self.ternary_hybrid_output.is_none()
+    }
+
+    /// Pin this model to the protocol's canonical per-row INT8 execution
+    /// profile.
+    ///
+    /// A GGUF artifact hash commits the source weights, but it does not by
+    /// itself commit which of the optional in-memory quantizations executes.
+    /// The full loader normally retains I16 and block-I8 variants while the
+    /// multi-range validator loader deliberately drops them after merging.
+    /// A community worker using the former and validator shards using the
+    /// latter can therefore hold identical model bytes yet produce different
+    /// token hashes. Reward-bearing whole-model workers call this immediately
+    /// after loading so their output is exactly what the distributed validator
+    /// verifier recomputes.
+    pub fn enforce_canonical_i8_profile(&mut self) {
+        self.q4_layers = None;
+        self.q4_output = None;
+        self.i16_layers = None;
+        self.i16_output = None;
+        self.block_i8_layers = None;
+        self.block_i8_output = None;
+        self.ternary_layers = None;
+        self.ternary_output = None;
+        self.ternary_hybrid_layers = None;
+        self.ternary_hybrid_output = None;
+        debug_assert!(self.has_canonical_i8_profile());
     }
 
     /// Convert all weights from I8 to I16 format.
@@ -3889,6 +3934,30 @@ pub fn load_cached_model_shard(
     start_layer: usize,
     end_layer: usize,
 ) -> Result<CachedIntegerModel, crate::InferenceError> {
+    load_cached_model_shard_profile(path, start_layer, end_layer, true)
+}
+
+/// Load a whole GGUF directly into the protocol's canonical per-row INT8
+/// profile. Unlike `load_cached_model`, this never materializes I16 or
+/// block-I8 copies, keeping peak memory suitable for a community worker while
+/// producing exactly what the merged validator ranges recompute.
+#[cfg(feature = "candle")]
+pub fn load_cached_model_canonical_i8(
+    path: &str,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    let model = load_cached_model_shard_profile(path, 0, usize::MAX, false)?;
+    debug_assert!(model.has_all_transformer_layers());
+    debug_assert!(model.has_canonical_i8_profile());
+    Ok(model)
+}
+
+#[cfg(feature = "candle")]
+fn load_cached_model_shard_profile(
+    path: &str,
+    start_layer: usize,
+    end_layer: usize,
+    include_optional_quantizations: bool,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
     use crate::InferenceError;
     use candle_core::Device;
     use candle_core::quantized::gguf_file;
@@ -4056,7 +4125,11 @@ pub fn load_cached_model_shard(
      -> Result<(I8Weights, I16Weights), InferenceError> {
         let f = extract_f32(reader, content, name)?;
         let i8w = I8Weights::quantize_f32(&f, rows, cols);
-        let i16w = I16Weights::quantize_f32(&f, rows, cols);
+        let i16w = if include_optional_quantizations {
+            I16Weights::quantize_f32(&f, rows, cols)
+        } else {
+            I16Weights::empty()
+        };
         Ok((i8w, i16w))
     };
 
@@ -4094,10 +4167,11 @@ pub fn load_cached_model_shard(
         let f = extract_f32(&mut reader, &content, "output.weight")
             .or_else(|_| extract_f32(&mut reader, &content, "token_embd.weight"))?;
         let i8w = I8Weights::quantize_f32(&f, vocab_size, d_model);
-        let i16w = I16Weights::quantize_f32(&f, vocab_size, d_model);
+        let i16w = include_optional_quantizations
+            .then(|| I16Weights::quantize_f32(&f, vocab_size, d_model));
         let fn_ = extract_norm(&mut reader, &content, "output_norm.weight", d_model);
         info!("Shard last: output head + final_norm loaded");
-        (i8w, Some(i16w), fn_)
+        (i8w, i16w, fn_)
     } else {
         (I8Weights::empty(), None, Vec::new())
     };
@@ -4168,7 +4242,7 @@ pub fn load_cached_model_shard(
     // Q4 is OPT-IN: enable by setting ARC_Q4_SHARD=1. Without it, the
     // shard uses the I16 SIMD path (higher quality). Q4 gives ~2× more
     // speed at the cost of additional quantization noise (4-bit vs 16-bit).
-    let enable_q4 = std::env::var("ARC_Q4_SHARD").is_ok();
+    let enable_q4 = include_optional_quantizations && std::env::var("ARC_Q4_SHARD").is_ok();
     let mut any_i16 = false;
     let mut any_q4 = false;
     for l in start_layer..end_layer {
@@ -4252,7 +4326,7 @@ pub fn load_cached_model_shard(
             w_up: wu16,
             w_down: wd16,
         };
-        any_i16 = true;
+        any_i16 = include_optional_quantizations;
         // Convert the just-loaded I8 layer to Q4 if requested.
         if enable_q4 {
             let l8 = &layers[l];
@@ -4269,9 +4343,10 @@ pub fn load_cached_model_shard(
         }
         if (l - start_layer).is_multiple_of(4) || l == end_layer - 1 {
             info!(
-                "Shard layer {}/{} loaded as I8+I16{} ({} of {})",
+                "Shard layer {}/{} loaded as I8{}{} ({} of {})",
                 l + 1,
                 n_layers,
+                if any_i16 { "+I16" } else { "" },
                 if any_q4 { "+Q4" } else { "" },
                 l - start_layer + 1,
                 end_layer - start_layer
@@ -4360,6 +4435,15 @@ pub fn load_cached_model_shard(
     ))
 }
 
+#[cfg(not(feature = "candle"))]
+pub fn load_cached_model_canonical_i8(
+    _path: &str,
+) -> Result<CachedIntegerModel, crate::InferenceError> {
+    Err(crate::InferenceError::Runtime(
+        "candle feature not enabled".into(),
+    ))
+}
+
 /// Load the union of multiple disjoint layer ranges into a single
 /// `CachedIntegerModel`. The per-range layers vec is always full `n_layers`
 /// long; slots outside any provided range are placeholders and are never
@@ -4405,9 +4489,14 @@ pub fn load_cached_model_ranges(
 
     let mut aggregate = load_cached_model_shard(path, sorted[0].0, sorted[0].1)?;
     let n_layers = aggregate.config.n_layers;
+    // Multi-range execution is the canonical per-row I8 validator profile.
+    // Drop the first sub-load's optional copies before loading the next range
+    // so an 8 GiB validator never holds I8+I16 for multiple ranges at once.
+    aggregate.enforce_canonical_i8_profile();
 
     for &(start, end) in &sorted[1..] {
         let mut other = load_cached_model_shard(path, start, end)?;
+        other.enforce_canonical_i8_profile();
         // Sanity: every shard load must produce the same n_layers-sized layers vec
         if other.layers.len() != aggregate.layers.len() {
             return Err(InferenceError::Runtime(format!(
@@ -4787,6 +4876,42 @@ mod tests {
         let mut inconsistent = build_test_model(32, 16, 2, 32, 1);
         inconsistent.config.n_layers = 2;
         assert!(!inconsistent.has_all_transformer_layers());
+    }
+
+    #[test]
+    fn canonical_community_profile_matches_validator_i8_and_detects_i16_drift() {
+        // The full GGUF loader normally leaves optional higher-precision
+        // paths populated. Model that state with enable_i16(), then apply the
+        // role-specific profile exactly as --full-integer-worker does.
+        let mut worker = build_test_model(32, 16, 2, 32, 2);
+        worker.enable_i16();
+        assert!(!worker.has_canonical_i8_profile());
+        worker.enforce_canonical_i8_profile();
+        assert!(worker.has_canonical_i8_profile());
+        assert_eq!(
+            worker.effective_precision_label(),
+            CANONICAL_REWARD_INFERENCE_PROFILE
+        );
+
+        // Multi-range validator merging retains the same base per-row I8
+        // weights but drops optional profiles. A worker completion and the
+        // validator recomputation must therefore agree byte-for-byte.
+        let validator = build_test_model(32, 16, 2, 32, 2);
+        assert!(validator.has_canonical_i8_profile());
+        let prompt = [worker.config.bos_token, 3, 4];
+        let (worker_tokens, worker_hash) = worker.generate(&prompt, 2, &worker.config.eos_tokens);
+        let (validator_tokens, validator_hash) =
+            validator.generate(&prompt, 2, &validator.config.eos_tokens);
+        assert_eq!(worker_tokens, validator_tokens);
+        assert_eq!(worker_hash, validator_hash);
+
+        let mut drifted = build_test_model(32, 16, 2, 32, 2);
+        drifted.enable_i16();
+        assert_eq!(
+            drifted.effective_precision_label(),
+            "INT16 integer (per-row, cross-platform deterministic)"
+        );
+        assert!(!drifted.has_canonical_i8_profile());
     }
 
     #[test]

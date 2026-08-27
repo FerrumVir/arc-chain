@@ -239,7 +239,10 @@ pub async fn restart_node(app: AppHandle, state: State<'_, AppState>) -> CmdResu
 /// All other state (WAL, blocks, identity, config) is preserved. Only
 /// the peer dial cache is removed.
 #[tauri::command]
-pub async fn reset_peer_state(app: AppHandle, state: State<'_, AppState>) -> CmdResult<ResetPeerStateResult> {
+pub async fn reset_peer_state(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CmdResult<ResetPeerStateResult> {
     // Resolve the data dir through the SAME helper node_manager uses.
     // Duplicating the expansion here (HOME-only) meant this deleted
     // known_peers.json from a different directory than the node actually
@@ -316,16 +319,8 @@ pub async fn node_status(state: State<'_, AppState>) -> CmdResult<NodeStatus> {
     let chain = chain_host(&state).await;
     let chain_choice = cached_chain_choice(&state).await;
 
-    let mut status = rpc_client::fetch_status(
-        &state.http,
-        &local,
-        &chain,
-        port,
-        pid,
-        address,
-        crash,
-    )
-    .await;
+    let mut status =
+        rpc_client::fetch_status(&state.http, &local, &chain, port, pid, address, crash).await;
 
     status.chain_host = Some(chain);
     status.chain_height = chain_choice.as_ref().map(|c| c.height);
@@ -364,13 +359,10 @@ pub async fn fetch_attestations(
         store.identity.as_ref().map(|i| i.address.clone())
     };
     let host = chain_host(&state).await;
-    Ok(rpc_client::fetch_attestations(
-        &state.http,
-        &host,
-        limit.unwrap_or(20),
-        address.as_deref(),
+    Ok(
+        rpc_client::fetch_attestations(&state.http, &host, limit.unwrap_or(20), address.as_deref())
+            .await,
     )
-    .await)
 }
 
 #[tauri::command]
@@ -379,9 +371,7 @@ pub async fn fetch_logs(
     limit: Option<u32>,
 ) -> CmdResult<Vec<LogEntry>> {
     let node = state.node.lock().await;
-    Ok(node
-        .logs_snapshot(limit.unwrap_or(200) as usize)
-        .await)
+    Ok(node.logs_snapshot(limit.unwrap_or(200) as usize).await)
 }
 
 #[tauri::command]
@@ -429,10 +419,7 @@ pub async fn fetch_earnings_projection(
         store.identity.as_ref().map(|i| i.address.clone())
     };
     let host = chain_host(&state).await;
-    Ok(
-        rpc_client::fetch_earnings_projection(&state.http, &host, address.as_deref())
-            .await,
-    )
+    Ok(rpc_client::fetch_earnings_projection(&state.http, &host, address.as_deref()).await)
 }
 
 /// What the node on THIS machine is contributing. Local read by design — the
@@ -474,10 +461,7 @@ pub async fn fetch_block_txs(
     limit: Option<u32>,
 ) -> CmdResult<crate::types::BlockTxs> {
     let host = chain_host(&state).await;
-    Ok(
-        rpc_client::fetch_block_txs(&state.http, &host, height, limit.unwrap_or(50))
-            .await,
-    )
+    Ok(rpc_client::fetch_block_txs(&state.http, &host, height, limit.unwrap_or(50)).await)
 }
 
 /// Look one hash up on the pinned host. Replaces an `openExternal` to a
@@ -530,7 +514,10 @@ pub async fn send_arc(
     let _write_guard = state.wallet_write.lock().await;
     let address = {
         let store = state.store.lock().await;
-        store.identity.as_ref().map(|identity| identity.address.clone())
+        store
+            .identity
+            .as_ref()
+            .map(|identity| identity.address.clone())
     }
     .ok_or_else(|| "no identity".to_string())?;
 
@@ -540,17 +527,23 @@ pub async fn send_arc(
         .balance_base
         .parse::<u64>()
         .map_err(|_| "selected host returned an invalid wallet balance".to_string())?;
-    if amount_base > available {
+    // Read the domain from the exact pinned origin before touching the
+    // recovery phrase. Missing v3 recovery metadata fails closed. The v3
+    // minimum fee is part of the signed transaction and therefore part of
+    // the available-balance decision too.
+    let domain = rpc_client::transaction_signing_domain(&state.http, &host).await?;
+    let fee_base = crate::wallet::transfer_fee_base(domain);
+    let required = amount_base
+        .checked_add(fee_base)
+        .ok_or_else(|| "amount plus transaction fee exceeds ARC's base-unit limit".to_string())?;
+    if required > available {
         return Err(format!(
-            "insufficient balance: available {} ARC, requested {} ARC",
+            "insufficient balance: available {} ARC, requested {} ARC plus {} ARC network fee",
             account.balance_arc,
-            crate::wallet::format_arc_amount(amount_base)
+            crate::wallet::format_arc_amount(amount_base),
+            crate::wallet::format_arc_amount(fee_base),
         ));
     }
-
-    // Read the domain from the exact pinned origin before touching the
-    // recovery phrase. Missing v3 recovery metadata fails closed.
-    let domain = rpc_client::transaction_signing_domain(&state.http, &host).await?;
     let tx = {
         let store = state.store.lock().await;
         let identity = store
@@ -602,13 +595,11 @@ async fn probe_chain_host(http: &reqwest::Client) -> Option<ChainHostChoice> {
         let host = host.to_string();
         set.spawn(async move {
             let url = format!("{}/block/latest", host);
-            let resp = tokio::time::timeout(
-                std::time::Duration::from_secs(3),
-                http.get(&url).send(),
-            )
-            .await
-            .ok()?
-            .ok()?;
+            let resp =
+                tokio::time::timeout(std::time::Duration::from_secs(3), http.get(&url).send())
+                    .await
+                    .ok()?
+                    .ok()?;
             if !resp.status().is_success() {
                 return None;
             }
@@ -705,7 +696,10 @@ async fn chain_host(state: &AppState) -> String {
             // Every seed refused or timed out. Fall back to the first
             // candidate so the caller still produces a well-formed error
             // against a real host rather than panicking on an empty string.
-            tracing::warn!("no seed answered /block/latest; falling back to {}", WALLET_HOSTS[0]);
+            tracing::warn!(
+                "no seed answered /block/latest; falling back to {}",
+                WALLET_HOSTS[0]
+            );
             WALLET_HOSTS[0].to_string()
         }
     }
@@ -856,7 +850,12 @@ pub async fn run_inference_via_coordinator(
     let mut last_err = String::new();
     for host in &candidates {
         match rpc_client::run_inference_consensus(
-            &client, host, &prompt, max_tokens, k, chat_template,
+            &client,
+            host,
+            &prompt,
+            max_tokens,
+            k,
+            chat_template,
         )
         .await
         {
@@ -903,10 +902,8 @@ pub async fn run_inference_via_coordinator_direct(
 
     let mut last_err = String::new();
     for host in &candidates {
-        match rpc_client::run_inference_remote(
-            &client, host, &prompt, max_tokens, chat_template,
-        )
-        .await
+        match rpc_client::run_inference_remote(&client, host, &prompt, max_tokens, chat_template)
+            .await
         {
             Ok(mut r) => {
                 r.served_locally = *host == local_prefix;
@@ -984,7 +981,10 @@ pub async fn tier1_result(
             Err(e) => last_err = format!("{}: {}", host, e),
         }
     }
-    Err(format!("tier1_result not found on any host; last: {}", last_err))
+    Err(format!(
+        "tier1_result not found on any host; last: {}",
+        last_err
+    ))
 }
 
 /// Tier 1 RPC host candidates in the order to try them. Honors
@@ -1000,8 +1000,7 @@ fn tier1_candidate_hosts() -> Vec<String> {
         }
     }
     use rand::seq::SliceRandom;
-    let mut hosts: Vec<String> =
-        COORDINATOR_HOSTS.iter().map(|s| s.to_string()).collect();
+    let mut hosts: Vec<String> = COORDINATOR_HOSTS.iter().map(|s| s.to_string()).collect();
     hosts.shuffle(&mut rand::thread_rng());
     hosts
 }
@@ -1102,7 +1101,10 @@ pub async fn save_logs(app: AppHandle, state: State<'_, AppState>) -> CmdResult<
 
     let Some(path) = picked else {
         // User cancelled - not an error.
-        return Ok(SavedLogs { path: None, lines: entries.len() });
+        return Ok(SavedLogs {
+            path: None,
+            lines: entries.len(),
+        });
     };
     let path: PathBuf = path
         .into_path()
@@ -1185,7 +1187,10 @@ pub async fn set_worker_threads(
             "POST /node/threads returned {} - falling back to a restart",
             r.status()
         ),
-        Err(e) => tracing::info!("POST /node/threads failed ({}) - falling back to a restart", e),
+        Err(e) => tracing::info!(
+            "POST /node/threads failed ({}) - falling back to a restart",
+            e
+        ),
     }
 
     restart_node(app, state).await?;
@@ -1202,8 +1207,7 @@ pub async fn set_worker_threads(
 /// a previous release sitting in ~/.arc/bin and must redownload, otherwise
 /// chain bug fixes never reach existing users on auto-update.
 const EXPECTED_NODE_VERSION: &str = env!("CARGO_PKG_VERSION");
-const ARC_RELEASE_DOWNLOAD_ROOT: &str =
-    "https://github.com/FerrumVir/arc-chain/releases/download";
+const ARC_RELEASE_DOWNLOAD_ROOT: &str = "https://github.com/FerrumVir/arc-chain/releases/download";
 const MAX_NODE_BINARY_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CHECKSUM_MANIFEST_BYTES: usize = 1024 * 1024;
 
@@ -1231,13 +1235,10 @@ fn expected_release_sha256(manifest: &str, asset: &str) -> Result<[u8; 32], Stri
         .next()
         .ok_or_else(|| format!("SHA256SUMS has no entry for {}", asset))?;
     if matches.next().is_some() {
-        return Err(format!(
-            "SHA256SUMS has more than one entry for {}",
-            asset
-        ));
+        return Err(format!("SHA256SUMS has more than one entry for {}", asset));
     }
-    let decoded = hex::decode(digest)
-        .map_err(|_| format!("SHA256SUMS has invalid hex for {}", asset))?;
+    let decoded =
+        hex::decode(digest).map_err(|_| format!("SHA256SUMS has invalid hex for {}", asset))?;
     decoded
         .try_into()
         .map_err(|_| format!("SHA256SUMS has a non-SHA-256 digest for {}", asset))
@@ -1310,7 +1311,9 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
                 if semver_gt(EXPECTED_NODE_VERSION, &v) {
                     tracing::info!(
                         "arc-node {} at {} is older than this desktop's {} - attempting refresh",
-                        v, target.display(), EXPECTED_NODE_VERSION
+                        v,
+                        target.display(),
+                        EXPECTED_NODE_VERSION
                     );
                     // Fall through to the download attempt below.
                 } else if semver_gt(&v, EXPECTED_NODE_VERSION) {
@@ -1321,7 +1324,9 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
                 } else {
                     return Err(format!(
                         "managed arc-node at {} reports unrecognized version '{}'; expected v{}",
-                        target.display(), v, EXPECTED_NODE_VERSION
+                        target.display(),
+                        v,
+                        EXPECTED_NODE_VERSION
                     ));
                 }
             }
@@ -1356,7 +1361,11 @@ async fn ensure_binary_inner(app: &AppHandle) -> Result<BinaryStatus, String> {
             // Last chance: a dev build we skipped earlier because the
             // managed path existed but turned out unusable.
             if let Some(dev) = crate::node_manager::dev_build_binary() {
-                tracing::warn!("arc-node download failed ({}) - falling back to {}", e, dev.display());
+                tracing::warn!(
+                    "arc-node download failed ({}) - falling back to {}",
+                    e,
+                    dev.display()
+                );
                 return Ok(installed(&dev));
             }
             Err(format!(
@@ -1545,7 +1554,11 @@ fn install_over(tmp: &Path, target: &Path) -> Result<(), String> {
         // Put the original back rather than leaving the user with nothing.
         let _ = std::fs::rename(&displaced, target);
         let _ = std::fs::remove_file(tmp);
-        format!("could not install new arc-node at {}: {}", target.display(), e)
+        format!(
+            "could not install new arc-node at {}: {}",
+            target.display(),
+            e
+        )
     })
 }
 
@@ -1608,11 +1621,17 @@ fn platform_release_asset() -> Option<&'static str> {
 fn resolve_testnet_resources(app: &AppHandle) -> TestnetResources {
     let resolver = app.path();
     let seeds = resolver
-        .resolve("resources/testnet-seeds.txt", tauri::path::BaseDirectory::Resource)
+        .resolve(
+            "resources/testnet-seeds.txt",
+            tauri::path::BaseDirectory::Resource,
+        )
         .ok()
         .filter(|p: &PathBuf| p.exists());
     let genesis = resolver
-        .resolve("resources/genesis.toml", tauri::path::BaseDirectory::Resource)
+        .resolve(
+            "resources/genesis.toml",
+            tauri::path::BaseDirectory::Resource,
+        )
         .ok()
         .filter(|p: &PathBuf| p.exists());
     TestnetResources {
@@ -1698,8 +1717,8 @@ fn verify_model_file(path: &Path, spec: &ModelTierSpec) -> Result<bool, String> 
         return Ok(false);
     }
 
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| format!("open {}: {}", path.display(), error))?;
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("open {}: {}", path.display(), error))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
@@ -1770,7 +1789,9 @@ pub async fn recommended_tier() -> CmdResult<String> {
 /// are multi-gigabyte. A same-size mutation must never be treated as ready.
 #[tauri::command]
 pub async fn existing_model_for_tier(tier: String) -> CmdResult<Option<String>> {
-    let Some(spec) = tier_spec(&tier) else { return Ok(None) };
+    let Some(spec) = tier_spec(&tier) else {
+        return Ok(None);
+    };
     let p = model_path_for(&tier);
     let verify_path = p.clone();
     let valid = tokio::task::spawn_blocking(move || verify_model_file(&verify_path, spec))
@@ -1789,8 +1810,7 @@ pub async fn existing_model_for_tier(tier: String) -> CmdResult<Option<String>> 
 /// good model.
 #[tauri::command]
 pub async fn download_model(app: AppHandle, tier: String) -> CmdResult<String> {
-    let spec = tier_spec(&tier)
-        .ok_or_else(|| format!("unknown model tier: {}", tier))?;
+    let spec = tier_spec(&tier).ok_or_else(|| format!("unknown model tier: {}", tier))?;
     let target = model_path_for(&tier);
 
     // Already downloaded and hash-verified → done.
@@ -2091,8 +2111,8 @@ mod release_binary_tests {
             size_bytes: good.len() as u64,
             sha256: digest,
         };
-        let path = std::env::temp_dir()
-            .join(format!("arc-model-check-{}-same-size", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("arc-model-check-{}-same-size", std::process::id()));
         std::fs::write(&path, good).unwrap();
         assert!(verify_model_file(&path, &spec).unwrap());
         std::fs::write(&path, b"evil").unwrap();

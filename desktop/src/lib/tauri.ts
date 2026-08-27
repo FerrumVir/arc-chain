@@ -963,6 +963,16 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         rewardPerAttestation: null,
         rewardRateSource: "unknown" as const,
         communityRewardsEnabled: null,
+        projectedDailyArc: null,
+        projectedDailyUnavailableReason: null,
+        rewardPolicyHash: null,
+        rewardBudgetEpoch: null,
+        rewardsRemainingThisEpoch: null,
+        workerRewardsRemainingThisEpoch: null,
+        coordinatorRewardsRemainingThisEpoch: null,
+        issuanceReadyForWorker: null,
+        rewardProgram: null,
+        rewardIsCustomerDemand: null,
         attestationsTotal: 0,
         firstAttestationBlock: null,
         attestationsPerDay: null,
@@ -982,7 +992,8 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
       if (d.kind !== "ok") {
         return { ...empty, unavailable: reason(path, d) } as T;
       }
-      if (!confirmedEarningsFromBody(d.body)) {
+      const confirmed = confirmedEarningsFromBody(d.body);
+      if (!confirmed) {
         return {
           ...empty,
           unavailable: `${base} answered ${path}, but did not provide the candidate mined-0x25 receipt and reward-readiness contract. Legacy inference-count arithmetic is not projected as earnings.`,
@@ -1001,6 +1012,12 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         observedPerDay !== null && observedPerDay >= 0
           ? observedPerDay
           : null;
+      const rewardBudget =
+        d.body.reward_budget !== null &&
+        typeof d.body.reward_budget === "object" &&
+        !Array.isArray(d.body.reward_budget)
+          ? (d.body.reward_budget as Record<string, unknown>)
+          : {};
       return {
         sourceHost: base,
         unavailable: null,
@@ -1012,6 +1029,23 @@ async function liveInvoke<T>(cmd: string, args?: unknown): Promise<T> {
           d.body,
           "community_rewards_v1_enabled",
         ),
+        projectedDailyArc: confirmed.projectedDailyArc,
+        projectedDailyUnavailableReason:
+          confirmed.projectedDailyUnavailableReason,
+        rewardPolicyHash: strOf(d.body, ["reward_issuance_policy_hash"]),
+        rewardBudgetEpoch: numOf(rewardBudget, ["epoch"]),
+        rewardsRemainingThisEpoch: numOf(rewardBudget, [
+          "remaining_this_epoch",
+        ]),
+        workerRewardsRemainingThisEpoch: numOf(rewardBudget, [
+          "worker_remaining_this_epoch",
+        ]),
+        coordinatorRewardsRemainingThisEpoch: numOf(rewardBudget, [
+          "coordinator_remaining_this_epoch",
+        ]),
+        issuanceReadyForWorker: nBool(d.body, "issuance_ready_for_worker"),
+        rewardProgram: strOf(d.body, ["reward_program"]),
+        rewardIsCustomerDemand: nBool(d.body, "reward_is_customer_demand"),
         attestationsTotal,
         firstAttestationBlock: numOf(d.body, ["first_attestation_block"]),
         attestationsPerDay: perDay,
@@ -1710,6 +1744,16 @@ async function mockInvoke<T>(cmd: string, args?: unknown): Promise<T> {
         rewardPerAttestation: MOCK_REWARD_PER_RECEIPT,
         rewardRateSource: "chain",
         communityRewardsEnabled: true,
+        projectedDailyArc: 108,
+        projectedDailyUnavailableReason: null,
+        rewardPolicyHash: "0xpreview-policy",
+        rewardBudgetEpoch: 2,
+        rewardsRemainingThisEpoch: 31,
+        workerRewardsRemainingThisEpoch: 7,
+        coordinatorRewardsRemainingThisEpoch: 11,
+        issuanceReadyForWorker: true,
+        rewardProgram: "protocol-capped testnet promotional compute subsidy",
+        rewardIsCustomerDemand: false,
         attestationsTotal: 1_283,
         firstAttestationBlock: 118_011,
         attestationsPerDay: 43.2,

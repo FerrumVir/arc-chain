@@ -69,11 +69,13 @@ import pathlib
 import sys
 text = pathlib.Path(sys.argv[1]).read_text()
 markers = [
-    'ensure_capture_and_freeze "$capture_id" nyc',
-    'ensure_capture_and_freeze "$capture_id" lax',
+    'ensure_stopped "$capture_id" nyc',
+    'ensure_stopped "$capture_id" lax',
     'QUORUM HALTED',
     'for node in "${REMAINING[@]}"; do',
-    'run_remote "$node" freeze "$capture_id" "$node"',
+    'ALL LEGACY WRITERS HALTED',
+    'for node in nyc lax ams lhr nrt sgp; do',
+    'ensure_offline_capture "$capture_id" "$node"',
 ]
 positions = []
 cursor = 0
@@ -85,30 +87,81 @@ assert positions == sorted(positions), positions
 PY
     grep -Fq 'pkill -TERM -x arc-node' "$NODE_HELPER" || return 1
     grep -Fq 'refusing SIGKILL and freeze' "$NODE_HELPER" || return 1
-    grep -Fq 'already-stopped process' "$NODE_HELPER" || return 1
+    grep -Fq 'copy_stopped_data_tree' "$NODE_HELPER" || return 1
+    grep -Fq 'refusing offline copy while arc-node is running' "$NODE_HELPER" || return 1
+    for required in \
+        'arc-self-heal.service arc-node.service' \
+        'RefuseManualStart=yes' \
+        'Restart=no' \
+        'systemctl disable --now' \
+        'legacy-service-fence.json' \
+        'verify_legacy_restart_fence'
+    do
+        grep -Fq -- "$required" "$NODE_HELPER" || {
+            printf 'persistent reboot-safe legacy service fence is missing: %s\n' "$required"
+            return 1
+        }
+    done
     if grep -Eq 'kill[[:space:]]+-9|pkill[[:space:]]+-KILL' "$NODE_HELPER" "$ORCHESTRATOR"; then
         printf 'freeze path can force-kill a node before WAL flush\n'
         return 1
     fi
 }
 
-capture_requires_snapshot_endpoints_final_wal_and_exact_export() {
+capture_requires_all_writers_stopped_complete_data_and_exact_export() {
     for required in \
-        '/sync/snapshot/info' \
-        '/sync/snapshot' \
-        'application/octet-stream' \
-        'state.snapshot.lz4' \
-        'state.wal' \
-        'snapshot_pair_matches' \
+        'fence-stop' \
+        'stopped-status' \
+        'capture-offline' \
+        'complete_data_dir=true' \
+        'source-data.files.sha256' \
+        'copied-data.files.sha256' \
+        'data-dir/state.wal' \
         'recovery export' \
-        '--data-dir "$capture_root"' \
-        '--snapshot "$capture_root/state.snapshot.lz4"' \
+        '--data-dir "$working_data"' \
+        '--snapshot "$temporary/capture.snapshot.lz4"' \
+        'capture-snapshot.selection.json' \
+        'offline-wal-recovery.json' \
+        'quarantined-wal-tail.bin' \
+        'preserved_unclassified' \
         '--validator-public-keys "$stage_root/validator-public-keys.json"' \
+        '--legacy-validator-set "$stage_root/legacy-validator-set-40m.json"' \
+        'source_validator_count' \
+        'source_validator_stake' \
+        'source_validator_set_hash' \
+        'legacy_validator_set_artifact_sha256' \
+        'source_snapshot_artifact_sha256' \
+        'reference_source_wal_artifact_sha256' \
         '--source-consensus-round "$source_round"' \
+        '--created-at-unix-ms "$created_at_unix_ms"' \
         '--allow-unbound-legacy-wal'
     do
         grep -Fq -- "$required" "$NODE_HELPER" || {
-            printf 'snapshot-assisted recovery export contract is missing: %s\n' "$required"
+            printf 'offline recovery export contract is missing: %s\n' "$required"
+            return 1
+        }
+    done
+    if grep -Fq '/sync/snapshot' "$NODE_HELPER"; then
+        printf 'offline freeze must not depend on a live snapshot RPC\n'
+        return 1
+    fi
+}
+
+legacy_source_set_is_manifest_bound_staged_and_archived() {
+    for required in \
+        'artifacts.legacy_validator_set.path' \
+        'artifacts.legacy_validator_set.sha256' \
+        'artifacts.source_snapshot.sha256' \
+        'artifacts.source_wal.sha256' \
+        'stage_file "$node" "$manifest_sha" legacy-validators' \
+        'legacy-validator-set-40m.json' \
+        'upload_immutable "$legacy_validator_set"' \
+        'upload_immutable "$source_snapshot"' \
+        'upload_immutable "$source_wal"' \
+        'verify_reference_pair'
+    do
+        grep -Fq -- "$required" "$ORCHESTRATOR" || {
+            printf 'legacy source validator artifact is not sealed end to end: %s\n' "$required"
             return 1
         }
     done
@@ -152,10 +205,16 @@ PY
 
 forks_are_labelled_retained_and_only_canonical_match_gates_seal() {
     for required in \
+        'valid_canonical' \
+        'valid_noncanonical_fork' \
+        'preserved_unclassified' \
+        'classification_reason' \
         'canonical_match' \
         'canonical_count' \
+        'fork_count' \
+        'unclassified_count' \
         'none of the six preserved captures matches' \
-        'all non-matching forks remain labelled and retained' \
+        'all six remain labelled and retained' \
         'for node in nyc lax ams lhr nrt sgp' \
         'rclone copyto' \
         '--immutable --checksum' \
@@ -169,14 +228,101 @@ forks_are_labelled_retained_and_only_canonical_match_gates_seal() {
     done
 }
 
+mixed_all_six_classifications_are_counted_without_dropping_invalid_evidence() (
+    # Sourcing defines the exact production summarizer; the empty command only
+    # prints usage and performs no mutation.
+    . "$ORCHESTRATOR" >/dev/null
+    local summary
+    summary="$(printf '%s\n' \
+        '{"node":"nyc","classification":"valid_canonical"}' \
+        '{"node":"lax","classification":"valid_noncanonical_fork"}' \
+        '{"node":"ams","classification":"valid_noncanonical_fork"}' \
+        '{"node":"lhr","classification":"valid_noncanonical_fork"}' \
+        '{"node":"nrt","classification":"valid_noncanonical_fork"}' \
+        '{"node":"sgp","classification":"preserved_unclassified"}' \
+        | summarize_binding_statuses)" || return 1
+    [ "$summary" = '1 4 1' ] || return 1
+    printf '%s\n' \
+        '{"node":"nyc","classification":"valid_canonical"}' \
+        '{"node":"nyc","classification":"valid_noncanonical_fork"}' \
+        '{"node":"ams","classification":"valid_noncanonical_fork"}' \
+        '{"node":"lhr","classification":"valid_noncanonical_fork"}' \
+        '{"node":"nrt","classification":"valid_noncanonical_fork"}' \
+        '{"node":"sgp","classification":"preserved_unclassified"}' \
+        | summarize_binding_statuses >/dev/null 2>&1 && return 1
+    return 0
+)
+
+offline_wal_boundary_slices_and_reconstructs_exact_immutable_bytes() (
+    . "$NODE_HELPER" >/dev/null
+    local fixture="$TEST_TMP/wal-boundary"
+    mkdir -p "$fixture/evidence"
+    printf 'committed-tail' > "$fixture/state.wal"
+    cat > "$fixture/export-summary.json" <<'JSON'
+{"source_wal_original_bytes":14,"source_wal_accepted_prefix_bytes":9,"source_wal_quarantined_tail_bytes":5,"source_wal_tail_reason":"uncommitted records after the last complete SetBlock + Checkpoint"}
+JSON
+    write_offline_wal_evidence \
+        "$fixture/state.wal" "$fixture/export-summary.json" \
+        "$fixture/offline-wal-recovery.json" "$fixture/evidence" || return 1
+    [ "$(cat "$fixture/evidence/recovered-state.wal")" = committed ] || return 1
+    [ "$(cat "$fixture/evidence/quarantined-wal-tail.bin")" = -tail ] || return 1
+    cat "$fixture/evidence/recovered-state.wal" \
+        "$fixture/evidence/quarantined-wal-tail.bin" > "$fixture/reconstructed.wal"
+    cmp --silent "$fixture/state.wal" "$fixture/reconstructed.wal" || return 1
+    python3 - "$fixture/offline-wal-recovery.json" <<'PY' || return 1
+import json
+import pathlib
+import sys
+value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert value["accepted_prefix_bytes"] == 9
+assert value["quarantined_tail_bytes"] == 5
+assert value["prefix_plus_tail_reconstructs_capture"] is True
+assert value["prefix_plus_tail_sha256"] == value["capture_wal_sha256"]
+PY
+
+    cat > "$fixture/missing-boundary.json" <<'JSON'
+{"status":"EXPORTED_UNSIGNED"}
+JSON
+    mkdir "$fixture/rejected"
+    write_offline_wal_evidence \
+        "$fixture/state.wal" "$fixture/missing-boundary.json" \
+        "$fixture/should-not-exist.json" "$fixture/rejected" \
+        >/dev/null 2>&1 && return 1
+    [ ! -e "$fixture/should-not-exist.json" ] || return 1
+    return 0
+)
+
+drive_upload_is_operator_owned_bounded_parallel_and_aggregate_checked() {
+    for required in \
+        'local upload_order=(nyc lax ams lhr nrt sgp)' \
+        'for upload_index in 0 3; do' \
+        '"${upload_order[@]:upload_index:3}"' \
+        '--transfers 1 --checkers 1 --retries 5 --low-level-retries 20' \
+        'rclone check "$source_dir" "$destination"' \
+        '"$log_root/$node-upload.log"' \
+        'one or more preserved validator uploads failed; COMPLETE was not emitted'
+    do
+        grep -Fq -- "$required" "$ORCHESTRATOR" || {
+            printf 'bounded operator-owned archive upload contract is missing: %s\n' "$required"
+            return 1
+        }
+    done
+    if grep -Eq 'run_remote[^\n]*(rclone|DRIVE_REMOTE)|scp[^\n]*(rclone\.conf|Drive)' \
+        "$ORCHESTRATOR"; then
+        printf 'archive flow can distribute Drive configuration or credentials to validators\n'
+        return 1
+    fi
+}
+
 archives_are_create_only_and_exclude_private_noncanonical_bulk() {
     for required in \
         'existing archive checksum failed; refusing replacement' \
         'partial archive or evidence exists; refusing replacement' \
-        'archive_scope=public-chain-recovery-bundle-v2' \
-        'excluded_private_material=true' \
+        'archive_scope=complete-stopped-legacy-data-v3' \
+        'complete_data_dir=true' \
+        'excluded_outside_data_dir_private_material=true' \
         'excluded_service_environments=true' \
-        'excluded_build_models_git_and_dag_trace=true'
+        'excluded_build_models_and_git=true'
     do
         grep -Fq -- "$required" "$NODE_HELPER" || {
             printf 'archive create-only/exclusion contract is missing: %s\n' "$required"
@@ -199,15 +345,23 @@ run_test 'freeze capture and final checkpoint seal require independent exact has
     freeze_and_seal_have_independent_exact_authorizations
 run_test 'freeze plan is canonical, create-only, read-only, and checksum-bound' \
     freeze_plan_is_canonical_create_only_and_tamper_evident
-run_test 'NYC and LAX halt quorum before the remaining live captures and clean stops' \
+run_test 'NYC and LAX halt quorum before every all-six offline data copy' \
     freeze_halts_quorum_before_remaining_snapshots_and_stops
-run_test 'every capture includes stable LZ4 evidence, final WAL, and exact recovery export' \
-    capture_requires_snapshot_endpoints_final_wal_and_exact_export
+run_test 'every capture is a complete stopped data directory classified by exact export' \
+    capture_requires_all_writers_stopped_complete_data_and_exact_export
+run_test 'legacy source validator set is manifest-bound, staged, verified, and archived' \
+    legacy_source_set_is_manifest_bound_staged_and_archived
 run_test 'capture index fails on changed, missing, and unexpected bytes' \
     capture_index_detects_changed_missing_and_unexpected_bytes
 run_test 'all six forks are labelled and retained while a real canonical match gates sealing' \
     forks_are_labelled_retained_and_only_canonical_match_gates_seal
-run_test 'archives are create-only and exclude private keys, secrets, build/model/Git, and DAG bulk' \
+run_test 'one canonical, four forks, and one unclassified capture are all retained and counted' \
+    mixed_all_six_classifications_are_counted_without_dropping_invalid_evidence
+run_test 'exporter boundary slices exact WAL prefix/tail and reconstructs immutable bytes' \
+    offline_wal_boundary_slices_and_reconstructs_exact_immutable_bytes
+run_test 'Drive upload uses two bounded three-node batches and aggregates every check' \
+    drive_upload_is_operator_owned_bounded_parallel_and_aggregate_checked
+run_test 'archives are create-only, retain complete chain data, and exclude out-of-tree secrets/build/Git' \
     archives_are_create_only_and_exclude_private_noncanonical_bulk
 run_test 'fleet archive scripts pass shell syntax and warning lint' archive_scripts_are_lintable
 

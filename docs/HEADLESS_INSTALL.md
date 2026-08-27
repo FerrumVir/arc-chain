@@ -78,6 +78,13 @@ node without `--model` cannot execute local model inference, and installing a
 model does not guarantee jobs or rewards; assignment and reward policy are
 network behavior, not an installer promise.
 
+When `--model` is present, the managed runner adds
+`--full-integer-worker`. This loads the complete deterministic integer model
+required for independent verification but does not announce the residential
+machine as a validator layer shard. Never substitute `--shard-range 0:32` for
+that flag: doing so publishes an overlapping shard that is normally
+unreachable behind NAT.
+
 The recovery candidate currently bundles an explicit incomplete validator-set
 placeholder. With that file, a stake-zero process starts in HTTP-only migration
 observer mode: community inference can be tested, but chain P2P, consensus,
@@ -98,7 +105,7 @@ network identity hash.
 - An observer/router does not need a model or GPU. Size CPU, RAM, storage, and
   bandwidth from measured local usage before exposing it as a public service.
 - The current full-model worker target is Llama-2-7B Q4_K_M (about 4 GB on
-  disk). Use at least 8 GB system RAM; 12 GB or more provides safer loading and
+  disk). Use at least 16 GB system RAM for the expanded integer weights plus
   OS/chain headroom. More CPU cores reduce latency. A GPU is optional and does
   not change correctness or reward eligibility.
 - Pass the GGUF by absolute path. Capacity is advertised only after every model
@@ -106,11 +113,14 @@ network identity hash.
   those exact artifact bytes. A matching filename or architecture shape is not
   proof of identical weights. The coordinator independently recomputes every
   accepted community result.
-- No hardware tier guarantees work. Jobs depend on demand, exact-artifact
-  capacity, coordinator health, assignment, and independent verification.
+- No hardware tier guarantees work. Promotional jobs depend on coordinator
+  availability and policy, exact-artifact capacity, assignment, and independent
+  verification. Validator recomputation proves output agreement, not customer
+  demand.
   Payment additionally requires reward-protocol activation, validator-approval
   collection, strict greater-than-two-thirds identity and active-stake
-  authorization, treasury funding, and a successful mined `0x25` receipt.
+  authorization, treasury funding, remaining block/epoch/worker/coordinator
+  promotional budget, and a successful mined `0x25` receipt.
 
 The installer never emits `--model ""`. It also stores the validator seed in a
 mode-`0600` environment file instead of process arguments, so `ps` does not

@@ -12,6 +12,18 @@ use std::net::IpAddr;
 
 const KEY_DERIVATION_DOMAIN: &str = "ARC-chain-validator-keypair-v1";
 pub const ARC_BASE_UNITS: u64 = arc_types::economics::ARC_BASE_UNITS;
+/// Protocol-v3 transfer floor. Kept explicit here because the desktop depends
+/// only on the wire/type crate; v3 recovery-domain signing is the signal that
+/// the state admission rule applies.
+pub const V3_MIN_TRANSFER_FEE_BASE: u64 = 1;
+
+pub fn transfer_fee_base(transaction_domain: Option<Hash256>) -> u64 {
+    if transaction_domain.is_some() {
+        V3_MIN_TRANSFER_FEE_BASE
+    } else {
+        0
+    }
+}
 
 /// Accept production HTTPS origins and loopback-only HTTP for local dev.
 /// Wallet writes never follow redirects (configured in `lib.rs`).
@@ -24,8 +36,10 @@ pub fn validate_rpc_origin(value: &str) -> Result<String, String> {
         || parsed.fragment().is_some()
         || parsed.path() != "/"
     {
-        return Err("wallet RPC must be an origin with no credentials, path, query, or fragment"
-            .to_string());
+        return Err(
+            "wallet RPC must be an origin with no credentials, path, query, or fragment"
+                .to_string(),
+        );
     }
     if parsed.port() == Some(0) {
         return Err("wallet RPC port must be non-zero".to_string());
@@ -42,10 +56,13 @@ pub fn validate_rpc_origin(value: &str) -> Result<String, String> {
         "https" => {}
         "http" if loopback => {}
         "http" => {
-            return Err("remote wallet RPC must use HTTPS; plaintext HTTP is local-dev only"
-                .to_string())
+            return Err(
+                "remote wallet RPC must use HTTPS; plaintext HTTP is local-dev only".to_string(),
+            )
         }
-        _ => return Err("wallet RPC must use HTTPS (or HTTP on loopback for local dev)".to_string()),
+        _ => {
+            return Err("wallet RPC must use HTTPS (or HTTP on loopback for local dev)".to_string())
+        }
     }
     Ok(value.trim().trim_end_matches('/').to_string())
 }
@@ -166,6 +183,7 @@ pub fn signed_transfer(
     }
 
     let mut tx = Transaction::new_transfer(expected_from, to, amount_base, nonce);
+    tx.fee = transfer_fee_base(transaction_domain);
     match transaction_domain {
         Some(domain) => tx
             .sign_in_domain(&keypair, &domain)
@@ -249,11 +267,26 @@ mod tests {
 
         assert_eq!(tx.from.to_hex(), identity.address);
         assert_eq!(tx.nonce, 4);
+        assert_eq!(tx.fee, V3_MIN_TRANSFER_FEE_BASE);
         tx.verify_signature_in_domain(&domain).unwrap();
         assert!(
             tx.verify_signature().is_err(),
             "domain-bound tx verified as legacy"
         );
+    }
+
+    #[test]
+    fn legacy_transfer_keeps_zero_fee_while_v3_fee_is_signed() {
+        let identity = identity::derive(PHRASE).unwrap();
+        let recipient = "11".repeat(32);
+        let legacy = signed_transfer(&identity, &recipient, 1, 0, None).unwrap();
+        assert_eq!(legacy.fee, 0);
+        legacy.verify_signature().unwrap();
+
+        let domain = Hash256([9u8; 32]);
+        let v3 = signed_transfer(&identity, &recipient, 1, 0, Some(domain)).unwrap();
+        assert_eq!(v3.fee, 1);
+        v3.verify_signature_in_domain(&domain).unwrap();
     }
 
     #[test]

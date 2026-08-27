@@ -231,7 +231,8 @@ test.describe("Spawn CLI contract (Rust source)", () => {
   // Guard against regressions in the node_manager.rs flag wiring: the
   // only way arc-node joins testnet is if --rpc, --p2p-port, --data-dir,
   // --validator-seed, --seeds-file, --genesis, --eth-rpc-port, and
-  // --community-mode all end up on the cmd line.
+  // --community-mode and the non-shard full-integer worker role all end up on
+  // the cmd line.
   const src = fs.readFileSync(
     path.resolve(REPO_DESKTOP, "src-tauri", "src", "node_manager.rs"),
     "utf8",
@@ -253,6 +254,7 @@ test.describe("Spawn CLI contract (Rust source)", () => {
       '"--genesis"',
       '"--eth-rpc-port"',
       '"--community-mode"',
+      '"--full-integer-worker"',
     ]) {
       expect(src).toContain(flag);
     }
@@ -267,7 +269,7 @@ test.describe("Spawn CLI contract (Rust source)", () => {
     // wrong reason and would have stayed green if the gate were deleted.
     // Assert the actual argv condition.
     expect(src).toMatch(
-      /if\s+config\.role\s*==\s*"worker"\s*&&\s*config\.model_path\.is_some\(\)\s*\{[\s\S]{0,200}?--community-mode/,
+      /if\s+config\.role\s*==\s*"worker"\s*&&\s*config\.model_path\.is_some\(\)\s*\{[\s\S]{0,600}?--community-mode[\s\S]{0,100}?--full-integer-worker/,
     );
   });
 

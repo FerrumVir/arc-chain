@@ -216,6 +216,19 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     tokenizer_only: bool,
 
+    /// Load the complete deterministic integer model for a stake-zero
+    /// community worker without advertising a validator layer shard.
+    ///
+    /// A normal unsharded GGUF prefers the Candle Q4 backend and keeps only
+    /// the integer tokenizer in memory; that is suitable for direct local
+    /// inference but cannot produce the cross-platform integer result that
+    /// community reward verification recomputes. Using `--shard-range 0:N`
+    /// to force integer loading is unsafe for a home worker because it also
+    /// announces an overlapping, usually NAT-unreachable validator shard.
+    /// This flag is the explicit full-integer, no-shard-advertisement role.
+    #[arg(long, default_value_t = false)]
+    full_integer_worker: bool,
+
     /// First layer index to load (inclusive). Pipeline-parallel sharding.
     /// Together with --shard-end, makes this node a SHARD HOLDER for a slice
     /// of the model. Embeddings load only when --shard-start=0; output head
@@ -887,11 +900,67 @@ fn prepare_recovery_dag_startup(
     }))
 }
 
+fn verify_canonical_state_block_for_dag_commit(
+    state: &StateDB,
+    transition_height: u64,
+    commit_index: u64,
+    dag_block: &arc_consensus::DagBlock,
+    transactions: &std::collections::HashMap<[u8; 32], arc_types::Transaction>,
+) -> Result<()> {
+    let height = transition_height
+        .checked_add(commit_index)
+        .and_then(|height| height.checked_add(1))
+        .ok_or_else(|| anyhow::anyhow!("canonical DAG/state binding height overflows u64"))?;
+    let block = state.get_block(height).ok_or_else(|| {
+        anyhow::anyhow!(
+            "DAG commit {} has no canonical state block at height {}",
+            dag_block.hash,
+            height
+        )
+    })?;
+    ensure!(
+        block.header.producer == dag_block.author
+            && block.header.timestamp == dag_block.timestamp
+            && block.header.height == height,
+        "canonical state block {} does not bind DAG leader {} author/timestamp/height",
+        block.hash,
+        dag_block.hash
+    );
+    let mut expected_state_transactions = Vec::new();
+    for hash in &dag_block.transactions {
+        ensure!(
+            transactions.contains_key(&hash.0),
+            "DAG commit {} is missing durable transaction body {}",
+            dag_block.hash,
+            hash
+        );
+        if state
+            .get_receipt(&hash.0)
+            .is_some_and(|receipt| receipt.block_hash == block.hash)
+        {
+            expected_state_transactions.push(*hash);
+        }
+    }
+    ensure!(
+        block.tx_hashes == expected_state_transactions,
+        "canonical state block {} transaction list does not match DAG commit {}",
+        block.hash,
+        dag_block.hash
+    );
+    Ok(())
+}
+
 fn replay_recovery_dag_wal(
     engine: &arc_consensus::ConsensusEngine,
+    state: &StateDB,
     startup: &RecoveryDagStartup,
     expected_commits: u64,
-) -> Result<(u64, u64, Vec<arc_types::Transaction>)> {
+) -> Result<(
+    u64,
+    u64,
+    Vec<arc_types::Transaction>,
+    Option<(Hash256, u64)>,
+)> {
     let installed = engine
         .install_recovery_cursor(startup.binding.source_consensus_round)
         .map_err(|error| anyhow::anyhow!("failed to install signed recovery cursor: {error}"))?;
@@ -906,6 +975,7 @@ fn replay_recovery_dag_wal(
         )
     })?;
     let mut commits = 0u64;
+    let mut committed_hashes = Vec::new();
     let mut transactions = std::collections::HashMap::<[u8; 32], arc_types::Transaction>::new();
     for entry in entries {
         match entry.op {
@@ -972,6 +1042,7 @@ fn replay_recovery_dag_wal(
                 commits = commits
                     .checked_add(1)
                     .ok_or_else(|| anyhow::anyhow!("recovery DAG commit count overflows u64"))?;
+                committed_hashes.push(hash);
             }
             _ => bail!(
                 "recovery DAG WAL contains a non-DAG state operation at sequence {}",
@@ -979,6 +1050,69 @@ fn replay_recovery_dag_wal(
             ),
         }
     }
+    for (index, hash) in committed_hashes.iter().enumerate() {
+        let block = engine.get_block(hash).ok_or_else(|| {
+            anyhow::anyhow!("restored DAG commit {hash} disappeared during strict replay")
+        })?;
+        verify_canonical_state_block_for_dag_commit(
+            state,
+            startup.binding.transition_height,
+            index as u64,
+            &block,
+            &transactions,
+        )?;
+    }
+
+    // The state WAL fsync deliberately precedes the separate DAG commit
+    // cursor fsync. A crash in that narrow window leaves exactly one extra
+    // canonical state block. Reconstruct only the deterministic next leader,
+    // verify its full two-round certificate and exact state-block binding, then
+    // ask the caller to append the missing commit record before networking.
+    let repaired_commit = if commits.checked_add(1) == Some(expected_commits) {
+        let round = engine.last_committed_round();
+        let mut validators: Vec<_> = engine
+            .frozen_validator_set()
+            .validators
+            .iter()
+            .map(|validator| validator.address)
+            .collect();
+        validators.sort_by_key(|address| address.0);
+        let leader = validators
+            .get(round as usize % validators.len().max(1))
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("cannot repair DAG commit with empty validator set"))?;
+        let candidates: Vec<_> = engine
+            .blocks_in_round(round)
+            .into_iter()
+            .filter_map(|hash| engine.get_block(&hash))
+            .filter(|block| block.author == leader)
+            .collect();
+        ensure!(
+            candidates.len() == 1,
+            "cannot uniquely repair DAG commit round {round}: found {} leader blocks",
+            candidates.len()
+        );
+        let candidate = &candidates[0];
+        verify_canonical_state_block_for_dag_commit(
+            state,
+            startup.binding.transition_height,
+            commits,
+            candidate,
+            &transactions,
+        )?;
+        engine
+            .restore_recovery_commit_from_local_wal(candidate.hash)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "canonical state tail names uncertified DAG commit {}: {error}",
+                    candidate.hash
+                )
+            })?;
+        commits += 1;
+        Some((candidate.hash, candidate.round))
+    } else {
+        None
+    };
     ensure!(
         commits == expected_commits,
         "recovery DAG/state WAL commit mismatch: DAG has {}, canonical state has {} post-transition blocks",
@@ -991,6 +1125,7 @@ fn replay_recovery_dag_wal(
         engine.current_round(),
         engine.last_committed_round(),
         transactions,
+        repaired_commit,
     ))
 }
 
@@ -1139,45 +1274,44 @@ fn run_operator_command(command: OperatorCommand) -> Result<()> {
     }
 }
 
-/// Rewrites a pulled peer's `self_shard.socket_addr` in place when it carries
-/// a stub (0.0.0.0 / 127.x / [::] / [::1] / empty), replacing the host with the
-/// URL we just pulled from and keeping the declared port. When no port is
-/// declared, falls back to the pulled URL's port or 9090.
+/// Bind a pulled peer's `self_shard.socket_addr` to the exact explicit RPC
+/// origin that served it.
+///
+/// The registry body is remote-controlled, so even a syntactically routable
+/// address in it cannot choose where this process later sends shard traffic.
+/// Production uses the reviewed HTTPS origin; local rehearsals use an explicit
+/// loopback HTTP origin. This also preserves the scheme required by TLS rather
+/// than incorrectly turning an HTTPS gateway into raw HTTP on the node's
+/// loopback-only port.
 ///
 /// Pure JSON mutation - no I/O, no async. Unit-testable against static fixtures.
 /// Companion to the receiver-side `rewrite_stub_shard_addr` in `rpc.rs`.
 fn rewrite_pulled_self_shard(self_shard: &mut serde_json::Value, pulled_from_addr: &str) {
-    let Some(sa) = self_shard.get("socket_addr").and_then(|v| v.as_str()) else {
-        return;
-    };
-    let is_stub = sa.starts_with("0.0.0.0")
-        || sa.starts_with("127.")
-        || sa.starts_with("[::]")
-        || sa.starts_with("[::1]")
-        || sa.is_empty();
-    if !is_stub {
+    if !self_shard
+        .get("socket_addr")
+        .is_some_and(serde_json::Value::is_string)
+    {
         return;
     }
-    let declared_port = sa.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
-    let parsed_origin = reqwest::Url::parse(pulled_from_addr)
+    let Ok(origin) = reqwest::Url::parse(pulled_from_addr)
         .or_else(|_| reqwest::Url::parse(&format!("http://{pulled_from_addr}")))
-        .ok();
-    let fallback_port = parsed_origin
-        .as_ref()
-        .and_then(reqwest::Url::port_or_known_default)
-        .unwrap_or(9090);
-    let port = declared_port.unwrap_or(fallback_port);
-    let Some(origin_host) = parsed_origin.as_ref().and_then(reqwest::Url::host_str) else {
+    else {
         return;
     };
-    let host = match origin_host.parse::<std::net::IpAddr>() {
-        Ok(std::net::IpAddr::V6(_)) => format!("[{origin_host}]"),
-        _ => origin_host.to_string(),
-    };
+    if !matches!(origin.scheme(), "http" | "https")
+        || origin.host_str().is_none()
+        || !origin.username().is_empty()
+        || origin.password().is_some()
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || origin.path() != "/"
+    {
+        return;
+    }
     if let Some(obj) = self_shard.as_object_mut() {
         obj.insert(
             "socket_addr".to_string(),
-            serde_json::Value::String(format!("{host}:{port}")),
+            serde_json::Value::String(origin.as_str().trim_end_matches('/').to_string()),
         );
     }
 }
@@ -1489,9 +1623,57 @@ async fn post_signed_community<T: serde::Serialize>(
     keypair: &arc_crypto::KeyPair,
     timeout: std::time::Duration,
 ) -> Result<reqwest::Response> {
-    let signed = rpc::sign_community_request(path, payload, keypair)
-        .map_err(anyhow::Error::msg)
-        .context("sign community HTTP mutation")?;
+    let info = client
+        .get(format!("{rpc_base}/network/info"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| format!("GET community coordinator audience from {rpc_base}"))?
+        .error_for_status()
+        .with_context(|| format!("community coordinator {rpc_base} has no audience metadata"))?
+        .json::<serde_json::Value>()
+        .await
+        .context("decode community coordinator audience")?;
+    let target_coordinator = info
+        .get("validator_address")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("coordinator omitted validator_address"))
+        .and_then(|value| {
+            Hash256::from_hex(value)
+                .map_err(|error| anyhow::anyhow!("invalid coordinator validator_address: {error}"))
+        })?;
+    let transaction_domain = match info.get("transaction_domain") {
+        Some(serde_json::Value::String(value)) => {
+            Some(Hash256::from_hex(value).map_err(|error| {
+                anyhow::anyhow!("invalid coordinator transaction_domain: {error}")
+            })?)
+        }
+        Some(serde_json::Value::Null) | None => None,
+        Some(_) => {
+            return Err(anyhow::anyhow!(
+                "coordinator transaction_domain is malformed"
+            ));
+        }
+    };
+    if info
+        .get("recovery_active")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        && transaction_domain.is_none()
+    {
+        return Err(anyhow::anyhow!(
+            "recovery coordinator omitted its required transaction_domain"
+        ));
+    }
+    let signed = rpc::sign_community_request(
+        path,
+        payload,
+        keypair,
+        target_coordinator,
+        transaction_domain,
+    )
+    .map_err(anyhow::Error::msg)
+    .context("sign community HTTP mutation")?;
     client
         .post(format!("{rpc_base}{path}"))
         .json(&signed)
@@ -1512,6 +1694,55 @@ fn is_genesis_migration_observer(
     stake == 0
         && !insecure_dev_mode
         && genesis.is_some_and(|config| !config.chain.validator_set_complete)
+}
+
+/// Consensus/P2P is a staked validator role. A complete production genesis
+/// must not turn stake-zero community/full-model workers into unauthenticated
+/// validator transport participants merely because migration mode ended.
+fn chain_participation_allowed(
+    stake: u64,
+    migration_observer: bool,
+    insecure_dev_validator_seed: bool,
+) -> bool {
+    !migration_observer && (stake > 0 || insecure_dev_validator_seed)
+}
+
+fn validate_full_integer_worker_role(
+    cli: &Cli,
+    stake: u64,
+    community_rpc_bases: &[String],
+) -> Result<()> {
+    if !cli.full_integer_worker {
+        return Ok(());
+    }
+    ensure!(
+        stake == 0,
+        "--full-integer-worker is a stake-zero community role"
+    );
+    ensure!(
+        !cli.no_community && !community_rpc_bases.is_empty(),
+        "--full-integer-worker requires community networking and at least one explicit --community-rpc-url"
+    );
+    ensure!(
+        cli.model.is_some(),
+        "--full-integer-worker requires --model <exact GGUF path>"
+    );
+    ensure!(
+        !cli.tokenizer_only,
+        "--full-integer-worker is incompatible with --tokenizer-only"
+    );
+    ensure!(
+        !cli.enable_i16,
+        "--full-integer-worker is pinned to the canonical per-row INT8 reward profile and is incompatible with --enable-i16"
+    );
+    ensure!(
+        cli.shard_ranges.is_empty()
+            && cli.shard_start.is_none()
+            && cli.shard_end.is_none()
+            && !cli.auto_shard_join,
+        "--full-integer-worker must not carry shard ranges or --auto-shard-join; it never advertises validator shards"
+    );
+    Ok(())
 }
 
 async fn auto_shard_join(
@@ -1757,6 +1988,7 @@ async fn main() -> Result<()> {
         rpc::validate_community_rpc_bases(&raw_community_rpc_urls, allow_insecure_community_rpc)
             .map_err(anyhow::Error::msg)
             .context("invalid community RPC configuration")?;
+    validate_full_integer_worker_role(&cli, stake, &community_rpc_bases)?;
     let mut raw_coordinator_rpc_bases = community_rpc_bases.clone();
     for shard_host in &cli.shard_hosts {
         let shard_host = shard_host.trim();
@@ -1883,7 +2115,8 @@ async fn main() -> Result<()> {
         ),
         None => (Vec::new(), Block::genesis().hash),
     };
-    let chain_participation_enabled = !migration_observer;
+    let chain_participation_enabled =
+        chain_participation_allowed(stake, migration_observer, cli.insecure_dev_validator_seed);
     if migration_observer {
         tracing::warn!("╔══════════════════════════════════════════════════════════════╗");
         tracing::warn!("║  VALIDATOR-SET MIGRATION PENDING: COMMUNITY OBSERVER MODE   ║");
@@ -2315,8 +2548,14 @@ async fn main() -> Result<()> {
     let (candle_engine, candle_model_id): (
         Option<Arc<arc_inference::candle_backend::GgufEngine>>,
         Option<arc_crypto::Hash256>,
-    ) = if is_shard_holder {
-        tracing::info!("Shard holder mode - candle backend SKIPPED to save ~4 GB RAM");
+    ) = if is_shard_holder || cli.full_integer_worker {
+        if cli.full_integer_worker {
+            tracing::info!(
+                "Full integer community-worker mode - candle backend SKIPPED; validator shard advertisement remains disabled"
+            );
+        } else {
+            tracing::info!("Shard holder mode - candle backend SKIPPED to save ~4 GB RAM");
+        }
         (None, None)
     } else if let Some(model_path) = &cli.model {
         if !model_path.ends_with(".arc-int8") {
@@ -2365,11 +2604,20 @@ async fn main() -> Result<()> {
                     model_path,
                     &held_ranges,
                 )
+            } else if cli.full_integer_worker {
+                arc_inference::cached_integer_model::load_cached_model_canonical_i8(model_path)
             } else {
                 arc_inference::cached_integer_model::load_cached_model(model_path)
             };
             match load_result {
                 Ok(mut model) => {
+                    if cli.full_integer_worker {
+                        model.enforce_canonical_i8_profile();
+                        tracing::info!(
+                            profile = arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE,
+                            "Pinned full community worker to the validator-compatible reward profile"
+                        );
+                    }
                     let elapsed = load_start.elapsed();
                     let mb_held: usize = model
                         .layers
@@ -2416,7 +2664,8 @@ async fn main() -> Result<()> {
                     // alongside the I16 ones, and got byte-identical output out
                     // of the same scalar loop. `--enable-i16` forces it on any
                     // architecture.
-                    let want_i16 = cli.enable_i16 || cfg!(target_arch = "aarch64");
+                    let want_i16 = cli.enable_i16
+                        || (cfg!(target_arch = "aarch64") && !cli.full_integer_worker);
                     if model.i16_layers.is_none() && layers_held > 0 && want_i16 {
                         model.enable_i16();
                         tracing::info!(
@@ -2454,6 +2703,25 @@ async fn main() -> Result<()> {
             .verify_unchanged()
             .context("--model changed while the inference runtime was loading it")?;
     }
+    if cli.full_integer_worker {
+        let model = inference_model.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("--full-integer-worker failed to load the deterministic integer model")
+        })?;
+        ensure!(
+            model.has_all_transformer_layers(),
+            "--full-integer-worker loaded only {}/{} transformer layers",
+            model
+                .layers
+                .iter()
+                .filter(|layer| layer.is_loaded())
+                .count(),
+            model.config.n_layers
+        );
+        ensure!(
+            candle_engine.is_none() && held_ranges.is_empty() && model.has_canonical_i8_profile(),
+            "--full-integer-worker invariant failed: worker must use the canonical per-row INT8 profile and must not advertise shard ranges"
+        );
+    }
 
     // ── Record boot time for uptime tracking ──────────────────────────
     let boot_time = Instant::now();
@@ -2471,6 +2739,10 @@ async fn main() -> Result<()> {
 
         // The authenticated handshake commits to the canonical parsed genesis
         // hash, separating chains with different identities/state/validators.
+        let mut allowed_validator_addresses = std::collections::HashSet::new();
+        allowed_validator_addresses.insert(validator_address.0);
+        allowed_validator_addresses.extend(genesis_validators.iter().map(|(address, _)| address.0));
+        let allowed_validator_addresses = Arc::new(allowed_validator_addresses);
         let peer_count_transport = peer_count.clone();
         let transport_keypair = validator_keypair.clone();
         tokio::spawn(run_transport(
@@ -2479,6 +2751,7 @@ async fn main() -> Result<()> {
             validator_address,
             stake,
             genesis_hash,
+            allowed_validator_addresses,
             outbound_rx,
             inbound_tx,
             peer_count_transport,
@@ -2595,16 +2868,32 @@ async fn main() -> Result<()> {
         // Bounded read: scans only the latest segment (≤64 MB), not every
         // segment. NYC's dag-wal is 5 GB+ and growing; reading the whole
         // history at boot would balloon memory and slow startup minutes.
+        let mut recovery_commit_repair = None;
         if let Some(startup) = recovery_dag_startup.as_ref() {
             let expected_commits = state
                 .height()
                 .checked_sub(startup.binding.transition_height)
                 .ok_or_else(|| anyhow::anyhow!("recovery state precedes transition height"))?;
-            let (recovered_round, recovered_committed, recovered_transactions) =
-                replay_recovery_dag_wal(consensus.engine.as_ref(), startup, expected_commits)?;
+            let (recovered_round, recovered_committed, recovered_transactions, repaired_commit) =
+                replay_recovery_dag_wal(
+                    consensus.engine.as_ref(),
+                    state.as_ref(),
+                    startup,
+                    expected_commits,
+                )?;
+            recovery_commit_repair = repaired_commit;
+            // Certified-but-not-yet-committed replay blocks may become
+            // executable on the first consensus tick. Their exact bodies must
+            // be installed directly as availability preimages; the live
+            // mempool drain order is not a recovery guarantee.
+            consensus.install_recovered_preimages(recovered_transactions.clone());
             let mut restored_transactions = 0usize;
             for transaction in recovered_transactions {
-                if state.get_receipt(&transaction.hash.0).is_none() {
+                if state.get_receipt(&transaction.hash.0).is_none()
+                    && state
+                        .validate_v3_transaction_admission(&transaction)
+                        .is_ok()
+                {
                     mempool.insert(transaction).map_err(|error| {
                         anyhow::anyhow!(
                             "failed to restore a recovery-domain DAG transaction into the mempool: {error}"
@@ -2645,6 +2934,22 @@ async fn main() -> Result<()> {
 
         match arc_state::WalWriter::with_segments(&dag_wal_path, 64 * 1024 * 1024) {
             Ok(dag_wal) => {
+                if let Some((hash, round)) = recovery_commit_repair {
+                    dag_wal.append(arc_state::WalOp::CommitDagBlock(hash), round);
+                    dag_wal.sync().map_err(|error| {
+                        anyhow::anyhow!(
+                            "failed to durably repair DAG commit {} at round {}: {}",
+                            hash,
+                            round,
+                            error
+                        )
+                    })?;
+                    tracing::warn!(
+                        %hash,
+                        round,
+                        "Repaired crash window between canonical state fsync and DAG commit fsync"
+                    );
+                }
                 consensus.dag_wal = Some(Arc::new(dag_wal));
                 tracing::info!("DAG persistence WAL enabled: {}", dag_wal_path.display());
             }
@@ -3426,14 +3731,21 @@ async fn main() -> Result<()> {
                                     .unwrap_or(value);
                                 Hash256::from_hex(bare).ok()
                             });
+                        let transaction_domain_required = job
+                            .get("transaction_domain_required")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false);
                         let transaction_domain_is_malformed = job
                             .get("transaction_domain")
                             .is_some_and(|value| !value.is_null())
                             && assignment_transaction_domain.is_none();
+                        let required_transaction_domain_is_missing =
+                            transaction_domain_required && assignment_transaction_domain.is_none();
                         let assignment_model_matches =
                             assignment_model_id == Some(worker_model_id_hash);
                         if !assignment_model_matches
                             || transaction_domain_is_malformed
+                            || required_transaction_domain_is_missing
                             || input.is_empty()
                             || input.len() > 32_768
                             || max_tokens == 0
@@ -3444,6 +3756,9 @@ async fn main() -> Result<()> {
                                     .to_string()
                             } else if transaction_domain_is_malformed {
                                 "assignment carried a malformed recovery transaction domain"
+                                    .to_string()
+                            } else if required_transaction_domain_is_missing {
+                                "assignment requires recovery-domain signing but omitted the transaction domain"
                                     .to_string()
                             } else {
                                 format!(
@@ -3643,7 +3958,8 @@ async fn main() -> Result<()> {
                             tokens_generated: tokens_gen,
                             total_ms: elapsed_ms,
                             ms_per_token: ms_per_tok,
-                            engine: "INT8 integer (community worker)".to_string(),
+                            engine: arc_inference::cached_integer_model::CANONICAL_REWARD_INFERENCE_PROFILE
+                                .to_string(),
                             error: None,
                             signed_attestation_hex,
                         };
@@ -3887,6 +4203,44 @@ mod tests {
     }
 
     #[test]
+    fn complete_genesis_keeps_stake_zero_community_worker_off_consensus_transport() {
+        let cli = Cli::try_parse_from([
+            "arc-node",
+            "--community",
+            "--community-rpc-url",
+            "https://validator.example",
+        ])
+        .unwrap();
+        let mut genesis: config::GenesisConfig =
+            toml::from_str(include_str!("../../../genesis.toml")).unwrap();
+        genesis.chain.validator_set_complete = true;
+        let migration_observer = is_genesis_migration_observer(
+            Some(&genesis),
+            cli.stake,
+            cli.insecure_dev_validator_seed,
+        );
+        assert!(
+            !migration_observer,
+            "the validator set is declared complete"
+        );
+        assert_eq!(cli.stake, 0);
+        assert!(
+            !chain_participation_allowed(
+                cli.stake,
+                migration_observer,
+                cli.insecure_dev_validator_seed,
+            ),
+            "stake-zero workers must not start QUIC, gossip, or consensus"
+        );
+        assert!(
+            !cli.no_community && !cli.community_rpc_urls.is_empty(),
+            "outbound authenticated community HTTP remains enabled"
+        );
+        assert!(chain_participation_allowed(1, false, false));
+        assert!(chain_participation_allowed(0, false, true));
+    }
+
+    #[test]
     fn cli_defaults_keep_unauthenticated_rpc_local_and_eth_disabled() {
         let cli = Cli::try_parse_from(["arc-node"]).unwrap();
         assert_eq!(cli.rpc, "127.0.0.1:9944");
@@ -3914,6 +4268,68 @@ mod tests {
                 "https://seed-b.example:9443".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn full_integer_worker_is_explicit_stake_zero_and_never_a_shard_holder() {
+        let valid = Cli::try_parse_from([
+            "arc-node",
+            "--stake",
+            "0",
+            "--model",
+            "/models/llama2-7b.gguf",
+            "--full-integer-worker",
+            "--community-rpc-url",
+            "https://seed.example",
+        ])
+        .unwrap();
+        let origins = vec!["https://seed.example".to_string()];
+        validate_full_integer_worker_role(&valid, 0, &origins).unwrap();
+        assert!(valid.shard_ranges.is_empty());
+        assert!(valid.shard_start.is_none());
+        assert!(valid.shard_end.is_none());
+
+        assert!(validate_full_integer_worker_role(&valid, 1, &origins).is_err());
+        assert!(validate_full_integer_worker_role(&valid, 0, &[]).is_err());
+
+        for incompatible in [
+            "--tokenizer-only",
+            "--enable-i16",
+            "--no-community",
+            "--auto-shard-join",
+        ] {
+            let cli = Cli::try_parse_from([
+                "arc-node",
+                "--stake",
+                "0",
+                "--model",
+                "/models/llama2-7b.gguf",
+                "--full-integer-worker",
+                "--community-rpc-url",
+                "https://seed.example",
+                incompatible,
+            ])
+            .unwrap();
+            assert!(
+                validate_full_integer_worker_role(&cli, 0, &origins).is_err(),
+                "{incompatible} must be rejected"
+            );
+        }
+
+        let ranged = Cli::try_parse_from([
+            "arc-node",
+            "--stake",
+            "0",
+            "--model",
+            "/models/llama2-7b.gguf",
+            "--full-integer-worker",
+            "--community-rpc-url",
+            "https://seed.example",
+            "--shard-range",
+            "0:32",
+        ])
+        .unwrap();
+        assert!(validate_full_integer_worker_role(&ranged, 0, &origins).is_err());
     }
 
     #[test]
@@ -4014,7 +4430,9 @@ mod tests {
         ));
         std::fs::create_dir(&data_dir).unwrap();
         let domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"domain"), 7, 11);
-        let binding = recovery_test_binding(domain.clone());
+        let mut binding = recovery_test_binding(domain.clone());
+        binding.source_height = 0;
+        binding.transition_height = 0;
         let validators: Vec<Hash256> = (0..4).map(|index| hash_bytes(&[index as u8])).collect();
         let bootstrap = binding.initial_consensus_round;
 
@@ -4067,6 +4485,19 @@ mod tests {
             .find(|block| block.author == leader)
             .unwrap()
             .hash;
+        let leader_block = round_0
+            .iter()
+            .find(|block| block.hash == leader_hash)
+            .unwrap();
+        let state = StateDB::with_genesis(&[(transaction_key.address(), 100)]);
+        let canonical_transactions = if leader_block.transactions.is_empty() {
+            Vec::new()
+        } else {
+            vec![transaction.clone()]
+        };
+        state
+            .execute_block_adaptive_at(&canonical_transactions, leader, bootstrap)
+            .unwrap();
         writer.append(WalOp::CommitDagBlock(leader_hash), bootstrap);
         writer.sync().unwrap();
         drop(writer);
@@ -4078,8 +4509,8 @@ mod tests {
         };
         for _ in 0..2 {
             let engine = recovery_test_engine(&validators, &domain);
-            let (round, committed, transactions) =
-                replay_recovery_dag_wal(&engine, &startup, 1).unwrap();
+            let (round, committed, transactions, repaired) =
+                replay_recovery_dag_wal(&engine, &state, &startup, 1).unwrap();
             assert_eq!(round, bootstrap + 3);
             assert_eq!(committed, bootstrap + 1);
             assert_eq!(
@@ -4089,56 +4520,83 @@ mod tests {
                     .collect::<Vec<_>>(),
                 vec![transaction.hash]
             );
+            assert!(repaired.is_none());
             assert_eq!(engine.committed_blocks(), vec![leader_hash]);
         }
 
+        let repair_dir = std::env::temp_dir().join(format!(
+            "arc-recovery-dag-repair-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&repair_dir).unwrap();
+        let repair_writer = WalWriter::with_segments(&repair_dir, 64 * 1024 * 1024).unwrap();
+        repair_writer.append(
+            WalOp::SetFullTransaction(transaction.hash, Box::new(transaction.clone())),
+            bootstrap,
+        );
+        for block in round_0.iter().chain(&round_1).chain(&round_2) {
+            repair_writer.append(
+                WalOp::SetDagBlock(block.hash, bincode::serialize(block).unwrap()),
+                block.round,
+            );
+        }
+        repair_writer.sync().unwrap();
+        drop(repair_writer);
+        let repair_startup = RecoveryDagStartup {
+            wal_dir: repair_dir.clone(),
+            binding: startup.binding.clone(),
+            archived_legacy_wal: None,
+        };
+        let repair_engine = recovery_test_engine(&validators, &domain);
+        let (_, repaired_cursor, _, repaired) =
+            replay_recovery_dag_wal(&repair_engine, &state, &repair_startup, 1).unwrap();
+        assert_eq!(repaired_cursor, bootstrap + 1);
+        assert_eq!(repaired, Some((leader_hash, bootstrap)));
+        assert_eq!(repair_engine.committed_blocks(), vec![leader_hash]);
+
         let wrong_domain = arc_consensus::ConsensusDomain::new(hash_bytes(b"wrong"), 7, 11);
         let engine = recovery_test_engine(&validators, &wrong_domain);
-        assert!(replay_recovery_dag_wal(&engine, &startup, 1).is_err());
+        assert!(replay_recovery_dag_wal(&engine, &state, &startup, 1).is_err());
+        std::fs::remove_dir_all(&repair_dir).unwrap();
         std::fs::remove_dir_all(&data_dir).unwrap();
     }
 
     #[test]
-    fn pulled_stub_rewritten_to_seed_host_port() {
-        // AMS announces self_shard with socket_addr=0.0.0.0:9090. We pulled
-        // through its HTTPS gateway, so that origin's host is routable while
-        // the shard's declared serving port remains authoritative.
+    fn pulled_shard_is_bound_to_exact_https_seed_origin() {
         let mut v = json!({
             "start_layer": 10, "end_layer": 14, "socket_addr": "0.0.0.0:9090",
             "node_name": "AMS"
         });
         rewrite_pulled_self_shard(&mut v, "https://seed-ams.example");
-        assert_eq!(v["socket_addr"], "seed-ams.example:9090");
+        assert_eq!(v["socket_addr"], "https://seed-ams.example");
     }
 
     #[test]
-    fn pulled_routable_addr_is_left_alone() {
+    fn pulled_routable_or_metadata_addr_cannot_override_seed_origin() {
         let mut v = json!({
-            "start_layer": 10, "end_layer": 14, "socket_addr": "136.244.109.1:9090",
+            "start_layer": 10, "end_layer": 14, "socket_addr": "169.254.169.254:80",
             "node_name": "AMS"
         });
-        rewrite_pulled_self_shard(&mut v, "136.244.109.1:9090");
-        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+        rewrite_pulled_self_shard(&mut v, "https://136-244-109-1.nip.io");
+        assert_eq!(v["socket_addr"], "https://136-244-109-1.nip.io");
     }
 
     #[test]
-    fn pulled_stub_uses_declared_port_over_pulled_url_port() {
-        // Peer bound to 9090 but we pulled from its port 8545 (hypothetical) -
-        // prefer the port the peer declared for its listener.
+    fn pulled_origin_port_and_scheme_are_authoritative() {
         let mut v = json!({
             "socket_addr": "0.0.0.0:9090", "node_name": "X"
         });
-        rewrite_pulled_self_shard(&mut v, "1.2.3.4:8545");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+        rewrite_pulled_self_shard(&mut v, "https://1.2.3.4:9443");
+        assert_eq!(v["socket_addr"], "https://1.2.3.4:9443");
     }
 
     #[test]
-    fn pulled_stub_falls_back_to_pulled_url_port_when_declared_is_bad() {
+    fn pulled_plain_host_is_normalized_to_explicit_http_origin() {
         let mut v = json!({
             "socket_addr": "0.0.0.0:junk", "node_name": "X"
         });
-        rewrite_pulled_self_shard(&mut v, "https://1.2.3.4:9443");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9443");
+        rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
     }
 
     #[test]
@@ -4149,25 +4607,25 @@ mod tests {
             "socket_addr": "127.0.0.1:9090", "node_name": "X"
         });
         rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
     }
 
     #[test]
     fn pulled_ipv6_stub_rewritten() {
         let mut v = json!({"socket_addr": "[::]:9090", "node_name": "X"});
         rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
 
         let mut v = json!({"socket_addr": "[::1]:9090", "node_name": "X"});
         rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
     }
 
     #[test]
     fn pulled_empty_addr_rewritten() {
         let mut v = json!({"socket_addr": "", "node_name": "X"});
         rewrite_pulled_self_shard(&mut v, "1.2.3.4:9090");
-        assert_eq!(v["socket_addr"], "1.2.3.4:9090");
+        assert_eq!(v["socket_addr"], "http://1.2.3.4:9090");
     }
 
     #[test]
@@ -4179,11 +4637,47 @@ mod tests {
     }
 
     #[test]
-    fn pulled_url_with_no_port_is_tolerated() {
-        // Defensive: if a legacy caller carries a host without a port,
-        // rewrite still produces a sensible string (host + default 9090).
+    fn pulled_url_with_no_port_uses_the_origins_scheme_default() {
         let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
         rewrite_pulled_self_shard(&mut v, "136.244.109.1");
-        assert_eq!(v["socket_addr"], "136.244.109.1:9090");
+        assert_eq!(v["socket_addr"], "http://136.244.109.1");
+    }
+
+    #[test]
+    fn invalid_pulled_origin_cannot_replace_existing_destination() {
+        let mut v = json!({"socket_addr": "0.0.0.0:9090", "node_name": "X"});
+        rewrite_pulled_self_shard(&mut v, "https://user@seed.example/path");
+        assert_eq!(v["socket_addr"], "0.0.0.0:9090");
+    }
+
+    #[test]
+    fn legacy_recovery_validator_file_accepts_only_canonical_eight_positive_stakes() {
+        let path = std::env::temp_dir().join(format!(
+            "arc-legacy-validator-set-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let mut records: Vec<_> = (0..8)
+            .map(|index| {
+                json!({
+                    "address": hash_bytes(format!("legacy-{index}").as_bytes()).to_hex(),
+                    "stake": 5_000_000,
+                })
+            })
+            .collect();
+        std::fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+        let parsed = load_legacy_recovery_validator_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(parsed.len(), 8);
+        assert_eq!(parsed.iter().map(|entry| entry.1).sum::<u64>(), 40_000_000);
+
+        records.extend((0..10).map(|index| {
+            json!({
+                "address": hash_bytes(format!("phantom-peer-{index}").as_bytes()).to_hex(),
+                "stake": 0,
+            })
+        }));
+        std::fs::write(&path, serde_json::to_vec(&records).unwrap()).unwrap();
+        let error = load_legacy_recovery_validator_file(path.to_str().unwrap()).unwrap_err();
+        assert!(format!("{error:#}").contains("exactly 8 validators"));
+        std::fs::remove_file(path).unwrap();
     }
 }

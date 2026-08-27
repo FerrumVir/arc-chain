@@ -12,14 +12,10 @@ import type { EarningsProjection, RewardEconomics } from "../lib/types";
  *
  * The rules it follows, in order of how badly breaking each one would hurt:
  *
- * 1. **A projection needs a measured rate.** `attestationsPerDay` is the
- *    backward-compatible field name for successful mined 0x25 receipts/day.
- *    It comes from the chain host or it is absent. This component never derives a rate
- *    itself: deriving one means assuming a block time, and block production is
- *    stalled on four of six seeds, so any assumed block time is wrong by an
- *    unknown factor. With no rate, it shows the configured amount for one
- *    successful mined reward receipt and says
- *    a rate needs history. It does not extrapolate from zero.
+ * 1. **The forecast is backend-authoritative.** `projectedDailyArc` is either
+ *    supplied after the coordinator applies readiness, treasury, and
+ *    consensus-budget policy, or it is absent with a reason. This component
+ *    never reconstructs it from receipt rate or reward amount.
  * 2. **The treasury is finite.** The remaining balance and the number of
  *    reward receipts it can still fund are shown whenever known. A per-day
  *    figure with no stated ceiling implies an unlimited payout, and that is the
@@ -50,7 +46,7 @@ const PROJECTION_DAYS = 7;
 const BOND_DIGITS = 6;
 
 interface Derived {
-  /** Net ARC per mined community-reward receipt, worker bond removed when known. */
+  /** Explicit reward amount for one mined receipt; never used to synthesize a forecast. */
   netPerAttestation: number | null;
   perDay: number | null;
   perWeek: number | null;
@@ -65,23 +61,18 @@ interface Derived {
  */
 function derive(
   p: EarningsProjection | undefined,
-  econ: RewardEconomics | undefined,
+  _econ: RewardEconomics | undefined,
 ): Derived {
   const reward = p?.rewardPerAttestation ?? null;
-  if (reward === null) {
-    return { netPerAttestation: null, perDay: null, perWeek: null };
-  }
-  const bond = econ?.bondPerAttestation ?? null;
-  const net = bond !== null ? reward - bond : reward;
-  const rate = p?.attestationsPerDay ?? null;
-  // No rate → no projection. Deliberately not `rate ?? 0`.
-  if (rate === null) {
-    return { netPerAttestation: net, perDay: null, perWeek: null };
-  }
+  // The coordinator already applies readiness, budget, treasury and observed
+  // receipt policy. Reconstructing `(reward - bond) * observedRate` here can
+  // display a forecast the coordinator explicitly withheld. A worker
+  // certificate bond is also not a deduction from this authoritative field.
+  const perDay = p?.projectedDailyArc ?? null;
   return {
-    netPerAttestation: net,
-    perDay: net * rate,
-    perWeek: net * rate * PROJECTION_DAYS,
+    netPerAttestation: reward,
+    perDay,
+    perWeek: perDay === null ? null : perDay * PROJECTION_DAYS,
   };
 }
 
@@ -151,10 +142,10 @@ function assumptionClauses(
           : "no worker bond is required for a verified community reward certificate",
       );
     } else if (compact) {
-      out.push(`${formatArc(bond, BOND_DIGITS)} ARC bond netted out`);
+      out.push(`${formatArc(bond, BOND_DIGITS)} ARC worker bond (not deducted here)`);
     } else {
       out.push(
-        `${formatArc(bond, BOND_DIGITS)} ARC worker certificate bond netted out`,
+        `${formatArc(bond, BOND_DIGITS)} ARC worker certificate bond reported separately; the backend projection is not recomputed or reduced here`,
       );
     }
   } else if (econ?.unavailable) {
@@ -289,10 +280,44 @@ function FundingLabel() {
       className="status-pill info"
       data-testid="projection-funding-label"
       style={{ fontSize: "var(--text-xs)", fontWeight: 500 }}
-      title="Only successful mined 0x25 receipts move testnet treasury ARC. Raw 0x16 attestations are not payment, and no fiat value is shown."
+      title="Only successful mined 0x25 receipts move promotional testnet treasury ARC. Validator recomputation is not proof of customer demand; raw 0x16 attestations are not payment."
     >
-      Testnet treasury transfer, not revenue
+      Promotional testnet subsidy, not demand or revenue
     </span>
+  );
+}
+
+function BudgetLine({
+  projection,
+  compact = false,
+}: {
+  projection: EarningsProjection;
+  compact?: boolean;
+}) {
+  const remaining = projection.rewardsRemainingThisEpoch;
+  const worker = projection.workerRewardsRemainingThisEpoch;
+  const coordinator = projection.coordinatorRewardsRemainingThisEpoch;
+  if (remaining === null && worker === null && coordinator === null) return null;
+  const policy = projection.rewardPolicyHash;
+  return (
+    <p
+      data-testid="projection-reward-budget"
+      style={{
+        margin: "var(--space-3) 0 0",
+        fontSize: "var(--text-xs)",
+        color: "var(--text-muted)",
+        lineHeight: 1.6,
+      }}
+    >
+      Promotional cap
+      {projection.rewardBudgetEpoch !== null
+        ? `, epoch ${formatInt(projection.rewardBudgetEpoch)}`
+        : ""}
+      : {remaining === null ? "—" : formatInt(remaining)} global, {worker === null ? "—" : formatInt(worker)} for this worker, and {coordinator === null ? "—" : formatInt(coordinator)} for this coordinator remain.
+      {!compact && policy
+        ? ` Policy ${policy.slice(0, 12)}… is consensus-sealed.`
+        : ""}
+    </p>
   );
 }
 
@@ -361,6 +386,7 @@ export function ProjectedEarnings({
           testId="projection-unavailable"
         />
         <TreasuryLine econ={econ} compact={compact} />
+        <BudgetLine projection={projection} compact={compact} />
       </Card>
     );
   }
@@ -382,6 +408,7 @@ export function ProjectedEarnings({
           testId="projection-rollout-inactive"
         />
         <TreasuryLine econ={econ} compact={compact} />
+        <BudgetLine projection={projection} compact={compact} />
       </Card>
     );
   }
@@ -411,13 +438,14 @@ export function ProjectedEarnings({
               margin: 0,
             }}
           >
-            {projection.rateUnavailableReason ??
-              "This host reports no observed mined-reward-receipt rate."}{" "}
+            {projection.projectedDailyUnavailableReason ??
+              "This host withheld an authoritative daily reward projection."}{" "}
             <strong>
-              No per-day figure is shown: a rate has to be measured, and there
-              is nothing yet to measure.
+              No per-day figure is shown unless the coordinator explicitly
+              supplies one after applying readiness and reward-budget policy.
             </strong>{" "}
-            Nothing here is extrapolated from zero.
+            Nothing here is reconstructed from receipt count, reward amount,
+            or bond terms.
           </p>
           <p
             style={{
@@ -433,6 +461,7 @@ export function ProjectedEarnings({
           </p>
         </div>
         <TreasuryLine econ={econ} compact={compact} />
+        <BudgetLine projection={projection} compact={compact} />
       </Card>
     );
   }
@@ -493,6 +522,7 @@ export function ProjectedEarnings({
         {!compact && <RateCaveat p={projection} />}
       </div>
       <TreasuryLine econ={econ} compact={compact} />
+      <BudgetLine projection={projection} compact={compact} />
     </Card>
   );
 }

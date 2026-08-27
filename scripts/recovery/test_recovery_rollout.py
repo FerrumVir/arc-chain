@@ -31,14 +31,38 @@ def digest(path: Path) -> str:
 class ManifestFixture:
     def __init__(self, root: Path, *, production: bool = False, reward_receipt: bool = False) -> None:
         self.root = root
-        artifact_names = ["binary", "genesis", "checkpoint"] + (["caddy"] if production else [])
+        artifact_names = ["binary", "genesis", "checkpoint", "legacy_validator_set"] + (
+            ["source_snapshot", "source_wal", "caddy"] if production else []
+        )
         artifacts = {}
         for name in artifact_names:
             path = root / name
-            path.write_bytes(f"arc-{name}".encode())
+            if name == "legacy_validator_set":
+                path.write_text(
+                    json.dumps(
+                        [
+                            {"address": f"{index + 101:064x}", "stake": 5_000_000}
+                            for index in range(8)
+                        ],
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            else:
+                path.write_bytes(f"arc-{name}".encode())
             path.chmod(0o700 if name in {"binary", "caddy"} else 0o600)
             artifacts[name] = {"path": str(path), "sha256": digest(path)}
         validators = []
+        balanced_ranges = (
+            [[0, 6], [12, 17], [17, 22]],
+            [[0, 6], [12, 17], [22, 27]],
+            [[0, 6], [17, 22], [27, 32]],
+            [[6, 12], [12, 17], [27, 32]],
+            [[6, 12], [17, 22], [22, 27]],
+            [[6, 12], [22, 27], [27, 32]],
+        )
         for index in range(6):
             key = root / f"key-{index}.json"
             key.write_text("{}", encoding="utf-8")
@@ -65,6 +89,9 @@ class ManifestFixture:
                         "service_user": "root",
                         "service_name": "arc-node-v3-recovery.service",
                         "public_hostname": f"{ip.replace('.', '-')}.nip.io",
+                        "model_path": "/opt/arc-models/llama2-7b.gguf",
+                        "model_sha256": rollout.CANONICAL_MODEL_SHA256,
+                        "shard_ranges": balanced_ranges[index],
                     }
                 )
             validators.append(node)
@@ -97,14 +124,19 @@ class ManifestFixture:
             "mode": "production" if production else "local",
             "chain": {
                 "chain_id": "arc-recovery-test",
+                "genesis_hash": "0x" + "0" * 64,
                 "protocol_version": "3.0.0",
                 "recovery_epoch": 7,
                 "validator_set_id": 9,
                 "source_height": 100,
+                "source_consensus_round": 9876,
+                "created_at_unix_ms": 1_787_857_623_000,
                 "source_block_hash": "0x" + "1" * 64,
+                "source_state_root": "0x" + "5" * 64,
                 "transition_height": 101,
                 "transition_block_hash": "0x" + "2" * 64,
                 "full_state_root": "0x" + "3" * 64,
+                "recovery_domain": "0x" + "6" * 64,
                 "approved_checkpoint_manifest_hash": "0x" + "4" * 64,
             },
             "artifacts": artifacts,
@@ -178,6 +210,31 @@ class RecoveryRolloutTests(unittest.TestCase):
         with self.assertRaisesRegex(rollout.RolloutError, "missing: caddy"):
             rollout.validate_manifest(missing_caddy)
 
+    def test_production_requires_canonical_model_and_exact_balanced_3x_shards(self) -> None:
+        value = self.fixture(production=True)
+        self.assertIs(rollout.validate_manifest(value), value)
+
+        wrong_model = copy.deepcopy(value)
+        wrong_model["validators"][0]["model_sha256"] = "f" * 64
+        with self.assertRaisesRegex(rollout.RolloutError, "canonical v0.8"):
+            rollout.validate_manifest(wrong_model)
+
+        unbalanced = copy.deepcopy(value)
+        unbalanced["validators"][0]["shard_ranges"] = [[0, 6], [12, 17]]
+        with self.assertRaisesRegex(rollout.RolloutError, "exactly 16 layers"):
+            rollout.validate_manifest(unbalanced)
+
+        wrong_replication = copy.deepcopy(value)
+        wrong_replication["validators"][0]["shard_ranges"] = [[0, 6], [12, 17], [22, 27]]
+        with self.assertRaisesRegex(rollout.RolloutError, "exact 3x coverage"):
+            rollout.validate_manifest(wrong_replication)
+
+        for forbidden in ("--shard-range=0:32", "--enable-i16"):
+            override = copy.deepcopy(value)
+            override["validators"][0]["extra_args"] = [forbidden]
+            with self.assertRaisesRegex(rollout.RolloutError, "protected flag"):
+                rollout.validate_manifest(override)
+
     def test_seal_is_canonical_read_only_hash_bound_and_create_only(self) -> None:
         draft = self.root / "draft.json"
         sealed = self.root / "locked.json"
@@ -241,11 +298,16 @@ class RecoveryRolloutTests(unittest.TestCase):
         body = {
             "status": "VERIFIED_QUORUM",
             "manifest_hash": value["chain"]["approved_checkpoint_manifest_hash"],
+            "genesis_hash": value["chain"]["genesis_hash"],
             "full_state_root": value["chain"]["full_state_root"],
             "source_height": 100,
+            "source_consensus_round": 9876,
+            "created_at_unix_ms": 1_787_857_623_000,
             "source_block_hash": value["chain"]["source_block_hash"],
+            "source_state_root": value["chain"]["source_state_root"],
             "transition_height": 101,
             "transition_block_hash": value["chain"]["transition_block_hash"],
+            "recovery_domain": value["chain"]["recovery_domain"],
             "recovery_epoch": 7,
             "validator_set_id": 9,
             "protocol_version": "3.0.0",
@@ -274,7 +336,7 @@ class RecoveryRolloutTests(unittest.TestCase):
                     "validator_set_id": 9,
                     "validators_active": 6,
                     "checkpoint_manifest_hash": value["chain"]["approved_checkpoint_manifest_hash"],
-                    "recovery_domain": "0x" + "9" * 64,
+                    "recovery_domain": value["chain"]["recovery_domain"],
                     "last_block_height": 110,
                 }
             return {
@@ -289,6 +351,41 @@ class RecoveryRolloutTests(unittest.TestCase):
         with self.assertRaisesRegex(rollout.RolloutError, "same-height fork"):
             harness.common_commitment()
 
+    def test_frontend_config_binds_source_boundary_domain_and_all_six_v3_replicas(self) -> None:
+        value = self.fixture(production=True)
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        config = harness.frontend_config()
+        checkpoint = config["checkpoint"]
+        self.assertEqual(checkpoint["height"], value["chain"]["source_height"])
+        self.assertEqual(checkpoint["recoveryHeight"], value["chain"]["transition_height"])
+        self.assertEqual(
+            checkpoint["boundaryBlockHash"], value["chain"]["transition_block_hash"].removeprefix("0x")
+        )
+        self.assertEqual(
+            checkpoint["boundaryStateRoot"], value["chain"]["full_state_root"].removeprefix("0x")
+        )
+        self.assertEqual(checkpoint["recoveryEpoch"], 7)
+        self.assertEqual(checkpoint["validatorSetId"], 9)
+        self.assertEqual(checkpoint["protocolVersion"], "3.0.0")
+        self.assertEqual(
+            checkpoint["recoveryDomain"], value["chain"]["recovery_domain"].removeprefix("0x")
+        )
+        self.assertEqual(checkpoint["legacySourceId"], checkpoint["v3SourceId"])
+        self.assertEqual(len(config["sources"]), 6)
+        self.assertTrue(all(source["kind"] == "v3" for source in config["sources"]))
+        self.assertEqual(
+            {source["baseUrl"] for source in config["sources"]},
+            {node["rpc_url"] for node in value["validators"]},
+        )
+
+        output = self.root / "frontend.lock.json"
+        digest_value = rollout.write_frontend_config(harness, output)
+        self.assertEqual(digest_value, digest(output))
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o444)
+        self.assertEqual(stat.S_IMODE(Path(str(output) + ".sha256").stat().st_mode), 0o444)
+        with self.assertRaisesRegex(rollout.RolloutError, "refusing replacement"):
+            rollout.write_frontend_config(harness, output)
+
     def test_gateway_is_https_only_loopback_limited_and_fail_closed(self) -> None:
         value = self.fixture(production=True)
         harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
@@ -296,16 +393,78 @@ class RecoveryRolloutTests(unittest.TestCase):
         caddy = harness.caddyfile(node)
         nginx = harness.nginx_filter(node)
         runtime = harness.runtime_argv(node, remote=True)
+        unit = harness.systemd_unit(node)
         self.assertIn("reverse_proxy 127.0.0.1:18080", caddy)
+        self.assertIn("https://ferrumvir.github.io", caddy)
+        self.assertIn('header Vary "Origin"', caddy)
+        self.assertIn('respond "" 204', caddy)
+        self.assertIn("header Access-Control-Request-Method GET", caddy)
+        self.assertIn("header Access-Control-Request-Method POST", caddy)
         self.assertIn('Strict-Transport-Security "max-age=31536000', caddy)
         self.assertIn('respond "not found" 404', caddy)
         self.assertIn("max_size 1MB", caddy)
+        self.assertIn("path /shards/announce /inference/forward_shard /inference/cleanup_shard", caddy)
+        self.assertIn("remote_ip 192.0.2.1 192.0.2.2", caddy)
+        self.assertIn("max_size 4MB", caddy)
         self.assertIn("limit_req zone=arc_write_", nginx)
+        self.assertIn("limit_req zone=arc_shard_", nginx)
+        self.assertIn("client_max_body_size 4m", nginx)
+        self.assertIn("inference/(?:forward_shard|cleanup_shard)", nginx)
         self.assertIn("listen 127.0.0.1:18080", nginx)
         self.assertNotIn("listen 9090", nginx)
         self.assertIn("location = /internal/community/reward/approve", nginx)
+        self.assertIn("health|info|network/info", nginx)
+        self.assertIn("account/(?:0x)?[0-9a-fA-F]{64}(?:/txs)?", nginx)
+        internal = caddy[caddy.index("@validatorApproval"):]
+        self.assertNotIn("Access-Control-Allow-Origin", internal)
         self.assertEqual(runtime.count("--community-rpc-url"), 6)
+        self.assertEqual(runtime.count("--model"), 1)
+        self.assertEqual(runtime.count("--shard-range"), 3)
+        self.assertIn("0:6", runtime)
+        self.assertIn("12:17", runtime)
+        self.assertIn("17:22", runtime)
+        self.assertIn(
+            "Environment=ARC_PUBLIC_SOCKET=https://192-0-2-1.nip.io",
+            unit,
+        )
         self.assertTrue(all(value.startswith("https://") for index, value in enumerate(runtime) if index and runtime[index - 1] == "--community-rpc-url"))
+        for private_path in (
+            "/shards/announce",
+            "/inference/forward_shard",
+            "/inference/cleanup_shard",
+        ):
+            self.assertNotIn(private_path, rollout.DEFAULT_PUBLIC_POST_PATHS)
+
+    def test_production_shard_gate_requires_exact_origin_bound_3x_view_on_every_node(self) -> None:
+        value = self.fixture(production=True)
+        harness = rollout.RecoveryRollout(value, "d" * 64, output=io.StringIO())
+        model_id = "0x" + "a" * 64
+        shards = []
+        for source in value["validators"]:
+            for start, end in source["shard_ranges"]:
+                shards.append(
+                    {
+                        "start_layer": start,
+                        "end_layer": end,
+                        "total_layers": 32,
+                        "model_id": model_id,
+                        "socket_addr": source["rpc_url"],
+                    }
+                )
+        healthy = {
+            "total_layers": 32,
+            "fully_covered": True,
+            "model_id": model_id,
+            "shards": shards,
+        }
+        harness._http_json = lambda node, path, timeout=10: copy.deepcopy(healthy)
+        self.assertEqual(harness._check_production_shard_topology(), "a" * 64)
+
+        poisoned = copy.deepcopy(healthy)
+        poisoned["shards"][0]["socket_addr"] = "http://169.254.169.254"
+        harness._http_json = lambda node, path, timeout=10: copy.deepcopy(poisoned)
+        with self.assertRaisesRegex(rollout.RolloutError, "sealed exact 3x HTTPS"):
+            harness._check_production_shard_topology()
 
     def test_successful_receipt_and_earnings_must_agree_on_all_six(self) -> None:
         value = self.fixture(reward_receipt=True)
@@ -335,6 +494,30 @@ class RecoveryRolloutTests(unittest.TestCase):
                     "validator_set_commitment": commitment,
                     "reward_base": 2_500_000,
                     "reward_arc": 2.5,
+                    "issuance_policy": {
+                        "reward_amount": 2_500_000,
+                        "epoch_blocks": 216_000,
+                        "max_per_block": 1,
+                        "max_per_epoch": 40,
+                        "max_per_worker_epoch": 8,
+                        "max_per_coordinator_epoch": 16,
+                    },
+                    "issuance_policy_hash": "0x" + "f" * 64,
+                    "prospective_budget": {
+                        "block_height": 138_000,
+                        "epoch": 0,
+                        "issued_this_block": 0,
+                        "remaining_this_block": 1,
+                        "issued_this_epoch": 1,
+                        "remaining_this_epoch": 39,
+                        "coordinator_issued_this_epoch": 1,
+                        "coordinator_remaining_this_epoch": 15,
+                        "worker_issued_this_epoch": None,
+                        "worker_remaining_this_epoch": None,
+                    },
+                    "treasury_rewards_remaining": 39,
+                    "reward_program": "protocol-capped testnet promotional compute subsidy",
+                    "reward_is_customer_demand": False,
                 }
             if path.startswith("/community/reward_receipt/"):
                 return {

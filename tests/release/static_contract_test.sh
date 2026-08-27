@@ -25,6 +25,7 @@ DESKTOP_CARGO_LOCK="$REPO_ROOT/desktop/src-tauri/Cargo.lock"
 DESKTOP_NPM_LOCK="$REPO_ROOT/desktop/package-lock.json"
 CANONICAL_SEEDS="$REPO_ROOT/testnet-seeds.txt"
 DESKTOP_SEEDS="$REPO_ROOT/desktop/src-tauri/resources/testnet-seeds.txt"
+VALIDATOR_TRANSPORT="$REPO_ROOT/crates/arc-net/src/transport.rs"
 
 REQUIRED_ASSETS='
 arc-node-linux-x86_64
@@ -778,16 +779,44 @@ ref: ${{ needs.validate.outputs.sha }}' ]; then
         'EXPECTED_SHA: ${{ needs.validate.outputs.sha }}' \
         'git ls-remote --exit-code --tags origin' \
         'if [ "$REMOTE_SHA" != "$EXPECTED_SHA" ]; then' \
+        '"repos/$GITHUB_REPOSITORY/immutable-releases" --jq '\''.enabled'\''' \
+        'if [ "$IMMUTABLE_RELEASES_ENABLED" != true ]; then' \
         'gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100"' \
         'if grep -Fxq "$RELEASE_TAG" "$EXISTING_TAGS"; then' \
         'gh release create "$RELEASE_TAG" release-files/*' \
         '--verify-tag' \
         '--target "$EXPECTED_SHA"' \
+        '"repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '\''.immutable'\''' \
+        'if [ "$CREATED_RELEASE_IMMUTABLE" != true ]; then' \
         'releases/download/${{ needs.validate.outputs.tag }}/install.sh' \
         'bash install.sh --version ${{ needs.validate.outputs.version }}'
     do
         printf '%s\n' "$publish_block" | grep -Fq -- "$required" || {
             printf 'create-only exact-commit publisher is missing: %s\n' "$required"
+            return 1
+        }
+    done
+}
+
+validator_transport_cannot_regress_to_anonymous_or_test_only_tls() {
+    local forbidden
+    for forbidden in \
+        'TestnetCertVerifier' \
+        '.with_no_client_auth()' \
+        'certificate pinning is not implemented'
+    do
+        if grep -Fq -- "$forbidden" "$VALIDATOR_TRANSPORT"; then
+            printf 'validator transport contains forbidden TLS bypass: %s\n' "$forbidden"
+            return 1
+        fi
+    done
+    for required in \
+        'allowed_validators' \
+        'make_server_config' \
+        'make_client_config'
+    do
+        grep -Fq -- "$required" "$VALIDATOR_TRANSPORT" || {
+            printf 'validator transport omits authenticated allowlist contract: %s\n' "$required"
             return 1
         }
     done
@@ -822,6 +851,7 @@ run_test 'release golden vectors cover Linux x86/ARM, both Macs, and Windows' cr
 run_test 'updater signatures verify against the embedded key and reject rotation' updater_signatures_are_verified_against_the_embedded_key
 run_test 'signing and publishing require the owner-protected release environment' release_secret_jobs_require_the_owner_environment
 run_test 'publisher pins one validated commit, rechecks the tag, and refuses release replacement' publish_is_pinned_to_one_validated_commit_and_create_only
+run_test 'validator QUIC forbids anonymous/test-only TLS and retains exact allowlisting' validator_transport_cannot_regress_to_anonymous_or_test_only_tls
 run_test 'release-related shell scripts pass bash syntax validation' relevant_shell_is_syntax_valid
 
 finish_tests

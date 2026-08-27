@@ -571,16 +571,12 @@ if [ -n "$REQUESTED_VERSION" ] && [ "$VERSION" != "$REQUESTED_VERSION" ]; then
     die "GitHub returned $RESOLVED_TAG when v$REQUESTED_VERSION was requested"
 fi
 
-ASSET_NAMES="$TMP_DIR/assets.txt"
-sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-    "$TMP_DIR/release.json" > "$ASSET_NAMES"
-REQUIRED_DOWNLOADS="$NODE_ASSET $CLI_ASSET SHA256SUMS testnet-seeds.txt genesis.toml"
-if [ "$INSTALL_UPDATER" = true ]; then REQUIRED_DOWNLOADS="$REQUIRED_DOWNLOADS install.sh"; fi
-for asset in $REQUIRED_DOWNLOADS; do
-    if ! grep -Fxq "$asset" "$ASSET_NAMES"; then
-        die "Release $RESOLVED_TAG is incomplete for $PLATFORM: missing $asset. Refusing to fall back to an older release."
-    fi
-done
+# Do not scrape the release asset array with a greedy line-oriented regex.
+# GitHub serves API JSON minified on one line, where that approach captures
+# only the final `name` value. The exact immutable tag is resolved above; each
+# required asset is downloaded from that tag below with fail-on-404 and then
+# matched to exactly one SHA256SUMS entry. A missing asset therefore fails
+# closed without release walking or fallback.
 
 INSTALLED_VERSION=""
 if [ -x "$ARC_DIR/bin/arc-node" ]; then
@@ -994,7 +990,7 @@ for origin in "${COMMUNITY_RPC_ORIGINS[@]}"; do
     NODE_ARGS+=(--community-rpc-url "$origin")
 done
 if [ -n "$MODEL_PATH" ]; then
-    NODE_ARGS+=(--model "$MODEL_PATH")
+    NODE_ARGS+=(--model "$MODEL_PATH" --full-integer-worker)
 fi
 
 {

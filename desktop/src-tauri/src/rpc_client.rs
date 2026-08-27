@@ -661,7 +661,9 @@ fn transaction_signing_domain_from_value(
     let active = value
         .get("recovery_active")
         .and_then(Value::as_bool)
-        .ok_or_else(|| format!("{base_url} did not state whether recovery-domain signing is active"))?;
+        .ok_or_else(|| {
+            format!("{base_url} did not state whether recovery-domain signing is active")
+        })?;
     let raw_domain = value
         .get("recovery_domain")
         .or_else(|| value.get("transaction_domain"))
@@ -702,49 +704,47 @@ fn wallet_result_from_lookup(
     lookup: TxLookup,
     flow: &str,
 ) -> WalletTxResult {
-    let (receipt_status, mined, unavailable, message) = match (
-        lookup.status.as_str(),
-        lookup.success,
-    ) {
-        ("mined", Some(true)) => (
-            "mined_success",
-            true,
-            None,
-            lookup
-                .block_height
-                .map(|height| format!("{flow} confirmed in block #{height}."))
-                .unwrap_or_else(|| format!("{flow} has a successful mined receipt.")),
-        ),
-        ("mined", Some(false)) => (
-            "mined_failed",
-            true,
-            None,
-            lookup
-                .block_height
-                .map(|height| format!("{flow} was mined but failed in block #{height}."))
-                .unwrap_or_else(|| format!("{flow} was mined but execution failed.")),
-        ),
-        ("not_found", _) => (
-            "pending",
-            false,
-            None,
-            format!("{flow} was accepted and is waiting for a mined receipt."),
-        ),
-        ("mined", None) => (
-            "receipt_unavailable",
-            true,
-            Some("the mined receipt did not include an execution result".to_string()),
-            format!("{flow} is in a block, but its success result is unavailable."),
-        ),
-        _ => (
-            "receipt_unavailable",
-            false,
-            lookup.unavailable.clone().or_else(|| {
-                Some("the receipt lookup could not establish transaction status".to_string())
-            }),
-            format!("{flow} was accepted, but its mined receipt could not be verified yet."),
-        ),
-    };
+    let (receipt_status, mined, unavailable, message) =
+        match (lookup.status.as_str(), lookup.success) {
+            ("mined", Some(true)) => (
+                "mined_success",
+                true,
+                None,
+                lookup
+                    .block_height
+                    .map(|height| format!("{flow} confirmed in block #{height}."))
+                    .unwrap_or_else(|| format!("{flow} has a successful mined receipt.")),
+            ),
+            ("mined", Some(false)) => (
+                "mined_failed",
+                true,
+                None,
+                lookup
+                    .block_height
+                    .map(|height| format!("{flow} was mined but failed in block #{height}."))
+                    .unwrap_or_else(|| format!("{flow} was mined but execution failed.")),
+            ),
+            ("not_found", _) => (
+                "pending",
+                false,
+                None,
+                format!("{flow} was accepted and is waiting for a mined receipt."),
+            ),
+            ("mined", None) => (
+                "receipt_unavailable",
+                true,
+                Some("the mined receipt did not include an execution result".to_string()),
+                format!("{flow} is in a block, but its success result is unavailable."),
+            ),
+            _ => (
+                "receipt_unavailable",
+                false,
+                lookup.unavailable.clone().or_else(|| {
+                    Some("the receipt lookup could not establish transaction status".to_string())
+                }),
+                format!("{flow} was accepted, but its mined receipt could not be verified yet."),
+            ),
+        };
 
     WalletTxResult {
         tx_hash,
@@ -838,7 +838,9 @@ pub async fn faucet_claim(
         .and_then(Value::as_str)
         .map(strip_0x)
         .filter(|hash| is_tx_hash(hash))
-        .ok_or_else(|| "faucet accepted the request but returned no valid transaction hash".to_string())?;
+        .ok_or_else(|| {
+            "faucet accepted the request but returned no valid transaction hash".to_string()
+        })?;
     let amount = v
         .get("amount")
         .and_then(Value::as_u64)
@@ -1544,6 +1546,16 @@ pub async fn fetch_earnings_projection(
                 reward_per_attestation: None,
                 reward_rate_source: "unknown".to_string(),
                 community_rewards_enabled: None,
+                projected_daily_arc: None,
+                projected_daily_unavailable_reason: None,
+                reward_policy_hash: None,
+                reward_budget_epoch: None,
+                rewards_remaining_this_epoch: None,
+                worker_rewards_remaining_this_epoch: None,
+                coordinator_rewards_remaining_this_epoch: None,
+                issuance_ready_for_worker: None,
+                reward_program: None,
+                reward_is_customer_demand: None,
                 attestations_total: 0,
                 first_attestation_block: None,
                 attestations_per_day: None,
@@ -1565,6 +1577,16 @@ pub async fn fetch_earnings_projection(
                 reward_per_attestation: None,
                 reward_rate_source: "unknown".to_string(),
                 community_rewards_enabled: None,
+                projected_daily_arc: None,
+                projected_daily_unavailable_reason: None,
+                reward_policy_hash: None,
+                reward_budget_epoch: None,
+                rewards_remaining_this_epoch: None,
+                worker_rewards_remaining_this_epoch: None,
+                coordinator_rewards_remaining_this_epoch: None,
+                issuance_ready_for_worker: None,
+                reward_program: None,
+                reward_is_customer_demand: None,
                 attestations_total: 0,
                 first_attestation_block: None,
                 attestations_per_day: None,
@@ -1575,7 +1597,7 @@ pub async fn fetch_earnings_projection(
         }
     };
 
-    if confirmed_earnings_from_value(v).is_none() {
+    let Some(confirmed) = confirmed_earnings_from_value(v) else {
         return EarningsProjection {
             source_host: base_url.to_string(),
             unavailable: Some(format!(
@@ -1585,6 +1607,16 @@ pub async fn fetch_earnings_projection(
             reward_per_attestation: None,
             reward_rate_source: "unknown".to_string(),
             community_rewards_enabled: None,
+            projected_daily_arc: None,
+            projected_daily_unavailable_reason: None,
+            reward_policy_hash: None,
+            reward_budget_epoch: None,
+            rewards_remaining_this_epoch: None,
+            worker_rewards_remaining_this_epoch: None,
+            coordinator_rewards_remaining_this_epoch: None,
+            issuance_ready_for_worker: None,
+            reward_program: None,
+            reward_is_customer_demand: None,
             attestations_total: 0,
             first_attestation_block: None,
             attestations_per_day: None,
@@ -1592,7 +1624,7 @@ pub async fn fetch_earnings_projection(
             observed_over_blocks: None,
             rate_caveat: None,
         };
-    }
+    };
 
     let chain_rate = pick_u64(v, &["reward_per_attestation_base"])
         .map(|b| b as f64 / ARC_BASE_UNITS)
@@ -1645,6 +1677,7 @@ pub async fn fetch_earnings_projection(
     // The host's own caveat about how it derived the rate. Shown verbatim
     // rather than paraphrased — it knows its method and this build does not.
     let rate_caveat = pick_str(v, &["attestations_per_day_caveat"]);
+    let budget = v.get("reward_budget").and_then(Value::as_object);
 
     EarningsProjection {
         source_host: base_url.to_string(),
@@ -1652,6 +1685,24 @@ pub async fn fetch_earnings_projection(
         reward_per_attestation,
         reward_rate_source: reward_rate_source.to_string(),
         community_rewards_enabled,
+        projected_daily_arc: confirmed.projected_daily_arc,
+        projected_daily_unavailable_reason: confirmed.projected_daily_unavailable_reason,
+        reward_policy_hash: pick_str(v, &["reward_issuance_policy_hash"]),
+        reward_budget_epoch: budget
+            .and_then(|value| value.get("epoch"))
+            .and_then(Value::as_u64),
+        rewards_remaining_this_epoch: budget
+            .and_then(|value| value.get("remaining_this_epoch"))
+            .and_then(Value::as_u64),
+        worker_rewards_remaining_this_epoch: budget
+            .and_then(|value| value.get("worker_remaining_this_epoch"))
+            .and_then(Value::as_u64),
+        coordinator_rewards_remaining_this_epoch: budget
+            .and_then(|value| value.get("coordinator_remaining_this_epoch"))
+            .and_then(Value::as_u64),
+        issuance_ready_for_worker: v.get("issuance_ready_for_worker").and_then(Value::as_bool),
+        reward_program: pick_str(v, &["reward_program"]),
+        reward_is_customer_demand: v.get("reward_is_customer_demand").and_then(Value::as_bool),
         attestations_total,
         first_attestation_block,
         attestations_per_day,
@@ -2511,9 +2562,7 @@ mod chain_read_tests {
             json!({"protocol_version":"3.0.0", "recovery_active":true, "recovery_domain":format!("0x{}", "00".repeat(32))}),
             json!({"protocol_version":"3.0.0", "recovery_active":false, "recovery_domain":null}),
         ] {
-            assert!(
-                transaction_signing_domain_from_value(&bad, "https://seed.nip.io").is_err()
-            );
+            assert!(transaction_signing_domain_from_value(&bad, "https://seed.nip.io").is_err());
         }
     }
 

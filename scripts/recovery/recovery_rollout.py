@@ -41,24 +41,44 @@ SAFE_REMOTE_RE = re.compile(r"^[A-Za-z0-9_./:@%+=,-]+$")
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 PROTECTED_FLAGS = {
     "--approved-recovery-manifest-hash",
+    "--allow-insecure-community-rpc",
+    "--auto-shard-join",
+    "--community",
+    "--community-mode",
     "--community-rpc-url",
     "--data-dir",
+    "--enable-i16",
     "--genesis",
     "--insecure-dev-validator-seed",
+    "--full-integer-worker",
+    "--model",
     "--p2p-port",
     "--peers",
     "--recovery-checkpoint",
     "--recovery-epoch",
     "--rpc",
+    "--shard-hosts",
+    "--shard-end",
+    "--shard-range",
+    "--shard-start",
     "--stake",
+    "--tokenizer-only",
+    "--no-community",
     "--validator-key-file",
     "--validator-seed",
     "--validator-set-id",
 }
 REQUIRED_VALIDATORS = 6
 REQUIRED_APPROVALS = 5
+CANONICAL_MODEL_SHA256 = "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
+CANONICAL_MODEL_LAYERS = 32
+REQUIRED_SHARD_REPLICATION = 3
+REQUIRED_LAYERS_PER_VALIDATOR = (
+    CANONICAL_MODEL_LAYERS * REQUIRED_SHARD_REPLICATION // REQUIRED_VALIDATORS
+)
 DEFAULT_PUBLIC_GET_PATHS = (
     "/health",
+    "/info",
     "/network/info",
     "/stats",
     "/validators",
@@ -66,11 +86,14 @@ DEFAULT_PUBLIC_GET_PATHS = (
     "/blocks",
     "/inference/attestations",
     "/economics/rewards",
+    "/community/list",
     "/community/reward_policy",
+    "/workers/scoreboard",
     "/shards",
     "/models",
     "/models/shards",
 )
+PUBLIC_BROWSER_ORIGIN = "https://ferrumvir.github.io"
 DEFAULT_PUBLIC_POST_PATHS = (
     "/inference/run",
     "/inference/run_consensus",
@@ -231,14 +254,19 @@ def validate_manifest(value: Any) -> dict[str, Any]:
         "manifest.chain",
         (
             "chain_id",
+            "genesis_hash",
             "protocol_version",
             "recovery_epoch",
             "validator_set_id",
             "source_height",
+            "source_consensus_round",
+            "created_at_unix_ms",
             "source_block_hash",
+            "source_state_root",
             "transition_height",
             "transition_block_hash",
             "full_state_root",
+            "recovery_domain",
             "approved_checkpoint_manifest_hash",
         ),
     )
@@ -249,18 +277,29 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     required_int(chain["recovery_epoch"], "manifest.chain.recovery_epoch", minimum=1)
     required_int(chain["validator_set_id"], "manifest.chain.validator_set_id", minimum=1)
     source_height = required_int(chain["source_height"], "manifest.chain.source_height")
+    required_int(chain["source_consensus_round"], "manifest.chain.source_consensus_round")
+    required_int(chain["created_at_unix_ms"], "manifest.chain.created_at_unix_ms", minimum=1)
     transition_height = required_int(chain["transition_height"], "manifest.chain.transition_height", minimum=1)
     if transition_height != source_height + 1:
         fail("manifest.chain.transition_height must be exactly source_height + 1")
     for key in (
         "source_block_hash",
+        "source_state_root",
         "transition_block_hash",
         "full_state_root",
+        "genesis_hash",
+        "recovery_domain",
         "approved_checkpoint_manifest_hash",
     ):
         bare_hash(chain[key], f"manifest.chain.{key}")
 
-    artifact_names = ("binary", "genesis", "checkpoint", "caddy") if mode == "production" else ("binary", "genesis", "checkpoint")
+    artifact_names = (
+        "binary",
+        "genesis",
+        "checkpoint",
+        "legacy_validator_set",
+        *(("source_snapshot", "source_wal", "caddy") if mode == "production" else ()),
+    )
     artifacts = require_keys(manifest["artifacts"], "manifest.artifacts", artifact_names)
     for key in artifact_names:
         validate_artifact(artifacts[key], f"manifest.artifacts.{key}")
@@ -354,6 +393,7 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     service_names: set[str] = set()
     hosts: set[str] = set()
     stakes: list[int] = []
+    shard_coverage = [0] * CANONICAL_MODEL_LAYERS
     for index, raw_node in enumerate(validators):
         field = f"manifest.validators[{index}]"
         common = (
@@ -368,7 +408,17 @@ def validate_manifest(value: Any) -> dict[str, Any]:
             "data_dir",
             "extra_args",
         )
-        production = ("host", "ssh_user", "remote_root", "service_user", "service_name", "public_hostname")
+        production = (
+            "host",
+            "ssh_user",
+            "remote_root",
+            "service_user",
+            "service_name",
+            "public_hostname",
+            "model_path",
+            "model_sha256",
+            "shard_ranges",
+        )
         node = require_keys(raw_node, field, common + (production if mode == "production" else ()))
         name = required_string(node["name"], f"{field}.name")
         if not SAFE_ID_RE.fullmatch(name) or name in names:
@@ -443,10 +493,57 @@ def validate_manifest(value: Any) -> dict[str, Any]:
                 fail(f"{field}.public_hostname must embed the exact approved host IP")
             if rpc_url != f"https://{public_hostname}":
                 fail(f"{field}.rpc_url must be exactly https://{public_hostname}")
+            absolute_path(node["model_path"], f"{field}.model_path")
+            if node["model_sha256"] != CANONICAL_MODEL_SHA256:
+                fail(
+                    f"{field}.model_sha256 must pin the canonical v0.8 Llama-2-7B artifact"
+                )
+            ranges = node["shard_ranges"]
+            if not isinstance(ranges, list) or not ranges:
+                fail(f"{field}.shard_ranges must be a non-empty array")
+            normalized_ranges: list[tuple[int, int]] = []
+            for range_index, layer_range in enumerate(ranges):
+                range_field = f"{field}.shard_ranges[{range_index}]"
+                if (
+                    not isinstance(layer_range, list)
+                    or len(layer_range) != 2
+                    or not all(isinstance(bound, int) and not isinstance(bound, bool) for bound in layer_range)
+                ):
+                    fail(f"{range_field} must be [start, end] integer bounds")
+                start, end = layer_range
+                if start < 0 or start >= end or end > CANONICAL_MODEL_LAYERS:
+                    fail(
+                        f"{range_field} must be non-empty and inside [0, {CANONICAL_MODEL_LAYERS})"
+                    )
+                normalized_ranges.append((start, end))
+            normalized_ranges.sort()
+            for previous, current in zip(normalized_ranges, normalized_ranges[1:]):
+                if current[0] < previous[1]:
+                    fail(f"{field}.shard_ranges overlap within one validator")
+            held_layers = sum(end - start for start, end in normalized_ranges)
+            if held_layers != REQUIRED_LAYERS_PER_VALIDATOR:
+                fail(
+                    f"{field}.shard_ranges must hold exactly {REQUIRED_LAYERS_PER_VALIDATOR} layers, found {held_layers}"
+                )
+            for start, end in normalized_ranges:
+                for layer in range(start, end):
+                    shard_coverage[layer] += 1
 
     total_stake = sum(stakes)
     if any((total_stake - stake) * 3 <= total_stake * 2 for stake in stakes):
         fail("validator stakes do not preserve strict >2/3 quorum during every one-node restart")
+    if mode == "production" and any(
+        replicas != REQUIRED_SHARD_REPLICATION for replicas in shard_coverage
+    ):
+        bad = [
+            f"{layer}:{replicas}"
+            for layer, replicas in enumerate(shard_coverage)
+            if replicas != REQUIRED_SHARD_REPLICATION
+        ]
+        fail(
+            "production shard_ranges must provide exact 3x coverage for every model layer; "
+            + ", ".join(bad)
+        )
     return manifest
 
 
@@ -543,6 +640,37 @@ def load_sealed_manifest(path: Path) -> tuple[dict[str, Any], str]:
     return manifest, digest
 
 
+def write_frontend_config(rollout: "RecoveryRollout", output_path: Path) -> str:
+    if output_path.suffix != ".json":
+        fail("frontend config output must end in .json")
+    payload = canonical_bytes(rollout.frontend_config())
+    digest = sha256_bytes(payload)
+    sidecar = output_path.with_name(output_path.name + ".sha256")
+    if output_path.exists() or sidecar.exists():
+        fail("frontend config or checksum already exists; refusing replacement")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    created: list[Path] = []
+    try:
+        _exclusive_write(output_path, payload, 0o444)
+        created.append(output_path)
+        _exclusive_write(sidecar, f"{digest}  {output_path.name}\n".encode(), 0o444)
+        created.append(sidecar)
+        directory_fd = os.open(output_path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        for path in reversed(created):
+            try:
+                path.chmod(0o600)
+                path.unlink()
+            except OSError:
+                pass
+        raise
+    return digest
+
+
 def run_checked(
     argv: Sequence[str],
     *,
@@ -610,6 +738,61 @@ class RecoveryRollout:
     def say(self, message: str) -> None:
         print(message, file=self.output, flush=True)
 
+    def frontend_config(self) -> dict[str, Any]:
+        """Derive the public recovered-network config from the sealed manifest.
+
+        The six v3 validators retain and serve blocks 0..H from the checkpoint
+        payload, so the selected primary is intentionally both the historical
+        and continuation source. No synthetic legacy API is invented.
+        """
+        if self.manifest["mode"] != "production":
+            fail("recovered frontend config requires a production rollout manifest")
+        sources = [
+            {
+                "id": f"v3-{node['name']}",
+                "name": f"ARC v3 {node['name'].upper()}",
+                "region": node["name"].upper(),
+                "kind": "v3",
+                "baseUrl": node["rpc_url"],
+                "enabled": True,
+                "replicaGroup": self.manifest["rollout_id"],
+            }
+            for node in self.validators
+        ]
+        primary = sources[0]["id"]
+        chain = self.chain
+        return {
+            "schema": "arc.frontend.network.v1",
+            "state": "recovered",
+            "network": {"name": "ARC Testnet", "chainId": chain["chain_id"]},
+            "checkpoint": {
+                "height": chain["source_height"],
+                "recoveryHeight": chain["transition_height"],
+                "blockHash": bare_hash(chain["source_block_hash"], "source block hash"),
+                "stateRoot": bare_hash(chain["source_state_root"], "source state root"),
+                "manifestHash": bare_hash(
+                    chain["approved_checkpoint_manifest_hash"], "checkpoint manifest hash"
+                ),
+                "boundaryBlockHash": bare_hash(
+                    chain["transition_block_hash"], "transition block hash"
+                ),
+                "boundaryStateRoot": bare_hash(
+                    chain["full_state_root"], "transition state root"
+                ),
+                "recoveryEpoch": chain["recovery_epoch"],
+                "validatorSetId": chain["validator_set_id"],
+                "protocolVersion": chain["protocol_version"],
+                "recoveryDomain": bare_hash(chain["recovery_domain"], "recovery domain"),
+                "legacySourceId": primary,
+                "v3SourceId": primary,
+            },
+            "sources": sources,
+            "services": {},
+            "notices": [
+                "Recovered protocol-v3 network; every listed validator serves the retained canonical history and H+1 continuation."
+            ],
+        }
+
     def recovery_cli(self, action: str, node: Mapping[str, Any] | None = None, *, remote: bool = False) -> list[str]:
         artifacts = self.manifest["artifacts"]
         if remote:
@@ -652,6 +835,11 @@ class RecoveryRollout:
             genesis = self.manifest["artifacts"]["genesis"]["path"]
         peers = [candidate["p2p_advertise"] for candidate in self.validators if candidate["name"] != node["name"]]
         community_origins = [candidate["rpc_url"] for candidate in self.validators]
+        inference_args: list[str] = []
+        if self.manifest["mode"] == "production":
+            inference_args = ["--model", node["model_path"]]
+            for start, end in node["shard_ranges"]:
+                inference_args.extend(("--shard-range", f"{start}:{end}"))
         return [
             binary,
             "--rpc",
@@ -673,6 +861,7 @@ class RecoveryRollout:
             "--validator-set-id",
             str(self.chain["validator_set_id"]),
             *(flag for origin in community_origins for flag in ("--community-rpc-url", origin)),
+            *inference_args,
             *node["extra_args"],
         ]
 
@@ -694,8 +883,18 @@ class RecoveryRollout:
         if self.manifest["mode"] == "production":
             self.say("  public RPC:                 pinned Caddy HTTPS nip.io/sslip.io gateways; node listeners stay loopback")
             self.say("  internal approvals:         six explicit HTTPS origins; no P2P-derived or raw :9090 RPC")
+            self.say(
+                "  inference topology:          canonical Llama-2-7B / 32 layers / exact 3x replication / 16 layers per validator"
+            )
         for node in self.validators:
-            self.say(f"    {node['name']}: {node['address']} rpc={node['rpc_url']} data={node['data_dir']}")
+            shard_note = ""
+            if self.manifest["mode"] == "production":
+                shard_note = " shards=" + ",".join(
+                    f"{start}:{end}" for start, end in node["shard_ranges"]
+                )
+            self.say(
+                f"    {node['name']}: {node['address']} rpc={node['rpc_url']} data={node['data_dir']}{shard_note}"
+            )
         self.say("  execute phases: verify artifacts/checkpoint; require fresh dirs; import; start 5+1; prove H/H+1; converge; restart 1-at-a-time; prove rewards")
         self.say("  rollback: stop only newly started v3 services/processes; preserve every data dir and log")
 
@@ -710,11 +909,16 @@ class RecoveryRollout:
             fail(f"recovery CLI did not return JSON: {error}")
         expected = {
             "manifest_hash": self.chain["approved_checkpoint_manifest_hash"],
+            "genesis_hash": self.chain["genesis_hash"],
             "full_state_root": self.chain["full_state_root"],
             "source_height": self.chain["source_height"],
+            "source_consensus_round": self.chain["source_consensus_round"],
+            "created_at_unix_ms": self.chain["created_at_unix_ms"],
             "source_block_hash": self.chain["source_block_hash"],
+            "source_state_root": self.chain["source_state_root"],
             "transition_height": self.chain["transition_height"],
             "transition_block_hash": self.chain["transition_block_hash"],
+            "recovery_domain": self.chain["recovery_domain"],
             "recovery_epoch": self.chain["recovery_epoch"],
             "validator_set_id": self.chain["validator_set_id"],
             "protocol_version": self.chain["protocol_version"],
@@ -790,7 +994,7 @@ class RecoveryRollout:
     def _preflight_production(self) -> None:
         script = r"""
 set -eu
-root=$1 data=$2 key=$3 service=$4 gateway_service=$5 filter_service=$6 rpc=$7
+root=$1 data=$2 key=$3 service=$4 gateway_service=$5 filter_service=$6 rpc=$7 model=$8 model_sha=$9
 command -v sha256sum >/dev/null
 command -v systemctl >/dev/null
 command -v curl >/dev/null
@@ -803,6 +1007,9 @@ test "$(stat -c %a "$key")" = 600
 test ! -e "/etc/systemd/system/$service"
 test ! -e "/etc/systemd/system/$gateway_service"
 test ! -e "/etc/systemd/system/$filter_service"
+test -f "$model"
+test ! -L "$model"
+printf '%s  %s\n' "$model_sha" "$model" | sha256sum --check --strict
 listeners=$(ss -ltnp | grep -E ':(80|443)[[:space:]]' || true)
 if [ -n "$listeners" ] && printf '%s\n' "$listeners" | grep -v nginx >/dev/null; then
   printf 'ports 80/443 are occupied by a non-nginx process\n%s\n' "$listeners" >&2
@@ -812,6 +1019,17 @@ if pgrep -x arc-node >/dev/null 2>&1; then
   printf 'legacy or unapproved arc-node is still running\n' >&2
   exit 1
 fi
+for retired in arc-self-heal.service arc-node.service; do
+  fence="/etc/systemd/system/$retired.d/arc-recovery-freeze.conf"
+  test -f "$fence"
+  test ! -L "$fence"
+  grep -Fxq 'RefuseManualStart=yes' "$fence"
+  grep -Fxq 'Restart=no' "$fence"
+  if systemctl is-active --quiet "$retired" || systemctl is-enabled --quiet "$retired"; then
+    printf 'retired legacy service is not persistently fenced: %s\n' "$retired" >&2
+    exit 1
+  fi
+done
 case "$rpc" in 127.*|localhost:*) ;; *) printf 'RPC is not loopback\n' >&2; exit 1 ;; esac
 """
         for node in self.validators:
@@ -830,6 +1048,8 @@ case "$rpc" in 127.*|localhost:*) ;; *) printf 'RPC is not loopback\n' >&2; exit
                     self.gateway_service_name(node),
                     self.filter_service_name(node),
                     node["rpc_listen"],
+                    node["model_path"],
+                    node["model_sha256"],
                 ),
             )
             self.say(f"PASS {node['name']} remote fresh-dir/key/service/DNS preflight")
@@ -863,7 +1083,10 @@ case "$rpc" in 127.*|localhost:*) ;; *) printf 'RPC is not loopback\n' >&2; exit
                 fail(f"{node['name']} /network/info {key}: expected {expected!r}, got {info.get(key)!r}")
         if bare_hash(info.get("checkpoint_manifest_hash"), f"{node['name']} checkpoint_manifest_hash") != expected_hash:
             fail(f"{node['name']} reports an unapproved checkpoint manifest hash")
-        bare_hash(info.get("recovery_domain"), f"{node['name']} recovery_domain")
+        if bare_hash(info.get("recovery_domain"), f"{node['name']} recovery_domain") != bare_hash(
+            self.chain["recovery_domain"], "manifest recovery_domain"
+        ):
+            fail(f"{node['name']} reports a recovery domain outside the sealed manifest")
 
     def wait_nodes_ready(self, timeout: int | None = None) -> None:
         deadline = time.monotonic() + (timeout or self.checks["startup_timeout_seconds"])
@@ -996,18 +1219,69 @@ case "$rpc" in 127.*|localhost:*) ;; *) printf 'RPC is not loopback\n' >&2; exit
         for key, expected in exact.items():
             if value.get(key) != expected:
                 fail(f"{node['name']} reward policy {key}: expected {expected!r}, got {value.get(key)!r}")
+        issuance_policy = value.get("issuance_policy")
+        expected_issuance_policy = {
+            "reward_amount": value.get("reward_base"),
+            "epoch_blocks": 216_000,
+            "max_per_block": 1,
+            "max_per_epoch": 40,
+            "max_per_worker_epoch": 8,
+            "max_per_coordinator_epoch": 16,
+        }
+        if issuance_policy != expected_issuance_policy:
+            fail(
+                f"{node['name']} reward issuance policy differs from the sealed v3 promotional caps"
+            )
+        bare_hash(value.get("issuance_policy_hash"), f"{node['name']} reward issuance policy hash")
+        if value.get("reward_program") != "protocol-capped testnet promotional compute subsidy":
+            fail(f"{node['name']} does not label the reward as the promotional testnet subsidy")
+        if value.get("reward_is_customer_demand") is not False:
+            fail(f"{node['name']} incorrectly represents validator recomputation as customer demand")
+        budget = value.get("prospective_budget")
+        if not isinstance(budget, dict):
+            fail(f"{node['name']} reward policy omits prospective consensus budget counters")
+        for key in (
+            "block_height",
+            "epoch",
+            "issued_this_block",
+            "remaining_this_block",
+            "issued_this_epoch",
+            "remaining_this_epoch",
+            "coordinator_issued_this_epoch",
+            "coordinator_remaining_this_epoch",
+        ):
+            if not isinstance(budget.get(key), int) or isinstance(budget.get(key), bool) or budget[key] < 0:
+                fail(f"{node['name']} reward prospective budget {key} is not a nonnegative integer")
+        if budget.get("worker_issued_this_epoch") is not None or budget.get("worker_remaining_this_epoch") is not None:
+            fail(f"{node['name']} policy invents a worker-specific counter without a worker identity")
         if expected_ready:
             for key in ("transaction_domain", "validator_set_commitment"):
                 bare_hash(value.get(key), f"{node['name']} reward policy {key}")
             if value.get("readiness_unavailable_reason") is not None:
                 fail(f"{node['name']} claims ready but reports a readiness failure")
+            if value.get("treasury_rewards_remaining", 0) <= 0 or any(
+                budget[key] <= 0
+                for key in (
+                    "remaining_this_block",
+                    "remaining_this_epoch",
+                    "coordinator_remaining_this_epoch",
+                )
+            ):
+                fail(f"{node['name']} claims issuance-ready with an exhausted treasury or budget")
         elif value.get("readiness_unavailable_reason") in {None, ""}:
             fail(f"{node['name']} must explain why issuance is unavailable")
         return value
 
     def prove_reward_policy(self) -> None:
         policies = [self._policy(node) for node in self.validators]
-        fields = ("transaction_domain", "validator_set_commitment", "reward_base", "reward_arc")
+        fields = (
+            "transaction_domain",
+            "validator_set_commitment",
+            "reward_base",
+            "reward_arc",
+            "issuance_policy_hash",
+            "issuance_policy",
+        )
         if any(len({json.dumps(policy.get(key), sort_keys=True) for policy in policies}) != 1 for key in fields):
             fail("validators disagree on reward domain, set commitment, or amount")
         state = "issuance-ready" if self.checks["reward"]["expect_issuance_ready"] else "fail-closed disabled"
@@ -1220,6 +1494,7 @@ Requires={self.filter_service_name(node)} {self.gateway_service_name(node)}
 Type=simple
 User={node['service_user']}
 UMask=0077
+Environment=ARC_PUBLIC_SOCKET={self._systemd_escape_arg(node['rpc_url'])}
 ExecStart={argv}
 Restart=on-failure
 RestartSec=2s
@@ -1252,9 +1527,56 @@ WantedBy=multi-user.target
         -Server
     }}
 
+    # Browser preflight is answered at the public TLS edge. It is never
+    # proxied to the node, and these matchers deliberately exclude every
+    # inter-validator/internal route.
+    @readPreflight {{
+        method OPTIONS
+        header Origin {PUBLIC_BROWSER_ORIGIN}
+        header Access-Control-Request-Method GET
+        path {get_paths} /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/*
+    }}
+    handle @readPreflight {{
+        header Access-Control-Allow-Origin "{PUBLIC_BROWSER_ORIGIN}"
+        header Vary "Origin"
+        header Access-Control-Allow-Methods "GET, OPTIONS"
+        header Access-Control-Allow-Headers "Accept, Content-Type"
+        header Access-Control-Max-Age "600"
+        respond "" 204
+    }}
+
+    @writePreflight {{
+        method OPTIONS
+        header Origin {PUBLIC_BROWSER_ORIGIN}
+        header Access-Control-Request-Method POST
+        path {post_paths}
+    }}
+    handle @writePreflight {{
+        header Access-Control-Allow-Origin "{PUBLIC_BROWSER_ORIGIN}"
+        header Vary "Origin"
+        header Access-Control-Allow-Methods "POST, OPTIONS"
+        header Access-Control-Allow-Headers "Accept, Content-Type"
+        header Access-Control-Max-Age "600"
+        respond "" 204
+    }}
+
+    @corsRead {{
+        method GET
+        header Origin {PUBLIC_BROWSER_ORIGIN}
+        path {get_paths} /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/*
+    }}
+    handle @corsRead {{
+        header Access-Control-Allow-Origin "{PUBLIC_BROWSER_ORIGIN}"
+        header Vary "Origin"
+        request_body {{
+            max_size 1MB
+        }}
+        reverse_proxy 127.0.0.1:18080
+    }}
+
     @read {{
-        method GET OPTIONS
-        path {get_paths} /block/* /tx/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/*
+        method GET
+        path {get_paths} /block/* /tx/* /account/* /account/*/txs /worker/earnings/* /community/reward_receipt/* /community/reward_job/*
     }}
     handle @read {{
         request_body {{
@@ -1263,8 +1585,22 @@ WantedBy=multi-user.target
         reverse_proxy 127.0.0.1:18080
     }}
 
+    @corsWrite {{
+        method POST
+        header Origin {PUBLIC_BROWSER_ORIGIN}
+        path {post_paths}
+    }}
+    handle @corsWrite {{
+        header Access-Control-Allow-Origin "{PUBLIC_BROWSER_ORIGIN}"
+        header Vary "Origin"
+        request_body {{
+            max_size 1MB
+        }}
+        reverse_proxy 127.0.0.1:18080
+    }}
+
     @write {{
-        method POST OPTIONS
+        method POST
         path {post_paths}
     }}
     handle @write {{
@@ -1282,6 +1618,18 @@ WantedBy=multi-user.target
     handle @validatorApproval {{
         request_body {{
             max_size 1MB
+        }}
+        reverse_proxy 127.0.0.1:18080
+    }}
+
+    @validatorShard {{
+        method POST
+        path /shards/announce /inference/forward_shard /inference/cleanup_shard
+        remote_ip {validator_ips}
+    }}
+    handle @validatorShard {{
+        request_body {{
+            max_size 4MB
         }}
         reverse_proxy 127.0.0.1:18080
     }}
@@ -1309,6 +1657,7 @@ http {{
     server_tokens off;
     limit_req_zone $binary_remote_addr zone=arc_read_{zone}:10m rate=30r/s;
     limit_req_zone $binary_remote_addr zone=arc_write_{zone}:10m rate=30r/m;
+    limit_req_zone $binary_remote_addr zone=arc_shard_{zone}:10m rate=100r/s;
     set_real_ip_from 127.0.0.1;
     real_ip_header X-Forwarded-For;
     real_ip_recursive on;
@@ -1320,14 +1669,14 @@ http {{
         allow 127.0.0.1;
         deny all;
         client_max_body_size 1m;
-        location ~ ^/(?:health|network/info|stats|validators|block/latest|blocks|inference/attestations|economics/rewards|community/reward_policy|shards|models|models/shards)$ {{
+        location ~ ^/(?:health|info|network/info|stats|validators|block/latest|blocks|inference/attestations|economics/rewards|community/list|community/reward_policy|workers/scoreboard|shards|models|models/shards)$ {{
             limit_except GET OPTIONS {{ deny all; }}
             limit_req zone=arc_read_{zone} burst=60 nodelay;
             proxy_pass http://{upstream};
             proxy_http_version 1.1;
             proxy_read_timeout 60s;
         }}
-        location ~ ^/(?:block/[0-9]+(?:/txs)?|tx/(?:0x)?[0-9a-fA-F]{{64}}(?:/full)?|account/(?:0x)?[0-9a-fA-F]{{64}}/txs|worker/earnings/(?:0x)?[0-9a-fA-F]{{64}}|community/reward_(?:receipt|job)/(?:0x)?[0-9a-fA-F]{{64}})$ {{
+        location ~ ^/(?:block/[0-9]+(?:/txs)?|tx/(?:0x)?[0-9a-fA-F]{{64}}(?:/full)?|account/(?:0x)?[0-9a-fA-F]{{64}}(?:/txs)?|worker/earnings/(?:0x)?[0-9a-fA-F]{{64}}|community/reward_(?:receipt|job)/(?:0x)?[0-9a-fA-F]{{64}})$ {{
             limit_except GET OPTIONS {{ deny all; }}
             limit_req zone=arc_read_{zone} burst=60 nodelay;
             proxy_pass http://{upstream};
@@ -1350,6 +1699,17 @@ http {{
             proxy_pass http://{upstream};
             proxy_http_version 1.1;
             proxy_read_timeout 180s;
+        }}
+        location ~ ^/(?:shards/announce|inference/(?:forward_shard|cleanup_shard))$ {{
+{allow_lines}
+            deny all;
+            limit_except POST {{ deny all; }}
+            client_max_body_size 4m;
+            limit_req zone=arc_shard_{zone} burst=200 nodelay;
+            proxy_pass http://{upstream};
+            proxy_http_version 1.1;
+            proxy_read_timeout 180s;
+            proxy_send_timeout 180s;
         }}
         location / {{ return 404; }}
     }}
@@ -1414,6 +1774,10 @@ WantedBy=multi-user.target
             (artifacts["binary"]["path"], f"{root}/arc-node"),
             (artifacts["genesis"]["path"], f"{root}/genesis.toml"),
             (artifacts["checkpoint"]["path"], f"{root}/recovery.arcchkpt"),
+            (
+                artifacts["legacy_validator_set"]["path"],
+                f"{root}/legacy-validator-set-40m.json",
+            ),
             (artifacts["caddy"]["path"], f"{root}/caddy"),
         ):
             self.scp(node, source, destination)
@@ -1431,13 +1795,17 @@ WantedBy=multi-user.target
                 self.scp(node, str(path), f"{root}/{name}")
         verify_script = r"""
 set -eu
-root=$1 binary_sha=$2 genesis_sha=$3 checkpoint_sha=$4 caddy_sha=$5
+root=$1 binary_sha=$2 genesis_sha=$3 checkpoint_sha=$4 legacy_validators_sha=$5 caddy_sha=$6 model=$7 model_sha=$8
 printf '%s  %s/arc-node\n' "$binary_sha" "$root" | sha256sum --check --strict
 printf '%s  %s/genesis.toml\n' "$genesis_sha" "$root" | sha256sum --check --strict
 printf '%s  %s/recovery.arcchkpt\n' "$checkpoint_sha" "$root" | sha256sum --check --strict
+printf '%s  %s/legacy-validator-set-40m.json\n' "$legacy_validators_sha" "$root" | sha256sum --check --strict
 printf '%s  %s/caddy\n' "$caddy_sha" "$root" | sha256sum --check --strict
+test -f "$model"
+test ! -L "$model"
+printf '%s  %s\n' "$model_sha" "$model" | sha256sum --check --strict
 chmod 0500 "$root/arc-node" "$root/caddy"
-chmod 0400 "$root/genesis.toml" "$root/recovery.arcchkpt" "$root/Caddyfile" "$root"/*.conf "$root"/*.service
+chmod 0400 "$root/genesis.toml" "$root/recovery.arcchkpt" "$root/legacy-validator-set-40m.json" "$root/Caddyfile" "$root"/*.conf "$root"/*.service
 "$root/caddy" validate --config "$root/Caddyfile" --adapter caddyfile
 """
         self.ssh(
@@ -1448,7 +1816,10 @@ chmod 0400 "$root/genesis.toml" "$root/recovery.arcchkpt" "$root/Caddyfile" "$ro
                 artifacts["binary"]["sha256"],
                 artifacts["genesis"]["sha256"],
                 artifacts["checkpoint"]["sha256"],
+                artifacts["legacy_validator_set"]["sha256"],
                 artifacts["caddy"]["sha256"],
+                node["model_path"],
+                node["model_sha256"],
             ),
         )
         remote_verify = self.recovery_cli("verify", node, remote=True)
@@ -1463,6 +1834,14 @@ chmod 0400 "$root/genesis.toml" "$root/recovery.arcchkpt" "$root/Caddyfile" "$ro
 set -eu
 root=$1 hostname=$2 service=$3 gateway_service=$4 filter_service=$5
 export DEBIAN_FRONTEND=noninteractive
+for retired in arc-self-heal.service arc-node.service; do
+  fence="/etc/systemd/system/$retired.d/arc-recovery-freeze.conf"
+  test -f "$fence"
+  grep -Fxq 'RefuseManualStart=yes' "$fence"
+  grep -Fxq 'Restart=no' "$fence"
+  ! systemctl is-active --quiet "$retired"
+  ! systemctl is-enabled --quiet "$retired"
+done
 old_nginx_active=$(systemctl is-active nginx.service 2>/dev/null || true)
 old_nginx_enabled=$(systemctl is-enabled nginx.service 2>/dev/null || true)
 {
@@ -1562,6 +1941,153 @@ fi
 """
         self.ssh(node, script, (node["rpc_listen"], node["service_name"]))
         self._http_json(node, "/network/info")
+        self._prove_public_browser_contract(node)
+
+    def _prove_public_browser_contract(self, node: Mapping[str, Any]) -> None:
+        """Exercise the browser contract at the public TLS edge.
+
+        OPTIONS must terminate at Caddy with no node proxy. Public GET/POST
+        routes expose CORS only to the exact GitHub Pages origin, while the
+        validator-only approval and shard routes expose no browser CORS at all.
+        """
+
+        def request(
+            method: str,
+            path: str,
+            *,
+            origin: str,
+            requested_method: str | None = None,
+        ) -> tuple[int, Mapping[str, str]]:
+            headers = {
+                "Accept": "application/json",
+                "Origin": origin,
+                "User-Agent": "arc-recovery-browser-gate/1",
+            }
+            if requested_method is not None:
+                headers["Access-Control-Request-Method"] = requested_method
+                headers["Access-Control-Request-Headers"] = "content-type"
+            rpc_request = urllib.request.Request(
+                node["rpc_url"] + path,
+                data=b"" if method == "POST" else None,
+                headers=headers,
+                method=method,
+            )
+            try:
+                with urllib.request.urlopen(
+                    rpc_request,
+                    timeout=20,
+                    context=ssl.create_default_context(),
+                ) as response:
+                    response.read(1024)
+                    return response.status, response.headers
+            except urllib.error.HTTPError as error:
+                error.read(1024)
+                return error.code, error.headers
+            except (urllib.error.URLError, TimeoutError) as error:
+                raise RolloutError(
+                    f"{node['name']} browser CORS gate {method} {path}: {error}"
+                ) from error
+
+        def require_allowed(status: int, headers: Mapping[str, str], expected: int) -> None:
+            if status != expected:
+                fail(f"{node['name']} public browser preflight returned HTTP {status}, expected {expected}")
+            if headers.get("Access-Control-Allow-Origin") != PUBLIC_BROWSER_ORIGIN:
+                fail(f"{node['name']} public browser route omitted the exact allow-origin")
+            vary = {part.strip().lower() for part in headers.get("Vary", "").split(",")}
+            if "origin" not in vary:
+                fail(f"{node['name']} public browser route omitted Vary: Origin")
+
+        status, headers = request(
+            "OPTIONS",
+            "/network/info",
+            origin=PUBLIC_BROWSER_ORIGIN,
+            requested_method="GET",
+        )
+        require_allowed(status, headers, 204)
+        status, headers = request(
+            "OPTIONS",
+            "/inference/run",
+            origin=PUBLIC_BROWSER_ORIGIN,
+            requested_method="POST",
+        )
+        require_allowed(status, headers, 204)
+        status, headers = request("GET", "/network/info", origin=PUBLIC_BROWSER_ORIGIN)
+        require_allowed(status, headers, 200)
+
+        status, headers = request(
+            "OPTIONS",
+            "/internal/community/reward/approve",
+            origin=PUBLIC_BROWSER_ORIGIN,
+            requested_method="POST",
+        )
+        if status != 404 or headers.get("Access-Control-Allow-Origin") is not None:
+            fail(f"{node['name']} validator approval route leaked browser CORS")
+        status, headers = request(
+            "OPTIONS",
+            "/network/info",
+            origin="https://attacker.invalid",
+            requested_method="GET",
+        )
+        if status != 404 or headers.get("Access-Control-Allow-Origin") is not None:
+            fail(f"{node['name']} public route allowed an unsealed browser origin")
+
+    def _check_production_shard_topology(self) -> str:
+        expected: dict[tuple[int, int], set[str]] = {}
+        for validator in self.validators:
+            for start, end in validator["shard_ranges"]:
+                expected.setdefault((start, end), set()).add(validator["rpc_url"])
+
+        model_ids: set[str] = set()
+        for validator in self.validators:
+            body = self._http_json(validator, "/shards", timeout=20)
+            if body.get("total_layers") != CANONICAL_MODEL_LAYERS or body.get("fully_covered") is not True:
+                fail(f"{validator['name']} does not report one fully covered 32-layer shard pipeline")
+            model_id = bare_hash(body.get("model_id"), f"{validator['name']} /shards model_id")
+            model_ids.add(model_id)
+            actual: dict[tuple[int, int], set[str]] = {}
+            shards = body.get("shards")
+            if not isinstance(shards, list):
+                fail(f"{validator['name']} /shards omitted the shard array")
+            for index, shard in enumerate(shards):
+                if not isinstance(shard, dict):
+                    fail(f"{validator['name']} /shards[{index}] is not an object")
+                if bare_hash(shard.get("model_id"), f"{validator['name']} shard model_id") != model_id:
+                    fail(f"{validator['name']} mixed model artifacts in one shard registry")
+                start = shard.get("start_layer")
+                end = shard.get("end_layer")
+                origin = shard.get("socket_addr")
+                if (
+                    not isinstance(start, int)
+                    or isinstance(start, bool)
+                    or not isinstance(end, int)
+                    or isinstance(end, bool)
+                    or not isinstance(origin, str)
+                ):
+                    fail(f"{validator['name']} /shards[{index}] has malformed range/origin fields")
+                actual.setdefault((start, end), set()).add(origin.rstrip("/"))
+            if actual != expected:
+                fail(
+                    f"{validator['name']} shard registry differs from the sealed exact 3x HTTPS topology"
+                )
+        if len(model_ids) != 1:
+            fail("validator shard registries disagree on the exact BLAKE3 model artifact ID")
+        return next(iter(model_ids))
+
+    def prove_production_shard_topology(self) -> None:
+        deadline = time.monotonic() + self.checks["convergence_timeout_seconds"]
+        last_error: RolloutError | None = None
+        while time.monotonic() < deadline:
+            try:
+                model_id = self._check_production_shard_topology()
+                self.say(
+                    "PASS all validators expose the sealed 32-layer/3x-replicated topology "
+                    f"through validator-only HTTPS (model_id=0x{model_id})"
+                )
+                return
+            except RolloutError as error:
+                last_error = error
+                time.sleep(self.checks["poll_interval_seconds"])
+        raise RolloutError(f"production shard topology did not converge: {last_error}")
 
     def execute_production(self) -> None:
         complete = False
@@ -1580,6 +2106,7 @@ fi
             for node in self.validators:
                 self._prove_production_listener(node)
             self.say("PASS all public sources use verified HTTPS and every arc-node RPC listener is loopback-only")
+            self.prove_production_shard_topology()
             self.prove_boundary()
             self.prove_advancing_convergence()
             for node in self.validators:
@@ -1660,6 +2187,12 @@ def build_parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify", help="read-only live convergence and optional mined-reward verification")
     verify.add_argument("--manifest", required=True, type=Path)
     verify.add_argument("--reward-evidence", type=Path)
+    frontend = subparsers.add_parser(
+        "frontend-config",
+        help="derive a create-only recovered frontend config from the sealed production manifest",
+    )
+    frontend.add_argument("--manifest", required=True, type=Path)
+    frontend.add_argument("--output", required=True, type=Path)
     return parser
 
 
@@ -1673,6 +2206,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         manifest, digest = load_sealed_manifest(args.manifest)
         rollout = RecoveryRollout(manifest, digest)
+        if args.command == "frontend-config":
+            config_digest = write_frontend_config(rollout, args.output)
+            print(
+                f"FRONTEND CONFIG {args.output} sha256={config_digest} "
+                f"rollout_sha256={digest}"
+            )
+            return 0
         if args.command == "verify":
             evidence = parse_evidence_file(args.reward_evidence) if args.reward_evidence else None
             if evidence is not None and manifest["checks"]["reward"]["mode"] != "receipt":

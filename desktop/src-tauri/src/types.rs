@@ -514,6 +514,19 @@ pub struct EarningsProjection {
     /// Exact rollout gate reported by the selected coordinator. Only `Some(true)`
     /// permits the UI to show a forward-looking community reward projection.
     pub community_rewards_enabled: Option<bool>,
+    /// Backend-authoritative forecast after readiness/budget/treasury policy.
+    pub projected_daily_arc: Option<f64>,
+    /// Populated exactly when `projected_daily_arc` is unavailable.
+    pub projected_daily_unavailable_reason: Option<String>,
+    /// Consensus-sealed promotional issuance policy commitment.
+    pub reward_policy_hash: Option<String>,
+    pub reward_budget_epoch: Option<u64>,
+    pub rewards_remaining_this_epoch: Option<u64>,
+    pub worker_rewards_remaining_this_epoch: Option<u64>,
+    pub coordinator_rewards_remaining_this_epoch: Option<u64>,
+    pub issuance_ready_for_worker: Option<bool>,
+    pub reward_program: Option<String>,
+    pub reward_is_customer_demand: Option<bool>,
     pub attestations_total: u64,
     pub first_attestation_block: Option<u64>,
     /// Reward receipts per day, MEASURED over this address's retained history.

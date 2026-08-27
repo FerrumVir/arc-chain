@@ -23,37 +23,50 @@
       "additionalProperties": false,
       "required": [
         "chain_id",
+        "genesis_hash",
         "protocol_version",
         "recovery_epoch",
         "validator_set_id",
         "source_height",
+        "source_consensus_round",
+        "created_at_unix_ms",
         "source_block_hash",
+        "source_state_root",
         "transition_height",
         "transition_block_hash",
         "full_state_root",
+        "recovery_domain",
         "approved_checkpoint_manifest_hash"
       ],
       "properties": {
         "chain_id": { "type": "string", "minLength": 1 },
+        "genesis_hash": { "$ref": "#/$defs/hash" },
         "protocol_version": { "type": "string", "pattern": "^3\\.[0-9]+\\.[0-9]+$" },
         "recovery_epoch": { "type": "integer", "minimum": 1 },
         "validator_set_id": { "type": "integer", "minimum": 1 },
         "source_height": { "type": "integer", "minimum": 0 },
+        "source_consensus_round": { "type": "integer", "minimum": 0 },
+        "created_at_unix_ms": { "type": "integer", "minimum": 1 },
         "source_block_hash": { "$ref": "#/$defs/hash" },
+        "source_state_root": { "$ref": "#/$defs/hash" },
         "transition_height": { "type": "integer", "minimum": 1 },
         "transition_block_hash": { "$ref": "#/$defs/hash" },
         "full_state_root": { "$ref": "#/$defs/hash" },
+        "recovery_domain": { "$ref": "#/$defs/hash" },
         "approved_checkpoint_manifest_hash": { "$ref": "#/$defs/hash" }
       }
     },
     "artifacts": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["binary", "genesis", "checkpoint"],
+      "required": ["binary", "genesis", "checkpoint", "legacy_validator_set"],
       "properties": {
         "binary": { "$ref": "#/$defs/artifact" },
         "genesis": { "$ref": "#/$defs/artifact" },
         "checkpoint": { "$ref": "#/$defs/artifact" },
+        "legacy_validator_set": { "$ref": "#/$defs/artifact" },
+        "source_snapshot": { "$ref": "#/$defs/artifact" },
+        "source_wal": { "$ref": "#/$defs/artifact" },
         "caddy": { "$ref": "#/$defs/artifact" }
       }
     },
@@ -123,7 +136,9 @@
                 "/blocks",
                 "/inference/attestations",
                 "/economics/rewards",
+                "/community/list",
                 "/community/reward_policy",
+                "/workers/scoreboard",
                 "/shards",
                 "/models",
                 "/models/shards"
@@ -193,7 +208,25 @@
         "remote_root": { "type": "string", "pattern": "^/" },
         "service_user": { "type": "string", "minLength": 1 },
         "service_name": { "type": "string", "pattern": "^arc-node-v3-[a-z0-9-]+\\.service$" },
-        "public_hostname": { "type": "string", "pattern": "^[A-Za-z0-9.-]+\\.(nip|sslip)\\.io$" }
+        "public_hostname": { "type": "string", "pattern": "^[A-Za-z0-9.-]+\\.(nip|sslip)\\.io$" },
+        "model_path": { "type": "string", "pattern": "^/" },
+        "model_sha256": {
+          "const": "08a5566d61d7cb6b420c3e4387a39e0078e1f2fe5f055f3a03887385304d4bfa"
+        },
+        "shard_ranges": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "array",
+            "prefixItems": [
+              { "type": "integer", "minimum": 0, "maximum": 31 },
+              { "type": "integer", "minimum": 1, "maximum": 32 }
+            ],
+            "items": false,
+            "minItems": 2,
+            "maxItems": 2
+          }
+        }
       }
     }
   }

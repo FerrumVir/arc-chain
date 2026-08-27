@@ -256,6 +256,21 @@ export interface EarningsProjection extends Unavailable {
    * projection is shown only when this is true.
    */
   communityRewardsEnabled: boolean | null;
+  /** Authoritative backend forecast after readiness/budget/treasury policy. */
+  projectedDailyArc: number | null;
+  /** Populated exactly when projectedDailyArc is unavailable. */
+  projectedDailyUnavailableReason: string | null;
+  /** Consensus-sealed promotional issuance policy commitment. */
+  rewardPolicyHash: string | null;
+  /** Epoch containing the prospective next reward block. */
+  rewardBudgetEpoch: number | null;
+  rewardsRemainingThisEpoch: number | null;
+  workerRewardsRemainingThisEpoch: number | null;
+  coordinatorRewardsRemainingThisEpoch: number | null;
+  issuanceReadyForWorker: boolean | null;
+  rewardProgram: string | null;
+  /** Must be false for the v0.8 promotional subsidy. */
+  rewardIsCustomerDemand: boolean | null;
   /** Successful mined reward receipts retained for this address. */
   attestationsTotal: number;
   /** Block containing the first retained successful reward receipt. */
