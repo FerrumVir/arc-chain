@@ -9,6 +9,7 @@ pub mod inference_validator;
 pub mod pipeline;
 pub mod planner;
 pub mod producer;
+pub mod recovery_dag_wal;
 pub mod rpc;
 pub mod state_sync;
 pub mod vrf;
