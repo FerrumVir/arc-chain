@@ -2359,14 +2359,32 @@ impl StateDB {
         producer: Address,
         timestamp: u64,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.execute_block_adaptive_at_with_proof(transactions, producer, timestamp, Hash256::ZERO)
+    }
+
+    /// Execute one canonical consensus decision and bind its authenticated DAG
+    /// identity directly into the resulting linear block header. Protocol-v3
+    /// consensus uses a domain-separated commitment to the exact DAG hash and
+    /// round; legacy and direct execution paths retain a zero proof hash.
+    pub fn execute_block_adaptive_at_with_proof(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp: u64,
+        proof_hash: Hash256,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         let mode = crate::block_stm::choose_execution_mode(transactions);
         match mode {
-            crate::block_stm::AdaptiveMode::Sequential => {
-                self.execute_block_verified_at(transactions, producer, timestamp)
-            }
+            crate::block_stm::AdaptiveMode::Sequential => self
+                .execute_block_verified_at_with_proof(
+                    transactions,
+                    producer,
+                    timestamp,
+                    proof_hash,
+                ),
             crate::block_stm::AdaptiveMode::BlockSTM => {
                 // Use BlockSTM partitioned execution
-                self.execute_block_blockstm_at(transactions, producer, timestamp)
+                self.execute_block_blockstm_at(transactions, producer, timestamp, proof_hash)
             }
         }
     }
@@ -2377,6 +2395,7 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
         timestamp: u64,
+        proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
@@ -2483,7 +2502,7 @@ impl StateDB {
             parent_hash: parent,
             tx_root,
             state_root,
-            proof_hash: Hash256::ZERO,
+            proof_hash,
             tx_count: transactions.len() as u32,
             producer,
             protocol_version: self.active_protocol_version(),
@@ -2536,6 +2555,16 @@ impl StateDB {
         transactions: &[Transaction],
         producer: Address,
         timestamp: u64,
+    ) -> Result<(Block, Vec<TxReceipt>), StateError> {
+        self.execute_block_verified_at_with_proof(transactions, producer, timestamp, Hash256::ZERO)
+    }
+
+    fn execute_block_verified_at_with_proof(
+        &self,
+        transactions: &[Transaction],
+        producer: Address,
+        timestamp: u64,
+        proof_hash: Hash256,
     ) -> Result<(Block, Vec<TxReceipt>), StateError> {
         self.require_healthy_wal()?;
         self.validate_next_protocol_block_admission(transactions)?;
@@ -2694,7 +2723,7 @@ impl StateDB {
             parent_hash: parent,
             tx_root,
             state_root,
-            proof_hash: Hash256::ZERO,
+            proof_hash,
             tx_count: transactions.len() as u32,
             producer,
             protocol_version: self.active_protocol_version(),
@@ -9404,7 +9433,7 @@ mod tests {
             .execute_block_verified_at(std::slice::from_ref(&transaction), addr(99), timestamp)
             .unwrap();
         let (blockstm_block, blockstm_receipts) = blockstm
-            .execute_block_blockstm_at(&[transaction], addr(99), timestamp)
+            .execute_block_blockstm_at(&[transaction], addr(99), timestamp, Hash256::ZERO)
             .unwrap();
 
         assert!(!sequential_receipts[0].success);
@@ -9443,7 +9472,12 @@ mod tests {
         let mut transfer = Transaction::new_transfer(signer.address(), recipient, 11, 0);
         transfer.sign(&signer).unwrap();
         let (_, receipts) = state
-            .execute_block_blockstm_at(&[first, second, transfer], addr(99), 1_800_000_001_001)
+            .execute_block_blockstm_at(
+                &[first, second, transfer],
+                addr(99),
+                1_800_000_001_001,
+                Hash256::ZERO,
+            )
             .unwrap();
 
         assert_eq!(
@@ -9752,6 +9786,28 @@ mod tests {
         assert_eq!(first_next.header.parent_hash, first_block.hash);
         assert_eq!(second_next.header.parent_hash, second_block.hash);
         assert_eq!(first_next.hash, second_next.hash);
+    }
+
+    #[test]
+    fn consensus_proof_hash_is_persisted_in_the_canonical_block_identity() {
+        let producer = addr(93);
+        let proof = hash_bytes(b"recovery-domain DAG decision round 42");
+        let first = StateDB::with_genesis(&[]);
+        let second = StateDB::with_genesis(&[]);
+
+        let (bound, _) = first
+            .execute_block_adaptive_at_with_proof(&[], producer, 1_800_000_000_500, proof)
+            .unwrap();
+        let (unbound, _) = second
+            .execute_block_adaptive_at(&[], producer, 1_800_000_000_500)
+            .unwrap();
+
+        assert_eq!(bound.header.proof_hash, proof);
+        assert_eq!(unbound.header.proof_hash, Hash256::ZERO);
+        assert_ne!(bound.hash, unbound.hash);
+        let stored = first.get_block(bound.header.height).unwrap();
+        assert_eq!(stored.hash, bound.hash);
+        assert_eq!(stored.header.proof_hash, proof);
     }
 
     #[test]
