@@ -216,7 +216,9 @@ pub struct RetainedRecordSet {
     pub record_count: u64,
     pub payload_bytes: u64,
     pub file_bytes: u64,
+    /// Minimum round present; physical record order is preserved separately.
     pub first_round: Option<u64>,
+    /// Maximum round present; physical record order is preserved separately.
     pub last_round: Option<u64>,
     pub records_file_hash: Hash256,
 }
@@ -284,7 +286,9 @@ pub struct RecordLogInspection {
     pub payload_bytes: u64,
     pub valid_prefix_bytes: u64,
     pub total_file_bytes: u64,
+    /// Minimum round in the valid prefix, not the first physical record.
     pub first_round: Option<u64>,
+    /// Maximum round in the valid prefix, not the last physical record.
     pub last_round: Option<u64>,
     pub valid_prefix_hash: Hash256,
     pub complete_file_hash: Hash256,
@@ -300,7 +304,9 @@ pub struct ActiveLogInspection {
     pub payload_bytes: u64,
     pub valid_prefix_bytes: u64,
     pub total_file_bytes: u64,
+    /// Minimum round in complete active batches, independent of append order.
     pub first_round: Option<u64>,
+    /// Maximum round in complete active batches, independent of append order.
     pub last_round: Option<u64>,
     pub valid_prefix_hash: Hash256,
     pub complete_file_hash: Hash256,
@@ -438,7 +444,6 @@ pub struct ActiveLogWriter {
     file: File,
     inspection: ActiveLogInspection,
     seen: HashMap<(RetainedRecordKind, u64, [u8; 32]), Hash256>,
-    last_round: Option<u64>,
     active_hasher: blake3::Hasher,
     poisoned: Option<String>,
     _store_lock: StoreLock,
@@ -487,7 +492,6 @@ impl ActiveLogWriter {
         let mut batch_payload_bytes = 0u64;
         let mut batch_seen = HashMap::new();
         let mut appendable = Vec::with_capacity(records.len());
-        let mut previous_round = self.last_round;
         for record in records {
             validate_record(record)?;
             let identity = record_identity(record);
@@ -506,11 +510,6 @@ impl ActiveLogWriter {
                 }
                 continue;
             }
-            if previous_round.is_some_and(|round| record.round < round) {
-                return Err(GenerationError::Invalid(
-                    "active batch records are not ordered by nondecreasing round".into(),
-                ));
-            }
             if record.round < cursor.retention_floor_round
                 || record.round > cursor.retention_ceiling_round
             {
@@ -524,7 +523,6 @@ impl ActiveLogWriter {
             batch_payload_bytes = batch_payload_bytes
                 .checked_add(record.payload.len() as u64)
                 .ok_or_else(|| GenerationError::Invalid("batch payload size overflow".into()))?;
-            previous_round = Some(record.round);
         }
         if batch_payload_bytes > HARD_MAX_ACTIVE_BATCH_PAYLOAD_BYTES {
             return Err(GenerationError::Invalid(format!(
@@ -615,16 +613,30 @@ impl ActiveLogWriter {
             .checked_add(frame.len() as u64)
             .ok_or_else(|| GenerationError::Invalid("active prefix size overflow".into()))?;
         self.inspection.total_file_bytes = self.inspection.valid_prefix_bytes;
-        self.inspection.first_round = self
-            .inspection
-            .first_round
-            .or_else(|| appendable.first().map(|record| record.round));
-        self.inspection.last_round = appendable.last().map(|record| record.round);
+        let batch_min_round = appendable
+            .iter()
+            .map(|record| record.round)
+            .min()
+            .expect("non-empty appendable batch");
+        let batch_max_round = appendable
+            .iter()
+            .map(|record| record.round)
+            .max()
+            .expect("non-empty appendable batch");
+        self.inspection.first_round = Some(
+            self.inspection
+                .first_round
+                .map_or(batch_min_round, |round| round.min(batch_min_round)),
+        );
+        self.inspection.last_round = Some(
+            self.inspection
+                .last_round
+                .map_or(batch_max_round, |round| round.max(batch_max_round)),
+        );
         let current_hash = Hash256(*self.active_hasher.clone().finalize().as_bytes());
         self.inspection.valid_prefix_hash = current_hash;
         self.inspection.complete_file_hash = current_hash;
         self.inspection.suffix = TornSuffix::Clean;
-        self.last_round = self.inspection.last_round;
         for record in &appendable {
             self.seen
                 .insert(record_identity(record), record_payload_fingerprint(record));
@@ -930,16 +942,12 @@ impl GenerationStore {
                 "active delta changed between validation and writer open".into(),
             ));
         }
-        let last_round = active_inspection
-            .last_round
-            .or(generation.manifest.retained_records.last_round);
         Ok(ActiveLogWriter {
             generation,
             path,
             file,
             inspection: active_inspection,
             seen,
-            last_round,
             active_hasher,
             poisoned: None,
             _store_lock: store_lock,
@@ -1627,6 +1635,10 @@ fn validate_manifest(manifest: &GenerationManifest) -> Result<()> {
         return Err(GenerationError::Invalid(
             "non-empty record set must commit to both round bounds".into(),
         ));
+    } else if records.first_round > records.last_round {
+        return Err(GenerationError::Invalid(
+            "record-set minimum round exceeds its maximum round".into(),
+        ));
     }
     Ok(())
 }
@@ -1793,17 +1805,11 @@ fn validate_record(record: &RetainedDagRecord) -> Result<()> {
     Ok(())
 }
 
-fn validate_record_sequence(
+fn validate_record_identity(
     record: &RetainedDagRecord,
-    previous_round: Option<u64>,
     seen: &mut HashSet<(RetainedRecordKind, u64, [u8; 32])>,
 ) -> Result<()> {
     validate_record(record)?;
-    if previous_round.is_some_and(|round| record.round < round) {
-        return Err(GenerationError::Invalid(
-            "retained records are not ordered by nondecreasing round".into(),
-        ));
-    }
     if !seen.insert(record_identity(record)) {
         return Err(GenerationError::Invalid(
             "duplicate retained record identity in one generation".into(),
@@ -1848,11 +1854,11 @@ where
     let mut record_count = 0u64;
     let mut payload_bytes = 0u64;
     let mut file_bytes = RECORD_MAGIC.len() as u64;
-    let mut first_round = None;
-    let mut last_round = None;
+    let mut first_round: Option<u64> = None;
+    let mut last_round: Option<u64> = None;
     let mut seen = HashSet::new();
     for record in records {
-        validate_record_sequence(&record, last_round, &mut seen)?;
+        validate_record_identity(&record, &mut seen)?;
         if record.round < cursor.retention_floor_round
             || record.round > cursor.retention_ceiling_round
         {
@@ -1894,8 +1900,8 @@ where
         file_bytes = file_bytes
             .checked_add(4 + encoded.len() as u64 + 32)
             .ok_or_else(|| GenerationError::Invalid("record file byte count overflow".into()))?;
-        first_round.get_or_insert(record.round);
-        last_round = Some(record.round);
+        first_round = Some(first_round.map_or(record.round, |round| round.min(record.round)));
+        last_round = Some(last_round.map_or(record.round, |round| round.max(record.round)));
     }
     file.sync_all()
         .map_err(|error| io_error("fsync", path, error))?;
@@ -1979,8 +1985,8 @@ where
     let mut record_count = 0u64;
     let mut payload_bytes = 0u64;
     let mut valid_prefix_bytes = header.len() as u64;
-    let mut first_round = None;
-    let mut last_round = None;
+    let mut first_round: Option<u64> = None;
+    let mut last_round: Option<u64> = None;
     let mut seen = HashSet::new();
     let suffix;
     loop {
@@ -2047,7 +2053,7 @@ where
             )));
         }
         let record = decode_record(&encoded)?;
-        validate_record_sequence(&record, last_round, &mut seen)?;
+        validate_record_identity(&record, &mut seen)?;
         record_count = record_count
             .checked_add(1)
             .ok_or_else(|| GenerationError::Invalid("record count overflow".into()))?;
@@ -2064,8 +2070,8 @@ where
                 "record log exceeds its configured payload bound".into(),
             ));
         }
-        first_round.get_or_insert(record.round);
-        last_round = Some(record.round);
+        first_round = Some(first_round.map_or(record.round, |round| round.min(record.round)));
+        last_round = Some(last_round.map_or(record.round, |round| round.max(record.round)));
         visitor(record)?;
         prefix_hasher.update(&length_bytes);
         prefix_hasher.update(&encoded);
@@ -2156,9 +2162,8 @@ where
     let mut batch_count = 0u64;
     let mut record_count = 0u64;
     let mut payload_bytes = 0u64;
-    let mut first_round = None;
-    let mut last_round = None;
-    let mut previous_round = generation.manifest.retained_records.last_round;
+    let mut first_round: Option<u64> = None;
+    let mut last_round: Option<u64> = None;
     let mut seen = HashSet::new();
     let suffix;
     loop {
@@ -2224,7 +2229,7 @@ where
         let batch = decode_active_batch(&body, batch_count, limits)?;
         let mut batch_payload = 0u64;
         for record in &batch {
-            validate_record_sequence(record, previous_round, &mut seen)?;
+            validate_record_identity(record, &mut seen)?;
             if record.round < generation.manifest.dag_cursor.retention_floor_round
                 || record.round > generation.manifest.dag_cursor.retention_ceiling_round
             {
@@ -2236,7 +2241,8 @@ where
             batch_payload = batch_payload
                 .checked_add(record.payload.len() as u64)
                 .ok_or_else(|| GenerationError::Invalid("active payload size overflow".into()))?;
-            previous_round = Some(record.round);
+            first_round = Some(first_round.map_or(record.round, |round| round.min(record.round)));
+            last_round = Some(last_round.map_or(record.round, |round| round.max(record.round)));
         }
         if batch_payload > HARD_MAX_ACTIVE_BATCH_PAYLOAD_BYTES {
             return Err(GenerationError::Invalid(
@@ -2267,8 +2273,6 @@ where
                 "active delta exceeds the generation's combined retention caps".into(),
             ));
         }
-        first_round = first_round.or_else(|| batch.first().map(|record| record.round));
-        last_round = batch.last().map(|record| record.round).or(last_round);
         for record in batch {
             visitor(record)?;
         }
@@ -3156,6 +3160,76 @@ mod tests {
                 .record_count,
             0
         );
+    }
+
+    #[test]
+    fn consensus_append_order_allows_late_lower_round_commit_and_compaction() {
+        let parent = TestDirectory::new("consensus-append-order");
+        let store = GenerationStore::new(parent.0.join("store"));
+        let block_100_hash = h(b"round-100-block");
+        let physical_order = vec![
+            RetainedDagRecord::transaction(100, h(b"round-100-transaction"), vec![1]),
+            RetainedDagRecord::dag_block(100, block_100_hash, vec![2]),
+            RetainedDagRecord::dag_block(101, h(b"round-101-block"), vec![3]),
+            RetainedDagRecord::dag_block(102, h(b"round-102-block"), vec![4]),
+        ];
+        let generation = store
+            .create_initial(input(10, 5, 100), physical_order.clone())
+            .unwrap();
+        assert_eq!(generation.manifest.retained_records.first_round, Some(100));
+        assert_eq!(generation.manifest.retained_records.last_round, Some(102));
+
+        let late_commit = RetainedDagRecord::commit(100, block_100_hash);
+        let mut writer = store
+            .open_current_active_writer(&binding(), generation.pin)
+            .unwrap();
+        writer
+            .append_batch(std::slice::from_ref(&late_commit), ActiveDurability::Fsync)
+            .expect("Commit(100) must remain valid after blocks through round 102");
+        assert_eq!(writer.inspection().first_round, Some(100));
+        assert_eq!(writer.inspection().last_round, Some(100));
+        drop(writer);
+
+        let mut streamed = Vec::new();
+        let summary = store
+            .stream_current_generation_and_active(&binding(), generation.pin, |record| {
+                streamed.push(record);
+                Ok(())
+            })
+            .unwrap();
+        let mut expected_order = physical_order;
+        expected_order.push(late_commit);
+        assert_eq!(
+            streamed, expected_order,
+            "physical WAL order must be retained"
+        );
+
+        let compacted = store
+            .append_compacted(
+                generation.pin,
+                summary.active_pin,
+                input(11, 6, 100),
+                streamed,
+            )
+            .unwrap();
+        assert_eq!(compacted.manifest.retained_records.first_round, Some(100));
+        assert_eq!(compacted.manifest.retained_records.last_round, Some(102));
+        assert_eq!(
+            store
+                .load_current(&binding(), Some(compacted.pin))
+                .unwrap()
+                .pin,
+            compacted.pin
+        );
+
+        let mut reloaded = Vec::new();
+        store
+            .stream_current_generation_and_active(&binding(), compacted.pin, |record| {
+                reloaded.push(record);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reloaded, expected_order);
     }
 
     #[test]
